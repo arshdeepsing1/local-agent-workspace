@@ -74,6 +74,7 @@ def test_tab_and_click_insert_and_escape_closes_until_the_text_changes(ui, page)
     start_app(ui, page)
     box = message(page)
     box.press_sequentially("/han")
+    expect(options(page)).to_have_count(1)
     box.press("Tab")
     expect(box).to_have_value("/handoff ")
     expect(box).to_be_focused()
@@ -179,3 +180,20 @@ def test_matching_ranks_id_prefixes_then_name_prefixes_then_substrings(ui):
     })""")
     assert ranked == {"rev": ["review", "code-review", "preview"], "all": ["preview", "code-review", "review"],
                       "queries": ["", "rev", None, None, None, None]}
+
+
+def test_enter_and_tab_wait_for_the_list_instead_of_sending_or_leaving(ui, page):
+    start_app(ui, page, setup="""const list = fake.defer('skills')
+      fake.override = path => path === '/api/skills' ? list.promise : undefined""")
+    box = message(page)
+    box.press_sequentially("/han")
+    expect(page.get_by_role("status").filter(has_text="Loading skills…")).to_be_visible()
+    box.press("Enter")
+    box.press("Tab")
+    expect(box).to_be_focused()
+    expect(box).to_have_value("/han")
+    assert not ui.requests("/api/sessions", "POST") and not ui.requests("/api/sessions/created/messages")
+    ui.run("fake.deferreds.skills.resolve(fake.json(skills))")
+    expect(options(page)).to_have_count(1)
+    box.press("Enter")
+    expect(box).to_have_value("/handoff ")

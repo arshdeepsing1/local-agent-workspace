@@ -54,13 +54,16 @@ export function useSlashMenu({ value, setValue, loadSkills }) {
   const keyDown = event => {
     if (!open || event.isComposing) return false
     if (event.key === 'Escape') { event.preventDefault(); setDismissed(value); return true }
+    const completes = (event.key === 'Enter' || event.key === 'Tab') && !event.shiftKey
+    // Until the first list arrives, do not send a half-typed command or leave the box.
+    if (!skills && !error && completes) { event.preventDefault(); return true }
     if (!matches.length) return false
     if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
       event.preventDefault()
       setHighlight({ query, index: (index + (event.key === 'ArrowDown' ? 1 : -1) + matches.length) % matches.length })
       return true
     }
-    if ((event.key === 'Enter' || event.key === 'Tab') && !event.shiftKey) { event.preventDefault(); choose(matches[index]); return true }
+    if (completes) { event.preventDefault(); choose(matches[index]); return true }
     return false
   }
   const listed = open && matches.length > 0
