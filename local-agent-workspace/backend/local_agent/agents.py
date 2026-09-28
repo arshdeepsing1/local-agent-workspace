@@ -113,6 +113,8 @@ You CAN inspect folders outside the workspace, including Downloads. Call list_fi
 with that path; the app requests folder access when needed. Never claim you cannot
 access an external folder without attempting the file tool. Use glob="*.csv" when
 asked about CSV files. Use list_skills/use_skill for explicitly relevant workspace skills.
+A user message that starts with /<skill-id> (or /skill <skill-id>) has selected that skill:
+follow its instructions, treating any text after the command as the request.
 Record multi-step work with create_task/update_task; keep status truthful. Delegate only a
 concrete independent task, supplying its needed context. Subagents share files, so avoid
 concurrent conflicting edits. Open the child conversation to approve its pending actions.
@@ -340,6 +342,20 @@ class AgentManager:
         session["active_skills"] = ids
         self.store.save(session)
         return {"active_skills": ids}
+
+    def requested_skill(self, tools, prompt):
+        """The skill a message names: `/skill <id> …`, or `/<id> …` for a listed skill.
+        Any other text starting with a slash, such as a path, stays an ordinary message."""
+        words = prompt.split(maxsplit=2)
+        if not words or not words[0].startswith("/"):
+            return None
+        if words[0] == "/skill" and len(words) > 1:
+            return words[1]
+        try:
+            listed = {skill["id"] for skill in self.extensions.skills(tools)}
+        except (OSError, ValueError):
+            return None  # The skills list reports a broken skills folder.
+        return words[0][1:] if words[0][1:] in listed else None
 
     @staticmethod
     def metadata_page(items, offset, key):
@@ -1233,8 +1249,8 @@ class AgentManager:
         tools = WorkspaceTools(session["workspace"], self.settings.values["env_file"], session.get("allowed_directories", []), mode == "bypassPermissions")
         definitions = filter_tools(session, [*TOOL_DEFINITIONS, *[tool for tool in FEATURE_TOOLS
                        if not session.get("is_subagent") or tool["function"]["name"] != "delegate_task"], *external_tools])
-        if prompt.startswith("/skill "):
-            skill_id = prompt.split(maxsplit=2)[1]
+        skill_id = self.requested_skill(tools, prompt)
+        if skill_id:
             self.select_skill(session, tools, skill_id)
         # Complete interrupted tool exchanges before sending the next user turn.
         wire, context_state = repair_tool_history(session["wire"], session["events"], session.get("context_state", {}))

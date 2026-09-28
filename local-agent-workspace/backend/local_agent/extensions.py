@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from . import config
 from .jobs import CommandTimeout, run_process
 from .mcp_client import MCPConnection, bounded_error, bounded_result
 
@@ -91,8 +92,11 @@ def validate_config(config):
 
 
 class ExtensionManager:
-    def __init__(self, settings):
+    def __init__(self, settings, app_skills=None):
         self.settings = settings
+        # Skills shipped with the app (skills/<id>/SKILL.md) are offered in every
+        # workspace; a workspace skill with the same ID replaces the shipped one.
+        self.app_skills = Path(app_skills) if app_skills is not None else config.APP_ROOT / "skills"
         self.path = settings.state_dir / "extensions.json"
         self.config = {"servers": [], "hooks": []}
         if self.path.exists():
@@ -173,6 +177,16 @@ class ExtensionManager:
         target = tools.path(f".agents/skills/{skill_id}/SKILL.md")
         if not target.is_relative_to(tools.root) or not stat.S_ISREG(target.stat().st_mode):
             raise ValueError("Skills must be regular files inside this workspace.")
+        return self._read_skill(skill_id, target, str(target.relative_to(tools.root)))
+
+    def _app_skill(self, skill_id):
+        folder = self.app_skills / skill_id
+        target = folder / "SKILL.md"
+        if folder.is_symlink() or target.is_symlink() or not stat.S_ISREG(target.stat().st_mode):
+            raise ValueError("Shipped skills must be regular files in the app's skills folder.")
+        return self._read_skill(skill_id, target, str(target))
+
+    def _read_skill(self, skill_id, target, path):
         with target.open("rb") as source:
             raw = source.read(SKILL_LIMIT + 1)
         if len(raw) > SKILL_LIMIT or b"\x00" in raw:
@@ -192,14 +206,15 @@ class ExtensionManager:
                     else:
                         description = value[:300]
         return {"id": skill_id, "name": self.settings.redact(name), "description": self.settings.redact(description),
-                "path": str(target.relative_to(tools.root)), "text": self.settings.redact(text)}
+                "path": path, "text": self.settings.redact(text)}
 
-    def skills(self, tools):
-        folder = tools.path(".agents/skills")
-        if not folder.exists():
-            return []
-        if not folder.is_relative_to(tools.root) or not folder.is_dir():
-            raise ValueError("Skills must be in this workspace's .agents/skills directory.")
+    @staticmethod
+    def _in_workspace(tools, skill_id):
+        # Any workspace entry for this ID takes it over, even an invalid one, so a
+        # shipped skill never silently replaces a workspace skill that fails to load.
+        return os.path.lexists(tools.root / ".agents" / "skills" / skill_id / "SKILL.md")
+
+    def _discover(self, folder, load):
         children = list(itertools.islice(folder.iterdir(), 101))
         if len(children) > 100:
             raise ValueError("Skill discovery scans at most 100 entries; reduce the skills directory.")
@@ -210,7 +225,7 @@ class ExtensionManager:
             if not (child / "SKILL.md").exists():
                 continue
             try:
-                skill = self._skill(tools, child.name)
+                skill = load(child.name)
             except (OSError, ValueError, UnicodeError):
                 continue
             skills.append({key: value for key, value in skill.items() if key != "text"})
@@ -218,7 +233,23 @@ class ExtensionManager:
                 raise ValueError("At most 30 workspace skills can be discovered.")
         return skills
 
+    def skills(self, tools):
+        folder = tools.path(".agents/skills")
+        skills = []
+        if folder.exists():
+            if not folder.is_relative_to(tools.root) or not folder.is_dir():
+                raise ValueError("Skills must be in this workspace's .agents/skills directory.")
+            skills = self._discover(folder, lambda skill_id: self._skill(tools, skill_id))
+        try:
+            shipped = self._discover(self.app_skills, self._app_skill) if self.app_skills.is_dir() else []
+        except (OSError, ValueError):
+            shipped = []
+        return skills + [skill for skill in shipped if not self._in_workspace(tools, skill["id"])]
+
     def load_skill(self, tools, skill_id):
+        if (isinstance(skill_id, str) and SKILL_IDENTIFIER.fullmatch(skill_id) and not self._in_workspace(tools, skill_id)
+                and os.path.lexists(self.app_skills / skill_id / "SKILL.md")):
+            return self._app_skill(skill_id)
         return self._skill(tools, skill_id)
 
     async def run_hook(self, hook, payload, workspace):

@@ -36,6 +36,7 @@ export default function App() {
     disabled=${!app.ready || (!!app.activeId && !active) || !app.settings?.configured}
     onModel=${app.changeModel}
     onSend=${app.send} onError=${showError} onAttach=${() => setWorkspaceOpen(true)}
+    loadSkills=${() => api(`/skills${app.activeId ? `?session_id=${encodeURIComponent(app.activeId)}` : ''}`)}
     onStop=${() => { if (active) void api(`/sessions/${active.id}/stop`, 'POST').catch(e => showError(e.message)) }} />`
   return html`<div class=${`app-shell ${workspaceOpen ? 'workspace-visible' : ''}`}>
     <${Sidebar} settings=${app.settings} connection=${app.connection} sessions=${app.sessions} activeId=${app.activeId}

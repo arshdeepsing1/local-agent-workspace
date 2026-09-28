@@ -25,7 +25,8 @@ frontend that runs without a build step.
 - Workspace file explorer, text editor with stale-file detection, Git status/diff,
   and a non-interactive command runner.
 - File checkpoints with reviewed, reversible restore and managed Git worktrees.
-- Explicit MCP servers, workspace skills, and approval-controlled tool lifecycle hooks.
+- Explicit MCP servers, workspace skills with a `/` command menu, and approval-controlled
+  tool lifecycle hooks.
 - Persistent tasks with dependencies and bounded subagents in separate conversations.
 - Collapsible activity and persisted provider reasoning summaries when returned by the endpoint.
 - Responsive desktop/mobile UI, bundled fonts, and no credential storage in the browser.
@@ -178,6 +179,12 @@ when opening a conversation or performing restart recovery.
   The message box stays editable while connecting. The permissions menu opens above
   the composer; clicking the input closes it, and choosing a mode returns focus to chat.
   Open tabs reconnect after a server restart without discarding the current draft.
+- **Skills (`/`)**: type `/` at the start of the message box to list the skills this
+  conversation can use, with their descriptions; keep typing to filter. Use ↑/↓ to
+  highlight one and Enter or Tab (or click it) to insert `/<skill-id> `, then add your
+  request and press Enter to send. Esc closes the list. A message that starts with a
+  listed skill's command selects that skill; any other text starting with `/`, such as a
+  path, is sent unchanged. See **Agent tools: MCP, skills, and hooks** below.
 - **Model selection**: the dropdown below the message box changes the model for
   the current conversation. Its history, title, folder access, and permissions are
   preserved, and the next reply uses the selected endpoint with the retained chat
@@ -572,20 +579,25 @@ An MCP result with `is_error=true` is displayed as an error even when the server
 request itself succeeded. Its bounded diagnostic remains available to the model;
 the app does not automatically retry the action.
 
-Install workspace skills at `.agents/skills/<skill-id>/SKILL.md`. Optional simple
-frontmatter supplies `name` and `description`. Enable a discovered skill in the
-panel, begin a message with `/skill <skill-id>`, or ask the model to use its
-`list_skills` / `use_skill` tools. Selection persists per chat, instructions reload
+Install workspace skills at `.agents/skills/<skill-id>/SKILL.md`. Skills shipped with
+the app in `skills/<skill-id>/SKILL.md` are available in every workspace; a workspace
+skill with the same ID replaces the shipped one. Other folders, such as
+`.claude/skills`, are not read. Optional simple frontmatter supplies `name` and
+`description`. Enable a discovered skill in the panel, begin a message with
+`/<skill-id>` (type `/` to choose from the list) or `/skill <skill-id>`, or ask the
+model to use its `list_skills` / `use_skill` tools. Selection persists per chat, instructions reload
 on each model request, and a newly selected/changed skill must reach the model
 before a write, command, or MCP call. At most three selected skills fit a combined
 8 KB instruction budget. Skills never override user instructions or permissions;
 this version has no marketplace, installer, dependency execution, or automatic
 matching engine.
 
-The app ships a detailed handoff skill at `skills/handoff/SKILL.md`. To use it, copy
-it to `<chat workspace>/.agents/skills/handoff/SKILL.md` (for example
-`my-project/.agents/skills/handoff/SKILL.md`), reopen **Agent tools → Extensions**, and
-send `/skill handoff Create a handoff for this conversation`. It asks for a cold-start
+The app ships a detailed handoff skill at `skills/handoff/SKILL.md`, available in every
+workspace: send `/handoff Create a handoff for this conversation` (or type `/han` and
+press Enter to insert the command). To change it for one project, copy it to
+`<chat workspace>/.agents/skills/handoff/SKILL.md` (for example
+`my-project/.agents/skills/handoff/SKILL.md`) and edit the copy; that copy then
+replaces the shipped skill in that workspace. It asks for a cold-start
 document in the style of a long working-session memory file, written in parts of
 about half the file text one response can hold (about 20 KB at 20,000 Max output
 tokens, about 8 KB at the 8,192 default) so no single response hits the output limit,
@@ -822,7 +834,8 @@ snapshots, and stale editor writes. None of these automated tests calls a paid m
 Frontend tests verify that expired local tokens refresh once and that other
 errors never replay a potentially completed action, that editor drafts survive saves
 and navigation, that delayed permission responses or deleted conversation URLs
-do not corrupt the active view, and that model replies cannot inject HTML or scripts.
+do not corrupt the active view, that model replies cannot inject HTML or scripts, and
+that the `/` skill menu lists, filters, and inserts skills without blocking ordinary messages.
 Backend regressions additionally cover credential
 path aliases, unreadable configuration recovery, cancellation during startup or
 after a child process outlives its shell, and recovery of completed tool results
@@ -842,7 +855,7 @@ after interrupted delivery.
 - `backend/local_agent/config.py`: external credentials and portable configuration.
 - `backend/local_agent/context.py`: request estimates and bounded history compaction.
 - `backend/local_agent/activity.py`: app-generated activity log for handoffs (`insert_activity_log`).
-- `skills/handoff/SKILL.md`: detailed handoff skill to copy into a workspace's `.agents/skills/handoff/`.
+- `skills/`: skills shipped with the app and offered in every workspace; `handoff/SKILL.md` is the detailed handoff skill. A workspace's `.agents/skills/<id>/` replaces the shipped skill with that ID.
 - `backend/local_agent/telemetry.py`: inference ledger, validated usage, DBU estimates, and failure categories.
 - `backend/local_agent/usage_export.py` / `scripts/usage_report.py`: usage rows and CSV correlated with conversation history.
 - `backend/local_agent/instructions.py`: scoped project guidance loading.

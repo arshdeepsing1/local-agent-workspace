@@ -12,11 +12,16 @@ window.makeSession = (id, title = id) => ({
   id, title, workspace: '/project', model: 'test-model', status: 'idle',
   events: [], updated: 1, permission_mode: 'manual', allowed_directories: [],
 })
+window.skills = [
+  { id: 'review', name: 'Code review', description: 'Review the current diff for correctness bugs.', path: '.agents/skills/review/SKILL.md' },
+  { id: 'handoff', name: 'handoff', description: 'Write a detailed cold-start handoff.', path: '/app/skills/handoff/SKILL.md' },
+]
 fake.sessions = new Map([['a', makeSession('a', 'Other conversation')]])
 fake.settings = { ...baseSettings }
 fake.handle = (path, options) => {
   const body = () => JSON.parse(options.body)
   if (path === '/api/bootstrap') return fake.json({ token: 'test-token', settings: fake.settings })
+  if (path === '/api/skills' || path.startsWith('/api/skills?')) return fake.json(skills)
   if (path === '/api/connection') return fake.json({ connected: true, models: ['test-model', 'other-model', 'latest-model'], error: null })
   if (path === '/api/settings' && options.method === 'PUT') {
     fake.settings = { ...fake.settings, ...body() }

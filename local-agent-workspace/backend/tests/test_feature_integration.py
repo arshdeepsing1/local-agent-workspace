@@ -314,3 +314,47 @@ def test_metadata_pages_bound_escaped_unicode_and_no_omissions():
             break
         offset = page['next_offset']
     assert found == items
+
+
+async def test_slash_skill_id_selects_a_listed_skill_and_other_slashes_stay_text(runtime, monkeypatch):
+    manager, session, project, tools = runtime
+    skill = project / '.agents/skills/review/SKILL.md'
+    skill.parent.mkdir(parents=True)
+    skill.write_text('Review rule: trace behavior.')
+    seen = []
+    async def handler(request):
+        messages = json.loads(request.content)['messages']
+        seen.append((messages[0]['content'], messages[-1]['content']))
+        return stream('Done')
+    gateway(monkeypatch, handler)
+    for prompt in ('/tmp/output.log is empty', '/reviewer check this', '/ look', '/unknown do it'):
+        await manager.run_databricks(session, prompt)
+        assert session.get('active_skills', []) == []
+        assert 'Review rule' not in seen[-1][0] and seen[-1][1] == prompt
+    await manager.run_databricks(session, '/review')
+    assert session['active_skills'] == ['review']
+    system, user = seen[-1]
+    assert 'Workspace skill: review\nReview rule: trace behavior.' in system and user == '/review'
+    assert 'starts with /<skill-id>' in system
+    await manager.run_databricks(session, '/review   the parser too')
+    assert session['active_skills'] == ['review']
+
+
+async def test_shipped_skill_works_in_any_workspace_until_the_workspace_defines_it(runtime, monkeypatch, tmp_path):
+    manager, session, project, tools = runtime
+    shipped = tmp_path / 'skills/handoff/SKILL.md'  # APP_ROOT is tmp_path in this fixture
+    shipped.parent.mkdir(parents=True)
+    shipped.write_text('---\nname: handoff\ndescription: Write a handoff\n---\nShipped handoff rules.')
+    manager.extensions.app_skills = tmp_path / 'skills'
+    seen = []
+    async def handler(request):
+        seen.append(json.loads(request.content)['messages'][0]['content'])
+        return stream('Done')
+    gateway(monkeypatch, handler)
+    await manager.run_databricks(session, '/handoff Create a handoff')
+    assert session['active_skills'] == ['handoff'] and 'Shipped handoff rules.' in seen[-1]
+    own = project / '.agents/skills/handoff/SKILL.md'
+    own.parent.mkdir(parents=True)
+    own.write_text('Project handoff rules.')
+    await manager.run_databricks(session, 'Continue')
+    assert 'Project handoff rules.' in seen[-1] and 'Shipped handoff rules.' not in seen[-1]

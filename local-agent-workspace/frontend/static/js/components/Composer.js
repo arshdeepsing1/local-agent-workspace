@@ -2,12 +2,14 @@ import { html, useEffect, useRef, useState } from '../lib.js'
 import { ArrowUp, ChevronDown, Folder, FolderPlus, Laptop, Plus, Square } from '../icons.js'
 import { modelLabel } from '../types.js'
 import PermissionsMenu from './PermissionsMenu.js'
+import { useSlashMenu } from './SlashMenu.js'
 
 // Props: value, setValue, model, models, busy, disabled, modelSaving, onModel, workspace,
-// mode, onMode, onProject, onFolders, onSend, onStop, onAttach, onError
+// mode, onMode, onProject, onFolders, onSend, onStop, onAttach, onError, loadSkills
 export default function Composer(p) {
   const [sending, setSending] = useState(false)
   const input = useRef(null)
+  const slash = useSlashMenu({ value: p.value, setValue: p.setValue, loadSkills: p.loadSkills })
   useEffect(() => { input.current?.focus() }, [])
   const submit = async () => {
     if (!p.value.trim() || sending || p.modelSaving || p.busy || p.disabled) return
@@ -30,8 +32,9 @@ export default function Composer(p) {
     </div>
     <div class="composer">
       <textarea ref=${input} aria-label="Message" placeholder=${p.mode === 'plan' ? 'Describe what you want to plan' : 'Describe a task or ask a question'} value=${p.value}
-        onInput=${e => p.setValue(e.currentTarget.value)} rows=${1}
-        onKeyDown=${e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); void submit() } }} />
+        onInput=${e => p.setValue(e.currentTarget.value)} rows=${1} ...${slash.inputProps}
+        onKeyDown=${e => { if (slash.keyDown(e)) return; if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); void submit() } }} />
+      ${slash.menu}
       ${p.busy ? html`<button class="send-button stop-button" aria-label="Stop response" onClick=${p.onStop}><${Square} size=${15} fill="currentColor" /></button>` :
         html`<button class="send-button" aria-label="Send message" disabled=${!p.value.trim() || sending || p.modelSaving || p.disabled} onClick=${() => void submit()}><${ArrowUp} size=${19} /></button>`}
     </div>

@@ -15,6 +15,8 @@
 //   instruction_sources?, prepared_for_next_turn?, breakdown?, estimate_scale?, summary_adjustment? }
 // Job: { id, session_id, workspace, command, state, created, updated, exit_code,
 //   output?, truncated, timeout_seconds, max_output_bytes, background }
+// Skill: { id, name, description, path } (path is workspace-relative, or absolute
+//   for a skill shipped with the app)
 
 export function modelLabel(model) {
   return model.replace(/^databricks-/, '').replace(/^system\.ai\./, '')

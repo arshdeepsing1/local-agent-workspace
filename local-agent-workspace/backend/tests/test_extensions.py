@@ -16,7 +16,8 @@ from local_agent.tools import WorkspaceTools
 def manager(tmp_path):
     state = tmp_path / "state"
     state.mkdir()
-    return ExtensionManager(SimpleNamespace(state_dir=state, redact=lambda text: text.replace("secret-token", "[REDACTED]")))
+    return ExtensionManager(SimpleNamespace(state_dir=state, redact=lambda text: text.replace("secret-token", "[REDACTED]")),
+                            app_skills=tmp_path / "no-shipped-skills")
 
 
 def hook(command, **values):
@@ -111,6 +112,57 @@ def test_skills_reject_external_and_secret_symlink_targets(manager, tmp_path):
     target.symlink_to(secret)
     with pytest.raises(ValueError, match="Credential"):
         manager.load_skill(tools, "linked")
+
+
+def test_shipped_skills_fill_in_ids_the_workspace_does_not_define(manager, tmp_path):
+    shipped = tmp_path / "app/skills"
+    manager.app_skills = shipped
+    for skill_id, text in (("handoff", "---\ndescription: Write a handoff\n---\nShipped rules."), ("review", "Shipped review.")):
+        (shipped / skill_id).mkdir(parents=True)
+        (shipped / skill_id / "SKILL.md").write_text(text)
+    workspace = tmp_path / "workspace"
+    (workspace / ".agents/skills/review").mkdir(parents=True)
+    (workspace / ".agents/skills/review/SKILL.md").write_text("Workspace review.")
+    tools = WorkspaceTools(str(workspace))
+    assert manager.skills(tools) == [
+        {"id": "review", "name": "review", "description": "", "path": ".agents/skills/review/SKILL.md"},
+        {"id": "handoff", "name": "handoff", "description": "Write a handoff", "path": str(shipped / "handoff/SKILL.md")}]
+    assert manager.load_skill(tools, "handoff")["text"].endswith("Shipped rules.")
+    assert manager.load_skill(tools, "review")["text"] == "Workspace review."
+    # A workspace copy replaces the shipped skill, even when that copy is invalid.
+    (workspace / ".agents/skills/handoff").mkdir()
+    (workspace / ".agents/skills/handoff/SKILL.md").write_text("x" * 8001)
+    assert [skill["id"] for skill in manager.skills(tools)] == ["review"]
+    with pytest.raises(ValueError, match="8 KB"):
+        manager.load_skill(tools, "handoff")
+    with pytest.raises(ValueError):
+        manager.load_skill(tools, "../handoff")
+
+
+def test_shipped_skills_reject_symlinks_and_oversized_files(manager, tmp_path):
+    shipped = tmp_path / "app/skills"
+    manager.app_skills = shipped
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "SKILL.md").write_text("Outside instructions")
+    (shipped / "file-link").mkdir(parents=True)
+    (shipped / "file-link/SKILL.md").symlink_to(outside / "SKILL.md")
+    (shipped / "folder-link").symlink_to(outside)
+    (shipped / "large").mkdir()
+    (shipped / "large/SKILL.md").write_text("x" * 8001)
+    tools = WorkspaceTools(str(tmp_path / "workspace"))
+    assert manager.skills(tools) == []
+    for skill_id in ("file-link", "folder-link"):
+        with pytest.raises(ValueError, match="regular files in the app's skills folder"):
+            manager.load_skill(tools, skill_id)
+
+
+def test_the_app_ships_the_handoff_skill_to_every_workspace(tmp_path):
+    manager = ExtensionManager(SimpleNamespace(state_dir=tmp_path, redact=lambda text: text))
+    tools = WorkspaceTools(str(tmp_path))
+    handoff = next(skill for skill in manager.skills(tools) if skill["id"] == "handoff")
+    assert handoff["path"] == str(Path(__file__).resolve().parents[2] / "skills/handoff/SKILL.md")
+    assert "insert_activity_log" in manager.load_skill(tools, "handoff")["text"]
 
 
 async def test_hook_receives_json_stdin_strips_credentials_and_redacts_output(manager, tmp_path, monkeypatch):
