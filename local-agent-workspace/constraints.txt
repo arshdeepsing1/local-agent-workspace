@@ -1,0 +1,12 @@
+# Dependency versions used for this app's validation.
+fastapi==0.141.1
+uvicorn==0.53.0
+websockets==17.1
+httpx==0.28.1
+regex==2026.9.10
+mcp==2.2.0
+httpx2==2.13.0
+jsonschema==4.26.0
+pytest==9.1.1
+pytest-asyncio==1.4.0
+playwright==1.63.0
