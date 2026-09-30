@@ -41,6 +41,9 @@ from .drafts import DraftPersistenceError, STORAGE_ERRORS, StreamDraft
 
 MAX_OUTPUT_LIMIT_RETRIES = 2
 HANDOFF_FOLDER = "handoffs/auto"
+# "/<skill-id>" as its own word: after the start, a space or an opening bracket or
+# quote, and before the end, a space or closing punctuation. "/tmp/x" or "~/x" never match.
+SKILL_COMMAND = re.compile(r"(?<![^\s(\[{\"'`])/([A-Za-z0-9][A-Za-z0-9_.-]*)(?![^\s)\]},;:!?\"'`])")
 MAX_RATE_LIMIT_RETRIES = 3
 RATE_LIMIT_RETRY_DELAYS = (5.0, 15.0, 40.0)
 OUTPUT_LIMIT_HISTORY_PLACEHOLDER = (
@@ -113,8 +116,9 @@ You CAN inspect folders outside the workspace, including Downloads. Call list_fi
 with that path; the app requests folder access when needed. Never claim you cannot
 access an external folder without attempting the file tool. Use glob="*.csv" when
 asked about CSV files. Use list_skills/use_skill for explicitly relevant workspace skills.
-A user message that starts with /<skill-id> (or /skill <skill-id>) has selected that skill:
-follow its instructions, treating any text after the command as the request.
+A user message that contains /<skill-id> as a word (or starts with /skill <skill-id>) has
+selected that skill, and its instructions are included here: follow them, treating the rest
+of the message as the request.
 Record multi-step work with create_task/update_task; keep status truthful. Delegate only a
 concrete independent task, supplying its needed context. Subagents share files, so avoid
 concurrent conflicting edits. Open the child conversation to approve its pending actions.
@@ -343,19 +347,27 @@ class AgentManager:
         self.store.save(session)
         return {"active_skills": ids}
 
-    def requested_skill(self, tools, prompt):
-        """The skill a message names: `/skill <id> …`, or `/<id> …` for a listed skill.
-        Any other text starting with a slash, such as a path, stays an ordinary message."""
+    def requested_skills(self, tools, prompt):
+        """The skills a message names: `/skill <id> …` at its start, or a listed
+        skill's `/<id>` as a word anywhere ("/handoff …", "… use /handoff to …").
+        Other slashes, such as paths, leave the message ordinary text."""
         words = prompt.split(maxsplit=2)
-        if not words or not words[0].startswith("/"):
-            return None
-        if words[0] == "/skill" and len(words) > 1:
-            return words[1]
+        if words and words[0] == "/skill" and len(words) > 1:
+            return [words[1]]
+        if "/" not in prompt:
+            return []
         try:
             listed = {skill["id"] for skill in self.extensions.skills(tools)}
         except (OSError, ValueError):
-            return None  # The skills list reports a broken skills folder.
-        return words[0][1:] if words[0][1:] in listed else None
+            return []  # The skills list reports a broken skills folder.
+        found = []
+        for match in SKILL_COMMAND.finditer(prompt):
+            skill_id = match.group(1)
+            if skill_id not in listed:
+                skill_id = skill_id.rstrip(".")  # A sentence can end right after it.
+            if skill_id in listed and skill_id not in found:
+                found.append(skill_id)
+        return found
 
     @staticmethod
     def metadata_page(items, offset, key):
@@ -1249,8 +1261,7 @@ class AgentManager:
         tools = WorkspaceTools(session["workspace"], self.settings.values["env_file"], session.get("allowed_directories", []), mode == "bypassPermissions")
         definitions = filter_tools(session, [*TOOL_DEFINITIONS, *[tool for tool in FEATURE_TOOLS
                        if not session.get("is_subagent") or tool["function"]["name"] != "delegate_task"], *external_tools])
-        skill_id = self.requested_skill(tools, prompt)
-        if skill_id:
+        for skill_id in self.requested_skills(tools, prompt):
             self.select_skill(session, tools, skill_id)
         # Complete interrupted tool exchanges before sending the next user turn.
         wire, context_state = repair_tool_history(session["wire"], session["events"], session.get("context_state", {}))

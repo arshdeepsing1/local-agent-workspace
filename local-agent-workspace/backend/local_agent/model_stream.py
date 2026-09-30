@@ -130,5 +130,13 @@ class ToolCallBuffer:
                 call["function"][key].append(fragment)
 
     def finish(self):
-        return {index: {**call, "function": {key: "".join(parts) for key, parts in call["function"].items()}}
-                for index, call in self.calls.items()}
+        calls = {}
+        for index, call in self.calls.items():
+            function = {key: "".join(parts) for key, parts in call["function"].items()}
+            # Claude on Databricks streams a call that takes no input (list_skills,
+            # list_tasks) with no argument text. That means {}, and history must
+            # hold valid JSON because it is sent back to the endpoint.
+            if not function["arguments"].strip():
+                function["arguments"] = "{}"
+            calls[index] = {**call, "function": function}
+        return calls

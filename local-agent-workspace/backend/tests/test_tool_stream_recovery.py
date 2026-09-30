@@ -74,6 +74,40 @@ async def test_incomplete_batch_never_executes_or_poisons_next_turn(runtime, mon
     assert not any(message.get("tool_calls") for message in requests[-1]["messages"])
 
 
+async def test_no_input_call_runs_with_its_batch_and_replays_as_valid_json(runtime, monkeypatch):
+    """The '/handoff' failure: Claude streams list_skills with no argument text."""
+    manager, session = runtime
+    requests, executed = [], []
+
+    def frame(delta, finish=None):
+        return "data: " + json.dumps({"choices": [{"delta": delta, "finish_reason": finish}]}) + "\n\n"
+
+    async def gateway(request):
+        requests.append(json.loads(request.content))
+        if len(requests) == 1:
+            return httpx.Response(200, text="".join([
+                frame({"role": "assistant", "content": "I'll find the files and load the handoff skill."}),
+                frame({"tool_calls": [{"index": 1, "id": "files", "type": "function",
+                                       "function": {"name": "list_files", "arguments": ""}}]}),
+                frame({"tool_calls": [{"index": 1, "function": {"arguments": '{"path": "notes"}'}}]}),
+                frame({"tool_calls": [{"index": 2, "id": "skills", "type": "function",
+                                       "function": {"name": "list_skills", "arguments": ""}}]}),
+                frame({}, "tool_calls"), "data: [DONE]\n\n"]))
+        return response(finish="stop", text="Found them.")
+
+    async def execute(session, tools, name, values, call_id):
+        executed.append((name, values, call_id))
+        return "{}"
+
+    manager.execute_tool = execute
+    mock_gateway(monkeypatch, gateway)
+    assert await manager.run_databricks(session, "Read notes/*.md and use /handoff to write a handoff.") is True
+    assert executed == [("list_files", {"path": "notes"}, "files"), ("list_skills", {}, "skills")]
+    replayed = [call for message in requests[1]["messages"] for call in message.get("tool_calls", [])]
+    assert [json.loads(call["function"]["arguments"]) for call in replayed] == [{"path": "notes"}, {}]
+    assert not any(event["type"] == "error" for event in session["events"])
+
+
 async def test_output_limit_retry_history_is_bounded_persisted_and_resets_after_valid_tool_batch(runtime, monkeypatch):
     manager, session = runtime
     manager.settings.values.update(max_output_tokens=4096, max_agent_steps=6)

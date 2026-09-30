@@ -335,9 +335,30 @@ async def test_slash_skill_id_selects_a_listed_skill_and_other_slashes_stay_text
     assert session['active_skills'] == ['review']
     system, user = seen[-1]
     assert 'Workspace skill: review\nReview rule: trace behavior.' in system and user == '/review'
-    assert 'starts with /<skill-id>' in system
+    assert 'contains /<skill-id> as a word' in system
     await manager.run_databricks(session, '/review   the parser too')
     assert session['active_skills'] == ['review']
+
+
+async def test_skill_command_inside_a_longer_request_selects_it_but_paths_do_not(runtime, monkeypatch):
+    """'Read these files and use /handoff to …' selects the skill for that same request."""
+    manager, session, project, tools = runtime
+    for skill_id in ('handoff', 'review'):
+        skill = project / f'.agents/skills/{skill_id}/SKILL.md'
+        skill.parent.mkdir(parents=True)
+        skill.write_text(f'{skill_id} rules.')
+    seen = []
+    async def handler(request):
+        seen.append(json.loads(request.content)['messages'][0]['content'])
+        return stream('Done')
+    gateway(monkeypatch, handler)
+    for prompt in ('Summarize /tmp/handoff/notes.md and ~/handoff', 'Is x /handoffs y or a/handoff the same?'):
+        await manager.run_databricks(session, prompt)
+        assert session.get('active_skills', []) == [] and 'handoff rules.' not in seen[-1]
+    await manager.run_databricks(session, 'Read ~/notes/project*.md and handoffs/*.md and use /handoff skill '
+                                          'to create a detailed handoff in handoffs/, then /review.')
+    assert session['active_skills'] == ['handoff', 'review']
+    assert 'handoff rules.' in seen[-1] and 'review rules.' in seen[-1]
 
 
 async def test_shipped_skill_works_in_any_workspace_until_the_workspace_defines_it(runtime, monkeypatch, tmp_path):

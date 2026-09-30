@@ -77,6 +77,20 @@ def test_tool_argument_budget_counts_utf8_across_fragments_and_calls():
     assert buffer.finish()[1]["function"]["arguments"] == first
 
 
+def test_call_without_argument_text_means_an_empty_object():
+    # Claude on Databricks streams a call that takes no input with no argument
+    # text; before the fix json.loads("") failed the whole response.
+    buffer = ToolCallBuffer()
+    buffer.add({"index": 0, "id": "none", "function": {"name": "list_skills"}})
+    buffer.add({"index": 1, "id": "empty", "function": {"name": "list_tasks", "arguments": ""}})
+    buffer.add({"index": 2, "id": "blank", "function": {"name": "list_jobs", "arguments": " \n"}})
+    buffer.add({"index": 3, "id": "real", "function": {"name": "read_file", "arguments": '{"path":'}})
+    buffer.add({"index": 3, "function": {"arguments": ' "a.md"}'}})
+    calls = buffer.finish()
+    assert [calls[index]["function"]["arguments"] for index in range(3)] == ["{}", "{}", "{}"]
+    assert calls[3]["function"]["arguments"] == '{"path": "a.md"}'
+
+
 def test_tool_metadata_cannot_bypass_assembly_budget():
     buffer = ToolCallBuffer()
     for index in range(MAX_TOOL_CALLS):

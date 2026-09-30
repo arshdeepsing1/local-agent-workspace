@@ -182,9 +182,11 @@ when opening a conversation or performing restart recovery.
 - **Skills (`/`)**: type `/` at the start of the message box to list the skills this
   conversation can use, with their descriptions; keep typing to filter. Use ↑/↓ to
   highlight one and Enter or Tab (or click it) to insert `/<skill-id> `, then add your
-  request and press Enter to send. Esc closes the list. A message that starts with a
-  listed skill's command selects that skill; any other text starting with `/`, such as a
-  path, is sent unchanged. See **Agent tools: MCP, skills, and hooks** below.
+  request and press Enter to send. Esc closes the list. A message that contains a
+  listed skill's command as a word, at its start or anywhere else (`Read the notes and
+  use /handoff to …`), selects that skill for the whole message. Other text with `/`,
+  such as a path (`/tmp/x.log`, `~/handoff/`), is sent unchanged.
+  See **Agent tools: MCP, skills, and hooks** below.
 - **Model selection**: the dropdown below the message box changes the model for
   the current conversation. Its history, title, folder access, and permissions are
   preserved, and the next reply uses the selected endpoint with the retained chat
@@ -420,7 +422,9 @@ event. If interruption leaves that internal continuation unanswered, the next re
 turn removes it before sending the new prompt. A valid tool batch resets this
 consecutive-retry allowance. After two automatic retries, or when no configured step
 remains, the app stops with an explicit error so the limit cannot create an unbounded loop.
-Malformed tool arguments still stop immediately. Existing malformed tool
+Malformed tool arguments still stop immediately. A call streamed with no argument
+text, which is how Claude on Databricks sends a tool that takes no input such as
+`list_skills`, means `{}`. Existing malformed tool
 exchanges are excluded from subsequent model requests while their original
 history and recorded outcomes remain saved; the conversation can resume without
 deleting it. This does not guarantee that the model can finish any size of output
@@ -583,8 +587,9 @@ Install workspace skills at `.agents/skills/<skill-id>/SKILL.md`. Skills shipped
 the app in `skills/<skill-id>/SKILL.md` are available in every workspace; a workspace
 skill with the same ID replaces the shipped one. Other folders, such as
 `.claude/skills`, are not read. Optional simple frontmatter supplies `name` and
-`description`. Enable a discovered skill in the panel, begin a message with
-`/<skill-id>` (type `/` to choose from the list) or `/skill <skill-id>`, or ask the
+`description`. Enable a discovered skill in the panel, use `/<skill-id>` as a word in a
+message (type `/` at the start to choose from the list), begin a message with
+`/skill <skill-id>`, or ask the
 model to use its `list_skills` / `use_skill` tools. Selection persists per chat, instructions reload
 on each model request, and a newly selected/changed skill must reach the model
 before a write, command, or MCP call. At most three selected skills fit a combined
@@ -838,8 +843,9 @@ do not corrupt the active view, that model replies cannot inject HTML or scripts
 that the `/` skill menu lists, filters, and inserts skills without blocking ordinary messages.
 Backend regressions additionally cover credential
 path aliases, unreadable configuration recovery, cancellation during startup or
-after a child process outlives its shell, and recovery of completed tool results
-after interrupted delivery.
+after a child process outlives its shell, recovery of completed tool results
+after interrupted delivery, tool calls streamed without arguments, and skill commands
+inside a longer message.
 
 ## Architecture
 
