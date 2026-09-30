@@ -14,9 +14,9 @@ from .tools import TOOL_DEFINITIONS, WorkspaceTools, file_error
 from .permissions import BASIC_COMMANDS, COMMAND_TOOLS, mode_prompt, tool_decision
 from .activity import ACTIVITY_TOOL, activity_content, activity_log, local_time, redact_secrets
 from .context import (
-    DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT_TOKENS, SUMMARY_MAX_TOKENS,
-    build_condense_messages, build_handoff_messages, build_summary_messages, estimate_scale, estimate_tokens,
-    handoff_output_tokens, prepare_context, summary_byte_limit,
+    DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT_TOKENS, OUTPUT_LIMIT_CONTINUATION, SUMMARY_MAX_TOKENS,
+    build_condense_messages, build_handoff_messages, build_summary_messages, condense_output_tokens,
+    estimate_scale, estimate_tokens, handoff_output_tokens, prepare_context, summary_byte_limit,
 )
 from .tools import LIMIT as FILE_LIMIT
 from .config import DEFAULT_MAX_AGENT_STEPS
@@ -49,12 +49,6 @@ RATE_LIMIT_RETRY_DELAYS = (5.0, 15.0, 40.0)
 OUTPUT_LIMIT_HISTORY_PLACEHOLDER = (
     "[The previous response reached the configured output-token limit. Its partial text was omitted from "
     "model history, and none of its proposed tool calls ran.]"
-)
-OUTPUT_LIMIT_CONTINUATION = (
-    "Automatic continuation after an output cutoff: none of the previous response's proposed tool calls ran. "
-    "Continue the user's existing task, inspect current state before acting, and do not repeat completed side "
-    "effects. Split large writes and tool arguments into small, focused steps that fit comfortably within the "
-    "output limit."
 )
 
 
@@ -976,7 +970,7 @@ class AgentManager:
 
         async def condense(summary, limit_bytes):
             return await self.summarize_context(session, client, url, headers, build_condense_messages(
-                summary, limit_bytes, preservation_note))
+                summary, limit_bytes, preservation_note), max_tokens=condense_output_tokens(limit_bytes))
 
         return summarize, condense
 
@@ -1028,6 +1022,11 @@ class AgentManager:
         return save
 
     async def summary_adjustment_notice(self, session, info):
+        if info.get("compacted_in_turn"):
+            await self.event(session, "notice", text=(
+                "This request's tool results outgrew the context budget, so its earlier results were summarized "
+                "and it continues. The request and its latest results are kept as they are; the full history is "
+                "preserved."))
         if info.get("handoff_path"):
             await self.event(session, "notice", text=(
                 f"Saved a detailed handoff of the summarized turns to {info['handoff_path']} in the workspace."))

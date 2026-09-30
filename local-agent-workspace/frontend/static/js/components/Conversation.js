@@ -5,6 +5,19 @@ import { renderMarkdown } from '../markdown.js'
 import { Brand } from './Sidebar.js'
 import RequestDetails from './RequestDetails.js'
 
+// A long file is read in pages. Naming the lines each read covered keeps the
+// pages of one file from looking like the same read repeated.
+function readRange(event) {
+  let result = {}
+  try {
+    const parsed = JSON.parse(event.output || '{}')
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) result = parsed
+  } catch { /* A failed read returns plain text. */ }
+  const start = Number.isInteger(result.start_line) ? result.start_line : event.input?.start_line
+  if (Number.isInteger(start) && Number.isInteger(result.end_line) && result.end_line >= start) return ` · lines ${start}–${result.end_line}`
+  return Number.isInteger(start) && start > 1 ? ` · from line ${start}` : ''
+}
+
 // Returns Map<event id, { subject, taskStatus? }> for every tool event.
 function summarizeTools(events) {
   const taskTitles = new Map()
@@ -13,6 +26,7 @@ function summarizeTools(events) {
     if (event.type !== 'tool') continue
     const input = event.input || {}
     let subject = String(input.path || input.file_path || input.command || input.query || input.task || input.title || '')
+    if (event.name === 'read_file') subject += readRange(event)
     let taskStatus
     if (event.name === 'create_task' || event.name === 'update_task') {
       let task = {}

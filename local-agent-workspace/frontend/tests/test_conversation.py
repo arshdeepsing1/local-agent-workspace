@@ -325,3 +325,20 @@ def test_child_link_navigation_and_back(ui, page, kind):
     expect(page.get_by_text("Delegated parser review.")).to_be_visible()
     expect(page.get_by_text("Child findings.")).to_have_count(0)
     expect(page.get_by_role("button", name="Open subagent")).to_have_count(1)
+
+
+def test_pages_of_one_file_show_the_lines_each_read_covered(ui, page):
+    # Reported: consecutive pages of a long file looked like the same read repeated.
+    def read(event_id, start, end=None, state="completed", output=None):
+        page_json = json.dumps({"path": "notes/v7.md", "start_line": start, "end_line": end, "content": "…"})
+        return (f"{{ id: '{event_id}', type: 'tool', name: 'read_file', state: '{state}', "
+                f"input: {{ path: 'notes/v7.md'{f', start_line: {start}' if start > 1 else ''} }}, "
+                f"output: {json.dumps(output if output is not None else page_json)} }}")
+    show(ui, "[" + ", ".join([read("p1", 1, 108), read("p2", 109, 243), read("p3", 244, state="running", output=""),
+                               read("empty", 1, 0), read("failed", 500, state="error", output="Not a file.")]) + "]")
+    for name in ("read file notes/v7.md · lines 1–108", "read file notes/v7.md · lines 109–243",
+                 "read file notes/v7.md · from line 244", "read file notes/v7.md · from line 500"):
+        expect(page.get_by_role("button", name=name, exact=True)).to_be_visible()
+    expect(page.get_by_role("button", name="read file notes/v7.md", exact=True)).to_be_visible()
+    page.get_by_text("Activity · 5 actions").click()
+    expect(page.locator(".activity-subject").nth(1)).to_have_text(" · notes/v7.md · lines 109–243")

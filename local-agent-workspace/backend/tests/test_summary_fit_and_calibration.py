@@ -11,7 +11,7 @@ from local_agent.api import create_app
 from local_agent.config import Settings
 from local_agent.context import (
     MAX_ESTIMATE_SCALE, MIN_CONTEXT_WINDOW, REPLY_RESERVE, SAFETY_MARGIN, SUMMARY_MAX_BYTES,
-    SUMMARY_MAX_TOKENS, SUMMARY_MIN_BYTES, SUMMARY_TRIM_MARKER, build_condense_messages,
+    SUMMARY_MAX_TOKENS, SUMMARY_MIN_BYTES, SUMMARY_TRIM_MARKER, build_condense_messages, condense_output_tokens,
     build_summary_messages, context_breakdown, estimate_scale, estimate_tokens, fit_summary,
     prepare_context, summary_byte_limit, trim_summary,
 )
@@ -151,6 +151,34 @@ def test_trim_keeps_valid_utf8_start_and_end_within_limit(text):
     assert trimmed.encode("utf-8").decode("utf-8") == trimmed
     assert trimmed.startswith(text[:2]) and trimmed.endswith(text[-2:])
     assert trim_summary("short", 3500) == "short"
+
+
+async def test_a_condensed_summary_still_too_long_is_condensed_once_more_before_trimming():
+    # Reported: condensing a long compaction handoff to 12,000 bytes came back too
+    # long, so the summary lost its middle part.
+    replies = ["z" * 5000, "Complete short summary."]
+    received = []
+
+    async def condense(summary, limit_bytes):
+        received.append(len(summary))
+        return replies[len(received) - 1]
+
+    fitted, adjustment = await fit_summary("y" * 9000, 3500, condense)
+    assert (fitted, adjustment) == ("Complete short summary.", "condensed")
+    assert received == [9000, 5000]
+
+    received.clear()
+    replies[1] = "w" * 4000  # Still too long after two requests: trim the shortest text.
+    fitted, adjustment = await fit_summary("y" * 9000, 3500, condense)
+    assert adjustment == "trimmed" and fitted.startswith("w") and len(received) == 2
+
+
+def test_condense_requests_get_output_room_for_their_byte_limit():
+    assert condense_output_tokens(SUMMARY_MIN_BYTES) == SUMMARY_MAX_TOKENS
+    # At about 3 bytes per token the old 4,096-token reserve barely held the
+    # 12,000-byte target itself; now it holds a reply half again as long.
+    assert condense_output_tokens(SUMMARY_MAX_BYTES) == 6000
+    assert condense_output_tokens(SUMMARY_MAX_BYTES) * 3 >= SUMMARY_MAX_BYTES * 3 // 2 > SUMMARY_MAX_TOKENS * 3
 
 
 async def test_fit_summary_prefers_the_original_when_condensing_grows_it():

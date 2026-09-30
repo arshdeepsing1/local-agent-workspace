@@ -420,3 +420,27 @@ def test_oversized_export_is_rejected_before_validation_and_full_copy(runtime, m
     monkeypatch.setattr("local_agent.portability.validate_bundle", lambda value: pytest.fail("Oversized data reached validation/copy"))
     with pytest.raises(ValueError, match="16 MiB"):
         export_bundle([source], source["id"])
+
+
+async def test_summary_inside_a_turn_and_compaction_details_export_import_and_fork(runtime):
+    """A long request can be compacted before it finishes; the summary then ends
+    at a model response (wire[3]) instead of a user message."""
+    app, manager, source, destination = runtime
+    source["context_state"] = {"summary": "Read the file; facts kept.", "through": 3, "compactions": 1,
+                               "handoff_files": [{"path": "handoffs/auto/h.md", "compaction": 1}]}
+    source["context_info"] = {"estimated_tokens": 10, "input_budget": 100, "context_window": 131072,
+                              "reply_reserve": 8192, "compactions": 1, "summarized_messages": 3,
+                              "estimate_method": "weighted_utf8", "prepared_for_next_turn": True,
+                              "handoff_path": "handoffs/auto/h.md", "compacted_in_turn": True}
+    manager.store.save(source)
+    async with await client_for(app) as client:
+        response = await client.get(f"/api/sessions/{source['id']}/export")
+        assert response.status_code == 200, response.text
+        bundle = response.json()
+        assert bundle["sessions"][0]["context_state"]["through"] == 3
+        assert "handoff_path" not in bundle["sessions"][0]["context_info"]
+        imported = await client.post("/api/sessions/import", params={"workspace": str(destination)}, json=bundle)
+        assert imported.status_code == 201, imported.text
+        assert manager.store.get(imported.json()["session"]["id"])["context_state"]["through"] == 3
+        fork = await client.post(f"/api/sessions/{source['id']}/fork")
+        assert fork.status_code == 201, fork.text

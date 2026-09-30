@@ -9,7 +9,8 @@ from local_agent.agents import AgentManager
 from local_agent.config import Settings
 from local_agent.context import (
     HANDOFF_MAX_TOKENS, HANDOFF_POINTER_FILES, SAFETY_MARGIN, SUMMARY_MAX_TOKENS, SUMMARY_PREFIX,
-    build_handoff_messages, context_messages, estimate_tokens, handoff_output_tokens, handoff_pointer,
+    build_handoff_messages, condense_output_tokens, context_messages, estimate_tokens, handoff_output_tokens,
+    handoff_pointer,
     prepare_context, summary_byte_limit,
 )
 from local_agent.store import Store
@@ -190,7 +191,8 @@ async def test_automatic_compaction_saves_a_handoff_and_points_the_model_to_it(r
     assert any("Saved a detailed handoff" in text for text in notices)
     assert not any("condensed it" in text for text in notices)
     compactions = [c for c in session["inference_calls"] if c["purpose"] == "compaction"]
-    assert {c["max_output_tokens"] for c in compactions} == {HANDOFF_TOKENS, SUMMARY_MAX_TOKENS}
+    # Condensing a 12,000-byte summary gets room to overshoot instead of 4,096 tokens.
+    assert {c["max_output_tokens"] for c in compactions} == {HANDOFF_TOKENS, condense_output_tokens(LIMIT)} == {8192, 6000}
 
 
 async def test_disabled_setting_keeps_plain_summaries_and_writes_no_file(runtime, monkeypatch):

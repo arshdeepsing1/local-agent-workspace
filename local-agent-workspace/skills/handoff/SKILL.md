@@ -13,6 +13,7 @@ The reader is a new LLM session with zero prior context. Write every section so 
 3. If earlier turns were compacted (your context contains "Summary of earlier conversation"), say so in the handoff and never invent details you can no longer see. The app's activity log (below) still lists every command and file from those turns.
 4. Follow any extra instructions in the user's message. Do not stop to ask questions unless the destination is unclear.
 5. Resuming an interrupted handoff: read the end of the file and continue from the `<!-- handoff continues -->` marker; do not start over.
+6. Source files: when the handoff must cover older handoffs, memory files, notes or past conversations, list them first (`list_files` with a glob), then read each completely, oldest first, following `next_line`, and never read a page twice. Read past conversations from Markdown transcripts (the app's `scripts/conversation_transcript.py` writes them), not raw `.jsonl` files. If the sources outgrow your context, the app summarizes this request's earlier results and continues: rely on that summary and the handoffs it lists under `handoffs/auto/`, and re-read only a section you still need.
 
 Cost: every extra model request resends the whole conversation, which is what uses Databricks' per-minute input-token limit and most of the cost. Batch independent tool calls into one response, do not call `get_job_output` or `list_jobs` just to list commands (the activity log does that), and do not re-read files you already read.
 

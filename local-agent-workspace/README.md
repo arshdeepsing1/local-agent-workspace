@@ -19,8 +19,9 @@ frontend that runs without a build step.
 - Resume conversations after refreshing or restarting the app.
 - Periodic partial-reply checkpoints, safe JSON conversation export/import, and
   completed-conversation forks with fresh permissions.
-- Configurable context budgeting, automatic summaries of older turns, and a visible
-  context meter. Full conversation history stays on disk.
+- Configurable context budgeting, automatic summaries of older turns (and of a single long
+  request's earlier tool results), and a visible context meter. Full conversation history
+  stays on disk, and a script turns it into Markdown transcripts.
 - Automatic workspace-scoped `AGENTS.md` and `CLAUDE.md` guidance loading.
 - Workspace file explorer, text editor with stale-file detection, Git status/diff,
   and a non-interactive command runner.
@@ -227,7 +228,8 @@ when opening a conversation or performing restart recovery.
   approval expires after five minutes; a browser refresh retains it while the server runs.
 - **Tool details**: task cards show their names and task status. A completed create/update
   action does not mean the task itself is finished. Expand command cards to see the
-  full command (including inline Python), options, and output separately.
+  full command (including inline Python), options, and output separately. A long file
+  is read in pages, so a read card names the lines it covered (`lines 109–243`).
 - **Request details**: expand the details below an assistant response or tool-only
   model request to inspect its endpoint, completion status, stop reason, and
   provider-reported token usage when available. Failed requests distinguish invalid
@@ -442,7 +444,10 @@ retained summary may use about an eighth of the input budget, between 3,500 and
 12,000 UTF-8 bytes (12,000 with the default settings); that byte cap is not a token
 count. A summary that comes back longer is not discarded, because producing it may
 have required a large billed request: a small extra request, containing only that
-summary, asks the model to condense it. If condensing fails or is still too long, the
+summary, asks the model to condense it, and a second one condenses that result if it
+is shorter but still too long. A condensing request may use about one output token per
+two bytes of the limit (6,000 tokens for 12,000 bytes, at least 4,096), so a slightly
+long reply is not cut off. If condensing fails or is still too long, the
 app keeps the start and end of the summary and omits part of the middle. Either case
 adds a visible notice and is shown in context details. These summary limits are
 separate from the main reply limit and total context budget.
@@ -466,12 +471,19 @@ it and compaction continues with the summary only. Subagent conversations do not
 write compaction handoffs. Turn the setting off for the previous summary-only
 compaction.
 The newest turn and its complete tool exchanges are retained verbatim;
-the preceding turn is also retained when space allows. Summaries persist across
+the preceding turn is also retained when space allows. One request can outgrow the
+budget by itself, for example when it reads many large files. The app then summarizes
+that request's earlier tool exchanges and continues instead of stopping: the request
+itself stays verbatim after the summary, followed by its latest exchanges up to half
+the input budget, so later results have room before another compaction. The summary
+(and handoff) request is asked to keep the facts the unfinished work needs from the
+files and output read so far, and a notice reports the compaction. Manual **Compact
+now** still keeps the latest turn intact. Summaries persist across
 restarts, while the full display transcript and original model/tool history remain
 in that conversation's JSONL file. Summary requests are additional billed inference. A failed or stopped
 summary leaves the previous summary state intact and performs no tools. Summaries
 can lose details; they are not an exact substitute for the original transcript.
-If the latest turn, tool output, or project guidance alone is too large, the app
+If the request, its latest tool results, or project guidance alone are too large, the app
 reports an error instead of silently cutting it. The error states the estimated
 tokens needed and the input-budget arithmetic (context budget minus Max output
 tokens minus the 2,048-token safety margin). When Max output tokens is above the
@@ -607,9 +619,29 @@ document in the style of a long working-session memory file, written in parts of
 about half the file text one response can hold (about 20 KB at 20,000 Max output
 tokens, about 8 KB at the 8,192 default) so no single response hits the output limit,
 and ends by calling `insert_activity_log`. Select **Accept edits** first to avoid approving every part.
-The skill uses 5.4 KB of the 8 KB skill budget. Automatic compaction handoffs (see
+The skill uses 6 KB of the 8 KB skill budget. Automatic compaction handoffs (see
 Context and project instructions) are written from the turns being compacted; use the
 skill when you want a curated handoff, for example before ending a session.
+
+A handoff can also be built from a project's earlier material, such as older handoffs,
+memory files and past conversations, for example: `Read ~/notes/project-v*.md,
+handoffs/*.md and history/*.md, oldest first, and use /handoff to write one detailed
+handoff in handoffs/`. The skill tells the model to list the files, read each one once
+in full, and rely on the app's in-request compaction when they do not all fit (see
+Context and project instructions). Give it past conversations as Markdown transcripts,
+not as their `.jsonl` files, which are several times larger and hold lines too long for
+`read_file`:
+
+```bash
+python3 scripts/conversation_transcript.py .local/conversations/<id>.jsonl [more.jsonl ...] --out-dir ~/my-project/history
+```
+
+Each conversation becomes `<date>-<title>-<id>.md` (an existing file is never replaced):
+the messages and replies in full, one line per tool call with its main input, and
+command output shortened to 600 characters (`--excerpt`). `--out all.md` joins them,
+oldest first. The script needs only Python 3 and replaces common secret shapes with
+`[REDACTED]`, but transcripts contain whatever the conversations did: review them before
+sharing. Copy a conversation file first if the app is running.
 
 The model receives the current local date, time, and timezone with each request, so
 handoffs and file names use the real date. It is also told its per-response output
@@ -840,12 +872,13 @@ Frontend tests verify that expired local tokens refresh once and that other
 errors never replay a potentially completed action, that editor drafts survive saves
 and navigation, that delayed permission responses or deleted conversation URLs
 do not corrupt the active view, that model replies cannot inject HTML or scripts, and
-that the `/` skill menu lists, filters, and inserts skills without blocking ordinary messages.
+that the `/` skill menu lists, filters, and inserts skills without blocking ordinary messages,
+and that the pages of a long file read name the lines they covered.
 Backend regressions additionally cover credential
 path aliases, unreadable configuration recovery, cancellation during startup or
 after a child process outlives its shell, recovery of completed tool results
-after interrupted delivery, tool calls streamed without arguments, and skill commands
-inside a longer message.
+after interrupted delivery, tool calls streamed without arguments, skill commands
+inside a longer message, and compaction inside one request that outgrows the budget.
 
 ## Architecture
 
@@ -861,6 +894,8 @@ inside a longer message.
 - `backend/local_agent/config.py`: external credentials and portable configuration.
 - `backend/local_agent/context.py`: request estimates and bounded history compaction.
 - `backend/local_agent/activity.py`: app-generated activity log for handoffs (`insert_activity_log`).
+- `backend/local_agent/transcript.py` / `scripts/conversation_transcript.py`: Markdown transcripts of saved conversations.
+- `backend/local_agent/redaction.py`: common secret shapes replaced in logs, handoffs and transcripts.
 - `skills/`: skills shipped with the app and offered in every workspace; `handoff/SKILL.md` is the detailed handoff skill. A workspace's `.agents/skills/<id>/` replaces the shipped skill with that ID.
 - `backend/local_agent/telemetry.py`: inference ledger, validated usage, DBU estimates, and failure categories.
 - `backend/local_agent/usage_export.py` / `scripts/usage_report.py`: usage rows and CSV correlated with conversation history.

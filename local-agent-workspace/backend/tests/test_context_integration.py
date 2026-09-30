@@ -265,3 +265,50 @@ def test_explicit_saved_context_budget_is_preserved_on_load_and_other_settings_e
     assert settings.update({"model": "another-model"})["context_window"] == budget
     assert json.loads(settings.path.read_text())["context_window"] == budget
     assert Settings(state).values["context_window"] == budget
+
+
+async def test_a_request_that_reads_more_than_the_budget_compacts_inside_the_turn_and_finishes(runtime, monkeypatch):
+    """The reported failure: one request read many large files, then stopped with
+    'The latest turn and project instructions need about N estimated input tokens'."""
+    from local_agent.portability import export_bundle, validate_bundle
+    manager, session, project = runtime
+    manager.settings.values["context_window"] = 32768
+    input_budget = 32768 - 8192 - 2048
+    (project / "notes").mkdir()
+    files = [f"notes/memory-{number:02}.md" for number in range(12)]
+    for number, path in enumerate(files):
+        (project / path).write_text(f"# Memory {number}\n" + f"Fact {number}: release checklist detail.\n" * 170)
+    request = "Read every notes/memory-*.md file and summarize the project history."
+    streamed, summaries = [], []
+
+    async def gateway(request_):
+        payload = json.loads(request_.content)
+        assert estimate_tokens(payload["messages"], payload.get("tools", ())) <= input_budget
+        if not payload["stream"]:
+            summaries.append(payload)
+            return httpx.Response(200, json={"choices": [{"message": {"content": "Memory files read so far: facts kept."},
+                                                          "finish_reason": "stop"}]})
+        streamed.append(payload)
+        if len(streamed) <= len(files):
+            path = files[len(streamed) - 1]
+            return response(call={"id": f"read-{len(streamed)}", "type": "function",
+                                  "function": {"name": "read_file", "arguments": json.dumps({"path": path})}})
+        return response("History summarized.")
+
+    mock_gateway(monkeypatch, gateway)
+    await manager.run(session, request)
+
+    assert not [event for event in session["events"] if event["type"] == "error"]
+    assert [event["state"] for event in session["events"] if event["type"] == "tool"] == ["completed"] * len(files)
+    assert session["events"][-1]["type"] == "assistant" and session["events"][-1]["text"] == "History summarized."
+    assert summaries and len(streamed) == len(files) + 1
+    notices = [event["text"] for event in session["events"] if event["type"] == "notice"]
+    assert any("outgrew the context budget" in text for text in notices)
+    state = session["context_state"]
+    assert state["compactions"] >= 1 and session["wire"][state["through"]]["role"] == "assistant"
+    # After compaction the request is still sent verbatim, right after the summary.
+    after = next(payload for payload in streamed if payload["messages"][1]["content"].startswith("Summary of earlier"))
+    assert after["messages"][2] == {"role": "user", "content": request}
+    assert list((project / "handoffs" / "auto").glob("*-compaction-1.md"))
+    # The compacted conversation can still be exported, imported and forked.
+    validate_bundle(json.loads(json.dumps(export_bundle([session], session["id"]))))

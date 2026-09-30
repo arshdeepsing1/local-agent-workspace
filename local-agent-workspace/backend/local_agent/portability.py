@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from .context import MAX_ESTIMATE_SCALE, SUMMARY_MAX_BYTES
+from .context import MAX_ESTIMATE_SCALE, SUMMARY_MAX_BYTES, context_boundary
 
 
 MAX_BUNDLE_BYTES = 16 * 1024 * 1024
@@ -245,8 +245,8 @@ def validate_bundle(value):
         through = state.get("through", 0)
         if len(state.get("summary", "").encode("utf-8")) > SUMMARY_MAX_BYTES:
             raise ValueError(f"The conversation summary exceeds the {SUMMARY_MAX_BYTES:,}-byte limit.")
-        if through > len(session["wire"]) or through and through < len(session["wire"]) and session["wire"][through]["role"] != "user":
-            raise ValueError("The saved summary must end at a complete turn boundary.")
+        if through > len(session["wire"]) or not context_boundary(session["wire"], through):
+            raise ValueError("The saved summary must end at a complete turn or tool-exchange boundary.")
         if through and not state.get("summary"):
             raise ValueError("A summarized prefix requires a conversation summary.")
         _validate_wire(session["wire"])
@@ -287,8 +287,11 @@ def export_bundle(sessions, root_id):
         record = {key: value for key, value in source.items() if key in Conversation.model_fields}
         record["events"] = [{key: value for key, value in event.items() if key in Event.model_fields}
                             for event in record["events"]]
-        if record.get("context_state"):
-            record["context_state"] = {key: value for key, value in record["context_state"].items() if key in ContextState.model_fields}
+        # Keep only the fields a bundle defines; newer display details such as
+        # a compaction's handoff path must not make the whole export invalid.
+        for key, model in (("context_state", ContextState), ("context_info", ContextInfo)):
+            if record.get(key):
+                record[key] = {name: value for name, value in record[key].items() if name in model.model_fields}
         records.append(record)
     bundle = {"format": FORMAT, "version": 1, "root_session_id": root_id,
               "exported_at": time.time(), "sessions": records}

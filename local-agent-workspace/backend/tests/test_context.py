@@ -6,9 +6,9 @@ import re
 import pytest
 
 from local_agent.context import (
-    DEFAULT_CONTEXT_WINDOW, MAX_CONTEXT_WINDOW, MIN_CONTEXT_WINDOW, REPLY_RESERVE,
+    DEFAULT_CONTEXT_WINDOW, MAX_CONTEXT_WINDOW, MIN_CONTEXT_WINDOW, OUTPUT_LIMIT_CONTINUATION, REPLY_RESERVE,
     SAFETY_MARGIN, SUMMARY_MAX_BYTES, SUMMARY_MAX_TOKENS, SUMMARY_PREFIX, build_summary_messages,
-    context_breakdown, context_messages, estimate_tokens, prepare_context,
+    context_boundary, context_breakdown, context_messages, estimate_tokens, prepare_context, retained_request,
 )
 
 
@@ -329,3 +329,104 @@ async def test_invalid_reply_reserve_is_rejected(reply_reserve):
     with pytest.raises(ValueError, match="output-token limit"):
         await prepare_context([user("Hello")], {}, SYSTEM, TOOLS, DEFAULT_CONTEXT_WINDOW,
                               forbidden_summary, reply_reserve=reply_reserve)
+
+
+# --- Compaction inside one long turn ----------------------------------------------
+
+def read_exchange(number, size=6000):
+    call_id = f"read-{number}"
+    return [{"role": "assistant", "content": None, "tool_calls": [{"id": call_id, "type": "function", "function": {
+                "name": "read_file", "arguments": json.dumps({"path": f"notes/file-{number}.md"})}}]},
+            {"role": "tool", "tool_call_id": call_id, "content": f"file {number}: " + "fact " * (size // 5)}]
+
+
+def reading_turn(request="Read every notes file and write a detailed handoff.", files=15):
+    return [user(request), *[message for number in range(files) for message in read_exchange(number)]]
+
+
+async def test_one_turn_that_outgrows_the_budget_is_compacted_inside_the_turn():
+    wire = reading_turn()
+    original = copy.deepcopy(wire)
+    chunks = []
+    input_budget = COMPACTION_CONTEXT_WINDOW - REPLY_RESERVE - SAFETY_MARGIN
+    assert estimate_tokens([SYSTEM, *wire], TOOLS) > input_budget
+
+    async def summarize(previous, chunk, limit_bytes):
+        assert estimate_tokens(build_summary_messages(previous, chunk, limit_bytes=limit_bytes)) <= (
+            COMPACTION_CONTEXT_WINDOW - SUMMARY_MAX_TOKENS - SAFETY_MARGIN)
+        chunks.append(chunk)
+        return "Files 0-8 read: their facts are recorded here."
+
+    messages, state, info = await prepare_context(wire, {}, SYSTEM, TOOLS, COMPACTION_CONTEXT_WINDOW, summarize)
+    through = state["through"]
+    assert wire[through]["role"] == "assistant" and 0 < through < len(wire) - 1
+    assert "".join(chunks) == json.dumps(wire[:through], ensure_ascii=False)
+    # The request stays verbatim after the summary, then the latest exchanges.
+    assert messages[1] == user(SUMMARY_PREFIX + "Files 0-8 read: their facts are recorded here.")
+    assert messages[2] == wire[0] and messages[3:] == wire[through:]
+    assert messages[-1] == wire[-1]
+    assert info["compacted_in_turn"] is True and state["compactions"] == 1
+    assert info["estimated_tokens"] <= input_budget
+    # Only the exchanges that fit in half the budget are kept, leaving room to continue.
+    retained = estimate_tokens([SYSTEM, user(SUMMARY_PREFIX + "x" * 12000), *messages[2:]], TOOLS)
+    assert retained <= input_budget // 2
+    assert estimate_tokens([SYSTEM, user(SUMMARY_PREFIX + "x" * 12000), wire[0], *wire[through - 2:]], TOOLS) > input_budget // 2
+    assert wire == original
+
+
+async def test_repeated_compaction_in_one_turn_gives_the_summarizer_the_request_again():
+    wire = reading_turn()
+    chunks = []
+
+    async def summarize(previous, chunk, limit_bytes):
+        chunks.append((previous, chunk))
+        return f"Summary {len(chunks)}"
+
+    _, first, _ = await prepare_context(wire, {}, SYSTEM, TOOLS, COMPACTION_CONTEXT_WINDOW, summarize)
+    wire.extend(message for number in range(15, 27) for message in read_exchange(number))
+    chunks.clear()
+    messages, second, info = await prepare_context(wire, first, SYSTEM, TOOLS, COMPACTION_CONTEXT_WINDOW, summarize)
+    assert second["through"] > first["through"] and wire[second["through"]]["role"] == "assistant"
+    assert chunks[0][0] == first["summary"]
+    assert "".join(chunk for _, chunk in chunks) == json.dumps(
+        [wire[0], *wire[first["through"]:second["through"]]], ensure_ascii=False)
+    assert messages[2] == wire[0] and messages[3:] == wire[second["through"]:]
+    assert info["compacted_in_turn"] is True and second["compactions"] == 2
+
+
+async def test_request_before_an_output_limit_continuation_is_the_one_kept():
+    wire = reading_turn()
+    wire[1:1] = [assistant("[The previous response reached the configured output-token limit.]"),
+                 user(OUTPUT_LIMIT_CONTINUATION)]
+
+    async def summarize(previous, chunk, limit_bytes):
+        return "Earlier reads summarized."
+
+    messages, state, _ = await prepare_context(wire, {}, SYSTEM, TOOLS, COMPACTION_CONTEXT_WINDOW, summarize)
+    assert state["through"] > 3 and messages[2] == wire[0]
+    assert OUTPUT_LIMIT_CONTINUATION not in json.dumps(messages)
+    assert context_messages(wire, {"summary": "s", "through": 2})[1] == wire[0]
+
+
+async def test_turn_whose_latest_exchange_alone_is_too_large_reports_the_budget():
+    wire = [user("old"), assistant("answer"), user("Read the log."), *read_exchange(0, size=90000)]
+    with pytest.raises(ValueError) as error:
+        await prepare_context(wire, {}, SYSTEM, TOOLS, COMPACTION_CONTEXT_WINDOW, forbidden_summary)
+    message = str(error.value)
+    assert re.search(r"The latest request, its most recent tool results, and project instructions need about "
+                     r"[\d,]+ estimated input tokens", message)
+    assert "The input budget is 22,528 tokens" in message
+
+
+async def test_manual_compaction_still_keeps_the_latest_turn_intact():
+    with pytest.raises(ValueError, match="No earlier turns to compact"):
+        await prepare_context(reading_turn(files=2), {}, SYSTEM, TOOLS, DEFAULT_CONTEXT_WINDOW,
+                              forbidden_summary, force_compact=True)
+
+
+def test_summary_boundaries_are_turn_starts_or_responses_inside_a_turn():
+    wire = reading_turn(files=2)
+    assert [index for index in range(len(wire) + 1) if context_boundary(wire, index)] == [0, 1, 3, 5]
+    assert retained_request(wire, 3) == [wire[0]] and retained_request(wire, 0) == []
+    assert context_boundary([assistant("orphan"), user("next")], 0) and not context_boundary(
+        [assistant("orphan"), assistant("again")], 1)
