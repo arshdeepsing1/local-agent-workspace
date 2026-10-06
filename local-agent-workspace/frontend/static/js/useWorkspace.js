@@ -168,6 +168,7 @@ export function useWorkspace() {
           setSession(current => current?.id === activeId ? { ...current, status: data.status } : current)
           setSessions(current => current.map(item => item.id === activeId ? {
             ...item, status: data.status, ...(data.terminal_reason ? { terminal_reason: data.terminal_reason } : {}),
+            ...(data.turn_ended ? { turn_ended: data.turn_ended } : {}),
           } : item))
           if (data.status === 'idle') void refreshSessions().catch(e => setError(e.message))
         }

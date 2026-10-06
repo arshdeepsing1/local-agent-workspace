@@ -11,7 +11,12 @@ window.permissionRequests = 0
 window.pageHidden = false
 window.focusCalls = 0
 class TestNotification {
-  constructor(title, options) { Object.assign(this, { title, body: options.body, tag: options.tag, closed: false }); notifications.push(this) }
+  constructor(title, options) {
+    const replaced = notifications.find(n => n.tag === options.tag && !n.closed)
+    if (replaced) replaced.closed = true
+    Object.assign(this, { title, body: options.body, tag: options.tag, closed: false, alerted: !replaced || !!options.renotify })
+    notifications.push(this)
+  }
   close() { this.closed = true }
 }
 TestNotification.permission = 'default'
@@ -104,17 +109,17 @@ def test_background_chats_notify_when_they_need_approval_finish_or_fail(ui, page
     ui.wait("notifications.length === 1")
     update(ui, "a", status="running")
     ui.tick(1500)
-    update(ui, "a", status="idle", terminal_reason="completed", updated=2)
+    update(ui, "a", status="idle", terminal_reason="completed", updated=2, turn_ended=2)
     ui.tick(1500)
     ui.wait("notifications.length === 2")
     update(ui, "a", status="running")
     ui.tick(10000)
-    update(ui, "a", status="idle", terminal_reason="error", updated=3)
+    update(ui, "a", status="idle", terminal_reason="error", updated=3, turn_ended=3)
     ui.tick(1500)
     ui.wait("notifications.length === 3")
     update(ui, "a", status="running")
     ui.tick(10000)
-    update(ui, "a", status="idle", terminal_reason="stopped", updated=4)
+    update(ui, "a", status="idle", terminal_reason="stopped", updated=4, turn_ended=4)
     ui.tick(1500)
     settle(ui)
     expect(row(page, "Other conversation").locator(".activity-dot")).to_have_count(0)
@@ -142,7 +147,7 @@ def test_the_open_chat_notifies_only_while_the_page_is_hidden(ui, page):
     ui.emit("a", {"type": "status", "status": "running"})
     ui.emit("a", {"type": "status", "status": "awaiting_approval"})
     ui.emit("a", {"type": "status", "status": "running"})
-    ui.emit("a", {"type": "status", "status": "idle", "terminal_reason": "inference_error"})
+    ui.emit("a", {"type": "status", "status": "idle", "terminal_reason": "inference_error", "turn_ended": 5})
     ui.wait("notifications.length === 2")
     short = long_title[:59] + "…"
     assert notes(ui) == [["Local", f"Needs your approval: {short}", "a:approval"],
@@ -154,11 +159,71 @@ def test_a_subagent_notifies_only_when_it_needs_approval(ui, page):
     update(ui, "c", status="awaiting_approval")
     ui.tick(1500)
     ui.wait("notifications.length === 1")
-    update(ui, "c", status="idle", terminal_reason="completed", updated=2)
+    update(ui, "c", status="idle", terminal_reason="completed", updated=2, turn_ended=2)
     ui.tick(1500)
     expect(row(page, "Delegated check").locator(".row-badge")).to_have_count(0)
     settle(ui)
     assert notes(ui) == [["Local", "Needs your approval: Delegated check", "c:approval"]]
+
+
+def test_turn_ends_notify_after_automatic_compaction_but_not_after_a_manual_one(ui, page):
+    start(ui, page, "b", setup=GRANTED + sessions(("a", "Other conversation", {"turn_ended": 1}),
+                                                   ("b", "Selected chat", {})), clock=True)
+    ui.show_session("b")
+    ui.run("window.pageHidden = true")
+    # A manual compaction: its end is not a reply.
+    update(ui, "a", status="compacting")
+    ui.tick(10000)
+    update(ui, "a", status="idle", updated=2)
+    ui.tick(1500)
+    # A turn that compacts automatically and then fails.
+    update(ui, "a", status="running", turn_ended=None)
+    ui.tick(10000)
+    update(ui, "a", status="compacting")
+    ui.tick(1500)
+    update(ui, "a", status="idle", terminal_reason="inference_error", turn_ended=3, updated=3)
+    ui.tick(1500)
+    ui.wait("notifications.length === 1")
+    # A turn that ran entirely between two polls is still reported.
+    update(ui, "a", terminal_reason="completed", turn_ended=4, updated=4)
+    ui.tick(10000)
+    ui.wait("notifications.length === 2")
+    settle(ui)
+    assert notes(ui) == [["Local", "Stopped with an error: Other conversation", "a:error"],
+                         ["Local", "Finished: Other conversation", "a:finished"]]
+
+
+def test_a_turn_cut_off_by_a_server_restart_is_an_error_not_finished(ui, page):
+    start(ui, page, "b", setup=GRANTED + sessions(("a", "Other conversation", {"status": "running", "turn_ended": None}),
+                                                   ("b", "Selected chat", {})) + seen({"a": 1, "b": 1}), clock=True)
+    ui.show_session("b")
+    update(ui, "a", status="idle", terminal_reason="interrupted", turn_ended=6, updated=6)
+    ui.tick(1500)
+    ui.wait("notifications.length === 1")
+    assert notes(ui) == [["Local", "Stopped with an error: Other conversation", "a:error"]]
+    expect(row(page, "Other conversation")).to_contain_text("Error")
+
+
+def test_a_repeated_approval_alerts_again_and_answered_notifications_close(ui, page):
+    start(ui, page, "b", setup=GRANTED + sessions(("a", "Other conversation", {"status": "running"}),
+                                                   ("b", "Selected chat", {})), clock=True)
+    ui.show_session("b")
+    for _ in range(2):
+        update(ui, "a", status="awaiting_approval")
+        ui.tick(1500)
+        update(ui, "a", status="running")
+        ui.tick(1500)
+    ui.wait("notifications.length === 2")
+    # Each request alerts; the answered one was closed, not silently replaced.
+    assert ui.js("notifications.map(n => [n.tag, n.closed, n.alerted])") == [
+        ["a:approval", True, True], ["a:approval", True, True]]
+    update(ui, "a", status="idle", terminal_reason="completed", turn_ended=2, updated=2)
+    ui.tick(1500)
+    ui.wait("notifications.length === 3")
+    assert ui.js("notifications[2].closed") is False
+    # Opening the chat answers its notification.
+    row(page, "Other conversation").click()
+    ui.wait("notifications[2].closed")
 
 
 def test_no_notifications_unless_turned_on(ui, page):
@@ -172,6 +237,27 @@ def test_no_notifications_unless_turned_on(ui, page):
 
 
 # Tab title
+
+def test_every_page_holds_one_presence_socket_for_the_server(ui, page):
+    start(ui, page, clock=True)
+    ui.wait("fake.presence.length === 1")
+    assert ui.js("fake.presence[0].protocols[0]") == "local-workspace"
+    assert ui.js("fake.presence[0].url").endswith("/api/presence")
+    assert ui.js("fake.sockets.length") == 0  # No conversation is open.
+    ui.run("fake.presence[0].close()")  # The server restarted.
+    ui.tick(5000)
+    ui.wait("fake.presence.length === 2")
+
+
+def test_the_notify_switch_shows_its_state_in_text(ui, page):
+    start(ui, page, setup=NOTIFICATIONS)
+    switch = page.get_by_role("switch", name="Notify me", exact=True)
+    expect(switch.locator(".notify-state")).to_have_text("Off")
+    expect(switch.locator(".lucide-bell-off")).to_have_count(1)
+    switch.click()
+    expect(switch.locator(".notify-state")).to_have_text("On")
+    expect(switch.locator(".lucide-bell")).to_have_count(1)
+
 
 def test_tab_title_counts_chats_waiting_for_approval(ui, page):
     start(ui, page, setup=TITLE + sessions(("a", "First", {"status": "awaiting_approval"}),
@@ -216,6 +302,23 @@ def test_rows_show_approval_activity_error_and_unread(ui, page):
     expect(row(page, "Changed chat").locator(".unread-dot")).to_have_count(0)
     expect(row(page, "Failed chat").locator(".row-badge")).to_have_count(0)
     assert ui.js("JSON.parse(localStorage.getItem('local.seenConversations'))") == {"a": 1, "b": 1, "c": 5, "d": 7, "e": 3}
+
+
+def test_read_state_is_shared_between_tabs(ui, page):
+    key = "local.seenConversations"
+    start(ui, page, setup=STATUS_CHATS + seen({"a": 1, "b": 1, "c": 1, "d": 1, "e": 3}))
+    expect(row(page, "Failed chat")).to_contain_text("Error")
+    # Another tab opened the failed chat.
+    ui.run(f"""const value = JSON.stringify({{ a: 1, b: 1, c: 5, d: 1, e: 3 }})
+      localStorage.setItem('{key}', value)
+      dispatchEvent(new StorageEvent('storage', {{ key: '{key}', newValue: value }}))""")
+    expect(row(page, "Failed chat").locator(".row-badge")).to_have_count(0)
+    # A write from a tab that has not heard of another tab's read keeps it.
+    ui.run(f"localStorage.setItem('{key}', JSON.stringify({{ a: 1, b: 1, c: 5, d: 1, e: 9 }}))")
+    row(page, "Changed chat").click()
+    expect(row(page, "Changed chat")).to_have_attribute("aria-current", "page")
+    ui.wait(f"JSON.parse(localStorage.getItem('{key}')).d === 7")
+    assert ui.js(f"JSON.parse(localStorage.getItem('{key}'))") == {"a": 1, "b": 1, "c": 5, "d": 7, "e": 9}
 
 
 def test_first_use_marks_existing_chats_read_and_later_changes_unread(ui, page):
@@ -331,6 +434,22 @@ def test_granted_folders_can_be_browsed_with_change_dots(ui, page):
     root.select_option(".")
     expect(page.get_by_role("button", name="note.txt")).to_be_visible()
     expect(parent).to_be_disabled()
+
+
+def test_a_file_from_a_granted_folder_is_not_called_a_project_file(ui, page):
+    start(ui, page, "a", setup=FOLDERS)
+    ui.show_session("a")
+    page.get_by_role("button", name="Workspace", exact=True).click()
+    page.get_by_role("button", name="note.txt").click()
+    page.get_by_role("button", name="Add this file to chat", exact=True).click()
+    message = page.get_by_role("textbox", name="Message")
+    expect(message).to_have_value("Please read the project file: note.txt")
+    page.get_by_role("button", name="Workspace", exact=True).click()
+    page.get_by_role("button", name="Back to files", exact=True).click()
+    page.get_by_role("combobox", name="Browse").select_option("/srv/data")
+    page.get_by_role("button", name="readme.md").click()
+    page.get_by_role("button", name="Add this file to chat", exact=True).click()
+    expect(message).to_have_value("Please read the project file: note.txt\nPlease read the file: /srv/data/readme.md")
 
 
 def test_the_root_resets_for_another_chat_or_a_removed_grant(ui, page):

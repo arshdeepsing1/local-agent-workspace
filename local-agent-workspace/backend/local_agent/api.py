@@ -359,6 +359,23 @@ def create_app(settings=None):
         finally:
             manager.listeners.get(session_id, set()).discard(socket)
 
+    @app.websocket("/api/presence")
+    async def presence(socket: WebSocket):
+        """Held open by every page, so desktop notifications know a page is open."""
+        protocols = [p.strip() for p in socket.headers.get("sec-websocket-protocol", "").split(",")]
+        if len(protocols) != 2 or protocols[0] != "local-workspace" or not secrets.compare_digest(protocols[1], local_token) or not origin_allowed(socket.headers.get("origin")):
+            await socket.close(code=1008)
+            return
+        await socket.accept(subprotocol="local-workspace")
+        manager.pages.add(socket)
+        try:
+            while True:
+                await socket.receive_text()
+        except WebSocketDisconnect:
+            pass
+        finally:
+            manager.pages.discard(socket)
+
     @app.get("/api/files")
     async def files(path: str = ".", session_id: str | None = None):
         return workspace_tools(session_id).list_files(path)

@@ -17,9 +17,8 @@ APP_NAME = "Local"
 TITLE_LIMIT = 60
 TIMEOUT_SECONDS = 5
 OSASCRIPT = "/usr/bin/osascript"
-# Statuses of a turn in progress; manual compaction ("compacting") is not a reply.
-TURN_STATUSES = frozenset({"running", "naming", "delegating", "awaiting_approval"})
-ERROR_REASONS = frozenset({"error", "inference_error"})
+# "interrupted": the server stopped during the turn.
+ERROR_REASONS = frozenset({"error", "inference_error", "interrupted"})
 # The notifier needs the desktop session, not the server's credentials.
 ENVIRONMENT_KEYS = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "DISPLAY",
                     "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR")
@@ -32,15 +31,19 @@ def short_title(title, limit=TITLE_LIMIT):
     return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
 
 
-def attention_message(session, previous, status):
-    """The notification for a status change, or None. Only a status and the title."""
+def attention_message(session, previous, status, turn_ended=False):
+    """The notification for a status change, or None. Only a status and the title.
+
+    turn_ended marks the idle status that ends a turn, including one that failed
+    during an automatic compaction; the end of a manual compaction is not a reply.
+    """
     if status == previous:
         return None
     title = short_title(session.get("title"))
     if status == "awaiting_approval":
         return f"Needs your approval: {title}"
     # A subagent's end is reported by its parent's turn; a stop was asked for.
-    if status != "idle" or previous not in TURN_STATUSES or session.get("is_subagent"):
+    if status != "idle" or not turn_ended or session.get("is_subagent"):
         return None
     reason = session.get("terminal_reason")
     if reason == "stopped":
@@ -63,7 +66,9 @@ def notification_argv(message, platform=None, which=shutil.which, osascript=OSAS
     if platform.startswith("linux"):
         program = which("notify-send")
         # The message starts with a fixed status word, so it cannot be read as an option.
-        return [program, APP_NAME, message] if program else None
+        # Notification servers may read the body as markup: show a title's <, > and & as text.
+        body = message.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        return [program, APP_NAME, body] if program else None
     return None
 
 

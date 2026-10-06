@@ -1,5 +1,5 @@
 import { html, useAutoFocus, useEffect, useRef, useState } from '../lib.js'
-import { ArrowLeftRight, Bell, Code2, Folder, Pencil, Plus, Settings as SettingsIcon, Trash2, X } from '../icons.js'
+import { ArrowLeftRight, Bell, BellOff, Code2, Folder, Pencil, Plus, Settings as SettingsIcon, Trash2, X } from '../icons.js'
 
 export function Brand({ small = false }) {
   return html`<span class=${`brand-symbol ${small ? 'small' : ''}`} aria-hidden="true"><i /><i /><i /><i /></span>`
@@ -75,7 +75,8 @@ function NotifyToggle({ notifications }) {
     : permission === 'denied' && !enabled ? 'Notifications are blocked for this page in the browser settings.' : ''
   return html`<button class="notify-toggle" role="switch" aria-checked=${enabled} disabled=${!!hint}
     title=${hint || 'Notify me when a conversation needs approval, finishes, or stops with an error'}
-    onClick=${() => void toggle()}><${Bell} size=${16} />Notify me</button>
+    onClick=${() => void toggle()}>${enabled ? html`<${Bell} size=${16} />` : html`<${BellOff} size=${16} />`}Notify me
+    <span class="notify-state" aria-hidden="true">${enabled ? 'On' : 'Off'}</span></button>
     ${hint ? html`<p class="notify-hint">${hint}</p>` : null}`
 }
 

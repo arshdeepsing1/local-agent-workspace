@@ -8,8 +8,11 @@
 //   permission_mode, allowed_directories, context_info?, active_skills?,
 //   parent_session_id?, is_subagent?, delegation?, tool_profile?, subagent_tool_profile?,
 //   terminal_reason?: how the last turn ended: 'completed'|'stopped'|'error'|'inference_error'|
-//   'tool_error'|'step_limit'|'interrupted' (also in the /api/sessions summaries) }
-// Status message: { type: 'status', status, terminal_reason? (sent with 'idle') }
+//   'tool_error'|'step_limit'|'interrupted' (also in the /api/sessions summaries),
+//   turn_ended?: epoch seconds when the last turn ended; null while a turn runs (also in summaries) }
+// Status message: { type: 'status', status, terminal_reason?, turn_ended? (sent with 'idle'
+//   when a turn ended; a manual compaction leaves turn_ended unchanged) }
+// /api/presence: a WebSocket (same protocols as the stream) each page holds open; no messages.
 // AgentEvent: { id, type: 'user'|'assistant'|'tool'|'notice'|'error', text?,
 //   reasoning_summary?, reasoning_truncated?, child_session_id?, request_info?,
 //   name?, input?, output?, preview?, state?, delegation?, origin?,

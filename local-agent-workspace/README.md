@@ -189,29 +189,36 @@ when opening a conversation or performing restart recovery.
 - **Conversation status**: each sidebar row shows what its chat is doing.
   **Needs approval** marks a chat waiting for an approval card; a pulsing dot marks a chat
   that is working (replying, compacting, naming itself or waiting for a subagent); **Error**
-  marks a chat whose last reply ended with an error and that you have not opened since; a
+  marks a chat whose last reply ended with an error, or was cut off because the server
+  stopped, and that you have not opened since; a
   blue dot marks a chat that changed since you last opened it. **Running** above the list
   shows only chats that are not idle; click it again to show all. The browser remembers when
-  you last opened each chat (in `localStorage`, on this browser only); the first time, every
+  you last opened each chat (in `localStorage`, on this browser only, shared by its tabs: a
+  chat opened in one tab counts as read in the others); the first time, every
   existing chat counts as read. Renaming a chat does not mark it unread. While any chat waits
   for approval, the tab title starts with the count, for example `(2) Local — …`.
   The sidebar list refreshes every 1.5 seconds while a chat is working and every 10 seconds
   otherwise, so chats started in another tab also show up.
 - **Notifications**: click **Notify me** at the bottom of the sidebar to turn on browser
-  notifications; the browser asks for permission only then. You are notified when a chat
-  starts waiting for approval, finishes a reply, or stops with an error, if this page is
-  hidden or that chat is not the one open. A notification reads, for example,
+  notifications; the browser asks for permission only then. The switch shows **On** or
+  **Off**. You are notified when a chat starts waiting for approval, finishes a reply, or
+  stops with an error (also during an automatic compaction, or because the server stopped
+  during the reply), if this page is hidden or that chat is not the one open. A notification reads, for example,
   "Needs your approval: Fix the parser" with the chat title cut to 60 characters, and never
   contains conversation text. Clicking it brings the window forward and opens that chat.
   Stopping a reply yourself, or a manual compaction, does not notify, and a subagent's chat
-  notifies only when it needs approval. Each open tab notifies on its own; the browser
-  replaces a notification with the same chat and status. If the browser blocks
+  notifies only when it needs approval. A notification closes when it no longer applies (the
+  approval was answered, the chat started another turn, or you opened the chat), so the next
+  approval request alerts again. Each open tab notifies on its own; the browser replaces a
+  notification with the same chat and status. If the browser blocks
   notifications for the page, the sidebar says so; allow them in the browser's site settings.
   For when no tab is open, see **Settings → Desktop notification when no browser tab is open**:
   the server then shows the same text as a system notification (`notify-send` on Linux when
-  it is installed, `osascript` on macOS, nothing elsewhere). It is off by default, only
-  applies while no page of the app is connected to the server, and starts the notifier
-  directly, with the title and message as arguments (no shell) and a 5-second limit.
+  it is installed, `osascript` on macOS, nothing elsewhere). It is off by default and only
+  applies while no page of the app is open: every page, also one with no chat selected,
+  holds a connection to the server (`/api/presence`). It starts the notifier directly, with
+  the title and message as arguments (no shell) and a 5-second limit; for `notify-send`,
+  `<`, `>` and `&` in a title are escaped so that notification servers show them as text.
 - **Skills (`/`)**: type `/` at the start of the message box to list the skills this
   conversation can use, with their descriptions; keep typing to filter. Use ↑/↓ to
   highlight one and Enter or Tab (or click it) to insert `/<skill-id> `, then add your
@@ -241,7 +248,8 @@ when opening a conversation or performing restart recovery.
   permissions, or selected conversation. Manual titles persist after restart and
   are never replaced by automatic naming, including a title request already in flight.
 - **Workspace / Files**: browse a folder, edit UTF-8 text files up to 80 KB, or use
-  the plus button to reference the file in chat. When the conversation has granted
+  the plus button to reference the file in chat ("Please read the project file: <path>", or
+  "Please read the file: <absolute path>" for a granted folder). When the conversation has granted
   folders (**Folder access**), **Browse** at the top switches between **Project** and each
   granted folder; a granted folder is shown by absolute paths and the parent button stops
   at that folder. The choice goes back to **Project** for another conversation or when the
@@ -957,9 +965,14 @@ show in the changes bar, as dots in the file list and as an inline diff whose Ke
 send the reviewed file state, and that notifications (with a faked Notification API and
 `document.hidden`), the tab-title count, sidebar status badges, unread and Running filter,
 and the Files root switcher with change dots in granted folders work without `localStorage` too.
+UI tests also cover a turn that fails during an automatic compaction (notifies) and a manual
+compaction (does not), a turn cut off by a server restart, closing answered notifications,
+read state shared between tabs, and the page's presence connection.
 Backend tests check the desktop notifier with a fake runner: nothing is sent while a page is
-connected, the command is an argument list without a shell, titles are cut to 60 characters,
-and notifier failures are ignored.
+connected (with or without a chat open), a turn failing during automatic compaction notifies
+and a manual compaction does not, a turn cut off by a restart is marked `interrupted`, the
+command is an argument list without a shell, titles are cut to 60 characters and escaped for
+`notify-send`, and notifier failures are ignored.
 Backend regressions additionally cover credential
 path aliases, unreadable configuration recovery, cancellation during startup or
 after a child process outlives its shell, recovery of completed tool results
@@ -968,7 +981,7 @@ inside a longer message, and compaction inside one request that outgrows the bud
 
 ## Architecture
 
-- `backend/local_agent/api.py`: local API, WebSocket stream, workspace endpoints.
+- `backend/local_agent/api.py`: local API, WebSocket stream, page presence socket, workspace endpoints.
 - `backend/local_agent/agents.py`: session/approval events and the Databricks tool loop.
 - `backend/local_agent/tools.py`: scoped file queries/edits and tool definitions.
 - `backend/local_agent/jobs.py`: streamed processes, managed jobs, and cleanup.
