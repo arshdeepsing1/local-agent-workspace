@@ -98,17 +98,23 @@ class DelegateManager:
     def children(self, parent_id):
         return [session for session in self.manager.store.list() if session.get("parent_session_id") == parent_id]
 
+    def _readable(self, session_id):
+        try:
+            return self.manager.store.get(session_id)
+        except (ValueError, OSError):
+            return None  # Reported by the store; recovery skips it.
+
     def recover(self):
         for summary in self.manager.store.list():
-            child = self.manager.store.get(summary["id"])
-            progress = child.get("delegation")
+            child = self._readable(summary["id"])
+            progress = (child or {}).get("delegation")
             if not progress or not child.get("parent_event_id"):
                 continue
             if not progress.get("terminal_reason"):
                 progress = {**progress, "status": "interrupted", "terminal_reason": "interrupted"}
                 child.update(delegation=progress, terminal_reason="interrupted")
                 self.manager.store.save(child)
-            parent = self.manager.store.get(child["parent_session_id"])
+            parent = self._readable(child["parent_session_id"])
             event = next((item for item in (parent or {}).get("events", [])
                           if item["id"] == child["parent_event_id"] and item.get("child_session_id") == child["id"]), None)
             if event is not None and not event.get("delegation", {}).get("terminal_reason"):

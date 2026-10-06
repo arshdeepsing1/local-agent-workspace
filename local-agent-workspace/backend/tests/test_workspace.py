@@ -100,6 +100,7 @@ async def test_approval_cannot_overwrite_a_newer_disk_edit(setup):
     settings, store, tools = setup
     manager = AgentManager(store, settings)
     session = store.create(settings.values)
+    manager.remember_file(session, tools.path("hello.txt"))  # As if read: overwriting needs a read first.
     task = asyncio.create_task(manager.execute_tool(session, tools, "write_file", {"path": "hello.txt", "content": "model edit"}, "call1"))
     await asyncio.sleep(0)
     (tools.root / "hello.txt").write_text("user edited while waiting")

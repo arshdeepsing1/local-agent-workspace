@@ -2,6 +2,9 @@
 //
 // Settings: { workspace, model, env_file, context_window, max_output_tokens,
 //   max_agent_steps, compaction_handoffs?, approval_timeout_minutes? (0 = no limit), host, configured }
+// Bootstrap (GET /bootstrap): { token, settings: Settings, storage_problems: StorageProblem[] }
+// StorageProblem: { file, reason } a conversation file in the state folder that could not
+//   be read; it is hidden and left unchanged. reason never quotes the file's contents.
 // Connection: { connected, models: string[], error: string | null }
 // Session: { id, title, workspace, model, status, events: AgentEvent[], updated,
 //   permission_mode, allowed_directories, context_info?, active_skills?,

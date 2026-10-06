@@ -11,7 +11,23 @@ from .telemetry import LEDGER_VERSION
 
 
 _SAFE_SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
-_SEPARATE_FIELDS = ("context_state", "instruction_directories", "inference_calls", "command_jobs")
+_SEPARATE_FIELDS = ("context_state", "instruction_directories", "file_views", "inference_calls", "command_jobs")
+
+
+class UnreadableConversation(ValueError):
+    """A conversation file that cannot be loaded. The reason never quotes its contents."""
+
+    def __init__(self, file, reason):
+        super().__init__(f"Conversation file {file} could not be read: {reason}.")
+        self.file, self.reason = file, reason
+
+
+def _fingerprint(path):
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    return (info.st_size, info.st_mtime_ns)
 
 
 class Store:
@@ -27,6 +43,11 @@ class Store:
         self.conversations.chmod(0o700)
         self._lock = threading.RLock()
         self._command_jobs = {}
+        # Unreadable conversation files: {file name: reason}. They are skipped and
+        # reported, never deleted, moved or rewritten.
+        self._list_problems = {}
+        # Files whose header lists but whose full load failed: {name: (reason, fingerprint)}.
+        self._load_problems = {}
 
         # Requests serialize DB work on the app's event loop. Allow application
         # creation and lifespan teardown on different threads (ASGI test clients).
@@ -64,7 +85,7 @@ class Store:
         metadata = {key: value for key, value in session.items()
                     if key not in ("events", "wire", *_SEPARATE_FIELDS)}
         yield {"record": "session", "version": 1, "data": metadata}
-        for name in ("context_state", "instruction_directories"):
+        for name in ("context_state", "instruction_directories", "file_views"):
             if name in session:
                 yield {"record": "field", "name": name, "data": session[name]}
         if "inference_calls" in session:
@@ -139,33 +160,41 @@ class Store:
         descriptor = os.open(path, flags)
         try:
             with os.fdopen(descriptor, "r", encoding="utf-8") as source:
-                first = source.readline()
-                if not first:
-                    raise ValueError(f"Conversation file is empty: {path.name}")
-                record = json.loads(first)
-                if (not isinstance(record, dict) or record.get("record") != "session"
-                        or record.get("version") != 1 or not isinstance(record.get("data"), dict)):
-                    raise ValueError(f"Conversation file has an invalid header: {path.name}")
-                session = record["data"]
-                if metadata_only:
-                    return session
-                events, wire = [], []
-                for line in source:
-                    record = json.loads(line)
-                    kind = record.get("record") if isinstance(record, dict) else None
-                    if (kind == "field" and record.get("name") in _SEPARATE_FIELDS
-                            and "data" in record):
-                        session[record["name"]] = record["data"]
-                    elif kind == "inference_call" and "data" in record:
-                        session.setdefault("inference_calls", []).append(record["data"])
-                    elif kind == "command_job" and "data" in record:
-                        session.setdefault("command_jobs", []).append(record["data"])
-                    elif kind == "event" and "data" in record:
-                        events.append(record["data"])
-                    elif kind == "wire" and "data" in record:
-                        wire.append(record["data"])
-                    else:
-                        raise ValueError(f"Conversation file has an invalid record: {path.name}")
+                line_number = 1
+                try:
+                    first = source.readline()
+                    if not first:
+                        raise UnreadableConversation(path.name, "the file is empty")
+                    record = json.loads(first)
+                    if (not isinstance(record, dict) or record.get("record") != "session"
+                            or record.get("version") != 1 or not isinstance(record.get("data"), dict)):
+                        raise UnreadableConversation(path.name, "the first line is not a conversation header")
+                    session = record["data"]
+                    if metadata_only:
+                        return session
+                    events, wire = [], []
+                    for line_number, line in enumerate(source, start=2):
+                        record = json.loads(line)
+                        kind = record.get("record") if isinstance(record, dict) else None
+                        if (kind == "field" and record.get("name") in _SEPARATE_FIELDS
+                                and "data" in record):
+                            session[record["name"]] = record["data"]
+                        elif kind == "inference_call" and "data" in record:
+                            session.setdefault("inference_calls", []).append(record["data"])
+                        elif kind == "command_job" and "data" in record:
+                            session.setdefault("command_jobs", []).append(record["data"])
+                        elif kind == "event" and "data" in record:
+                            events.append(record["data"])
+                        elif kind == "wire" and "data" in record:
+                            wire.append(record["data"])
+                        else:
+                            raise UnreadableConversation(path.name, f"line {line_number} is not a valid record")
+                except json.JSONDecodeError:
+                    raise UnreadableConversation(path.name, f"line {line_number} is not valid JSON") from None
+                except UnicodeDecodeError:
+                    raise UnreadableConversation(path.name, "the file is not UTF-8 text") from None
+                except RecursionError:
+                    raise UnreadableConversation(path.name, f"line {line_number} is nested too deeply") from None
                 return {**session, "events": events, "wire": wire}
         except BaseException:
             # os.fdopen owns and normally closes the descriptor. If constructing
@@ -323,21 +352,58 @@ class Store:
                 session = self._read_lines(path)
             except FileNotFoundError:
                 return None
+            except OSError as exc:
+                raise UnreadableConversation(path.name, f"it could not be opened ({exc.strerror or type(exc).__name__})") from None
+            if session.get("id") != session_id:
+                raise UnreadableConversation(path.name, "its conversation ID does not match the file name")
             self._command_jobs[session_id] = self._merge_jobs(
                 self._command_jobs.get(session_id, []), session.get("command_jobs", []))
             return session
 
     def list(self):
+        """Readable conversations, newest first. Unreadable files are skipped and
+        reported in problems(); they are left exactly as they are."""
         with self._lock:
-            summaries = []
+            summaries, problems = [], {}
             for path in self.conversations.glob("*.jsonl"):
                 if path.is_symlink():
                     continue
-                metadata = self._read_lines(path, metadata_only=True)
+                known = self._load_problems.get(path.name)
+                if known is not None:
+                    if known[1] == _fingerprint(path):
+                        problems[path.name] = known[0]
+                        continue
+                    del self._load_problems[path.name]  # Changed since; try it again.
+                try:
+                    metadata = self._read_lines(path, metadata_only=True)
+                except FileNotFoundError:
+                    continue  # Deleted while listing.
+                except UnreadableConversation as exc:
+                    problems[path.name] = exc.reason
+                    continue
+                except OSError as exc:
+                    problems[path.name] = f"it could not be opened ({exc.strerror or type(exc).__name__})"
+                    continue
                 if metadata.get("id") != path.stem:
-                    raise ValueError(f"Conversation filename does not match its ID: {path.name}")
-                summaries.append(self.summary(metadata))
+                    problems[path.name] = "its conversation ID does not match the file name"
+                elif (type(metadata.get("updated")) not in (int, float) or not isinstance(metadata.get("workspace"), str)
+                      or not isinstance(metadata.get("title", ""), str)):
+                    problems[path.name] = "its header lacks a valid title, workspace or update time"
+                else:
+                    summaries.append(self.summary(metadata))
+            self._list_problems = problems
             return sorted(summaries, key=lambda session: session["updated"], reverse=True)
+
+    def record_problem(self, file, reason):
+        """Hide a conversation whose full load failed until its file changes."""
+        with self._lock:
+            self._load_problems[file] = (reason, _fingerprint(self.conversations / file))
+            self._list_problems[file] = reason
+
+    def problems(self):
+        """Files skipped by the latest list(), as [{file, reason}] sorted by name."""
+        with self._lock:
+            return [{"file": file, "reason": reason} for file, reason in sorted(self._list_problems.items())]
 
     def delete(self, session_id):
         if not self._valid_id(session_id):

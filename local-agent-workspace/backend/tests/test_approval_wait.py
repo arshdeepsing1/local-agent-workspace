@@ -71,6 +71,7 @@ async def test_with_no_limit_an_approval_waits_until_it_is_answered(runtime, mon
     manager.settings.values["approval_timeout_minutes"] = 0
     timeouts = expire_waits_of(monkeypatch, 300)
     (project / "note.txt").write_text("before")
+    manager.remember_file(session, project / "note.txt")  # As if read: overwriting needs a read first.
     run = asyncio.create_task(manager.execute_tool(session, tools, "write_file", {"path": "note.txt", "content": "after"}, "call"))
     await asyncio.sleep(0.05)
     assert not run.done()

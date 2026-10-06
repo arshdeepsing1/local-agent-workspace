@@ -19,6 +19,7 @@ from .context import (
     MAX_CONTEXT_WINDOW, MAX_MAX_OUTPUT_TOKENS, MIN_CONTEXT_WINDOW, MIN_MAX_OUTPUT_TOKENS,
 )
 from .store import Store
+from .git_tools import working_tree_changes
 from .tools import WorkspaceTools, file_error
 from .permissions import PermissionMode
 from .telemetry import session_metrics
@@ -158,7 +159,8 @@ def create_app(settings=None):
 
     @app.get("/api/bootstrap")
     async def bootstrap():
-        return {"token": local_token, "settings": settings.public()}
+        store.list()  # Refreshes the report of unreadable conversation files.
+        return {"token": local_token, "settings": settings.public(), "storage_problems": store.problems()}
 
     def check_folder(path, workspace):
         folder = WorkspaceTools(workspace, settings.values["env_file"]).resolve(path)
@@ -342,7 +344,10 @@ def create_app(settings=None):
         if len(protocols) != 2 or protocols[0] != "local-workspace" or not secrets.compare_digest(protocols[1], local_token) or not origin_allowed(socket.headers.get("origin")):
             await socket.close(code=1008)
             return
-        session = manager.get(session_id)
+        try:
+            session = manager.get(session_id)
+        except (ValueError, OSError):
+            session = None  # An unreadable conversation file.
         if not session:
             await socket.close(code=1008)
             return
@@ -378,9 +383,8 @@ def create_app(settings=None):
 
     @app.get("/api/git")
     async def git_changes(session_id: str | None = None):
-        tools = workspace_tools(session_id)
-        result = await tools.run_command("git status --short --untracked-files=normal && git diff --no-ext-diff --no-textconv -- . ':!*.env' ':!.env*' ':!env_vars.txt'")
-        return result
+        # No shell, and no programs named by the repository's configuration.
+        return await working_tree_changes(workspace_tools(session_id).root)
 
     @app.post("/api/command")
     async def command(body: Prompt, session_id: str | None = None):

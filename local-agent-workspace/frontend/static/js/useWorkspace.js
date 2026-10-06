@@ -24,6 +24,7 @@ export function useWorkspace() {
   const [error, setError] = useState('')
   const [online, setOnline] = useState(true)
   const [ready, setReady] = useState(false)
+  const [storageProblems, setStorageProblems] = useState([])
   const [draftMode, setDraftMode] = useState('manual')
   // Unreviewed agent file changes of one conversation: { id, value: Changes }.
   const [changes, setChanges] = useState({ id: null, value: null })
@@ -82,6 +83,7 @@ export function useWorkspace() {
       if (!mounted) return
       setToken(bootstrap.token)
       setSettings(bootstrap.settings)
+      setStorageProblems(bootstrap.storage_problems || [])
       const list = await api('/sessions')
       if (!mounted) return
       setSessions(list)
@@ -304,5 +306,5 @@ export function useWorkspace() {
     setError: reportError, setActiveId: selectSession, newConversation, send, saveSettings, deleteSession, renameSession, changeModel,
     modelSaving: modelSaves.has(selection.key) || (!activeId && defaultModelSave.current !== null),
     checkConnection, refreshSessions, permissionMode: activeSession?.permission_mode || draftMode, setPermissionMode, allowFolder, removeFolder,
-    changes: activeId && changes.id === activeId ? changes.value : null, reviewChanges }
+    changes: activeId && changes.id === activeId ? changes.value : null, reviewChanges, storageProblems }
 }

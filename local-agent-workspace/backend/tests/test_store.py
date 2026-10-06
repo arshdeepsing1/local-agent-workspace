@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from local_agent.store import Store
+from local_agent.store import Store, UnreadableConversation
 from local_agent.telemetry import LEDGER_VERSION
 
 
@@ -87,7 +87,7 @@ def test_list_reads_only_the_small_first_record(tmp_path):
 
     assert store.list() == [Store.summary(session)]
     assert len(json.dumps(store.list())) < 1000
-    with pytest.raises(json.JSONDecodeError):
+    with pytest.raises(UnreadableConversation, match="line 8 is not valid JSON"):
         store.get("example")
     store.db.close()
 

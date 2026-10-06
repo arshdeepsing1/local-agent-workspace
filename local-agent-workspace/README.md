@@ -29,6 +29,10 @@ frontend that runs without a build step.
 - Review of the agent's file edits, as in an editor's chat: a "files changed" bar with
   Keep and Undo, dots on changed files in the file explorer, and an inline red/green
   diff with Keep and Undo for each change.
+- The agent must read an existing file before overwriting it, and is told which files it
+  read or wrote changed since (your saves, an Undo, a command).
+- An unreadable conversation file does not stop the app: it is skipped, left unchanged,
+  and named in a notice.
 - Explicit MCP servers, workspace skills with a `/` command menu, and approval-controlled
   tool lifecycle hooks.
 - Persistent tasks with dependencies and bounded subagents in separate conversations.
@@ -154,8 +158,8 @@ subagent conversations (32 total, 16 MiB maximum). Export requires idle chats.
 Imports preserve historical messages, tool results, summaries, and usage, remap
 conversation/event/call IDs and included child links, and cancel historical active
 states. Credential settings, hooks/MCP configuration, task-board records, jobs, file checkpoint ownership,
-and folder grants are not transferred. Conversation text can itself contain sensitive
-data: inspect exported files before sharing them. Choose a trusted bundle and an
+folder grants, and the record of which files the agent read are not transferred.
+Conversation text can itself contain sensitive data: inspect exported files before sharing them. Choose a trusted bundle and an
 existing destination folder; imported paths never select the destination for you.
 Repeated imports intentionally create separate copies. Unsupported versions, malformed
 history, oversized bundles, and authority-bearing fields are rejected atomically.
@@ -183,6 +187,8 @@ when opening a conversation or performing restart recovery.
   The message box stays editable while connecting. The permissions menu opens above
   the composer; clicking the input closes it, and choosing a mode returns focus to chat.
   Open tabs reconnect after a server restart without discarding the current draft.
+  A tab that does not accept an update within 5 seconds is disconnected, so it cannot
+  hold up a reply, Stop or saving; it reconnects and reloads the conversation.
 - **Skills (`/`)**: type `/` at the start of the message box to list the skills this
   conversation can use, with their descriptions; keep typing to filter. Use ↑/↓ to
   highlight one and Enter or Tab (or click it) to insert `/<skill-id> `, then add your
@@ -243,12 +249,18 @@ when opening a conversation or performing restart recovery.
     Shell commands, MCP tools and hooks are not; **Workspace / Changes** shows Git's view.
     A subagent's edits are listed in the subagent's conversation. Exports, imports and
     forks do not copy the list, and deleting a conversation forgets it and leaves the
-    files as they are. The model is not told about an undo; it reads a file again before
-    editing it. Recovery's limits apply: regular UTF-8 files up to 80 KB. An agent edit
-    saves a file with Windows (CRLF) line endings with LF endings, so every line of such
-    a file shows as changed.
+    files as they are. Before its next request the model is told which files it read or
+    wrote changed since, an undo included, and `write_file` refuses to replace such a file
+    until the model reads it again (see **Tool details**). Recovery's limits apply: regular
+    UTF-8 files up to 80 KB. An agent edit saves a file with Windows (CRLF) line endings
+    with LF endings, so every line of such a file shows as changed.
 - **Workspace / Changes**: inspect Git status and tracked-file diffs. Untracked
-  paths appear in status; their contents are available in Files.
+  paths appear in status; their contents are available in Files. The server runs Git
+  directly (no shell) with the programs a repository's configuration can name switched
+  off: `core.fsmonitor`, hooks, clean/smudge filters, external diff and text conversion.
+  It also limits Git's environment, stops after 60 seconds, and shows at most 80 KB.
+  Credential files (`.env`, `.env.*`, `env_vars.txt`) are left out of the diff. A folder
+  that is not a Git repository shows Git's own message.
 - **Workspace / Terminal**: run a command explicitly and see output while it runs.
   Set the timeout (1–3,600 seconds, default 60) and retained output limit
   (1,024–1,000,000 bytes, default 80,000). A foreground job disables Run until it
@@ -271,6 +283,18 @@ when opening a conversation or performing restart recovery.
   action does not mean the task itself is finished. Expand command cards to see the
   full command (including inline Python), options, and output separately. A long file
   is read in pages, so a read card names the lines it covered (`lines 109–243`).
+  **Read before overwriting:** the conversation remembers the size and modification time
+  of each file the agent read (`read_file`, any page) or wrote, up to 500 files.
+  `write_file` on an existing file is refused, before any approval card, unless the
+  conversation has read or written it and it has not changed since; the card shows
+  "Not run:" and the reason, and the model reads the file and writes again. The check
+  repeats after the approval and before the write. New files, `edit_file` (its
+  `old_text` must match exactly) and `insert_activity_log` are not refused.
+  Before each model request the app checks the 200 most recent of these files and, if
+  any changed or were deleted (your editor saves, an Undo, a command), adds one line at
+  the end of the system message naming up to 10 of them. A deleted file is named once.
+  The system message keeps its stable parts first and puts the folder grants, the current
+  time and this line last, so a provider that caches prompt prefixes can reuse more.
 - **Request details**: expand the details below an assistant response or tool-only
   model request to inspect its endpoint, completion status, stop reason, and
   provider-reported token usage when available. Failed requests distinguish invalid
@@ -315,8 +339,9 @@ tools cannot browse it.
   Records include conversation metadata, user and assistant events, reasoning and
   request usage, tool calls and results, and the exact Databricks message/tool
   history (`wire`). Commands associated with the chat are included as sanitized job
-  records with their command, state, limits, exit status, and bounded retained output.
-  Files are atomically replaced as current-state snapshots rather than appended
+  records with their command, state, limits, exit status, and bounded retained output,
+  plus the size and modification time of the files the agent last read or wrote (paths
+  only, no contents). Files are atomically replaced as current-state snapshots rather than appended
   indefinitely while an answer streams.
 - `conversations.sqlite3`: operational state only. Its `jobs` table stores command
   metadata, states, and bounded output for live control and restart recovery; terminal
@@ -332,6 +357,14 @@ tools cannot browse it.
 - `extensions.json`: explicitly configured MCP servers and lifecycle hooks.
 - `worktrees/`: actual app-created Git worktrees; copying the database alone does
   not migrate these checkouts or their Git registrations.
+
+A conversation file that cannot be read (empty, not JSON, a damaged header or record,
+or an ID that does not match the file name) does not stop the app. It is skipped, the
+other conversations list and open as usual, and a notice at the top of the page names
+the file and the reason; the reason never quotes the file's contents. The app never
+deletes, moves or rewrites such a file. Repair or remove it with the server stopped;
+it is listed again once it can be read. Requesting it through the API reports the
+problem instead of a server error.
 
 New sessions have empty message history and fresh permissions.
 Project files are shared on disk when chats select the same workspace; starting a
@@ -909,7 +942,10 @@ browser-controlled folder checks/grants/removal, OS-denied access,
 cancellation (including process-group termination), path/symlink/secret boundaries,
 credential-free shell environment, restart recovery, API access control, WebSocket
 snapshots, stale editor writes, and keeping or undoing agent changes (whole files and single
-changes, stale-review refusal, undo as a restorable checkpoint). None of these automated
+changes, stale-review refusal, undo as a restorable checkpoint), read-before-write refusals
+and the changed-files notice, `/api/git` not running a repository's `core.fsmonitor`
+program or filters, startup with unreadable conversation files, and dropping a WebSocket
+that stalls. None of these automated
 tests calls a paid model.
 Frontend tests verify that expired local tokens refresh once and that other
 errors never replay a potentially completed action, that editor drafts survive saves
@@ -918,7 +954,8 @@ do not corrupt the active view, that model replies cannot inject HTML or scripts
 that the `/` skill menu lists, filters, and inserts skills without blocking ordinary messages,
 that the pages of a long file read name the lines they covered, and that agent changes
 show in the changes bar, as dots in the file list and as an inline diff whose Keep and Undo
-send the reviewed file state.
+send the reviewed file state, and that unreadable conversation files are named in a
+dismissible notice.
 Backend regressions additionally cover credential
 path aliases, unreadable configuration recovery, cancellation during startup or
 after a child process outlives its shell, recovery of completed tool results
@@ -932,7 +969,7 @@ inside a longer message, and compaction inside one request that outgrows the bud
 - `backend/local_agent/tools.py`: scoped file queries/edits and tool definitions.
 - `backend/local_agent/jobs.py`: streamed processes, managed jobs, and cleanup.
 - `backend/local_agent/permissions.py`: shared mode rules and model instructions.
-- `backend/local_agent/store.py`: per-conversation JSONL storage and legacy migration.
+- `backend/local_agent/store.py`: per-conversation JSONL storage, unreadable-file reports, and legacy migration.
 - `backend/local_agent/drafts.py`: bounded periodic streamed-reply checkpoints.
 - `backend/local_agent/portability.py` / `portability_api.py`: validated conversation copies.
 - `backend/local_agent/tool_profiles.py` / `tool_schema.py`: tool ceilings and offline input validation.
@@ -946,6 +983,7 @@ inside a longer message, and compaction inside one request that outgrows the bud
 - `backend/local_agent/usage_export.py` / `scripts/usage_report.py`: usage rows and CSV correlated with conversation history.
 - `backend/local_agent/instructions.py`: scoped project guidance loading.
 - `backend/local_agent/recovery.py` / `worktrees.py`: file recovery and Git worktrees.
+- `backend/local_agent/git_tools.py`: Git without a shell or repository-configured programs (worktrees, `/api/git`).
 - `backend/local_agent/changes.py`: the agent's file changes per conversation, their diffs, Keep and Undo.
 - `backend/local_agent/extensions.py` / `mcp_client.py`: skills, hooks, MCP lifecycle.
 - `backend/local_agent/planning.py` / `feature_tools.py`: tasks and delegated workers.
