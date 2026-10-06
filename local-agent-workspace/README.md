@@ -161,8 +161,9 @@ completion and Stop flush the final state. After an abrupt process death, the la
 saved partial reply is shown as interrupted; the most recent uncheckpointed text
 may be lost. Incomplete streamed tool arguments are never persisted as executable
 requests or replayed. A local storage failure stops the response and reports that
-recent history may not have been saved. Back up both the conversation JSONL files
-and the separate operational SQLite database.
+recent history may not have been saved. Back up the whole `conversations/` folder
+(the JSONL files and their `.state.json` files) and the separate operational SQLite
+database.
 
 **Agent tools → Conversation** exports a versioned JSON bundle, optionally with
 subagent conversations (32 total, 16 MiB maximum). Export requires idle chats.
