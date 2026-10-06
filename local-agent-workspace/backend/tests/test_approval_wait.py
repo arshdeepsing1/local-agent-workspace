@@ -58,9 +58,17 @@ async def answer_when_pending(manager, session, allowed):
     manager.decide(session_id, event_id, allowed)
 
 
-async def test_by_default_an_approval_waits_until_it_is_answered(runtime, monkeypatch):
+async def test_by_default_an_approval_waits_an_hour(runtime, monkeypatch):
+    manager, session, _, tools = runtime
+    assert manager.settings.values["approval_timeout_minutes"] == 60
+    timeouts = expire_waits_of(monkeypatch, 3600)
+    output = await bounded(manager.execute_tool(session, tools, "write_file", {"path": "a.txt", "content": "x"}, "call"))
+    assert timeouts == [3600] and "did not answer" in output
+
+
+async def test_with_no_limit_an_approval_waits_until_it_is_answered(runtime, monkeypatch):
     manager, session, project, tools = runtime
-    assert manager.settings.values["approval_timeout_minutes"] == 0
+    manager.settings.values["approval_timeout_minutes"] = 0
     timeouts = expire_waits_of(monkeypatch, 300)
     (project / "note.txt").write_text("before")
     run = asyncio.create_task(manager.execute_tool(session, tools, "write_file", {"path": "note.txt", "content": "after"}, "call"))
@@ -158,7 +166,7 @@ def test_the_wait_is_a_validated_setting(tmp_path, monkeypatch):
     settings.values.update(workspace=str(tmp_path), env_file="")
     with TestClient(create_app(settings)) as client:
         bootstrap = client.get("/api/bootstrap").json()
-        assert bootstrap["settings"]["approval_timeout_minutes"] == 0
+        assert bootstrap["settings"]["approval_timeout_minutes"] == 60
         headers = {"X-Local-Token": bootstrap["token"]}
         body = {"workspace": str(tmp_path), "model": "test-model", "env_file": ""}
         for bad in (-1, 1441, 2.5, True, "30"):

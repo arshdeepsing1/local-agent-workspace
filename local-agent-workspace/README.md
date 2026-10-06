@@ -259,13 +259,13 @@ when opening a conversation or performing restart recovery.
   This remains a noninteractive command runner: stdin is closed, with no PTY.
   Closing the panel does not cancel a job. Errors pause polling until **Refresh jobs**.
 - **Approvals**: approve or decline model-proposed writes, commands, MCP calls, and hooks. An unanswered
-  approval waits until you answer it or press **Stop**, like Claude desktop; a browser refresh
-  retains it while the server runs (a server restart cancels it). To give up on unanswered
-  cards, set **Settings → Approval wait (minutes)** to 1–1,440: after that time the card shows
-  "Not answered in time", the action does not run, and the agent is told nobody answered
-  (not that you declined). 0, the default, means no limit. A card with a limit shows the time
-  it expires (with the weekday when that is not today). Before this setting existed, every card
-  expired after five minutes. An action stopped without any card, for example by Plan mode or
+  card waits **Settings → Approval wait (minutes)**, 60 by default (1–1,440); a browser refresh
+  retains it while the server runs (a server restart cancels it). After that time the card shows
+  "Not answered in time", the action does not run, and the agent is told nobody answered (not
+  that you declined). The card shows when it expires (with the weekday when that is not today).
+  0 waits until you answer or press **Stop**, like Claude desktop, but a waiting card keeps the
+  chat busy, and a busy chat blocks Undo and Recovery restores in its project. Before this
+  setting existed, every card expired after five minutes. An action stopped without any card, for example by Plan mode or
   because project instructions changed mid-turn, shows "Not run:" and the reason, not "declined".
 - **Tool details**: task cards show their names and task status. A completed create/update
   action does not mean the task itself is finished. Expand command cards to see the

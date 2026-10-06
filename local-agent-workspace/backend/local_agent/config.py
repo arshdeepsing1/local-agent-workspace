@@ -15,7 +15,9 @@ DEFAULT_MAX_AGENT_STEPS = 32
 MIN_MAX_AGENT_STEPS = 1
 MAX_MAX_AGENT_STEPS = 64
 # Minutes an approval card waits for an answer; 0 waits until it is answered or stopped.
-DEFAULT_APPROVAL_MINUTES = 0
+# A forgotten card keeps its chat busy, which blocks Undo and Recovery in that workspace,
+# so the default is a long but finite wait.
+DEFAULT_APPROVAL_MINUTES = 60
 MAX_APPROVAL_MINUTES = 1440
 
 

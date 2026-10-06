@@ -166,11 +166,11 @@ def test_compaction_handoffs_can_be_turned_off(ui, page):
     assert ui.bodies("/api/settings", "PUT")[0]["compaction_handoffs"] is False
 
 
-def test_approval_wait_is_a_setting_with_no_limit_by_default(ui, page):
-    start_app(ui, page)
+def test_approval_wait_is_a_setting_of_an_hour_by_default(ui, page):
+    start_app(ui, page, setup="fake.settings = { ...baseSettings, approval_timeout_minutes: 60 }")
     page.get_by_role("button", name="Settings", exact=True).click()
     wait = page.get_by_role("dialog").get_by_role("spinbutton", name="Approval wait (minutes)")
-    expect(wait).to_have_value("0")
+    expect(wait).to_have_value("60")
     wait.fill("45")
     page.get_by_role("button", name="Save settings").click()
     expect(page.get_by_role("dialog")).to_have_count(0)
