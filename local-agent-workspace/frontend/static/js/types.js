@@ -1,11 +1,15 @@
 // Shapes of the main API objects, for reference while editing (JSDoc only).
 //
 // Settings: { workspace, model, env_file, context_window, max_output_tokens,
-//   max_agent_steps, compaction_handoffs?, approval_timeout_minutes? (0 = no limit), host, configured }
+//   max_agent_steps, compaction_handoffs?, approval_timeout_minutes? (0 = no limit),
+//   system_notifications? (server notifications while no page is open), host, configured }
 // Connection: { connected, models: string[], error: string | null }
 // Session: { id, title, workspace, model, status, events: AgentEvent[], updated,
 //   permission_mode, allowed_directories, context_info?, active_skills?,
-//   parent_session_id?, is_subagent?, delegation?, tool_profile?, subagent_tool_profile? }
+//   parent_session_id?, is_subagent?, delegation?, tool_profile?, subagent_tool_profile?,
+//   terminal_reason?: how the last turn ended: 'completed'|'stopped'|'error'|'inference_error'|
+//   'tool_error'|'step_limit'|'interrupted' (also in the /api/sessions summaries) }
+// Status message: { type: 'status', status, terminal_reason? (sent with 'idle') }
 // AgentEvent: { id, type: 'user'|'assistant'|'tool'|'notice'|'error', text?,
 //   reasoning_summary?, reasoning_truncated?, child_session_id?, request_info?,
 //   name?, input?, output?, preview?, state?, delegation?, origin?,

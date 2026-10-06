@@ -14,6 +14,9 @@ frontend that runs without a build step.
 - Per-conversation permissions below the composer: Manual, Auto, Accept edits,
   Plan and Bypass permissions. Access additional local folders through an approval card.
 - Stop an agent response, including its foreground command or pending approval.
+- Conversation status in the sidebar (needs approval, working, error, unread) with a
+  Running filter, a "(n)" tab-title count of chats waiting for approval, opt-in browser
+  notifications, and an optional desktop notification from the server when no page is open.
 - Managed background jobs with explicit Stop, output retrieval, status/history,
   per-command time/output limits, and cleanup on normal server shutdown.
 - Resume conversations after refreshing or restarting the app.
@@ -23,8 +26,8 @@ frontend that runs without a build step.
   request's earlier tool results), and a visible context meter. Full conversation history
   stays on disk, and a script turns it into Markdown transcripts.
 - Automatic workspace-scoped `AGENTS.md` and `CLAUDE.md` guidance loading.
-- Workspace file explorer, text editor with stale-file detection, Git status/diff,
-  and a non-interactive command runner.
+- Workspace file explorer (the project and the conversation's granted folders), text
+  editor with stale-file detection, Git status/diff, and a non-interactive command runner.
 - File checkpoints with reviewed, reversible restore and managed Git worktrees.
 - Review of the agent's file edits, as in an editor's chat: a "files changed" bar with
   Keep and Undo, dots on changed files in the file explorer, and an inline red/green
@@ -183,6 +186,32 @@ when opening a conversation or performing restart recovery.
   The message box stays editable while connecting. The permissions menu opens above
   the composer; clicking the input closes it, and choosing a mode returns focus to chat.
   Open tabs reconnect after a server restart without discarding the current draft.
+- **Conversation status**: each sidebar row shows what its chat is doing.
+  **Needs approval** marks a chat waiting for an approval card; a pulsing dot marks a chat
+  that is working (replying, compacting, naming itself or waiting for a subagent); **Error**
+  marks a chat whose last reply ended with an error and that you have not opened since; a
+  blue dot marks a chat that changed since you last opened it. **Running** above the list
+  shows only chats that are not idle; click it again to show all. The browser remembers when
+  you last opened each chat (in `localStorage`, on this browser only); the first time, every
+  existing chat counts as read. Renaming a chat does not mark it unread. While any chat waits
+  for approval, the tab title starts with the count, for example `(2) Local — …`.
+  The sidebar list refreshes every 1.5 seconds while a chat is working and every 10 seconds
+  otherwise, so chats started in another tab also show up.
+- **Notifications**: click **Notify me** at the bottom of the sidebar to turn on browser
+  notifications; the browser asks for permission only then. You are notified when a chat
+  starts waiting for approval, finishes a reply, or stops with an error, if this page is
+  hidden or that chat is not the one open. A notification reads, for example,
+  "Needs your approval: Fix the parser" with the chat title cut to 60 characters, and never
+  contains conversation text. Clicking it brings the window forward and opens that chat.
+  Stopping a reply yourself, or a manual compaction, does not notify, and a subagent's chat
+  notifies only when it needs approval. Each open tab notifies on its own; the browser
+  replaces a notification with the same chat and status. If the browser blocks
+  notifications for the page, the sidebar says so; allow them in the browser's site settings.
+  For when no tab is open, see **Settings → Desktop notification when no browser tab is open**:
+  the server then shows the same text as a system notification (`notify-send` on Linux when
+  it is installed, `osascript` on macOS, nothing elsewhere). It is off by default, only
+  applies while no page of the app is connected to the server, and starts the notifier
+  directly, with the title and message as arguments (no shell) and a 5-second limit.
 - **Skills (`/`)**: type `/` at the start of the message box to list the skills this
   conversation can use, with their descriptions; keep typing to filter. Use ↑/↓ to
   highlight one and Enter or Tab (or click it) to insert `/<skill-id> `, then add your
@@ -212,7 +241,11 @@ when opening a conversation or performing restart recovery.
   permissions, or selected conversation. Manual titles persist after restart and
   are never replaced by automatic naming, including a title request already in flight.
 - **Workspace / Files**: browse a folder, edit UTF-8 text files up to 80 KB, or use
-  the plus button to reference the file in chat. Save detects concurrent disk edits.
+  the plus button to reference the file in chat. When the conversation has granted
+  folders (**Folder access**), **Browse** at the top switches between **Project** and each
+  granted folder; a granted folder is shown by absolute paths and the parent button stops
+  at that folder. The choice goes back to **Project** for another conversation or when the
+  folder's grant is removed. Save detects concurrent disk edits.
   Unsaved editor text stays with its conversation when closing the workspace panel,
   attaching a file, or switching chats. Text entered during a save remains unsaved
   until the next save. Editor drafts are kept in the current page, not across reloads.
@@ -224,7 +257,8 @@ when opening a conversation or performing restart recovery.
   The **Keep** and **Undo** buttons on the bar act on every listed file; the check and
   arrow buttons on a row act on that file only.
   In **Workspace / Files**, a dot marks each changed file and each folder that contains
-  one. Click a file, in the bar or in the file list, to review it: removed lines are red
+  one. Changes in a granted folder outside the project get their dots when you choose
+  that folder in **Browse**, whose entry then ends with "(changed files)". Click a file, in the bar or in the file list, to review it: removed lines are red
   and added lines green, and each change has its own **Keep** and **Undo**. The box at the
   bottom right shows the position (`1 of 3`), moves between changes with its arrows, and
   keeps or undoes the whole file. **Edit** switches to the text editor (an unsaved draft is
@@ -267,6 +301,8 @@ when opening a conversation or performing restart recovery.
   chat busy, and a busy chat blocks Undo and Recovery restores in its project. Before this
   setting existed, every card expired after five minutes. An action stopped without any card, for example by Plan mode or
   because project instructions changed mid-turn, shows "Not run:" and the reason, not "declined".
+  A chat waiting for approval shows **Needs approval** in the sidebar and counts in the tab
+  title; **Notify me** also tells you when this page is hidden or another chat is open.
 - **Tool details**: task cards show their names and task status. A completed create/update
   action does not mean the task itself is finished. Expand command cards to see the
   full command (including inline Python), options, and output separately. A long file
@@ -916,9 +952,14 @@ errors never replay a potentially completed action, that editor drafts survive s
 and navigation, that delayed permission responses or deleted conversation URLs
 do not corrupt the active view, that model replies cannot inject HTML or scripts, and
 that the `/` skill menu lists, filters, and inserts skills without blocking ordinary messages,
-that the pages of a long file read name the lines they covered, and that agent changes
+that the pages of a long file read name the lines they covered, that agent changes
 show in the changes bar, as dots in the file list and as an inline diff whose Keep and Undo
-send the reviewed file state.
+send the reviewed file state, and that notifications (with a faked Notification API and
+`document.hidden`), the tab-title count, sidebar status badges, unread and Running filter,
+and the Files root switcher with change dots in granted folders work without `localStorage` too.
+Backend tests check the desktop notifier with a fake runner: nothing is sent while a page is
+connected, the command is an argument list without a shell, titles are cut to 60 characters,
+and notifier failures are ignored.
 Backend regressions additionally cover credential
 path aliases, unreadable configuration recovery, cancellation during startup or
 after a child process outlives its shell, recovery of completed tool results
@@ -946,12 +987,14 @@ inside a longer message, and compaction inside one request that outgrows the bud
 - `backend/local_agent/usage_export.py` / `scripts/usage_report.py`: usage rows and CSV correlated with conversation history.
 - `backend/local_agent/instructions.py`: scoped project guidance loading.
 - `backend/local_agent/recovery.py` / `worktrees.py`: file recovery and Git worktrees.
+- `backend/local_agent/notify.py`: optional desktop notifications (status and title only) when no page is open.
 - `backend/local_agent/changes.py`: the agent's file changes per conversation, their diffs, Keep and Undo.
 - `backend/local_agent/extensions.py` / `mcp_client.py`: skills, hooks, MCP lifecycle.
 - `backend/local_agent/planning.py` / `feature_tools.py`: tasks and delegated workers.
 - `backend/local_agent/feature_api.py`: scoped feature endpoints.
 - `backend/local_agent/reasoning.py`: provider reasoning-summary extraction.
-- `frontend/static/js/`: browser interface (Preact + htm, no build), conversation state, editor and settings.
+- `frontend/static/js/`: browser interface (Preact + htm, no build), conversation state, editor and settings;
+  `attention.js` holds browser notifications, the tab-title count and unread tracking.
 - `frontend/tests/`: browser tests (pytest + Playwright) with a fake backend.
 - `design/`: original visual concept and extracted design tokens.
 

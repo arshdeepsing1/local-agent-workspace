@@ -70,10 +70,13 @@ export function useWorkspace() {
   const hasActiveSessions = sessions.some(item => item.status !== 'idle')
 
   useEffect(() => {
-    if (!hasActiveSessions) return
-    const timer = setInterval(() => void refreshSessions().catch(e => setError(e.message)), 1500)
+    // Every 1.5 s while a chat is active; every 10 s otherwise, to notice chats started
+    // elsewhere. A failed slow poll stays quiet: the server may just be restarting.
+    if (!ready) return
+    const timer = hasActiveSessions ? setInterval(() => void refreshSessions().catch(e => setError(e.message)), 1500)
+      : setInterval(() => void refreshSessions().catch(() => {}), 10000)
     return () => clearInterval(timer)
-  }, [hasActiveSessions, refreshSessions])
+  }, [ready, hasActiveSessions, refreshSessions])
 
   useEffect(() => {
     let mounted = true
@@ -163,7 +166,9 @@ export function useWorkspace() {
           // replacing this newer streamed status.
           sessionsRequest.current++
           setSession(current => current?.id === activeId ? { ...current, status: data.status } : current)
-          setSessions(current => current.map(item => item.id === activeId ? { ...item, status: data.status } : item))
+          setSessions(current => current.map(item => item.id === activeId ? {
+            ...item, status: data.status, ...(data.terminal_reason ? { terminal_reason: data.terminal_reason } : {}),
+          } : item))
           if (data.status === 'idle') void refreshSessions().catch(e => setError(e.message))
         }
         if (data.type === 'title') {
@@ -213,11 +218,13 @@ export function useWorkspace() {
     await api(`/sessions/${id}/messages`, 'POST', { text })
   }
   const saveSettings = async next => {
-    const { workspace, model, env_file, context_window, max_output_tokens, max_agent_steps, compaction_handoffs, approval_timeout_minutes } = next
+    const { workspace, model, env_file, context_window, max_output_tokens, max_agent_steps, compaction_handoffs, approval_timeout_minutes,
+      system_notifications } = next
     const saved = await api('/settings', 'PUT', {
       workspace, model, env_file, context_window, max_output_tokens, max_agent_steps,
       ...(typeof compaction_handoffs === 'boolean' ? { compaction_handoffs } : {}),
       ...(Number.isInteger(approval_timeout_minutes) ? { approval_timeout_minutes } : {}),
+      ...(typeof system_notifications === 'boolean' ? { system_notifications } : {}),
     })
     setSettings(saved)
     void checkConnection().catch(e => setError(e.message))
@@ -262,6 +269,7 @@ export function useWorkspace() {
     setSessions(current => current.map(item => item.id === id ? { ...item, title: updated.title } : item))
     // Renaming never replaces live events/status or changes the selected chat.
     setSession(current => current?.id === id ? { ...current, title: updated.title } : current)
+    return updated
   }
   const setPermissionMode = async permission_mode => {
     const target = selected.current

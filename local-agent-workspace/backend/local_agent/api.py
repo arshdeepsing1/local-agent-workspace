@@ -86,6 +86,7 @@ class SettingsEdit(BaseModel):
     max_agent_steps: int | None = Field(default=None, ge=MIN_MAX_AGENT_STEPS, le=MAX_MAX_AGENT_STEPS, strict=True)
     compaction_handoffs: bool | None = Field(default=None, strict=True)
     approval_timeout_minutes: int | None = Field(default=None, ge=0, le=MAX_APPROVAL_MINUTES, strict=True)
+    system_notifications: bool | None = Field(default=None, strict=True)
 
 
 class CommandRequest(BaseModel):

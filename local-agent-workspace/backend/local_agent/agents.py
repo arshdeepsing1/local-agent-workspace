@@ -38,6 +38,7 @@ from .telemetry import (
 from .model_stream import ToolCallBuffer, error_body_prefix, sse_data
 from .tool_schema import validate_arguments
 from .drafts import DraftPersistenceError, STORAGE_ERRORS, StreamDraft
+from .notify import SystemNotifier, attention_message
 
 
 MAX_OUTPUT_LIMIT_RETRIES = 2
@@ -306,6 +307,7 @@ class AgentManager:
         self.task_board = TaskManager(store)
         self.delegates = DelegateManager(self)
         self.extension_connections = {}
+        self.notifier = SystemNotifier()
         self.jobs = JobManager(store, settings.redact, self.job_update, redaction_tokens=self.redaction_tokens)
         for summary in store.list():
             session = store.get(summary["id"])
@@ -498,12 +500,25 @@ class AgentManager:
                     self.listeners.get(session_id, set()).discard(socket)
 
     async def status(self, session, status):
+        previous = self.statuses.get(session["id"], "idle")
         self.statuses[session["id"]] = status
-        await self.broadcast(session["id"], {"type": "status", "status": status})
+        message = {"type": "status", "status": status}
+        if status == "idle" and session.get("terminal_reason"):
+            message["terminal_reason"] = session["terminal_reason"]  # How the turn ended, for the page's notifications.
+        await self.broadcast(session["id"], message)
+        self.notify_status(session, previous, status)
         await self.delegates.progress(session, status=status)
         if status == "idle":
             # Commands can also change reviewed files; refresh their counts after each turn.
             await self.publish_changes(session, only_tracked=True)
+
+    def notify_status(self, session, previous, status):
+        """A desktop notification of the change, only if enabled and no page is open."""
+        if self.settings.values.get("system_notifications") is not True or any(self.listeners.values()):
+            return
+        message = attention_message(session, previous, status)
+        if message:
+            self.notifier.send(message)
 
     def session_tools(self, session):
         return WorkspaceTools(session["workspace"], self.settings.values["env_file"], session.get("allowed_directories", []),
