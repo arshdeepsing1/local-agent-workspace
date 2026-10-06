@@ -11,7 +11,8 @@ from .telemetry import LEDGER_VERSION
 
 
 _SAFE_SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
-_SEPARATE_FIELDS = ("context_state", "instruction_directories", "inference_calls", "command_jobs")
+# Kept out of the header record so list and metadata reads stay small.
+_SEPARATE_FIELDS = ("context_state", "instruction_directories", "allow_rules", "inference_calls", "command_jobs")
 
 
 class Store:
@@ -64,7 +65,7 @@ class Store:
         metadata = {key: value for key, value in session.items()
                     if key not in ("events", "wire", *_SEPARATE_FIELDS)}
         yield {"record": "session", "version": 1, "data": metadata}
-        for name in ("context_state", "instruction_directories"):
+        for name in ("context_state", "instruction_directories", "allow_rules"):
             if name in session:
                 yield {"record": "field", "name": name, "data": session[name]}
         if "inference_calls" in session:

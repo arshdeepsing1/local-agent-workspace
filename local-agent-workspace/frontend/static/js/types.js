@@ -6,6 +6,7 @@
 // Session: { id, title, workspace, model, status, events: AgentEvent[], updated,
 //   permission_mode, allowed_directories, allow_rules: AllowRule[], context_info?, active_skills?,
 //   parent_session_id?, is_subagent?, delegation?, tool_profile?, subagent_tool_profile? }
+//   GET /sessions list items omit events and allow_rules.
 // AllowRule ("Allow for this chat", exact matches only): { tool: 'run_command', command }
 //   | { tool: 'edits' } (write_file, edit_file, insert_activity_log) | { tool: 'mcp__<server>__<tool>' }
 //   | { tool: 'hook', hook: <hook id> }. Removed with DELETE /sessions/<id>/allow-rules (body: the rule).

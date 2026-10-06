@@ -17,12 +17,28 @@ export function ruleLabel(rule) {
   return `Tool: ${rule.tool}`
 }
 
+// The visible label. A command keeps its exact spacing, since a rule matches only that exact text.
+function RuleText({ rule }) {
+  if (rule.tool !== 'run_command') return ruleLabel(rule)
+  return html`Command: <code>${rule.command}</code>`
+}
+
 export default function PermissionsMenu({ mode, busy, onChange, onError, onDone, rules = [], onRemoveRule }) {
   const [open, setOpen] = useState(false)
   const [saving, setSaving] = useState(false)
   const container = useRef(null)
   const trigger = useRef(null)
   const menu = useRef(null)
+  // After a rule is removed, focus stays in the menu: on the remove button now at the same
+  // place, the one before it, or the selected mode once no rules are left.
+  const refocus = useRef(null)
+  useEffect(() => {
+    if (refocus.current === null || saving || !open) return
+    const buttons = menu.current?.querySelectorAll('.allow-rule [role="menuitem"]') || []
+    const target = buttons[Math.min(refocus.current, buttons.length - 1)] || menu.current?.querySelector('[aria-checked="true"]')
+    refocus.current = null
+    target?.focus()
+  })
   useEffect(() => {
     if (!open) return
     menu.current?.querySelector('[aria-checked="true"]')?.focus()
@@ -37,7 +53,8 @@ export default function PermissionsMenu({ mode, busy, onChange, onError, onDone,
     catch (e) { onError(e.message) }
     finally { setSaving(false) }
   }
-  const remove = async rule => {
+  const remove = async (rule, index) => {
+    refocus.current = index
     setSaving(true)
     try { await onRemoveRule(rule) }
     catch (e) { onError(e.message) }
@@ -69,14 +86,15 @@ export default function PermissionsMenu({ mode, busy, onChange, onError, onDone,
       </button>`)}
       ${rules.length && onRemoveRule ? html`<div class="allow-rules" role="group" aria-label="Allowed in this chat">
         <div class="permissions-heading">Allowed in this chat</div>
-        ${rules.map(rule => {
+        ${rules.map((rule, index) => {
           const text = ruleLabel(rule)
-          return html`<div class="allow-rule" key=${JSON.stringify(rule)}><span title=${text}>${text}</span>
+          return html`<div class="allow-rule" key=${JSON.stringify(rule)}><span title=${text}><${RuleText} rule=${rule} /></span>
             <button role="menuitem" class="icon-button" aria-label=${`Remove rule: ${text}`} aria-disabled=${busy || saving}
-              onClick=${() => { if (!busy && !saving) void remove(rule) }}><${X} size=${13} /></button></div>`
+              aria-describedby=${busy ? 'permissions-note' : undefined} title=${busy ? 'Stop the response before removing rules.' : undefined}
+              onClick=${() => { if (!busy && !saving) void remove(rule, index) }}><${X} size=${13} /></button></div>`
         })}
       </div>` : null}
-      <p>${busy ? 'Stop the response before changing modes.' : 'Applies to this conversation. Auto uses local rules.'}</p>
+      <p class="permissions-note" id="permissions-note">${busy ? `Stop the response before changing modes${rules.length && onRemoveRule ? ' or removing rules' : ''}.` : 'Applies to this conversation. Auto uses local rules.'}</p>
     </div>` : null}
   </div>`
 }

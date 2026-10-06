@@ -2,6 +2,7 @@ import { html, useEffect, useMemo, useRef, useState } from '../lib.js'
 import { ChevronDown, ChevronUp } from '../icons.js'
 import { api } from '../api.js'
 import { DiffStat, STATUS_LABELS } from './ChangesBar.js'
+import { blockerOf, OpenBlockingChat } from './BlockingChat.js'
 
 // The agent's changes to one file, inline: removed lines in red, added lines in
 // green, Keep/Undo on each change, and a bar at the bottom right that moves between
@@ -10,11 +11,13 @@ import { DiffStat, STATUS_LABELS } from './ChangesBar.js'
 //   hunks: [{ index, line, added, removed }],
 //   lines: [{ kind: 'context'|'removed'|'added', text, old?, new?, hunk?, newline? }] }
 // Props: sessionId, path, version (changes when the file or its review changes),
-//   busy (a response is running; Undo waits for it), onAction(action, files) -> Promise
-export default function DiffReview({ sessionId, path, version, busy, onAction }) {
+//   busy (a response is running; Undo waits for it), onAction(action, files) -> Promise,
+//   onSelectSession(id) (opens a chat that an error names as blocking Undo)
+export default function DiffReview({ sessionId, path, version, busy, onAction, onSelectSession }) {
   const [diff, setDiff] = useState(null)
   const [loadError, setLoadError] = useState('')
   const [error, setError] = useState('')  // The last Keep/Undo failure; a refresh keeps it visible.
+  const [blocker, setBlocker] = useState(null)  // The other chat that error names, if any.
   const [active, setActive] = useState(0)
   const [working, setWorking] = useState(false)
   const [revision, setRevision] = useState(0)
@@ -38,10 +41,10 @@ export default function DiffReview({ sessionId, path, version, busy, onAction })
   }
   const run = async (action, hunk) => {
     if (!diff || working) return
-    setWorking(true); setError('')
+    setWorking(true); setError(''); setBlocker(null)
     const file = { path, current_hash: diff.current_hash }
     try { await onAction(action, [hunk === undefined ? file : { ...file, baseline_hash: diff.baseline_hash, hunk }]) }
-    catch (e) { setError(e.message) }
+    catch (e) { setError(e.message); setBlocker(blockerOf(e)) }
     finally { setWorking(false); setRevision(value => value + 1) }
   }
   const undoTitle = busy ? 'Stop the response before undoing changes.' : undefined
@@ -49,7 +52,8 @@ export default function DiffReview({ sessionId, path, version, busy, onAction })
   return html`<div class="diff-review" role="region" aria-label=${`Agent changes in ${path}`}>
     <div class="diff-review-summary"><span>${STATUS_LABELS[diff.status] || diff.status}</span><${DiffStat} added=${diff.added} removed=${diff.removed} />
       <span class="diff-review-note">${count ? `${count} ${count === 1 ? 'change' : 'changes'} by the agent` : diff.status === 'created' ? 'Empty new file' : 'No line changes'}</span></div>
-    ${error || loadError ? html`<div class="panel-error" role="alert">${error || loadError}</div>` : null}
+    ${error || loadError ? html`<div class=${`panel-error ${error && blocker ? 'blocked-error' : ''}`} role="alert">${error ? html`<span>${error}</span>` : loadError}
+      <${OpenBlockingChat} blocker=${error ? blocker : null} currentId=${sessionId} onSelect=${onSelectSession} /></div>` : null}
     <div class="diff-review-lines" ref=${scroller} tabindex="0">
       ${diff.lines.map((line, index) => {
         const hunk = starts.get(index)

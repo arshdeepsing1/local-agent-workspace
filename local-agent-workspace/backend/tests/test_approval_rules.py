@@ -1,5 +1,6 @@
 """Approval quick wins: "Allow for this chat" rules, decline notes, and 409s that name the blocking chat."""
 import asyncio
+import json
 
 import httpx
 import pytest
@@ -267,7 +268,8 @@ async def test_decline_notes_for_mcp_folder_access_and_hooks(runtime, tmp_path):
     task = asyncio.create_task(manager.execute_tool(session, tools, "write_file", {"path": "a.txt", "content": "x"}, "hooked"))
     await answer(manager, False, note="Skip the hook today.")
     output = await task
-    assert output.endswith("Hook approval declined. Their note: Skip the hook today.") and not (project / "a.txt").exists()
+    assert output.endswith(": User declined this hook. Their note: Skip the hook today. "
+                           "Do not retry write_file without a new instruction.") and not (project / "a.txt").exists()
 
 
 # Rules over the API: persistence, removal, and copies
@@ -343,6 +345,10 @@ def test_rules_are_listed_survive_a_restart_and_are_removed_only_when_idle(api):
     client = connect(app)
     try:
         assert client.get(f"/api/sessions/{sid}").json()["allow_rules"] == rules
+        # Rules stay out of the sidebar list and the small header record that list reads.
+        assert [item for item in client.get("/api/sessions").json() if "allow_rules" in item] == []
+        header = app.state.manager.store._path(sid).read_text(encoding="utf-8").splitlines()[0]
+        assert "make test" not in header and "allow_rules" not in header
         assert client.post("/api/sessions").json()["allow_rules"] == []
         route = f"/api/sessions/{sid}/allow-rules"
         app.state.manager.statuses[sid] = "awaiting_approval"
@@ -475,3 +481,20 @@ async def test_a_running_command_names_the_chat_that_started_it(api):
         await manager.jobs.stop(job["id"])
         await manager.jobs.shutdown()
         manager.store.db.close()
+
+
+def test_rules_saved_in_an_older_header_record_still_load(tmp_path):
+    store = Store(tmp_path / "state.sqlite3")
+    try:
+        session = store.create({"workspace": str(tmp_path), "model": "test-model"})
+        path = store._path(session["id"])
+        lines = path.read_text(encoding="utf-8").splitlines()
+        header = json.loads(lines[0])
+        header["data"]["allow_rules"] = [{"tool": "edits"}]
+        path.write_text("\n".join([json.dumps(header), *lines[1:]]) + "\n", encoding="utf-8")
+        assert store.get(session["id"])["allow_rules"] == [{"tool": "edits"}]
+        store.save(store.get(session["id"]))
+        assert "allow_rules" not in path.read_text(encoding="utf-8").splitlines()[0]
+        assert store.get(session["id"])["allow_rules"] == [{"tool": "edits"}]
+    finally:
+        store.db.close()

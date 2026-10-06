@@ -409,9 +409,8 @@ class AgentManager:
                                      **({"allowed_by_rule": True} if by_rule else {}))
             try:
                 if session.get("permission_mode") != "bypassPermissions" and not by_rule and not await self.approve(session, event):
-                    note = event.get("decline_note")
                     raise ValueError("Hook approval was not answered in time." if event.get("approval") == "expired"
-                                     else "Hook approval declined." + (f" Their note: {note}" if note else ""))
+                                     else declined(event, "this hook", f"Do not retry {name} without a new instruction."))
                 if asyncio.current_task().cancelling():
                     return
                 payload = {"event": phase, "session_id": session["id"], "tool": name, "arguments": arguments, "call_id": call_id}

@@ -168,5 +168,7 @@
 .approval-buttons{flex-wrap:wrap}
 .tool-rule{margin:0 13px 10px;font-size:11px;color:var(--muted)}
 .allow-rules{border-top:1px solid #eeeee9;margin-top:5px;padding-top:7px}.allow-rules .permissions-heading{padding:0 7px 4px}
-.allow-rule{display:flex;align-items:center;gap:6px;padding:2px 3px 2px 7px;font-size:12px}.allow-rule>span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.allow-rule .icon-button{width:25px;height:25px}.allow-rule .icon-button[aria-disabled=true]{opacity:.5;cursor:default}
+.allow-rule{display:flex;align-items:center;gap:6px;padding:2px 3px 2px 7px;font-size:12px}.allow-rule>span{flex:1;min-width:0;overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;line-clamp:3;overflow-wrap:anywhere}.allow-rule code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;white-space:pre-wrap;overflow-wrap:anywhere}
+.permissions-menu>.permissions-note{position:sticky;bottom:-7px;background:#fff;padding-bottom:7px;margin-bottom:-7px}.allow-rule .icon-button{width:25px;height:25px}.allow-rule .icon-button[aria-disabled=true]{opacity:.5;cursor:default}
 .open-blocking-chat{font-size:12px;padding:5px 10px;max-width:40%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:inline-block}
+.blocked-error{display:flex;align-items:center;gap:8px 10px;flex-wrap:wrap}.blocked-error>span{flex:1 1 12em;min-width:0}.blocked-error .open-blocking-chat{max-width:100%;background:var(--surface)}

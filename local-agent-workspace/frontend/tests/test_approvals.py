@@ -143,8 +143,41 @@ def test_rules_cannot_be_removed_while_the_chat_is_busy(ui, page):
     remove = rules.get_by_role("menuitem", name="Remove rule: File edits")
     expect(remove).to_have_attribute("aria-disabled", "true")
     remove.click(force=True)
-    expect(page.get_by_text("Stop the response before changing modes.")).to_be_visible()
+    note = page.get_by_text("Stop the response before changing modes or removing rules.", exact=True)
+    expect(note).to_be_visible()
+    # to_be_visible ignores clipping by the menu's scroll area; the note must sit inside the menu's
+    # visible box at any scroll position, including the top.
+    menu = page.get_by_role("menu")
+    for position in ("0", "m.scrollHeight"):
+        assert menu.evaluate(f"m => {{ m.scrollTop = {position}; return m.scrollHeight > m.clientHeight }}")
+        area, box = menu.bounding_box(), note.bounding_box()
+        assert area["y"] <= box["y"] and box["y"] + box["height"] <= area["y"] + area["height"], (position, area, box)
     assert ui.requests("/api/sessions/a/allow-rules", "DELETE") == []
+
+
+def test_removing_rules_with_the_keyboard_keeps_focus_in_the_menu(ui, page):
+    rules = open_permissions(ui, page)
+    page.keyboard.press("End")
+    expect(rules.get_by_role("menuitem", name="Remove rule: Hook: check")).to_be_focused()
+    for remaining, focused in ((3, "Tool: mcp__docs__search"), (2, "File edits"), (1, "Command: make test")):
+        page.keyboard.press("Enter")
+        expect(rules.get_by_role("menuitem")).to_have_count(remaining)
+        expect(rules.get_by_role("menuitem", name=f"Remove rule: {focused}")).to_be_focused()
+    page.keyboard.press("Enter")
+    expect(rules).to_have_count(0)
+    expect(page.get_by_role("menuitemradio", name=re.compile("^Manual"))).to_be_focused()
+    page.keyboard.press("Escape")
+    expect(page.get_by_role("menu")).to_have_count(0)
+    expect(page.get_by_role("button", name=re.compile("^Permissions:"))).to_be_focused()
+
+
+def test_a_command_rule_shows_its_exact_spacing(ui, page):
+    ui.app(session="a", scenario="workspace", setup=RULES + "\nfake.sessions.get('a').allow_rules = [{ tool: 'run_command', command: 'echo  two  spaces' }]")
+    ui.show_session("a")
+    page.get_by_role("button", name=re.compile("^Permissions:")).click()
+    code = page.get_by_role("group", name="Allowed in this chat").locator("code")
+    expect(code).to_have_text("echo  two  spaces")
+    assert code.evaluate("element => element.innerText") == "echo  two  spaces"
 
 
 def test_a_chat_without_rules_shows_no_rule_list(ui, page):
@@ -214,3 +247,55 @@ def test_api_errors_keep_string_details_and_expose_object_details(ui):
     assert result["plain"] == ["Plain words.", 409, False]
     assert result["text"] == [message, "x"]
     assert result["lookup"] == "x" and result["unknown"] is None
+
+
+def open_review(ui, page):
+    ui.emit("b", {"type": "changes", "changes": {"files": [{"path": "note.txt", "status": "modified", "added": 2, "removed": 1,
+                                                            "current_hash": "hash-note.txt"}], "added": 2, "removed": 1}})
+    page.get_by_role("region", name="Changed files").get_by_role("button", name=re.compile("^1 file changed")).click()
+    page.get_by_title("Review note.txt").click()
+    return page.get_by_role("region", name="Agent changes in note.txt")
+
+
+def test_undo_in_the_file_review_offers_to_open_the_blocking_chat(ui, page):
+    ui.app(session="b", scenario="workspace", setup=BLOCKED)
+    ui.show_session("b")
+    review = open_review(ui, page)
+    review.get_by_role("button", name="Undo change 1").click()
+    alert = review.get_by_role("alert")
+    expect(alert).to_contain_text("“Other conversation” is waiting for your approval. Answer or stop it before undoing agent changes.")
+    expect(page.locator(".app-error")).to_have_count(0)
+    # The selected chat itself is not offered; a later error naming another chat is.
+    ui.run("blocker = 'b'")
+    review.get_by_role("button", name="Undo this file").click()
+    expect(alert).to_contain_text("“Selected chat” is waiting for your approval.")
+    expect(page.get_by_role("button", name=re.compile("^Open “"))).to_have_count(0)
+    ui.run("blocker = 'a'")
+    review.get_by_role("button", name="Undo this file").click()
+    alert.get_by_role("button", name="Open “Other conversation”").click()
+    ui.wait("fake.socketsFor('a').length === 1")
+    assert ui.js("location.search") == "?session=a"
+
+
+RESTORE_BLOCKED = BLOCKED + """
+window.checkpoint = { id: 'cp', path: 'src/main.py', status: 'available', created: 1 }
+fake.override = path => {
+  if (path === '/api/checkpoints?session_id=b') return fake.json([checkpoint])
+  if (path === '/api/checkpoints/cp/preview?session_id=b') return fake.json({ ...checkpoint, diff: '-a\\n+b', expected_current_hash: 'h', can_restore: true })
+  if (path === '/api/checkpoints/cp/restore?session_id=b') return fake.json({ detail: {
+    message: '“Other conversation” is still running. Stop it before restoring checkpoints.', session_id: 'a', title: 'Other conversation' } }, 409)
+}"""
+
+
+def test_a_blocked_recovery_restore_can_open_the_blocking_chat_from_the_dialog(ui, page):
+    ui.app(session="b", scenario="workspace", setup=RESTORE_BLOCKED)
+    ui.show_session("b")
+    page.get_by_role("button", name="Agent tools", exact=True).click()
+    dialog = page.get_by_role("dialog", name="Agent tools")
+    dialog.get_by_role("button", name="Preview checkpoint src/main.py").click()
+    dialog.get_by_role("button", name="Restore checkpoint").click()
+    expect(dialog.get_by_role("alert")).to_contain_text("“Other conversation” is still running. Stop it before restoring checkpoints.")
+    dialog.get_by_role("button", name="Open “Other conversation”").click()
+    expect(dialog).to_have_count(0)
+    ui.wait("fake.socketsFor('a').length === 1")
+    assert ui.js("location.search") == "?session=a"

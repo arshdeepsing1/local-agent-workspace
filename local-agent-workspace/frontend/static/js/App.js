@@ -1,6 +1,6 @@
 import { html, resolve, useState } from './lib.js'
 import { Folder, Laptop, Menu, PanelRight, Pencil, Terminal, X } from './icons.js'
-import { api, blockingChat } from './api.js'
+import { api } from './api.js'
 import { useWorkspace } from './useWorkspace.js'
 import Sidebar, { Brand } from './components/Sidebar.js'
 import Composer from './components/Composer.js'
@@ -11,6 +11,7 @@ import WorkspacePanel from './components/WorkspacePanel.js'
 import FolderAccessDialog from './components/FolderAccessDialog.js'
 import ContextMeter from './components/ContextMeter.js'
 import ChangesBar, { plural } from './components/ChangesBar.js'
+import { blockerOf, OpenBlockingChat } from './components/BlockingChat.js'
 
 export default function App() {
   const app = useWorkspace()
@@ -35,7 +36,7 @@ export default function App() {
   const [blocker, setBlocker] = useState(null)
   const showError = error => {
     const message = typeof error === 'string' ? error : error?.message || String(error)
-    setBlocker(error?.detail?.session_id ? error.detail : blockingChat(message))
+    setBlocker(blockerOf(error))
     app.setError(message)
   }
   const changedFiles = app.changes?.files.length || 0
@@ -65,8 +66,7 @@ export default function App() {
           ${changedFiles ? html`<span class="change-count" title=${`${plural(changedFiles, 'file')} changed by the agent`}><span aria-hidden="true">${changedFiles}</span><span class="sr-only">(${plural(changedFiles, 'changed file')})</span></span>` : null}</button>
       </header>
       ${app.error ? html`<div class="app-error" role="alert"><span>${app.error}</span>
-        ${blocker && blocker.message === app.error && blocker.session_id !== app.activeId ? html`<button class="outline open-blocking-chat"
-          onClick=${() => app.setActiveId(blocker.session_id)}>Open “${blocker.title}”</button>` : null}<button class="icon-button" aria-label="Dismiss error" onClick=${() => app.setError('')}><${X} size=${16} /></button></div>` : null}
+        <${OpenBlockingChat} blocker=${blocker?.message === app.error ? blocker : null} currentId=${app.activeId} onSelect=${app.setActiveId} /><button class="icon-button" aria-label="Dismiss error" onClick=${() => app.setError('')}><${X} size=${16} /></button></div>` : null}
       ${!app.online && app.activeId ? html`<div class="connection-banner">Reconnecting to your local server… Refresh if the server was restarted.</div>` : null}
       ${app.connection && !app.connection.connected ? html`<div class="connection-banner"><span>${app.connection.error || 'Configure Databricks to start a conversation.'}</span><button onClick=${() => setSettingsOpen(true)}>Open settings</button></div>` : null}
       ${hasMessages && active ? html`<${Conversation} key=${active.id} session=${active} onError=${showError} onSelectSession=${app.setActiveId} />` :
@@ -88,7 +88,7 @@ export default function App() {
     </main>
     ${workspaceOpen && app.settings && (!app.activeId || active) ? html`<${WorkspacePanel} key=${editorKey} sessionId=${app.activeId}
       workspace=${workspace} file=${editorDrafts[editorKey] || null} setFile=${setEditorFile} onClose=${() => setWorkspaceOpen(false)}
-      changes=${app.changes} busy=${busy} review=${review?.viewKey === app.viewKey ? review : null} onReviewOpened=${() => setReview(null)} onReview=${app.reviewChanges}
+      changes=${app.changes} busy=${busy} review=${review?.viewKey === app.viewKey ? review : null} onReviewOpened=${() => setReview(null)} onReview=${app.reviewChanges} onSelectSession=${app.setActiveId}
       onAttach=${path => { setDraft(current => `${current}${current ? '\n' : ''}Please read the project file: ${path}`); setWorkspaceOpen(false) }} />` : null}
     ${agentToolsOpen && app.settings && (!app.activeId || active) ? html`<${AgentToolsDialog} key=${editorKey} session=${active} workspace=${workspace} onClose=${() => setAgentToolsOpen(false)} onError=${showError} onSelectSession=${id => { setAgentToolsOpen(false); app.setActiveId(id); void app.refreshSessions().catch(e => showError(e.message)) }} />` : null}
     ${settingsOpen && app.settings ? html`<${SettingsDialog} settings=${app.settings} connection=${app.connection} onSave=${app.saveSettings} onClose=${() => setSettingsOpen(false)} />` : null}

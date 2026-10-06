@@ -169,7 +169,8 @@ Forks also start in Manual with no folder grants, allow rules or active skills, 
 profile restrictions, and do not copy child conversations, task-board records, jobs, or file checkpoints.
 
 The sidebar reads the small metadata record at the start of each conversation file
-instead of loading every event and provider-history record. Full content is loaded
+instead of loading every event and provider-history record. Allow rules are stored as
+separate records after it, so the sidebar list does not carry them. Full content is loaded
 when opening a conversation or performing restart recovery.
 
 ## Working with the app
@@ -271,7 +272,9 @@ when opening a conversation or performing restart recovery.
   because project instructions changed mid-turn, shows "Not run:" and the reason, not "declined".
   When a busy chat blocks an action, the error names that chat and why (for example
   "“Fix the parser” is waiting for your approval. Answer or stop it before undoing agent
-  changes."); when it is another chat, **Open “…”** next to the error switches to it.
+  changes."); when it is another chat, **Open “…”** next to the error switches to it. The
+  button appears in the error banner, next to Undo errors in the Workspace file review, and
+  next to Restore errors in **Agent tools** → **Recovery**.
 - **Allow for this chat**: next to Decline and Approve, a card offers **Always allow this
   command in this chat** (commands), **Allow edits in this chat** (`write_file`, `edit_file`,
   `insert_activity_log`), **Allow this tool in this chat** (one MCP tool) or **Allow this hook
@@ -282,8 +285,8 @@ when opening a conversation or performing restart recovery.
   Plan still blocks it, Bypass is unchanged, and credential exclusions, folder-access cards,
   project-guidance checks and the changed-file check still apply. Folder-access cards have no
   such button: a folder grant already lasts for the chat. Rules are saved with the chat (at most
-  100), listed under **Allowed in this chat** in the permissions menu, where each can be removed
-  while the chat is idle, and inherited by subagents. Forks and imports start without rules.
+  100), listed under **Allowed in this chat** in the permissions menu (commands with their exact
+  spacing), where each can be removed while the chat is idle, and inherited by subagents. Forks and imports start without rules.
 - **Decline with a note**: **Tell the agent why (optional)** on a card adds up to 2,000 characters
   to a Decline. The agent receives "User declined this action. Their note: … Do not retry it
   without a new instruction." (similar wording for MCP calls, hooks and folder access), and the

@@ -6,8 +6,9 @@ import DiffReview from './DiffReview.js'
 
 // file: { id, path, content, original, mode?: 'edit'|'review' } | null; setFile accepts a value or an updater.
 // changes: the conversation's unreviewed agent changes (see ChangesBar); review: { path } opens
-// that file's changes once, then onReviewOpened() clears it; onReview(action, files) keeps or undoes.
-export default function WorkspacePanel({ sessionId, workspace, file, setFile, onClose, onAttach, changes: agentChanges, busy, review, onReviewOpened, onReview }) {
+// that file's changes once, then onReviewOpened() clears it; onReview(action, files) keeps or undoes;
+// onSelectSession(id) opens a chat that a review error names as blocking.
+export default function WorkspacePanel({ sessionId, workspace, file, setFile, onClose, onAttach, changes: agentChanges, busy, review, onReviewOpened, onReview, onSelectSession }) {
   const [tab, setTab] = useState('files')
   const [directory, setDirectory] = useState('.')
   const [files, setFiles] = useState([])
@@ -99,7 +100,7 @@ export default function WorkspacePanel({ sessionId, workspace, file, setFile, on
           <button class="icon-button" onClick=${() => onAttach(file.path)} aria-label="Add this file to chat"><${Plus} size=${16} /></button>
           <button class="icon-button" onClick=${() => void save()} disabled=${!dirty || loading || reviewing} aria-label="Save file"><${Save} size=${16} /></button>
         </div>
-        ${reviewing ? html`<${DiffReview} sessionId=${sessionId} path=${file.path} version=${pending.current_hash} busy=${busy} onAction=${onReview} />` : html`
+        ${reviewing ? html`<${DiffReview} sessionId=${sessionId} path=${file.path} version=${pending.current_hash} busy=${busy} onAction=${onReview} onSelectSession=${onSelectSession} />` : html`
         <textarea class="code-editor" aria-label=${`Edit ${file.path}`} value=${file.content} spellcheck=${false} onInput=${e => setFile({ ...file, content: e.currentTarget.value })} />
         <div class="editor-status">${file.content.split('\n').length} lines<span>${dirty ? 'Unsaved changes' : 'Saved on disk'}</span></div>`}
       </div>` : html`<div class="file-browser">
