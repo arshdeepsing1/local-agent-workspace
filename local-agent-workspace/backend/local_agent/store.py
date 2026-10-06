@@ -390,6 +390,9 @@ class Store:
                     return
             jobs = self._merge_jobs(session.get("command_jobs", []), jobs, [job])
             session["command_jobs"] = jobs
+            legacy = {name: session[name] for name in _SIDECAR_FIELDS if name in session}
+            if legacy:  # Older field records: move them first, as the rewrite drops them.
+                self._save_sidecar({"id": session_id, **legacy, **self._read_sidecar(session_id)})
             self._write(session)
             self._command_jobs[session_id] = jobs
 

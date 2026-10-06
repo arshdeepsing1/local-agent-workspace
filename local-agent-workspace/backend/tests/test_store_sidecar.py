@@ -106,6 +106,31 @@ def test_legacy_field_records_are_still_read_and_moved_on_save(tmp_path):
     store.db.close()
 
 
+@pytest.mark.parametrize("newer", [None, [{"tool": "run_command", "command": "make lint"}]])
+def test_a_command_job_moves_legacy_field_records_to_the_sidecar(tmp_path, newer):
+    """A job mirrored into a chat written before the sidecar (before any save) keeps its rules."""
+    store = Store(tmp_path / "sessions.db")
+    store.save(prepared())
+    store.db.close()
+    path = tmp_path / "conversations" / "example.jsonl"
+    with path.open("a") as output:
+        output.write(json.dumps({"record": "field", "name": "file_views", "data": VIEWS}) + "\n")
+        output.write(json.dumps({"record": "field", "name": "allow_rules", "data": RULES}) + "\n")
+    sidecar = tmp_path / "conversations" / "example.state.json"
+    if newer:  # A sidecar written later wins over the field records.
+        sidecar.write_text(json.dumps({"allow_rules": newer}))
+    store = Store(tmp_path / "sessions.db")
+    store.save_job({"id": "job", "session_id": "example", "created": 30, "updated": 30, "state": "interrupted"})
+    assert "allow_rules" not in path.read_text()
+    reopened = Store(tmp_path / "sessions.db")
+    session = reopened.get("example")
+    reopened.db.close()
+    assert session["command_jobs"][0]["state"] == "interrupted"
+    assert session["file_views"] == VIEWS and session["allow_rules"] == (newer or RULES)
+    assert json.loads(sidecar.read_text()) == {"file_views": VIEWS, "allow_rules": newer or RULES}
+    store.db.close()
+
+
 def test_delete_removes_the_sidecar(tmp_path):
     store = Store(tmp_path / "sessions.db")
     store.save({**prepared(), "allow_rules": RULES})
