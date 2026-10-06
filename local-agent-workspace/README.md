@@ -74,7 +74,9 @@ panel and worktrees. Shell tools select zsh, bash, or sh, in that order. The
 frontend is plain JavaScript loaded directly by the browser, so a fresh checkout
 needs no Node.js, pnpm, or frontend build to run or change. Native Windows is not
 supported by the POSIX filesystem/process handling; use a Linux environment such as WSL for that
-platform. Linux/WSL have not yet been validated.
+platform. The continuous-integration workflow (`.github/workflows/tests.yml`) runs the backend
+and UI test suites on Ubuntu and macOS; everyday use on Linux and WSL has not yet been checked
+by hand.
 
 Clone the repository or copy the `local-agent-workspace` folder, including
 `backend`, `frontend`, and the setup files at its root. No sibling repository
