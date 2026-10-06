@@ -494,6 +494,20 @@ class Store:
             self._load_problems[file] = (reason, _fingerprint(self.conversations / file))
             self._list_problems[file] = reason
 
+    def problem_workspaces(self):
+        """Workspaces named by the readable headers of files the latest list() skipped."""
+        with self._lock:
+            names = list(self._list_problems)
+        workspaces = []
+        for name in names:
+            try:
+                header = self._read_lines(self.conversations / name, metadata_only=True)
+            except (OSError, ValueError):
+                continue  # No readable header: nothing names a workspace.
+            if isinstance(header.get("workspace"), str):
+                workspaces.append(header["workspace"])
+        return workspaces
+
     def problems(self):
         """Files skipped by the latest list(), as [{file, reason}] sorted by name."""
         with self._lock:

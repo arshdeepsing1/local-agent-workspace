@@ -743,7 +743,8 @@ load the restored content; unsaved browser drafts are intentionally preserved.
 source files stay in the original checkout and are not copied. **Open conversation**
 starts a new Manual-mode conversation in that worktree. Removal only accepts
 app-owned clean worktrees, rejects modified/untracked/ignored files and worktrees
-used by any saved conversation or running command, and keeps the branch and its
+used by any saved conversation (also one hidden as unreadable whose first line still names
+the worktree) or running command, and keeps the branch and its
 commits. Delete the worktree's conversations and choose another default workspace
 before removal. Git hooks, filters, and fsmonitor are disabled for managed worktree
 operations. This is deliberate workspace isolation, not automatic per-task copies.
