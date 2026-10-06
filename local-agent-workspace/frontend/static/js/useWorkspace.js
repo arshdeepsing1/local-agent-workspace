@@ -322,6 +322,7 @@ export function useWorkspace() {
     if (selected.current === target) setSession(current => current?.id === updated.id ? {
       ...current, allow_rules: updated.allow_rules,
     } : current)
+    return updated
   }
   const reviewChanges = async (action, files) => {
     const id = selected.current.id

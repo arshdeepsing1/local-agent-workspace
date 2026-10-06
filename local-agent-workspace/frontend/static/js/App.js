@@ -48,9 +48,16 @@ export default function App() {
   }
   const changedFiles = app.changes?.files.length || 0
   const openReview = path => { setReview({ path, viewKey: app.viewKey }); setWorkspaceOpen(true) }
+  // Removing a rule saves the chat (a newer 'updated'); like a rename, your own change is not news.
+  const removeAllowRule = async rule => {
+    const id = app.activeId
+    const before = app.sessions.find(item => item.id === id)?.updated
+    const updated = await app.removeAllowRule(rule)
+    if (typeof updated?.updated === 'number') attention.renamed(id, before, updated.updated)
+  }
   const composer = html`<${Composer} key=${app.viewKey} value=${draft} setValue=${setDraft} model=${active?.model || app.settings?.model || 'databricks-gpt-oss-120b'}
     workspace=${active?.workspace || app.settings?.workspace || ''} mode=${app.permissionMode} onMode=${app.setPermissionMode} onProject=${() => setSettingsOpen(true)}
-    onFolders=${() => setFoldersOpen(true)} rules=${active?.allow_rules || []} onRemoveRule=${app.removeAllowRule}
+    onFolders=${() => setFoldersOpen(true)} rules=${active?.allow_rules || []} onRemoveRule=${removeAllowRule}
     models=${app.connection?.models || []} busy=${busy} modelSaving=${app.modelSaving}
     disabled=${!app.ready || (!!app.activeId && !active) || !app.settings?.configured}
     onModel=${app.changeModel}
