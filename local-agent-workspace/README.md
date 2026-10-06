@@ -187,7 +187,8 @@ when opening a conversation or performing restart recovery.
   Drafts stay with their conversation while switching chats and are saved in this
   browser's `localStorage` about half a second after you stop typing (and when the page
   closes), so they survive a reload; the new-conversation view keeps its own draft, which
-  moves to the conversation once it exists. A sent draft is removed. At most 50 drafts
+  moves to the conversation once it exists. A sent draft is removed; text typed while it
+  was sending is saved as the new draft. At most 50 drafts
   are kept (the oldest goes first). A draft over 100 KB, or any draft when the browser
   blocks storage, is kept only in the page. Drafts stay in this browser profile; the
   server never receives them.
@@ -314,27 +315,30 @@ when opening a conversation or performing restart recovery.
   on disk. Child conversations remain separately available in the sidebar.
 - **Continue**: when the latest turn of an idle conversation stopped before it finished —
   at the **Agent steps** limit, at the output-token limit after the automatic retries,
-  by **Stop**, or because the server restarted during it — a **Continue** button above
+  by **Stop**, or because the server restarted before its answer finished (not while it
+  was only naming the chat or during a manual compaction) — a **Continue** button above
   the message box sends `Continue from where you stopped.` as an ordinary message. It
   is not shown while the conversation is busy, after a completed turn, or after other
-  errors. Your draft is left as it is.
+  errors. Your draft is left as it is, and keyboard focus moves to the message box.
 - **Task checklist**: when the conversation has tasks (from the model's `create_task` /
   `update_task` or **Agent tools → Tasks**), a **Tasks 2/5 done** bar above the message
   box, under the changes bar, shows the progress and the task in progress. Expand it to
-  list every task with its status. It updates as tasks change; cancelled tasks are listed
+  list every task with its status; long titles wrap. It updates as tasks change; cancelled tasks are listed
   but not counted.
 - **Code in replies**: once a reply is complete, its fenced code blocks are syntax
   highlighted (highlight.js, common languages). A block tagged with a language is
   highlighted in that language; an untagged block is guessed, up to 20 KB. **Copy code**
   copies a block's exact text.
 - **Copy and export a conversation**: **Agent tools → Conversation → Export Markdown**
-  downloads the conversation as a Markdown transcript (`<date>-<title>-<id>.md`), and
+  downloads the conversation as a Markdown transcript (`<date>-<title>-<id>.md`; a secret
+  in the title becomes `redacted` in the file name), and
   **Copy conversation** copies the same text. It is the transcript the
   `scripts/conversation_transcript.py` script writes (see **Agent tools: MCP, skills,
   and hooks**): messages and replies in full, one line per tool call with its main
   input, and command output shortened to 600 characters. Common secret shapes and the
   configured Databricks token are replaced with `[REDACTED]`; review it before sharing.
-  Both work during a response and show what has been saved so far.
+  Both work during a response and show what has been saved so far; their result is shown
+  right under the two buttons.
 
 ### Conversation storage
 
@@ -961,15 +965,16 @@ show in the changes bar, as dots in the file list and as an inline diff whose Ke
 send the reviewed file state, that the Continue button appears only after a step-limit,
 output-limit, stopped or interrupted turn and sends its message, that the task checklist
 follows pushed tasks per conversation, that drafts survive a reload, are evicted oldest
-first and are removed when sent, that code blocks are highlighted only when a reply is
+first, are removed when sent and keep text typed during the send, that code blocks are highlighted only when a reply is
 complete and copy their exact text, and that the Markdown transcript downloads and copies.
 Backend regressions additionally cover credential
 path aliases, unreadable configuration recovery, cancellation during startup or
 after a child process outlives its shell, recovery of completed tool results
 after interrupted delivery, tool calls streamed without arguments, skill commands
 inside a longer message, compaction inside one request that outgrows the budget,
-how a turn ended in the idle status, task pushes on change and on connect, `get_task`
-scoping and permissions, and the Markdown transcript endpoint's content, redaction and headers.
+how a turn ended in the idle status, which restarts mark a turn interrupted, task pushes on change and on connect, `get_task`
+scoping and permissions, and the Markdown transcript endpoint's content, redaction and headers
+(including the file name).
 
 ## Architecture
 

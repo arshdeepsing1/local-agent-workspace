@@ -297,7 +297,7 @@ def create_app(settings=None):
         session = session_or_404(session_id)
         text = transcript(session, redact=settings.redact)
         return Response(text, media_type="text/markdown; charset=utf-8", headers={
-            "Content-Disposition": f'attachment; filename="{transcript_file_name(session)}"',
+            "Content-Disposition": f'attachment; filename="{transcript_file_name(session, redact=settings.redact)}"',
             "Cache-Control": "no-store"})
 
     @app.delete("/api/sessions/{session_id}")

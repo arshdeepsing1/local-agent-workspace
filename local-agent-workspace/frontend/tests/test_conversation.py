@@ -137,12 +137,25 @@ def test_finished_code_blocks_are_highlighted_and_copy_raw_code(ui, page):
     expect(page.get_by_role("button", name="Copy code")).to_be_visible()
 
 
+@pytest.mark.parametrize("tag,grammar_word", [("c#", "namespace"), ("c++", "template"), ("cpp", "template")])
+def test_code_blocks_use_the_tagged_language_including_aliases_with_symbols(ui, page, tag, grammar_word):
+    # "namespace" and "template" are keywords in C# and C++, not in C.
+    code = "namespace App { template<typename T> class Box {}; }"
+    show(ui, "[{ id: 'reply', type: 'assistant', text: " + json.dumps(f"```{tag}\n{code}\n```") + " }]")
+    block = page.locator(".markdown pre code")
+    expect(block).to_have_class(re.compile(r"\bhljs\b"))
+    expect(block).not_to_have_class(re.compile(r"(^|\s)language-c(\s|$)"))
+    expect(block.locator(".hljs-keyword", has_text=grammar_word)).to_have_count(1)
+    expect(block).to_have_text(code)
+
+
 def test_code_is_highlighted_only_after_the_reply_finishes_and_only_once(ui, page):
     ui.start(setup=SETUP)
     ui.js("""import('/static/vendor/highlight.min.js').then(({ default: hljs }) => {
-      const original = hljs.highlightElement.bind(hljs)
+      const highlight = hljs.highlight.bind(hljs), auto = hljs.highlightAuto.bind(hljs)
       window.highlighted = []
-      hljs.highlightElement = element => { window.highlighted.push(element.textContent); return original(element) }
+      hljs.highlight = (text, options) => { window.highlighted.push(text); return highlight(text, options) }
+      hljs.highlightAuto = text => { window.highlighted.push(text); return auto(text) }
     })""")
     done = "{ id: 'done', type: 'assistant', text: '```js\\nconst done = 1\\n```' }"
     def props(text, status):

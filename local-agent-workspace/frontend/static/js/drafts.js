@@ -54,7 +54,8 @@ export function saveDraft(key, text) {
 // The composer draft of each view (viewKey), saved under storeKey: the
 // conversation id, or 'new' before the conversation exists. When the new view
 // becomes a conversation, its draft moves from 'new' to the id.
-// Returns [draft, setDraft, forget(...storeKeys)]; forget removes a sent draft at once.
+// Returns [draft, setDraft, forget(sentText, ...storeKeys)]; forget removes a
+// sent draft at once. Text typed while the message was sending is saved again.
 export function useSavedDrafts(viewKey, storeKey) {
   const [drafts, setDrafts] = useState({})
   const known = Object.prototype.hasOwnProperty.call(drafts, viewKey)
@@ -70,6 +71,9 @@ export function useSavedDrafts(viewKey, storeKey) {
 
   const pending = useRef(null)
   const timer = useRef(0)
+  const latest = useRef(draft)
+  latest.current = draft
+  const [revision, setRevision] = useState(0)
   const flush = () => {
     clearTimeout(timer.current)
     const next = pending.current
@@ -85,17 +89,19 @@ export function useSavedDrafts(viewKey, storeKey) {
     pending.current = { key: storeKey, text: draft }
     clearTimeout(timer.current)
     timer.current = setTimeout(flush, SAVE_DELAY_MS)
-  }, [draft, known, viewKey, storeKey])
+  }, [draft, known, viewKey, storeKey, revision])
   // Save at once when switching views and when the page is closed or reloaded.
   useEffect(() => flush, [viewKey, storeKey])
   useEffect(() => {
     window.addEventListener('pagehide', flush)
     return () => window.removeEventListener('pagehide', flush)
   }, [])
-  const forget = (...keys) => {
+  const forget = (sent, ...keys) => {
     clearTimeout(timer.current)
     pending.current = null
     for (const key of new Set(keys)) if (key) removeDraft(key)
+    // The composer keeps text typed during the send; schedule its save again.
+    if (latest.current && latest.current.trim() !== sent) setRevision(value => value + 1)
   }
   return [draft, setDraft, forget]
 }

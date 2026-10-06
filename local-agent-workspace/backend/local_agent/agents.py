@@ -287,7 +287,8 @@ def unanswered(event, declined):
 def public_session(session, status="idle"):
     return {"permission_mode": "manual", "allowed_directories": [],
             **{k: v for k, v in session.items()
-               if k not in ("wire", "context_state", "instruction_directories", "inference_calls", "command_jobs")},
+               if k not in ("wire", "context_state", "instruction_directories", "inference_calls", "command_jobs",
+                            "turn_running")},
             "status": status}
 
 
@@ -309,21 +310,27 @@ class AgentManager:
         self.jobs = JobManager(store, settings.redact, self.job_update, redaction_tokens=self.redaction_tokens)
         for summary in store.list():
             session = store.get(summary["id"])
-            interrupted = False
+            # run() persists turn_running until the model loop ends. A title call
+            # (after the answer completed) or a manual compaction outside a turn
+            # is finished as interrupted but does not make the turn incomplete.
+            cut_short = session.pop("turn_running", False) is True
+            changed = cut_short
             for call in session.get("inference_calls", []):
                 if isinstance(call, dict) and call.get("status") == "running":
                     finish_inference_call(call, {"status": "interrupted", "error_kind": "incomplete_response"})
-                    interrupted = True
+                    changed = True
+                    cut_short |= call.get("purpose") == "agent"
             for event in session["events"]:
                 if event.get("state") in ("running", "pending"):
                     event["state"] = "cancelled"
-                    interrupted = True
+                    changed = cut_short = True
                 if event.get("request_info", {}).get("status") == "running":
                     event["request_info"].update(status="interrupted", error_kind="incomplete_response")
-                    interrupted = True
-            if interrupted:
+                    changed = cut_short = True
+            if cut_short:
                 # The UI offers Continue for a turn the restart cut short.
                 session["terminal_reason"] = "interrupted"
+            if changed:
                 store.save(session)
         self.delegates.recover()
 
@@ -627,6 +634,7 @@ class AgentManager:
             await self.broadcast(session["id"], {"type": "event", "event": error})
 
         try:
+            session["turn_running"] = True  # Saved with the user event; read by restart recovery.
             await self.status(session, "running")
             origin = {}
             if session.get("parent_event_id") and not session["events"] and not session.get("delegation", {}).get("terminal_reason"):
@@ -638,6 +646,7 @@ class AgentManager:
                 self.store.save(session)
                 await self.broadcast(session["id"], {"type": "title", "title": session["title"]})
             completed = await self.run_databricks(session, prompt)
+            session.pop("turn_running", None)  # The answer is finished; naming is not part of it.
             if completed and needs_title(session):
                 previous_title = session["title"]
                 await self.status(session, "naming")
@@ -697,6 +706,7 @@ class AgentManager:
                 if terminal_reason == "completed" and any(item.get("state") == "error" for item in events):
                     terminal_reason = "tool_error"
             session["terminal_reason"] = terminal_reason
+            session.pop("turn_running", None)
             try:
                 self.store.save(session)
             except STORAGE_ERRORS as exc:

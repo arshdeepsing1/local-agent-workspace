@@ -169,13 +169,13 @@
 .task-checklist-toggle{width:100%;justify-content:flex-start;gap:7px;padding:9px;font-size:12px;color:var(--ink);white-space:nowrap;min-width:0}
 .task-checklist-current{color:var(--muted);overflow:hidden;text-overflow:ellipsis;min-width:0}
 .task-checklist-list{list-style:none;margin:0;padding:4px 10px 8px;border-top:1px solid #eeeee9;max-height:min(220px,30dvh);overflow:auto}
-.task-checklist-item{display:flex;align-items:center;gap:8px;padding:4px 2px;min-width:0}
-.task-checklist-icon{flex-shrink:0;color:#8b8373}
+.task-checklist-item{display:flex;align-items:flex-start;gap:8px;padding:4px 2px;min-width:0}
+.task-checklist-icon{flex-shrink:0;margin-top:1px;color:#8b8373}
 .task-checklist-item.in_progress .task-checklist-icon{color:var(--accent)}
 .task-checklist-item.completed .task-checklist-icon{color:#3d6b2a}
 .task-checklist-item.completed .task-checklist-title,.task-checklist-item.cancelled .task-checklist-title{color:var(--muted)}
 .task-checklist-item.cancelled .task-checklist-title{text-decoration:line-through}
-.task-checklist-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.task-checklist-title{min-width:0;white-space:normal;overflow-wrap:anywhere}
 .continue-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0 0 10px;padding:6px 6px 6px 12px;border:1px solid #e2e2dd;border-radius:12px;background:var(--surface);font-size:12px;color:#62635e}
 .continue-bar button{font-size:12px;padding:5px 12px;border-radius:7px;flex-shrink:0}
 .markdown .code-block{position:relative;margin:0 0 14px}

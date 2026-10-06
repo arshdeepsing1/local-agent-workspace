@@ -20,7 +20,7 @@ export default function App() {
   // Message drafts are saved in localStorage per conversation ('new' before it exists).
   const draftKey = app.activeId || 'new'
   const [draft, setDraft, forgetDraft] = useSavedDrafts(app.viewKey, draftKey)
-  const send = async text => { const id = await app.send(text); forgetDraft(draftKey, id) }
+  const send = async text => { const id = await app.send(text); forgetDraft(text, draftKey, id) }
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [agentToolsOpen, setAgentToolsOpen] = useState(false)
   const [workspaceOpen, setWorkspaceOpen] = useState(false)

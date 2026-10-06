@@ -132,12 +132,38 @@ def test_copy_conversation_copies_the_transcript_even_while_busy(ui, page):
 
 
 def test_copy_conversation_starts_the_clipboard_write_during_the_click(ui, page):
-    # Where the browser offers ClipboardItem, the write starts at once and gets the text when it arrives.
-    show(ui, TRANSCRIPT + """; Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
-      write: async items => { fake.clipboard.push(await (await items[0].getType('text/plain')).text()) } } })""")
+    # Where the browser offers ClipboardItem, the write starts at once (Safari allows it only
+    # during the click) and gets the text when the transcript arrives.
+    show(ui, TRANSCRIPT + """; const respond = fake.handle, held = fake.defer('transcript')
+      fake.handle = (...args) => held.promise.then(() => respond(...args))
+      window.writeStarted = false
+      Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+      write: async items => { window.writeStarted = true; fake.clipboard.push(await (await items[0].getType('text/plain')).text()) } } })""")
     page.get_by_role("button", name="Copy conversation").click()
+    ui.wait("fake.calls.length === 1")
+    assert ui.js("window.writeStarted") is True
+    assert ui.js("fake.clipboard") == []
+    ui.run("fake.deferreds.transcript.resolve()")
     expect(page.get_by_role("status")).to_have_text("Conversation copied as Markdown.")
     assert ui.js("fake.clipboard") == ["# Transcript: Fix the export\n\n**User:**\n\nPlease fix it. Token: [REDACTED]\n"]
+
+
+def test_transcript_messages_appear_under_the_transcript_buttons(ui, page):
+    # The section is long; a message at its end would be out of view in the dialog.
+    follows = "document.querySelector('[role={0}]').previousElementSibling.textContent"
+    show(ui, TRANSCRIPT)
+    page.get_by_role("button", name="Copy conversation").click()
+    expect(page.get_by_role("status")).to_have_text("Conversation copied as Markdown.")
+    assert ui.js(follows.format("status")) == "Export MarkdownCopy conversation"
+    show(ui, TRANSCRIPT, props=PROPS.replace("'source'", "'gone'"))
+    page.get_by_role("button", name="Export Markdown").click()
+    expect(page.get_by_role("alert")).to_have_text("Conversation not found.")
+    assert ui.js(follows.format("alert")) == "Export MarkdownCopy conversation"
+    # Messages of the other actions stay at the end, after the import form.
+    show(ui, "fake.handle = () => fake.json({ detail: 'Export failed.' }, 500)")
+    page.get_by_role("button", name="Export conversation").click()
+    expect(page.get_by_role("alert")).to_have_text("Export failed.")
+    assert ui.js("document.querySelector('[role=alert]').previousElementSibling.tagName") == "FORM"
 
 
 def test_transcript_errors_are_shown_and_need_a_conversation(ui, page):

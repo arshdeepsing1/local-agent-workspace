@@ -27,21 +27,25 @@ export default function ConversationTransfer({ sessionId, workspace, busy = fals
   const [pending, setPending] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
+  // Which actions the message belongs to: it is shown right under them.
+  const [noticeFor, setNoticeFor] = useState('transfer')
   const inFlight = useRef(false)
   const alive = useRef(true)
   useEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
   const disabled = busy || pending
 
   // A transcript can be read during a response; the other actions wait for it.
-  async function run(operation, needsIdle = true) {
+  async function run(operation, needsIdle = true, area = 'transfer') {
     if ((needsIdle && busy) || inFlight.current) return
     inFlight.current = true
-    setPending(true); setError(''); setNotice('')
+    setPending(true); setError(''); setNotice(''); setNoticeFor(area)
     try { await operation() } catch (e) {
       if (alive.current) { setError(e.message); onError(e.message) }
     } finally { inFlight.current = false; if (alive.current) setPending(false) }
   }
 
+  const messages = html`${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
+    ${notice ? html`<p role="status">${notice}</p>` : null}`
   const transcriptPath = () => `/sessions/${encodeURIComponent(sessionId)}/transcript.md`
   return html`<section class="agent-tools-section" aria-label="Conversation transfer">
     <h3>Markdown transcript</h3>
@@ -52,12 +56,13 @@ export default function ConversationTransfer({ sessionId, workspace, busy = fals
         if (!alive.current) return
         saveFile(file.text, file.name || `transcript-${sessionId.slice(0, 8)}.md`, 'text/markdown')
         setNotice('Markdown transcript exported.')
-      }, false)}>Export Markdown</button>
+      }, false, 'transcript')}>Export Markdown</button>
       <button class="outline" disabled=${pending || !sessionId} onClick=${() => void run(async () => {
         await copyLoaded(async () => (await apiFile(transcriptPath())).text)
         if (alive.current) setNotice('Conversation copied as Markdown.')
-      }, false)}>Copy conversation</button>
+      }, false, 'transcript')}>Copy conversation</button>
     </div>
+    ${noticeFor === 'transcript' ? messages : null}
     <h3>Export, import, and fork</h3>
     <p>Conversation files include messages, tool output, summaries, and reported usage, which may contain private data or pasted secrets. Review before sharing. Credential/settings files, file checkpoints, task-board records, and managed jobs are not copied.</p>
     <div class="agent-tools-actions">
@@ -86,7 +91,6 @@ export default function ConversationTransfer({ sessionId, workspace, busy = fals
       <p class="field-help">Each import creates a new copy in this selected folder, never overwrites an existing conversation, and starts with manual permissions, no folder grants, and no active skills. Imported paths and tool requests are historical data; nothing is executed during import.</p>
       <button class="primary" disabled=${disabled || !file || !destination.trim()}>Import as new conversation</button>
     </form>
-    ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
-    ${notice ? html`<p role="status">${notice}</p>` : null}
+    ${noticeFor === 'transfer' ? messages : null}
   </section>`
 }

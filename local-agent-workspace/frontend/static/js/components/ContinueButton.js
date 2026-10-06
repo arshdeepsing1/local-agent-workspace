@@ -44,7 +44,11 @@ export default function ContinueButton({ session, disabled, onSend, onError }) {
   if (!reason) return null
   const send = async () => {
     setSending(true)
-    try { await onSend(CONTINUE_MESSAGE) }
+    try {
+      await onSend(CONTINUE_MESSAGE)
+      // This button leaves once the turn starts; keep keyboard focus in the composer.
+      document.querySelector('textarea[aria-label="Message"]')?.focus()
+    }
     catch (e) { onError(e.message) }
     finally { setSending(false) }
   }

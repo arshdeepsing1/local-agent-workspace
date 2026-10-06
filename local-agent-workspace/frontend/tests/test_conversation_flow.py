@@ -1,6 +1,7 @@
 """Whole-app conversation helpers: the Continue button, the live task checklist and saved drafts."""
 import json
 import re
+from datetime import datetime
 
 import pytest
 from playwright.sync_api import expect
@@ -8,8 +9,8 @@ from playwright.sync_api import expect
 CONTINUE = "Continue from where you stopped."
 
 
-def start_app(ui, page, session=None, setup=""):
-    ui.app(session=session, scenario="workspace", setup=setup)
+def start_app(ui, page, session=None, setup="", **start):
+    ui.app(session=session, scenario="workspace", setup=setup, **start)
     expect(page.get_by_role("combobox", name="Model")).to_have_value("test-model")
 
 
@@ -43,13 +44,15 @@ def test_continue_after_the_step_limit_sends_the_message_and_keeps_the_draft(ui,
     ui.show_session("a")
     expect(page.get_by_text("The agent reached its step limit.")).to_be_visible()
     message(page).fill("My unsent idea")
-    continue_button(page).click()
+    continue_button(page).focus()
+    page.keyboard.press("Enter")
     ui.wait("fake.requests('/api/sessions/a/messages', 'POST').length === 1")
     assert ui.bodies("/api/sessions/a/messages", "POST") == [{"text": CONTINUE}]
     expect(message(page)).to_have_value("My unsent idea")
     # Never while busy, and not after the next turn completes.
     ui.emit("a", {"type": "status", "status": "running"})
     expect(continue_button(page)).to_have_count(0)
+    expect(message(page)).to_be_focused()  # Not lost with the removed button.
     ui.emit("a", {"type": "event", "event": {"id": "u2", "type": "user", "text": CONTINUE}})
     ui.emit("a", {"type": "event", "event": {"id": "r2", "type": "assistant", "text": "Finished."}})
     ui.emit("a", {"type": "status", "status": "idle", "terminal_reason": "completed"})
@@ -143,6 +146,19 @@ def test_task_checklist_shows_live_tasks_per_conversation(ui, page):
     expect(page.get_by_role("region", name="Tasks")).to_have_count(0)
 
 
+def test_task_checklist_shows_long_titles_in_full_on_a_phone(ui, page):
+    page.set_viewport_size({"width": 390, "height": 844})
+    start_app(ui, page, session="a")
+    ui.show_session("a")
+    title = "Fix empty input handling in the tokenizer and the parser so that a blank line never wraps the result"
+    ui.emit("a", {"type": "tasks", "tasks": [{**TASKS[1], "title": title}]})
+    page.get_by_role("button", name=re.compile(r"^Tasks 0\/1 done")).click()
+    item = page.locator(".task-checklist-title")
+    expect(item).to_have_text(title)
+    # Wrapped, not cut off with an ellipsis (the title attribute is out of reach on touch screens).
+    assert ui.js("(e => e.scrollWidth <= e.clientWidth && e.getBoundingClientRect().height > 20)(document.querySelector('.task-checklist-title'))")
+
+
 # Saved drafts
 
 def stored(ui):
@@ -157,12 +173,40 @@ def test_drafts_survive_a_reload_per_conversation(ui, page):
     ui.show_session("a")
     expect(message(page)).to_have_value("")
     message(page).fill("Reply for a")
-    remount(ui, page)  # Reloads at ?session=a before the save delay ends.
+    remount(ui, page)  # Reloads at ?session=a (the pagehide save is checked deterministically below).
     ui.show_session("a")
     expect(message(page)).to_have_value("Reply for a")
     page.get_by_role("button", name="New conversation").click()
     expect(message(page)).to_have_value("A new idea")
     assert stored(ui) == {"new": "A new idea", "a": "Reply for a"}
+
+
+def test_a_draft_is_saved_when_the_page_is_hidden_before_the_save_delay(ui, page):
+    start_app(ui, page, session="a", clock=True)
+    ui.show_session("a")
+    page.clock.pause_at(datetime.fromtimestamp(ui.js("Date.now()") / 1000 + 1))
+    message(page).fill("Typed just before closing")
+    ui.tick(100)  # The page renders and schedules the save; its 500 ms delay has not passed.
+    expect(message(page)).to_have_value("Typed just before closing")
+    assert stored(ui) == {}
+    ui.run("window.dispatchEvent(new PageTransitionEvent('pagehide'))")
+    assert stored(ui) == {"a": "Typed just before closing"}
+
+
+def test_text_typed_while_sending_is_saved(ui, page):
+    start_app(ui, page, session="a", setup="""fake.override = (path, options) =>
+      path === '/api/sessions/a/messages' && options.method === 'POST' ? fake.defer('send').promise : undefined""")
+    ui.show_session("a")
+    message(page).fill("First")
+    page.get_by_role("button", name="Send message").click()
+    ui.wait("fake.requests('/api/sessions/a/messages', 'POST').length === 1")
+    message(page).fill("Second thought")
+    ui.run("fake.deferreds.send.resolve(fake.json({ ok: true }))")
+    ui.wait("localStorage.getItem('local-workspace:draft:a') === 'Second thought'")
+    expect(message(page)).to_have_value("Second thought")
+    remount(ui, page)
+    ui.show_session("a")
+    expect(message(page)).to_have_value("Second thought")
 
 
 def test_sent_drafts_are_removed_at_once(ui, page):

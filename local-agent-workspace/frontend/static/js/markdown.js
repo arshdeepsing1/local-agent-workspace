@@ -17,7 +17,7 @@ const AUTO_DETECT_LIMIT = 20 * 1024
 
 // Syntax highlighting and a Copy code button for each code block of rendered
 // Markdown, once renderMarkdown()'s sanitized HTML is in the page. highlight.js
-// reads a block's text and writes escaped markup, so no unsanitized HTML is
+// reads a block's text and returns escaped markup, so no unsanitized HTML is
 // inserted. Blocks done before are skipped, so calling it again is cheap.
 export function enhanceCodeBlocks(root) {
   for (const code of root.querySelectorAll('pre > code')) {
@@ -26,7 +26,15 @@ export function enhanceCodeBlocks(root) {
     const text = code.textContent
     const language = /(?:^|\s)language-(\S+)/.exec(code.className)?.[1]
     if (language ? hljs.getLanguage(language) : text.length <= AUTO_DETECT_LIMIT) {
-      try { hljs.highlightElement(code) } catch { /* Leave the block as plain text. */ }
+      try {
+        // Highlight with the tag as written (aliases such as c# and c++ resolve
+        // here); highlightElement re-reads the class and would take "c#" as "c".
+        // highlight.js escapes the text it marks up.
+        const result = language ? hljs.highlight(text, { language, ignoreIllegals: true }) : hljs.highlightAuto(text)
+        code.innerHTML = result.value
+        code.classList.add('hljs')
+        if (!language && result.language) code.classList.add(`language-${result.language}`)
+      } catch { code.textContent = text /* Leave the block as plain text. */ }
     }
     const block = document.createElement('div')
     block.className = 'code-block'

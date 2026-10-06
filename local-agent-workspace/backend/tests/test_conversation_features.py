@@ -7,13 +7,14 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from local_agent.agents import AgentManager
+from local_agent.agents import AgentManager, public_session
 from local_agent.api import create_app
 from local_agent.config import Settings
 from local_agent.feature_tools import FEATURE_TOOLS
 from local_agent.instructions import load_project_instructions
 from local_agent.permissions import tool_decision
 from local_agent.store import Store
+from local_agent.telemetry import begin_inference_call
 from local_agent.tool_profiles import tool_allowed
 from local_agent.tools import TOOL_DEFINITIONS, WorkspaceTools
 from local_agent.transcript import transcript
@@ -133,6 +134,48 @@ def test_restart_marks_a_cut_short_turn_interrupted(runtime):
     assert saved["terminal_reason"] == "interrupted"
     assert saved["events"][-1]["request_info"] == {"model": "m", "status": "interrupted", "error_kind": "incomplete_response"}
     assert manager.store.get(other["id"])["terminal_reason"] == "completed"
+
+
+@pytest.mark.parametrize("purpose,in_turn,expected", [
+    ("title", False, "completed"),        # killed while naming a finished turn
+    ("compaction", False, "completed"),   # killed during a manual compaction
+    ("compaction", True, "interrupted"),  # killed while compacting inside a turn
+    ("agent", False, "interrupted"),      # killed while the model was answering
+])
+def test_restart_interrupts_only_a_turn_in_progress(runtime, purpose, in_turn, expected):
+    manager, session, _, _ = runtime
+    session["terminal_reason"] = "completed"
+    session["events"] += [
+        {"id": "user", "type": "user", "text": "Work", "created": 1},
+        {"id": "reply", "type": "assistant", "text": "Done", "created": 2, "request_info": {"model": "m", "status": "completed"}},
+    ]
+    begin_inference_call(session, purpose, "m")
+    if in_turn:
+        session["turn_running"] = True
+    manager.store.save(session)
+    AgentManager(manager.store, manager.settings)
+    saved = manager.store.get(session["id"])
+    assert saved["terminal_reason"] == expected
+    assert saved["inference_calls"][-1]["status"] == "interrupted"
+    assert "turn_running" not in saved
+    assert [event.get("request_info", {}).get("status") for event in saved["events"]] == [None, "completed"]
+
+
+async def test_turn_marker_covers_the_model_loop_but_not_naming(runtime, monkeypatch):
+    manager, session, _, _ = runtime
+    seen = []
+
+    async def answer(request):
+        seen.append((json.loads(request.content).get("stream"), manager.store.get(session["id"]).get("turn_running")))
+        return reply("Done.") if len(seen) == 1 else httpx.Response(200, json={"choices": [{"message": {"content": "Title"}}]})
+    gateway(monkeypatch, answer)
+    manager.start(session["id"], "Work")
+    await manager.tasks[session["id"]]
+    assert seen[0] == (True, True)
+    assert len(seen) == 2 and seen[1][1] is None
+    saved = manager.store.get(session["id"])
+    assert "turn_running" not in saved and saved["terminal_reason"] == "completed"
+    assert "turn_running" not in public_session({**saved, "turn_running": True})
 
 
 # Live task checklist and get_task.
@@ -270,6 +313,9 @@ def test_transcript_export_is_the_script_markdown_with_redaction(client):
     session_id = client.post("/api/sessions").json()["id"]
     session = manager.get(session_id)
     session.update(title="Fix the CSV export!", created=1767225600)
+    secret_title = manager.store.create(manager.settings.values)
+    secret_title.update(title="Why does configured-secret-value fail with password=hunter22", created=1767225600)
+    manager.store.save(secret_title)
     session["events"] += [
         {"id": "u", "type": "user", "text": "The value configured-secret-value came from the profile; password=hunter22", "created": 1767225600},
         {"id": "a", "type": "assistant", "text": "# Plan\n\n```python\nprint('ok')\n```", "created": 1767225601},
@@ -293,6 +339,12 @@ def test_transcript_export_is_the_script_markdown_with_redaction(client):
     # The configured credential (no common secret shape here) and a common secret shape.
     assert "configured-secret-value" not in text and "hunter22" not in text
     assert "The value [REDACTED] came from the profile; password=[REDACTED]" in text
+    # A secret in the title stays out of the file name too.
+    disposition = Message()
+    disposition["content-disposition"] = client.get(f"/api/sessions/{secret_title['id']}/transcript.md").headers["content-disposition"]
+    name = disposition.get_filename()
+    assert name.endswith(f"-why-does-redacted-fail-with-password-redacted-{secret_title['id'][:8]}.md"), name
+    assert "secret" not in name and "hunter" not in name
     assert client.get("/api/sessions/missing/transcript.md").status_code == 404
     # The local token is required, like every other API route.
     del client.headers["X-Local-Token"]
