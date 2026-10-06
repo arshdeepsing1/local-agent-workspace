@@ -179,3 +179,13 @@
 .permissions-menu>.permissions-note{position:sticky;bottom:-7px;background:#fff;padding-bottom:7px;margin-bottom:-7px}.allow-rule .icon-button{width:25px;height:25px}.allow-rule .icon-button[aria-disabled=true]{opacity:.5;cursor:default}
 .open-blocking-chat{font-size:12px;padding:5px 10px;max-width:40%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:inline-block}
 .blocked-error{display:flex;align-items:center;gap:8px 10px;flex-wrap:wrap}.blocked-error>span{flex:1 1 12em;min-width:0}.blocked-error .open-blocking-chat{max-width:100%;background:var(--surface)}
+/* M1 attention: conversation status badges, Running filter, notification toggle, Files root switcher */
+.conversation-list-heading{display:flex;align-items:center;justify-content:space-between;gap:8px}.conversation-list-heading .section-label{flex:1}
+.running-filter{font-size:11px;padding:3px 8px;margin:0 4px 13px 0;border:1px solid var(--border);border-radius:999px;color:var(--muted)}.running-filter[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}.running-filter[aria-pressed=true]:hover:not(:disabled){background:var(--accent-hover)}
+.conversation-row>button:first-child>.conversation-name{flex:1;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.row-badge{flex:none;font-size:10px;line-height:1;padding:3px 6px;border-radius:999px;white-space:nowrap}.row-badge.approval{background:#f4e3d4;color:#8c4a31}.row-badge.error{background:#f5e0d9;color:#98492f}
+.unread-dot{flex:none;width:7px;height:7px;border-radius:50%;background:#4f7fb3}
+.notify-toggle{gap:14px;font-size:13px;padding:7px 0;justify-content:flex-start;border-radius:5px;width:100%;color:var(--muted)}.notify-toggle svg{width:18px}.notify-toggle[aria-checked=true]{color:var(--accent)}
+.notify-state{margin-left:auto;font-size:10px;line-height:1;padding:3px 6px;border-radius:999px;border:1px solid var(--border);color:var(--muted)}.notify-toggle[aria-checked=true] .notify-state{background:var(--accent);border-color:var(--accent);color:#fff}
+.notify-hint{font-size:10px;color:var(--muted);margin:0 0 4px 32px;line-height:1.5}
+.file-root{display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid #e3dfd5;font-size:11px;color:var(--muted)}.file-root select{flex:1;min-width:0;border:1px solid var(--border);border-radius:6px;background:var(--surface);padding:4px 6px;font-size:11px;text-overflow:ellipsis}

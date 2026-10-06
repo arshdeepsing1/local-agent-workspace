@@ -1,14 +1,18 @@
 // Shapes of the main API objects, for reference while editing (JSDoc only).
 //
 // Settings: { workspace, model, env_file, context_window, max_output_tokens,
-//   max_agent_steps, compaction_handoffs?, approval_timeout_minutes? (0 = no limit), host, configured }
+//   max_agent_steps, compaction_handoffs?, approval_timeout_minutes? (0 = no limit),
+//   system_notifications? (server notifications while no page is open), host, configured }
 // Bootstrap (GET /bootstrap): { token, settings: Settings, storage_problems: StorageProblem[] }
 // StorageProblem: { file, reason } a conversation file in the state folder that could not
 //   be read; it is hidden and left unchanged. reason never quotes the file's contents.
 // Connection: { connected, models: string[], error: string | null }
 // Session: { id, title, workspace, model, status, events: AgentEvent[], updated,
 //   permission_mode, allowed_directories, allow_rules: AllowRule[], context_info?, active_skills?,
-//   parent_session_id?, is_subagent?, delegation?, tool_profile?, subagent_tool_profile? }
+//   parent_session_id?, is_subagent?, delegation?, tool_profile?, subagent_tool_profile?,
+//   terminal_reason?: how the last turn ended: 'completed'|'stopped'|'error'|'inference_error'|
+//   'tool_error'|'step_limit'|'interrupted' (also in the /api/sessions summaries),
+//   turn_ended?: epoch seconds when the last turn ended; null while a turn runs (also in summaries) }
 //   GET /sessions list items omit events and allow_rules.
 // AllowRule ("Allow for this chat", exact matches only): { tool: 'run_command', command }
 //   | { tool: 'edits' } (write_file, edit_file, insert_activity_log) | { tool: 'mcp__<server>__<tool>' }
@@ -16,6 +20,9 @@
 // Approval answer (POST /sessions/<id>/approvals/<event id>): { allowed, remember?: true (approve only),
 //   note?: string (decline only, at most 2,000 characters) }
 // The 'permissions' socket message: { type: 'permissions', permission_mode, allowed_directories, allow_rules }
+// Status message: { type: 'status', status, terminal_reason?, turn_ended? (sent with 'idle'
+//   when a turn ended; a manual compaction leaves turn_ended unchanged) }
+// /api/presence: a WebSocket (same protocols as the stream) each page holds open; no messages.
 // AgentEvent: { id, type: 'user'|'assistant'|'tool'|'notice'|'error', text?,
 //   reasoning_summary?, reasoning_truncated?, child_session_id?, request_info?,
 //   name?, input?, output?, preview?, state?, delegation?, origin?,

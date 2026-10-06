@@ -2,6 +2,7 @@ import { html, resolve, useState } from './lib.js'
 import { Folder, Laptop, Menu, PanelRight, Pencil, Terminal, X } from './icons.js'
 import { api } from './api.js'
 import { useWorkspace } from './useWorkspace.js'
+import { useAttention } from './attention.js'
 import Sidebar, { Brand } from './components/Sidebar.js'
 import Composer from './components/Composer.js'
 import Conversation from './components/Conversation.js'
@@ -16,6 +17,7 @@ import { blockerOf, OpenBlockingChat } from './components/BlockingChat.js'
 
 export default function App() {
   const app = useWorkspace()
+  const attention = useAttention({ sessions: app.sessions, activeId: app.activeId, ready: app.ready, onSelect: app.setActiveId })
   const [drafts, setDrafts] = useState({})
   const draft = drafts[app.viewKey] || ''
   const setDraft = value => setDrafts(current => ({ ...current, [app.viewKey]: resolve(value, current[app.viewKey] || '') }))
@@ -55,7 +57,10 @@ export default function App() {
     <${Sidebar} settings=${app.settings} connection=${app.connection} sessions=${app.sessions} activeId=${app.activeId}
       open=${sidebarOpen} close=${() => setSidebarOpen(false)} onNew=${app.newConversation}
       onSelect=${app.setActiveId} onSettings=${() => setSettingsOpen(true)}
-      onRename=${app.renameSession}
+      attention=${attention} onRename=${async (id, title) => {
+        const before = app.sessions.find(item => item.id === id)?.updated
+        attention.renamed(id, before, (await app.renameSession(id, title)).updated)
+      }}
       onDelete=${id => void app.deleteSession(id).catch(e => showError(e.message))} />
     <main class="main-area">
       <header class="topbar"><button class="icon-button mobile-only" aria-label="Open sidebar" onClick=${() => setSidebarOpen(true)}><${Menu} size=${20} /></button>
@@ -89,9 +94,10 @@ export default function App() {
       </div>
     </main>
     ${workspaceOpen && app.settings && (!app.activeId || active) ? html`<${WorkspacePanel} key=${editorKey} sessionId=${app.activeId}
+      allowedDirectories=${active?.allowed_directories || []}
       workspace=${workspace} file=${editorDrafts[editorKey] || null} setFile=${setEditorFile} onClose=${() => setWorkspaceOpen(false)}
       changes=${app.changes} busy=${busy} review=${review?.viewKey === app.viewKey ? review : null} onReviewOpened=${() => setReview(null)} onReview=${app.reviewChanges} onSelectSession=${app.setActiveId}
-      onAttach=${path => { setDraft(current => `${current}${current ? '\n' : ''}Please read the project file: ${path}`); setWorkspaceOpen(false) }} />` : null}
+      onAttach=${path => { setDraft(current => `${current}${current ? '\n' : ''}Please read the ${path.startsWith('/') ? 'file' : 'project file'}: ${path}`); setWorkspaceOpen(false) }} />` : null}
     ${agentToolsOpen && app.settings && (!app.activeId || active) ? html`<${AgentToolsDialog} key=${editorKey} session=${active} workspace=${workspace} onClose=${() => setAgentToolsOpen(false)} onError=${showError} onSelectSession=${id => { setAgentToolsOpen(false); app.setActiveId(id); void app.refreshSessions().catch(e => showError(e.message)) }} />` : null}
     ${settingsOpen && app.settings ? html`<${SettingsDialog} settings=${app.settings} connection=${app.connection} onSave=${app.saveSettings} onClose=${() => setSettingsOpen(false)} />` : null}
     ${foldersOpen && app.settings ? html`<${FolderAccessDialog} key=${app.viewKey} workspace=${active?.workspace || app.settings.workspace} folders=${active?.allowed_directories || []}

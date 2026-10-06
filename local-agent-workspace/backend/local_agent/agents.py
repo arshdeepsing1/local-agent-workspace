@@ -41,6 +41,7 @@ from .tool_schema import validate_arguments
 from .drafts import DraftPersistenceError, STORAGE_ERRORS, StreamDraft
 from .store import UnreadableConversation
 from .approvals import MAX_ALLOW_RULES, allowed_by_rule, declined, rule_for
+from .notify import SystemNotifier, attention_message
 
 
 MAX_OUTPUT_LIMIT_RETRIES = 2
@@ -322,6 +323,7 @@ class AgentManager:
         self.tasks = {}
         self.listeners = {}
         self.closing_sockets = set()
+        self.pages = set()  # Presence sockets: one per open page, with or without a chat selected.
         self.pending = {}
         self.statuses = {}
         self.checkpoints = CheckpointManager(store)
@@ -331,6 +333,7 @@ class AgentManager:
         self.task_board = TaskManager(store)
         self.delegates = DelegateManager(self)
         self.extension_connections = {}
+        self.notifier = SystemNotifier()
         self.jobs = JobManager(store, settings.redact, self.job_update, redaction_tokens=self.redaction_tokens)
         for summary in store.list():
             try:
@@ -363,6 +366,10 @@ class AgentManager:
             if event.get("request_info", {}).get("status") == "running":
                 event["request_info"].update(status="interrupted", error_kind="incomplete_response")
                 interrupted = True
+        if "turn_ended" in session and session["turn_ended"] is None:
+            # The server stopped during a turn: it did not finish.
+            session.update(terminal_reason="interrupted", turn_ended=time.time())
+            interrupted = True
         return interrupted
 
     def workspace_available(self, workspace):
@@ -555,13 +562,28 @@ class AgentManager:
         self.closing_sockets.add(task)
         task.add_done_callback(self.closing_sockets.discard)
 
-    async def status(self, session, status):
+    async def status(self, session, status, turn_ended=False):
+        """turn_ended: this idle status ends a turn (not a manual compaction)."""
+        previous = self.statuses.get(session["id"], "idle")
         self.statuses[session["id"]] = status
-        await self.broadcast(session["id"], {"type": "status", "status": status})
+        message = {"type": "status", "status": status}
+        if status == "idle":
+            # How and when the last turn ended, for the page's notifications.
+            message.update({key: session[key] for key in ("terminal_reason", "turn_ended") if session.get(key)})
+        await self.broadcast(session["id"], message)
+        self.notify_status(session, previous, status, turn_ended)
         await self.delegates.progress(session, status=status)
         if status == "idle":
             # Commands can also change reviewed files; refresh their counts after each turn.
             await self.publish_changes(session, only_tracked=True)
+
+    def notify_status(self, session, previous, status, turn_ended=False):
+        """A desktop notification of the change, only if enabled and no page is open."""
+        if self.settings.values.get("system_notifications") is not True or self.pages or any(self.listeners.values()):
+            return
+        message = attention_message(session, previous, status, turn_ended)
+        if message:
+            self.notifier.send(message)
 
     def session_tools(self, session):
         return WorkspaceTools(session["workspace"], self.settings.values["env_file"], session.get("allowed_directories", []),
@@ -687,10 +709,10 @@ class AgentManager:
         if task and task.cancelled() and self.tasks.get(session_id) is task:
             session = self.live.pop(session_id, None)
             if session is not None:
-                session["terminal_reason"] = "stopped"
+                session.update(terminal_reason="stopped", turn_ended=time.time())
                 self.store.save(session)
                 await self.delegates.progress(session, terminal_reason="stopped")
-                await self.status(session, "idle")
+                await self.status(session, "idle", turn_ended=True)
 
     async def run(self, session, prompt):
         terminal_reason = "completed"
@@ -708,6 +730,7 @@ class AgentManager:
             await self.broadcast(session["id"], {"type": "event", "event": error})
 
         try:
+            session["turn_ended"] = None  # Saved with the user message: a restart can tell the turn was cut off.
             await self.status(session, "running")
             origin = {}
             if session.get("parent_event_id") and not session["events"] and not session.get("delegation", {}).get("terminal_reason"):
@@ -777,7 +800,7 @@ class AgentManager:
                     terminal_reason = "error"
                 if terminal_reason == "completed" and any(item.get("state") == "error" for item in events):
                     terminal_reason = "tool_error"
-            session["terminal_reason"] = terminal_reason
+            session.update(terminal_reason=terminal_reason, turn_ended=time.time())
             try:
                 self.store.save(session)
             except STORAGE_ERRORS as exc:
@@ -787,7 +810,7 @@ class AgentManager:
                 await self.broadcast(session["id"], {"type": "event", "event": event})
             self.live.pop(session["id"], None)
             try:
-                await self.status(session, "idle")
+                await self.status(session, "idle", turn_ended=True)
             except STORAGE_ERRORS as exc:
                 await report_storage_failure(exc)
 

@@ -67,6 +67,7 @@ class Settings:
             "max_agent_steps": DEFAULT_MAX_AGENT_STEPS,
             "compaction_handoffs": True,
             "approval_timeout_minutes": DEFAULT_APPROVAL_MINUTES,
+            "system_notifications": False,
         }
         if self.path.exists():
             saved = json.loads(self.path.read_text())
@@ -116,6 +117,8 @@ class Settings:
         minutes = candidate["approval_timeout_minutes"]
         if type(minutes) is not int or not 0 <= minutes <= MAX_APPROVAL_MINUTES:
             raise ValueError(f"Approval wait must be 0 (no limit) or 1 to {MAX_APPROVAL_MINUTES:,} minutes.")
+        if type(candidate["system_notifications"]) is not bool:
+            raise ValueError("Desktop notifications must be on or off.")
         candidate["workspace"] = str(workspace)
         self.values = candidate
         temp = self.path.with_suffix(".tmp")

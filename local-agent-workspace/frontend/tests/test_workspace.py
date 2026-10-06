@@ -133,8 +133,9 @@ def test_settings_edit_and_save_only_databricks_fields(ui, page):
     expect(dialog.get_by_label("Agent runtime")).to_have_count(0)
     expect(dialog.get_by_text(re.compile("Claude|MCP|skills", re.I))).to_have_count(0)
     checkboxes = dialog.get_by_role("checkbox")
-    expect(checkboxes).to_have_count(1)
-    expect(dialog.locator("label:has(input[type=checkbox])")).to_have_text("Save a detailed handoff at each compaction")
+    expect(checkboxes).to_have_count(2)
+    expect(dialog.locator("label:has(input[type=checkbox])")).to_have_text([
+        "Save a detailed handoff at each compaction", "Desktop notification when no browser tab is open"])
     dialog.get_by_label("Project folder").fill("/updated-project")
     endpoint.fill("databricks-gpt-oss-120b")
     dialog.get_by_label("Credential file").fill("/credentials/env_vars.txt")
@@ -794,6 +795,8 @@ def test_reconnecting_stops_when_the_conversation_was_deleted(ui):
     ui.wait("hook.error.includes('no longer exists')")
     assert ui.js("hook.activeId") is None
     assert ui.js("fake.sockets.length") == 1
-    calls = ui.js("fake.calls.length")
+    # The idle 10-second list poll continues; reconnect attempts do not.
+    reconnects = "fake.calls.filter(call => call.path !== '/api/sessions').length"
+    calls = ui.js(reconnects)
     ui.tick(10000)
-    assert ui.js("fake.calls.length") == calls
+    assert ui.js(reconnects) == calls

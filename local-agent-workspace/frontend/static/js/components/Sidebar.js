@@ -1,5 +1,5 @@
 import { html, useAutoFocus, useEffect, useRef, useState } from '../lib.js'
-import { ArrowLeftRight, Code2, Folder, Pencil, Plus, Settings as SettingsIcon, Trash2, X } from '../icons.js'
+import { ArrowLeftRight, Bell, BellOff, Code2, Folder, Pencil, Plus, Settings as SettingsIcon, Trash2, X } from '../icons.js'
 
 export function Brand({ small = false }) {
   return html`<span class=${`brand-symbol ${small ? 'small' : ''}`} aria-hidden="true"><i /><i /><i /><i /></span>`
@@ -20,7 +20,18 @@ function RenameForm({ session, title, setTitle, saving, error, onSave, onCancel 
   </form>`
 }
 
-function ConversationRow({ session, selected, onSelect, onDelete, onRename }) {
+const ACTIVITY = { running: 'Running', compacting: 'Compacting', naming: 'Naming', delegating: 'Delegating' }
+
+// Status after the title, so the row's accessible name still starts with the title.
+function RowStatus({ session, unread, failed }) {
+  if (session.status === 'awaiting_approval') return html`<span class="row-badge approval">Needs approval</span>`
+  if (session.status !== 'idle') return html`<span class="sr-only">${ACTIVITY[session.status] || 'Working'}</span>`
+  if (failed) return html`<span class="row-badge error" title="The last reply ended with an error">Error</span>`
+  if (unread) return html`<span class="unread-dot" title="Changed since you last opened it"><span class="sr-only">Unread</span></span>`
+  return null
+}
+
+function ConversationRow({ session, selected, unread, failed, onSelect, onDelete, onRename }) {
   const [editing, setEditing] = useState(false)
   const [title, setTitle] = useState('')
   const [saving, setSaving] = useState(false)
@@ -45,7 +56,8 @@ function ConversationRow({ session, selected, onSelect, onDelete, onRename }) {
     ${editing ? html`<${RenameForm} session=${session} title=${title} saving=${saving} error=${error}
       setTitle=${value => { setTitle(value); setError('') }} onSave=${() => void save()} onCancel=${finish} />` : html`
       <button onClick=${onSelect} title=${`${session.title}\nSession: ${session.id}`} aria-current=${selected ? 'page' : undefined}>
-        ${session.status !== 'idle' ? html`<span class="activity-dot" />` : null}<span>${session.title}<small class="session-id"> · ${session.id.slice(0, 8)}</small></span>
+        ${session.status !== 'idle' && session.status !== 'awaiting_approval' ? html`<span class="activity-dot" aria-hidden="true" title=${ACTIVITY[session.status] || 'Working'} />` : null}<span class="conversation-name">${session.title}<small class="session-id"> · ${session.id.slice(0, 8)}</small></span>
+        <${RowStatus} session=${session} unread=${unread} failed=${failed} />
       </button>
       <button ref=${renameButton} class="rename-session" aria-label=${`Rename ${session.title}`} title="Rename conversation"
         onClick=${() => { setTitle(session.title); setError(''); setEditing(true) }}><${Pencil} size=${14} /></button>
@@ -55,9 +67,25 @@ function ConversationRow({ session, selected, onSelect, onDelete, onRename }) {
   </div>`
 }
 
-// Props: settings, connection, sessions, activeId, open, close, onNew, onSelect, onSettings, onDelete, onRename
+// Turns browser notifications on or off; permission is asked for only by this click.
+function NotifyToggle({ notifications }) {
+  if (!notifications) return null
+  const { enabled, permission, toggle } = notifications
+  const hint = permission === 'unsupported' ? 'This browser cannot show notifications.'
+    : permission === 'denied' && !enabled ? 'Notifications are blocked for this page in the browser settings.' : ''
+  return html`<button class="notify-toggle" role="switch" aria-checked=${enabled} disabled=${!!hint}
+    title=${hint || 'Notify me when a conversation needs approval, finishes, or stops with an error'}
+    onClick=${() => void toggle()}>${enabled ? html`<${Bell} size=${16} />` : html`<${BellOff} size=${16} />`}Notify me
+    <span class="notify-state" aria-hidden="true">${enabled ? 'On' : 'Off'}</span></button>
+    ${hint ? html`<p class="notify-hint">${hint}</p>` : null}`
+}
+
+// Props: settings, connection, sessions, activeId, open, close, onNew, onSelect, onSettings, onDelete, onRename,
+// attention?: { unread(session), failed(session), notifications }
 export default function Sidebar(props) {
   const folder = props.settings?.workspace.split('/').filter(Boolean).pop() || 'Choose a project'
+  const [runningOnly, setRunningOnly] = useState(false)
+  const shown = runningOnly ? props.sessions.filter(s => s.status !== 'idle') : props.sessions
   return html`
     ${props.open ? html`<button class="sidebar-scrim" aria-label="Close sidebar" onClick=${props.close} />` : null}
     <aside class=${`sidebar ${props.open ? 'visible' : ''}`}>
@@ -69,13 +97,18 @@ export default function Sidebar(props) {
         <${Folder} /><span>${folder}</span><${ArrowLeftRight} size=${15} />
       </button>
       <div class="conversation-list">
-        <p class="section-label">Conversations</p>
+        <div class="conversation-list-heading"><p class="section-label">Conversations</p>
+          ${props.sessions.length ? html`<button class="running-filter" aria-pressed=${runningOnly} title="Show only conversations that are working or waiting"
+            onClick=${() => setRunningOnly(value => !value)}>Running</button>` : null}</div>
         ${props.sessions.length === 0 ? html`<p class="empty-sessions">Your conversations will appear here.</p>` :
-          props.sessions.map(s => html`<${ConversationRow} key=${s.id} session=${s} selected=${props.activeId === s.id}
+          shown.length === 0 ? html`<p class="empty-sessions">No conversation is running.</p>` :
+          shown.map(s => html`<${ConversationRow} key=${s.id} session=${s} selected=${props.activeId === s.id}
+            unread=${!!props.attention?.unread(s)} failed=${!!props.attention?.failed(s)}
             onSelect=${() => { props.onSelect(s.id); props.close() }} onDelete=${() => props.onDelete(s.id)} onRename=${props.onRename} />`)}
       </div>
       <footer class="sidebar-footer">
         <button class="settings-button" onClick=${props.onSettings}><${SettingsIcon} />Settings</button>
+        <${NotifyToggle} notifications=${props.attention?.notifications} />
         <div class="connection-state" title=${props.connection?.error || props.settings?.host || 'Checking connection'}>
           <span class=${`status-dot ${props.connection?.connected ? 'connected' : props.connection ? 'disconnected' : ''}`} />
           ${props.connection === null ? 'Checking Databricks…' : props.connection.connected ? 'Databricks connected' : 'Connection needs attention'}

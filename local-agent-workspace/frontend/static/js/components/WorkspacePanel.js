@@ -8,9 +8,16 @@ import DiffReview from './DiffReview.js'
 // changes: the conversation's unreviewed agent changes (see ChangesBar); review: { path } opens
 // that file's changes once, then onReviewOpened() clears it; onReview(action, files) keeps or undoes;
 // onSelectSession(id) opens a chat that a review error names as blocking.
-export default function WorkspacePanel({ sessionId, workspace, file, setFile, onClose, onAttach, changes: agentChanges, busy, review, onReviewOpened, onReview, onSelectSession }) {
+// allowedDirectories: the conversation's granted folders (absolute), offered as other roots of Files.
+export default function WorkspacePanel({ sessionId, workspace, allowedDirectories = [], file, setFile, onClose, onAttach, changes: agentChanges, busy, review, onReviewOpened, onReview, onSelectSession }) {
   const [tab, setTab] = useState('files')
+  // root '.' is the project; a granted folder is browsed by absolute paths and never above itself.
+  const [root, setRoot] = useState('.')
   const [directory, setDirectory] = useState('.')
+  const chooseRoot = value => { setRoot(value); setDirectory(value) }
+  useEffect(() => { if (root !== '.' && !allowedDirectories.includes(root)) chooseRoot('.') }, [root, allowedDirectories.join('\n')])
+  const parentOf = path => root === '.' ? (path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '.')
+    : path.slice(0, path.lastIndexOf('/')).length < root.length ? root : path.slice(0, path.lastIndexOf('/'))
   const [files, setFiles] = useState([])
   const [changes, setChanges] = useState('')
   const [error, setError] = useState('')
@@ -104,7 +111,11 @@ export default function WorkspacePanel({ sessionId, workspace, file, setFile, on
         <textarea class="code-editor" aria-label=${`Edit ${file.path}`} value=${file.content} spellcheck=${false} onInput=${e => setFile({ ...file, content: e.currentTarget.value })} />
         <div class="editor-status">${file.content.split('\n').length} lines<span>${dirty ? 'Unsaved changes' : 'Saved on disk'}</span></div>`}
       </div>` : html`<div class="file-browser">
-        <div class="file-path"><button class="icon-button" aria-label="Parent folder" disabled=${directory === '.'} onClick=${() => setDirectory(directory.includes('/') ? directory.slice(0, directory.lastIndexOf('/')) : '.')}><${ArrowLeft} size=${15} /></button><span>${directory === '.' ? 'Project files' : directory}</span>
+        ${allowedDirectories.length ? html`<div class="file-root"><label for="files-root">Browse</label><select id="files-root" value=${root} title=${root === '.' ? workspace : root} onChange=${e => chooseRoot(e.currentTarget.value)}>
+          <option value=".">Project</option>
+          ${allowedDirectories.map(folder => html`<option key=${folder} value=${folder}>${folder}${[...changed.keys()].some(path => path.startsWith(`${folder}/`)) ? ' (changed files)' : ''}</option>`)}
+        </select></div>` : null}
+        <div class="file-path"><button class="icon-button" aria-label="Parent folder" disabled=${directory === root} onClick=${() => setDirectory(parentOf(directory))}><${ArrowLeft} size=${15} /></button><span title=${directory === '.' ? workspace : directory}>${directory === '.' ? 'Project files' : directory}</span>
           <button class="icon-button" aria-label="Refresh files" disabled=${loading} onClick=${() => void refresh()}><${RefreshCw} size=${14} className=${loading ? 'spin' : ''} /></button></div>
         <div class="file-list">${files.map(entry => {
           // Like an editor's explorer: a dot on files the agent changed, and on folders containing them.
