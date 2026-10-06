@@ -11,6 +11,7 @@ import WorkspacePanel from './components/WorkspacePanel.js'
 import FolderAccessDialog from './components/FolderAccessDialog.js'
 import ContextMeter from './components/ContextMeter.js'
 import ChangesBar, { plural } from './components/ChangesBar.js'
+import StorageNotice from './components/StorageNotice.js'
 
 export default function App() {
   const app = useWorkspace()
@@ -59,6 +60,7 @@ export default function App() {
           ${changedFiles ? html`<span class="change-count" title=${`${plural(changedFiles, 'file')} changed by the agent`}><span aria-hidden="true">${changedFiles}</span><span class="sr-only">(${plural(changedFiles, 'changed file')})</span></span>` : null}</button>
       </header>
       ${app.error ? html`<div class="app-error" role="alert"><span>${app.error}</span><button class="icon-button" aria-label="Dismiss error" onClick=${() => app.setError('')}><${X} size=${16} /></button></div>` : null}
+      <${StorageNotice} problems=${app.storageProblems} />
       ${!app.online && app.activeId ? html`<div class="connection-banner">Reconnecting to your local server… Refresh if the server was restarted.</div>` : null}
       ${app.connection && !app.connection.connected ? html`<div class="connection-banner"><span>${app.connection.error || 'Configure Databricks to start a conversation.'}</span><button onClick=${() => setSettingsOpen(true)}>Open settings</button></div>` : null}
       ${hasMessages && active ? html`<${Conversation} key=${active.id} session=${active} onError=${showError} onSelectSession=${app.setActiveId} />` :

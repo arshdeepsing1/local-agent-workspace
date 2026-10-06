@@ -49,6 +49,7 @@ async def test_agent_write_creates_checkpoint_only_after_approval(runtime):
     manager, session, project, tools = runtime
     turn = await manager.event(session, 'user', text='Update the note')
     (project / 'note.txt').write_text('before')
+    manager.remember_file(session, project / 'note.txt')  # As if read: overwriting needs a read first.
     session['permission_mode'] = 'manual'
     async def refuse(*args):
         return False
@@ -169,6 +170,7 @@ async def test_before_hook_changed_file_is_not_overwritten(runtime):
     configure_hook(manager)
     session['permission_mode'] = 'bypassPermissions'
     (project / 'note.txt').write_text('before')
+    manager.remember_file(session, project / 'note.txt')  # As if read: overwriting needs a read first.
     async def mutate(*args):
         (project / 'note.txt').write_text('hook edit')
         return {'exit_code': 0, 'output': '', 'truncated': False}

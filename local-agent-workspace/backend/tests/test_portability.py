@@ -231,6 +231,27 @@ async def test_fork_preserves_full_history_compaction_and_source_without_childre
         manager.run_databricks.assert_not_called()
 
 
+async def test_file_views_stay_local_in_export_import_and_fork(runtime):
+    """What the source conversation last read is about its own files: never copied."""
+    app, manager, source, destination = runtime
+    source["file_views"] = {"/srv/project/README.md": [12, 34]}
+    manager.store.save(source)
+    async with await client_for(app) as client:
+        bundle = (await client.get(f"/api/sessions/{source['id']}/export")).json()
+        assert "file_views" not in bundle["sessions"][0] and "/srv/project/README.md" not in json.dumps(bundle)
+        imported = await client.post("/api/sessions/import", params={"workspace": str(destination)}, json=bundle)
+        assert imported.status_code == 201, imported.text
+        assert "file_views" not in manager.store.get(imported.json()["session"]["id"])
+        fork = await client.post(f"/api/sessions/{source['id']}/fork")
+        assert fork.status_code == 201, fork.text
+        assert "file_views" not in manager.store.get(fork.json()["id"])
+        # A bundle that carries the field is rejected cleanly, as any unknown field is.
+        bundle["sessions"][0]["file_views"] = {"/etc/passwd": [1, 1]}
+        rejected = await client.post("/api/sessions/import", params={"workspace": str(destination)}, json=bundle)
+        assert rejected.status_code == 400 and "file_views" in rejected.json()["detail"]
+        assert "/etc/passwd" not in rejected.text
+
+
 async def test_fork_rejects_active_or_not_completed_conversations_and_export_active_children(runtime):
     app, manager, source, _ = runtime
     async with await client_for(app) as client:
