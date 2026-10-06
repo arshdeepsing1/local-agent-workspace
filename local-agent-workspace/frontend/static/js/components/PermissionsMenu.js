@@ -9,7 +9,15 @@ const modes = [
   { value: 'bypassPermissions', label: 'Bypass permissions', description: 'Run tools and access folders without asking' },
 ]
 
-export default function PermissionsMenu({ mode, busy, onChange, onError, onDone }) {
+// An "Allow for this chat" rule: { tool: 'run_command', command } | { tool: 'edits' } | { tool: <MCP tool> } | { tool: 'hook', hook }.
+export function ruleLabel(rule) {
+  if (rule.tool === 'run_command') return `Command: ${rule.command}`
+  if (rule.tool === 'edits') return 'File edits'
+  if (rule.tool === 'hook') return `Hook: ${rule.hook}`
+  return `Tool: ${rule.tool}`
+}
+
+export default function PermissionsMenu({ mode, busy, onChange, onError, onDone, rules = [], onRemoveRule }) {
   const [open, setOpen] = useState(false)
   const [saving, setSaving] = useState(false)
   const container = useRef(null)
@@ -29,6 +37,12 @@ export default function PermissionsMenu({ mode, busy, onChange, onError, onDone 
     catch (e) { onError(e.message) }
     finally { setSaving(false) }
   }
+  const remove = async rule => {
+    setSaving(true)
+    try { await onRemoveRule(rule) }
+    catch (e) { onError(e.message) }
+    finally { setSaving(false) }
+  }
   const label = modes.find(m => m.value === mode)?.label
   return html`<div class="permissions-control" ref=${container}>
     <button ref=${trigger} class="permission-trigger" aria-haspopup="menu" aria-expanded=${open}
@@ -40,7 +54,7 @@ export default function PermissionsMenu({ mode, busy, onChange, onError, onDone 
       if (event.key === 'Tab') setOpen(false)
       if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
         event.preventDefault()
-        const items = Array.from(menu.current?.querySelectorAll('[role="menuitemradio"]') || [])
+        const items = Array.from(menu.current?.querySelectorAll('[role="menuitemradio"], [role="menuitem"]') || [])
         const index = items.indexOf(document.activeElement)
         const next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1 : (index + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length
         items[next]?.focus()
@@ -53,6 +67,15 @@ export default function PermissionsMenu({ mode, busy, onChange, onError, onDone 
           <span class="permission-description">${m.description}</span></span>
         ${mode === m.value ? html`<${Check} size=${16} className="permission-check" />` : null}
       </button>`)}
+      ${rules.length && onRemoveRule ? html`<div class="allow-rules" role="group" aria-label="Allowed in this chat">
+        <div class="permissions-heading">Allowed in this chat</div>
+        ${rules.map(rule => {
+          const text = ruleLabel(rule)
+          return html`<div class="allow-rule" key=${JSON.stringify(rule)}><span title=${text}>${text}</span>
+            <button role="menuitem" class="icon-button" aria-label=${`Remove rule: ${text}`} aria-disabled=${busy || saving}
+              onClick=${() => { if (!busy && !saving) void remove(rule) }}><${X} size=${13} /></button></div>`
+        })}
+      </div>` : null}
       <p>${busy ? 'Stop the response before changing modes.' : 'Applies to this conversation. Auto uses local rules.'}</p>
     </div>` : null}
   </div>`

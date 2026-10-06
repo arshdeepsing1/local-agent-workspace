@@ -5,6 +5,7 @@ import sqlite3
 from fastapi import HTTPException, Request
 
 from .agents import public_session
+from .approvals import ensure_idle
 from .portability import MAX_BUNDLE_BYTES, MAX_SESSIONS, completed_for_fork, export_bundle, fresh_copies, parse_bundle
 from .tools import WorkspaceTools
 
@@ -12,9 +13,7 @@ from .tools import WorkspaceTools
 def register_portability(app, manager, settings, store, session_or_404):
     def idle(session_id):
         session = session_or_404(session_id)
-        task = manager.tasks.get(session_id)
-        if manager.statuses.get(session_id, "idle") != "idle" or task and not task.done():
-            raise HTTPException(409, "Stop the current response before exporting or forking this conversation.")
+        ensure_idle(manager, session, "exporting or forking this conversation")
         return session
 
     def destination(value):

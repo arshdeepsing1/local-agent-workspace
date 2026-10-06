@@ -1,6 +1,6 @@
 import { html, resolve, useState } from './lib.js'
 import { Folder, Laptop, Menu, PanelRight, Pencil, Terminal, X } from './icons.js'
-import { api } from './api.js'
+import { api, blockingChat } from './api.js'
 import { useWorkspace } from './useWorkspace.js'
 import Sidebar, { Brand } from './components/Sidebar.js'
 import Composer from './components/Composer.js'
@@ -31,12 +31,18 @@ export default function App() {
   const setEditorFile = value => setEditorDrafts(current => ({ ...current, [editorKey]: resolve(value, current[editorKey] || null) }))
   const hasMessages = !!active?.events.length
   const busy = !!active && active.status !== 'idle'
-  const showError = error => app.setError(error)
+  // An error can name another chat that blocks the action: { message, session_id, title }.
+  const [blocker, setBlocker] = useState(null)
+  const showError = error => {
+    const message = typeof error === 'string' ? error : error?.message || String(error)
+    setBlocker(error?.detail?.session_id ? error.detail : blockingChat(message))
+    app.setError(message)
+  }
   const changedFiles = app.changes?.files.length || 0
   const openReview = path => { setReview({ path, viewKey: app.viewKey }); setWorkspaceOpen(true) }
   const composer = html`<${Composer} key=${app.viewKey} value=${draft} setValue=${setDraft} model=${active?.model || app.settings?.model || 'databricks-gpt-oss-120b'}
     workspace=${active?.workspace || app.settings?.workspace || ''} mode=${app.permissionMode} onMode=${app.setPermissionMode} onProject=${() => setSettingsOpen(true)}
-    onFolders=${() => setFoldersOpen(true)}
+    onFolders=${() => setFoldersOpen(true)} rules=${active?.allow_rules || []} onRemoveRule=${app.removeAllowRule}
     models=${app.connection?.models || []} busy=${busy} modelSaving=${app.modelSaving}
     disabled=${!app.ready || (!!app.activeId && !active) || !app.settings?.configured}
     onModel=${app.changeModel}
@@ -58,7 +64,9 @@ export default function App() {
         <button class=${`outline workspace-toggle ${workspaceOpen ? 'active' : ''}`} onClick=${() => setWorkspaceOpen(v => !v)}><${PanelRight} size=${18} /><span>Workspace</span>
           ${changedFiles ? html`<span class="change-count" title=${`${plural(changedFiles, 'file')} changed by the agent`}><span aria-hidden="true">${changedFiles}</span><span class="sr-only">(${plural(changedFiles, 'changed file')})</span></span>` : null}</button>
       </header>
-      ${app.error ? html`<div class="app-error" role="alert"><span>${app.error}</span><button class="icon-button" aria-label="Dismiss error" onClick=${() => app.setError('')}><${X} size=${16} /></button></div>` : null}
+      ${app.error ? html`<div class="app-error" role="alert"><span>${app.error}</span>
+        ${blocker && blocker.message === app.error && blocker.session_id !== app.activeId ? html`<button class="outline open-blocking-chat"
+          onClick=${() => app.setActiveId(blocker.session_id)}>Open “${blocker.title}”</button>` : null}<button class="icon-button" aria-label="Dismiss error" onClick=${() => app.setError('')}><${X} size=${16} /></button></div>` : null}
       ${!app.online && app.activeId ? html`<div class="connection-banner">Reconnecting to your local server… Refresh if the server was restarted.</div>` : null}
       ${app.connection && !app.connection.connected ? html`<div class="connection-banner"><span>${app.connection.error || 'Configure Databricks to start a conversation.'}</span><button onClick=${() => setSettingsOpen(true)}>Open settings</button></div>` : null}
       ${hasMessages && active ? html`<${Conversation} key=${active.id} session=${active} onError=${showError} onSelectSession=${app.setActiveId} />` :

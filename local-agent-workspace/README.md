@@ -11,6 +11,8 @@ frontend that runs without a build step.
 - Databricks model selection, numbered line-range reads, paginated regex/literal
   search, file creation and exact edits, and shell commands with live output.
 - Approval cards with proposed edits and command text. A declined action does not run.
+  Decline with a note the agent reads, or allow one exact command, file edits, one MCP
+  tool or one hook for the rest of a chat.
 - Per-conversation permissions below the composer: Manual, Auto, Accept edits,
   Plan and Bypass permissions. Access additional local folders through an approval card.
 - Stop an agent response, including its foreground command or pending approval.
@@ -154,7 +156,7 @@ subagent conversations (32 total, 16 MiB maximum). Export requires idle chats.
 Imports preserve historical messages, tool results, summaries, and usage, remap
 conversation/event/call IDs and included child links, and cancel historical active
 states. Credential settings, hooks/MCP configuration, task-board records, jobs, file checkpoint ownership,
-and folder grants are not transferred. Conversation text can itself contain sensitive
+folder grants, and "Allow for this chat" rules are not transferred. Conversation text can itself contain sensitive
 data: inspect exported files before sharing them. Choose a trusted bundle and an
 existing destination folder; imported paths never select the destination for you.
 Repeated imports intentionally create separate copies. Unsupported versions, malformed
@@ -163,7 +165,7 @@ history, oversized bundles, and authority-bearing fields are rejected atomically
 **Fork completed conversation** makes a separate full-history copy in the same
 workspace, leaving the original unchanged. Only completed, idle conversations can
 be forked; running/failed turns and arbitrary turn selection are not supported.
-Forks also start in Manual with no folder grants or active skills, retain any tool
+Forks also start in Manual with no folder grants, allow rules or active skills, retain any tool
 profile restrictions, and do not copy child conversations, task-board records, jobs, or file checkpoints.
 
 The sidebar reads the small metadata record at the start of each conversation file
@@ -267,6 +269,26 @@ when opening a conversation or performing restart recovery.
   chat busy, and a busy chat blocks Undo and Recovery restores in its project. Before this
   setting existed, every card expired after five minutes. An action stopped without any card, for example by Plan mode or
   because project instructions changed mid-turn, shows "Not run:" and the reason, not "declined".
+  When a busy chat blocks an action, the error names that chat and why (for example
+  "“Fix the parser” is waiting for your approval. Answer or stop it before undoing agent
+  changes."); when it is another chat, **Open “…”** next to the error switches to it.
+- **Allow for this chat**: next to Decline and Approve, a card offers **Always allow this
+  command in this chat** (commands), **Allow edits in this chat** (`write_file`, `edit_file`,
+  `insert_activity_log`), **Allow this tool in this chat** (one MCP tool) or **Allow this hook
+  in this chat**. It approves the card and stores a rule for this conversation. Rules match
+  exactly: the same command text (only leading and trailing whitespace is ignored; never a
+  prefix), the same MCP tool name, the same hook ID. A later matching action runs without a
+  card in Manual, Auto and Accept edits, and its card says "Allowed by a rule for this chat".
+  Plan still blocks it, Bypass is unchanged, and credential exclusions, folder-access cards,
+  project-guidance checks and the changed-file check still apply. Folder-access cards have no
+  such button: a folder grant already lasts for the chat. Rules are saved with the chat (at most
+  100), listed under **Allowed in this chat** in the permissions menu, where each can be removed
+  while the chat is idle, and inherited by subagents. Forks and imports start without rules.
+- **Decline with a note**: **Tell the agent why (optional)** on a card adds up to 2,000 characters
+  to a Decline. The agent receives "User declined this action. Their note: … Do not retry it
+  without a new instruction." (similar wording for MCP calls, hooks and folder access), and the
+  collapsed card shows "Action declined: …". The note is information for the model; it never
+  changes what the chat may do.
 - **Tool details**: task cards show their names and task status. A completed create/update
   action does not mean the task itself is finished. Expand command cards to see the
   full command (including inline Python), options, and output separately. A long file
@@ -626,7 +648,7 @@ must still fit the aggregate tool/schema limits when a chat starts.
 
 The model sees names such as `mcp__example__tool`. MCP calls require their own
 approval in Manual, Auto, and Accept edits; Plan blocks them and Bypass permits
-them. MCP servers and hook commands have the user's OS/network access, not the
+them. **Allow this tool in this chat** approves one exact tool name for the rest of the chat. MCP servers and hook commands have the user's OS/network access, not the
 file tools' folder restrictions. Credential environment variables are stripped
 from local server/hook processes. Up to four servers, 32 tools, and 16 KB of tool
 schemas are supported; each call has a 60-second deadline and bounded 8 KB result.
@@ -721,7 +743,8 @@ error/outcome for invoked tools that fail, including MCP `is_error` results. Sch
 policy, and approval rejections and cancelled actions do not launch failure hooks.
 Foreground commands with failed/timed-out results also trigger failure hooks;
 background-job completion does not launch a deferred hook.
-Each hook separately asks for approval except in Bypass; Plan skips hooks. A declined
+Each hook separately asks for approval except in Bypass; Plan skips hooks.
+**Allow this hook in this chat** stops asking for that hook ID in that chat. A declined
 or failing before-hook blocks the tool. An after-hook failure displays a warning
 while retaining the completed action/result. Failure-hook errors also preserve the
 original error. Hooks have a 1–30 second timeout and
@@ -739,7 +762,8 @@ These planning records are available in Plan mode.
 
 The model can use `delegate_task` for one concrete task with explicitly supplied
 context. The child has a separate transcript/context and inherits workspace,
-model, permission mode, and folder grants. Files remain shared: choose independent
+model, permission mode, folder grants, and "Allow for this chat" rules (a copy: rules the
+child adds stay in the child). Files remain shared: choose independent
 work to avoid conflicting edits. One child runs per parent, at most three globally;
 children have 1–8 model steps (default six), cannot delegate again, and cannot start
 managed background jobs. The parent waits for a bounded result and an honest
@@ -789,6 +813,8 @@ Changes are saved per conversation; stop an active response before switching mod
 | Plan | Read/search approved folders and describe a plan; block file changes and shell commands. |
 | Bypass permissions | Run actions and access external folders without approval cards. Credential/generated-file exclusions still apply to file tools. |
 
+An "Allow for this chat" rule (see **Allow for this chat** above) turns a matching card into an
+automatic approval in Manual, Auto and Accept edits only; Plan ignores rules.
 Inspecting/stopping existing jobs, skills, structured tasks, and delegation are available
 in every mode. Delegated tools still follow the child's inherited permission mode.
 Starting a background job follows the same command approval rules as foreground
@@ -909,7 +935,10 @@ browser-controlled folder checks/grants/removal, OS-denied access,
 cancellation (including process-group termination), path/symlink/secret boundaries,
 credential-free shell environment, restart recovery, API access control, WebSocket
 snapshots, stale editor writes, and keeping or undoing agent changes (whole files and single
-changes, stale-review refusal, undo as a restorable checkpoint). None of these automated
+changes, stale-review refusal, undo as a restorable checkpoint), "Allow for this chat" rules (exact
+matching, Plan still denying, exclusions and folder cards kept, persistence, removal, subagent
+inheritance, none in forks or imports), decline notes reaching the model, and 409 details that
+name the blocking chat. None of these automated
 tests calls a paid model.
 Frontend tests verify that expired local tokens refresh once and that other
 errors never replay a potentially completed action, that editor drafts survive saves
@@ -918,7 +947,9 @@ do not corrupt the active view, that model replies cannot inject HTML or scripts
 that the `/` skill menu lists, filters, and inserts skills without blocking ordinary messages,
 that the pages of a long file read name the lines they covered, and that agent changes
 show in the changes bar, as dots in the file list and as an inline diff whose Keep and Undo
-send the reviewed file state.
+send the reviewed file state, that each kind of approval card offers its own "Allow for this
+chat" button and sends decline notes, that the permissions menu lists and removes rules, and that
+an error naming another chat offers to open it.
 Backend regressions additionally cover credential
 path aliases, unreadable configuration recovery, cancellation during startup or
 after a child process outlives its shell, recovery of completed tool results
@@ -932,6 +963,7 @@ inside a longer message, and compaction inside one request that outgrows the bud
 - `backend/local_agent/tools.py`: scoped file queries/edits and tool definitions.
 - `backend/local_agent/jobs.py`: streamed processes, managed jobs, and cleanup.
 - `backend/local_agent/permissions.py`: shared mode rules and model instructions.
+- `backend/local_agent/approvals.py`: "Allow for this chat" rules, decline-note wording, and 409 details naming a busy chat.
 - `backend/local_agent/store.py`: per-conversation JSONL storage and legacy migration.
 - `backend/local_agent/drafts.py`: bounded periodic streamed-reply checkpoints.
 - `backend/local_agent/portability.py` / `portability_api.py`: validated conversation copies.
