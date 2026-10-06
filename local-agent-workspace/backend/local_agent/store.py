@@ -269,12 +269,28 @@ class Store:
                     jobs[job["id"]] = dict(job)
         return sorted(jobs.values(), key=lambda job: (job.get("created", 0), job["id"]))
 
+    def _read_own(self, session_id):
+        """The conversation stored in <session_id>.jsonl, or None if there is none.
+
+        Raises UnreadableConversation if the file cannot be read or holds another
+        conversation, so its data is never written under a different name."""
+        path = self._path(session_id)
+        try:
+            session = self._read_lines(path)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise UnreadableConversation(path.name, f"it could not be opened ({exc.strerror or type(exc).__name__})") from None
+        if session.get("id") != session_id:
+            raise UnreadableConversation(path.name, "its conversation ID does not match the file name")
+        return session
+
     def _known_jobs(self, session_id):
         if session_id not in self._command_jobs:
             try:
-                session = self._read_lines(self._path(session_id))
-            except FileNotFoundError:
-                session = {}
+                session = self._read_own(session_id) or {}
+            except UnreadableConversation:
+                session = {}  # Nothing trustworthy to merge from that file.
             self._command_jobs[session_id] = self._merge_jobs(session.get("command_jobs", []))
         return self._command_jobs[session_id]
 
@@ -286,10 +302,14 @@ class Store:
         with self._lock:
             session = None
             jobs = self._command_jobs.get(session_id)
+            # An unreadable conversation file is left exactly as it is: the job
+            # stays in the operational database and is not mirrored into it.
             if jobs is None:
                 try:
-                    session = self._read_lines(self._path(session_id))
-                except FileNotFoundError:
+                    session = self._read_own(session_id)
+                except UnreadableConversation:
+                    return
+                if session is None:
                     return
                 jobs = self._merge_jobs(session.get("command_jobs", []))
                 self._command_jobs[session_id] = jobs
@@ -298,8 +318,10 @@ class Store:
                 return
             if session is None:
                 try:
-                    session = self._read_lines(self._path(session_id))
-                except FileNotFoundError:
+                    session = self._read_own(session_id)
+                except UnreadableConversation:
+                    return
+                if session is None:
                     return
             jobs = self._merge_jobs(session.get("command_jobs", []), jobs, [job])
             session["command_jobs"] = jobs
@@ -348,14 +370,14 @@ class Store:
             return None
         path = self._path(session_id)
         with self._lock:
-            try:
-                session = self._read_lines(path)
-            except FileNotFoundError:
+            known = self._load_problems.get(path.name)
+            if known is not None:
+                if known[1] == _fingerprint(path):
+                    raise UnreadableConversation(path.name, known[0])
+                del self._load_problems[path.name]  # Changed since; try it again.
+            session = self._read_own(session_id)
+            if session is None:
                 return None
-            except OSError as exc:
-                raise UnreadableConversation(path.name, f"it could not be opened ({exc.strerror or type(exc).__name__})") from None
-            if session.get("id") != session_id:
-                raise UnreadableConversation(path.name, "its conversation ID does not match the file name")
             self._command_jobs[session_id] = self._merge_jobs(
                 self._command_jobs.get(session_id, []), session.get("command_jobs", []))
             return session

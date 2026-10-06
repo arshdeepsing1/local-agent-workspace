@@ -126,3 +126,59 @@ async def test_git_runs_without_a_shell_and_with_a_limited_environment(tmp_path,
         assert "DATABRICKS_TOKEN" not in options["env"] and "GIT_DIR" not in options["env"]
         assert options["env"]["GIT_CONFIG_NOSYSTEM"] == "1" and options["env"]["GIT_TERMINAL_PROMPT"] == "0"
     assert any("--no-optional-locks" in argv and "status" in argv for argv, _ in calls)
+
+
+def test_a_filter_whose_driver_name_contains_an_equals_sign_does_not_run(repository, tmp_path):
+    """`-c filter.a=b.clean=` would set `filter.a`; the override must reach `filter.a=b.clean`."""
+    client, workspace = repository
+    marker = tmp_path / "filter-ran"
+    git(workspace, "config", "filter.a=b.clean", str(program(tmp_path / "clean.sh", marker)))
+    (workspace / ".gitattributes").write_text("*.py filter=a=b\n")
+    (workspace / "app.py").write_text("print('filtered')\n")
+
+    result = client.get("/api/git").json()
+
+    assert not marker.exists()
+    assert "+print('filtered')" in result["output"]
+
+
+def test_a_filter_configured_inside_a_submodule_does_not_run(repository, tmp_path):
+    client, workspace = repository
+    library = tmp_path / "library"
+    library.mkdir()
+    git(library, "init", "-q")
+    (library / "a.txt").write_text("one\n")
+    (library / ".gitattributes").write_text("* filter=demo\n")
+    git(library, "add", "-A")
+    git(library, "commit", "-qm", "library")
+    git(workspace, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(library), "sub")
+    git(workspace, "commit", "-qm", "add submodule")
+    marker = tmp_path / "submodule-filter-ran"
+    git(workspace / "sub", "config", "filter.demo.clean", str(program(tmp_path / "clean.sh", marker)))
+    (workspace / "sub" / "a.txt").write_text("two\n")
+    (workspace / "app.py").write_text("print('new')\n")
+
+    result = client.get("/api/git").json()
+
+    assert not marker.exists()
+    assert " M app.py" in result["output"]
+
+
+def test_credential_files_at_any_depth_stay_out_of_the_diff(repository):
+    client, workspace = repository
+    names = ["config/.env", "config/.env.production", "config/env_vars.txt", "config/prod.env",
+             "deploy/credentials.json", "keys/ID_RSA", "credentials/token.txt", ".netrc"]
+    for name in names:
+        (workspace / name).parent.mkdir(parents=True, exist_ok=True)
+        (workspace / name).write_text("TOKEN=old\n")
+    git(workspace, "add", "-A")
+    git(workspace, "commit", "-qm", "credentials")
+    for name in names:
+        (workspace / name).write_text("TOKEN=new-secret\n")
+    (workspace / "app.py").write_text("print('new')\n")
+
+    output = client.get("/api/git").json()["output"]
+
+    assert " M config/.env.production" in output  # status names the files
+    assert "+print('new')" in output
+    assert "new-secret" not in output

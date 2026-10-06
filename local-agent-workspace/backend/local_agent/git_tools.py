@@ -4,7 +4,9 @@ A repository's own configuration can name programs that ordinary commands run:
 `core.fsmonitor` (run by `git status`), hooks, and clean/smudge filters (run by
 `git status` and `git diff` on changed files). Every app-initiated Git command goes
 through run_git, which disables these, limits the environment, and bounds time and
-output.
+output. Filter overrides travel in GIT_CONFIG_COUNT/KEY/VALUE environment variables:
+unlike `-c name=value` they are not split at an `=` inside a driver name, and child
+Git processes inherit them.
 """
 import asyncio
 import codecs
@@ -13,27 +15,42 @@ import shutil
 import signal
 
 from .jobs import ENVIRONMENT_KEYS
+from .tools import SECRET_NAMES
 
 OUTPUT_LIMIT = 80_000
 SAFE_OPTIONS = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
                 "-c", "submodule.recurse=false", "-c", "core.pager=cat")
 FILTER_KEYS = r"^filter\..*\.(clean|smudge|process|required)$"
-# Same exclusions as the file tools' credential rules.
-DIFF_EXCLUDES = (":!*.env", ":!.env*", ":!env_vars.txt")
+# The file tools' credential names at any depth (any letter case), plus `*.env`.
+DIFF_EXCLUDES = (":!*.env", *(f":(exclude,glob,icase){pattern}" for name in sorted(SECRET_NAMES)
+                              for pattern in (f"**/{name}", f"**/{name}/**")),
+                 ":(exclude,glob,icase)**/.env.*")
 CHANGES_TIMEOUT = 60
 
 
-def git_environment():
+def filter_settings(names):
+    """(name, value) pairs that switch off the named filter driver settings."""
+    return [(key, "false" if key.endswith(".required") else "") for key in names]
+
+
+def git_environment(filters=()):
     env = {key: value for key, value in os.environ.items() if key in ENVIRONMENT_KEYS}
     env.update(GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1")
+    settings = filter_settings(filters)
+    if settings:
+        env["GIT_CONFIG_COUNT"] = str(len(settings))
+        for index, (key, value) in enumerate(settings):
+            env[f"GIT_CONFIG_KEY_{index}"], env[f"GIT_CONFIG_VALUE_{index}"] = key, value
     return env
 
 
 def filter_overrides(names):
-    """`-c` options that switch off the named filter driver settings."""
+    """`-c` options for the same settings, for Git older than 2.31. A name that
+    contains `=` cannot be given this way; the environment covers it."""
     options = []
-    for key in names:
-        options.extend(["-c", f"{key}={'false' if key.endswith('.required') else ''}"])
+    for key, value in filter_settings(names):
+        if "=" not in key:
+            options.extend(["-c", f"{key}={value}"])
     return options
 
 
@@ -47,7 +64,7 @@ async def run_git(workspace, arguments, *, filters=(), timeout=30, limit=None, g
     if not git:
         raise ValueError("Git is not installed or not on PATH.")
     spawning = asyncio.create_task(asyncio.create_subprocess_exec(
-        git, *SAFE_OPTIONS, *filter_overrides(filters), "-C", str(workspace), *arguments, env=git_environment(),
+        git, *SAFE_OPTIONS, *filter_overrides(filters), "-C", str(workspace), *arguments, env=git_environment(filters),
         stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT, start_new_session=True))
     process = None
@@ -82,22 +99,27 @@ async def run_git(workspace, arguments, *, filters=(), timeout=30, limit=None, g
 
 
 async def configured_filters(workspace, *, timeout=30, git=None):
-    _, names, _ = await run_git(workspace, ["config", "--name-only", "--get-regexp", FILTER_KEYS],
+    _, names, _ = await run_git(workspace, ["config", "--name-only", "-z", "--get-regexp", FILTER_KEYS],
                                 timeout=timeout, git=git)
-    return names.decode("utf-8", errors="replace").split()
+    return [name for name in names.decode("utf-8", errors="surrogateescape").split("\0") if name]
 
 
 async def working_tree_changes(workspace):
-    """`git status --short` followed by `git diff`, as {exit_code, output, truncated}."""
+    """`git status --short` followed by `git diff`, as {exit_code, output, truncated}.
+
+    --ignore-submodules=dirty keeps Git from running inside submodules, whose own
+    configuration may name filters; changed submodule commits are still listed."""
     try:
         async with asyncio.timeout(CHANGES_TIMEOUT):
             filters = await configured_filters(workspace, timeout=CHANGES_TIMEOUT)
             code, output, truncated = await run_git(
-                workspace, ["--no-optional-locks", "status", "--short", "--untracked-files=normal"],
+                workspace, ["--no-optional-locks", "status", "--short", "--untracked-files=normal",
+                            "--ignore-submodules=dirty"],
                 filters=filters, timeout=CHANGES_TIMEOUT)
             if code == 0 and not truncated:
                 code, diff, truncated = await run_git(
-                    workspace, ["--no-optional-locks", "diff", "--no-ext-diff", "--no-textconv", "--", ".", *DIFF_EXCLUDES],
+                    workspace, ["--no-optional-locks", "diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty",
+                              "--", ".", *DIFF_EXCLUDES],
                     filters=filters, timeout=CHANGES_TIMEOUT, limit=OUTPUT_LIMIT - len(output))
                 output += diff
     except TimeoutError as exc:

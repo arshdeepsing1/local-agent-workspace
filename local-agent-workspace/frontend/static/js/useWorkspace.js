@@ -44,10 +44,11 @@ export function useWorkspace() {
     if (!id) setDraftMode('manual')
     if (!fromHistory) updateUrl(id)
   }, [updateUrl])
-  const clearMissingSession = useCallback(() => {
+  // message: '' when another notice (the storage notice) already explains why.
+  const clearMissingSession = useCallback((message = 'That conversation no longer exists. Start a new conversation below.') => {
     selectSession(null, true)
     updateUrl(null, true)
-    setError('That conversation no longer exists. Start a new conversation below.')
+    setError(message)
   }, [selectSession, updateUrl])
 
   const refreshSessions = useCallback(async () => {
@@ -89,7 +90,8 @@ export function useWorkspace() {
       setSessions(list)
       // Only an explicit conversation URL resumes history. The root page is new.
       if (selected.current.id && !list.some(s => s.id === selected.current.id)) {
-        clearMissingSession()
+        const unreadable = (bootstrap.storage_problems || []).some(problem => problem.file === `${selected.current.id}.jsonl`)
+        clearMissingSession(unreadable ? '' : undefined)
       }
       setReady(true)
       await checkConnection()
@@ -123,6 +125,11 @@ export function useWorkspace() {
         if (error instanceof ApiError && error.status === 404) {
           clearMissingSession()
           void refreshSessions().catch(e => setError(e.message))
+        } else if (error instanceof ApiError && error.status === 400) {
+          // The server could not read this conversation's file: retrying cannot help.
+          clearMissingSession(error.message)
+          void refreshSessions().then(() => api('/bootstrap'))
+            .then(bootstrap => setStorageProblems(bootstrap.storage_problems || [])).catch(e => setError(e.message))
         } else {
           reconnect = true; setOnline(false); timer = setTimeout(() => void connect(), 2000)
         }

@@ -258,9 +258,13 @@ when opening a conversation or performing restart recovery.
   paths appear in status; their contents are available in Files. The server runs Git
   directly (no shell) with the programs a repository's configuration can name switched
   off: `core.fsmonitor`, hooks, clean/smudge filters, external diff and text conversion.
-  It also limits Git's environment, stops after 60 seconds, and shows at most 80 KB.
-  Credential files (`.env`, `.env.*`, `env_vars.txt`) are left out of the diff. A folder
-  that is not a Git repository shows Git's own message.
+  Git does not look inside submodule work trees, whose own configuration could name
+  filters; a submodule whose commit changed is still listed. The server also limits Git's
+  environment, stops after 60 seconds, and shows at most 80 KB. Credential files at any
+  depth (`.env`, `.env.*` including `.env.example`, `*.env`, `env_vars.txt`, `.netrc`,
+  `.npmrc`, `credentials`, `credentials.json`, `id_rsa`, `id_ed25519`, in any letter case)
+  are left out of the diff; status still names them. A folder that is not a Git
+  repository shows Git's own message.
 - **Workspace / Terminal**: run a command explicitly and see output while it runs.
   Set the timeout (1–3,600 seconds, default 60) and retained output limit
   (1,024–1,000,000 bytes, default 80,000). A foreground job disables Run until it
@@ -362,9 +366,11 @@ A conversation file that cannot be read (empty, not JSON, a damaged header or re
 or an ID that does not match the file name) does not stop the app. It is skipped, the
 other conversations list and open as usual, and a notice at the top of the page names
 the file and the reason; the reason never quotes the file's contents. The app never
-deletes, moves or rewrites such a file. Repair or remove it with the server stopped;
-it is listed again once it can be read. Requesting it through the API reports the
-problem instead of a server error.
+deletes, moves or rewrites such a file; a command job of that conversation stays in
+`conversations.sqlite3` and is not copied into the file. Repair or remove it with the
+server stopped; it is listed again once it can be read. Requesting it through the API
+reports the problem (HTTP 400) instead of a server error, and the page shows that message
+instead of trying to reconnect.
 
 New sessions have empty message history and fresh permissions.
 Project files are shared on disk when chats select the same workspace; starting a
@@ -944,8 +950,10 @@ credential-free shell environment, restart recovery, API access control, WebSock
 snapshots, stale editor writes, and keeping or undoing agent changes (whole files and single
 changes, stale-review refusal, undo as a restorable checkpoint), read-before-write refusals
 and the changed-files notice, `/api/git` not running a repository's `core.fsmonitor`
-program or filters, startup with unreadable conversation files, and dropping a WebSocket
-that stalls. None of these automated
+program or filters (a driver name containing `=` and a submodule's own filters included)
+and leaving nested credential files out of the diff, startup with unreadable conversation
+files (with command jobs, and a file holding another conversation's ID), and dropping a
+WebSocket that stalls. None of these automated
 tests calls a paid model.
 Frontend tests verify that expired local tokens refresh once and that other
 errors never replay a potentially completed action, that editor drafts survive saves
@@ -955,7 +963,8 @@ that the `/` skill menu lists, filters, and inserts skills without blocking ordi
 that the pages of a long file read name the lines they covered, and that agent changes
 show in the changes bar, as dots in the file list and as an inline diff whose Keep and Undo
 send the reviewed file state, and that unreadable conversation files are named in a
-dismissible notice.
+dismissible notice that returns keyboard focus to the message box, and that opening one
+shows the server's message without a reconnect loop.
 Backend regressions additionally cover credential
 path aliases, unreadable configuration recovery, cancellation during startup or
 after a child process outlives its shell, recovery of completed tool results

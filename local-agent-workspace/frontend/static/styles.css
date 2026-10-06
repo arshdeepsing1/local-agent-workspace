@@ -169,3 +169,4 @@
 .storage-notice>p,.storage-notice>div{flex:1;margin:0;overflow-wrap:anywhere;line-height:1.6}.storage-notice p{margin:0}
 .storage-notice ul{margin:4px 0 0;padding-left:18px}.storage-notice code{font:11px ui-monospace,SFMono-Regular,Menlo,monospace}
 @media(max-width:600px){.storage-notice{font-size:11px;padding:8px 12px}}
+.main-area:focus{outline:none}

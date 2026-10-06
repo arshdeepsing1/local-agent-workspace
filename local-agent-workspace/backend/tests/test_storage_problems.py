@@ -69,7 +69,7 @@ def test_app_starts_lists_and_opens_the_readable_conversations(state):
         assert "SECRET-CONTENT" not in json.dumps(bootstrap)
 
         # Opening one directly is a clear client error, never a server error.
-        for session_id in (GARBAGE_ID, EMPTY_ID, MISMATCH_ID, BODY_ID):
+        for session_id in (GARBAGE_ID, EMPTY_ID, MISMATCH_ID, BODY_ID, EVENTS_ID):
             response = client.get(f"/api/sessions/{session_id}")
             assert response.status_code == 400
             assert response.json()["detail"].startswith(f"Conversation file {session_id}.jsonl could not be read: ")
@@ -78,6 +78,54 @@ def test_app_starts_lists_and_opens_the_readable_conversations(state):
     # The files are left exactly as they were.
     for session_id, raw in files.items():
         assert (folder / f"{session_id}.jsonl").read_bytes() == raw
+
+
+def add_job(settings, session_id, job_id, state="completed"):
+    """A command job row, as JobManager keeps it in the operational database."""
+    import sqlite3
+    db = sqlite3.connect(settings.state_dir / "conversations.sqlite3")
+    db.execute("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, session_id TEXT, workspace TEXT, data TEXT)")
+    job = {"id": job_id, "session_id": session_id, "workspace": "/srv/project", "command": "true", "state": state,
+           "output": "", "created": 1.0, "updated": 2.0}
+    db.execute("INSERT INTO jobs VALUES (?, ?, ?, ?)", (job_id, session_id, "/srv/project", json.dumps(job)))
+    db.commit()
+    db.close()
+
+
+def test_command_jobs_of_unreadable_conversations_do_not_stop_startup(state):
+    settings, good, folder, files = state
+    add_job(settings, GARBAGE_ID, "job-1")
+    add_job(settings, EMPTY_ID, "job-2", state="running")
+    add_job(settings, BODY_ID, "job-3")
+    with TestClient(create_app(settings)) as client:
+        bootstrap = client.get("/api/bootstrap").json()
+        client.headers["X-Local-Token"] = bootstrap["token"]
+        assert [item["id"] for item in client.get("/api/sessions").json()] == [good["id"]]
+        assert len(bootstrap["storage_problems"]) == 5
+    for session_id, raw in files.items():
+        assert (folder / f"{session_id}.jsonl").read_bytes() == raw
+
+
+def test_a_file_holding_another_conversation_never_overwrites_it(state):
+    """A.jsonl restored from a copy of B: a job of A must not rewrite B.jsonl."""
+    settings, good, folder, _ = state
+    with TestClient(create_app(settings)) as client:
+        client.headers["X-Local-Token"] = client.get("/api/bootstrap").json()["token"]
+        stale = (folder / f"{good['id']}.jsonl").read_bytes()
+        client.put(f"/api/sessions/{good['id']}/title", json={"title": "Newer title"}).raise_for_status()
+    newer = (folder / f"{good['id']}.jsonl").read_bytes()
+    copy_id = "66666666-6666-4666-8666-666666666666"
+    (folder / f"{copy_id}.jsonl").write_bytes(stale)
+    add_job(settings, copy_id, "job-copy")
+
+    with TestClient(create_app(settings)) as client:
+        bootstrap = client.get("/api/bootstrap").json()
+        client.headers["X-Local-Token"] = bootstrap["token"]
+        assert client.get(f"/api/sessions/{good['id']}").json()["title"] == "Newer title"
+        assert {"file": f"{copy_id}.jsonl", "reason": "its conversation ID does not match the file name"} in (
+            bootstrap["storage_problems"])
+    assert (folder / f"{good['id']}.jsonl").read_bytes() == newer
+    assert (folder / f"{copy_id}.jsonl").read_bytes() == stale
 
 
 def test_a_repaired_file_is_listed_again(state):

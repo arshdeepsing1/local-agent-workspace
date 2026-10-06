@@ -6,7 +6,7 @@ import time
 import uuid
 from pathlib import Path
 
-from .git_tools import FILTER_KEYS, run_git
+from .git_tools import configured_filters, run_git
 
 
 class WorktreeManager:
@@ -30,8 +30,9 @@ class WorktreeManager:
         return code, text
 
     async def _filters(self, workspace):
-        _, names = await self._git(workspace, ["config", "--name-only", "--get-regexp", FILTER_KEYS], allowed=(0, 1))
-        return names.splitlines()
+        if not self.git:
+            raise ValueError("Git is required to create or remove a worktree.")
+        return await configured_filters(workspace, git=self.git)
 
     def list(self, workspace=None):
         workspace = str(Path(workspace).expanduser().resolve()) if workspace is not None else None
