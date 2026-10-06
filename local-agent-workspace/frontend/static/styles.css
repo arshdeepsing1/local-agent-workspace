@@ -206,6 +206,8 @@
 /* The changes, tasks and Continue bars get only the height the message box and a
    readable transcript leave, and scroll; the storage notice is bounded too. */
 .app-shell .chat-composer>*{flex-shrink:0}.app-shell .chat-composer>.composer-bars{flex:0 1 auto;min-height:0;overflow:auto;overscroll-behavior:contain}
+/* An open context meter shrinks and scrolls the same way, so Compact now stays reachable. */
+.app-shell .chat-composer>.context-meter[open]{flex:0 1 auto;min-height:3rem;overflow:auto;overscroll-behavior:contain}
 .app-shell .transcript,.app-shell .welcome{min-height:min(120px,16dvh)}
 .storage-notice{flex-shrink:0;max-height:min(160px,14dvh);overflow:auto}
 .markdown .code-block{position:relative;margin:0 0 14px}

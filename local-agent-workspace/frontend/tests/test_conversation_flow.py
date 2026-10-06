@@ -161,12 +161,20 @@ def test_task_checklist_shows_long_titles_in_full_on_a_phone(ui, page):
 
 # The bars above the message box never push it off-screen
 
+CONTEXT_INFO = {"estimated_tokens": 6000, "input_budget": 120832, "context_window": 131072, "reply_reserve": 8192,
+                "compactions": 1, "summarized_messages": 6, "estimate_method": "weighted_utf8", "instruction_files": [], "warnings": [],
+                "breakdown": {"system_instructions": 1000, "tool_definitions": 2000, "messages_and_results": 2500, "summary": 400,
+                              "request_overhead": 100}}
+
+
+@pytest.mark.parametrize("meter", [False, True])
 @pytest.mark.parametrize("width,height", [(390, 664), (390, 844), (844, 390), (667, 375), (1440, 900)])
-def test_open_changes_and_tasks_keep_the_message_box_on_screen(ui, page, width, height):
+def test_open_changes_and_tasks_keep_the_message_box_on_screen(ui, page, width, height, meter):
     page.set_viewport_size({"width": width, "height": height})
     problems = json.dumps([{"file": "broken-1.jsonl", "reason": "line 1 is not valid JSON"}])
     notice = "[{ id: 'n', type: 'notice', text: 'Reached the limit.', terminal_reason: 'step_limit' }]"
-    start_app(ui, page, session="a", setup=with_turn(notice, terminal_reason="step_limit") + "; fake.override = path => "
+    fields = {"terminal_reason": "step_limit", **({"context_info": CONTEXT_INFO} if meter else {})}
+    start_app(ui, page, session="a", setup=with_turn(notice, **fields) + "; fake.override = path => "
               f"path === '/api/bootstrap' ? fake.json({{ token: 'test-token', settings: fake.settings, storage_problems: {problems} }}) : undefined")
     ui.show_session("a")
     files = ", ".join(f"changedFile('src/module_{n}/file_{n}.py', {n + 1}, {n})" for n in range(12))
@@ -176,16 +184,36 @@ def test_open_changes_and_tasks_keep_the_message_box_on_screen(ui, page, width, 
     page.get_by_role("button", name=re.compile("files changed")).click()
     page.get_by_role("button", name=re.compile(r"^Tasks 0\/12 done")).click()
     expect(page.get_by_role("region", name="Tasks").get_by_role("listitem")).to_have_count(12)
-    for control in [message(page), page.get_by_role("button", name="Send message"),
-                    page.get_by_role("button", name=re.compile("^Permissions:")), page.get_by_role("combobox", name="Model")]:
-        box = control.bounding_box()
-        assert box and box["y"] >= 0 and box["y"] + box["height"] <= height and box["x"] + box["width"] <= width, box
-    assert ui.js("document.scrollingElement.scrollTop") == 0
-    assert ui.js("document.querySelector('.transcript').getBoundingClientRect().height") >= 56
-    # Every bar is still reachable with the keyboard, with its focus shown.
-    for control in [page.get_by_role("button", name="Undo changes to src/module_11/file_11.py"), continue_button(page)]:
+    compact = page.get_by_role("button", name="Compact now")
+    if meter:
+        page.get_by_text(re.compile("^Last model input")).click()
+        expect(compact).to_be_attached()
+
+    def on_screen():
+        for control in [message(page), page.get_by_role("button", name="Send message"),
+                        page.get_by_role("button", name=re.compile("^Permissions:")), page.get_by_role("combobox", name="Model")]:
+            box = control.bounding_box()
+            assert box and box["y"] >= 0 and box["y"] + box["height"] <= height and box["x"] + box["width"] <= width, box
+        assert ui.js("[document.scrollingElement.scrollTop, document.querySelector('.app-shell').scrollTop]") == [0, 0]
+        transcript = ui.js("(b => [b.top, b.height])(document.querySelector('.transcript').getBoundingClientRect())")
+        assert transcript[0] >= 0 and transcript[1] >= 56, transcript
+
+    on_screen()
+    if meter:  # The open meter scrolls, so the wheel brings Compact now into view.
+        details = page.locator(".context-details").bounding_box()
+        page.mouse.move(details["x"] + 20, details["y"] + 5)
+        for _ in range(20):
+            page.mouse.wheel(0, 200)
+        expect(compact).to_be_in_viewport(ratio=1)
+        on_screen()
+        ui.run("for (const e of document.querySelectorAll('.context-meter, .context-details')) e.scrollTop = 0")
+        if height < 600:  # Out of view again, for the keyboard check below.
+            expect(compact).not_to_be_in_viewport(ratio=1)
+    # Every bar (or the open meter's button) is still reachable with the keyboard, with its focus shown.
+    for control in [compact] if meter else [page.get_by_role("button", name="Undo changes to src/module_11/file_11.py"), continue_button(page)]:
         control.focus()
         expect(control).to_be_in_viewport(ratio=1)
+        on_screen()
 
 
 # Saved drafts
