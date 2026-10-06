@@ -6,3 +6,5 @@ __pycache__/
 *.pyc
 *.egg-info/
 .DS_Store
+# Automatic compaction handoffs when the app folder is a chat's workspace.
+handoffs/

@@ -1,2 +1,4 @@
 /claude-agent-sdk-python-main/
 .DS_Store
+# Automatic compaction handoffs when the repository root is a chat's workspace.
+/handoffs/

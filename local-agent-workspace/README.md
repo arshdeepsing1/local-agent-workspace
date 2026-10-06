@@ -897,7 +897,17 @@ python -m pip install -c constraints.txt -e './backend[test,ui-test]'
 python -m playwright install chromium
 # Then:
 (cd frontend && python -m pytest -q)
+
+# Static checks and the personal-data check (also run by CI):
+python -m pip install -c constraints.txt -e './backend[lint]'
+python -m ruff check --select F,E9 backend frontend/tests scripts
+python3 scripts/check_personal_data.py
 ```
+
+GitHub Actions (`.github/workflows/tests.yml` at the repository root) runs the personal-data
+check, the lint check and both test suites on Ubuntu and macOS for pull requests, pushes to
+`main`, and on demand. It uses no credentials and makes no model calls. Notable changes are
+listed in `CHANGELOG.md`.
 
 `python -m playwright install chromium` downloads Playwright's own Chromium; to use
 a browser that is already installed instead, set `UI_TEST_CHROMIUM` to its

@@ -1,0 +1,42 @@
+# Offline checks for Local Agent Workspace: no Databricks credentials, no paid model calls.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: local-agent-workspace
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the app with test and lint extras
+        run: python -m pip install -c constraints.txt -e './backend[test,ui-test,lint]'
+      - name: Install Chromium for the UI tests
+        run: python -m playwright install ${{ runner.os == 'Linux' && '--with-deps' || '' }} chromium
+      - name: Personal-data check
+        run: python scripts/check_personal_data.py
+      - name: Lint (errors and unused names)
+        run: python -m ruff check --select F,E9 backend frontend/tests scripts
+      - name: Backend tests
+        working-directory: local-agent-workspace/backend
+        run: python -m pytest -q
+      - name: UI tests
+        working-directory: local-agent-workspace/frontend
+        run: python -m pytest -q
