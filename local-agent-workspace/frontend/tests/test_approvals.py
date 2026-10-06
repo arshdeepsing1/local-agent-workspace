@@ -171,6 +171,30 @@ def test_removing_rules_with_the_keyboard_keeps_focus_in_the_menu(ui, page):
     expect(page.get_by_role("button", name=re.compile("^Permissions:"))).to_be_focused()
 
 
+def test_removing_a_rule_does_not_mark_the_chat_unread_after_leaving(ui, page):
+    # The server saves the chat (a newer 'updated') but pushes only a 'permissions' message.
+    ui.app(session="a", scenario="workspace", clock=True, setup=RULES.replace(
+        "allow_rules: fake.sessions.get('a').allow_rules", "updated: 9, allow_rules: fake.sessions.get('a').allow_rules")
+        + "\nfake.sessions.set('b', makeSession('b', 'Second chat'))")
+    expect(page.get_by_role("combobox", name="Model")).to_have_value("test-model")
+    ui.show_session("a")
+    page.get_by_role("button", name=re.compile("^Permissions:")).click()
+    page.get_by_role("menuitem", name="Remove rule: File edits").click()
+    expect(page.get_by_role("menuitem", name=re.compile("^Remove rule:"))).to_have_count(3)
+    page.keyboard.press("Escape")
+    page.get_by_role("button", name=re.compile("^Second chat")).click()
+    ui.show_session("b")
+    polls = len(ui.requests("/api/sessions", "GET"))
+    ui.tick(10000)  # The sessions list is polled and now has the newer 'updated'.
+    ui.wait(f"fake.requests('/api/sessions', 'GET').length > {polls}")
+    expect(page.get_by_role("button", name=re.compile("^Other conversation"))).not_to_contain_text("Unread")
+    assert json.loads(ui.js("localStorage.getItem('local.seenConversations')"))["a"] == 9
+    # A later change by the agent is still news.
+    ui.run("fake.sessions.set('a', { ...fake.sessions.get('a'), updated: 12 })")
+    ui.tick(10000)
+    expect(page.get_by_role("button", name=re.compile("^Other conversation"))).to_contain_text("Unread")
+
+
 def test_a_command_rule_shows_its_exact_spacing(ui, page):
     ui.app(session="a", scenario="workspace", setup=RULES + "\nfake.sessions.get('a').allow_rules = [{ tool: 'run_command', command: 'echo  two  spaces' }]")
     ui.show_session("a")

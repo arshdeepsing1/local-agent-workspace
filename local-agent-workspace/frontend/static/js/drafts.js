@@ -54,8 +54,9 @@ export function saveDraft(key, text) {
 // The composer draft of each view (viewKey), saved under storeKey: the
 // conversation id, or 'new' before the conversation exists. When the new view
 // becomes a conversation, its draft moves from 'new' to the id.
-// Returns [draft, setDraft, forget(sentText, ...storeKeys)]; forget removes a
-// sent draft at once. Text typed while the message was sending is saved again.
+// Returns [draft, setDraft, forget(sentText, ...storeKeys), release(storeKey)];
+// forget removes a sent draft at once. Text typed while the message was sending
+// is saved again.
 export function useSavedDrafts(viewKey, storeKey) {
   const [drafts, setDrafts] = useState({})
   const known = Object.prototype.hasOwnProperty.call(drafts, viewKey)
@@ -103,5 +104,22 @@ export function useSavedDrafts(viewKey, storeKey) {
     // The composer keeps text typed during the send; schedule its save again.
     if (latest.current && latest.current.trim() !== sent) setRevision(value => value + 1)
   }
-  return [draft, setDraft, forget]
+  // Sending the first message of a new conversation: its text leaves the shared
+  // 'new' draft at once, so a new conversation opened during the send starts
+  // empty. Returns restore(), which brings it back if the send fails: into the
+  // new-conversation view now open when its box is empty, else saved as the draft.
+  const release = key => {
+    const view = viewKey
+    const text = latest.current
+    clearTimeout(timer.current)
+    pending.current = null
+    removeDraft(key)
+    return () => {
+      const open = previous.current
+      if (open.viewKey === view) setRevision(value => value + 1)
+      else if (open.storeKey === key) setDrafts(current => current[open.viewKey] ? current : { ...current, [open.viewKey]: text })
+      else if (loadDraft(key) === null) saveDraft(key, text)
+    }
+  }
+  return [draft, setDraft, forget, release]
 }

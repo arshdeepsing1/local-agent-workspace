@@ -159,6 +159,63 @@ def test_task_checklist_shows_long_titles_in_full_on_a_phone(ui, page):
     assert ui.js("(e => e.scrollWidth <= e.clientWidth && e.getBoundingClientRect().height > 20)(document.querySelector('.task-checklist-title'))")
 
 
+# The bars above the message box never push it off-screen
+
+CONTEXT_INFO = {"estimated_tokens": 6000, "input_budget": 120832, "context_window": 131072, "reply_reserve": 8192,
+                "compactions": 1, "summarized_messages": 6, "estimate_method": "weighted_utf8", "instruction_files": [], "warnings": [],
+                "breakdown": {"system_instructions": 1000, "tool_definitions": 2000, "messages_and_results": 2500, "summary": 400,
+                              "request_overhead": 100}}
+
+
+@pytest.mark.parametrize("meter", [False, True])
+@pytest.mark.parametrize("width,height", [(390, 664), (390, 844), (844, 390), (667, 375), (1440, 900)])
+def test_open_changes_and_tasks_keep_the_message_box_on_screen(ui, page, width, height, meter):
+    page.set_viewport_size({"width": width, "height": height})
+    problems = json.dumps([{"file": "broken-1.jsonl", "reason": "line 1 is not valid JSON"}])
+    notice = "[{ id: 'n', type: 'notice', text: 'Reached the limit.', terminal_reason: 'step_limit' }]"
+    fields = {"terminal_reason": "step_limit", **({"context_info": CONTEXT_INFO} if meter else {})}
+    start_app(ui, page, session="a", setup=with_turn(notice, **fields) + "; fake.override = path => "
+              f"path === '/api/bootstrap' ? fake.json({{ token: 'test-token', settings: fake.settings, storage_problems: {problems} }}) : undefined")
+    ui.show_session("a")
+    files = ", ".join(f"changedFile('src/module_{n}/file_{n}.py', {n + 1}, {n})" for n in range(12))
+    ui.run(f"fake.socketFor('a').emit({{ type: 'changes', changes: makeChanges({files}) }})")
+    ui.emit("a", {"type": "tasks", "tasks": [{**TASKS[2], "id": f"t{n}", "title": f"Task number {n}"} for n in range(12)]})
+    expect(page.get_by_role("alert")).to_contain_text("broken-1.jsonl")
+    page.get_by_role("button", name=re.compile("files changed")).click()
+    page.get_by_role("button", name=re.compile(r"^Tasks 0\/12 done")).click()
+    expect(page.get_by_role("region", name="Tasks").get_by_role("listitem")).to_have_count(12)
+    compact = page.get_by_role("button", name="Compact now")
+    if meter:
+        page.get_by_text(re.compile("^Last model input")).click()
+        expect(compact).to_be_attached()
+
+    def on_screen():
+        for control in [message(page), page.get_by_role("button", name="Send message"),
+                        page.get_by_role("button", name=re.compile("^Permissions:")), page.get_by_role("combobox", name="Model")]:
+            box = control.bounding_box()
+            assert box and box["y"] >= 0 and box["y"] + box["height"] <= height and box["x"] + box["width"] <= width, box
+        assert ui.js("[document.scrollingElement.scrollTop, document.querySelector('.app-shell').scrollTop]") == [0, 0]
+        transcript = ui.js("(b => [b.top, b.height])(document.querySelector('.transcript').getBoundingClientRect())")
+        assert transcript[0] >= 0 and transcript[1] >= 56, transcript
+
+    on_screen()
+    if meter:  # The open meter scrolls, so the wheel brings Compact now into view.
+        details = page.locator(".context-details").bounding_box()
+        page.mouse.move(details["x"] + 20, details["y"] + 5)
+        for _ in range(20):
+            page.mouse.wheel(0, 200)
+        expect(compact).to_be_in_viewport(ratio=1)
+        on_screen()
+        ui.run("for (const e of document.querySelectorAll('.context-meter, .context-details')) e.scrollTop = 0")
+        if height < 600:  # Out of view again, for the keyboard check below.
+            expect(compact).not_to_be_in_viewport(ratio=1)
+    # Every bar (or the open meter's button) is still reachable with the keyboard, with its focus shown.
+    for control in [compact] if meter else [page.get_by_role("button", name="Undo changes to src/module_11/file_11.py"), continue_button(page)]:
+        control.focus()
+        expect(control).to_be_in_viewport(ratio=1)
+        on_screen()
+
+
 # Saved drafts
 
 def stored(ui):
@@ -235,6 +292,77 @@ def test_new_conversation_draft_moves_to_the_created_chat_and_is_cleared_on_send
     expect(message(page)).to_have_value("")
     page.wait_for_timeout(700)
     assert stored(ui) == {}
+
+
+DEFERRED_CREATION = """fake.override = (path, options) =>
+  path === '/api/sessions' && options.method === 'POST' ? fake.defer('create').promise : undefined"""
+
+
+def test_a_new_view_opened_while_the_first_message_is_sent_starts_empty(ui, page):
+    start_app(ui, page, setup=DEFERRED_CREATION)
+    message(page).fill("Hello there")
+    ui.wait("localStorage.getItem('local-workspace:draft:new') === 'Hello there'")
+    page.get_by_role("button", name="Send message").click()
+    ui.wait("fake.requests('/api/sessions', 'POST').length === 1")
+    assert stored(ui) == {}
+    page.get_by_role("button", name="New conversation").click()
+    expect(message(page)).to_have_value("")
+    ui.run("""fake.override = () => undefined
+      const created = makeSession('created', 'Created conversation'); fake.sessions.set('created', created)
+      fake.deferreds.create.resolve(fake.json(created))""")
+    ui.wait("fake.requests('/api/sessions/created/messages', 'POST').length === 1")
+    assert ui.bodies("/api/sessions/created/messages", "POST") == [{"text": "Hello there"}]
+    page.wait_for_timeout(700)
+    expect(message(page)).to_have_value("")
+    assert stored(ui) == {}
+
+
+@pytest.mark.parametrize("switch", [False, True])
+def test_a_failed_first_message_is_saved_again_as_the_new_draft(ui, page, switch):
+    start_app(ui, page, setup=DEFERRED_CREATION)
+    message(page).fill("Hello there")
+    page.get_by_role("button", name="Send message").click()
+    ui.wait("fake.requests('/api/sessions', 'POST').length === 1")
+    if switch:  # The user opened another chat while the first one was being created.
+        page.get_by_role("button", name=re.compile("^Other conversation")).click()
+        ui.show_session("a")
+    ui.run("fake.deferreds.create.resolve(fake.json({ detail: 'Could not create the conversation.' }, 500))")
+    if not switch:
+        expect(page.get_by_role("alert")).to_contain_text("Could not create the conversation.")
+    ui.wait("localStorage.getItem('local-workspace:draft:new') === 'Hello there'")
+    page.wait_for_timeout(700)
+    assert stored(ui) == {"new": "Hello there"}
+    if switch:
+        page.get_by_role("button", name="New conversation").click()
+    expect(message(page)).to_have_value("Hello there")
+
+
+def test_a_failed_first_message_comes_back_in_a_new_view_opened_during_the_send(ui, page):
+    start_app(ui, page, setup=DEFERRED_CREATION)
+    message(page).fill("Hello there")
+    page.get_by_role("button", name="Send message").click()
+    ui.wait("fake.requests('/api/sessions', 'POST').length === 1")
+    page.get_by_role("button", name="New conversation").click()
+    expect(message(page)).to_have_value("")
+    ui.run("fake.deferreds.create.resolve(fake.json({ detail: 'Could not create the conversation.' }, 500))")
+    expect(message(page)).to_have_value("Hello there")
+    message(page).press("End")
+    message(page).type("!")
+    ui.wait("localStorage.getItem('local-workspace:draft:new') === 'Hello there!'")
+    page.get_by_role("button", name="New conversation").click()
+    expect(message(page)).to_have_value("Hello there!")
+
+
+def test_a_first_message_that_fails_after_creation_stays_with_the_created_chat(ui, page):
+    start_app(ui, page, setup="""fake.override = (path, options) => path === '/api/sessions/created/messages'
+      ? fake.json({ detail: 'The model is unavailable.' }, 500) : undefined""")
+    message(page).fill("Hello there")
+    page.get_by_role("button", name="Send message").click()
+    expect(page.get_by_role("alert")).to_contain_text("The model is unavailable.")
+    ui.wait("localStorage.getItem('local-workspace:draft:created') === 'Hello there'")
+    page.wait_for_timeout(700)
+    assert stored(ui) == {"created": "Hello there"}
+    expect(message(page)).to_have_value("Hello there")
 
 
 def test_folder_access_creation_keeps_the_restored_draft_with_the_chat(ui, page):

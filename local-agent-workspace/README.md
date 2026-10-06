@@ -74,7 +74,9 @@ panel and worktrees. Shell tools select zsh, bash, or sh, in that order. The
 frontend is plain JavaScript loaded directly by the browser, so a fresh checkout
 needs no Node.js, pnpm, or frontend build to run or change. Native Windows is not
 supported by the POSIX filesystem/process handling; use a Linux environment such as WSL for that
-platform. Linux/WSL have not yet been validated.
+platform. The continuous-integration workflow (`.github/workflows/tests.yml`) runs the backend
+and UI test suites on Ubuntu and macOS; everyday use on Linux and WSL has not yet been checked
+by hand.
 
 Clone the repository or copy the `local-agent-workspace` folder, including
 `backend`, `frontend`, and the setup files at its root. No sibling repository
@@ -199,8 +201,10 @@ when opening a conversation or performing restart recovery.
   Drafts stay with their conversation while switching chats and are saved in this
   browser's `localStorage` about half a second after you stop typing (and when the page
   closes), so they survive a reload; the new-conversation view keeps its own draft, which
-  moves to the conversation once it exists. A sent draft is removed; text typed while it
-  was sending is saved as the new draft. At most 50 drafts
+  moves to the conversation once it exists. A sent draft is removed (a new conversation's
+  first message as soon as you send it, so **New** during the send starts empty; if sending
+  fails it comes back as the new-conversation draft, also in a new view opened during the
+  send); text typed while it was sending is saved as the new draft. At most 50 drafts
   are kept (the oldest goes first). A draft over 100 KB, or any draft when the browser
   blocks storage, is kept only in the page. Drafts stay in this browser profile; the
   server never receives them.

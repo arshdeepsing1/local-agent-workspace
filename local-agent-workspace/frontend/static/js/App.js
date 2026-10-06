@@ -23,8 +23,14 @@ export default function App() {
   const attention = useAttention({ sessions: app.sessions, activeId: app.activeId, ready: app.ready, onSelect: app.setActiveId })
   // Message drafts are saved in localStorage per conversation ('new' before it exists).
   const draftKey = app.activeId || 'new'
-  const [draft, setDraft, forgetDraft] = useSavedDrafts(app.viewKey, draftKey)
-  const send = async text => { const id = await app.send(text); forgetDraft(text, draftKey, id) }
+  const [draft, setDraft, forgetDraft, releaseDraft] = useSavedDrafts(app.viewKey, draftKey)
+  const send = async text => {
+    const restore = draftKey === 'new' ? releaseDraft('new') : null
+    let id
+    try { id = await app.send(text) }
+    catch (error) { restore?.(); throw error }
+    forgetDraft(text, draftKey, id)
+  }
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [agentToolsOpen, setAgentToolsOpen] = useState(false)
   const [workspaceOpen, setWorkspaceOpen] = useState(false)
@@ -48,9 +54,16 @@ export default function App() {
   }
   const changedFiles = app.changes?.files.length || 0
   const openReview = path => { setReview({ path, viewKey: app.viewKey }); setWorkspaceOpen(true) }
+  // Removing a rule saves the chat (a newer 'updated'); like a rename, your own change is not news.
+  const removeAllowRule = async rule => {
+    const id = app.activeId
+    const before = app.sessions.find(item => item.id === id)?.updated
+    const updated = await app.removeAllowRule(rule)
+    if (typeof updated?.updated === 'number') attention.renamed(id, before, updated.updated)
+  }
   const composer = html`<${Composer} key=${app.viewKey} value=${draft} setValue=${setDraft} model=${active?.model || app.settings?.model || 'databricks-gpt-oss-120b'}
     workspace=${active?.workspace || app.settings?.workspace || ''} mode=${app.permissionMode} onMode=${app.setPermissionMode} onProject=${() => setSettingsOpen(true)}
-    onFolders=${() => setFoldersOpen(true)} rules=${active?.allow_rules || []} onRemoveRule=${app.removeAllowRule}
+    onFolders=${() => setFoldersOpen(true)} rules=${active?.allow_rules || []} onRemoveRule=${removeAllowRule}
     models=${app.connection?.models || []} busy=${busy} modelSaving=${app.modelSaving}
     disabled=${!app.ready || (!!app.activeId && !active) || !app.settings?.configured}
     onModel=${app.changeModel}
@@ -86,9 +99,9 @@ export default function App() {
             <button class="outline" onClick=${() => setDraft('Help me make a change in this project: ')}><${Pencil} size=${16} />Make a change</button>
             <button class="outline" onClick=${() => setDraft('Run a command in this workspace: ')}><${Terminal} size=${16} />Run a command</button></div>
         </div></div>`}
-      <div class="chat-composer"><${ChangesBar} key=${`changes-${app.viewKey}`} changes=${app.changes} busy=${busy} onOpen=${openReview} onAction=${app.reviewChanges} onError=${showError} />
+      <div class="chat-composer"><div class="composer-bars"><${ChangesBar} key=${`changes-${app.viewKey}`} changes=${app.changes} busy=${busy} onOpen=${openReview} onAction=${app.reviewChanges} onError=${showError} />
         <${TaskChecklist} key=${`tasks-${app.viewKey}`} tasks=${app.tasks} />
-        <${ContinueButton} session=${active} disabled=${!app.ready || !app.online || app.modelSaving || !app.settings?.configured} onSend=${app.send} onError=${showError} />
+        <${ContinueButton} session=${active} disabled=${!app.ready || !app.online || app.modelSaving || !app.settings?.configured} onSend=${app.send} onError=${showError} /></div>
         ${composer}
         ${active?.status === 'awaiting_approval' ? html`<p class="composer-hint" role="status">An action is waiting for your approval above.</p>` : null}
         ${active?.status === 'compacting' ? html`<p class="composer-hint" role="status">Compacting context…</p>` : null}
