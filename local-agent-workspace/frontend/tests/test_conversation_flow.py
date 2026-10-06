@@ -266,6 +266,61 @@ def test_new_conversation_draft_moves_to_the_created_chat_and_is_cleared_on_send
     assert stored(ui) == {}
 
 
+DEFERRED_CREATION = """fake.override = (path, options) =>
+  path === '/api/sessions' && options.method === 'POST' ? fake.defer('create').promise : undefined"""
+
+
+def test_a_new_view_opened_while_the_first_message_is_sent_starts_empty(ui, page):
+    start_app(ui, page, setup=DEFERRED_CREATION)
+    message(page).fill("Hello there")
+    ui.wait("localStorage.getItem('local-workspace:draft:new') === 'Hello there'")
+    page.get_by_role("button", name="Send message").click()
+    ui.wait("fake.requests('/api/sessions', 'POST').length === 1")
+    assert stored(ui) == {}
+    page.get_by_role("button", name="New conversation").click()
+    expect(message(page)).to_have_value("")
+    ui.run("""fake.override = () => undefined
+      const created = makeSession('created', 'Created conversation'); fake.sessions.set('created', created)
+      fake.deferreds.create.resolve(fake.json(created))""")
+    ui.wait("fake.requests('/api/sessions/created/messages', 'POST').length === 1")
+    assert ui.bodies("/api/sessions/created/messages", "POST") == [{"text": "Hello there"}]
+    page.wait_for_timeout(700)
+    expect(message(page)).to_have_value("")
+    assert stored(ui) == {}
+
+
+@pytest.mark.parametrize("switch", [False, True])
+def test_a_failed_first_message_is_saved_again_as_the_new_draft(ui, page, switch):
+    start_app(ui, page, setup=DEFERRED_CREATION)
+    message(page).fill("Hello there")
+    page.get_by_role("button", name="Send message").click()
+    ui.wait("fake.requests('/api/sessions', 'POST').length === 1")
+    if switch:  # The user opened another chat while the first one was being created.
+        page.get_by_role("button", name=re.compile("^Other conversation")).click()
+        ui.show_session("a")
+    ui.run("fake.deferreds.create.resolve(fake.json({ detail: 'Could not create the conversation.' }, 500))")
+    if not switch:
+        expect(page.get_by_role("alert")).to_contain_text("Could not create the conversation.")
+    ui.wait("localStorage.getItem('local-workspace:draft:new') === 'Hello there'")
+    page.wait_for_timeout(700)
+    assert stored(ui) == {"new": "Hello there"}
+    if switch:
+        page.get_by_role("button", name="New conversation").click()
+    expect(message(page)).to_have_value("Hello there")
+
+
+def test_a_first_message_that_fails_after_creation_stays_with_the_created_chat(ui, page):
+    start_app(ui, page, setup="""fake.override = (path, options) => path === '/api/sessions/created/messages'
+      ? fake.json({ detail: 'The model is unavailable.' }, 500) : undefined""")
+    message(page).fill("Hello there")
+    page.get_by_role("button", name="Send message").click()
+    expect(page.get_by_role("alert")).to_contain_text("The model is unavailable.")
+    ui.wait("localStorage.getItem('local-workspace:draft:created') === 'Hello there'")
+    page.wait_for_timeout(700)
+    assert stored(ui) == {"created": "Hello there"}
+    expect(message(page)).to_have_value("Hello there")
+
+
 def test_folder_access_creation_keeps_the_restored_draft_with_the_chat(ui, page):
     start_app(ui, page, setup="try { localStorage.setItem('local-workspace:draft:new', 'Restored idea') } catch {}")
     expect(message(page)).to_have_value("Restored idea")
