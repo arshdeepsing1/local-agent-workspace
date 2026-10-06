@@ -280,6 +280,11 @@ def test_reasoning_display_limit_notice(ui, page, truncated):
     expect(page.get_by_text("Summary display limit reached.")).to_have_count(1 if truncated else 0)
 
 
+def test_activity_summary_counts_one_action_in_the_singular(ui, page):
+    show(ui, "[{ id: 'only', type: 'tool', name: 'list_files', state: 'completed', input: { path: '.' } }]")
+    expect(page.get_by_text("Activity · 1 action", exact=True)).to_be_visible()
+
+
 def test_activity_summary_keeps_states_and_approval(ui, page):
     states = ["running", "pending", "completed", "rejected", "cancelled", "error"]
     events = "[" + ",".join(f"{{ id: 'tool-{i}', type: 'tool', name: 'action_{i}', state: '{state}', input: {{ path: 'file-{i}' }} }}"

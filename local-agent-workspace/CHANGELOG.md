@@ -4,6 +4,23 @@ Notable changes to Local Agent Workspace, newest first. Dates are UTC.
 
 ## Unreleased
 
+Roadmap milestone M1 (attention, approval quick wins, safety):
+
+- Notifications: opt-in browser notifications when a chat needs approval, finishes or stops with
+  an error; a "(n)" count in the tab title; optional desktop notifications from the server when no
+  page is open (Settings).
+- Sidebar status: Needs approval, working, Error and unread markers, and a Running filter.
+- Approvals: **Allow for this chat** (an exact command, edits, an MCP tool or a hook), **Decline
+  with a note** that reaches the agent, and errors that name the busy chat with an Open button.
+- Safety: Workspace → Changes runs Git without a shell, hooks, fsmonitor or filters; an unreadable
+  conversation file is reported and hidden instead of stopping the app; a stalled browser tab is
+  disconnected after 5 seconds; `write_file` refuses to overwrite a file the agent has not read
+  (or that changed since), and the agent is told which files changed under it.
+- Conversation: a Continue button after a step limit, output limit, Stop or restart; a live task
+  checklist and a `get_task` tool; message drafts saved across reloads; highlighted code blocks
+  with Copy code; Markdown export and Copy conversation in Agent tools → Conversation.
+- Workspace → Files can browse folders granted to the chat, with change dots there too.
+- The volatile parts of the system prompt (time, granted folders) now come last.
 - Continuous integration: offline backend and UI tests, a lint check and a personal-data check on
   Ubuntu and macOS for every pull request and push to `main` (`.github/workflows/tests.yml`).
   `scripts/check_personal_data.py` runs the same personal-data check locally.

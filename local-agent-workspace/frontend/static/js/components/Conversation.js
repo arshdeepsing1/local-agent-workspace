@@ -189,7 +189,7 @@ export default function Conversation({ session, onError, onSelectSession }) {
     const el = container.current
     if (el) follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120
   }}><div class="transcript-inner">
-    ${tools.length ? html`<details class="activity-summary"><summary>Activity · ${tools.length} actions</summary>
+    ${tools.length ? html`<details class="activity-summary"><summary>Activity · ${tools.length} ${tools.length === 1 ? 'action' : 'actions'}</summary>
       <ol>${tools.map(event => {
         const summary = toolSummaries.get(event.id)
         return html`<li key=${event.id}><span>${(event.name || 'Tool').replace(/_/g, ' ')}</span>${summary.subject ? html`<span class="activity-subject"> · ${summary.subject}</span>` : null}
