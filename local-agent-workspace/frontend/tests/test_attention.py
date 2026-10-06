@@ -154,8 +154,9 @@ def test_the_open_chat_notifies_only_while_the_page_is_hidden(ui, page):
                          ["Local", f"Stopped with an error: {short}", "a:error"]]
 
 
-def test_a_subagent_notifies_only_when_it_needs_approval(ui, page):
-    start(ui, page, setup=GRANTED + sessions(("c", "Delegated check", {"is_subagent": True, "status": "running"})), clock=True)
+def test_a_delegated_turn_notifies_only_when_it_needs_approval(ui, page):
+    start(ui, page, setup=GRANTED + sessions(("c", "Delegated check", {"is_subagent": True, "status": "running",
+                                                                       "turn_delegated": True})), clock=True)
     update(ui, "c", status="awaiting_approval")
     ui.tick(1500)
     ui.wait("notifications.length === 1")
@@ -164,6 +165,35 @@ def test_a_subagent_notifies_only_when_it_needs_approval(ui, page):
     expect(row(page, "Delegated check").locator(".row-badge")).to_have_count(0)
     settle(ui)
     assert notes(ui) == [["Local", "Needs your approval: Delegated check", "c:approval"]]
+    # Continued by you, not by the parent: nobody else reports its end.
+    update(ui, "c", status="running", turn_ended=None, turn_delegated=False)
+    ui.tick(10000)
+    update(ui, "c", status="idle", terminal_reason="completed", updated=3, turn_ended=3)
+    ui.tick(1500)
+    ui.wait("notifications.length === 2")
+    assert notes(ui)[-1] == ["Local", "Finished: Delegated check", "c:finished"]
+
+
+def test_a_subagent_chat_open_in_a_hidden_tab_notifies_when_your_turn_ends(ui, page):
+    start(ui, page, "c", setup=GRANTED + sessions(("c", "Delegated check", {"is_subagent": True, "turn_ended": 1,
+                                                                            "turn_delegated": True})))
+    ui.show_session("c")
+    ui.run("window.pageHidden = true")
+    ui.emit("c", {"type": "status", "status": "running"})
+    # The status that ends your turn carries no turn_delegated: this turn was not delegated.
+    ui.emit("c", {"type": "status", "status": "idle", "terminal_reason": "completed", "turn_ended": 5})
+    ui.wait("notifications.length === 1")
+    assert notes(ui) == [["Local", "Finished: Delegated check", "c:finished"]]
+
+
+def test_a_turn_stopped_at_the_step_limit_is_not_announced_as_finished(ui, page):
+    start(ui, page, "b", setup=GRANTED + sessions(("a", "Long job", {"status": "running", "turn_ended": None}),
+                                                   ("b", "Selected chat", {})), clock=True)
+    ui.show_session("b")
+    update(ui, "a", status="idle", terminal_reason="step_limit", turn_ended=6, updated=6)
+    ui.tick(1500)
+    ui.wait("notifications.length === 1")
+    assert notes(ui) == [["Local", "Reached the step limit: Long job", "a:step_limit"]]
 
 
 def test_turn_ends_notify_after_automatic_compaction_but_not_after_a_manual_one(ui, page):

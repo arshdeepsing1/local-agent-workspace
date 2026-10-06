@@ -582,7 +582,8 @@ class AgentManager:
         message = {"type": "status", "status": status}
         if status == "idle":
             # How and when the last turn ended, for notifications and the Continue button.
-            message.update({key: session[key] for key in ("terminal_reason", "turn_ended") if session.get(key)})
+            message.update({key: session[key] for key in ("terminal_reason", "turn_ended", "turn_delegated")
+                            if session.get(key)})
         await self.broadcast(session["id"], message)
         self.notify_status(session, previous, status, turn_ended)
         await self.delegates.progress(session, status=status)
@@ -755,12 +756,13 @@ class AgentManager:
             # Saved with the user event. turn_running (internal) lasts until the model loop
             # ends and tells restart recovery the answer was cut short; turn_ended is None
             # while the turn runs and records when it ended (notifications).
-            session.update(turn_running=True, turn_ended=None)
-            await self.status(session, "running")
             origin = {}
             if session.get("parent_event_id") and not session["events"] and not session.get("delegation", {}).get("terminal_reason"):
                 origin = {"origin": {"kind": "delegated", "parent_session_id": session["parent_session_id"],
                                      "parent_event_id": session["parent_event_id"], "parent_call_id": session.get("parent_call_id")}}
+            # turn_delegated: the parent's delegate_task started this turn and reports its end.
+            session.update(turn_running=True, turn_ended=None, turn_delegated=bool(origin))
+            await self.status(session, "running")
             await self.event(session, "user", text=prompt, **origin)
             if session["title"] == "New conversation" and not session.get("title_generated"):
                 session["title"] = fallback_title(prompt, self.redact_title)

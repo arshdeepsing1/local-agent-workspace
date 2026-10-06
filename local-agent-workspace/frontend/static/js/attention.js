@@ -46,12 +46,14 @@ export function attentionFor(before, session) {
   if (session.status === 'awaiting_approval') {
     return before.status === 'awaiting_approval' ? null : { state: 'approval', body: `Needs your approval: ${title}` }
   }
-  // A subagent's end is reported by its parent's turn; a stop was asked for.
+  // A turn that delegate_task started is reported by its parent's turn (a subagent chat
+  // you continued yourself is not); a stop was asked for.
   if (session.status !== 'idle' || !session.turn_ended || session.turn_ended === before.turn_ended
-    || session.is_subagent || session.terminal_reason === 'stopped') return null
-  return ERROR_REASONS.has(session.terminal_reason)
-    ? { state: 'error', body: `Stopped with an error: ${title}` }
-    : { state: 'finished', body: `Finished: ${title}` }
+    || session.turn_delegated || session.terminal_reason === 'stopped') return null
+  if (ERROR_REASONS.has(session.terminal_reason)) return { state: 'error', body: `Stopped with an error: ${title}` }
+  // Not finished: the chat offers Continue.
+  if (session.terminal_reason === 'step_limit') return { state: 'step_limit', body: `Reached the step limit: ${title}` }
+  return { state: 'finished', body: `Finished: ${title}` }
 }
 
 // Held open while this page is: the server's desktop notifications are only for
