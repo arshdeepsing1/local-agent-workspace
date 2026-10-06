@@ -159,6 +159,35 @@ def test_task_checklist_shows_long_titles_in_full_on_a_phone(ui, page):
     assert ui.js("(e => e.scrollWidth <= e.clientWidth && e.getBoundingClientRect().height > 20)(document.querySelector('.task-checklist-title'))")
 
 
+# The bars above the message box never push it off-screen
+
+@pytest.mark.parametrize("width,height", [(390, 664), (390, 844), (844, 390), (667, 375), (1440, 900)])
+def test_open_changes_and_tasks_keep_the_message_box_on_screen(ui, page, width, height):
+    page.set_viewport_size({"width": width, "height": height})
+    problems = json.dumps([{"file": "broken-1.jsonl", "reason": "line 1 is not valid JSON"}])
+    notice = "[{ id: 'n', type: 'notice', text: 'Reached the limit.', terminal_reason: 'step_limit' }]"
+    start_app(ui, page, session="a", setup=with_turn(notice, terminal_reason="step_limit") + "; fake.override = path => "
+              f"path === '/api/bootstrap' ? fake.json({{ token: 'test-token', settings: fake.settings, storage_problems: {problems} }}) : undefined")
+    ui.show_session("a")
+    files = ", ".join(f"changedFile('src/module_{n}/file_{n}.py', {n + 1}, {n})" for n in range(12))
+    ui.run(f"fake.socketFor('a').emit({{ type: 'changes', changes: makeChanges({files}) }})")
+    ui.emit("a", {"type": "tasks", "tasks": [{**TASKS[2], "id": f"t{n}", "title": f"Task number {n}"} for n in range(12)]})
+    expect(page.get_by_role("alert")).to_contain_text("broken-1.jsonl")
+    page.get_by_role("button", name=re.compile("files changed")).click()
+    page.get_by_role("button", name=re.compile(r"^Tasks 0\/12 done")).click()
+    expect(page.get_by_role("region", name="Tasks").get_by_role("listitem")).to_have_count(12)
+    for control in [message(page), page.get_by_role("button", name="Send message"),
+                    page.get_by_role("button", name=re.compile("^Permissions:")), page.get_by_role("combobox", name="Model")]:
+        box = control.bounding_box()
+        assert box and box["y"] >= 0 and box["y"] + box["height"] <= height and box["x"] + box["width"] <= width, box
+    assert ui.js("document.scrollingElement.scrollTop") == 0
+    assert ui.js("document.querySelector('.transcript').getBoundingClientRect().height") >= 56
+    # Every bar is still reachable with the keyboard, with its focus shown.
+    for control in [page.get_by_role("button", name="Undo changes to src/module_11/file_11.py"), continue_button(page)]:
+        control.focus()
+        expect(control).to_be_in_viewport(ratio=1)
+
+
 # Saved drafts
 
 def stored(ui):

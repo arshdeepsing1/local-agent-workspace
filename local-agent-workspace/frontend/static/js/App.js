@@ -86,9 +86,9 @@ export default function App() {
             <button class="outline" onClick=${() => setDraft('Help me make a change in this project: ')}><${Pencil} size=${16} />Make a change</button>
             <button class="outline" onClick=${() => setDraft('Run a command in this workspace: ')}><${Terminal} size=${16} />Run a command</button></div>
         </div></div>`}
-      <div class="chat-composer"><${ChangesBar} key=${`changes-${app.viewKey}`} changes=${app.changes} busy=${busy} onOpen=${openReview} onAction=${app.reviewChanges} onError=${showError} />
+      <div class="chat-composer"><div class="composer-bars"><${ChangesBar} key=${`changes-${app.viewKey}`} changes=${app.changes} busy=${busy} onOpen=${openReview} onAction=${app.reviewChanges} onError=${showError} />
         <${TaskChecklist} key=${`tasks-${app.viewKey}`} tasks=${app.tasks} />
-        <${ContinueButton} session=${active} disabled=${!app.ready || !app.online || app.modelSaving || !app.settings?.configured} onSend=${app.send} onError=${showError} />
+        <${ContinueButton} session=${active} disabled=${!app.ready || !app.online || app.modelSaving || !app.settings?.configured} onSend=${app.send} onError=${showError} /></div>
         ${composer}
         ${active?.status === 'awaiting_approval' ? html`<p class="composer-hint" role="status">An action is waiting for your approval above.</p>` : null}
         ${active?.status === 'compacting' ? html`<p class="composer-hint" role="status">Compacting context…</p>` : null}
