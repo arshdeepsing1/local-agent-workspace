@@ -338,6 +338,32 @@ async def test_a_first_message_with_credentials_never_reaches_titles_or_notifica
     await manager.status(session, "awaiting_approval")
     await asyncio.sleep(0)
     assert runner.calls[-1][-1] == "Needs your approval: Old [REDACTED] title"
+    # Redacted before the title is cut to 60 characters, which would leave part of the value.
+    session["title"] = f"Please deploy the service now using {configured} for it"
+    await manager.status(session, "running")
+    await manager.status(session, "awaiting_approval")
+    await asyncio.sleep(0)
+    assert runner.calls[-1][-1] == "Needs your approval: Please deploy the service now using [REDACTED] for it"
+    assert not any(configured[:12] in call[-1] for call in runner.calls)
+
+
+async def test_a_chat_whose_first_message_has_a_credential_is_still_named(runtime, monkeypatch):
+    client, manager, session, runner = runtime
+    configured = "configured-workspace-credential-value"
+    manager.settings.env = {"DBRICKS_URL": "https://example.invalid", "DBRICKS_TOKEN": configured}
+
+    async def run_databricks(session, prompt):
+        await manager.event(session, "assistant", text="Done")
+        return True
+
+    async def generate_title(settings, session, save=None):
+        return "Named chat"
+    manager.run_databricks = run_databricks
+    monkeypatch.setattr("local_agent.agents.generate_title", generate_title)
+    await client.post(f"/api/sessions/{session['id']}/messages", json={"text": f"Use {configured} to call it"})
+    await asyncio.wait_for(manager.tasks[session["id"]], 5)
+    listed = next(item for item in (await client.get("/api/sessions")).json() if item["id"] == session["id"])
+    assert listed["title"] == "Named chat" and manager.get(session["id"])["title_generated"] is True
 
 
 def test_messages_name_only_the_status_and_a_short_title():

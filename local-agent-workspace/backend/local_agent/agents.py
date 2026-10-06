@@ -595,9 +595,11 @@ class AgentManager:
         """A desktop notification of the change, only if enabled and no page is open."""
         if self.settings.values.get("system_notifications") is not True or self.pages or any(self.listeners.values()):
             return
-        message = attention_message(session, previous, status, turn_ended)
+        # Titles stored before redaction, too; redacted before attention_message cuts them.
+        title = self.redact_title(str(session.get("title") or ""))
+        message = attention_message({**session, "title": title}, previous, status, turn_ended)
         if message:
-            self.notifier.send(self.redact_title(message))  # Titles stored before redaction, too.
+            self.notifier.send(message)
 
     def redact_title(self, text):
         """Text shown outside the chat (titles, notifications) without credentials or secret shapes."""
