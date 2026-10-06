@@ -596,7 +596,11 @@ class AgentManager:
             return
         message = attention_message(session, previous, status, turn_ended)
         if message:
-            self.notifier.send(message)
+            self.notifier.send(self.redact_title(message))  # Titles stored before redaction, too.
+
+    def redact_title(self, text):
+        """Text shown outside the chat (titles, notifications) without credentials or secret shapes."""
+        return self.settings.redact(redact_secrets(text))
 
     def session_tools(self, session):
         return WorkspaceTools(session["workspace"], self.settings.values["env_file"], session.get("allowed_directories", []),
@@ -759,16 +763,16 @@ class AgentManager:
                                      "parent_event_id": session["parent_event_id"], "parent_call_id": session.get("parent_call_id")}}
             await self.event(session, "user", text=prompt, **origin)
             if session["title"] == "New conversation" and not session.get("title_generated"):
-                session["title"] = fallback_title(prompt)
+                session["title"] = fallback_title(prompt, self.redact_title)
                 self.store.save(session)
                 await self.broadcast(session["id"], {"type": "title", "title": session["title"]})
             completed = await self.run_databricks(session, prompt)
             session.pop("turn_running", None)  # The answer is finished; naming is not part of it.
-            if completed and needs_title(session):
+            if completed and needs_title(session, self.redact_title):
                 previous_title = session["title"]
                 await self.status(session, "naming")
                 title = await generate_title(self.settings, session, self.store.save)
-                if title and needs_title(session) and session["title"] == previous_title:
+                if title and needs_title(session, self.redact_title) and session["title"] == previous_title:
                     session.update(title=title, title_generated=True)
                     self.store.save(session)
                     await self.broadcast(session["id"], {"type": "title", "title": title})

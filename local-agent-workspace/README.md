@@ -226,8 +226,10 @@ when opening a conversation or performing restart recovery.
   **Off**. You are notified when a chat starts waiting for approval, finishes a reply, or
   stops with an error (also during an automatic compaction, or because the server stopped
   during the reply), if this page is hidden or that chat is not the one open. A notification reads, for example,
-  "Needs your approval: Fix the parser" with the chat title cut to 60 characters, and never
-  contains conversation text. Clicking it brings the window forward and opens that chat.
+  "Needs your approval: Fix the parser": it contains only a status and the chat title, cut to
+  60 characters, never other conversation text. Until the chat is named, its title is the start
+  of the first message with credentials redacted (the configured token and common secret shapes
+  such as GitHub tokens). Clicking it brings the window forward and opens that chat.
   Stopping a reply yourself, or a manual compaction, does not notify, and a subagent's chat
   notifies only when it needs approval. A notification closes when it no longer applies (the
   approval was answered, the chat started another turn, or you opened the chat), so the next
