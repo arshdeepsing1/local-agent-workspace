@@ -17,6 +17,12 @@
 //   output?, truncated, timeout_seconds, max_output_bytes, background }
 // Skill: { id, name, description, path } (path is workspace-relative, or absolute
 //   for a skill shipped with the app)
+// Changes (pushed as { type: 'changes', changes } and returned by Keep/Undo): {
+//   files: [{ path, status: 'created'|'modified'|'deleted'|'unavailable', added, removed,
+//   current_hash: string | null, error? }], added, removed, error? }
+// ChangeDiff (GET /sessions/<id>/changes/diff?path=): { path, status, added, removed,
+//   baseline_hash, current_hash, hunks: [{ index, line, added, removed }],
+//   lines: [{ kind: 'context'|'removed'|'added', text, old?, new?, hunk?, newline? }] }
 
 export function modelLabel(model) {
   return model.replace(/^databricks-/, '').replace(/^system\.ai\./, '')

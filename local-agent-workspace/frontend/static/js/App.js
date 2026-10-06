@@ -10,6 +10,7 @@ import SettingsDialog from './components/SettingsDialog.js'
 import WorkspacePanel from './components/WorkspacePanel.js'
 import FolderAccessDialog from './components/FolderAccessDialog.js'
 import ContextMeter from './components/ContextMeter.js'
+import ChangesBar, { plural } from './components/ChangesBar.js'
 
 export default function App() {
   const app = useWorkspace()
@@ -21,6 +22,8 @@ export default function App() {
   const [workspaceOpen, setWorkspaceOpen] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [foldersOpen, setFoldersOpen] = useState(false)
+  // A changed file chosen in the changes bar, to open in the Workspace panel's review.
+  const [review, setReview] = useState(null)
   const active = app.session
   const workspace = active?.workspace || app.settings?.workspace || ''
   const editorKey = JSON.stringify([app.viewKey, workspace])
@@ -29,6 +32,8 @@ export default function App() {
   const hasMessages = !!active?.events.length
   const busy = !!active && active.status !== 'idle'
   const showError = error => app.setError(error)
+  const changedFiles = app.changes?.files.length || 0
+  const openReview = path => { setReview({ path, viewKey: app.viewKey }); setWorkspaceOpen(true) }
   const composer = html`<${Composer} key=${app.viewKey} value=${draft} setValue=${setDraft} model=${active?.model || app.settings?.model || 'databricks-gpt-oss-120b'}
     workspace=${active?.workspace || app.settings?.workspace || ''} mode=${app.permissionMode} onMode=${app.setPermissionMode} onProject=${() => setSettingsOpen(true)}
     onFolders=${() => setFoldersOpen(true)}
@@ -50,7 +55,8 @@ export default function App() {
         <span class="conversation-title">${active?.title || (app.activeId ? 'Loading conversation…' : 'New conversation')}
           ${app.activeId ? html`<small class="session-id" title=${`Session: ${app.activeId}`}> · ${app.activeId.slice(0, 8)}</small>` : null}</span>
         <button class="outline agent-tools-toggle" onClick=${() => setAgentToolsOpen(true)}>Agent tools</button>
-        <button class=${`outline workspace-toggle ${workspaceOpen ? 'active' : ''}`} onClick=${() => setWorkspaceOpen(v => !v)}><${PanelRight} size=${18} /><span>Workspace</span></button>
+        <button class=${`outline workspace-toggle ${workspaceOpen ? 'active' : ''}`} onClick=${() => setWorkspaceOpen(v => !v)}><${PanelRight} size=${18} /><span>Workspace</span>
+          ${changedFiles ? html`<span class="change-count" title=${`${plural(changedFiles, 'file')} changed by the agent`}><span aria-hidden="true">${changedFiles}</span><span class="sr-only">(${plural(changedFiles, 'changed file')})</span></span>` : null}</button>
       </header>
       ${app.error ? html`<div class="app-error" role="alert"><span>${app.error}</span><button class="icon-button" aria-label="Dismiss error" onClick=${() => app.setError('')}><${X} size=${16} /></button></div>` : null}
       ${!app.online && app.activeId ? html`<div class="connection-banner">Reconnecting to your local server… Refresh if the server was restarted.</div>` : null}
@@ -61,7 +67,8 @@ export default function App() {
             <button class="outline" onClick=${() => setDraft('Help me make a change in this project: ')}><${Pencil} size=${16} />Make a change</button>
             <button class="outline" onClick=${() => setDraft('Run a command in this workspace: ')}><${Terminal} size=${16} />Run a command</button></div>
         </div></div>`}
-      <div class="chat-composer">${composer}
+      <div class="chat-composer"><${ChangesBar} key=${`changes-${app.viewKey}`} changes=${app.changes} busy=${busy} onOpen=${openReview} onAction=${app.reviewChanges} onError=${showError} />
+        ${composer}
         ${active?.status === 'awaiting_approval' ? html`<p class="composer-hint" role="status">An action is waiting for your approval above.</p>` : null}
         ${active?.status === 'compacting' ? html`<p class="composer-hint" role="status">Compacting context…</p>` : null}
         ${active?.status === 'naming' ? html`<p class="composer-hint" role="status">Creating conversation title…</p>` : null}
@@ -73,6 +80,7 @@ export default function App() {
     </main>
     ${workspaceOpen && app.settings && (!app.activeId || active) ? html`<${WorkspacePanel} key=${editorKey} sessionId=${app.activeId}
       workspace=${workspace} file=${editorDrafts[editorKey] || null} setFile=${setEditorFile} onClose=${() => setWorkspaceOpen(false)}
+      changes=${app.changes} busy=${busy} review=${review?.viewKey === app.viewKey ? review : null} onReviewOpened=${() => setReview(null)} onReview=${app.reviewChanges}
       onAttach=${path => { setDraft(current => `${current}${current ? '\n' : ''}Please read the project file: ${path}`); setWorkspaceOpen(false) }} />` : null}
     ${agentToolsOpen && app.settings && (!app.activeId || active) ? html`<${AgentToolsDialog} key=${editorKey} session=${active} workspace=${workspace} onClose=${() => setAgentToolsOpen(false)} onError=${showError} onSelectSession=${id => { setAgentToolsOpen(false); app.setActiveId(id); void app.refreshSessions().catch(e => showError(e.message)) }} />` : null}
     ${settingsOpen && app.settings ? html`<${SettingsDialog} settings=${app.settings} connection=${app.connection} onSave=${app.saveSettings} onClose=${() => setSettingsOpen(false)} />` : null}

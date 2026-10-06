@@ -16,6 +16,19 @@ window.skills = [
   { id: 'review', name: 'Code review', description: 'Review the current diff for correctness bugs.', path: '.agents/skills/review/SKILL.md' },
   { id: 'handoff', name: 'handoff', description: 'Write a detailed cold-start handoff.', path: '/app/skills/handoff/SKILL.md' },
 ]
+// Agent file changes pushed over the socket ({ type: 'changes', changes }) and their review.
+window.changedFile = (path, added = 1, removed = 1, status = 'modified') => ({ path, status, added, removed, current_hash: `hash-${path}` })
+window.makeChanges = (...files) => ({ files, added: files.reduce((sum, item) => sum + item.added, 0), removed: files.reduce((sum, item) => sum + item.removed, 0) })
+window.noteDiff = {
+  path: 'note.txt', status: 'modified', added: 2, removed: 1, baseline_hash: 'base', current_hash: 'hash-note.txt',
+  hunks: [{ index: 0, line: 1, removed: 1, added: 1 }, { index: 1, line: 4, removed: 0, added: 1 }],
+  lines: [
+    { kind: 'context', text: 'one', old: 1, new: 1 }, { kind: 'removed', text: 'two', old: 2, hunk: 0 },
+    { kind: 'added', text: 'TWO', new: 2, hunk: 0 }, { kind: 'context', text: 'three', old: 3, new: 3 },
+    { kind: 'added', text: 'four', new: 4, hunk: 1, newline: false },
+  ],
+}
+fake.reviewResult = makeChanges()
 fake.sessions = new Map([['a', makeSession('a', 'Other conversation')]])
 fake.settings = { ...baseSettings }
 fake.handle = (path, options) => {
@@ -33,6 +46,8 @@ fake.handle = (path, options) => {
     return fake.json(created)
   }
   if (path === '/api/sessions') return fake.json([...fake.sessions.values()])
+  if (/^\/api\/sessions\/[^/]+\/changes\/diff\?/.test(path)) return fake.json(noteDiff)
+  if (/^\/api\/sessions\/[^/]+\/changes\/(keep|undo)$/.test(path)) return fake.json(fake.reviewResult)
   if (path.startsWith('/api/files?')) return fake.json([{ path: 'note.txt', name: 'note.txt', directory: false }])
   if (path.startsWith('/api/file?')) return fake.json({ content: 'original' })
   if (path === '/api/file' || path.endsWith('/messages')) return fake.json({ ok: true })

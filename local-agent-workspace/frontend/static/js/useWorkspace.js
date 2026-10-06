@@ -25,6 +25,9 @@ export function useWorkspace() {
   const [online, setOnline] = useState(true)
   const [ready, setReady] = useState(false)
   const [draftMode, setDraftMode] = useState('manual')
+  // Unreviewed agent file changes of one conversation: { id, value: Changes }.
+  const [changes, setChanges] = useState({ id: null, value: null })
+  const changesPushed = useRef(0)
 
   const updateUrl = useCallback((id, replace = false) => {
     const url = new URL(window.location.href)
@@ -144,6 +147,7 @@ export function useWorkspace() {
           setSession(current => current?.id === activeId ? { ...current, context_info: data.context_info } : current)
           setSessions(current => current.map(item => item.id === activeId ? { ...item, context_info: data.context_info } : item))
         }
+        if (data.type === 'changes') { changesPushed.current++; setChanges({ id: activeId, value: data.changes }) }
         if (data.type === 'event' && data.event.child_session_id) void refreshSessions().catch(e => setError(e.message))
         if (data.type === 'event') setSession(current => {
           if (!current || current.id !== activeId) return current
@@ -284,10 +288,20 @@ export function useWorkspace() {
       } : current)
     }
   }
+  const reviewChanges = async (action, files) => {
+    const id = selected.current.id
+    if (!id) return null
+    const pushed = changesPushed.current
+    const result = await api(`/sessions/${encodeURIComponent(id)}/changes/${action}`, 'POST', { files })
+    // The server also pushes the outcome; a pushed list can be newer than this response.
+    if (selected.current.id === id && changesPushed.current === pushed) setChanges({ id, value: result })
+    return result
+  }
   const activeSession = session?.id === activeId ? session : null
   const reportError = message => { if (selected.current.key === selection.key) setError(message) }
   return { settings, connection, sessions, session: activeSession, activeId, viewKey: selection.key, error, online, ready,
     setError: reportError, setActiveId: selectSession, newConversation, send, saveSettings, deleteSession, renameSession, changeModel,
     modelSaving: modelSaves.has(selection.key) || (!activeId && defaultModelSave.current !== null),
-    checkConnection, refreshSessions, permissionMode: activeSession?.permission_mode || draftMode, setPermissionMode, allowFolder, removeFolder }
+    checkConnection, refreshSessions, permissionMode: activeSession?.permission_mode || draftMode, setPermissionMode, allowFolder, removeFolder,
+    changes: activeId && changes.id === activeId ? changes.value : null, reviewChanges }
 }

@@ -26,6 +26,9 @@ frontend that runs without a build step.
 - Workspace file explorer, text editor with stale-file detection, Git status/diff,
   and a non-interactive command runner.
 - File checkpoints with reviewed, reversible restore and managed Git worktrees.
+- Review of the agent's file edits, as in an editor's chat: a "files changed" bar with
+  Keep and Undo, dots on changed files in the file explorer, and an inline red/green
+  diff with Keep and Undo for each change.
 - Explicit MCP servers, workspace skills with a `/` command menu, and approval-controlled
   tool lifecycle hooks.
 - Persistent tasks with dependencies and bounded subagents in separate conversations.
@@ -213,6 +216,37 @@ when opening a conversation or performing restart recovery.
   Unsaved editor text stays with its conversation when closing the workspace panel,
   attaching a file, or switching chats. Text entered during a save remains unsaved
   until the next save. Editor drafts are kept in the current page, not across reloads.
+- **Review agent changes (Keep / Undo)**: files the agent creates or edits with its file
+  tools are listed above the message box as **N files changed +added −removed**, and the
+  **Workspace** button shows how many there are. Expand the bar to see each file and its
+  line counts. **Keep** accepts the changes. **Undo** puts the file back as it was before
+  the agent first changed it in this conversation; a file the agent created is removed.
+  The **Keep** and **Undo** buttons on the bar act on every listed file; the check and
+  arrow buttons on a row act on that file only.
+  In **Workspace / Files**, a dot marks each changed file and each folder that contains
+  one. Click a file, in the bar or in the file list, to review it: removed lines are red
+  and added lines green, and each change has its own **Keep** and **Undo**. The box at the
+  bottom right shows the position (`1 of 3`), moves between changes with its arrows, and
+  keeps or undoes the whole file. **Edit** switches to the text editor (an unsaved draft is
+  kept) and **Review changes** switches back.
+  - Changes stay listed across replies until you keep or undo them, and after a refresh or
+    restart. A review always compares the file with its state before the agent's first
+    edit, so your own later saves to it are part of the diff.
+  - Keep works at any time. Undo waits until this conversation, and any other chat in the
+    same workspace, is idle and no workspace command is running (the Recovery rule). If a
+    file changed after the list or diff you looked at, its Keep or Undo is refused and the
+    list refreshes, so you can look again. An Undo of several files checks all of them
+    before it changes any.
+  - An undo is itself a file checkpoint: **Agent tools → Recovery → Other file edits** can
+    bring the agent's version back. Folders created for a new file are not removed.
+  - Only the agent's `write_file`, `edit_file` and `insert_activity_log` edits are listed.
+    Shell commands, MCP tools and hooks are not; **Workspace / Changes** shows Git's view.
+    A subagent's edits are listed in the subagent's conversation. Exports, imports and
+    forks do not copy the list, and deleting a conversation forgets it and leaves the
+    files as they are. The model is not told about an undo; it reads a file again before
+    editing it. Recovery's limits apply: regular UTF-8 files up to 80 KB. An agent edit
+    saves a file with Windows (CRLF) line endings with LF endings, so every line of such
+    a file shows as changed.
 - **Workspace / Changes**: inspect Git status and tracked-file diffs. Untracked
   paths appear in status; their contents are available in Files.
 - **Workspace / Terminal**: run a command explicitly and see output while it runs.
@@ -867,13 +901,17 @@ folder grants, shell classification, approval allow/deny,
 browser-controlled folder checks/grants/removal, OS-denied access,
 cancellation (including process-group termination), path/symlink/secret boundaries,
 credential-free shell environment, restart recovery, API access control, WebSocket
-snapshots, and stale editor writes. None of these automated tests calls a paid model.
+snapshots, stale editor writes, and keeping or undoing agent changes (whole files and single
+changes, stale-review refusal, undo as a restorable checkpoint). None of these automated
+tests calls a paid model.
 Frontend tests verify that expired local tokens refresh once and that other
 errors never replay a potentially completed action, that editor drafts survive saves
 and navigation, that delayed permission responses or deleted conversation URLs
 do not corrupt the active view, that model replies cannot inject HTML or scripts, and
 that the `/` skill menu lists, filters, and inserts skills without blocking ordinary messages,
-and that the pages of a long file read name the lines they covered.
+that the pages of a long file read name the lines they covered, and that agent changes
+show in the changes bar, as dots in the file list and as an inline diff whose Keep and Undo
+send the reviewed file state.
 Backend regressions additionally cover credential
 path aliases, unreadable configuration recovery, cancellation during startup or
 after a child process outlives its shell, recovery of completed tool results
@@ -901,6 +939,7 @@ inside a longer message, and compaction inside one request that outgrows the bud
 - `backend/local_agent/usage_export.py` / `scripts/usage_report.py`: usage rows and CSV correlated with conversation history.
 - `backend/local_agent/instructions.py`: scoped project guidance loading.
 - `backend/local_agent/recovery.py` / `worktrees.py`: file recovery and Git worktrees.
+- `backend/local_agent/changes.py`: the agent's file changes per conversation, their diffs, Keep and Undo.
 - `backend/local_agent/extensions.py` / `mcp_client.py`: skills, hooks, MCP lifecycle.
 - `backend/local_agent/planning.py` / `feature_tools.py`: tasks and delegated workers.
 - `backend/local_agent/feature_api.py`: scoped feature endpoints.

@@ -299,6 +299,7 @@ def create_app(settings=None):
             await manager.jobs.remove_session(session_id)
             manager.task_board.delete_session(session_id)
             manager.checkpoints.delete_session(session_id)
+            manager.changes.delete_session(session_id)
             store.delete(session_id)
             manager.live.pop(session_id, None)
             manager.statuses.pop(session_id, None)
@@ -348,6 +349,7 @@ def create_app(settings=None):
         manager.listeners.setdefault(session_id, set()).add(socket)
         try:
             await socket.send_json({"type": "snapshot", "session": public_session(session, manager.statuses.get(session_id, "idle"))})
+            await manager.publish_changes(session)
             while True:
                 await socket.receive_text()
         except WebSocketDisconnect:
@@ -369,6 +371,8 @@ def create_app(settings=None):
         if tools.read_file(body.path) != body.original:
             raise HTTPException(409, "This file changed on disk. Reopen it before saving.")
         manager.checkpoints.apply_edit(tools, "write_file", {"path": body.path, "content": body.content}, session_id=body.session_id)
+        if body.session_id:
+            await manager.publish_changes(session_or_404(body.session_id), tools, only_tracked=True)
         return {"ok": True}
 
     @app.get("/api/git")

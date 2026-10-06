@@ -189,7 +189,7 @@ class CheckpointManager:
             raise
         return record
 
-    def apply_edit(self, tools, name, arguments, session_id=None, turn_id=None):
+    def apply_edit(self, tools, name, arguments, session_id=None, turn_id=None, on_applied=None):
         if name not in ("write_file", "edit_file"):
             raise ValueError("Only app file writes and edits can create checkpoints.")
         target = tools.path(arguments["path"])
@@ -209,8 +209,14 @@ class CheckpointManager:
         after = _state(raw, before["mode"] if before["exists"] else 0o600)
         if before["hash"] == after["hash"]:
             return "No changes."
-        self._apply(tools, arguments["path"], target, before, after, session_id, turn_id=turn_id)
+        record = self._apply(tools, arguments["path"], target, before, after, session_id, turn_id=turn_id)
+        if on_applied is not None:
+            on_applied(record)
         return preview if preview != "No changes." else _diff(before, after, tools.display_path(target))
+
+    def apply_state(self, tools, path, target, current, after, session_id=None):
+        """Replace a reviewed state with another one, keeping a restorable checkpoint."""
+        return self._apply(tools, path, target, current, after, session_id)
 
     def preview(self, checkpoint_id, tools, session_id=None):
         record, target = self._get(checkpoint_id, tools, session_id)

@@ -23,6 +23,7 @@ from .config import DEFAULT_MAX_AGENT_STEPS
 from .instructions import load_project_instructions
 from .jobs import JobManager, validate_command_options
 from .recovery import CheckpointManager
+from .changes import ChangeReview
 from .worktrees import WorktreeManager
 from .extensions import ExtensionManager
 from .planning import TaskManager, DelegateManager
@@ -291,6 +292,7 @@ class AgentManager:
         self.pending = {}
         self.statuses = {}
         self.checkpoints = CheckpointManager(store)
+        self.changes = ChangeReview(store, self.checkpoints)
         self.worktrees = WorktreeManager(store, settings.state_dir)
         self.extensions = ExtensionManager(settings)
         self.task_board = TaskManager(store)
@@ -490,6 +492,25 @@ class AgentManager:
         self.statuses[session["id"]] = status
         await self.broadcast(session["id"], {"type": "status", "status": status})
         await self.delegates.progress(session, status=status)
+        if status == "idle":
+            # Commands can also change reviewed files; refresh their counts after each turn.
+            await self.publish_changes(session, only_tracked=True)
+
+    def session_tools(self, session):
+        return WorkspaceTools(session["workspace"], self.settings.values["env_file"], session.get("allowed_directories", []),
+                              session.get("permission_mode", "manual") == "bypassPermissions")
+
+    async def publish_changes(self, session, tools=None, only_tracked=False):
+        """Send the conversation's unreviewed agent file changes to its open pages."""
+        if not self.listeners.get(session["id"]):
+            return
+        try:
+            if only_tracked and not self.changes.has(session["id"]):
+                return
+            changes = self.changes.list(session["id"], tools or self.session_tools(session))
+        except (*STORAGE_ERRORS, ValueError, UnicodeError) as exc:
+            changes = {"files": [], "added": 0, "removed": 0, "error": self.settings.redact(file_error(exc))}
+        await self.broadcast(session["id"], {"type": "changes", "changes": changes})
 
     async def event(self, session, kind, **values):
         event = {"id": str(uuid.uuid4()), "type": kind, "created": time.time(), **values}
@@ -765,7 +786,8 @@ class AgentManager:
                 result = await connection.call(name, arguments)
             elif name in ("write_file", "edit_file"):
                 turn_id = next((item["id"] for item in reversed(session["events"]) if item["type"] == "user"), None)
-                result = self.checkpoints.apply_edit(tools, name, arguments, session_id=session["id"], turn_id=turn_id)
+                result = self.checkpoints.apply_edit(tools, name, arguments, session_id=session["id"], turn_id=turn_id,
+                                                     on_applied=lambda record: self.changes.track(record, tools))
                 if activity is not None:
                     # Return a compact result: the diff would put the whole log back into context.
                     result = {"path": arguments["path"], **activity}
@@ -816,6 +838,8 @@ class AgentManager:
             output = self.settings.redact(output)
             failed = name.startswith("mcp__") and isinstance(result, dict) and result.get("is_error") is True
             await self.update_event(session, event, state="error" if failed else "completed", output=output)
+            if name in ("write_file", "edit_file"):
+                await self.publish_changes(session, tools)
             await self.run_hooks(session, "after_tool", name, arguments, result, call_id=call_id)
             command_failed = (name == "run_command" and isinstance(result, dict) and not result.get("background")
                               and result.get("state") in {"failed", "timed_out"})
