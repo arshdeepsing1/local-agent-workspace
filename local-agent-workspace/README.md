@@ -451,10 +451,13 @@ tools cannot browse it.
   Records include conversation metadata, user and assistant events, reasoning and
   request usage, tool calls and results, and the exact Databricks message/tool
   history (`wire`). Commands associated with the chat are included as sanitized job
-  records with their command, state, limits, exit status, and bounded retained output,
-  plus the size and modification time of the files the agent last read or wrote (paths
-  only, no contents). Files are atomically replaced as current-state snapshots rather than appended
+  records with their command, state, limits, exit status, and bounded retained output.
+  Files are atomically replaced as current-state snapshots rather than appended
   indefinitely while an answer streams.
+- `conversations/<conversation-id>.state.json`: the chat's "Allow for this chat" rules and
+  the size and modification time of the files the agent last read or wrote (paths only, no
+  contents). It sits beside the JSONL file so earlier versions of the app can still open the
+  chat; it is never exported, and a missing or unreadable one counts as empty.
 - `conversations.sqlite3`: operational state only. Its `jobs` table stores command
   metadata, states, and bounded output for live control and restart recovery; terminal
   job snapshots are also mirrored into the owning chat JSONL. Chat messages, assistant

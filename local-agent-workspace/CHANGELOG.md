@@ -16,6 +16,8 @@ Roadmap milestone M1 (attention, approval quick wins, safety):
   conversation file is reported and hidden instead of stopping the app; a stalled browser tab is
   disconnected after 5 seconds; `write_file` refuses to overwrite a file the agent has not read
   (or that changed since), and the agent is told which files changed under it.
+- Storage: "Allow for this chat" rules and the files the agent read are kept in
+  `conversations/<id>.state.json`, so earlier versions can still open chats saved by this one.
 - Conversation: a Continue button after a step limit, output limit, Stop or restart; a live task
   checklist and a `get_task` tool; message drafts saved across reloads; highlighted code blocks
   with Copy code; Markdown export and Copy conversation in Agent tools → Conversation.

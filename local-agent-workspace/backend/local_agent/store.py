@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -9,10 +10,14 @@ from pathlib import Path
 
 from .telemetry import LEDGER_VERSION
 
+log = logging.getLogger(__name__)
 
 _SAFE_SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 # Kept out of the header record so list and metadata reads stay small.
 _SEPARATE_FIELDS = ("context_state", "instruction_directories", "file_views", "allow_rules", "inference_calls", "command_jobs")
+# Kept in <id>.state.json beside the conversation file, never in field records: versions
+# before these fields existed reject unknown field records but only read *.jsonl files.
+_SIDECAR_FIELDS = ("file_views", "allow_rules")
 
 
 class UnreadableConversation(ValueError):
@@ -44,6 +49,8 @@ class Store:
         self.conversations.chmod(0o700)
         self._lock = threading.RLock()
         self._command_jobs = {}
+        # The sidecar state last written or read, as JSON text, per conversation ID.
+        self._sidecars = {}
         # Unreadable conversation files: {file name: reason}. They are skipped and
         # reported, never deleted, moved or rewritten.
         self._list_problems = {}
@@ -86,7 +93,7 @@ class Store:
         metadata = {key: value for key, value in session.items()
                     if key not in ("events", "wire", *_SEPARATE_FIELDS)}
         yield {"record": "session", "version": 1, "data": metadata}
-        for name in ("context_state", "instruction_directories", "file_views", "allow_rules"):
+        for name in ("context_state", "instruction_directories"):
             if name in session:
                 yield {"record": "field", "name": name, "data": session[name]}
         if "inference_calls" in session:
@@ -134,6 +141,62 @@ class Store:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+
+    def _state_path(self, session_id):
+        return self._path(session_id).with_suffix(".state.json")
+
+    @staticmethod
+    def _sidecar_text(session):
+        state = {name: session[name] for name in _SIDECAR_FIELDS if name in session}
+        return json.dumps(state, ensure_ascii=False, separators=(",", ":"), sort_keys=True) if state else None
+
+    def _write_sidecar(self, session_id, text):
+        """Replace (or with text None, remove) <id>.state.json atomically."""
+        target = self._state_path(session_id)
+        if text is None:
+            target.unlink(missing_ok=True)
+            return
+        temporary = self.conversations / f".{target.name}.{uuid.uuid4().hex}.tmp"
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                output.write(text)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, target)
+            target.chmod(0o600)
+            self._sync_directory()
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+
+    def _save_sidecar(self, session):
+        """Write the sidecar when its fields changed since it was last written or read."""
+        text = self._sidecar_text(session)
+        if self._sidecars.get(session["id"], "") != text:
+            self._write_sidecar(session["id"], text)
+            self._sidecars[session["id"]] = text
+
+    def _read_sidecar(self, session_id):
+        """The sidecar fields, or {} when the file is missing or unreadable (never fatal)."""
+        path = self._state_path(session_id)
+        try:
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(descriptor, "r", encoding="utf-8") as source:
+                state = json.loads(source.read())
+            if not isinstance(state, dict):
+                raise ValueError("not an object")
+        except FileNotFoundError:
+            self._sidecars[session_id] = None
+            return {}
+        except (OSError, ValueError, RecursionError) as exc:
+            # Rewritten on the next save; the conversation itself stays readable.
+            log.warning("Ignored unreadable conversation state file %s (%s).", path.name, type(exc).__name__)
+            self._sidecars.pop(session_id, None)
+            return {}
+        state = {name: state[name] for name in _SIDECAR_FIELDS if name in state}
+        self._sidecars[session_id] = self._sidecar_text(state)
+        return state
 
     def _write(self, session, *, insert_only=False):
         temporary, target = self._temporary(session)
@@ -253,6 +316,7 @@ class Store:
             if merged or "command_jobs" in prepared:
                 prepared["command_jobs"] = merged
             self._write(prepared)
+            self._save_sidecar(prepared)
             self._command_jobs[session_id] = merged
         session["updated"] = prepared["updated"]
 
@@ -354,12 +418,17 @@ class Store:
                     temporary.unlink()
                 for target in published:
                     target.chmod(0o600)
+                for session in prepared:
+                    self._save_sidecar(session)
                 self._sync_directory()
             except BaseException:
                 for temporary, _ in staged:
                     temporary.unlink(missing_ok=True)
                 for target in published:
                     target.unlink(missing_ok=True)
+                for session in prepared:
+                    self._state_path(session["id"]).unlink(missing_ok=True)
+                    self._sidecars.pop(session["id"], None)
                 self._sync_directory()
                 raise
         for original, saved in zip(sessions, prepared):
@@ -379,6 +448,8 @@ class Store:
             session = self._read_own(session_id)
             if session is None:
                 return None
+            # Older files keep these as field records; the sidecar is newer when both exist.
+            session.update(self._read_sidecar(session_id))
             self._command_jobs[session_id] = self._merge_jobs(
                 self._command_jobs.get(session_id, []), session.get("command_jobs", []))
             return session
@@ -433,5 +504,7 @@ class Store:
             return
         with self._lock:
             self._path(session_id).unlink(missing_ok=True)
+            self._state_path(session_id).unlink(missing_ok=True)
             self._command_jobs.pop(session_id, None)
+            self._sidecars.pop(session_id, None)
             self._sync_directory()
