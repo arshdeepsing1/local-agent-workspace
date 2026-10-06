@@ -21,7 +21,9 @@ ALLOWED = [
 
 def main():
     root = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=True).stdout.strip()
-    result = subprocess.run(["git", "-C", root, "grep", "-n", "-I", "-i", "-E", PATTERN, "--", ".", ":!*/vendor/*"],
+    # This script names the allowed fixtures, so it is not searched itself.
+    result = subprocess.run(["git", "-C", root, "grep", "-n", "-I", "-i", "-E", PATTERN, "--", ".", ":!*/vendor/*",
+                             ":!*scripts/check_personal_data.py"],
                             capture_output=True, text=True)
     if result.returncode not in (0, 1):
         print(result.stderr, file=sys.stderr)

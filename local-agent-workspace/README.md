@@ -7,7 +7,10 @@ frontend that runs without a build step.
 
 ## Features
 
-- Streamed Markdown chat and multiple persistent conversations.
+- Streamed Markdown chat and multiple persistent conversations, with highlighted code
+  blocks that each have a Copy code button.
+- Unsent message drafts kept in the browser across reloads, and a Continue button after a
+  turn stopped at the step or output limit, by Stop, or by a server restart.
 - Databricks model selection, numbered line-range reads, paginated regex/literal
   search, file creation and exact edits, and shell commands with live output.
 - Approval cards with proposed edits and command text. A declined action does not run.
@@ -40,7 +43,10 @@ frontend that runs without a build step.
   and named in a notice.
 - Explicit MCP servers, workspace skills with a `/` command menu, and approval-controlled
   tool lifecycle hooks.
-- Persistent tasks with dependencies and bounded subagents in separate conversations.
+- Persistent tasks with dependencies, shown as a live checklist above the message box,
+  and bounded subagents in separate conversations.
+- Markdown transcripts of a conversation: download or copy one from the app, or write
+  them for many saved conversations with a script.
 - Collapsible activity and persisted provider reasoning summaries when returned by the endpoint.
 - Responsive desktop/mobile UI, bundled fonts, and no credential storage in the browser.
 
@@ -189,8 +195,14 @@ when opening a conversation or performing restart recovery.
   Select a sidebar conversation to resume it. Each saved chat has a `?session=<uuid>`
   URL, which preserves that selection on refresh and supports browser Back/Forward.
   The header and sidebar show a short session ID to distinguish repeated titles.
-  Drafts stay with their conversation while switching chats in the current page;
-  unsent drafts are not saved across a page reload.
+  Drafts stay with their conversation while switching chats and are saved in this
+  browser's `localStorage` about half a second after you stop typing (and when the page
+  closes), so they survive a reload; the new-conversation view keeps its own draft, which
+  moves to the conversation once it exists. A sent draft is removed; text typed while it
+  was sending is saved as the new draft. At most 50 drafts
+  are kept (the oldest goes first). A draft over 100 KB, or any draft when the browser
+  blocks storage, is kept only in the page. Drafts stay in this browser profile; the
+  server never receives them.
   The message box stays editable while connecting. The permissions menu opens above
   the composer; clicking the input closes it, and choosing a mode returns focus to chat.
   Open tabs reconnect after a server restart without discarding the current draft.
@@ -399,6 +411,32 @@ when opening a conversation or performing restart recovery.
   shell side effects are retained. Stop also cancels its active subagent. Deleting a
   conversation removes its jobs, tasks, and file checkpoint copies; edited files stay
   on disk. Child conversations remain separately available in the sidebar.
+- **Continue**: when the latest turn of an idle conversation stopped before it finished —
+  at the **Agent steps** limit, at the output-token limit after the automatic retries,
+  by **Stop**, or because the server restarted before its answer finished (not while it
+  was only naming the chat or during a manual compaction) — a **Continue** button above
+  the message box sends `Continue from where you stopped.` as an ordinary message. It
+  is not shown while the conversation is busy, after a completed turn, or after other
+  errors. Your draft is left as it is, and keyboard focus moves to the message box.
+- **Task checklist**: when the conversation has tasks (from the model's `create_task` /
+  `update_task` or **Agent tools → Tasks**), a **Tasks 2/5 done** bar above the message
+  box, under the changes bar, shows the progress and the task in progress. Expand it to
+  list every task with its status; long titles wrap. It updates as tasks change; cancelled tasks are listed
+  but not counted.
+- **Code in replies**: once a reply is complete, its fenced code blocks are syntax
+  highlighted (highlight.js, common languages). A block tagged with a language is
+  highlighted in that language; an untagged block is guessed, up to 20 KB. **Copy code**
+  copies a block's exact text.
+- **Copy and export a conversation**: **Agent tools → Conversation → Export Markdown**
+  downloads the conversation as a Markdown transcript (`<date>-<title>-<id>.md`; a secret
+  in the title becomes `redacted` in the file name), and
+  **Copy conversation** copies the same text. It is the transcript the
+  `scripts/conversation_transcript.py` script writes (see **Agent tools: MCP, skills,
+  and hooks**): messages and replies in full, one line per tool call with its main
+  input, and command output shortened to 600 characters. Common secret shapes and the
+  configured Databricks token are replaced with `[REDACTED]`; review it before sharing.
+  Both work during a response and show what has been saved so far; their result is shown
+  right under the two buttons.
 
 ### Conversation storage
 
@@ -842,8 +880,10 @@ turns are idle.
 ### Agent tools: tasks, subagents, and activity
 
 **Tasks** shows persisted tasks, descriptions, status, and dependencies. Add them
-manually or let the model use `create_task`, `list_tasks`, and `update_task`. A
-conversation holds up to 50 tasks; dependencies must belong to the same chat,
+manually or let the model use `create_task`, `list_tasks`, `get_task` (one task's full
+description, status, and dependencies; read-only, so it runs in every mode), and
+`update_task`. Every change, by the model or here, updates the task checklist above
+the message box. A conversation holds up to 50 tasks; dependencies must belong to the same chat,
 cannot form cycles, and must finish before dependent work starts or completes.
 These planning records are available in Plan mode.
 
@@ -869,7 +909,7 @@ Unfinished delegated runs are marked interrupted on restart rather than left run
 **Tasks → New subagent tool ceiling** selects `inherit`, `read_only`, or `file_editor`
 for future children while the parent is idle. The model may request a narrower
 `tool_profile` in `delegate_task` but cannot widen the parent's ceiling. Read-only
-permits file listing/reading/search, skill discovery/selection, and task listing;
+permits file listing/reading/search, skill discovery/selection, and task listing/reading;
 file-editor additionally permits file writes/edits under normal approval rules.
 Both file-only profiles exclude shell commands, jobs, MCP startup/calls, hooks,
 task mutations, and further delegation. Restrictions persist on child continuation,
@@ -977,9 +1017,10 @@ generated and nothing needs rebuilding or restarting.
   `static/js/lib.js` lists the differences from React worth knowing (`class`,
   `onInput` for live text input). `static/js/types.js` documents the API shapes.
 - `frontend/static/styles.css`: all styling.
-- `frontend/static/vendor/`: Preact 10.29.8, htm 3.1.1, marked 18.0.14 (Markdown)
-  and DOMPurify 3.4.16 (sanitizing), copied from their npm releases with their
-  licenses; only the trailing source-map comment was removed. To update one,
+- `frontend/static/vendor/`: Preact 10.29.8, htm 3.1.1, marked 18.0.14 (Markdown),
+  DOMPurify 3.4.16 (sanitizing) and highlight.js 11.12.0 (code highlighting, the ES
+  module build with its common languages), copied from their npm releases with their
+  licenses; only the trailing source-map comment was removed (highlight.js has none). To update one,
   download the new version from `https://cdn.jsdelivr.net/npm/<package>@<version>/`
   and replace the file:
 
@@ -990,8 +1031,11 @@ generated and nothing needs rebuilding or restarting.
   | `htm.module.js` | `htm/dist/htm.module.js` |
   | `marked.esm.js` | `marked/lib/marked.esm.js` |
   | `purify.es.js` | `dompurify/dist/purify.es.mjs` |
+  | `highlight.min.js` | `@highlightjs/cdn-assets/es/highlight.min.js` |
 
   DOMPurify is dual-licensed (Apache-2.0 or MPL-2.0); both texts are included.
+  highlight.js is BSD-3-Clause (`LICENSE-highlightjs.txt`); its file was checked against
+  the npm registry tarball's sha512 integrity.
 - `frontend/static/fonts/`: the DM Sans `.woff2` files and licence from
   `@fontsource/dm-sans` 5.3.0 (`files/` folder), unchanged.
 - `frontend/static/js/icons.js`: the Lucide icons used by the UI, as inline SVG copied from
@@ -1056,7 +1100,12 @@ its own "Allow for this chat" button and sends decline notes, that the permissio
 and removes rules, that an error naming another chat offers to open it, and that notifications
 (with a faked Notification API and `document.hidden`), the tab-title count, sidebar status
 badges, unread and Running filter, and the Files root switcher with change dots in granted
-folders work without `localStorage` too.
+folders work without `localStorage` too, that the Continue button appears only after a
+step-limit, output-limit, stopped or interrupted turn and sends its message, that the task
+checklist follows pushed tasks per conversation, that drafts survive a reload, are evicted oldest
+first, are removed when sent and keep text typed during the send, that code blocks are
+highlighted only when a reply is complete and copy their exact text, and that the Markdown
+transcript downloads and copies.
 UI tests also cover a turn that fails during an automatic compaction (notifies) and a manual
 compaction (does not), a turn cut off by a server restart, closing answered notifications,
 read state shared between tabs, and the page's presence connection.
@@ -1069,7 +1118,10 @@ Backend regressions additionally cover credential
 path aliases, unreadable configuration recovery, cancellation during startup or
 after a child process outlives its shell, recovery of completed tool results
 after interrupted delivery, tool calls streamed without arguments, skill commands
-inside a longer message, and compaction inside one request that outgrows the budget.
+inside a longer message, compaction inside one request that outgrows the budget,
+how a turn ended in the idle status, which restarts mark a turn interrupted, task pushes on change and on connect, `get_task`
+scoping and permissions, and the Markdown transcript endpoint's content, redaction and headers
+(including the file name).
 
 ## Architecture
 
@@ -1086,7 +1138,7 @@ inside a longer message, and compaction inside one request that outgrows the bud
 - `backend/local_agent/config.py`: external credentials and portable configuration.
 - `backend/local_agent/context.py`: request estimates and bounded history compaction.
 - `backend/local_agent/activity.py`: app-generated activity log for handoffs (`insert_activity_log`).
-- `backend/local_agent/transcript.py` / `scripts/conversation_transcript.py`: Markdown transcripts of saved conversations.
+- `backend/local_agent/transcript.py` / `scripts/conversation_transcript.py`: Markdown transcripts of saved conversations (also `GET /api/sessions/<id>/transcript.md`).
 - `backend/local_agent/redaction.py`: common secret shapes replaced in logs, handoffs and transcripts.
 - `skills/`: skills shipped with the app and offered in every workspace; `handoff/SKILL.md` is the detailed handoff skill. A workspace's `.agents/skills/<id>/` replaces the shipped skill with that ID.
 - `backend/local_agent/telemetry.py`: inference ledger, validated usage, DBU estimates, and failure categories.
@@ -1101,7 +1153,8 @@ inside a longer message, and compaction inside one request that outgrows the bud
 - `backend/local_agent/feature_api.py`: scoped feature endpoints.
 - `backend/local_agent/reasoning.py`: provider reasoning-summary extraction.
 - `frontend/static/js/`: browser interface (Preact + htm, no build), conversation state, editor and settings;
-  `attention.js` holds browser notifications, the tab-title count and unread tracking.
+  `attention.js` holds browser notifications, the tab-title count and unread tracking, `drafts.js` saves
+  message drafts, and `markdown.js` renders and highlights replies.
 - `frontend/tests/`: browser tests (pytest + Playwright) with a fake backend.
 - `design/`: original visual concept and extracted design tokens.
 

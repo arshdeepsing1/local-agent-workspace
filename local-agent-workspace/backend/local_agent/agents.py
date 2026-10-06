@@ -312,7 +312,8 @@ def unanswered(event, declined):
 def public_session(session, status="idle"):
     return {"permission_mode": "manual", "allowed_directories": [], "allow_rules": [],
             **{k: v for k, v in session.items()
-               if k not in ("wire", "context_state", "instruction_directories", "inference_calls", "command_jobs", "file_views")},
+               if k not in ("wire", "context_state", "instruction_directories", "inference_calls", "command_jobs",
+                            "file_views", "turn_running")},
             "status": status}
 
 
@@ -353,24 +354,36 @@ class AgentManager:
 
     @staticmethod
     def mark_interrupted(session):
-        """Close work that was running when the app last stopped; True if anything changed."""
-        interrupted = False
+        """Close work that was running when the app last stopped; True if anything changed.
+
+        run() keeps turn_running until the model loop ends. A title request (after the
+        answer completed) or a manual compaction outside a turn is closed as interrupted
+        but does not make the turn incomplete. Older records without the marker count as
+        cut short when an agent request or a tool was still running.
+        """
+        cut_short = session.pop("turn_running", False) is True
+        changed = cut_short
         for call in session.get("inference_calls", []):
             if isinstance(call, dict) and call.get("status") == "running":
                 finish_inference_call(call, {"status": "interrupted", "error_kind": "incomplete_response"})
-                interrupted = True
+                changed = True
+                cut_short |= call.get("purpose") == "agent"
         for event in session["events"]:
             if event.get("state") in ("running", "pending"):
                 event["state"] = "cancelled"
-                interrupted = True
+                changed = cut_short = True
             if event.get("request_info", {}).get("status") == "running":
                 event["request_info"].update(status="interrupted", error_kind="incomplete_response")
-                interrupted = True
+                changed = cut_short = True
+        if cut_short:
+            session["terminal_reason"] = "interrupted"  # Continue is offered; notifications report it.
         if "turn_ended" in session and session["turn_ended"] is None:
-            # The server stopped during a turn: it did not finish.
-            session.update(terminal_reason="interrupted", turn_ended=time.time())
-            interrupted = True
-        return interrupted
+            if not cut_short:
+                # Stopped while naming the chat: the answer itself had finished.
+                session["terminal_reason"] = "completed"
+            session["turn_ended"] = time.time()  # The turn ended when the server stopped.
+            changed = True
+        return changed
 
     def workspace_available(self, workspace):
         from pathlib import Path
@@ -568,7 +581,7 @@ class AgentManager:
         self.statuses[session["id"]] = status
         message = {"type": "status", "status": status}
         if status == "idle":
-            # How and when the last turn ended, for the page's notifications.
+            # How and when the last turn ended, for notifications and the Continue button.
             message.update({key: session[key] for key in ("terminal_reason", "turn_ended") if session.get(key)})
         await self.broadcast(session["id"], message)
         self.notify_status(session, previous, status, turn_ended)
@@ -600,6 +613,11 @@ class AgentManager:
         except (*STORAGE_ERRORS, ValueError, UnicodeError) as exc:
             changes = {"files": [], "added": 0, "removed": 0, "error": self.settings.redact(file_error(exc))}
         await self.broadcast(session["id"], {"type": "changes", "changes": changes})
+
+    async def publish_tasks(self, session_id):
+        """Send the conversation's task list to its open pages (the live checklist)."""
+        if self.listeners.get(session_id):
+            await self.broadcast(session_id, {"type": "tasks", "tasks": self.task_board.list(session_id)})
 
     async def event(self, session, kind, **values):
         event = {"id": str(uuid.uuid4()), "type": kind, "created": time.time(), **values}
@@ -730,7 +748,10 @@ class AgentManager:
             await self.broadcast(session["id"], {"type": "event", "event": error})
 
         try:
-            session["turn_ended"] = None  # Saved with the user message: a restart can tell the turn was cut off.
+            # Saved with the user event. turn_running (internal) lasts until the model loop
+            # ends and tells restart recovery the answer was cut short; turn_ended is None
+            # while the turn runs and records when it ended (notifications).
+            session.update(turn_running=True, turn_ended=None)
             await self.status(session, "running")
             origin = {}
             if session.get("parent_event_id") and not session["events"] and not session.get("delegation", {}).get("terminal_reason"):
@@ -742,6 +763,7 @@ class AgentManager:
                 self.store.save(session)
                 await self.broadcast(session["id"], {"type": "title", "title": session["title"]})
             completed = await self.run_databricks(session, prompt)
+            session.pop("turn_running", None)  # The answer is finished; naming is not part of it.
             if completed and needs_title(session):
                 previous_title = session["title"]
                 await self.status(session, "naming")
@@ -800,14 +822,17 @@ class AgentManager:
                     terminal_reason = "error"
                 if terminal_reason == "completed" and any(item.get("state") == "error" for item in events):
                     terminal_reason = "tool_error"
+            for event in updates:
+                await self.broadcast(session["id"], {"type": "event", "event": event})
+            # Set and saved right before the idle status, with no await in between on success,
+            # so a sessions poll never sees a new turn_ended while the chat still looks busy.
             session.update(terminal_reason=terminal_reason, turn_ended=time.time())
+            session.pop("turn_running", None)
             try:
                 self.store.save(session)
             except STORAGE_ERRORS as exc:
                 session["terminal_reason"] = "error"
                 await report_storage_failure(exc)
-            for event in updates:
-                await self.broadcast(session["id"], {"type": "event", "event": event})
             self.live.pop(session["id"], None)
             try:
                 await self.status(session, "idle", turn_ended=True)
@@ -948,12 +973,17 @@ class AgentManager:
                 tasks = self.task_board.list(session["id"])
                 items = [{key: item[key] for key in ("id", "title", "status", "depends_on")} for item in tasks]
                 result = self.metadata_page(items, arguments.get("offset", 0), "tasks")
+            elif name == "get_task":
+                task = self.task_board.get(session["id"], arguments["task_id"])
+                result = {key: task[key] for key in ("id", "title", "description", "status", "depends_on")}
             elif name == "create_task":
                 task = self.task_board.create(session["id"], **arguments)
                 result = {key: task[key] for key in ("id", "title", "status", "depends_on")}
+                await self.publish_tasks(session["id"])
             elif name == "update_task":
                 task = self.task_board.update(session["id"], arguments["task_id"], {k: v for k, v in arguments.items() if k != "task_id"})
                 result = {key: task[key] for key in ("id", "title", "status", "depends_on")}
+                await self.publish_tasks(session["id"])
             elif name == "delegate_task":
                 await self.status(session, "delegating")
                 try:

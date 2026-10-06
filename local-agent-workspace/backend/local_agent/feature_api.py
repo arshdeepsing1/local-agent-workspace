@@ -154,12 +154,16 @@ def register_features(app, manager, settings, store, session_or_404, workspace_t
     @app.post("/api/sessions/{session_id}/tasks")
     async def create_task(session_id: str, body: TaskRequest):
         session_or_404(session_id)
-        return manager.task_board.create(session_id, **body.model_dump())
+        task = manager.task_board.create(session_id, **body.model_dump())
+        await manager.publish_tasks(session_id)
+        return task
 
     @app.patch("/api/sessions/{session_id}/tasks/{task_id}")
     async def update_task(session_id: str, task_id: str, body: dict):
         session_or_404(session_id)
-        return manager.task_board.update(session_id, task_id, body)
+        task = manager.task_board.update(session_id, task_id, body)
+        await manager.publish_tasks(session_id)
+        return task
 
     @app.get("/api/sessions/{session_id}/children")
     async def children(session_id: str):

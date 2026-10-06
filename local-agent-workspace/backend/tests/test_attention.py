@@ -233,7 +233,7 @@ async def test_a_turn_cut_off_by_a_restart_is_marked_interrupted(tmp_path, monke
     async with first.router.lifespan_context(first):
         store = first.state.manager.store
         cut, done = store.create(settings.values), store.create(settings.values)
-        cut.update(terminal_reason="completed", turn_ended=None)  # Running when the server stopped.
+        cut.update(terminal_reason="completed", turn_ended=None, turn_running=True)  # Running when the server stopped.
         done.update(terminal_reason="completed", turn_ended=123.0)
         store.save(cut)
         store.save(done)

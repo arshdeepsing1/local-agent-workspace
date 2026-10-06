@@ -29,6 +29,8 @@ export function useWorkspace() {
   // Unreviewed agent file changes of one conversation: { id, value: Changes }.
   const [changes, setChanges] = useState({ id: null, value: null })
   const changesPushed = useRef(0)
+  // The selected conversation's tasks, pushed as { type: 'tasks', tasks }: { id, value: Task[] }.
+  const [tasks, setTasks] = useState({ id: null, value: [] })
 
   const updateUrl = useCallback((id, replace = false) => {
     const url = new URL(window.location.href)
@@ -161,6 +163,7 @@ export function useWorkspace() {
           setSessions(current => current.map(item => item.id === activeId ? { ...item, context_info: data.context_info } : item))
         }
         if (data.type === 'changes') { changesPushed.current++; setChanges({ id: activeId, value: data.changes }) }
+        if (data.type === 'tasks') setTasks({ id: activeId, value: data.tasks })
         if (data.type === 'event' && data.event.child_session_id) void refreshSessions().catch(e => setError(e.message))
         if (data.type === 'event') setSession(current => {
           if (!current || current.id !== activeId) return current
@@ -175,7 +178,10 @@ export function useWorkspace() {
           // Keep the sidebar current and prevent an older list response from
           // replacing this newer streamed status.
           sessionsRequest.current++
-          setSession(current => current?.id === activeId ? { ...current, status: data.status } : current)
+          setSession(current => current?.id === activeId ? {
+            ...current, status: data.status, ...('terminal_reason' in data ? { terminal_reason: data.terminal_reason } : {}),
+            ...(data.turn_ended ? { turn_ended: data.turn_ended } : {}),
+          } : current)
           setSessions(current => current.map(item => item.id === activeId ? {
             ...item, status: data.status, ...(data.terminal_reason ? { terminal_reason: data.terminal_reason } : {}),
             ...(data.turn_ended ? { turn_ended: data.turn_ended } : {}),
@@ -227,6 +233,7 @@ export function useWorkspace() {
   const send = async text => {
     const id = await ensureSession(selected.current)
     await api(`/sessions/${id}/messages`, 'POST', { text })
+    return id
   }
   const saveSettings = async next => {
     const { workspace, model, env_file, context_window, max_output_tokens, max_agent_steps, compaction_handoffs, approval_timeout_minutes,
@@ -331,5 +338,6 @@ export function useWorkspace() {
     setError: reportError, setActiveId: selectSession, newConversation, send, saveSettings, deleteSession, renameSession, changeModel,
     modelSaving: modelSaves.has(selection.key) || (!activeId && defaultModelSave.current !== null),
     checkConnection, refreshSessions, permissionMode: activeSession?.permission_mode || draftMode, setPermissionMode, allowFolder, removeFolder, removeAllowRule,
-    changes: activeId && changes.id === activeId ? changes.value : null, reviewChanges, storageProblems }
+    changes: activeId && changes.id === activeId ? changes.value : null, reviewChanges, storageProblems,
+    tasks: activeId && tasks.id === activeId ? tasks.value : [] }
 }

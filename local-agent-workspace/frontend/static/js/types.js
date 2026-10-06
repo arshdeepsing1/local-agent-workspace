@@ -41,6 +41,10 @@
 // Changes (pushed as { type: 'changes', changes } and returned by Keep/Undo): {
 //   files: [{ path, status: 'created'|'modified'|'deleted'|'unavailable', added, removed,
 //   current_hash: string | null, error? }], added, removed, error? }
+// Task (pushed as { type: 'tasks', tasks } when they change and after the snapshot): { id, title,
+//   description, status: 'pending'|'in_progress'|'completed'|'cancelled', depends_on: string[], created, updated }
+// GET /sessions/<id>/transcript.md: the conversation as Markdown (text/markdown, attachment file name
+//   <date>-<title>-<id8>.md), as written by scripts/conversation_transcript.py, with secrets redacted.
 // ChangeDiff (GET /sessions/<id>/changes/diff?path=): { path, status, added, removed,
 //   baseline_hash, current_hash, hunks: [{ index, line, added, removed }],
 //   lines: [{ kind: 'context'|'removed'|'added', text, old?, new?, hunk?, newline? }] }

@@ -19,6 +19,13 @@ class TaskManager:
         rows = self.store.db.execute("SELECT data FROM tasks WHERE session_id=? ORDER BY created, id", (session_id,)).fetchall()
         return [json.loads(row[0]) for row in rows]
 
+    def get(self, session_id, task_id):
+        """One task of this conversation; another conversation's task is not found."""
+        task = next((item for item in self.list(session_id) if item["id"] == task_id), None)
+        if not task:
+            raise ValueError("Task not found in this conversation.")
+        return task
+
     def _validate(self, task, tasks):
         if not isinstance(task["title"], str) or not task["title"].strip() or len(task["title"]) > 200:
             raise ValueError("Task title must contain 1 to 200 characters.")

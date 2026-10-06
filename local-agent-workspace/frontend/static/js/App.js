@@ -14,13 +14,17 @@ import ContextMeter from './components/ContextMeter.js'
 import ChangesBar, { plural } from './components/ChangesBar.js'
 import StorageNotice from './components/StorageNotice.js'
 import { blockerOf, OpenBlockingChat } from './components/BlockingChat.js'
+import TaskChecklist from './components/TaskChecklist.js'
+import ContinueButton from './components/ContinueButton.js'
+import { removeDraft, useSavedDrafts } from './drafts.js'
 
 export default function App() {
   const app = useWorkspace()
   const attention = useAttention({ sessions: app.sessions, activeId: app.activeId, ready: app.ready, onSelect: app.setActiveId })
-  const [drafts, setDrafts] = useState({})
-  const draft = drafts[app.viewKey] || ''
-  const setDraft = value => setDrafts(current => ({ ...current, [app.viewKey]: resolve(value, current[app.viewKey] || '') }))
+  // Message drafts are saved in localStorage per conversation ('new' before it exists).
+  const draftKey = app.activeId || 'new'
+  const [draft, setDraft, forgetDraft] = useSavedDrafts(app.viewKey, draftKey)
+  const send = async text => { const id = await app.send(text); forgetDraft(text, draftKey, id) }
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [agentToolsOpen, setAgentToolsOpen] = useState(false)
   const [workspaceOpen, setWorkspaceOpen] = useState(false)
@@ -50,7 +54,7 @@ export default function App() {
     models=${app.connection?.models || []} busy=${busy} modelSaving=${app.modelSaving}
     disabled=${!app.ready || (!!app.activeId && !active) || !app.settings?.configured}
     onModel=${app.changeModel}
-    onSend=${app.send} onError=${showError} onAttach=${() => setWorkspaceOpen(true)}
+    onSend=${send} onError=${showError} onAttach=${() => setWorkspaceOpen(true)}
     loadSkills=${() => api(`/skills${app.activeId ? `?session_id=${encodeURIComponent(app.activeId)}` : ''}`)}
     onStop=${() => { if (active) void api(`/sessions/${active.id}/stop`, 'POST').catch(e => showError(e.message)) }} />`
   return html`<div class=${`app-shell ${workspaceOpen ? 'workspace-visible' : ''}`}>
@@ -61,7 +65,7 @@ export default function App() {
         const before = app.sessions.find(item => item.id === id)?.updated
         attention.renamed(id, before, (await app.renameSession(id, title)).updated)
       }}
-      onDelete=${id => void app.deleteSession(id).catch(e => showError(e.message))} />
+      onDelete=${id => void app.deleteSession(id).then(() => removeDraft(id)).catch(e => showError(e.message))} />
     <main class="main-area">
       <header class="topbar"><button class="icon-button mobile-only" aria-label="Open sidebar" onClick=${() => setSidebarOpen(true)}><${Menu} size=${20} /></button>
         <${Laptop} size=${18} className="topbar-device" />
@@ -83,6 +87,8 @@ export default function App() {
             <button class="outline" onClick=${() => setDraft('Run a command in this workspace: ')}><${Terminal} size=${16} />Run a command</button></div>
         </div></div>`}
       <div class="chat-composer"><${ChangesBar} key=${`changes-${app.viewKey}`} changes=${app.changes} busy=${busy} onOpen=${openReview} onAction=${app.reviewChanges} onError=${showError} />
+        <${TaskChecklist} key=${`tasks-${app.viewKey}`} tasks=${app.tasks} />
+        <${ContinueButton} session=${active} disabled=${!app.ready || !app.online || app.modelSaving || !app.settings?.configured} onSend=${app.send} onError=${showError} />
         ${composer}
         ${active?.status === 'awaiting_approval' ? html`<p class="composer-hint" role="status">An action is waiting for your approval above.</p>` : null}
         ${active?.status === 'compacting' ? html`<p class="composer-hint" role="status">Compacting context…</p>` : null}

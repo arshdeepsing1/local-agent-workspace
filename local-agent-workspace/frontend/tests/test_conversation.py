@@ -101,13 +101,93 @@ def test_ordinary_messages_have_no_invented_reasoning_or_activity(ui, page):
 
 
 def test_markdown_renders_gfm_and_shows_raw_html_as_text(ui, page):
-    show(ui, """[{ id: 'reply', type: 'assistant', text: '| a | b |\\n|---|---|\\n| 1 | ~~2~~ |\\n\\n<img src=x onerror="window.pwned=1"> [ok](https://example.com) [bad](javascript:alert(1))' }]""")
+    code = ('\\n\\n```html\\n<img src=x onerror="window.pwned=2"><script>window.pwned=3</script>\\n```'
+            '\\n\\n```\\n<img src=x onerror="window.pwned=4">\\n```'
+            '\\n\\n```"><img src=x onerror=window.pwned=5>\\nplain\\n```')
+    show(ui, """[{ id: 'reply', type: 'assistant', text: '| a | b |\\n|---|---|\\n| 1 | ~~2~~ |\\n\\n<img src=x onerror="window.pwned=1"> [ok](https://example.com) [bad](javascript:alert(1))""" + code + "' }]")
     expect(page.locator(".markdown table td del")).to_have_text("2")
     expect(page.locator(".markdown img")).to_have_count(0)
+    expect(page.locator(".markdown script")).to_have_count(0)
     expect(page.locator(".markdown")).to_contain_text('<img src=x onerror="window.pwned=1">')
     expect(page.get_by_role("link", name="ok")).to_have_attribute("href", "https://example.com")
     expect(page.locator(".markdown a", has_text="bad")).not_to_have_attribute("href", re.compile("javascript"))
+    # Code blocks are highlighted (or left plain) from their text, never parsed as HTML.
+    blocks = page.locator(".markdown .code-block pre code")
+    expect(blocks).to_have_count(3)
+    expect(blocks.nth(0)).to_have_class(re.compile(r"\bhljs\b"))
+    expect(blocks.nth(0)).to_have_text('<img src=x onerror="window.pwned=2"><script>window.pwned=3</script>')
+    expect(blocks.nth(1)).to_have_text('<img src=x onerror="window.pwned=4">')
+    expect(blocks.nth(2)).to_have_text("plain")
+    page.wait_for_timeout(100)
     assert ui.js("window.pwned === undefined")
+
+
+def test_finished_code_blocks_are_highlighted_and_copy_raw_code(ui, page):
+    code = 'def greet(name):\n    return f"Hi {name} & <bye>"'
+    show(ui, "[{ id: 'reply', type: 'assistant', text: " + json.dumps(f"Run this:\n\n```python\n{code}\n```") + " }]")
+    block = page.locator(".markdown pre code")
+    expect(block).to_have_class(re.compile(r"\bhljs\b"))
+    expect(block.locator(".hljs-keyword").first).to_have_text("def")
+    expect(block.locator(".hljs-string")).to_have_count(1)
+    copy = page.get_by_role("button", name="Copy code")
+    copy.focus()
+    page.keyboard.press("Enter")
+    expect(page.get_by_role("button", name="Copied")).to_be_visible()
+    assert ui.js("fake.clipboard") == [code]
+    expect(page.get_by_role("button", name="Copy code")).to_be_visible()
+
+
+@pytest.mark.parametrize("tag,grammar_word", [("c#", "namespace"), ("c++", "template"), ("cpp", "template")])
+def test_code_blocks_use_the_tagged_language_including_aliases_with_symbols(ui, page, tag, grammar_word):
+    # "namespace" and "template" are keywords in C# and C++, not in C.
+    code = "namespace App { template<typename T> class Box {}; }"
+    show(ui, "[{ id: 'reply', type: 'assistant', text: " + json.dumps(f"```{tag}\n{code}\n```") + " }]")
+    block = page.locator(".markdown pre code")
+    expect(block).to_have_class(re.compile(r"\bhljs\b"))
+    expect(block).not_to_have_class(re.compile(r"(^|\s)language-c(\s|$)"))
+    expect(block.locator(".hljs-keyword", has_text=grammar_word)).to_have_count(1)
+    expect(block).to_have_text(code)
+
+
+def test_code_is_highlighted_only_after_the_reply_finishes_and_only_once(ui, page):
+    ui.start(setup=SETUP)
+    ui.js("""import('/static/vendor/highlight.min.js').then(({ default: hljs }) => {
+      const highlight = hljs.highlight.bind(hljs), auto = hljs.highlightAuto.bind(hljs)
+      window.highlighted = []
+      hljs.highlight = (text, options) => { window.highlighted.push(text); return highlight(text, options) }
+      hljs.highlightAuto = text => { window.highlighted.push(text); return auto(text) }
+    })""")
+    done = "{ id: 'done', type: 'assistant', text: '```js\\nconst done = 1\\n```' }"
+    def props(text, status):
+        return ("{ onError: fake.spy('onError'), session: makeSession([" + done + ", { id: 'live', type: 'assistant', text: "
+                + json.dumps(text) + ", request_info: { model: 'm', status: '" + status + "' } }]) }")
+    page.evaluate("() => mount('components/Conversation.js', () => (" + props("```sh\nls", "running") + "))")
+    expect(page.get_by_role("button", name="Copy code")).to_have_count(1)
+    ui.run("window.finishedBlock = document.querySelector('.code-block')")
+    for text in ("```sh\nls -la", "```sh\nls -la\n```\n\nMore"):
+        ui.rerender(props(text, "running"))
+        expect(page.locator(".markdown").nth(1)).to_contain_text(text.split("\n")[1])
+    expect(page.locator(".markdown").nth(1).locator("code.hljs")).to_have_count(0)
+    assert ui.js("window.highlighted") == ["const done = 1\n"]
+    ui.rerender(props("```sh\nls -la\n```\n\nMore", "completed"))
+    expect(page.get_by_role("button", name="Copy code")).to_have_count(2)
+    expect(page.locator(".markdown").nth(1).locator("code.hljs")).to_have_count(1)
+    assert ui.js("window.highlighted") == ["const done = 1\n", "ls -la\n"]
+    assert ui.js("document.querySelector('.code-block') === window.finishedBlock")
+
+
+def test_large_untagged_and_unknown_language_blocks_stay_plain_but_copyable(ui, page):
+    large = "x = 1\n" * 4000  # 24 KB
+    text = f"```\n{large}```\n\n```python\n{large}```\n\n```no-such-language\nlet x = 1\n```"
+    show(ui, "[{ id: 'reply', type: 'assistant', text: " + json.dumps(text) + " }]")
+    blocks = page.locator(".markdown pre code")
+    expect(page.get_by_role("button", name="Copy code")).to_have_count(3)
+    expect(blocks.nth(0)).not_to_have_class(re.compile(r"\bhljs\b"))
+    expect(blocks.nth(1)).to_have_class(re.compile(r"\bhljs\b"))
+    expect(blocks.nth(2)).not_to_have_class(re.compile(r"\bhljs\b"))
+    page.get_by_role("button", name="Copy code").nth(0).click()
+    ui.wait("fake.clipboard.length === 1")
+    assert ui.js("fake.clipboard[0]") == large.rstrip("\n")
 
 
 def test_usage_snapshot_for_event_without_text(ui, page):
