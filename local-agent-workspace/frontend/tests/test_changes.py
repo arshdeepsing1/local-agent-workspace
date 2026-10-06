@@ -191,3 +191,16 @@ def test_a_pushed_list_newer_than_a_review_response_wins(ui):
     ui.run("fake.override = () => undefined; fake.reviewResult = makeChanges(changedFile('d.txt'))")
     ui.js("hook.reviewChanges('keep', [{ path: 'c.txt' }])")
     ui.wait("hook.changes.files[0].path === 'd.txt'")
+
+
+def test_a_file_outside_the_project_is_listed_by_its_full_path_and_opens_for_review(ui, page):
+    start_app(ui, page)
+    push(ui, "changedFile('/srv/notes/todo.md', 3, 0, 'created')")
+    bar(page).get_by_role("button", name=re.compile("^1 file changed")).click()
+    expect(page.get_by_role("listitem")).to_contain_text("todo.md/srv/notesNew file+3")
+    page.get_by_title("Review /srv/notes/todo.md").click()
+    expect(review(page, "/srv/notes/todo.md")).to_be_visible()
+    ui.wait("fake.requests('/api/sessions/a/changes/diff?path=%2Fsrv%2Fnotes%2Ftodo.md').length === 1")
+    # The file list shows the project folder only, so it has no dot for this file.
+    page.get_by_role("button", name="Back to files").click()
+    expect(page.get_by_role("img", name=re.compile("Changed by the agent|Contains changed files"))).to_have_count(0)

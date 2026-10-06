@@ -19,7 +19,7 @@ from .context import (
     estimate_scale, estimate_tokens, handoff_output_tokens, prepare_context, summary_byte_limit,
 )
 from .tools import LIMIT as FILE_LIMIT
-from .config import DEFAULT_MAX_AGENT_STEPS
+from .config import DEFAULT_APPROVAL_MINUTES, DEFAULT_MAX_AGENT_STEPS
 from .instructions import load_project_instructions
 from .jobs import JobManager, validate_command_options
 from .recovery import CheckpointManager
@@ -276,6 +276,14 @@ def repair_tool_history(wire, events, state):
     return repaired, state
 
 
+def unanswered(event, declined):
+    """The model-facing result of an approval that was declined or never answered."""
+    if event.get("approval") == "expired":
+        return ("The user did not answer this approval request in time, so it did not run. "
+                "Ask the user before trying it again.")
+    return declined
+
+
 def public_session(session, status="idle"):
     return {"permission_mode": "manual", "allowed_directories": [],
             **{k: v for k, v in session.items()
@@ -397,7 +405,8 @@ class AgentManager:
                                      preview=f"Hook: {hook['id']}\nFor tool: {name}\nCommand: {hook['command']}\nTimeout: {hook['timeout_seconds']} seconds", output="")
             try:
                 if session.get("permission_mode") != "bypassPermissions" and not await self.approve(session, event):
-                    raise ValueError("Hook approval declined.")
+                    raise ValueError("Hook approval was not answered in time." if event.get("approval") == "expired"
+                                     else "Hook approval declined.")
                 if asyncio.current_task().cancelling():
                     return
                 payload = {"event": phase, "session_id": session["id"], "tool": name, "arguments": arguments, "call_id": call_id}
@@ -535,18 +544,23 @@ class AgentManager:
         await self.broadcast(session["id"], {"type": "delta", "id": event["id"], "text": text})
 
     async def approve(self, session, event):
+        """Wait for the user's answer; event["approval"] records approved, declined or expired."""
         future = asyncio.get_running_loop().create_future()
         key = (session["id"], event["id"])
         self.pending[key] = future
+        minutes = self.settings.values.get("approval_timeout_minutes", DEFAULT_APPROVAL_MINUTES)
+        seconds = minutes * 60 if type(minutes) is int and minutes > 0 else None  # None waits until answered or stopped.
         try:
-            await self.update_event(session, event, state="pending")
+            await self.update_event(session, event, state="pending",
+                                    **({"approval_expires": time.time() + seconds} if seconds else {}))
             await self.status(session, "awaiting_approval")
-            allowed = await asyncio.wait_for(future, timeout=300)
+            allowed = await asyncio.wait_for(future, timeout=seconds)
+            outcome = "approved" if allowed else "declined"
         except TimeoutError:
-            allowed = False
+            allowed, outcome = False, "expired"
         finally:
             self.pending.pop(key, None)
-        await self.update_event(session, event, state="running" if allowed else "rejected")
+        await self.update_event(session, event, state="running" if allowed else "rejected", approval=outcome)
         await self.status(session, "running")
         return allowed
 
@@ -722,12 +736,15 @@ class AgentManager:
                     raise ValueError("MCP tool is not available in this turn.")
                 await self.update_event(session, event, preview=json.dumps(arguments, indent=2))
                 if decision == "ask" and not await self.approve(session, event):
-                    output = "User declined this MCP action. Do not retry it without a new instruction."
+                    output = unanswered(event, "User declined this MCP action. Do not retry it without a new instruction.")
                     await self.update_event(session, event, output=output)
                     return output
             if name in ("list_files", "read_file", "search_files", "write_file", "edit_file"):
-                if not await self.ensure_access(session, tools, arguments.get("path", "."), name in ("list_files", "search_files")):
-                    output = "User declined folder access. Do not retry or use a command to circumvent this decision."
+                access = {}
+                if not await self.ensure_access(session, tools, arguments.get("path", "."), name in ("list_files", "search_files"), access):
+                    output = ("The user did not answer the folder access request in time, so this file tool did not run. "
+                              "Ask the user before trying again." if access.get("expired") else
+                              "User declined folder access. Do not retry or use a command to circumvent this decision.")
                     await self.update_event(session, event, state="rejected", output=output)
                     return output
                 target = tools.path(arguments.get("path", "."))
@@ -761,7 +778,7 @@ class AgentManager:
                     preview = tools.change(name, arguments)
                 await self.update_event(session, event, preview=preview)
                 if decision == "ask" and not await self.approve(session, event):
-                    output = "User declined this action. Do not retry it without a new instruction."
+                    output = unanswered(event, "User declined this action. Do not retry it without a new instruction.")
                     await self.update_event(session, event, output=output)
                     return output
                 if not self.guidance_matches(session, tools):
@@ -852,7 +869,7 @@ class AgentManager:
                 await self.run_hooks(session, "tool_failure", name, arguments, call_id=call_id, error=output)
         return output
 
-    async def ensure_access(self, session, tools, value, directory=False):
+    async def ensure_access(self, session, tools, value, directory=False, outcome=None):
         target = tools.resolve(value)  # Exclusions apply before any access prompt.
         if tools.permitted(target):
             return True
@@ -860,7 +877,10 @@ class AgentManager:
         event = await self.event(session, "tool", name="access_directory", input={"path": str(folder)},
                                  state="running", output="", preview=f"Allow file tools to access {folder} for this conversation?\n\nReads may send file contents to your configured model. Edits follow the selected permission mode.")
         if not await self.approve(session, event):
-            await self.update_event(session, event, output="Folder access declined.")
+            expired = event.get("approval") == "expired"
+            if outcome is not None:
+                outcome["expired"] = expired
+            await self.update_event(session, event, output="Folder access was not answered in time." if expired else "Folder access declined.")
             return False
         tools.allowed_directories.append(folder)
         session.setdefault("allowed_directories", []).append(str(folder))

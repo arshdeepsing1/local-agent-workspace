@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .agents import AgentManager, public_session
-from .config import APP_ROOT, MAX_MAX_AGENT_STEPS, MIN_MAX_AGENT_STEPS, Settings
+from .config import APP_ROOT, MAX_APPROVAL_MINUTES, MAX_MAX_AGENT_STEPS, MIN_MAX_AGENT_STEPS, Settings
 from .context import (
     MAX_CONTEXT_WINDOW, MAX_MAX_OUTPUT_TOKENS, MIN_CONTEXT_WINDOW, MIN_MAX_OUTPUT_TOKENS,
 )
@@ -85,6 +85,7 @@ class SettingsEdit(BaseModel):
     max_output_tokens: int | None = Field(default=None, ge=MIN_MAX_OUTPUT_TOKENS, le=MAX_MAX_OUTPUT_TOKENS, strict=True)
     max_agent_steps: int | None = Field(default=None, ge=MIN_MAX_AGENT_STEPS, le=MAX_MAX_AGENT_STEPS, strict=True)
     compaction_handoffs: bool | None = Field(default=None, strict=True)
+    approval_timeout_minutes: int | None = Field(default=None, ge=0, le=MAX_APPROVAL_MINUTES, strict=True)
 
 
 class CommandRequest(BaseModel):

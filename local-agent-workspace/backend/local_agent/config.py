@@ -14,6 +14,9 @@ APP_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MAX_AGENT_STEPS = 32
 MIN_MAX_AGENT_STEPS = 1
 MAX_MAX_AGENT_STEPS = 64
+# Minutes an approval card waits for an answer; 0 waits until it is answered or stopped.
+DEFAULT_APPROVAL_MINUTES = 0
+MAX_APPROVAL_MINUTES = 1440
 
 
 def read_env(path: Path) -> dict[str, str]:
@@ -61,6 +64,7 @@ class Settings:
             "max_output_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
             "max_agent_steps": DEFAULT_MAX_AGENT_STEPS,
             "compaction_handoffs": True,
+            "approval_timeout_minutes": DEFAULT_APPROVAL_MINUTES,
         }
         if self.path.exists():
             saved = json.loads(self.path.read_text())
@@ -107,6 +111,9 @@ class Settings:
             raise ValueError(f"Agent step limit must be an integer from {MIN_MAX_AGENT_STEPS} to {MAX_MAX_AGENT_STEPS}.")
         if type(candidate["compaction_handoffs"]) is not bool:
             raise ValueError("Compaction handoffs must be on or off.")
+        minutes = candidate["approval_timeout_minutes"]
+        if type(minutes) is not int or not 0 <= minutes <= MAX_APPROVAL_MINUTES:
+            raise ValueError(f"Approval wait must be 0 (no limit) or 1 to {MAX_APPROVAL_MINUTES:,} minutes.")
         candidate["workspace"] = str(workspace)
         self.values = candidate
         temp = self.path.with_suffix(".tmp")

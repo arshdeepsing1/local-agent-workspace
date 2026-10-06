@@ -213,10 +213,11 @@ export function useWorkspace() {
     await api(`/sessions/${id}/messages`, 'POST', { text })
   }
   const saveSettings = async next => {
-    const { workspace, model, env_file, context_window, max_output_tokens, max_agent_steps, compaction_handoffs } = next
+    const { workspace, model, env_file, context_window, max_output_tokens, max_agent_steps, compaction_handoffs, approval_timeout_minutes } = next
     const saved = await api('/settings', 'PUT', {
       workspace, model, env_file, context_window, max_output_tokens, max_agent_steps,
       ...(typeof compaction_handoffs === 'boolean' ? { compaction_handoffs } : {}),
+      ...(Number.isInteger(approval_timeout_minutes) ? { approval_timeout_minutes } : {}),
     })
     setSettings(saved)
     void checkConnection().catch(e => setError(e.message))

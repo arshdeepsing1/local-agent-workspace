@@ -66,6 +66,8 @@ class Event(Record):
     output: str | None = None
     preview: str | None = None
     state: Literal["pending", "running", "completed", "rejected", "cancelled", "error"] | None = None
+    approval: Literal["approved", "declined", "expired"] | None = None
+    approval_expires: float | None = None
     call_id: str | None = None
     child_session_id: str | None = None
     origin: Origin | None = None

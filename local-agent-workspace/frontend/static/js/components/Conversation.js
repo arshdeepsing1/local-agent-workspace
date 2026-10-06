@@ -58,7 +58,7 @@ function ToolDetails({ event, pending }) {
 }
 
 function toolOutcome(event) {
-  if (event.state === 'rejected') return 'Action declined'
+  if (event.state === 'rejected') return event.approval === 'expired' ? 'Not answered in time; the action did not run' : 'Action declined'
   if (event.state === 'cancelled') return 'Action cancelled'
   const output = (event.output || '').trim().replace(/\s+/g, ' ')
   return output ? output.slice(0, 240) + (output.length > 240 ? '…' : '') : 'Tool returned an error'
@@ -99,7 +99,8 @@ function ToolCard({ event, summary, sessionId, onError, onSelectSession }) {
     </button>
     <${DelegationStatus} event=${event} onSelectSession=${onSelectSession} />
     ${expanded || pending ? html`<div class="tool-body">
-      ${pending ? html`<p>Local needs your approval to ${title.toLowerCase()}.</p>
+      ${pending ? html`<p>Local needs your approval to ${title.toLowerCase()}.${event.approval_expires
+          ? ` If you do not answer by ${new Date(event.approval_expires * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}, it will not run.` : ''}</p>
         <${ToolDetails} event=${event} pending=${true} />
         <div class="approval-buttons"><button class="outline" disabled=${deciding} onClick=${() => void decide(false)}><${X} size=${15} />Decline</button>
           <button class="primary" disabled=${deciding} onClick=${() => void decide(true)}><${Check} size=${15} />Approve</button></div>`

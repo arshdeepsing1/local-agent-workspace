@@ -1,14 +1,15 @@
 // Shapes of the main API objects, for reference while editing (JSDoc only).
 //
 // Settings: { workspace, model, env_file, context_window, max_output_tokens,
-//   max_agent_steps, compaction_handoffs?, host, configured }
+//   max_agent_steps, compaction_handoffs?, approval_timeout_minutes? (0 = no limit), host, configured }
 // Connection: { connected, models: string[], error: string | null }
 // Session: { id, title, workspace, model, status, events: AgentEvent[], updated,
 //   permission_mode, allowed_directories, context_info?, active_skills?,
 //   parent_session_id?, is_subagent?, delegation?, tool_profile?, subagent_tool_profile? }
 // AgentEvent: { id, type: 'user'|'assistant'|'tool'|'notice'|'error', text?,
 //   reasoning_summary?, reasoning_truncated?, child_session_id?, request_info?,
-//   name?, input?, output?, preview?, state?, delegation?, origin? }
+//   name?, input?, output?, preview?, state?, delegation?, origin?,
+//   approval?: 'approved'|'declined'|'expired', approval_expires? (epoch seconds, only with a limit) }
 // RequestInfo: { model, status, finish_reason?, http_status?, error_kind?, usage? }
 // ContextInfo: { estimated_tokens, input_budget, context_window, reply_reserve,
 //   compactions, summarized_messages, estimate_method, instruction_files, warnings,
