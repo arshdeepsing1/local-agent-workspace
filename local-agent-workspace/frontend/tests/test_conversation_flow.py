@@ -309,6 +309,22 @@ def test_a_failed_first_message_is_saved_again_as_the_new_draft(ui, page, switch
     expect(message(page)).to_have_value("Hello there")
 
 
+def test_a_failed_first_message_comes_back_in_a_new_view_opened_during_the_send(ui, page):
+    start_app(ui, page, setup=DEFERRED_CREATION)
+    message(page).fill("Hello there")
+    page.get_by_role("button", name="Send message").click()
+    ui.wait("fake.requests('/api/sessions', 'POST').length === 1")
+    page.get_by_role("button", name="New conversation").click()
+    expect(message(page)).to_have_value("")
+    ui.run("fake.deferreds.create.resolve(fake.json({ detail: 'Could not create the conversation.' }, 500))")
+    expect(message(page)).to_have_value("Hello there")
+    message(page).press("End")
+    message(page).type("!")
+    ui.wait("localStorage.getItem('local-workspace:draft:new') === 'Hello there!'")
+    page.get_by_role("button", name="New conversation").click()
+    expect(message(page)).to_have_value("Hello there!")
+
+
 def test_a_first_message_that_fails_after_creation_stays_with_the_created_chat(ui, page):
     start_app(ui, page, setup="""fake.override = (path, options) => path === '/api/sessions/created/messages'
       ? fake.json({ detail: 'The model is unavailable.' }, 500) : undefined""")

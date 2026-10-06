@@ -201,8 +201,9 @@ when opening a conversation or performing restart recovery.
   browser's `localStorage` about half a second after you stop typing (and when the page
   closes), so they survive a reload; the new-conversation view keeps its own draft, which
   moves to the conversation once it exists. A sent draft is removed (a new conversation's
-  first message as soon as you send it, so **New** during the send starts empty; it is saved
-  again if sending fails); text typed while it was sending is saved as the new draft. At most 50 drafts
+  first message as soon as you send it, so **New** during the send starts empty; if sending
+  fails it comes back as the new-conversation draft, also in a new view opened during the
+  send); text typed while it was sending is saved as the new draft. At most 50 drafts
   are kept (the oldest goes first). A draft over 100 KB, or any draft when the browser
   blocks storage, is kept only in the page. Drafts stay in this browser profile; the
   server never receives them.

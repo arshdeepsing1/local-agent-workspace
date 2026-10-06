@@ -106,7 +106,8 @@ export function useSavedDrafts(viewKey, storeKey) {
   }
   // Sending the first message of a new conversation: its text leaves the shared
   // 'new' draft at once, so a new conversation opened during the send starts
-  // empty. Returns restore(), which saves it again if the send fails.
+  // empty. Returns restore(), which brings it back if the send fails: into the
+  // new-conversation view now open when its box is empty, else saved as the draft.
   const release = key => {
     const view = viewKey
     const text = latest.current
@@ -114,7 +115,9 @@ export function useSavedDrafts(viewKey, storeKey) {
     pending.current = null
     removeDraft(key)
     return () => {
-      if (previous.current.viewKey === view) setRevision(value => value + 1)
+      const open = previous.current
+      if (open.viewKey === view) setRevision(value => value + 1)
+      else if (open.storeKey === key) setDrafts(current => current[open.viewKey] ? current : { ...current, [open.viewKey]: text })
       else if (loadDraft(key) === null) saveDraft(key, text)
     }
   }
