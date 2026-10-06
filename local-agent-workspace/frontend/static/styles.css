@@ -170,3 +170,12 @@
 .storage-notice ul{margin:4px 0 0;padding-left:18px}.storage-notice code{font:11px ui-monospace,SFMono-Regular,Menlo,monospace}
 @media(max-width:600px){.storage-notice{font-size:11px;padding:8px 12px}}
 .main-area:focus{outline:none}
+/* M1 approvals: "Allow for this chat", decline notes, and naming the blocking chat */
+.decline-note{display:block;font-size:12px;margin:10px 0}.decline-note textarea{display:block;width:100%;min-height:44px;resize:vertical;margin-top:5px;padding:7px 9px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--ink);font-size:12px;line-height:1.5}
+.approval-buttons{flex-wrap:wrap}
+.tool-rule{margin:0 13px 10px;font-size:11px;color:var(--muted)}
+.allow-rules{border-top:1px solid #eeeee9;margin-top:5px;padding-top:7px}.allow-rules .permissions-heading{padding:0 7px 4px}
+.allow-rule{display:flex;align-items:center;gap:6px;padding:2px 3px 2px 7px;font-size:12px}.allow-rule>span{flex:1;min-width:0;overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;line-clamp:3;overflow-wrap:anywhere}.allow-rule code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;white-space:pre-wrap;overflow-wrap:anywhere}
+.permissions-menu>.permissions-note{position:sticky;bottom:-7px;background:#fff;padding-bottom:7px;margin-bottom:-7px}.allow-rule .icon-button{width:25px;height:25px}.allow-rule .icon-button[aria-disabled=true]{opacity:.5;cursor:default}
+.open-blocking-chat{font-size:12px;padding:5px 10px;max-width:40%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:inline-block}
+.blocked-error{display:flex;align-items:center;gap:8px 10px;flex-wrap:wrap}.blocked-error>span{flex:1 1 12em;min-width:0}.blocked-error .open-blocking-chat{max-width:100%;background:var(--surface)}

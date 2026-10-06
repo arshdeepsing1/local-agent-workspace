@@ -12,6 +12,7 @@ import FolderAccessDialog from './components/FolderAccessDialog.js'
 import ContextMeter from './components/ContextMeter.js'
 import ChangesBar, { plural } from './components/ChangesBar.js'
 import StorageNotice from './components/StorageNotice.js'
+import { blockerOf, OpenBlockingChat } from './components/BlockingChat.js'
 
 export default function App() {
   const app = useWorkspace()
@@ -32,12 +33,18 @@ export default function App() {
   const setEditorFile = value => setEditorDrafts(current => ({ ...current, [editorKey]: resolve(value, current[editorKey] || null) }))
   const hasMessages = !!active?.events.length
   const busy = !!active && active.status !== 'idle'
-  const showError = error => app.setError(error)
+  // An error can name another chat that blocks the action: { message, session_id, title }.
+  const [blocker, setBlocker] = useState(null)
+  const showError = error => {
+    const message = typeof error === 'string' ? error : error?.message || String(error)
+    setBlocker(blockerOf(error))
+    app.setError(message)
+  }
   const changedFiles = app.changes?.files.length || 0
   const openReview = path => { setReview({ path, viewKey: app.viewKey }); setWorkspaceOpen(true) }
   const composer = html`<${Composer} key=${app.viewKey} value=${draft} setValue=${setDraft} model=${active?.model || app.settings?.model || 'databricks-gpt-oss-120b'}
     workspace=${active?.workspace || app.settings?.workspace || ''} mode=${app.permissionMode} onMode=${app.setPermissionMode} onProject=${() => setSettingsOpen(true)}
-    onFolders=${() => setFoldersOpen(true)}
+    onFolders=${() => setFoldersOpen(true)} rules=${active?.allow_rules || []} onRemoveRule=${app.removeAllowRule}
     models=${app.connection?.models || []} busy=${busy} modelSaving=${app.modelSaving}
     disabled=${!app.ready || (!!app.activeId && !active) || !app.settings?.configured}
     onModel=${app.changeModel}
@@ -59,7 +66,8 @@ export default function App() {
         <button class=${`outline workspace-toggle ${workspaceOpen ? 'active' : ''}`} onClick=${() => setWorkspaceOpen(v => !v)}><${PanelRight} size=${18} /><span>Workspace</span>
           ${changedFiles ? html`<span class="change-count" title=${`${plural(changedFiles, 'file')} changed by the agent`}><span aria-hidden="true">${changedFiles}</span><span class="sr-only">(${plural(changedFiles, 'changed file')})</span></span>` : null}</button>
       </header>
-      ${app.error ? html`<div class="app-error" role="alert"><span>${app.error}</span><button class="icon-button" aria-label="Dismiss error" onClick=${() => app.setError('')}><${X} size=${16} /></button></div>` : null}
+      ${app.error ? html`<div class="app-error" role="alert"><span>${app.error}</span>
+        <${OpenBlockingChat} blocker=${blocker?.message === app.error ? blocker : null} currentId=${app.activeId} onSelect=${app.setActiveId} /><button class="icon-button" aria-label="Dismiss error" onClick=${() => app.setError('')}><${X} size=${16} /></button></div>` : null}
       <${StorageNotice} problems=${app.storageProblems} />
       ${!app.online && app.activeId ? html`<div class="connection-banner">Reconnecting to your local server… Refresh if the server was restarted.</div>` : null}
       ${app.connection && !app.connection.connected ? html`<div class="connection-banner"><span>${app.connection.error || 'Configure Databricks to start a conversation.'}</span><button onClick=${() => setSettingsOpen(true)}>Open settings</button></div>` : null}
@@ -82,7 +90,7 @@ export default function App() {
     </main>
     ${workspaceOpen && app.settings && (!app.activeId || active) ? html`<${WorkspacePanel} key=${editorKey} sessionId=${app.activeId}
       workspace=${workspace} file=${editorDrafts[editorKey] || null} setFile=${setEditorFile} onClose=${() => setWorkspaceOpen(false)}
-      changes=${app.changes} busy=${busy} review=${review?.viewKey === app.viewKey ? review : null} onReviewOpened=${() => setReview(null)} onReview=${app.reviewChanges}
+      changes=${app.changes} busy=${busy} review=${review?.viewKey === app.viewKey ? review : null} onReviewOpened=${() => setReview(null)} onReview=${app.reviewChanges} onSelectSession=${app.setActiveId}
       onAttach=${path => { setDraft(current => `${current}${current ? '\n' : ''}Please read the project file: ${path}`); setWorkspaceOpen(false) }} />` : null}
     ${agentToolsOpen && app.settings && (!app.activeId || active) ? html`<${AgentToolsDialog} key=${editorKey} session=${active} workspace=${workspace} onClose=${() => setAgentToolsOpen(false)} onError=${showError} onSelectSession=${id => { setAgentToolsOpen(false); app.setActiveId(id); void app.refreshSessions().catch(e => showError(e.message)) }} />` : null}
     ${settingsOpen && app.settings ? html`<${SettingsDialog} settings=${app.settings} connection=${app.connection} onSave=${app.saveSettings} onClose=${() => setSettingsOpen(false)} />` : null}

@@ -4,6 +4,7 @@ from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
 from .agents import public_session
+from .approvals import busy_conflict, busy_status, clip_title, ensure_idle
 from .tool_profiles import validate_profile
 
 
@@ -42,9 +43,8 @@ class SubagentProfileRequest(BaseModel):
 
 
 def register_features(app, manager, settings, store, session_or_404, workspace_tools):
-    def idle(session):
-        if manager.statuses.get(session["id"], "idle") != "idle":
-            raise HTTPException(409, "Stop the current response before changing this conversation.")
+    def idle(session, action="changing this conversation"):
+        ensure_idle(manager, session, action)
 
     def scoped_worktree(worktree_id, tools):
         record = next((item for item in manager.worktrees.list(str(tools.root)) if item["id"] == worktree_id), None)
@@ -74,8 +74,14 @@ def register_features(app, manager, settings, store, session_or_404, workspace_t
         # Writing files back is an explicit user action, guarded against active writers in this workspace.
         for summary in store.list():
             if Path(summary["workspace"]).resolve() == tools.root:
-                idle(summary)
-        if any(job["state"] == "running" for job in manager.jobs.list(workspace=str(tools.root))):
+                idle(summary, action)
+        job = next((job for job in manager.jobs.list(workspace=str(tools.root)) if job["state"] == "running"), None)
+        owner = job and job.get("session_id") and store.get(job["session_id"])
+        if owner:
+            raise HTTPException(409, detail={
+                "message": f"A command started in “{clip_title(owner.get('title'))}” is still running. Stop it in Terminal before {action}.",
+                "session_id": owner["id"], "title": clip_title(owner.get("title"), 160)})
+        if job:
             raise HTTPException(409, f"Stop workspace commands before {action}.")
 
     @app.post("/api/checkpoints/{checkpoint_id}/restore")
@@ -174,7 +180,11 @@ def register_features(app, manager, settings, store, session_or_404, workspace_t
         return result
 
     def extensions_idle():
-        if any(not task.done() for task in manager.tasks.values()):
+        active = next((session_id for session_id, task in manager.tasks.items() if not task.done()), None)
+        session = active and manager.get(active)
+        if session:
+            raise busy_conflict(session, busy_status(manager, active), "changing or testing extensions")
+        if active:
             raise HTTPException(409, "Stop active responses before changing or testing extensions.")
 
     @app.get("/api/extensions")

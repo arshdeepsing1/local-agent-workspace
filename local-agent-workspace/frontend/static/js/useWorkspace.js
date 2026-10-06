@@ -150,6 +150,7 @@ export function useWorkspace() {
         }
         if (data.type === 'permissions') setSession(current => current?.id === activeId ? {
           ...current, permission_mode: data.permission_mode, allowed_directories: data.allowed_directories,
+          allow_rules: data.allow_rules || current.allow_rules,
         } : current)
         if (data.type === 'context') {
           contextUpdates.current.set(activeId, data.context_info)
@@ -298,6 +299,14 @@ export function useWorkspace() {
       } : current)
     }
   }
+  const removeAllowRule = async rule => {
+    const target = selected.current
+    if (!activeId) return
+    const updated = await api(`/sessions/${activeId}/allow-rules`, 'DELETE', rule)
+    if (selected.current === target) setSession(current => current?.id === updated.id ? {
+      ...current, allow_rules: updated.allow_rules,
+    } : current)
+  }
   const reviewChanges = async (action, files) => {
     const id = selected.current.id
     if (!id) return null
@@ -312,6 +321,6 @@ export function useWorkspace() {
   return { settings, connection, sessions, session: activeSession, activeId, viewKey: selection.key, error, online, ready,
     setError: reportError, setActiveId: selectSession, newConversation, send, saveSettings, deleteSession, renameSession, changeModel,
     modelSaving: modelSaves.has(selection.key) || (!activeId && defaultModelSave.current !== null),
-    checkConnection, refreshSessions, permissionMode: activeSession?.permission_mode || draftMode, setPermissionMode, allowFolder, removeFolder,
+    checkConnection, refreshSessions, permissionMode: activeSession?.permission_mode || draftMode, setPermissionMode, allowFolder, removeFolder, removeAllowRule,
     changes: activeId && changes.id === activeId ? changes.value : null, reviewChanges, storageProblems }
 }

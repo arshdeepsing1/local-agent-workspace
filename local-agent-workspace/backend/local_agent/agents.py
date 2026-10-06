@@ -40,6 +40,7 @@ from .model_stream import ToolCallBuffer, error_body_prefix, sse_data
 from .tool_schema import validate_arguments
 from .drafts import DraftPersistenceError, STORAGE_ERRORS, StreamDraft
 from .store import UnreadableConversation
+from .approvals import MAX_ALLOW_RULES, allowed_by_rule, declined, rule_for
 
 
 MAX_OUTPUT_LIMIT_RETRIES = 2
@@ -308,7 +309,7 @@ def unanswered(event, declined):
 
 
 def public_session(session, status="idle"):
-    return {"permission_mode": "manual", "allowed_directories": [],
+    return {"permission_mode": "manual", "allowed_directories": [], "allow_rules": [],
             **{k: v for k, v in session.items()
                if k not in ("wire", "context_state", "instruction_directories", "inference_calls", "command_jobs", "file_views")},
             "status": status}
@@ -440,12 +441,15 @@ class AgentManager:
                 return
             if not hook["enabled"] or hook["event"] != phase or ("tools" in hook and name not in hook["tools"]):
                 continue
+            by_rule = (session.get("permission_mode") != "bypassPermissions"
+                       and allowed_by_rule(session, f"hook_{phase}", {"hook_id": hook["id"]}))
             event = await self.event(session, "tool", name=f"hook_{phase}", state="running", input={"hook_id": hook["id"], "tool": name, "call_id": call_id},
-                                     preview=f"Hook: {hook['id']}\nFor tool: {name}\nCommand: {hook['command']}\nTimeout: {hook['timeout_seconds']} seconds", output="")
+                                     preview=f"Hook: {hook['id']}\nFor tool: {name}\nCommand: {hook['command']}\nTimeout: {hook['timeout_seconds']} seconds", output="",
+                                     **({"allowed_by_rule": True} if by_rule else {}))
             try:
-                if session.get("permission_mode") != "bypassPermissions" and not await self.approve(session, event):
+                if session.get("permission_mode") != "bypassPermissions" and not by_rule and not await self.approve(session, event):
                     raise ValueError("Hook approval was not answered in time." if event.get("approval") == "expired"
-                                     else "Hook approval declined.")
+                                     else declined(event, "this hook", f"Do not retry {name} without a new instruction."))
                 if asyncio.current_task().cancelling():
                     return
                 payload = {"event": phase, "session_id": session["id"], "tool": name, "arguments": arguments, "call_id": call_id}
@@ -608,21 +612,54 @@ class AgentManager:
             await self.update_event(session, event, state="pending",
                                     **({"approval_expires": time.time() + seconds} if seconds else {}))
             await self.status(session, "awaiting_approval")
-            allowed = await asyncio.wait_for(future, timeout=seconds)
+            answer = await asyncio.wait_for(future, timeout=seconds)
+            answer = answer if isinstance(answer, dict) else {"allowed": bool(answer)}
+            allowed = answer["allowed"]
             outcome = "approved" if allowed else "declined"
         except TimeoutError:
-            allowed, outcome = False, "expired"
+            allowed, outcome, answer = False, "expired", {}
         finally:
             self.pending.pop(key, None)
-        await self.update_event(session, event, state="running" if allowed else "rejected", approval=outcome)
+        rule = answer.get("rule") if allowed else None
+        if rule and rule not in session.setdefault("allow_rules", []):
+            session["allow_rules"].append(rule)
+        await self.update_event(session, event, state="running" if allowed else "rejected", approval=outcome,
+                                **({"decline_note": answer["note"]} if not allowed and answer.get("note") else {}))
+        if rule:
+            await self.publish_permissions(session)
         await self.status(session, "running")
         return allowed
 
-    def decide(self, session_id, event_id, allowed):
+    def decide(self, session_id, event_id, allowed, remember=False, note=None):
+        """Answer a pending card. remember stores an exact allow rule for this chat;
+        note (Decline only) is returned to the model with the decline."""
         future = self.pending.get((session_id, event_id))
         if not future or future.done():
             raise ValueError("This approval is no longer pending.")
-        future.set_result(allowed)
+        answer = {"allowed": bool(allowed)}
+        if remember:
+            if not allowed:
+                raise ValueError("Only an approval can be remembered for this chat.")
+            session = self.get(session_id) or {}
+            event = next((item for item in session.get("events", []) if item.get("id") == event_id), {})
+            rule = rule_for(event.get("name"), event.get("input"))
+            if rule is None:
+                raise ValueError("This action cannot be allowed for the whole chat.")
+            rules = session.get("allow_rules") or []
+            if rule not in rules and len(rules) >= MAX_ALLOW_RULES:
+                raise ValueError(f"This chat already allows {MAX_ALLOW_RULES} actions. Remove one in the Permissions menu first.")
+            answer["rule"] = rule
+        note = note.strip() if isinstance(note, str) else ""
+        if note:
+            if allowed:
+                raise ValueError("A note can only be sent with Decline.")
+            answer["note"] = self.settings.redact(note)
+        future.set_result(answer)
+
+    async def publish_permissions(self, session):
+        await self.broadcast(session["id"], {"type": "permissions", "permission_mode": session.get("permission_mode", "manual"),
+                                               "allowed_directories": session.get("allowed_directories", []),
+                                               "allow_rules": session.get("allow_rules", [])})
 
     def start(self, session_id, prompt):
         if session_id in self.tasks and not self.tasks[session_id].done():
@@ -788,9 +825,11 @@ class AgentManager:
                     raise ValueError("Project or skill instructions changed. Review refreshed guidance before using MCP tools.")
                 if name not in mcp_names:
                     raise ValueError("MCP tool is not available in this turn.")
-                await self.update_event(session, event, preview=json.dumps(arguments, indent=2))
-                if decision == "ask" and not await self.approve(session, event):
-                    output = unanswered(event, "User declined this MCP action. Do not retry it without a new instruction.")
+                by_rule = decision == "ask" and allowed_by_rule(session, name, arguments)
+                await self.update_event(session, event, preview=json.dumps(arguments, indent=2),
+                                        **({"allowed_by_rule": True} if by_rule else {}))
+                if decision == "ask" and not by_rule and not await self.approve(session, event):
+                    output = unanswered(event, declined(event, "this MCP action"))
                     await self.update_event(session, event, output=output)
                     return output
             if name in ("list_files", "read_file", "search_files", "write_file", "edit_file"):
@@ -798,9 +837,10 @@ class AgentManager:
                 if not await self.ensure_access(session, tools, arguments.get("path", "."), name in ("list_files", "search_files"), access):
                     output = ("The user did not answer the folder access request in time, so this file tool did not run. "
                               "Ask the user before trying again." if access["approval"] == "expired" else
-                              "User declined folder access. Do not retry or use a command to circumvent this decision.")
+                              declined(access, "folder access", "Do not retry or use a command to circumvent this decision."))
                     # The file tool did not run because of the access card's answer; show the same outcome on it.
-                    await self.update_event(session, event, state="rejected", output=output, approval=access["approval"])
+                    await self.update_event(session, event, state="rejected", output=output, approval=access["approval"],
+                                            **({"decline_note": access["decline_note"]} if access.get("decline_note") else {}))
                     return output
                 target = tools.path(arguments.get("path", "."))
                 if target.is_relative_to(tools.root):
@@ -838,9 +878,10 @@ class AgentManager:
                                + ("\nBackground job: continues after this chat turn; stop it in Terminal or with stop_job." if arguments.get("background") else "\nForeground command: Stop response also stops this job."))
                 else:
                     preview = tools.change(name, arguments)
-                await self.update_event(session, event, preview=preview)
-                if decision == "ask" and not await self.approve(session, event):
-                    output = unanswered(event, "User declined this action. Do not retry it without a new instruction.")
+                by_rule = decision == "ask" and allowed_by_rule(session, name, arguments)
+                await self.update_event(session, event, preview=preview, **({"allowed_by_rule": True} if by_rule else {}))
+                if decision == "ask" and not by_rule and not await self.approve(session, event):
+                    output = unanswered(event, declined(event))
                     await self.update_event(session, event, output=output)
                     return output
                 if not self.guidance_matches(session, tools):
@@ -1000,14 +1041,13 @@ class AgentManager:
         if not await self.approve(session, event):
             expired = event.get("approval") == "expired"
             if outcome is not None:
-                outcome["approval"] = "expired" if expired else "declined"
+                outcome.update(approval="expired" if expired else "declined", decline_note=event.get("decline_note"))
             await self.update_event(session, event, output="Folder access was not answered in time." if expired else "Folder access declined.")
             return False
         tools.allowed_directories.append(folder)
         session.setdefault("allowed_directories", []).append(str(folder))
         await self.update_event(session, event, state="completed", output="Folder access granted for this conversation.")
-        await self.broadcast(session["id"], {"type": "permissions", "permission_mode": session.get("permission_mode", "manual"),
-                                               "allowed_directories": session["allowed_directories"]})
+        await self.publish_permissions(session)
         return True
 
     async def run_databricks(self, session, prompt):
