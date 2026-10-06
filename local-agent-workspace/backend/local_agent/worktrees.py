@@ -101,6 +101,13 @@ class WorktreeManager:
             workspace = Path(session["workspace"]).expanduser().resolve()
             if workspace.is_relative_to(target):
                 return True
+        # A conversation hidden as unreadable may be repaired and still needs its workspace.
+        for workspace in self.store.problem_workspaces():
+            try:
+                if Path(workspace).expanduser().resolve().is_relative_to(target):
+                    return True
+            except (OSError, RuntimeError, ValueError):
+                continue
         exists = self.store.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'").fetchone()
         if exists:
             for (data,) in self.store.db.execute("SELECT data FROM jobs"):

@@ -127,3 +127,12 @@ async def test_title_deadline_cancels_a_stalled_request(setup, monkeypatch):
     mock_gateway(monkeypatch, gateway)
     assert await asyncio.wait_for(generate_title(*setup), 1) is None
     assert cancelled.is_set()
+
+
+def test_a_redacted_fallback_title_is_cut_after_redaction_and_still_renamed():
+    secret = "s3cret-" * 12  # Longer than the title, so cutting first would leave part of it.
+    redact = lambda text: text.replace(secret, "[REDACTED]")
+    prompt = f"Use {secret} to call the API"
+    assert fallback_title(prompt, redact) == "Use [REDACTED] to call the API"
+    session = {"events": [{"type": "user", "text": prompt}], "title": fallback_title(prompt, redact)}
+    assert needs_title(session, redact) and not needs_title(session)

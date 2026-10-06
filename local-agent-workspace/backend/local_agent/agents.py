@@ -582,7 +582,8 @@ class AgentManager:
         message = {"type": "status", "status": status}
         if status == "idle":
             # How and when the last turn ended, for notifications and the Continue button.
-            message.update({key: session[key] for key in ("terminal_reason", "turn_ended") if session.get(key)})
+            message.update({key: session[key] for key in ("terminal_reason", "turn_ended", "turn_delegated")
+                            if session.get(key)})
         await self.broadcast(session["id"], message)
         self.notify_status(session, previous, status, turn_ended)
         await self.delegates.progress(session, status=status)
@@ -594,9 +595,15 @@ class AgentManager:
         """A desktop notification of the change, only if enabled and no page is open."""
         if self.settings.values.get("system_notifications") is not True or self.pages or any(self.listeners.values()):
             return
-        message = attention_message(session, previous, status, turn_ended)
+        # Titles stored before redaction, too; redacted before attention_message cuts them.
+        title = self.redact_title(str(session.get("title") or ""))
+        message = attention_message({**session, "title": title}, previous, status, turn_ended)
         if message:
             self.notifier.send(message)
+
+    def redact_title(self, text):
+        """Text shown outside the chat (titles, notifications) without credentials or secret shapes."""
+        return self.settings.redact(redact_secrets(text))
 
     def session_tools(self, session):
         return WorkspaceTools(session["workspace"], self.settings.values["env_file"], session.get("allowed_directories", []),
@@ -751,24 +758,25 @@ class AgentManager:
             # Saved with the user event. turn_running (internal) lasts until the model loop
             # ends and tells restart recovery the answer was cut short; turn_ended is None
             # while the turn runs and records when it ended (notifications).
-            session.update(turn_running=True, turn_ended=None)
-            await self.status(session, "running")
             origin = {}
             if session.get("parent_event_id") and not session["events"] and not session.get("delegation", {}).get("terminal_reason"):
                 origin = {"origin": {"kind": "delegated", "parent_session_id": session["parent_session_id"],
                                      "parent_event_id": session["parent_event_id"], "parent_call_id": session.get("parent_call_id")}}
+            # turn_delegated: the parent's delegate_task started this turn and reports its end.
+            session.update(turn_running=True, turn_ended=None, turn_delegated=bool(origin))
+            await self.status(session, "running")
             await self.event(session, "user", text=prompt, **origin)
             if session["title"] == "New conversation" and not session.get("title_generated"):
-                session["title"] = fallback_title(prompt)
+                session["title"] = fallback_title(prompt, self.redact_title)
                 self.store.save(session)
                 await self.broadcast(session["id"], {"type": "title", "title": session["title"]})
             completed = await self.run_databricks(session, prompt)
             session.pop("turn_running", None)  # The answer is finished; naming is not part of it.
-            if completed and needs_title(session):
+            if completed and needs_title(session, self.redact_title):
                 previous_title = session["title"]
                 await self.status(session, "naming")
                 title = await generate_title(self.settings, session, self.store.save)
-                if title and needs_title(session) and session["title"] == previous_title:
+                if title and needs_title(session, self.redact_title) and session["title"] == previous_title:
                     session.update(title=title, title_generated=True)
                     self.store.save(session)
                     await self.broadcast(session["id"], {"type": "title", "title": title})

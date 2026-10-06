@@ -12,7 +12,8 @@
 //   parent_session_id?, is_subagent?, delegation?, tool_profile?, subagent_tool_profile?,
 //   terminal_reason?: how the last turn ended: 'completed'|'stopped'|'error'|'inference_error'|
 //   'tool_error'|'step_limit'|'interrupted' (also in the /api/sessions summaries),
-//   turn_ended?: epoch seconds when the last turn ended; null while a turn runs (also in summaries) }
+//   turn_ended?: epoch seconds when the last turn ended; null while a turn runs (also in summaries),
+//   turn_delegated?: true while the last turn is one a parent's delegate_task started (also in summaries) }
 //   GET /sessions list items omit events and allow_rules.
 // AllowRule ("Allow for this chat", exact matches only): { tool: 'run_command', command }
 //   | { tool: 'edits' } (write_file, edit_file, insert_activity_log) | { tool: 'mcp__<server>__<tool>' }
@@ -21,7 +22,8 @@
 //   note?: string (decline only, at most 2,000 characters) }
 // The 'permissions' socket message: { type: 'permissions', permission_mode, allowed_directories, allow_rules }
 // Status message: { type: 'status', status, terminal_reason?, turn_ended? (sent with 'idle'
-//   when a turn ended; a manual compaction leaves turn_ended unchanged) }
+//   when a turn ended; a manual compaction leaves turn_ended unchanged), turn_delegated? (true, with
+//   turn_ended, when a parent's delegate_task started that turn) }
 // /api/presence: a WebSocket (same protocols as the stream) each page holds open; no messages.
 // AgentEvent: { id, type: 'user'|'assistant'|'tool'|'notice'|'error', text?,
 //   reasoning_summary?, reasoning_truncated?, child_session_id?, request_info?,

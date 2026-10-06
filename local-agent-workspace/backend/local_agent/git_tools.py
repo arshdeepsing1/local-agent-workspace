@@ -21,8 +21,8 @@ OUTPUT_LIMIT = 80_000
 SAFE_OPTIONS = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
                 "-c", "submodule.recurse=false", "-c", "core.pager=cat")
 FILTER_KEYS = r"^filter\..*\.(clean|smudge|process|required)$"
-# The file tools' credential names at any depth (any letter case), plus `*.env`.
-DIFF_EXCLUDES = (":!*.env", *(f":(exclude,glob,icase){pattern}" for name in sorted(SECRET_NAMES)
+# The file tools' credential names and `*.env`, at any depth and in any letter case.
+DIFF_EXCLUDES = (":(exclude,glob,icase)**/*.env", *(f":(exclude,glob,icase){pattern}" for name in sorted(SECRET_NAMES)
                               for pattern in (f"**/{name}", f"**/{name}/**")),
                  ":(exclude,glob,icase)**/.env.*")
 CHANGES_TIMEOUT = 60

@@ -42,14 +42,17 @@ def attention_message(session, previous, status, turn_ended=False):
     title = short_title(session.get("title"))
     if status == "awaiting_approval":
         return f"Needs your approval: {title}"
-    # A subagent's end is reported by its parent's turn; a stop was asked for.
-    if status != "idle" or not turn_ended or session.get("is_subagent"):
+    # A turn that delegate_task started is reported by its parent's turn (a subagent chat
+    # you continued yourself is not); a stop was asked for.
+    if status != "idle" or not turn_ended or session.get("turn_delegated"):
         return None
     reason = session.get("terminal_reason")
     if reason == "stopped":
         return None
     if reason in ERROR_REASONS:
         return f"Stopped with an error: {title}"
+    if reason == "step_limit":  # Not finished: the chat offers Continue.
+        return f"Reached the step limit: {title}"
     return f"Finished: {title}"
 
 

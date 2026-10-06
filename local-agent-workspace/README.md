@@ -161,8 +161,9 @@ completion and Stop flush the final state. After an abrupt process death, the la
 saved partial reply is shown as interrupted; the most recent uncheckpointed text
 may be lost. Incomplete streamed tool arguments are never persisted as executable
 requests or replayed. A local storage failure stops the response and reports that
-recent history may not have been saved. Back up both the conversation JSONL files
-and the separate operational SQLite database.
+recent history may not have been saved. Back up the whole `conversations/` folder
+(the JSONL files and their `.state.json` files) and the separate operational SQLite
+database.
 
 **Agent tools → Conversation** exports a versioned JSON bundle, optionally with
 subagent conversations (32 total, 16 MiB maximum). Export requires idle chats.
@@ -223,15 +224,19 @@ when opening a conversation or performing restart recovery.
   otherwise, so chats started in another tab also show up.
 - **Notifications**: click **Notify me** at the bottom of the sidebar to turn on browser
   notifications; the browser asks for permission only then. The switch shows **On** or
-  **Off**. You are notified when a chat starts waiting for approval, finishes a reply, or
+  **Off**. You are notified when a chat starts waiting for approval, finishes a reply,
+  reaches the **Agent steps** limit ("Reached the step limit: …", so you can Continue it), or
   stops with an error (also during an automatic compaction, or because the server stopped
   during the reply), if this page is hidden or that chat is not the one open. A notification reads, for example,
-  "Needs your approval: Fix the parser" with the chat title cut to 60 characters, and never
-  contains conversation text. Clicking it brings the window forward and opens that chat.
-  Stopping a reply yourself, or a manual compaction, does not notify, and a subagent's chat
-  notifies only when it needs approval. A notification closes when it no longer applies (the
-  approval was answered, the chat started another turn, or you opened the chat), so the next
-  approval request alerts again. Each open tab notifies on its own; the browser replaces a
+  "Needs your approval: Fix the parser": it contains only a status and the chat title, cut to
+  60 characters, never other conversation text. Until the chat is named, its title is the start
+  of the first message with credentials redacted (the configured token and common secret shapes
+  such as GitHub tokens). Clicking it brings the window forward and opens that chat.
+  Stopping a reply yourself, or a manual compaction, does not notify. A subagent's turn started
+  by its parent notifies only when it needs approval (the parent's turn reports its end); a
+  subagent chat you continue yourself notifies like any other. A notification closes when it
+  no longer applies (the approval was answered, the chat started another turn, or you opened
+  the chat), so the next approval request alerts again. Each open tab notifies on its own; the browser replaces a
   notification with the same chat and status. If the browser blocks
   notifications for the page, the sidebar says so; allow them in the browser's site settings.
   For when no tab is open, see **Settings → Desktop notification when no browser tab is open**:
@@ -451,10 +456,13 @@ tools cannot browse it.
   Records include conversation metadata, user and assistant events, reasoning and
   request usage, tool calls and results, and the exact Databricks message/tool
   history (`wire`). Commands associated with the chat are included as sanitized job
-  records with their command, state, limits, exit status, and bounded retained output,
-  plus the size and modification time of the files the agent last read or wrote (paths
-  only, no contents). Files are atomically replaced as current-state snapshots rather than appended
+  records with their command, state, limits, exit status, and bounded retained output.
+  Files are atomically replaced as current-state snapshots rather than appended
   indefinitely while an answer streams.
+- `conversations/<conversation-id>.state.json`: the chat's "Allow for this chat" rules and
+  the size and modification time of the files the agent last read or wrote (paths only, no
+  contents). It sits beside the JSONL file so earlier versions of the app can still open the
+  chat; it is never exported, and a missing or unreadable one counts as empty.
 - `conversations.sqlite3`: operational state only. Its `jobs` table stores command
   metadata, states, and bounded output for live control and restart recovery; terminal
   job snapshots are also mirrored into the owning chat JSONL. Chat messages, assistant
@@ -738,7 +746,8 @@ load the restored content; unsaved browser drafts are intentionally preserved.
 source files stay in the original checkout and are not copied. **Open conversation**
 starts a new Manual-mode conversation in that worktree. Removal only accepts
 app-owned clean worktrees, rejects modified/untracked/ignored files and worktrees
-used by any saved conversation or running command, and keeps the branch and its
+used by any saved conversation (also one hidden as unreadable whose first line still names
+the worktree) or running command, and keeps the branch and its
 commits. Delete the worktree's conversations and choose another default workspace
 before removal. Git hooks, filters, and fsmonitor are disabled for managed worktree
 operations. This is deliberate workspace isolation, not automatic per-task copies.
@@ -1112,8 +1121,9 @@ read state shared between tabs, and the page's presence connection.
 Backend tests check the desktop notifier with a fake runner: nothing is sent while a page is
 connected (with or without a chat open), a turn failing during automatic compaction notifies
 and a manual compaction does not, a turn cut off by a restart is marked `interrupted`, the
-command is an argument list without a shell, titles are cut to 60 characters and escaped for
-`notify-send`, and notifier failures are ignored.
+command is an argument list without a shell, titles are cut to 60 characters, redacted and
+escaped for `notify-send`, a step-limit stop is not called finished, a subagent chat you continue
+yourself notifies, and notifier failures are ignored.
 Backend regressions additionally cover credential
 path aliases, unreadable configuration recovery, cancellation during startup or
 after a child process outlives its shell, recovery of completed tool results

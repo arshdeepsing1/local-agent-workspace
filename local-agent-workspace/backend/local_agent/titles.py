@@ -15,16 +15,19 @@ TITLE_TIMEOUT = 10
 TITLE_MAX_LENGTH = 60
 
 
-def fallback_title(prompt):
+def fallback_title(prompt, redact=None):
+    """The start of the first message; `redact` removes credentials before it is cut."""
+    if redact is not None:
+        prompt = redact(prompt)
     return " ".join(prompt.split())[:64] or "New conversation"
 
 
-def needs_title(session):
+def needs_title(session, redact=None):
     if session.get("title_generated"):
         return False
     first = next((event.get("text", "") for event in session["events"] if event["type"] == "user"), "")
     return bool(first) and session["title"] in {
-        "New conversation", fallback_title(first), first.replace("\n", " ")[:64],
+        "New conversation", fallback_title(first), fallback_title(first, redact), first.replace("\n", " ")[:64],
     }
 
 

@@ -167,6 +167,7 @@ def test_a_filter_configured_inside_a_submodule_does_not_run(repository, tmp_pat
 def test_credential_files_at_any_depth_stay_out_of_the_diff(repository):
     client, workspace = repository
     names = ["config/.env", "config/.env.production", "config/env_vars.txt", "config/prod.env",
+             "deploy/PROD.ENV", "release/prod.Env", "TOP.ENV", "config/.ENV.local",
              "deploy/credentials.json", "keys/ID_RSA", "credentials/token.txt", ".netrc"]
     for name in names:
         (workspace / name).parent.mkdir(parents=True, exist_ok=True)

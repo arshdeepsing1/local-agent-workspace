@@ -8,6 +8,7 @@ from local_agent import notify
 from local_agent.api import create_app
 from local_agent.config import Settings
 from local_agent.telemetry import InferenceError
+from local_agent.titles import needs_title
 from local_agent.notify import SystemNotifier, attention_message, notification_argv, run_notification, short_title
 
 
@@ -268,6 +269,103 @@ async def test_notifier_failures_never_reach_the_conversation(runtime):
         task.cancel()
 
 
+async def test_a_subagent_chat_you_continue_yourself_notifies_when_it_ends(runtime):
+    client, manager, parent, runner = runtime
+    manager.settings.values["system_notifications"] = True
+
+    async def run_databricks(session, prompt):
+        await manager.event(session, "assistant", text="Private reply text")
+        return False
+    manager.run_databricks = run_databricks
+    result = await manager.delegates.delegate(parent, "Check the parser")
+    child = result["child_session_id"]
+    await asyncio.sleep(0)
+    assert runner.calls == []  # The parent's turn reports a delegated turn.
+    assert (await listed(client, {"id": child}))["turn_delegated"] is True
+
+    await client.post(f"/api/sessions/{child}/messages", json={"text": "Continue from where you stopped."})
+    await asyncio.wait_for(manager.tasks[child], 5)
+    await asyncio.sleep(0)
+    summary = await listed(client, {"id": child})
+    assert summary["is_subagent"] is True and summary["turn_delegated"] is False
+    assert [call[-1] for call in runner.calls] == [f"Finished: {summary['title']}"]
+
+
+async def test_a_turn_stopped_at_the_step_limit_is_not_announced_as_finished(runtime):
+    client, manager, session, runner = runtime
+    manager.settings.values["system_notifications"] = True
+
+    async def run_databricks(session, prompt):
+        await manager.event(session, "notice", text="Reached the step limit.", terminal_reason="step_limit")
+        return False
+    manager.run_databricks = run_databricks
+    await client.post(f"/api/sessions/{session['id']}/messages", json={"text": "Long job"})
+    await asyncio.wait_for(manager.tasks[session["id"]], 5)
+    await asyncio.sleep(0)
+    assert (await listed(client, session))["terminal_reason"] == "step_limit"
+    assert runner.calls == [["/usr/bin/notify-send", "Local", "Reached the step limit: Long job"]]
+
+
+async def test_a_first_message_with_credentials_never_reaches_titles_or_notifications(runtime):
+    client, manager, session, runner = runtime
+    manager.settings.values["system_notifications"] = True
+    configured = "configured-workspace-credential-value"
+    github = "ghp_" + "x7" * 18
+    manager.settings.env = {"DBRICKS_URL": "https://example.invalid", "DBRICKS_TOKEN": configured}
+
+    async def run_databricks(session, prompt):
+        await manager.status(session, "awaiting_approval")
+        await manager.status(session, "running")
+        await manager.event(session, "assistant", text="Done")
+        return False  # Not completed, so no title request is made.
+    manager.run_databricks = run_databricks
+    text = f"Use {configured} and {github} to call it"
+    await client.post(f"/api/sessions/{session['id']}/messages", json={"text": text})
+    await asyncio.wait_for(manager.tasks[session["id"]], 5)
+    await asyncio.sleep(0)
+    shown = [call[-1] for call in runner.calls]
+    assert shown == ["Needs your approval: Use [REDACTED] and [REDACTED] to call it",
+                     "Finished: Use [REDACTED] and [REDACTED] to call it"]
+    titles = [item["title"] for item in (await client.get("/api/sessions")).json()]
+    titles.append((await client.get(f"/api/sessions/{session['id']}")).json()["title"])
+    assert not any(secret in str(value) for secret in (configured, github) for value in (titles, runner.calls))
+    assert needs_title(manager.get(session["id"]), manager.redact_title)  # It is still named later.
+
+    # A title stored by an earlier version is redacted in the notification as well.
+    runner.calls.clear()
+    session = manager.get(session["id"])
+    session["title"] = f"Old {configured} title"
+    await manager.status(session, "awaiting_approval")
+    await asyncio.sleep(0)
+    assert runner.calls[-1][-1] == "Needs your approval: Old [REDACTED] title"
+    # Redacted before the title is cut to 60 characters, which would leave part of the value.
+    session["title"] = f"Please deploy the service now using {configured} for it"
+    await manager.status(session, "running")
+    await manager.status(session, "awaiting_approval")
+    await asyncio.sleep(0)
+    assert runner.calls[-1][-1] == "Needs your approval: Please deploy the service now using [REDACTED] for it"
+    assert not any(configured[:12] in call[-1] for call in runner.calls)
+
+
+async def test_a_chat_whose_first_message_has_a_credential_is_still_named(runtime, monkeypatch):
+    client, manager, session, runner = runtime
+    configured = "configured-workspace-credential-value"
+    manager.settings.env = {"DBRICKS_URL": "https://example.invalid", "DBRICKS_TOKEN": configured}
+
+    async def run_databricks(session, prompt):
+        await manager.event(session, "assistant", text="Done")
+        return True
+
+    async def generate_title(settings, session, save=None):
+        return "Named chat"
+    manager.run_databricks = run_databricks
+    monkeypatch.setattr("local_agent.agents.generate_title", generate_title)
+    await client.post(f"/api/sessions/{session['id']}/messages", json={"text": f"Use {configured} to call it"})
+    await asyncio.wait_for(manager.tasks[session["id"]], 5)
+    listed = next(item for item in (await client.get("/api/sessions")).json() if item["id"] == session["id"])
+    assert listed["title"] == "Named chat" and manager.get(session["id"])["title_generated"] is True
+
+
 def test_messages_name_only_the_status_and_a_short_title():
     long_title = "A very long conversation title " * 4
     message = attention_message({"title": long_title, "terminal_reason": "completed"}, "running", "idle", True)
@@ -279,8 +377,11 @@ def test_messages_name_only_the_status_and_a_short_title():
     assert attention_message({"title": "T", "terminal_reason": "tool_error"}, "running", "idle", True) == "Finished: T"
     assert attention_message({"title": "T", "terminal_reason": "completed"}, "compacting", "idle") is None  # Manual.
     assert attention_message({"title": "T", "terminal_reason": "stopped"}, "running", "idle", True) is None
-    assert attention_message({"title": "T", "is_subagent": True}, "running", "idle", True) is None
-    assert attention_message({"title": "T", "is_subagent": True}, "running", "awaiting_approval") == "Needs your approval: T"
+    assert attention_message({"title": "T", "terminal_reason": "step_limit"}, "running", "idle", True) == "Reached the step limit: T"
+    assert attention_message({"title": "T", "is_subagent": True, "turn_delegated": True}, "running", "idle", True) is None
+    assert attention_message({"title": "T", "is_subagent": True, "turn_delegated": False}, "running", "idle", True) == "Finished: T"
+    assert attention_message({"title": "T", "is_subagent": True, "turn_delegated": True},
+                             "running", "awaiting_approval") == "Needs your approval: T"
     assert attention_message({"title": "T"}, "idle", "running") is None
 
 
