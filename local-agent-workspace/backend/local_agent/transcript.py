@@ -127,6 +127,20 @@ def _tool(event, excerpt_chars):
     return line
 
 
+def transcript_file_stem(session):
+    """<date>-<title>-<id>, the name the transcript script and the app's export give a transcript."""
+    try:
+        day = datetime.fromtimestamp(float(session.get("created"))).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OverflowError, OSError):
+        day = "undated"
+    slug = re.sub(r"[^a-z0-9]+", "-", str(session.get("title") or "").lower()).strip("-")[:60].strip("-") or "chat"
+    return f"{day}-{slug}-{str(session.get('id', ''))[:8]}".rstrip("-")
+
+
+def transcript_file_name(session):
+    return transcript_file_stem(session) + ".md"
+
+
 def transcript(session, *, excerpt_chars=EXCERPT_CHARS, redact=lambda text: text):
     """Markdown for one conversation. Common secret shapes and anything redact
     replaces (the app's configured credentials) are replaced with [REDACTED]."""

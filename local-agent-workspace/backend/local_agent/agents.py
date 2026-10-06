@@ -322,6 +322,8 @@ class AgentManager:
                     event["request_info"].update(status="interrupted", error_kind="incomplete_response")
                     interrupted = True
             if interrupted:
+                # The UI offers Continue for a turn the restart cut short.
+                session["terminal_reason"] = "interrupted"
                 store.save(session)
         self.delegates.recover()
 
@@ -499,7 +501,10 @@ class AgentManager:
 
     async def status(self, session, status):
         self.statuses[session["id"]] = status
-        await self.broadcast(session["id"], {"type": "status", "status": status})
+        message = {"type": "status", "status": status}
+        if status == "idle" and session.get("terminal_reason"):
+            message["terminal_reason"] = session["terminal_reason"]  # How the turn ended (the Continue button).
+        await self.broadcast(session["id"], message)
         await self.delegates.progress(session, status=status)
         if status == "idle":
             # Commands can also change reviewed files; refresh their counts after each turn.
@@ -520,6 +525,11 @@ class AgentManager:
         except (*STORAGE_ERRORS, ValueError, UnicodeError) as exc:
             changes = {"files": [], "added": 0, "removed": 0, "error": self.settings.redact(file_error(exc))}
         await self.broadcast(session["id"], {"type": "changes", "changes": changes})
+
+    async def publish_tasks(self, session_id):
+        """Send the conversation's task list to its open pages (the live checklist)."""
+        if self.listeners.get(session_id):
+            await self.broadcast(session_id, {"type": "tasks", "tasks": self.task_board.list(session_id)})
 
     async def event(self, session, kind, **values):
         event = {"id": str(uuid.uuid4()), "type": kind, "created": time.time(), **values}
@@ -818,12 +828,17 @@ class AgentManager:
                 tasks = self.task_board.list(session["id"])
                 items = [{key: item[key] for key in ("id", "title", "status", "depends_on")} for item in tasks]
                 result = self.metadata_page(items, arguments.get("offset", 0), "tasks")
+            elif name == "get_task":
+                task = self.task_board.get(session["id"], arguments["task_id"])
+                result = {key: task[key] for key in ("id", "title", "description", "status", "depends_on")}
             elif name == "create_task":
                 task = self.task_board.create(session["id"], **arguments)
                 result = {key: task[key] for key in ("id", "title", "status", "depends_on")}
+                await self.publish_tasks(session["id"])
             elif name == "update_task":
                 task = self.task_board.update(session["id"], arguments["task_id"], {k: v for k, v in arguments.items() if k != "task_id"})
                 result = {key: task[key] for key in ("id", "title", "status", "depends_on")}
+                await self.publish_tasks(session["id"])
             elif name == "delegate_task":
                 await self.status(session, "delegating")
                 try:

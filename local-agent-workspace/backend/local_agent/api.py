@@ -24,6 +24,7 @@ from .permissions import PermissionMode
 from .telemetry import session_metrics
 from .activity import redact_secrets
 from .usage_export import usage_csv, usage_rows
+from .transcript import transcript, transcript_file_name
 from .feature_api import register_features
 from .portability_api import register_portability
 
@@ -291,6 +292,14 @@ def create_app(settings=None):
             "Content-Disposition": f'attachment; filename="usage-{session_id[:8]}.csv"',
             "Cache-Control": "no-store"})
 
+    @app.get("/api/sessions/{session_id}/transcript.md")
+    async def export_session_transcript(session_id: str):
+        session = session_or_404(session_id)
+        text = transcript(session, redact=settings.redact)
+        return Response(text, media_type="text/markdown; charset=utf-8", headers={
+            "Content-Disposition": f'attachment; filename="{transcript_file_name(session)}"',
+            "Cache-Control": "no-store"})
+
     @app.delete("/api/sessions/{session_id}")
     async def delete_session(session_id: str):
         session_or_404(session_id)
@@ -351,6 +360,12 @@ def create_app(settings=None):
         try:
             await socket.send_json({"type": "snapshot", "session": public_session(session, manager.statuses.get(session_id, "idle"))})
             await manager.publish_changes(session)
+            try:
+                tasks = manager.task_board.list(session_id)
+            except ValueError:  # Deleted while connecting.
+                tasks = []
+            if tasks:
+                await socket.send_json({"type": "tasks", "tasks": tasks})
             while True:
                 await socket.receive_text()
         except WebSocketDisconnect:

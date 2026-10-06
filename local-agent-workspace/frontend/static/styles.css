@@ -163,3 +163,31 @@
 .review-bar .icon-button{width:26px;height:26px;padding:4px}.review-position{min-width:42px;text-align:center;color:var(--muted);white-space:nowrap}
 .review-bar .primary,.review-bar .outline{font-size:12px;padding:5px 12px;border-radius:7px}
 @media(max-width:600px){.changes-actions button{padding:5px 9px}.changes-dir{display:none}.review-bar{right:8px;bottom:8px}}
+
+/* M1 conversation: task checklist, Continue button, code blocks (Copy code, highlight.js light theme). */
+.task-checklist{border:1px solid #e2e2dd;border-radius:12px;background:var(--surface);margin:0 0 10px;font-size:12px;overflow:hidden}
+.task-checklist-toggle{width:100%;justify-content:flex-start;gap:7px;padding:9px;font-size:12px;color:var(--ink);white-space:nowrap;min-width:0}
+.task-checklist-current{color:var(--muted);overflow:hidden;text-overflow:ellipsis;min-width:0}
+.task-checklist-list{list-style:none;margin:0;padding:4px 10px 8px;border-top:1px solid #eeeee9;max-height:min(220px,30dvh);overflow:auto}
+.task-checklist-item{display:flex;align-items:center;gap:8px;padding:4px 2px;min-width:0}
+.task-checklist-icon{flex-shrink:0;color:#8b8373}
+.task-checklist-item.in_progress .task-checklist-icon{color:var(--accent)}
+.task-checklist-item.completed .task-checklist-icon{color:#3d6b2a}
+.task-checklist-item.completed .task-checklist-title,.task-checklist-item.cancelled .task-checklist-title{color:var(--muted)}
+.task-checklist-item.cancelled .task-checklist-title{text-decoration:line-through}
+.task-checklist-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.continue-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0 0 10px;padding:6px 6px 6px 12px;border:1px solid #e2e2dd;border-radius:12px;background:var(--surface);font-size:12px;color:#62635e}
+.continue-bar button{font-size:12px;padding:5px 12px;border-radius:7px;flex-shrink:0}
+.markdown .code-block{position:relative;margin:0 0 14px}
+.markdown .code-block>pre{margin:0;padding-top:30px}
+.code-copy{position:absolute;top:5px;right:6px;font-size:11px;line-height:1.4;padding:3px 8px;border-radius:6px;color:#62635e;background:#f7f7f4;border:1px solid #e2e2dd}
+.code-copy:hover{color:var(--ink);background:#fff}
+.hljs-comment,.hljs-quote,.hljs-meta{color:#6b675d;font-style:italic}
+.hljs-keyword,.hljs-selector-tag,.hljs-doctag,.hljs-template-tag{color:#9c3d2a}
+.hljs-string,.hljs-regexp,.hljs-addition,.hljs-template-variable,.hljs-meta .hljs-string{color:#3d6b2a}
+.hljs-number,.hljs-literal,.hljs-symbol,.hljs-bullet,.hljs-variable.language_{color:#8a5300}
+.hljs-title,.hljs-section,.hljs-title.function_,.hljs-name{color:#2b5a8a}
+.hljs-type,.hljs-built_in,.hljs-title.class_,.hljs-selector-class,.hljs-selector-id{color:#7a4a8c}
+.hljs-attr,.hljs-attribute,.hljs-property,.hljs-variable,.hljs-params,.hljs-selector-attr,.hljs-selector-pseudo{color:#0f6670}
+.hljs-deletion{color:#8a2b1d;background:#fbe4e0}.hljs-addition{background:#e3f0dc}
+.hljs-emphasis{font-style:italic}.hljs-strong{font-weight:600}

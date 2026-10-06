@@ -104,3 +104,47 @@ def test_import_completion_after_unmount_is_ignored(ui, page):
     ui.run("unmount()")
     ui.js("(async () => { fake.deferreds.import.resolve(fake.json({ session: { id: 'created-after-close' }, imported_count: 1 })); await new Promise(done => setTimeout(done, 20)) })()")
     assert ui.spy("select") == []
+
+
+MARKDOWN = "# Transcript: Fix the export\\n\\n**User:**\\n\\nPlease fix it. Token: [REDACTED]\\n"
+TRANSCRIPT = ("fake.handle = path => path === '/api/sessions/source/transcript.md' ? new Response('" + MARKDOWN + "', { status: 200, headers: {"
+              " 'Content-Type': 'text/markdown; charset=utf-8', 'Content-Disposition': 'attachment; filename=\"2026-01-01-fix-the-export-source.md\"' } })"
+              " : fake.json({ detail: 'Conversation not found.' }, 404)")
+
+
+def test_export_markdown_downloads_the_server_transcript(ui, page):
+    show(ui, TRANSCRIPT + "; fake.captureDownloads()")
+    page.get_by_role("button", name="Export Markdown").click()
+    expect(page.get_by_role("status")).to_have_text("Markdown transcript exported.")
+    assert ui.js("fake.calls.map(call => [call.path, call.method, call.headers['X-Local-Token']])") == [
+        ["/api/sessions/source/transcript.md", "GET", "local-token"]]
+    download = ui.js("(async () => { const d = fake.downloads[0]; return { count: fake.downloads.length, name: d.download, revoked: d.revoked, type: d.blob.type, text: await d.blob.text() } })()")
+    assert download == {"count": 1, "name": "2026-01-01-fix-the-export-source.md", "revoked": True, "type": "text/markdown",
+                        "text": "# Transcript: Fix the export\n\n**User:**\n\nPlease fix it. Token: [REDACTED]\n"}
+
+
+def test_copy_conversation_copies_the_transcript_even_while_busy(ui, page):
+    show(ui, TRANSCRIPT, props=PROPS.replace("busy: false", "busy: true"))
+    expect(page.get_by_role("button", name="Export conversation")).to_be_disabled()
+    page.get_by_role("button", name="Copy conversation").click()
+    expect(page.get_by_role("status")).to_have_text("Conversation copied as Markdown.")
+    assert ui.js("fake.clipboard") == ["# Transcript: Fix the export\n\n**User:**\n\nPlease fix it. Token: [REDACTED]\n"]
+
+
+def test_copy_conversation_starts_the_clipboard_write_during_the_click(ui, page):
+    # Where the browser offers ClipboardItem, the write starts at once and gets the text when it arrives.
+    show(ui, TRANSCRIPT + """; Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+      write: async items => { fake.clipboard.push(await (await items[0].getType('text/plain')).text()) } } })""")
+    page.get_by_role("button", name="Copy conversation").click()
+    expect(page.get_by_role("status")).to_have_text("Conversation copied as Markdown.")
+    assert ui.js("fake.clipboard") == ["# Transcript: Fix the export\n\n**User:**\n\nPlease fix it. Token: [REDACTED]\n"]
+
+
+def test_transcript_errors_are_shown_and_need_a_conversation(ui, page):
+    show(ui, TRANSCRIPT, props=PROPS.replace("'source'", "'gone'"))
+    page.get_by_role("button", name="Copy conversation").click()
+    expect(page.get_by_role("alert")).to_have_text("Conversation not found.")
+    assert ui.js("fake.clipboard") == []
+    ui.rerender("{ workspace: '/default', onSelectSession: fake.spy('select'), onError: fake.spy('onError') }")
+    expect(page.get_by_role("button", name="Export Markdown")).to_be_disabled()
+    expect(page.get_by_role("button", name="Copy conversation")).to_be_disabled()

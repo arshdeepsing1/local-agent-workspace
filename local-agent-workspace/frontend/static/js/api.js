@@ -26,13 +26,20 @@ export async function apiJsonText(path, body) {
   return request(path, 'POST', body)
 }
 // Download a non-JSON response (for example a CSV export) with the local token.
-export async function apiText(path, retried = false) {
+export async function apiText(path) {
+  return (await apiFile(path)).text
+}
+// The same, with the file name from the response's Content-Disposition header (or null).
+export async function apiFile(path, retried = false) {
   const response = await fetch(`/api${path}`, { headers: { 'X-Local-Token': token } })
-  if (response.ok) return response.text()
+  if (response.ok) {
+    const name = /filename="([^"]+)"/.exec(response.headers.get('Content-Disposition') || '')?.[1] || null
+    return { text: await response.text(), name }
+  }
   const data = await response.json().catch(() => ({}))
   if (response.status === 403 && data.code === 'reconnect_required' && !retried) {
     await refreshToken()
-    return apiText(path, true)
+    return apiFile(path, true)
   }
   throw new ApiError(typeof data.detail === 'string' ? data.detail : `Request failed with HTTP ${response.status}.`, response.status)
 }

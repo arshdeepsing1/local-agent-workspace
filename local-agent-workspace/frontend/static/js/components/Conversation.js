@@ -1,7 +1,7 @@
 import { html, useEffect, useMemo, useRef, useState } from '../lib.js'
 import { Check, ChevronDown, ChevronRight, Copy, FileText, LoaderCircle, Terminal, X } from '../icons.js'
 import { api } from '../api.js'
-import { renderMarkdown } from '../markdown.js'
+import { enhanceCodeBlocks, renderMarkdown } from '../markdown.js'
 import { Brand } from './Sidebar.js'
 import RequestDetails from './RequestDetails.js'
 
@@ -131,17 +131,22 @@ function CopyAction({ text, label }) {
   }}>${copied ? html`<${Check} size=${14} />` : html`<${Copy} size=${14} />`}</button>`
 }
 
-function Markdown({ text }) {
+function Markdown({ text, streaming = false }) {
   // Parsing is the expensive part of a streamed reply, so parse only on change.
   const markup = useMemo(() => renderMarkdown(text), [text])
-  return html`<div class="markdown" dangerouslySetInnerHTML=${{ __html: markup }} />`
+  const element = useRef(null)
+  // Highlight code once the reply is complete; the page keeps unchanged markup,
+  // so other replies are not highlighted again on each streamed delta.
+  useEffect(() => { if (!streaming && element.current) enhanceCodeBlocks(element.current) }, [markup, streaming])
+  return html`<div class="markdown" ref=${element} dangerouslySetInnerHTML=${{ __html: markup }} />`
 }
 
 function Reply({ text, reasoning, truncated, requestInfo }) {
+  const streaming = requestInfo?.status === 'running'
   return html`<div class="assistant-reply"><${Brand} small=${true} />
     <div class="reply-content">${reasoning ? html`<details class="reasoning-summary"><summary>Provider reasoning summary</summary>
-      <p class="muted">Supplied by the model endpoint.</p><${Markdown} text=${reasoning} />
-      ${truncated ? html`<p class="muted">Summary display limit reached.</p>` : null}</details>` : null}<${Markdown} text=${text} />
+      <p class="muted">Supplied by the model endpoint.</p><${Markdown} text=${reasoning} streaming=${streaming} />
+      ${truncated ? html`<p class="muted">Summary display limit reached.</p>` : null}</details>` : null}<${Markdown} text=${text} streaming=${streaming} />
       ${text ? html`<${CopyAction} text=${text} label="Copy response" />` : null}
       ${requestInfo ? html`<${RequestDetails} info=${requestInfo} />` : null}
     </div></div>`
