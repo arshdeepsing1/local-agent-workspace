@@ -2,6 +2,8 @@
 import asyncio
 
 import pytest
+
+WAIT_FOR = asyncio.wait_for  # The real one; the tests below replace it in the app module.
 from fastapi.testclient import TestClient
 
 from local_agent.agents import AgentManager
@@ -44,6 +46,11 @@ def expire_waits_of(monkeypatch, seconds):
     return timeouts
 
 
+async def bounded(call):
+    """Fail within seconds instead of hanging if an approval wait regresses."""
+    return await WAIT_FOR(call, 5)
+
+
 async def answer_when_pending(manager, session, allowed):
     while not manager.pending:
         await asyncio.sleep(0.01)
@@ -82,7 +89,7 @@ async def test_an_unanswered_action_expires_after_the_configured_wait(runtime, m
     manager, session, project, tools = runtime
     manager.settings.values["approval_timeout_minutes"] = 30
     expire_waits_of(monkeypatch, 1800)
-    output = await manager.execute_tool(session, tools, "run_command", {"command": "touch ran.txt"}, "call")
+    output = await bounded(manager.execute_tool(session, tools, "run_command", {"command": "touch ran.txt"}, "call"))
     event = session["events"][-1]
     assert (event["state"], event["approval"]) == ("rejected", "expired")
     assert event["approval_expires"] > event["created"] + 1790
@@ -101,11 +108,48 @@ async def test_an_unanswered_folder_access_request_is_not_called_a_decline(runti
     (outside / "data.csv").write_text("a,b\n")
     manager.settings.values["approval_timeout_minutes"] = 1
     expire_waits_of(monkeypatch, 60)
-    output = await manager.execute_tool(session, tools, "read_file", {"path": str(outside / "data.csv")}, "call")
+    output = await bounded(manager.execute_tool(session, tools, "read_file", {"path": str(outside / "data.csv")}, "call"))
     access = next(item for item in session["events"] if item.get("name") == "access_directory")
     assert (access["approval"], access["output"]) == ("expired", "Folder access was not answered in time.")
+    read = next(item for item in session["events"] if item.get("call_id") == "call")
+    assert (read["state"], read["approval"]) == ("rejected", "expired")
     assert "did not answer the folder access request in time" in output
     assert not session.get("allowed_directories")
+
+
+async def test_a_declined_folder_access_request_marks_the_file_tool_declined(runtime, tmp_path):
+    manager, session, _, tools = runtime
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    run = asyncio.create_task(manager.execute_tool(session, tools, "list_files", {"path": str(outside)}, "call"))
+    await answer_when_pending(manager, session, False)
+    assert (await run).startswith("User declined folder access.")
+    listing = next(item for item in session["events"] if item.get("call_id") == "call")
+    assert (listing["state"], listing["approval"]) == ("rejected", "declined")
+
+
+async def test_unanswered_mcp_calls_and_hooks_are_not_called_declined(runtime, monkeypatch):
+    manager, session, project, tools = runtime
+    manager.settings.values["approval_timeout_minutes"] = 5
+    expire_waits_of(monkeypatch, 300)
+    called = []
+
+    class Connection:
+        tool_names = {"mcp__demo__echo"}
+        definitions = [{"function": {"name": "mcp__demo__echo", "parameters": {"type": "object"}}}]
+
+        async def call(self, name, arguments):
+            called.append(arguments)
+            return {"ok": True}
+    manager.extension_connections[session["id"]] = Connection()
+    output = await bounded(manager.execute_tool(session, tools, "mcp__demo__echo", {"value": "hi"}, "mcp"))
+    assert "did not answer this approval request in time" in output and "declined" not in output and not called
+    assert session["events"][-1]["approval"] == "expired"
+
+    manager.extensions.update_config({"hooks": [{"id": "check", "enabled": True, "event": "before_tool", "command": "true"}]})
+    session["permission_mode"] = "acceptEdits"
+    output = await bounded(manager.execute_tool(session, tools, "write_file", {"path": "note.txt", "content": "x"}, "edit"))
+    assert output.endswith("Hook approval was not answered in time.") and not (project / "note.txt").exists()
 
 
 def test_the_wait_is_a_validated_setting(tmp_path, monkeypatch):

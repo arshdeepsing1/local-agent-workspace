@@ -318,6 +318,24 @@ def test_an_approval_with_a_limit_shows_when_it_expires_and_an_expired_one_says_
                 f"{{ ...{card}, id: 'declined', state: 'rejected', approval: 'declined' }}]) }}")
     expect(page.get_by_text("Not answered in time; the action did not run")).to_have_count(1)
     expect(page.get_by_text("Action declined")).to_have_count(1)
+    # A limit can reach 24 hours, so an expiry on another day names the weekday.
+    module = "import('/static/js/components/Conversation.js')"
+    now = "new Date(2026, 9, 6, 15, 42)"
+    later_today = "new Date(2026, 9, 6, 18, 5).getTime() / 1000"
+    tomorrow = "new Date(2026, 9, 7, 15, 42).getTime() / 1000"
+    assert ui.js(f"{module}.then(m => m.expiryTime({later_today}, {now}))") == ui.js(
+        f"new Date({later_today} * 1000).toLocaleTimeString([], {{ hour: '2-digit', minute: '2-digit' }})")
+    assert ui.js(f"{module}.then(m => m.expiryTime({tomorrow}, {now}))") == ui.js(
+        f"new Date({tomorrow} * 1000).toLocaleString([], {{ weekday: 'short', hour: '2-digit', minute: '2-digit' }})")
+
+
+def test_an_action_blocked_without_an_approval_card_says_why_instead_of_declined(ui, page):
+    blocked = ("{ id: 'blocked', type: 'tool', name: 'write_file', state: 'rejected', input: { path: 'sub/x.py' }, "
+               "output: 'Project instructions were discovered or changed. Review the refreshed project guidance first.' }")
+    show(ui, f"[{blocked}, {{ id: 'plan', type: 'tool', name: 'run_command', state: 'rejected', input: {{ command: 'ls' }} }}]")
+    expect(page.get_by_text("Not run: Project instructions were discovered or changed.", exact=False)).to_be_visible()
+    expect(page.get_by_text("Action not run", exact=True)).to_be_visible()
+    expect(page.get_by_text("Action declined")).to_have_count(0)
 
 
 @pytest.mark.parametrize("kind", ["notice", "user"])

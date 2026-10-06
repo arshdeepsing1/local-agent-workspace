@@ -743,9 +743,10 @@ class AgentManager:
                 access = {}
                 if not await self.ensure_access(session, tools, arguments.get("path", "."), name in ("list_files", "search_files"), access):
                     output = ("The user did not answer the folder access request in time, so this file tool did not run. "
-                              "Ask the user before trying again." if access.get("expired") else
+                              "Ask the user before trying again." if access["approval"] == "expired" else
                               "User declined folder access. Do not retry or use a command to circumvent this decision.")
-                    await self.update_event(session, event, state="rejected", output=output)
+                    # The file tool did not run because of the access card's answer; show the same outcome on it.
+                    await self.update_event(session, event, state="rejected", output=output, approval=access["approval"])
                     return output
                 target = tools.path(arguments.get("path", "."))
                 if target.is_relative_to(tools.root):
@@ -879,7 +880,7 @@ class AgentManager:
         if not await self.approve(session, event):
             expired = event.get("approval") == "expired"
             if outcome is not None:
-                outcome["expired"] = expired
+                outcome["approval"] = "expired" if expired else "declined"
             await self.update_event(session, event, output="Folder access was not answered in time." if expired else "Folder access declined.")
             return False
         tools.allowed_directories.append(folder)

@@ -58,10 +58,24 @@ function ToolDetails({ event, pending }) {
 }
 
 function toolOutcome(event) {
-  if (event.state === 'rejected') return event.approval === 'expired' ? 'Not answered in time; the action did not run' : 'Action declined'
-  if (event.state === 'cancelled') return 'Action cancelled'
   const output = (event.output || '').trim().replace(/\s+/g, ' ')
-  return output ? output.slice(0, 240) + (output.length > 240 ? '…' : '') : 'Tool returned an error'
+  const clipped = output.slice(0, 240) + (output.length > 240 ? '…' : '')
+  if (event.state === 'rejected') {
+    if (event.approval === 'expired') return 'Not answered in time; the action did not run'
+    if (event.approval === 'declined') return 'Action declined'
+    // Blocked without an approval card (Plan mode, changed instructions, a tool profile), or an older event.
+    return output ? `Not run: ${clipped}` : 'Action not run'
+  }
+  if (event.state === 'cancelled') return 'Action cancelled'
+  return output ? clipped : 'Tool returned an error'
+}
+
+// The time an approval card expires, with the weekday when that is not today (limits reach 24 hours).
+export function expiryTime(seconds, now = new Date()) {
+  const when = new Date(seconds * 1000)
+  const options = { hour: '2-digit', minute: '2-digit' }
+  return when.toDateString() === now.toDateString() ? when.toLocaleTimeString([], options)
+    : when.toLocaleString([], { weekday: 'short', ...options })
 }
 
 function DelegationStatus({ event, onSelectSession }) {
@@ -100,7 +114,7 @@ function ToolCard({ event, summary, sessionId, onError, onSelectSession }) {
     <${DelegationStatus} event=${event} onSelectSession=${onSelectSession} />
     ${expanded || pending ? html`<div class="tool-body">
       ${pending ? html`<p>Local needs your approval to ${title.toLowerCase()}.${event.approval_expires
-          ? ` If you do not answer by ${new Date(event.approval_expires * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}, it will not run.` : ''}</p>
+          ? ` If you do not answer by ${expiryTime(event.approval_expires)}, it will not run.` : ''}</p>
         <${ToolDetails} event=${event} pending=${true} />
         <div class="approval-buttons"><button class="outline" disabled=${deciding} onClick=${() => void decide(false)}><${X} size=${15} />Decline</button>
           <button class="primary" disabled=${deciding} onClick=${() => void decide(true)}><${Check} size=${15} />Approve</button></div>`
