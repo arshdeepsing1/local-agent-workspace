@@ -15,6 +15,8 @@ UPDATE_TIMEOUT_SECONDS = 2
 KILL_GRACE_SECONDS = 5
 NOT_STOPPED = ("[The command did not end when it was stopped and may still be running, "
                "for example as another user through sudo.]")
+TIMEOUT_NOT_STOPPED = "Command exceeded its time limit and did not end when it was stopped; it may still be running."
+DRAINING = set()  # Output readers of commands that did not end when stopped.
 ENVIRONMENT_KEYS = {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SHELL", "USER", "LOGNAME", "VIRTUAL_ENV"}
 
 
@@ -48,21 +50,48 @@ def kill_group(pid):
         pass
 
 
-async def settle(awaitable):
-    """Wait for a command whose group was just killed. False if it is still running
-    after KILL_GRACE_SECONDS; the wait is then cancelled."""
+async def settle(reader):
+    """Give a command whose group was just killed KILL_GRACE_SECONDS to end.
+
+    reader is the task that drains the command's output and then reaps it. Returns
+    (ended, cancellation). A command still running after the grace period keeps
+    being drained in the background, so a full pipe never blocks it. A cancellation
+    of the caller during the wait is returned, not raised, so that the caller can
+    finish its cleanup and then raise it.
+    """
+    cancellation = None
     try:
-        async with asyncio.timeout(KILL_GRACE_SECONDS):
-            await awaitable
-    except TimeoutError:
-        return False
-    return True
+        await asyncio.wait({reader}, timeout=KILL_GRACE_SECONDS)
+    except asyncio.CancelledError as error:
+        cancellation = error
+    if not reader.done():
+        DRAINING.add(reader)
+        reader.add_done_callback(drained)
+    return reader.done(), cancellation
+
+
+def drained(reader):
+    DRAINING.discard(reader)
+    if not reader.cancelled():
+        reader.exception()  # Retrieved, so a failure is not reported as never retrieved.
+
+
+async def discard_output(process):
+    """Read a command's output to the end without keeping it, then reap it."""
+    while await process.stdout.read(65536):
+        pass
+    await process.wait()
+
+
+def with_note(output, result):
+    """The (already redacted) output, followed by NOT_STOPPED if the command did not end."""
+    return output + ("\n" if output else "") + NOT_STOPPED if result.get("stopped") is False else output
 
 
 class CommandTimeout(TimeoutError):
     def __init__(self, result, stopped=True):
-        super().__init__("Command exceeded its time limit and its process group was stopped." if stopped else
-                         "Command exceeded its time limit and did not end when it was stopped; it may still be running.")
+        super().__init__("Command exceeded its time limit and its process group was stopped." if stopped
+                         else TIMEOUT_NOT_STOPPED)
         self.result = result
 
 
@@ -81,9 +110,11 @@ async def run_process(command, workspace, timeout_seconds=60, max_output_bytes=8
         # reap that process before propagating cancellation.
         process = await spawning
         kill_group(process.pid)
-        if not await settle(process.communicate()):
-            error.result = {"exit_code": None, "output": NOT_STOPPED, "truncated": False}
-        raise
+        ended, cancellation = await settle(asyncio.ensure_future(discard_output(process)))
+        error = cancellation or error
+        if not ended:
+            error.result = {"exit_code": None, "output": "", "truncated": False, "stopped": False}
+        raise error
 
     output = ""
     retained = 0
@@ -92,8 +123,9 @@ async def run_process(command, workspace, timeout_seconds=60, max_output_bytes=8
     changed = asyncio.Event()
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
-    def result():
-        return {"exit_code": process.returncode, "output": output, "truncated": truncated}
+    def result(stopped=True):
+        values = {"exit_code": process.returncode, "output": output, "truncated": truncated}
+        return values if stopped else {**values, "stopped": False}
 
     async def drain():
         nonlocal output, retained, truncated, finished
@@ -144,18 +176,20 @@ async def run_process(command, workspace, timeout_seconds=60, max_output_bytes=8
         # Always kill the group, even when the shell itself has already exited:
         # its children may still be running and holding the output pipe open.
         kill_group(process.pid)
-        # Cancelling the gather on a timeout also cancels the reader.
-        stopped = await settle(asyncio.gather(reader, return_exceptions=True))
+        stopped, cancellation = await settle(reader)
         publisher.cancel()
         await asyncio.gather(publisher, return_exceptions=True)
         if stopped:
+            await asyncio.gather(reader, return_exceptions=True)
             await process.wait()
-        else:
-            output += ("\n" if output else "") + NOT_STOPPED
+        # A Stop during the grace period after a timeout ends as a cancellation.
+        if cancellation is not None:
+            cancellation.result = result(stopped)
+            raise cancellation from error
         if isinstance(error, TimeoutError):
-            raise CommandTimeout(result(), stopped) from error
+            raise CommandTimeout(result(stopped), stopped) from error
         if isinstance(error, asyncio.CancelledError):
-            error.result = result()
+            error.result = result(stopped)
         raise
     return result()
 
@@ -283,8 +317,9 @@ class JobManager:
             job.update(state="failed", output=sanitize(str(error)))
         finally:
             if result is not None:
+                partial = result["truncated"] or job["state"] in {"cancelled", "timed_out"}
                 job.update(exit_code=result["exit_code"], truncated=result["truncated"],
-                           output=sanitize(result["output"], partial=result["truncated"] or job["state"] in {"cancelled", "timed_out"}))
+                           output=with_note(sanitize(result["output"], partial=partial), result))
             job["updated"] = time.time()
             self._persist(job, mirror=True)
             self._prune()

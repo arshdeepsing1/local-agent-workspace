@@ -184,11 +184,20 @@ async def test_cancellation_while_process_creation_finishes_still_reaps_child(tm
     assert processes[0].returncode is not None
 
 
+async def wait_for_file(path, seconds=10):
+    async with asyncio.timeout(seconds):
+        while not path.exists():
+            await asyncio.sleep(.05)
+
+
 async def test_a_timeout_does_not_wait_for_a_command_that_cannot_be_stopped(tmp_path, unkillable_group):
+    # The command writes more than a pipe holds after it is given up on: it must keep being drained.
+    command = "printf partial; sleep 2; head -c 300000 /dev/zero; touch finished"
     with pytest.raises(CommandTimeout) as caught:
-        await asyncio.wait_for(run_process("printf partial; sleep 30", tmp_path, timeout_seconds=1), 10)
+        await asyncio.wait_for(run_process(command, tmp_path, timeout_seconds=1), 10)
     assert "did not end when it was stopped" in str(caught.value)
-    assert caught.value.result == {"exit_code": None, "output": "partial\n" + NOT_STOPPED, "truncated": False}
+    assert caught.value.result == {"exit_code": None, "output": "partial", "truncated": False, "stopped": False}
+    await wait_for_file(tmp_path / "finished")
 
 
 async def test_cancellation_during_creation_does_not_wait_for_a_command_that_cannot_be_stopped(
@@ -206,7 +215,7 @@ async def test_cancellation_during_creation_does_not_wait_for_a_command_that_can
 
     async def run():
         try:
-            return await run_process("sleep 30", tmp_path)
+            return await run_process("sleep 1; head -c 300000 /dev/zero; touch finished", tmp_path)
         except asyncio.CancelledError as error:
             results.append(getattr(error, "result", None))
             raise
@@ -218,7 +227,8 @@ async def test_cancellation_during_creation_does_not_wait_for_a_command_that_can
     release.set()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, 10)
-    assert results == [{"exit_code": None, "output": NOT_STOPPED, "truncated": False}]
+    assert results == [{"exit_code": None, "output": "", "truncated": False, "stopped": False}]
+    await wait_for_file(tmp_path / "finished")
 
 
 async def test_job_stop_before_task_starts(store, tmp_path):
@@ -285,6 +295,29 @@ async def test_stop_does_not_wait_for_a_command_that_cannot_be_stopped(store, tm
     stopped = await asyncio.wait_for(manager.stop(job["id"]), 10)
     assert stopped["state"] == "cancelled"
     assert stopped["output"] == "before\n" + NOT_STOPPED
+
+
+async def test_stop_after_a_timeout_while_waiting_for_the_command_to_end_finishes_cleanly(store, tmp_path, monkeypatch,
+                                                                                            unkillable_group):
+    from local_agent import jobs
+    monkeypatch.setattr(jobs, "KILL_GRACE_SECONDS", 3)
+    manager = JobManager(store, lambda text: text, None)
+    job = await manager.start("printf before; sleep 30", tmp_path, timeout_seconds=1)
+    async with asyncio.timeout(5):
+        while not unkillable_group:  # The time limit was reached and the kill was answered EPERM.
+            await asyncio.sleep(.01)
+    stopped = await asyncio.wait_for(manager.stop(job["id"]), 2)
+    assert stopped["state"] == "cancelled"
+    assert stopped["output"] == "before\n" + NOT_STOPPED
+    assert not [task for task in asyncio.all_tasks() if task.get_coro().__qualname__.endswith(".publish")]
+
+
+async def test_the_note_that_a_command_did_not_end_keeps_a_partly_printed_token_hidden(store, tmp_path, unkillable_group):
+    manager = JobManager(store, lambda text: text, None, redaction_tokens=lambda: ("supersecret-token",))
+    job = await manager.start("printf 'abc supersec'; sleep 30", tmp_path, timeout_seconds=1)
+    finished = await asyncio.wait_for(manager.wait(job["id"]), 10)
+    assert finished["state"] == "timed_out"
+    assert finished["output"] == "abc \n" + NOT_STOPPED
 
 
 async def test_cancelling_wait_leaves_job_for_explicit_stop(store, tmp_path):

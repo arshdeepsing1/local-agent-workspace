@@ -193,6 +193,16 @@ async def test_hook_timeout_retains_output_and_cancellation_removes_input(manage
     assert not (tmp_path / "must-not-exist").exists()
 
 
+async def test_a_long_hook_output_still_says_when_the_hook_did_not_end(manager, tmp_path, unkillable_group):
+    from local_agent.jobs import NOT_STOPPED
+    configured = hook("printf '%5000s' | tr ' ' x; sleep 30", timeout_seconds=1)
+    manager.update_config({"hooks": [configured]})
+    result = await asyncio.wait_for(manager.run_hook(configured, {}, tmp_path), 10)
+    assert result["timed_out"] is True and result["stopped"] is False and result["truncated"] is True
+    assert result["output"].startswith("xxx") and result["output"].endswith("\n" + NOT_STOPPED)
+    assert len(json.dumps(result, indent=2).encode()) <= 4000
+
+
 async def test_hook_rejects_disabled_or_changed_configuration(manager, tmp_path):
     configured = hook("true")
     manager.update_config({"hooks": [{**configured, "enabled": False}]})

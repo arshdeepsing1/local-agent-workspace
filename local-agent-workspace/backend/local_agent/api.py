@@ -20,6 +20,7 @@ from .context import (
 )
 from .store import Store
 from .git_tools import working_tree_changes
+from .jobs import NOT_STOPPED, TIMEOUT_NOT_STOPPED
 from .tools import WorkspaceTools, file_error
 from .permissions import PermissionMode
 from .telemetry import session_metrics
@@ -428,7 +429,7 @@ def create_app(settings=None):
             await manager.jobs.stop(job["id"])
             raise
         if job["state"] == "timed_out":
-            raise HTTPException(408, "Command stopped after 60 seconds.")
+            raise HTTPException(408, TIMEOUT_NOT_STOPPED if job["output"].endswith(NOT_STOPPED) else "Command stopped after 60 seconds.")
         return {"job_id": job["id"], "exit_code": job["exit_code"], "output": job["output"], "truncated": job["truncated"]}
 
     def job_scope(session_id):

@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from local_agent.agents import AgentManager, public_session
 from local_agent.api import create_app
 from local_agent.config import Settings
+from local_agent.jobs import TIMEOUT_NOT_STOPPED
 from local_agent.store import Store
 from local_agent.tools import WorkspaceTools
 
@@ -32,6 +33,24 @@ async def runtime(settings):
     yield manager, session, WorkspaceTools(session["workspace"])
     await manager.jobs.shutdown()
     store.db.close()
+
+
+async def test_the_compatibility_command_endpoint_says_when_a_timed_out_command_did_not_end(settings, monkeypatch,
+                                                                                            unkillable_group):
+    import httpx
+    app = create_app(settings)
+    manager = app.state.manager
+    start = manager.jobs.start
+
+    async def short_start(*args, **kwargs):
+        return await start(*args, **{**kwargs, "timeout_seconds": 1})
+    monkeypatch.setattr(manager.jobs, "start", short_start)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://localhost") as client:
+            client.headers["X-Local-Token"] = (await client.get("/api/bootstrap")).json()["token"]
+            response = await asyncio.wait_for(client.post("/api/command", json={"text": "printf partial; sleep 30"}), 10)
+    assert response.status_code == 408
+    assert response.json()["detail"] == TIMEOUT_NOT_STOPPED
 
 
 @pytest.mark.parametrize("mode", ["plan", "manual", "acceptEdits", "auto"])
