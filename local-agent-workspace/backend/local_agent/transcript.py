@@ -108,6 +108,10 @@ def _tool(event, excerpt_chars):
         detail = f"Listed {_code(path)}" + (f" matching {_code(arguments['glob'])}" if arguments.get("glob") else "")
     elif name == "search_files":
         detail = f"Searched {_code(path)} for {_code(arguments.get('query', ''))}"
+    elif name == "find_files":
+        detail = f"Found files matching {_code(arguments.get('pattern', ''))} in {_code(path)}"
+    elif name == "wait_job":
+        detail = f"Waited for job {_code(str(arguments.get('job_id', ''))[:8])}"
     elif name == "access_directory":
         detail = f"Folder access for {_code(path)}"
     elif name == "insert_activity_log":

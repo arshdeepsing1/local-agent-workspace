@@ -3,10 +3,13 @@ import codecs
 import copy
 import json
 import os
+import re
 import signal
 import time
 import uuid
 from pathlib import Path
+
+import regex as safe_regex
 
 
 MAX_ACTIVE_JOBS = 4
@@ -18,6 +21,23 @@ NOT_STOPPED = ("[The command did not end when it was stopped and may still be ru
 TIMEOUT_NOT_STOPPED = "Command exceeded its time limit and did not end when it was stopped; it may still be running."
 DRAINING = set()  # Output readers of commands that did not end when stopped.
 ENVIRONMENT_KEYS = {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SHELL", "USER", "LOGNAME", "VIRTUAL_ENV"}
+# Never passed to commands by name (Settings -> Environment variables for commands):
+# model credentials, and loader or shell-startup variables that would change what
+# even Auto mode's basic commands do. config.py validates the same sets.
+CREDENTIAL_ENV = {"DBRICKS_TOKEN", "DATABRICKS_TOKEN", "DBRICKS_URL", "DATABRICKS_HOST", "LOCAL_AGENT_ENV_FILE"}
+DENIED_ENV = {"BASH_ENV", "ENV", "ZDOTDIR", "PROMPT_COMMAND", "SHELLOPTS", "BASHOPTS", "IFS", "PYTHONSTARTUP",
+              "PERL5OPT", "RUBYOPT", "NODE_OPTIONS"}
+DENIED_ENV_PREFIXES = ("LD_", "DYLD_")
+TERM_GRACE_SECONDS = 2
+ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+JOB_NOTICE_STATES = {"completed", "failed", "timed_out"}  # Background jobs that get a finished notice.
+HEAD_CHARS = 1_500  # A failed command's first result: up to this much of the start,
+TAIL_CHARS = 4_500  # and this much of the end,
+MIN_HEAD_CHARS = 200  # or at least this much of the start alone.
+WAIT_SCAN_SECONDS = 1.0  # wait_job's regular-expression budget per batch of new output
+WAIT_THREAD_CHARS = 65_536  # larger batches are scanned in a worker thread
+WAIT_OUTPUT_CHARS = 4_000
+PAGE_BYTES = 8_000
 
 
 def shell_argv(command):
@@ -70,6 +90,23 @@ async def settle(reader):
     return reader.done(), cancellation
 
 
+async def terminate(reader, pid):
+    """Ask a command's process group to end (SIGTERM), give it TERM_GRACE_SECONDS,
+    then kill what is left and settle(). Returns (ended, cancellation) like settle()."""
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    cancellation = None
+    try:
+        await asyncio.wait({reader}, timeout=TERM_GRACE_SECONDS)
+    except asyncio.CancelledError as error:
+        cancellation = error
+    kill_group(pid)
+    ended, later = await settle(reader)
+    return ended, cancellation or later
+
+
 def drained(reader):
     DRAINING.discard(reader)
     if not reader.cancelled():
@@ -95,10 +132,14 @@ class CommandTimeout(TimeoutError):
         self.result = result
 
 
-async def run_process(command, workspace, timeout_seconds=60, max_output_bytes=80_000, on_output=None):
-    """Run a noninteractive command, retaining bounded output while draining its pipe."""
+async def run_process(command, workspace, timeout_seconds=60, max_output_bytes=80_000, on_output=None,
+                      extra_env=None):
+    """Run a noninteractive command, retaining bounded output while draining its pipe.
+
+    extra_env holds variables passed through by name; the caller has filtered them."""
     validate_command_options(command, timeout_seconds, max_output_bytes)
     env = {key: value for key, value in os.environ.items() if key in ENVIRONMENT_KEYS}
+    env.update(extra_env or {})
     spawning = asyncio.create_task(asyncio.create_subprocess_exec(
         *shell_argv(command), cwd=workspace, env=env,
         stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
@@ -173,10 +214,10 @@ async def run_process(command, workspace, timeout_seconds=60, max_output_bytes=8
             await asyncio.shield(reader)
             await publisher
     except BaseException as error:
-        # Always kill the group, even when the shell itself has already exited:
+        # Always stop the group, even when the shell itself has already exited:
         # its children may still be running and holding the output pipe open.
-        kill_group(process.pid)
-        stopped, cancellation = await settle(reader)
+        # SIGTERM first, so that they can clean up; SIGKILL after the grace period.
+        stopped, cancellation = await terminate(reader, process.pid)
         publisher.cancel()
         await asyncio.gather(publisher, return_exceptions=True)
         if stopped:
@@ -194,12 +235,86 @@ async def run_process(command, workspace, timeout_seconds=60, max_output_bytes=8
     return result()
 
 
+def job_command(command, limit):
+    """A job's command on one line, at most limit characters."""
+    text = " ".join(str(command).split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def job_ending(job):
+    """How a finished job ended, for notices: 'completed (exit 0)', 'failed (exit 2)' or 'timed out'."""
+    if job["state"] == "timed_out":
+        return "timed out"
+    exit_code = f" (exit {job['exit_code']})" if type(job.get("exit_code")) is int else ""
+    return ("completed" if job["state"] == "completed" else "failed") + exit_code
+
+
+def until_pattern(text):
+    """wait_job's until_regex, compiled with the same safe engine as search_files."""
+    if not isinstance(text, str) or len(text) > 500:
+        raise ValueError("until_regex must be text of at most 500 characters.")
+    try:
+        return safe_regex.compile(text, safe_regex.VERSION1)
+    except (safe_regex.error, RecursionError) as error:
+        raise ValueError(f"Invalid until_regex: {error}") from error
+
+
+def scan_lines(text, start, pattern, timeout):
+    """The first line of text that pattern matches, as (line, offset of the line), or None.
+
+    text holds only complete lines, except at the end of a finished job's output.
+    start is the offset of text in the job output."""
+    from .tools import REGEX_TIMEOUT
+    deadline = time.monotonic() + timeout
+    position = 0
+    lines = text.split("\n")
+    if text.endswith("\n"):
+        lines.pop()  # A final LF ends the last line; it does not start an empty one.
+    for line in lines:
+        stripped = line[:-1] if line.endswith("\r") else line
+        remaining = deadline - time.monotonic()
+        try:
+            if remaining <= 0:
+                raise TimeoutError
+            if pattern.search(stripped, timeout=min(REGEX_TIMEOUT, remaining), concurrent=True):
+                return stripped, start + position
+        except TimeoutError:
+            raise ValueError("until_regex took too long; simplify it.") from None
+        position += len(line) + 1
+    return None
+
+
+def wait_page(job, reason, match, from_offset):
+    """wait_job's result: the new output since from_offset (its end when long), at most 8,000 bytes of JSON."""
+    from .tools import _excerpt
+    output = job["output"]
+    total = len(output)
+
+    def page(begin):
+        return {"job_id": job["id"], "state": job["state"], "exit_code": job["exit_code"], "reason": reason,
+                "match": match and {"line": _excerpt(match[0])[0], "offset": match[1]},
+                "output": output[begin:], "output_start": begin, "next_offset": total, "total_chars": total}
+
+    low = min(total, max(from_offset, total - WAIT_OUTPUT_CHARS))
+    high = total
+    while low < high:  # The smallest start whose page fits.
+        middle = (low + high) // 2
+        if len(json.dumps(page(middle), indent=2).encode("utf-8")) <= PAGE_BYTES:
+            high = middle
+        else:
+            low = middle + 1
+    return page(low)
+
+
 class JobManager:
-    def __init__(self, store, redact, on_update, redaction_tokens=None):
+    def __init__(self, store, redact, on_update, redaction_tokens=None, environment=None):
         self.store = store
         self.redact = redact
         self.on_update = on_update
         self.redaction_tokens = redaction_tokens or (lambda: ())
+        self.environment = environment  # Variables passed to commands by name, read at job start.
+        self._signal = asyncio.Condition()  # Notified after every change to a job (wait_job).
+        self._changes = 0
         self._tasks = {}
         self._jobs = {}
         self._removing_sessions = set()
@@ -223,6 +338,11 @@ class JobManager:
         self.store.db.commit()
         if mirror:
             self.store.save_job(job)
+
+    async def _changed(self):
+        self._changes += 1
+        async with self._signal:
+            self._signal.notify_all()
 
     async def _notify(self, job):
         if self.on_update is not None:
@@ -300,12 +420,19 @@ class JobManager:
         async def output(text, truncated):
             job.update(output=sanitize(text, partial=True), truncated=truncated, updated=time.time())
             self._persist(job)
+            await self._changed()
             await self._notify(job)
 
         result = None
         try:
+            extra_env = {}
+            if self.environment is not None:
+                try:
+                    extra_env = dict(self.environment() or {})
+                except Exception:
+                    extra_env = {}  # A broken setting must not stop the command.
             result = await run_process(command, job["workspace"], job["timeout_seconds"],
-                                       job["max_output_bytes"], output)
+                                       job["max_output_bytes"], output, extra_env=extra_env)
             job["state"] = "completed" if result["exit_code"] == 0 else "failed"
         except CommandTimeout as error:
             result = error.result
@@ -323,6 +450,7 @@ class JobManager:
             job["updated"] = time.time()
             self._persist(job, mirror=True)
             self._prune()
+            await self._changed()
             await self._notify(job)
 
     async def wait(self, job_id):
@@ -348,8 +476,46 @@ class JobManager:
                 job.update(state="cancelled", updated=time.time())
                 self._persist(job, mirror=True)
                 self._prune()
+                await self._changed()
                 await self._notify(job)
         return copy.deepcopy(job)
+
+    async def watch(self, job_id, offset, pattern, timeout):
+        """Wait until the job ends, a new complete output line after offset matches
+        pattern, or timeout seconds pass. Returns (job copy, reason, (line, offset) or None).
+        Each wake-up scans only output not scanned before. Cancelling the wait leaves the job running."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        cursor = offset
+        while True:
+            seen = self._changes
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise ValueError("The job is no longer available.")
+            running = job["state"] == "running"
+            output = job["output"]
+            cursor = min(cursor, len(output))  # Retained output can shrink (a withheld secret prefix).
+            if pattern is not None:
+                end = len(output) if not running else output.rfind("\n", cursor) + 1
+                if end > cursor:
+                    text = output[cursor:end]
+                    if len(text) > WAIT_THREAD_CHARS:
+                        found = await asyncio.to_thread(scan_lines, text, cursor, pattern, WAIT_SCAN_SECONDS)
+                    else:
+                        found = scan_lines(text, cursor, pattern, WAIT_SCAN_SECONDS)
+                    if found is not None:
+                        return copy.deepcopy(job), "matched", found
+                    cursor = end
+            if not running:
+                return copy.deepcopy(job), "exited", None
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return copy.deepcopy(job), "timeout", None
+            async with self._signal:
+                try:
+                    await asyncio.wait_for(self._signal.wait_for(lambda: self._changes != seen), remaining)
+                except TimeoutError:
+                    pass
 
     async def shutdown(self):
         self._closed = True

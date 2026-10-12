@@ -243,7 +243,7 @@ async def test_get_task_is_in_every_tool_profile(runtime, monkeypatch, profile):
     gateway(monkeypatch, handler)
     await manager.run_databricks(session, "Which task is next?")
     assert "get_task" in seen[0]
-    assert len([*TOOL_DEFINITIONS, *FEATURE_TOOLS]) == 17
+    assert len([*TOOL_DEFINITIONS, *FEATURE_TOOLS]) == 19
 
 
 # API: task routes push the list, the stream sends it on connect, and the transcript export.

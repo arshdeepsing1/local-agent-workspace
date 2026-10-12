@@ -27,6 +27,8 @@ function summarizeTools(events) {
     const input = event.input || {}
     let subject = String(input.path || input.file_path || input.command || input.query || input.task || input.title || '')
     if (event.name === 'read_file') subject += readRange(event)
+    if (event.name === 'find_files') subject = `${input.pattern ?? ''}` + (input.path && input.path !== '.' ? ` in ${input.path}` : '')
+    if (event.name === 'wait_job') subject = `job ${String(input.job_id ?? '').slice(0, 8)}` + (input.until_regex ? ` until /${input.until_regex}/` : '')
     let taskStatus
     if (event.name === 'create_task' || event.name === 'update_task') {
       let task = {}

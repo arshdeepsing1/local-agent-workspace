@@ -90,3 +90,14 @@ def test_script_writes_one_file_per_conversation_without_replacing_any(tmp_path)
     assert text.index("# Transcript: Nightly export") < text.index("# Transcript: Later chat")
     usage = subprocess.run([sys.executable, str(SCRIPT)], capture_output=True, text=True)
     assert usage.returncode == 2 and "usage:" in usage.stderr
+
+
+def test_find_files_and_wait_job_lines():
+    events = [{"id": "u", "type": "user", "created": 1790000000.0, "text": "Find the tests"},
+              {"id": "f", "type": "tool", "name": "find_files", "state": "completed", "output": "{}",
+               "input": {"pattern": "src/**/*.test.ts", "path": "web"}},
+              {"id": "w", "type": "tool", "name": "wait_job", "state": "completed", "output": "{}",
+               "input": {"job_id": "0123456789abcdef", "until_regex": "ready"}}]
+    text = transcript({"id": "c1", "title": "Tests", "events": events})
+    assert "- Found files matching `src/**/*.test.ts` in `web`\n" in text
+    assert "- Waited for job `01234567`\n" in text

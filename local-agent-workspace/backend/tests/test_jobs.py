@@ -4,6 +4,7 @@ import os
 import shlex
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -304,8 +305,9 @@ async def test_stop_after_a_timeout_while_waiting_for_the_command_to_end_finishe
     manager = JobManager(store, lambda text: text, None)
     job = await manager.start("printf before; sleep 30", tmp_path, timeout_seconds=1)
     async with asyncio.timeout(5):
-        while not unkillable_group:  # The time limit was reached and the kill was answered EPERM.
+        while not unkillable_group:  # The time limit was reached and SIGTERM was answered EPERM.
             await asyncio.sleep(.01)
+    await asyncio.sleep(jobs.TERM_GRACE_SECONDS + .1)  # Past the grace period: SIGKILL was answered EPERM too.
     stopped = await asyncio.wait_for(manager.stop(job["id"]), 2)
     assert stopped["state"] == "cancelled"
     assert stopped["output"] == "before\n" + NOT_STOPPED
@@ -583,3 +585,83 @@ async def test_restart_does_not_rewrite_already_mirrored_terminal_jobs(tmp_path,
     assert writes == []
     assert reopened.get(session["id"])["command_jobs"][0]["state"] == "completed"
     reopened.db.close()
+
+
+async def test_sigterm_lets_a_command_clean_up_after_a_timeout(tmp_path, killpg_answer):
+    command = "trap 'sleep 0.3; touch done.txt; exit 0' TERM; printf started; sleep 30"
+    with pytest.raises(CommandTimeout) as caught:
+        await asyncio.wait_for(run_process(command, tmp_path, timeout_seconds=1), 10)
+    assert caught.value.result["output"].startswith("started")
+    assert (tmp_path / "done.txt").exists()
+
+
+async def test_sigterm_lets_a_background_job_clean_up_when_stopped(store, tmp_path, killpg_answer):
+    manager = JobManager(store, lambda text: text, None)
+    job = await manager.start("trap 'sleep 0.3; touch done.txt; exit 0' TERM; printf started; sleep 30", tmp_path,
+                              background=True)
+    async with asyncio.timeout(5):
+        while manager.get(job["id"])["output"] != "started":
+            await asyncio.sleep(.01)
+    stopped = await asyncio.wait_for(manager.stop(job["id"]), 10)
+    assert stopped["state"] == "cancelled"
+    assert (tmp_path / "done.txt").exists()
+
+
+REAL_KILLPG = os.killpg  # killpg_answer replaces os.killpg during a test.
+
+
+def group_alive(pgid):
+    try:
+        REAL_KILLPG(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return True
+    for entry in proc.iterdir():  # Members that ended but were not reaped (zombies) do not count.
+        try:
+            fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+        except (OSError, IndexError):
+            continue
+        if int(fields[2]) == pgid and fields[0] != "Z":
+            return True
+    return False
+
+
+async def test_a_command_that_ignores_sigterm_is_killed_after_the_grace_period(tmp_path, monkeypatch, killpg_answer):
+    from local_agent import jobs
+    monkeypatch.setattr(jobs, "TERM_GRACE_SECONDS", 0.5)
+    command = "printf '%s\\n' $$; trap '' TERM; sleep 30"
+    started = time.monotonic()
+    with pytest.raises(CommandTimeout) as caught:
+        await asyncio.wait_for(run_process(command, tmp_path, timeout_seconds=1), 10)
+    elapsed = time.monotonic() - started
+    assert 1 + 0.5 <= elapsed < 1 + 0.5 + 1.5
+    pgid = int(caught.value.result["output"].split()[0])
+    async with asyncio.timeout(3):
+        while group_alive(pgid):
+            await asyncio.sleep(.05)
+
+
+async def test_passed_environment_variables_reach_the_command(tmp_path):
+    result = await run_process(python_command("import os; print(os.environ.get('MY_TOOL_HOME'))"), tmp_path,
+                               extra_env={"MY_TOOL_HOME": "/srv/tool"})
+    assert result["output"] == "/srv/tool\n"
+
+
+async def test_job_manager_reads_the_environment_at_job_start(store, tmp_path):
+    values = {"MY_TOOL_HOME": "/srv/first"}
+    manager = JobManager(store, lambda text: text, None, environment=lambda: dict(values))
+    job = await manager.start(python_command("import os; print(os.environ.get('MY_TOOL_HOME'))"), tmp_path)
+    assert (await manager.wait(job["id"]))["output"] == "/srv/first\n"
+    values["MY_TOOL_HOME"] = "/srv/second"
+    job = await manager.start(python_command("import os; print(os.environ.get('MY_TOOL_HOME'))"), tmp_path)
+    assert (await manager.wait(job["id"]))["output"] == "/srv/second\n"
+
+    def broken():
+        raise RuntimeError("settings unavailable")
+    manager.environment = broken
+    job = await manager.start("printf ran", tmp_path)
+    assert (await manager.wait(job["id"]))["output"] == "ran"

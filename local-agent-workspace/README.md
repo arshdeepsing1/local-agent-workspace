@@ -976,42 +976,106 @@ The shell strips model credentials from its inherited environment.
 1–64. This is a model-request ceiling, not a tool-call count: one model response can
 request several tools. Reaching the ceiling preserves completed actions and stops
 until the user continues or raises the setting. **Max output tokens** defaults to
-8,192 per request with the bounds described above. The editor and file edits retain
-their 80 KB limit. Agent reads use
-`read_file(path, start_line=1, max_lines=200)` and return numbered lines plus
-`next_line`; `max_lines` can be 1–1,000. Reads scan at most 8 MB from the start of
-a regular UTF-8 file, reject lines over 128 KB, and return at most 8 KB of serialized
-JSON per page. They can therefore inspect larger source files without loading
-those files into the editor. File reads, search results, and job-output pages have
-explicit continuation markers. The filesystem can change between pages.
+8,192 per request with the bounds described above. The editor and file edits are
+limited by Settings → File write limit (80 KB by default).
+
+Agent reads use `read_file(path, start_line=1, max_lines=400)` and return numbered
+lines plus `next_line`; `max_lines` can be 1–2,000. A page holds at most a quarter of
+**Context window** in bytes of serialized JSON, from 8 KB to 32 KB (32 KB with a
+128K-token window). `tail_lines` (1–2,000) returns the last lines instead, with their
+absolute line numbers, which suits logs: it reads backwards from the end, works on files
+up to 512 MB, and needs those lines to fit in 8 MB. Forward reads scan at most 8 MB from
+the start of a regular file. Lines longer than 128 KB are refused. Lines end at LF only,
+and one CR before it is dropped, so CRLF files read normally. Bytes that are not valid
+UTF-8 are shown as U+FFFD (�) and the first 20 such lines are listed in
+`invalid_utf8_lines`; files with NUL bytes are refused as binary. Reads can therefore
+inspect larger files without loading them into the editor. File reads, search results,
+and job-output pages have explicit continuation markers. The filesystem can change
+between pages.
 
 The agent's `list_files` returns `entries` in pages of at most 8 KB. Pass the
 returned `next_offset` with the same path, depth, and glob to continue. Discovery
 still stops at 300 matches per query; `listing_limit_reached` indicates that the
 folder or glob should be narrowed to find additional files. The file explorer's
-existing listing API is unchanged.
+existing listing API is unchanged. To find files by name at any depth, the agent uses
+`find_files(pattern)`: `**` matches any number of folders (`src/**/*.test.ts`), a
+pattern without `/` matches file names anywhere (`*.py`), `{a,b}` gives alternatives,
+and letter case is ignored. `sort="modified"` lists the newest first, with UTC
+modification times. Pages hold at most 500 paths and 8 KB, with `total` and `next_offset`.
+
+`find_files` and `search_files` see the same files. Inside a Git work tree they use
+`git ls-files --cached --others --exclude-standard`, so files that `.gitignore` excludes
+are skipped unless the call sets `include_ignored=true`; untracked nested repositories
+and submodules are listed in full. Git is used only when the repository's top level is
+inside the workspace or granted folder being searched (in Bypass mode outside every
+folder: when it is neither your home folder nor `/`), so a dotfiles repository in the
+home folder cannot hide a project's files. Outside Git, or when Git fails (the result
+then has a `note`), the folder is walked without `.gitignore`. Either way the fixed
+exclusions apply: credential names, generated folders, symbolic links to folders, and
+the configured credential file under any name, including hard links to it. Listing
+stops with an error after 10 seconds, 20,000 folders, or 200,000 files.
 
 `search_files` supports literal search by default, `regex=true`, `case_sensitive`,
 `context_lines` (0–5), `offset` (0–10,000), and `max_results` (1–100, default 50).
-Results identify file/line, adjacent lines, clipped excerpts, omitted files, and
-`next_offset`. Query length is capped at 1,000 characters. Search skips binary,
-excluded, unreadable, and over-2-MB files; scan limits are 16 MB of file content,
-5,000 files, 2,000 directories, and three seconds. Regex matches have an additional
-50 ms timeout. Limit errors ask for a narrower query rather than claiming no matches.
-The Python `regex==2026.9.10` dependency enforces regex timeouts and is installed
-by the normal backend installation command.
+Case-insensitive literal search uses Unicode simple case folding, one character for
+one: `K` also finds the Kelvin sign, but `STRASSE` does not find `Straße`. Regular
+expressions use full case folding and find it. `output_mode` chooses the result:
+`content` (the default) returns file/line, adjacent lines, and clipped excerpts;
+`files_with_matches` lists the matching files; `count` gives matching lines per file
+and `total_matches`. `offset` counts matches in `content` mode and files in the other
+modes, and every result has `next_offset`. Query length is capped at 1,000 characters.
+Binary (NUL) and non-UTF-8 files are not searched; `skipped_files` counts files over
+2 MB and files that could not be read. Before reading, a search refuses more than
+20,000 files, or more than 64 MB in files of up to 2 MB, after `glob` filtering.
+Reading and matching then have 10 seconds, and each regex match 50 ms. Limit errors
+ask for a narrower query rather than claiming no matches. The Python `regex==2026.9.10`
+dependency enforces regex timeouts and is installed by the normal backend installation command.
+
+ripgrep (`rg`) is optional. When it is installed, literal searches of a folder use it
+to find candidate files faster, and the results are the same without it: Python reads
+every candidate and produces every match, count, and `skipped_files`, and it always
+reads symbolic links, which rg skips. rg runs without a shell, configuration, or ignore
+files, and never with `-i`: a case-insensitive query becomes character classes built
+from Python's own case folding. Regular expressions, case-insensitive queries with
+non-ASCII letters, and single-file searches do not use rg. When rg fails, for example
+in a folder with an unreadable file, takes more than 5 seconds, or prints too much,
+the search reads every file itself: slower, with the same results.
 
 `run_command` accepts `timeout_seconds`, `max_output_bytes`, and `background`.
-It returns a job ID and the first output page. `list_jobs`, `get_job_output`, and
-`stop_job` inspect, paginate, and stop jobs in the same conversation. The job's
+It returns a job ID and the first output page. When a command failed, timed out, or
+was stopped and its output does not fit one page, the first result shows up to 1,500
+characters of the start and up to 4,500 of the end instead (`excerpt: "head_and_tail"`),
+with the omitted range and the `get_job_output` offset where it begins; successful
+commands keep their first page. `list_jobs`, `get_job_output`, `wait_job`, and
+`stop_job` inspect, paginate, wait for, and stop jobs in the same conversation.
+`wait_job` waits up to 300 seconds (default 60) until the job ends or a new output line
+matches `until_regex`, and returns the new output and `next_offset` to wait again;
+Stop ends the wait, not the job. The job's
 exit code and state distinguish success, failure, timeout, and cancellation.
 Only the configured prefix of output is retained; excess output is drained and
 reported as truncated. Foreground cancellation, timeouts, command completion,
-and normal app shutdown clean up the command's process group. Use managed
+and normal app shutdown clean up the command's process group. A timeout, Stop, or
+shutdown sends SIGTERM to the group first, so commands can clean up, and SIGKILL
+2 seconds later. Use managed
 background mode instead of shell `&`, detached daemons, or commands that escape
 the process group. This is process supervision, not an OS sandbox. After an
 abnormal server death, previously running jobs are marked **interrupted** and
 never replayed; their outcome and surviving processes must be checked manually.
+
+Commands get `PATH`, `HOME`, `LANG`, `LC_ALL`, `TMPDIR`, `SHELL`, `USER`, `LOGNAME`, and
+`VIRTUAL_ENV` from the server's environment, plus the variables named in
+**Settings → Environment variables for commands**, with values from the server's
+environment when each job starts. These are never passed: the model credential
+variables (`DBRICKS_TOKEN`, `DATABRICKS_TOKEN`, `DBRICKS_URL`, `DATABRICKS_HOST`,
+`LOCAL_AGENT_ENV_FILE`), loader variables (`LD_*`, `DYLD_*`), shell and interpreter
+startup variables (`BASH_ENV`, `ENV`, `ZDOTDIR`, `PROMPT_COMMAND`, `SHELLOPTS`,
+`BASHOPTS`, `IFS`, `PYTHONSTARTUP`, `PERL5OPT`, `RUBYOPT`, `NODE_OPTIONS`), and any
+value that contains the Databricks token. Hooks do not get these variables.
+
+When a background job that the agent started completes, fails, or times out, its
+conversation gets a notice, also when the chat is idle, and the agent's next model
+request names the job once. Nothing wakes an idle chat. Jobs started from the
+Terminal panel, and stopped or cancelled jobs, get no notice.
 Automatic compaction adds bounded summary requests beyond the configured agent steps.
 Databricks inference is billed to your workspace. Endpoints must support streaming,
 function calling, and non-streamed text responses for summarization.

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from local_agent import search
 from local_agent import tools as tools_module
 from local_agent.tools import WorkspaceTools
 
@@ -121,17 +122,26 @@ def test_range_unicode_output_budget_and_complete_line_pagination(tmp_path):
 
 
 @pytest.mark.parametrize("arguments", [{"start_line": 0}, {"start_line": True}, {"start_line": "1"},
-                                       {"max_lines": 0}, {"max_lines": 1001}, {"max_lines": False}])
+                                       {"max_lines": 0}, {"max_lines": 2001}, {"max_lines": False},
+                                       {"tail_lines": 0}, {"tail_lines": 2001}, {"tail_lines": True}])
 def test_range_parameter_validation(tmp_path, arguments):
     with pytest.raises(ValueError):
         WorkspaceTools(str(tmp_path)).read_file_range("missing", **arguments)
 
 
-@pytest.mark.parametrize("raw", [b"hello\x00binary", b"\xffinvalid"])
-def test_range_rejects_binary_and_invalid_utf8(tmp_path, raw):
-    (tmp_path / "bad").write_bytes(raw)
-    with pytest.raises((ValueError, UnicodeError)):
+def test_range_rejects_binary_and_replaces_invalid_utf8(tmp_path):
+    (tmp_path / "bad").write_bytes(b"hello\x00binary")
+    with pytest.raises(ValueError, match="Binary files"):
         WorkspaceTools(str(tmp_path)).read_file_range("bad")
+    (tmp_path / "latin").write_bytes(b"caf\xe9\nfine\n\xffinvalid\r\n")
+    result = WorkspaceTools(str(tmp_path)).read_file_range("latin")
+    assert result["content"] == "1: caf\ufffd\n2: fine\n3: \ufffdinvalid"
+    assert result["invalid_utf8_lines"] == [1, 3]
+    assert result["encoding_note"] == "Some bytes are not valid UTF-8 and are shown as U+FFFD (\ufffd)."
+    tail = WorkspaceTools(str(tmp_path)).read_file_range("latin", tail_lines=2)
+    assert tail["content"] == "2: fine\n3: \ufffdinvalid" and tail["invalid_utf8_lines"] == [3]
+    clean = WorkspaceTools(str(tmp_path)).read_file_range("latin", start_line=2, max_lines=1)
+    assert "invalid_utf8_lines" not in clean and "encoding_note" not in clean
 
 
 def test_range_rejects_nonregular_and_excessive_lines(tmp_path, monkeypatch):
@@ -170,7 +180,7 @@ def test_query_guards_credentials_aliases_and_external_paths(tmp_path):
         tools.search_files("needle", path=str(tmp_path))
     result = tools.search_files("needle")
     assert [m["path"] for m in result["matches"]] == ["normal.txt"]
-    assert result["skipped_files"] == 5
+    assert result["skipped_files"] == 0  # Excluded and credential files are not part of the search at all.
 
 
 def test_search_literal_regex_case_and_unicode(tmp_path):
@@ -180,7 +190,9 @@ def test_search_literal_regex_case_and_unicode(tmp_path):
     assert [m["line"] for m in tools.search_files("a.b", regex=True)["matches"]] == [1, 2]
     assert [m["line"] for m in tools.search_files("mixed")["matches"]] == [3, 4]
     assert [m["line"] for m in tools.search_files("mixed", case_sensitive=True)["matches"]] == [4]
-    assert [m["line"] for m in tools.search_files("STRASSE")["matches"]] == [5]
+    # Literal searches use simple case folding (one character for one), regular expressions full folding.
+    assert [m["line"] for m in tools.search_files("STRASSE")["matches"]] == []
+    assert [m["line"] for m in tools.search_files("STRAßE")["matches"]] == [5]
     assert [m["line"] for m in tools.search_files("STRASSE", regex=True)["matches"]] == [5]
 
 
@@ -221,7 +233,7 @@ def test_search_large_files_and_explicit_skips(tmp_path):
     (tmp_path / ".git" / "secret").write_text("needle")
     result = WorkspaceTools(str(tmp_path)).search_files("needle")
     assert [(m["path"], m["line"]) for m in result["matches"]] == [("large.txt", 20_001)]
-    assert result["skipped_files"] == 4
+    assert result["skipped_files"] == 1  # Only the oversize file: binary and non-UTF-8 files are not counted.
 
 
 def test_search_output_budget_and_excerpt_metadata(tmp_path):
@@ -278,14 +290,14 @@ async def test_expensive_regex_has_deadline_without_blocking_event_loop(tmp_path
     assert ticks >= 2
 
 
-@pytest.mark.parametrize("constant, value, message", [("SEARCH_FILE_SCAN_LIMIT", 1, "file scan"),
-                                                       ("SEARCH_DIR_SCAN_LIMIT", 0, "directory scan"),
-                                                       ("SEARCH_TOTAL_LIMIT", 1, "byte scan"),
-                                                       ("QUERY_TIMEOUT", 0, "time limit")])
-def test_search_scan_limits_are_explicit_errors(tmp_path, monkeypatch, constant, value, message):
+@pytest.mark.parametrize("module, constant, value, message", [(tools_module, "SEARCH_FILE_SCAN_LIMIT", 1, "file scan"),
+                                                               (search, "WALK_DIR_LIMIT", 0, "Directory scan"),
+                                                               (tools_module, "SEARCH_TOTAL_LIMIT", 1, "byte scan"),
+                                                               (tools_module, "SEARCH_TIMEOUT", 0, "time limit")])
+def test_search_scan_limits_are_explicit_errors(tmp_path, monkeypatch, module, constant, value, message):
     (tmp_path / "a.txt").write_text("normal text")
     (tmp_path / "b.txt").write_text("more text")
-    monkeypatch.setattr(tools_module, constant, value)
+    monkeypatch.setattr(module, constant, value)
     with pytest.raises(ValueError, match=message):
         WorkspaceTools(str(tmp_path)).search_files("absent")
 
@@ -305,3 +317,136 @@ def test_search_unreadable_walk_raises(tmp_path, monkeypatch):
     monkeypatch.setattr(tools_module.os, "walk", denied)
     with pytest.raises(PermissionError):
         WorkspaceTools(str(tmp_path)).search_files("needle")
+
+
+@pytest.mark.parametrize("separator", [" ", "\x0b", "\x0c", "\x1c", "\x85", "\r\n"])
+def test_search_and_read_agree_on_line_numbers(tmp_path, separator):
+    (tmp_path / "bare-cr").write_bytes(b"one\rtwo\nthree four\nfive TARGET\n")
+    tools = WorkspaceTools(str(tmp_path))
+    match = tools.search_files("TARGET", path="bare-cr")["matches"][0]
+    assert match["line"] == 3
+    assert tools.read_file_range("bare-cr")["content"].split("\n")[match["line"] - 1] == "3: five TARGET"
+
+    text = f"alpha{separator}beta\ngamma\nTARGET{separator}x\ndelta\n"
+    (tmp_path / "mixed").write_bytes(text.encode("utf-8"))
+    match = tools.search_files("TARGET", path="mixed", context_lines=1)["matches"][0]
+    page = dict(line.split(": ", 1) for line in tools.read_file_range("mixed")["content"].split("\n"))
+    assert page[str(match["line"])] == match["text"]
+    for neighbour in (*match["before"], *match["after"]):
+        assert page[str(neighbour["line"])] == neighbour["text"]
+    assert [item["line"] for item in match["before"] + match["after"]] == [match["line"] - 1, match["line"] + 1]
+
+
+def test_split_lines():
+    assert tools_module.split_lines("") == []
+    assert tools_module.split_lines("a\n") == ["a"]
+    assert tools_module.split_lines("a\r\n\r\nb") == ["a", "", "b"]
+    assert tools_module.split_lines("a\r\r\n") == ["a\r"]
+    assert tools_module.split_lines("a\rb c") == ["a\rb c"]
+
+
+@pytest.mark.parametrize("trailing_newline", [False, True])
+def test_tail_of_a_long_file_has_exact_line_numbers(tmp_path, trailing_newline):
+    text = "".join(f"line {number}\n" for number in range(1, 100_001))
+    (tmp_path / "log.txt").write_text(text if trailing_newline else text[:-1])
+    tools = WorkspaceTools(str(tmp_path))
+    result = tools.read_file_range("log.txt", tail_lines=3)
+    assert result == {"path": "log.txt", "start_line": 99_998, "end_line": 100_000,
+                      "content": "99998: line 99998\n99999: line 99999\n100000: line 100000",
+                      "next_line": None, "truncated": False, "tail": True}
+    small = tmp_path / "small.txt"
+    small.write_text("a\r\nb\r\n")
+    assert tools.read_file_range("small.txt", tail_lines=5)["content"] == "1: a\n2: b"
+    (tmp_path / "empty.txt").touch()
+    assert tools.read_file_range("empty.txt", tail_lines=5)["content"] == ""
+    with pytest.raises(ValueError, match="either start_line or tail_lines"):
+        tools.read_file_range("log.txt", start_line=2, tail_lines=3)
+
+
+def test_tail_keeps_the_last_lines_that_fit_the_page(tmp_path):
+    (tmp_path / "wide.txt").write_text("".join(f"{number} " + "x" * 200 + "\n" for number in range(1, 501)))
+    result = WorkspaceTools(str(tmp_path)).read_file_range("wide.txt", tail_lines=200)
+    assert result["truncated"] and result["end_line"] == 500
+    assert size(result) <= tools_module.QUERY_OUTPUT_LIMIT
+    assert result["content"].endswith("500: 500 " + "x" * 200)
+    assert result["content"].startswith(f"{result['start_line']}: {result['start_line']} ")
+
+
+def test_tail_works_on_files_too_large_to_scan_from_the_start(tmp_path, monkeypatch):
+    target = tmp_path / "big.log"
+    with target.open("w") as output:
+        for number in range(1, 400_001):
+            output.write(f"{number:08d} {'.' * 41}\n")
+    assert target.stat().st_size >= 20_000_000
+    tools = WorkspaceTools(str(tmp_path))
+    result = tools.read_file_range("big.log", tail_lines=2)
+    assert result["content"] == f"399999: 00399999 {'.' * 41}\n400000: 00400000 {'.' * 41}"
+    with pytest.raises(ValueError, match="8 MB"):
+        tools.read_file_range("big.log", start_line=390_000)
+    monkeypatch.setattr(tools_module, "READ_SCAN_LIMIT", 100)
+    with pytest.raises(ValueError, match="The last lines exceed 8 MB"):
+        tools.read_file_range("big.log", tail_lines=10)
+    monkeypatch.setattr(tools_module, "TAIL_FILE_LIMIT", 1000)
+    with pytest.raises(ValueError, match="files up to 512 MB"):
+        tools.read_file_range("big.log", tail_lines=1)
+
+
+def test_larger_pages_for_larger_context_budgets(tmp_path):
+    (tmp_path / "long.txt").write_text("".join(f"{number} " + "y" * 60 + "\n" for number in range(1, 1001)))
+    tools = WorkspaceTools(str(tmp_path))
+    default = tools.read_file_range("long.txt")
+    large = tools.read_file_range("long.txt", page_bytes=32_000)
+    assert size(default) <= 8_000 < size(large) <= 32_000
+    assert large["end_line"] > default["end_line"] and large["truncated"]
+    assert tools.read_file_range("long.txt", page_bytes=10 ** 9)["end_line"] == large["end_line"]  # Clamped.
+    assert tools_module.read_page_bytes(131_072) == 32_000
+    assert tools_module.read_page_bytes(64_000) == 16_000
+    assert tools_module.read_page_bytes(8_192) == 8_000
+    assert tools_module.read_page_bytes("not a number") == 8_000
+    assert tools_module.read_page_bytes(None) == 8_000
+    with pytest.raises(ValueError, match="32 KB"):
+        (tmp_path / "line.txt").write_text("z" * 40_000)
+        tools.read_file_range("line.txt", page_bytes=32_000)
+
+
+async def test_agent_reads_use_the_context_budget(tmp_path, monkeypatch):
+    import httpx
+    from local_agent.agents import AgentManager
+    from local_agent.config import Settings
+    from local_agent.store import Store
+
+    monkeypatch.setattr("local_agent.config.APP_ROOT", tmp_path)
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "long.txt").write_text("".join(f"{number} " + "w" * 60 + "\n" for number in range(1, 1001)))
+    settings = Settings(tmp_path / "state")
+    settings.values.update(workspace=str(project), env_file="", context_window=131_072)
+    settings.credentials = lambda: ("https://gateway.example", "test-token")
+    store = Store(settings.state_dir / "reads.sqlite3")
+    manager = AgentManager(store, settings)
+    session = store.create(settings.values)
+    requests = []
+
+    def reply(delta):
+        chunk = {"choices": [{"delta": delta, "finish_reason": "tool_calls" if "tool_calls" in delta else "stop"}]}
+        return httpx.Response(200, text="data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n")
+
+    async def gateway(request):
+        payload = json.loads(request.content)
+        if "tools" not in payload:
+            return reply({"content": "Title"})
+        requests.append(payload)
+        if len(requests) == 1:
+            return reply({"tool_calls": [{"index": 0, "id": "r1", "type": "function", "function": {
+                "name": "read_file", "arguments": json.dumps({"path": "long.txt"})}}]})
+        return reply({"content": "Done."})
+
+    client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client(**kwargs, transport=httpx.MockTransport(gateway)))
+    try:
+        await manager.run(session, "Read long.txt")
+    finally:
+        store.db.close()
+    result = next(message for message in requests[-1]["messages"] if message["role"] == "tool")["content"]
+    assert 8_000 < len(result.encode()) <= 32_000
+    assert json.loads(result)["start_line"] == 1
