@@ -11,7 +11,10 @@ Git processes inherit them.
 import asyncio
 import codecs
 import os
+import posixpath
+import re
 import shutil
+import stat
 
 from .jobs import ENVIRONMENT_KEYS, discard_output, kill_group, settle
 from .tools import SECRET_NAMES
@@ -128,3 +131,229 @@ async def working_tree_changes(workspace):
     if truncated:
         text += f"\n[Output limit reached: showing the first {OUTPUT_LIMIT // 1000} KB.]"
     return {"exit_code": None if truncated else code, "output": text, "truncated": truncated}
+
+
+# The structured Changes view: Git status as file entries, and one file's diff as lines.
+STATUS_OUTPUT_LIMIT = 1_000_000
+FILE_DIFF_LIMIT = 512_000
+UNTRACKED_FILE_LIMIT = 1_000_000
+STATUS_ENTRY_LIMIT = 2_000
+STATUS_CODES = {"M": "modified", "T": "type_changed", "A": "added", "D": "deleted", "R": "renamed", "C": "copied"}
+DIFF_OPTIONS = ("--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty", "--relative")
+
+
+def _decode(raw):
+    return raw.decode("utf-8", errors="replace")
+
+
+def _git_failure(output):
+    text = _decode(output).strip()
+    if "not a git repository" in text.lower():
+        return None
+    return ValueError("Git could not read this folder: " + (text.splitlines() or ["no output"])[-1][:300])
+
+
+def parse_status(raw, prefix=""):
+    """Parse `git status --porcelain=v2 -z --branch` output.
+
+    Returns (branch, entries). Paths are made relative to `prefix` (the workspace's
+    folder inside the repository); entries outside it are left out."""
+    records = raw.split(b"\0")
+    branch, entries = None, []
+
+    def relative(path):
+        path = _decode(path)
+        if path.startswith(prefix):
+            return path[len(prefix):]
+        return posixpath.relpath(path, prefix.rstrip("/") or ".")
+
+    index = 0
+    while index < len(records):
+        record = records[index]
+        index += 1
+        kind = record[:2]
+        if record.startswith(b"# branch.head "):
+            head = _decode(record[len(b"# branch.head "):])
+            branch = None if head == "(detached)" else head
+        elif kind in (b"1 ", b"2 "):
+            fields = record.split(b" ", 8 if kind == b"1 " else 9)
+            if len(fields) < (9 if kind == b"1 " else 10):
+                continue
+            original = None
+            if kind == b"2 ":
+                if index >= len(records):
+                    break  # Cut off by the output limit.
+                original = relative(records[index])
+                index += 1
+            path = relative(fields[-1])
+            codes = _decode(fields[1])
+            for area, code in zip(("staged", "unstaged"), codes):
+                if code == ".":
+                    continue
+                entry = {"path": path, "area": area, "status": STATUS_CODES.get(code, "modified")}
+                if original is not None:
+                    entry["orig_path"] = original
+                entries.append(entry)
+        elif kind == b"u ":
+            fields = record.split(b" ", 10)
+            if len(fields) == 11:
+                entries.append({"path": relative(fields[-1]), "area": "unstaged", "status": "conflicted"})
+        elif kind == b"? ":
+            entries.append({"path": relative(record[2:]), "area": "untracked", "status": "untracked"})
+    return branch, entries
+
+
+def parse_numstat(raw):
+    """{path: (added, removed)} from `git diff --numstat -z`; binary files give None counts."""
+    counts = {}
+    records = raw.split(b"\0")
+    index = 0
+    while index < len(records):
+        fields = records[index].split(b"\t", 2)
+        index += 1
+        if len(fields) != 3 or not all(value == b"-" or value.isdigit() for value in fields[:2]):
+            continue
+        added, removed, path = fields
+        if not path:  # A rename: "added\tremoved\t\0old\0new\0".
+            if index + 1 >= len(records):
+                break
+            path = records[index + 1]
+            index += 2
+        counts[_decode(path)] = (None if added == b"-" else int(added), None if removed == b"-" else int(removed))
+    return counts
+
+
+async def working_tree_status(workspace, classify):
+    """Git's view of the workspace as file entries, for the Changes view.
+
+    classify(relative path) returns 'credential', 'generated' or None. Credential
+    entries carry no counts, and their diffs are refused by the API."""
+    try:
+        async with asyncio.timeout(CHANGES_TIMEOUT):
+            code, output, _ = await run_git(workspace, ["rev-parse", "--show-prefix"], timeout=CHANGES_TIMEOUT)
+            if code != 0:
+                error = _git_failure(output)
+                if error is None:
+                    return {"repository": False, "branch": None, "files": [], "truncated": False}
+                raise error
+            prefix = _decode(output).strip()
+            filters = await configured_filters(workspace, timeout=CHANGES_TIMEOUT)
+            code, output, truncated = await run_git(
+                workspace, ["--no-optional-locks", "status", "--porcelain=v2", "-z", "--branch",
+                            "--untracked-files=all", "--ignore-submodules=dirty", "--", "."],
+                filters=filters, timeout=CHANGES_TIMEOUT, limit=STATUS_OUTPUT_LIMIT)
+            if code != 0 and not truncated:
+                raise _git_failure(output) or ValueError("Git could not read this folder.")
+            if truncated:
+                output = output[:output.rfind(b"\0") + 1]  # Drop the record that was cut off.
+            branch, entries = parse_status(output, prefix)
+            counts = {}
+            for area, extra in (("unstaged", []), ("staged", ["--cached"])):
+                _, numstat, _ = await run_git(
+                    workspace, ["--no-optional-locks", "diff", *extra, "--numstat", "-z", *DIFF_OPTIONS,
+                                "--", ".", *DIFF_EXCLUDES],
+                    filters=filters, timeout=CHANGES_TIMEOUT, limit=STATUS_OUTPUT_LIMIT)
+                counts[area] = parse_numstat(numstat)
+    except TimeoutError as exc:
+        raise ValueError(f"Git did not finish within {CHANGES_TIMEOUT} seconds.") from exc
+    if len(entries) > STATUS_ENTRY_LIMIT:
+        entries, truncated = entries[:STATUS_ENTRY_LIMIT], True
+    files = []
+    for entry in entries:
+        kinds = [classify(path) for path in (entry["path"], entry.get("orig_path")) if path is not None]
+        hidden = "credential" if "credential" in kinds else "generated" if "generated" in kinds else None
+        added, removed = counts.get(entry["area"], {}).get(entry["path"], (None, None))
+        if hidden == "credential":
+            added = removed = None
+        files.append({**entry, "added": added, "removed": removed, "hidden": hidden})
+    return {"repository": True, "branch": branch, "files": files, "truncated": bool(truncated)}
+
+
+def parse_diff(text):
+    """Lines of a unified diff: hunk headers, then context, removed and added lines."""
+    lines, binary = [], False
+    old = new = old_left = new_left = 0
+    for line in text.split("\n"):
+        if old_left > 0 or new_left > 0:
+            marker = line[:1]
+            if marker in (" ", "") and old_left > 0 and new_left > 0:
+                lines.append({"kind": "context", "text": line[1:], "old": old, "new": new})
+                old, new, old_left, new_left = old + 1, new + 1, old_left - 1, new_left - 1
+                continue
+            if marker == "-" and old_left > 0:
+                lines.append({"kind": "removed", "text": line[1:], "old": old})
+                old, old_left = old + 1, old_left - 1
+                continue
+            if marker == "+" and new_left > 0:
+                lines.append({"kind": "added", "text": line[1:], "new": new})
+                new, new_left = new + 1, new_left - 1
+                continue
+            if marker == "\\":
+                if lines and lines[-1]["kind"] != "hunk":
+                    lines[-1]["newline"] = False
+                continue
+            old_left = new_left = 0  # Not a hunk line: the hunk ended early.
+        if line.startswith("\\") and lines and lines[-1]["kind"] != "hunk":
+            lines[-1]["newline"] = False
+        elif line.startswith("Binary files "):
+            binary = True
+        else:
+            header = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
+            if header:
+                old, old_left = int(header[1]), int(header[2] if header[2] is not None else 1)
+                new, new_left = int(header[3]), int(header[4] if header[4] is not None else 1)
+                lines.append({"kind": "hunk", "text": line})
+    return binary, lines
+
+
+def _untracked_diff(tools, path):
+    target = tools.path(path)
+    info = target.stat()
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("Only regular files can be shown.")
+    if info.st_size > UNTRACKED_FILE_LIMIT:
+        raise ValueError(f"This file is larger than {UNTRACKED_FILE_LIMIT // 1_000_000} MB.")
+    with target.open("rb") as source:
+        raw = source.read(UNTRACKED_FILE_LIMIT + 1)
+    if b"\0" in raw:
+        return True, []
+    text = _decode(raw)
+    rows = text.split("\n")
+    ends_with_newline = rows[-1] == ""
+    if ends_with_newline:
+        rows.pop()
+    lines = [{"kind": "added", "text": row.removesuffix("\r"), "new": number} for number, row in enumerate(rows, 1)]
+    if lines and not ends_with_newline:
+        lines[-1]["newline"] = False
+    return False, lines
+
+
+async def file_diff(workspace, path, area, orig_path=None, tools=None):
+    """One file's changes in the staged or unstaged area, or an untracked file's lines.
+
+    Paths are workspace-relative; the caller validates them and refuses credential
+    and generated-folder files."""
+    truncated = False
+    if area == "untracked":
+        binary, lines = await asyncio.to_thread(_untracked_diff, tools, path)
+    elif area in ("staged", "unstaged"):
+        pathspecs = [f":(literal){path}", *([f":(literal){orig_path}"] if orig_path else [])]
+        try:
+            async with asyncio.timeout(CHANGES_TIMEOUT):
+                filters = await configured_filters(workspace, timeout=CHANGES_TIMEOUT)
+                code, output, truncated = await run_git(
+                    workspace, ["--no-optional-locks", "diff", *(["--cached"] if area == "staged" else []),
+                                *DIFF_OPTIONS, "--no-color", "-U3", "--", *pathspecs, *DIFF_EXCLUDES],
+                    filters=filters, timeout=CHANGES_TIMEOUT, limit=FILE_DIFF_LIMIT)
+        except TimeoutError as exc:
+            raise ValueError(f"Git did not finish within {CHANGES_TIMEOUT} seconds.") from exc
+        if code != 0 and not truncated:
+            raise _git_failure(output) or ValueError("This folder is not a Git repository.")
+        if truncated:
+            output = output[:output.rfind(b"\n") + 1]  # Drop the line that was cut off.
+        binary, lines = parse_diff(_decode(output))
+    else:
+        raise ValueError("Choose the staged, unstaged or untracked area.")
+    return {"path": path, "area": area, "binary": binary, "truncated": truncated,
+            "added": sum(line["kind"] == "added" for line in lines),
+            "removed": sum(line["kind"] == "removed" for line in lines), "lines": lines}

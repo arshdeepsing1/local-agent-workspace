@@ -19,6 +19,16 @@ MAX_MAX_AGENT_STEPS = 64
 # so the default is a long but finite wait.
 DEFAULT_APPROVAL_MINUTES = 60
 MAX_APPROVAL_MINUTES = 1440
+MAX_USER_INSTRUCTIONS = 8_000
+MIN_WRITE_LIMIT_KB = 16
+MAX_WRITE_LIMIT_KB = 1000
+MAX_COMMAND_ENV = 32
+ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
+# Never passed to commands; equal to jobs.CREDENTIAL_ENV, DENIED_ENV and DENIED_ENV_PREFIXES.
+CREDENTIAL_ENV = {"DBRICKS_TOKEN", "DATABRICKS_TOKEN", "DBRICKS_URL", "DATABRICKS_HOST", "LOCAL_AGENT_ENV_FILE"}
+DENIED_ENV = {"BASH_ENV", "ENV", "ZDOTDIR", "PROMPT_COMMAND", "SHELLOPTS", "BASHOPTS", "IFS", "PYTHONSTARTUP",
+              "PERL5OPT", "RUBYOPT", "NODE_OPTIONS"}
+DENIED_ENV_PREFIXES = ("LD_", "DYLD_")
 
 
 def read_env(path: Path) -> dict[str, str]:
@@ -68,6 +78,10 @@ class Settings:
             "compaction_handoffs": True,
             "approval_timeout_minutes": DEFAULT_APPROVAL_MINUTES,
             "system_notifications": False,
+            "user_instructions": "",
+            "write_limit_kb": 80,
+            "command_env": [],
+            "rate_limit_auto_continue": True,
         }
         if self.path.exists():
             saved = json.loads(self.path.read_text())
@@ -119,6 +133,23 @@ class Settings:
             raise ValueError(f"Approval wait must be 0 (no limit) or 1 to {MAX_APPROVAL_MINUTES:,} minutes.")
         if type(candidate["system_notifications"]) is not bool:
             raise ValueError("Desktop notifications must be on or off.")
+        instructions = candidate["user_instructions"]
+        if not isinstance(instructions, str) or len(instructions) > MAX_USER_INSTRUCTIONS or "\x00" in instructions:
+            raise ValueError(f"Custom instructions must be text of at most {MAX_USER_INSTRUCTIONS:,} characters.")
+        write_limit = candidate["write_limit_kb"]
+        if type(write_limit) is not int or not MIN_WRITE_LIMIT_KB <= write_limit <= MAX_WRITE_LIMIT_KB:
+            raise ValueError(f"File write limit must be an integer from {MIN_WRITE_LIMIT_KB} to {MAX_WRITE_LIMIT_KB:,} KB.")
+        names = candidate["command_env"]
+        if (not isinstance(names, list) or len(names) > MAX_COMMAND_ENV or len(set(map(str, names))) != len(names)
+                or any(not isinstance(name, str) or not ENV_NAME.match(name) for name in names)):
+            raise ValueError(f"List at most {MAX_COMMAND_ENV} environment variable names (letters, digits and _, not starting with a digit).")
+        for name in names:
+            if name in CREDENTIAL_ENV:
+                raise ValueError(f"{name} cannot be passed to commands.")
+            if name in DENIED_ENV or name.startswith(DENIED_ENV_PREFIXES):
+                raise ValueError(f"{name} changes how programs start and cannot be passed to commands.")
+        if type(candidate["rate_limit_auto_continue"]) is not bool:
+            raise ValueError("Continue after rate limits must be on or off.")
         candidate["workspace"] = str(workspace)
         self.values = candidate
         temp = self.path.with_suffix(".tmp")

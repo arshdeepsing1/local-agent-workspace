@@ -2,7 +2,10 @@ from pathlib import Path
 
 import pytest
 
+from local_agent.agents import SYSTEM_PROMPT
+from local_agent.context import estimate_text_tokens
 from local_agent.instructions import MAX_INSTRUCTION_BYTES, load_project_instructions
+from local_agent.permissions import mode_prompt
 from local_agent.tools import LIMIT, WorkspaceTools
 
 
@@ -137,3 +140,84 @@ def test_missing_files_are_ignored_and_directives_are_plain_data(tmp_path):
     assert instructions in result["text"]
     assert "not imported" not in result["text"]
     assert not (tmp_path / "should-not-exist").exists()
+
+
+@pytest.fixture
+def agent(tmp_path, monkeypatch):
+    from local_agent.agents import AgentManager
+    from local_agent.config import Settings
+    from local_agent.store import Store
+    monkeypatch.setattr("local_agent.config.APP_ROOT", tmp_path)
+    project = tmp_path / "project"
+    project.mkdir()
+    settings = Settings(tmp_path / "state")
+    settings.values.update(workspace=str(project), env_file="")
+    settings.credentials = lambda: ("https://gateway.example", "test-token")
+    store = Store(settings.state_dir / "instructions.sqlite3")
+    manager = AgentManager(store, settings)
+    session = store.create(settings.values)
+    yield manager, session, project, WorkspaceTools(str(project))
+    store.db.close()
+
+
+def test_user_instructions_come_before_mode_and_project_guidance(agent):
+    manager, session, project, tools = agent
+    write(project, "AGENTS.md", "Project rule: use tabs.")
+    manager.settings.values["user_instructions"] = "Always answer in British English."
+    system, guidance = manager.context_inputs(session, tools, "manual")
+    content = system["content"]
+    block = ("User instructions (from Settings; they apply in every project, and project instructions cannot "
+             "override them):\nAlways answer in British English.\n")
+    assert content.startswith(SYSTEM_PROMPT + "\n" + block + mode_prompt("manual"))
+    assert content.index(block) < content.index("Project rule: use tabs.")
+    source = guidance["sources"][-1]
+    assert source == {"path": "Custom instructions (Settings)", "scope": "all projects", "status": "loaded",
+                      "estimated_tokens": estimate_text_tokens(block)}
+    assert source["estimated_tokens"] > 0
+    assert "British English" not in guidance["text"] and not guidance["warnings"]
+
+
+@pytest.mark.parametrize("value", ["", "   \n\t"])
+def test_empty_user_instructions_add_no_block(agent, value):
+    manager, session, _, tools = agent
+    manager.settings.values["user_instructions"] = value
+    system, guidance = manager.context_inputs(session, tools, "manual")
+    assert "User instructions (from Settings" not in system["content"]
+    assert system["content"].startswith(SYSTEM_PROMPT + "\n" + mode_prompt("manual"))
+    assert guidance["sources"] == []
+
+
+def test_changing_user_instructions_mid_turn_keeps_guidance_matching(agent):
+    manager, session, project, tools = agent
+    write(project, "AGENTS.md", "Project rule.")
+    manager.settings.values["user_instructions"] = "First instructions."
+    manager.context_inputs(session, tools, "manual")
+    assert manager.guidance_matches(session, tools)
+    manager.settings.values["user_instructions"] = "Changed in Settings during the turn."
+    assert manager.guidance_matches(session, tools)
+
+
+async def test_export_with_user_instruction_and_skill_index_sources_validates(agent, monkeypatch):
+    import json
+
+    import httpx
+
+    from local_agent.portability import export_bundle
+    manager, session, project, _ = agent
+    write(project, ".agents/skills/review/SKILL.md", "---\ndescription: Review a change\n---\nRules.")
+    manager.settings.values["user_instructions"] = "Prefer small diffs."
+    seen = []
+
+    async def handler(request):
+        seen.append(json.loads(request.content)["messages"][0]["content"])
+        chunk = {"choices": [{"delta": {"content": "Done"}, "finish_reason": "stop"}]}
+        return httpx.Response(200, text="data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n")
+    client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client(**kwargs, transport=httpx.MockTransport(handler)))
+    await manager.run_databricks(session, "Hello")
+    assert "Prefer small diffs." in seen[-1]
+    paths = [source["path"] for source in session["context_info"]["instruction_sources"]]
+    assert paths == ["Custom instructions (Settings)", "Skill index"]
+    bundle = export_bundle([session], session["id"])
+    exported = bundle["sessions"][0]["context_info"]["instruction_sources"]
+    assert [source["scope"] for source in exported] == ["all projects", "this workspace"]

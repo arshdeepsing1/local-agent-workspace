@@ -30,7 +30,8 @@ window.noteDiff = {
 }
 fake.reviewResult = makeChanges()
 fake.sessions = new Map([['a', makeSession('a', 'Other conversation')]])
-fake.settings = { ...baseSettings }
+// The M2 user settings at their defaults (the server always returns them).
+fake.settings = { ...baseSettings, user_instructions: '', write_limit_kb: 80, command_env: [], rate_limit_auto_continue: true }
 fake.handle = (path, options) => {
   const body = () => JSON.parse(options.body)
   if (path === '/api/bootstrap') return fake.json({ token: 'test-token', settings: fake.settings })

@@ -131,11 +131,13 @@ def test_settings_edit_and_save_only_databricks_fields(ui, page):
     expect(steps).to_have_attribute("max", "64")
     expect(dialog.get_by_text(re.compile("not individual tool calls"))).to_be_visible()
     expect(dialog.get_by_label("Agent runtime")).to_have_count(0)
-    expect(dialog.get_by_text(re.compile("Claude|MCP|skills", re.I))).to_have_count(0)
+    # No agent runtime options: CLAUDE.md is named only as a project instruction file.
+    expect(dialog.get_by_text(re.compile(r"Claude(?!\.md)|MCP|skills", re.I))).to_have_count(0)
     checkboxes = dialog.get_by_role("checkbox")
-    expect(checkboxes).to_have_count(2)
+    expect(checkboxes).to_have_count(3)
     expect(dialog.locator("label:has(input[type=checkbox])")).to_have_text([
-        "Save a detailed handoff at each compaction", "Desktop notification when no browser tab is open"])
+        "Save a detailed handoff at each compaction", "Desktop notification when no browser tab is open",
+        "Continue automatically after rate limits"])
     dialog.get_by_label("Project folder").fill("/updated-project")
     endpoint.fill("databricks-gpt-oss-120b")
     dialog.get_by_label("Credential file").fill("/credentials/env_vars.txt")
@@ -433,7 +435,8 @@ def test_draft_model_changes_default_before_creating_conversation(ui, page):
     resolve(ui, "settings", "fake.settings")
     expect(model(page)).to_have_value("other-model")
     assert ui.bodies("/api/settings") == [{"workspace": "/project", "model": "other-model", "env_file": "", "context_window": 131072,
-                                           "max_output_tokens": 8192, "max_agent_steps": 32}]
+                                           "max_output_tokens": 8192, "max_agent_steps": 32, "user_instructions": "",
+                                           "write_limit_kb": 80, "command_env": [], "rate_limit_auto_continue": True}]
     send(page).click()
     ui.show_session("created")
     assert ui.js("fake.sessions.get('created').model") == "other-model"
@@ -800,3 +803,134 @@ def test_reconnecting_stops_when_the_conversation_was_deleted(ui):
     calls = ui.js(reconnects)
     ui.tick(10000)
     assert ui.js(reconnects) == calls
+
+
+# Opening files from replies, VS Code links, and the Git view of Workspace / Changes
+
+def test_open_in_vs_code_link_points_at_the_opened_line(ui, page):
+    ui.app(session="a", scenario="workspace", setup="""
+      fake.sessions.set('a', { ...makeSession('a', 'Other conversation'), events: [
+        { id: 'r', type: 'assistant', text: 'The bug is in `src/app.py:12`.' }] })
+      fake.override = path => path.startsWith('/api/file?')
+        ? fake.json({ path: 'src/app.py', content: 'x\\n'.repeat(30), absolute: '/abs/path/src/app.py' }) : undefined""")
+    ui.show_session("a")
+    page.locator(".markdown a.path-link").click()
+    link = page.get_by_role("link", name="Open in VS Code")
+    expect(link).to_have_attribute("href", "vscode://file/abs/path/src/app.py:12")
+    page.get_by_role("button", name="Back to files").click()
+    page.get_by_role("button", name="note.txt").click()
+    expect(page.get_by_role("link", name="Open in VS Code")).to_have_attribute("href", "vscode://file/abs/path/src/app.py:1")
+
+
+def test_no_vs_code_link_without_an_absolute_path(ui, page):
+    start_app(ui, page)
+    open_editor(page)
+    expect(page.get_by_role("link", name="Open in VS Code")).to_have_count(0)
+
+
+def test_a_failed_open_shows_the_server_error(ui, page):
+    ui.app(session="a", scenario="workspace", setup="""
+      fake.sessions.set('a', { ...makeSession('a', 'Other conversation'), events: [
+        { id: 'r', type: 'assistant', text: 'See /srv/data/report.csv for the totals.' }] })
+      fake.override = path => path.startsWith('/api/file?') ? fake.json({ detail:
+        'This folder needs access approval in this conversation. Ask the agent to inspect its absolute path.' }, 400) : undefined""")
+    ui.show_session("a")
+    page.locator(".markdown a.path-link").click()
+    panel = page.get_by_role("complementary", name="Workspace panel")
+    expect(panel.get_by_role("alert")).to_have_text(
+        "This folder needs access approval in this conversation. Ask the agent to inspect its absolute path.")
+    assert ui.requests("/api/file?path=%2Fsrv%2Fdata%2Freport.csv&session_id=a")
+
+
+GIT_STATUS = {"repository": True, "branch": "feature/login", "truncated": False, "files": [
+    {"path": "src/app.py", "area": "staged", "status": "modified", "added": 3, "removed": 1, "hidden": None},
+    {"path": "src/new name.py", "orig_path": "src/old.py", "area": "staged", "status": "renamed", "added": 0,
+     "removed": 0, "hidden": None},
+    {"path": "src/app.py", "area": "unstaged", "status": "modified", "added": 1, "removed": 0, "hidden": None},
+    {"path": ".env", "area": "unstaged", "status": "modified", "added": None, "removed": None, "hidden": "credential"},
+    {"path": "notes/todo.md", "area": "untracked", "status": "untracked", "added": None, "removed": None, "hidden": None},
+    {"path": "dist/app.js", "area": "untracked", "status": "untracked", "added": None, "removed": None, "hidden": "generated"},
+]}
+GIT_DIFF = {"path": "src/app.py", "area": "staged", "binary": False, "truncated": False, "added": 1, "removed": 1, "lines": [
+    {"kind": "hunk", "text": "@@ -9,3 +9,3 @@ def main():"}, {"kind": "context", "text": "a = 1", "old": 9, "new": 9},
+    {"kind": "removed", "text": "b = 2", "old": 10}, {"kind": "added", "text": "b = 3", "new": 10},
+    {"kind": "context", "text": "c = 4", "old": 11, "new": 11, "newline": False}]}
+
+
+def open_git(ui, page, status=GIT_STATUS, diff=GIT_DIFF, setup=""):
+    start_app(ui, page, setup=f"""window.gitStatus = {json.dumps(status)}; window.gitDiff = {json.dumps(diff)}
+      fake.override = path => path.startsWith('/api/git/status') ? fake.json(gitStatus)
+        : path.startsWith('/api/git/diff') ? fake.json(gitDiff)
+        : path.startsWith('/api/file?') ? fake.json({{ path: 'src/app.py', content: 'x\\n'.repeat(20), absolute: '/project/src/app.py' }})
+        : undefined; {setup}""")
+    page.get_by_role("button", name="Workspace", exact=True).click()
+    page.get_by_role("button", name="Changes", exact=True).click()
+    return page.get_by_role("complementary", name="Workspace panel")
+
+
+def test_git_groups_render_and_a_row_opens_a_read_only_diff(ui, page):
+    panel = open_git(ui, page)
+    expect(panel.locator(".file-path")).to_contain_text("feature/login")
+    expect(panel.get_by_role("heading")).to_have_text(["Workspace", "Staged changes (2)", "Changes (2)", "Untracked (2)"])
+    staged = panel.get_by_role("region", name="Staged changes")
+    expect(staged.locator(".git-row")).to_have_text([re.compile(r"^M\s*src/app\.py\s*\+3\s*−1$"), re.compile(r"^R\s*src/new name\.py")])
+    expect(panel.get_by_text("Git's view of the project, including changes made by commands. "
+                             "Credential files are listed without their contents.")).to_be_visible()
+    staged.get_by_role("button", name=re.compile(r"src\/app\.py")).click()
+    assert ui.requests("/api/git/diff?path=src%2Fapp.py&area=staged")
+    lines = panel.get_by_role("region", name="Diff of src/app.py").locator(".diff-line")
+    expect(lines).to_have_count(5)
+    expect(lines.nth(0)).to_have_text("@@ -9,3 +9,3 @@ def main():")
+    expect(lines.nth(0)).to_have_class(re.compile(r"\bhunk\b"))
+    expect(lines.nth(3)).to_have_class(re.compile(r"\badded\b"))
+    expect(lines.nth(4).locator(".no-newline")).to_be_visible()
+    expect(panel.locator("textarea")).to_have_count(0)
+    expect(panel.get_by_role("link", name="Open in VS Code")).to_have_attribute("href", "vscode://file/project/src/app.py:9")
+    panel.get_by_role("button", name="Back to changes").click()
+    panel.get_by_role("region", name="Staged changes").get_by_role("button", name=re.compile(r"src\/new name\.py")).click()
+    assert ui.requests("/api/git/diff?path=src%2Fnew+name.py&area=staged&orig_path=src%2Fold.py")
+    panel.get_by_role("button", name="Back to changes").click()
+    staged.get_by_role("button", name=re.compile(r"src\/app\.py")).click()
+    panel.get_by_role("button", name="Open file").click()
+    expect(panel.get_by_role("textbox", name="Edit src/app.py")).to_be_visible()
+    expect(panel.locator(".editor-status")).to_contain_text("Line 9")
+
+
+def test_hidden_rows_are_not_clickable(ui, page):
+    panel = open_git(ui, page)
+    secret = panel.locator(".git-row", has_text=".env")
+    expect(secret).to_contain_text("Credential file: diff hidden")
+    expect(secret.get_by_role("button")).to_have_count(0)
+    assert ui.js("document.querySelector('.git-row.hidden').tagName") == "DIV"
+    generated = panel.locator(".git-row", has_text="dist/app.js")
+    expect(generated).to_contain_text("Generated folder: diff not shown")
+    generated.click()
+    secret.click()
+    assert not ui.js("fake.calls.some(call => call.path.startsWith('/api/git/diff'))")
+    expect(panel.get_by_role("button", name=re.compile(r"\.env"))).to_have_count(0)
+
+
+def test_not_a_git_repository(ui, page):
+    panel = open_git(ui, page, status={"repository": False, "branch": None, "files": [], "truncated": False})
+    expect(panel.get_by_text("Not a Git repository.")).to_be_visible()
+    expect(panel.get_by_role("heading", name=re.compile(r"\(\d+\)"))).to_have_count(0)
+
+
+def test_git_view_refreshes_on_refresh_and_when_a_response_ends(ui, page):
+    ui.app(session="a", scenario="workspace", setup=f"""window.gitStatus = {json.dumps(GIT_STATUS)}
+      fake.override = path => path.startsWith('/api/git/status') ? fake.json(gitStatus) : undefined""")
+    ui.show_session("a")
+    page.get_by_role("button", name="Workspace", exact=True).click()
+    page.get_by_role("button", name="Changes", exact=True).click()
+    panel = page.get_by_role("complementary", name="Workspace panel")
+    expect(panel.get_by_role("heading", name="Untracked (2)")).to_be_visible()
+    count = len(ui.requests("/api/git/status?session_id=a"))
+    assert count == 1
+    ui.run("gitStatus = { ...gitStatus, files: gitStatus.files.filter(entry => entry.area !== 'untracked') }")
+    panel.get_by_role("button", name="Refresh changes").click()
+    expect(panel.get_by_role("heading", name=re.compile("^Untracked"))).to_have_count(0)
+    ui.run("gitStatus = { ...gitStatus, files: [] }")
+    ui.emit("a", {"type": "status", "status": "running"})
+    ui.emit("a", {"type": "status", "status": "idle"})
+    expect(panel.get_by_text("Your working tree is clean.")).to_be_visible()
+    assert len(ui.requests("/api/git/status?session_id=a")) == 3

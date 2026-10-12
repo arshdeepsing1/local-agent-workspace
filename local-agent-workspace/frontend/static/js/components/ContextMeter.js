@@ -1,5 +1,8 @@
 import { html, useState } from '../lib.js'
 
+// Custom instructions (Settings) and the skill index are not files with a folder scope.
+const WIDE_SCOPES = ['all projects', 'this workspace']
+
 export default function ContextMeter({ info, busy = false, onCompact }) {
   const [note, setNote] = useState('')
   const [submitting, setSubmitting] = useState(false)
@@ -33,10 +36,11 @@ export default function ContextMeter({ info, busy = false, onCompact }) {
       <p>Of the ${info.context_window.toLocaleString()}-token context window, ${info.reply_reserve.toLocaleString()} tokens are reserved for the response and ${safetyReserve.toLocaleString()} for safety.</p>
       <p>The response limit is separate from the context window. Increasing the context budget does not increase the response limit.</p>
       <p>Compactions: ${info.compactions}. Messages summarized: ${info.summarized_messages}.</p>
-      <p class="context-heading">Loaded project instructions</p>
+      <p class="context-heading">Loaded instructions</p>
       ${info.instruction_sources?.length ? html`
         <ul>${info.instruction_sources.map(source => html`<li key=${source.path}>
-          <code>${source.path}</code> · scope: <code>${source.scope}</code> and descendants · ${source.status === 'loaded' ? `~${source.estimated_tokens.toLocaleString()} tokens` : 'Omitted · 0 tokens loaded'}
+          ${WIDE_SCOPES.includes(source.scope) ? html`${source.path} · applies to ${source.scope}`
+            : html`<code>${source.path}</code> · scope: <code>${source.scope}</code> and descendants`} · ${source.status === 'loaded' ? `~${source.estimated_tokens.toLocaleString()} tokens` : 'Omitted · 0 tokens loaded'}
           ${source.reason ? html`<p>${source.reason}</p>` : null}
         </li>`)}</ul>
         <p>File costs are estimates included in system instructions above; shared guidance and framing are counted separately.</p>`
