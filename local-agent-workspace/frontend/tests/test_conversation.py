@@ -395,7 +395,7 @@ def test_an_approval_with_a_limit_shows_when_it_expires_and_an_expired_one_says_
     card = "{ id: 'approval', type: 'tool', name: 'write_file', state: 'pending', input: { path: 'a.txt' }, preview: 'diff' }"
     show(ui, f"[{card}]")
     expect(page.get_by_text("Local needs your approval to write file.", exact=True)).to_be_visible()
-    expires = "new Date(2026, 9, 6, 15, 42).getTime() / 1000"
+    expires = "new Date().setHours(15, 42, 0, 0) / 1000"  # Today, so the card shows only the time.
     ui.rerender(f"{{ onError: fake.spy('onError'), session: makeSession([{{ ...{card}, approval_expires: {expires} }}]) }}")
     time = ui.js(f"new Date({expires} * 1000).toLocaleTimeString([], {{ hour: '2-digit', minute: '2-digit' }})")
     expect(page.get_by_text(f"Local needs your approval to write file. If you do not answer by {time}, it will not run.")).to_be_visible()
