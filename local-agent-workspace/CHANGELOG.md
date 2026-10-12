@@ -22,6 +22,10 @@ Roadmap milestone M1 (attention, approval quick wins, safety):
 - Conversation: a Continue button after a step limit, output limit, Stop or restart; a live task
   checklist and a `get_task` tool; message drafts saved across reloads; highlighted code blocks
   with Copy code; Markdown export and Copy conversation in Agent tools → Conversation.
+- Stopping commands: on macOS, Workspace → Changes and command jobs no longer fail with "Operation
+  not permitted" when the command has just exited. A command that does not end when stopped (for
+  example one running as another user through sudo) no longer makes Stop or a time limit hang:
+  after 5 seconds the job ends with a note that the command may still be running.
 - Workspace → Files can browse folders granted to the chat, with change dots there too.
 - The volatile parts of the system prompt (time, granted folders) now come last.
 - Continuous integration: offline backend and UI tests, a lint check and a personal-data check on
