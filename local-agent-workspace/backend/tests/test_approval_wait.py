@@ -1,5 +1,6 @@
 """How long an approval card waits, and how an unanswered card is reported."""
 import asyncio
+import json
 
 import pytest
 
@@ -158,7 +159,7 @@ async def test_unanswered_mcp_calls_and_hooks_are_not_called_declined(runtime, m
     manager.extensions.update_config({"hooks": [{"id": "check", "enabled": True, "event": "before_tool", "command": "true"}]})
     session["permission_mode"] = "acceptEdits"
     output = await bounded(manager.execute_tool(session, tools, "write_file", {"path": "note.txt", "content": "x"}, "edit"))
-    assert output.endswith("Hook approval was not answered in time.") and not (project / "note.txt").exists()
+    assert json.loads(output)["message"].endswith("Hook approval was not answered in time.") and not (project / "note.txt").exists()
 
 
 def test_the_wait_is_a_validated_setting(tmp_path, monkeypatch):

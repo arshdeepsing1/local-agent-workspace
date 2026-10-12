@@ -267,7 +267,7 @@ async def test_decline_notes_for_mcp_folder_access_and_hooks(runtime, tmp_path):
     session["permission_mode"] = "acceptEdits"
     task = asyncio.create_task(manager.execute_tool(session, tools, "write_file", {"path": "a.txt", "content": "x"}, "hooked"))
     await answer(manager, False, note="Skip the hook today.")
-    output = await task
+    output = json.loads(await task)["message"]  # A blocked tool is a structured error for the model.
     assert output.endswith(": User declined this hook. Their note: Skip the hook today. "
                            "Do not retry write_file without a new instruction.") and not (project / "a.txt").exists()
 

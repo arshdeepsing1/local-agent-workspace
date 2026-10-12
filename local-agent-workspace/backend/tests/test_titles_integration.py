@@ -144,10 +144,14 @@ async def test_unsuccessful_turn_does_not_generate_title(runtime, monkeypatch, f
             "function": {"name": "list_files", "arguments": '{"path":"."}'},
         })
 
+    async def sleep(delay):
+        pass
+
     mock_gateway(monkeypatch, gateway)
+    monkeypatch.setattr("local_agent.agents.asyncio.sleep", sleep)  # A 503 is retried three times.
     await run_turn(manager, session["id"], "Inspect the project.")
     saved = manager.store.get(session["id"])
-    expected_requests = {"http_error": 1, "response_limit": 3, "step_limit": 32}[failure]
+    expected_requests = {"http_error": 4, "response_limit": 3, "step_limit": 32}[failure]
     assert len(requests) == expected_requests
     assert all(request["stream"] for request in requests)
     assert saved["title"] == "Inspect the project."

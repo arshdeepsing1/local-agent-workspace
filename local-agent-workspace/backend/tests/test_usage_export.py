@@ -35,7 +35,8 @@ def recorded_session():
     for event_id, attempt, status, usage in (("a1", 1, 429, None), ("a1", 2, 200, {"input_tokens": 1000, "output_tokens": 50}),
                                              ("a2", 1, 200, {"input_tokens": 1200, "output_tokens": 5})):
         call = begin_inference_call(session, "agent", MODEL, event_id=event_id, max_output_tokens=8192,
-                                    attempt=attempt, estimated_input_tokens=900)
+                                    attempt=attempt, estimated_input_tokens=900,
+                                    retry_reason="rate_limit" if attempt > 1 else None)
         record_response_id(call, None if status == 429 else f"resp-{event_id}")
         finish_inference_call(call, {"status": "completed" if status == 200 else "error", "http_status": status,
                                      **({"usage": usage} if usage else {})})
@@ -129,6 +130,7 @@ def test_rows_link_calls_to_replies_tools_and_retries():
     assert first["event_id"] == retry["event_id"] == "a1" and first["estimated_dbu"] == 0.0
     assert retry["tools_called"] == "run_command, read_file" and retry["response_id"] == "resp-a1"
     assert retry["input_tokens"] == 1000 and retry["estimated_input_tokens"] == 900
+    assert [row["retry_reason"] for row in rows] == ["", "rate_limit", "", ""]
     assert second["reply_excerpt"] == "Done." and second["tools_called"] == ""
     assert title["event_id"] == "" and title["reply_excerpt"] == ""
     assert all(row["conversation_id"] == "chat-1" and row["call_id"] for row in rows)
@@ -147,6 +149,7 @@ def test_csv_has_all_columns_and_neutralizes_spreadsheet_formulas():
     text = usage_csv(usage_rows(recorded_session()))
     rows = list(csv.DictReader(io.StringIO(text)))
     assert tuple(rows[0]) == COLUMNS
+    assert COLUMNS[COLUMNS.index("attempt") + 1] == "retry_reason" and rows[1]["retry_reason"] == "rate_limit"
     assert rows[1]["reply_excerpt"].startswith("'=cmd")
     assert rows[1]["tools_called"] == "run_command, read_file"
 

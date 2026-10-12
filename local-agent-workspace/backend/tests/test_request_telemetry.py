@@ -190,6 +190,7 @@ async def test_pre_admission_rate_limit_stops_after_bounded_retries(runtime, mon
 
     mock_gateway(monkeypatch, gateway)
     monkeypatch.setattr("local_agent.agents.asyncio.sleep", sleep)
+    manager.settings.values["rate_limit_auto_continue"] = False  # The waits after these are in test_transient_retries.
     await manager.run(session, "Hello")
 
     assert len(requests) == 4 and delays == [0, 0, 0]
@@ -212,8 +213,10 @@ async def test_pre_admission_rate_limit_stops_after_bounded_retries(runtime, mon
 ])
 async def test_bad_streams_are_typed_and_never_execute_tools(runtime, monkeypatch, kind, body):
     manager, session = runtime
+    requests = []
 
     async def gateway(request):
+        requests.append(request)
         return httpx.Response(200, text=body)
 
     async def execute(*args):
@@ -227,6 +230,9 @@ async def test_bad_streams_are_typed_and_never_execute_tools(runtime, monkeypatc
     assert session["events"][-1]["error_kind"] == kind
     if kind == "output_limit":
         assert info["finish_reason"] == "length" and info["usage"] == {"output_tokens": 8192}
+    # Invalid arguments and a clean end without a finish reason get two hidden retries;
+    # an output cutoff gets its two continuations; broken or empty streams none.
+    assert len(requests) == (1 if kind == "invalid_response" else 3)
     assert not any(message.get("tool_calls") for message in session["wire"])
 
 
@@ -253,12 +259,20 @@ async def test_sse_failure_preserves_last_usage_and_redacts_error(runtime, monke
 
 async def test_network_failure_has_no_invented_status_or_usage(runtime, monkeypatch):
     manager, session = runtime
+    requests, delays = [], []
 
     async def gateway(request):
+        requests.append(request)
         raise httpx.ConnectError("Connection failed private-token", request=request)
 
+    async def sleep(delay):
+        delays.append(delay)
+
     mock_gateway(monkeypatch, gateway)
+    monkeypatch.setattr("local_agent.agents.asyncio.sleep", sleep)
     await manager.run(session, "Hello")
+    # A connection that failed before any response is retried three times.
+    assert len(requests) == 4 and delays == [2.0, 5.0, 15.0]
     info = request_event(session)["request_info"]
     assert info == {"model": session["model"], "status": "error", "error_kind": "network"}
     assert "private-token" not in json.dumps(manager.store.get(session["id"]))

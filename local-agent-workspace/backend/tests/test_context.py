@@ -10,6 +10,10 @@ from local_agent.context import (
     SAFETY_MARGIN, SUMMARY_MAX_TOKENS, SUMMARY_PREFIX, build_summary_messages,
     context_boundary, context_breakdown, context_messages, estimate_tokens, prepare_context, retained_request,
 )
+from local_agent.context import (
+    INCOMPLETE_RESPONSE_CONTINUATION, INVALID_ARGUMENTS_CONTINUATION, VERIFY_CONTINUATION_PREFIX, is_continuation,
+    turn_start,
+)
 
 
 SYSTEM = {"role": "system", "content": "Follow the user's current request."}
@@ -430,3 +434,25 @@ def test_summary_boundaries_are_turn_starts_or_responses_inside_a_turn():
     assert retained_request(wire, 3) == [wire[0]] and retained_request(wire, 0) == []
     assert context_boundary([assistant("orphan"), user("next")], 0) and not context_boundary(
         [assistant("orphan"), assistant("again")], 1)
+
+
+CONTINUATIONS = [OUTPUT_LIMIT_CONTINUATION, INVALID_ARGUMENTS_CONTINUATION, INCOMPLETE_RESPONSE_CONTINUATION,
+                 VERIFY_CONTINUATION_PREFIX + " the project's verify command `pytest -q` failed (failed, exit 1)."]
+
+
+@pytest.mark.parametrize("text", CONTINUATIONS)
+def test_app_continuations_never_start_a_turn(text):
+    assert is_continuation(user(text))
+    wire = [user("Fix the parser."), assistant("[Placeholder]"), user(text), assistant("Fixed.")]
+    # The real request starts the turn; a summary ending inside it keeps that request.
+    assert turn_start(wire, 3) == 0 and turn_start(wire, 2) == 0
+    assert retained_request(wire, 3) == [wire[0]]
+    assert [index for index in range(len(wire) + 1) if context_boundary(wire, index)] == [0, 1, 2, 3, 4]
+
+
+def test_only_the_apps_exact_messages_are_continuations():
+    assert not is_continuation(assistant(INVALID_ARGUMENTS_CONTINUATION))
+    assert not is_continuation(user(INVALID_ARGUMENTS_CONTINUATION + " And also this."))
+    assert not is_continuation(user("Please run " + VERIFY_CONTINUATION_PREFIX))
+    assert not is_continuation({"role": "user", "content": [{"type": "text", "text": OUTPUT_LIMIT_CONTINUATION}]})
+    assert not is_continuation(None)

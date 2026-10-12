@@ -396,6 +396,22 @@ when opening a conversation or performing restart recovery.
   requests, rate limits, output limits, network failures, and other error categories;
   an HTTP status is shown when returned. Interrupted requests remain distinguishable
   after restart, and older conversations without metadata still display normally.
+  A request that got no usable response is sent again unchanged, with a notice that
+  says why and how long it waits: an HTTP 429 rate limit, HTTP 502, 503 or 504 before
+  the reply started, or a connection that failed before any response arrived. These
+  share at most three retries per request. HTTP 500, a read timeout (the model may
+  still be generating, and billing) and any failure after the reply started are never
+  repeated; the turn ends with the error. If Databricks still rate limits the chat
+  after the three retries, the app waits up to twice per message (the provider's
+  `Retry-After` up to 2 minutes, otherwise until just after the next minute) and tries
+  again, so a request makes at most six attempts. The notice shows the time, and
+  **Stop** cancels the wait. Turn the waits off with **Settings → Continue
+  automatically after rate limits**. When a reply's tool calls had invalid or
+  incomplete arguments, or the reply ended without a finish reason, none of its tools
+  run, and the app asks the model in a hidden message to issue them again or to
+  continue: up to twice in a row, with a notice each time. A reply stopped by the
+  provider's content filter, an empty reply and a stream cut off mid-message are not
+  retried; the turn ends with the error.
 - **Other folders**: ask, for example, `Are there any CSV files in
   ~/Downloads?`. The agent can list, read and search absolute or `~/`
   paths. The first file-tool request outside the project opens a folder-access card.
@@ -427,6 +443,23 @@ when opening a conversation or performing restart recovery.
   the message box sends `Continue from where you stopped.` as an ordinary message. It
   is not shown while the conversation is busy, after a completed turn, or after other
   errors. Your draft is left as it is, and keyboard focus moves to the message box.
+  It is also offered when the model's reply still could not be used after the hidden
+  retries, and when Databricks still rate limited the chat after the automatic retries.
+- **Verify**: **Agent tools → Verify** sets a command for the project folder, for
+  example `pytest -q`, with a time limit (10 to 3,600 seconds, default 600) and fix
+  rounds (1 to 3, default 2). After a reply in which the agent changed files, the app
+  runs it as the agent's `run_command`: Manual, Auto and Accept edits show an approval
+  card unless an "Always allow this command in this chat" rule matches, Bypass runs
+  it, and Plan mode, subagents and restricted tool profiles never run it. Hooks and the
+  project-instruction checks apply as for any command, and **Stop** stops it. A notice
+  reports the result. If it fails, the agent gets the last 3,000 characters of its
+  output (credentials redacted, fenced and marked as data, not instructions) in a hidden
+  message and another model request to fix it. After the last fix round, or when no
+  agent step is left, the turn ends with a notice; the full output is in the command
+  card. Each fix round uses an agent step. Leave the command empty to turn Verify off.
+  The settings are kept in `<state dir>/projects.json` for each resolved workspace path
+  (a worktree is its own project), never in the repository, and are not part of
+  conversation exports.
 - **Task checklist**: when the conversation has tasks (from the model's `create_task` /
   `update_task` or **Agent tools → Tasks**), a **Tasks 2/5 done** bar above the message
   box, under the changes bar, shows the progress and the task in progress. Expand it to
@@ -564,11 +597,23 @@ requests, so the app does not send them). Match there on endpoint, `request_time
 within a few seconds of `started_utc`, and the exact token counts. The ledger also
 keeps each response's `id` as `response_id` (Databricks encrypts it) for support
 requests.
-For chat and context-summary calls, an HTTP 429 `REQUEST_LIMIT_EXCEEDED` response
-received before streaming begins is retried at most three times. The app honors numeric or HTTP-date `Retry-After`
-headers and root/nested JSON `retry_after` values, capped at 60 seconds; otherwise
-it waits 5, 15, then 40 seconds. A rate-limit signal after streamed content begins
+For chat calls, an HTTP 429 `REQUEST_LIMIT_EXCEEDED` response, HTTP 502, 503 or 504,
+and a connection failure, received before streaming begins, share at most three
+retries per request (see **Request details**). The app honors numeric or HTTP-date
+`Retry-After` headers and root/nested JSON `retry_after` values, capped at 60 seconds;
+otherwise it waits 5, 15, then 40 seconds after a rate limit and 2, 5, then 15 seconds
+after the others. Context-summary calls are not streamed and can run for minutes: they
+retry the same rate limits and gateway errors, but of connection failures only those
+before the request was sent (connect, pool and write failures), never a read failure
+that may follow an accepted, billed request. A failure after streamed content begins
 is not retried because repeating a partial response could be unsafe.
+
+The ledger and the CSV (the `retry_reason` column, after `attempt`) record why the app
+sent a request automatically: `rate_limit`, `server_error` or `network` for a repeat
+of the same request, `rate_limit_wait` after an automatic wait, `output_limit`,
+`invalid_tool_arguments` or `incomplete_response` for the request after a hidden
+continuation, and `verify` for a Verify fix round. The Usage section's **Automatic
+retries** tile counts these calls; **429 responses** counts rate-limited calls.
 
 ### Context and project instructions
 

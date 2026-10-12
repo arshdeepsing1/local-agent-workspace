@@ -105,11 +105,13 @@ def _now():
 
 
 def begin_inference_call(session, purpose, model, *, event_id=None, max_output_tokens=None, attempt=None,
-                         estimated_input_tokens=None):
+                         estimated_input_tokens=None, retry_reason=None):
     """Append one provider attempt to the durable per-session inference ledger.
 
     estimated_input_tokens is the app's unscaled heuristic estimate of the
     request; comparing it with provider-reported usage calibrates later budgets.
+    retry_reason names why the app sent this request automatically (a retry of a
+    failed attempt, an automatic continuation or a Verify fix round).
     """
     call = {"id": str(uuid.uuid4()), "purpose": purpose, "model": model,
             "created": _now(), "status": "running"}
@@ -121,6 +123,8 @@ def begin_inference_call(session, purpose, model, *, event_id=None, max_output_t
         call["attempt"] = attempt
     if type(estimated_input_tokens) is int and estimated_input_tokens >= 0:
         call["estimated_input_tokens"] = estimated_input_tokens
+    if isinstance(retry_reason, str):
+        call["retry_reason"] = retry_reason
     session["inference_ledger_version"] = LEDGER_VERSION
     session.setdefault("inference_calls", []).append(call)
     return call
@@ -198,7 +202,7 @@ def _public_call(call, *, fallback=False):
     for key in ("http_status", "attempt", "max_output_tokens"):
         if type(call.get(key)) is int:
             result[key] = call[key]
-    for key in ("error_kind", "finish_reason"):
+    for key in ("error_kind", "finish_reason", "retry_reason"):
         if isinstance(call.get(key), str):
             result[key] = call[key]
     usage = reported_usage(call.get("usage"))
@@ -217,7 +221,7 @@ def _public_call(call, *, fallback=False):
 
 
 def _totals(calls):
-    totals = {"calls": len(calls), "successful": 0, "errors": 0, "rate_limited": 0,
+    totals = {"calls": len(calls), "successful": 0, "errors": 0, "rate_limited": 0, "retries": 0,
               **{field: 0 for field in USAGE_FIELDS}}
     estimates = []
     usage_complete = True
@@ -225,6 +229,7 @@ def _totals(calls):
         totals["successful"] += call["status"] == "completed"
         totals["errors"] += call["status"] == "error"
         totals["rate_limited"] += call.get("http_status") == 429 or call.get("error_kind") == "rate_limit"
+        totals["retries"] += isinstance(call.get("retry_reason"), str)
         rejected = _explicit_rejection(call)
         usage = {} if rejected else call.get("usage", {})
         if not rejected and not ("input_tokens" in usage and "output_tokens" in usage):

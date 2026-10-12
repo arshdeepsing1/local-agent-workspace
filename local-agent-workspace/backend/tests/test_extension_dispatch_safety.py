@@ -107,9 +107,10 @@ async def test_failure_hook_has_original_redacted_error_and_cannot_replace_it(ru
 
     tools.execute = fail
     manager.extensions.run_hook = hook
-    output = await manager.execute_tool(session, tools, "read_file", {"path": "note.txt"}, "failed-call")
+    model_output = await manager.execute_tool(session, tools, "read_file", {"path": "note.txt"}, "failed-call")
+    assert "failure hook also failed" not in model_output and "synthetic-token" not in model_output
+    output = json.loads(model_output)["message"]  # Hooks and the card get the plain message.
     assert "original tool failure" in output and "synthetic-token" not in output
-    assert "failure hook also failed" not in output
     assert payloads == [{"event": "tool_failure", "session_id": session["id"], "tool": "read_file",
         "arguments": {"path": "note.txt"}, "call_id": "failed-call", "error": output, "outcome": "error"}]
     assert session["events"][0]["output"] == output

@@ -212,8 +212,9 @@ async def test_get_task_returns_details_for_this_conversation_only(runtime):
 
     other = manager.store.create(manager.settings.values)
     output = await manager.execute_tool(other, tools, "get_task", {"task_id": first["id"]}, "g3")
-    assert output == "Task not found in this conversation."
+    assert json.loads(output) == {"error_kind": "not_found", "message": "Task not found in this conversation."}
     assert other["events"][-1]["state"] == "error"
+    assert other["events"][-1]["output"] == "Task not found in this conversation."
 
 
 @pytest.mark.parametrize("mode", ["manual", "auto", "acceptEdits", "plan", "bypassPermissions"])

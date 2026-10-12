@@ -30,6 +30,7 @@ from .transcript import transcript, transcript_file_name
 from .feature_api import register_features
 from .portability_api import register_portability
 from .approvals import MAX_DECLINE_NOTE, ensure_idle, register_approvals
+from .projects import register_projects
 
 
 # Browsers refuse ES modules served with a non-JavaScript type, and some systems
@@ -469,6 +470,7 @@ def create_app(settings=None):
     register_features(app, manager, settings, store, session_or_404, workspace_tools)
     register_portability(app, manager, settings, store, session_or_404)
     register_approvals(app, manager, store, session_or_404)
+    register_projects(app, manager, settings, workspace_tools)
 
     # The browser loads the frontend source files directly; there is no build step.
     frontend = APP_ROOT / "frontend"
