@@ -79,7 +79,7 @@ function toolOutcome(event) {
 export function allowLabel(event) {
   const name = event.name || ''
   if (name === 'run_command') return typeof event.input?.command === 'string' && event.input.command.trim() ? 'Always allow this command in this chat' : null
-  if (['write_file', 'edit_file', 'insert_activity_log'].includes(name)) return 'Allow edits in this chat'
+  if (['write_file', 'edit_file', 'insert_activity_log', 'move_path', 'delete_path', 'notebook_edit'].includes(name)) return 'Allow edits in this chat'
   if (name.startsWith('mcp__')) return 'Allow this tool in this chat'
   if (name.startsWith('hook_')) return 'Allow this hook in this chat'
   return null

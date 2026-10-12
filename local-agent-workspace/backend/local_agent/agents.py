@@ -20,6 +20,9 @@ from .context import (
     estimate_scale, estimate_tokens, handoff_output_tokens, prepare_context, summary_byte_limit,
 )
 from .tools import LIMIT as FILE_LIMIT
+from .tools import write_limit_setting
+from . import diagnostics, notebooks
+from .edits import preview_diff, split_lines
 from .config import DEFAULT_APPROVAL_MINUTES, DEFAULT_MAX_AGENT_STEPS
 from .instructions import load_project_instructions
 from .jobs import JobManager, validate_command_options
@@ -168,6 +171,10 @@ def current_time_text(now=None):
 FILE_VIEW_LIMIT = 500  # files whose last read or write a conversation remembers
 FILE_VIEW_CHECK_LIMIT = 200  # of those, the most recent checked before each model request
 CHANGED_FILE_NAMES = 10
+FILE_CHANGE_TOOLS = ("write_file", "edit_file", "move_path", "delete_path", "notebook_edit")
+PATH_TOOLS = ("list_files", "find_files", "read_file", "search_files", "notebook_read", *FILE_CHANGE_TOOLS)
+DIRECTORY_TOOLS = ("list_files", "find_files", "search_files")
+DELETE_PREVIEW_LINES = 200
 
 
 def file_fingerprint(path):
@@ -607,7 +614,8 @@ class AgentManager:
 
     def session_tools(self, session):
         return WorkspaceTools(session["workspace"], self.settings.values["env_file"], session.get("allowed_directories", []),
-                              session.get("permission_mode", "manual") == "bypassPermissions")
+                              session.get("permission_mode", "manual") == "bypassPermissions",
+                              write_limit=write_limit_setting(self.settings.values))
 
     async def publish_changes(self, session, tools=None, only_tracked=False):
         """Send the conversation's unreviewed agent file changes to its open pages."""
@@ -888,42 +896,54 @@ class AgentManager:
                     output = unanswered(event, declined(event, "this MCP action"))
                     await self.update_event(session, event, output=output)
                     return output
-            if name in ("list_files", "read_file", "search_files", "write_file", "edit_file"):
-                access = {}
-                if not await self.ensure_access(session, tools, arguments.get("path", "."), name in ("list_files", "search_files"), access):
-                    output = ("The user did not answer the folder access request in time, so this file tool did not run. "
-                              "Ask the user before trying again." if access["approval"] == "expired" else
-                              declined(access, "folder access", "Do not retry or use a command to circumvent this decision."))
-                    # The file tool did not run because of the access card's answer; show the same outcome on it.
-                    await self.update_event(session, event, state="rejected", output=output, approval=access["approval"],
-                                            **({"decline_note": access["decline_note"]} if access.get("decline_note") else {}))
-                    return output
-                target = tools.path(arguments.get("path", "."))
-                if target.is_relative_to(tools.root):
-                    directory = target if name in ("list_files", "search_files") and target.is_dir() else target.parent
-                    relative = directory.relative_to(tools.root).as_posix()
-                    directories = session.setdefault("instruction_directories", [])
-                    if relative not in directories:
-                        directories.append(relative)
-            if name in ("write_file", "edit_file", "run_command"):
+            if name in PATH_TOOLS:
+                # move_path needs access to both ends; the destination is always a file path.
+                paths = [arguments.get("path", ".")] + ([arguments["destination"]] if name == "move_path" else [])
+                for value in paths:
+                    access = {}
+                    if not await self.ensure_access(session, tools, value, name in DIRECTORY_TOOLS, access):
+                        output = ("The user did not answer the folder access request in time, so this file tool did not run. "
+                                  "Ask the user before trying again." if access["approval"] == "expired" else
+                                  declined(access, "folder access", "Do not retry or use a command to circumvent this decision."))
+                        # The file tool did not run because of the access card's answer; show the same outcome on it.
+                        await self.update_event(session, event, state="rejected", output=output, approval=access["approval"],
+                                                **({"decline_note": access["decline_note"]} if access.get("decline_note") else {}))
+                        return output
+                for value in paths:
+                    target = tools.path(value)
+                    if target.is_relative_to(tools.root):
+                        directory = target if name in DIRECTORY_TOOLS and target.is_dir() else target.parent
+                        relative = directory.relative_to(tools.root).as_posix()
+                        directories = session.setdefault("instruction_directories", [])
+                        if relative not in directories:
+                            directories.append(relative)
+            if name in FILE_CHANGE_TOOLS + ("run_command",):
                 if not self.guidance_matches(session, tools):
                     output = "Project instructions were discovered or changed. Review the refreshed project guidance in the next model request before retrying this action. No file was changed and no command ran."
                     await self.update_event(session, event, state="rejected", output=output)
                     return output
-                original = None
-                if name != "run_command" and tools.path(arguments["path"]).exists():
-                    original = tools.read_file(arguments["path"])
-                # Overwriting needs the file as this conversation last saw it. edit_file
-                # needs exact old_text instead; the app-generated activity log is exempt.
-                guarded = name == "write_file" and activity is None and original is not None
-                refusal = guarded and self.overwrite_refusal(session, tools, arguments["path"])
+                if name in ("move_path", "delete_path"):
+                    self.checkpoints.check_file_operation(tools, name, arguments)
+                original = self.change_targets(tools, name, arguments)
+                # Replacing, deleting or cell-editing a file needs the file as this conversation
+                # last saw it. edit_file needs exact old_text instead; the activity log is exempt.
+                guarded = []
+                if activity is None and name == "write_file" and original[str(tools.path(arguments["path"]))] is not None:
+                    guarded.append((arguments["path"], "overwriting"))
+                elif name in ("delete_path", "notebook_edit"):
+                    guarded.append((arguments["path"], "deleting" if name == "delete_path" else "editing"))
+                elif (name == "move_path" and arguments.get("overwrite") is True
+                      and original[str(tools.path(arguments["destination"]))] is not None):
+                    guarded.append((arguments["destination"], "overwriting"))
+                refusal = next(filter(None, (self.overwrite_refusal(session, tools, *guard) for guard in guarded)), None)
                 if refusal:
                     await self.update_event(session, event, state="rejected", output=refusal)
                     return refusal
                 if activity is not None:
                     content, activity = activity_content(
-                        session, original, [*session.get("command_jobs", []), *self.jobs.list(session_id=session["id"])],
-                        exclude_event_id=event["id"], redact=self.settings.redact)
+                        session, original.get(str(tools.path(arguments["path"]))),
+                        [*session.get("command_jobs", []), *self.jobs.list(session_id=session["id"])],
+                        exclude_event_id=event["id"], redact=self.settings.redact, limit=min(FILE_LIMIT, tools.write_limit))
                     arguments = {**arguments, "content": content}
                 if name == "run_command":
                     validate_command_options(arguments["command"], arguments.get("timeout_seconds", 60), arguments.get("max_output_bytes", 80000))
@@ -933,7 +953,7 @@ class AgentManager:
                                + f" · Output limit: {arguments.get('max_output_bytes', 80000)} bytes"
                                + ("\nBackground job: continues after this chat turn; stop it in Terminal or with stop_job." if arguments.get("background") else "\nForeground command: Stop response also stops this job."))
                 else:
-                    preview = tools.change(name, arguments)
+                    preview = self.file_change_preview(tools, name, arguments)
                 by_rule = decision == "ask" and allowed_by_rule(session, name, arguments)
                 await self.update_event(session, event, preview=preview, **({"allowed_by_rule": True} if by_rule else {}))
                 if decision == "ask" and not by_rule and not await self.approve(session, event):
@@ -943,24 +963,24 @@ class AgentManager:
                 if not self.guidance_matches(session, tools):
                     raise ValueError("Project instructions changed while preparing this action. Review the refreshed guidance before retrying. No file was changed and no command ran.")
                 if name != "run_command":
-                    current = tools.read_file(arguments["path"]) if tools.path(arguments["path"]).exists() else None
-                    if current != original:
+                    if self.change_targets(tools, name, arguments) != original:
                         raise ValueError("The file changed while waiting for approval. Read it again and propose a fresh edit.")
-                    if guarded and (refusal := self.overwrite_refusal(session, tools, arguments["path"])):
-                        raise ValueError(refusal)
+                    for guard in guarded:
+                        if refusal := self.overwrite_refusal(session, tools, *guard):
+                            raise ValueError(refusal)
             if mode == "auto" and name in COMMAND_TOOLS and decision == "allow":
                 arguments = {**arguments, "command": BASIC_COMMANDS[arguments["command"].strip()]}
             await self.run_hooks(session, "before_tool", name, arguments, call_id=call_id)
             # Approval or a hook can change guidance; recheck before any external action.
-            if name in ("write_file", "edit_file", "run_command") or name.startswith("mcp__"):
+            if name in FILE_CHANGE_TOOLS + ("run_command",) or name.startswith("mcp__"):
                 if not self.guidance_matches(session, tools):
                     raise ValueError("Project instructions changed before execution. Review the refreshed guidance and retry.")
-                if name in ("write_file", "edit_file"):
-                    current = tools.read_file(arguments["path"]) if tools.path(arguments["path"]).exists() else None
-                    if current != original:
+                if name in FILE_CHANGE_TOOLS:
+                    if self.change_targets(tools, name, arguments) != original:
                         raise ValueError("The file changed before execution. Read it again and propose a fresh edit.")
-                    if guarded and (refusal := self.overwrite_refusal(session, tools, arguments["path"])):
-                        raise ValueError(refusal)
+                    for guard in guarded:
+                        if refusal := self.overwrite_refusal(session, tools, *guard):
+                            raise ValueError(refusal)
             invoked = True
             if name.startswith("mcp__"):
                 result = await connection.call(name, arguments)
@@ -968,10 +988,44 @@ class AgentManager:
                 turn_id = next((item["id"] for item in reversed(session["events"]) if item["type"] == "user"), None)
                 result = self.checkpoints.apply_edit(tools, name, arguments, session_id=session["id"], turn_id=turn_id,
                                                      on_applied=lambda record: self.changes.track(record, tools))
-                self.remember_file(session, tools.path(arguments["path"]))
+                target = tools.path(arguments["path"])
+                self.remember_file(session, target)
                 if activity is not None:
                     # Return a compact result: the diff would put the whole log back into context.
                     result = {"path": arguments["path"], **activity}
+                else:
+                    result += self.file_diagnostics(tools, target, original.get(str(target)))
+            elif name == "move_path":
+                turn_id = next((item["id"] for item in reversed(session["events"]) if item["type"] == "user"), None)
+                source, target = tools.path(arguments["path"]), tools.path(arguments["destination"])
+                result = self.checkpoints.apply_move(tools, arguments["path"], arguments["destination"],
+                                                     overwrite=arguments.get("overwrite") is True, session_id=session["id"],
+                                                     turn_id=turn_id, on_applied=lambda record: self.changes.track(record, tools))
+                self.forget_file(session, source)
+                self.remember_file(session, target)
+                result += self.file_diagnostics(tools, target, original.get(str(target)))
+            elif name == "delete_path":
+                turn_id = next((item["id"] for item in reversed(session["events"]) if item["type"] == "user"), None)
+                result = self.checkpoints.apply_delete(tools, arguments["path"], session_id=session["id"], turn_id=turn_id,
+                                                       on_applied=lambda record: self.changes.track(record, tools))
+                self.forget_file(session, tools.path(arguments["path"]))
+            elif name == "notebook_read":
+                # Stat first: a change during the read then counts as unseen.
+                target = tools.path(arguments["path"])
+                seen = file_fingerprint(target)
+                result = await asyncio.to_thread(notebooks.read_notebook, tools, arguments["path"],
+                                                 arguments.get("offset", 0), arguments.get("max_cells", 20))
+                self.remember_file(session, target, seen)
+            elif name == "notebook_edit":
+                turn_id = next((item["id"] for item in reversed(session["events"]) if item["type"] == "user"), None)
+                target = tools.path(arguments["path"])
+                before = original.get(str(target))
+                after, summary = notebooks.plan_edit(before, arguments)
+                self.checkpoints.apply_text(tools, arguments["path"], after, before, session_id=session["id"], turn_id=turn_id,
+                                            on_applied=lambda record: self.changes.track(record, tools))
+                self.remember_file(session, target)
+                result = (notebooks.preview(tools.display_path(target), summary)
+                          + diagnostics.report(tools.display_path(target), before, after))
             elif name == "list_skills":
                 result = self.metadata_page(self.extensions.skills(tools), arguments.get("offset", 0), "skills")
             elif name == "use_skill":
@@ -1030,7 +1084,7 @@ class AgentManager:
             output = self.settings.redact(output)
             failed = name.startswith("mcp__") and isinstance(result, dict) and result.get("is_error") is True
             await self.update_event(session, event, state="error" if failed else "completed", output=output)
-            if name in ("write_file", "edit_file"):
+            if name in FILE_CHANGE_TOOLS:
                 await self.publish_changes(session, tools)
             await self.run_hooks(session, "after_tool", name, arguments, result, call_id=call_id)
             command_failed = (name == "run_command" and isinstance(result, dict) and not result.get("background")
@@ -1058,8 +1112,8 @@ class AgentManager:
         session["file_views"] = views
 
     @staticmethod
-    def overwrite_refusal(session, tools, path):
-        """Why write_file may not replace this existing file yet, or None."""
+    def overwrite_refusal(session, tools, path, verb="overwriting"):
+        """Why a file tool may not replace, delete or edit this existing file yet, or None."""
         target = tools.path(path)
         current = file_fingerprint(target)
         if current is None:
@@ -1067,11 +1121,59 @@ class AgentManager:
         views = session.get("file_views") if isinstance(session.get("file_views"), dict) else {}
         name = tools.display_path(target)
         if str(target) not in views:
-            return f"Read {name} before overwriting it: this conversation has not read it yet. Use read_file, then write again."
+            return f"Read {name} before {verb} it: this conversation has not read it yet. Use read_file, then write again."
         if views[str(target)] != current:
-            return (f"Read {name} again before overwriting it: it changed since you last read or wrote it (for example "
+            return (f"Read {name} again before {verb} it: it changed since you last read or wrote it (for example "
                     "the user edited it, undid an agent change, or a command changed it). Use read_file, then write again.")
         return None
+
+    @staticmethod
+    def forget_file(session, target):
+        """Drop a moved or deleted file from what this conversation remembers having read."""
+        views = session.get("file_views")
+        if isinstance(views, dict) and str(target) in views:
+            session["file_views"] = {path: seen for path, seen in views.items() if path != str(target)}
+
+    @staticmethod
+    def change_targets(tools, name, arguments):
+        """{absolute path: exact text or None} of the files a file tool changes; compared again before it runs."""
+        values = [] if name == "run_command" else [arguments["path"]]
+        if name == "notebook_edit":
+            notebooks.check_size(tools.path(arguments["path"]))
+        if name == "move_path":
+            values.append(arguments["destination"])
+        return {str(tools.path(value)): tools.read_raw(value) for value in values}
+
+    @staticmethod
+    def file_change_preview(tools, name, arguments):
+        """The approval card's text for a file tool."""
+        if name in ("write_file", "edit_file"):
+            return tools.change(name, arguments)
+        source = tools.path(arguments["path"])
+        if name == "notebook_edit":
+            _, summary = notebooks.plan_edit(tools.read_raw(arguments["path"]), arguments)
+            return notebooks.preview(tools.display_path(source), summary)
+        text = tools.read_raw(arguments["path"]) or ""
+        if name == "move_path":
+            target = tools.path(arguments["destination"])
+            preview = f"Move {tools.display_path(source)} → {tools.display_path(target)}"
+            replaced = tools.read_raw(arguments["destination"])
+            if replaced is not None:
+                preview += f"\n\nReplaces the existing file:\n{preview_diff(tools.display_path(target), replaced, text)}"
+            return preview
+        lines = preview_diff(tools.display_path(source), text, "").splitlines(True)
+        if len(lines) > DELETE_PREVIEW_LINES:
+            lines = lines[:DELETE_PREVIEW_LINES] + [f"… {len(lines) - DELETE_PREVIEW_LINES:,} more lines\n"]
+        return f"Delete {tools.display_path(source)} ({len(split_lines(text)):,} lines)\n\n" + "".join(lines)
+
+    @staticmethod
+    def file_diagnostics(tools, target, before):
+        """New problems the edit introduced in this file, as text to append to the tool result."""
+        try:
+            after = tools.read_raw(str(target))
+        except (ValueError, OSError, UnicodeError):
+            return ""
+        return diagnostics.report(tools.display_path(target), before, after) if after is not None else ""
 
     @staticmethod
     def changed_files_notice(session, tools):
@@ -1338,7 +1440,8 @@ class AgentManager:
             host, token = self.settings.credentials()
             mode = session.get("permission_mode", "manual")
             tools = WorkspaceTools(session["workspace"], self.settings.values["env_file"],
-                                   session.get("allowed_directories", []), mode == "bypassPermissions")
+                                   session.get("allowed_directories", []), mode == "bypassPermissions",
+                                   write_limit=write_limit_setting(self.settings.values))
             system, guidance = self.context_inputs(session, tools, mode)
             state = session.get("context_state", {})
             definitions = state.get("tool_definitions")
@@ -1526,7 +1629,7 @@ class AgentManager:
     async def _run_databricks(self, session, prompt, external_tools):
         host, token = self.settings.credentials()
         mode = session.get("permission_mode", "manual")
-        tools = WorkspaceTools(session["workspace"], self.settings.values["env_file"], session.get("allowed_directories", []), mode == "bypassPermissions")
+        tools = WorkspaceTools(session["workspace"], self.settings.values["env_file"], session.get("allowed_directories", []), mode == "bypassPermissions", write_limit=write_limit_setting(self.settings.values))
         definitions = filter_tools(session, [*TOOL_DEFINITIONS, *[tool for tool in FEATURE_TOOLS
                        if not session.get("is_subagent") or tool["function"]["name"] != "delegate_task"], *external_tools])
         for skill_id in self.requested_skills(tools, prompt):

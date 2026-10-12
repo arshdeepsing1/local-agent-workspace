@@ -19,8 +19,9 @@ ACTIVITY_MARKER = "<!-- activity-log -->"
 MAX_COMMAND_CHARS = 4000
 MAX_PATHS_PER_GROUP = 200
 FILE_GROUPS = (
-    ("write_file", "Created or replaced"), ("edit_file", "Edited"), ("read_file", "Read"),
-    ("list_files", "Listed"), ("search_files", "Searched"),
+    ("write_file", "Created or replaced"), ("edit_file", "Edited"), ("move_path", "Moved"), ("delete_path", "Deleted"),
+    ("notebook_edit", "Edited notebook"), ("read_file", "Read"), ("notebook_read", "Read notebook"),
+    ("list_files", "Listed"), ("search_files", "Searched"), ("find_files", "Searched for files in"),
 )
 
 
@@ -170,11 +171,12 @@ def insert_log(original, log):
     return original.rstrip("\n") + "\n\n" + log, "appended"
 
 
-def activity_content(session, original, jobs=None, *, exclude_event_id=None, redact=lambda text: text):
+def activity_content(session, original, jobs=None, *, exclude_event_id=None, redact=lambda text: text, limit=LIMIT):
     base = "" if original is None else original.replace(ACTIVITY_MARKER, "", 1)
-    budget = LIMIT - len(base.encode("utf-8")) - 2
+    budget = limit - len(base.encode("utf-8")) - 2
     if budget < 1000:
-        raise ValueError("The file is too close to the 80 KB limit for an activity log. Insert it into a separate, new file.")
+        raise ValueError(f"The file is too close to the {limit // 1000} KB limit for an activity log. "
+                         "Insert it into a separate, new file.")
     log, stats = activity_log(session, jobs, exclude_event_id=exclude_event_id, redact=redact, max_bytes=budget)
     content, placement = insert_log(original, log)
     return content, {**stats, "placement": placement, "bytes_added": len(log.encode("utf-8"))}

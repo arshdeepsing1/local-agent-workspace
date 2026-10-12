@@ -304,3 +304,17 @@ async def test_agent_tool_edits_are_tracked_and_pushed_but_declined_ones_are_not
     await manager.status(session, "idle")
     assert [item["type"] for item in socket.sent] == ["status", "changes"]
     store.db.close()
+
+
+def test_an_agent_edit_of_a_crlf_file_is_one_change_and_undo_restores_its_bytes(review):
+    changes, _, tools, _ = review
+    target = tools.root / "win.txt"
+    original = b"".join(f"line {number}\r\n".encode() for number in range(20))
+    target.write_bytes(original)
+    agent_edit(review, "edit_file", path="win.txt", old_text="line 7", new_text="line seven")
+    assert target.read_bytes() == original.replace(b"line 7\r\n", b"line seven\r\n")
+    diff = changes.diff("chat", tools, "win.txt")
+    assert len(diff["hunks"]) == 1 and (diff["added"], diff["removed"]) == (1, 1)
+    assert [line["text"] for line in diff["lines"] if line["kind"] != "context"] == ["line 7", "line seven"]
+    act(review, "undo", "win.txt")
+    assert target.read_bytes() == original

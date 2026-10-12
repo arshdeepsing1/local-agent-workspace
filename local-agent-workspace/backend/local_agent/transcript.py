@@ -104,6 +104,12 @@ def _tool(event, excerpt_chars):
             detail += f" lines {start}–{end}"
     elif name in ("write_file", "edit_file"):
         detail = ("Wrote " if name == "write_file" else "Edited ") + _code(path)
+    elif name == "move_path":
+        detail = f"Moved {_code(path)} to {_code(arguments.get('destination', ''))}"
+    elif name == "delete_path":
+        detail = f"Deleted {_code(path)}"
+    elif name in ("notebook_edit", "notebook_read"):
+        detail = ("Edited notebook " if name == "notebook_edit" else "Read notebook ") + _code(path)
     elif name == "list_files":
         detail = f"Listed {_code(path)}" + (f" matching {_code(arguments['glob'])}" if arguments.get("glob") else "")
     elif name == "search_files":

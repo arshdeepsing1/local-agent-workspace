@@ -4,13 +4,43 @@ import difflib
 import hashlib
 import json
 import os
+import re
 import stat
 import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from .tools import LIMIT, file_error
+from .edits import plan_change, preview_diff
+from .tools import MAX_WRITE_LIMIT, file_error
+
+CHECKPOINT_BYTES_LIMIT = 256 * 1024 * 1024
+CHECKPOINT_PRUNE_TARGET = 192 * 1024 * 1024
+SYMLINK = "{} is a symbolic link; move_path and delete_path work on regular files only."
+NOT_MOVABLE = ("{tool} {verb} one regular UTF-8 text file within the file write limit; "
+               "use run_command for folders, binary or larger files.")
+
+
+def _umask():
+    try:
+        with open("/proc/self/status", encoding="ascii", errors="replace") as status:
+            for line in status:
+                if line.startswith("Umask:"):
+                    return int(line.split()[1], 8)
+    except (OSError, ValueError, IndexError):
+        pass
+    old = os.umask(0)  # No /proc (macOS): read the umask by setting and restoring it.
+    os.umask(old)
+    return old
+
+
+# New files get the usual mode for the user's umask; existing files keep theirs.
+NEW_FILE_MODE = 0o666 & ~_umask()
+
+
+def _lines(text):
+    # Split at "\n" only, like the change review (changes.py imports this module).
+    return re.findall(r"[^\n]*\n|[^\n]+", text)
 
 
 def _state(content=None, mode=None, identity=None):
@@ -43,7 +73,7 @@ def _parent(target, create=False):
         os.close(descriptor)
 
 
-def _read_at(directory, name):
+def _read_at(directory, name, limit=MAX_WRITE_LIMIT):
     try:
         descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
     except FileNotFoundError:
@@ -52,10 +82,10 @@ def _read_at(directory, name):
         before = os.fstat(source.fileno())
         if not stat.S_ISREG(before.st_mode):
             raise ValueError("Recovery supports regular UTF-8 files only.")
-        raw = source.read(LIMIT + 1)
+        raw = source.read(limit + 1)
         after = os.fstat(source.fileno())
-        if len(raw) > LIMIT:
-            raise ValueError("Recovery supports files up to 80 KB.")
+        if len(raw) > limit:
+            raise ValueError(f"Recovery supports files up to {limit // 1000:,} KB.")
         if b"\x00" in raw:
             raise ValueError("Binary files cannot be checkpointed.")
         raw.decode("utf-8")
@@ -65,10 +95,10 @@ def _read_at(directory, name):
         return _state(raw, stat.S_IMODE(after.st_mode), identity(after))
 
 
-def _snapshot(target):
+def _snapshot(target, limit=MAX_WRITE_LIMIT):
     try:
         with _parent(target) as directory:
-            return _read_at(directory, target.name)
+            return _read_at(directory, target.name, limit)
     except FileNotFoundError:
         return _state()
 
@@ -79,8 +109,8 @@ def _same(current, expected):
 
 
 def _diff(before, after, path):
-    result = "".join(difflib.unified_diff(_bytes(before).decode("utf-8").splitlines(True),
-                                          _bytes(after).decode("utf-8").splitlines(True),
+    result = "".join(difflib.unified_diff(_lines(_bytes(before).decode("utf-8")),
+                                          _lines(_bytes(after).decode("utf-8")),
                                           fromfile=path if before["exists"] else "/dev/null",
                                           tofile=path if after["exists"] else "/dev/null"))
     if not result and before["exists"] != after["exists"]:
@@ -91,13 +121,56 @@ def _diff(before, after, path):
 class CheckpointManager:
     def __init__(self, store):
         self.store = store
-        store.db.execute("CREATE TABLE IF NOT EXISTS checkpoints (id TEXT PRIMARY KEY, workspace TEXT, session_id TEXT, data TEXT)")
-        store.db.commit()
+        db = store.db
+        db.execute("CREATE TABLE IF NOT EXISTS checkpoints (id TEXT PRIMARY KEY, workspace TEXT, session_id TEXT, data TEXT)")
+        # Record sizes live beside the records, so the store cap never reads the data column.
+        db.execute("CREATE TABLE IF NOT EXISTS checkpoint_sizes (id TEXT PRIMARY KEY, size INTEGER, pending INTEGER, seq INTEGER)")
+        # Stores from before the cap: size every record once, oldest saves first.
+        db.execute("""INSERT INTO checkpoint_sizes (id, size, pending, seq)
+                      SELECT id, length(CAST(data AS BLOB)), instr(data, '"status": "pending"') > 0, rowid
+                      FROM checkpoints WHERE id NOT IN (SELECT id FROM checkpoint_sizes)""")
+        db.commit()
+        self.total = db.execute("SELECT COALESCE(SUM(size), 0) FROM checkpoint_sizes").fetchone()[0]
 
     def _save(self, record):
-        self.store.db.execute("INSERT OR REPLACE INTO checkpoints VALUES (?, ?, ?, ?)",
-                              (record["id"], record["workspace"], record["session_id"], json.dumps(record)))
-        self.store.db.commit()
+        data = json.dumps(record)
+        size, pending = len(data.encode("utf-8")), int(record["status"] == "pending")
+        db = self.store.db
+        row = db.execute("SELECT size FROM checkpoint_sizes WHERE id=?", (record["id"],)).fetchone()
+        db.execute("INSERT OR REPLACE INTO checkpoints VALUES (?, ?, ?, ?)",
+                   (record["id"], record["workspace"], record["session_id"], data))
+        if row:
+            db.execute("UPDATE checkpoint_sizes SET size=?, pending=? WHERE id=?", (size, pending, record["id"]))
+        else:
+            seq = db.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM checkpoint_sizes").fetchone()[0]
+            db.execute("INSERT INTO checkpoint_sizes VALUES (?, ?, ?, ?)", (record["id"], size, pending, seq))
+        db.commit()
+        self.total += size - (row[0] if row else 0)
+
+    def _delete(self, ids):
+        db = self.store.db
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            marks = ",".join("?" * len(chunk))
+            db.execute(f"DELETE FROM checkpoints WHERE id IN ({marks})", chunk)
+            db.execute(f"DELETE FROM checkpoint_sizes WHERE id IN ({marks})", chunk)
+        db.commit()
+        self.total = db.execute("SELECT COALESCE(SUM(size), 0) FROM checkpoint_sizes").fetchone()[0]
+
+    def _prune(self, keep_id):
+        """Bound the store: drop the oldest finished records once it exceeds the cap."""
+        if self.total <= CHECKPOINT_BYTES_LIMIT:
+            return
+        excess, ids = self.total - CHECKPOINT_PRUNE_TARGET, []
+        rows = self.store.db.execute("SELECT id, size FROM checkpoint_sizes WHERE pending=0 AND id != ? ORDER BY seq",
+                                     (keep_id,))
+        for checkpoint_id, size in rows:
+            if excess < 0:
+                break
+            ids.append(checkpoint_id)
+            excess -= size
+        rows.close()
+        self._delete(ids)
 
     @staticmethod
     def _metadata(record):
@@ -113,8 +186,11 @@ class CheckpointManager:
                 and (workspace is None or record["workspace"] == workspace)]
 
     def delete_session(self, session_id):
+        self.store.db.execute("DELETE FROM checkpoint_sizes WHERE id IN (SELECT id FROM checkpoints WHERE session_id=?)",
+                              (session_id,))
         self.store.db.execute("DELETE FROM checkpoints WHERE session_id=?", (session_id,))
         self.store.db.commit()
+        self.total = self.store.db.execute("SELECT COALESCE(SUM(size), 0) FROM checkpoint_sizes").fetchone()[0]
 
     def _get(self, checkpoint_id, tools, session_id):
         row = self.store.db.execute("SELECT data FROM checkpoints WHERE id=?", (checkpoint_id,)).fetchone()
@@ -184,9 +260,9 @@ class CheckpointManager:
             # Keep recovery data if replacement succeeded but a later fsync or
             # metadata update failed. Remove checkpoints for unchanged failed edits.
             if not applied and not getattr(error, "checkpoint_written", False):
-                self.store.db.execute("DELETE FROM checkpoints WHERE id=?", (record["id"],))
-                self.store.db.commit()
+                self._delete([record["id"]])
             raise
+        self._prune(record["id"])
         return record
 
     def apply_edit(self, tools, name, arguments, session_id=None, turn_id=None, on_applied=None):
@@ -194,25 +270,99 @@ class CheckpointManager:
             raise ValueError("Only app file writes and edits can create checkpoints.")
         target = tools.path(arguments["path"])
         before = _snapshot(target)
-        preview = tools.change(name, arguments)
-        old = _bytes(before).decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
-        if name == "edit_file":
-            needle = arguments["old_text"]
-            if not needle or old.count(needle) != 1:
-                raise ValueError("old_text must match exactly once; include more surrounding context.")
-            new = old.replace(needle, arguments["new_text"], 1)
-        else:
-            new = arguments["content"]
-        raw = new.encode("utf-8")
-        if len(raw) > LIMIT or b"\x00" in raw:
-            raise ValueError("File content must be UTF-8 text without NUL bytes and at most 80 KB.")
-        after = _state(raw, before["mode"] if before["exists"] else 0o600)
+        before_text = _bytes(before).decode("utf-8") if before["exists"] else None
+        plan = plan_change(name, arguments, before_text, tools.write_limit)
+        after = _state(plan.text.encode("utf-8"), before["mode"] if before["exists"] else NEW_FILE_MODE)
         if before["hash"] == after["hash"]:
             return "No changes."
         record = self._apply(tools, arguments["path"], target, before, after, session_id, turn_id=turn_id)
         if on_applied is not None:
             on_applied(record)
-        return preview if preview != "No changes." else _diff(before, after, tools.display_path(target))
+        diff = preview_diff(tools.display_path(target), before_text, plan.text)
+        return plan.prefix + (diff if diff != "No changes." else _diff(before, after, tools.display_path(target)))
+
+    @staticmethod
+    def check_file_operation(tools, name, arguments):
+        """Validate move_path or delete_path without changing anything.
+
+        Returns (source, source state, destination, destination state); the
+        destination entries are None for delete_path.
+        """
+        verb = "moves" if name == "move_path" else "deletes"
+        names = [("path", arguments["path"])] + ([("destination", arguments["destination"])] if name == "move_path" else [])
+        for label, value in names:
+            # Check the link itself, before tools.path resolves it to its target.
+            try:
+                info = os.lstat(tools.root / Path(value).expanduser())
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            if stat.S_ISLNK(info.st_mode):
+                raise ValueError(SYMLINK.format(label))
+        source = tools.path(arguments["path"])
+        try:
+            # The write limit applies to what a move or delete carries; snapshots of
+            # other files read up to the recovery maximum.
+            before = _snapshot(source, tools.write_limit)
+        except (ValueError, UnicodeError, IsADirectoryError) as error:
+            raise ValueError(NOT_MOVABLE.format(tool=name, verb=verb)) from error
+        if not before["exists"]:
+            raise ValueError("path does not exist.")
+        if name != "move_path":
+            return source, before, None, None
+        destination = tools.path(arguments["destination"])
+        try:
+            same = destination == source or destination.exists() and destination.samefile(source)
+        except OSError:
+            same = False
+        if same:
+            raise ValueError("path and destination are the same file.")
+        if destination.is_dir():
+            raise ValueError("destination is a folder; give the full new file path.")
+        current = _snapshot(destination)
+        if current["exists"] and arguments.get("overwrite") is not True:
+            raise ValueError("destination already exists; set overwrite=true to replace it (read it first).")
+        return source, before, destination, current
+
+    def apply_move(self, tools, path, destination, *, overwrite=False, session_id=None, turn_id=None, on_applied=None):
+        """Move one text file as two checkpoints: create (or replace) the destination, then delete the source."""
+        arguments = {"path": path, "destination": destination, "overwrite": overwrite}
+        source, before, target, current = self.check_file_operation(tools, "move_path", arguments)
+        created = self._apply(tools, destination, target, current, _state(_bytes(before), before["mode"]), session_id,
+                              turn_id=turn_id)
+        if on_applied is not None:
+            on_applied(created)
+        try:
+            removed = self._apply(tools, path, source, before, _state(), session_id, turn_id=turn_id)
+        except (ValueError, OSError) as error:
+            raise ValueError(f"Created {destination} but could not remove {path}: {file_error(error)}. "
+                             "Both files exist now; review them in the change review.") from error
+        if on_applied is not None:
+            on_applied(removed)
+        return f"Moved {path} to {destination}."
+
+    def apply_delete(self, tools, path, *, session_id=None, turn_id=None, on_applied=None):
+        source, before, _, _ = self.check_file_operation(tools, "delete_path", {"path": path})
+        record = self._apply(tools, path, source, before, _state(), session_id, turn_id=turn_id)
+        if on_applied is not None:
+            on_applied(record)
+        return f"Deleted {path}. Undo restores it from the change review."
+
+    def apply_text(self, tools, path, text, before, *, session_id=None, turn_id=None, on_applied=None):
+        """Write text planned from before (the file's text, or None); refuses if the file no longer matches."""
+        target = tools.path(path)
+        current = _snapshot(target)
+        if (_bytes(current).decode("utf-8") if current["exists"] else None) != before:
+            raise ValueError("The file changed before execution. Read it again and propose a fresh edit.")
+        raw = text.encode("utf-8")
+        if len(raw) > MAX_WRITE_LIMIT or b"\x00" in raw:
+            raise ValueError(f"File content must be UTF-8 text without NUL bytes and at most {MAX_WRITE_LIMIT // 1000} KB.")
+        after = _state(raw, current["mode"] if current["exists"] else NEW_FILE_MODE)
+        if after["hash"] == current["hash"]:
+            return None
+        record = self._apply(tools, path, target, current, after, session_id, turn_id=turn_id)
+        if on_applied is not None:
+            on_applied(record)
+        return record
 
     def apply_state(self, tools, path, target, current, after, session_id=None):
         """Replace a reviewed state with another one, keeping a restorable checkpoint."""

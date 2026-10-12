@@ -78,7 +78,7 @@ class FolderAccess(BaseModel):
 
 class FileEdit(BaseModel):
     path: str
-    content: str = Field(max_length=80000)
+    content: str = Field(max_length=1_000_000)  # The write limit (bytes) is checked by apply_edit.
     original: str
     session_id: str | None = None
 
@@ -158,10 +158,12 @@ def create_app(settings=None):
         return session
 
     def workspace_tools(session_id=None):
+        from .tools import write_limit_setting
         session = session_or_404(session_id) if session_id else {}
         workspace = session.get("workspace", settings.values["workspace"])
         return WorkspaceTools(workspace, settings.values["env_file"], session.get("allowed_directories", []),
-                              session.get("permission_mode") == "bypassPermissions")
+                              session.get("permission_mode") == "bypassPermissions",
+                              write_limit=write_limit_setting(settings.values))
 
     @app.get("/api/bootstrap")
     async def bootstrap():

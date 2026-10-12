@@ -278,8 +278,9 @@ when opening a conversation or performing restart recovery.
   Renaming also works during a response and does not change its history, model,
   permissions, or selected conversation. Manual titles persist after restart and
   are never replaced by automatic naming, including a title request already in flight.
-- **Workspace / Files**: browse a folder, edit UTF-8 text files up to 80 KB, or use
-  the plus button to reference the file in chat ("Please read the project file: <path>", or
+- **Workspace / Files**: browse a folder, edit UTF-8 text files up to the file write limit
+  (Settings, 80 KB by default), or use the plus button to reference the file in chat
+  ("Please read the project file: <path>", or
   "Please read the file: <absolute path>" for a granted folder). When the conversation has granted
   folders (**Folder access**), **Browse** at the top switches between **Project** and each
   granted folder; a granted folder is shown by absolute paths and the parent button stops
@@ -312,15 +313,18 @@ when opening a conversation or performing restart recovery.
     before it changes any.
   - An undo is itself a file checkpoint: **Agent tools → Recovery → Other file edits** can
     bring the agent's version back. Folders created for a new file are not removed.
-  - Only the agent's `write_file`, `edit_file` and `insert_activity_log` edits are listed.
+  - Only the agent's `write_file`, `edit_file`, `move_path`, `delete_path`, `notebook_edit`
+    and `insert_activity_log` changes are listed. A move is listed as the new file (created)
+    and the old one (deleted); undo both to put the file back where it was.
     Shell commands, MCP tools and hooks are not; **Workspace / Changes** shows Git's view.
     A subagent's edits are listed in the subagent's conversation. Exports, imports and
     forks do not copy the list, and deleting a conversation forgets it and leaves the
     files as they are. Before its next request the model is told which files it read or
-    wrote changed since, an undo included, and `write_file` refuses to replace such a file
-    until the model reads it again (see **Tool details**). Recovery's limits apply: regular
-    UTF-8 files up to 80 KB. An agent edit saves a file with Windows (CRLF) line endings
-    with LF endings, so every line of such a file shows as changed.
+    wrote changed since, an undo included, and `write_file`, `delete_path` and
+    `notebook_edit` refuse to change such a file until the model reads it again (see
+    **Tool details**). Recovery's limits apply: regular UTF-8 files up to 1 MB. Line endings
+    are kept: an edit to a Windows (CRLF) file keeps CRLF, and a file with mixed endings
+    keeps each unchanged line's ending.
 - **Workspace / Changes**: inspect Git status and tracked-file diffs. Untracked
   paths appear in status; their contents are available in Files. The server runs Git
   directly (no shell) with the programs a repository's configuration can name switched
@@ -384,7 +388,35 @@ when opening a conversation or performing restart recovery.
   conversation has read or written it and it has not changed since; the card shows
   "Not run:" and the reason, and the model reads the file and writes again. The check
   repeats after the approval and before the write. New files, `edit_file` (its
-  `old_text` must match exactly) and `insert_activity_log` are not refused.
+  `old_text` must match exactly) and `insert_activity_log` are not refused. The same check
+  applies before `delete_path` deletes a file, before `notebook_edit` changes a notebook,
+  and before `move_path` with `overwrite=true` replaces an existing destination.
+  **Edits:** `edit_file` takes one `old_text`/`new_text` pair (`replace_all=true` replaces
+  every occurrence), or `edits`: up to 50 replacements applied in order to one file, all
+  checked before anything is written, with one approval card and one checkpoint. A
+  replacement that is not found, or that matches more than once without `replace_all`,
+  changes nothing. With `replace_all` or `edits` the result starts with "Applied 2 edits
+  (5 replacements)." Line endings are kept: unchanged text stays byte-identical and new
+  lines take the file's most common ending (CRLF on a tie). `write_file` and editor saves
+  of LF text over a CRLF file keep CRLF; over a file with mixed endings they keep the
+  endings of the unchanged first and last lines. Matching is linear, also for 1 MB files.
+  **Diagnostics:** after `write_file`, `edit_file`, `move_path` and `notebook_edit` the app
+  checks the file offline: Python syntax with the server's own Python parser (the code
+  never runs, and the message names the Python version, so a project on a newer Python
+  may see false alarms), JSON and notebooks, TOML, and unresolved merge-conflict markers in
+  any text file. Only problems the change introduced are reported, at most five, after
+  "Diagnostics for <path>:" in the tool result. No project checker runs after each edit.
+  **Move and delete:** `move_path` moves or renames one regular UTF-8 text file within the
+  file write limit, creating folders as needed; an existing destination needs
+  `overwrite=true`. `delete_path` deletes one such file. Both refuse folders, binary or
+  larger files and symbolic links (a link is never followed), and suggest `run_command`
+  for those. Each path needs folder access, credential files stay excluded, and both
+  follow the permission mode like edits (**Allow edits in this chat** covers them).
+  **Notebooks:** `notebook_read` reads a Jupyter notebook as cells (index, id, type,
+  source and a short summary of outputs) in pages of at most 8 KB. `notebook_edit`
+  replaces, inserts or deletes one cell, found by id or index, or clears outputs; an
+  edited code cell loses its outputs, and the file keeps its JSON formatting. It works on
+  notebooks up to 1 MB whatever the write limit, with one approval card and a checkpoint.
   Before each model request the app checks the 200 most recent of these files and, if
   any changed or were deleted (your editor saves, an Undo, a command), adds one line at
   the end of the system message naming up to 10 of them. A deleted file is named once.
@@ -724,7 +756,8 @@ of the system-instruction estimate; do not add them again to the overall total.
 ### Agent tools: recovery and worktrees
 
 Open **Agent tools** in the header. **Recovery** lists checkpoints created before
-successful `write_file`, `edit_file`, and editor saves. Preview the reverse diff,
+successful `write_file`, `edit_file`, `move_path`, `delete_path`, `notebook_edit`, and
+editor saves. Preview the reverse diff,
 then click **Restore checkpoint**. Restoring verifies the current file's content,
 mode, type, location, and access scope; conflicting external changes are rejected.
 A restore creates a reverse checkpoint, so it can be undone. Restoring creation
@@ -738,7 +771,14 @@ atomic whole-turn undo. Earlier edits to the same file may no longer be restorab
 Manual editor saves, reverse checkpoints, and older unassociated records remain
 under **Other file edits**.
 
-Recovery covers regular UTF-8 files up to 80 KB. It preserves existing bytes and
+Recovery covers regular UTF-8 files up to 1 MB. Recovery and the change review read
+files up to 1 MB whatever the file write limit (Settings, 16–1,000 KB, 80 KB by
+default), so lowering the limit never blocks reviewing or undoing an earlier, larger
+edit; the limit applies only to new content. The checkpoint store is capped at 256 MiB:
+past that, the oldest finished checkpoints are removed until it is under 192 MiB, so
+the oldest edits may no longer be restorable here. Change-review baselines are separate
+copies and are not part of this cap. New files get the mode your umask gives (usually
+0644); existing files keep theirs. Recovery preserves existing bytes and
 permissions, uses atomic replacement, and pins directories during writes. It does
 not snapshot shell commands, MCP servers, hooks, Git operations, or whole folders.
 It is not a substitute for Git/backups, nor a filesystem lock against unrelated
