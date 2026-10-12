@@ -31,6 +31,18 @@ def validate_command_options(command, timeout_seconds=60, max_output_bytes=80_00
         raise ValueError("Command output limit must be an integer from 1,024 to 1,000,000 bytes.")
 
 
+def kill_group(pid):
+    """Stop a command started in its own session, and anything it started.
+
+    A group with nothing left to stop raises ESRCH, or on macOS EPERM while its
+    exited processes wait to be reaped (macOS still signals any that are running).
+    """
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 class CommandTimeout(TimeoutError):
     def __init__(self, result):
         super().__init__("Command exceeded its time limit and its process group was stopped.")
@@ -51,10 +63,7 @@ async def run_process(command, workspace, timeout_seconds=60, max_output_bytes=8
         # Process creation can finish after its caller is cancelled. Acquire and
         # reap that process before propagating cancellation.
         process = await spawning
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        kill_group(process.pid)
         await process.communicate()
         raise
 
@@ -83,10 +92,7 @@ async def run_process(command, workspace, timeout_seconds=60, max_output_bytes=8
         await process.wait()
         # Children with redirected stdio may outlive a successful shell without
         # keeping this pipe open. Completion ends the entire managed group.
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        kill_group(process.pid)
         finished = True
         changed.set()
 
@@ -119,10 +125,7 @@ async def run_process(command, workspace, timeout_seconds=60, max_output_bytes=8
     except BaseException as error:
         # Always kill the group, even when the shell itself has already exited:
         # its children may still be running and holding the output pipe open.
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        kill_group(process.pid)
         await asyncio.gather(reader, return_exceptions=True)
         publisher.cancel()
         await asyncio.gather(publisher, return_exceptions=True)

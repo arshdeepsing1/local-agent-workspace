@@ -12,9 +12,8 @@ import asyncio
 import codecs
 import os
 import shutil
-import signal
 
-from .jobs import ENVIRONMENT_KEYS
+from .jobs import ENVIRONMENT_KEYS, kill_group
 from .tools import SECRET_NAMES
 
 OUTPUT_LIMIT = 80_000
@@ -52,18 +51,6 @@ def filter_overrides(names):
         if "=" not in key:
             options.extend(["-c", f"{key}={value}"])
     return options
-
-
-def kill_group(pid):
-    """Stop a command started in its own session, and anything it started.
-
-    A group that has already exited raises ESRCH; on macOS it raises EPERM while
-    the exited leader waits to be reaped. Either way there is nothing left to stop.
-    """
-    try:
-        os.killpg(pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
 
 
 async def run_git(workspace, arguments, *, filters=(), timeout=30, limit=None, git=None):

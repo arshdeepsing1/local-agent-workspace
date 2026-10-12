@@ -95,7 +95,7 @@ async def test_truncated_utf8_drops_incomplete_character(tmp_path):
     assert result["truncated"] is True
 
 
-async def test_timeout_retains_partial_output(tmp_path):
+async def test_timeout_retains_partial_output(tmp_path, killpg_answer):
     with pytest.raises(CommandTimeout) as caught:
         await run_process("printf partial; sleep 5", tmp_path, timeout_seconds=1)
     assert caught.value.result["output"] == "partial"
@@ -103,7 +103,7 @@ async def test_timeout_retains_partial_output(tmp_path):
 
 
 @pytest.mark.parametrize("cancel", [False, True])
-async def test_kill_group_even_after_shell_exits(tmp_path, cancel):
+async def test_kill_group_even_after_shell_exits(tmp_path, cancel, killpg_answer):
     marker = tmp_path / "orphan-completed"
     seen = asyncio.Event()
 
@@ -124,7 +124,7 @@ async def test_kill_group_even_after_shell_exits(tmp_path, cancel):
     assert not marker.exists()
 
 
-async def test_normal_exit_stops_child_with_redirected_stdio(tmp_path):
+async def test_normal_exit_stops_child_with_redirected_stdio(tmp_path, killpg_answer):
     marker = tmp_path / "unmanaged-child"
     command = f"(sleep .3; touch {shlex.quote(str(marker))}) >/dev/null 2>&1 & printf completed"
     result = await run_process(command, tmp_path)
@@ -161,7 +161,7 @@ async def test_observer_error_does_not_stop_command(tmp_path):
     assert result["exit_code"] == 0
 
 
-async def test_cancellation_while_process_creation_finishes_still_reaps_child(tmp_path, monkeypatch):
+async def test_cancellation_while_process_creation_finishes_still_reaps_child(tmp_path, monkeypatch, killpg_answer):
     original = asyncio.create_subprocess_exec
     created = asyncio.Event()
     release = asyncio.Event()
