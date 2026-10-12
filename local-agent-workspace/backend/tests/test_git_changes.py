@@ -105,6 +105,27 @@ async def test_output_is_bounded(tmp_path, monkeypatch, killpg_answer):
     assert len(result["output"].encode()) < 1100
 
 
+async def test_truncated_output_returns_even_when_more_than_asyncio_buffers_was_left_unread(tmp_path, monkeypatch):
+    import asyncio
+    import time
+
+    from local_agent import git_tools
+    path = tmp_path / "chatty-git"
+    path.write_text("#!/bin/sh\nexec head -c 5000000 /dev/zero\n")
+    path.chmod(0o755)
+    create = asyncio.create_subprocess_exec
+
+    async def slow_first_read(*args, **kwargs):
+        process = await create(*args, **kwargs)
+        await asyncio.sleep(.5)  # asyncio buffers past 128 KiB of output and pauses reading.
+        return process
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", slow_first_read)
+    started = time.monotonic()
+    _, raw, truncated = await asyncio.wait_for(git_tools.run_git(tmp_path, ["diff"], limit=1000, timeout=5, git=str(path)), 10)
+    assert truncated is True and len(raw) == 1000
+    assert time.monotonic() - started < 4
+
+
 def slow_git(tmp_path):
     """A stand-in for Git that records its process ID and then hangs."""
     pid = tmp_path / "git.pid"

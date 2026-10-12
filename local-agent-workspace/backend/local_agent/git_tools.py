@@ -81,7 +81,11 @@ async def run_git(workspace, arguments, *, filters=(), timeout=30, limit=None, g
             if len(raw) > limit:
                 raw, truncated = raw[:limit], True
                 kill_group(process.pid)
-            await process.wait()
+                # Read the rest: once over 128 KiB is buffered asyncio stops reading,
+                # never sees the end of the output, and wait() alone would not return.
+                await discard_output(process)
+            else:
+                await process.wait()
     except BaseException:
         if process is None:
             process = await spawning
