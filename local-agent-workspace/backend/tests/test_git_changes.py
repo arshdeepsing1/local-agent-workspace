@@ -105,13 +105,37 @@ async def test_output_is_bounded(tmp_path, monkeypatch, killpg_answer):
     assert len(result["output"].encode()) < 1100
 
 
+def slow_git(tmp_path):
+    """A stand-in for Git that records its process ID and then hangs."""
+    pid = tmp_path / "git.pid"
+    path = tmp_path / "slow-git"
+    path.write_text(f"#!/bin/sh\necho $$ > '{pid}'\nexec sleep 30\n")
+    path.chmod(0o755)
+    return path, pid
+
+
 async def test_a_timeout_stops_git_and_is_reported(tmp_path, killpg_answer):
+    import asyncio
+    import os
+
     from local_agent import git_tools
-    workspace = tmp_path / "project"
-    workspace.mkdir()
-    git(workspace, "init", "-q")
+    path, pid = slow_git(tmp_path)
     with pytest.raises(TimeoutError):
-        await git_tools.run_git(workspace, ["status"], timeout=0)
+        await asyncio.wait_for(git_tools.run_git(tmp_path, ["status"], timeout=1, git=str(path)), 10)
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pid.read_text()), 0)
+
+
+async def test_a_timeout_does_not_wait_for_a_git_that_cannot_be_stopped(tmp_path, unkillable_group):
+    import asyncio
+    import time
+
+    from local_agent import git_tools
+    path, _ = slow_git(tmp_path)
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(git_tools.run_git(tmp_path, ["status"], timeout=1, git=str(path)), 10)
+    assert unkillable_group and time.monotonic() - started < 5
 
 
 async def test_git_runs_without_a_shell_and_with_a_limited_environment(tmp_path, monkeypatch):

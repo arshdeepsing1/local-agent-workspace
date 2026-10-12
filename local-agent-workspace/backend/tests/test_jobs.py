@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from local_agent.jobs import CommandTimeout, JobManager, run_process, shell_argv, validate_command_options
+from local_agent.jobs import NOT_STOPPED, CommandTimeout, JobManager, run_process, shell_argv, validate_command_options
 from local_agent.store import Store
 
 
@@ -184,6 +184,43 @@ async def test_cancellation_while_process_creation_finishes_still_reaps_child(tm
     assert processes[0].returncode is not None
 
 
+async def test_a_timeout_does_not_wait_for_a_command_that_cannot_be_stopped(tmp_path, unkillable_group):
+    with pytest.raises(CommandTimeout) as caught:
+        await asyncio.wait_for(run_process("printf partial; sleep 30", tmp_path, timeout_seconds=1), 10)
+    assert "did not end when it was stopped" in str(caught.value)
+    assert caught.value.result == {"exit_code": None, "output": "partial\n" + NOT_STOPPED, "truncated": False}
+
+
+async def test_cancellation_during_creation_does_not_wait_for_a_command_that_cannot_be_stopped(
+        tmp_path, monkeypatch, unkillable_group):
+    original = asyncio.create_subprocess_exec
+    created = asyncio.Event()
+    release = asyncio.Event()
+    results = []
+
+    async def paused_creation(*args, **kwargs):
+        process = await original(*args, **kwargs)
+        created.set()
+        await release.wait()
+        return process
+
+    async def run():
+        try:
+            return await run_process("sleep 30", tmp_path)
+        except asyncio.CancelledError as error:
+            results.append(getattr(error, "result", None))
+            raise
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", paused_creation)
+    task = asyncio.create_task(run())
+    await asyncio.wait_for(created.wait(), 1)
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 10)
+    assert results == [{"exit_code": None, "output": NOT_STOPPED, "truncated": False}]
+
+
 async def test_job_stop_before_task_starts(store, tmp_path):
     manager = JobManager(store, lambda text: text, None)
     job = await manager.start("touch must-not-exist", tmp_path)
@@ -238,6 +275,16 @@ async def test_repeated_stop_retains_output_and_cleans_up(store, tmp_path):
     stopped = await asyncio.gather(manager.stop(job["id"]), manager.stop(job["id"]))
     assert all(item["state"] == "cancelled" and item["output"] == "before" for item in stopped)
     assert not (tmp_path / "must-not-exist").exists()
+
+
+async def test_stop_does_not_wait_for_a_command_that_cannot_be_stopped(store, tmp_path, unkillable_group):
+    manager = JobManager(store, lambda text: text, None)
+    job = await manager.start("printf before; sleep 30", tmp_path)
+    while manager.get(job["id"])["output"] != "before":
+        await asyncio.sleep(.01)
+    stopped = await asyncio.wait_for(manager.stop(job["id"]), 10)
+    assert stopped["state"] == "cancelled"
+    assert stopped["output"] == "before\n" + NOT_STOPPED
 
 
 async def test_cancelling_wait_leaves_job_for_explicit_stop(store, tmp_path):

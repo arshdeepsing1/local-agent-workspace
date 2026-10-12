@@ -12,6 +12,9 @@ from pathlib import Path
 MAX_ACTIVE_JOBS = 4
 MAX_COMPLETED_JOBS = 100
 UPDATE_TIMEOUT_SECONDS = 2
+KILL_GRACE_SECONDS = 5
+NOT_STOPPED = ("[The command did not end when it was stopped and may still be running, "
+               "for example as another user through sudo.]")
 ENVIRONMENT_KEYS = {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SHELL", "USER", "LOGNAME", "VIRTUAL_ENV"}
 
 
@@ -36,6 +39,8 @@ def kill_group(pid):
 
     A group with nothing left to stop raises ESRCH, or on macOS EPERM while its
     exited processes wait to be reaped (macOS still signals any that are running).
+    EPERM also means every running member belongs to another user, for example
+    through sudo, so wait for the command afterwards with settle(), not forever.
     """
     try:
         os.killpg(pid, signal.SIGKILL)
@@ -43,9 +48,21 @@ def kill_group(pid):
         pass
 
 
+async def settle(awaitable):
+    """Wait for a command whose group was just killed. False if it is still running
+    after KILL_GRACE_SECONDS; the wait is then cancelled."""
+    try:
+        async with asyncio.timeout(KILL_GRACE_SECONDS):
+            await awaitable
+    except TimeoutError:
+        return False
+    return True
+
+
 class CommandTimeout(TimeoutError):
-    def __init__(self, result):
-        super().__init__("Command exceeded its time limit and its process group was stopped.")
+    def __init__(self, result, stopped=True):
+        super().__init__("Command exceeded its time limit and its process group was stopped." if stopped else
+                         "Command exceeded its time limit and did not end when it was stopped; it may still be running.")
         self.result = result
 
 
@@ -59,12 +76,13 @@ async def run_process(command, workspace, timeout_seconds=60, max_output_bytes=8
         stderr=asyncio.subprocess.STDOUT, start_new_session=True))
     try:
         process = await asyncio.shield(spawning)
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as error:
         # Process creation can finish after its caller is cancelled. Acquire and
         # reap that process before propagating cancellation.
         process = await spawning
         kill_group(process.pid)
-        await process.communicate()
+        if not await settle(process.communicate()):
+            error.result = {"exit_code": None, "output": NOT_STOPPED, "truncated": False}
         raise
 
     output = ""
@@ -126,12 +144,16 @@ async def run_process(command, workspace, timeout_seconds=60, max_output_bytes=8
         # Always kill the group, even when the shell itself has already exited:
         # its children may still be running and holding the output pipe open.
         kill_group(process.pid)
-        await asyncio.gather(reader, return_exceptions=True)
+        # Cancelling the gather on a timeout also cancels the reader.
+        stopped = await settle(asyncio.gather(reader, return_exceptions=True))
         publisher.cancel()
         await asyncio.gather(publisher, return_exceptions=True)
-        await process.wait()
+        if stopped:
+            await process.wait()
+        else:
+            output += ("\n" if output else "") + NOT_STOPPED
         if isinstance(error, TimeoutError):
-            raise CommandTimeout(result()) from error
+            raise CommandTimeout(result(), stopped) from error
         if isinstance(error, asyncio.CancelledError):
             error.result = result()
         raise

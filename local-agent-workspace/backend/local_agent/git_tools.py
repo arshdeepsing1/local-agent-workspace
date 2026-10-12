@@ -13,7 +13,7 @@ import codecs
 import os
 import shutil
 
-from .jobs import ENVIRONMENT_KEYS, kill_group
+from .jobs import ENVIRONMENT_KEYS, kill_group, settle
 from .tools import SECRET_NAMES
 
 OUTPUT_LIMIT = 80_000
@@ -86,7 +86,7 @@ async def run_git(workspace, arguments, *, filters=(), timeout=30, limit=None, g
         if process is None:
             process = await spawning
         kill_group(process.pid)
-        await process.communicate()
+        await settle(process.communicate())
         raise
     return process.returncode, raw, truncated
 

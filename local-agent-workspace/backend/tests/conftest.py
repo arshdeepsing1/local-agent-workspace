@@ -1,5 +1,7 @@
+import asyncio
 import errno
 import os
+import signal
 
 import pytest
 
@@ -23,3 +25,26 @@ def killpg_answer(request, monkeypatch):
             raise PermissionError(errno.EPERM, "Operation not permitted")
         monkeypatch.setattr(os, "killpg", not_permitted)
     return request.param
+
+
+@pytest.fixture
+async def unkillable_group(monkeypatch):
+    """Make os.killpg answer EPERM without signalling, as for a command whose running
+    processes all belong to another user (for example through sudo), and shorten
+    the grace period after a kill. The groups are killed for real afterwards."""
+    from local_agent import jobs
+    killpg = os.killpg
+    groups = set()
+
+    def not_permitted(pid, sig):
+        groups.add(pid)
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+    monkeypatch.setattr(os, "killpg", not_permitted)
+    monkeypatch.setattr(jobs, "KILL_GRACE_SECONDS", 0.5)
+    yield groups
+    for pid in groups:
+        try:
+            killpg(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    await asyncio.sleep(0.2)  # Let the event loop reap them before it closes.
