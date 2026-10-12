@@ -54,6 +54,18 @@ def filter_overrides(names):
     return options
 
 
+def kill_group(pid):
+    """Stop a command started in its own session, and anything it started.
+
+    A group that has already exited raises ESRCH; on macOS it raises EPERM while
+    the exited leader waits to be reaped. Either way there is nothing left to stop.
+    """
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 async def run_git(workspace, arguments, *, filters=(), timeout=30, limit=None, git=None):
     """Run `git <arguments>` in workspace. Returns (exit code, output bytes, truncated).
 
@@ -81,18 +93,12 @@ async def run_git(workspace, arguments, *, filters=(), timeout=30, limit=None, g
                 raw += chunk
             if len(raw) > limit:
                 raw, truncated = raw[:limit], True
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                kill_group(process.pid)
             await process.wait()
     except BaseException:
         if process is None:
             process = await spawning
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        kill_group(process.pid)
         await process.communicate()
         raise
     return process.returncode, raw, truncated

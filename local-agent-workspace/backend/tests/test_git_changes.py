@@ -91,8 +91,26 @@ def test_a_folder_that_is_not_a_repository_gets_a_readable_message(client):
     assert "not a git repository" in result["output"] and result["exit_code"] != 0
 
 
-async def test_output_is_bounded(tmp_path, monkeypatch):
+def report_kills_as_not_permitted(monkeypatch):
+    """Answer os.killpg as macOS does for a group whose leader has exited but is not yet reaped."""
+    import errno
+    import os
+    killpg = os.killpg
+
+    def not_permitted(pid, sig):
+        try:
+            killpg(pid, sig)
+        except ProcessLookupError:
+            pass
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+    monkeypatch.setattr(os, "killpg", not_permitted)
+
+
+@pytest.mark.parametrize("macos", [False, True], ids=["killpg", "killpg-not-permitted"])
+async def test_output_is_bounded(tmp_path, monkeypatch, macos):
     from local_agent import git_tools
+    if macos:
+        report_kills_as_not_permitted(monkeypatch)
     workspace = tmp_path / "big"
     workspace.mkdir()
     git(workspace, "init", "-q")
@@ -103,6 +121,16 @@ async def test_output_is_bounded(tmp_path, monkeypatch):
     assert result["truncated"] is True and result["exit_code"] is None
     assert result["output"].endswith("[Output limit reached: showing the first 1 KB.]")
     assert len(result["output"].encode()) < 1100
+
+
+async def test_a_timeout_is_reported_even_when_macos_says_the_exited_git_is_not_permitted(tmp_path, monkeypatch):
+    from local_agent import git_tools
+    report_kills_as_not_permitted(monkeypatch)
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    git(workspace, "init", "-q")
+    with pytest.raises(TimeoutError):
+        await git_tools.run_git(workspace, ["status"], timeout=0)
 
 
 async def test_git_runs_without_a_shell_and_with_a_limited_environment(tmp_path, monkeypatch):
