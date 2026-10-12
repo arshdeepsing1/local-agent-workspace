@@ -50,6 +50,10 @@
 // ChangeDiff (GET /sessions/<id>/changes/diff?path=): { path, status, added, removed,
 //   baseline_hash, current_hash, hunks: [{ index, line, added, removed }],
 //   lines: [{ kind: 'context'|'removed'|'added', text, old?, new?, hunk?, newline? }] }
+// WorkspaceFolders (GET, POST { path } and DELETE { path } /workspace-folders?session_id=, the
+//   session optional): the project's folders added to Files, view only (the agent's access is
+//   unchanged). { workspace (absolute project path), folders: [{ path (absolute), missing: boolean }],
+//   added? (POST only: the resolved path of the folder just added, or already listed) }
 
 export function modelLabel(model) {
   return model.replace(/^databricks-/, '').replace(/^system\.ai\./, '')
