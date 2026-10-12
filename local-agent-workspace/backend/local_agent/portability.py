@@ -66,6 +66,10 @@ class Event(Record):
     output: str | None = None
     preview: str | None = None
     state: Literal["pending", "running", "completed", "rejected", "cancelled", "error"] | None = None
+    approval: Literal["approved", "declined", "expired"] | None = None
+    approval_expires: float | None = None
+    decline_note: str | None = None
+    allowed_by_rule: bool | None = None
     call_id: str | None = None
     child_session_id: str | None = None
     origin: Origin | None = None
@@ -399,7 +403,7 @@ def fresh_copies(bundle, workspace, *, kind="import"):
         parent_event = source.pop("parent_event_id", None)
         parent_call = source.pop("parent_call_id", None)
         source.update(id=ids[old_id], workspace=workspace, created=now, updated=now,
-                      permission_mode="manual", allowed_directories=[], active_skills=[],
+                      permission_mode="manual", allowed_directories=[], allow_rules=[], active_skills=[],
                       provenance={"kind": kind, "source_session_id": old_id, "source_workspace": source["workspace"],
                                   "source_created": source["created"], "copied_at": now})
         if old_id == bundle["root_session_id"] and kind == "fork":

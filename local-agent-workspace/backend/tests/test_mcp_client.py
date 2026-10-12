@@ -4,7 +4,6 @@ import os
 import signal
 import socket
 import sys
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest

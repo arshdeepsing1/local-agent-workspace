@@ -32,9 +32,15 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         <label>Agent steps per message<input type="number" required min=${1} max=${64} step=${1}
           value=${form.max_agent_steps || ''} onInput=${number('max_agent_steps')} /></label>
         <p class="field-help">Limits model round trips for one message, not individual tool calls. One model response can request several tools. The default is 32.</p>
+        <label>Approval wait (minutes)<input type="number" required min=${0} max=${1440} step=${1}
+          value=${form.approval_timeout_minutes ?? 60} onInput=${number('approval_timeout_minutes')} /></label>
+        <p class="field-help">How long an approval card waits for your answer (default 60). After that the action does not run and the agent is told nobody answered. 0 waits until you answer or press Stop, but a waiting card keeps the chat busy, which blocks Undo and Recovery in this project.</p>
         <label class="settings-checkbox"><input type="checkbox" checked=${form.compaction_handoffs !== false}
           onChange=${e => field('compaction_handoffs', e.currentTarget.checked)} />Save a detailed handoff at each compaction</label>
         <p class="field-help">When earlier turns are compacted, the model writes a detailed handoff (up to 16,000 output tokens) that the app saves to handoffs/auto/ in the project folder with an exact log of every command. The model is told where to find it after compaction. Compaction then takes a few minutes longer and uses more output tokens.</p>
+        <label class="settings-checkbox"><input type="checkbox" checked=${form.system_notifications === true}
+          onChange=${e => field('system_notifications', e.currentTarget.checked)} />Desktop notification when no browser tab is open</label>
+        <p class="field-help">When no page of this app is open, the server shows a system notification when a conversation needs approval, finishes, or stops with an error (notify-send on Linux, osascript on macOS). It names only the status and the conversation title.</p>
         <label>Credential file<input value=${form.env_file} onInput=${e => field('env_file', e.currentTarget.value)} placeholder="/path/to/env_vars.txt" /></label>
         <p class="field-help">Read on the server. Use DBRICKS_URL and DBRICKS_TOKEN assignments. Environment variables also work.</p>
         <p class="settings-note">Project and model changes apply to new conversations. Use Folder access above the chat input to allow additional folders. Commands run according to your selected permission mode.</p>

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import re
 import time
 import uuid
@@ -19,10 +20,11 @@ from .context import (
     estimate_scale, estimate_tokens, handoff_output_tokens, prepare_context, summary_byte_limit,
 )
 from .tools import LIMIT as FILE_LIMIT
-from .config import DEFAULT_MAX_AGENT_STEPS
+from .config import DEFAULT_APPROVAL_MINUTES, DEFAULT_MAX_AGENT_STEPS
 from .instructions import load_project_instructions
 from .jobs import JobManager, validate_command_options
 from .recovery import CheckpointManager
+from .changes import ChangeReview
 from .worktrees import WorktreeManager
 from .extensions import ExtensionManager
 from .planning import TaskManager, DelegateManager
@@ -37,6 +39,9 @@ from .telemetry import (
 from .model_stream import ToolCallBuffer, error_body_prefix, sse_data
 from .tool_schema import validate_arguments
 from .drafts import DraftPersistenceError, STORAGE_ERRORS, StreamDraft
+from .store import UnreadableConversation
+from .approvals import MAX_ALLOW_RULES, allowed_by_rule, declined, rule_for
+from .notify import SystemNotifier, attention_message
 
 
 MAX_OUTPUT_LIMIT_RETRIES = 2
@@ -45,6 +50,7 @@ HANDOFF_FOLDER = "handoffs/auto"
 # quote, and before the end, a space or closing punctuation. "/tmp/x" or "~/x" never match.
 SKILL_COMMAND = re.compile(r"(?<![^\s(\[{\"'`])/([A-Za-z0-9][A-Za-z0-9_.-]*)(?![^\s)\]},;:!?\"'`])")
 MAX_RATE_LIMIT_RETRIES = 3
+SOCKET_SEND_TIMEOUT = 5.0  # seconds one WebSocket send may take before the page is dropped
 RATE_LIMIT_RETRY_DELAYS = (5.0, 15.0, 40.0)
 OUTPUT_LIMIT_HISTORY_PLACEHOLDER = (
     "[The previous response reached the configured output-token limit. Its partial text was omitted from "
@@ -157,6 +163,26 @@ def current_time_text(now=None):
     offset = f"{offset[:3]}:{offset[3:]}" if len(offset) == 5 else offset
     return (f"Current local date and time: {now:%Y-%m-%d %H:%M} {now.tzname()} (UTC{offset}). "
             "Use it for dates; do not infer today's date from file names.")
+
+
+FILE_VIEW_LIMIT = 500  # files whose last read or write a conversation remembers
+FILE_VIEW_CHECK_LIMIT = 200  # of those, the most recent checked before each model request
+CHANGED_FILE_NAMES = 10
+
+
+def file_fingerprint(path):
+    """[size, mtime_ns] of an existing file, or None."""
+    try:
+        info = os.stat(path)
+    except (OSError, ValueError):
+        return None
+    return [info.st_size, info.st_mtime_ns]
+
+
+def changed_files_text(names, total):
+    more = f" and {total - len(names)} more" if total > len(names) else ""
+    return ("Files changed since you last read or wrote them (by the user, an undo, or a command): "
+            f"{', '.join(names)}{more}. Read a file again before editing it.")
 
 
 def output_limit_text(max_output_tokens):
@@ -275,10 +301,19 @@ def repair_tool_history(wire, events, state):
     return repaired, state
 
 
+def unanswered(event, declined):
+    """The model-facing result of an approval that was declined or never answered."""
+    if event.get("approval") == "expired":
+        return ("The user did not answer this approval request in time, so it did not run. "
+                "Ask the user before trying it again.")
+    return declined
+
+
 def public_session(session, status="idle"):
-    return {"permission_mode": "manual", "allowed_directories": [],
+    return {"permission_mode": "manual", "allowed_directories": [], "allow_rules": [],
             **{k: v for k, v in session.items()
-               if k not in ("wire", "context_state", "instruction_directories", "inference_calls", "command_jobs")},
+               if k not in ("wire", "context_state", "instruction_directories", "inference_calls", "command_jobs",
+                            "file_views", "turn_running")},
             "status": status}
 
 
@@ -288,32 +323,67 @@ class AgentManager:
         self.live = {}
         self.tasks = {}
         self.listeners = {}
+        self.closing_sockets = set()
+        self.pages = set()  # Presence sockets: one per open page, with or without a chat selected.
         self.pending = {}
         self.statuses = {}
         self.checkpoints = CheckpointManager(store)
+        self.changes = ChangeReview(store, self.checkpoints)
         self.worktrees = WorktreeManager(store, settings.state_dir)
         self.extensions = ExtensionManager(settings)
         self.task_board = TaskManager(store)
         self.delegates = DelegateManager(self)
         self.extension_connections = {}
+        self.notifier = SystemNotifier()
         self.jobs = JobManager(store, settings.redact, self.job_update, redaction_tokens=self.redaction_tokens)
         for summary in store.list():
-            session = store.get(summary["id"])
-            interrupted = False
-            for call in session.get("inference_calls", []):
-                if isinstance(call, dict) and call.get("status") == "running":
-                    finish_inference_call(call, {"status": "interrupted", "error_kind": "incomplete_response"})
-                    interrupted = True
-            for event in session["events"]:
-                if event.get("state") in ("running", "pending"):
-                    event["state"] = "cancelled"
-                    interrupted = True
-                if event.get("request_info", {}).get("status") == "running":
-                    event["request_info"].update(status="interrupted", error_kind="incomplete_response")
-                    interrupted = True
+            try:
+                session = store.get(summary["id"])
+                if session is None:
+                    continue
+                interrupted = self.mark_interrupted(session)
+            except (ValueError, OSError, TypeError, AttributeError, KeyError) as exc:
+                # One unreadable conversation must not stop the app. It stays on
+                # disk unchanged and is reported instead of listed.
+                store.record_problem(f"{summary['id']}.jsonl", exc.reason if isinstance(exc, UnreadableConversation)
+                                     else "its records could not be loaded")
+                continue
             if interrupted:
                 store.save(session)
         self.delegates.recover()
+
+    @staticmethod
+    def mark_interrupted(session):
+        """Close work that was running when the app last stopped; True if anything changed.
+
+        run() keeps turn_running until the model loop ends. A title request (after the
+        answer completed) or a manual compaction outside a turn is closed as interrupted
+        but does not make the turn incomplete. Older records without the marker count as
+        cut short when an agent request or a tool was still running.
+        """
+        cut_short = session.pop("turn_running", False) is True
+        changed = cut_short
+        for call in session.get("inference_calls", []):
+            if isinstance(call, dict) and call.get("status") == "running":
+                finish_inference_call(call, {"status": "interrupted", "error_kind": "incomplete_response"})
+                changed = True
+                cut_short |= call.get("purpose") == "agent"
+        for event in session["events"]:
+            if event.get("state") in ("running", "pending"):
+                event["state"] = "cancelled"
+                changed = cut_short = True
+            if event.get("request_info", {}).get("status") == "running":
+                event["request_info"].update(status="interrupted", error_kind="incomplete_response")
+                changed = cut_short = True
+        if cut_short:
+            session["terminal_reason"] = "interrupted"  # Continue is offered; notifications report it.
+        if "turn_ended" in session and session["turn_ended"] is None:
+            if not cut_short:
+                # Stopped while naming the chat: the answer itself had finished.
+                session["terminal_reason"] = "completed"
+            session["turn_ended"] = time.time()  # The turn ended when the server stopped.
+            changed = True
+        return changed
 
     def workspace_available(self, workspace):
         from pathlib import Path
@@ -391,11 +461,15 @@ class AgentManager:
                 return
             if not hook["enabled"] or hook["event"] != phase or ("tools" in hook and name not in hook["tools"]):
                 continue
+            by_rule = (session.get("permission_mode") != "bypassPermissions"
+                       and allowed_by_rule(session, f"hook_{phase}", {"hook_id": hook["id"]}))
             event = await self.event(session, "tool", name=f"hook_{phase}", state="running", input={"hook_id": hook["id"], "tool": name, "call_id": call_id},
-                                     preview=f"Hook: {hook['id']}\nFor tool: {name}\nCommand: {hook['command']}\nTimeout: {hook['timeout_seconds']} seconds", output="")
+                                     preview=f"Hook: {hook['id']}\nFor tool: {name}\nCommand: {hook['command']}\nTimeout: {hook['timeout_seconds']} seconds", output="",
+                                     **({"allowed_by_rule": True} if by_rule else {}))
             try:
-                if session.get("permission_mode") != "bypassPermissions" and not await self.approve(session, event):
-                    raise ValueError("Hook approval declined.")
+                if session.get("permission_mode") != "bypassPermissions" and not by_rule and not await self.approve(session, event):
+                    raise ValueError("Hook approval was not answered in time." if event.get("approval") == "expired"
+                                     else declined(event, "this hook", f"Do not retry {name} without a new instruction."))
                 if asyncio.current_task().cancelling():
                     return
                 payload = {"event": phase, "session_id": session["id"], "tool": name, "arguments": arguments, "call_id": call_id}
@@ -481,15 +555,76 @@ class AgentManager:
     async def broadcast(self, session_id, data):
         sockets = tuple(self.listeners.get(session_id, set()))
         if sockets:
-            results = await asyncio.gather(*(s.send_json(data) for s in sockets), return_exceptions=True)
+            # A stalled browser must not hold up generation, Stop or saves. A dropped
+            # page reconnects and receives a fresh snapshot.
+            results = await asyncio.gather(*(asyncio.wait_for(s.send_json(data), SOCKET_SEND_TIMEOUT) for s in sockets),
+                                           return_exceptions=True)
             for socket, result in zip(sockets, results):
                 if isinstance(result, Exception):
                     self.listeners.get(session_id, set()).discard(socket)
+                    self.close_socket(socket)
 
-    async def status(self, session, status):
+    def close_socket(self, socket):
+        """Close a dropped socket in the background, giving up after the send deadline."""
+        async def close():
+            try:
+                await asyncio.wait_for(socket.close(code=1011), SOCKET_SEND_TIMEOUT)
+            except Exception:
+                pass
+        task = asyncio.create_task(close())
+        self.closing_sockets.add(task)
+        task.add_done_callback(self.closing_sockets.discard)
+
+    async def status(self, session, status, turn_ended=False):
+        """turn_ended: this idle status ends a turn (not a manual compaction)."""
+        previous = self.statuses.get(session["id"], "idle")
         self.statuses[session["id"]] = status
-        await self.broadcast(session["id"], {"type": "status", "status": status})
+        message = {"type": "status", "status": status}
+        if status == "idle":
+            # How and when the last turn ended, for notifications and the Continue button.
+            message.update({key: session[key] for key in ("terminal_reason", "turn_ended", "turn_delegated")
+                            if session.get(key)})
+        await self.broadcast(session["id"], message)
+        self.notify_status(session, previous, status, turn_ended)
         await self.delegates.progress(session, status=status)
+        if status == "idle":
+            # Commands can also change reviewed files; refresh their counts after each turn.
+            await self.publish_changes(session, only_tracked=True)
+
+    def notify_status(self, session, previous, status, turn_ended=False):
+        """A desktop notification of the change, only if enabled and no page is open."""
+        if self.settings.values.get("system_notifications") is not True or self.pages or any(self.listeners.values()):
+            return
+        # Titles stored before redaction, too; redacted before attention_message cuts them.
+        title = self.redact_title(str(session.get("title") or ""))
+        message = attention_message({**session, "title": title}, previous, status, turn_ended)
+        if message:
+            self.notifier.send(message)
+
+    def redact_title(self, text):
+        """Text shown outside the chat (titles, notifications) without credentials or secret shapes."""
+        return self.settings.redact(redact_secrets(text))
+
+    def session_tools(self, session):
+        return WorkspaceTools(session["workspace"], self.settings.values["env_file"], session.get("allowed_directories", []),
+                              session.get("permission_mode", "manual") == "bypassPermissions")
+
+    async def publish_changes(self, session, tools=None, only_tracked=False):
+        """Send the conversation's unreviewed agent file changes to its open pages."""
+        if not self.listeners.get(session["id"]):
+            return
+        try:
+            if only_tracked and not self.changes.has(session["id"]):
+                return
+            changes = self.changes.list(session["id"], tools or self.session_tools(session))
+        except (*STORAGE_ERRORS, ValueError, UnicodeError) as exc:
+            changes = {"files": [], "added": 0, "removed": 0, "error": self.settings.redact(file_error(exc))}
+        await self.broadcast(session["id"], {"type": "changes", "changes": changes})
+
+    async def publish_tasks(self, session_id):
+        """Send the conversation's task list to its open pages (the live checklist)."""
+        if self.listeners.get(session_id):
+            await self.broadcast(session_id, {"type": "tasks", "tasks": self.task_board.list(session_id)})
 
     async def event(self, session, kind, **values):
         event = {"id": str(uuid.uuid4()), "type": kind, "created": time.time(), **values}
@@ -514,26 +649,64 @@ class AgentManager:
         await self.broadcast(session["id"], {"type": "delta", "id": event["id"], "text": text})
 
     async def approve(self, session, event):
+        """Wait for the user's answer; event["approval"] records approved, declined or expired."""
         future = asyncio.get_running_loop().create_future()
         key = (session["id"], event["id"])
         self.pending[key] = future
+        minutes = self.settings.values.get("approval_timeout_minutes", DEFAULT_APPROVAL_MINUTES)
+        seconds = minutes * 60 if type(minutes) is int and minutes > 0 else None  # None waits until answered or stopped.
         try:
-            await self.update_event(session, event, state="pending")
+            await self.update_event(session, event, state="pending",
+                                    **({"approval_expires": time.time() + seconds} if seconds else {}))
             await self.status(session, "awaiting_approval")
-            allowed = await asyncio.wait_for(future, timeout=300)
+            answer = await asyncio.wait_for(future, timeout=seconds)
+            answer = answer if isinstance(answer, dict) else {"allowed": bool(answer)}
+            allowed = answer["allowed"]
+            outcome = "approved" if allowed else "declined"
         except TimeoutError:
-            allowed = False
+            allowed, outcome, answer = False, "expired", {}
         finally:
             self.pending.pop(key, None)
-        await self.update_event(session, event, state="running" if allowed else "rejected")
+        rule = answer.get("rule") if allowed else None
+        if rule and rule not in session.setdefault("allow_rules", []):
+            session["allow_rules"].append(rule)
+        await self.update_event(session, event, state="running" if allowed else "rejected", approval=outcome,
+                                **({"decline_note": answer["note"]} if not allowed and answer.get("note") else {}))
+        if rule:
+            await self.publish_permissions(session)
         await self.status(session, "running")
         return allowed
 
-    def decide(self, session_id, event_id, allowed):
+    def decide(self, session_id, event_id, allowed, remember=False, note=None):
+        """Answer a pending card. remember stores an exact allow rule for this chat;
+        note (Decline only) is returned to the model with the decline."""
         future = self.pending.get((session_id, event_id))
         if not future or future.done():
             raise ValueError("This approval is no longer pending.")
-        future.set_result(allowed)
+        answer = {"allowed": bool(allowed)}
+        if remember:
+            if not allowed:
+                raise ValueError("Only an approval can be remembered for this chat.")
+            session = self.get(session_id) or {}
+            event = next((item for item in session.get("events", []) if item.get("id") == event_id), {})
+            rule = rule_for(event.get("name"), event.get("input"))
+            if rule is None:
+                raise ValueError("This action cannot be allowed for the whole chat.")
+            rules = session.get("allow_rules") or []
+            if rule not in rules and len(rules) >= MAX_ALLOW_RULES:
+                raise ValueError(f"This chat already allows {MAX_ALLOW_RULES} actions. Remove one in the Permissions menu first.")
+            answer["rule"] = rule
+        note = note.strip() if isinstance(note, str) else ""
+        if note:
+            if allowed:
+                raise ValueError("A note can only be sent with Decline.")
+            answer["note"] = self.settings.redact(note)
+        future.set_result(answer)
+
+    async def publish_permissions(self, session):
+        await self.broadcast(session["id"], {"type": "permissions", "permission_mode": session.get("permission_mode", "manual"),
+                                               "allowed_directories": session.get("allowed_directories", []),
+                                               "allow_rules": session.get("allow_rules", [])})
 
     def start(self, session_id, prompt):
         if session_id in self.tasks and not self.tasks[session_id].done():
@@ -561,10 +734,10 @@ class AgentManager:
         if task and task.cancelled() and self.tasks.get(session_id) is task:
             session = self.live.pop(session_id, None)
             if session is not None:
-                session["terminal_reason"] = "stopped"
+                session.update(terminal_reason="stopped", turn_ended=time.time())
                 self.store.save(session)
                 await self.delegates.progress(session, terminal_reason="stopped")
-                await self.status(session, "idle")
+                await self.status(session, "idle", turn_ended=True)
 
     async def run(self, session, prompt):
         terminal_reason = "completed"
@@ -582,22 +755,28 @@ class AgentManager:
             await self.broadcast(session["id"], {"type": "event", "event": error})
 
         try:
-            await self.status(session, "running")
+            # Saved with the user event. turn_running (internal) lasts until the model loop
+            # ends and tells restart recovery the answer was cut short; turn_ended is None
+            # while the turn runs and records when it ended (notifications).
             origin = {}
             if session.get("parent_event_id") and not session["events"] and not session.get("delegation", {}).get("terminal_reason"):
                 origin = {"origin": {"kind": "delegated", "parent_session_id": session["parent_session_id"],
                                      "parent_event_id": session["parent_event_id"], "parent_call_id": session.get("parent_call_id")}}
+            # turn_delegated: the parent's delegate_task started this turn and reports its end.
+            session.update(turn_running=True, turn_ended=None, turn_delegated=bool(origin))
+            await self.status(session, "running")
             await self.event(session, "user", text=prompt, **origin)
             if session["title"] == "New conversation" and not session.get("title_generated"):
-                session["title"] = fallback_title(prompt)
+                session["title"] = fallback_title(prompt, self.redact_title)
                 self.store.save(session)
                 await self.broadcast(session["id"], {"type": "title", "title": session["title"]})
             completed = await self.run_databricks(session, prompt)
-            if completed and needs_title(session):
+            session.pop("turn_running", None)  # The answer is finished; naming is not part of it.
+            if completed and needs_title(session, self.redact_title):
                 previous_title = session["title"]
                 await self.status(session, "naming")
                 title = await generate_title(self.settings, session, self.store.save)
-                if title and needs_title(session) and session["title"] == previous_title:
+                if title and needs_title(session, self.redact_title) and session["title"] == previous_title:
                     session.update(title=title, title_generated=True)
                     self.store.save(session)
                     await self.broadcast(session["id"], {"type": "title", "title": title})
@@ -651,17 +830,20 @@ class AgentManager:
                     terminal_reason = "error"
                 if terminal_reason == "completed" and any(item.get("state") == "error" for item in events):
                     terminal_reason = "tool_error"
-            session["terminal_reason"] = terminal_reason
+            for event in updates:
+                await self.broadcast(session["id"], {"type": "event", "event": event})
+            # Set and saved right before the idle status, with no await in between on success,
+            # so a sessions poll never sees a new turn_ended while the chat still looks busy.
+            session.update(terminal_reason=terminal_reason, turn_ended=time.time())
+            session.pop("turn_running", None)
             try:
                 self.store.save(session)
             except STORAGE_ERRORS as exc:
                 session["terminal_reason"] = "error"
                 await report_storage_failure(exc)
-            for event in updates:
-                await self.broadcast(session["id"], {"type": "event", "event": event})
             self.live.pop(session["id"], None)
             try:
-                await self.status(session, "idle")
+                await self.status(session, "idle", turn_ended=True)
             except STORAGE_ERRORS as exc:
                 await report_storage_failure(exc)
 
@@ -699,15 +881,22 @@ class AgentManager:
                     raise ValueError("Project or skill instructions changed. Review refreshed guidance before using MCP tools.")
                 if name not in mcp_names:
                     raise ValueError("MCP tool is not available in this turn.")
-                await self.update_event(session, event, preview=json.dumps(arguments, indent=2))
-                if decision == "ask" and not await self.approve(session, event):
-                    output = "User declined this MCP action. Do not retry it without a new instruction."
+                by_rule = decision == "ask" and allowed_by_rule(session, name, arguments)
+                await self.update_event(session, event, preview=json.dumps(arguments, indent=2),
+                                        **({"allowed_by_rule": True} if by_rule else {}))
+                if decision == "ask" and not by_rule and not await self.approve(session, event):
+                    output = unanswered(event, declined(event, "this MCP action"))
                     await self.update_event(session, event, output=output)
                     return output
             if name in ("list_files", "read_file", "search_files", "write_file", "edit_file"):
-                if not await self.ensure_access(session, tools, arguments.get("path", "."), name in ("list_files", "search_files")):
-                    output = "User declined folder access. Do not retry or use a command to circumvent this decision."
-                    await self.update_event(session, event, state="rejected", output=output)
+                access = {}
+                if not await self.ensure_access(session, tools, arguments.get("path", "."), name in ("list_files", "search_files"), access):
+                    output = ("The user did not answer the folder access request in time, so this file tool did not run. "
+                              "Ask the user before trying again." if access["approval"] == "expired" else
+                              declined(access, "folder access", "Do not retry or use a command to circumvent this decision."))
+                    # The file tool did not run because of the access card's answer; show the same outcome on it.
+                    await self.update_event(session, event, state="rejected", output=output, approval=access["approval"],
+                                            **({"decline_note": access["decline_note"]} if access.get("decline_note") else {}))
                     return output
                 target = tools.path(arguments.get("path", "."))
                 if target.is_relative_to(tools.root):
@@ -724,6 +913,13 @@ class AgentManager:
                 original = None
                 if name != "run_command" and tools.path(arguments["path"]).exists():
                     original = tools.read_file(arguments["path"])
+                # Overwriting needs the file as this conversation last saw it. edit_file
+                # needs exact old_text instead; the app-generated activity log is exempt.
+                guarded = name == "write_file" and activity is None and original is not None
+                refusal = guarded and self.overwrite_refusal(session, tools, arguments["path"])
+                if refusal:
+                    await self.update_event(session, event, state="rejected", output=refusal)
+                    return refusal
                 if activity is not None:
                     content, activity = activity_content(
                         session, original, [*session.get("command_jobs", []), *self.jobs.list(session_id=session["id"])],
@@ -738,9 +934,10 @@ class AgentManager:
                                + ("\nBackground job: continues after this chat turn; stop it in Terminal or with stop_job." if arguments.get("background") else "\nForeground command: Stop response also stops this job."))
                 else:
                     preview = tools.change(name, arguments)
-                await self.update_event(session, event, preview=preview)
-                if decision == "ask" and not await self.approve(session, event):
-                    output = "User declined this action. Do not retry it without a new instruction."
+                by_rule = decision == "ask" and allowed_by_rule(session, name, arguments)
+                await self.update_event(session, event, preview=preview, **({"allowed_by_rule": True} if by_rule else {}))
+                if decision == "ask" and not by_rule and not await self.approve(session, event):
+                    output = unanswered(event, declined(event))
                     await self.update_event(session, event, output=output)
                     return output
                 if not self.guidance_matches(session, tools):
@@ -749,6 +946,8 @@ class AgentManager:
                     current = tools.read_file(arguments["path"]) if tools.path(arguments["path"]).exists() else None
                     if current != original:
                         raise ValueError("The file changed while waiting for approval. Read it again and propose a fresh edit.")
+                    if guarded and (refusal := self.overwrite_refusal(session, tools, arguments["path"])):
+                        raise ValueError(refusal)
             if mode == "auto" and name in COMMAND_TOOLS and decision == "allow":
                 arguments = {**arguments, "command": BASIC_COMMANDS[arguments["command"].strip()]}
             await self.run_hooks(session, "before_tool", name, arguments, call_id=call_id)
@@ -760,12 +959,16 @@ class AgentManager:
                     current = tools.read_file(arguments["path"]) if tools.path(arguments["path"]).exists() else None
                     if current != original:
                         raise ValueError("The file changed before execution. Read it again and propose a fresh edit.")
+                    if guarded and (refusal := self.overwrite_refusal(session, tools, arguments["path"])):
+                        raise ValueError(refusal)
             invoked = True
             if name.startswith("mcp__"):
                 result = await connection.call(name, arguments)
             elif name in ("write_file", "edit_file"):
                 turn_id = next((item["id"] for item in reversed(session["events"]) if item["type"] == "user"), None)
-                result = self.checkpoints.apply_edit(tools, name, arguments, session_id=session["id"], turn_id=turn_id)
+                result = self.checkpoints.apply_edit(tools, name, arguments, session_id=session["id"], turn_id=turn_id,
+                                                     on_applied=lambda record: self.changes.track(record, tools))
+                self.remember_file(session, tools.path(arguments["path"]))
                 if activity is not None:
                     # Return a compact result: the diff would put the whole log back into context.
                     result = {"path": arguments["path"], **activity}
@@ -778,12 +981,17 @@ class AgentManager:
                 tasks = self.task_board.list(session["id"])
                 items = [{key: item[key] for key in ("id", "title", "status", "depends_on")} for item in tasks]
                 result = self.metadata_page(items, arguments.get("offset", 0), "tasks")
+            elif name == "get_task":
+                task = self.task_board.get(session["id"], arguments["task_id"])
+                result = {key: task[key] for key in ("id", "title", "description", "status", "depends_on")}
             elif name == "create_task":
                 task = self.task_board.create(session["id"], **arguments)
                 result = {key: task[key] for key in ("id", "title", "status", "depends_on")}
+                await self.publish_tasks(session["id"])
             elif name == "update_task":
                 task = self.task_board.update(session["id"], arguments["task_id"], {k: v for k, v in arguments.items() if k != "task_id"})
                 result = {key: task[key] for key in ("id", "title", "status", "depends_on")}
+                await self.publish_tasks(session["id"])
             elif name == "delegate_task":
                 await self.status(session, "delegating")
                 try:
@@ -810,12 +1018,20 @@ class AgentManager:
                 if name == "stop_job":
                     job = await self.jobs.stop(job["id"])
                 result = self.job_output(job, arguments.get("offset", 0), arguments.get("max_chars", 4000))
+            elif name == "read_file":
+                # Stat first: a change during the read then counts as unseen.
+                target = tools.path(arguments["path"])
+                seen = file_fingerprint(target)
+                result = await tools.execute(name, arguments)
+                self.remember_file(session, target, seen)
             else:
                 result = await tools.execute(name, arguments)
             output = result if isinstance(result, str) else json.dumps(result, indent=2)
             output = self.settings.redact(output)
             failed = name.startswith("mcp__") and isinstance(result, dict) and result.get("is_error") is True
             await self.update_event(session, event, state="error" if failed else "completed", output=output)
+            if name in ("write_file", "edit_file"):
+                await self.publish_changes(session, tools)
             await self.run_hooks(session, "after_tool", name, arguments, result, call_id=call_id)
             command_failed = (name == "run_command" and isinstance(result, dict) and not result.get("background")
                               and result.get("state") in {"failed", "timed_out"})
@@ -828,7 +1044,55 @@ class AgentManager:
                 await self.run_hooks(session, "tool_failure", name, arguments, call_id=call_id, error=output)
         return output
 
-    async def ensure_access(self, session, tools, value, directory=False):
+    @staticmethod
+    def remember_file(session, target, fingerprint=None):
+        """Record a file as this conversation last read or wrote it."""
+        views = session.get("file_views")
+        views = dict(views) if isinstance(views, dict) else {}
+        views.pop(str(target), None)
+        fingerprint = fingerprint or file_fingerprint(target)
+        if fingerprint is not None:
+            views[str(target)] = fingerprint
+        while len(views) > FILE_VIEW_LIMIT:
+            views.pop(next(iter(views)))
+        session["file_views"] = views
+
+    @staticmethod
+    def overwrite_refusal(session, tools, path):
+        """Why write_file may not replace this existing file yet, or None."""
+        target = tools.path(path)
+        current = file_fingerprint(target)
+        if current is None:
+            return None
+        views = session.get("file_views") if isinstance(session.get("file_views"), dict) else {}
+        name = tools.display_path(target)
+        if str(target) not in views:
+            return f"Read {name} before overwriting it: this conversation has not read it yet. Use read_file, then write again."
+        if views[str(target)] != current:
+            return (f"Read {name} again before overwriting it: it changed since you last read or wrote it (for example "
+                    "the user edited it, undid an agent change, or a command changed it). Use read_file, then write again.")
+        return None
+
+    @staticmethod
+    def changed_files_notice(session, tools):
+        """One line naming remembered files that changed or disappeared, or ""."""
+        views = session.get("file_views")
+        if not isinstance(views, dict) or not views:
+            return ""
+        changed, missing = [], []
+        for path, seen in list(views.items())[-FILE_VIEW_CHECK_LIMIT:][::-1]:
+            current = file_fingerprint(path)
+            if current != seen:
+                changed.append(tools.display_path(Path(path)))
+                if current is None:
+                    missing.append(path)
+        if not changed:
+            return ""
+        # A deleted file is reported once; there is nothing left to read again.
+        session["file_views"] = {path: seen for path, seen in views.items() if path not in missing}
+        return changed_files_text(changed[:CHANGED_FILE_NAMES], len(changed))
+
+    async def ensure_access(self, session, tools, value, directory=False, outcome=None):
         target = tools.resolve(value)  # Exclusions apply before any access prompt.
         if tools.permitted(target):
             return True
@@ -836,13 +1100,15 @@ class AgentManager:
         event = await self.event(session, "tool", name="access_directory", input={"path": str(folder)},
                                  state="running", output="", preview=f"Allow file tools to access {folder} for this conversation?\n\nReads may send file contents to your configured model. Edits follow the selected permission mode.")
         if not await self.approve(session, event):
-            await self.update_event(session, event, output="Folder access declined.")
+            expired = event.get("approval") == "expired"
+            if outcome is not None:
+                outcome.update(approval="expired" if expired else "declined", decline_note=event.get("decline_note"))
+            await self.update_event(session, event, output="Folder access was not answered in time." if expired else "Folder access declined.")
             return False
         tools.allowed_directories.append(folder)
         session.setdefault("allowed_directories", []).append(str(folder))
         await self.update_event(session, event, state="completed", output="Folder access granted for this conversation.")
-        await self.broadcast(session["id"], {"type": "permissions", "permission_mode": session.get("permission_mode", "manual"),
-                                               "allowed_directories": session["allowed_directories"]})
+        await self.publish_permissions(session)
         return True
 
     async def run_databricks(self, session, prompt):
@@ -858,19 +1124,22 @@ class AgentManager:
             finally:
                 self.extension_connections.pop(session["id"], None)
 
-    def context_inputs(self, session, tools, mode):
+    def context_inputs(self, session, tools, mode, notice=""):
         guidance = load_project_instructions(tools, session.get("instruction_directories", []))
         tools.instruction_signature = (guidance["text"], guidance["warnings"])
         tools.skill_signature = self.skill_text(session, tools)
+        # Stable text first and the parts that change between requests last, so a
+        # provider's prompt prefix caching can reuse the longest possible prefix.
         system = {"role": "system", "content": SYSTEM_PROMPT + "\n" + mode_prompt(mode)
                   + (f"\nEnforced tool profile: {session['tool_profile']}. Commands, MCP tools and hooks are unavailable."
                      if session.get("tool_profile", "inherit") != "inherit" else "")
                   + "\nWorkspace: " + session["workspace"]
-                  + "\nAdditional allowed folders: " + json.dumps(session.get("allowed_directories", []))
-                  + "\n" + current_time_text()
                   + "\n" + output_limit_text(self.settings.values.get("max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS))
                   + "\n" + guidance["text"] + "\n" + tools.skill_signature
-                  + ("\nProject instruction warnings: " + json.dumps(guidance["warnings"]) if guidance["warnings"] else "")}
+                  + ("\nProject instruction warnings: " + json.dumps(guidance["warnings"]) if guidance["warnings"] else "")
+                  + "\nAdditional allowed folders: " + json.dumps(session.get("allowed_directories", []))
+                  + "\n" + current_time_text()
+                  + ("\n" + notice if notice else "")}
         return system, guidance
 
     async def summarize_context(self, session, client, url, headers, messages, *, max_tokens=SUMMARY_MAX_TOKENS,
@@ -1283,7 +1552,7 @@ class AgentManager:
                      else self.settings.values.get("max_agent_steps", DEFAULT_MAX_AGENT_STEPS))
             consecutive_output_retries = 0
             for step_index in range(steps):
-                system, guidance = self.context_inputs(session, tools, mode)
+                system, guidance = self.context_inputs(session, tools, mode, self.changed_files_notice(session, tools))
                 plan = self.handoff_plan(session, context_window)
                 summarize, condense = self.compaction_requests(session, client, url, headers,
                                                                handoff_tokens=plan and plan["tokens"])

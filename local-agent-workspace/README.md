@@ -7,13 +7,21 @@ frontend that runs without a build step.
 
 ## Features
 
-- Streamed Markdown chat and multiple persistent conversations.
+- Streamed Markdown chat and multiple persistent conversations, with highlighted code
+  blocks that each have a Copy code button.
+- Unsent message drafts kept in the browser across reloads, and a Continue button after a
+  turn stopped at the step or output limit, by Stop, or by a server restart.
 - Databricks model selection, numbered line-range reads, paginated regex/literal
   search, file creation and exact edits, and shell commands with live output.
 - Approval cards with proposed edits and command text. A declined action does not run.
+  Decline with a note the agent reads, or allow one exact command, file edits, one MCP
+  tool or one hook for the rest of a chat.
 - Per-conversation permissions below the composer: Manual, Auto, Accept edits,
   Plan and Bypass permissions. Access additional local folders through an approval card.
 - Stop an agent response, including its foreground command or pending approval.
+- Conversation status in the sidebar (needs approval, working, error, unread) with a
+  Running filter, a "(n)" tab-title count of chats waiting for approval, opt-in browser
+  notifications, and an optional desktop notification from the server when no page is open.
 - Managed background jobs with explicit Stop, output retrieval, status/history,
   per-command time/output limits, and cleanup on normal server shutdown.
 - Resume conversations after refreshing or restarting the app.
@@ -23,12 +31,22 @@ frontend that runs without a build step.
   request's earlier tool results), and a visible context meter. Full conversation history
   stays on disk, and a script turns it into Markdown transcripts.
 - Automatic workspace-scoped `AGENTS.md` and `CLAUDE.md` guidance loading.
-- Workspace file explorer, text editor with stale-file detection, Git status/diff,
-  and a non-interactive command runner.
+- Workspace file explorer (the project and the conversation's granted folders), text
+  editor with stale-file detection, Git status/diff, and a non-interactive command runner.
 - File checkpoints with reviewed, reversible restore and managed Git worktrees.
+- Review of the agent's file edits, as in an editor's chat: a "files changed" bar with
+  Keep and Undo, dots on changed files in the file explorer, and an inline red/green
+  diff with Keep and Undo for each change.
+- The agent must read an existing file before overwriting it, and is told which files it
+  read or wrote changed since (your saves, an Undo, a command).
+- An unreadable conversation file does not stop the app: it is skipped, left unchanged,
+  and named in a notice.
 - Explicit MCP servers, workspace skills with a `/` command menu, and approval-controlled
   tool lifecycle hooks.
-- Persistent tasks with dependencies and bounded subagents in separate conversations.
+- Persistent tasks with dependencies, shown as a live checklist above the message box,
+  and bounded subagents in separate conversations.
+- Markdown transcripts of a conversation: download or copy one from the app, or write
+  them for many saved conversations with a script.
 - Collapsible activity and persisted provider reasoning summaries when returned by the endpoint.
 - Responsive desktop/mobile UI, bundled fonts, and no credential storage in the browser.
 
@@ -56,7 +74,9 @@ panel and worktrees. Shell tools select zsh, bash, or sh, in that order. The
 frontend is plain JavaScript loaded directly by the browser, so a fresh checkout
 needs no Node.js, pnpm, or frontend build to run or change. Native Windows is not
 supported by the POSIX filesystem/process handling; use a Linux environment such as WSL for that
-platform. Linux/WSL have not yet been validated.
+platform. The continuous-integration workflow (`.github/workflows/tests.yml`) runs the backend
+and UI test suites on Ubuntu and macOS; everyday use on Linux and WSL has not yet been checked
+by hand.
 
 Clone the repository or copy the `local-agent-workspace` folder, including
 `backend`, `frontend`, and the setup files at its root. No sibling repository
@@ -143,16 +163,18 @@ completion and Stop flush the final state. After an abrupt process death, the la
 saved partial reply is shown as interrupted; the most recent uncheckpointed text
 may be lost. Incomplete streamed tool arguments are never persisted as executable
 requests or replayed. A local storage failure stops the response and reports that
-recent history may not have been saved. Back up both the conversation JSONL files
-and the separate operational SQLite database.
+recent history may not have been saved. Back up the whole `conversations/` folder
+(the JSONL files and their `.state.json` files) and the separate operational SQLite
+database.
 
 **Agent tools → Conversation** exports a versioned JSON bundle, optionally with
 subagent conversations (32 total, 16 MiB maximum). Export requires idle chats.
 Imports preserve historical messages, tool results, summaries, and usage, remap
 conversation/event/call IDs and included child links, and cancel historical active
 states. Credential settings, hooks/MCP configuration, task-board records, jobs, file checkpoint ownership,
-and folder grants are not transferred. Conversation text can itself contain sensitive
-data: inspect exported files before sharing them. Choose a trusted bundle and an
+folder grants, "Allow for this chat" rules, and the record of which files the agent read are
+not transferred. Conversation text can itself contain sensitive data: inspect exported files
+before sharing them. Choose a trusted bundle and an
 existing destination folder; imported paths never select the destination for you.
 Repeated imports intentionally create separate copies. Unsupported versions, malformed
 history, oversized bundles, and authority-bearing fields are rejected atomically.
@@ -160,11 +182,12 @@ history, oversized bundles, and authority-bearing fields are rejected atomically
 **Fork completed conversation** makes a separate full-history copy in the same
 workspace, leaving the original unchanged. Only completed, idle conversations can
 be forked; running/failed turns and arbitrary turn selection are not supported.
-Forks also start in Manual with no folder grants or active skills, retain any tool
+Forks also start in Manual with no folder grants, allow rules or active skills, retain any tool
 profile restrictions, and do not copy child conversations, task-board records, jobs, or file checkpoints.
 
 The sidebar reads the small metadata record at the start of each conversation file
-instead of loading every event and provider-history record. Full content is loaded
+instead of loading every event and provider-history record. Allow rules are stored as
+separate records after it, so the sidebar list does not carry them. Full content is loaded
 when opening a conversation or performing restart recovery.
 
 ## Working with the app
@@ -175,11 +198,58 @@ when opening a conversation or performing restart recovery.
   Select a sidebar conversation to resume it. Each saved chat has a `?session=<uuid>`
   URL, which preserves that selection on refresh and supports browser Back/Forward.
   The header and sidebar show a short session ID to distinguish repeated titles.
-  Drafts stay with their conversation while switching chats in the current page;
-  unsent drafts are not saved across a page reload.
+  Drafts stay with their conversation while switching chats and are saved in this
+  browser's `localStorage` about half a second after you stop typing (and when the page
+  closes), so they survive a reload; the new-conversation view keeps its own draft, which
+  moves to the conversation once it exists. A sent draft is removed (a new conversation's
+  first message as soon as you send it, so **New** during the send starts empty; if sending
+  fails it comes back as the new-conversation draft, also in a new view opened during the
+  send); text typed while it was sending is saved as the new draft. At most 50 drafts
+  are kept (the oldest goes first). A draft over 100 KB, or any draft when the browser
+  blocks storage, is kept only in the page. Drafts stay in this browser profile; the
+  server never receives them.
   The message box stays editable while connecting. The permissions menu opens above
   the composer; clicking the input closes it, and choosing a mode returns focus to chat.
   Open tabs reconnect after a server restart without discarding the current draft.
+  A tab that does not accept an update within 5 seconds is disconnected, so it cannot
+  hold up a reply, Stop or saving; it reconnects and reloads the conversation.
+- **Conversation status**: each sidebar row shows what its chat is doing.
+  **Needs approval** marks a chat waiting for an approval card; a pulsing dot marks a chat
+  that is working (replying, compacting, naming itself or waiting for a subagent); **Error**
+  marks a chat whose last reply ended with an error, or was cut off because the server
+  stopped, and that you have not opened since; a
+  blue dot marks a chat that changed since you last opened it. **Running** above the list
+  shows only chats that are not idle; click it again to show all. The browser remembers when
+  you last opened each chat (in `localStorage`, on this browser only, shared by its tabs: a
+  chat opened in one tab counts as read in the others); the first time, every
+  existing chat counts as read. Renaming a chat does not mark it unread. While any chat waits
+  for approval, the tab title starts with the count, for example `(2) Local — …`.
+  The sidebar list refreshes every 1.5 seconds while a chat is working and every 10 seconds
+  otherwise, so chats started in another tab also show up.
+- **Notifications**: click **Notify me** at the bottom of the sidebar to turn on browser
+  notifications; the browser asks for permission only then. The switch shows **On** or
+  **Off**. You are notified when a chat starts waiting for approval, finishes a reply,
+  reaches the **Agent steps** limit ("Reached the step limit: …", so you can Continue it), or
+  stops with an error (also during an automatic compaction, or because the server stopped
+  during the reply), if this page is hidden or that chat is not the one open. A notification reads, for example,
+  "Needs your approval: Fix the parser": it contains only a status and the chat title, cut to
+  60 characters, never other conversation text. Until the chat is named, its title is the start
+  of the first message with credentials redacted (the configured token and common secret shapes
+  such as GitHub tokens). Clicking it brings the window forward and opens that chat.
+  Stopping a reply yourself, or a manual compaction, does not notify. A subagent's turn started
+  by its parent notifies only when it needs approval (the parent's turn reports its end); a
+  subagent chat you continue yourself notifies like any other. A notification closes when it
+  no longer applies (the approval was answered, the chat started another turn, or you opened
+  the chat), so the next approval request alerts again. Each open tab notifies on its own; the browser replaces a
+  notification with the same chat and status. If the browser blocks
+  notifications for the page, the sidebar says so; allow them in the browser's site settings.
+  For when no tab is open, see **Settings → Desktop notification when no browser tab is open**:
+  the server then shows the same text as a system notification (`notify-send` on Linux when
+  it is installed, `osascript` on macOS, nothing elsewhere). It is off by default and only
+  applies while no page of the app is open: every page, also one with no chat selected,
+  holds a connection to the server (`/api/presence`). It starts the notifier directly, with
+  the title and message as arguments (no shell) and a 5-second limit; for `notify-send`,
+  `<`, `>` and `&` in a title are escaped so that notification servers show them as text.
 - **Skills (`/`)**: type `/` at the start of the message box to list the skills this
   conversation can use, with their descriptions; keep typing to filter. Use ↑/↓ to
   highlight one and Enter or Tab (or click it) to insert `/<skill-id> `, then add your
@@ -209,12 +279,59 @@ when opening a conversation or performing restart recovery.
   permissions, or selected conversation. Manual titles persist after restart and
   are never replaced by automatic naming, including a title request already in flight.
 - **Workspace / Files**: browse a folder, edit UTF-8 text files up to 80 KB, or use
-  the plus button to reference the file in chat. Save detects concurrent disk edits.
+  the plus button to reference the file in chat ("Please read the project file: <path>", or
+  "Please read the file: <absolute path>" for a granted folder). When the conversation has granted
+  folders (**Folder access**), **Browse** at the top switches between **Project** and each
+  granted folder; a granted folder is shown by absolute paths and the parent button stops
+  at that folder. The choice goes back to **Project** for another conversation or when the
+  folder's grant is removed. Save detects concurrent disk edits.
   Unsaved editor text stays with its conversation when closing the workspace panel,
   attaching a file, or switching chats. Text entered during a save remains unsaved
   until the next save. Editor drafts are kept in the current page, not across reloads.
+- **Review agent changes (Keep / Undo)**: files the agent creates or edits with its file
+  tools are listed above the message box as **N files changed +added −removed**, and the
+  **Workspace** button shows how many there are. Expand the bar to see each file and its
+  line counts. **Keep** accepts the changes. **Undo** puts the file back as it was before
+  the agent first changed it in this conversation; a file the agent created is removed.
+  The **Keep** and **Undo** buttons on the bar act on every listed file; the check and
+  arrow buttons on a row act on that file only.
+  In **Workspace / Files**, a dot marks each changed file and each folder that contains
+  one. Changes in a granted folder outside the project get their dots when you choose
+  that folder in **Browse**, whose entry then ends with "(changed files)". Click a file, in the bar or in the file list, to review it: removed lines are red
+  and added lines green, and each change has its own **Keep** and **Undo**. The box at the
+  bottom right shows the position (`1 of 3`), moves between changes with its arrows, and
+  keeps or undoes the whole file. **Edit** switches to the text editor (an unsaved draft is
+  kept) and **Review changes** switches back.
+  - Changes stay listed across replies until you keep or undo them, and after a refresh or
+    restart. A review always compares the file with its state before the agent's first
+    edit, so your own later saves to it are part of the diff.
+  - Keep works at any time. Undo waits until this conversation, and any other chat in the
+    same workspace, is idle and no workspace command is running (the Recovery rule). If a
+    file changed after the list or diff you looked at, its Keep or Undo is refused and the
+    list refreshes, so you can look again. An Undo of several files checks all of them
+    before it changes any.
+  - An undo is itself a file checkpoint: **Agent tools → Recovery → Other file edits** can
+    bring the agent's version back. Folders created for a new file are not removed.
+  - Only the agent's `write_file`, `edit_file` and `insert_activity_log` edits are listed.
+    Shell commands, MCP tools and hooks are not; **Workspace / Changes** shows Git's view.
+    A subagent's edits are listed in the subagent's conversation. Exports, imports and
+    forks do not copy the list, and deleting a conversation forgets it and leaves the
+    files as they are. Before its next request the model is told which files it read or
+    wrote changed since, an undo included, and `write_file` refuses to replace such a file
+    until the model reads it again (see **Tool details**). Recovery's limits apply: regular
+    UTF-8 files up to 80 KB. An agent edit saves a file with Windows (CRLF) line endings
+    with LF endings, so every line of such a file shows as changed.
 - **Workspace / Changes**: inspect Git status and tracked-file diffs. Untracked
-  paths appear in status; their contents are available in Files.
+  paths appear in status; their contents are available in Files. The server runs Git
+  directly (no shell) with the programs a repository's configuration can name switched
+  off: `core.fsmonitor`, hooks, clean/smudge filters, external diff and text conversion.
+  Git does not look inside submodule work trees, whose own configuration could name
+  filters; a submodule whose commit changed is still listed. The server also limits Git's
+  environment, stops after 60 seconds, and shows at most 80 KB. Credential files at any
+  depth (`.env`, `.env.*` including `.env.example`, `*.env`, `env_vars.txt`, `.netrc`,
+  `.npmrc`, `credentials`, `credentials.json`, `id_rsa`, `id_ed25519`, in any letter case)
+  are left out of the diff; status still names them. A folder that is not a Git
+  repository shows Git's own message.
 - **Workspace / Terminal**: run a command explicitly and see output while it runs.
   Set the timeout (1–3,600 seconds, default 60) and retained output limit
   (1,024–1,000,000 bytes, default 80,000). A foreground job disables Run until it
@@ -225,11 +342,54 @@ when opening a conversation or performing restart recovery.
   This remains a noninteractive command runner: stdin is closed, with no PTY.
   Closing the panel does not cancel a job. Errors pause polling until **Refresh jobs**.
 - **Approvals**: approve or decline model-proposed writes, commands, MCP calls, and hooks. An unanswered
-  approval expires after five minutes; a browser refresh retains it while the server runs.
+  card waits **Settings → Approval wait (minutes)**, 60 by default (1–1,440); a browser refresh
+  retains it while the server runs (a server restart cancels it). After that time the card shows
+  "Not answered in time", the action does not run, and the agent is told nobody answered (not
+  that you declined). The card shows when it expires (with the weekday when that is not today).
+  0 waits until you answer or press **Stop**, like Claude desktop, but a waiting card keeps the
+  chat busy, and a busy chat blocks Undo and Recovery restores in its project. Before this
+  setting existed, every card expired after five minutes. An action stopped without any card, for example by Plan mode or
+  because project instructions changed mid-turn, shows "Not run:" and the reason, not "declined".
+  When a busy chat blocks an action, the error names that chat and why (for example
+  "“Fix the parser” is waiting for your approval. Answer or stop it before undoing agent
+  changes."); when it is another chat, **Open “…”** next to the error switches to it. The
+  button appears in the error banner, next to Undo errors in the Workspace file review, and
+  next to Restore errors in **Agent tools** → **Recovery**.
+  A chat waiting for approval shows **Needs approval** in the sidebar and counts in the tab
+  title; **Notify me** also tells you when this page is hidden or another chat is open.
+- **Allow for this chat**: next to Decline and Approve, a card offers **Always allow this
+  command in this chat** (commands), **Allow edits in this chat** (`write_file`, `edit_file`,
+  `insert_activity_log`), **Allow this tool in this chat** (one MCP tool) or **Allow this hook
+  in this chat**. It approves the card and stores a rule for this conversation. Rules match
+  exactly: the same command text (only leading and trailing whitespace is ignored; never a
+  prefix), the same MCP tool name, the same hook ID. A later matching action runs without a
+  card in Manual, Auto and Accept edits, and its card says "Allowed by a rule for this chat".
+  Plan still blocks it, Bypass is unchanged, and credential exclusions, folder-access cards,
+  project-guidance checks and the changed-file check still apply. Folder-access cards have no
+  such button: a folder grant already lasts for the chat. Rules are saved with the chat (at most
+  100), listed under **Allowed in this chat** in the permissions menu (commands with their exact
+  spacing), where each can be removed while the chat is idle, and inherited by subagents. Forks and imports start without rules.
+- **Decline with a note**: **Tell the agent why (optional)** on a card adds up to 2,000 characters
+  to a Decline. The agent receives "User declined this action. Their note: … Do not retry it
+  without a new instruction." (similar wording for MCP calls, hooks and folder access), and the
+  collapsed card shows "Action declined: …". The note is information for the model; it never
+  changes what the chat may do.
 - **Tool details**: task cards show their names and task status. A completed create/update
   action does not mean the task itself is finished. Expand command cards to see the
   full command (including inline Python), options, and output separately. A long file
   is read in pages, so a read card names the lines it covered (`lines 109–243`).
+  **Read before overwriting:** the conversation remembers the size and modification time
+  of each file the agent read (`read_file`, any page) or wrote, up to 500 files.
+  `write_file` on an existing file is refused, before any approval card, unless the
+  conversation has read or written it and it has not changed since; the card shows
+  "Not run:" and the reason, and the model reads the file and writes again. The check
+  repeats after the approval and before the write. New files, `edit_file` (its
+  `old_text` must match exactly) and `insert_activity_log` are not refused.
+  Before each model request the app checks the 200 most recent of these files and, if
+  any changed or were deleted (your editor saves, an Undo, a command), adds one line at
+  the end of the system message naming up to 10 of them. A deleted file is named once.
+  The system message keeps its stable parts first and puts the folder grants, the current
+  time and this line last, so a provider that caches prompt prefixes can reuse more.
 - **Request details**: expand the details below an assistant response or tool-only
   model request to inspect its endpoint, completion status, stop reason, and
   provider-reported token usage when available. Failed requests distinguish invalid
@@ -260,6 +420,32 @@ when opening a conversation or performing restart recovery.
   shell side effects are retained. Stop also cancels its active subagent. Deleting a
   conversation removes its jobs, tasks, and file checkpoint copies; edited files stay
   on disk. Child conversations remain separately available in the sidebar.
+- **Continue**: when the latest turn of an idle conversation stopped before it finished —
+  at the **Agent steps** limit, at the output-token limit after the automatic retries,
+  by **Stop**, or because the server restarted before its answer finished (not while it
+  was only naming the chat or during a manual compaction) — a **Continue** button above
+  the message box sends `Continue from where you stopped.` as an ordinary message. It
+  is not shown while the conversation is busy, after a completed turn, or after other
+  errors. Your draft is left as it is, and keyboard focus moves to the message box.
+- **Task checklist**: when the conversation has tasks (from the model's `create_task` /
+  `update_task` or **Agent tools → Tasks**), a **Tasks 2/5 done** bar above the message
+  box, under the changes bar, shows the progress and the task in progress. Expand it to
+  list every task with its status; long titles wrap. It updates as tasks change; cancelled tasks are listed
+  but not counted.
+- **Code in replies**: once a reply is complete, its fenced code blocks are syntax
+  highlighted (highlight.js, common languages). A block tagged with a language is
+  highlighted in that language; an untagged block is guessed, up to 20 KB. **Copy code**
+  copies a block's exact text.
+- **Copy and export a conversation**: **Agent tools → Conversation → Export Markdown**
+  downloads the conversation as a Markdown transcript (`<date>-<title>-<id>.md`; a secret
+  in the title becomes `redacted` in the file name), and
+  **Copy conversation** copies the same text. It is the transcript the
+  `scripts/conversation_transcript.py` script writes (see **Agent tools: MCP, skills,
+  and hooks**): messages and replies in full, one line per tool call with its main
+  input, and command output shortened to 600 characters. Common secret shapes and the
+  configured Databricks token are replaced with `[REDACTED]`; review it before sharing.
+  Both work during a response and show what has been saved so far; their result is shown
+  right under the two buttons.
 
 ### Conversation storage
 
@@ -277,6 +463,10 @@ tools cannot browse it.
   records with their command, state, limits, exit status, and bounded retained output.
   Files are atomically replaced as current-state snapshots rather than appended
   indefinitely while an answer streams.
+- `conversations/<conversation-id>.state.json`: the chat's "Allow for this chat" rules and
+  the size and modification time of the files the agent last read or wrote (paths only, no
+  contents). It sits beside the JSONL file so earlier versions of the app can still open the
+  chat; it is never exported, and a missing or unreadable one counts as empty.
 - `conversations.sqlite3`: operational state only. Its `jobs` table stores command
   metadata, states, and bounded output for live control and restart recovery; terminal
   job snapshots are also mirrored into the owning chat JSONL. Chat messages, assistant
@@ -291,6 +481,16 @@ tools cannot browse it.
 - `extensions.json`: explicitly configured MCP servers and lifecycle hooks.
 - `worktrees/`: actual app-created Git worktrees; copying the database alone does
   not migrate these checkouts or their Git registrations.
+
+A conversation file that cannot be read (empty, not JSON, a damaged header or record,
+or an ID that does not match the file name) does not stop the app. It is skipped, the
+other conversations list and open as usual, and a notice at the top of the page names
+the file and the reason; the reason never quotes the file's contents. The app never
+deletes, moves or rewrites such a file; a command job of that conversation stays in
+`conversations.sqlite3` and is not copied into the file. Repair or remove it with the
+server stopped; it is listed again once it can be read. Requesting it through the API
+reports the problem (HTTP 400) instead of a server error, and the page shows that message
+instead of trying to reconnect.
 
 New sessions have empty message history and fresh permissions.
 Project files are shared on disk when chats select the same workspace; starting a
@@ -550,7 +750,8 @@ load the restored content; unsaved browser drafts are intentionally preserved.
 source files stay in the original checkout and are not copied. **Open conversation**
 starts a new Manual-mode conversation in that worktree. Removal only accepts
 app-owned clean worktrees, rejects modified/untracked/ignored files and worktrees
-used by any saved conversation or running command, and keeps the branch and its
+used by any saved conversation (also one hidden as unreadable whose first line still names
+the worktree) or running command, and keeps the branch and its
 commits. Delete the worktree's conversations and choose another default workspace
 before removal. Git hooks, filters, and fsmonitor are disabled for managed worktree
 operations. This is deliberate workspace isolation, not automatic per-task copies.
@@ -585,7 +786,7 @@ must still fit the aggregate tool/schema limits when a chat starts.
 
 The model sees names such as `mcp__example__tool`. MCP calls require their own
 approval in Manual, Auto, and Accept edits; Plan blocks them and Bypass permits
-them. MCP servers and hook commands have the user's OS/network access, not the
+them. **Allow this tool in this chat** approves one exact tool name for the rest of the chat. MCP servers and hook commands have the user's OS/network access, not the
 file tools' folder restrictions. Credential environment variables are stripped
 from local server/hook processes. Up to four servers, 32 tools, and 16 KB of tool
 schemas are supported; each call has a 60-second deadline and bounded 8 KB result.
@@ -680,7 +881,8 @@ error/outcome for invoked tools that fail, including MCP `is_error` results. Sch
 policy, and approval rejections and cancelled actions do not launch failure hooks.
 Foreground commands with failed/timed-out results also trigger failure hooks;
 background-job completion does not launch a deferred hook.
-Each hook separately asks for approval except in Bypass; Plan skips hooks. A declined
+Each hook separately asks for approval except in Bypass; Plan skips hooks.
+**Allow this hook in this chat** stops asking for that hook ID in that chat. A declined
 or failing before-hook blocks the tool. An after-hook failure displays a warning
 while retaining the completed action/result. Failure-hook errors also preserve the
 original error. Hooks have a 1–30 second timeout and
@@ -691,14 +893,17 @@ turns are idle.
 ### Agent tools: tasks, subagents, and activity
 
 **Tasks** shows persisted tasks, descriptions, status, and dependencies. Add them
-manually or let the model use `create_task`, `list_tasks`, and `update_task`. A
-conversation holds up to 50 tasks; dependencies must belong to the same chat,
+manually or let the model use `create_task`, `list_tasks`, `get_task` (one task's full
+description, status, and dependencies; read-only, so it runs in every mode), and
+`update_task`. Every change, by the model or here, updates the task checklist above
+the message box. A conversation holds up to 50 tasks; dependencies must belong to the same chat,
 cannot form cycles, and must finish before dependent work starts or completes.
 These planning records are available in Plan mode.
 
 The model can use `delegate_task` for one concrete task with explicitly supplied
 context. The child has a separate transcript/context and inherits workspace,
-model, permission mode, and folder grants. Files remain shared: choose independent
+model, permission mode, folder grants, and "Allow for this chat" rules (a copy: rules the
+child adds stay in the child). Files remain shared: choose independent
 work to avoid conflicting edits. One child runs per parent, at most three globally;
 children have 1–8 model steps (default six), cannot delegate again, and cannot start
 managed background jobs. The parent waits for a bounded result and an honest
@@ -717,7 +922,7 @@ Unfinished delegated runs are marked interrupted on restart rather than left run
 **Tasks → New subagent tool ceiling** selects `inherit`, `read_only`, or `file_editor`
 for future children while the parent is idle. The model may request a narrower
 `tool_profile` in `delegate_task` but cannot widen the parent's ceiling. Read-only
-permits file listing/reading/search, skill discovery/selection, and task listing;
+permits file listing/reading/search, skill discovery/selection, and task listing/reading;
 file-editor additionally permits file writes/edits under normal approval rules.
 Both file-only profiles exclude shell commands, jobs, MCP startup/calls, hooks,
 task mutations, and further delegation. Restrictions persist on child continuation,
@@ -748,6 +953,8 @@ Changes are saved per conversation; stop an active response before switching mod
 | Plan | Read/search approved folders and describe a plan; block file changes and shell commands. |
 | Bypass permissions | Run actions and access external folders without approval cards. Credential/generated-file exclusions still apply to file tools. |
 
+An "Allow for this chat" rule (see **Allow for this chat** above) turns a matching card into an
+automatic approval in Manual, Auto and Accept edits only; Plan ignores rules.
 Inspecting/stopping existing jobs, skills, structured tasks, and delegation are available
 in every mode. Delegated tools still follow the child's inherited permission mode.
 Starting a background job follows the same command approval rules as foreground
@@ -823,9 +1030,10 @@ generated and nothing needs rebuilding or restarting.
   `static/js/lib.js` lists the differences from React worth knowing (`class`,
   `onInput` for live text input). `static/js/types.js` documents the API shapes.
 - `frontend/static/styles.css`: all styling.
-- `frontend/static/vendor/`: Preact 10.29.8, htm 3.1.1, marked 18.0.14 (Markdown)
-  and DOMPurify 3.4.16 (sanitizing), copied from their npm releases with their
-  licenses; only the trailing source-map comment was removed. To update one,
+- `frontend/static/vendor/`: Preact 10.29.8, htm 3.1.1, marked 18.0.14 (Markdown),
+  DOMPurify 3.4.16 (sanitizing) and highlight.js 11.12.0 (code highlighting, the ES
+  module build with its common languages), copied from their npm releases with their
+  licenses; only the trailing source-map comment was removed (highlight.js has none). To update one,
   download the new version from `https://cdn.jsdelivr.net/npm/<package>@<version>/`
   and replace the file:
 
@@ -836,8 +1044,11 @@ generated and nothing needs rebuilding or restarting.
   | `htm.module.js` | `htm/dist/htm.module.js` |
   | `marked.esm.js` | `marked/lib/marked.esm.js` |
   | `purify.es.js` | `dompurify/dist/purify.es.mjs` |
+  | `highlight.min.js` | `@highlightjs/cdn-assets/es/highlight.min.js` |
 
   DOMPurify is dual-licensed (Apache-2.0 or MPL-2.0); both texts are included.
+  highlight.js is BSD-3-Clause (`LICENSE-highlightjs.txt`); its file was checked against
+  the npm registry tarball's sha512 integrity.
 - `frontend/static/fonts/`: the DM Sans `.woff2` files and licence from
   `@fontsource/dm-sans` 5.3.0 (`files/` folder), unchanged.
 - `frontend/static/js/icons.js`: the Lucide icons used by the UI, as inline SVG copied from
@@ -856,7 +1067,17 @@ python -m pip install -c constraints.txt -e './backend[test,ui-test]'
 python -m playwright install chromium
 # Then:
 (cd frontend && python -m pytest -q)
+
+# Static checks and the personal-data check (also run by CI):
+python -m pip install -c constraints.txt -e './backend[lint]'
+python -m ruff check --select F,E9 backend frontend/tests scripts
+python3 scripts/check_personal_data.py
 ```
+
+GitHub Actions (`.github/workflows/tests.yml` at the repository root) runs the personal-data
+check, the lint check and both test suites on Ubuntu and macOS for pull requests, pushes to
+`main`, and on demand. It uses no credentials and makes no model calls. Notable changes are
+listed in `CHANGELOG.md`.
 
 `python -m playwright install chromium` downloads Playwright's own Chromium; to use
 a browser that is already installed instead, set `UI_TEST_CHROMIUM` to its
@@ -867,45 +1088,87 @@ folder grants, shell classification, approval allow/deny,
 browser-controlled folder checks/grants/removal, OS-denied access,
 cancellation (including process-group termination), path/symlink/secret boundaries,
 credential-free shell environment, restart recovery, API access control, WebSocket
-snapshots, and stale editor writes. None of these automated tests calls a paid model.
+snapshots, stale editor writes, and keeping or undoing agent changes (whole files and single
+changes, stale-review refusal, undo as a restorable checkpoint), read-before-write refusals
+and the changed-files notice, `/api/git` not running a repository's `core.fsmonitor`
+program or filters (a driver name containing `=` and a submodule's own filters included)
+and leaving nested credential files out of the diff, startup with unreadable conversation
+files (with command jobs, and a file holding another conversation's ID), dropping a
+WebSocket that stalls, "Allow for this chat" rules (exact matching, Plan still denying,
+exclusions and folder cards kept, persistence, removal, subagent inheritance, none in forks
+or imports), decline notes reaching the model, and 409 details that name the blocking chat.
+None of these automated
+tests calls a paid model.
 Frontend tests verify that expired local tokens refresh once and that other
 errors never replay a potentially completed action, that editor drafts survive saves
 and navigation, that delayed permission responses or deleted conversation URLs
 do not corrupt the active view, that model replies cannot inject HTML or scripts, and
 that the `/` skill menu lists, filters, and inserts skills without blocking ordinary messages,
-and that the pages of a long file read name the lines they covered.
+that the pages of a long file read name the lines they covered, that agent changes
+show in the changes bar, as dots in the file list and as an inline diff whose Keep and Undo
+send the reviewed file state, that unreadable conversation files are named in a
+dismissible notice that returns keyboard focus to the message box, that opening one
+shows the server's message without a reconnect loop, that each kind of approval card offers
+its own "Allow for this chat" button and sends decline notes, that the permissions menu lists
+and removes rules, that an error naming another chat offers to open it, and that notifications
+(with a faked Notification API and `document.hidden`), the tab-title count, sidebar status
+badges, unread and Running filter, and the Files root switcher with change dots in granted
+folders work without `localStorage` too, that the Continue button appears only after a
+step-limit, output-limit, stopped or interrupted turn and sends its message, that the task
+checklist follows pushed tasks per conversation, that drafts survive a reload, are evicted oldest
+first, are removed when sent and keep text typed during the send, that code blocks are
+highlighted only when a reply is complete and copy their exact text, and that the Markdown
+transcript downloads and copies.
+UI tests also cover a turn that fails during an automatic compaction (notifies) and a manual
+compaction (does not), a turn cut off by a server restart, closing answered notifications,
+read state shared between tabs, and the page's presence connection.
+Backend tests check the desktop notifier with a fake runner: nothing is sent while a page is
+connected (with or without a chat open), a turn failing during automatic compaction notifies
+and a manual compaction does not, a turn cut off by a restart is marked `interrupted`, the
+command is an argument list without a shell, titles are cut to 60 characters, redacted and
+escaped for `notify-send`, a step-limit stop is not called finished, a subagent chat you continue
+yourself notifies, and notifier failures are ignored.
 Backend regressions additionally cover credential
 path aliases, unreadable configuration recovery, cancellation during startup or
 after a child process outlives its shell, recovery of completed tool results
 after interrupted delivery, tool calls streamed without arguments, skill commands
-inside a longer message, and compaction inside one request that outgrows the budget.
+inside a longer message, compaction inside one request that outgrows the budget,
+how a turn ended in the idle status, which restarts mark a turn interrupted, task pushes on change and on connect, `get_task`
+scoping and permissions, and the Markdown transcript endpoint's content, redaction and headers
+(including the file name).
 
 ## Architecture
 
-- `backend/local_agent/api.py`: local API, WebSocket stream, workspace endpoints.
+- `backend/local_agent/api.py`: local API, WebSocket stream, page presence socket, workspace endpoints.
 - `backend/local_agent/agents.py`: session/approval events and the Databricks tool loop.
 - `backend/local_agent/tools.py`: scoped file queries/edits and tool definitions.
 - `backend/local_agent/jobs.py`: streamed processes, managed jobs, and cleanup.
 - `backend/local_agent/permissions.py`: shared mode rules and model instructions.
-- `backend/local_agent/store.py`: per-conversation JSONL storage and legacy migration.
+- `backend/local_agent/approvals.py`: "Allow for this chat" rules, decline-note wording, and 409 details naming a busy chat.
+- `backend/local_agent/store.py`: per-conversation JSONL storage, unreadable-file reports, and legacy migration.
 - `backend/local_agent/drafts.py`: bounded periodic streamed-reply checkpoints.
 - `backend/local_agent/portability.py` / `portability_api.py`: validated conversation copies.
 - `backend/local_agent/tool_profiles.py` / `tool_schema.py`: tool ceilings and offline input validation.
 - `backend/local_agent/config.py`: external credentials and portable configuration.
 - `backend/local_agent/context.py`: request estimates and bounded history compaction.
 - `backend/local_agent/activity.py`: app-generated activity log for handoffs (`insert_activity_log`).
-- `backend/local_agent/transcript.py` / `scripts/conversation_transcript.py`: Markdown transcripts of saved conversations.
+- `backend/local_agent/transcript.py` / `scripts/conversation_transcript.py`: Markdown transcripts of saved conversations (also `GET /api/sessions/<id>/transcript.md`).
 - `backend/local_agent/redaction.py`: common secret shapes replaced in logs, handoffs and transcripts.
 - `skills/`: skills shipped with the app and offered in every workspace; `handoff/SKILL.md` is the detailed handoff skill. A workspace's `.agents/skills/<id>/` replaces the shipped skill with that ID.
 - `backend/local_agent/telemetry.py`: inference ledger, validated usage, DBU estimates, and failure categories.
 - `backend/local_agent/usage_export.py` / `scripts/usage_report.py`: usage rows and CSV correlated with conversation history.
 - `backend/local_agent/instructions.py`: scoped project guidance loading.
 - `backend/local_agent/recovery.py` / `worktrees.py`: file recovery and Git worktrees.
+- `backend/local_agent/git_tools.py`: Git without a shell or repository-configured programs (worktrees, `/api/git`).
+- `backend/local_agent/notify.py`: optional desktop notifications (status and title only) when no page is open.
+- `backend/local_agent/changes.py`: the agent's file changes per conversation, their diffs, Keep and Undo.
 - `backend/local_agent/extensions.py` / `mcp_client.py`: skills, hooks, MCP lifecycle.
 - `backend/local_agent/planning.py` / `feature_tools.py`: tasks and delegated workers.
 - `backend/local_agent/feature_api.py`: scoped feature endpoints.
 - `backend/local_agent/reasoning.py`: provider reasoning-summary extraction.
-- `frontend/static/js/`: browser interface (Preact + htm, no build), conversation state, editor and settings.
+- `frontend/static/js/`: browser interface (Preact + htm, no build), conversation state, editor and settings;
+  `attention.js` holds browser notifications, the tab-title count and unread tracking, `drafts.js` saves
+  message drafts, and `markdown.js` renders and highlights replies.
 - `frontend/tests/`: browser tests (pytest + Playwright) with a fake backend.
 - `design/`: original visual concept and extracted design tokens.
 

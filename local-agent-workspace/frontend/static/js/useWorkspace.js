@@ -24,7 +24,13 @@ export function useWorkspace() {
   const [error, setError] = useState('')
   const [online, setOnline] = useState(true)
   const [ready, setReady] = useState(false)
+  const [storageProblems, setStorageProblems] = useState([])
   const [draftMode, setDraftMode] = useState('manual')
+  // Unreviewed agent file changes of one conversation: { id, value: Changes }.
+  const [changes, setChanges] = useState({ id: null, value: null })
+  const changesPushed = useRef(0)
+  // The selected conversation's tasks, pushed as { type: 'tasks', tasks }: { id, value: Task[] }.
+  const [tasks, setTasks] = useState({ id: null, value: [] })
 
   const updateUrl = useCallback((id, replace = false) => {
     const url = new URL(window.location.href)
@@ -40,10 +46,11 @@ export function useWorkspace() {
     if (!id) setDraftMode('manual')
     if (!fromHistory) updateUrl(id)
   }, [updateUrl])
-  const clearMissingSession = useCallback(() => {
+  // message: '' when another notice (the storage notice) already explains why.
+  const clearMissingSession = useCallback((message = 'That conversation no longer exists. Start a new conversation below.') => {
     selectSession(null, true)
     updateUrl(null, true)
-    setError('That conversation no longer exists. Start a new conversation below.')
+    setError(message)
   }, [selectSession, updateUrl])
 
   const refreshSessions = useCallback(async () => {
@@ -67,10 +74,13 @@ export function useWorkspace() {
   const hasActiveSessions = sessions.some(item => item.status !== 'idle')
 
   useEffect(() => {
-    if (!hasActiveSessions) return
-    const timer = setInterval(() => void refreshSessions().catch(e => setError(e.message)), 1500)
+    // Every 1.5 s while a chat is active; every 10 s otherwise, to notice chats started
+    // elsewhere. A failed slow poll stays quiet: the server may just be restarting.
+    if (!ready) return
+    const timer = hasActiveSessions ? setInterval(() => void refreshSessions().catch(e => setError(e.message)), 1500)
+      : setInterval(() => void refreshSessions().catch(() => {}), 10000)
     return () => clearInterval(timer)
-  }, [hasActiveSessions, refreshSessions])
+  }, [ready, hasActiveSessions, refreshSessions])
 
   useEffect(() => {
     let mounted = true
@@ -79,12 +89,14 @@ export function useWorkspace() {
       if (!mounted) return
       setToken(bootstrap.token)
       setSettings(bootstrap.settings)
+      setStorageProblems(bootstrap.storage_problems || [])
       const list = await api('/sessions')
       if (!mounted) return
       setSessions(list)
       // Only an explicit conversation URL resumes history. The root page is new.
       if (selected.current.id && !list.some(s => s.id === selected.current.id)) {
-        clearMissingSession()
+        const unreadable = (bootstrap.storage_problems || []).some(problem => problem.file === `${selected.current.id}.jsonl`)
+        clearMissingSession(unreadable ? '' : undefined)
       }
       setReady(true)
       await checkConnection()
@@ -118,6 +130,11 @@ export function useWorkspace() {
         if (error instanceof ApiError && error.status === 404) {
           clearMissingSession()
           void refreshSessions().catch(e => setError(e.message))
+        } else if (error instanceof ApiError && error.status === 400) {
+          // The server could not read this conversation's file: retrying cannot help.
+          clearMissingSession(error.message)
+          void refreshSessions().then(() => api('/bootstrap'))
+            .then(bootstrap => setStorageProblems(bootstrap.storage_problems || [])).catch(e => setError(e.message))
         } else {
           reconnect = true; setOnline(false); timer = setTimeout(() => void connect(), 2000)
         }
@@ -138,12 +155,15 @@ export function useWorkspace() {
         }
         if (data.type === 'permissions') setSession(current => current?.id === activeId ? {
           ...current, permission_mode: data.permission_mode, allowed_directories: data.allowed_directories,
+          allow_rules: data.allow_rules || current.allow_rules,
         } : current)
         if (data.type === 'context') {
           contextUpdates.current.set(activeId, data.context_info)
           setSession(current => current?.id === activeId ? { ...current, context_info: data.context_info } : current)
           setSessions(current => current.map(item => item.id === activeId ? { ...item, context_info: data.context_info } : item))
         }
+        if (data.type === 'changes') { changesPushed.current++; setChanges({ id: activeId, value: data.changes }) }
+        if (data.type === 'tasks') setTasks({ id: activeId, value: data.tasks })
         if (data.type === 'event' && data.event.child_session_id) void refreshSessions().catch(e => setError(e.message))
         if (data.type === 'event') setSession(current => {
           if (!current || current.id !== activeId) return current
@@ -158,8 +178,14 @@ export function useWorkspace() {
           // Keep the sidebar current and prevent an older list response from
           // replacing this newer streamed status.
           sessionsRequest.current++
-          setSession(current => current?.id === activeId ? { ...current, status: data.status } : current)
-          setSessions(current => current.map(item => item.id === activeId ? { ...item, status: data.status } : item))
+          setSession(current => current?.id === activeId ? {
+            ...current, status: data.status, ...('terminal_reason' in data ? { terminal_reason: data.terminal_reason } : {}),
+            ...(data.turn_ended ? { turn_ended: data.turn_ended } : {}),
+          } : current)
+          setSessions(current => current.map(item => item.id === activeId ? {
+            ...item, status: data.status, ...(data.terminal_reason ? { terminal_reason: data.terminal_reason } : {}),
+            ...(data.turn_ended ? { turn_ended: data.turn_ended, turn_delegated: !!data.turn_delegated } : {}),
+          } : item))
           if (data.status === 'idle') void refreshSessions().catch(e => setError(e.message))
         }
         if (data.type === 'title') {
@@ -207,12 +233,16 @@ export function useWorkspace() {
   const send = async text => {
     const id = await ensureSession(selected.current)
     await api(`/sessions/${id}/messages`, 'POST', { text })
+    return id
   }
   const saveSettings = async next => {
-    const { workspace, model, env_file, context_window, max_output_tokens, max_agent_steps, compaction_handoffs } = next
+    const { workspace, model, env_file, context_window, max_output_tokens, max_agent_steps, compaction_handoffs, approval_timeout_minutes,
+      system_notifications } = next
     const saved = await api('/settings', 'PUT', {
       workspace, model, env_file, context_window, max_output_tokens, max_agent_steps,
       ...(typeof compaction_handoffs === 'boolean' ? { compaction_handoffs } : {}),
+      ...(Number.isInteger(approval_timeout_minutes) ? { approval_timeout_minutes } : {}),
+      ...(typeof system_notifications === 'boolean' ? { system_notifications } : {}),
     })
     setSettings(saved)
     void checkConnection().catch(e => setError(e.message))
@@ -257,6 +287,7 @@ export function useWorkspace() {
     setSessions(current => current.map(item => item.id === id ? { ...item, title: updated.title } : item))
     // Renaming never replaces live events/status or changes the selected chat.
     setSession(current => current?.id === id ? { ...current, title: updated.title } : current)
+    return updated
   }
   const setPermissionMode = async permission_mode => {
     const target = selected.current
@@ -284,10 +315,30 @@ export function useWorkspace() {
       } : current)
     }
   }
+  const removeAllowRule = async rule => {
+    const target = selected.current
+    if (!activeId) return
+    const updated = await api(`/sessions/${activeId}/allow-rules`, 'DELETE', rule)
+    if (selected.current === target) setSession(current => current?.id === updated.id ? {
+      ...current, allow_rules: updated.allow_rules,
+    } : current)
+    return updated
+  }
+  const reviewChanges = async (action, files) => {
+    const id = selected.current.id
+    if (!id) return null
+    const pushed = changesPushed.current
+    const result = await api(`/sessions/${encodeURIComponent(id)}/changes/${action}`, 'POST', { files })
+    // The server also pushes the outcome; a pushed list can be newer than this response.
+    if (selected.current.id === id && changesPushed.current === pushed) setChanges({ id, value: result })
+    return result
+  }
   const activeSession = session?.id === activeId ? session : null
   const reportError = message => { if (selected.current.key === selection.key) setError(message) }
   return { settings, connection, sessions, session: activeSession, activeId, viewKey: selection.key, error, online, ready,
     setError: reportError, setActiveId: selectSession, newConversation, send, saveSettings, deleteSession, renameSession, changeModel,
     modelSaving: modelSaves.has(selection.key) || (!activeId && defaultModelSave.current !== null),
-    checkConnection, refreshSessions, permissionMode: activeSession?.permission_mode || draftMode, setPermissionMode, allowFolder, removeFolder }
+    checkConnection, refreshSessions, permissionMode: activeSession?.permission_mode || draftMode, setPermissionMode, allowFolder, removeFolder, removeAllowRule,
+    changes: activeId && changes.id === activeId ? changes.value : null, reviewChanges, storageProblems,
+    tasks: activeId && tasks.id === activeId ? tasks.value : [] }
 }

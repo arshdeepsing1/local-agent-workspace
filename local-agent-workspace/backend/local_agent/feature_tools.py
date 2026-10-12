@@ -12,6 +12,8 @@ FEATURE_TOOLS = [
     definition("use_skill", "Load a workspace skill for this conversation. Skills do not override permissions or the user.",
                {"skill_id": {"type": "string"}}, ["skill_id"]),
     definition("list_tasks", "List structured tasks and dependencies, five per page. Follow next_offset.", {"offset": {"type": "integer", "minimum": 0, "maximum": 50}}),
+    definition("get_task", "Read one task of this conversation: its title, full description, status and dependencies.",
+               {"task_id": {"type": "string"}}, ["task_id"]),
     definition("create_task", "Record one planned task. Dependencies must be existing task IDs from this conversation.",
                {"title": {"type": "string"}, "description": {"type": "string"},
                 "depends_on": {"type": "array", "items": {"type": "string"}}}, ["title"]),

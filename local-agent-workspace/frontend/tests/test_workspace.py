@@ -133,8 +133,9 @@ def test_settings_edit_and_save_only_databricks_fields(ui, page):
     expect(dialog.get_by_label("Agent runtime")).to_have_count(0)
     expect(dialog.get_by_text(re.compile("Claude|MCP|skills", re.I))).to_have_count(0)
     checkboxes = dialog.get_by_role("checkbox")
-    expect(checkboxes).to_have_count(1)
-    expect(dialog.locator("label:has(input[type=checkbox])")).to_have_text("Save a detailed handoff at each compaction")
+    expect(checkboxes).to_have_count(2)
+    expect(dialog.locator("label:has(input[type=checkbox])")).to_have_text([
+        "Save a detailed handoff at each compaction", "Desktop notification when no browser tab is open"])
     dialog.get_by_label("Project folder").fill("/updated-project")
     endpoint.fill("databricks-gpt-oss-120b")
     dialog.get_by_label("Credential file").fill("/credentials/env_vars.txt")
@@ -164,6 +165,17 @@ def test_compaction_handoffs_can_be_turned_off(ui, page):
     page.get_by_role("button", name="Save settings").click()
     expect(page.get_by_role("dialog")).to_have_count(0)
     assert ui.bodies("/api/settings", "PUT")[0]["compaction_handoffs"] is False
+
+
+def test_approval_wait_is_a_setting_of_an_hour_by_default(ui, page):
+    start_app(ui, page, setup="fake.settings = { ...baseSettings, approval_timeout_minutes: 60 }")
+    page.get_by_role("button", name="Settings", exact=True).click()
+    wait = page.get_by_role("dialog").get_by_role("spinbutton", name="Approval wait (minutes)")
+    expect(wait).to_have_value("60")
+    wait.fill("45")
+    page.get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    assert ui.bodies("/api/settings", "PUT")[0]["approval_timeout_minutes"] == 45
 
 
 # Renaming
@@ -783,6 +795,8 @@ def test_reconnecting_stops_when_the_conversation_was_deleted(ui):
     ui.wait("hook.error.includes('no longer exists')")
     assert ui.js("hook.activeId") is None
     assert ui.js("fake.sockets.length") == 1
-    calls = ui.js("fake.calls.length")
+    # The idle 10-second list poll continues; reconnect attempts do not.
+    reconnects = "fake.calls.filter(call => call.path !== '/api/sessions').length"
+    calls = ui.js(reconnects)
     ui.tick(10000)
-    assert ui.js("fake.calls.length") == calls
+    assert ui.js(reconnects) == calls

@@ -1,6 +1,5 @@
 import asyncio
 import json
-import os
 import shlex
 import subprocess
 from pathlib import Path
@@ -164,6 +163,25 @@ async def test_remove_blocks_sessions_and_running_jobs_in_subdirectories(worktre
     store.db.commit()
     nested.rmdir()
     await manager.remove(record["id"])
+
+
+async def test_remove_blocks_a_conversation_hidden_as_unreadable(worktrees):
+    manager, repo, store = worktrees
+    record = await manager.create(repo, "codex/hidden")
+    target = Path(record["path"])
+    session = store.create({"workspace": str(target), "model": "fake"})
+    path = store.conversations / f"{session['id']}.jsonl"
+    with path.open("a") as output:
+        output.write("{not json\n")  # A valid header, then a damaged line.
+    store.list()
+    store.record_problem(path.name, "line 2 is not valid JSON")  # As startup does.
+    assert store.list() == [] and [item["file"] for item in store.problems()] == [path.name]
+    with pytest.raises(ValueError, match="conversation or running command"):
+        await manager.remove(record["id"])
+    assert target.is_dir()
+    path.write_text("{not json\n")  # Not even the header is readable: nothing names the worktree.
+    await manager.remove(record["id"])
+    assert not target.exists()
 
 
 async def test_metadata_survives_manager_restart(worktrees):

@@ -4,11 +4,23 @@ from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
 from .agents import public_session
+from .approvals import busy_conflict, busy_status, clip_title, ensure_idle
 from .tool_profiles import validate_profile
 
 
 class RestoreRequest(BaseModel):
     expected_current_hash: str = Field(min_length=1, max_length=128)
+
+
+class ChangeTarget(BaseModel):
+    path: str = Field(min_length=1, max_length=4096)
+    current_hash: str | None = Field(default=None, max_length=128)
+    baseline_hash: str | None = Field(default=None, max_length=128)
+    hunk: int | None = Field(default=None, ge=0, le=1_000_000)
+
+
+class ChangeAction(BaseModel):
+    files: list[ChangeTarget] = Field(min_length=1, max_length=500)
 
 
 class WorktreeRequest(BaseModel):
@@ -31,9 +43,8 @@ class SubagentProfileRequest(BaseModel):
 
 
 def register_features(app, manager, settings, store, session_or_404, workspace_tools):
-    def idle(session):
-        if manager.statuses.get(session["id"], "idle") != "idle":
-            raise HTTPException(409, "Stop the current response before changing this conversation.")
+    def idle(session, action="changing this conversation"):
+        ensure_idle(manager, session, action)
 
     def scoped_worktree(worktree_id, tools):
         record = next((item for item in manager.worktrees.list(str(tools.root)) if item["id"] == worktree_id), None)
@@ -59,16 +70,52 @@ def register_features(app, manager, settings, store, session_or_404, workspace_t
                 preview["error"] = settings.redact(preview["error"])
         return result
 
+    def workspace_idle(tools, action):
+        # Writing files back is an explicit user action, guarded against active writers in this workspace.
+        for summary in store.list():
+            if Path(summary["workspace"]).resolve() == tools.root:
+                idle(summary, action)
+        job = next((job for job in manager.jobs.list(workspace=str(tools.root)) if job["state"] == "running"), None)
+        owner = job and job.get("session_id") and store.get(job["session_id"])
+        if owner:
+            raise HTTPException(409, detail={
+                "message": f"A command started in “{clip_title(owner.get('title'))}” is still running. Stop it in Terminal before {action}.",
+                "session_id": owner["id"], "title": clip_title(owner.get("title"), 160)})
+        if job:
+            raise HTTPException(409, f"Stop workspace commands before {action}.")
+
     @app.post("/api/checkpoints/{checkpoint_id}/restore")
     async def restore(checkpoint_id: str, body: RestoreRequest, session_id: str | None = None):
         tools = workspace_tools(session_id)
-        # A restore is an explicit user action, guarded against active writers in this workspace.
-        for summary in store.list():
-            if Path(summary["workspace"]).resolve() == tools.root:
-                idle(summary)
-        if any(job["state"] == "running" for job in manager.jobs.list(workspace=str(tools.root))):
-            raise HTTPException(409, "Stop workspace commands before restoring a checkpoint.")
-        return manager.checkpoints.restore(checkpoint_id, tools, body.expected_current_hash, session_id=session_id)
+        workspace_idle(tools, "restoring a checkpoint")
+        result = manager.checkpoints.restore(checkpoint_id, tools, body.expected_current_hash, session_id=session_id)
+        if session_id:
+            await manager.publish_changes(session_or_404(session_id), only_tracked=True)
+        return result
+
+    @app.get("/api/sessions/{session_id}/changes")
+    async def changes(session_id: str):
+        session_or_404(session_id)
+        return manager.changes.list(session_id, workspace_tools(session_id))
+
+    @app.get("/api/sessions/{session_id}/changes/diff")
+    async def change_diff(session_id: str, path: str):
+        session_or_404(session_id)
+        return manager.changes.diff(session_id, workspace_tools(session_id), path)
+
+    @app.post("/api/sessions/{session_id}/changes/{action}")
+    async def review_changes(session_id: str, action: str, body: ChangeAction):
+        session = session_or_404(session_id)
+        if action not in ("keep", "undo"):
+            raise HTTPException(404, "Unknown review action.")
+        tools = workspace_tools(session_id)
+        if action == "undo":
+            workspace_idle(tools, "undoing agent changes")
+        try:
+            return manager.changes.act(session_id, tools, action, [item.model_dump() for item in body.files])
+        finally:
+            # Other open pages of this conversation see the outcome, including a partial undo.
+            await manager.publish_changes(session)
 
     @app.get("/api/worktrees")
     async def worktrees(session_id: str | None = None):
@@ -107,12 +154,16 @@ def register_features(app, manager, settings, store, session_or_404, workspace_t
     @app.post("/api/sessions/{session_id}/tasks")
     async def create_task(session_id: str, body: TaskRequest):
         session_or_404(session_id)
-        return manager.task_board.create(session_id, **body.model_dump())
+        task = manager.task_board.create(session_id, **body.model_dump())
+        await manager.publish_tasks(session_id)
+        return task
 
     @app.patch("/api/sessions/{session_id}/tasks/{task_id}")
     async def update_task(session_id: str, task_id: str, body: dict):
         session_or_404(session_id)
-        return manager.task_board.update(session_id, task_id, body)
+        task = manager.task_board.update(session_id, task_id, body)
+        await manager.publish_tasks(session_id)
+        return task
 
     @app.get("/api/sessions/{session_id}/children")
     async def children(session_id: str):
@@ -133,7 +184,11 @@ def register_features(app, manager, settings, store, session_or_404, workspace_t
         return result
 
     def extensions_idle():
-        if any(not task.done() for task in manager.tasks.values()):
+        active = next((session_id for session_id, task in manager.tasks.items() if not task.done()), None)
+        session = active and manager.get(active)
+        if session:
+            raise busy_conflict(session, busy_status(manager, active), "changing or testing extensions")
+        if active:
             raise HTTPException(409, "Stop active responses before changing or testing extensions.")
 
     @app.get("/api/extensions")

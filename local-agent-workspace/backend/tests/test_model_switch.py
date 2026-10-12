@@ -99,7 +99,9 @@ async def test_busy_conversation_rejects_model_changes(app_client, phase):
     manager.statuses[session_id] = phase
     response = await client.put(f"/api/sessions/{session_id}/model", json={"model": "new-endpoint"})
     assert response.status_code == 409
-    assert "Stop" in response.json()["detail"]
+    detail = response.json()["detail"]
+    assert detail["session_id"] == session_id and detail["title"] == "New conversation"
+    assert detail["message"].startswith("“New conversation” ") and detail["message"].endswith("before changing the model.")
     assert manager.store.get(session_id) == before
 
 

@@ -14,18 +14,22 @@ from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .agents import AgentManager, public_session
-from .config import APP_ROOT, MAX_MAX_AGENT_STEPS, MIN_MAX_AGENT_STEPS, Settings
+from .config import APP_ROOT, MAX_APPROVAL_MINUTES, MAX_MAX_AGENT_STEPS, MIN_MAX_AGENT_STEPS, Settings
 from .context import (
     MAX_CONTEXT_WINDOW, MAX_MAX_OUTPUT_TOKENS, MIN_CONTEXT_WINDOW, MIN_MAX_OUTPUT_TOKENS,
 )
 from .store import Store
+from .git_tools import working_tree_changes
+from .jobs import NOT_STOPPED, TIMEOUT_NOT_STOPPED
 from .tools import WorkspaceTools, file_error
 from .permissions import PermissionMode
 from .telemetry import session_metrics
 from .activity import redact_secrets
 from .usage_export import usage_csv, usage_rows
+from .transcript import transcript, transcript_file_name
 from .feature_api import register_features
 from .portability_api import register_portability
+from .approvals import MAX_DECLINE_NOTE, ensure_idle, register_approvals
 
 
 # Browsers refuse ES modules served with a non-JavaScript type, and some systems
@@ -52,6 +56,8 @@ class CompactionRequest(BaseModel):
 
 class Decision(BaseModel):
     allowed: bool
+    remember: bool = Field(default=False, strict=True)  # Approve and store an exact allow rule for this chat.
+    note: str | None = Field(default=None, max_length=MAX_DECLINE_NOTE, strict=True)  # Decline only.
 
 
 class SessionPermissions(BaseModel):
@@ -85,6 +91,8 @@ class SettingsEdit(BaseModel):
     max_output_tokens: int | None = Field(default=None, ge=MIN_MAX_OUTPUT_TOKENS, le=MAX_MAX_OUTPUT_TOKENS, strict=True)
     max_agent_steps: int | None = Field(default=None, ge=MIN_MAX_AGENT_STEPS, le=MAX_MAX_AGENT_STEPS, strict=True)
     compaction_handoffs: bool | None = Field(default=None, strict=True)
+    approval_timeout_minutes: int | None = Field(default=None, ge=0, le=MAX_APPROVAL_MINUTES, strict=True)
+    system_notifications: bool | None = Field(default=None, strict=True)
 
 
 class CommandRequest(BaseModel):
@@ -157,7 +165,8 @@ def create_app(settings=None):
 
     @app.get("/api/bootstrap")
     async def bootstrap():
-        return {"token": local_token, "settings": settings.public()}
+        store.list()  # Refreshes the report of unreadable conversation files.
+        return {"token": local_token, "settings": settings.public(), "storage_problems": store.problems()}
 
     def check_folder(path, workspace):
         folder = WorkspaceTools(workspace, settings.values["env_file"]).resolve(path)
@@ -211,8 +220,7 @@ def create_app(settings=None):
     @app.put("/api/sessions/{session_id}/permissions")
     async def permissions(session_id: str, body: SessionPermissions):
         session = session_or_404(session_id)
-        if manager.statuses.get(session_id, "idle") != "idle":
-            raise HTTPException(409, "Stop the current response before changing permissions.")
+        ensure_idle(manager, session, "changing permissions")
         session["permission_mode"] = body.permission_mode
         store.save(session)
         result = public_session(session)
@@ -222,8 +230,7 @@ def create_app(settings=None):
     @app.put("/api/sessions/{session_id}/model")
     async def change_model(session_id: str, body: SessionModel):
         session = session_or_404(session_id)
-        if manager.statuses.get(session_id, "idle") != "idle":
-            raise HTTPException(409, "Stop the current response before changing the model.")
+        ensure_idle(manager, session, "changing the model")
         model = body.model.strip()
         if not model:
             raise ValueError("Enter a model endpoint name.")
@@ -251,8 +258,7 @@ def create_app(settings=None):
     @app.post("/api/sessions/{session_id}/folders")
     async def allow_folder(session_id: str, body: FolderAccess):
         session = session_or_404(session_id)
-        if manager.statuses.get(session_id, "idle") != "idle":
-            raise HTTPException(409, "Stop the current response before changing folder access.")
+        ensure_idle(manager, session, "changing folder access")
         folder = str(check_folder(body.path, session["workspace"]))
         allowed = session.setdefault("allowed_directories", [])
         if folder not in allowed and folder != session["workspace"]:
@@ -265,8 +271,7 @@ def create_app(settings=None):
     @app.delete("/api/sessions/{session_id}/folders")
     async def remove_folder(session_id: str, body: FolderAccess):
         session = session_or_404(session_id)
-        if manager.statuses.get(session_id, "idle") != "idle":
-            raise HTTPException(409, "Stop the current response before changing folder access.")
+        ensure_idle(manager, session, "changing folder access")
         folder = str(Path(body.path).expanduser().resolve())
         session["allowed_directories"] = [p for p in session.get("allowed_directories", []) if p != folder]
         store.save(session)
@@ -290,6 +295,14 @@ def create_app(settings=None):
             "Content-Disposition": f'attachment; filename="usage-{session_id[:8]}.csv"',
             "Cache-Control": "no-store"})
 
+    @app.get("/api/sessions/{session_id}/transcript.md")
+    async def export_session_transcript(session_id: str):
+        session = session_or_404(session_id)
+        text = transcript(session, redact=settings.redact)
+        return Response(text, media_type="text/markdown; charset=utf-8", headers={
+            "Content-Disposition": f'attachment; filename="{transcript_file_name(session, redact=settings.redact)}"',
+            "Cache-Control": "no-store"})
+
     @app.delete("/api/sessions/{session_id}")
     async def delete_session(session_id: str):
         session_or_404(session_id)
@@ -299,6 +312,7 @@ def create_app(settings=None):
             await manager.jobs.remove_session(session_id)
             manager.task_board.delete_session(session_id)
             manager.checkpoints.delete_session(session_id)
+            manager.changes.delete_session(session_id)
             store.delete(session_id)
             manager.live.pop(session_id, None)
             manager.statuses.pop(session_id, None)
@@ -322,16 +336,14 @@ def create_app(settings=None):
 
     @app.post("/api/sessions/{session_id}/compact", status_code=202)
     async def compact(session_id: str, body: CompactionRequest):
-        session_or_404(session_id)
-        if manager.statuses.get(session_id, "idle") != "idle" or (session_id in manager.tasks and not manager.tasks[session_id].done()):
-            raise HTTPException(409, "Stop the current response before compacting context.")
+        ensure_idle(manager, session_or_404(session_id), "compacting context")
         manager.start_compaction(session_id, body.preservation_note)
         return {"ok": True}
 
     @app.post("/api/sessions/{session_id}/approvals/{event_id}")
     async def approval(session_id: str, event_id: str, body: Decision):
         session_or_404(session_id)
-        manager.decide(session_id, event_id, body.allowed)
+        manager.decide(session_id, event_id, body.allowed, body.remember, body.note)
         return {"ok": True}
 
     @app.websocket("/api/sessions/{session_id}/stream")
@@ -340,7 +352,10 @@ def create_app(settings=None):
         if len(protocols) != 2 or protocols[0] != "local-workspace" or not secrets.compare_digest(protocols[1], local_token) or not origin_allowed(socket.headers.get("origin")):
             await socket.close(code=1008)
             return
-        session = manager.get(session_id)
+        try:
+            session = manager.get(session_id)
+        except (ValueError, OSError):
+            session = None  # An unreadable conversation file.
         if not session:
             await socket.close(code=1008)
             return
@@ -348,12 +363,36 @@ def create_app(settings=None):
         manager.listeners.setdefault(session_id, set()).add(socket)
         try:
             await socket.send_json({"type": "snapshot", "session": public_session(session, manager.statuses.get(session_id, "idle"))})
+            await manager.publish_changes(session)
+            try:
+                tasks = manager.task_board.list(session_id)
+            except ValueError:  # Deleted while connecting.
+                tasks = []
+            if tasks:
+                await socket.send_json({"type": "tasks", "tasks": tasks})
             while True:
                 await socket.receive_text()
         except WebSocketDisconnect:
             pass
         finally:
             manager.listeners.get(session_id, set()).discard(socket)
+
+    @app.websocket("/api/presence")
+    async def presence(socket: WebSocket):
+        """Held open by every page, so desktop notifications know a page is open."""
+        protocols = [p.strip() for p in socket.headers.get("sec-websocket-protocol", "").split(",")]
+        if len(protocols) != 2 or protocols[0] != "local-workspace" or not secrets.compare_digest(protocols[1], local_token) or not origin_allowed(socket.headers.get("origin")):
+            await socket.close(code=1008)
+            return
+        await socket.accept(subprotocol="local-workspace")
+        manager.pages.add(socket)
+        try:
+            while True:
+                await socket.receive_text()
+        except WebSocketDisconnect:
+            pass
+        finally:
+            manager.pages.discard(socket)
 
     @app.get("/api/files")
     async def files(path: str = ".", session_id: str | None = None):
@@ -369,13 +408,14 @@ def create_app(settings=None):
         if tools.read_file(body.path) != body.original:
             raise HTTPException(409, "This file changed on disk. Reopen it before saving.")
         manager.checkpoints.apply_edit(tools, "write_file", {"path": body.path, "content": body.content}, session_id=body.session_id)
+        if body.session_id:
+            await manager.publish_changes(session_or_404(body.session_id), tools, only_tracked=True)
         return {"ok": True}
 
     @app.get("/api/git")
     async def git_changes(session_id: str | None = None):
-        tools = workspace_tools(session_id)
-        result = await tools.run_command("git status --short --untracked-files=normal && git diff --no-ext-diff --no-textconv -- . ':!*.env' ':!.env*' ':!env_vars.txt'")
-        return result
+        # No shell, and no programs named by the repository's configuration.
+        return await working_tree_changes(workspace_tools(session_id).root)
 
     @app.post("/api/command")
     async def command(body: Prompt, session_id: str | None = None):
@@ -389,7 +429,7 @@ def create_app(settings=None):
             await manager.jobs.stop(job["id"])
             raise
         if job["state"] == "timed_out":
-            raise HTTPException(408, "Command stopped after 60 seconds.")
+            raise HTTPException(408, TIMEOUT_NOT_STOPPED if job["output"].endswith(NOT_STOPPED) else "Command stopped after 60 seconds.")
         return {"job_id": job["id"], "exit_code": job["exit_code"], "output": job["output"], "truncated": job["truncated"]}
 
     def job_scope(session_id):
@@ -428,6 +468,7 @@ def create_app(settings=None):
 
     register_features(app, manager, settings, store, session_or_404, workspace_tools)
     register_portability(app, manager, settings, store, session_or_404)
+    register_approvals(app, manager, store, session_or_404)
 
     # The browser loads the frontend source files directly; there is no build step.
     frontend = APP_ROOT / "frontend"

@@ -3,6 +3,7 @@ import { X } from '../icons.js'
 import { api } from '../api.js'
 import ConversationTransfer from './ConversationTransfer.js'
 import UsagePanel from './UsagePanel.js'
+import { blockerOf, OpenBlockingChat } from './BlockingChat.js'
 
 // Props: session, workspace?, onClose, onSelectSession, onError
 const profileLabels = { inherit: 'Inherit permitted tools', read_only: 'Read-only files', file_editor: 'Read and edit files' }
@@ -12,20 +13,21 @@ const scopeQuery = session => session ? `?session_id=${encodeURIComponent(sessio
 function useRequest(onError) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  const [blocker, setBlocker] = useState(null)  // The other chat that error names, if any.
   const alive = useRef(false)
   const report = useRef(onError)
   report.current = onError
   useEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
   const run = useCallback(async (operation, success) => {
-    setBusy(true); setError('')
+    setBusy(true); setError(''); setBlocker(null)
     try {
       const value = await operation()
       if (alive.current) success(value)
     } catch (e) {
-      if (alive.current) { setError(e.message); report.current(e.message) }
+      if (alive.current) { setError(e.message); setBlocker(blockerOf(e)); report.current(e.message) }
     } finally { if (alive.current) setBusy(false) }
   }, [])
-  return { busy, error, run }
+  return { busy, error, blocker, run }
 }
 
 export default function AgentToolsDialog(props) {
@@ -46,9 +48,9 @@ function AgentToolsScope(props) {
   </dialog>`
 }
 
-function Recovery({ session, onError }) {
+function Recovery({ session, onError, onSelectSession }) {
   const query = scopeQuery(session)
-  const { busy, error, run } = useRequest(onError)
+  const { busy, error, blocker, run } = useRequest(onError)
   const [items, setItems] = useState([])
   const [previews, setPreviews] = useState([])
   const [turnPreview, setTurnPreview] = useState(null)
@@ -71,7 +73,8 @@ function Recovery({ session, onError }) {
   return html`<section class="agent-tools-section" aria-label="Recovery">
     <div class="agent-tools-section-heading"><h3>File checkpoints</h3><button class="outline" disabled=${busy} onClick=${() => void refresh()}>Refresh checkpoints</button></div>
     <p>Preview file checkpoints by user turn, then restore individual files. Commands and MCP side effects are not reversible here.</p>
-    ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
+    ${error ? html`<p class=${`form-error ${blocker ? 'blocked-error' : ''}`} role="alert"><span>${error}</span>
+      <${OpenBlockingChat} blocker=${blocker} currentId=${session?.id} onSelect=${onSelectSession} /></p>` : null}
     ${notice ? html`<p role="status">${notice}</p>` : null}
     <div class="agent-tools-list">${Array.from(groups, ([turnId, checkpoints]) => html`<section class="recovery-turn" key=${turnId || 'unassociated'}>
       <div class="agent-tools-section-heading"><div><h4>${turnId ? 'User turn' : 'Other file edits'}</h4>

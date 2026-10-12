@@ -7,7 +7,7 @@ import pytest
 
 from local_agent.context import (
     DEFAULT_CONTEXT_WINDOW, MAX_CONTEXT_WINDOW, MIN_CONTEXT_WINDOW, OUTPUT_LIMIT_CONTINUATION, REPLY_RESERVE,
-    SAFETY_MARGIN, SUMMARY_MAX_BYTES, SUMMARY_MAX_TOKENS, SUMMARY_PREFIX, build_summary_messages,
+    SAFETY_MARGIN, SUMMARY_MAX_TOKENS, SUMMARY_PREFIX, build_summary_messages,
     context_boundary, context_breakdown, context_messages, estimate_tokens, prepare_context, retained_request,
 )
 

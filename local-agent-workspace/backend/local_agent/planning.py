@@ -19,6 +19,13 @@ class TaskManager:
         rows = self.store.db.execute("SELECT data FROM tasks WHERE session_id=? ORDER BY created, id", (session_id,)).fetchall()
         return [json.loads(row[0]) for row in rows]
 
+    def get(self, session_id, task_id):
+        """One task of this conversation; another conversation's task is not found."""
+        task = next((item for item in self.list(session_id) if item["id"] == task_id), None)
+        if not task:
+            raise ValueError("Task not found in this conversation.")
+        return task
+
     def _validate(self, task, tasks):
         if not isinstance(task["title"], str) or not task["title"].strip() or len(task["title"]) > 200:
             raise ValueError("Task title must contain 1 to 200 characters.")
@@ -98,17 +105,23 @@ class DelegateManager:
     def children(self, parent_id):
         return [session for session in self.manager.store.list() if session.get("parent_session_id") == parent_id]
 
+    def _readable(self, session_id):
+        try:
+            return self.manager.store.get(session_id)
+        except (ValueError, OSError):
+            return None  # Reported by the store; recovery skips it.
+
     def recover(self):
         for summary in self.manager.store.list():
-            child = self.manager.store.get(summary["id"])
-            progress = child.get("delegation")
+            child = self._readable(summary["id"])
+            progress = (child or {}).get("delegation")
             if not progress or not child.get("parent_event_id"):
                 continue
             if not progress.get("terminal_reason"):
                 progress = {**progress, "status": "interrupted", "terminal_reason": "interrupted"}
                 child.update(delegation=progress, terminal_reason="interrupted")
                 self.manager.store.save(child)
-            parent = self.manager.store.get(child["parent_session_id"])
+            parent = self._readable(child["parent_session_id"])
             event = next((item for item in (parent or {}).get("events", [])
                           if item["id"] == child["parent_event_id"] and item.get("child_session_id") == child["id"]), None)
             if event is not None and not event.get("delegation", {}).get("terminal_reason"):
@@ -175,7 +188,8 @@ class DelegateManager:
         child.update(parent_session_id=parent["id"], is_subagent=True, max_steps=max_steps,
                      tool_profile=profile,
                      permission_mode=parent.get("permission_mode", "manual"),
-                     allowed_directories=list(parent.get("allowed_directories", [])))
+                     allowed_directories=list(parent.get("allowed_directories", [])),
+                     allow_rules=[dict(rule) for rule in parent.get("allow_rules", [])])
         event_id = parent_event["id"] if parent_event is not None else str(uuid.uuid4())
         child.update(parent_event_id=event_id, parent_call_id=(parent_event or {}).get("call_id"),
                      delegation={"status": "running", "completed_tools": 0})

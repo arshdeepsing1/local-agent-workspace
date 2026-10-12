@@ -11,7 +11,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from . import config
-from .jobs import CommandTimeout, run_process
+from .jobs import NOT_STOPPED, CommandTimeout, run_process, with_note
 from .mcp_client import MCPConnection, bounded_error, bounded_result
 
 CONFIG_LIMIT = 32_000
@@ -269,7 +269,9 @@ class ExtensionManager:
                 result = await run_process(command, workspace, selected["timeout_seconds"], 4096)
             except CommandTimeout as error:
                 result = {**error.result, "timed_out": True}
-            output = bounded_result(self._redact(result["output"], tokens, partial=result["truncated"] or result.get("timed_out", False)), limit=3800)
-            return {**result, "output": output["output"], "truncated": result["truncated"] or output["truncated"]}
+            # Room for the note that a command did not end, added after redaction.
+            room = len(NOT_STOPPED) + 1 if result.get("stopped") is False else 0
+            output = bounded_result(self._redact(result["output"], tokens, partial=result["truncated"] or result.get("timed_out", False)), limit=3800 - room)
+            return {**result, "output": with_note(output["output"], result), "truncated": result["truncated"] or output["truncated"]}
         finally:
             Path(filename).unlink(missing_ok=True)

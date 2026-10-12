@@ -20,24 +20,17 @@ Common secret shapes are replaced with [REDACTED]; review a transcript before
 sharing it. Copy a conversation file first if the app is running.
 """
 import argparse
-import re
 import sys
-from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 
-from local_agent.transcript import EXCERPT_CHARS, transcript  # noqa: E402
+from local_agent.transcript import EXCERPT_CHARS, transcript, transcript_file_stem  # noqa: E402
 from local_agent.usage_export import session_from_jsonl  # noqa: E402
 
 
 def file_name(session, folder):
-    try:
-        day = datetime.fromtimestamp(float(session.get("created"))).strftime("%Y-%m-%d")
-    except (TypeError, ValueError, OverflowError, OSError):
-        day = "undated"
-    slug = re.sub(r"[^a-z0-9]+", "-", str(session.get("title") or "").lower()).strip("-")[:60].strip("-") or "chat"
-    stem = f"{day}-{slug}-{str(session.get('id', ''))[:8]}".rstrip("-")
+    stem = transcript_file_stem(session)
     for suffix in ("", *(f"-{number}" for number in range(2, 1000))):
         if not (folder / f"{stem}{suffix}.md").exists():
             return folder / f"{stem}{suffix}.md"

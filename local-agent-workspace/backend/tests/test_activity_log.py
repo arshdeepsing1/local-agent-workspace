@@ -96,7 +96,7 @@ def test_oldest_commands_are_omitted_to_fit_and_the_newest_are_kept(tmp_path):
     assert len(text.encode()) <= 20_000
     assert stats["commands_omitted"] > 0 and f"{stats['commands_omitted']} earlier commands were omitted" in text
     assert "step-059" in text and "step-000" not in text
-    assert f"### Commands run (60)" in text
+    assert "### Commands run (60)" in text
 
 
 def test_insert_replaces_marker_appends_or_creates_and_rejects_duplicates():

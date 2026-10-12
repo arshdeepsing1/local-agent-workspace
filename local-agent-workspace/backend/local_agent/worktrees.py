@@ -1,14 +1,12 @@
 """App-owned Git worktrees; removing one always preserves its branch."""
 import asyncio
 import json
-import os
 import shutil
-import signal
 import time
 import uuid
 from pathlib import Path
 
-from .jobs import ENVIRONMENT_KEYS
+from .git_tools import configured_filters, run_git
 
 
 class WorktreeManager:
@@ -23,46 +21,18 @@ class WorktreeManager:
     async def _git(self, workspace, arguments, *, allowed=(0,), filters=()):
         if not self.git:
             raise ValueError("Git is required to create or remove a worktree.")
-        env = {key: value for key, value in os.environ.items() if key in ENVIRONMENT_KEYS}
-        env.update(GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1")
-        options = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "submodule.recurse=false"]
-        for key in filters:
-            options.extend(["-c", f"{key}={'false' if key.endswith('.required') else ''}"])
-        spawning = asyncio.create_task(asyncio.create_subprocess_exec(
-            self.git, *options, "-C", str(workspace), *arguments, env=env,
-            stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT, start_new_session=True))
-        process = None
-        try:
-            process = await asyncio.shield(spawning)
-            async with asyncio.timeout(30):
-                raw = await process.stdout.read(80_001)
-                # read(n) can return early; continue to EOF while keeping a hard bound.
-                while len(raw) <= 80_000:
-                    chunk = await process.stdout.read(80_001 - len(raw))
-                    if not chunk:
-                        break
-                    raw += chunk
-                if len(raw) > 80_000:
-                    raise ValueError("Git output limit reached; inspect the repository directly.")
-                await process.wait()
-        except BaseException:
-            if process is None:
-                process = await spawning
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            await process.communicate()
-            raise
+        code, raw, truncated = await run_git(workspace, arguments, filters=filters, git=self.git)
+        if truncated:
+            raise ValueError("Git output limit reached; inspect the repository directly.")
         text = raw.decode("utf-8", errors="replace").strip()
-        if process.returncode not in allowed:
-            raise ValueError(text or f"Git exited with status {process.returncode}.")
-        return process.returncode, text
+        if code not in allowed:
+            raise ValueError(text or f"Git exited with status {code}.")
+        return code, text
 
     async def _filters(self, workspace):
-        _, names = await self._git(workspace, ["config", "--name-only", "--get-regexp", r"^filter\..*\.(clean|smudge|process|required)$"], allowed=(0, 1))
-        return names.splitlines()
+        if not self.git:
+            raise ValueError("Git is required to create or remove a worktree.")
+        return await configured_filters(workspace, git=self.git)
 
     def list(self, workspace=None):
         workspace = str(Path(workspace).expanduser().resolve()) if workspace is not None else None
@@ -131,6 +101,13 @@ class WorktreeManager:
             workspace = Path(session["workspace"]).expanduser().resolve()
             if workspace.is_relative_to(target):
                 return True
+        # A conversation hidden as unreadable may be repaired and still needs its workspace.
+        for workspace in self.store.problem_workspaces():
+            try:
+                if Path(workspace).expanduser().resolve().is_relative_to(target):
+                    return True
+            except (OSError, RuntimeError, ValueError):
+                continue
         exists = self.store.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'").fetchone()
         if exists:
             for (data,) in self.store.db.execute("SELECT data FROM jobs"):

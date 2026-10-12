@@ -1,7 +1,7 @@
 import { html, useEffect, useMemo, useRef, useState } from '../lib.js'
 import { Check, ChevronDown, ChevronRight, Copy, FileText, LoaderCircle, Terminal, X } from '../icons.js'
 import { api } from '../api.js'
-import { renderMarkdown } from '../markdown.js'
+import { enhanceCodeBlocks, renderMarkdown } from '../markdown.js'
 import { Brand } from './Sidebar.js'
 import RequestDetails from './RequestDetails.js'
 
@@ -57,11 +57,40 @@ function ToolDetails({ event, pending }) {
     ${!pending || event.output ? html`<p class="tool-detail-label">Output</p><pre aria-label="Output">${event.output || (event.state === 'running' ? 'Waiting for output…' : 'No output.')}</pre>` : null}`
 }
 
+const clip = text => {
+  const flat = String(text || '').trim().replace(/\s+/g, ' ')
+  return flat.slice(0, 240) + (flat.length > 240 ? '…' : '')
+}
+
 function toolOutcome(event) {
-  if (event.state === 'rejected') return 'Action declined'
+  const clipped = clip(event.output)
+  if (event.state === 'rejected') {
+    if (event.approval === 'expired') return 'Not answered in time; the action did not run'
+    if (event.approval === 'declined') return event.decline_note ? `Action declined: ${clip(event.decline_note)}` : 'Action declined'
+    // Blocked without an approval card (Plan mode, changed instructions, a tool profile), or an older event.
+    return clipped ? `Not run: ${clipped}` : 'Action not run'
+  }
   if (event.state === 'cancelled') return 'Action cancelled'
-  const output = (event.output || '').trim().replace(/\s+/g, ' ')
-  return output ? output.slice(0, 240) + (output.length > 240 ? '…' : '') : 'Tool returned an error'
+  return clipped || 'Tool returned an error'
+}
+
+// The "Allow for this chat" button of a pending card. A folder-access card has none:
+// its grant already lasts for this chat.
+export function allowLabel(event) {
+  const name = event.name || ''
+  if (name === 'run_command') return typeof event.input?.command === 'string' && event.input.command.trim() ? 'Always allow this command in this chat' : null
+  if (['write_file', 'edit_file', 'insert_activity_log'].includes(name)) return 'Allow edits in this chat'
+  if (name.startsWith('mcp__')) return 'Allow this tool in this chat'
+  if (name.startsWith('hook_')) return 'Allow this hook in this chat'
+  return null
+}
+
+// The time an approval card expires, with the weekday when that is not today (limits reach 24 hours).
+export function expiryTime(seconds, now = new Date()) {
+  const when = new Date(seconds * 1000)
+  const options = { hour: '2-digit', minute: '2-digit' }
+  return when.toDateString() === now.toDateString() ? when.toLocaleTimeString([], options)
+    : when.toLocaleString([], { weekday: 'short', ...options })
 }
 
 function DelegationStatus({ event, onSelectSession }) {
@@ -79,12 +108,16 @@ function DelegationStatus({ event, onSelectSession }) {
 function ToolCard({ event, summary, sessionId, onError, onSelectSession }) {
   const [expanded, setExpanded] = useState(false)
   const [deciding, setDeciding] = useState(false)
+  const [note, setNote] = useState('')
   const pending = event.state === 'pending'
   const title = (event.name || 'Tool').replace(/_/g, ' ')
   const isTask = event.name === 'create_task' || event.name === 'update_task'
-  const decide = async allowed => {
+  const allowInChat = pending ? allowLabel(event) : null
+  const decide = async (allowed, remember = false) => {
     setDeciding(true)
-    try { await api(`/sessions/${sessionId}/approvals/${event.id}`, 'POST', { allowed }) }
+    // The note goes to the model with a Decline; remember stores an exact rule for this chat.
+    const body = { allowed, ...(remember ? { remember: true } : {}), ...(!allowed && note.trim() ? { note: note.trim() } : {}) }
+    try { await api(`/sessions/${sessionId}/approvals/${event.id}`, 'POST', body) }
     catch (e) { onError(e.message) }
     finally { setDeciding(false) }
   }
@@ -98,10 +131,16 @@ function ToolCard({ event, summary, sessionId, onError, onSelectSession }) {
       ${expanded || pending ? html`<${ChevronDown} size=${14} />` : html`<${ChevronRight} size=${14} />`}
     </button>
     <${DelegationStatus} event=${event} onSelectSession=${onSelectSession} />
+    ${event.allowed_by_rule ? html`<p class="tool-rule">Allowed by a rule for this chat</p>` : null}
     ${expanded || pending ? html`<div class="tool-body">
-      ${pending ? html`<p>Local needs your approval to ${title.toLowerCase()}.</p>
+      ${pending ? html`<p>Local needs your approval to ${title.toLowerCase()}.${event.approval_expires
+          ? ` If you do not answer by ${expiryTime(event.approval_expires)}, it will not run.` : ''}</p>
         <${ToolDetails} event=${event} pending=${true} />
+        <label class="decline-note"><span>Tell the agent why (optional)</span>
+          <textarea rows=${2} maxLength=${2000} spellcheck=${false} value=${note} disabled=${deciding}
+            onInput=${e => setNote(e.currentTarget.value)} /></label>
         <div class="approval-buttons"><button class="outline" disabled=${deciding} onClick=${() => void decide(false)}><${X} size=${15} />Decline</button>
+          ${allowInChat ? html`<button class="outline" disabled=${deciding} onClick=${() => void decide(true, true)}>${allowInChat}</button>` : null}
           <button class="primary" disabled=${deciding} onClick=${() => void decide(true)}><${Check} size=${15} />Approve</button></div>`
         : html`<${ToolDetails} event=${event} pending=${false} /><small class="muted">Action: ${event.state}</small>`}
     </div>` : null}
@@ -116,17 +155,22 @@ function CopyAction({ text, label }) {
   }}>${copied ? html`<${Check} size=${14} />` : html`<${Copy} size=${14} />`}</button>`
 }
 
-function Markdown({ text }) {
+function Markdown({ text, streaming = false }) {
   // Parsing is the expensive part of a streamed reply, so parse only on change.
   const markup = useMemo(() => renderMarkdown(text), [text])
-  return html`<div class="markdown" dangerouslySetInnerHTML=${{ __html: markup }} />`
+  const element = useRef(null)
+  // Highlight code once the reply is complete; the page keeps unchanged markup,
+  // so other replies are not highlighted again on each streamed delta.
+  useEffect(() => { if (!streaming && element.current) enhanceCodeBlocks(element.current) }, [markup, streaming])
+  return html`<div class="markdown" ref=${element} dangerouslySetInnerHTML=${{ __html: markup }} />`
 }
 
 function Reply({ text, reasoning, truncated, requestInfo }) {
+  const streaming = requestInfo?.status === 'running'
   return html`<div class="assistant-reply"><${Brand} small=${true} />
     <div class="reply-content">${reasoning ? html`<details class="reasoning-summary"><summary>Provider reasoning summary</summary>
-      <p class="muted">Supplied by the model endpoint.</p><${Markdown} text=${reasoning} />
-      ${truncated ? html`<p class="muted">Summary display limit reached.</p>` : null}</details>` : null}<${Markdown} text=${text} />
+      <p class="muted">Supplied by the model endpoint.</p><${Markdown} text=${reasoning} streaming=${streaming} />
+      ${truncated ? html`<p class="muted">Summary display limit reached.</p>` : null}</details>` : null}<${Markdown} text=${text} streaming=${streaming} />
       ${text ? html`<${CopyAction} text=${text} label="Copy response" />` : null}
       ${requestInfo ? html`<${RequestDetails} info=${requestInfo} />` : null}
     </div></div>`
@@ -145,7 +189,7 @@ export default function Conversation({ session, onError, onSelectSession }) {
     const el = container.current
     if (el) follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120
   }}><div class="transcript-inner">
-    ${tools.length ? html`<details class="activity-summary"><summary>Activity · ${tools.length} actions</summary>
+    ${tools.length ? html`<details class="activity-summary"><summary>Activity · ${tools.length} ${tools.length === 1 ? 'action' : 'actions'}</summary>
       <ol>${tools.map(event => {
         const summary = toolSummaries.get(event.id)
         return html`<li key=${event.id}><span>${(event.name || 'Tool').replace(/_/g, ' ')}</span>${summary.subject ? html`<span class="activity-subject"> · ${summary.subject}</span>` : null}

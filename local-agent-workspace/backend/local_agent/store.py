@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -9,9 +10,30 @@ from pathlib import Path
 
 from .telemetry import LEDGER_VERSION
 
+log = logging.getLogger(__name__)
 
 _SAFE_SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
-_SEPARATE_FIELDS = ("context_state", "instruction_directories", "inference_calls", "command_jobs")
+# Kept out of the header record so list and metadata reads stay small.
+_SEPARATE_FIELDS = ("context_state", "instruction_directories", "file_views", "allow_rules", "inference_calls", "command_jobs")
+# Kept in <id>.state.json beside the conversation file, never in field records: versions
+# before these fields existed reject unknown field records but only read *.jsonl files.
+_SIDECAR_FIELDS = ("file_views", "allow_rules")
+
+
+class UnreadableConversation(ValueError):
+    """A conversation file that cannot be loaded. The reason never quotes its contents."""
+
+    def __init__(self, file, reason):
+        super().__init__(f"Conversation file {file} could not be read: {reason}.")
+        self.file, self.reason = file, reason
+
+
+def _fingerprint(path):
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    return (info.st_size, info.st_mtime_ns)
 
 
 class Store:
@@ -27,6 +49,13 @@ class Store:
         self.conversations.chmod(0o700)
         self._lock = threading.RLock()
         self._command_jobs = {}
+        # The sidecar state last written or read, as JSON text, per conversation ID.
+        self._sidecars = {}
+        # Unreadable conversation files: {file name: reason}. They are skipped and
+        # reported, never deleted, moved or rewritten.
+        self._list_problems = {}
+        # Files whose header lists but whose full load failed: {name: (reason, fingerprint)}.
+        self._load_problems = {}
 
         # Requests serialize DB work on the app's event loop. Allow application
         # creation and lifespan teardown on different threads (ASGI test clients).
@@ -113,6 +142,62 @@ class Store:
         finally:
             os.close(descriptor)
 
+    def _state_path(self, session_id):
+        return self._path(session_id).with_suffix(".state.json")
+
+    @staticmethod
+    def _sidecar_text(session):
+        state = {name: session[name] for name in _SIDECAR_FIELDS if name in session}
+        return json.dumps(state, ensure_ascii=False, separators=(",", ":"), sort_keys=True) if state else None
+
+    def _write_sidecar(self, session_id, text):
+        """Replace (or with text None, remove) <id>.state.json atomically."""
+        target = self._state_path(session_id)
+        if text is None:
+            target.unlink(missing_ok=True)
+            return
+        temporary = self.conversations / f".{target.name}.{uuid.uuid4().hex}.tmp"
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                output.write(text)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, target)
+            target.chmod(0o600)
+            self._sync_directory()
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+
+    def _save_sidecar(self, session):
+        """Write the sidecar when its fields changed since it was last written or read."""
+        text = self._sidecar_text(session)
+        if self._sidecars.get(session["id"], "") != text:
+            self._write_sidecar(session["id"], text)
+            self._sidecars[session["id"]] = text
+
+    def _read_sidecar(self, session_id):
+        """The sidecar fields, or {} when the file is missing or unreadable (never fatal)."""
+        path = self._state_path(session_id)
+        try:
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(descriptor, "r", encoding="utf-8") as source:
+                state = json.loads(source.read())
+            if not isinstance(state, dict):
+                raise ValueError("not an object")
+        except FileNotFoundError:
+            self._sidecars[session_id] = None
+            return {}
+        except (OSError, ValueError, RecursionError) as exc:
+            # Rewritten on the next save; the conversation itself stays readable.
+            log.warning("Ignored unreadable conversation state file %s (%s).", path.name, type(exc).__name__)
+            self._sidecars.pop(session_id, None)
+            return {}
+        state = {name: state[name] for name in _SIDECAR_FIELDS if name in state}
+        self._sidecars[session_id] = self._sidecar_text(state)
+        return state
+
     def _write(self, session, *, insert_only=False):
         temporary, target = self._temporary(session)
         try:
@@ -139,33 +224,41 @@ class Store:
         descriptor = os.open(path, flags)
         try:
             with os.fdopen(descriptor, "r", encoding="utf-8") as source:
-                first = source.readline()
-                if not first:
-                    raise ValueError(f"Conversation file is empty: {path.name}")
-                record = json.loads(first)
-                if (not isinstance(record, dict) or record.get("record") != "session"
-                        or record.get("version") != 1 or not isinstance(record.get("data"), dict)):
-                    raise ValueError(f"Conversation file has an invalid header: {path.name}")
-                session = record["data"]
-                if metadata_only:
-                    return session
-                events, wire = [], []
-                for line in source:
-                    record = json.loads(line)
-                    kind = record.get("record") if isinstance(record, dict) else None
-                    if (kind == "field" and record.get("name") in _SEPARATE_FIELDS
-                            and "data" in record):
-                        session[record["name"]] = record["data"]
-                    elif kind == "inference_call" and "data" in record:
-                        session.setdefault("inference_calls", []).append(record["data"])
-                    elif kind == "command_job" and "data" in record:
-                        session.setdefault("command_jobs", []).append(record["data"])
-                    elif kind == "event" and "data" in record:
-                        events.append(record["data"])
-                    elif kind == "wire" and "data" in record:
-                        wire.append(record["data"])
-                    else:
-                        raise ValueError(f"Conversation file has an invalid record: {path.name}")
+                line_number = 1
+                try:
+                    first = source.readline()
+                    if not first:
+                        raise UnreadableConversation(path.name, "the file is empty")
+                    record = json.loads(first)
+                    if (not isinstance(record, dict) or record.get("record") != "session"
+                            or record.get("version") != 1 or not isinstance(record.get("data"), dict)):
+                        raise UnreadableConversation(path.name, "the first line is not a conversation header")
+                    session = record["data"]
+                    if metadata_only:
+                        return session
+                    events, wire = [], []
+                    for line_number, line in enumerate(source, start=2):
+                        record = json.loads(line)
+                        kind = record.get("record") if isinstance(record, dict) else None
+                        if (kind == "field" and record.get("name") in _SEPARATE_FIELDS
+                                and "data" in record):
+                            session[record["name"]] = record["data"]
+                        elif kind == "inference_call" and "data" in record:
+                            session.setdefault("inference_calls", []).append(record["data"])
+                        elif kind == "command_job" and "data" in record:
+                            session.setdefault("command_jobs", []).append(record["data"])
+                        elif kind == "event" and "data" in record:
+                            events.append(record["data"])
+                        elif kind == "wire" and "data" in record:
+                            wire.append(record["data"])
+                        else:
+                            raise UnreadableConversation(path.name, f"line {line_number} is not a valid record")
+                except json.JSONDecodeError:
+                    raise UnreadableConversation(path.name, f"line {line_number} is not valid JSON") from None
+                except UnicodeDecodeError:
+                    raise UnreadableConversation(path.name, "the file is not UTF-8 text") from None
+                except RecursionError:
+                    raise UnreadableConversation(path.name, f"line {line_number} is nested too deeply") from None
                 return {**session, "events": events, "wire": wire}
         except BaseException:
             # os.fdopen owns and normally closes the descriptor. If constructing
@@ -223,6 +316,7 @@ class Store:
             if merged or "command_jobs" in prepared:
                 prepared["command_jobs"] = merged
             self._write(prepared)
+            self._save_sidecar(prepared)
             self._command_jobs[session_id] = merged
         session["updated"] = prepared["updated"]
 
@@ -240,12 +334,28 @@ class Store:
                     jobs[job["id"]] = dict(job)
         return sorted(jobs.values(), key=lambda job: (job.get("created", 0), job["id"]))
 
+    def _read_own(self, session_id):
+        """The conversation stored in <session_id>.jsonl, or None if there is none.
+
+        Raises UnreadableConversation if the file cannot be read or holds another
+        conversation, so its data is never written under a different name."""
+        path = self._path(session_id)
+        try:
+            session = self._read_lines(path)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise UnreadableConversation(path.name, f"it could not be opened ({exc.strerror or type(exc).__name__})") from None
+        if session.get("id") != session_id:
+            raise UnreadableConversation(path.name, "its conversation ID does not match the file name")
+        return session
+
     def _known_jobs(self, session_id):
         if session_id not in self._command_jobs:
             try:
-                session = self._read_lines(self._path(session_id))
-            except FileNotFoundError:
-                session = {}
+                session = self._read_own(session_id) or {}
+            except UnreadableConversation:
+                session = {}  # Nothing trustworthy to merge from that file.
             self._command_jobs[session_id] = self._merge_jobs(session.get("command_jobs", []))
         return self._command_jobs[session_id]
 
@@ -257,10 +367,14 @@ class Store:
         with self._lock:
             session = None
             jobs = self._command_jobs.get(session_id)
+            # An unreadable conversation file is left exactly as it is: the job
+            # stays in the operational database and is not mirrored into it.
             if jobs is None:
                 try:
-                    session = self._read_lines(self._path(session_id))
-                except FileNotFoundError:
+                    session = self._read_own(session_id)
+                except UnreadableConversation:
+                    return
+                if session is None:
                     return
                 jobs = self._merge_jobs(session.get("command_jobs", []))
                 self._command_jobs[session_id] = jobs
@@ -269,11 +383,16 @@ class Store:
                 return
             if session is None:
                 try:
-                    session = self._read_lines(self._path(session_id))
-                except FileNotFoundError:
+                    session = self._read_own(session_id)
+                except UnreadableConversation:
+                    return
+                if session is None:
                     return
             jobs = self._merge_jobs(session.get("command_jobs", []), jobs, [job])
             session["command_jobs"] = jobs
+            legacy = {name: session[name] for name in _SIDECAR_FIELDS if name in session}
+            if legacy:  # Older field records: move them first, as the rewrite drops them.
+                self._save_sidecar({"id": session_id, **legacy, **self._read_sidecar(session_id)})
             self._write(session)
             self._command_jobs[session_id] = jobs
 
@@ -302,12 +421,17 @@ class Store:
                     temporary.unlink()
                 for target in published:
                     target.chmod(0o600)
+                for session in prepared:
+                    self._save_sidecar(session)
                 self._sync_directory()
             except BaseException:
                 for temporary, _ in staged:
                     temporary.unlink(missing_ok=True)
                 for target in published:
                     target.unlink(missing_ok=True)
+                for session in prepared:
+                    self._state_path(session["id"]).unlink(missing_ok=True)
+                    self._sidecars.pop(session["id"], None)
                 self._sync_directory()
                 raise
         for original, saved in zip(sessions, prepared):
@@ -319,30 +443,85 @@ class Store:
             return None
         path = self._path(session_id)
         with self._lock:
-            try:
-                session = self._read_lines(path)
-            except FileNotFoundError:
+            known = self._load_problems.get(path.name)
+            if known is not None:
+                if known[1] == _fingerprint(path):
+                    raise UnreadableConversation(path.name, known[0])
+                del self._load_problems[path.name]  # Changed since; try it again.
+            session = self._read_own(session_id)
+            if session is None:
                 return None
+            # Older files keep these as field records; the sidecar is newer when both exist.
+            session.update(self._read_sidecar(session_id))
             self._command_jobs[session_id] = self._merge_jobs(
                 self._command_jobs.get(session_id, []), session.get("command_jobs", []))
             return session
 
     def list(self):
+        """Readable conversations, newest first. Unreadable files are skipped and
+        reported in problems(); they are left exactly as they are."""
         with self._lock:
-            summaries = []
+            summaries, problems = [], {}
             for path in self.conversations.glob("*.jsonl"):
                 if path.is_symlink():
                     continue
-                metadata = self._read_lines(path, metadata_only=True)
+                known = self._load_problems.get(path.name)
+                if known is not None:
+                    if known[1] == _fingerprint(path):
+                        problems[path.name] = known[0]
+                        continue
+                    del self._load_problems[path.name]  # Changed since; try it again.
+                try:
+                    metadata = self._read_lines(path, metadata_only=True)
+                except FileNotFoundError:
+                    continue  # Deleted while listing.
+                except UnreadableConversation as exc:
+                    problems[path.name] = exc.reason
+                    continue
+                except OSError as exc:
+                    problems[path.name] = f"it could not be opened ({exc.strerror or type(exc).__name__})"
+                    continue
                 if metadata.get("id") != path.stem:
-                    raise ValueError(f"Conversation filename does not match its ID: {path.name}")
-                summaries.append(self.summary(metadata))
+                    problems[path.name] = "its conversation ID does not match the file name"
+                elif (type(metadata.get("updated")) not in (int, float) or not isinstance(metadata.get("workspace"), str)
+                      or not isinstance(metadata.get("title", ""), str)):
+                    problems[path.name] = "its header lacks a valid title, workspace or update time"
+                else:
+                    summaries.append(self.summary(metadata))
+            self._list_problems = problems
             return sorted(summaries, key=lambda session: session["updated"], reverse=True)
+
+    def record_problem(self, file, reason):
+        """Hide a conversation whose full load failed until its file changes."""
+        with self._lock:
+            self._load_problems[file] = (reason, _fingerprint(self.conversations / file))
+            self._list_problems[file] = reason
+
+    def problem_workspaces(self):
+        """Workspaces named by the readable headers of files the latest list() skipped."""
+        with self._lock:
+            names = list(self._list_problems)
+        workspaces = []
+        for name in names:
+            try:
+                header = self._read_lines(self.conversations / name, metadata_only=True)
+            except (OSError, ValueError):
+                continue  # No readable header: nothing names a workspace.
+            if isinstance(header.get("workspace"), str):
+                workspaces.append(header["workspace"])
+        return workspaces
+
+    def problems(self):
+        """Files skipped by the latest list(), as [{file, reason}] sorted by name."""
+        with self._lock:
+            return [{"file": file, "reason": reason} for file, reason in sorted(self._list_problems.items())]
 
     def delete(self, session_id):
         if not self._valid_id(session_id):
             return
         with self._lock:
             self._path(session_id).unlink(missing_ok=True)
+            self._state_path(session_id).unlink(missing_ok=True)
             self._command_jobs.pop(session_id, None)
+            self._sidecars.pop(session_id, None)
             self._sync_directory()

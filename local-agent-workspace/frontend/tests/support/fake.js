@@ -3,7 +3,8 @@
 //   fake.handle(path, options)   default responses for a test file (scenario)
 //   fake.override(path, options) per-test responses; return undefined to fall through
 //   fake.calls                   every request: { path, method, body, headers }
-//   fake.sockets                 every WebSocket opened by the UI
+//   fake.sockets                 every conversation WebSocket opened by the UI
+//   fake.presence                every presence WebSocket (one per open page)
 //   fake.spy(name, impl)         callback props; arguments land in fake.spies[name]
 //   fake.defer(name)             a pending response resolved later from the test
 (() => {
@@ -23,7 +24,7 @@
       this.onopen = null
       this.onmessage = null
       this.onclose = null
-      fake.sockets.push(this)
+      ;(url.endsWith('/api/presence') ? fake.presence : fake.sockets).push(this)
     }
     close() { this.onclose?.() }
     open() { this.onopen?.() }
@@ -34,6 +35,7 @@
     json, deferred,
     calls: [],
     sockets: [],
+    presence: [],
     spies: {},
     deferreds: {},
     clipboard: [],

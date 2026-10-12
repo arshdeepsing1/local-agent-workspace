@@ -5,7 +5,7 @@ import PermissionsMenu from './PermissionsMenu.js'
 import { useSlashMenu } from './SlashMenu.js'
 
 // Props: value, setValue, model, models, busy, disabled, modelSaving, onModel, workspace,
-// mode, onMode, onProject, onFolders, onSend, onStop, onAttach, onError, loadSkills
+// mode, onMode, onProject, onFolders, onSend, onStop, onAttach, onError, loadSkills, rules, onRemoveRule
 export default function Composer(p) {
   const [sending, setSending] = useState(false)
   const input = useRef(null)
@@ -40,7 +40,8 @@ export default function Composer(p) {
     </div>
     <div class="composer-toolbar">
       <button class="attach-button icon-button" aria-label="Add project file" onClick=${p.onAttach}><${Plus} size=${19} /></button>
-      <${PermissionsMenu} mode=${p.mode} busy=${p.busy || p.disabled || sending || p.modelSaving} onChange=${p.onMode} onError=${p.onError} onDone=${() => input.current?.focus()} />
+      <${PermissionsMenu} mode=${p.mode} busy=${p.busy || p.disabled || sending || p.modelSaving} onChange=${p.onMode} onError=${p.onError} onDone=${() => input.current?.focus()}
+        rules=${p.rules} onRemoveRule=${p.onRemoveRule} />
       <span class="composer-spacer" />
       <div class="model-control">
         <select aria-label="Model" value=${p.model} disabled=${p.disabled || p.busy || sending || p.modelSaving} onChange=${e => void changeModel(e.currentTarget.value)}

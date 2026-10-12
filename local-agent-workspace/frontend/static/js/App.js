@@ -2,6 +2,7 @@ import { html, resolve, useState } from './lib.js'
 import { Folder, Laptop, Menu, PanelRight, Pencil, Terminal, X } from './icons.js'
 import { api } from './api.js'
 import { useWorkspace } from './useWorkspace.js'
+import { useAttention } from './attention.js'
 import Sidebar, { Brand } from './components/Sidebar.js'
 import Composer from './components/Composer.js'
 import Conversation from './components/Conversation.js'
@@ -10,17 +11,33 @@ import SettingsDialog from './components/SettingsDialog.js'
 import WorkspacePanel from './components/WorkspacePanel.js'
 import FolderAccessDialog from './components/FolderAccessDialog.js'
 import ContextMeter from './components/ContextMeter.js'
+import ChangesBar, { plural } from './components/ChangesBar.js'
+import StorageNotice from './components/StorageNotice.js'
+import { blockerOf, OpenBlockingChat } from './components/BlockingChat.js'
+import TaskChecklist from './components/TaskChecklist.js'
+import ContinueButton from './components/ContinueButton.js'
+import { removeDraft, useSavedDrafts } from './drafts.js'
 
 export default function App() {
   const app = useWorkspace()
-  const [drafts, setDrafts] = useState({})
-  const draft = drafts[app.viewKey] || ''
-  const setDraft = value => setDrafts(current => ({ ...current, [app.viewKey]: resolve(value, current[app.viewKey] || '') }))
+  const attention = useAttention({ sessions: app.sessions, activeId: app.activeId, ready: app.ready, onSelect: app.setActiveId })
+  // Message drafts are saved in localStorage per conversation ('new' before it exists).
+  const draftKey = app.activeId || 'new'
+  const [draft, setDraft, forgetDraft, releaseDraft] = useSavedDrafts(app.viewKey, draftKey)
+  const send = async text => {
+    const restore = draftKey === 'new' ? releaseDraft('new') : null
+    let id
+    try { id = await app.send(text) }
+    catch (error) { restore?.(); throw error }
+    forgetDraft(text, draftKey, id)
+  }
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [agentToolsOpen, setAgentToolsOpen] = useState(false)
   const [workspaceOpen, setWorkspaceOpen] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [foldersOpen, setFoldersOpen] = useState(false)
+  // A changed file chosen in the changes bar, to open in the Workspace panel's review.
+  const [review, setReview] = useState(null)
   const active = app.session
   const workspace = active?.workspace || app.settings?.workspace || ''
   const editorKey = JSON.stringify([app.viewKey, workspace])
@@ -28,31 +45,52 @@ export default function App() {
   const setEditorFile = value => setEditorDrafts(current => ({ ...current, [editorKey]: resolve(value, current[editorKey] || null) }))
   const hasMessages = !!active?.events.length
   const busy = !!active && active.status !== 'idle'
-  const showError = error => app.setError(error)
+  // An error can name another chat that blocks the action: { message, session_id, title }.
+  const [blocker, setBlocker] = useState(null)
+  const showError = error => {
+    const message = typeof error === 'string' ? error : error?.message || String(error)
+    setBlocker(blockerOf(error))
+    app.setError(message)
+  }
+  const changedFiles = app.changes?.files.length || 0
+  const openReview = path => { setReview({ path, viewKey: app.viewKey }); setWorkspaceOpen(true) }
+  // Removing a rule saves the chat (a newer 'updated'); like a rename, your own change is not news.
+  const removeAllowRule = async rule => {
+    const id = app.activeId
+    const before = app.sessions.find(item => item.id === id)?.updated
+    const updated = await app.removeAllowRule(rule)
+    if (typeof updated?.updated === 'number') attention.renamed(id, before, updated.updated)
+  }
   const composer = html`<${Composer} key=${app.viewKey} value=${draft} setValue=${setDraft} model=${active?.model || app.settings?.model || 'databricks-gpt-oss-120b'}
     workspace=${active?.workspace || app.settings?.workspace || ''} mode=${app.permissionMode} onMode=${app.setPermissionMode} onProject=${() => setSettingsOpen(true)}
-    onFolders=${() => setFoldersOpen(true)}
+    onFolders=${() => setFoldersOpen(true)} rules=${active?.allow_rules || []} onRemoveRule=${removeAllowRule}
     models=${app.connection?.models || []} busy=${busy} modelSaving=${app.modelSaving}
     disabled=${!app.ready || (!!app.activeId && !active) || !app.settings?.configured}
     onModel=${app.changeModel}
-    onSend=${app.send} onError=${showError} onAttach=${() => setWorkspaceOpen(true)}
+    onSend=${send} onError=${showError} onAttach=${() => setWorkspaceOpen(true)}
     loadSkills=${() => api(`/skills${app.activeId ? `?session_id=${encodeURIComponent(app.activeId)}` : ''}`)}
     onStop=${() => { if (active) void api(`/sessions/${active.id}/stop`, 'POST').catch(e => showError(e.message)) }} />`
   return html`<div class=${`app-shell ${workspaceOpen ? 'workspace-visible' : ''}`}>
     <${Sidebar} settings=${app.settings} connection=${app.connection} sessions=${app.sessions} activeId=${app.activeId}
       open=${sidebarOpen} close=${() => setSidebarOpen(false)} onNew=${app.newConversation}
       onSelect=${app.setActiveId} onSettings=${() => setSettingsOpen(true)}
-      onRename=${app.renameSession}
-      onDelete=${id => void app.deleteSession(id).catch(e => showError(e.message))} />
+      attention=${attention} onRename=${async (id, title) => {
+        const before = app.sessions.find(item => item.id === id)?.updated
+        attention.renamed(id, before, (await app.renameSession(id, title)).updated)
+      }}
+      onDelete=${id => void app.deleteSession(id).then(() => removeDraft(id)).catch(e => showError(e.message))} />
     <main class="main-area">
       <header class="topbar"><button class="icon-button mobile-only" aria-label="Open sidebar" onClick=${() => setSidebarOpen(true)}><${Menu} size=${20} /></button>
         <${Laptop} size=${18} className="topbar-device" />
         <span class="conversation-title">${active?.title || (app.activeId ? 'Loading conversation…' : 'New conversation')}
           ${app.activeId ? html`<small class="session-id" title=${`Session: ${app.activeId}`}> · ${app.activeId.slice(0, 8)}</small>` : null}</span>
         <button class="outline agent-tools-toggle" onClick=${() => setAgentToolsOpen(true)}>Agent tools</button>
-        <button class=${`outline workspace-toggle ${workspaceOpen ? 'active' : ''}`} onClick=${() => setWorkspaceOpen(v => !v)}><${PanelRight} size=${18} /><span>Workspace</span></button>
+        <button class=${`outline workspace-toggle ${workspaceOpen ? 'active' : ''}`} onClick=${() => setWorkspaceOpen(v => !v)}><${PanelRight} size=${18} /><span>Workspace</span>
+          ${changedFiles ? html`<span class="change-count" title=${`${plural(changedFiles, 'file')} changed by the agent`}><span aria-hidden="true">${changedFiles}</span><span class="sr-only">(${plural(changedFiles, 'changed file')})</span></span>` : null}</button>
       </header>
-      ${app.error ? html`<div class="app-error" role="alert"><span>${app.error}</span><button class="icon-button" aria-label="Dismiss error" onClick=${() => app.setError('')}><${X} size=${16} /></button></div>` : null}
+      ${app.error ? html`<div class="app-error" role="alert"><span>${app.error}</span>
+        <${OpenBlockingChat} blocker=${blocker?.message === app.error ? blocker : null} currentId=${app.activeId} onSelect=${app.setActiveId} /><button class="icon-button" aria-label="Dismiss error" onClick=${() => app.setError('')}><${X} size=${16} /></button></div>` : null}
+      <${StorageNotice} problems=${app.storageProblems} />
       ${!app.online && app.activeId ? html`<div class="connection-banner">Reconnecting to your local server… Refresh if the server was restarted.</div>` : null}
       ${app.connection && !app.connection.connected ? html`<div class="connection-banner"><span>${app.connection.error || 'Configure Databricks to start a conversation.'}</span><button onClick=${() => setSettingsOpen(true)}>Open settings</button></div>` : null}
       ${hasMessages && active ? html`<${Conversation} key=${active.id} session=${active} onError=${showError} onSelectSession=${app.setActiveId} />` :
@@ -61,7 +99,10 @@ export default function App() {
             <button class="outline" onClick=${() => setDraft('Help me make a change in this project: ')}><${Pencil} size=${16} />Make a change</button>
             <button class="outline" onClick=${() => setDraft('Run a command in this workspace: ')}><${Terminal} size=${16} />Run a command</button></div>
         </div></div>`}
-      <div class="chat-composer">${composer}
+      <div class="chat-composer"><div class="composer-bars"><${ChangesBar} key=${`changes-${app.viewKey}`} changes=${app.changes} busy=${busy} onOpen=${openReview} onAction=${app.reviewChanges} onError=${showError} />
+        <${TaskChecklist} key=${`tasks-${app.viewKey}`} tasks=${app.tasks} />
+        <${ContinueButton} session=${active} disabled=${!app.ready || !app.online || app.modelSaving || !app.settings?.configured} onSend=${app.send} onError=${showError} /></div>
+        ${composer}
         ${active?.status === 'awaiting_approval' ? html`<p class="composer-hint" role="status">An action is waiting for your approval above.</p>` : null}
         ${active?.status === 'compacting' ? html`<p class="composer-hint" role="status">Compacting context…</p>` : null}
         ${active?.status === 'naming' ? html`<p class="composer-hint" role="status">Creating conversation title…</p>` : null}
@@ -72,8 +113,10 @@ export default function App() {
       </div>
     </main>
     ${workspaceOpen && app.settings && (!app.activeId || active) ? html`<${WorkspacePanel} key=${editorKey} sessionId=${app.activeId}
+      allowedDirectories=${active?.allowed_directories || []}
       workspace=${workspace} file=${editorDrafts[editorKey] || null} setFile=${setEditorFile} onClose=${() => setWorkspaceOpen(false)}
-      onAttach=${path => { setDraft(current => `${current}${current ? '\n' : ''}Please read the project file: ${path}`); setWorkspaceOpen(false) }} />` : null}
+      changes=${app.changes} busy=${busy} review=${review?.viewKey === app.viewKey ? review : null} onReviewOpened=${() => setReview(null)} onReview=${app.reviewChanges} onSelectSession=${app.setActiveId}
+      onAttach=${path => { setDraft(current => `${current}${current ? '\n' : ''}Please read the ${path.startsWith('/') ? 'file' : 'project file'}: ${path}`); setWorkspaceOpen(false) }} />` : null}
     ${agentToolsOpen && app.settings && (!app.activeId || active) ? html`<${AgentToolsDialog} key=${editorKey} session=${active} workspace=${workspace} onClose=${() => setAgentToolsOpen(false)} onError=${showError} onSelectSession=${id => { setAgentToolsOpen(false); app.setActiveId(id); void app.refreshSessions().catch(e => showError(e.message)) }} />` : null}
     ${settingsOpen && app.settings ? html`<${SettingsDialog} settings=${app.settings} connection=${app.connection} onSave=${app.saveSettings} onClose=${() => setSettingsOpen(false)} />` : null}
     ${foldersOpen && app.settings ? html`<${FolderAccessDialog} key=${app.viewKey} workspace=${active?.workspace || app.settings.workspace} folders=${active?.allowed_directories || []}

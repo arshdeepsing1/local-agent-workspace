@@ -127,6 +127,22 @@ def _tool(event, excerpt_chars):
     return line
 
 
+def transcript_file_stem(session, *, redact=lambda text: text):
+    """<date>-<title>-<id>, the name the transcript script and the app's export give a transcript.
+    The title is redacted like the transcript itself, so a secret becomes "-redacted-"."""
+    try:
+        day = datetime.fromtimestamp(float(session.get("created"))).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OverflowError, OSError):
+        day = "undated"
+    title = redact(redact_secrets(str(session.get("title") or "")))
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:60].strip("-") or "chat"
+    return f"{day}-{slug}-{str(session.get('id', ''))[:8]}".rstrip("-")
+
+
+def transcript_file_name(session, *, redact=lambda text: text):
+    return transcript_file_stem(session, redact=redact) + ".md"
+
+
 def transcript(session, *, excerpt_chars=EXCERPT_CHARS, redact=lambda text: text):
     """Markdown for one conversation. Common secret shapes and anything redact
     replaces (the app's configured credentials) are replaced with [REDACTED]."""
