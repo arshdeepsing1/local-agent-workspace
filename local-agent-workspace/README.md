@@ -1088,7 +1088,8 @@ measurements.
 **Settings → Auto-compact at (% of input budget)** (default 90, 50–100) sets when
 automatic compaction runs: when the next request's estimate passes that share of the
 input budget (the budget left after the reply and safety reserves). With the default
-settings that is about 108,748 tokens. Lower values compact sooner and keep requests
+settings (Claude Opus 5.5 at 200,000 and 16,384) that is about 163,411 tokens; at 131,072 and 8,192 it is
+about 108,748. Lower values compact sooner and keep requests
 smaller; 100 waits until the input budget is full. Compaction looks for a cut that
 brings the request under the threshold. When no cut does (for example a large first
 request, or a large request after a few short turns) and the request still fits the
@@ -1144,8 +1145,8 @@ When older turns are compacted, the same endpoint summarizes them in bounded req
 The summarizer reads a shortened copy of the archived messages; the saved history
 never changes. Tool results longer than a limit (3/32 of the summary request's input
 room, at least 8,000 and at most 64,000 bytes, twice that inside one long request; at
-a 131,072-token context budget with handoffs on it is 10,596 bytes, or 9,828 on models
-that always think) keep
+the default 200,000-token context budget on Claude Opus 5.5 with handoffs on it is 16,290 bytes; at
+131,072 tokens it is 10,596 bytes, or 9,828 on models that always think) keep
 their start and end around a marker; a `read_file` page also keeps the definition
 lines (`class`, `def`, `function` and similar) of its omitted middle with their line
 numbers. File contents in `write_file`, `edit_file` and `notebook_edit` arguments keep
