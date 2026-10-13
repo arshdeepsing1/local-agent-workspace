@@ -50,6 +50,20 @@ def event(session, call_id):
     return next(item for item in reversed(session["events"]) if item.get("call_id") == call_id)
 
 
+async def test_a_read_summarized_at_compaction_must_be_read_again(runtime):
+    manager, session, project, tools = runtime
+    await read(manager, session, tools)
+    target = str((project / "note.txt").resolve())
+    session["file_views"], session["context_state"] = agents.forget_summarized_reads(
+        session["file_views"], {"summary": "s", "through": 2, "compactions": 1}, [target])
+    output = await write(manager, session, tools, "new\n")
+    assert "Read note.txt again before overwriting it: its earlier contents were summarized out of your context" in output
+    assert (project / "note.txt").read_text() == "original\n"
+    await read(manager, session, tools)
+    await write(manager, session, tools, "new\n")
+    assert (project / "note.txt").read_text() == "new\n"
+
+
 async def test_overwriting_is_refused_before_a_read_without_asking_the_user(runtime):
     manager, session, project, tools = runtime
     session["permission_mode"] = "manual"

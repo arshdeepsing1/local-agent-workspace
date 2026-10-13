@@ -9,6 +9,7 @@ from .context import (
     DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT_TOKENS, MAX_CONTEXT_WINDOW,
     MAX_MAX_OUTPUT_TOKENS, MIN_CONTEXT_WINDOW, MIN_MAX_OUTPUT_TOKENS, SAFETY_MARGIN,
 )
+from .context import DEFAULT_AUTO_COMPACT_PERCENT, MAX_AUTO_COMPACT_PERCENT, MIN_AUTO_COMPACT_PERCENT
 
 APP_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MAX_AGENT_STEPS = 32
@@ -76,6 +77,7 @@ class Settings:
             "max_output_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
             "max_agent_steps": DEFAULT_MAX_AGENT_STEPS,
             "compaction_handoffs": True,
+            "auto_compact_percent": DEFAULT_AUTO_COMPACT_PERCENT,
             "approval_timeout_minutes": DEFAULT_APPROVAL_MINUTES,
             "system_notifications": False,
             "user_instructions": "",
@@ -129,6 +131,10 @@ class Settings:
             raise ValueError(f"Agent step limit must be an integer from {MIN_MAX_AGENT_STEPS} to {MAX_MAX_AGENT_STEPS}.")
         if type(candidate["compaction_handoffs"]) is not bool:
             raise ValueError("Compaction handoffs must be on or off.")
+        percent = candidate["auto_compact_percent"]
+        if type(percent) is not int or not MIN_AUTO_COMPACT_PERCENT <= percent <= MAX_AUTO_COMPACT_PERCENT:
+            raise ValueError(f"Auto-compact threshold must be an integer from {MIN_AUTO_COMPACT_PERCENT} to "
+                             f"{MAX_AUTO_COMPACT_PERCENT} percent.")
         minutes = candidate["approval_timeout_minutes"]
         if type(minutes) is not int or not 0 <= minutes <= MAX_APPROVAL_MINUTES:
             raise ValueError(f"Approval wait must be 0 (no limit) or 1 to {MAX_APPROVAL_MINUTES:,} minutes.")

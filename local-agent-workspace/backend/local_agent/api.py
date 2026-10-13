@@ -22,6 +22,7 @@ from .config import MAX_COMMAND_ENV, MAX_USER_INSTRUCTIONS, MAX_WRITE_LIMIT_KB, 
 from .context import (
     MAX_CONTEXT_WINDOW, MAX_MAX_OUTPUT_TOKENS, MIN_CONTEXT_WINDOW, MIN_MAX_OUTPUT_TOKENS,
 )
+from .context import MAX_AUTO_COMPACT_PERCENT, MIN_AUTO_COMPACT_PERCENT
 from .store import Store, UnreadableConversation
 from . import conversation_search
 from .git_tools import file_diff, working_tree_changes, working_tree_status
@@ -129,6 +130,8 @@ class SettingsEdit(BaseModel):
     max_output_tokens: int | None = Field(default=None, ge=MIN_MAX_OUTPUT_TOKENS, le=MAX_MAX_OUTPUT_TOKENS, strict=True)
     max_agent_steps: int | None = Field(default=None, ge=MIN_MAX_AGENT_STEPS, le=MAX_MAX_AGENT_STEPS, strict=True)
     compaction_handoffs: bool | None = Field(default=None, strict=True)
+    auto_compact_percent: int | None = Field(default=None, ge=MIN_AUTO_COMPACT_PERCENT, le=MAX_AUTO_COMPACT_PERCENT,
+                                             strict=True)
     approval_timeout_minutes: int | None = Field(default=None, ge=0, le=MAX_APPROVAL_MINUTES, strict=True)
     system_notifications: bool | None = Field(default=None, strict=True)
     auto_keep_changes: bool | None = Field(default=None, strict=True)

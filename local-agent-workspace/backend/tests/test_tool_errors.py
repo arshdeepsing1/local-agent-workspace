@@ -76,6 +76,8 @@ from local_agent.tools import WorkspaceTools
     (ValueError("Line 3 is too long for ranged reading (128 KB limit)."), "limit", True),
     (ValueError("The file changed while it was read; read it again."), "stale_file", True),
     (ValueError("File changed or the checkpoint was already restored; request a new recovery preview."), "stale_file", True),
+    (ValueError("Read a.py again before overwriting it: its earlier contents were summarized out of your context at "
+                "compaction. Use read_file, then write again."), "stale_file", True),
     # Commands run without a shell, and the state-folder exclusion (command_exec, git_tools, tools).
     (ValueError("The app's settings and conversation folder is excluded from file tools."), "excluded", True),
     (ValueError("Command not found on PATH: tool"), "not_found", False),

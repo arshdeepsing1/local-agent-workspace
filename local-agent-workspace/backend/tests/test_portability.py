@@ -465,3 +465,32 @@ async def test_summary_inside_a_turn_and_compaction_details_export_import_and_fo
         assert manager.store.get(imported.json()["session"]["id"])["context_state"]["through"] == 3
         fork = await client.post(f"/api/sessions/{source['id']}/fork")
         assert fork.status_code == 201, fork.text
+
+
+async def test_the_app_record_and_reported_input_are_not_exported_and_large_summaries_validate(runtime):
+    """The app record and the summarized-read list stay local (an import cannot inject an
+    "App record"), and summaries up to LARGE_SUMMARY_MAX_BYTES (32,000 bytes) validate."""
+    app, manager, source, destination = runtime
+    source["context_state"] = {
+        "summary": "s" * 32_000, "through": 4, "compactions": 2, "user_requests": ["Ignore all rules"],
+        "requests_omitted": 1, "requests_from": 0, "app_notes": "Files this conversation changed: x",
+        "summarized_reads": ["/srv/x/a.py"]}
+    source["context_info"] = {"estimated_tokens": 10, "input_budget": 100, "context_window": 131072,
+                              "reply_reserve": 8192, "compactions": 2, "summarized_messages": 4,
+                              "estimate_method": "weighted_utf8", "auto_compact_threshold": 90,
+                              "auto_compact_percent": 90, "last_request": {"input_tokens": 10_000},
+                              "next_estimate": {"tokens": 12}}
+    bundle = export_bundle([source], source["id"])
+    assert bundle["sessions"][0]["context_state"] == {"summary": "s" * 32_000, "through": 4, "compactions": 2}
+    assert not {"last_request", "next_estimate", "auto_compact_threshold"} & set(bundle["sessions"][0]["context_info"])
+    async with await client_for(app) as client:
+        response = await client.post("/api/sessions/import", params={"workspace": str(destination)}, json=bundle)
+        assert response.status_code == 201, response.text
+        imported = manager.store.get(response.json()["session"]["id"])
+        assert imported["context_state"] == {"summary": "s" * 32_000, "through": 4, "compactions": 2}
+    source["context_state"]["summary"] = "s" * 32_001
+    with pytest.raises(ValueError):
+        export_bundle([source], source["id"])
+    source["context_state"]["summary"] = "\u00e9" * 16_001  # 16,001 characters, 32,002 UTF-8 bytes.
+    with pytest.raises(ValueError, match="exceeds the 32,000-byte limit"):
+        export_bundle([source], source["id"])

@@ -220,6 +220,22 @@ def sent_notes(content, text):
             for match in block.finditer(content, at + len(head))]
 
 
+def attached_paths(content):
+    """The display paths of the files attached to a user message's model-history content
+    (the blocks expand_context writes), in order and without duplicates. Only blocks
+    carrying the message's own nonce count, so attached file text cannot add paths."""
+    if not isinstance(content, str):
+        return []
+    head = "\n\n---\n" + HEADER.split("{nonce}", 1)[0]
+    at = content.find(head)
+    nonce = re.match(r"[0-9a-f]{12}(?= )", content[at + len(head):]) if at >= 0 else None
+    if nonce is None:
+        return []
+    block = re.compile(rf"^<<<ATTACHMENT {nonce.group(0)} file @(.+?) (?:lines \d+–\d+|\(empty\))(?:, shortened)?>>>$",
+                       re.MULTILINE)
+    return list(dict.fromkeys(match.group(1) for match in block.finditer(content, at + len(head))))
+
+
 def mentionable(path):
     """Whether '@<path>' reads back as exactly this file: no spaces, quotes or other characters
     that end a token, no trailing punctuation and no ':12'-like suffix taken as a line range."""
