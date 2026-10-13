@@ -197,11 +197,19 @@ def _pyvenv_version(config_file):
     return None
 
 
+# Where venvs keep site-packages: lib/python3.X (CPython, conda), lib/pypy3.X (PyPy), lib64, or the top level.
+SITE_PACKAGES = (("lib", "*", "site-packages"), ("lib64", "*", "site-packages"), ("site-packages",))
+
+
 def has_pip(venv):
-    """Whether the pip module is installed in the virtual environment (uv venv and --without-pip leave it out).
-    Looks for the package, as `python -m pip` needs it; nothing runs."""
-    pattern = os.path.join(glob.escape(str(venv)), "lib", "python*", "site-packages", "pip", "__init__.py")
-    return bool(glob.glob(pattern))
+    """Whether the pip module is installed in the virtual environment (uv venv and --without-pip leave it out):
+    True or False, or None when no site-packages folder is found (a layout not recognised). Looks for the
+    package, as `python -m pip` needs it; nothing runs."""
+    root = glob.escape(str(venv))
+    folders = [path for parts in SITE_PACKAGES for path in glob.glob(os.path.join(root, *parts))]
+    if any(os.path.isfile(os.path.join(folder, "pip", "__init__.py")) for folder in folders):
+        return True
+    return False if folders else None
 
 
 def _python_venv(value, settings):
@@ -230,7 +238,7 @@ def python_venv_status(settings):
     version = f" (Python {venv['version']})" if venv["version"] else ""
     pip = has_pip(venv["path"])
     return {"path": venv["path"], "state": "ready",
-            "message": f"Ready: commands use {venv['python']}{version}." + ("" if pip else " No pip is installed in it."),
+            "message": f"Ready: commands use {venv['python']}{version}." + (" No pip is installed in it." if pip is False else ""),
             "python": venv["python"], "version": venv["version"], "pip": pip, "source": source}
 
 

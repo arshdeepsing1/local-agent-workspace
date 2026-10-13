@@ -695,8 +695,11 @@ async def test_edits_inside_the_venv_are_protected(layout, runtime):
 # 35a A venv without pip (uv venv, --without-pip): a pip on PATH belongs to another Python
 
 
-async def test_the_system_prompt_names_a_venv_without_pip(layout, runtime):
+@pytest.mark.parametrize("site", ["lib/python3.12/site-packages", "lib/pypy3.10/site-packages",
+                                  "lib64/python3.12/site-packages", "site-packages"])
+async def test_the_system_prompt_names_a_venv_without_pip(layout, runtime, site):
     venv = make_venv(layout.tmp / "venvs" / "v")
+    (venv / site).mkdir(parents=True)  # uv venv and --without-pip create site-packages without pip.
     manager, session, tools = runtime(python_venv=str(venv))
     text = system_text(manager, session, tools)
     assert f"commands run with the virtual environment {venv} active" in text
@@ -706,13 +709,22 @@ async def test_the_system_prompt_names_a_venv_without_pip(layout, runtime):
     status = manager.settings.public()["python_venv_status"]
     assert status["pip"] is False and "No pip is installed in it." in status["message"]
     # Checked again on every use: once pip is installed, the usual line comes back.
-    package = venv / "lib" / "python3.12" / "site-packages" / "pip"
-    package.mkdir(parents=True)
+    package = venv / site / "pip"
+    package.mkdir()
     (package / "__init__.py").write_text("")
     text = system_text(manager, session, tools)
     assert "python, pip and installed tools resolve there" in text and "Install packages with `python -m pip`" in text
     assert "has no pip" not in text
     assert manager.settings.public()["python_venv_status"]["pip"] is True
+
+
+async def test_a_venv_layout_without_site_packages_keeps_the_usual_pip_line(layout, runtime):
+    venv = make_venv(layout.tmp / "venvs" / "v")  # No site-packages folder the app recognises.
+    manager, session, tools = runtime(python_venv=str(venv))
+    text = system_text(manager, session, tools)
+    assert "Install packages with `python -m pip`" in text and "has no pip" not in text
+    status = manager.settings.public()["python_venv_status"]
+    assert status["pip"] is None and "No pip" not in status["message"]
 
 
 # 35 An invalid venv is not used
