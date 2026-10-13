@@ -1292,7 +1292,10 @@ where that applies).
 notebook, move, delete, MCP or activity-log cards). The app validates the change, checks the
 rules again, refuses it when the file changed since the card was shown, and shows a new
 preview; the card keeps waiting with the same expiry. The agent is told that you edited the
-action ("It ran as: …" for a command) and that its own proposal did not run.
+action ("It ran as: …" for a command) and that its own proposal did not run. **Save edit** stays
+off until the text differs, and changing it back to the agent's own proposal is not an edit. An
+edited Verify card runs the edited command as that Verify run: the Verify notices name it, and a
+failure starts a fix round as usual.
 
 **From a card and the menu.** An approval card's **Always allow…** button opens a form that
 sets where the rule is saved (**This chat**, **This project** or **All projects**; only the

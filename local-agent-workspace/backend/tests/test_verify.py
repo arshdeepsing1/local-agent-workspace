@@ -444,3 +444,28 @@ async def test_an_expired_verify_approval_gets_a_plain_notice(runtime, monkeypat
     await manager.run(session, "Write the notes")
     assert len(requests) == 2 and verify_runs(session)[0]["approval"] == "expired"
     assert notices(session)[-1] == "Verify did not run: the approval expired."
+
+
+@pytest.mark.parametrize("edited, last", [
+    ("test -f notes.txt", "Verify passed: test -f notes.txt"),
+    ("false", "Verify failed (exit 1). Asking the agent to fix it (round 1 of 2)."),
+])
+async def test_a_verify_card_edited_before_approving_reports_the_command_that_ran(runtime, monkeypatch, edited, last):
+    manager, session, project = runtime
+    configure(manager, project, "true")
+    session.update(permission_mode="acceptEdits")
+    manager.store.save(session)
+    requests = model(monkeypatch, write("notes.txt"), say("Done."), say("Nothing to fix."))
+    manager.start(session["id"], "Write the notes")
+    session = manager.live[session["id"]]
+    await wait_for(lambda: any(event.get("verify") and event.get("state") == "pending" for event in session["events"]))
+    card = verify_runs(session)[0]
+    await manager.revise_card(session["id"], card["id"], {"command": edited})
+    manager.decide(session["id"], card["id"], True)
+    await asyncio.wait_for(manager.tasks[session["id"]], 10)
+    assert card["edited"] is True and card["output"].lstrip().startswith("{")
+    assert last in notices(session)
+    assert not any(text.startswith("Verify did not run:") for text in notices(session))
+    if edited == "false":
+        assert requests[2]["messages"][-1]["content"].startswith(
+            VERIFY_CONTINUATION_PREFIX + " the project's verify command `false` failed (failed, exit 1)")

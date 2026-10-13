@@ -1805,7 +1805,7 @@ class AgentManager:
             else:
                 result = await tools.execute(name, arguments)
             output = result if isinstance(result, str) else json.dumps(result, indent=2)
-            if edited_note:
+            if edited_note and origin != "verify":  # Verify reads the JSON result; its card says it was edited.
                 output = edited_note + "\n" + output
             output = self.settings.redact(output)
             failed = name.startswith("mcp__") and isinstance(result, dict) and result.get("is_error") is True
@@ -1844,11 +1844,15 @@ class AgentManager:
 
     def card_reviser(self, session, tools, event, name, definition, card, original):
         """Edit before approving: the closure that checks and applies a change to a waiting card."""
+        proposed = card["arguments"]
+
         async def revise(changes):
             if (not isinstance(changes, dict) or not changes or set(changes) - set(EDITABLE[name])
                     or any(type(value) is not str for value in changes.values())):
                 raise ValueError(EDIT_ONLY[name])
             new = {**card["arguments"], **changes}
+            if new == card["arguments"]:
+                return  # Saved without a change: the card stays as it is.
             validate_arguments(definition["parameters"], new, limit=512 * 1024)
             if name == "run_command":
                 validate_command_options(new["command"], new.get("timeout_seconds", 60), new.get("max_output_bytes", 80000))
@@ -1867,7 +1871,8 @@ class AgentManager:
             card["arguments"] = new
             fields = self.card_fields(tools, name, new, verdict, EDITABLE[name])
             event.pop("uncertain", None)
-            await self.update_event(session, event, input=new, preview=preview, edited=True,
+            # Changed back to the agent's own proposal: not an edit, so the agent is not told it was.
+            await self.update_event(session, event, input=new, preview=preview, edited=new != proposed,
                                     **{key: fields[key] for key in ("rule_options", "rememberable", "uncertain") if key in fields})
         return revise
 
@@ -2517,6 +2522,8 @@ class AgentManager:
             "max_output_bytes": VERIFY_OUTPUT_BYTES}, None, origin="verify")
         card = next((item for item in reversed(session["events"]) if item.get("verify")), {})
         state["since"] = len(session["events"])
+        if card.get("edited") and isinstance(edited := (card.get("input") or {}).get("command"), str):
+            shown = clip(self.settings.redact(redact_secrets(edited)), 200)  # The command the user edited ran.
         try:
             result = json.loads(output)
         except ValueError:

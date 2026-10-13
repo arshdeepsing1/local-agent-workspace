@@ -209,6 +209,19 @@ def test_a_rejected_edit_keeps_the_editor_and_its_text(ui, page):
     assert ui.requests("/api/sessions/a/approvals/card", "POST") == []
 
 
+def test_save_edit_waits_for_a_change(ui, page):
+    show(ui, f"[{EDIT_CARD}]")
+    page.get_by_role("button", name="Edit", exact=True).click()
+    command = page.get_by_role("textbox", name="Command", exact=True)
+    save = page.get_by_role("button", name="Save edit")
+    expect(save).to_be_disabled()
+    command.fill("npm test -- --ci")
+    expect(save).to_be_enabled()
+    command.fill("npm test")
+    expect(save).to_be_disabled()
+    assert ui.requests("/api/sessions/parent/approvals/card/edit", "POST") == []
+
+
 @pytest.mark.parametrize("name, field, label", [("write_file", "content", "File content"), ("edit_file", "new_text", "Replacement text")])
 def test_file_cards_edit_their_own_field(ui, page, name, field, label):
     show(ui, f"""[{{ id: 'card', type: 'tool', name: '{name}', state: 'pending', preview: 'diff',

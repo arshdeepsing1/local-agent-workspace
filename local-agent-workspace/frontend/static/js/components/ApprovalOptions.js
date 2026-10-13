@@ -84,8 +84,10 @@ function RememberOptions({ event, disabled, onApprove }) {
 // Edit before approving: the server re-checks the edited action and pushes the card's new preview.
 function EditAction({ event, sessionId, onError, onClose }) {
   const fields = (event.editable || []).filter(field => FIELD_LABELS[field])
-  const [values, setValues] = useState(() => Object.fromEntries(fields.map(field => [field, typeof event.input?.[field] === 'string' ? event.input[field] : ''])))
+  const current = field => typeof event.input?.[field] === 'string' ? event.input[field] : ''
+  const [values, setValues] = useState(() => Object.fromEntries(fields.map(field => [field, current(field)])))
   const [saving, setSaving] = useState(false)
+  const changed = fields.some(field => values[field] !== current(field))
   const first = useAutoFocus()
   const save = async () => {
     setSaving(true)
@@ -99,7 +101,7 @@ function EditAction({ event, sessionId, onError, onClose }) {
     ${fields.map((field, index) => html`<label key=${field}>${FIELD_LABELS[field]}<textarea ref=${index === 0 ? first : null} spellcheck=${false} disabled=${saving}
       rows=${field === 'command' ? 3 : 8} value=${values[field]} onInput=${e => { const value = e.currentTarget.value; setValues(current => ({ ...current, [field]: value })) }} /></label>`)}
     <div class="approval-buttons"><button class="outline" disabled=${saving} onClick=${onClose}>Cancel edit</button>
-      <button class="primary" disabled=${saving} onClick=${() => void save()}>Save edit</button></div>
+      <button class="primary" disabled=${saving || !changed} onClick=${() => void save()}>Save edit</button></div>
   </div>`
 }
 

@@ -76,6 +76,22 @@ async def test_an_edited_command_runs_instead_of_the_proposed_one(live):
     assert event["edited"] is True and "editable" not in event
 
 
+async def test_saving_an_unchanged_edit_or_changing_it_back_is_not_an_edit(live):
+    manager, session, _, tools, client = live
+    calls = recorder(manager)
+    task = asyncio.create_task(manager.execute_tool(session, tools, "run_command", {"command": "npm test"}, "c"))
+    key, event = await card(manager)
+    assert (await edit(client, key, {"command": "npm test"})).json() == {"ok": True}
+    assert not event.get("edited") and event["input"] == {"command": "npm test"}
+    assert (await edit(client, key, {"command": "npm test -- --watch=false"})).json() == {"ok": True}
+    assert event["edited"] is True
+    assert (await edit(client, key, {"command": "npm test"})).json() == {"ok": True}
+    assert not event.get("edited") and event["preview"].startswith("npm test\n\nTimeout:")
+    manager.decide(*key, True)
+    output = await asyncio.wait_for(task, 5)
+    assert not output.startswith("[The user edited") and calls == [{"command": "npm test"}]
+
+
 async def test_an_edit_that_a_rule_blocks_is_refused_and_the_card_stays(live):
     manager, session, _, tools, client = live
     calls = recorder(manager)
