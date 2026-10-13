@@ -359,3 +359,82 @@ def test_the_gate_keeps_at_most_64_endpoints():
     assert gate.remaining("endpoint-0", "other") == 0 and gate.learned_limit("endpoint-0", OTPM) is None
     assert gate.remaining("endpoint-64", "other") == 60 and gate.learned_limit("endpoint-64", OTPM) == 1000
     assert gate.remaining("endpoint-1", "other") == 60
+
+
+# --- Compaction under a reported OTPM limit (integration review B, findings 1 and 6) -------------
+
+OPUS_OTPM = 20_000
+OPUS_OTPM_BODY = {"error": {"message": "Too many tokens", "limit_type": "output_tokens_per_minute",
+                            "limit": OPUS_OTPM, "current": 0, "retry_after": 3}}
+HANDOFF_TEXT = "\n\n".join(f"## {section}\nok" for section in (
+    "Goal and current status", "Open tasks and next steps", "User requirements, preferences and constraints",
+    "Decisions and reasons", "Errors, causes and fixes", "Files read and changed", "Commands and results",
+    "Work done in detail", "Key facts and gotchas"))
+
+
+@pytest.fixture
+def opus_otpm(runtime, monkeypatch, delays):
+    """The default Opus 5.5 chat (200,000 / 16,384, handoffs on) in a workspace whose OTPM limit is
+    20,000: like Databricks, the gateway answers any max_tokens above it with an OTPM 429."""
+    manager, new_session, now = runtime
+    manager.settings.values.update(model="databricks-claude-opus-5-5", context_window=200000, max_output_tokens=16384)
+    sent = []
+
+    async def gateway(request):
+        body = json.loads(request.content)
+        sent.append((bool(body.get("stream")), body.get("max_tokens")))
+        if body.get("max_tokens", 0) > OPUS_OTPM:
+            return httpx.Response(429, json=OPUS_OTPM_BODY)
+        if body.get("stream"):
+            return httpx.Response(200, text=sse())
+        return httpx.Response(200, json={"choices": [{"message": {"content": HANDOFF_TEXT},
+                                                      "finish_reason": "stop"}]})
+    mock_gateway(monkeypatch, gateway)
+
+    def chat():
+        session = new_session()
+        assert session["model"] == "databricks-claude-opus-5-5" and manager.request_limits(session) == (200000, 16384)
+        session["wire"] = [{"role": "user", "content": "first " * 50}, {"role": "assistant", "content": "ok " * 50},
+                           {"role": "user", "content": "second"}, {"role": "assistant", "content": "ok"}]
+        return session
+    return manager, chat, sent
+
+
+def errors(session):
+    return [event["text"] for event in session["events"] if event["type"] == "error"]
+
+
+async def test_a_compaction_429_on_otpm_is_resent_at_the_reported_limit(opus_otpm):
+    manager, chat, sent = opus_otpm
+    session = chat()
+    await manager.manual_compact(session)
+    # 16,000 handoff + 8,192 thinking room is rejected (not billed); the handoff shrinks to fit.
+    assert sent == [(False, 24192), (False, OPUS_OTPM)] and errors(session) == []
+    sent.clear()
+    await manager.manual_compact(chat())
+    assert sent == [(False, OPUS_OTPM)]  # Learned: no second rejection.
+
+
+async def test_a_learned_otpm_limit_lets_an_automatic_compaction_turn_complete(opus_otpm):
+    manager, chat, sent = opus_otpm
+    session = chat()
+    # A retryable OTPM 429 on an agent step teaches the same limit.
+    manager.rate_gate.note(session["model"], "another chat", 0, parse_rate_limit(OPUS_OTPM_BODY))
+    session["wire"] = [message for number in range(6) for message in (
+        {"role": "user", "content": f"Q{number} " + "x" * 120_000}, {"role": "assistant", "content": f"A{number}."})]
+    await manager.run(session, "next")
+    assert session["terminal_reason"] == "completed" and errors(session) == []
+    assert (False, OPUS_OTPM) in sent and all(max_tokens <= OPUS_OTPM for _, max_tokens in sent)
+
+
+async def test_a_compaction_that_cannot_fit_names_the_settings_that_size_it(opus_otpm):
+    manager, chat, sent = opus_otpm
+    session = chat()
+    manager.rate_gate.note(session["model"], "another chat", 0,
+                           parse_rate_limit({"limit_type": "output_tokens_per_minute", "limit": 10_000}))
+    await manager.manual_compact(session)
+    assert sent == []
+    error = errors(session)[-1]
+    assert "needs max_tokens 12,288" in error and "(10,000)" in error
+    assert "Save a detailed handoff at each compaction" in error and "Settings → Context budget" in error
+    assert "Max output tokens" not in error

@@ -1285,7 +1285,11 @@ request whose Max output tokens is above the reported OTPM limit can never start
 stops at once with an `output_tokens_over_limit` error naming the limit and a per-request
 value for four requests at once, remembers that limit for an hour, and refuses further
 requests to that endpoint, before any compaction, until Settings changes; no **Continue**
-button is offered. When Databricks asks one chat to pause, other chats and compaction
+button is offered. A compaction request is sized by the context budget, not by Max output
+tokens: under a reported OTPM limit its handoff or summary shrinks to fit (a first rejection
+is resent once at the reported limit; Databricks does not bill it), and only when even the
+smallest summary plus thinking room cannot fit does compaction stop, with an error naming
+Settings → Save a detailed handoff at each compaction and Settings → Context budget. When Databricks asks one chat to pause, other chats and compaction
 requests to the same endpoint wait for that pause too, plus up to 3 seconds of random
 jitter so they do not all retry at once, with a notice; a request with a smaller Max output
 tokens may pass an output-tokens pause, and Stop cancels the wait. `/btw` does not wait: it

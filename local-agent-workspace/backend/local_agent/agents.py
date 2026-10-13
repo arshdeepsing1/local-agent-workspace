@@ -74,7 +74,7 @@ import math
 import random
 from . import request_limits
 from .request_limits import LONG_REQUEST_TIMEOUT, STREAM_READ_TIMEOUT, PayloadTooLarge, check_payload, encode_payload
-from .rate_limits import (ITPM, OTPM, RATE_LIMIT_WAIT_CAP, RateLimitGate, describe, otpm_too_low,
+from .rate_limits import (ITPM, OTPM, CompactionOverOtpm, RATE_LIMIT_WAIT_CAP, RateLimitGate, describe, otpm_too_low,
                           parse_rate_limit, request_info_fields)
 from .context import in_turn_tokens
 from .model_profiles import CONCURRENT_REQUESTS
@@ -3011,8 +3011,9 @@ class AgentManager:
         if len(body) > request_limits.PAYLOAD_LIMIT_BYTES:
             raise ValueError(f"The context compaction request would be {len(body) / 1_000_000:.1f} MB, above the "
                              "Databricks 4 MB request limit, so it was not sent. History is preserved.")
-        if (refusal := self.otpm_preflight(session, max_tokens)) is not None:
-            raise ValueError(str(refusal))
+        if (limit := self.rate_gate.learned_limit(session["model"], OTPM)) and max_tokens > limit:
+            # Not the agent's refusal: Settings → Max output tokens does not size a compaction request.
+            raise CompactionOverOtpm(session["model"], max_tokens, limit)
         retry_reason = None
         for attempt in range(MAX_TRANSIENT_RETRIES + 1):
             await self.wait_for_rate_limit(session, "context compaction", max_tokens)
@@ -3051,7 +3052,7 @@ class AgentManager:
                     finish_inference_call(call, info)
                     self.store.save(session)
                     if error.kind == "output_tokens_over_limit":
-                        raise ValueError(str(error) + " History is preserved.")
+                        raise CompactionOverOtpm(session["model"], max_tokens, error.rate_limit.limit)
                     reason = getattr(error, "retry_reason", None)
                     if reason and attempt < MAX_TRANSIENT_RETRIES:
                         delay = transient_retry_delay(error, attempt)
@@ -3120,18 +3121,40 @@ class AgentManager:
         allowance (compaction_output_allowance) is added to every request's max_tokens,
         because a model that always thinks spends part of max_tokens on thinking.
         """
+        def fitted(tokens):
+            """tokens (the output reserve before the allowance), lowered to fit the output-tokens-per-minute
+            limit Databricks reported for this endpoint, which it reserves max_tokens against; never below
+            SUMMARY_MAX_TOKENS (summarize_context then refuses with the compaction message)."""
+            limit = self.rate_gate.learned_limit(session["model"], OTPM)
+            if limit and tokens + allowance > limit:
+                return max(SUMMARY_MAX_TOKENS, min(tokens, limit - allowance))
+            return tokens
+
+        async def fitting(send, base):
+            """send(tokens) once, and once more at the size a first OTPM 429 taught (it was not billed)."""
+            tokens = fitted(base)
+            try:
+                return await send(tokens)
+            except CompactionOverOtpm:
+                if fitted(base) >= tokens:
+                    raise
+                return await send(fitted(base))
+
         async def summarize(previous, chunk, limit_bytes):
             if handoff_tokens:
-                return await self.summarize_context(session, client, url, headers, build_handoff_messages(
-                    previous, chunk, preservation_note, handoff_tokens), max_tokens=handoff_tokens + allowance,
-                    keep_truncated=True)
-            return await self.summarize_context(session, client, url, headers, build_summary_messages(
-                previous, chunk, preservation_note, limit_bytes), max_tokens=summary_output_tokens(limit_bytes) + allowance,
-                keep_truncated=True, document="summary")
+                # The handoff's word target follows its reserve, so a smaller one is asked for a shorter handoff.
+                return await fitting(lambda tokens: self.summarize_context(
+                    session, client, url, headers, build_handoff_messages(previous, chunk, preservation_note, tokens),
+                    max_tokens=tokens + allowance, keep_truncated=True), handoff_tokens)
+            return await fitting(lambda tokens: self.summarize_context(
+                session, client, url, headers, build_summary_messages(previous, chunk, preservation_note, limit_bytes),
+                max_tokens=tokens + allowance, keep_truncated=True, document="summary"),
+                summary_output_tokens(limit_bytes))
 
         async def condense(summary, limit_bytes):
-            return await self.summarize_context(session, client, url, headers, build_condense_messages(
-                summary, limit_bytes, preservation_note), max_tokens=condense_output_tokens(limit_bytes) + allowance)
+            return await fitting(lambda tokens: self.summarize_context(
+                session, client, url, headers, build_condense_messages(summary, limit_bytes, preservation_note),
+                max_tokens=tokens + allowance), condense_output_tokens(limit_bytes))
 
         return summarize, condense
 
