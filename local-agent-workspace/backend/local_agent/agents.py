@@ -2023,6 +2023,12 @@ class AgentManager:
         project = self.projects.get(str(tools.root))
         command = project["verify_command"]
         if not command or not any(changed_project_file(tools, event) for event in session["events"][state["since"]:]):
+            if command and state["rounds"]:
+                # A fix round in which the agent changed no files: say how Verify ended instead of
+                # leaving "Asking the agent to fix it" as its last word.
+                await self.event(session, "notice", text=(
+                    f"Verify did not run again: the agent changed no files in fix round {state['rounds']}. "
+                    "The last run failed; its output is in the command card above."))
             return "done"
         # Notices are plain text; only the model-facing continuation quotes the command in backticks.
         shown = clip(self.settings.redact(redact_secrets(command)), 200)

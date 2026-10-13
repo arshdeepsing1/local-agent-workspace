@@ -548,7 +548,8 @@ when opening a conversation or performing restart recovery.
   or is stopped, the hidden message stays in the model history with a short placeholder
   reply, so your next message (**Continue**, say) still carries the output or the note. After the last fix
   round, or when no agent step is left, the turn ends with a notice; the full output is in the command
-  card. Each fix round uses an agent step. Leave the command empty to turn Verify off.
+  card. When the agent answers a fix round without changing files (it fixed nothing, or fixed it
+  with a command only), Verify does not run again and a notice says the last run failed. Each fix round uses an agent step. Leave the command empty to turn Verify off.
   The settings are kept in `<state dir>/projects.json` for each resolved workspace path
   (a worktree is its own project), never in the repository, and are not part of
   conversation exports.
