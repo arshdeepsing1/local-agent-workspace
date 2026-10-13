@@ -28,6 +28,30 @@ OTPM_TOO_LOW = (
     "({limit:,}), so Databricks rejects every request before it starts. Lower Settings → Max output tokens to at "
     "most {limit:,}; a quarter of the limit or less leaves room for several requests per minute. With {requests} "
     "requests at once (a chat and its subagents), at most {share:,} each.")
+# A compaction request's max_tokens does not come from Settings → Max output tokens: under a
+# reported OTPM limit it shrinks to the smallest summary plus the thinking room, an eighth of the
+# context budget up to 8,192 tokens. Only that room can still change, so the advice names the
+# budget at which it fits, or the limit itself.
+COMPACTION_OTPM_TOO_LOW = (
+    "This context compaction request needs max_tokens {max_tokens:,} (the smallest summary, {summary:,} tokens, "
+    "plus thinking room), above the output-tokens-per-minute limit Databricks reported for {model} ({limit:,}), "
+    "so Databricks rejects it before it starts. {advice} History is preserved.")
+COMPACTION_BUDGET_ADVICE = (
+    "The thinking room is an eighth of Settings → Context budget, up to 8,192 tokens: lower the context budget to at "
+    "most {budget:,} tokens, or ask your workspace admin for a higher output-tokens-per-minute limit.")
+COMPACTION_ADMIN_ADVICE = (
+    "No setting makes it fit: ask your workspace admin for a higher output-tokens-per-minute limit for this endpoint.")
+
+
+def compaction_otpm_advice(max_tokens, limit):
+    """What can make a compaction request of max_tokens fit an OTPM limit."""
+    from .context import MIN_CONTEXT_WINDOW, SUMMARY_MAX_TOKENS  # context imports neither this module nor agents
+    room = limit - SUMMARY_MAX_TOKENS
+    # budget // 8 <= room; a model without thinking room needs only the summary.
+    budget = 8 * room + 7
+    if max_tokens > SUMMARY_MAX_TOKENS and room > 0 and budget >= MIN_CONTEXT_WINDOW:
+        return COMPACTION_BUDGET_ADVICE.format(budget=budget)
+    return COMPACTION_ADMIN_ADVICE
 
 
 @dataclass(frozen=True)
@@ -102,6 +126,17 @@ def request_info_fields(info):
 def otpm_too_low(model, max_tokens, limit, concurrent):
     return OTPM_TOO_LOW.format(model=model, max_tokens=max_tokens, limit=limit, requests=concurrent,
                                share=limit // max(1, concurrent))
+
+
+class CompactionOverOtpm(ValueError):
+    """A compaction request whose max_tokens is above the OTPM limit Databricks reported (limit)."""
+
+    def __init__(self, model, max_tokens, limit):
+        from .context import SUMMARY_MAX_TOKENS
+        super().__init__(COMPACTION_OTPM_TOO_LOW.format(model=model, max_tokens=max_tokens, limit=limit,
+                                                        summary=SUMMARY_MAX_TOKENS,
+                                                        advice=compaction_otpm_advice(max_tokens, limit)))
+        self.limit = limit
 
 
 class RateLimitGate:

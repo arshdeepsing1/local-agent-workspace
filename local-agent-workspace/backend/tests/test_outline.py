@@ -6,7 +6,7 @@ import time
 import httpx
 import pytest
 
-from local_agent import outline
+from local_agent import outline, outline_ast
 from local_agent.agents import AgentManager
 from local_agent.config import Settings
 from local_agent.outline import outline_file, outline_format
@@ -189,7 +189,7 @@ def test_large_python_files_and_recursion_errors_use_the_line_scan(workspace, mo
 
     def deep(text):
         raise RecursionError("too deep")
-    monkeypatch.setattr(outline.ast, "parse", deep)
+    monkeypatch.setattr(outline_ast.ast, "parse", deep)
     result = outline_file(tools, "p.py")
     assert result["note"] == "Python could not parse this file; this outline comes from a line scan."
     assert "5 class Parser:" in result["entries"]
@@ -297,7 +297,8 @@ def test_errors_have_their_kinds(workspace, monkeypatch):
     assert error_kind(lambda: outline_file(tools, "missing.md"))[0] == "not_found"
     monkeypatch.setattr(outline, "OUTLINE_SCAN_LIMIT", 3)
     kind, message = error_kind(lambda: outline_file(tools, "doc.md"))
-    assert kind == "limit" and "8 MB outline limit" in message
+    assert kind == "limit" and "8 MB outline and search limit" in message and "tail_lines" in message
+    assert "search_files" not in message  # It cannot read a file over 8 MB either.
 
 
 def test_invalid_utf8_is_replaced_with_a_note(workspace):
@@ -461,11 +462,190 @@ async def test_the_system_message_guidance_follows_the_offered_tools_and_the_inp
     system = requests[0]["messages"][0]["content"]
     budget = 65536 - 8192 - 2048
     assert "call outline_file" in system and "call project_overview first" in system
-    assert (f"smaller than about {budget // 3:,} tokens (roughly {budget // 3 * 3:,} bytes; a third of your "
-            f"{budget:,}-token input budget)") in system
+    # test-endpoint starts at estimate scale 1.0: 55,296 / 1.25 for read_file's overhead.
+    assert ("smaller than about 44,000 bytes (read_file's file_bytes; about a third of your "
+            f"{budget:,}-token input budget once read)") in system
     # Turning off read_file also turns off outline_file (it covers it): the guidance leaves it out.
     session["disabled_tools"] = ["read_file"]
     requests = script(monkeypatch, [("list_files", {"path": "."})])
     await manager.run(session, "Hello again")
     system = requests[0]["messages"][0]["content"]
     assert "outline_file" not in system and "call project_overview first" in system
+
+
+# --- The handoff size in the system message (integration review B, findings 2 and 7) -------------
+
+def markdown_handoff(size):
+    """A Markdown handoff of just under size bytes: headings, blank and short lines, quotes and
+    backslashes, which read_file's line numbers and JSON escaping make costlier than plain text."""
+    words = 'the app keeps state in sqlite and "quoted" paths like src/billing/db.py with \\ escapes — →'.split()
+    lines, total, number = [], 0, 0
+    while True:
+        number += 1
+        kind = number % 7
+        line = ("" if kind == 0 else "## " + " ".join(words[number % 5:number % 5 + 3]) if kind == 1
+                else "    " + " ".join(words[:number % 9 + 2]) if kind == 2
+                else "- " + " ".join(words[(number + i) % len(words)] for i in range(4 + number % 21)))
+        if total + len(line.encode()) + 1 > size:
+            return "\n".join(lines) + "\n"
+        lines.append(line)
+        total += len(line.encode()) + 1
+
+
+async def test_a_handoff_of_the_stated_size_costs_about_a_third_of_the_budget_once_read(tmp_path, monkeypatch):
+    import re
+
+    from local_agent.context import estimate_scale, prepare_context, scaled_estimate
+    monkeypatch.delenv("LOCAL_AGENT_MODEL")  # The Opus 5.5 default (200,000 / 16,384, scale 1.3).
+    monkeypatch.setattr("local_agent.config.APP_ROOT", tmp_path)
+    project = tmp_path / "project"
+    project.mkdir()
+    settings = Settings(tmp_path / "state")
+    settings.values.update(workspace=str(project), env_file="")
+    store = Store(tmp_path / "handoff.sqlite3")
+    try:
+        manager = AgentManager(store, settings)
+        session = store.create(settings.values)
+        tools = manager.session_tools(session)
+        definitions = manager.step_definitions(session, [])
+        available = {item["function"]["name"] for item in definitions}
+        system, _ = manager.context_inputs(session, tools, "manual", available=available)
+        size = int(re.search(r"smaller than about ([\d,]+) bytes \(read_file's file_bytes", system["content"])
+                   .group(1).replace(",", ""))
+        assert size == 111_000
+        (project / "handoff.md").write_text(markdown_handoff(size - 1), encoding="utf-8")
+        window, output = manager.request_limits(session)
+        budget = manager.input_budget(session)
+        scale = estimate_scale([], session["model"])
+        wire, state, compactions, start = [{"role": "user", "content": "Resume from handoff.md"}], {}, [], 1
+        base = scaled_estimate([system, *wire], definitions, scale)
+
+        async def summarize(previous, chunk, limit):
+            return "## Goal and current status\nsummary"
+        while start:
+            result = tools.read_file_range("handoff.md", start, 2000, page_bytes=read_page_bytes(window))
+            call = f"c{start}"
+            wire += [{"role": "assistant", "content": None, "tool_calls": [{"id": call, "type": "function", "function": {
+                "name": "read_file", "arguments": json.dumps({"path": "handoff.md", "start_line": start})}}]},
+                     {"role": "tool", "tool_call_id": call, "content": json.dumps(result, indent=2)}]
+            _, state, info = await prepare_context(wire, state, system, definitions, window, summarize,
+                                                   reply_reserve=output, scale=scale, auto_compact_percent=50)
+            compactions += ["compaction" in info]
+            start = result["next_line"]
+        # Read as advised, it neither reaches the lowest Auto-compact (50%) nor costs much more than a third.
+        assert not any(compactions)
+        assert scaled_estimate([system, *wire], definitions, scale) - base <= 0.40 * budget
+        # The text uses the model's starting scale, so calibration does not change the system message.
+        session["inference_calls"] = [{"purpose": "agent", "model": session["model"], "status": "completed",
+                                       "estimated_input_tokens": 100_000, "usage": {"input_tokens": 117_000}}]
+        assert estimate_scale(session["inference_calls"], session["model"]) == 1.17
+        again, _ = manager.context_inputs(session, tools, "manual", available=available)
+        assert again["content"] == system["content"]
+    finally:
+        store.db.close()
+
+
+# --- search_files on one large file (integration review B, finding 5) ------------------------------
+
+def test_one_file_between_2_and_8_mb_is_searched_to_its_end(workspace):
+    root, tools = workspace
+    body = "".join(f"## Section {number}\n" + "detail text line\n" * 20 for number in range(8_000))
+    write(root, "big-handoff.md", body + "## Next actions\nShip it.\n")
+    assert 2_000_000 < (root / "big-handoff.md").stat().st_size < 8_000_000
+    result = tools.search_files("Next actions", path="big-handoff.md")
+    assert result["skipped_files"] == 0 and [match["line"] for match in result["matches"]] == [8_000 * 21 + 1]
+    # outline_file stops at 20,000 entries on such a file; search still finds a late definition.
+    write(root, "generated_big.py", "".join(f"def func_{number}(value):\n    return value + {number:08d}\n"
+                                           for number in range(30_000)) + "# " + "x" * 600_000 + "\n")
+    assert (root / "generated_big.py").stat().st_size > 2_000_000
+    found = tools.search_files("def func_29999", path="generated_big.py")
+    assert [match["line"] for match in found["matches"]] == [59_999]
+    # A folder search keeps its 2 MB cap per file and counts what it skipped.
+    folder = tools.search_files("Next actions", path=".")
+    assert folder["matches"] == [] and folder["skipped_files"] == 2
+
+
+def test_one_file_over_8_mb_is_a_limit_error_naming_tail_lines(workspace):
+    root, tools = workspace
+    write(root, "app.log", "log line\n" * 1_000_000)
+    kind, message = error_kind(lambda: tools.search_files("Next actions", path="app.log"))
+    assert kind == "limit" and "9.0 MB" in message and "tail_lines" in message
+
+
+# --- Large Python files are parsed in a child process (integration review B, finding 15) ---------
+
+COMPLEX_PYTHON = """import functools
+
+
+@functools.cache
+@other
+def top():
+    pass
+
+
+class Outer:
+    class Inner:
+        async def deep(self):
+            def inner_most():
+                pass
+
+    if True:
+        def in_if(self):
+            pass
+    else:
+        def in_else(self):
+            pass
+
+    try:
+        def in_try(self):
+            pass
+    except ValueError:
+        def in_except(self):
+            pass
+
+    def matched(self, value):
+        match value:
+            case 1:
+                def in_case():
+                    pass
+
+
+async def last():
+    pass
+"""
+
+
+def test_the_child_parser_gives_the_same_outline(workspace, monkeypatch):
+    root, tools = workspace
+    write(root, "c.py", COMPLEX_PYTHON)
+    inline = outline_file(tools, "c.py")
+    calls = []
+    run = outline.subprocess.run
+    monkeypatch.setattr(outline.subprocess, "run", lambda *args, **kwargs: calls.append(args) or run(*args, **kwargs))
+    monkeypatch.setattr(outline, "AST_CHILD_BYTES", 10)
+    child = outline_file(tools, "c.py")
+    assert len(calls) == 1 and child == inline and "note" not in child
+    assert "4-7 def top():" in child["entries"] and "13-14       def inner_most():" in child["entries"]
+    write(root, "bad.py", COMPLEX_PYTHON + "def broken(:\n")
+    result = outline_file(tools, "bad.py")
+    assert result["note"].startswith("Python could not parse this file (line 39)")
+    assert "10 class Outer:" in result["entries"]
+
+
+def test_a_slow_or_broken_child_parser_falls_back_to_the_line_scan(workspace, monkeypatch, tmp_path):
+    root, tools = workspace
+    write(root, "c.py", COMPLEX_PYTHON)
+    monkeypatch.setattr(outline, "AST_CHILD_BYTES", 10)
+    slow = tmp_path / "slow.py"
+    slow.write_text("import time\ntime.sleep(30)\n")
+    monkeypatch.setattr(outline, "AST_CHILD_SCRIPT", slow)
+    monkeypatch.setattr(outline, "AST_CHILD_TIMEOUT", 0.5)
+    started = time.monotonic()
+    result = outline_file(tools, "c.py")
+    assert time.monotonic() - started < 2.5  # Stopped at its timeout, well within the outline deadline.
+    assert result["note"] == outline.LARGE_PYTHON_NOTE and "10 class Outer:" in result["entries"]
+    for script in (tmp_path / "missing.py", tmp_path / "noise.py"):
+        (tmp_path / "noise.py").write_text("print('not json')\n")
+        monkeypatch.setattr(outline, "AST_CHILD_SCRIPT", script)
+        result = outline_file(tools, "c.py")
+        assert result["note"] == outline.LARGE_PYTHON_NOTE and "10 class Outer:" in result["entries"]

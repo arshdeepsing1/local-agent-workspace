@@ -145,6 +145,29 @@ def test_current_time_text_states_the_local_date_and_offset_without_the_time():
     assert "UTC+05:30)" in text and "do not infer today's date from file names" in text
     assert "run `date` when the exact time matters" in text and "13:55" not in text
     assert current_time_text(datetime(2026, 9, 24, 0, 1, tzinfo=zone)) == text
+    # Without run_command (a restricted subagent) the model is not told to run `date`.
+    restricted = current_time_text(datetime(2026, 9, 24, 13, 55, tzinfo=zone), commands=False)
+    assert restricted.endswith("file names.") and "`date`" not in restricted and "13:55" not in restricted
+
+
+@pytest.mark.parametrize("profile, date, writes", [("read_only", False, False), ("file_editor", False, True),
+                                                   ("inherit", True, True)])
+def test_the_system_message_names_only_tools_the_profile_offers(tmp_path, monkeypatch, profile, date, writes):
+    monkeypatch.setattr("local_agent.config.APP_ROOT", tmp_path)
+    settings = Settings(tmp_path / "state")
+    settings.values.update(workspace=str(tmp_path), env_file="")
+    store = Store(settings.state_dir / "profiles.sqlite3")
+    try:
+        manager = AgentManager(store, settings)
+        session = store.create(settings.values)
+        session["tool_profile"] = profile
+        available = {item["function"]["name"] for item in manager.step_definitions(session, [])}
+        assert ("run_command" in available) is date and ("write_file" in available) is writes
+        system, _ = manager.context_inputs(session, manager.session_tools(session), "manual", available=available)
+        assert ("run `date`" in system["content"]) is date
+        assert ("File write limit" in system["content"]) is writes
+    finally:
+        store.db.close()
 
 
 # --- Agent integration --------------------------------------------------------------

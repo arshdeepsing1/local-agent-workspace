@@ -74,7 +74,7 @@ import math
 import random
 from . import request_limits
 from .request_limits import LONG_REQUEST_TIMEOUT, STREAM_READ_TIMEOUT, PayloadTooLarge, check_payload, encode_payload
-from .rate_limits import (ITPM, OTPM, RATE_LIMIT_WAIT_CAP, RateLimitGate, describe, otpm_too_low,
+from .rate_limits import (ITPM, OTPM, CompactionOverOtpm, RATE_LIMIT_WAIT_CAP, RateLimitGate, describe, otpm_too_low,
                           parse_rate_limit, request_info_fields)
 from .context import in_turn_tokens
 from .model_profiles import CONCURRENT_REQUESTS
@@ -331,15 +331,30 @@ def tool_arguments(calls):
     return arguments
 
 
-def current_time_text(now=None):
+def redact_value(value, tokens):
+    """value with each token replaced by [REDACTED] in every string inside dicts and lists."""
+    if isinstance(value, str):
+        for token in tokens:
+            if token:
+                value = value.replace(token, "[REDACTED]")
+        return value
+    if isinstance(value, dict):
+        return {key: redact_value(item, tokens) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_value(item, tokens) for item in value]
+    return value
+
+
+def current_time_text(now=None, *, commands=True):
     """The model otherwise guesses today's date, for example from file names. Day precision:
     a minute in the system message would change it, and miss the provider's prompt cache for
-    everything after it, once a minute."""
+    everything after it, once a minute. commands: run_command is offered, so the model can run
+    `date` for the time (a restricted subagent gets the time from its parent if it needs it)."""
     now = datetime.now().astimezone() if now is None else now
     offset = now.strftime("%z")
     offset = f"{offset[:3]}:{offset[3:]}" if len(offset) == 5 else offset
     return (f"Current local date: {now:%Y-%m-%d} ({now.tzname()}, UTC{offset}). Use it for dates; do not infer "
-            "today's date from file names; run `date` when the exact time matters.")
+            "today's date from file names" + ("; run `date` when the exact time matters." if commands else "."))
 
 
 # Appended to the system message when outline_file or project_overview is offered
@@ -354,21 +369,34 @@ LARGE_INPUT_WRITES = ("A file you write is limited by Settings → File write li
                       "numbered parts and list them at the top of the first.")
 
 
-def large_input_guidance(available=None, input_budget=None):
+# A full read with read_file costs more than file_bytes / 3 estimated tokens: its line numbers
+# and JSON-escaped newlines add about a quarter (measured x1.24 on Markdown handoffs).
+HANDOFF_READ_OVERHEAD = 1.25
+
+
+def handoff_read_bytes(input_budget, scale=1.0):
+    """The file_bytes of a handoff whose full read costs about a third of input_budget as the app
+    estimates it: 3 bytes per token, times the estimate scale and read_file's overhead, rounded
+    down to thousands (111,000 at the Opus 5.5 default with its 1.3 starting scale)."""
+    return int(input_budget // 3 * 3 / scale / HANDOFF_READ_OVERHEAD) // 1000 * 1000
+
+
+def large_input_guidance(available=None, input_budget=None, scale=1.0):
     """The large-project guidance for the offered tools (None: every tool), or "". input_budget
-    (the request's input budget in tokens) gives the model the handoff size in numbers."""
+    (the request's input budget in tokens) gives the model the handoff size in numbers. scale is
+    the model's starting estimate scale, not the calibrated one: that changes after most responses,
+    and this text sits early in the system message, where a change misses the prompt cache."""
     overview = available is None or "project_overview" in available
     outline = available is None or "outline_file" in available
     if not overview and not outline:
         return ""
-    # The app estimates about 3 bytes of text per token, so a third of the budget in
-    # tokens is about the budget in bytes (read_file's file_bytes).
     handoff_size = ("about a third of your context budget" if input_budget is None else
-                    f"about {input_budget // 3:,} tokens (roughly {input_budget // 3 * 3:,} bytes; a third of your "
-                    f"{input_budget:,}-token input budget)")
+                    f"about {handoff_read_bytes(input_budget, scale):,} bytes (read_file's file_bytes; about a third "
+                    f"of your {input_budget:,}-token input budget once read)")
     return " ".join(part for part, wanted in ((LARGE_INPUT_OVERVIEW, overview),
                                               (LARGE_INPUT_OUTLINE.format(handoff_size=handoff_size), outline),
-                                              (LARGE_INPUT_WRITES, True)) if wanted)
+                                              (LARGE_INPUT_WRITES, available is None or "write_file" in available))
+                    if wanted)
 
 
 FILE_VIEW_LIMIT = 500  # files whose last read or write a conversation remembers
@@ -625,6 +653,16 @@ def repair_tool_history(wire, events, state):
     return repaired, state
 
 
+def card_answers(events, call_id, output):
+    """Whether the newest tool card of call_id is finished with output as what the model receives,
+    so repair_tool_history rebuilds the same tool message from it."""
+    for event in reversed(events):
+        if event.get("type") == "tool" and event.get("call_id") == call_id:
+            return (event.get("state") in ("completed", "error", "rejected")
+                    and event.get("model_output", event.get("output")) == output)
+    return False
+
+
 def unanswered(event, declined):
     """The model-facing result of an approval that was declined, blocked or never answered."""
     if event.get("approval") == "blocked":
@@ -859,7 +897,12 @@ class AgentManager:
         for hook in self.extensions.public_config()["hooks"]:
             if asyncio.current_task().cancelling():
                 return
-            if not hook["enabled"] or hook["event"] != phase or ("tools" in hook and name not in hook["tools"]):
+            # A hook for read_file also runs for outline_file, and one for list_files or find_files for
+            # project_overview (COVERED_BY), as their rules and turned-off tools do.
+            selected = hook.get("tools")
+            cover = None if selected is None or name in selected else covering_tool(name, selected)
+            if not hook["enabled"] or hook["event"] != phase or (selected is not None and name not in selected
+                                                                 and cover is None):
                 continue
             hook_tools = self.session_tools(session)
             verdict = self.permission(session, hook_tools, f"hook_{phase}", {"hook_id": hook["id"]})
@@ -885,7 +928,8 @@ class AgentManager:
                             if approval == "declined" else event["blocked_reason"])
                 if asyncio.current_task().cancelling():
                     return
-                payload = {"event": phase, "session_id": session["id"], "tool": name, "arguments": arguments, "call_id": call_id}
+                payload = {"event": phase, "session_id": session["id"], "tool": name, "arguments": arguments, "call_id": call_id,
+                           **({"covered_by": cover} if cover else {})}
                 if result is not None:
                     payload["result"] = result
                 if phase == "tool_failure":
@@ -1310,7 +1354,8 @@ class AgentManager:
         allowed = [*session.get("allowed_directories", []), *self.standing_directories()]
         return WorkspaceTools(session["workspace"], self.settings.values["env_file"], allowed,
                               session.get("permission_mode", "manual") == "bypassPermissions",
-                              write_limit=write_limit_setting(self.settings.values), excluded_roots=(self.settings.state_dir,))
+                              write_limit=write_limit_setting(self.settings.values), excluded_roots=(self.settings.state_dir,),
+                              secrets=self.redaction_tokens())
 
     def track_change(self, session, record, tools):
         """Track an applied agent file edit in this chat's review and, for a subagent, in its parent's."""
@@ -1358,7 +1403,8 @@ class AgentManager:
         return WorkspaceTools(session["workspace"], self.settings.values["env_file"],
                               [*session.get("allowed_directories", []), *self.standing_directories(), *extra],
                               session.get("permission_mode", "manual") == "bypassPermissions",
-                              write_limit=write_limit_setting(self.settings.values), excluded_roots=(self.settings.state_dir,))
+                              write_limit=write_limit_setting(self.settings.values), excluded_roots=(self.settings.state_dir,),
+                              secrets=self.redaction_tokens())
 
     async def publish_changes(self, session, only_tracked=False):
         """Send the conversation's unreviewed agent file changes to its open pages. Always listed with
@@ -1777,6 +1823,7 @@ class AgentManager:
         # The files count as seen only once the model receives them (_content_sent).
         self.unsent_views[session_id] = views
         self.live[session_id] = session
+        self.store.keep_encodings(session_id)
         self.statuses[session_id] = "running"
         task = self.tasks[session_id] = asyncio.create_task(self.run(session, prompt, content, attachments or None))
         task.add_done_callback(lambda done: self._after_task(session_id, "turn", done))
@@ -1794,6 +1841,7 @@ class AgentManager:
         # A task cancelled before its first scheduling never enters run's finally.
         if task and task.cancelled() and self.tasks.get(session_id) is task:
             session = self.live.pop(session_id, None)
+            self.store.forget_encodings(session_id)
             if session is not None:
                 session.update(terminal_reason="stopped", turn_ended=time.time())
                 self.store.save(session)
@@ -1901,8 +1949,9 @@ class AgentManager:
                     notified.clear()
                 notified.add((session["id"], turn))
                 await self.event(session, "notice", text=(
-                    "Your queued message will be sent after the agent's next step: together with the latest tool "
-                    "results it would not fit in the context budget."))
+                    "Your queued message waits for a later step: together with the latest tool results it would not "
+                    "fit in the context budget. If the reply completes first, it is sent as the next message; after "
+                    "Stop, an error or the step limit it stays queued until you click Send queued messages."))
             await self.publish_queue(session)
             return
         sent = {item["id"] for item in entries}
@@ -2012,6 +2061,7 @@ class AgentManager:
         self.workspace_available(session["workspace"])
         self._pause_queue(session)
         self.live[session_id] = session
+        self.store.keep_encodings(session_id)
         self.statuses[session_id] = "running"
         task = self.tasks[session_id] = asyncio.create_task(
             self.run_shell(session, command, timeout_seconds, max_output_bytes))
@@ -2052,6 +2102,7 @@ class AgentManager:
         finally:
             self.store.save(session)
             self.live.pop(session["id"], None)
+            self.store.forget_encodings(session["id"])
             if noted:  # The composer shows the output waiting for the next message.
                 await self.publish_pending(session)
             await self.status(session, "idle")
@@ -2296,6 +2347,7 @@ class AgentManager:
                 session["terminal_reason"] = "error"
                 await report_storage_failure(exc)
             self.live.pop(session["id"], None)
+            self.store.forget_encodings(session["id"])
             try:
                 await self.status(session, "idle", turn_ended=True)
             except STORAGE_ERRORS as exc:
@@ -2629,8 +2681,9 @@ class AgentManager:
                 result = await tools.execute(name, arguments, page_bytes=read_page_bytes(self.request_limits(session)[0]))
             else:
                 result = await tools.execute(name, arguments)
-            # The hard cap applies to the card and the model alike, before redaction.
-            result = bound_result(result, TOOL_RESULT_HARD_LIMIT)
+            # Redacted before the hard cap and any shortening: a cut through the token leaves a part
+            # the exact match no longer finds. The cap applies to the card and the model alike.
+            result = bound_result(redact_value(result, self.redaction_tokens()), TOOL_RESULT_HARD_LIMIT)
             output = result if isinstance(result, str) else json.dumps(result, indent=2)
             if edited_note and origin != "verify":  # Verify reads the JSON result; its card says it was edited.
                 output = edited_note + "\n" + output
@@ -2942,12 +2995,13 @@ class AgentManager:
                   + self.coding_dir_text(session) + self.python_text(session)
                   + "\n" + output_limit_text(self.request_limits(session)[1], thinking=bool(thinking_reserve(session["model"])))
                   + (("\n" + guidance_text) if (guidance_text := large_input_guidance(
-                      available, input_budget=self.input_budget(session))) else "")
+                      available, input_budget=self.input_budget(session),
+                      scale=estimate_scale([], session["model"]))) else "")
                   + ("\n" + index if index else "")
                   + "\n" + guidance["text"] + "\n" + tools.skill_signature
                   + ("\nProject instruction warnings: " + json.dumps(guidance["warnings"]) if guidance["warnings"] else "")
                   + "\nAdditional allowed folders: " + json.dumps(session.get("allowed_directories", []))
-                  + "\n" + current_time_text()
+                  + "\n" + current_time_text(commands=available is None or "run_command" in available)
                   + ("\n" + notice if notice else "")}
         return system, guidance
 
@@ -3011,8 +3065,9 @@ class AgentManager:
         if len(body) > request_limits.PAYLOAD_LIMIT_BYTES:
             raise ValueError(f"The context compaction request would be {len(body) / 1_000_000:.1f} MB, above the "
                              "Databricks 4 MB request limit, so it was not sent. History is preserved.")
-        if (refusal := self.otpm_preflight(session, max_tokens)) is not None:
-            raise ValueError(str(refusal))
+        if (limit := self.rate_gate.learned_limit(session["model"], OTPM)) and max_tokens > limit:
+            # Not the agent's refusal: Settings → Max output tokens does not size a compaction request.
+            raise CompactionOverOtpm(session["model"], max_tokens, limit)
         retry_reason = None
         for attempt in range(MAX_TRANSIENT_RETRIES + 1):
             await self.wait_for_rate_limit(session, "context compaction", max_tokens)
@@ -3051,7 +3106,7 @@ class AgentManager:
                     finish_inference_call(call, info)
                     self.store.save(session)
                     if error.kind == "output_tokens_over_limit":
-                        raise ValueError(str(error) + " History is preserved.")
+                        raise CompactionOverOtpm(session["model"], max_tokens, error.rate_limit.limit)
                     reason = getattr(error, "retry_reason", None)
                     if reason and attempt < MAX_TRANSIENT_RETRIES:
                         delay = transient_retry_delay(error, attempt)
@@ -3120,18 +3175,40 @@ class AgentManager:
         allowance (compaction_output_allowance) is added to every request's max_tokens,
         because a model that always thinks spends part of max_tokens on thinking.
         """
+        def fitted(tokens):
+            """tokens (the output reserve before the allowance), lowered to fit the output-tokens-per-minute
+            limit Databricks reported for this endpoint, which it reserves max_tokens against; never below
+            SUMMARY_MAX_TOKENS (summarize_context then refuses with the compaction message)."""
+            limit = self.rate_gate.learned_limit(session["model"], OTPM)
+            if limit and tokens + allowance > limit:
+                return max(SUMMARY_MAX_TOKENS, min(tokens, limit - allowance))
+            return tokens
+
+        async def fitting(send, base):
+            """send(tokens) once, and once more at the size a first OTPM 429 taught (it was not billed)."""
+            tokens = fitted(base)
+            try:
+                return await send(tokens)
+            except CompactionOverOtpm:
+                if fitted(base) >= tokens:
+                    raise
+                return await send(fitted(base))
+
         async def summarize(previous, chunk, limit_bytes):
             if handoff_tokens:
-                return await self.summarize_context(session, client, url, headers, build_handoff_messages(
-                    previous, chunk, preservation_note, handoff_tokens), max_tokens=handoff_tokens + allowance,
-                    keep_truncated=True)
-            return await self.summarize_context(session, client, url, headers, build_summary_messages(
-                previous, chunk, preservation_note, limit_bytes), max_tokens=summary_output_tokens(limit_bytes) + allowance,
-                keep_truncated=True, document="summary")
+                # The handoff's word target follows its reserve, so a smaller one is asked for a shorter handoff.
+                return await fitting(lambda tokens: self.summarize_context(
+                    session, client, url, headers, build_handoff_messages(previous, chunk, preservation_note, tokens),
+                    max_tokens=tokens + allowance, keep_truncated=True), handoff_tokens)
+            return await fitting(lambda tokens: self.summarize_context(
+                session, client, url, headers, build_summary_messages(previous, chunk, preservation_note, limit_bytes),
+                max_tokens=tokens + allowance, keep_truncated=True, document="summary"),
+                summary_output_tokens(limit_bytes))
 
         async def condense(summary, limit_bytes):
-            return await self.summarize_context(session, client, url, headers, build_condense_messages(
-                summary, limit_bytes, preservation_note), max_tokens=condense_output_tokens(limit_bytes) + allowance)
+            return await fitting(lambda tokens: self.summarize_context(
+                session, client, url, headers, build_condense_messages(summary, limit_bytes, preservation_note),
+                max_tokens=tokens + allowance), condense_output_tokens(limit_bytes))
 
         return summarize, condense
 
@@ -3334,6 +3411,7 @@ class AgentManager:
         self.workspace_available(session["workspace"])
         self._pause_queue(session)
         self.live[session_id] = session
+        self.store.keep_encodings(session_id)
         self.statuses[session_id] = "compacting"
         task = self.tasks[session_id] = asyncio.create_task(self.manual_compact(session, preservation_note.strip()))
         task.add_done_callback(lambda done: self._after_task(session_id, "compaction", done))
@@ -3388,6 +3466,7 @@ class AgentManager:
             await self.event(session, "error", text=self.settings.redact(str(exc))[:1500])
         finally:
             self.live.pop(session["id"], None)
+            self.store.forget_encodings(session["id"])
             await self.status(session, "idle")
 
     async def model_response(self, session, event, client, url, headers, payload, retry_reason=None, body=None):
@@ -3539,7 +3618,14 @@ class AgentManager:
                     # Repeat only a request that got no response status: a failure after
                     # one may follow a billed generation, and ReadTimeout may still be running.
                     retryable = "http_status" not in info and isinstance(exc, NETWORK_RETRY_ERRORS)
-                    exc = InferenceError(str(exc) or "The connection to Databricks failed.", "network")
+                    if isinstance(exc, httpx.ReadTimeout):
+                        # Over a real socket its text is empty; say what happened and what helps.
+                        exc = InferenceError(
+                            f"Databricks sent no data for {STREAM_READ_TIMEOUT:g} seconds, so the app stopped waiting. "
+                            "A large request with thinking can be silent for minutes. Send a message to continue; if "
+                            "this repeats, lower Settings → Context budget or Settings → Max output tokens.", "network")
+                    else:
+                        exc = InferenceError(str(exc) or "The connection to Databricks failed.", "network")
                     if retryable:
                         mark_retryable(exc, "network")
                 elif isinstance(exc, (json.JSONDecodeError, KeyError, TypeError, AttributeError)):
@@ -3970,7 +4056,11 @@ class AgentManager:
                     if allowance.settled == settled:
                         allowance.charge(output)  # A refusal or another early return is sent too.
                     wire.append({"role": "tool", "tool_call_id": call["id"], "content": output})
-                    self.store.save(session)
+                    if not card_answers(session["events"], call["id"], output):
+                        # A finished card already saved this result; repair_tool_history rebuilds this
+                        # message from it if the app stops before the next save. Each save rewrites
+                        # the whole conversation file.
+                        self.store.save(session)
                 if step_index + 1 < steps:
                     await self.drain_queue(session, wire, tools, fits=lambda message: in_turn_tokens(
                         [*model_history(wire), message], context_state, system, definitions, input_budget,

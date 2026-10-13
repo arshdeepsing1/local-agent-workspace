@@ -219,3 +219,48 @@ async def test_stop_during_tool_does_not_launch_failure_hook(runtime):
     with pytest.raises(asyncio.CancelledError):
         await task
     assert not any(event.get("name", "").startswith("hook_") for event in session["events"])
+
+
+# --- Hooks follow the tools that cover outline_file and project_overview (integration review B, finding 13)
+
+def recorded_hooks(manager, exit_code):
+    payloads = []
+
+    async def run_hook(hook, payload, workspace, env=None):
+        payloads.append(payload)
+        return {"output": "blocked by policy" if exit_code else "", "exit_code": exit_code}
+    manager.extensions.run_hook = run_hook
+    return payloads
+
+
+@pytest.mark.parametrize("selected, name, arguments", [
+    (["read_file"], "outline_file", {"path": "plan.md"}),
+    (["find_files"], "project_overview", {"path": "."}),
+    (["list_files"], "project_overview", {"path": "."}),
+])
+async def test_a_before_tool_hook_on_a_covering_tool_blocks_the_covered_tool(runtime, selected, name, arguments):
+    manager, session, tools = runtime
+    (tools.root / "plan.md").write_text("# Acquisition\n## Price: 40M\n")
+    configure(manager, tools=selected)
+    payloads = recorded_hooks(manager, 1)
+    output = await manager.execute_tool(session, tools, name, arguments, "c1")
+    assert f"Before-tool hook blocked {name}: Hook failed (exit 1)" in output and "40M" not in output
+    assert payloads == [{"event": "before_tool", "session_id": session["id"], "tool": name, "arguments": arguments,
+                         "call_id": "c1", "covered_by": selected[0]}]
+
+
+async def test_an_after_tool_hook_on_read_file_sees_outline_calls_and_an_empty_list_none(runtime):
+    manager, session, tools = runtime
+    (tools.root / "plan.md").write_text("# Acquisition\n## Price: 40M\n")
+    configure(manager, phase="after_tool", tools=["read_file"])
+    payloads = recorded_hooks(manager, 0)
+    await manager.execute_tool(session, tools, "outline_file", {"path": "plan.md"}, "c1")
+    assert [(payload["tool"], payload["covered_by"]) for payload in payloads] == [("outline_file", "read_file")]
+    assert "Price: 40M" in json.dumps(payloads[0]["result"])
+    # A hook on read_file itself gets no covered_by; an empty tools array still selects nothing.
+    await manager.execute_tool(session, tools, "read_file", {"path": "plan.md"}, "c2")
+    assert payloads[-1]["tool"] == "read_file" and "covered_by" not in payloads[-1]
+    configure(manager, phase="after_tool", tools=[])
+    payloads.clear()
+    await manager.execute_tool(session, tools, "outline_file", {"path": "plan.md"}, "c3")
+    assert payloads == []

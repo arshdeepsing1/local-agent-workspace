@@ -416,14 +416,36 @@ def test_superseded_reads_check_only_the_calls_on_their_own_path(monkeypatch):
     archived += [calls(("w1", "edit_file", {"path": "./src/f7.py", "old_text": "a", "new_text": "b"})),
                  result("w1", "ok")]
     completed.add("w1")
-    checks = []
-    original = context._supersedes
-    monkeypatch.setattr(context, "_supersedes", lambda *args: checks.append(args) or original(*args))
     text, stats = summary_transcript(archived, [], 64_000, completed)
     assert stats["superseded"] == 1
-    assert len(checks) <= 2 * 400 + 2
     messages = json.loads(text)
     assert messages[2 + 4 * 7]["content"].startswith("[The app omitted this read_file result for src/f7.py")
+
+
+@pytest.mark.parametrize("edited", [True, False])
+def test_many_paged_reads_of_one_file_are_checked_in_linear_time(monkeypatch, edited):
+    """Integration review B, finding 17: reads of one path with different arguments never
+    supersede each other, so a scan of the later calls on that path ran to its end for each."""
+    n = 3_000
+    archived, completed = [user("Page through the log")], set()
+    for number in range(n):
+        archived += [calls((f"r{number}", "read_file", {"path": "logs/big.log", "start_line": number * 40 + 1})),
+                     result(f"r{number}", page("logs/big.log", 1_200))]
+        completed.add(f"r{number}")
+    # One identical re-read (start_line 1.0 equals 1, as dict equality has it) and, optionally, an edit.
+    archived += [calls(("again", "read_file", {"path": "./logs/big.log", "start_line": 1.0})),
+                 result("again", page("logs/big.log", 1_200))]
+    completed.add("again")
+    if edited:
+        archived += [calls(("w", "edit_file", {"path": "./logs/big.log", "old_text": "a", "new_text": "b"})),
+                     result("w", "ok")]
+        completed.add("w")
+    normalised = []
+    original = context._normal_arguments
+    monkeypatch.setattr(context, "_normal_arguments", lambda arguments: normalised.append(1) or original(arguments))
+    _, stats = summary_transcript(archived, [], 64_000, completed)
+    assert stats["superseded"] == (n + 1 if edited else 1)
+    assert len(normalised) <= 2 * (n + 1) + 4
 
 
 # --- 14-16: chunks, condensing and trimming ---------------------------------------------------

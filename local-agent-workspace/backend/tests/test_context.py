@@ -485,3 +485,22 @@ def test_only_the_apps_exact_messages_are_continuations():
     assert not is_continuation(user("Please run " + VERIFY_CONTINUATION_PREFIX))
     assert not is_continuation({"role": "user", "content": [{"type": "text", "text": OUTPUT_LIMIT_CONTINUATION}]})
     assert not is_continuation(None)
+
+
+async def test_a_transcript_that_fits_one_summary_request_is_probed_once(monkeypatch):
+    """Integration review B, finding 16: each probe of the chunk search serializes about the whole
+    transcript on the event loop; one that fits whole needs no search."""
+    from local_agent import context
+    probes = []
+    encode = context.encode_payload
+    monkeypatch.setattr(context, "encode_payload", lambda payload: probes.append(1) or encode(payload))
+    wire = [message for number in range(40) for message in (
+        user(f"Question {number} " + "q" * 2_000), assistant(f"Answer {number} " + "a" * 2_000))] + [user("Latest")]
+    chunks = []
+
+    async def summarize(previous, chunk, limit_bytes):
+        chunks.append(chunk)
+        return "Summary."
+    probes.clear()
+    await prepare_context(wire, {}, SYSTEM, TOOLS, 262_144, summarize, force_compact=True)
+    assert len(chunks) == 1 and len(probes) <= 2  # One probe, plus the final request check.

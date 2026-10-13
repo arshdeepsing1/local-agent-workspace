@@ -132,8 +132,9 @@ def queue(session, text):
     session["queued_messages"] = [{"id": "q1", "text": text, "paused": False, "created": 1}]
 
 
-WAIT_NOTICE = ("Your queued message will be sent after the agent's next step: together with the latest tool results "
-               "it would not fit in the context budget.")
+WAIT_NOTICE = ("Your queued message waits for a later step: together with the latest tool results it would not fit "
+               "in the context budget. If the reply completes first, it is sent as the next message; after Stop, an "
+               "error or the step limit it stays queued until you click Send queued messages.")
 
 
 async def test_a_queued_message_that_does_not_fit_waits_unpaused_with_one_notice(runtime):
@@ -189,9 +190,14 @@ def test_a_shortened_attachment_says_where_the_rest_is(runtime):
     (project / "long.py").write_text("".join(f"x{number} = {number}\n" for number in range(500)))
     tools = manager.session_tools(session)
     content, attachments, _ = mentions.expand_context(manager, session, tools, "See @long.py")
-    assert ", shortened; read the rest with read_file start_line=201 or list its sections with outline_file>>>" in content
+    # The size, which read_file gives only from line 1, lets the model choose between paging and outlining.
+    size = f" (the file is {(project / 'long.py').stat().st_size:,} bytes)"
+    assert (f", shortened{size}; read the rest with read_file start_line=201 or list its sections with "
+            "outline_file>>>") in content
     assert attachments[0]["truncated"] is True and mentions.attached_paths(content) == ["long.py"]
+    # A header stored before the size was added is still recognised at compaction.
+    assert mentions.attached_paths(content.replace(size, "")) == ["long.py"]
     session["disabled_tools"] = ["outline_file"]
     content, _, _ = mentions.expand_context(manager, session, tools, "See @long.py")
-    assert ", shortened; read the rest with read_file start_line=201>>>" in content
+    assert f", shortened{size}; read the rest with read_file start_line=201>>>" in content
     assert mentions.attached_paths(content) == ["long.py"]

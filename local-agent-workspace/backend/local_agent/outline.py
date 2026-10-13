@@ -1,26 +1,36 @@
 """outline_file: the structure of one text file with line numbers, without reading it all.
 
 Markdown headings (with the line where each section ends), Python classes and functions
-(from ast, with end lines) and, for other languages, declarations found by a line scan.
+(from ast, with end lines; the parser holds the GIL, so a file over 100 KB is parsed in a
+child process that the deadline can stop) and, for other languages, declarations found by
+a line scan.
 Line numbers count LF-separated lines, as read_file does (tools.split_lines). Every
 pattern runs through the `regex` module with a timeout and has bounded quantifiers, and
 the whole outline has a 3-second deadline, so a pathological file cannot hang the app.
 Paths go through WorkspaceTools.path(): the file tools' exclusions and folder access apply.
 """
-import ast
 import json
 import stat
+import subprocess
+import sys
 import time
 from pathlib import Path
 
 import regex as safe_regex
 
 from . import tools as tool_rules
+from .outline_ast import definitions
 from .tools import (ENCODING_NOTE, MAX_LARGE_PAGE_BYTES, MIN_PAGE_BYTES, QUERY_OUTPUT_LIMIT, _integer, _output_size,
                     split_lines)
 
 OUTLINE_SCAN_LIMIT = tool_rules.READ_SCAN_LIMIT  # 8 MB
-PYTHON_AST_LIMIT = 1_000_000  # ast cannot be interrupted; about a second at this size.
+PYTHON_AST_LIMIT = 1_000_000  # About a second of parsing at this size.
+# ast.parse holds the GIL, pausing the event loop (every chat and the page) while it runs: up to
+# about 0.1-0.3 s at this size. Larger files are parsed in a child process, which the outline
+# deadline can stop.
+AST_CHILD_BYTES = 100_000
+AST_CHILD_SCRIPT = Path(__file__).with_name("outline_ast.py")
+AST_CHILD_TIMEOUT = 2.5
 MAX_OUTLINE_ENTRIES = 20_000
 OUTLINE_OFFSET_LIMIT = 20_000
 ENTRY_TEXT_CHARS = 160
@@ -223,34 +233,38 @@ def _markdown(lines, scan):
         scan.add(line, ends.get(position, len(lines)), level, text)
 
 
-def _python_ast(text, lines, scan):
-    tree = ast.parse(text)
-    found, visited = [], [0]
+class _ChildFailed(Exception):
+    """The child parser did not answer in time or usably: outline from the line scan instead."""
 
-    def walk(nodes, level):
-        for node in nodes:
-            visited[0] += 1
-            scan.tick(visited[0])
-            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-                start = min([decorator.lineno for decorator in node.decorator_list] + [node.lineno])
-                label = lines[node.lineno - 1].strip() if 1 <= node.lineno <= len(lines) else node.name
-                found.append((start, node.end_lineno, level, label))
-                if len(found) > MAX_OUTLINE_ENTRIES:
-                    raise _Full
-                if level < 6:
-                    walk(node.body, level + 1)
-            else:
-                # if/else, for, while, with, try/except/else/finally and match cases add no level.
-                for child in ast.iter_child_nodes(node):
-                    if isinstance(child, (ast.stmt, ast.excepthandler, ast.match_case)):
-                        walk([child], level)
+
+def _child_definitions(text, scan):
+    """definitions() from a child process (outline_ast.py); SyntaxError as the child reports it."""
     try:
-        walk(tree.body, 1)
-    except _Full:
-        pass
+        done = subprocess.run([sys.executable, "-I", str(AST_CHILD_SCRIPT), str(MAX_OUTLINE_ENTRIES)],
+                              input=text.encode("utf-8"), capture_output=True,
+                              timeout=min(AST_CHILD_TIMEOUT, scan.timeout()))
+        reply = json.loads(done.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        raise _ChildFailed from error
+    if isinstance(reply, dict) and isinstance(reply.get("found"), list):
+        found = reply["found"]
+        if all(isinstance(entry, list) and len(entry) == 4 and all(type(value) is int for value in entry)
+               for entry in found):
+            return [tuple(entry) for entry in found]
+    if isinstance(reply, dict) and reply.get("error") is not None:
+        error = SyntaxError(str(reply["error"]))
+        error.lineno = reply.get("lineno") if type(reply.get("lineno")) is int else None
+        raise error
+    raise _ChildFailed
+
+
+def _python_ast(text, lines, scan, size):
+    found = (_child_definitions(text, scan) if size > AST_CHILD_BYTES
+             else definitions(text, MAX_OUTLINE_ENTRIES, scan.tick))
+    scan.tick(0)
     found.sort(key=lambda item: item[0])
-    for entry in found:
-        scan.add(*entry)
+    for start, end, level, lineno in found:
+        scan.add(start, end, level, lines[lineno - 1].strip() if 1 <= lineno <= len(lines) else "")
 
 
 def _line_scan(lines, scan, patterns):
@@ -278,8 +292,9 @@ def _clip(text):
     return text if len(text) <= ENTRY_TEXT_CHARS else text[:ENTRY_TEXT_CHARS - 1] + "…"
 
 
-def _entry(line, end, level, text):
+def _entry(line, end, level, text, redact=None):
     indent = "  " * (level - 1)
+    text = redact(text) if redact else text  # Before the cut, which could split the configured token.
     return f"{line}-{end} {indent}{_clip(text)}" if end is not None else f"{line} {indent}{_clip(text)}"
 
 
@@ -296,8 +311,8 @@ def outline_file(tools, path, *, offset=0, max_level=6, page_bytes=QUERY_OUTPUT_
     kind = outline_format(target)
     if kind == "notebook":
         raise ValueError("Only regular text files can be outlined; use notebook_read for Jupyter notebooks.")
-    too_large = ("This file exceeds the 8 MB outline limit; use search_files (for example regex=true with ^#{1,3} "
-                 "or ^\\s*(def|class)) to find sections.")
+    too_large = ("This file exceeds the 8 MB outline and search limit; use read_file with tail_lines for its end, or "
+                 "run_command with grep -n (if available) to find lines.")
     if info.st_size > OUTLINE_SCAN_LIMIT:
         raise ValueError(too_large)
     with target.open("rb") as source:
@@ -328,7 +343,10 @@ def outline_file(tools, path, *, offset=0, max_level=6, page_bytes=QUERY_OUTPUT_
                 fallback = BARE_CR_NOTE
             else:
                 try:
-                    _python_ast(text, lines, scan)
+                    _python_ast(text, lines, scan, len(raw))
+                except _ChildFailed:
+                    fallback = LARGE_PYTHON_NOTE
+                    scan.entries = []
                 except (SyntaxError, ValueError, RecursionError, MemoryError) as error:
                     if isinstance(error, ValueError) and str(error) == TIMEOUT_MESSAGE:
                         raise
@@ -361,7 +379,8 @@ def outline_file(tools, path, *, offset=0, max_level=6, page_bytes=QUERY_OUTPUT_
         result["note"] = " ".join(notes)
     if scan.full:
         result["outline_limit_reached"] = True
-    return _page(result, [_entry(*entry) for entry in selected[offset:]], offset, page_bytes)
+    redact = getattr(tools, "redact", None)
+    return _page(result, [_entry(*entry, redact) for entry in selected[offset:]], offset, page_bytes)
 
 
 def _page(result, entries, offset, page_bytes):

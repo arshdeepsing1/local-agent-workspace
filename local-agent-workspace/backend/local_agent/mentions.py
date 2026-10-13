@@ -133,12 +133,15 @@ def _snapshot(manager, session, tools, mention):
         shortened = True
     shown = tools.display_path(target)
     return {"kind": "file", "token": token, "target": target, "seen": seen, "display": shown, "start": first,
-            "end": last, "shortened": shortened, "text": content}
+            "end": last, "shortened": shortened, "text": content, "bytes": seen[0] if seen else None}
 
 
 def shortened_note(session, item):
-    """The header note of a shortened file attachment: where the rest of the file is."""
-    return (f", shortened; read the rest with read_file start_line={item['end'] + 1}"
+    """The header note of a shortened file attachment: the file's size (read_file gives it only on a
+    read from line 1, and the system message's handoff rule needs it) and where the rest is."""
+    size = item.get("bytes")
+    return (", shortened" + (f" (the file is {size:,} bytes)" if type(size) is int else "")
+            + f"; read the rest with read_file start_line={item['end'] + 1}"
             + (" or list its sections with outline_file" if tool_allowed(session, "outline_file") else ""))
 
 
@@ -239,7 +242,8 @@ def attached_paths(content):
     if nonce is None:
         return []
     block = re.compile(rf"^<<<ATTACHMENT {nonce.group(0)} file @(.+?) (?:lines \d+–\d+|\(empty\))"
-                       rf"(?:, shortened(?:; read the rest with read_file start_line=\d+(?: or list its sections with "
+                       rf"(?:, shortened(?: \(the file is [\d,]+ bytes\))?(?:; read the rest with read_file "
+                       rf"start_line=\d+(?: or list its sections with "
                        rf"outline_file)?)?)?>>>$", re.MULTILINE)
     return list(dict.fromkeys(match.group(1) for match in block.finditer(content, at + len(head))))
 

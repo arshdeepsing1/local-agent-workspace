@@ -513,8 +513,7 @@ def _shortened_call(call, stats):
     return {**call, "function": {**call["function"], "arguments": json.dumps(updated, ensure_ascii=False)}}
 
 
-def _same_path(left, right):
-    return isinstance(left, str) and isinstance(right, str) and posixpath.normpath(left) == posixpath.normpath(right)
+_READS = ("read_file", "notebook_read")
 
 
 def _normal_arguments(arguments):
@@ -523,16 +522,29 @@ def _normal_arguments(arguments):
     return arguments
 
 
-def _supersedes(read_name, read_arguments, name, arguments):
-    """Whether a later completed call makes an earlier read's result stale or repeated."""
-    path = read_arguments.get("path")
-    if not isinstance(path, str) or not isinstance(arguments, dict):
-        return False
+def _changed_paths(name, arguments):
+    """The paths a completed call changes: a later change makes an earlier read of them stale."""
     if name in ("write_file", "edit_file", "notebook_edit", "delete_path"):
-        return _same_path(arguments.get("path"), path)
-    if name == "move_path":
-        return _same_path(arguments.get("path"), path) or _same_path(arguments.get("destination"), path)
-    return name == read_name and _normal_arguments(arguments) == _normal_arguments(read_arguments)
+        values = (arguments.get("path"),)
+    elif name == "move_path":
+        values = (arguments.get("path"), arguments.get("destination"))
+    else:
+        values = ()
+    return [value for value in values if isinstance(value, str)]
+
+
+def _frozen(value):
+    """A hashable value, equal exactly when the dicts and lists are equal (1 == 1.0, as before)."""
+    if isinstance(value, dict):
+        return frozenset((key, _frozen(item)) for key, item in value.items())
+    if isinstance(value, list):
+        return tuple(_frozen(item) for item in value)
+    return value
+
+
+def _read_key(name, arguments):
+    """A read's name and normalised arguments: a later identical read repeats its result."""
+    return name, _frozen(_normal_arguments(arguments))
 
 
 def summary_transcript(archived, later, result_limit, completed_calls=None):
@@ -547,9 +559,10 @@ def summary_transcript(archived, later, result_limit, completed_calls=None):
     needs no change serializes exactly as json.dumps(archived)."""
     stats = {"elided_bytes": 0, "superseded": 0, "shortened": 0}
     combined = [*archived, *later]
-    # Completed calls by the normalised paths they name ("path", and "destination"
-    # for move_path), so each read checks only the later calls on its own path.
-    calls, issued = {}, {}
+    # The last position of a completed change to each normalised path, and of each completed
+    # read by its arguments: a read is superseded when either is later (linear, not a scan of
+    # the later calls on its path, which many paged reads of one file make quadratic).
+    calls, last_change, last_read = {}, {}, {}
     for position, message in enumerate(combined):
         if isinstance(message, dict) and message.get("role") == "assistant" and isinstance(message.get("tool_calls"), list):
             for call in message["tool_calls"]:
@@ -558,9 +571,10 @@ def summary_transcript(archived, later, result_limit, completed_calls=None):
                 calls[call_id] = (name, arguments)
                 if completed_calls is None or call_id not in completed_calls or not isinstance(arguments, dict):
                     continue
-                for key in {posixpath.normpath(value) for value in (arguments.get("path"), arguments.get("destination"))
-                            if isinstance(value, str)}:
-                    issued.setdefault(key, []).append((position, name, arguments))
+                for value in _changed_paths(name, arguments):
+                    last_change[posixpath.normpath(value)] = position
+                if name in _READS and isinstance(arguments.get("path"), str):
+                    last_read[_read_key(name, arguments)] = position
     transformed = []
     for position, message in enumerate(archived):
         if not isinstance(message, dict):
@@ -585,11 +599,10 @@ def summary_transcript(archived, later, result_limit, completed_calls=None):
                 message = {**message, "tool_calls": shortened}
         elif role == "tool" and isinstance(content, str):
             name, arguments = calls.get(message.get("tool_call_id"), (None, None))
-            if (name in ("read_file", "notebook_read") and isinstance(arguments, dict) and completed_calls is not None
-                    and isinstance(arguments.get("path"), str) and _size(content) >= SUPERSEDED_MIN_BYTES and any(
-                        later_position > position and _supersedes(name, arguments, later_name, later_arguments)
-                        for later_position, later_name, later_arguments
-                        in issued.get(posixpath.normpath(arguments["path"]), ()))):
+            if (name in _READS and isinstance(arguments, dict) and completed_calls is not None
+                    and isinstance(arguments.get("path"), str) and _size(content) >= SUPERSEDED_MIN_BYTES
+                    and (last_change.get(posixpath.normpath(arguments["path"]), -1) > position
+                         or last_read.get(_read_key(name, arguments), -1) > position)):
                 message = {**message, "content": SUPERSEDED_READ.format(
                     tool=name, path=arguments.get("path"), total=_size(content))}
                 stats["superseded"] += 1
@@ -1157,17 +1170,26 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
                 adjustment = change
             return result
 
+        def fragment_fits(fragment):
+            # The summary carried over from the previous chunk, as it is when called.
+            request = (build_handoff_messages(summary, fragment, preservation_note, request_tokens) if handoff_path
+                       else build_summary_messages(summary, fragment, preservation_note, summary_limit))
+            return (scaled_estimate(request, (), scale) <= summary_input_budget
+                    and len(encode_payload({"messages": request})) <= request_limits.PAYLOAD_TARGET_BYTES)
+
         while offset < len(transcript):
             # Find a whole-character fragment whose estimated serialized request fits,
-            # including the previous summary and JSON escaping of Unicode/text.
+            # including the previous summary and JSON escaping of Unicode/text. The rest of
+            # the transcript usually fits whole: one probe instead of a search, each of whose
+            # probes serializes about the whole transcript on the event loop.
             low, high = 0, len(transcript) - offset
+            if fragment_fits(transcript[offset:]):
+                low = high
+            else:
+                high -= 1
             while low < high:
                 middle = (low + high + 1) // 2
-                fragment = transcript[offset:offset + middle]
-                request = (build_handoff_messages(summary, fragment, preservation_note, request_tokens) if handoff_path
-                           else build_summary_messages(summary, fragment, preservation_note, summary_limit))
-                if (scaled_estimate(request, (), scale) <= summary_input_budget
-                        and len(encode_payload({"messages": request})) <= request_limits.PAYLOAD_TARGET_BYTES):
+                if fragment_fits(transcript[offset:offset + middle]):
                     low = middle
                 else:
                     high = middle - 1

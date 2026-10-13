@@ -265,3 +265,33 @@ def test_the_slash_menu_offers_the_side_question_first(ui, page):
     expect(first).to_contain_text("Ask about this conversation without adding to it (one model request).")
     box.press("Enter")
     expect(box).to_have_value("/btw ")
+
+
+def put_text(page, text):
+    """Set the message box as a paste does (fill() types long text slowly)."""
+    message(page).evaluate("(box, text) => { box.value = text; box.dispatchEvent(new Event('input', { bubbles: true })) }",
+                           text)
+
+
+def test_a_message_over_50000_characters_is_not_sent_and_gets_advice(ui, page):
+    start_app(ui, page)
+    put_text(page, "x" * 50_001)
+    message(page).press("Enter")
+    expect(page.get_by_role("alert")).to_contain_text(
+        "Messages are limited to 50,000 characters (this one has 50,001). Save long text such as a handoff as a file "
+        "in the project and attach it with @")
+    assert not ui.requests("/api/sessions/a/messages")
+    assert message(page).input_value() == "x" * 50_001
+    # The limit counts code points, as the server does: 30,000 emoji are 60,000 UTF-16 units.
+    page.get_by_role("button", name="Dismiss").click()
+    put_text(page, "\U0001F600" * 30_000)
+    message(page).press("Enter")
+    ui.wait("fake.requests('/api/sessions/a/messages', 'POST').length === 1")
+
+    # In a new draft no empty conversation is created.
+    ui.run("window.history.pushState(null, '', '?'); window.dispatchEvent(new PopStateEvent('popstate'))")
+    expect(page.get_by_role("heading", name="What’s up next?")).to_be_visible()
+    put_text(page, "y" * 60_000)
+    message(page).press("Enter")
+    expect(page.get_by_role("alert")).to_contain_text("(this one has 60,000)")
+    assert not ui.requests("/api/sessions", "POST")

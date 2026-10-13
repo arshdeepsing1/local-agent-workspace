@@ -4,6 +4,7 @@ import { modelLabel } from '../types.js'
 import PermissionsMenu from './PermissionsMenu.js'
 import { useSlashMenu } from './SlashMenu.js'
 import { mentionLabel, parseMentions, removeMention, useMentionMenu } from './MentionMenu.js'
+import { MAX_MESSAGE_LENGTH } from '../reviewComments.js'
 
 // What the text in the message box does when sent: a message, a ! command or a /btw question.
 export function messageKind(text) {
@@ -44,6 +45,15 @@ export default function Composer(p) {
   const submit = async () => {
     if (!text || sending || p.modelSaving || p.disabled || blocked) return
     if (kind === 'side') { askSide(); return }
+    // The server's limit counts code points; checked before sending, so no draft chat is created and
+    // the text stays in the box.
+    const chars = kind === 'message' ? [...text].length : 0
+    if (chars > MAX_MESSAGE_LENGTH) {
+      p.onError(`Messages are limited to ${MAX_MESSAGE_LENGTH.toLocaleString('en-US')} characters (this one has ` +
+        `${chars.toLocaleString('en-US')}). Save long text such as a handoff as a file in the project and attach it ` +
+        'with @ (or ask the agent to read it), so the agent can outline it and read the parts it needs.')
+      return
+    }
     setSending(true)
     try {
       if (kind === 'shell') await p.onShell(text.slice(1).trim())

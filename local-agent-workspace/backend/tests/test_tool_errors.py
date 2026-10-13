@@ -48,8 +48,10 @@ from local_agent.tools import WorkspaceTools
     (ValueError("Only regular text files can be outlined."), "wrong_type", False),
     (ValueError("Only regular text files can be outlined; use notebook_read for Jupyter notebooks."), "wrong_type",
      False),
-    (ValueError("This file exceeds the 8 MB outline limit; use search_files (for example regex=true with ^#{1,3} or "
-                "^\\s*(def|class)) to find sections."), "limit", True),
+    (ValueError("This file exceeds the 8 MB outline and search limit; use read_file with tail_lines for its end, or "
+                "run_command with grep -n (if available) to find lines."), "limit", True),
+    (ValueError("This file is 10.2 MB, larger than the 8 MB limit for searching one file. Use read_file with "
+                "tail_lines for its end, or run_command with grep -n (if available) to find lines."), "limit", True),
     (ValueError("Binary files cannot be outlined."), "wrong_type", False),
     (ValueError("Outlining this file took longer than 3 seconds; use search_files to find sections."), "limit", True),
     (ValueError("offset is beyond the 2 outline entries."), "invalid_arguments", True),

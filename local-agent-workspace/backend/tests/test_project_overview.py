@@ -132,3 +132,27 @@ def test_a_file_path_is_the_wrong_type(project):
 def test_read_modes_allow_it_without_a_card(mode):
     assert evaluate(mode, "project_overview", {"path": "."}).decision == "allow"
     assert evaluate(mode, "outline_file", {"path": "a.md"}).decision == "allow"
+
+
+def test_key_file_matches_the_fnmatch_patterns_in_one_compiled_pattern(monkeypatch):
+    """Integration review B, finding 18: the same answers as fnmatchcase over each KEY_FILES pattern."""
+    import fnmatch
+    from pathlib import PurePosixPath
+
+    from local_agent import overview
+    from local_agent.overview import KEY_FILES, WORKFLOWS, key_file
+
+    def expected(name):
+        lower = name.lower()
+        return len(PurePosixPath(lower).parts) <= 3 and (lower.startswith(WORKFLOWS) or any(
+            fnmatch.fnmatchcase(PurePosixPath(lower).name, pattern) for pattern in KEY_FILES))
+    examples = [pattern.replace("*", "x") for pattern in KEY_FILES] + [pattern.replace("*", "") for pattern in KEY_FILES]
+    names = [*examples, "README.md", "Dockerfile", "compose.yzml", "requirements.txt.bak", "[x].sln", "a.sln",
+             "docker-compose.yaml", "x\nreadme", "readme\n", ".github/workflows/ci.yml", ".GitHub/Workflows/CI.yml",
+             ".github/workflows/sub/ci.yml", "notes.txt", "src/main.py"]
+    paths = [prefix + name for name in names for prefix in ("", "pkg/", "pkg/mod/", "pkg/mod/deep/")]
+    assert [key_file(path) for path in paths] == [expected(path) for path in paths]
+    calls = []
+    match = fnmatch.fnmatchcase
+    monkeypatch.setattr(overview.fnmatch, "fnmatchcase", lambda *args: calls.append(args) or match(*args))
+    assert key_file("pkg/mod/f1.py") is False and key_file("README.md") is True and calls == []
