@@ -4,6 +4,46 @@ Notable changes to Local Agent Workspace, newest first. Dates are UTC.
 
 ## Unreleased
 
+Default model, code folder, Python environment, large inputs and compaction:
+
+- The default model is Claude Opus 5.5 (`databricks-claude-opus-5-5`) with a 200,000-token
+  context budget and 16,384 Max output tokens. Saved settings still at the old default (GPT OSS
+  120B at 131,072 and 8,192) move to Opus 5.5 once; Settings says so, notes that Opus 5.5 costs
+  more per token and how to switch back. Budgets left at a model's defaults follow a model
+  change. Settings shows each endpoint's limits and warns about budgets above what it accepts or
+  above its per-minute limits; requests use the endpoint's caps. Opus 5.5 usage rates are in the
+  usage panel.
+- `LOCAL_AGENT_CODING_DIR` (Settings → **Default folder for new code**): where the agent creates
+  new standalone scripts, tools and projects when you do not say where. Every chat may read and
+  write there without a Folder access card (edits still follow the permission mode); home,
+  hidden, system and app folders are refused.
+- `LOCAL_AGENT_PYTHON_VENV` (Settings → **Python virtual environment**): the agent's commands,
+  Verify, hooks and the Terminal run with that virtual environment first on `PATH` (and without
+  the app server's own environment), the system prompt tells the agent to use it, and edits
+  inside it always ask outside Bypass.
+- Large inputs within the Databricks limits: requests stay under the 4 MB request limit
+  (compaction also runs on size, and an oversized request is refused before it is sent);
+  rate-limit responses show which limit was hit and are waited out together by every chat on the
+  endpoint; a Max output tokens setting above the endpoint's output-tokens-per-minute limit is
+  refused with what to set instead. New read tools `outline_file` (sections of large Markdown,
+  Python and other source files with line ranges) and `project_overview` (a bounded summary of a
+  large codebase); read pages grow to 128 KB on large budgets; each response's tool results
+  share an allowance so one step cannot overflow the context (a read that does not fit is
+  withheld with a note, other results keep their start and end). Agent requests wait up to 300
+  seconds for the stream, compaction and side questions up to 600. The system prompt carries the
+  date only, so Databricks can reuse its cached prefix all day.
+- Compaction keeps what matters: the summary has seven fixed sections (goal and status, open
+  tasks and next steps, your requirements and constraints in your words, decisions, errors,
+  files, commands), large tool output is shortened before summarizing, your earlier requests are
+  kept word for word in an app record next to the summary, and files whose contents left the
+  context must be read again before they are overwritten. **Settings → Auto-compact at**
+  (50–100% of the input budget, 90 by default) sets when automatic compaction runs. Models that
+  always think get extra output room for summaries.
+- **Last model input** shows the input tokens Databricks reported for the last request and their
+  share of the input budget, with the components (cached input included once) and how far the
+  app's estimate was off; it says when it shows an estimate instead, and follows model and
+  Settings changes. A request-size line shows the body size against the 4 MB limit.
+
 Roadmap milestone M4 (conversation control and history):
 
 - Edit, retry and rewind: **Edit message** replaces a message and everything after it (and can
