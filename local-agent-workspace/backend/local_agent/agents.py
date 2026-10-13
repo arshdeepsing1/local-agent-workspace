@@ -21,7 +21,7 @@ from .rules import (APP_ROOT, RuleStore, card_rule_options, default_rule, normal
 from .activity import ACTIVITY_TOOL, activity_content, activity_log, local_time, redact_secrets
 from .context import (
     DEFAULT_AUTO_COMPACT_PERCENT, MAX_AUTO_COMPACT_PERCENT,
-    MIN_AUTO_COMPACT_PERCENT, OUTPUT_LIMIT_CONTINUATION, SUMMARY_MAX_TOKENS,
+    MIN_AUTO_COMPACT_PERCENT, OUTPUT_LIMIT_CONTINUATION, SAFETY_MARGIN, SUMMARY_MAX_TOKENS,
     build_condense_messages, build_handoff_messages, build_summary_messages, compaction_output_allowance,
     condense_output_tokens, estimate_prior, estimate_scale, estimate_tokens, handoff_output_tokens, handoff_with_contents,
     last_request_report, model_context_window, next_request_estimate, prepare_context, summary_byte_limit,
@@ -78,8 +78,8 @@ from .rate_limits import (ITPM, OTPM, RATE_LIMIT_WAIT_CAP, RateLimitGate, descri
                           parse_rate_limit, request_info_fields)
 from .context import in_turn_tokens
 from .model_profiles import CONCURRENT_REQUESTS
-from .result_budget import (ALLOWANCE_MARGIN_TOKENS, JOB_TOOLS, TOOL_RESULT_HARD_LIMIT, ResultAllowance, bound_result,
-                            cap_text, deferred_text, shorten_result)
+from .result_budget import (ALLOWANCE_MARGIN_TOKENS, FULL_RESULT_TOOLS, TOOL_RESULT_HARD_LIMIT, ResultAllowance,
+                            bound_result, cap_text, deferred_text, shorten_result, shortened_hint)
 from .permissions import tool_kind
 from .tool_profiles import covering_tool
 
@@ -348,19 +348,26 @@ LARGE_INPUT_OVERVIEW = ("In an unfamiliar or large project, call project_overvie
                         "find_files and search_files (output_mode=files_with_matches narrows quickly) before reading.")
 LARGE_INPUT_OUTLINE = ("For a long file (read_file reports file_bytes and a hint), call outline_file and read only the "
                        "line ranges you need. A handoff you are asked to resume from: read it completely when it is "
-                       "smaller than about a third of your context budget; otherwise outline it, read its current "
+                       "smaller than {handoff_size}; otherwise outline it, read its current "
                        "status, next actions and open questions completely, and read other sections as you need them.")
 LARGE_INPUT_WRITES = ("A file you write is limited by Settings → File write limit; split a longer handoff into "
                       "numbered parts and list them at the top of the first.")
 
 
-def large_input_guidance(available=None):
-    """The large-project guidance for the offered tools (None: every tool), or ""."""
+def large_input_guidance(available=None, input_budget=None):
+    """The large-project guidance for the offered tools (None: every tool), or "". input_budget
+    (the request's input budget in tokens) gives the model the handoff size in numbers."""
     overview = available is None or "project_overview" in available
     outline = available is None or "outline_file" in available
     if not overview and not outline:
         return ""
-    return " ".join(part for part, wanted in ((LARGE_INPUT_OVERVIEW, overview), (LARGE_INPUT_OUTLINE, outline),
+    # The app estimates about 3 bytes of text per token, so a third of the budget in
+    # tokens is about the budget in bytes (read_file's file_bytes).
+    handoff_size = ("about a third of your context budget" if input_budget is None else
+                    f"about {input_budget // 3:,} tokens (roughly {input_budget // 3 * 3:,} bytes; a third of your "
+                    f"{input_budget:,}-token input budget)")
+    return " ".join(part for part, wanted in ((LARGE_INPUT_OVERVIEW, overview),
+                                              (LARGE_INPUT_OUTLINE.format(handoff_size=handoff_size), outline),
                                               (LARGE_INPUT_WRITES, True)) if wanted)
 
 
@@ -406,9 +413,11 @@ SEEN_PATH_TOOLS = ("read_file", "notebook_read", "write_file", "edit_file", "not
 
 
 def completed_call_ids(session):
-    """Ids of the tool calls whose tool event finished in state "completed"."""
+    """Ids of the tool calls whose tool event finished in state "completed" and whose result
+    reached the model. A withheld read (result_withheld) delivered nothing, so for compaction
+    it neither supersedes an earlier read nor keeps its file seen."""
     return {event["call_id"] for event in session.get("events", []) if isinstance(event, dict)
-            and event.get("type") == "tool" and event.get("state") == "completed"
+            and event.get("type") == "tool" and event.get("state") == "completed" and not event.get("result_withheld")
             and isinstance(event.get("call_id"), str) and event["call_id"]}
 
 
@@ -2607,12 +2616,14 @@ class AgentManager:
             failed = name.startswith("mcp__") and isinstance(result, dict) and result.get("is_error") is True
             model_output, extra = output, {}
             if allowance is not None:
-                if name in JOB_TOOLS:
-                    allowance.charge(output)  # job_seen() has advanced: what it returned must reach the model.
+                if name in FULL_RESULT_TOOLS:
+                    # A job page (job_seen() has advanced) or the user's own answers: always sent whole.
+                    allowance.charge(output)
                 elif tool_kind(name) == "read":
                     if not allowance.admit(output):
                         cost = allowance.cost(output)
                         model_output = deferred_text(name, cost, allowance.total)
+                        allowance.charge(model_output)
                         extra = {"model_output": model_output,
                                  "result_withheld": {"estimated_tokens": cost, "allowance_tokens": allowance.total}}
                         if views_key is not None:
@@ -2623,12 +2634,15 @@ class AgentManager:
                                 views[views_key] = views_prev
                             session["file_views"] = views
                 elif not allowance.admit(output):
-                    # The action ran; its result is shortened, never withheld.
-                    text = json.dumps(shorten_result(result), indent=2)
-                    if edited_note and origin != "verify":
-                        text = edited_note + "\n" + text
-                    model_output = cap_text(self.settings.redact(text))
-                    extra = {"model_output": model_output, "result_shortened": True}
+                    # The action ran; its result is shortened, never withheld. A result with
+                    # nothing long enough to shorten is sent as it is.
+                    short = shorten_result(result, hint=shortened_hint(name))
+                    if short["omitted_bytes"]:
+                        text = json.dumps(short, indent=2)
+                        if edited_note and origin != "verify":
+                            text = edited_note + "\n" + text
+                        model_output = cap_text(self.settings.redact(text))
+                        extra = {"model_output": model_output, "result_shortened": True}
                     allowance.charge(model_output)
             await self.update_event(session, event, state="error" if failed else "completed", output=output, **extra)
             if name in FILE_CHANGE_TOOLS:
@@ -2905,7 +2919,8 @@ class AgentManager:
                   + "\nWorkspace: " + session["workspace"]
                   + self.coding_dir_text(session) + self.python_text(session)
                   + "\n" + output_limit_text(self.request_limits(session)[1], thinking=bool(thinking_reserve(session["model"])))
-                  + (("\n" + guidance_text) if (guidance_text := large_input_guidance(available)) else "")
+                  + (("\n" + guidance_text) if (guidance_text := large_input_guidance(
+                      available, input_budget=self.input_budget(session))) else "")
                   + ("\n" + index if index else "")
                   + "\n" + guidance["text"] + "\n" + tools.skill_signature
                   + ("\nProject instruction warnings: " + json.dumps(guidance["warnings"]) if guidance["warnings"] else "")
@@ -2913,6 +2928,11 @@ class AgentManager:
                   + "\n" + current_time_text()
                   + ("\n" + notice if notice else "")}
         return system, guidance
+
+    def input_budget(self, session):
+        """The input budget prepare_context uses for this chat's requests."""
+        context_window, max_output_tokens = self.request_limits(session)
+        return context_window - max_output_tokens - SAFETY_MARGIN
 
     def coding_dir_text(self, session):
         """The system prompt line for the default code folder, or ""."""
@@ -3850,14 +3870,20 @@ class AgentManager:
                     await self.refresh_next_estimate(session, system, definitions, wire, context_state)
                     return True
                 consecutive_output_retries = consecutive_repairs = 0
+                # The response's reported input tokens can change the scale the next request uses.
+                scale = estimate_scale(session.get("inference_calls"), session["model"])
                 # The results of this response share what the input budget leaves after the
                 # latest exchange, so in-turn compaction can always keep them (result_budget).
                 fixed = in_turn_tokens(model_history(wire), context_state, system, definitions, input_budget, scale)
                 allowance = ResultAllowance(
-                    max(0, min(input_budget // 2, input_budget - fixed - ALLOWANCE_MARGIN_TOKENS)), scale)
+                    max(0, min(input_budget // 2, input_budget - fixed - ALLOWANCE_MARGIN_TOKENS)), scale,
+                    calls=len(ordered_calls))
                 for call, values in zip(ordered_calls, arguments):
+                    settled = allowance.settled
                     output = await self.execute_tool(session, tools, call["function"]["name"], values, call["id"],
                                                      allowance=allowance)
+                    if allowance.settled == settled:
+                        allowance.charge(output)  # A refusal or another early return is sent too.
                     wire.append({"role": "tool", "tool_call_id": call["id"], "content": output})
                     self.store.save(session)
                 if step_index + 1 < steps:

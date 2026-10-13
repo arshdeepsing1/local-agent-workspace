@@ -137,7 +137,13 @@ const FILE_INPUTS = { read_file: 'path', write_file: 'path', edit_file: 'path', 
 
 // What the agent received when it differs from the card (the per-response context allowance).
 function allowanceNote(event) {
-  if (event.result_withheld) return 'Result not sent to the agent: earlier results in the same step filled its context allowance. The agent can run it again.'
+  const withheld = event.result_withheld
+  if (withheld) {
+    const estimated = Number(withheld.estimated_tokens), allowance = Number(withheld.allowance_tokens)
+    // As result_budget.deferred_text tells the model: one result larger than the whole allowance.
+    if (estimated > allowance) return `Result not sent to the agent: it is larger than the step's context allowance (about ${estimated.toLocaleString('en-US')} of ${allowance.toLocaleString('en-US')} tokens). The agent was asked to read a smaller part.`
+    return 'Result not sent to the agent: earlier results in the same step filled its context allowance. The agent can run it again.'
+  }
   if (event.result_shortened) return 'Result shortened for the agent to fit its context allowance.'
   return null
 }

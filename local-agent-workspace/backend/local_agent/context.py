@@ -923,12 +923,12 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
     messages = [system_message, *context_messages(wire, state)]
     estimate = before = scaled_estimate(messages, tools, scale)
     adjustment = saved_handoff = compaction = cut = None
-    in_turn = deferred = False
+    in_turn = deferred = byte_fallback = False
     # The 4 MB Databricks request limit: compaction also runs when the request body would
     # pass the app's byte target (request_limits). Within the token budget this only
     # happens when the estimator undercounts bytes, so the check usually costs nothing.
-    over_bytes = request_bytes_over(messages, tools, estimate_tokens(messages, tools),
-                                    request_limits.PAYLOAD_TARGET_BYTES)
+    # The scaled estimate is at least the unscaled one (scale >= 1), so it serves as the bound.
+    over_bytes = request_bytes_over(messages, tools, estimate, request_limits.PAYLOAD_TARGET_BYTES)
 
     if force_compact or estimate > threshold or over_bytes:
         # Turn starts only: the app's hidden continuations and the user's steered
@@ -950,8 +950,8 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
             """size (needed_at(candidate)) fits limit, and the request stays under the byte target."""
             if size > limit:
                 return False
-            retained = [system_message, *retained_at(candidate)]
-            return not request_bytes_over(retained, tools, estimate_tokens(retained, tools),
+            # size, the scaled estimate, bounds the unscaled one: no second serialization.
+            return not request_bytes_over([system_message, *retained_at(candidate)], tools, size,
                                           request_limits.PAYLOAD_TARGET_BYTES)
 
         request_index = turn_request(wire, len(wire) - 1)
@@ -999,6 +999,15 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
             cut = boundary_cut(input_budget)
             if cut is None and (cut := in_turn_cut(input_budget)) is not None:
                 in_turn = True
+        if cut is None and over_bytes:
+            # Over the byte target and no cut reaches it: take the latest cut (it keeps the
+            # least) when it fits the input budget and makes the request smaller, so a request
+            # just over the 4 MB limit can still be sent. check_payload refuses it if it cannot.
+            latest = responses[-1] if responses else boundaries[-1] if boundaries else None
+            if latest is not None and needed_at(latest) <= input_budget and len(encode_payload(
+                    {"messages": [system_message, *retained_at(latest)], "tools": list(tools)})) < len(
+                    encode_payload({"messages": messages, "tools": list(tools)})):
+                cut, in_turn, byte_fallback = latest, bool(responses), True
         if cut is None:
             if not force_compact and estimate <= input_budget:
                 # Over the threshold (or the byte target) but within the budget, and no
@@ -1098,7 +1107,9 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
                 f"The summary and latest turns still exceed the context budget: they need about "
                 f"{estimate:,} estimated input tokens.", context_window, reply_reserve, input_budget,
                 default_reply_reserve)
-        if request_bytes_over(messages, tools, estimate_tokens(messages, tools), request_limits.PAYLOAD_TARGET_BYTES):
+        # The byte fallback only had to make the request smaller; check_payload is its limit.
+        byte_limit = request_limits.PAYLOAD_LIMIT_BYTES if byte_fallback else request_limits.PAYLOAD_TARGET_BYTES
+        if request_bytes_over(messages, tools, estimate, byte_limit):
             size = len(encode_payload({"messages": messages, "tools": list(tools)}))
             raise budget_error(
                 f"The summary and latest turns would be a {size / 1_000_000:.1f} MB request, above the Databricks "

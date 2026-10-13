@@ -272,3 +272,160 @@ def test_the_allowance_arithmetic():
     allowance.charge("x" * 3000)
     assert allowance.left < 0
     assert agents.ALLOWANCE_MARGIN_TOKENS == 1024
+
+
+@pytest.mark.parametrize("window, output, count, refusals", [(32768, 4096, 64, False), (24576, 2048, 48, True)])
+async def test_many_reads_and_refusals_in_one_response_never_end_with_a_budget_error(runtime, monkeypatch, window,
+                                                                                       output, count, refusals):
+    """Every call's text reaches the next request: room for one deferred-read notice per call is kept,
+    and notices and refusals are charged too, so in-turn compaction keeps them all."""
+    manager, session, project = runtime
+    manager.settings.values.update(context_window=window, max_output_tokens=output)
+    names = [f"f{index:02d}.txt" for index in range(count)]
+    for name in names:
+        (project / name).write_text("".join(f"line {number:03d} " + "y" * 50 + "\n" for number in range(60)))
+    calls = [("read_file", {"path": name}) for name in names]
+    if refusals:
+        session["disabled_tools"] = ["find_files"]
+        calls[1::8] = [("find_files", {"pattern": f"*{index}.py"}) for index in range(len(calls[1::8]))]
+    requests, summaries = gateway(monkeypatch, [calls_stream(calls), done()])
+    made = []
+
+    class Recorded(ResultAllowance):
+        def __init__(self, *args, **options):
+            super().__init__(*args, **options)
+            made.append(self)
+    monkeypatch.setattr(agents, "ResultAllowance", Recorded)
+    await manager.run(session, "Read every file " + "r" * 3000)
+    errors = [event["text"] for event in session["events"] if event["type"] == "error"]
+    assert errors == [] and session["terminal_reason"] == "completed" and len(requests) == 2
+    assert any("result_deferred" in event.get("model_output", "") for event in tool_events(session, "read_file"))
+    if refusals:
+        assert {event["state"] for event in tool_events(session, "find_files")} == {"rejected"}
+    # Every call was settled against the allowance, and the next request carried a message for each.
+    allowance, = made
+    assert allowance.settled == count and allowance.pending == 0
+    assert sum(message["role"] == "tool" for message in requests[1]["messages"]) == count
+
+
+async def test_the_allowance_uses_the_scale_the_response_reported(runtime, monkeypatch):
+    """The model response's reported input tokens change the estimate scale of the next request; the
+    allowance follows that scale, not the one from before the response."""
+    from local_agent.context import estimate_tokens
+    manager, session, project = runtime
+    manager.settings.values.update(context_window=32768, max_output_tokens=4096)
+    names = [f"f{index:02d}.txt" for index in range(12)]
+    for name in names:
+        (project / name).write_text("".join(f"line {number:03d} " + "y" * 50 + "\n" for number in range(60)))
+
+    def reported(response, body):
+        usage = {"prompt_tokens": int(estimate_tokens(body["messages"], body["tools"]) * 1.4), "completion_tokens": 10}
+        return httpx.Response(200, text=response.text.replace(
+            "data: [DONE]", "data: " + json.dumps({"choices": [], "usage": usage}) + "\n\ndata: [DONE]"))
+    requests, summaries = gateway(monkeypatch, [
+        lambda body: reported(calls_stream([("read_file", {"path": name}) for name in names]), body),
+        lambda body: reported(done(), body)])
+    await manager.run(session, "Read every file")
+    errors = [event["text"] for event in session["events"] if event["type"] == "error"]
+    assert errors == [] and session["terminal_reason"] == "completed" and len(requests) == 2
+    assert any("result_deferred" in event.get("model_output", "") for event in tool_events(session, "read_file"))
+
+
+async def test_the_users_answers_and_plan_feedback_are_always_sent_whole(runtime, monkeypatch):
+    manager, session, project = runtime
+    tools = manager.session_tools(session)
+    answer = "Use the staging database. " + "Keep the column order as in the spec; " * 25 + "FINAL: never drop users."
+    answers = {"answers": [{"question": f"Question {index}?", "selected": [], "other": answer} for index in range(4)]}
+    feedback = {"approved": False, "feedback": "Split step two. " + "Explain the migration order. " * 70}
+
+    async def handle(session, event, name, arguments):
+        return answers if name == "ask_user" else feedback
+    monkeypatch.setattr(manager.interactions, "handle", handle)
+    allowance = ResultAllowance(10)
+    output = await manager.execute_tool(session, tools, "ask_user", {"questions": [
+        {"question": "Which database?", "header": "DB", "options": [{"label": "staging"}, {"label": "prod"}]}]}, "c1",
+        allowance=allowance)
+    assert json.loads(output) == answers
+    output = await manager.execute_tool(session, tools, "submit_plan", {"plan": "1. Migrate\n2. Test"}, "c2",
+                                        allowance=allowance)
+    assert json.loads(output) == feedback and allowance.left < 0
+    for event in tool_events(session):
+        assert "result_shortened" not in event and "model_output" not in event
+
+
+async def test_a_small_action_result_is_sent_unchanged_when_the_allowance_is_used_up(runtime):
+    manager, session, project = runtime
+    tools = manager.session_tools(session)
+    allowance = ResultAllowance(0)
+    output = await manager.execute_tool(session, tools, "run_command", {"command": "echo hi"}, "c1",
+                                        allowance=allowance)
+    result = json.loads(output)
+    assert "result_shortened" not in result and "hint" not in result and result["exit_code"] == 0
+    event, = tool_events(session, "run_command")
+    assert event["output"] == output and "model_output" not in event and "result_shortened" not in event
+    assert allowance.left < 0  # Sent, so charged.
+
+
+async def test_only_a_shortened_command_points_at_get_job_output(runtime):
+    manager, session, project = runtime
+    tools = manager.session_tools(session)
+    created = json.loads(await manager.execute_tool(session, tools, "create_task", {
+        "title": "Long task", "description": "Describe the migration. " * 150}, "c1"))
+    output = json.loads(await manager.execute_tool(session, tools, "get_task", {"task_id": created["id"]}, "c2",
+                                                   allowance=ResultAllowance(10)))
+    assert output["result_shortened"] is True and output["omitted_bytes"] > 0
+    assert output["hint"] == result_budget.SHORTENED_HINT and "get_job_output" not in output["hint"]
+    assert "get_job_output" in result_budget.shortened_hint("run_command")
+
+
+def test_room_for_every_calls_notice_is_kept_until_it_is_settled():
+    single = ResultAllowance(10_000)
+    allowance = ResultAllowance(10_000, calls=3)
+    stub = allowance.stub
+    assert stub >= allowance.cost(result_budget.deferred_text("read_file", 10 ** 9, 10 ** 9))
+    assert allowance.left == 10_000 - 3 * stub and single.left == 10_000
+    big = "x" * ((10_000 - 2 * stub - result_budget.RESULT_FRAMING_TOKENS) * 3)
+    assert allowance.cost(big) == 10_000 - 2 * stub
+    # The first result may use everything except the room kept for the other two calls.
+    assert allowance.admit(big) and allowance.left == 0 and allowance.settled == 1
+    # A small result fits in its own call's notice room; a larger one does not.
+    assert not allowance.admit("y" * 3000) and allowance.settled == 1
+    allowance.charge(result_budget.deferred_text("read_file", 140, 10_000))
+    assert allowance.settled == 2 and allowance.left >= 0
+    allowance.charge("The user turned off find_files in this chat. Use other tools.")
+    assert allowance.settled == 3 and allowance.left >= 0
+    # With no room left, a result as small as a notice still uses its own call's room.
+    assert ResultAllowance(2 * stub, calls=2).admit("y" * (stub - result_budget.RESULT_FRAMING_TOKENS) * 3)
+
+
+async def test_a_withheld_reread_neither_supersedes_the_real_read_nor_keeps_the_file_seen(runtime):
+    """Compaction past a real read, with only a withheld re-read of the same file after the cut:
+    the summarizer still gets the real read's content, and the file must be read again before a write."""
+    from local_agent.agents import completed_call_ids, forget_summarized_reads
+    from local_agent.context import summary_transcript
+    manager, session, project = runtime
+    page_file(project, "a.txt")
+    tools = manager.session_tools(session)
+    real = await manager.execute_tool(session, tools, "read_file", {"path": "a.txt"}, "c1",
+                                      allowance=ResultAllowance(10 ** 6))
+    withheld = await manager.execute_tool(session, tools, "read_file", {"path": "a.txt"}, "c2",
+                                          allowance=ResultAllowance(10))
+    assert "result_deferred" not in real and "result_deferred" in withheld
+    key = str(project / "a.txt")
+    assert key in session["file_views"]  # The real read's view is restored.
+
+    def read_call(call_id):
+        return {"role": "assistant", "content": None, "tool_calls": [{
+            "id": call_id, "type": "function", "function": {"name": "read_file", "arguments": '{"path": "a.txt"}'}}]}
+    wire = [{"role": "user", "content": "Read a.txt"}, read_call("c1"), {"role": "tool", "tool_call_id": "c1", "content": real},
+            read_call("c2"), {"role": "tool", "tool_call_id": "c2", "content": withheld}]
+    completed = completed_call_ids(session)
+    assert completed == {"c1"}
+    text, stats = summary_transcript(wire[:3], wire[3:], 10 ** 9, completed)
+    assert stats["superseded"] == 0 and "a.txt line 0000" in text
+    record, holder = manager.compaction_record(session, tools)
+    assert "a.txt" in record(wire, 3) and holder["forgotten"] == [key]
+    session["file_views"], _ = forget_summarized_reads(session["file_views"], {}, holder["forgotten"])
+    output = await manager.execute_tool(session, tools, "write_file", {"path": "a.txt", "content": "new\n"}, "c3")
+    assert tool_events(session, "write_file")[-1]["state"] in ("rejected", "error") and "read" in output.lower()
+    assert (project / "a.txt").read_text() != "new\n"

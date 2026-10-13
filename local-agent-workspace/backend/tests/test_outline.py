@@ -156,6 +156,16 @@ def test_python_syntax_errors_fall_back_to_a_line_scan(workspace):
     assert result["note"].endswith("; this outline comes from a line scan.")
 
 
+def test_a_byte_order_mark_does_not_hide_line_one(workspace):
+    root, tools = workspace
+    write(root, "bom.py", b"\xef\xbb\xbfdef first():\n    pass\n\nclass A:\n    def f(self):\n        pass\n")
+    result = outline_file(tools, "bom.py")
+    assert result["entries"] == ["1-2 def first():", "4-6 class A:", "5-6   def f(self):"]
+    assert "note" not in result
+    write(root, "bom.md", b"\xef\xbb\xbf# Title\ntext\n## Part\n")
+    assert entries(tools, "bom.md") == ["1-3 Title", "3-3   Part"]
+
+
 def test_a_bare_carriage_return_uses_the_line_scan_like_read_file(workspace):
     root, tools = workspace
     write(root, "cr.py", "x = 1\rdef f():\n    pass\n")
@@ -199,7 +209,9 @@ FAMILY_SAMPLES = {
                ["1 pub struct A;", "2 impl A {", "3   pub(crate) async fn go(&self) {}"]),
     "Main.java": ("public class Main {\n    public static void main(String[] args) {\n    }\n    private int x;\n}\n",
                   ["1 public class Main {", "2   public static void main(String[] args) {"]),
-    "x.c": ("#include <stdio.h>\nstruct point {\n};\nint main(void)\n{\n    if (x) {}\n}\nint declared(void);\n",
+    # Column-0 control lines (macro bodies, K&R style) reach the keyword filter: not entries.
+    "x.c": ("#include <stdio.h>\nstruct point {\n};\nint main(void)\n{\n    if (x) {}\n}\nint declared(void);\n"
+            "if (ready)\nwhile (x)\nreturn (value)\nswitch(mode)\n",
             ["2 struct point {", "4 int main(void)"]),
     "a.rb": "module M\n  class C\n    def run\n    end\n  end\nend\n",
     "a.php": "<?php\nfinal class Repo {\n    public static function find() {}\n}\n",
@@ -428,3 +440,32 @@ async def test_read_file_points_at_outline_file_unless_it_is_turned_off(agent, m
     second = tool_events(session, "read_file")[-1]
     assert "hint" not in json.loads(second["output"])
     assert "outline_file" not in [tool["function"]["name"] for tool in requests[0]["tools"]]
+
+
+async def test_a_deny_rule_for_outline_file_removes_the_read_file_hint(agent, monkeypatch):
+    manager, session, project, _ = agent
+    (project / "big.md").write_text("# Title\n" + "text line\n" * 10_000)
+    manager.rules.add("project", session["workspace"], {"behavior": "deny", "tool": "outline_file"})
+    script(monkeypatch, [("read_file", {"path": "big.md"})])
+    await manager.run(session, "Read it")
+    read, = tool_events(session, "read_file")
+    result = json.loads(read["output"])
+    assert read["state"] == "completed" and result["start_line"] == 1 and "hint" not in result
+
+
+async def test_the_system_message_guidance_follows_the_offered_tools_and_the_input_budget(agent, monkeypatch):
+    manager, session, project, _ = agent
+    manager.settings.values.update(context_window=65536, max_output_tokens=8192)
+    requests = script(monkeypatch, [("list_files", {"path": "."})])
+    await manager.run(session, "Hello")
+    system = requests[0]["messages"][0]["content"]
+    budget = 65536 - 8192 - 2048
+    assert "call outline_file" in system and "call project_overview first" in system
+    assert (f"smaller than about {budget // 3:,} tokens (roughly {budget // 3 * 3:,} bytes; a third of your "
+            f"{budget:,}-token input budget)") in system
+    # Turning off read_file also turns off outline_file (it covers it): the guidance leaves it out.
+    session["disabled_tools"] = ["read_file"]
+    requests = script(monkeypatch, [("list_files", {"path": "."})])
+    await manager.run(session, "Hello again")
+    system = requests[0]["messages"][0]["content"]
+    assert "outline_file" not in system and "call project_overview first" in system

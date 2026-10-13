@@ -306,3 +306,56 @@ async def test_a_side_question_during_another_chats_block_asks_to_wait(runtime, 
         await manager.side_question(session["id"], "Still there?")
     assert str(caught.value) == f"Databricks is rate limiting test-endpoint; ask again in {math.ceil(42.2)} seconds."
     assert requests == []
+
+
+async def test_compaction_waits_for_another_chats_block(runtime, delays):
+    manager, new_session, _ = runtime
+    session = new_session()
+    manager.rate_gate.note(session["model"], "another chat", 30)
+    sent = []
+
+    class Client:
+        async def post(self, url, **kwargs):
+            sent.append(len(delays))
+            response = httpx.Response(200, json={"choices": [{"message": {"content": "Summary."},
+                                                              "finish_reason": "stop"}]})
+            response.request = httpx.Request("POST", url)
+            return response
+    result = await manager.summarize_context(session, Client(), "https://gateway.example/x", {},
+                                             [{"role": "user", "content": "history"}])
+    assert result == "Summary." and delays == [30.5] and sent == [1]  # Waited before sending.
+    assert notices(session) == ["Waiting 30 seconds before context compaction: Databricks rate-limited another "
+                                "chat's request to test-endpoint."]
+
+
+async def test_the_automatic_continue_notice_names_the_limit(runtime, monkeypatch, delays):
+    manager, new_session, _ = runtime
+    manager.settings.values["rate_limit_auto_continue"] = True
+    session = new_session()
+    body = {"error": {"message": "Rate limit exceeded", "limit_type": "input_tokens_per_minute", "limit": 1000000,
+                      "current": 1003000, "retry_after": 2}}
+    requests = []
+
+    async def gateway(request):
+        requests.append(request)
+        return httpx.Response(429, json=body) if len(requests) <= 4 else httpx.Response(200, text=sse())
+    mock_gateway(monkeypatch, gateway)
+    await manager.run(session, "Hello")
+    assert len(requests) == 5 and session["terminal_reason"] == "completed"
+    waiting = [text for text in notices(session) if text.startswith("Databricks is still rate limiting this chat")]
+    assert len(waiting) == 1 and waiting[0].startswith(
+        "Databricks is still rate limiting this chat (input tokens per minute (ITPM): limit 1,000,000, current "
+        "1,003,000). Continuing automatically at ")
+    assert waiting[0].endswith("(1 of 2). Press Stop to cancel.")
+
+
+def test_the_gate_keeps_at_most_64_endpoints():
+    now = [0.0]
+    gate = RateLimitGate(clock=lambda: now[0])
+    info = RateLimitInfo("output_tokens_per_minute", "output tokens per minute (OTPM)", 1000, None, None)
+    for index in range(65):
+        gate.note(f"endpoint-{index}", "chat", 60, info)
+    assert len(gate.blocked) == 64 and len(gate.learned) == 64
+    assert gate.remaining("endpoint-0", "other") == 0 and gate.learned_limit("endpoint-0", OTPM) is None
+    assert gate.remaining("endpoint-64", "other") == 60 and gate.learned_limit("endpoint-64", OTPM) == 1000
+    assert gate.remaining("endpoint-1", "other") == 60

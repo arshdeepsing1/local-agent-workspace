@@ -1240,8 +1240,9 @@ request body itself (compact UTF-8 JSON) and sends exactly those bytes, so it kn
 size it sends; the context details show "Request size: 245 KB of Databricks' 4 MB limit."
 for the latest request. Compaction also runs when a request would pass 3.8 MB, a check
 that costs nothing today because the token estimate already bounds the size (at most three
-bytes per estimated token, about 3.1 MB at the 1,048,576-token maximum). A request still
-over 4 MB is not sent: the turn ends with a `payload_too_large` error that suggests smaller
+bytes per estimated token, about 3.1 MB at the 1,048,576-token maximum). When no
+compaction brings such a request under 3.8 MB, the app still compacts at the latest point
+that fits when that makes the request smaller. A request still over 4 MB is not sent: the turn ends with a `payload_too_large` error that suggests smaller
 steps or a lower context budget, without a **Continue** button; a compaction or `/btw`
 request over the limit is refused the same way. Agent requests wait up to 300 seconds for
 the next streamed data (a large prefill with thinking can be silent for minutes);
@@ -1912,7 +1913,7 @@ Outlining is not a read: `write_file` still refuses to replace a file the conver
 only outlined. `project_overview(path=".", include_ignored=false)` summarizes a folder from
 file names and sizes, without reading any file: files and bytes by language and by
 top-level folder, key files (README, build and configuration files, CI workflows, up to
-three folders deep) and the largest files, in at most 12,000 bytes (longer lists are cut,
+two folders deep) and the largest files, in at most 12,000 bytes (longer lists are cut,
 with the counts left out in `omitted`). It lists the same files as `find_files` (the same
 `.gitignore` handling and exclusions); a folder too large to list (more than 200,000
 files, 20,000 folders or 10 seconds) gives a partial overview of its top level with a note
@@ -1922,7 +1923,8 @@ the tool that shows the same content: rules for `read_file` cover `outline_file`
 rules for `list_files` or `find_files` cover `project_overview`. With both tools offered,
 the system message asks the model to start an unfamiliar or large project with
 `project_overview`, to outline long files, to read a handoff smaller than about a third of
-its context budget completely (otherwise its status, next actions and open questions in
+its input budget completely (the message gives that size in tokens and bytes, from
+**Settings → Context budget** and **Max output tokens**) (otherwise its status, next actions and open questions in
 full, and other sections as needed), and to split a handoff longer than **Settings → File
 write limit** into numbered parts listed at the top of the first.
 
@@ -1939,18 +1941,26 @@ end around a marker, and the result says `truncated` with `omitted_bytes`.
 The results of one model response also share a **context allowance**: what the input
 budget leaves after the latest exchange, with room for the largest summary, the app
 record, a handoff line, the tool definitions and 1,024 tokens for the next step's notices,
-and at most half the input budget. A compaction inside that turn can therefore always keep
-every result it was given. A read (`read_file`, `outline_file`, `search_files` and the
-other read tools) that does not fit runs but is not sent: the model gets a short
-`result_deferred` message asking it to request the result again in its next response (or
-a smaller range, when one result alone is larger than the allowance), its card says
-"Result not sent to the agent", and a `read_file` or `notebook_read` that was not sent
-does not count as a read for `write_file`. Results of actions that already ran (commands,
-edits, MCP calls, subagents) are never withheld but shortened: short fields such as a
-command's `job_id`, `state` and `exit_code` are kept, long text keeps its start and end
-(the end of a command's output, where failures appear), and the card says "Result
-shortened for the agent". `wait_job`, `get_job_output` and `list_jobs` results are always
-sent, because they move the job's read position. The card always shows the full result.
+and at most half the input budget. Room for a short notice per tool call of the response is
+kept aside, and every text sent is counted, including notices and refusals. A compaction
+inside that turn can therefore keep every result it was given, as long as the response's
+own tool calls and their notices fit the budget. The allowance uses the estimate scale
+after the response's reported input tokens, as the next request does. A read (`read_file`,
+`outline_file`, `search_files` and the other read tools) that does not fit runs but is not
+sent: the model gets a short `result_deferred` message asking it to request the result
+again in its next response (or a smaller range, when one result alone is larger than the
+allowance), its card says "Result not sent to the agent" (and, for a result larger than
+the whole allowance, that the agent was asked to read a smaller part), and a `read_file`
+or `notebook_read` that was not sent does not count as a read for `write_file`, nor as a
+read that keeps a file's contents in context after a compaction. Results of actions that
+already ran (commands, edits, MCP calls, subagents) are never withheld but shortened:
+short fields such as a command's `job_id`, `state` and `exit_code` are kept, long text
+keeps its start and end (the end of a command's output, where failures appear, which
+`get_job_output` can read in full), and the card says "Result shortened for the agent". A
+result with no long text is sent as it is. `wait_job`, `get_job_output` and `list_jobs`
+results are always sent, because they move the job's read position, and so are your
+`ask_user` answers and `submit_plan` feedback, which are never shortened. The card always
+shows the full result. Forks, exports and imports keep what the model was sent.
 Nothing in the history is shortened later; compaction is the only way history shrinks.
 
 `search_files` supports literal search by default, `regex=true`, `case_sensitive`,

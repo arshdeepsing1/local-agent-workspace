@@ -86,6 +86,31 @@ def test_in_turn_tokens_matches_the_in_turn_cut_at_the_latest_response():
     assert in_turn_tokens(wire[6:], {}, system, [], 20000) == small
 
 
+async def test_in_turn_tokens_equals_what_the_in_turn_cut_at_the_latest_response_needs():
+    """The allowance's guarantee rests on in_turn_tokens being exactly prepare_context's needed_at
+    for the latest response (summary, app record, handoff line, request and steering, tools)."""
+    import re
+    request = {"role": "user", "content": "Refactor the parser"}
+    first = {"role": "assistant", "content": None, "tool_calls": [call("c0", "src/a.py")]}
+    steer = {"role": "user", "content": STEER_PREFIX + "Also keep the old API."}
+    latest = {"role": "assistant", "content": None, "tool_calls": [call(f"c{index}", f"src/p{index}.py")
+                                                                   for index in range(1, 4)]}
+    wire = [request, first, {"role": "tool", "tool_call_id": "c0", "content": "small"}, steer, latest,
+            *({"role": "tool", "tool_call_id": f"c{index}", "content": "r" * 40_000} for index in range(1, 4))]
+    system = {"role": "system", "content": "s" * 2000}
+    tools = [{"type": "function", "function": {"name": "read_file", "description": "d" * 3000}}]
+
+    async def summarize(previous, chunk, limit):
+        raise AssertionError("no cut fits")
+    # The in-turn helper reserves one more handoff line (compaction 999, a 128-character path).
+    state = {"summary": "", "through": 0, "compactions": 998}
+    with pytest.raises(ValueError) as caught:
+        await prepare_context(wire, state, system, tools, 32768, summarize, reply_reserve=4096, scale=1.3,
+                              auto_compact_percent=100, record_requests=True, handoff_path="x" * 128)
+    needed = int(re.search(r"need about ([\d,]+) estimated", str(caught.value)).group(1).replace(",", ""))
+    assert needed == in_turn_tokens(wire, state, system, tools, 32768 - 4096 - 2048, 1.3)
+
+
 @pytest.fixture
 def runtime(tmp_path, monkeypatch):
     monkeypatch.setattr("local_agent.config.APP_ROOT", tmp_path)

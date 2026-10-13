@@ -312,6 +312,9 @@ def outline_file(tools, path, *, offset=0, max_level=6, page_bytes=QUERY_OUTPUT_
     except UnicodeDecodeError:
         text = raw.decode("utf-8", errors="replace")
         notes.append(ENCODING_NOTE)
+    # A UTF-8 byte order mark (Windows editors) would hide a heading or definition on line 1,
+    # and ast.parse rejects it in a str; line numbers do not change.
+    text = text.removeprefix("\ufeff")
     lines = split_lines(text)
     scan = _Scan()
     try:

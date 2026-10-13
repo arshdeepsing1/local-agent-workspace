@@ -137,6 +137,58 @@ async def test_compaction_also_runs_when_the_request_passes_the_byte_target(monk
     assert len(encode_payload({"messages": messages, "tools": []})) <= 60_000
 
 
+async def test_a_byte_triggered_compaction_that_cannot_reach_the_target_still_shrinks_the_request(monkeypatch):
+    """Within the token budget and over the byte target, with no cut that reaches the target: the
+    latest cut that fits is taken when it makes the request smaller (addendum B)."""
+    monkeypatch.setattr(request_limits, "PAYLOAD_TARGET_BYTES", 100_000)
+    wire = [{"role": "user", "content": "old " + "o" * 90_000}, {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "new " + "n" * 101_000}]
+    calls = []
+
+    async def summarize(previous, chunk, limit):
+        calls.append(len(chunk))
+        return "## Goal and current status\nRead the old text."
+    system = {"role": "system", "content": "s"}
+    before = len(encode_payload({"messages": [system, *wire], "tools": []}))
+    messages, state, info = await prepare_context(wire, {}, system, [], 1_048_576, summarize, reply_reserve=8192)
+    after = len(encode_payload({"messages": messages, "tools": []}))
+    assert info["estimated_tokens"] < info["auto_compact_threshold"]  # Not a token-triggered compaction.
+    assert calls and info["compactions"] == 1 and state["through"] == 2
+    # Still over the target (the latest message alone is), but under the 4 MB limit: it is sent.
+    assert request_limits.PAYLOAD_TARGET_BYTES < after < before
+    assert messages[-1] == wire[-1]
+
+
+async def test_the_byte_checks_add_no_serialization_of_their_own(monkeypatch):
+    """fits() and the trigger use the scaled estimate as the bound: every estimate_tokens call in a
+    compaction comes from a scaled_estimate."""
+    from local_agent import context
+    counts = {"estimate": 0, "scaled": 0}
+    estimate, scaled = context.estimate_tokens, context.scaled_estimate
+
+    def counted_estimate(*args, **options):
+        counts["estimate"] += 1
+        return estimate(*args, **options)
+
+    def counted_scaled(*args, **options):
+        counts["scaled"] += 1
+        return scaled(*args, **options)
+    monkeypatch.setattr(context, "estimate_tokens", counted_estimate)
+    monkeypatch.setattr(context, "scaled_estimate", counted_scaled)
+    wire = [{"role": "user", "content": "Read everything"}]
+    for number in range(12):
+        wire += [{"role": "assistant", "content": None, "tool_calls": [{"id": f"c{number}", "type": "function",
+                  "function": {"name": "read_file", "arguments": json.dumps({"path": f"f{number}.txt"})}}]},
+                 {"role": "tool", "tool_call_id": f"c{number}", "content": "y" * 12_000}]
+
+    async def summarize(previous, chunk, limit):
+        return "## Goal and current status\nReading files."
+    messages, state, info = await prepare_context(wire, {}, {"role": "system", "content": "s"}, [], 32768, summarize,
+                                                  reply_reserve=4096)
+    assert info["compactions"] == 1 and info.get("compacted_in_turn")
+    assert counts["scaled"] > 3 and counts["estimate"] == counts["scaled"]
+
+
 async def test_the_measured_body_is_sent_and_shown_before_the_request(runtime, monkeypatch):
     manager, session = runtime
     seen, order = [], []
@@ -295,3 +347,25 @@ async def test_the_system_message_changes_once_a_day_not_once_a_minute(runtime, 
     changed = [(old, new) for old, new in zip(first, third) if old != new]
     expected = [current_time_text(datetime(2026, 10, day, 10, 0, tzinfo=zone).astimezone()) for day in (13, 14)]
     assert len(first) == len(third) and changed == [tuple(expected)]
+
+
+async def test_a_stream_read_error_near_the_execution_limit_gives_the_notice(runtime, monkeypatch):
+    manager, session = runtime
+    ticks = iter([0, 590, 1000, 1590])
+    monkeypatch.setattr(agents, "request_clock", lambda: next(ticks))
+
+    class CutStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield ("data: " + json.dumps({"choices": [{"delta": {"content": "Part"}}]}) + "\n\n").encode()
+            raise httpx.ReadError("The connection was closed.")
+    requests = []
+
+    async def gateway(request):
+        requests.append(request)
+        return httpx.Response(200, stream=CutStream())
+    mock_gateway(monkeypatch, gateway)
+    await manager.run(session, "Write the report")
+    assert len(requests) == 1  # A failure after a status is not repeated.
+    texts = [text for text in notices(session) if text.startswith("Databricks stops a request after 597 seconds")]
+    assert texts == ["Databricks stops a request after 597 seconds, and this one ran 590 seconds. If this repeats, "
+                     "lower Settings → Max output tokens or Settings → Context budget."]

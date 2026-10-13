@@ -22,9 +22,14 @@ SHORT_STRING_CHARS = 200
 MAX_PASSES = 20
 OMITTED = "\n[… {n:,} characters omitted …]\n"
 MARKER_RESERVE = 64  # Bytes kept free for one OMITTED marker.
-SHORTENED_HINT = ("This step's context allowance was used up by earlier results. For a command, read the rest with "
-                  "get_job_output and its job_id.")
+SHORTENED_HINT = ("This step's context allowance was used up by earlier results, so the app shortened this result; "
+                  "the action itself ran.")
+COMMAND_SHORTENED_HINT = SHORTENED_HINT + " Read the rest of the output with get_job_output and its job_id."
 JOB_TOOLS = ("wait_job", "get_job_output", "list_jobs")
+# Tools whose results are always sent in full and charged: a job page (job_seen() has
+# advanced), and the user's own answers and plan feedback, which are short and bounded
+# (interactions.MAX_OTHER, MAX_FEEDBACK) and exist nowhere else.
+FULL_RESULT_TOOLS = (*JOB_TOOLS, "ask_user", "submit_plan")
 
 
 def _bytes(text):
@@ -157,28 +162,50 @@ def shorten_result(result, chars=SHORTEN_CHARS, hint=SHORTENED_HINT):
     return {**value, "result_shortened": True, "omitted_bytes": omitted, "hint": hint}
 
 
-class ResultAllowance:
-    """The input tokens one model response's tool results may still add (see the module docstring)."""
+def shortened_hint(name):
+    """The hint of a shortened result: only a command's output can be read again."""
+    return COMMAND_SHORTENED_HINT if name == "run_command" else SHORTENED_HINT
 
-    def __init__(self, total, scale=1.0):
+
+class ResultAllowance:
+    """The input tokens one model response's tool results may still add (see the module docstring).
+
+    Every call of the response sends at least a short text (a deferred read's notice, a
+    refusal), so room for one STUB per call (calls) is kept aside until that call's result
+    is settled by admit or charge; settled counts the calls settled so far."""
+
+    def __init__(self, total, scale=1.0, calls=0):
         self.total = max(0, int(total))
-        self.left = self.total
         self.scale = scale
+        self.stub = self.cost(STUB_TEXT)
+        self.pending = max(0, int(calls))
+        self.left = self.total - self.pending * self.stub
+        self.settled = 0
 
     def cost(self, text):
         """Estimated scaled tokens a result adds to the next request, with its message framing."""
         return math.ceil((estimate_text_tokens(text) + RESULT_FRAMING_TOKENS) * self.scale)
 
+    def _settle(self):
+        """Release the room kept for the current call's notice."""
+        self.settled += 1
+        if self.pending:
+            self.pending -= 1
+            self.left += self.stub
+
     def admit(self, text):
-        """True, and charged, when the result fits what is left."""
+        """True, and charged, when the result fits what is left (with the room kept for this
+        call's notice). False leaves the call unsettled: the caller charges what it sends instead."""
         cost = self.cost(text)
-        if cost > self.left:
+        if cost > self.left + (self.stub if self.pending else 0):
             return False
+        self._settle()
         self.left -= cost
         return True
 
     def charge(self, text):
         """Charge a result that is sent in any case (left may go below zero)."""
+        self._settle()
         self.left -= self.cost(text)
 
 
@@ -193,3 +220,7 @@ def deferred_text(name, cost, total):
                    f"in this response already use this step's context allowance ({total:,} tokens).")
         hint = "Call it again in your next response, alone or with fewer large reads."
     return json.dumps({"error_kind": "result_deferred", "message": message, "hint": hint})
+
+
+# The longest deferred-read notice (a long tool name, large numbers): the room kept per call.
+STUB_TEXT = max((deferred_text("x" * 64, 10 ** 12, total) for total in (10 ** 12, 1)), key=len)

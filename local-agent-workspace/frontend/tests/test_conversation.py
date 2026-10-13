@@ -608,11 +608,18 @@ def test_collapsed_cards_say_when_the_agent_got_less_than_the_card(ui, page):
       { id: 'withheld', type: 'tool', name: 'read_file', state: 'completed', output: '{"content": "1: a"}',
         input: { path: 'a.txt' }, model_output: '{"error_kind": "result_deferred"}',
         result_withheld: { estimated_tokens: 9000, allowance_tokens: 4000 } },
+      { id: 'deferred', type: 'tool', name: 'read_file', state: 'completed', output: '{"content": "1: c"}',
+        input: { path: 'c.txt' }, model_output: '{"error_kind": "result_deferred"}',
+        result_withheld: { estimated_tokens: 3000, allowance_tokens: 4000 } },
       { id: 'shortened', type: 'tool', name: 'run_command', state: 'completed', output: '{"output": "long"}',
         input: { command: 'make test' }, model_output: '{"result_shortened": true}', result_shortened: true },
       { id: 'plain', type: 'tool', name: 'read_file', state: 'completed', output: '{}', input: { path: 'b.txt' } },
     ]""")
-    expect(page.locator(".tool-outcome")).to_have_count(2)
+    expect(page.locator(".tool-outcome")).to_have_count(3)
+    # One read larger than the whole allowance: running it again would not help.
+    expect(page.get_by_text("Result not sent to the agent: it is larger than the step's context allowance (about "
+                            "9,000 of 4,000 tokens). The agent was asked to read a smaller part.",
+                            exact=True)).to_be_visible()
     expect(page.get_by_text("Result not sent to the agent: earlier results in the same step filled its context "
                             "allowance. The agent can run it again.", exact=True)).to_be_visible()
     expect(page.get_by_text("Result shortened for the agent to fit its context allowance.", exact=True)).to_be_visible()
