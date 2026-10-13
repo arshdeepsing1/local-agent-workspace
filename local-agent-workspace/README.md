@@ -253,8 +253,10 @@ when opening a conversation or performing restart recovery.
   - **Projects**: chats are grouped by project folder. The current project (the one
     **Settings** selects) comes first and is open; other projects are closed, and their
     heading shows the folder name, the number of chats and badges such as `1 needs approval`
-    or `2 running`. Click a heading to open or close it. A chat in an app-managed worktree is
-    listed under the project it came from and shows its branch. A group shows 50 chats, then
+    or `2 running`. Click a heading to open or close it. A chat in an app-managed worktree, and
+    each of its subagent chats, is listed under the project it came from and shows its branch;
+    the project button above the message box shows that project and the branch too. A group
+    shows 50 chats, then
     **Show N more**.
   - **Subagents**: a subagent chat is listed under its parent behind **Show N subagents**,
     which opens by itself while a subagent is working. A subagent whose parent was deleted
@@ -340,8 +342,10 @@ when opening a conversation or performing restart recovery.
   the message shows only your text and the file names. Snapshots follow the chat's own file
   access: credential files, generated folders, the app's state folder, folders the chat may not
   read (use **Folder access** first) and read deny rules or a turned-off `read_file` refuse the
-  message with an error. Missing paths, folders and words such as `@dist` stay plain text. Secrets
-  in snapshots are redacted like command output. An attached file counts as read, so the agent may
+  message with an error. Missing paths, folders and words such as `@dist` stay plain text, and so
+  do tokens inside code: a fenced block, or a code span on one line (a run of backticks closes
+  only at the next run of the same length, as in the quoted lines of review comments). Secrets in snapshots are redacted like command output, before a snapshot is
+  shortened to 8,000 characters. An attached file counts as read, so the agent may
   edit it without reading it again. Only your typed text selects skills.
 - **Shell commands (`!`)**: a message starting with `!` runs the rest as one shell command in the
   project folder, like **Workspace → Terminal** Run, when the chat is idle, for at most 60 seconds
@@ -700,7 +704,11 @@ when opening a conversation or performing restart recovery.
   actions under it.
   - **Edit message** (pencil) replaces that message and everything after it with your
     edited text and sends it. **Also undo file changes made from this message on**
-    rewinds the agent's file edits too. Ctrl+Enter (Cmd+Enter) sends, Esc cancels.
+    rewinds the agent's file edits too. Ctrl+Enter (Cmd+Enter) sends, Esc cancels. The new
+    text is checked like any message before anything changes: an `@` file the chat may not
+    attach, or too many or too large files, is an error in the editor, and the conversation
+    stays as it was. If the message still cannot be sent after the rewind, its text is put in
+    the message box (a typed draft is kept) with the error.
   - **Retry response** on the last reply sends the same message again in place of
     everything from it on. It is offered only when that reply answers your latest
     message: when the latest message failed or was stopped before any reply, use **Edit
@@ -721,10 +729,15 @@ when opening a conversation or performing restart recovery.
     `insert_activity_log`, `move_path`, `delete_path`, `notebook_edit`) are rewound,
     including those of turns an earlier conversation rewind removed; changes made by
     commands or by subagents are not. After a conversation rewind the message you
-    rewound to is put in an empty message box (a typed draft is kept), and a notice
-    links to the archived earlier version.
+    rewound to is put in an empty message box (a typed draft is kept) and keyboard focus
+    moves there, and a notice above the message box links to the archived earlier version.
   - The conversation keeps its id, settings, grants, usage ledger, queued messages and
-    waiting command output; the record of which files the agent read is cleared, so the
+    waiting command output. The output of `!` commands that the removed message itself
+    carried waits again (its chip shows above the box), so **Retry response** and **Edit
+    message** send it with the message again, and after **Rewind to here** it goes with your
+    next message. `@` files are read again when the message is sent. Each rewound turn's
+    ending is kept: a stopped or cut-short turn still offers **Continue**, and a completed one
+    can still be forked whole. The record of which files the agent read is cleared, so the
     agent reads files again before overwriting them. All of this needs an idle chat,
     including no waiting approval, question or plan card, and file rewinds also need the
     other chats and commands in the workspace to be idle.
@@ -857,7 +870,9 @@ Startup after a clean shutdown reads only the first line (the header) of each co
 file. When the server stops normally, it writes `conversations/.clean-shutdown` after every
 response, compaction and command job has stopped; the next start removes that marker first
 and then loads in full only the chats whose header shows a turn that did not finish, plus
-subagent chats whose delegation is still open or whose parent was just repaired. Without the
+subagent chats whose delegation is still open or whose parent was just repaired. Finished
+command jobs were copied into their chats when they ended, so they are not copied again (only
+after a crash are they copied again, which loads each owning chat). Without the
 marker (after a crash or a kill, a failed shutdown, or on a new or older state folder) every
 conversation is loaded and repaired as before, which takes longer with many chats. One
 consequence: after a clean shutdown, a file whose header is readable but whose later records
@@ -1163,7 +1178,7 @@ before removal. Git hooks, filters, and fsmonitor are disabled for managed workt
 operations. This is deliberate workspace isolation, not automatic per-task copies.
 
 **New chat in worktree** on the welcome screen creates a worktree on a new branch
-(default `chat/<date>-<time>`) from the selected chat's project, or the default
+(default `chat/<date>-<time>`, to the second) from the selected chat's project, or the default
 workspace, and opens a chat in it. **Fork from here** can put a fork in a new worktree
 too; forking a worktree chat starts the new branch from that worktree's last commit,
 and a plain fork of a worktree chat stays in the same worktree. Worktree chats record
