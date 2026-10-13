@@ -123,7 +123,7 @@ def test_rewind_dialog_shows_statuses_disables_impossible_choices_and_sends_flag
     expect(dialog.get_by_role("radio", name=re.compile("^Code only"))).to_be_disabled()
     expect(dialog.get_by_text("Cannot rewind files: b.txt changed between its edits.")).to_be_visible()
     expect(dialog.get_by_role("radio", name="Conversation only")).to_be_checked()
-    expect(dialog.get_by_text("Removes 2 messages and replies after this point.")).to_be_visible()
+    expect(dialog.get_by_text("Removes 1 message and 1 reply after this point.")).to_be_visible()
     expect(dialog.get_by_text("The summary of earlier turns covers messages after this point, so it is dropped; the next message may compact again.")).to_be_visible()
     expect(dialog.get_by_text("Changes made by commands or by subagents are not rewound. The current version is kept as an archived conversation.")).to_be_visible()
     dialog.get_by_role("button", name="Rewind").click()
@@ -156,7 +156,7 @@ def test_code_only_rewind_leaves_the_conversation_and_composer(ui, page):
     page.get_by_role("button", name="Rewind to here").nth(1).click()
     dialog = page.get_by_role("dialog", name="Rewind conversation")
     dialog.get_by_role("radio", name="Code only").check()
-    expect(dialog.get_by_text("Removes 2 messages and replies after this point.")).to_have_count(0)
+    expect(dialog.get_by_text("Removes 1 message and 1 reply after this point.")).to_have_count(0)
     dialog.get_by_role("button", name="Rewind").click()
     expect(dialog).to_have_count(0)
     assert rewind_posts(ui) == [{"before_event_id": "u2", "conversation": False, "code": True}]
@@ -208,19 +208,86 @@ def test_no_retry_after_steering(ui, page):
     expect(page.get_by_role("button", name="Retry response")).to_have_count(0)
 
 
-def test_actions_are_hidden_while_busy_except_forking_older_replies(ui, page):
+def test_actions_are_hidden_while_busy(ui, page):
     start(ui, page)
     expect(page.get_by_role("button", name="Edit message")).to_have_count(2)
-    ui.emit("a", {"type": "status", "status": "running"})
-    expect(page.get_by_role("button", name="Edit message")).to_have_count(0)
-    expect(page.get_by_role("button", name="Rewind to here")).to_have_count(0)
+    expect(page.get_by_role("button", name="Fork from here")).to_have_count(2)
+    for status in ("running", "awaiting_approval"):
+        ui.emit("a", {"type": "status", "status": status})
+        expect(page.get_by_role("button", name="Edit message")).to_have_count(0)
+        expect(page.get_by_role("button", name="Rewind to here")).to_have_count(0)
+        expect(page.get_by_role("button", name="Retry response")).to_have_count(0)
+        expect(page.get_by_role("button", name="Fork from here")).to_have_count(0)
+        expect(page.get_by_role("button", name="Copy message")).to_have_count(2)
+        expect(page.get_by_role("button", name="Copy response")).to_have_count(2)
+
+
+FAILED_LATEST = EVENTS + [{"id": "u3", "type": "user", "text": "Third task", "in_wire": False},
+                          {"id": "e3", "type": "error", "text": "Databricks returned HTTP 500."}]
+
+
+def test_no_retry_when_the_latest_message_got_no_reply(ui, page):
+    # The last reply answers an earlier message; Retry would resend a different, later one.
+    start(ui, page, events=FAILED_LATEST)
+    expect(page.get_by_role("button", name="Edit message")).to_have_count(3)
     expect(page.get_by_role("button", name="Retry response")).to_have_count(0)
-    fork = page.get_by_role("button", name="Fork from here")
-    expect(fork).to_have_count(1)
-    expect(page.locator(".reply-content").filter(has_text="First answer.").get_by_role("button", name="Fork from here")).to_be_visible()
-    expect(page.get_by_role("button", name="Copy message")).to_have_count(2)
-    ui.emit("a", {"type": "status", "status": "awaiting_approval"})
-    expect(page.get_by_role("button", name="Edit message")).to_have_count(0)
+    expect(page.get_by_role("button", name="Fork from here")).to_have_count(2)
+
+
+def test_rewind_counts_messages_and_replies_separately(ui, page):
+    start(ui, page, events=FAILED_LATEST)
+    page.get_by_role("button", name="Rewind to here").nth(2).click()
+    dialog = page.get_by_role("dialog", name="Rewind conversation")
+    expect(dialog.get_by_text("Removes 1 message and 0 replies after this point.")).to_be_visible()
+    dialog.get_by_role("button", name="Cancel").click()
+    page.get_by_role("button", name="Rewind to here").first.click()
+    expect(dialog.get_by_text("Removes 3 messages and 2 replies after this point.")).to_be_visible()
+
+
+BUSY_NEIGHBOUR = """
+window.rewindError = { status: 409, body: { detail: { message: '“Other work” is still running. Stop it before rewinding files.', session_id: 'other', title: 'Other work' } } }
+fake.sessions.set('other', makeSession('other', 'Other work'))
+"""
+
+
+def test_a_busy_neighbour_refusing_a_file_rewind_can_be_opened(ui, page):
+    start(ui, page, extra=BUSY_NEIGHBOUR)
+    page.get_by_role("button", name="Rewind to here").nth(1).click()
+    dialog = page.get_by_role("dialog", name="Rewind conversation")
+    dialog.get_by_role("button", name="Rewind").click()
+    expect(dialog.get_by_role("alert")).to_contain_text("is still running")
+    dialog.get_by_role("button", name="Open “Other work”").click()
+    assert selected(ui, "other")
+    expect(dialog).to_have_count(0)
+
+
+def test_a_busy_neighbour_refusing_an_edit_can_be_opened(ui, page):
+    start(ui, page, extra=BUSY_NEIGHBOUR)
+    page.get_by_role("button", name="Edit message").first.click()
+    page.get_by_role("checkbox", name="Also undo file changes made from this message on").check()
+    page.get_by_role("button", name="Send edited message").click()
+    alert = page.get_by_role("alert")
+    expect(alert).to_contain_text("is still running")
+    alert.get_by_role("button", name="Open “Other work”").click()
+    assert selected(ui, "other")
+
+
+def test_edit_returns_focus_to_its_button_and_a_sent_edit_to_the_message_box(ui, page):
+    start(ui, page)
+    edit = page.get_by_role("button", name="Edit message").nth(1)
+    edit.focus()
+    page.keyboard.press("Enter")
+    editor = page.get_by_role("textbox", name="Edit message")
+    expect(editor).to_be_focused()
+    editor.press("Escape")
+    expect(edit).to_be_focused()
+    page.keyboard.press("Enter")
+    page.get_by_role("button", name="Cancel edit").click()
+    expect(page.get_by_role("button", name="Edit message").nth(1)).to_be_focused()
+    page.get_by_role("button", name="Edit message").nth(1).click()
+    page.get_by_role("textbox", name="Edit message").press("Control+Enter")
+    ui.wait("fake.requests('/api/sessions/a/rewind', 'POST').length === 1")
+    expect(message_box(page)).to_be_focused()
 
 
 def test_fork_from_here_posts_the_next_user_message_and_selects_the_fork(ui, page):
@@ -228,6 +295,7 @@ def test_fork_from_here_posts_the_next_user_message_and_selects_the_fork(ui, pag
     page.locator(".reply-content").filter(has_text="First answer.").get_by_role("button", name="Fork from here").click()
     dialog = page.get_by_role("dialog", name="Fork conversation")
     expect(dialog.get_by_role("textbox", name="Title")).to_have_value("Work (fork)")
+    expect(dialog.get_by_role("textbox", name="Title")).to_be_focused()
     expect(dialog.get_by_role("textbox", name="Branch name")).to_have_count(0)
     dialog.get_by_role("button", name="Fork").click()
     assert selected(ui, "forked")
@@ -266,9 +334,19 @@ fake.override = (path, options) => path === '/api/sessions/a/fork'
 
 def test_new_chat_in_worktree_from_the_welcome_screen(ui, page):
     start(ui, page, session=None)
-    page.get_by_role("button", name="New chat in worktree").click()
+    toggle = page.get_by_role("button", name="New chat in worktree")
+    toggle.click()
     form = page.get_by_role("form", name="New chat in worktree")
     branch = form.get_by_role("textbox", name="Branch name")
+    expect(branch).to_be_focused()
+    branch.press("Escape")
+    expect(form).to_have_count(0)
+    expect(toggle).to_be_focused()
+    page.keyboard.press("Enter")
+    expect(branch).to_be_focused()
+    form.get_by_role("button", name="Cancel").click()
+    expect(toggle).to_be_focused()
+    toggle.click()
     expect(branch).to_have_value(re.compile(r"^chat/\d{4}-\d{2}-\d{2}-\d{4}$"))
     branch.fill("chat/x")
     form.get_by_role("button", name="Create").click()

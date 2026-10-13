@@ -1,4 +1,4 @@
-import { html, useState } from '../lib.js'
+import { html, useEffect, useRef, useState } from '../lib.js'
 import { GitBranch } from '../icons.js'
 import { api } from '../api.js'
 import { stampedBranch } from './ForkDialog.js'
@@ -10,9 +10,17 @@ export default function WorktreeChat({ sessionId, onSelectSession, onError }) {
   const [open, setOpen] = useState(false)
   const [branch, setBranch] = useState('')
   const [saving, setSaving] = useState(false)
+  const input = useRef(null)
+  const toggle = useRef(null)
+  const opened = useRef(false)
+  useEffect(() => {
+    if (open) input.current?.focus()
+    else if (opened.current) toggle.current?.focus()  // Back to the button after Cancel or Esc.
+    opened.current = open
+  }, [open])
   const scope = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''
   if (!open) {
-    return html`<button class="outline" onClick=${() => { setBranch(stampedBranch('chat')); setOpen(true) }}><${GitBranch} size=${16} />New chat in worktree</button>`
+    return html`<button ref=${toggle} class="outline" onClick=${() => { setBranch(stampedBranch('chat')); setOpen(true) }}><${GitBranch} size=${16} />New chat in worktree</button>`
   }
   const submit = async e => {
     e.preventDefault()
@@ -26,8 +34,11 @@ export default function WorktreeChat({ sessionId, onSelectSession, onError }) {
     } catch (error) { onError(error) }
     finally { setSaving(false) }
   }
-  return html`<form class="worktree-chat" aria-label="New chat in worktree" onSubmit=${submit}>
-    <label>Branch name<input maxLength=${200} spellcheck=${false} value=${branch} disabled=${saving}
+  const onKeyDown = e => {
+    if (e.key === 'Escape' && !saving) { e.preventDefault(); setOpen(false) }
+  }
+  return html`<form class="worktree-chat" aria-label="New chat in worktree" onSubmit=${submit} onKeyDown=${onKeyDown}>
+    <label>Branch name<input ref=${input} maxLength=${200} spellcheck=${false} value=${branch} disabled=${saving}
       onInput=${e => setBranch(e.currentTarget.value)} /></label>
     <button type="submit" class="primary" disabled=${saving || !branch.trim()}>Create</button>
     <button type="button" class="outline" disabled=${saving} onClick=${() => setOpen(false)}>Cancel</button>

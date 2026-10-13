@@ -25,27 +25,57 @@ class HistoryError(ValueError):
     """A cut that would corrupt the model history; nothing was changed."""
 
 
+def _carries(message, text):
+    """True when this wire message holds the user's text (the app may add context around it)."""
+    content = message.get("content")
+    return isinstance(content, str) and isinstance(text, str) and bool(text) and text in content
+
+
+def _own_prompt(message, text):
+    """True when a message that looks like an app prompt is the user's own text that only starts like one
+    (for example a pasted Verify note). An app prompt never equals the user's message exactly."""
+    content = message.get("content")
+    return isinstance(content, str) and isinstance(text, str) and bool(text) and (
+        content == text or content.startswith(text + "\n\n"))
+
+
 def user_turns(session):
     """One entry per user event, in order: {event_index, event_id, wire_index, known}.
 
     wire_index is the position of the event's own user message in the wire, or None
     when its text never reached the wire. known is False for an older event whose
-    position cannot be proven.
+    position cannot be proven. A tracked event whose wire message does not hold its
+    text refuses the cut (LEGACY_UNALIGNED) instead of guessing.
     """
     events, wire = session["events"], session["wire"]
     users = [(index, event) for index, event in enumerate(events) if event.get("type") == "user"]
-    wire_users = [index for index, message in enumerate(wire)
-                  if message.get("role") == "user" and not context.is_app_prompt(message)]
     first = next((number for number, (_, event) in enumerate(users) if "in_wire" in event), len(users))
     legacy, tracked = users[:first], users[first:]
     if any("in_wire" not in event for _, event in tracked):
         raise HistoryError(LEGACY_UNALIGNED)
-    in_wire = sum(event["in_wire"] is True for _, event in tracked)
-    if in_wire > len(wire_users):
+    # Tracked events are the newest; their messages are the last user messages in the wire. Match them
+    # from the end, skipping app prompts unless one is exactly the user's own text.
+    sent = [event for _, event in tracked if event["in_wire"] is True]
+    positions, pending, split = [], len(sent), len(wire)
+    for index in range(len(wire) - 1, -1, -1):
+        if not pending:
+            break
+        message = wire[index]
+        if message.get("role") != "user":
+            continue
+        text = sent[pending - 1].get("text")
+        if context.is_app_prompt(message) and not _own_prompt(message, text):
+            continue
+        if not _carries(message, text):
+            raise HistoryError(LEGACY_UNALIGNED)
+        positions.append(index)
+        pending -= 1
+        split = index
+    if pending:
         raise HistoryError(LEGACY_UNALIGNED)
-    # Tracked events are the newest; their messages are the last ones in the wire.
-    split = len(wire_users) - in_wire
-    legacy_wire, tracked_wire = wire_users[:split], iter(wire_users[split:])
+    tracked_wire = iter(reversed(positions))
+    legacy_wire = [index for index, message in enumerate(wire[:split])
+                   if message.get("role") == "user" and not context.is_app_prompt(message)]
     aligned = len(legacy) == len(legacy_wire) and all(
         event.get("text") == wire[position].get("content") for (_, event), position in zip(legacy, legacy_wire))
     turns = [{"event_index": index, "event_id": event["id"], "wire_index": legacy_wire[number] if aligned else None,

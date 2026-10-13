@@ -75,6 +75,10 @@ def summary(through):
             "tool_definitions": [{"function": {"name": "read_file"}}]}
 
 
+PASTED = VERIFY_CONTINUATION_PREFIX + " my notes from yesterday, pasted."
+VERIFY_FAILED = VERIFY_CONTINUATION_PREFIX + " the project's verify command `make test` failed (exit 1)."
+
+
 # name -> (session, {user event id: (event_cut, wire_cut, summary_dropped) | error message})
 CASES = {
     "a_plain": (session_of([user("u1", "One"), reply("a1"), user("u2", "Two"), reply("a2"), user("u3", "Three"),
@@ -128,6 +132,17 @@ CASES = {
         session_of([user("u1", "One", MISSING), reply("a1"), user("u1b", "Lost", MISSING), user("u2", "Two"),
                     reply("a2")], [u("One"), a(), u("Two"), a()]),
         {"u1": history.LEGACY_UNALIGNED, "u1b": history.LEGACY_UNALIGNED, "u2": (3, 2, False)}),
+    # The user's own message may start like an app prompt (a pasted Verify note); a real Verify message follows it.
+    "j_user_text_like_app_prompt": (
+        session_of([user("u1", "One", MISSING), reply("a1"), user("u2", PASTED), reply("a2", "Checked."),
+                    {"id": "n2", "type": "notice", "text": "Verify failed."}, reply("a2b", "Fixed."),
+                    user("u3", "Next"), reply("a3")],
+                   [u("One"), a(), u(PASTED), a("Checked."), u(VERIFY_FAILED), a("Fixed."), u("Next"), a()]),
+        {"u1": (0, 0, False), "u2": (2, 2, False), "u3": (6, 6, False)}),
+    "j_tracked_only_user_text_like_app_prompt": (
+        session_of([user("u1", PASTED), reply("a1", "Checked."), user("u2", "Next"), reply("a2")],
+                   [u(PASTED), a("Checked."), u(VERIFY_FAILED), a("Fixed."), u("Next"), a()]),
+        {"u1": (0, 0, False), "u2": (2, 4, False)}),
 }
 
 
@@ -146,7 +161,8 @@ def assert_cut(session, event_id, expected=None):
     assert cut["events"] == session["events"][:event_cut]
     assert cut["wire"] == session["wire"][:wire_cut]
     if wire_cut < len(session["wire"]):
-        assert session["wire"][wire_cut]["role"] == "user" and not is_app_prompt(session["wire"][wire_cut])
+        message = session["wire"][wire_cut]
+        assert message["role"] == "user" and message["content"] == session["events"][event_cut]["text"]
     if expected is not None:
         assert (event_cut, wire_cut, info["summary_dropped"]) == expected
     assert info["events_removed"] == len(session["events"]) - event_cut
@@ -212,6 +228,19 @@ def test_more_flagged_messages_than_wire_messages_are_refused():
     session = session_of([user("u1", "One"), reply("a1"), user("u2", "Two"), reply("a2")], [u("One"), a()])
     with pytest.raises(history.HistoryError):
         history.user_turns(session)
+
+
+def test_a_flagged_message_that_does_not_hold_its_text_is_refused():
+    # Its own wire message is missing (for example the app dropped it), so the match would shift to an
+    # earlier turn: refused rather than cut at the wrong place.
+    session = session_of([user("u1", "One", MISSING), reply("a1"), user("u2", "Two"), reply("a2"),
+                          user("u3", INVALID_ARGUMENTS_CONTINUATION), {"id": "e3", "type": "error", "text": "Failed."},
+                          user("u4", "Four"), reply("a4")],
+                         [u("One"), a(), u("Two"), a(), u("Four"), a()])
+    for event_id in ("u1", "u2", "u3", "u4"):
+        with pytest.raises(history.HistoryError) as error:
+            history.cut_points(session, event_id)
+        assert str(error.value) == history.LEGACY_UNALIGNED
 
 
 def test_a_cut_into_an_unanswered_tool_exchange_is_refused():

@@ -1,4 +1,4 @@
-import { html, useAutoFocus, useEffect, useRef, useState } from '../lib.js'
+import { html, useEffect, useRef, useState } from '../lib.js'
 import { X } from '../icons.js'
 import { api } from '../api.js'
 
@@ -13,7 +13,7 @@ export function stampedBranch(prefix, now = new Date()) {
 // onSelectSession(new id), onClose.
 export default function ForkDialog({ session, beforeEventId, onSelectSession, onClose }) {
   const dialog = useRef(null)
-  const titleInput = useAutoFocus()
+  const titleInput = useRef(null)
   const [title, setTitle] = useState(`${session.title || 'New conversation'} (fork)`.slice(0, 160))
   const [worktree, setWorktree] = useState(false)
   const [branch, setBranch] = useState(() => stampedBranch('fork'))
@@ -22,6 +22,8 @@ export default function ForkDialog({ session, beforeEventId, onSelectSession, on
   useEffect(() => {
     const node = dialog.current
     node?.showModal()
+    // After showModal, which focuses the first control (Close); the title is what to change first.
+    titleInput.current?.focus()
     return () => { if (node?.open) node.close() }
   }, [])
   const submit = async e => {

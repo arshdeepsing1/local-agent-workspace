@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 from . import approvals
 from .agents import public_session
 from .approvals import busy_conflict, busy_status, ensure_idle
+from .portability_api import root_project
 from .tool_profiles import validate_profile
 
 
@@ -131,7 +132,7 @@ def register_features(app, manager, settings, store, session_or_404, workspace_t
         # A new worktree chat starts with normal manual permissions and no inherited external grants.
         session["title"] = f"Worktree: {record['branch']}"[:100]
         # The root project, also when the worktree was made from a worktree chat (sidebar grouping).
-        source = (parent.get("worktree") or {}).get("source_workspace") or record["source_workspace"]
+        source = root_project(manager, record["source_workspace"], parent.get("worktree"))
         session["worktree"] = {"id": record["id"], "branch": record["branch"], "source_workspace": source}
         store.save(session)
         return public_session(session)

@@ -1,4 +1,4 @@
-"""Fork from here: a new chat from any user message (or the whole chat, also while it runs), with an
+"""Fork from here: a new chat from any user message (or the whole chat) of an idle chat, with an
 optional title and an optional new Git worktree."""
 import copy
 import json
@@ -162,32 +162,27 @@ async def test_title_override_and_validation(runtime):
         assert len(manager.store.list()) == count
 
 
-async def test_a_busy_chat_forks_only_before_its_running_turn(runtime):
+@pytest.mark.parametrize("status", ["running", "awaiting_approval"])
+async def test_a_busy_chat_cannot_fork_from_any_point(runtime, status):
+    """Like Edit, Retry and Rewind: a running turn or a waiting approval, question or plan card blocks it."""
     app, manager, project = runtime
     template, _ = CASES["f_steered"]
-    events = copy.deepcopy(template["events"]) + [
-        {"id": "u3", "type": "user", "text": "Running", "in_wire": True},
-        {"id": "u3s", "type": "user", "text": "Steer", "in_wire": True, "steered": True}]
-    wire = copy.deepcopy(template["wire"]) + [{"role": "user", "content": "Running"},
-                                              {"role": "assistant", "content": None, "tool_calls": [
-                                                  {"id": "live", "type": "function",
-                                                   "function": {"name": "list_files", "arguments": "{}"}}]},
-                                              {"role": "tool", "tool_call_id": "live", "content": "[]"},
-                                              {"role": "user", "content": "Steer"}]
-    source = stored(manager, project, events, wire)
-    manager.statuses[source["id"]] = "running"
+    source = stored(manager, project, template["events"], template["wire"])
+    manager.statuses[source["id"]] = status
+    before = Path(manager.store._path(source["id"])).read_bytes()
+    count = len(manager.store.list())
     async with await client_for(app) as client:
         url = f"/api/sessions/{source['id']}/fork"
-        for event_id in ("u1", "s1", "u2", "u3"):
-            response = await client.post(url, json={"before_event_id": event_id})
-            assert response.status_code == 201, (event_id, response.text)
-        fork = manager.store.get(response.json()["id"])
-        assert len(fork["wire"]) == len(template["wire"])
-        for body in ({"before_event_id": "u3s"}, {}):
-            response = await client.post(url, json=body)
-            assert response.status_code == 409
-            assert "forking from this point" in response.json()["detail"]["message"]
-        assert (await client.post(url)).status_code == 409  # The whole-chat fork still needs an idle chat.
+        for body in ({"before_event_id": "u1"}, {"before_event_id": "u2"}, {"title": "Copy"}, None):
+            response = await (client.post(url, json=body) if body is not None else client.post(url))
+            assert response.status_code == 409, (body, response.text)
+            if body is not None:
+                assert "forking from this point" in response.json()["detail"]["message"]
+            assert response.json()["detail"]["session_id"] == source["id"]
+        manager.statuses[source["id"]] = "idle"
+        assert (await client.post(url, json={"before_event_id": "u2"})).status_code == 201
+    assert len(manager.store.list()) == count + 1
+    assert Path(manager.store._path(source["id"])).read_bytes() == before
 
 
 def repository(path):
@@ -258,3 +253,22 @@ async def test_new_worktree_chat_records_its_project(runtime):
         assert response.status_code == 200, response.text
         assert response.json()["worktree"] == {"id": record["id"], "branch": "chat/new",
                                                "source_workspace": str(project.resolve())}
+
+
+async def test_new_worktree_chat_from_a_chat_without_the_worktree_header_records_the_root_project(runtime):
+    """A worktree chat saved before the header existed: its folder is resolved through the worktree records."""
+    app, manager, project = runtime
+    repository(project)
+    root = str(project.resolve())
+    async with await client_for(app) as client:
+        first = (await client.post("/api/worktrees", json={"branch": "chat/old"})).json()
+        parent = (await client.post(f"/api/worktrees/{first['id']}/session")).json()
+        legacy = manager.store.get(parent["id"])
+        legacy.pop("worktree")
+        manager.store.save(legacy)
+        record = (await client.post("/api/worktrees", json={"branch": "chat/new"},
+                                    params={"session_id": legacy["id"]})).json()
+        assert record["source_workspace"] == first["path"]  # Made from the worktree's own checkout.
+        response = await client.post(f"/api/worktrees/{record['id']}/session", params={"session_id": legacy["id"]})
+        assert response.status_code == 200, response.text
+        assert response.json()["worktree"] == {"id": record["id"], "branch": "chat/new", "source_workspace": root}

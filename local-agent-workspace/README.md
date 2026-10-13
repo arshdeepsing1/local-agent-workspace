@@ -196,8 +196,11 @@ An in-place rewind (**Edit**, **Retry**, **Rewind to here**) first saves the who
 conversation as an archived copy titled `<title> (before rewind)`. The copy keeps the
 messages, replies, tool results and summary, starts in Manual with no grants, rules or
 active skills, and does not copy the usage ledger, jobs, queued messages or waiting
-command output: usage stays counted once, in the live chat. Archived copies can be
-opened from the rewind notice and deleted like any conversation.
+command output. Its own **Usage** view still shows the token counts recorded on its
+replies, as historical calls marked incomplete (like a fork); no view adds usage across
+chats. A worktree chat's copy keeps its `worktree` header, so it is listed with its
+project. Archived copies can be opened from the rewind notice and deleted like any
+conversation.
 
 Each user message records whether its text reached the model history (`in_wire`), so
 a cut before any message maps exactly onto the model history; app-generated prompts
@@ -557,14 +560,16 @@ when opening a conversation or performing restart recovery.
   errors. Your draft is left as it is, and keyboard focus moves to the message box.
   It is also offered when the model's reply still could not be used after the hidden
   retries, and when Databricks still rate limited the chat after the automatic retries.
-- **Edit, retry and rewind**: while a conversation is idle, hover a message to see its
-  actions.
+- **Edit, retry and rewind**: while a conversation is idle, each message shows its
+  actions under it.
   - **Edit message** (pencil) replaces that message and everything after it with your
     edited text and sends it. **Also undo file changes made from this message on**
     rewinds the agent's file edits too. Ctrl+Enter (Cmd+Enter) sends, Esc cancels.
   - **Retry response** on the last reply sends the same message again in place of
-    everything from it on. It is not offered when the latest turn included a message
-    sent while the agent was working; use **Edit message** then.
+    everything from it on. It is offered only when that reply answers your latest
+    message: when the latest message failed or was stopped before any reply, use **Edit
+    message** or **Continue** instead. It is not offered when the latest turn included a
+    message sent while the agent was working; use **Edit message** then.
   - **Rewind to here** opens a dialog: **Conversation and code**, **Conversation
     only** or **Code only**. It shows how many messages and replies go, whether the
     summary of earlier turns is dropped (when it covers messages after the point; the
@@ -590,8 +595,8 @@ when opening a conversation or performing restart recovery.
   - **Fork from here** (on the last reply of each turn) opens a new chat with the
     conversation up to that reply; optionally give it a title and create it in a new
     Git worktree (a new branch from the chat's checkout at its last commit; uncommitted
-    changes are not copied). It also works while the chat runs, for replies before the
-    running turn.
+    changes are not copied). Like the other actions, it needs an idle chat with no
+    waiting approval, question or plan card.
   - **Stop marker**: when you press **Stop**, the reply's partial text is kept in the
     model history followed by `[The user stopped this response before it finished. Tool
     calls it was preparing did not run.]`, after any interrupted tool call gets its
@@ -1018,7 +1023,8 @@ and a plain fork of a worktree chat stays in the same worktree. Worktree chats r
 project, never another worktree. Permission rules saved for a project apply to that
 folder only: a worktree chat does not inherit its source project's "Always allow in
 this project" rules, because a worktree is a separate folder (least privilege). Rules
-allowed inside a worktree chat apply to that worktree.
+allowed inside a worktree chat apply to that worktree. An archived `(before rewind)` copy
+of a worktree chat also uses the worktree: delete it too before removing the worktree.
 
 Rewinding files (**Rewind to here**, or **Edit message** with **Also undo file
 changes**) uses the same checkpoints: see **Edit, retry and rewind**. API:

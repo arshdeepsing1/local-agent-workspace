@@ -1,5 +1,6 @@
 import { html, useAutoFocus, useState } from '../lib.js'
 import { api } from '../api.js'
+import { blockerOf, OpenBlockingChat } from './BlockingChat.js'
 
 // Files a refused file rewind names (a 409 with detail.files).
 export function RefusedFiles({ error }) {
@@ -8,8 +9,9 @@ export function RefusedFiles({ error }) {
 }
 
 // Edit and resend: replaces a user message and everything after it (POST /rewind with resend_text).
-// Props: sessionId, event (the user event), onSent(result), onCancel.
-export default function EditMessage({ sessionId, event, onSent, onCancel }) {
+// Props: sessionId, event (the user event), onSent(result), onCancel, onSelectSession(id) (opens a chat that
+// blocks the file rewind).
+export default function EditMessage({ sessionId, event, onSent, onCancel, onSelectSession }) {
   const [text, setText] = useState(event.text || '')
   const [code, setCode] = useState(false)
   const [sending, setSending] = useState(false)
@@ -34,7 +36,8 @@ export default function EditMessage({ sessionId, event, onSent, onCancel }) {
     <label class="edit-message-option"><input type="checkbox" checked=${code} disabled=${sending}
       onChange=${e => setCode(e.currentTarget.checked)} /><span>Also undo file changes made from this message on</span></label>
     <p class="field-help">Replaces this message and everything after it. The current version is kept as an archived conversation.</p>
-    ${error ? html`<div class="form-error" role="alert"><p>${error.message}</p><${RefusedFiles} error=${error} /></div>` : null}
+    ${error ? html`<div class="form-error" role="alert"><p>${error.message}</p><${RefusedFiles} error=${error} />
+      <${OpenBlockingChat} blocker=${blockerOf(error)} currentId=${sessionId} onSelect=${onSelectSession} /></div>` : null}
     <div class="edit-message-actions"><button type="button" class="outline" disabled=${sending} onClick=${onCancel}>Cancel edit</button>
       <button type="button" class="primary" disabled=${sending || !text.trim()} onClick=${() => void send()}>Send edited message</button></div>
   </div>`

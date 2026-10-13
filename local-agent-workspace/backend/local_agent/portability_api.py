@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from . import approvals
 from .agents import public_session
-from .approvals import busy_conflict, busy_status, ensure_idle
+from .approvals import busy_status, ensure_idle
 from .history import HistoryError, cut_points, cut_session, rewind_turn_ids
 from .portability import MAX_BUNDLE_BYTES, MAX_SESSIONS, completed_for_fork, export_bundle, fresh_copies, parse_bundle
 from .recovery import rewind_refusal
@@ -35,11 +35,12 @@ class RewindRequest(BaseModel):
     resend_text: str | None = Field(default=None, min_length=1, max_length=50000, strict=True)
 
 
-# Never copied into a rewind backup: the usage ledger and jobs stay with the live chat (usage is never
-# counted twice), and authority, links and local state are not carried.
+# Never copied into a rewind backup: the usage ledger and jobs stay with the live chat, and authority,
+# links and local state are not carried. The worktree header stays: it is display metadata (grouping under
+# the project), not authority.
 BACKUP_DROPPED = ("pinned", "inference_calls", "command_jobs", "context_info", "file_views", "instruction_directories",
                   "turn_running", "queued_messages", "pending_context", "parent_session_id", "parent_event_id",
-                  "parent_call_id", "delegation", "worktree")
+                  "parent_call_id", "delegation")
 
 
 def backup_copy(session):
@@ -52,6 +53,20 @@ def backup_copy(session):
                   active_skills=[], provenance={"kind": "rewind_backup", "source_session_id": session["id"],
                                                 "copied_at": time.time()})
     return backup
+
+
+def managed_worktree_of(manager, workspace):
+    """The app's worktree record whose folder is this workspace, or None."""
+    folder = str(Path(workspace).expanduser().resolve())
+    return next((record for record in manager.worktrees.list() if record["path"] == folder), None)
+
+
+def root_project(manager, workspace, header=None):
+    """The project a chat in this workspace belongs to, never an app-internal worktree folder: the chat's
+    worktree header, else the managed worktree's source (chats made before the header existed), else the
+    workspace itself. Used by Fork into worktree and New chat in worktree."""
+    record = managed_worktree_of(manager, workspace)
+    return (header or {}).get("source_workspace") or (record or {}).get("source_workspace") or workspace
 
 
 def clean_title(value):
@@ -117,17 +132,6 @@ def register_portability(app, manager, settings, store, session_or_404):
             raw.extend(chunk)
         return insert(parse_bundle(raw), folder, "import")
 
-    def managed_worktree(workspace):
-        """The app's worktree record whose folder is this workspace, or None."""
-        folder = str(Path(workspace).expanduser().resolve())
-        return next((record for record in manager.worktrees.list() if record["path"] == folder), None)
-
-    def root_project(session):
-        """The project a worktree chat belongs to, never an app-internal worktree folder."""
-        record = managed_worktree(session["workspace"])
-        return ((session.get("worktree") or {}).get("source_workspace")
-                or (record or {}).get("source_workspace") or session["workspace"])
-
     @app.post("/api/sessions/{session_id}/fork", status_code=201)
     async def fork(session_id: str, body: ForkRequest | None = None):
         if body is None:
@@ -136,23 +140,17 @@ def register_portability(app, manager, settings, store, session_or_404):
             result = insert(export_bundle([source], session_id), destination(source["workspace"]), "fork")
             return result["session"]
         live = session_or_404(session_id)
+        # Like the other history actions: no running turn and no waiting approval, question or plan card.
+        ensure_idle(manager, live, "forking from this point")
         title = clean_title(body.title) if body.title is not None else None
-        # Copied before any await: a running turn keeps changing the live chat.
+        # Copied before any await, so later changes to the live chat never reach the fork.
         source = copy.deepcopy(live)
-        status = busy_status(manager, session_id)
         try:
-            event_cut, _ = cut_points(source, body.before_event_id)
-            if status != "idle":
-                # Only replies before the running turn: the last user message that started a turn.
-                start = max((index for index, event in enumerate(source["events"])
-                             if event.get("type") == "user" and event.get("steered") is not True), default=-1)
-                if body.before_event_id is None or event_cut > start:
-                    raise busy_conflict(live, status, "forking from this point")
             cut, _ = cut_session(source, body.before_event_id)
             bundle = export_bundle([cut], session_id)
         except HistoryError as exc:
             raise HTTPException(400, str(exc)) from exc
-        project = root_project(source)
+        project = root_project(manager, source["workspace"], source.get("worktree"))
         worktree, created = None, None
         if body.worktree_branch is not None:
             # A new branch from the source chat's own checkout at its last commit.
@@ -163,7 +161,7 @@ def register_portability(app, manager, settings, store, session_or_404):
             except BaseException:
                 await remove_worktree(created)
                 raise
-        elif (worktree := managed_worktree(source["workspace"])) is not None:
+        elif (worktree := managed_worktree_of(manager, source["workspace"])) is not None:
             # destination() refuses the state folder, where managed worktrees live.
             worktree = manager.worktrees.validate(worktree["id"])
             folder = worktree["path"]

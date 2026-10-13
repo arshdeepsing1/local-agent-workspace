@@ -248,7 +248,8 @@ async def test_conversation_rewind_in_place_keeps_the_chat_and_writes_an_archive
                    allow_rules=[{"tool": "edits"}], active_skills=["review"], file_views={"/srv/x/a.txt": "seen"},
                    queued_messages=[{"id": "q", "text": "Later"}], pending_context=[{"command": "ls", "output": "x"}],
                    inference_calls=[{"id": "call-1", "purpose": "agent", "status": "completed"}],
-                   instruction_directories=["docs"], tool_profile="read_only")
+                   instruction_directories=["docs"], tool_profile="read_only",
+                   worktree={"id": "wt-1", "branch": "chat/x", "source_workspace": "/srv/x"})
     manager.store.save(session)
     async with await client_for(app) as client:
         response = await client.post(f"/api/sessions/{session['id']}/rewind",
@@ -276,6 +277,8 @@ async def test_conversation_rewind_in_place_keeps_the_chat_and_writes_an_archive
     for key in ("queued_messages", "pending_context", "file_views", "instruction_directories", "context_info"):
         assert not backup.get(key)
     assert backup["tool_profile"] == "read_only"
+    # Display metadata, not authority: the backup is grouped with its project and found next to its worktree.
+    assert backup["worktree"] == {"id": "wt-1", "branch": "chat/x", "source_workspace": "/srv/x"}
     assert backup["provenance"]["kind"] == "rewind_backup"
     assert backup["provenance"]["source_session_id"] == session["id"]
     assert backup["created"] == session["created"]

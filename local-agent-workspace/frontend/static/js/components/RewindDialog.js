@@ -2,6 +2,7 @@ import { html, useEffect, useRef, useState } from '../lib.js'
 import { X } from '../icons.js'
 import { api } from '../api.js'
 import { RefusedFiles } from './EditMessage.js'
+import { blockerOf, OpenBlockingChat } from './BlockingChat.js'
 
 const FILE_STATUS = {
   restore: 'Will be restored',
@@ -12,15 +13,24 @@ const FILE_STATUS = {
 
 const CHOICES = [['both', 'Conversation and code'], ['conversation', 'Conversation only'], ['code', 'Code only']]
 
-// The user messages and replies from this message on (what a conversation rewind removes).
-function removedCount(events, eventId) {
+// The user messages and the replies from this message on (what a conversation rewind removes).
+export function removedCounts(events, eventId) {
   const start = events.findIndex(item => item.id === eventId)
-  return start < 0 ? 0 : events.slice(start).filter(item => item.type === 'user' || (item.type === 'assistant' && item.text)).length
+  const removed = start < 0 ? [] : events.slice(start)
+  return { messages: removed.filter(item => item.type === 'user').length,
+    replies: removed.filter(item => item.type === 'assistant' && item.text).length }
+}
+
+const plural = (count, one, many) => `${count} ${count === 1 ? one : many}`
+
+export function removedLine({ messages, replies }) {
+  return `Removes ${plural(messages, 'message', 'messages')} and ${plural(replies, 'reply', 'replies')} after this point.`
 }
 
 // Rewind to a user message: the conversation (in place, after an archived copy), the agent's file
-// edits, or both. Props: session, event (the user event), onRewound({ conversation, backupId }), onClose.
-export default function RewindDialog({ session, event, onRewound, onClose }) {
+// edits, or both. Props: session, event (the user event), onRewound({ conversation, backupId }), onClose,
+// onSelectSession(id) (opens a chat that blocks the file rewind).
+export default function RewindDialog({ session, event, onRewound, onClose, onSelectSession }) {
   const dialog = useRef(null)
   const [preview, setPreview] = useState(null)
   const [choice, setChoice] = useState(null)
@@ -57,7 +67,7 @@ export default function RewindDialog({ session, event, onRewound, onClose }) {
       onRewound({ conversation, backupId: result.backup_session_id })
     } catch (e) { setError(e); setSaving(false) }
   }
-  const count = removedCount(session.events, event.id)
+  const counts = removedCounts(session.events, event.id)
   return html`<dialog ref=${dialog} class="settings-dialog rewind-dialog" aria-label="Rewind conversation"
     onCancel=${onClose} onClick=${e => { if (e.target === dialog.current) onClose() }}>
     <form class="dialog-content" onSubmit=${submit}>
@@ -69,12 +79,13 @@ export default function RewindDialog({ session, event, onRewound, onClose }) {
         return html`<label class="choice" key=${value}><input type="radio" name="rewind-choice" value=${value} checked=${choice === value}
           disabled=${saving || !possible(value)} onChange=${() => setChoice(value)} /><span>${label}${reason ? html`<small class="choice-reason">${reason}</small>` : null}</span></label>`
       })}</fieldset>
-        ${preview.conversation.possible && choice !== 'code' ? html`<p class="field-help">Removes ${count} ${count === 1 ? 'message and reply' : 'messages and replies'} after this point.</p>` : null}
+        ${preview.conversation.possible && choice !== 'code' ? html`<p class="field-help">${removedLine(counts)}</p>` : null}
         ${preview.conversation.summary_dropped && choice !== 'code' ? html`<p class="field-help">The summary of earlier turns covers messages after this point, so it is dropped; the next message may compact again.</p>` : null}
         ${preview.code.files.length ? html`<ul class="rewind-files" aria-label="Files">${preview.code.files.map(file => html`<li key=${file.path}>
           <span class="rewind-path">${file.path}</span><span class=${`rewind-status ${file.status}`}>${file.status === 'unavailable' ? file.error || 'Unavailable' : FILE_STATUS[file.status] || file.status}</span></li>`)}</ul>` : null}
         <p class="settings-note">Changes made by commands or by subagents are not rewound. The current version is kept as an archived conversation.</p>` : null}
-      ${error ? html`<div class="form-error" role="alert"><p>${error.message}</p><${RefusedFiles} error=${error} /></div>` : null}
+      ${error ? html`<div class="form-error" role="alert"><p>${error.message}</p><${RefusedFiles} error=${error} />
+        <${OpenBlockingChat} blocker=${blockerOf(error)} currentId=${session.id} onSelect=${onSelectSession} /></div>` : null}
       <footer><button type="button" class="outline" onClick=${onClose}>Cancel</button>
         <button type="submit" class="primary" disabled=${saving || !choice || !possible(choice)}>Rewind</button></footer>
     </form>

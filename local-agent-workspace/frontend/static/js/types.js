@@ -81,9 +81,9 @@
 //   files: [{ path, status }], resent: boolean, resend_error? }. 409 detail { message, files } when a file
 //   changed; 500 detail { message } when files were rewound but the conversation could not be saved.
 // Fork from a point (POST /sessions/<id>/fork { before_event_id?, title?, worktree_branch? }) -> Session (201).
-//   Without a body, only a completed idle chat forks whole. A rewind backup Session has archived: true and
-//   provenance { kind: 'rewind_backup', source_session_id, copied_at }; worktree chats have
-//   worktree: { id, branch, source_workspace (the root project) }.
+//   Needs an idle chat (409 naming it otherwise); without a body, only a completed idle chat forks whole.
+//   A rewind backup Session has archived: true and provenance { kind: 'rewind_backup', source_session_id,
+//   copied_at }; worktree chats, and their backups, have worktree: { id, branch, source_workspace (the root project) }.
 // ApiError: { message, status, detail? }. A 409 that a busy chat causes has
 //   detail { message, session_id, title } naming that chat; other errors have no detail.
 // RequestInfo: { model, status, finish_reason?, http_status?, error_kind?, usage? }
