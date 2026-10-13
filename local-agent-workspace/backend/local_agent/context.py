@@ -799,13 +799,25 @@ def _trim_middle(summary, limit_bytes):
             + data[len(data) - tail:].decode("utf-8", errors="ignore").lstrip())
 
 
+# A cut body ends with one newline and may need a blank line before the next heading.
+CUT_SLACK = 2
+
+
+def _middle_room(body):
+    """The most bytes _cut_lines_middle can remove from body (0 when it cannot cut)."""
+    lines = body.rstrip("\n").split("\n")
+    if len(lines) < 3:
+        return 0
+    return max(0, sum(_size(line) + 1 for line in lines[1:-1]) - _size(SECTION_TRIM_MARKER) - CUT_SLACK)
+
+
 def _cut_lines_middle(body, remove):
     """body without at least remove bytes of whole lines from its middle, marked
     with SECTION_TRIM_MARKER; None when body has too few lines to cut."""
     lines = body.rstrip("\n").split("\n")
     if len(lines) < 3:
         return None
-    need = remove + _size(SECTION_TRIM_MARKER)
+    need = remove + _size(SECTION_TRIM_MARKER) + CUT_SLACK
     # Drop lines around the middle, alternating so the first and last lines stay.
     low = high = len(lines) // 2
     dropped = 0
@@ -821,13 +833,32 @@ def _cut_lines_middle(body, remove):
     return "\n".join(lines[:low]).rstrip() + SECTION_TRIM_MARKER + "\n".join(lines[high:]) + "\n"
 
 
+def _required_shares(rooms, weights, excess):
+    """{name: bytes to cut} spreading excess over the sections in proportion to weights,
+    each at most its room; a share a section cannot take goes to the others."""
+    shares, left, open_ = {}, excess, [name for name in rooms if rooms[name] > 0]
+    while left > 0 and open_:
+        total = sum(weights[name] for name in open_) or 1
+        wanted = {name: -(-left * weights[name] // total) for name in open_}
+        full = [name for name in open_ if wanted[name] >= rooms[name]]
+        if not full:
+            shares.update(wanted)
+            break
+        for name in full:
+            shares[name] = rooms[name]
+            left -= rooms[name]
+            open_.remove(name)
+    return shares
+
+
 def trim_summary(summary, limit_bytes):
     """Fit an oversized summary within limit_bytes without a model request.
 
     With at least three known sections, the least important sections are shortened
     first (SECTION_TRIM_ORDER), then reduced to their headings; only then are whole
-    lines cut from the middle of the required sections, in proportion to their size.
-    Otherwise, or if that is still not enough, the start and end are kept (_trim_middle)."""
+    lines cut from the middle of the required sections, in proportion to their size
+    (a share a short section cannot take goes to the others). Otherwise, or if no
+    whole-line cut is enough, the start and end are kept (_trim_middle)."""
     if _size(summary) <= limit_bytes:
         return summary
     text = summary
@@ -857,23 +888,30 @@ def trim_summary(summary, limit_bytes):
                     cut = ""
                 text = (text[:start] + heading + cut.rstrip() + SECTION_TRIM_MARKER
                         + ("\n" if end < len(text) else "") + text[end:])
-        excess = _size(text) - limit_bytes
-        if excess > 0:
+        for _ in range(3):  # One pass normally fits; a later one takes a rounding remainder.
+            excess = _size(text) - limit_bytes
+            if excess <= 0:
+                break
             sections = summary_sections(text)
-            required = [(name, sections[name]) for name in REQUIRED_SUMMARY_SECTIONS if name in sections]
-            total = sum(_size(text[start:end]) for _, (start, end) in required) or 1
+            parts = {}
+            for name in REQUIRED_SUMMARY_SECTIONS:
+                if name in sections:
+                    start, end = sections[name]
+                    line_end = text.find("\n", start, end)
+                    if line_end >= 0:
+                        parts[name] = (start, end, line_end + 1)
+            rooms = {name: _middle_room(text[cut:end]) for name, (_, end, cut) in parts.items()}
+            weights = {name: _size(text[start:end]) for name, (start, end, _) in parts.items()}
+            shares = _required_shares(rooms, weights, excess)
+            if not shares:
+                break
             # Later sections first, so earlier offsets stay valid.
-            for name, (start, end) in sorted(required, key=lambda item: -item[1][0]):
-                section = text[start:end]
-                line_end = section.find("\n")
-                if line_end < 0:
-                    continue
-                heading, body = section[:line_end + 1], section[line_end + 1:]
-                share = -(-excess * _size(section) // total)
-                shorter = _cut_lines_middle(body, share)
+            for name in sorted(shares, key=lambda item: -parts[item][0]):
+                start, end, cut = parts[name]
+                shorter = _cut_lines_middle(text[cut:end], shares[name])
                 if shorter is not None:
                     gap = "\n" if end < len(text) and not shorter.endswith("\n\n") else ""
-                    text = text[:start] + heading + shorter + gap + text[end:]
+                    text = text[:cut] + shorter + gap + text[end:]
     return _trim_middle(text, limit_bytes)
 
 
@@ -962,7 +1000,7 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
     pointer = handoff_pointer(handoff_files)
     messages = [system_message, *context_messages(wire, state)]
     estimate = before = scaled_estimate(messages, tools, scale)
-    adjustment = saved_handoff = compaction = None
+    adjustment = fitted_to_budget = saved_handoff = compaction = None
     in_turn = deferred = False
 
     if force_compact or estimate > threshold:
@@ -1123,8 +1161,9 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
             # A small cut shortens the least important sections; a large one is condensed first.
             shorten = counted_condense if condense and not attempt and limit < size * 3 // 4 else None
             updated["summary"], change = await fit_summary(updated["summary"], limit, shorten)
-            if change and adjustment != "trimmed":
-                adjustment = change
+            # Reported apart from summary_adjustment: the summary was within its own byte limit.
+            if change and fitted_to_budget != "trimmed":
+                fitted_to_budget = change
             messages = [system_message, *context_messages(wire, updated)]
             estimate = scaled_estimate(messages, tools, scale)
         if estimate > input_budget:
@@ -1162,6 +1201,8 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
         info["estimate_scale"] = float(scale)
     if adjustment:
         info["summary_adjustment"] = adjustment
+    if fitted_to_budget:
+        info["summary_fitted_to_budget"] = fitted_to_budget
     if saved_handoff:
         info["handoff_path"] = saved_handoff
     if in_turn:

@@ -1116,8 +1116,10 @@ the two differ and the scale later estimates use. After a compaction, or in a
 after the input budget changes, or once a request to another model has been prepared,
 it is headed "Earlier request" in the same way. A model change or a Settings save
 moves the meter to the budgets, auto-compact mark and next-request estimate of the
-chat's next request right away (a running chat follows on its next request), so the
-~N% is then of the new input budget. When a turn ends, the details also show the
+chat's next request right away (a running chat follows when its turn ends; budgets apply
+from its next turn). When that changed the input budget, the collapsed meter reads
+**Next request · ~N%**: the next request's estimate, rescaled to the chat's model, as a
+share of the new input budget. When a turn ends, the details also show the
 estimate for the next request before your next message. Title, compaction and side
 question requests never change this report.
 
@@ -1186,11 +1188,14 @@ lost the goal, open tasks or requirements section counts as failed. If condensin
 fails or is still too long, the app shortens the least important sections first, then
 reduces them to their headings; only then does it remove whole lines from the middle of
 the first three sections, in proportion to their size, keeping each one's first and last
-lines. Only if that is still not enough (for example a summary without those sections)
-does it keep the start and end of the summary. The summary's room is reserved in bytes,
+lines; a share that a short section cannot give goes to the others. Only if whole lines
+are not enough (for example a summary without those sections) does it keep the start
+and end of the summary. The summary's room is reserved in bytes,
 but escapes and non-ASCII text count more toward the estimate: when the request after a
 compaction is still over the input budget, the summary, already paid for, is shortened
-(or condensed once) until it fits instead of being discarded. A plain summary cut off at its output limit is kept with a note. These
+(or condensed once) to fit rather than discarded, and the compaction notice and the meter
+say why; only when even a summary of about 1,750 bytes would not fit does the turn stop
+with the context-budget error. A plain summary cut off at its output limit is kept with a note. These
 summary limits are separate from the main reply limit and total context budget.
 
 Next to the summary, the model gets an **app record** that the app writes itself,

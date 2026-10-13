@@ -48,3 +48,8 @@ def test_the_default_figures_in_the_readme_match_the_code():
     for stale in ("4,096 output tokens with the default settings", "(12,000 with the default settings)",
                   "10,000 tokens · 8.3%"):
         assert stale not in text
+
+
+def test_the_summary_floor_in_the_readme_matches_the_code():
+    # prepare_context stops shortening a billed summary below half the summary minimum.
+    assert f"even a summary of about {context.SUMMARY_MIN_BYTES // 2:,} bytes would not fit" in readme()

@@ -2,7 +2,10 @@
 summary never cuts through the user's requirements first, and a billed summary is shortened instead
 of discarded when the request overshoots (pure context)."""
 
+import random
+
 from local_agent import context
+from local_agent.agents import AgentManager
 from local_agent.context import (
     REQUEST_CLIP_MARKER, SAFETY_MARGIN, SECTION_TRIM_MARKER, SUMMARY_TRIM_MARKER, app_record_limit,
     merge_user_requests, prepare_context, summary_byte_limit, summary_sections, trim_summary,
@@ -68,10 +71,11 @@ def rule_line(n):
     return f'- RULE-{n}: "never push to main unless the user says so; rule {n} of the project"'
 
 
-def rule_summary(rules, lower_bytes=2_000):
+def rule_summary(rules, lower_bytes=2_000, goal_lines=12):
     """A nine-section handoff whose requirements quote many rules."""
     bodies = {
-        "Goal and current status": "\n".join(f"Goal line {i}: the billing export is in progress." for i in range(12)),
+        "Goal and current status": "\n".join(f"Goal line {i}: the billing export is in progress."
+                                             for i in range(goal_lines)),
         "Open tasks and next steps": "\n".join(f"- Task {i}: finish part {i} of the export." for i in range(25)),
         "User requirements, preferences and constraints": "\n".join(rule_line(n) for n in range(1, rules + 1)),
     }
@@ -107,6 +111,27 @@ def test_required_sections_over_the_limit_lose_whole_middle_lines_only():
     assert SECTION_TRIM_MARKER.strip() in trimmed and SUMMARY_TRIM_MARKER not in trimmed
 
 
+def test_a_short_goal_passes_its_share_of_the_cut_to_the_other_sections():
+    # A goal of one to three lines has no middle lines to give; its share used to fall
+    # through to the byte-offset cut, which split a quoted rule and dropped the next one.
+    limit = summary_byte_limit(OPUS_BUDGET)
+    rng = random.Random(17)
+    cases = [(3, 25, 200)] + [(rng.randint(1, 3), rng.randint(3, 60), rng.randint(150, 400)) for _ in range(150)]
+    for goal_lines, tasks, rules in cases:
+        summary, bodies = rule_summary(rules, lower_bytes=1_980, goal_lines=goal_lines)
+        body = "\n".join(f"- Task {i}: " + "t" * rng.randint(10, 120) for i in range(tasks))
+        summary = summary.replace(bodies["Open tasks and next steps"], body)
+        trimmed = trim_summary(summary, limit)
+        case = (goal_lines, tasks, rules)
+        assert len(trimmed.encode()) <= limit and SUMMARY_TRIM_MARKER not in trimmed, case
+        lines = trimmed.split("\n")
+        assert all(line in lines for line in bodies["Goal and current status"].split("\n")), case
+        originals = {rule_line(n) for n in range(1, rules + 1)}
+        kept = [line for line in lines if "RULE-" in line]
+        assert all(line in originals for line in kept), case  # No rule is cut inside its line.
+        assert rule_line(1) in kept and rule_line(rules) in kept, case
+
+
 # --- A billed summary is shortened, not discarded, when the request overshoots -----------
 
 def placeholder_needs(window, reserve, size):
@@ -125,6 +150,18 @@ def history_at(window, reserve, tokens):
         low, high = (middle, high) if placeholder_needs(window, reserve, middle) <= tokens else (low, middle - 1)
     return [user("First: " + "a" * 200_000), assistant("Done."), user("Second: " + "b" * 200_000),
             assistant("Done."), user("Prev request"), assistant("ok"), user("L" * (low - 50))]
+
+
+async def notice_for(info):
+    """The compaction notice AgentManager posts for this info."""
+    texts = []
+
+    class Manager:
+        async def event(self, session, kind, **fields):
+            texts.append(fields["text"])
+
+    await AgentManager.summary_adjustment_notice(Manager(), {"id": "c"}, info)
+    return texts[-1]
 
 
 def japanese(limit):
@@ -156,7 +193,12 @@ async def test_a_billed_summary_is_shortened_until_the_request_fits():
             auto_compact_percent=percent, record_requests=True, app_record=lambda wire, cut, limit: notes)
         assert len(calls) == 1, (kind, percent, scale)
         assert info["estimated_tokens"] <= OPUS_BUDGET and info["compaction"]["after_tokens"] <= OPUS_BUDGET
-        assert info["summary_adjustment"] == "trimmed" and len(state["summary"].encode()) < calls[0]
+        # The summary was within its own limit: the shortening is reported as fitting the request.
+        assert "summary_adjustment" not in info and info["summary_fitted_to_budget"] == "trimmed"
+        assert len(state["summary"].encode()) < calls[0]
+        text = await notice_for(info)
+        assert "over the input budget" in text and "part of the summary was omitted to fit" in text
+        assert "longer than" not in text and "could not be condensed" not in text
 
 
 async def test_a_large_overshoot_is_condensed_once_before_trimming():
@@ -172,7 +214,11 @@ async def test_a_large_overshoot_is_condensed_once_before_trimming():
 
     _, state, info = await prepare_context(wire, {}, SYSTEM, TOOLS, OPUS_WINDOW, summarize, reply_reserve=OPUS_OUTPUT,
                                            condense=condense, auto_compact_percent=100, record_requests=True)
-    assert len(condensed) == 1 and info["summary_adjustment"] == "condensed"
+    assert len(condensed) == 1 and info["summary_fitted_to_budget"] == "condensed"
+    assert "summary_adjustment" not in info
+    text = await notice_for(info)
+    assert "over the input budget" in text and "a short extra request condensed the summary to fit" in text
+    assert "longer than" not in text
     assert info["estimated_tokens"] <= OPUS_BUDGET and info["compaction"]["requests"] == 2
 
 
