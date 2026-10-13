@@ -16,6 +16,8 @@ _SAFE_SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 # Kept out of the header record so list and metadata reads stay small.
 _SEPARATE_FIELDS = ("context_state", "instruction_directories", "file_views", "allow_rules", "inference_calls", "command_jobs",
                     "queued_messages", "pending_context")
+# Context meter fields left out of list summaries and headers (see Store.summary).
+_METER_FIELDS = ("last_request", "next_estimate")
 # Kept in <id>.state.json beside the conversation file, never in field records: versions
 # before these fields existed reject unknown field records but only read *.jsonl files.
 _SIDECAR_FIELDS = ("file_views", "allow_rules", "queued_messages", "pending_context")
@@ -77,8 +79,13 @@ class Store:
 
     @staticmethod
     def summary(session):
-        return {k: v for k, v in session.items()
-                if k not in ("wire", "events", *_SEPARATE_FIELDS)}
+        summary = {k: v for k, v in session.items()
+                   if k not in ("wire", "events", *_SEPARATE_FIELDS)}
+        info = summary.get("context_info")
+        if isinstance(info, dict) and any(key in info for key in _METER_FIELDS):
+            # The context meter's reported input lives only in the full session.
+            summary["context_info"] = {k: v for k, v in info.items() if k not in _METER_FIELDS}
+        return summary
 
     @staticmethod
     def _valid_id(session_id):

@@ -12,7 +12,10 @@ from local_agent import mentions
 from local_agent.agents import AgentManager, forget_summarized_reads
 from local_agent.api import create_app
 from local_agent.config import Settings
-from local_agent.context import SAFETY_MARGIN, VERIFY_CONTINUATION_PREFIX
+from local_agent.context import (
+    SAFETY_MARGIN, SUMMARY_SECTIONS, compaction_output_allowance, condense_output_tokens, estimate_scale,
+    estimate_tokens, handoff_output_tokens, summary_byte_limit, summary_output_tokens, verify_declined_message,
+)
 from local_agent.store import Store
 from local_agent.tools import WorkspaceTools
 
@@ -106,6 +109,29 @@ async def test_a_streamed_reply_sets_the_reported_input_and_broadcasts_it(runtim
     assert any(update.get("type") == "context" and update["context_info"].get("last_request") == report
                and "next_estimate" not in update["context_info"] for update in updates)
     assert manager.store.get(session["id"])["context_info"]["last_request"] == report
+    # The scale later estimates use counts this report; estimate_scale is the one this request used.
+    assert report["next_estimate_scale"] == estimate_scale(session["inference_calls"], session["model"]) > 1
+    assert report["estimate_scale"] == 1.0
+
+
+async def test_the_next_scale_falls_from_the_opus_prior_to_the_reported_ratio(runtime, monkeypatch):
+    manager, session, _ = runtime
+    session["model"] = "databricks-claude-opus-5-5"
+    reported = {}
+
+    def gateway(request):
+        payload = json.loads(request.content)
+        if not payload["stream"]:
+            return summary_reply("A title")
+        # Report 1.2 times the unscaled estimate: 7.7 percent fewer than the 1.3 prior's estimate.
+        reported["tokens"] = round(estimate_tokens(payload["messages"], payload["tools"]) * 1.2)
+        return sse(reply_chunk(usage={"prompt_tokens": reported["tokens"], "completion_tokens": 5}))
+
+    mock_gateway(monkeypatch, gateway)
+    await manager.run(session, "Hello")
+    report = session["context_info"]["last_request"]
+    assert report["estimate_scale"] == 1.3 and report["estimate_gap_percent"] < -2
+    assert report["next_estimate_scale"] == pytest.approx(1.2, abs=0.001)
 
 
 async def test_next_estimate_and_last_request_carry_over_and_mark_a_compaction(runtime, monkeypatch):
@@ -132,6 +158,10 @@ async def test_next_estimate_and_last_request_carry_over_and_mark_a_compaction(r
     # The second step's prepared context still shows the first step's report, without a stale next estimate.
     prepared = next(info for info in contexts[first + 1:] if "next_estimate" not in info)
     assert prepared["last_request"]["uncached_input_tokens"] == 7000
+    # Mid-turn (tool results still to come) the meter gets no "before your next message" estimate.
+    assert not [info for info in contexts if "next_estimate" in info
+                and info["last_request"]["uncached_input_tokens"] == 7000]
+    assert "next_estimate" in contexts[-1] and contexts[-1]["last_request"]["uncached_input_tokens"] == 9000
     info = session["context_info"]
     assert info["last_request"]["input_tokens"] == 10_000
     assert info["next_estimate"]["tokens"] > 0
@@ -196,6 +226,25 @@ async def test_compaction_and_title_requests_never_set_the_reported_input(runtim
 
 
 # --- 4-5: metrics and settings -------------------------------------------------------------
+
+def test_list_summaries_leave_out_the_meter_fields(runtime):
+    manager, session, _ = runtime
+    report = {"input_tokens": 10_000, "compactions": 0}
+    session["context_info"] = {"estimated_tokens": 9000, "input_budget": 55_296, "compactions": 0,
+                               "last_request": report, "next_estimate": {"tokens": 9100}}
+    manager.store.save(session)
+    store = Store(manager.settings.state_dir / "tests.sqlite3")  # A fresh store reads the file.
+    try:
+        listed = next(item for item in store.list() if item["id"] == session["id"])
+        assert listed["context_info"] == {"estimated_tokens": 9000, "input_budget": 55_296, "compactions": 0}
+        assert "last_request" not in store.header(session["id"])["context_info"]
+        assert store.get(session["id"])["context_info"]["last_request"] == report
+    finally:
+        store.db.close()
+    with TestClient(create_app(manager.settings)) as client:
+        headers = {"X-Local-Token": client.get("/api/bootstrap").json()["token"]}
+        listed = next(item for item in client.get("/api/sessions", headers=headers).json() if item["id"] == session["id"])
+        assert "last_request" not in listed["context_info"] and "next_estimate" not in listed["context_info"]
 
 def test_metrics_return_the_last_reported_input(runtime):
     manager, _, project = runtime
@@ -376,10 +425,98 @@ def test_files_changed_come_only_from_calls_in_the_summarized_history(runtime):
     assert f"- [pending] Ship the billing API (task_id {task['id']})" in notes and "and 0 completed tasks." in notes
 
 
+def test_files_changed_leave_out_failed_writes_and_tasks_are_listed_by_status(runtime):
+    manager, session, project = runtime
+    tools = manager.session_tools(session)
+    (project / "src").mkdir()
+    wire = [user("Edit"), read_call("w1", "src/api.py", "write_file"), {"role": "tool", "tool_call_id": "w1", "content": "ok"},
+            read_call("w2", "src/db.py", "write_file"), {"role": "tool", "tool_call_id": "w2", "content": "refused"},
+            assistant("Done."), user("Next")]
+    session["events"] = [tool_event("w1", "write_file", "src/api.py"),
+                         tool_event("w2", "write_file", "src/db.py", state="error")]
+    board = manager.task_board
+    done = board.create(session["id"], title="Done task")
+    board.update(session["id"], done["id"], {"status": "completed"})
+    dropped = board.create(session["id"], title="Dropped task")
+    board.update(session["id"], dropped["id"], {"status": "cancelled"})
+    waiting = board.create(session["id"], title="Waiting task")
+    active = board.create(session["id"], title="Active task")
+    board.update(session["id"], active["id"], {"status": "in_progress"})
+    record, _ = manager.compaction_record(session, tools)
+    notes = record(wire, 6)
+    changed = notes.split("Files this conversation changed before this point (newest first):\n")[1].split("\n\n")[0]
+    assert changed.split("\n") == ["- src/api.py"]
+    tasks = notes.split("(list_tasks shows the current state):\n")[1].split("\n\n")[0].split("\n")
+    assert tasks == [f"- [in_progress] Active task (task_id {active['id']})",
+                     f"- [pending] Waiting task (task_id {waiting['id']})",
+                     f"- [cancelled] Dropped task (task_id {dropped['id']})", "and 1 completed task."]
+
+
+async def test_the_in_turn_notice_names_the_limit_the_request_passed(runtime):
+    manager, session, _ = runtime
+    compaction = {"number": 2, "trigger": "in_turn", "before_tokens": 52_366, "after_tokens": 30_000,
+                  "threshold_tokens": 49_766, "summarized_messages": 8, "requests": 1, "elided_bytes": 0,
+                  "superseded_results": 0}
+    info = {"input_budget": 55_296, "auto_compact_percent": 90, "compaction": compaction}
+    await manager.summary_adjustment_notice(session, info)
+    await manager.summary_adjustment_notice(session, {**info, "compaction": {**compaction, "before_tokens": 56_000}})
+    first, second = [event["text"] for event in session["events"] if event["type"] == "notice"]
+    assert first.startswith("This request's tool results passed the auto-compact threshold, so its earlier results")
+    assert "needed about 52,366 estimated input tokens, over the 90% auto-compact threshold of 49,766" in first
+    assert second.startswith("This request's tool results outgrew the context budget, so its earlier results")
+
+
+async def test_compaction_requests_get_the_thinking_allowance_on_opus_5_5(runtime, monkeypatch):
+    manager, session, project = runtime
+    session["model"] = "databricks-claude-opus-5-5"
+    window = 65_536
+    allowance = compaction_output_allowance(session["model"], window)
+    limit = summary_byte_limit(window - 8192 - SAFETY_MARGIN)
+    assert allowance == 8192
+    kinds = []
+
+    def gateway(request):
+        payload = json.loads(request.content)
+        if payload["stream"]:
+            return sse(reply_chunk())
+        system, text = payload["messages"][0]["content"], payload["messages"][1]["content"]
+        kind = ("condense" if "Summary to shorten:\n" in text else "handoff" if system.startswith(
+            "Write a detailed handoff document") else "summary" if system.startswith("Summarize conversation history")
+            else "title")
+        kinds.append((kind, payload["max_tokens"]))
+        # A long first reply, so the app also condenses it.
+        long = "\n\n".join(f"## {name}\n" + "detail " * 400 for name in SUMMARY_SECTIONS)
+        return summary_reply("Short summary." if kind in ("condense", "title") else long)
+
+    mock_gateway(monkeypatch, gateway)
+    session["wire"] = long_history()
+    manager.store.save(session)
+    await manager.run(session, "Continue")  # Automatic, handoffs off.
+    manager.settings.values["compaction_handoffs"] = True
+    session["wire"] += long_history()
+    manager.store.save(session)
+    await manager.run(session, "Continue again")  # Automatic, with a handoff.
+    session["wire"] += [user("Next"), assistant("Done.")]
+    manager.store.save(session)
+    manager.start_compaction(session["id"])  # Manual, with a handoff.
+    await manager.tasks[session["id"]]
+    manager.settings.values["compaction_handoffs"] = False
+    session = manager.store.get(session["id"])
+    session["wire"] += [user("More"), assistant("Done.")]
+    manager.store.save(session)
+    manager.start_compaction(session["id"])  # Manual, plain summary.
+    await manager.tasks[session["id"]]
+    expected = {"summary": summary_output_tokens(limit) + allowance,
+                "condense": condense_output_tokens(limit) + allowance,
+                "handoff": handoff_output_tokens(window) + allowance}
+    seen = {kind for kind, _ in kinds}
+    assert {"summary", "condense", "handoff"} <= seen
+    assert all(tokens == expected[kind] for kind, tokens in kinds if kind != "title")
+
+
 async def test_a_declined_verify_note_is_recorded_as_the_users_request(runtime, monkeypatch):
     manager, session, _ = runtime
-    note = (f"{VERIFY_CONTINUATION_PREFIX} the user declined the project's verify command `pytest`, so it did not "
-            "run. Their note: keep using tabs\nAnswer the note.")
+    note = verify_declined_message("pytest", "keep using tabs")
     session["wire"] = [*long_history(2), user("Fix it"), assistant("Edited."), user(note), assistant("Okay."),
                        *long_history(2)]
     manager.store.save(session)

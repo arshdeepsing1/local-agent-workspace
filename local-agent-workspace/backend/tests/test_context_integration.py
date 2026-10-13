@@ -302,8 +302,15 @@ async def test_a_request_that_reads_more_than_the_budget_compacts_inside_the_tur
     assert [event["state"] for event in session["events"] if event["type"] == "tool"] == ["completed"] * len(files)
     assert session["events"][-1]["type"] == "assistant" and session["events"][-1]["text"] == "History summarized."
     assert summaries and len(streamed) == len(files) + 1
-    notices = [event["text"] for event in session["events"] if event["type"] == "notice"]
-    assert any("outgrew the context budget" in text for text in notices)
+    # The notice says which limit the request passed: the auto-compact threshold (90 percent
+    # by default) or, when it grew past it within one step, the whole input budget.
+    in_turn = [event for event in session["events"]
+               if event["type"] == "notice" and (event.get("compaction") or {}).get("trigger") == "in_turn"]
+    assert in_turn
+    for event in in_turn:
+        over_budget = event["compaction"]["before_tokens"] > input_budget
+        assert ("outgrew the context budget" in event["text"]) is over_budget
+        assert ("passed the auto-compact threshold" in event["text"]) is not over_budget
     state = session["context_state"]
     assert state["compactions"] >= 1 and session["wire"][state["through"]]["role"] == "assistant"
     # After compaction the request is still sent verbatim, right after the summary.

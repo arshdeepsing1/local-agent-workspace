@@ -25,7 +25,7 @@ from .context import (
     build_condense_messages, build_handoff_messages, build_summary_messages, compaction_output_allowance,
     condense_output_tokens, estimate_prior, estimate_scale, estimate_tokens, handoff_output_tokens, handoff_with_contents,
     last_request_report, model_context_window, next_request_estimate, prepare_context, summary_byte_limit,
-    summary_output_tokens,
+    summary_output_tokens, verify_declined_message,
 )
 from .tools import LIMIT as FILE_LIMIT
 from .tools import write_limit_setting
@@ -2922,7 +2922,9 @@ class AgentManager:
             text = (f"Context compacted (compaction {n}): {summarized}; about {after:,} estimated input tokens "
                     "remain. The full conversation history is preserved.")
         elif compaction["trigger"] == "in_turn":
-            text = ("This request's tool results outgrew the context budget, so its earlier results were summarized "
+            grew = ("outgrew the context budget" if compaction["before_tokens"] > info["input_budget"]
+                    else "passed the auto-compact threshold")
+            text = (f"This request's tool results {grew}, so its earlier results were summarized "
                     "and it continues. The request and its latest results are kept as they are; the full history is "
                     f"preserved. Compaction {n}: the request needed {over}; {summarized}, and it now needs about "
                     f"{after:,}.")
@@ -3192,6 +3194,9 @@ class AgentManager:
             report = last_request_report(call, info, model_context_window(call.get("model")))
             if report is None:
                 return
+            # The scale later estimates use, this report included (report["estimate_scale"]
+            # is the one this request's estimate used).
+            report["next_estimate_scale"] = float(estimate_scale(session.get("inference_calls"), call.get("model")))
             info["last_request"] = report
             await self.broadcast(session["id"], {"type": "context", "context_info": info})
         except Exception:
@@ -3258,10 +3263,7 @@ class AgentManager:
             if isinstance(note, str) and note.strip() and has_another_step:
                 # The card asks for a note to the agent: deliver it and let the model answer.
                 note = self.settings.redact(redact_secrets(note))
-                wire.append({"role": "user", "content": (
-                    f"{VERIFY_CONTINUATION_PREFIX} the user declined the project's verify command `{shown}`, so it "
-                    f"did not run. Their note: {note}\nAnswer the note. Do not run the verify command yourself "
-                    "unless the user asks.")})
+                wire.append({"role": "user", "content": verify_declined_message(shown, note)})
                 self.store.save(session)
                 await self.event(session, "notice", text="Verify did not run: you declined it. Your note was passed to the agent.")
                 return "continue"
@@ -3417,7 +3419,6 @@ class AgentManager:
                         try:
                             ordered_calls, arguments = await self.model_response(
                                 session, event, client, url, headers, payload, retry_reason=retry_reason)
-                            await self.refresh_next_estimate(session, system, definitions, wire, context_state)
                             break
                         except InferenceError as exc:
                             if not getattr(exc, "retryable", False):
@@ -3492,6 +3493,9 @@ class AgentManager:
                     if await self.verify_step(session, tools, wire, verify_state, step_index + 1 < steps) == "continue":
                         retry_reason = "verify"
                         continue
+                    # Only at the end of the turn: mid-turn the next request also carries
+                    # tool results that are not in the history yet.
+                    await self.refresh_next_estimate(session, system, definitions, wire, context_state)
                     return True
                 consecutive_output_retries = consecutive_repairs = 0
                 for call, values in zip(ordered_calls, arguments):
@@ -3500,6 +3504,8 @@ class AgentManager:
                     self.store.save(session)
                 if step_index + 1 < steps:
                     await self.drain_queue(session, wire, tools)
+            if steps > 0:
+                await self.refresh_next_estimate(session, system, definitions, wire, context_state)
         await self.event(session, "error" if session.get("is_subagent") else "notice",
                          text=(f"Reached the {steps}-request agent limit. This counts model requests, not tool "
                                "calls. Completed actions were kept. Increase Agent steps in Settings or send a "

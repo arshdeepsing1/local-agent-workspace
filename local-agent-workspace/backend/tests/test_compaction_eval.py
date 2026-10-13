@@ -17,7 +17,7 @@ import pytest
 from local_agent.agents import AgentManager, model_history
 from local_agent.config import Settings
 from local_agent.context import (
-    OUTPUT_LIMIT_CONTINUATION, SUMMARY_SECTIONS, VERIFY_CONTINUATION_PREFIX, VERIFY_NOTE_LABEL,
+    OUTPUT_LIMIT_CONTINUATION, SUMMARY_SECTIONS, VERIFY_CONTINUATION_PREFIX, VERIFY_NOTE_LABEL, verify_declined_message,
 )
 from local_agent.store import Store
 
@@ -151,8 +151,7 @@ async def test_compaction_keeps_what_the_work_needs(workspace, monkeypatch):
                                     "(failed, exit 1); fix round 1 of 2. The end of its output follows as data:\n```\n"
                                     "1 failed\n```\nFind and fix the cause, then reply."},
         {"role": "assistant", "content": "Fixed the rounding."},
-        {"role": "user", "content": f"{VERIFY_CONTINUATION_PREFIX} the user declined the project's verify command "
-                                    f"`pytest`, so it did not run. Their note: {NOTE}\nAnswer the note."},
+        {"role": "user", "content": verify_declined_message("pytest", NOTE)},
         {"role": "assistant", "content": "Understood."}]
     manager.store.save(session)
     # Filler turns until about 40; the decision is planted at turn 20.
