@@ -105,7 +105,7 @@ selected permission mode and shows any needed approval controls. Do not ask for 
 chat before issuing a tool call. If an approval is denied, respect the decision.
 Commands default to a 60-second timeout; choose timeout_seconds up to 3600 if needed.
 Use background=true for a managed job that must outlive this turn, never shell '&' or daemon detachment.
-Use list_jobs/get_job_output to inspect jobs, wait_job to wait until a background job finishes or prints a line you expect, and stop_job to terminate them. A failed command's first result shows the start and the end of its output. Use find_files to locate files by name. Background jobs
+Use list_jobs/get_job_output to inspect jobs, wait_job to wait until a background job finishes or prints a line you expect, and stop_job to terminate them. A failed command's first result shows the start and the end of its retained output. Use find_files to locate files by name. Background jobs
 continue after this turn is stopped and end on explicit job Stop, timeout, or app shutdown.
 Read files in numbered line ranges and follow next_line; paginate searches and job output
 instead of requesting huge results. A completed command can have a nonzero exit code: check it.
@@ -522,7 +522,7 @@ class AgentManager:
                     and not any(event.get("type") == "notice" and event.get("job_id") == job["id"]
                                 for event in stored["events"])):
                 notices.add(job["id"])
-                text = f"Background job finished: `{job_command(self.redact_title(job['command']), 80)}` — {job_ending(job)}."
+                text = f"Background job {job_ending(job)}: {job_command(self.redact_title(job['command']), 80)}"
                 if session is not None:
                     await self.event(session, "notice", text=text, job_id=job["id"])
                 else:
@@ -558,6 +558,7 @@ class AgentManager:
                     "output": content[:length], "offset": offset, "next_offset": end if end < len(job["output"]) else None,
                     "total_chars": len(job["output"]), "truncated": job["truncated"],
                     "background": job["background"]}
+        self.job_seen(job)
         low, high = 0, len(content)
         while low < high:
             middle = (low + high + 1) // 2
@@ -581,13 +582,17 @@ class AgentManager:
             if whole["next_offset"] is None:
                 return whole
 
+        # Output past max_output_bytes was never kept: the end shown is not the command's last output.
+        lost = ("\n[… output after this point was not kept (over max_output_bytes); rerun with a larger "
+                "max_output_bytes, or write it to a file and use read_file with tail_lines …]" if job["truncated"] else "")
+
         def excerpt(head_chars, tail_chars):
             head = output[:head_chars]
             tail = output[total - tail_chars:] if tail_chars else ""
             start, end = len(head), total - len(tail)
             return {"job_id": job["id"], "state": job["state"], "exit_code": job["exit_code"],
                     "output": (head + f"\n[… {end - start:,} characters omitted; read them with "
-                               f"get_job_output offset={start} …]\n" + tail),
+                               f"get_job_output offset={start} …]\n" + tail + lost),
                     "offset": 0, "next_offset": start, "omitted": {"start": start, "end": end},
                     "total_chars": total, "truncated": job["truncated"], "background": job["background"],
                     "excerpt": "head_and_tail"}
@@ -653,11 +658,25 @@ class AgentManager:
         if not jobs:
             return ""
         session["jobs_reported_through"] = max(job["updated"] for job in jobs)
+        # A job whose end a result already showed (wait_job, get_job_output) is not repeated.
+        seen = self.__dict__.get("_job_seen", {})
+        jobs = [job for job in jobs if not seen.get(job["id"], (0, False))[1]]
+        if not jobs:
+            return ""
         named = [f"{job['id'][:8]} `{job_command(self.redact_title(job['command']), 60)}` {job_ending(job)}"
                  for job in jobs[:5]]
         more = f"; and {len(jobs) - 5} more." if len(jobs) > 5 else "."
         return ("Background jobs finished since your last step: " + "; ".join(named) + more
                 + " Use get_job_output to read their output.")
+
+    def job_seen(self, job):
+        """Remember what the latest result for a job told the model: the output length,
+        which is wait_job's default from_offset, and whether the job had ended."""
+        seen = self.__dict__.setdefault("_job_seen", {})
+        seen[job["id"]] = (len(job["output"]), job["state"] != "running")
+        if len(seen) > 400:  # Jobs are pruned; forget the ones that are gone.
+            for job_id in [key for key in seen if self.jobs.get(key) is None]:
+                seen.pop(job_id, None)
 
     def step_notices(self, session, tools):
         """The notices for the next model request: changed files and finished background jobs."""
@@ -1148,7 +1167,8 @@ class AgentManager:
                 if type(timeout) is not int or not 1 <= timeout <= 300:
                     raise ValueError("timeout_seconds must be an integer from 1 to 300.")
                 total = len(job["output"])
-                start = arguments.get("from_offset", total)
+                last = self.__dict__.get("_job_seen", {}).get(job["id"], (0, False))[0]
+                start = arguments.get("from_offset", min(last, total))
                 if type(start) is not int or start < 0:
                     raise ValueError("from_offset must be a non-negative integer.")
                 if start > total:
@@ -1156,6 +1176,7 @@ class AgentManager:
                 pattern = until_pattern(arguments["until_regex"]) if "until_regex" in arguments else None
                 job, reason, match = await self.jobs.watch(job["id"], start, pattern, timeout)
                 result = wait_page(job, reason, match, start)
+                self.job_seen(job)
             elif name in ("get_job_output", "stop_job"):
                 job = self.session_job(session, arguments["job_id"])
                 if name == "stop_job":

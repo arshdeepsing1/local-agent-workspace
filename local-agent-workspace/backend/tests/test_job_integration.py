@@ -216,6 +216,18 @@ async def test_a_failed_command_shows_the_start_and_the_end_of_its_output(runtim
     assert wide["excerpt"] == "head_and_tail" and wide["output"].startswith("é中")
 
 
+async def test_head_and_tail_says_when_the_end_of_the_output_was_not_kept(runtime):
+    manager, session, tools = runtime
+    session["permission_mode"] = "bypassPermissions"
+    result = json.loads(await manager.execute_tool(session, tools, "run_command", {
+        "command": "seq 1 30000; echo 'ERROR: the real failure'; exit 2"}, "t"))
+    assert result["truncated"] is True and result["excerpt"] == "head_and_tail"
+    assert "ERROR" not in result["output"]
+    assert result["output"].endswith("[… output after this point was not kept (over max_output_bytes); rerun with a "
+                                     "larger max_output_bytes, or write it to a file and use read_file with tail_lines …]")
+    assert len(json.dumps(result, indent=2).encode()) <= 8000
+
+
 def test_head_and_tail_falls_back_to_the_first_page_or_the_whole_output(runtime):
     manager, _, _ = runtime
     job = {"id": "j", "state": "failed", "exit_code": 1, "truncated": False, "background": False, "output": "x" * 5000}
@@ -278,7 +290,7 @@ async def test_a_background_job_that_ends_after_the_turn_leaves_one_notice(runti
     stored = manager.store.get(session["id"])
     notices = [event for event in stored["events"] if event["type"] == "notice"]
     assert [event["text"] for event in notices] == [
-        "Background job finished: `sleep .3; printf finished; exit 2` — failed (exit 2)."]
+        "Background job failed (exit 2): sleep .3; printf finished; exit 2"]
     assert notices[0]["job_id"] == started["job_id"]
     assert [data["event"]["id"] for data in sent if data.get("event", {}).get("type") == "notice"] == [notices[0]["id"]]
     await manager.job_update(manager.jobs.get(started["job_id"]))  # A repeated update adds nothing.
@@ -307,7 +319,7 @@ async def test_a_slow_page_does_not_lose_the_notice(runtime, monkeypatch):
     assert time.monotonic() - begun < 3
     stored = manager.store.get(session["id"])
     assert [event["text"] for event in stored["events"] if event["type"] == "notice"] == [
-        "Background job finished: `sleep .3; printf done` — completed (exit 0)."]
+        "Background job completed (exit 0): sleep .3; printf done"]
 
 
 async def test_terminal_and_cancelled_jobs_get_no_notice(runtime):
@@ -376,7 +388,11 @@ async def test_the_next_model_request_reports_a_finished_background_job_once(set
                {"content": "Started."},
                {"tool_calls": [{"index": 0, "id": "c2", "type": "function", "function": {
                    "name": "list_jobs", "arguments": "{}"}}]},
-               {"content": "Done."}]
+               {"content": "Done."},
+               {"tool_calls": [{"index": 0, "id": "c3", "type": "function", "function": {
+                   "name": "run_command", "arguments": json.dumps({"command": "sleep .2; printf again", "background": True})}}]},
+               None,  # wait_job on that job: filled in below.
+               {"content": "Built again."}]
 
     async def gateway(request):
         payload = json.loads(request.content)
@@ -384,6 +400,10 @@ async def test_the_next_model_request_reports_a_finished_background_job_once(set
             return httpx.Response(200, text='data: {"choices": [{"delta": {"content": "Title"}, "finish_reason": "stop"}]}\n\ndata: [DONE]\n\n')
         requests.append(payload)
         delta = replies[len(requests) - 1]
+        if delta is None:
+            again = next(event["job_id"] for event in reversed(session["events"]) if event.get("name") == "run_command")
+            delta = {"tool_calls": [{"index": 0, "id": "c4", "type": "function", "function": {
+                "name": "wait_job", "arguments": json.dumps({"job_id": again, "timeout_seconds": 10})}}]}
         chunk = {"choices": [{"delta": delta, "finish_reason": "tool_calls" if "tool_calls" in delta else "stop"}]}
         return httpx.Response(200, text="data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n")
 
@@ -400,7 +420,52 @@ async def test_the_next_model_request_reports_a_finished_background_job_once(set
         assert (f"Background jobs finished since your last step: {job_id[:8]} `sleep .2; printf built` completed (exit 0). "
                 "Use get_job_output to read their output.") in systems[2]
         assert [event["text"] for event in session["events"] if event["type"] == "notice"] == [
-            "Background job finished: `sleep .2; printf built` — completed (exit 0)."]
+            "Background job completed (exit 0): sleep .2; printf built"]
+        # wait_job already showed that the next job ended: the following request does not repeat it.
+        await manager.run(session, "Build it again and wait")
+        systems = [payload["messages"][0]["content"] for payload in requests]
+        waited = next(event for event in session["events"] if event.get("name") == "wait_job")
+        assert json.loads(waited["output"])["reason"] == "exited"
+        assert [text.count("Background jobs finished") for text in systems] == [0, 0, 1, 0, 0, 0, 0]
     finally:
         await manager.jobs.shutdown()
         store.db.close()
+
+
+async def test_a_job_ending_while_its_chat_is_live_leaves_one_notice(runtime):
+    manager, session, tools = runtime
+    session["permission_mode"] = "bypassPermissions"
+    sent = []
+
+    async def broadcast(session_id, data):
+        sent.append((session_id, data))
+    manager.broadcast = broadcast
+    started = json.loads(await manager.execute_tool(session, tools, "run_command", {
+        "command": "sleep .2; printf ready", "background": True}, "bg"))
+    waited = json.loads(await asyncio.wait_for(manager.execute_tool(session, tools, "wait_job", {
+        "job_id": started["job_id"], "timeout_seconds": 10}, "w"), 10))
+    assert waited["reason"] == "exited"
+    assert manager.live[session["id"]] is session  # Still live: the turn goes on.
+    notices = [event for event in session["events"] if event["type"] == "notice"]
+    assert [(event["text"], event["job_id"]) for event in notices] == [
+        ("Background job completed (exit 0): sleep .2; printf ready", started["job_id"])]
+    stored = manager.store.get(session["id"])
+    assert [event["id"] for event in stored["events"] if event["type"] == "notice"] == [notices[0]["id"]]
+    assert [data["event"]["id"] for sid, data in sent
+            if sid == session["id"] and data.get("event", {}).get("type") == "notice"] == [notices[0]["id"]]
+
+
+async def test_notices_redact_secret_shapes_in_the_command(runtime):
+    manager, session, tools = runtime
+    session["permission_mode"] = "bypassPermissions"
+    secret = "ghp_" + "A1b2" * 6  # A token shape that redact_secrets replaces.
+    session["jobs_reported_through"] = 0.0
+    started = json.loads(await manager.execute_tool(session, tools, "run_command", {
+        "command": f"sleep .2; printf ok # {secret}", "background": True}, "bg"))
+    await wait_for_turn_end(manager, session)
+    await asyncio.wait_for(manager.jobs.wait(started["job_id"]), 10)
+    stored = manager.store.get(session["id"])
+    texts = [event["text"] for event in stored["events"] if event["type"] == "notice"]
+    assert texts == ["Background job completed (exit 0): sleep .2; printf ok # [REDACTED]"]
+    report = manager.background_jobs_notice(stored)
+    assert started["job_id"][:8] in report and "[REDACTED]" in report and secret not in report

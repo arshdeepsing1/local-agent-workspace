@@ -999,8 +999,9 @@ still stops at 300 matches per query; `listing_limit_reached` indicates that the
 folder or glob should be narrowed to find additional files. The file explorer's
 existing listing API is unchanged. To find files by name at any depth, the agent uses
 `find_files(pattern)`: `**` matches any number of folders (`src/**/*.test.ts`), a
-pattern without `/` matches file names anywhere (`*.py`), `{a,b}` gives alternatives,
-and letter case is ignored. `sort="modified"` lists the newest first, with UTC
+pattern without `/` matches file names anywhere (`*.py`), `./*.py` only directly in
+the folder searched, and a pattern with `/` matches the path below that folder or the
+path as the results show it. `{a,b}` gives alternatives, and letter case is ignored. `sort="modified"` lists the newest first, with UTC
 modification times. Pages hold at most 500 paths and 8 KB, with `total` and `next_offset`.
 
 `find_files` and `search_files` see the same files. Inside a Git work tree they use
@@ -1008,11 +1009,15 @@ modification times. Pages hold at most 500 paths and 8 KB, with `total` and `nex
 are skipped unless the call sets `include_ignored=true`; untracked nested repositories
 and submodules are listed in full. Git is used only when the repository's top level is
 inside the workspace or granted folder being searched (in Bypass mode outside every
-folder: when it is neither your home folder nor `/`), so a dotfiles repository in the
-home folder cannot hide a project's files. Outside Git, or when Git fails (the result
-then has a `note`), the folder is walked without `.gitignore`. Either way the fixed
-exclusions apply: credential names, generated folders, symbolic links to folders, and
-the configured credential file under any name, including hard links to it. Listing
+folder: anywhere) and is neither your home folder nor `/`, so a dotfiles repository in
+the home folder cannot hide a project's files, also when the workspace is the home
+folder. Outside Git the folder is walked without `.gitignore`. When Git fails, or the
+repository's top level is above the workspace or granted folder (a package folder of a
+larger repository, say), the folder is walked too and the result has a `note` saying
+that `.gitignore` was not applied. Either way the fixed exclusions apply: credential
+names, generated folders, symbolic links to folders and every file below them (also
+when Git still lists such a file), and the configured credential file under any name,
+including hard links to it. Listing
 stops with an error after 10 seconds, 20,000 folders, or 200,000 files.
 
 `search_files` supports literal search by default, `regex=true`, `case_sensitive`,
@@ -1044,13 +1049,17 @@ the search reads every file itself: slower, with the same results.
 `run_command` accepts `timeout_seconds`, `max_output_bytes`, and `background`.
 It returns a job ID and the first output page. When a command failed, timed out, or
 was stopped and its output does not fit one page, the first result shows up to 1,500
-characters of the start and up to 4,500 of the end instead (`excerpt: "head_and_tail"`),
-with the omitted range and the `get_job_output` offset where it begins; successful
-commands keep their first page. `list_jobs`, `get_job_output`, `wait_job`, and
+characters of the start and up to 4,500 of the end of the retained output instead
+(`excerpt: "head_and_tail"`), with the omitted range and the `get_job_output` offset
+where it begins; when the command printed more than `max_output_bytes`, the excerpt
+ends with a line saying that the rest was not kept. Successful commands keep their
+first page. `list_jobs`, `get_job_output`, `wait_job`, and
 `stop_job` inspect, paginate, wait for, and stop jobs in the same conversation.
 `wait_job` waits up to 300 seconds (default 60) until the job ends or a new output line
-matches `until_regex`, and returns the new output and `next_offset` to wait again;
-Stop ends the wait, not the job. The job's
+matches `until_regex`, and returns the new output and `next_offset` to wait again.
+Without `from_offset` it scans from the end of the last result the conversation got
+for that job, so a line printed in between still counts. Stop ends the wait, not the
+job. The job's
 exit code and state distinguish success, failure, timeout, and cancellation.
 Only the configured prefix of output is retained; excess output is drained and
 reported as truncated. Foreground cancellation, timeouts, command completion,
@@ -1074,7 +1083,8 @@ value that contains the Databricks token. Hooks do not get these variables.
 
 When a background job that the agent started completes, fails, or times out, its
 conversation gets a notice, also when the chat is idle, and the agent's next model
-request names the job once. Nothing wakes an idle chat. Jobs started from the
+request names the job once, unless a `wait_job` or `get_job_output` result already
+showed that it ended. Nothing wakes an idle chat. Jobs started from the
 Terminal panel, and stopped or cancelled jobs, get no notice.
 Automatic compaction adds bounded summary requests beyond the configured agent steps.
 Databricks inference is billed to your workspace. Endpoints must support streaming,

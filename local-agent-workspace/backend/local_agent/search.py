@@ -1,10 +1,11 @@
 """The files that find_files and search_files consider, and ripgrep as a candidate filter.
 
 The file universe is computed the same way for both tools. Inside a Git work tree
-whose top level lies within the permitted folder, `git ls-files` lists tracked and
-untracked files and leaves out what .gitignore excludes. Otherwise the folder is
-walked. In both cases the file tools' credential and generated-folder exclusions
-apply, and the configured credential file is left out by identity.
+whose top level lies within the permitted folder, and is neither the home folder nor
+'/', `git ls-files` lists tracked and untracked files and leaves out what .gitignore
+excludes. Otherwise the folder is walked. In both cases the file tools' credential and
+generated-folder exclusions apply, files below a symbolic link to a folder are left
+out, and the configured credential file is left out by identity.
 
 ripgrep, when installed, only narrows which files Python reads for a literal
 search. Python reads every candidate and produces every result, so results are the
@@ -18,6 +19,7 @@ import stat
 import subprocess
 import threading
 import time
+import unicodedata
 from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 
@@ -35,6 +37,8 @@ PROCESS_OUTPUT_LIMIT = 32_000_000
 READ_CHUNK = 65_536
 RG_ENVIRONMENT = ("PATH", "HOME", "LANG", "LC_ALL")
 GIT_NOTE = "Git could not list the files here, so .gitignore was not applied."
+OUTSIDE_NOTE = ("This folder is inside a Git repository whose top level is outside the workspace or granted folder, "
+                "so .gitignore was not applied.")
 MAX_ALTERNATIVES = 20
 
 
@@ -101,6 +105,13 @@ def _identity(path):
     return info.st_dev, info.st_ino
 
 
+def _home():
+    try:
+        return Path.home().resolve()
+    except (RuntimeError, KeyError, OSError):
+        return None
+
+
 def _permitted_root(tools, base):
     if base.is_relative_to(tools.root):
         return tools.root
@@ -109,7 +120,8 @@ def _permitted_root(tools, base):
 
 def _git_names(tools, base, deadline):
     """(names relative to base, None), (None, GIT_NOTE) when Git failed in a work
-    tree, or (None, None) when Git does not apply here."""
+    tree, (None, OUTSIDE_NOTE) when the repository starts above the permitted folder,
+    or (None, None) when Git does not apply here."""
     git = shutil.which("git")
     if not git:
         return None, None
@@ -121,13 +133,15 @@ def _git_names(tools, base, deadline):
         return None, None
     text = output.decode("utf-8", errors="surrogateescape")
     toplevel = Path(text[:-1] if text.endswith("\n") else text).resolve()
+    # A dotfiles repository in the home folder, often with a '*' ignore rule, must
+    # not hide a project's files, also when the workspace is the home folder itself.
+    if toplevel in (_home(), Path("/")):
+        return None, None
+    # Nor may a repository that starts above the permitted folder decide what is
+    # visible inside it; the result says that .gitignore was not applied.
     root = _permitted_root(tools, base)
-    # A repository that starts above the permitted folder (a dotfiles repository in
-    # the home folder, say) must not decide what is visible inside it.
     if root is not None and not toplevel.is_relative_to(root):
-        return None, None
-    if root is None and toplevel in (Path.home().resolve(), Path("/")):
-        return None, None
+        return None, OUTSIDE_NOTE
     check_deadline(deadline)
     code, output, overflow = bounded_run(
         [git, *SAFE_OPTIONS, "-C", str(base), "--no-optional-locks", "ls-files", "-z", "--cached", "--others",
@@ -179,6 +193,19 @@ def list_universe(tools, base, *, include_ignored, deadline):
         return [Entry(base.name, base, base.stat().st_size, False)], None
     credential = _identity(tools.credential_file) if tools.credential_file else None
     counter = [0]
+    real_base = os.path.realpath(base)
+    plain = {}  # Parent folder -> True when no folder from base down to it is a symbolic link.
+
+    def plain_folders(relative):
+        """Git can list a file below a folder that is now a symbolic link (to a folder
+        outside the workspace, or to .git). The walk never enters such links; neither
+        does this listing."""
+        parent = PurePosixPath(relative).parent.as_posix()
+        if parent == ".":
+            return True
+        if parent not in plain:
+            plain[parent] = os.path.realpath(base / parent) == os.path.join(real_base, parent)
+        return plain[parent]
     names, note = (None, None) if include_ignored else _git_names(tools, base, deadline)
 
     def expanded():
@@ -212,6 +239,11 @@ def list_universe(tools, base, *, include_ignored, deadline):
         except UnicodeEncodeError:
             continue  # Not representable as text in a tool result.
         if tool_rules.excluded(PurePosixPath(relative).parts):
+            continue
+        try:
+            if not plain_folders(relative):
+                continue
+        except (OSError, ValueError):
             continue
         path = base / relative
         try:
@@ -314,10 +346,16 @@ def _translate(pattern, segment_start=True):
 
 def compile_glob(pattern):
     """A case-insensitive matcher for find_files patterns. '*' and '?' never cross '/';
-    '**/' is zero or more folders; a pattern without '/' matches names at any depth."""
+    '**/' is zero or more folders; a pattern without '/' matches names at any depth.
+    A leading './' anchors the pattern at the folder searched ('./*.py': only there)."""
     if not isinstance(pattern, str) or not 1 <= len(pattern) <= 500 or "\x00" in pattern:
         raise ValueError("pattern must be 1 to 500 characters.")
-    if "/" not in pattern:
+    anchored = pattern.startswith("./")
+    while pattern.startswith("./"):
+        pattern = pattern[2:]
+    if not pattern:
+        raise ValueError("pattern must be 1 to 500 characters.")
+    if "/" not in pattern and not anchored:
         pattern = "**/" + pattern
     try:
         return safe_regex.compile(_translate(pattern), safe_regex.IGNORECASE | safe_regex.VERSION0 | safe_regex.DOTALL)
@@ -371,9 +409,17 @@ def rg_pattern(query):
     return "".join(out)
 
 
+def candidate_key(name):
+    """A file name compared loosely: rg prints the spelling on disk, Git its own, and
+    on macOS they can differ in letter case or Unicode normal form. A looser match only
+    makes Python read more files, never changes a result."""
+    return unicodedata.normalize("NFC", name).casefold()
+
+
 def rg_candidates(rg, base, query, case_sensitive, deadline):
-    """Relative paths of files under base that may contain query, or None when rg
-    cannot be trusted for this search (any error, a timeout or too much output)."""
+    """candidate_key()s of relative paths of files under base that may contain query,
+    or None when rg cannot be trusted for this search (any error, a timeout or too
+    much output, or a query that cannot be passed as an argument)."""
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         return None
@@ -387,13 +433,13 @@ def rg_candidates(rg, base, query, case_sensitive, deadline):
     env = {key: value for key, value in os.environ.items() if key in RG_ENVIRONMENT}
     try:
         code, output, overflow = bounded_run(argv, base, env, min(RG_TIMEOUT, remaining), PROCESS_OUTPUT_LIMIT)
-    except OSError:
-        return None
+    except (OSError, ValueError):
+        return None  # ValueError: for example a lone surrogate, which no argument can hold.
     if overflow or code not in (0, 1):
         return None  # 2 also means that some file could not be read.
     names = set()
     for raw in output.split(b"\0"):
         if raw:
             name = raw.decode("utf-8", errors="surrogateescape")
-            names.add(name[2:] if name.startswith("./") else name)
+            names.add(candidate_key(name[2:] if name.startswith("./") else name))
     return names

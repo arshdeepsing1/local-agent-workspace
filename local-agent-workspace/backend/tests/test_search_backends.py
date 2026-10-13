@@ -391,3 +391,107 @@ def test_scan_limits_count_files_that_are_never_read(tmp_path, monkeypatch):
     monkeypatch.setattr(tools_module, "SEARCH_FILE_SCAN_LIMIT", 1)
     with pytest.raises(ValueError, match="file scan"):
         tools.search_files("needle")
+
+
+@needs_git
+@pytest.mark.parametrize("target", ["outside", ".git"])
+def test_a_git_listed_file_below_a_symlinked_folder_is_never_listed_or_read(tmp_path, monkeypatch, target):
+    root = tmp_path / "repo"
+    (root / "sub").mkdir(parents=True)
+    (root / "sub" / "a.txt").write_text("needle inside\n")
+    (root / "readme.txt").write_text("plain\n")
+    git(root, "init", "-q")
+    git(root, "add", ".")
+    git(root, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "x")
+    shutil.rmtree(root / "sub")
+    if target == "outside":
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "a.txt").write_text("needle OUTSIDE-SECRET-VALUE\n")
+        (root / "sub").symlink_to(outside)
+    else:
+        (root / ".git" / "a.txt").write_text("needle [remote] OUTSIDE-SECRET-VALUE\n")
+        (root / "sub").symlink_to(".git")
+    tools = WorkspaceTools(str(root))
+    with pytest.raises(ValueError):
+        tools.path("sub/a.txt")
+    assert tools.find_files("*.txt")["files"] == ["readme.txt"]
+    for regex_mode in (False, True):
+        result = tools.search_files("needle", regex=regex_mode)
+        assert result["matches"] == [] and result["skipped_files"] == 0
+    rg = fake_rg(tmp_path, "sys.stdout.write('./sub/a.txt\\0'); sys.exit(0)")
+    monkeypatch.setattr(search, "ripgrep", lambda: rg)
+    assert tools.search_files("needle", case_sensitive=True)["matches"] == []
+    assert "OUTSIDE-SECRET-VALUE" not in str(tools.search_files("needle", output_mode="count"))
+
+
+@needs_git
+@pytest.mark.parametrize("workspace", ["home", "granted"])
+def test_a_dotfiles_repository_at_home_never_hides_files_in_home(tmp_path, monkeypatch, workspace):
+    home = tmp_path / "home"
+    home.mkdir()
+    git(home, "init", "-q")
+    (home / ".gitignore").write_text("*\n")  # Ignores everything.
+    (home / "proj").mkdir()
+    (home / "proj" / "app.py").write_text("needle = 1\n")
+    monkeypatch.setenv("HOME", str(home))
+    if workspace == "home":
+        tools = WorkspaceTools(str(home))
+        expected = "proj/app.py"
+    else:
+        (tmp_path / "work").mkdir()
+        tools = WorkspaceTools(str(tmp_path / "work"), allowed_directories=[str(home)])
+        expected = str(home / "proj" / "app.py")
+    for path in (str(home / "proj"), str(home)):
+        found = tools.find_files("*.py", path=path)
+        assert found["files"] == [expected] and "note" not in found
+        assert [m["path"] for m in tools.search_files("needle", path=path)["matches"]] == [expected]
+
+
+@needs_git
+def test_a_workspace_inside_a_larger_repository_says_gitignore_was_not_applied(tmp_path):
+    mono = tmp_path / "mono"
+    (mono / "app" / "src").mkdir(parents=True)
+    (mono / "app" / "build").mkdir()
+    (mono / ".gitignore").write_text("build/\n")
+    (mono / "app" / "src" / "a.js").write_text("needle\n")
+    (mono / "app" / "build" / "bundle.js").write_text("needle\n")
+    git(mono, "init", "-q")
+    assert WorkspaceTools(str(mono)).find_files("*.js") == {
+        "files": ["app/src/a.js"], "total": 1, "next_offset": None, "truncated": False}
+    tools = WorkspaceTools(str(mono / "app"))
+    found = tools.find_files("*.js")
+    assert found["files"] == ["build/bundle.js", "src/a.js"]
+    assert found["note"] == search.OUTSIDE_NOTE
+    assert "outside" in found["note"] and ".gitignore was not applied" in found["note"]
+    assert tools.search_files("needle", output_mode="files_with_matches")["note"] == search.OUTSIDE_NOTE
+
+
+def test_a_query_rg_cannot_take_falls_back_with_the_same_result(tmp_path, monkeypatch):
+    tools = small_tree(tmp_path / "work")
+    (tmp_path / "work" / "emoji.txt").write_text("half \U0001f600 here\n")
+    for query in ("\ud83d", "needle \udcff"):
+        expected = tools.search_files(query, case_sensitive=True)
+        rg = fake_rg(tmp_path, "sys.exit(1)")
+        monkeypatch.setattr(search, "ripgrep", lambda: rg)
+        assert tools.search_files(query, case_sensitive=True) == expected
+        monkeypatch.setattr(search, "ripgrep", lambda: None)
+
+
+def test_rg_candidates_match_files_whatever_case_or_normal_form_rg_prints(tmp_path, monkeypatch):
+    import unicodedata
+    root = tmp_path / "work"
+    root.mkdir()
+    composed = unicodedata.normalize("NFC", "café.txt")
+    (root / "Readme.md").write_text("needle in readme\n")
+    (root / composed).write_text("needle in cafe\n")
+    tools = WorkspaceTools(str(root))
+    expected = tools.search_files("needle")
+    assert [m["path"] for m in expected["matches"]] == ["Readme.md", composed]
+    # As rg prints names on a case- and normalization-insensitive file system after a
+    # rename: the spelling on disk, not Git's.
+    decomposed = unicodedata.normalize("NFD", composed)
+    rg = fake_rg(tmp_path, f"sys.stdout.buffer.write(b'./README.md\\0./' + {decomposed.encode()!r} + b'\\0'); sys.exit(0)")
+    monkeypatch.setattr(search, "ripgrep", lambda: rg)
+    assert tools.search_files("needle") == expected
+    assert tools.search_files("needle", case_sensitive=True) == expected

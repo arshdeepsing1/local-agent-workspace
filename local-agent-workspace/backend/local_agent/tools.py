@@ -336,7 +336,7 @@ class WorkspaceTools:
             listed = search.rg_candidates(rg, search_root, query, case_sensitive, deadline) if rg else None
             if listed is not None:
                 # rg does not follow symbolic links; Python reads those itself.
-                candidates = listed | {entry.relative for entry in entries if entry.symlink}
+                candidates = listed | {search.candidate_key(entry.relative) for entry in entries if entry.symlink}
 
         key = {"content": "matches", "files_with_matches": "files", "count": "counts"}[output_mode]
         result = {key: [], **({"total_matches": 0} if output_mode == "count" else {}),
@@ -368,7 +368,7 @@ class WorkspaceTools:
             if item.size > SEARCH_FILE_LIMIT:
                 result["skipped_files"] += 1
                 continue
-            if candidates is not None and item.relative not in candidates:
+            if candidates is not None and search.candidate_key(item.relative) not in candidates:
                 continue
             try:
                 with open(item.path, "rb") as source:
@@ -457,7 +457,17 @@ class WorkspaceTools:
             raise ValueError("Path must be a regular file or directory.")
         deadline = time.monotonic() + search.ENUMERATION_TIMEOUT
         entries, note = search.list_universe(self, base, include_ignored=include_ignored, deadline=deadline)
-        matched = [entry for entry in entries if search.glob_match(matcher, entry.relative, deadline)]
+
+        def spellings(entry):
+            """The pattern matches the path below `path`; one with a '/' also matches the
+            path as the results show it, or the absolute path."""
+            yield entry.relative
+            if "/" in pattern:
+                yield self.display_path(entry.path)
+                if pattern.startswith("/"):
+                    yield str(entry.path)
+        matched = [entry for entry in entries
+                   if any(search.glob_match(matcher, name, deadline) for name in spellings(entry))]
         if sort == "modified":
             stamped = []
             for entry in matched:
@@ -598,7 +608,7 @@ TOOL_DEFINITIONS = [
     definition("list_files", "List local files using an absolute, home-relative or workspace-relative path. The app requests access for external folders. Optional glob filters names (e.g. *.csv). Returns entries and next_offset in pages of at most 8 KB; follow next_offset with the same path, depth and glob. If listing_limit_reached is true, narrow the folder or glob to find entries beyond the first 300. Excludes secrets and generated folders. Use find_files for recursive or ** searches.",
                {"path": STRING, "depth": {"type": "integer"}, "glob": STRING,
                 "offset": {"type": "integer", "minimum": 0, "maximum": 300}}, []),
-    definition("find_files", "Find files by glob pattern under a path (default: the workspace), at any depth. ** matches any number of folders (src/**/*.test.ts); a pattern without / matches file names anywhere (*.py); {a,b} gives alternatives. Case-insensitive. Inside a Git repository, files ignored by .gitignore are skipped unless include_ignored=true. sort=modified lists newest first. Returns files, total and next_offset in pages of at most 8 KB; follow next_offset with the same arguments. Excludes secrets and generated folders. External paths need folder access.",
+    definition("find_files", "Find files by glob pattern under a path (default: the workspace), at any depth. ** matches any number of folders (src/**/*.test.ts); a pattern without / matches file names anywhere (*.py), and ./*.py only directly in path; a pattern with / matches the path below path or the path as results show it; {a,b} gives alternatives. Case-insensitive. Inside a Git repository that starts within the workspace or granted folder, files ignored by .gitignore are skipped unless include_ignored=true; a note says when .gitignore was not applied. sort=modified lists newest first. Returns files, total and next_offset in pages of at most 8 KB; follow next_offset with the same arguments. Excludes secrets and generated folders. External paths need folder access.",
                {"pattern": STRING, "path": {"type": "string", "default": "."},
                 "sort": {"type": "string", "enum": ["path", "modified"], "default": "path"},
                 "include_ignored": {"type": "boolean", "default": False},
@@ -608,7 +618,7 @@ TOOL_DEFINITIONS = [
                {"path": STRING, "start_line": {"type": "integer", "minimum": 1},
                 "max_lines": {"type": "integer", "minimum": 1, "maximum": 2000, "default": 400},
                 "tail_lines": {"type": "integer", "minimum": 1, "maximum": 2000}}, ["path"]),
-    definition("search_files", "Search one UTF-8 file or files under a directory path (default: the workspace) for literal text or a bounded regular expression. Choose the narrowest path and glob; use regex=false unless regular-expression syntax is needed. Case-insensitive by default. output_mode=files_with_matches lists matching files; count gives matches per file. Inside a Git repository, .gitignored files are skipped unless include_ignored=true. Binary and non-UTF-8 files are not searched; skipped_files counts files over 2 MB and unreadable files. Literal searches use ripgrep, when installed, to find candidate files faster; results are the same either way. Returns next_offset for pagination; output is at most 8 KB. External paths trigger folder access approval.",
+    definition("search_files", "Search one UTF-8 file or files under a directory path (default: the workspace) for literal text or a bounded regular expression. Choose the narrowest path and glob; use regex=false unless regular-expression syntax is needed. Case-insensitive by default. output_mode=files_with_matches lists matching files; count gives matches per file. Inside a Git repository that starts within the workspace or granted folder, .gitignored files are skipped unless include_ignored=true; a note says when .gitignore was not applied. Binary and non-UTF-8 files are not searched; skipped_files counts files over 2 MB and unreadable files. Literal searches use ripgrep, when installed, to find candidate files faster; results are the same either way. Returns next_offset for pagination; output is at most 8 KB. External paths trigger folder access approval.",
                {"query": STRING, "glob": STRING, "path": STRING, "regex": {"type": "boolean"},
                 "case_sensitive": {"type": "boolean"}, "context_lines": {"type": "integer", "minimum": 0, "maximum": 5},
                 "offset": {"type": "integer", "minimum": 0, "maximum": 10000},
@@ -628,7 +638,7 @@ TOOL_DEFINITIONS = [
     definition("get_job_output", "Read a bounded output page for a job in this conversation. Follow next_offset; poll running jobs only when useful. Offsets count characters in retained output; truncated means later process output was discarded.",
                {"job_id": STRING, "offset": {"type": "integer", "minimum": 0, "maximum": 1000000, "default": 0},
                 "max_chars": {"type": "integer", "minimum": 1, "maximum": 8000, "default": 4000}}, ["job_id"]),
-    definition("wait_job", "Wait until a job of this conversation finishes, or until a new output line matches until_regex (Python regular expression, case-sensitive), for at most timeout_seconds (default 60, max 300). Only output after from_offset counts (default: the output length when you call). Returns reason (exited, matched or timeout), the matching line, the new output (its end if long) and next_offset to wait again. Stop ends the wait; the job keeps running.",
+    definition("wait_job", "Wait until a job of this conversation finishes, or until a new output line matches until_regex (Python regular expression, case-sensitive), for at most timeout_seconds (default 60, max 300). Only output after from_offset counts (default: total_chars of the last result for this job you received, so a line printed since then still counts; 0 if none). Returns reason (exited, matched or timeout), the matching line, the new output (its end if long) and next_offset to wait again. Stop ends the wait; the job keeps running.",
                {"job_id": STRING, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 300, "default": 60},
                 "until_regex": {"type": "string", "maxLength": 500},
                 "from_offset": {"type": "integer", "minimum": 0, "maximum": 1000000}}, ["job_id"]),

@@ -168,3 +168,21 @@ async def test_a_removed_job_ends_the_wait(runtime):
     await manager.jobs._changed()
     with pytest.raises(ValueError, match="no longer available"):
         await asyncio.wait_for(watcher, 5)
+
+
+async def test_a_line_printed_after_the_last_result_still_counts_by_default(runtime):
+    manager, session, tools = runtime
+    session["permission_mode"] = "bypassPermissions"
+    started = json.loads(await manager.execute_tool(session, tools, "run_command", {
+        "command": "sleep .2; printf 'Local: http://localhost:5173 ready\\n'; sleep 30", "background": True}, "bg"))
+    assert started["total_chars"] == 0
+    async with asyncio.timeout(5):  # The line is printed before the model calls wait_job.
+        while "ready" not in manager.jobs.get(started["job_id"])["output"]:
+            await asyncio.sleep(.02)
+    result = await wait(manager, session, tools, job_id=started["job_id"], until_regex="ready", timeout_seconds=1)
+    assert result["reason"] == "matched" and result["output_start"] == 0
+    assert result["match"]["line"] == "Local: http://localhost:5173 ready"
+    # The default then starts after what that result showed.
+    again = await wait(manager, session, tools, job_id=started["job_id"], until_regex="ready", timeout_seconds=1)
+    assert again["reason"] == "timeout" and again["output_start"] == result["total_chars"]
+    await manager.jobs.stop(started["job_id"])

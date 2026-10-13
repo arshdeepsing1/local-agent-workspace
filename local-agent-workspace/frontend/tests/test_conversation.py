@@ -294,10 +294,11 @@ def test_find_files_and_wait_job_cards_name_their_pattern_and_job(ui, page):
     ]""")
     expect(page.get_by_role("button", name="find files src/**/*.test.ts in web", exact=True)).to_be_visible()
     expect(page.get_by_role("button", name="find files *.py", exact=True)).to_be_visible()
-    expect(page.get_by_role("button", name="wait job job 01234567 until /ready on [0-9]+/", exact=True)).to_be_visible()
-    expect(page.get_by_role("button", name="wait job job fedcba98", exact=True)).to_be_visible()
+    expect(page.get_by_role("button", name="wait job 01234567 until /ready on [0-9]+/", exact=True)).to_be_visible()
+    expect(page.get_by_role("button", name="wait job fedcba98", exact=True)).to_be_visible()
     page.get_by_text("Activity · 4 actions").click()
     expect(page.locator("details.activity-summary").get_by_text("· src/**/*.test.ts in web")).to_be_visible()
+    expect(page.locator("details.activity-summary").get_by_text("· 01234567 until /ready on [0-9]+/")).to_be_visible()
 
 
 def test_activity_summary_keeps_states_and_approval(ui, page):

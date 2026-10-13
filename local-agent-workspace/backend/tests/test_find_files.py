@@ -39,13 +39,17 @@ from local_agent.tools import TOOL_DEFINITIONS, QUERY_OUTPUT_LIMIT, WorkspaceToo
     ("file{1", "file{1", True),
     ("a+b(c).txt", "a+b(c).txt", True),
     ("**", "any/where/at/all.txt", True),
+    ("./src/**/*.ts", "src/a/b.ts", True),
+    ("./*.py", "a.py", True),
+    ("./*.py", "d/a.py", False),
+    ("././docs/*.md", "docs/a.md", True),
 ])
 def test_glob_table(pattern, path, expected):
     assert (search.compile_glob(pattern).fullmatch(path) is not None) is expected
 
 
 @pytest.mark.parametrize("pattern, message", [("", "1 to 500"), ("x" * 501, "1 to 500"), ("a\x00b", "1 to 500"),
-                                              ("{a,{b,c}}", "Nested"), ("{" + ",".join("abcdefghijklmnopqrstu") + "}", "20")])
+                                              ("{a,{b,c}}", "Nested"), ("./", "1 to 500"), ("{" + ",".join("abcdefghijklmnopqrstu") + "}", "20")])
 def test_invalid_patterns(pattern, message):
     with pytest.raises(ValueError, match=message):
         search.compile_glob(pattern)
@@ -133,3 +137,16 @@ async def test_find_files_is_a_read_tool_run_through_execute(tmp_path):
     assert names[names.index("list_files") + 1] == "find_files"
     result = await WorkspaceTools(str(tmp_path)).execute("find_files", {"pattern": "src/*.{ts,tsx}", "sort": "path"})
     assert result["files"] == ["src/a.ts", "src/b.tsx"]
+
+
+def test_patterns_match_paths_below_path_or_as_results_show_them(tmp_path):
+    tree(tmp_path, ["src/app/a.test.ts", "src/b.ts", "lib/c.ts"])
+    tools = WorkspaceTools(str(tmp_path))
+    expected = ["src/app/a.test.ts", "src/b.ts"]
+    assert tools.find_files("**/*.ts", path="src")["files"] == expected
+    assert tools.find_files("src/**/*.ts", path="src")["files"] == expected  # As the results show the paths.
+    assert tools.find_files("./src/**/*.ts")["files"] == expected
+    assert tools.find_files("app/*.ts", path="src")["files"] == ["src/app/a.test.ts"]
+    assert tools.find_files(str(tmp_path / "src" / "**" / "*.ts"), path="src")["files"] == expected
+    assert tools.find_files("./*.ts", path="src")["files"] == ["src/b.ts"]
+    assert tools.find_files("src/*.ts", path="lib")["files"] == []  # Never outside path.
