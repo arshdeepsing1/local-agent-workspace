@@ -887,7 +887,12 @@ class AgentManager:
         for hook in self.extensions.public_config()["hooks"]:
             if asyncio.current_task().cancelling():
                 return
-            if not hook["enabled"] or hook["event"] != phase or ("tools" in hook and name not in hook["tools"]):
+            # A hook for read_file also runs for outline_file, and one for list_files or find_files for
+            # project_overview (COVERED_BY), as their rules and turned-off tools do.
+            selected = hook.get("tools")
+            cover = None if selected is None or name in selected else covering_tool(name, selected)
+            if not hook["enabled"] or hook["event"] != phase or (selected is not None and name not in selected
+                                                                 and cover is None):
                 continue
             hook_tools = self.session_tools(session)
             verdict = self.permission(session, hook_tools, f"hook_{phase}", {"hook_id": hook["id"]})
@@ -913,7 +918,8 @@ class AgentManager:
                             if approval == "declined" else event["blocked_reason"])
                 if asyncio.current_task().cancelling():
                     return
-                payload = {"event": phase, "session_id": session["id"], "tool": name, "arguments": arguments, "call_id": call_id}
+                payload = {"event": phase, "session_id": session["id"], "tool": name, "arguments": arguments, "call_id": call_id,
+                           **({"covered_by": cover} if cover else {})}
                 if result is not None:
                     payload["result"] = result
                 if phase == "tool_failure":

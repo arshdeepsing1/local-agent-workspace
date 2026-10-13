@@ -1573,7 +1573,9 @@ input. Existing MCP schema/argument caps remain in force.
 Hooks support `before_tool`, `after_tool`, and `tool_failure`. Each enabled hook receives JSON on
 stdin with the event, conversation ID, tool, arguments, stable `call_id`, and (after execution) result.
 The optional `tools` array selects exact names (including MCP names); omit it for
-all tools, or use an empty array to match none. Failure hooks receive the original
+all tools, or use an empty array to match none. A hook for `read_file` also runs for
+`outline_file`, and one for `list_files` or `find_files` also runs for `project_overview`;
+its input then has `covered_by` naming the selected tool. Failure hooks receive the original
 error/outcome for invoked tools that fail, including MCP `is_error` results. Schema,
 policy, and approval rejections and cancelled actions do not launch failure hooks.
 Foreground commands with failed/timed-out results also trigger failure hooks;
@@ -1949,8 +1951,8 @@ with the counts left out in `omitted`). It lists the same files as `find_files` 
 `.gitignore` handling and exclusions); a folder too large to list (more than 200,000
 files, 20,000 folders or 10 seconds) gives a partial overview of its top level with a note
 instead of an error. Both are read tools: no card, allowed in Plan and Don't ask, and
-external paths need folder access. A deny rule or a turned-off tool covers them through
-the tool that shows the same content: rules for `read_file` cover `outline_file`, and
+external paths need folder access. A deny rule, a turned-off tool or a hook covers them
+through the tool that shows the same content: rules for `read_file` cover `outline_file`, and
 rules for `list_files` or `find_files` cover `project_overview`. With both tools offered,
 the system message asks the model to start an unfamiliar or large project with
 `project_overview`, to outline long files, to read a handoff completely when a full read
