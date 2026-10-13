@@ -4,6 +4,38 @@ Notable changes to Local Agent Workspace, newest first. Dates are UTC.
 
 ## Unreleased
 
+Roadmap milestone M3 (permission rules, plan hand-off, questions):
+
+- Permission rules: **Always allow…** on an approval card saves a rule for this chat, this
+  project or all projects: an exact command, commands starting with a prefix followed only by
+  listed options, all file edits or edits under one folder, an MCP tool or a hook. The
+  Permissions menu lists rules by scope, adds **Deny** and **Always ask** rules (**Add a
+  rule…**) and removes them. Deny beats ask, and ask beats allow, in every mode (Bypass
+  included); rules never override credential exclusions, folder access or Plan. Project and
+  all-project rules live in `permission_rules.json` in the state folder, never in a repository.
+- Commands allowed by an exact or prefix rule run without a shell, and shell syntax never
+  matches such a rule. Programs that run other programs or code (`sh`, `sudo`, `env`, `xargs`,
+  `python -c`, `git -c`, `rg --pre` and similar) cannot be allowed by a rule, and a command a
+  deny or ask rule might cover but cannot be checked exactly gets a card.
+- Auto and Plan run a fixed list of read-only command forms (`pwd`, `ls`, `git status`,
+  `git diff`, `git log --oneline` and a few more) without a card, with Git hardened against a
+  repository's own programs (fsmonitor, hooks, filters, external diff and text conversion,
+  pager, signing, lazy fetch). No test runners or package managers are on the list.
+- Modes: a new **Don't ask** mode refuses instead of asking. The mode can change while a
+  response runs or a card waits; waiting cards are checked again, a running subagent follows,
+  and switching to Bypass asks for confirmation. Protected files (editor, CI and agent
+  configuration such as `.github/workflows`, `.vscode`, `AGENTS.md`, `CLAUDE.md`, shell startup
+  files) always ask outside Bypass. **Agent tools → Tools** turns tools off for one chat.
+  `delegate_task` and `stop_job` ask in Manual mode.
+- **Edit before approving**: change a waiting command, a `write_file` content or a single
+  `edit_file` replacement; the app checks it again and shows the new preview.
+- Plan hand-off: in Plan the agent calls `submit_plan`; its card offers **Approve** (then
+  Accept edits or Manual) or **Keep planning** with feedback. Questions: `ask_user` asks 1–4
+  questions with 2–4 options plus **Other**, also in Plan; subagents' questions reach you
+  through the parent chat. Both cards use the approval wait.
+- The state folder (settings, rules, conversations) cannot be reached through any file tool.
+- Markdown transcripts include answers to questions and plan reviews.
+
 Roadmap milestone M2 (agent quality):
 
 - Search and reading: a new `find_files` tool (globs with `**` and `{a,b}`, sort by path or
