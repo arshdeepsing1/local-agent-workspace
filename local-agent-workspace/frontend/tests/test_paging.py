@@ -38,20 +38,44 @@ def test_connect_checks_the_header_not_the_full_conversation(ui, page):
     assert ui.requests("/api/sessions/a", "GET") == []
 
 
+# Records the scroll position as soon as the earlier messages are in the page, before any
+# animation frame: a smooth scroll would still be near the top then.
+FIRST_POSITION = """const el = document.querySelector('.transcript')
+new MutationObserver((records, observer) => {
+  if (!el.querySelector('.user-message')?.textContent.includes('Message 0')) return
+  window.firstPosition = { top: el.scrollTop, height: el.scrollHeight }
+  observer.disconnect()
+}).observe(el, { childList: true, subtree: true })"""
+
+
 def test_earlier_messages_are_prepended_without_moving_the_view(ui, page):
     start(ui, page)
     button = page.get_by_role("button", name="Load earlier messages (100 more)")
     expect(button).to_be_visible()
-    ui.run("document.querySelector('.transcript').scrollTop = 40")
+    ui.run("document.querySelector('.transcript').scrollTo({ top: 0, behavior: 'instant' })")
     before = ui.js("(el => ({ top: el.scrollTop, height: el.scrollHeight }))(document.querySelector('.transcript'))")
-    ui.run("document.querySelector('.load-earlier').click()")
+    assert before["top"] == 0
+    ui.run(FIRST_POSITION)
+    button.click()
     expect(page.locator(".user-message").first).to_contain_text("Message 0")
     expect(button).to_have_count(0)
     assert texts(page) == [f"Message {number}" for number in range(250)]
     assert [call["path"] for call in ui.js("fake.requests(/\\/events\\?/)")] == ["/api/sessions/a/events?before=e100&limit=100"]
+    first = ui.js("window.firstPosition")
     after = ui.js("(el => ({ top: el.scrollTop, height: el.scrollHeight }))(document.querySelector('.transcript'))")
     assert after["height"] > before["height"]
-    assert abs(after["top"] - (before["top"] + after["height"] - before["height"])) <= 1
+    assert first["top"] > 0 and abs(first["top"] - (first["height"] - before["height"])) <= 1
+    assert abs(after["top"] - first["top"]) <= 1
+
+
+def test_focus_moves_to_the_transcript_when_the_last_page_is_loaded(ui, page):
+    start(ui, page)
+    button = page.get_by_role("button", name="Load earlier messages (100 more)")
+    button.focus()
+    page.keyboard.press("Enter")
+    expect(page.locator(".user-message").first).to_contain_text("Message 0")
+    expect(button).to_have_count(0)
+    assert ui.js("document.activeElement.className") == "transcript"
 
 
 def test_one_page_request_at_a_time(ui, page):

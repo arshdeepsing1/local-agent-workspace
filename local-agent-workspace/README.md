@@ -245,12 +245,14 @@ when opening a conversation or performing restart recovery.
     Archived chats are hidden, also when pinned; **Archived (N)** at the end of the list
     shows them, and **Unarchive** brings one back. Click a tag on a row to show only chats
     with that tag; **Clear tag filter** shows all again. Pinning, archiving and tagging do not
-    move a chat in the list or mark it unread, and work while it is replying. Tags are
+    change a chat's place in the newest-first order or mark it unread, and work while it is
+    replying. A pinned subagent chat is listed under **Pinned**, not under its parent. Tags are
     exported with a chat and kept by forks and imports; pin and archive are not.
   - **Search**: **Search conversations** shows only chats whose titles contain every word you
     type. From 3 characters, after a short pause, the messages of all chats are searched too
     (your messages and the agent's replies, not tool output) and listed under **Found in
-    messages** with a short excerpt; click one to open its chat. Excerpts have the configured
+    messages** with a short excerpt (chats that match only by title are not listed again
+    there); click one to open its chat. Excerpts have the configured
     token and common secret shapes replaced with `[REDACTED]`. The search reads the
     conversation files on demand (there is no index) and stops after 64 MiB or 3 seconds,
     saying "Search stopped early; refine your words."; archived chats are included and

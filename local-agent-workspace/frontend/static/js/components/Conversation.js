@@ -219,16 +219,21 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
   const container = useRef(null)
   const bottom = useRef(null)
   const follow = useRef(true)
-  // Prepending earlier messages keeps the visible ones in place: the scroll position moves by the added height.
+  // Prepending earlier messages keeps the visible ones in place: the scroll position moves by the
+  // added height at once (the transcript otherwise scrolls smoothly). When the last page arrives
+  // the focused button is gone, so focus moves to the transcript.
   const anchor = useRef(null)
   useLayoutEffect(() => {
     const el = container.current
-    if (el && anchor.current) el.scrollTop = anchor.current.top + el.scrollHeight - anchor.current.height
+    if (el && anchor.current) {
+      el.scrollTo({ top: anchor.current.top + el.scrollHeight - anchor.current.height, behavior: 'instant' })
+      if (anchor.current.focused && !el.contains(document.activeElement)) el.focus({ preventScroll: true })
+    }
     anchor.current = null
   }, [session.events_start])
-  const loadEarlier = () => {
+  const loadEarlier = event => {
     const el = container.current
-    anchor.current = el ? { top: el.scrollTop, height: el.scrollHeight } : null
+    anchor.current = el ? { top: el.scrollTop, height: el.scrollHeight, focused: document.activeElement === event?.currentTarget } : null
     void Promise.resolve(onLoadEarlier?.()).catch(error => { anchor.current = null; onError?.(error.message) })
   }
   const toolSummaries = useMemo(() => summarizeTools(session.events), [session.events])
@@ -236,7 +241,7 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
   useEffect(() => { if (follow.current) bottom.current?.scrollIntoView({ block: 'end' }) }, [last?.id, last?.text, last?.state])
   useEffect(() => { follow.current = true; bottom.current?.scrollIntoView({ block: 'end' }) }, [session.id])
   const tools = session.events.filter(event => event.type === 'tool')
-  return html`<div class="transcript" ref=${container} onScroll=${() => {
+  return html`<div class="transcript" ref=${container} tabIndex=${-1} onScroll=${() => {
     const el = container.current
     if (el) follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120
   }}><div class="transcript-inner">

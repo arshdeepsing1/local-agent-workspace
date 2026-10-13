@@ -17,14 +17,17 @@ const fold = text => String(text || '').toLowerCase()
 // A worktree chat belongs to the project it was made from.
 export const projectKey = session => session.worktree?.source_workspace || session.workspace || ''
 const folderName = path => path.split('/').filter(Boolean).pop() || path || 'No project'
+// Only a list of strings counts as tags, so a damaged header cannot break the list.
+const tagsOf = session => Array.isArray(session.tags) ? session.tags.filter(tag => typeof tag === 'string') : []
+const MAX_TAGS = 10
 
 // Subagent chats nest under their parent when it is listed and still linked (one level, so a
-// damaged parent cycle cannot hide both chats). Archived chats are never nested.
+// damaged parent cycle cannot hide both chats). Archived and pinned chats are never nested.
 function organize(sessions) {
   const byId = new Map(sessions.map(session => [session.id, session]))
   const childCount = new Map()
   const nestable = session => !!session.parent_session_id && session.parent_session_id !== session.id
-    && byId.has(session.parent_session_id) && !session.parent_deleted && !session.archived
+    && byId.has(session.parent_session_id) && !session.parent_deleted && !session.archived && !session.pinned
   const children = new Map()
   const topLevel = []
   for (const session of sessions) {
@@ -42,7 +45,7 @@ function organize(sessions) {
 function arrange(sessions, tree, { runningOnly, terms, tag, current }) {
   const filtering = runningOnly || terms.length > 0 || !!tag
   const passes = session => (!runningOnly || session.status !== 'idle')
-    && (!tag || (session.tags || []).some(item => fold(item) === fold(tag)))
+    && (!tag || tagsOf(session).some(item => fold(item) === fold(tag)))
     && terms.every(term => fold(session.title).includes(term))
   // While filtering, matching subagent chats are listed on their own.
   const pool = filtering ? sessions.filter(passes) : tree.topLevel
@@ -80,13 +83,22 @@ function RenameForm({ session, title, setTitle, saving, error, onSave, onCancel 
 
 function TagsForm({ session, onSave, onCancel }) {
   const input = useAutoFocus()
-  const [text, setText] = useState((session.tags || []).join(', '))
+  const [text, setText] = useState(tagsOf(session).join(', '))
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   const save = async () => {
     if (saving) return
+    // Tags that differ only in case count as one, as on the server.
+    const seen = new Set()
+    const tags = text.split(',').map(tag => tag.trim().replace(/\s+/g, ' ')).filter(tag => {
+      const key = tag.normalize('NFC').toLowerCase()
+      if (!tag || seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+    if (tags.length > MAX_TAGS) { setError(`Use at most ${MAX_TAGS} tags.`); return }
     setSaving(true); setError('')
-    try { await onSave(text.split(',').map(tag => tag.trim()).filter(Boolean)); onCancel() }
+    try { await onSave(tags); onCancel() }
     catch (e) { setError(e instanceof Error ? e.message : 'Could not save the tags.'); setSaving(false) }
   }
   return html`<form class="conversation-rename" aria-label=${`Edit tags of ${session.title}`} aria-busy=${saving}
@@ -101,28 +113,42 @@ function TagsForm({ session, onSave, onCancel }) {
   </form>`
 }
 
-// Pin, archive and tags of one chat.
-function RowMenu({ session, onMeta, onEditTags, onError }) {
+// Pin, archive and tags of one chat. onMoved(id) runs once a pin or archive change is saved,
+// since the row then moves to another section.
+function RowMenu({ session, onMeta, onEditTags, onError, onMoved }) {
   const [open, setOpen] = useState(false)
   const root = useRef(null)
   const button = useRef(null)
+  const menu = useRef(null)
   useEffect(() => {
     if (!open) return
+    menu.current?.querySelector('[role="menuitem"]')?.focus()
     const outside = event => { if (!root.current?.contains(event.target)) setOpen(false) }
-    document.addEventListener('mousedown', outside)
-    return () => document.removeEventListener('mousedown', outside)
+    document.addEventListener('pointerdown', outside)
+    document.addEventListener('focusin', outside)
+    return () => { document.removeEventListener('pointerdown', outside); document.removeEventListener('focusin', outside) }
   }, [open])
   const act = (changes) => {
     setOpen(false)
     button.current?.focus()
-    void onMeta(session.id, changes).catch(e => onError?.(e.message))
+    void onMeta(session.id, changes).then(() => onMoved?.(session.id), e => onError?.(e.message))
   }
   return html`<div class="row-menu-anchor" ref=${root} onKeyDown=${event => {
-    if (event.key === 'Escape' && open) { event.preventDefault(); setOpen(false); button.current?.focus() }
+    if (!open) return
+    if (event.key === 'Escape') { event.preventDefault(); setOpen(false); button.current?.focus() }
+    if (event.key === 'Tab') setOpen(false)
+    if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+      event.preventDefault()
+      const items = Array.from(menu.current?.querySelectorAll('[role="menuitem"]') || [])
+      const index = items.indexOf(document.activeElement)
+      const next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1
+        : (index + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length
+      items[next]?.focus()
+    }
   }}>
     <button ref=${button} class="row-more" aria-label=${`More actions for ${session.title}`} title="More actions"
       aria-haspopup="menu" aria-expanded=${open} onClick=${() => setOpen(value => !value)}><${Ellipsis} size=${14} /></button>
-    ${open ? html`<div class="row-menu" role="menu" aria-label=${`Actions for ${session.title}`}>
+    ${open ? html`<div class="row-menu" role="menu" aria-label=${`Actions for ${session.title}`} ref=${menu}>
       ${!session.archived ? html`<button role="menuitem" onClick=${() => act({ pinned: !session.pinned })}>${session.pinned ? 'Unpin' : 'Pin'}</button>` : null}
       <button role="menuitem" onClick=${() => act({ archived: !session.archived })}>${session.archived ? 'Unarchive' : 'Archive'}</button>
       <button role="menuitem" onClick=${() => { setOpen(false); onEditTags() }}>Edit tags…</button>
@@ -143,7 +169,7 @@ function RowStatus({ session, unread, failed }) {
   return changed
 }
 
-function ConversationRow({ session, selected, unread, failed, childCount, onSelect, onDelete, onAskDelete, onRename, onMeta, onTag, onError }) {
+function ConversationRow({ session, selected, unread, failed, childCount, onSelect, onDelete, onAskDelete, onRename, onMeta, onMoved, onTag, onError }) {
   const [editing, setEditing] = useState(null)  // null | 'title' | 'tags'
   const [title, setTitle] = useState('')
   const [saving, setSaving] = useState(false)
@@ -164,26 +190,28 @@ function ConversationRow({ session, selected, unread, failed, childCount, onSele
     catch (error) { setError(error instanceof Error ? error.message : 'Could not rename this conversation.') }
     finally { setSaving(false) }
   }
-  const branch = session.worktree?.branch
-  return html`<div class=${`conversation-row ${selected ? 'selected' : ''}`}>
+  const branch = typeof session.worktree?.branch === 'string' ? session.worktree.branch : ''
+  const tags = tagsOf(session)
+  return html`<div class=${`conversation-row ${selected ? 'selected' : ''}`} data-session-id=${session.id}>
     ${editing === 'title' ? html`<${RenameForm} session=${session} title=${title} saving=${saving} error=${error}
       setTitle=${value => { setTitle(value); setError('') }} onSave=${() => void save()} onCancel=${finish} />`
     : editing === 'tags' ? html`<${TagsForm} session=${session} onSave=${tags => onMeta(session.id, { tags })} onCancel=${finish} />` : html`
       <button onClick=${onSelect} title=${`${session.title}\nSession: ${session.id}`} aria-current=${selected ? 'page' : undefined}>
         ${session.status !== 'idle' && session.status !== 'awaiting_approval' ? html`<span class="activity-dot" aria-hidden="true" title=${ACTIVITY[session.status] || 'Working'} />` : null}<span class="conversation-name">${session.title}<small class="session-id"> · ${session.id.slice(0, 8)}</small></span>
-        ${branch ? html`<span class="branch-badge" title=${`Worktree branch ${branch}`}><${GitBranch} size=${11} /><span>${branch}</span></span>` : null}
         <${RowStatus} session=${session} unread=${unread} failed=${failed} />
       </button>
       <button ref=${renameButton} class="rename-session" aria-label=${`Rename ${session.title}`} title="Rename conversation"
         onClick=${() => { setTitle(session.title); setError(''); setEditing('title') }}><${Pencil} size=${14} /></button>
-      <${RowMenu} session=${session} onMeta=${onMeta} onError=${onError} onEditTags=${() => setEditing('tags')} />
+      <${RowMenu} session=${session} onMeta=${onMeta} onError=${onError} onMoved=${onMoved} onEditTags=${() => setEditing('tags')} />
       <button class="delete-session" aria-label=${`Delete ${session.title}`} onClick=${() => {
         if (childCount > 0) onAskDelete()
         else if (confirm('Delete this conversation? Your project files will remain.')) onDelete()
       }}><${Trash2} size=${14} /></button>`}
   </div>
-  ${!editing && session.tags?.length ? html`<div class="row-tags">${session.tags.map(tag => html`<button key=${tag} class="tag-chip"
-    title=${`Show conversations tagged ${tag}`} onClick=${() => onTag(tag)}>${tag}</button>`)}</div>` : null}`
+  ${!editing && (branch || tags.length) ? html`<div class="row-tags">
+    ${branch ? html`<span class="branch-badge" title=${`Worktree branch ${branch}`}><${GitBranch} size=${11} /><span>${branch}</span></span>` : null}
+    ${tags.map(tag => html`<button key=${tag} class="tag-chip"
+      title=${`Show conversations tagged ${tag}`} onClick=${() => onTag(tag)}>${tag}</button>`)}</div>` : null}`
 }
 
 // Turns browser notifications on or off; permission is asked for only by this click.
@@ -206,13 +234,16 @@ function badges(sessions, children) {
   return [waiting ? `${waiting} ${waiting === 1 ? 'needs' : 'need'} approval` : '', running ? `${running} running` : ''].filter(Boolean)
 }
 
-// Full-text matches from the server, opened with a click.
+// Chats whose messages match, from the server, opened with a click. Title matches are
+// left out: the title filter above already lists them.
+const messageHits = found => (found?.results || []).filter(result => Array.isArray(result.matches) && result.matches.length > 0)
 function FoundInMessages({ found, onOpen }) {
   if (!found) return null
+  const hits = messageHits(found)
   return html`<section class="found-in-messages" aria-label="Found in messages"><p class="section-label">Found in messages</p>
     ${found.error ? html`<p class="empty-sessions" role="alert">${found.error}</p>`
-      : found.results.length === 0 ? html`<p class="empty-sessions">No messages match.</p>`
-      : found.results.map(result => html`<button key=${result.id} class="found-result" onClick=${() => onOpen(result.id)}>
+      : hits.length === 0 ? html`<p class="empty-sessions">No messages match.</p>`
+      : hits.map(result => html`<button key=${result.id} class="found-result" onClick=${() => onOpen(result.id)}>
         <span class="found-title">${result.title}${result.archived ? html`<small class="muted"> · archived</small>` : null}</span>
         ${result.matches.map(match => html`<small key=${match.event_id} class="found-snippet">${match.snippet}</small>`)}
       </button>`)}
@@ -236,6 +267,8 @@ export default function Sidebar(props) {
   const [limits, setLimits] = useState({})  // section key -> rows shown
   const [found, setFound] = useState(null)
   const [deleting, setDeleting] = useState(null)  // { session, children }
+  const [moved, setMoved] = useState(null)  // id of a chat that Pin or Archive moved
+  const aside = useRef(null)
   const searchRequest = useRef(0)
   const terms = useMemo(() => fold(query).split(/\s+/).filter(Boolean), [query])
   const tree = useMemo(() => organize(props.sessions), [props.sessions])
@@ -256,12 +289,23 @@ export default function Sidebar(props) {
     return () => clearTimeout(timer)
   }, [text])
 
+  // The moved row is a new element, so focus follows it to its new place: its More actions
+  // button, or when the chat is now hidden, the Archived toggle.
+  useEffect(() => {
+    if (!moved) return
+    setMoved(null)
+    if (document.activeElement && document.activeElement !== document.body) return  // Focus is somewhere else now.
+    const target = aside.current?.querySelector(`.conversation-row[data-session-id="${CSS.escape(moved)}"] .row-more`)
+      || aside.current?.querySelector('.archived-toggle') || aside.current?.querySelector('.conversation-search input')
+    target?.focus()
+  }, [moved])
+
   const select = id => { props.onSelect(id); props.close() }
   const row = session => html`<${ConversationRow} key=${session.id} session=${session} selected=${props.activeId === session.id}
     unread=${!!props.attention?.unread(session)} failed=${!!props.attention?.failed(session)}
     childCount=${tree.childCount.get(session.id) || 0} onSelect=${() => select(session.id)}
     onDelete=${() => props.onDelete(session.id)} onAskDelete=${() => setDeleting({ session, children: tree.childCount.get(session.id) || 0 })}
-    onRename=${props.onRename} onMeta=${props.onMeta} onTag=${setTag} onError=${props.onError} />`
+    onRename=${props.onRename} onMeta=${props.onMeta} onMoved=${setMoved} onTag=${setTag} onError=${props.onError} />`
   // A row, and while nothing is filtered, its subagent chats behind a toggle.
   const entry = session => {
     const kids = view.filtering ? [] : tree.children.get(session.id) || []
@@ -293,12 +337,14 @@ export default function Sidebar(props) {
     </section>`
   }
 
+  const searching = text.length >= SEARCH_MIN_CHARS
   const empty = props.sessions.length === 0 ? 'Your conversations will appear here.'
     : view.listed === 0 && runningOnly ? 'No conversation is running.'
-      : view.listed === 0 && view.filtering && !view.archived.length ? 'No conversation matches.' : ''
+      : view.listed === 0 && view.filtering && !view.archived.length && !(searching && messageHits(found).length)
+        ? (terms.length ? 'No titles match.' : 'No conversation matches.') : ''
   return html`
     ${props.open ? html`<button class="sidebar-scrim" aria-label="Close sidebar" onClick=${props.close} />` : null}
-    <aside class=${`sidebar ${props.open ? 'visible' : ''}`}>
+    <aside class=${`sidebar ${props.open ? 'visible' : ''}`} ref=${aside}>
       <div class="brand"><${Brand} /><div><span>Local</span></div><span class="code-label"><${Code2} size=${17} />Code</span>
         <button class="icon-button mobile-only" onClick=${props.close} aria-label="Close sidebar"><${X} /></button>
       </div>
@@ -320,7 +366,7 @@ export default function Sidebar(props) {
         ${view.pinned.length ? html`<section class="pinned-group" aria-label="Pinned"><p class="section-label"><${Pin} size=${12} />Pinned</p>
           ${rows('pinned', view.pinned)}</section>` : null}
         ${view.groups.map(group)}
-        <${FoundInMessages} found=${text.length >= SEARCH_MIN_CHARS ? found : null} onOpen=${select} />
+        <${FoundInMessages} found=${searching ? found : null} onOpen=${select} />
         ${view.archived.length ? html`<button class="archived-toggle" aria-expanded=${showArchived}
           onClick=${() => setShowArchived(value => !value)}>${showArchived ? html`<${ChevronDown} size=${13} />` : html`<${ChevronRight} size=${13} />`}Archived (${view.archived.length})</button>
           ${showArchived ? html`<section class="archived-group" aria-label="Archived">${rows('archived', view.archived)}</section>` : null}` : null}
