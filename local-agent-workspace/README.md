@@ -242,6 +242,9 @@ when opening a conversation or performing restart recovery.
 ## Working with the app
 
 - **New conversation**: choose a model, then send a task. Enter sends; Shift+Enter adds a line.
+  A message is limited to 50,000 characters. A longer one is not sent (it stays in the box)
+  and the app advises saving long text such as a handoff as a file in the project and
+  attaching it with `@`, so the agent can outline it and read the parts it needs.
   Opening the root URL or clicking **New** starts with an empty context. Sending the
   first message creates a unique session, even if another chat has the same title.
   Select a sidebar conversation to resume it. Each saved chat has a `?session=<uuid>`
