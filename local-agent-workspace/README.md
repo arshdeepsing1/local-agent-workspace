@@ -825,7 +825,9 @@ it and compaction continues with the summary only. Subagent conversations do not
 write compaction handoffs. Turn the setting off for the previous summary-only
 compaction.
 The newest turn and its complete tool exchanges are retained verbatim;
-the preceding turn is also retained when space allows. One request can outgrow the
+the preceding turn is also retained when space allows. The app's hidden messages
+inside a turn (automatic retries, Verify results) belong to that turn and never count
+as a turn of their own. One request can outgrow the
 budget by itself, for example when it reads many large files. The app then summarizes
 that request's earlier tool exchanges and continues instead of stopping: the request
 itself stays verbatim after the summary, followed by its latest exchanges up to half

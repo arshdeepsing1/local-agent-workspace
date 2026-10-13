@@ -339,8 +339,9 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
     in_turn = False
 
     if force_compact or estimate > input_budget:
+        # Turn starts only: the app's hidden continuations sit inside a turn.
         boundaries = [index for index, message in enumerate(wire)
-                      if index > state["through"] and message.get("role") == "user"]
+                      if index > state["through"] and message.get("role") == "user" and not is_continuation(message)]
         if force_compact and not boundaries:
             raise ValueError("No earlier turns to compact. The latest turn is kept intact.")
 

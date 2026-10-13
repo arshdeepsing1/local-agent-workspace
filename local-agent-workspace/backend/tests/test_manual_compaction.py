@@ -10,7 +10,7 @@ from local_agent.api import create_app
 from local_agent.config import Settings
 from local_agent.context import (
     DEFAULT_CONTEXT_WINDOW, MIN_CONTEXT_WINDOW, SUMMARY_MAX_TOKENS, build_summary_messages, estimate_tokens,
-    handoff_output_tokens, prepare_context,
+    VERIFY_CONTINUATION_PREFIX, handoff_output_tokens, prepare_context,
 )
 from local_agent.instructions import load_project_instructions
 from local_agent.store import Store
@@ -234,6 +234,11 @@ async def test_manual_compaction_save_failure_does_not_publish_or_later_persist_
 def test_manual_compaction_rejects_no_earlier_turn_and_busy_sessions_before_inference(runtime):
     manager, session, _ = runtime
     session["context_state"]["through"] = 6
+    manager.store.save(session)
+    with pytest.raises(ValueError, match="No earlier turns"):
+        manager.start_compaction(session["id"])
+    # A hidden app continuation after the cut is part of the latest turn, not an earlier one.
+    session["wire"].append({"role": "user", "content": VERIFY_CONTINUATION_PREFIX + " the verify command failed."})
     manager.store.save(session)
     with pytest.raises(ValueError, match="No earlier turns"):
         manager.start_compaction(session["id"])

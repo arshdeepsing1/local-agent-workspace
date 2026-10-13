@@ -428,6 +428,29 @@ async def test_manual_compaction_still_keeps_the_latest_turn_intact():
                               forbidden_summary, force_compact=True)
 
 
+VERIFY_MESSAGE = user(VERIFY_CONTINUATION_PREFIX + " the project's verify command `pytest -q` failed (failed, exit 1).")
+
+
+async def test_manual_compaction_does_not_cut_one_turn_at_its_continuation():
+    # One turn with a Verify fix round: the hidden Verify message is not an earlier turn.
+    wire = [*reading_turn(files=1), assistant("Done."), VERIFY_MESSAGE, *read_exchange(1), assistant("Fixed.")]
+    with pytest.raises(ValueError, match="No earlier turns to compact"):
+        await prepare_context(wire, {}, SYSTEM, TOOLS, DEFAULT_CONTEXT_WINDOW, forbidden_summary, force_compact=True)
+
+
+async def test_automatic_compaction_keeps_the_latest_turn_whole_past_its_continuations():
+    wire = [user("Read the old log."), *read_exchange(0, size=75000), assistant("Read it."),
+            user("Latest request"), assistant("bad args"), user(INVALID_ARGUMENTS_CONTINUATION),
+            *read_exchange(1, size=100), assistant("Done."), VERIFY_MESSAGE, *read_exchange(2, size=100)]
+
+    async def summarize(previous, chunk, limit_bytes):
+        return "Old log read."
+
+    messages, state, info = await prepare_context(wire, {}, SYSTEM, TOOLS, COMPACTION_CONTEXT_WINDOW, summarize)
+    assert state["through"] == 4 and not info.get("compacted_in_turn")
+    assert messages[1] == user(SUMMARY_PREFIX + "Old log read.") and messages[2:] == wire[4:]
+
+
 def test_summary_boundaries_are_turn_starts_or_responses_inside_a_turn():
     wire = reading_turn(files=2)
     assert [index for index in range(len(wire) + 1) if context_boundary(wire, index)] == [0, 1, 3, 5]

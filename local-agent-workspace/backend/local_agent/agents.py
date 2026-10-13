@@ -1793,7 +1793,8 @@ class AgentManager:
         if not isinstance(preservation_note, str) or len(preservation_note) > 1000:
             raise ValueError("The preservation note must be at most 1,000 characters.")
         through = session.get("context_state", {}).get("through", 0)
-        if not any(index > through and message.get("role") == "user" for index, message in enumerate(session["wire"])):
+        if not any(index > through and message.get("role") == "user" and not is_continuation(message)
+                   for index, message in enumerate(session["wire"])):
             raise ValueError("No earlier turns to compact. The latest turn is kept intact.")
         self.workspace_available(session["workspace"])
         self.live[session_id] = session
