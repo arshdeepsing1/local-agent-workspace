@@ -110,6 +110,7 @@ def test_usage_graph_and_estimated_cost(ui, page):
     expect(cards.locator("div", has_text="Uncached input")).to_contain_text("1,200")
     expect(cards.locator("div", has_text="Cache read")).to_contain_text("300")
     expect(cards.locator("div", has_text="Cache write")).to_contain_text("100")
+    expect(cards.locator("div", has_text="Automatic retries")).to_contain_text("3")
     expect(page.get_by_text("Input incl. cache")).to_be_visible()
     expect(page.get_by_role("img", name=re.compile("Tokens by model call"))).to_be_visible()
     expect(page.get_by_role("cell", name="compaction")).to_be_visible()
@@ -120,6 +121,74 @@ def test_usage_graph_and_estimated_cost(ui, page):
     ui.rerender("{ ...dialogProps({ ...session(), status: 'running' }) }")
     ui.js("new Promise(done => setTimeout(done, 20))")
     assert len(ui.requests("/api/sessions/a/metrics")) == requests
+
+
+def test_verify_tab_loads_and_saves_the_project_command(ui, page):
+    open_tab(ui, page, "Verify")
+    section = page.get_by_role("region", name="Verify")
+    expect(section.get_by_role("heading", name="Verify command")).to_be_visible()
+    expect(section.get_by_text(re.compile(r"changed files in this project \(/project\)"))).to_be_visible()
+    command = section.get_by_role("textbox", name="Command")
+    expect(command).to_have_value("pytest -q")
+    expect(command).to_have_attribute("placeholder", "pytest -q")
+    expect(section.get_by_role("spinbutton", name="Time limit (seconds)")).to_have_value("600")
+    command.fill("  make check  ")
+    section.get_by_role("spinbutton", name="Time limit (seconds)").fill("120")
+    section.get_by_role("spinbutton", name="Fix rounds").fill("3")
+    section.get_by_role("button", name="Save", exact=True).click()
+    expect(section.get_by_role("status")).to_have_text("Verify command saved for this project.")
+    assert ui.bodies("/api/project-settings?session_id=a", "PUT") == [
+        {"verify_command": "make check", "verify_timeout_seconds": 120, "verify_max_rounds": 3}]
+    expect(command).to_have_value("make check")
+    command.fill("")
+    section.get_by_role("button", name="Save", exact=True).click()
+    expect(section.get_by_role("status")).to_have_text("Verify is off for this project.")
+    assert ui.bodies("/api/project-settings?session_id=a", "PUT")[-1]["verify_command"] == ""
+
+
+def test_verify_tab_reports_a_rejected_value(ui, page):
+    open_tab(ui, page, "Verify", """fake.override = (path, options) => path.startsWith('/api/project-settings') && options.method === 'PUT'
+      ? fake.json({ detail: 'The verify time limit must be an integer from 10 to 3,600 seconds.' }, 400) : undefined""")
+    section = page.get_by_role("region", name="Verify")
+    expect(section.get_by_role("textbox", name="Command")).to_have_value("pytest -q")
+    section.get_by_role("spinbutton", name="Time limit (seconds)").fill("5")
+    section.get_by_role("button", name="Save", exact=True).click()  # The field's own range check stops this one.
+    assert ui.bodies("/api/project-settings?session_id=a", "PUT") == []
+    section.get_by_role("spinbutton", name="Time limit (seconds)").fill("20")
+    section.get_by_role("button", name="Save", exact=True).click()
+    expect(section.get_by_role("alert")).to_have_text("The verify time limit must be an integer from 10 to 3,600 seconds.")
+    expect(section.get_by_role("status")).to_have_count(0)
+
+
+def test_saving_verify_keeps_keyboard_focus_and_ignores_repeat_submits(ui, page):
+    open_tab(ui, page, "Verify", pending("saving", "path.startsWith('/api/project-settings') && options.method === 'PUT'"))
+    section = page.get_by_role("region", name="Verify")
+    command = section.get_by_role("textbox", name="Command")
+    expect(command).to_have_value("pytest -q")
+    command.fill("make check")
+    command.press("Enter")
+    ui.wait("fake.calls.some(call => call.path.startsWith('/api/project-settings') && call.method === 'PUT')")
+    # The fields are read-only while saving, not disabled, so focus stays where it was.
+    expect(command).to_have_attribute("readonly", "")
+    expect(command).to_be_focused()
+    save = section.get_by_role("button", name="Save", exact=True)
+    expect(save).to_have_attribute("aria-disabled", "true")
+    command.press("Enter")
+    save.click(force=True)
+    assert len(ui.bodies("/api/project-settings?session_id=a", "PUT")) == 1
+    ui.run("fake.deferreds.saving.resolve(fake.json({ workspace: '/project', verify_command: 'make check', "
+           "verify_timeout_seconds: 600, verify_max_rounds: 2 }))")
+    expect(section.get_by_role("status")).to_have_text("Verify command saved for this project.")
+    expect(save).to_be_focused()  # The repeat click moved focus to Save, and it stays there.
+    expect(command).not_to_have_attribute("readonly", "")
+    expect(save).to_have_attribute("aria-disabled", "false")
+
+
+def test_verify_tab_without_a_conversation_uses_the_default_workspace(ui, page):
+    open_dialog(ui, selected="null")
+    page.get_by_role("button", name="Verify", exact=True).click()
+    expect(page.get_by_role("textbox", name="Command")).to_have_value("pytest -q")
+    assert ui.requests("/api/project-settings")
 
 
 def test_usage_csv_export_uses_the_local_token(ui, page):

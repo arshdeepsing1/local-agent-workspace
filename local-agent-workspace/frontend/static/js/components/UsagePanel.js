@@ -109,6 +109,7 @@ export default function UsagePanel({ session, onError }) {
         <div><small>Cache write</small><strong>${formatTokens(metrics.totals.cache_creation_input_tokens)}</strong></div>
         <div><small>Output tokens</small><strong>${formatTokens(metrics.totals.output_tokens)}</strong></div>
         <div><small>429 responses</small><strong>${integer.format(metrics.totals.rate_limited)}</strong></div>
+        <div><small>Automatic retries</small><strong>${integer.format(metrics.totals.retries ?? 0)}</strong></div>
         <div><small>Estimated cost</small><strong>${metrics.totals.estimated_dbu == null ? 'Unavailable' : `${formatDbu(metrics.totals.estimated_dbu)} DBU`}</strong></div>
       </div>
       ${!metrics.complete ? html`<p class="usage-warning" role="status">This older conversation has no complete inference ledger. Totals include visible agent calls only; title, compaction, and retry attempts may be missing.</p>` : null}

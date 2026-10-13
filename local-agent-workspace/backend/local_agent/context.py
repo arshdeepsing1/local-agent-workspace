@@ -48,6 +48,29 @@ OUTPUT_LIMIT_CONTINUATION = (
     "effects. Split large writes and tool arguments into small, focused steps that fit comfortably within the "
     "output limit."
 )
+# Hidden continuations after a response whose tool calls could not run, and the
+# prefix of the app's message after a failed Verify command.
+INVALID_ARGUMENTS_CONTINUATION = (
+    "Automatic retry: the tool calls in your previous response had invalid or incomplete arguments (details at "
+    "the end of that response), so none of them ran. Issue the needed tool calls again with complete, valid JSON "
+    "arguments; split large content into smaller calls."
+)
+INCOMPLETE_RESPONSE_CONTINUATION = (
+    "Automatic retry: your previous response ended before it was complete, so none of its tool calls ran. "
+    "Continue the user's task from the current state, inspect it before acting, and do not repeat completed "
+    "side effects."
+)
+VERIFY_CONTINUATION_PREFIX = "Automatic verification after your edits:"
+
+
+def is_continuation(message):
+    """True for a user-role message the app sent itself, not the user's request."""
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return False
+    content = message.get("content")
+    return isinstance(content, str) and (
+        content in (OUTPUT_LIMIT_CONTINUATION, INVALID_ARGUMENTS_CONTINUATION, INCOMPLETE_RESPONSE_CONTINUATION)
+        or content.startswith(VERIFY_CONTINUATION_PREFIX))
 
 
 def _weighted_size(value):
@@ -129,7 +152,7 @@ def turn_start(wire, index):
     nearest user message at or before it that is not the app's continuation."""
     for position in range(min(index, len(wire) - 1), -1, -1):
         message = wire[position]
-        if message.get("role") == "user" and message.get("content") != OUTPUT_LIMIT_CONTINUATION:
+        if message.get("role") == "user" and not is_continuation(message):
             return position
     return None
 

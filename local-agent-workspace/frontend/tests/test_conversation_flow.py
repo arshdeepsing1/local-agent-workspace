@@ -86,7 +86,23 @@ def test_continue_follows_live_turn_endings(ui, page):
     # An older record cut short by a restart, with the previous turn's reason.
     ("[{ type: 'assistant', text: 'Part', request_info: { status: 'interrupted', error_kind: 'incomplete_response' } }]",
      {"terminal_reason": "completed"}, "The response was interrupted."),
-    ("[{ type: 'error', text: 'Rate limited', error_kind: 'rate_limit' }]", {"terminal_reason": "inference_error"}, None),
+    ("[{ type: 'error', text: 'Rate limited', error_kind: 'rate_limit' }]", {"terminal_reason": "inference_error"},
+     "Databricks rate limited this chat."),
+    ("[{ type: 'error', text: 'Bad arguments', error_kind: 'invalid_tool_arguments' }]", {"terminal_reason": "inference_error"},
+     "The model's reply could not be used."),
+    ("[{ type: 'error', text: 'Ended early', error_kind: 'incomplete_response' }]", {"terminal_reason": "inference_error"},
+     "The model's reply could not be used."),
+    # A provider content-filter stop is shown as its own error, without Continue.
+    ("[{ type: 'assistant', text: 'No', request_info: { status: 'error', finish_reason: 'content_filter', "
+     "error_kind: 'content_filter' } }, { type: 'error', text: 'Filtered', error_kind: 'content_filter' }]",
+     {"terminal_reason": "inference_error"}, None),
+    # Only the turn's last error counts, and only for an inference error.
+    ("[{ type: 'error', text: 'Old', error_kind: 'rate_limit' }, { type: 'error', text: 'Server', error_kind: 'server' }]",
+     {"terminal_reason": "inference_error"}, None),
+    ("[{ type: 'error', text: 'Bad arguments', error_kind: 'invalid_tool_arguments' }]", {"terminal_reason": "error"}, None),
+    # A hidden automatic retry leaves the earlier reply's status 'error'; the turn then completed.
+    ("[{ type: 'assistant', text: 'Part', request_info: { status: 'error', error_kind: 'invalid_tool_arguments' } }, "
+     "{ type: 'assistant', text: 'All' }]", {"terminal_reason": "completed"}, None),
     ("[{ type: 'error', text: 'Broken' }]", {"terminal_reason": "error"}, None),
     # An automatic output-limit retry marks a reply interrupted; that turn then completed.
     ("[{ type: 'assistant', text: 'Part', request_info: { status: 'interrupted' } }, { type: 'assistant', text: 'All' }]",
@@ -101,6 +117,18 @@ def test_continue_reasons(ui, events, fields, shown):
     assert ui.js(f"import('/static/js/components/ContinueButton.js').then(m => m.stopReason({session}))") == shown
     # A conversation without a user message has no turn to continue.
     assert ui.js("import('/static/js/components/ContinueButton.js').then(m => m.stopReason({ status: 'idle', events: [], terminal_reason: 'stopped' }))") is None
+
+
+@pytest.mark.parametrize("kind,shown", [("invalid_tool_arguments", "The model's reply could not be used."),
+                                        ("rate_limit", "Databricks rate limited this chat.")])
+def test_continue_bar_after_an_inference_error(ui, page, kind, shown):
+    error = f"[{{ id: 'e', type: 'error', text: 'Request failed.', error_kind: '{kind}' }}]"
+    start_app(ui, page, session="a", setup=with_turn(error, terminal_reason="inference_error"))
+    ui.show_session("a")
+    expect(page.get_by_text(shown)).to_be_visible()
+    continue_button(page).click()
+    ui.wait("fake.requests('/api/sessions/a/messages', 'POST').length === 1")
+    assert ui.bodies("/api/sessions/a/messages", "POST") == [{"text": CONTINUE}]
 
 
 def test_continue_failure_is_reported(ui, page):

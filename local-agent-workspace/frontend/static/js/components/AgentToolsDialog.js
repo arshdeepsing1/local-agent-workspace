@@ -41,8 +41,8 @@ function AgentToolsScope(props) {
   return html`<dialog class="agent-tools-dialog" ref=${dialog} aria-label="Agent tools" onCancel=${props.onClose} onClick=${e => { if (e.target === dialog.current) props.onClose() }}>
     <div class="agent-tools-content">
       <header class="agent-tools-header"><div><h2>Agent tools</h2><p>${props.session?.title || 'Default workspace'}</p></div><button class="icon-button" aria-label="Close agent tools" onClick=${props.onClose}><${X} size=${18} /></button></header>
-      <nav class="agent-tools-tabs" aria-label="Agent tools sections">${['Recovery', 'Usage', 'Worktrees', 'Tasks', 'Extensions', 'Conversation'].map(name => html`<button key=${name} aria-pressed=${tab === name} onClick=${() => setTab(name)}>${name}</button>`)}</nav>
-      ${tab === 'Recovery' ? html`<${Recovery} ...${props} />` : tab === 'Usage' ? html`<${UsagePanel} session=${props.session} onError=${props.onError} />` : tab === 'Worktrees' ? html`<${Worktrees} ...${props} />` : tab === 'Tasks' ? html`<${Tasks} ...${props} />` : tab === 'Extensions' ? html`<${ExtensionsPanel} ...${props} />` :
+      <nav class="agent-tools-tabs" aria-label="Agent tools sections">${['Recovery', 'Usage', 'Worktrees', 'Tasks', 'Verify', 'Extensions', 'Conversation'].map(name => html`<button key=${name} aria-pressed=${tab === name} onClick=${() => setTab(name)}>${name}</button>`)}</nav>
+      ${tab === 'Recovery' ? html`<${Recovery} ...${props} />` : tab === 'Usage' ? html`<${UsagePanel} session=${props.session} onError=${props.onError} />` : tab === 'Worktrees' ? html`<${Worktrees} ...${props} />` : tab === 'Tasks' ? html`<${Tasks} ...${props} />` : tab === 'Verify' ? html`<${Verify} ...${props} />` : tab === 'Extensions' ? html`<${ExtensionsPanel} ...${props} />` :
         html`<${ConversationTransfer} sessionId=${props.session?.id} workspace=${props.session?.workspace || props.workspace || ''} busy=${!!props.session && props.session.status !== 'idle'} onError=${props.onError} onSelectSession=${id => { props.onSelectSession(id); props.onClose() }} />`}
     </div>
   </dialog>`
@@ -162,6 +162,42 @@ function SessionTasks({ session, onError, onSelectSession, onClose }) {
       ${profileNotice ? html`<p role="status">${profileNotice}</p>` : null}`}
     <div class="agent-tools-list">${children.map(child => html`<div class="agent-tools-row" key=${child.id}><div><strong>${child.title}</strong><small>${child.status === 'awaiting_approval' ? 'Waiting for approval' : child.status}</small><small>${profileLabels[child.tool_profile || 'inherit']}</small></div><button class="outline" aria-label=${`Open subagent ${child.title}`} onClick=${() => { onSelectSession(child.id); onClose() }}>Open</button></div>`)}</div>
     ${!busy && !children.length ? html`<p class="muted">No subagents in this conversation.</p>` : null}
+  </section>`
+}
+
+// The project's Verify command (app state, keyed by the resolved workspace, so a worktree is its own project).
+function Verify({ session, workspace, onError }) {
+  const query = scopeQuery(session)
+  const { busy, error, run } = useRequest(onError)
+  const [project, setProject] = useState(null)
+  const [command, setCommand] = useState('')
+  const [seconds, setSeconds] = useState('600')
+  const [rounds, setRounds] = useState('2')
+  const [notice, setNotice] = useState('')
+  const show = useCallback(values => {
+    setProject(values); setCommand(values.verify_command)
+    setSeconds(String(values.verify_timeout_seconds)); setRounds(String(values.verify_max_rounds))
+  }, [])
+  useEffect(() => { void run(() => api(`/project-settings${query}`), show) }, [query, run, show])
+  const save = e => {
+    e.preventDefault()
+    if (!project || busy) return  // A repeat Enter or click while saving.
+    setNotice('')
+    void run(() => api(`/project-settings${query}`, 'PUT', { verify_command: command.trim(), verify_timeout_seconds: Number(seconds), verify_max_rounds: Number(rounds) }),
+      values => { show(values); setNotice(values.verify_command ? 'Verify command saved for this project.' : 'Verify is off for this project.') })
+  }
+  const folder = project?.workspace || session?.workspace || workspace || 'this workspace'
+  return html`<section class="agent-tools-section" aria-label="Verify">
+    <h3>Verify command</h3>
+    <p>Runs after a reply in which the agent changed files in this project (${folder}). It runs like the agent's run_command: it asks for approval unless the permission mode or an “Always allow this command in this chat” rule allows it, and never runs in Plan mode. If it fails, the agent sees the end of its output and gets another model request to fix it, up to the fix rounds below. Leave it empty to turn it off.</p>
+    <form class="agent-tools-form" onSubmit=${save}>
+      <label>Command<input disabled=${!project} readOnly=${busy} maxLength=${2000} spellcheck=${false} value=${command} placeholder="pytest -q" onInput=${e => setCommand(e.currentTarget.value)} /></label>
+      <label>Time limit (seconds)<input type="number" min="10" max="3600" step="1" required disabled=${!project} readOnly=${busy} value=${seconds} onInput=${e => setSeconds(e.currentTarget.value)} /></label>
+      <label>Fix rounds<input type="number" min="1" max="3" step="1" required disabled=${!project} readOnly=${busy} value=${rounds} onInput=${e => setRounds(e.currentTarget.value)} /></label>
+      <div class="agent-tools-actions"><button class="primary" disabled=${!project} aria-disabled=${busy ? 'true' : 'false'}>Save</button></div>
+    </form>
+    ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}${notice ? html`<p role="status">${notice}</p>` : null}
+    <p class="field-help">Saved in this app's state for this project folder, not in the repository, and not included in conversation exports. Each fix round uses agent steps; the command card shows the full output.</p>
   </section>`
 }
 
