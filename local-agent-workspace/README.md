@@ -1294,6 +1294,18 @@ rules again, refuses it when the file changed since the card was shown, and show
 preview; the card keeps waiting with the same expiry. The agent is told that you edited the
 action ("It ran as: …" for a command) and that its own proposal did not run.
 
+**From a card and the menu.** An approval card's **Always allow…** button opens a form that
+sets where the rule is saved (**This chat**, **This project** or **All projects**; only the
+scopes the server offers) and what it matches: for a command, its exact text or **Commands
+starting with** one of the prefixes the server offers, plus the options allowed after it; for
+edits, all file edits or only files under a folder. **Approve and remember** approves the card
+and saves the rule. A command that cannot be split exactly can be remembered only by its exact
+text, in this chat. An edited card is marked "Edited by you". The **Permissions** menu lists the
+rules by scope, with **Deny** and **Always ask** badges and a remove button each, has **Add a
+rule…** (behavior, scope, a command, file edits or a tool, with options for allow prefixes) and a
+**Never asks** list naming what never needs approval. Adding or removing a chat or project rule
+from a new chat creates the chat first.
+
 **Turned-off tools.** **Agent tools → Tools** turns tools off for one chat. They are not
 offered to the agent and calls to them are refused. Subagents, forks and imports keep the setting.
 

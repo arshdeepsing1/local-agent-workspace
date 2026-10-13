@@ -61,7 +61,8 @@
 //   editable?: ('command'|'content'|'new_text')[], uncertain?: true (a command that could not be checked
 //   exactly against deny and ask rules) }
 //   ask_user events: { name: 'ask_user', input: { questions }, answers?: [{ question, selected, other }],
-//   question_outcome?: 'answered'|'skipped'|'expired', approval_expires? }; answered with
+//   question_outcome?: 'answered'|'skipped'|'expired', skipped_reason?: 'dont_ask', approval_expires? };
+//   answered with
 //   POST /sessions/<id>/questions/<event id> { answers?: [{ selected, other? }], skip?: true }.
 //   submit_plan events: { name: 'submit_plan', input: { plan, title? }, plan_outcome?: 'approved'|'keep_planning'|
 //   'expired'|'superseded', plan_mode?, feedback?, approval_expires? }; answered with
