@@ -1181,6 +1181,8 @@ class AgentManager:
             else:
                 # Commands can also change reviewed files; refresh their counts after each turn.
                 await self.publish_changes(session, only_tracked=True)
+            # A Settings save during the turn or compaction skipped this chat's meter; follow it now.
+            await self.refresh_meter_limits(session)
 
     def notify_status(self, session, previous, status, turn_ended=False):
         """A desktop notification of the change, only if enabled and no page is open."""
@@ -3082,6 +3084,12 @@ class AgentManager:
         elif adjustment == "trimmed":
             text += (f" The summary was longer than {limit:,} bytes and could not be condensed, so part of it was "
                      "omitted from the model's context.")
+        fitted = info.get("summary_fitted_to_budget")
+        if fitted:
+            # The summary was within its byte limit; the whole request was not.
+            text += (" The request after compaction was over the input budget (non-ASCII text and escapes count more "
+                     "than plain text), so " + ("a short extra request condensed the summary to fit." if fitted == "condensed"
+                                                else "part of the summary was omitted to fit."))
         await self.event(session, "notice", text=text, compaction=compaction)
 
     def start_compaction(self, session_id, preservation_note=""):
@@ -3361,8 +3369,8 @@ class AgentManager:
         its next request will use (prepare_context's formulas, so that request records the same values),
         rescale the next-request estimate to the chat's model, save and broadcast. The last request's
         estimate and report stay as they were, so a report from another budget shows as an earlier
-        request. A running chat is left alone: its next step prepares its own info, and note_last_request
-        reads the in-flight request's budget from the stored info. Never raises."""
+        request. A running chat is left alone until status() makes it idle: note_last_request reads the
+        in-flight request's budget from the stored info, and a turn keeps its budgets. Never raises."""
         import math
         from .context import SAFETY_MARGIN, compaction_threshold
         try:

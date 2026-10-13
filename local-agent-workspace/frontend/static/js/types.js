@@ -9,7 +9,7 @@
 //   python_venv (virtual environment the agent's commands, Verify, hooks and the Terminal use, '' = off),
 //   coding_dir_status: { path, state: 'off'|'ready'|'missing'|'invalid', message, source: 'settings'|'env'|'none' }
 //     (path: the checked absolute folder; the raw value only when invalid; null when off),
-//   python_venv_status: { path, state: 'off'|'ready'|'invalid', message, python, version, pip (bool when ready), source },
+//   python_venv_status: { path, state: 'off'|'ready'|'invalid', message, python, version, pip (when ready: bool, or null if no site-packages folder is found), source },
 //   default_model (the app's default endpoint),
 //   default_limits: { context_window, max_output_tokens } (the saved model's defaults; budgets equal to them
 //     follow a model change), model_migrated_from? (set while a legacy settings file at the old default
@@ -121,7 +121,9 @@
 // RequestInfo: { model, status, finish_reason?, http_status?, error_kind?, usage? }
 // ContextInfo: { estimated_tokens, input_budget, context_window, reply_reserve,
 //   compactions, summarized_messages, estimate_method, instruction_files, warnings,
-//   instruction_sources?, prepared_for_next_turn?, breakdown?, estimate_scale?, summary_adjustment?,
+//   instruction_sources?, prepared_for_next_turn?, breakdown?, estimate_scale?, summary_adjustment? (the summary was over its
+//   byte limit), summary_fitted_to_budget?: 'condensed'|'trimmed' (shortened because the request after compaction
+//   was over the input budget),
 //   estimate_prior? (true: estimate_scale is the model's starting ratio, not yet from reported counts),
 //   auto_compact_threshold?, auto_compact_percent?, compaction_deferred? (over the threshold but within the input
 //   budget, and no cut brings it under the threshold: sent as it was), compaction?: Compaction (when this request compacted), last_request?: LastRequest,

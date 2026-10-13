@@ -1,6 +1,7 @@
 """The context meter follows a model change or a Settings save before the next request: the budgets,
 the auto-compact threshold and the next-request estimate describe the request the chat will send,
 while the last request's report stays as it was (so the meter shows it as an earlier request)."""
+import asyncio
 import json
 import math
 
@@ -134,6 +135,47 @@ async def test_a_settings_save_moves_open_idle_chats_and_leaves_running_ones(app
     assert sockets[running].messages == []
     # A chat not open is not rewritten on every save; opening it brings it up to date (below).
     assert manager.store.get(closed)["context_info"]["input_budget"] == 181_568
+
+
+async def test_a_chat_running_during_a_settings_save_follows_when_its_turn_ends(app_client, monkeypatch, settings):
+    manager, client = app_client
+    session_id = await turn_on(manager, client, monkeypatch, OPUS)
+    socket = Socket()
+    manager.listeners.setdefault(session_id, set()).add(socket)
+    blocked, release = asyncio.Event(), asyncio.Event()
+    httpx_client = httpx.AsyncClient
+
+    async def gateway(request):
+        if not json.loads(request.content)["stream"]:
+            return httpx.Response(200, json={"choices": [{"message": {"content": "Title"}, "finish_reason": "stop"}]})
+        blocked.set()
+        await release.wait()
+        chunk = {"choices": [{"delta": {"content": "Done."}, "finish_reason": "stop"}], "usage": USAGE}
+        return httpx.Response(200, text="data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(httpx, "AsyncClient",
+                      lambda **kwargs: httpx_client(**kwargs, transport=httpx.MockTransport(gateway)))
+        turn = asyncio.create_task(manager.run(manager.get(session_id), "Again"))
+        await asyncio.wait_for(blocked.wait(), 10)
+        assert manager.statuses[session_id] == "running"
+        editable = {"workspace": settings.values["workspace"], "model": OPUS, "env_file": ""}
+        response = await client.put("/api/settings", json={**editable, "context_window": 40_000,
+                                                           "max_output_tokens": 4_096, "auto_compact_percent": 50})
+        assert response.status_code == 200
+        # The in-flight request keeps the budget it was prepared with.
+        assert manager.get(session_id)["context_info"]["input_budget"] == 181_568
+        release.set()
+        await turn
+    assert manager.statuses.get(session_id, "idle") == "idle"
+    info = manager.get(session_id)["context_info"]
+    assert limits_of(info) == {"context_window": 40_000, "reply_reserve": 4_096, "input_budget": 33_856,
+                               "auto_compact_percent": 50, "auto_compact_threshold": 16_928}
+    tokens = info["next_estimate"]["tokens"]
+    assert info["next_estimate"]["percent_of_input_budget"] == round(tokens * 100 / 33_856, 1)
+    assert info["last_request"]["input_budget"] == 181_568  # The report stays what was sent.
+    assert manager.store.get(session_id)["context_info"] == info
+    assert socket.messages[-1] == {"type": "context", "context_info": info}
 
 
 def test_opening_a_chat_brings_its_meter_up_to_date(settings):
