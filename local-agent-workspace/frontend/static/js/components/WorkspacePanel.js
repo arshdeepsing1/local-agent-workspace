@@ -7,9 +7,11 @@ import DiffReview, { DiffLine } from './DiffReview.js'
 import { DiffStat } from './ChangesBar.js'
 
 // A link that opens an absolute path at a line in VS Code (vscode://file/<path>:<line>).
+// Each path segment is encoded, so "#" or "?" in a name cannot start a fragment or query.
 function VSCodeLink({ absolute, line }) {
   if (typeof absolute !== 'string' || !absolute.startsWith('/')) return null
-  return html`<a class="icon-button" href=${`vscode://file${encodeURI(absolute)}:${line || 1}`} aria-label="Open in VS Code" title="Open in VS Code"><${Code2} size=${16} /></a>`
+  const path = absolute.split('/').map(encodeURIComponent).join('/')
+  return html`<a class="icon-button" href=${`vscode://file${path}:${line || 1}`} aria-label="Open in VS Code" title="Open in VS Code"><${Code2} size=${16} /></a>`
 }
 
 const GIT_GROUPS = [['staged', 'Staged changes'], ['unstaged', 'Changes'], ['untracked', 'Untracked']]
@@ -75,14 +77,17 @@ function GitChanges({ query, workspace, busy, onOpenFile }) {
     const { entry, diff } = selected
     const firstLine = diff ? changedLine(diff.lines) : 1
     const exists = entry.status !== 'deleted'
+    // An untracked file's status and area are both "Untracked": name it once.
+    const statusName = GIT_STATUS[entry.status]?.[1] || entry.status
+    const areaName = GIT_GROUPS.find(([area]) => area === entry.area)?.[1]
     return html`<div class="git-diff-view">
       <div class="editor-toolbar"><button ref=${backButton} class="icon-button" aria-label="Back to changes" title="Back to changes" onClick=${() => setSelected(null)}><${ArrowLeft} size=${16} /></button>
         <span title=${entry.orig_path ? `${entry.orig_path} → ${entry.path}` : entry.path}>${entry.path}</span>
         ${exists ? html`<button class="editor-mode" onClick=${() => onOpenFile(entry.path, firstLine)}><${File} size=${14} />Open file</button>
           <${VSCodeLink} absolute=${workspace.startsWith('/') ? `${workspace.replace(/\/+$/, '')}/${entry.path}` : null} line=${firstLine} />` : null}
       </div>
-      <div class="diff-review-summary"><span>${GIT_STATUS[entry.status]?.[1] || entry.status}</span>
-        <span>${GIT_GROUPS.find(([area]) => area === entry.area)?.[1]}</span>
+      <div class="diff-review-summary"><span>${statusName}</span>
+        ${areaName !== statusName ? html`<span>${areaName}</span>` : null}
         ${diff ? html`<${DiffStat} added=${diff.added} removed=${diff.removed} />` : null}
         ${entry.orig_path ? html`<span class="diff-review-note">from ${entry.orig_path}</span>` : null}</div>
       ${selected.error ? html`<div class="panel-error" role="alert">${selected.error}</div>`

@@ -921,6 +921,19 @@ def test_open_file_from_a_diff_goes_to_the_changed_line(ui, page, lines, line):
     expect(panel.get_by_role("link", name="Open in VS Code")).to_have_attribute("href", f"vscode://file/project/src/app.py:{line}")
 
 
+def test_an_untracked_diff_names_its_status_once_and_links_a_name_with_hash_and_question_mark(ui, page):
+    name = "notes/todo #1?.md"
+    status = {**GIT_STATUS, "files": [{"path": name, "area": "untracked", "status": "untracked", "added": 1, "removed": 0,
+                                       "hidden": None}]}
+    diff = {"path": name, "area": "untracked", "binary": False, "truncated": False, "added": 1, "removed": 0,
+            "lines": [{"kind": "hunk", "text": "@@ -0,0 +1 @@"}, {"kind": "added", "text": "x", "new": 1}]}
+    panel = open_git(ui, page, status=status, diff=diff)
+    panel.get_by_role("region", name="Untracked").get_by_role("button", name=re.compile("todo")).click()
+    expect(panel.locator(".diff-review-summary")).to_have_text(re.compile(r"^Untracked\s*\+1\s*−0$"))
+    expect(panel.get_by_role("link", name="Open in VS Code")).to_have_attribute(
+        "href", "vscode://file/project/notes/todo%20%231%3F.md:1")
+
+
 def test_hidden_rows_are_not_clickable(ui, page):
     panel = open_git(ui, page)
     secret = panel.locator(".git-row", has_text=".env")
