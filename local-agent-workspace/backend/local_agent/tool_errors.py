@@ -18,11 +18,14 @@ HINTS = {
     "edit_mismatch": ("Read the file again and copy old_text exactly, with enough context to match once, "
                       "or set replace_all=true."),
     "limit": "Narrow the request (path, glob, line range) or split it.",
+    "command_refused": "Do not run this command another way; ask the user to run it if it is needed.",
 }
 
 # Checked in order; the first rule whose phrases occur in the message wins.
 VALUE_ERROR_RULES = (
-    ("excluded", ("Credential files are excluded", "directory is excluded")),
+    # Read-only commands (command_exec): checked first, '/bin/ls is not available' is not a turned-off tool.
+    ("command_refused", ("does not run automatically", "Not a read-only", "not allowed in a read-only command")),
+    ("excluded", ("Credential files are excluded", "directory is excluded", "folder is excluded from file tools")),
     ("access_required", ("needs access approval",)),
     # Before stale_file: 'Project instructions changed before execution' is about guidance, not a file.
     ("guidance_changed", ("instructions changed",)),
@@ -30,7 +33,7 @@ VALUE_ERROR_RULES = (
                     "now resolves to a different file", "checkpoint was already restored")),
     ("edit_mismatch", ("old_text",)),
     ("not_found", ("was not found", "not found in this conversation", "does not exist", "job not found",
-                   "no longer available")),
+                   "no longer available", "Command not found", "Git is not installed")),
     ("unavailable_tool", ("not available",)),
     ("wrong_type", ("Not a directory", "must be a regular file", "Only regular", "Binary files cannot",
                     "Not a Jupyter notebook", "destination is a folder")),
@@ -40,7 +43,8 @@ VALUE_ERROR_RULES = (
 INVALID_ARGUMENT_PHRASES = ("must be an integer", "must be a boolean", "must be booleans", "must be true or false", "Give either",
                             "Use either", "cannot be empty", "Give cell_id or index", "needs source", "Put replace_all",
                             "Invalid until_regex", "Invalid pattern", "Invalid regular expression", "not supported in pattern",
-                            "alternatives", "is beyond", "is out of range", "must identify")
+                            "alternatives", "is beyond", "is out of range", "must identify",
+                            "in the foreground only", "without a shell needs")
 # A message that starts with an argument name, e.g. "output_mode must be content, files_with_matches or count."
 ARGUMENT_MESSAGE = re.compile(r"[A-Za-z_]+ must (?:be|contain) ")
 

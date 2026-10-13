@@ -171,7 +171,7 @@ def create_app(settings=None):
         workspace = session.get("workspace", settings.values["workspace"])
         return WorkspaceTools(workspace, settings.values["env_file"], session.get("allowed_directories", []),
                               session.get("permission_mode") == "bypassPermissions",
-                              write_limit=write_limit_setting(settings.values))
+                              write_limit=write_limit_setting(settings.values), excluded_roots=(settings.state_dir,))
 
     def ui_tools(session_id=None):
         """workspace_tools plus the folders added to Files, for the user's own browsing, editor saves and Recovery only.
@@ -183,7 +183,7 @@ def create_app(settings=None):
         return WorkspaceTools(workspace, settings.values["env_file"],
                               [*session.get("allowed_directories", []), *workspace_folders.paths(workspace)],
                               session.get("permission_mode") == "bypassPermissions",
-                              write_limit=write_limit_setting(settings.values))
+                              write_limit=write_limit_setting(settings.values), excluded_roots=(settings.state_dir,))
 
     @app.get("/api/bootstrap")
     async def bootstrap():
@@ -191,7 +191,7 @@ def create_app(settings=None):
         return {"token": local_token, "settings": settings.public(), "storage_problems": store.problems()}
 
     def check_folder(path, workspace):
-        folder = WorkspaceTools(workspace, settings.values["env_file"]).resolve(path)
+        folder = WorkspaceTools(workspace, settings.values["env_file"], excluded_roots=(settings.state_dir,)).resolve(path)
         if not folder.is_dir():
             raise ValueError("Choose an existing folder.")
         # Probe directory access without reading any file contents or returning names.

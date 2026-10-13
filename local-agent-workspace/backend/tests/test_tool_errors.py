@@ -76,6 +76,23 @@ from local_agent.tools import WorkspaceTools
     (ValueError("Line 3 is too long for ranged reading (128 KB limit)."), "limit", True),
     (ValueError("The file changed while it was read; read it again."), "stale_file", True),
     (ValueError("File changed or the checkpoint was already restored; request a new recovery preview."), "stale_file", True),
+    # Commands run without a shell, and the state-folder exclusion (command_exec, git_tools, tools).
+    (ValueError("The app's settings and conversation folder is excluded from file tools."), "excluded", True),
+    (ValueError("Command not found on PATH: tool"), "not_found", False),
+    (ValueError("Command not found: ./tool"), "not_found", False),
+    (ValueError("Git is not installed or not on PATH."), "not_found", False),
+    (ValueError("Not a read-only command."), "command_refused", True),
+    (ValueError("Not a read-only Git command."), "command_refused", True),
+    (ValueError("This Git option is not allowed in a read-only command."), "command_refused", True),
+    (ValueError("git resolves to /srv/x/bin/git, inside the project or a folder granted to this chat, "
+                "so it does not run automatically."), "command_refused", True),
+    (ValueError("This repository is a partial clone, and this Git version cannot switch off fetching missing "
+                "objects, so read-only Git does not run automatically."), "command_refused", True),
+    (ValueError("A command run without a shell needs 1 to 64 arguments, each text of at most 1,000 characters "
+                "without NUL."), "invalid_arguments", True),
+    (ValueError("/bin/ls is not available, so this read-only command does not run automatically."),
+     "command_refused", True),
+    (ValueError("Read-only commands run in the foreground only."), "invalid_arguments", True),
     (ValueError("Something else went wrong."), "error", False),
     (OSError("disk full"), "error", False),
 ])

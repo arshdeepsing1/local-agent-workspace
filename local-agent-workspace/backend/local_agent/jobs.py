@@ -132,23 +132,43 @@ class CommandTimeout(TimeoutError):
         self.result = result
 
 
-async def run_process(command, workspace, timeout_seconds=60, max_output_bytes=80_000, on_output=None,
-                      extra_env=None):
-    """Run a noninteractive command, retaining bounded output while draining its pipe.
-
-    extra_env holds variables passed through by name; the caller has filtered them."""
-    validate_command_options(command, timeout_seconds, max_output_bytes)
+def command_environment(extra_env=None):
+    """The environment commands run with: the variables named in ENVIRONMENT_KEYS, plus
+    extra_env, the variables passed through by name (the caller has filtered them)."""
     env = {key: value for key, value in os.environ.items() if key in ENVIRONMENT_KEYS}
     env.update(extra_env or {})
+    return env
+
+
+# A command given to run without a shell has at most 64 tokens (command_exec.prepare_command
+# checks it). The argument vector that runs may be longer: read-only Git adds its own options
+# and pathspecs.
+ARGV_LIMIT = 64
+PREPARED_ARGV_LIMIT = 256
+
+
+def validate_argv(argv, limit=ARGV_LIMIT):
+    """An argument vector run without a shell: 1 to limit text tokens, each without NUL
+    and at most 1,000 characters."""
+    if (not isinstance(argv, list) or not 1 <= len(argv) <= limit
+            or not all(isinstance(token, str) and "\0" not in token and len(token) <= 1000 for token in argv)
+            or not argv[0]):
+        raise ValueError(f"A command run without a shell needs 1 to {limit} arguments, each text of at most "
+                         "1,000 characters without NUL.")
+
+
+async def spawn(argv, workspace, env):
+    """Start argv in its own session with no stdin and stdout and stderr on one pipe.
+
+    Process creation can finish after its caller is cancelled. That process is then
+    acquired and reaped before the cancellation propagates."""
     spawning = asyncio.create_task(asyncio.create_subprocess_exec(
-        *shell_argv(command), cwd=workspace, env=env,
+        *argv, cwd=workspace, env=env,
         stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT, start_new_session=True))
     try:
-        process = await asyncio.shield(spawning)
+        return await asyncio.shield(spawning)
     except asyncio.CancelledError as error:
-        # Process creation can finish after its caller is cancelled. Acquire and
-        # reap that process before propagating cancellation.
         process = await spawning
         kill_group(process.pid)
         ended, cancellation = await settle(asyncio.ensure_future(discard_output(process)))
@@ -156,6 +176,21 @@ async def run_process(command, workspace, timeout_seconds=60, max_output_bytes=8
         if not ended:
             error.result = {"exit_code": None, "output": "", "truncated": False, "stopped": False}
         raise error
+
+
+async def run_process(command, workspace, timeout_seconds=60, max_output_bytes=80_000, on_output=None,
+                      extra_env=None, *, argv=None, env=None):
+    """Run a noninteractive command, retaining bounded output while draining its pipe.
+
+    command is the text run by the shell, or with argv the display text of argv,
+    which then runs without a shell. extra_env holds variables passed through by
+    name; the caller has filtered them. env, when given, replaces the whole
+    environment (command_environment(extra_env) otherwise)."""
+    validate_command_options(command, timeout_seconds, max_output_bytes)
+    if argv is not None:
+        validate_argv(argv, PREPARED_ARGV_LIMIT)
+    env = env if env is not None else command_environment(extra_env)
+    process = await spawn(list(argv) if argv is not None else shell_argv(command), workspace, env)
 
     output = ""
     retained = 0
@@ -421,9 +456,29 @@ class JobManager:
                 if (session_id is None or job["session_id"] == session_id)
                 and (workspace is None or job["workspace"] == workspace)]
 
+    def command_environment(self):
+        """The environment a command started now runs with, including the variables
+        passed through by name in Settings."""
+        extra_env = {}
+        if self.environment is not None:
+            try:
+                extra_env = dict(self.environment() or {})
+            except Exception:
+                extra_env = {}  # A broken setting must not stop the command.
+        return command_environment(extra_env)
+
     async def start(self, command, workspace, session_id=None, timeout_seconds=60,
-                    max_output_bytes=80_000, background=False):
+                    max_output_bytes=80_000, background=False, *, argv=None, env=None):
+        """Start a job. command is the shell text, or with argv its display text: argv
+        then runs without a shell, with env as its whole environment when given.
+        argv and env are never stored or published."""
         validate_command_options(command, timeout_seconds, max_output_bytes)
+        if argv is not None:
+            validate_argv(argv, PREPARED_ARGV_LIMIT)
+            argv = list(argv)
+        if env is not None and (not isinstance(env, dict)
+                                or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items())):
+            raise ValueError("A command environment must map names to text.")
         if self._closed:
             raise ValueError("Command manager is shutting down.")
         if session_id in self._removing_sessions:
@@ -452,6 +507,8 @@ class JobManager:
                "command": sanitize(command), "state": "running", "created": now, "updated": now,
                "exit_code": None, "output": "", "truncated": False, "timeout_seconds": timeout_seconds,
                "max_output_bytes": max_output_bytes, "background": bool(background)}
+        if argv is not None:
+            job["without_shell"] = True
         self._jobs[job["id"]] = job
         self._persist(job, mirror=True)
         # Publication precedes execution. A concurrent stop during publication
@@ -462,12 +519,12 @@ class JobManager:
             await self.stop(job["id"])
             raise
         if job["state"] == "running":
-            task = asyncio.create_task(self._run(job, command, sanitize))
+            task = asyncio.create_task(self._run(job, command, sanitize, argv, env and dict(env)))
             self._tasks[job["id"]] = task
             task.add_done_callback(lambda done: self._tasks.pop(job["id"], None))
         return copy.deepcopy(job)
 
-    async def _run(self, job, command, sanitize):
+    async def _run(self, job, command, sanitize, argv=None, env=None):
         async def output(text, truncated):
             job.update(output=sanitize(text, partial=True), truncated=truncated, updated=time.time())
             self._persist(job)
@@ -476,14 +533,10 @@ class JobManager:
 
         result = None
         try:
-            extra_env = {}
-            if self.environment is not None:
-                try:
-                    extra_env = dict(self.environment() or {})
-                except Exception:
-                    extra_env = {}  # A broken setting must not stop the command.
+            if env is None:
+                env = self.command_environment()
             result = await run_process(command, job["workspace"], job["timeout_seconds"],
-                                       job["max_output_bytes"], output, extra_env=extra_env)
+                                       job["max_output_bytes"], output, argv=argv, env=env)
             job["state"] = "completed" if result["exit_code"] == 0 else "failed"
         except CommandTimeout as error:
             result = error.result

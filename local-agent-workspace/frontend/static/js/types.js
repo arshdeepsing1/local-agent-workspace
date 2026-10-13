@@ -37,7 +37,8 @@
 //   compactions, summarized_messages, estimate_method, instruction_files, warnings,
 //   instruction_sources?, prepared_for_next_turn?, breakdown?, estimate_scale?, summary_adjustment? }
 // Job: { id, session_id, workspace, command, state, created, updated, exit_code,
-//   output?, truncated, timeout_seconds, max_output_bytes, background }
+//   output?, truncated, timeout_seconds, max_output_bytes, background,
+//   without_shell? (true: ran from an argument vector without a shell) }
 // Skill: { id, name, description, path } (path is workspace-relative, or absolute
 //   for a skill shipped with the app)
 // Changes (pushed as { type: 'changes', changes } and returned by Keep/Undo): {

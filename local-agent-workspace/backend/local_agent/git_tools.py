@@ -15,18 +15,39 @@ import posixpath
 import re
 import shutil
 import stat
+from pathlib import Path
 
 from .jobs import ENVIRONMENT_KEYS, discard_output, kill_group, settle
 from .tools import IGNORED, SECRET_NAMES
 
 OUTPUT_LIMIT = 80_000
+# diff.submodule=short keeps diff and show from starting a diff inside a submodule, where
+# --no-textconv and --no-ext-diff do not reach (configuration given with -c does). format.pretty
+# stays medium, so a repository's own format cannot ask for a signature check (%G?).
 SAFE_OPTIONS = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
-                "-c", "submodule.recurse=false", "-c", "core.pager=cat")
+                "-c", "submodule.recurse=false", "-c", "core.pager=cat",
+                "-c", "diff.submodule=short", "-c", "format.pretty=medium")
 FILTER_KEYS = r"^filter\..*\.(clean|smudge|process|required)$"
-# The file tools' credential names and `*.env`, at any depth and in any letter case.
-DIFF_EXCLUDES = (":(exclude,glob,icase)**/*.env", *(f":(exclude,glob,icase){pattern}" for name in sorted(SECRET_NAMES)
-                              for pattern in (f"**/{name}", f"**/{name}/**")),
-                 ":(exclude,glob,icase)**/.env.*")
+
+
+def _env_variants():
+    """Wildmatch patterns for every `.env.<suffix>` name except `.env.example`, which the file
+    tools read and edit: a pathspec exclusion cannot be undone by a later one."""
+    word = "example"
+    patterns = [".env."]
+    for index, letter in enumerate(word):
+        prefix = ".env." + word[:index]
+        if index:
+            patterns.append(prefix)
+        patterns.append(f"{prefix}[!{letter}]*")
+    return [*patterns, f".env.{word}?*"]
+
+
+# The file tools' credential names, `*.env` and `.env.*` (not `.env.example`), at any depth
+# and in any letter case.
+DIFF_EXCLUDES = (":(exclude,glob,icase)**/*.env", *(f":(exclude,glob,icase){pattern}"
+                                                     for name in [*sorted(SECRET_NAMES), *_env_variants()]
+                                                     for pattern in (f"**/{name}", f"**/{name}/**")))
 CHANGES_TIMEOUT = 60
 
 
@@ -37,7 +58,9 @@ def filter_settings(names):
 
 def git_environment(filters=()):
     env = {key: value for key, value in os.environ.items() if key in ENVIRONMENT_KEYS}
-    env.update(GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1")
+    # GIT_NO_LAZY_FETCH: in a partial clone, a missing object is not fetched, so the remote's
+    # configured upload-pack or SSH program does not run and nothing goes over the network.
+    env.update(GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1", GIT_NO_LAZY_FETCH="1")
     settings = filter_settings(filters)
     if settings:
         env["GIT_CONFIG_COUNT"] = str(len(settings))
@@ -104,6 +127,89 @@ async def configured_filters(workspace, *, timeout=30, git=None):
     _, names, _ = await run_git(workspace, ["config", "--name-only", "-z", "--get-regexp", FILTER_KEYS],
                                 timeout=timeout, git=git)
     return [name for name in names.decode("utf-8", errors="surrogateescape").split("\0") if name]
+
+
+def find_git(env, forbidden_roots):
+    """The git program on the absolute PATH entries of env, refused when it resolves
+    to a program inside one of forbidden_roots (the project and its granted folders)."""
+    entries = [entry for entry in str((env or {}).get("PATH") or "").split(os.pathsep) if os.path.isabs(entry)]
+    found = shutil.which("git", path=os.pathsep.join(entries))
+    if not found:
+        raise ValueError("Git is not installed or not on PATH.")
+    program = Path(found).resolve()
+    if any(program.is_relative_to(Path(root).resolve()) for root in forbidden_roots):
+        raise ValueError(f"git resolves to {program}, inside the project or a folder granted to this chat, "
+                         "so it does not run automatically.")
+    return found
+
+
+# Options a read-only Git command must not carry: each can run a program or write a file.
+# --format and --pretty can ask for a signature check (%G?); --submodule=diff diffs inside a submodule.
+READ_ONLY_REFUSED = ("--ext-diff", "--textconv", "--show-signature", "--output", "--exec-path", "--git-dir",
+                     "--work-tree", "--config-env", "--open-files-in-pager", "--paginate", "--format", "--pretty",
+                     "--submodule")
+# The first release of each Git series that honours GIT_NO_LAZY_FETCH (the May 2024 security releases).
+NO_LAZY_FETCH_RELEASES = ((2, 39, 4), (2, 40, 2), (2, 41, 1), (2, 42, 2), (2, 43, 4), (2, 44, 1), (2, 45, 1))
+PARTIAL_CLONE_KEYS = r"^(remote\..*\.promisor|extensions\.partialclone)$"
+PARTIAL_CLONE_REFUSED = ("This repository is a partial clone, and this Git version cannot switch off fetching "
+                         "missing objects, so read-only Git does not run automatically.")
+_versions = {}
+
+
+def honours_no_lazy_fetch(version):
+    """Whether a Git version (a tuple) honours GIT_NO_LAZY_FETCH. A distribution may have
+    backported it to an older number; that version is treated as not honouring it."""
+    if version >= NO_LAZY_FETCH_RELEASES[-1]:
+        return True
+    return any(version[:2] == release[:2] and version >= release for release in NO_LAZY_FETCH_RELEASES)
+
+
+async def git_version(workspace, git):
+    """The version of the git program as a tuple, (0, 0, 0) when it cannot be read."""
+    if git not in _versions:
+        _, output, _ = await run_git(workspace, ["version"], timeout=10, git=git)
+        match = re.search(rb"(\d+)\.(\d+)(?:\.(\d+))?", output)
+        _versions[git] = tuple(int(part or 0) for part in match.groups()) if match else (0, 0, 0)
+    return _versions[git]
+
+
+async def partial_clone(workspace, git):
+    """Whether the repository's configuration names a promisor remote (a partial clone)."""
+    _, names, _ = await run_git(workspace, ["config", "--name-only", "-z", "--get-regexp", PARTIAL_CLONE_KEYS], git=git)
+    return any(names.split(b"\0"))
+
+
+async def hardened_git_command(workspace, args, forbidden_roots, env=None):
+    """(argv, env) for a read-only Git command: status, diff, show, log, ls-files, branch
+    or rev-parse, with the programs a repository's configuration can name switched off
+    (fsmonitor, hooks, filters, textconv, external diff, signature checks), credential
+    files left out of diffs, status, diffs and file lists limited to the workspace (the
+    pathspec '.'), and no fetch of missing objects in a partial clone.
+    Git is found first, so a planted git never runs, not even for the filter query."""
+    git = find_git(env if env is not None else git_environment(), forbidden_roots)
+    if not args:
+        raise ValueError("Not a read-only Git command.")
+    sub, rest = args[0], list(args[1:])
+    if sub not in ("status", "diff", "show", "log", "ls-files", "branch", "rev-parse"):
+        raise ValueError("Not a read-only Git command.")
+    if any(token == "--" or token.startswith("-c") and not token.startswith("--")
+           or token.split("=", 1)[0] in READ_ONLY_REFUSED for token in rest):
+        raise ValueError("This Git option is not allowed in a read-only command.")
+    filters = await configured_filters(workspace, git=git)
+    if not honours_no_lazy_fetch(await git_version(workspace, git)) and await partial_clone(workspace, git):
+        raise ValueError(PARTIAL_CLONE_REFUSED)
+    paths = ["--", ".", *DIFF_EXCLUDES]
+    part = {
+        "status": [sub, "--ignore-submodules=dirty", *rest, *paths],
+        "diff": [sub, "--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty", *rest, *paths],
+        # --sparse: show the commit even when it changes nothing under the pathspec.
+        "show": [sub, "--no-ext-diff", "--no-textconv", "--no-show-signature", "--sparse", *rest, *paths],
+        "log": [sub, "--no-show-signature", *rest],
+        "ls-files": [sub, *rest, *paths],
+    }.get(sub, [sub, *rest])
+    argv = [git, *SAFE_OPTIONS, "-c", "log.showSignature=false", *filter_overrides(filters), "--no-optional-locks",
+            *part]
+    return argv, {**git_environment(filters), "GIT_OPTIONAL_LOCKS": "0"}
 
 
 async def working_tree_changes(workspace):
