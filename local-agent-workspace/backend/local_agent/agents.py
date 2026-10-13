@@ -3578,7 +3578,14 @@ class AgentManager:
                     # Repeat only a request that got no response status: a failure after
                     # one may follow a billed generation, and ReadTimeout may still be running.
                     retryable = "http_status" not in info and isinstance(exc, NETWORK_RETRY_ERRORS)
-                    exc = InferenceError(str(exc) or "The connection to Databricks failed.", "network")
+                    if isinstance(exc, httpx.ReadTimeout):
+                        # Over a real socket its text is empty; say what happened and what helps.
+                        exc = InferenceError(
+                            f"Databricks sent no data for {STREAM_READ_TIMEOUT:g} seconds, so the app stopped waiting. "
+                            "A large request with thinking can be silent for minutes. Send a message to continue; if "
+                            "this repeats, lower Settings → Context budget or Settings → Max output tokens.", "network")
+                    else:
+                        exc = InferenceError(str(exc) or "The connection to Databricks failed.", "network")
                     if retryable:
                         mark_retryable(exc, "network")
                 elif isinstance(exc, (json.JSONDecodeError, KeyError, TypeError, AttributeError)):

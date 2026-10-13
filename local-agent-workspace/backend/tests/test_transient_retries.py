@@ -379,3 +379,48 @@ async def test_stop_cancels_an_auto_continue_wait(runtime, monkeypatch, clock):
     await manager.stop(session["id"])
     saved = manager.store.get(session["id"])
     assert saved["terminal_reason"] == "stopped" and len(requests) == 4
+
+
+async def test_a_stalled_stream_names_the_read_timeout(runtime, monkeypatch):
+    """No data for STREAM_READ_TIMEOUT seconds ends the turn with advice, not a bare connection failure.
+    No delays fixture: it replaces asyncio.sleep everywhere, and the stall needs real time."""
+    manager, session = runtime
+    monkeypatch.setattr("local_agent.agents.STREAM_READ_TIMEOUT", 0.2)
+    requests = []
+    partial = ("data: " + json.dumps({"choices": [{"delta": {"content": "Part"}, "finish_reason": None}]}) + "\n\n").encode()
+
+    class Stalled(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield partial
+            await asyncio.Event().wait()
+
+    async def gateway(request):
+        requests.append(request)
+        return httpx.Response(200, stream=Stalled())
+
+    class Timing(httpx.AsyncBaseTransport):
+        """MockTransport ignores timeouts; this one applies the read timeout between chunks."""
+        async def handle_async_request(self, request):
+            response = await gateway(request)
+            read = request.extensions["timeout"]["read"]
+
+            class Timed(httpx.AsyncByteStream):
+                async def __aiter__(inner):
+                    chunks = response.stream.__aiter__()
+                    while True:
+                        try:
+                            chunk = await asyncio.wait_for(chunks.__anext__(), read)
+                        except StopAsyncIteration:
+                            return
+                        except asyncio.TimeoutError:
+                            raise httpx.ReadTimeout("", request=request) from None
+                        yield chunk
+            return httpx.Response(response.status_code, headers=response.headers, stream=Timed())
+
+    client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client(**kwargs, transport=Timing()))
+    await manager.run(session, "Hello")
+    error = session["events"][-1]
+    assert len(requests) == 1 and not notices(session)
+    assert error["error_kind"] == "network" and error["text"].startswith("Databricks sent no data for 0.2 seconds")
+    assert session["terminal_reason"] == "inference_error"

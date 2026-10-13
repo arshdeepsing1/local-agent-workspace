@@ -1268,8 +1268,10 @@ compaction brings such a request under 3.8 MB, the app still compacts at the lat
 that fits when that makes the request smaller. A request still over 4 MB is not sent: the turn ends with a `payload_too_large` error that suggests smaller
 steps or a lower context budget, without a **Continue** button; a compaction or `/btw`
 request over the limit is refused the same way. Agent requests wait up to 300 seconds for
-the next streamed data (a large prefill with thinking can be silent for minutes);
-compaction and `/btw` requests, which are not streamed, up to 600 seconds. Databricks
+the next streamed data (a large prefill with thinking can be silent for minutes); a
+request that gets no data for that long ends with an error saying so, which suggests
+sending a message to continue and, if it repeats, a lower context budget or Max output
+tokens. Compaction and `/btw` requests, which are not streamed, up to 600 seconds. Databricks
 stops a request after 597 seconds; when a stream ends early after about that long, a
 notice (once per turn) says so and suggests lowering Max output tokens or the context
 budget.
