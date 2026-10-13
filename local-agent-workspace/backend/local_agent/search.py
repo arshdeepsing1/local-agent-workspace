@@ -153,7 +153,12 @@ def _git_names(tools, base, deadline):
         if not raw or raw in seen:  # Unmerged entries are listed once per stage.
             continue
         seen.add(raw)
-        names.append(raw.decode("utf-8", errors="surrogateescape"))
+        name = raw.decode("utf-8", errors="surrogateescape")
+        # Git never writes absolute names or "." and ".." parts, but a hand-made index can hold
+        # them, and they would name files outside base that no permission check sees.
+        if name.startswith("/") or any(part in ("", ".", "..") for part in name.rstrip("/").split("/")):
+            continue
+        names.append(name)
     return names, None
 
 
@@ -204,7 +209,9 @@ def list_universe(tools, base, *, include_ignored, deadline):
         if parent == ".":
             return True
         if parent not in plain:
-            plain[parent] = os.path.realpath(base / parent) == os.path.join(real_base, parent)
+            # parent is relative and normalised (see _git_names), so os.path.join keeps real_base.
+            plain[parent] = (not PurePosixPath(parent).is_absolute()
+                             and os.path.realpath(base / parent) == os.path.join(real_base, parent))
         return plain[parent]
     names, note = (None, None) if include_ignored else _git_names(tools, base, deadline)
 

@@ -425,6 +425,55 @@ def test_a_git_listed_file_below_a_symlinked_folder_is_never_listed_or_read(tmp_
     assert "OUTSIDE-SECRET-VALUE" not in str(tools.search_files("needle", output_mode="count"))
 
 
+def rename_index_entries(index, names):
+    """Rewrite a version 2 Git index so its entries carry other names, as a hand-made index can.
+    Git refuses such names when it writes the index, but lists them when it reads one."""
+    import hashlib
+    import struct
+    data = index.read_bytes()
+    signature, version, count = struct.unpack(">4sII", data[:12])
+    assert (signature, version) == (b"DIRC", 2)
+    entries, position = [], 12
+    for _ in range(count):
+        fixed = data[position:position + 62]
+        length = struct.unpack(">H", fixed[60:62])[0] & 0xFFF
+        name = data[position + 62:position + 62 + length].decode()
+        position += (62 + length + 8) // 8 * 8
+        entries.append((names.get(name, name).encode(), fixed))
+    body = struct.pack(">4sII", b"DIRC", 2, len(entries))
+    for name, fixed in sorted(entries):
+        flags = struct.unpack(">H", fixed[60:62])[0] & ~0xFFF | len(name)
+        entry = fixed[:60] + struct.pack(">H", flags) + name
+        body += entry + b"\0" * (8 - len(entry) % 8)
+    index.write_bytes(body + hashlib.sha1(body).digest())
+
+
+@needs_git
+def test_git_index_names_outside_the_folder_are_never_listed_or_read(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "private.txt").write_text("needle OUTSIDE-SECRET-VALUE\n")
+    for name in ("a.txt", "b.txt", "c.txt", "d.txt"):
+        (root / name).write_text("needle inside\n")
+    git(root, "init", "-q")
+    git(root, "add", ".")
+    rename_index_entries(root / ".git" / "index", {"b.txt": str(outside / "private.txt"), "c.txt": "../outside/private.txt",
+                                                   "d.txt": "a/../../outside/private.txt"})
+    for name in ("b.txt", "c.txt", "d.txt"):
+        (root / name).unlink()
+    listed = subprocess.run(["git", "ls-files"], cwd=root, capture_output=True, text=True, check=True).stdout
+    assert str(outside / "private.txt") in listed  # Git lists the hand-made names.
+    tools = WorkspaceTools(str(root))
+    assert tools.find_files("*")["files"] == ["a.txt"]
+    monkeypatch.setattr(search, "ripgrep", lambda: None)
+    for query, regex_mode in (("needle", False), ("needle", True), (".", True)):
+        result = tools.search_files(query, regex=regex_mode)
+        assert [match["path"] for match in result["matches"]] == ["a.txt"]
+        assert "OUTSIDE-SECRET-VALUE" not in str(result)
+
+
 @needs_git
 @pytest.mark.parametrize("workspace", ["home", "granted"])
 def test_a_dotfiles_repository_at_home_never_hides_files_in_home(tmp_path, monkeypatch, workspace):
