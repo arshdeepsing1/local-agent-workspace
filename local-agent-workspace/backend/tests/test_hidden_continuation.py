@@ -156,7 +156,11 @@ async def test_content_filter_stop_is_shown_and_never_re_prompted(runtime, monke
     await manager.run(session, "Do it")
     assert len(requests) == 1
     assert replies(session)[0]["request_info"]["finish_reason"] == "content_filter"
-    assert session["events"][-1]["type"] == "error" and session["events"][-1]["error_kind"] == "incomplete_response"
+    assert session["events"][-1]["type"] == "error" and session["events"][-1]["error_kind"] == "content_filter"
+    assert session["events"][-1]["text"] == (
+        "The model provider's content filter stopped this response. No tool calls from this response ran.")
+    assert replies(session)[0]["request_info"]["error_kind"] == "content_filter"
+    assert session["terminal_reason"] == "inference_error"
     assert not any(event["type"] == "notice" for event in session["events"])
     assert session["wire"][-1]["role"] == "assistant"
 

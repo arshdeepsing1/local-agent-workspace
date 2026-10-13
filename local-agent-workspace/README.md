@@ -411,7 +411,8 @@ when opening a conversation or performing restart recovery.
   run, and the app asks the model in a hidden message to issue them again or to
   continue: up to twice in a row, with a notice each time. A reply stopped by the
   provider's content filter, an empty reply and a stream cut off mid-message are not
-  retried; the turn ends with the error.
+  retried; the turn ends with the error. A content filter stop says so, and no
+  **Continue** button is offered for it.
 - **Other folders**: ask, for example, `Are there any CSV files in
   ~/Downloads?`. The agent can list, read and search absolute or `~/`
   paths. The first file-tool request outside the project opens a folder-access card.
@@ -447,15 +448,21 @@ when opening a conversation or performing restart recovery.
   retries, and when Databricks still rate limited the chat after the automatic retries.
 - **Verify**: **Agent tools → Verify** sets a command for the project folder, for
   example `pytest -q`, with a time limit (10 to 3,600 seconds, default 600) and fix
-  rounds (1 to 3, default 2). After a reply in which the agent changed files, the app
-  runs it as the agent's `run_command`: Manual, Auto and Accept edits show an approval
-  card unless an "Always allow this command in this chat" rule matches, Bypass runs
-  it, and Plan mode, subagents and restricted tool profiles never run it. Hooks and the
+  rounds (1 to 3, default 2). After a reply in which the agent changed files inside the
+  project folder (edits in other folders do not count), the app runs it as the agent's
+  `run_command` with an output limit of 1,000,000 bytes: Manual, Auto and Accept edits
+  show an approval card unless an "Always allow this command in this chat" rule
+  matches, Bypass runs it, and Plan mode, subagents and restricted tool profiles never run it. Hooks and the
   project-instruction checks apply as for any command, and **Stop** stops it. A notice
   reports the result. If it fails, the agent gets the last 3,000 characters of its
   output (credentials redacted, fenced and marked as data, not instructions) in a hidden
-  message and another model request to fix it. After the last fix round, or when no
-  agent step is left, the turn ends with a notice; the full output is in the command
+  message and another model request to fix it. When the output was longer than the
+  limit, those are the last characters of the kept part, and the message and the notice
+  say that the output was cut. If you decline the approval card, let it expire, or stop
+  the command with **Stop job** in Terminal, there is no fix round and Verify does not
+  run again in that turn. A note typed on a declined card is passed to the agent, which
+  answers it in another model request when an agent step is left. After the last fix
+  round, or when no agent step is left, the turn ends with a notice; the full output is in the command
   card. Each fix round uses an agent step. Leave the command empty to turn Verify off.
   The settings are kept in `<state dir>/projects.json` for each resolved workspace path
   (a worktree is its own project), never in the repository, and are not part of

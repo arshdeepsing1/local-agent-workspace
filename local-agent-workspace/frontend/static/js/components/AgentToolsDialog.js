@@ -181,6 +181,7 @@ function Verify({ session, workspace, onError }) {
   useEffect(() => { void run(() => api(`/project-settings${query}`), show) }, [query, run, show])
   const save = e => {
     e.preventDefault()
+    if (!project || busy) return  // A repeat Enter or click while saving.
     setNotice('')
     void run(() => api(`/project-settings${query}`, 'PUT', { verify_command: command.trim(), verify_timeout_seconds: Number(seconds), verify_max_rounds: Number(rounds) }),
       values => { show(values); setNotice(values.verify_command ? 'Verify command saved for this project.' : 'Verify is off for this project.') })
@@ -190,10 +191,10 @@ function Verify({ session, workspace, onError }) {
     <h3>Verify command</h3>
     <p>Runs after a reply in which the agent changed files in this project (${folder}). It runs like the agent's run_command: it asks for approval unless the permission mode or an “Always allow this command in this chat” rule allows it, and never runs in Plan mode. If it fails, the agent sees the end of its output and gets another model request to fix it, up to the fix rounds below. Leave it empty to turn it off.</p>
     <form class="agent-tools-form" onSubmit=${save}>
-      <label>Command<input disabled=${!project || busy} maxLength=${2000} spellcheck=${false} value=${command} placeholder="pytest -q" onInput=${e => setCommand(e.currentTarget.value)} /></label>
-      <label>Time limit (seconds)<input type="number" min="10" max="3600" step="1" required disabled=${!project || busy} value=${seconds} onInput=${e => setSeconds(e.currentTarget.value)} /></label>
-      <label>Fix rounds<input type="number" min="1" max="3" step="1" required disabled=${!project || busy} value=${rounds} onInput=${e => setRounds(e.currentTarget.value)} /></label>
-      <div class="agent-tools-actions"><button class="primary" disabled=${!project || busy}>Save</button></div>
+      <label>Command<input disabled=${!project} readOnly=${busy} maxLength=${2000} spellcheck=${false} value=${command} placeholder="pytest -q" onInput=${e => setCommand(e.currentTarget.value)} /></label>
+      <label>Time limit (seconds)<input type="number" min="10" max="3600" step="1" required disabled=${!project} readOnly=${busy} value=${seconds} onInput=${e => setSeconds(e.currentTarget.value)} /></label>
+      <label>Fix rounds<input type="number" min="1" max="3" step="1" required disabled=${!project} readOnly=${busy} value=${rounds} onInput=${e => setRounds(e.currentTarget.value)} /></label>
+      <div class="agent-tools-actions"><button class="primary" disabled=${!project} aria-disabled=${busy ? 'true' : 'false'}>Save</button></div>
     </form>
     ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}${notice ? html`<p role="status">${notice}</p>` : null}
     <p class="field-help">Saved in this app's state for this project folder, not in the repository, and not included in conversation exports. Each fix round uses agent steps; the command card shows the full output.</p>

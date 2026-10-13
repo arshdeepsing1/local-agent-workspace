@@ -24,9 +24,16 @@ from local_agent.tools import WorkspaceTools
     (ValueError("Command output limit must be an integer from 1,024 to 1,000,000 bytes."), "invalid_arguments", True),
     (ValueError("background must be true or false."), "invalid_arguments", True),
     (ValueError("Give either start_line or tail_lines, not both."), "invalid_arguments", True),
+    (ValueError("regex and case_sensitive must be booleans."), "invalid_arguments", True),
     (ValueError("Credential files are excluded from file tools."), "excluded", True),
     (ValueError("This internal or generated directory is excluded."), "excluded", True),
     (ValueError("/srv/x needs access approval."), "access_required", False),
+    (ValueError("Project instructions changed before execution. Review the refreshed guidance and retry."),
+     "guidance_changed", True),
+    (ValueError("Project instructions changed while preparing this action. Review the refreshed guidance before "
+                "retrying. No file was changed and no command ran."), "guidance_changed", True),
+    (ValueError("Project or skill instructions changed. Review refreshed guidance before using MCP tools."),
+     "guidance_changed", True),
     (ValueError("The file changed while waiting for approval. Read it again and propose a fresh edit."), "stale_file", True),
     (ValueError("The file changed before execution. Read it again and propose a fresh edit."), "stale_file", True),
     (ValueError("old_text must match exactly once; include more surrounding context."), "edit_mismatch", True),
@@ -42,6 +49,13 @@ def test_classify_rules(exc, kind, hinted):
     found, hint = classify(exc, str(exc))
     assert found == kind
     assert (hint is not None) == hinted
+
+
+def test_a_guidance_change_is_not_called_a_stale_file():
+    message = "Project instructions changed before execution. Review the refreshed guidance and retry."
+    assert json.loads(tool_error_text(ValueError(message), message)) == {
+        "error_kind": "guidance_changed", "message": message,
+        "hint": "Re-read the refreshed project instructions, then retry."}
 
 
 def test_an_exception_can_name_its_own_kind_and_hint():

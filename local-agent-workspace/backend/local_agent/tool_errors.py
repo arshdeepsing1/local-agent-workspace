@@ -12,6 +12,7 @@ HINTS = {
     "not_found": "Check the path with find_files or list_files.",
     "invalid_arguments": "Fix the named field and call the tool again.",
     "excluded": "Do not try to reach this path another way.",
+    "guidance_changed": "Re-read the refreshed project instructions, then retry.",
     "stale_file": "Read the file again, then retry.",
     "edit_mismatch": ("Read the file again and copy old_text exactly, with enough context to match once, "
                       "or set replace_all=true."),
@@ -22,13 +23,15 @@ HINTS = {
 VALUE_ERROR_RULES = (
     ("excluded", ("Credential files are excluded", "directory is excluded")),
     ("access_required", ("needs access approval",)),
+    # Before stale_file: 'Project instructions changed before execution' is about guidance, not a file.
+    ("guidance_changed", ("instructions changed",)),
     ("stale_file", ("changed while waiting", "changed before execution", "changed since")),
     ("edit_mismatch", ("old_text",)),
     ("not_found", ("was not found", "not found in this conversation")),
     ("unavailable_tool", ("not available",)),
     ("limit", ("limit reached", "exceeds", "too large", "more than")),
 )
-INVALID_ARGUMENT_PHRASES = ("must be an integer", "must be a boolean", "must be true or false", "Give either")
+INVALID_ARGUMENT_PHRASES = ("must be an integer", "must be a boolean", "must be booleans", "must be true or false", "Give either")
 
 
 def _kind(exc, message):

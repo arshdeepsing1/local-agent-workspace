@@ -313,6 +313,28 @@ async def test_auto_continue_gives_up_after_six_attempts(runtime, monkeypatch, d
     assert session["terminal_reason"] == "inference_error"
 
 
+async def test_auto_continue_waits_are_counted_per_turn_not_per_request(runtime, monkeypatch, delays, clock):
+    manager, session = runtime
+    requests = []
+    tool_call = ("data: " + json.dumps({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "list", "function": {
+        "name": "list_files", "arguments": "{}"}}]}, "finish_reason": "tool_calls"}]}) + "\n\ndata: [DONE]\n\n")
+
+    async def gateway(request):
+        requests.append(request)
+        if len(requests) == 6:  # Step 1 succeeds after both waits; step 2 is rate limited again.
+            return httpx.Response(200, text=tool_call)
+        return httpx.Response(429, json=RATE_LIMITED)
+
+    mock_gateway(monkeypatch, gateway)
+    await manager.run(session, "List the files")
+    assert len(requests) == 6 + 4  # Step 2: the first attempt and three retries, then no more waits.
+    assert sum("Continuing automatically" in text for text in notices(session)) == 2
+    assert [event["state"] for event in session["events"] if event["type"] == "tool"] == ["completed"]
+    assert session["events"][-1]["error_kind"] == "rate_limit" and session["terminal_reason"] == "inference_error"
+    assert [call.get("retry_reason") for call in agent_calls(session)][6:] == [
+        None, "rate_limit", "rate_limit", "rate_limit"]
+
+
 async def test_auto_continue_can_be_turned_off_in_settings(runtime, monkeypatch, delays, clock):
     manager, session = runtime
     manager.settings.values["rate_limit_auto_continue"] = False

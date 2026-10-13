@@ -15,8 +15,8 @@ export const CONTINUE_MESSAGE = 'Continue from where you stopped.'
 //   'inference_error' with the turn's last error event's error_kind:
 //     'output_limit': the reply still hit the output-token limit after automatic retries;
 //     'invalid_tool_arguments' or 'incomplete_response': the reply could not be used
-//       even after the hidden automatic retries (a provider content filter stop is
-//       never retried and also ends this way);
+//       even after the hidden automatic retries. (A provider content filter stop has
+//       error_kind 'content_filter', is never retried and gets no Continue.)
 //     'rate_limit': Databricks still rate limited the request after the automatic
 //       retries and waits. (No code path sets terminal_reason 'rate_limit'.)
 // - Older records cut short by a restart keep a stale terminal_reason; their

@@ -92,6 +92,10 @@ def test_continue_follows_live_turn_endings(ui, page):
      "The model's reply could not be used."),
     ("[{ type: 'error', text: 'Ended early', error_kind: 'incomplete_response' }]", {"terminal_reason": "inference_error"},
      "The model's reply could not be used."),
+    # A provider content-filter stop is shown as its own error, without Continue.
+    ("[{ type: 'assistant', text: 'No', request_info: { status: 'error', finish_reason: 'content_filter', "
+     "error_kind: 'content_filter' } }, { type: 'error', text: 'Filtered', error_kind: 'content_filter' }]",
+     {"terminal_reason": "inference_error"}, None),
     # Only the turn's last error counts, and only for an inference error.
     ("[{ type: 'error', text: 'Old', error_kind: 'rate_limit' }, { type: 'error', text: 'Server', error_kind: 'server' }]",
      {"terminal_reason": "inference_error"}, None),

@@ -160,6 +160,30 @@ def test_verify_tab_reports_a_rejected_value(ui, page):
     expect(section.get_by_role("status")).to_have_count(0)
 
 
+def test_saving_verify_keeps_keyboard_focus_and_ignores_repeat_submits(ui, page):
+    open_tab(ui, page, "Verify", pending("saving", "path.startsWith('/api/project-settings') && options.method === 'PUT'"))
+    section = page.get_by_role("region", name="Verify")
+    command = section.get_by_role("textbox", name="Command")
+    expect(command).to_have_value("pytest -q")
+    command.fill("make check")
+    command.press("Enter")
+    ui.wait("fake.calls.some(call => call.path.startsWith('/api/project-settings') && call.method === 'PUT')")
+    # The fields are read-only while saving, not disabled, so focus stays where it was.
+    expect(command).to_have_attribute("readonly", "")
+    expect(command).to_be_focused()
+    save = section.get_by_role("button", name="Save", exact=True)
+    expect(save).to_have_attribute("aria-disabled", "true")
+    command.press("Enter")
+    save.click(force=True)
+    assert len(ui.bodies("/api/project-settings?session_id=a", "PUT")) == 1
+    ui.run("fake.deferreds.saving.resolve(fake.json({ workspace: '/project', verify_command: 'make check', "
+           "verify_timeout_seconds: 600, verify_max_rounds: 2 }))")
+    expect(section.get_by_role("status")).to_have_text("Verify command saved for this project.")
+    expect(save).to_be_focused()  # The repeat click moved focus to Save, and it stays there.
+    expect(command).not_to_have_attribute("readonly", "")
+    expect(save).to_have_attribute("aria-disabled", "false")
+
+
 def test_verify_tab_without_a_conversation_uses_the_default_workspace(ui, page):
     open_dialog(ui, selected="null")
     page.get_by_role("button", name="Verify", exact=True).click()
