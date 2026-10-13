@@ -185,9 +185,29 @@ history, oversized bundles, and authority-bearing fields are rejected atomically
 
 **Fork completed conversation** makes a separate full-history copy in the same
 workspace, leaving the original unchanged. Only completed, idle conversations can
-be forked; running/failed turns and arbitrary turn selection are not supported.
-Forks also start in Manual with no folder grants, allow rules or active skills, retain any tool
-profile restrictions, and do not copy child conversations, task-board records, jobs, or file checkpoints.
+be forked this way. **Fork from here** on a reply (see **Edit, retry and rewind**)
+copies the conversation up to that reply instead, also from a stopped or failed turn,
+and can put the copy in a new Git worktree. Every fork starts in Manual with no folder
+grants, allow rules or active skills, retains any tool profile restrictions and turned-off
+tools, and does not copy child conversations, task-board records, jobs, queued messages,
+or file checkpoints.
+
+An in-place rewind (**Edit**, **Retry**, **Rewind to here**) first saves the whole
+conversation as an archived copy titled `<title> (before rewind)`. The copy keeps the
+messages, replies, tool results and summary, starts in Manual with no grants, rules or
+active skills, and does not copy the usage ledger, jobs, queued messages or waiting
+command output. Its own **Usage** view still shows the token counts recorded on its
+replies, as historical calls marked incomplete (like a fork); no view adds usage across
+chats. A worktree chat's copy keeps its `worktree` header, so it is listed with its
+project. Archived copies can be opened from the rewind notice and deleted like any
+conversation.
+
+Each user message records whether its text reached the model history (`in_wire`), so
+a cut before any message maps exactly onto the model history; app-generated prompts
+(automatic continuations and Verify messages) always stay with the turn before them.
+Messages saved by earlier versions have no record and are matched by their exact
+text; when that is not possible, a conversation cut before them is refused with a
+message, while code-only rewinds and whole-chat forks still work.
 
 The sidebar reads the small metadata record at the start of each conversation file
 instead of loading every event and provider-history record. Allow rules are stored as
@@ -540,6 +560,52 @@ when opening a conversation or performing restart recovery.
   errors. Your draft is left as it is, and keyboard focus moves to the message box.
   It is also offered when the model's reply still could not be used after the hidden
   retries, and when Databricks still rate limited the chat after the automatic retries.
+- **Edit, retry and rewind**: while a conversation is idle, each message shows its
+  actions under it.
+  - **Edit message** (pencil) replaces that message and everything after it with your
+    edited text and sends it. **Also undo file changes made from this message on**
+    rewinds the agent's file edits too. Ctrl+Enter (Cmd+Enter) sends, Esc cancels.
+  - **Retry response** on the last reply sends the same message again in place of
+    everything from it on. It is offered only when that reply answers your latest
+    message: when the latest message failed or was stopped before any reply, use **Edit
+    message** or **Continue** instead. It is not offered when the latest turn included a
+    message sent while the agent was working; use **Edit message** then.
+  - **Rewind to here** opens a dialog: **Conversation and code**, **Conversation
+    only** or **Code only**. It shows how many messages and replies go, whether the
+    summary of earlier turns is dropped (when it covers messages after the point; the
+    next message may compact again), and each file the agent edited from that message
+    on: **Will be restored**, **Already as it was**, **Changed since the agent's last
+    edit**, or **Also changed by something else between the agent's edits** (an editor
+    save, an Undo, a Recovery restore, a subagent or a command wrote it between two
+    agent edits). Any file in the last two states, or one the chat can no longer
+    reach, refuses the whole file rewind and nothing is changed. A rewound file goes
+    back, in one write, to its state before the agent's first edit in that range; each
+    write keeps a reverse checkpoint, so **Agent tools → Recovery → Other file edits**
+    can undo it. Only edits made through the file tools (`write_file`, `edit_file`,
+    `insert_activity_log`, `move_path`, `delete_path`, `notebook_edit`) are rewound,
+    including those of turns an earlier conversation rewind removed; changes made by
+    commands or by subagents are not. After a conversation rewind the message you
+    rewound to is put in an empty message box (a typed draft is kept), and a notice
+    links to the archived earlier version.
+  - The conversation keeps its id, settings, grants, usage ledger, queued messages and
+    waiting command output; the record of which files the agent read is cleared, so the
+    agent reads files again before overwriting them. All of this needs an idle chat,
+    including no waiting approval, question or plan card, and file rewinds also need the
+    other chats and commands in the workspace to be idle.
+  - **Fork from here** (on the last reply of each turn) opens a new chat with the
+    conversation up to that reply; optionally give it a title and create it in a new
+    Git worktree (a new branch from the chat's checkout at its last commit; uncommitted
+    changes are not copied). Like the other actions, it needs an idle chat with no
+    waiting approval, question or plan card.
+  - **Stop marker**: when you press **Stop**, the reply's partial text is kept in the
+    model history followed by `[The user stopped this response before it finished. Tool
+    calls it was preparing did not run.]`, after any interrupted tool call gets its
+    "Execution interrupted" result, so the next message, an export or a fork sees a
+    complete history at once. A turn cut short by a shutdown or a restart gets `[This
+    response was cut off when the app stopped. …]` instead. A Stop before the message
+    reached the model history (for example while MCP servers start) adds nothing. The
+    **Stopped.** notice records what was interrupted (`stop_phase`: `streaming`, `tools`
+    for a tool or a waiting card, or `waiting` for a retry wait or context preparation).
 - **Verify**: **Agent tools → Verify** sets a command for the project folder, for
   example `pytest -q`, with a time limit (10 to 3,600 seconds, default 600) and fix
   rounds (1 to 3, default 2). After a reply in which the agent changed files inside the
@@ -947,6 +1013,25 @@ the worktree) or running command, and keeps the branch and its
 commits. Delete the worktree's conversations and choose another default workspace
 before removal. Git hooks, filters, and fsmonitor are disabled for managed worktree
 operations. This is deliberate workspace isolation, not automatic per-task copies.
+
+**New chat in worktree** on the welcome screen creates a worktree on a new branch
+(default `chat/<date>-<time>`) from the selected chat's project, or the default
+workspace, and opens a chat in it. **Fork from here** can put a fork in a new worktree
+too; forking a worktree chat starts the new branch from that worktree's last commit,
+and a plain fork of a worktree chat stays in the same worktree. Worktree chats record
+`worktree: {id, branch, source_workspace}`, where `source_workspace` is always the root
+project, never another worktree. Permission rules saved for a project apply to that
+folder only: a worktree chat does not inherit its source project's "Always allow in
+this project" rules, because a worktree is a separate folder (least privilege). Rules
+allowed inside a worktree chat apply to that worktree. An archived `(before rewind)` copy
+of a worktree chat also uses the worktree: delete it too before removing the worktree.
+
+Rewinding files (**Rewind to here**, or **Edit message** with **Also undo file
+changes**) uses the same checkpoints: see **Edit, retry and rewind**. API:
+`GET /api/sessions/<id>/rewind-preview?before_event_id=<user event id>` and
+`POST /api/sessions/<id>/rewind` `{before_event_id, conversation, code, resend_text?}`
+(409 with `{message, files}` when a file changed); `POST /api/sessions/<id>/fork`
+with `{before_event_id?, title?, worktree_branch?}` forks from a point.
 
 ### Agent tools: MCP, skills, and hooks
 

@@ -1,5 +1,5 @@
 import { html, useEffect, useMemo, useRef, useState } from '../lib.js'
-import { Check, ChevronDown, ChevronRight, Copy, FileText, LoaderCircle, Terminal, X } from '../icons.js'
+import { Check, ChevronDown, ChevronRight, Copy, FileText, GitBranch, LoaderCircle, Pencil, RefreshCw, Terminal, Undo2, X } from '../icons.js'
 import { api } from '../api.js'
 import { enhanceCodeBlocks, linkPaths, renderMarkdown } from '../markdown.js'
 import QuestionCard from './QuestionCard.js'
@@ -7,6 +7,10 @@ import PlanCard from './PlanCard.js'
 import { Brand } from './Sidebar.js'
 import RequestDetails from './RequestDetails.js'
 import ApprovalOptions, { ruleLine } from './ApprovalOptions.js'
+import EditMessage from './EditMessage.js'
+import RewindDialog from './RewindDialog.js'
+import ForkDialog from './ForkDialog.js'
+import { backupTitle, RewindNotice, setRewindNotice } from '../rewindNotice.js'
 
 // A long file is read in pages. Naming the lines each read covered keeps the
 // pages of one file from looking like the same read repeated.
@@ -201,19 +205,40 @@ function Markdown({ text, streaming = false, onOpenPath }) {
   return html`<div class="markdown" ref=${element} onClick=${open} dangerouslySetInnerHTML=${{ __html: markup }} />`
 }
 
-function Reply({ text, reasoning, truncated, requestInfo, onOpenPath }) {
+// Chips under a user message for its @ file snapshots and ! command outputs (metadata only).
+export function attachmentLabel(item) {
+  if (item?.kind === 'shell') {
+    const command = String(item.command || '')
+    return `! ${command.length > 60 ? `${command.slice(0, 59)}…` : command} · exit ${item.exit_code ?? '?'}`
+  }
+  const lines = Number.isInteger(item?.start_line) && Number.isInteger(item?.end_line) ? ` · lines ${item.start_line}–${item.end_line}` : ''
+  return `@${item?.path || ''}${lines}${item?.truncated ? ' · shortened' : ''}`
+}
+
+function Attachments({ items }) {
+  if (!Array.isArray(items) || !items.length) return null
+  return html`<ul class="attachment-chips" aria-label="Attachments">${items.map((item, index) => html`<li key=${index} class="attachment-chip">${attachmentLabel(item)}</li>`)}</ul>`
+}
+
+function ActionButton({ label, icon: Icon, onClick, disabled = false, target }) {
+  return html`<button class="icon-button message-action" aria-label=${label} title=${label} disabled=${disabled} data-target=${target} onClick=${onClick}><${Icon} size=${14} /></button>`
+}
+
+function Reply({ text, reasoning, truncated, requestInfo, onOpenPath, actions = null }) {
   const streaming = requestInfo?.status === 'running'
   return html`<div class="assistant-reply"><${Brand} small=${true} />
     <div class="reply-content">${reasoning ? html`<details class="reasoning-summary"><summary>Provider reasoning summary</summary>
       <p class="muted">Supplied by the model endpoint.</p><${Markdown} text=${reasoning} streaming=${streaming} />
       ${truncated ? html`<p class="muted">Summary display limit reached.</p>` : null}</details>` : null}<${Markdown} text=${text} streaming=${streaming} onOpenPath=${onOpenPath} />
-      ${text ? html`<${CopyAction} text=${text} label="Copy response" />` : null}
+      ${text || actions ? html`<div class="message-actions">${text ? html`<${CopyAction} text=${text} label="Copy response" />` : null}${actions}</div>` : null}
       ${requestInfo ? html`<${RequestDetails} info=${requestInfo} />` : null}
     </div></div>`
 }
 
 // onOpenPath({ path, line? }) opens a file named in a reply or a tool card in the Workspace panel.
-export default function Conversation({ session, onError, onSelectSession, onOpenPath }) {
+// busy: the chat is not idle (message actions other than Copy are hidden).
+// onPrefill(text) puts text in an empty composer and returns false when a typed draft was kept.
+export default function Conversation({ session, onError, onSelectSession, onOpenPath, busy = false, onPrefill }) {
   const container = useRef(null)
   const bottom = useRef(null)
   const follow = useRef(true)
@@ -222,6 +247,68 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
   useEffect(() => { if (follow.current) bottom.current?.scrollIntoView({ block: 'end' }) }, [session.events.length, last?.text, last?.state])
   useEffect(() => { follow.current = true; bottom.current?.scrollIntoView({ block: 'end' }) }, [session.id])
   const tools = session.events.filter(event => event.type === 'tool')
+  // Edit and resend, Retry, Rewind and Fork from here (history.py on the server).
+  const [editing, setEditing] = useState(null)  // the user event id being edited
+  const [rewinding, setRewinding] = useState(null)  // the user event to rewind to
+  const [forking, setForking] = useState(undefined)  // { beforeEventId } of the reply to fork from
+  const [retrying, setRetrying] = useState(false)
+  const editReturn = useRef(null)  // the user event whose 'Edit message' button gets focus after Cancel
+  useEffect(() => {
+    if (editing !== null || editReturn.current === null) return
+    const id = editReturn.current
+    editReturn.current = null
+    const button = [...(container.current?.querySelectorAll('[data-target]') ?? [])]
+      .find(item => item.dataset.target === `edit:${id}`)
+    button?.focus()
+  }, [editing])
+  const idle = !busy && session.status === 'idle'
+  const cuts = useMemo(() => {
+    const events = session.events
+    // The message that started the running (or latest) turn: the last one that was not steered.
+    const turnStart = events.findLastIndex(event => event.type === 'user' && !event.steered)
+    const nextUser = new Map()  // reply id -> index of the first user event after it
+    const turnEnds = new Set()  // replies that end a turn (no later reply before the next message)
+    let next = -1, replyAfter = false
+    for (let index = events.length - 1; index >= 0; index--) {
+      const event = events[index]
+      if (event.type === 'user') { next = index; replyAfter = false }
+      else if (event.type === 'assistant' && event.text) {
+        nextUser.set(event.id, next)
+        if (!replyAfter) turnEnds.add(event.id)
+        replyAfter = true
+      }
+    }
+    const lastReplyIndex = events.findLastIndex(event => event.type === 'assistant' && event.text)
+    const latestUserIndex = events.findLastIndex(event => event.type === 'user')
+    const steered = events.slice(turnStart + 1).some(event => event.type === 'user' && event.steered)
+    // Retry resends the latest message, so it is offered only on a reply to that message: after a turn
+    // that failed or was stopped before any reply, the last reply belongs to an earlier turn.
+    const retry = latestUserIndex >= 0 && turnStart >= 0 && !steered && lastReplyIndex > latestUserIndex
+    return { nextUser, turnEnds, lastReply: events[lastReplyIndex], latestUser: events[latestUserIndex], retry }
+  }, [session.events])
+  const rewound = (result, draftKept = false) => {
+    if (result.backupId) setRewindNotice(session.id, { title: backupTitle(session.title), backupId: result.backupId, draftKept })
+  }
+  const retry = async () => {
+    if (retrying || !cuts.latestUser) return
+    setRetrying(true)
+    try {
+      const result = await api(`/sessions/${encodeURIComponent(session.id)}/rewind`, 'POST',
+        { before_event_id: cuts.latestUser.id, conversation: true, resend_text: cuts.latestUser.text })
+      rewound({ backupId: result.backup_session_id })
+      if (result.resend_error) onError(result.resend_error)
+    } catch (e) { onError(e) }
+    finally { setRetrying(false) }
+  }
+  const replyActions = event => {
+    const next = cuts.nextUser.get(event.id) ?? -1
+    const fork = idle && cuts.turnEnds.has(event.id)
+    const canRetry = idle && cuts.retry && cuts.lastReply?.id === event.id
+    if (!fork && !canRetry) return null
+    return html`${fork ? html`<${ActionButton} label="Fork from here" icon=${GitBranch}
+        onClick=${() => setForking({ beforeEventId: next >= 0 ? session.events[next].id : null })} />` : null}
+      ${canRetry ? html`<${ActionButton} label="Retry response" icon=${RefreshCw} disabled=${retrying} onClick=${() => void retry()} />` : null}`
+  }
   return html`<div class="transcript" ref=${container} onScroll=${() => {
     const el = container.current
     if (el) follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120
@@ -234,15 +321,33 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
       })}</ol>
     </details>` : null}
     ${session.parent_session_id && onSelectSession ? html`<button class="outline parent-conversation" onClick=${() => onSelectSession(session.parent_session_id)}>Back to parent conversation</button>` : null}
+    <${RewindNotice} sessionId=${session.id} onSelectSession=${onSelectSession} />
     ${session.events.map(event => {
-      if (event.type === 'user') return html`<div class="user-message" key=${event.id}>${event.origin?.kind === 'delegated' ? html`<small class="delegation-origin">Delegated by parent conversation</small>` : null}${event.text}${event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}${event.text ? html`<${CopyAction} text=${event.text} label="Copy message" />` : null}</div>`
+      if (event.type === 'user' && editing === event.id && idle) return html`<${EditMessage} key=${event.id} sessionId=${session.id} event=${event}
+        onSelectSession=${onSelectSession}
+        onCancel=${() => { editReturn.current = event.id; setEditing(null) }} onSent=${result => {
+          setEditing(null)
+          rewound({ backupId: result.backup_session_id })
+          if (result.resend_error) onError(result.resend_error)
+          // The edited message is gone from the transcript; the message box is where to go on.
+          document.querySelector('textarea[aria-label="Message"]')?.focus()
+        }} />`
+      if (event.type === 'user') return html`<div class=${`user-message${event.steered ? ' steered' : ''}`} key=${event.id}>${event.steered ? html`<small class="steered-label">Sent while the agent was working</small>` : null}${event.origin?.kind === 'delegated' ? html`<small class="delegation-origin">Delegated by parent conversation</small>` : null}${event.text}<${Attachments} items=${event.attachments} />${event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}${event.text || idle ? html`<div class="message-actions">${event.text ? html`<${CopyAction} text=${event.text} label="Copy message" />` : null}${idle ? html`<${ActionButton} label="Edit message" icon=${Pencil} target=${`edit:${event.id}`} onClick=${() => setEditing(event.id)} /><${ActionButton} label="Rewind to here" icon=${Undo2} onClick=${() => setRewinding(event)} />` : null}</div>` : null}</div>`
       if (event.type === 'tool' && event.name === 'ask_user') return html`<${QuestionCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
       if (event.type === 'tool' && event.name === 'submit_plan') return html`<${PlanCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
       if (event.type === 'tool') return html`<${ToolCard} key=${event.id} event=${event} summary=${toolSummaries.get(event.id)} sessionId=${session.id} onError=${onError} onSelectSession=${onSelectSession} onOpenPath=${onOpenPath} />`
-      if (event.type === 'assistant') return event.text || event.reasoning_summary || event.request_info ? html`<${Reply} key=${event.id} text=${event.text || ''} reasoning=${event.reasoning_summary} truncated=${event.reasoning_truncated} requestInfo=${event.request_info} onOpenPath=${onOpenPath} />` : null
+      if (event.type === 'assistant') return event.text || event.reasoning_summary || event.request_info ? html`<${Reply} key=${event.id} text=${event.text || ''} reasoning=${event.reasoning_summary} truncated=${event.reasoning_truncated} requestInfo=${event.request_info} onOpenPath=${onOpenPath} actions=${event.text ? replyActions(event) : null} />` : null
       return html`<div class=${`conversation-notice ${event.type === 'error' ? 'error' : ''}`} key=${event.id}>${event.text}<${DelegationStatus} event=${event} onSelectSession=${onSelectSession} />${!event.delegation && event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}</div>`
     })}
     ${['running', 'delegating'].includes(session.status) ? html`<div class="working-indicator"><span /><span /><span /><span class="sr-only">Working</span></div>` : null}
+    ${rewinding && idle ? html`<${RewindDialog} session=${session} event=${rewinding} onClose=${() => setRewinding(null)}
+      onSelectSession=${onSelectSession}
+      onRewound=${result => {
+        setRewinding(null)
+        rewound(result, result.conversation && onPrefill ? onPrefill(rewinding.text || '') === false : false)
+      }} />` : null}
+    ${forking !== undefined && onSelectSession ? html`<${ForkDialog} session=${session} beforeEventId=${forking.beforeEventId}
+      onSelectSession=${onSelectSession} onClose=${() => setForking(undefined)} />` : null}
     <div ref=${bottom} />
   </div></div>`
 }

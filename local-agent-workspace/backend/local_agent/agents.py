@@ -56,6 +56,7 @@ from .approvals import MAX_ALLOW_RULES, busy_status, declined, rule_for
 from .notify import SystemNotifier, attention_message
 from .context import INCOMPLETE_RESPONSE_CONTINUATION, INVALID_ARGUMENTS_CONTINUATION, VERIFY_CONTINUATION_PREFIX
 from .context import is_continuation
+from . import history
 from .tool_errors import tool_error_text
 from .projects import ProjectSettings
 import random
@@ -553,6 +554,16 @@ class AgentManager:
                 changed = cut_short = True
         if cut_short:
             session["terminal_reason"] = "interrupted"  # Continue is offered; notifications report it.
+            newest = next((event for event in reversed(session["events"]) if event.get("type") == "user"), None)
+            if newest is not None and newest.get("in_wire") is True:
+                # Close the cut-short turn in the model history once: the next startup finds no
+                # turn_running and no running event, so cut_short is False then.
+                last = session["events"][-1]
+                info = last.get("request_info") or {}
+                partial = (last.get("text") or "") if last.get("type") == "assistant" and (
+                    info.get("status"), info.get("error_kind")) == ("interrupted", "incomplete_response") else ""
+                history.close_stopped(session, session["events"],
+                                      history.stopped_reply(partial, history.INTERRUPTED_MARKER), repair_tool_history)
         if "turn_ended" in session and session["turn_ended"] is None:
             if not cut_short:
                 # Stopped while naming the chat: the answer itself had finished.
@@ -994,6 +1005,8 @@ class AgentManager:
 
     async def event(self, session, kind, **values):
         event = {"id": str(uuid.uuid4()), "type": kind, "created": time.time(), **values}
+        if kind == "user":  # in_wire turns true once the text is in the model history (history.py).
+            event.setdefault("in_wire", False)
         session["events"].append(event)
         self.store.save(session)
         await self.broadcast(session["id"], {"type": "event", "event": event})
@@ -1007,6 +1020,13 @@ class AgentManager:
         await self.broadcast(session["id"], {"type": "event", "event": event})
         if event["type"] == "tool":
             await self.delegates.progress(session)
+
+    def mark_user_in_wire(self, session):
+        """The newest user event's text is now the wire's latest user message (history.py).
+        Not saved here: the next save persists it."""
+        event = next((item for item in reversed(session["events"]) if item.get("type") == "user"), None)
+        if event is not None and event.get("in_wire") is False:
+            event["in_wire"] = True
 
     async def delta(self, session, event, text, draft=None):
         event["text"] += text
@@ -1432,8 +1452,15 @@ class AgentManager:
                 asyncio.current_task().uncancel()
             else:
                 terminal_reason = "stopped"
+                # Before anything else: run's finally later marks running events cancelled.
+                turn = session["events"][first_event:]
+                phase = history.stop_phase(turn)
+                if turn and turn[0]["type"] == "user" and turn[0].get("in_wire") is True:
+                    # Only this turn's own prompt is closed, never the previous turn's.
+                    marker = history.INTERRUPTED_MARKER if getattr(self, "closing", False) else history.STOP_MARKER
+                    history.close_stopped(session, session["events"], marker, repair_tool_history)
                 try:
-                    await self.event(session, "notice", text="Stopped. You can continue this conversation.")
+                    await self.event(session, "notice", text="Stopped. You can continue this conversation.", stop_phase=phase)
                 except STORAGE_ERRORS as exc:
                     terminal_reason = "error"
                     await report_storage_failure(exc)
@@ -2457,6 +2484,10 @@ class AgentManager:
             if draft.failure:
                 info["error_kind"] = "unknown"
                 raise draft.failure
+            # Stopped while streaming: the partial text and a marker close the turn in the model
+            # history (never partial tool calls). The normal append above is never followed by an await.
+            marker = history.INTERRUPTED_MARKER if getattr(self, "closing", False) else history.STOP_MARKER
+            session["wire"].append({"role": "assistant", "content": history.stopped_reply(event["text"], marker)})
             raise
         except DraftPersistenceError:
             info.update(status="error", error_kind="unknown")
@@ -2636,6 +2667,7 @@ class AgentManager:
         wire.append({"role": "user", "content": prompt})
         context_window = self.settings.values.get("context_window", DEFAULT_CONTEXT_WINDOW)
         max_output_tokens = self.settings.values.get("max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS)
+        self.mark_user_in_wire(session)  # No await since the prompt was appended above.
         url = host + "/serving-endpoints/" + quote(session["model"], safe="") + "/invocations"
         headers = {"Authorization": f"Bearer {token}"}
         async with httpx.AsyncClient(timeout=httpx.Timeout(120, connect=20), follow_redirects=False) as client:

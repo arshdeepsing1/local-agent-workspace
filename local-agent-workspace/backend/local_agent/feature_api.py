@@ -3,8 +3,10 @@ from pathlib import Path
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
+from . import approvals
 from .agents import public_session
-from .approvals import busy_conflict, busy_status, clip_title, ensure_idle
+from .approvals import busy_conflict, busy_status, ensure_idle
+from .portability_api import root_project
 from .tool_profiles import validate_profile
 
 
@@ -75,18 +77,7 @@ def register_features(app, manager, settings, store, session_or_404, workspace_t
         return result
 
     def workspace_idle(tools, action):
-        # Writing files back is an explicit user action, guarded against active writers in this workspace.
-        for summary in store.list():
-            if Path(summary["workspace"]).resolve() == tools.root:
-                idle(summary, action)
-        job = next((job for job in manager.jobs.list(workspace=str(tools.root)) if job["state"] == "running"), None)
-        owner = job and job.get("session_id") and store.get(job["session_id"])
-        if owner:
-            raise HTTPException(409, detail={
-                "message": f"A command started in “{clip_title(owner.get('title'))}” is still running. Stop it in Terminal before {action}.",
-                "session_id": owner["id"], "title": clip_title(owner.get("title"), 160)})
-        if job:
-            raise HTTPException(409, f"Stop workspace commands before {action}.")
+        approvals.workspace_idle(manager, store, tools.root, action)
 
     @app.post("/api/checkpoints/{checkpoint_id}/restore")
     async def restore(checkpoint_id: str, body: RestoreRequest, session_id: str | None = None):
@@ -140,6 +131,9 @@ def register_features(app, manager, settings, store, session_or_404, workspace_t
         session = store.create({**settings.values, "workspace": record["path"], "model": parent.get("model", settings.values["model"])})
         # A new worktree chat starts with normal manual permissions and no inherited external grants.
         session["title"] = f"Worktree: {record['branch']}"[:100]
+        # The root project, also when the worktree was made from a worktree chat (sidebar grouping).
+        source = root_project(manager, record["source_workspace"], parent.get("worktree"))
+        session["worktree"] = {"id": record["id"], "branch": record["branch"], "source_workspace": source}
         store.save(session)
         return public_session(session)
 

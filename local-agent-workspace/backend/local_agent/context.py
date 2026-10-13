@@ -147,12 +147,28 @@ def handoff_pointer(files):
                                         for item in reversed(files[-HANDOFF_POINTER_FILES:]))
 
 
+def is_app_prompt(message):
+    """True for a user-role message the app appended to the model history itself.
+
+    Such a prompt belongs to the turn before it and is never one of the user's
+    turns (history cuts, turn_start, compaction boundaries). The app appends:
+    - OUTPUT_LIMIT_CONTINUATION after an output cutoff;
+    - INVALID_ARGUMENTS_CONTINUATION and INCOMPLETE_RESPONSE_CONTINUATION after a
+      response whose tool calls could not run;
+    - a message starting with VERIFY_CONTINUATION_PREFIX after a failed Verify run
+      or a declined one with the user's note.
+    All of them are is_continuation messages. The compaction summary
+    (SUMMARY_PREFIX) is only built into requests, never stored in the history.
+    """
+    return is_continuation(message)
+
+
 def turn_start(wire, index):
     """Index of the user request that began the turn holding wire[index]: the
-    nearest user message at or before it that is not the app's continuation."""
+    nearest user message at or before it that is not the app's own prompt."""
     for position in range(min(index, len(wire) - 1), -1, -1):
         message = wire[position]
-        if message.get("role") == "user" and not is_continuation(message):
+        if message.get("role") == "user" and not is_app_prompt(message):
             return position
     return None
 

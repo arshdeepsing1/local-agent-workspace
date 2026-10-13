@@ -143,6 +143,23 @@ def ensure_idle(manager, session, action=None):
         raise busy_conflict(session, status, action)
 
 
+def workspace_idle(manager, store, root, action):
+    """Writing files back is an explicit user action, guarded against active writers in this workspace:
+    every chat in the workspace root must be idle and no command may run there (HTTP 409 otherwise)."""
+    from pathlib import Path
+    for summary in store.list():
+        if Path(summary["workspace"]).resolve() == root:
+            ensure_idle(manager, summary, action)
+    job = next((job for job in manager.jobs.list(workspace=str(root)) if job["state"] == "running"), None)
+    owner = job and job.get("session_id") and store.get(job["session_id"])
+    if owner:
+        raise HTTPException(409, detail={
+            "message": f"A command started in “{clip_title(owner.get('title'))}” is still running. Stop it in Terminal before {action}.",
+            "session_id": owner["id"], "title": clip_title(owner.get("title"), 160)})
+    if job:
+        raise HTTPException(409, f"Stop workspace commands before {action}.")
+
+
 def known_tool_names():
     from .feature_tools import FEATURE_TOOLS
     from .tools import TOOL_DEFINITIONS

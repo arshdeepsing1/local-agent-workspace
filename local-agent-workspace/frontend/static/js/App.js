@@ -18,6 +18,8 @@ import { blockerOf, OpenBlockingChat } from './components/BlockingChat.js'
 import TaskChecklist from './components/TaskChecklist.js'
 import ContinueButton from './components/ContinueButton.js'
 import { removeDraft, useSavedDrafts } from './drafts.js'
+import { RewindNotice } from './rewindNotice.js'
+import WorktreeChat from './components/WorktreeChat.js'
 
 export default function App() {
   const app = useWorkspace()
@@ -101,11 +103,14 @@ export default function App() {
       <${StorageNotice} problems=${app.storageProblems} />
       ${!app.online && app.activeId ? html`<div class="connection-banner">Reconnecting to your local server… Refresh if the server was restarted.</div>` : null}
       ${app.connection && !app.connection.connected ? html`<div class="connection-banner"><span>${app.connection.error || 'Configure Databricks to start a conversation.'}</span><button onClick=${() => setSettingsOpen(true)}>Open settings</button></div>` : null}
-      ${hasMessages && active ? html`<${Conversation} key=${active.id} session=${active} onError=${showError} onSelectSession=${app.setActiveId} onOpenPath=${openFileAt} />` :
-        html`<div class="welcome"><div class="welcome-content"><div class="welcome-heading"><${Brand} /><h1>What’s up next?</h1></div>
+      ${hasMessages && active ? html`<${Conversation} key=${active.id} session=${active} onError=${showError} onSelectSession=${app.setActiveId} onOpenPath=${openFileAt}
+          busy=${busy} onPrefill=${text => { if (draft.trim()) return false; setDraft(text); return true }} />` :
+        html`<div class="welcome"><div class="welcome-content"><${RewindNotice} sessionId=${app.activeId} onSelectSession=${app.setActiveId} />
+          <div class="welcome-heading"><${Brand} /><h1>What’s up next?</h1></div>
           <div class="suggestions"><button class="outline" onClick=${() => setDraft('Explore this project. Read the relevant files and explain its structure and how to run it.')}><${Folder} size=${16} />Explore this project</button>
             <button class="outline" onClick=${() => setDraft('Help me make a change in this project: ')}><${Pencil} size=${16} />Make a change</button>
-            <button class="outline" onClick=${() => setDraft('Run a command in this workspace: ')}><${Terminal} size=${16} />Run a command</button></div>
+            <button class="outline" onClick=${() => setDraft('Run a command in this workspace: ')}><${Terminal} size=${16} />Run a command</button>
+            <${WorktreeChat} key=${app.viewKey} sessionId=${app.activeId} onSelectSession=${app.setActiveId} onError=${showError} /></div>
         </div></div>`}
       <div class="chat-composer"><div class="composer-bars"><${ChangesBar} key=${`changes-${app.viewKey}`} changes=${app.changes} busy=${busy} onOpen=${openReview} onAction=${app.reviewChanges} onError=${showError} />
         <${TaskChecklist} key=${`tasks-${app.viewKey}`} tasks=${app.tasks} />
