@@ -58,6 +58,19 @@ def read_env(path: Path) -> dict[str, str]:
     return result
 
 
+def follow_limits(follow, defaults, current):
+    """(context window, max output tokens) after the budgets marked in follow take a model's defaults.
+    A followed value that would leave the output at or above the context budget minus the safety
+    margin is not followed, so a model change never makes the kept budgets invalid."""
+    context_window, output = current
+    if follow[1] and type(defaults[0] if follow[0] else context_window) is int:
+        if defaults[1] < (defaults[0] if follow[0] else context_window) - SAFETY_MARGIN:
+            output = defaults[1]
+    if follow[0] and (type(output) is not int or output < defaults[0] - SAFETY_MARGIN):
+        context_window = defaults[0]
+    return context_window, output
+
+
 def credential_assignments(values):
     return {key: values[key] if key in values else values[alias]
             for key, alias in (("DBRICKS_URL", "DATABRICKS_HOST"), ("DBRICKS_TOKEN", "DATABRICKS_TOKEN"))
@@ -135,6 +148,7 @@ class Settings:
         return {**self.values, "host": host, "configured": configured,
                 "coding_dir_status": user_paths.coding_dir_status(self),
                 "python_venv_status": user_paths.python_venv_status(self), "default_model": DEFAULT_MODEL,
+                "default_limits": dict(zip(LIMIT_KEYS, default_limits(self.values["model"]))),
                 **({"model_migrated_from": self.migrated_from} if self.migrated_from is not None else {})}
 
     def env_equivalent(self, key, value, candidate=None):
@@ -161,11 +175,10 @@ class Settings:
         if isinstance(model, str) and model.strip() != self.values["model"]:
             # Budgets still at the old model's defaults follow the new model's, unless this save changes them.
             old, new = default_limits(self.values["model"]), default_limits(model)
-            for index, key in enumerate(LIMIT_KEYS):
-                if (values.get(key, self.values[key]) == self.values[key] and self.values[key] == old[index]
-                        and (index == 0 or (type(candidate["context_window"]) is int
-                                            and new[1] < candidate["context_window"] - SAFETY_MARGIN))):
-                    candidate[key] = new[index]
+            follow = [values.get(key, self.values[key]) == self.values[key] and self.values[key] == old[index]
+                      for index, key in enumerate(LIMIT_KEYS)]
+            followed = follow_limits(follow, new, (candidate["context_window"], candidate["max_output_tokens"]))
+            candidate.update(zip(LIMIT_KEYS, followed))
         workspace = Path(candidate["workspace"]).expanduser().resolve()
         if not workspace.is_dir():
             raise ValueError("Choose an existing project directory.")
@@ -220,7 +233,7 @@ class Settings:
             if value and value != self.values.get(key, ""):
                 try:
                     value = check(value, self, candidate)
-                except ValueError as exc:
+                except (ValueError, OSError) as exc:
                     raise ValueError(f"{label}: {exc}") from None
             candidate[key] = value
         candidate["workspace"] = str(workspace)

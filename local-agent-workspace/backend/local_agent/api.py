@@ -22,7 +22,7 @@ from .config import MAX_COMMAND_ENV, MAX_USER_INSTRUCTIONS, MAX_WRITE_LIMIT_KB, 
 from .context import (
     MAX_CONTEXT_WINDOW, MAX_MAX_OUTPUT_TOKENS, MIN_CONTEXT_WINDOW, MIN_MAX_OUTPUT_TOKENS, SAFETY_MARGIN,
 )
-from .model_profiles import effective_limits, limit_warnings, limits_note, public_profile
+from .model_profiles import default_limits, effective_limits, limit_warnings, limits_note, public_profile
 from .user_paths import standing_directories
 from .store import Store, UnreadableConversation
 from . import conversation_search
@@ -309,7 +309,9 @@ def create_app(settings=None):
         if profile and profile["recommended_context_window"] and profile["recommended_max_output_tokens"]:
             recommended = {"context_window": profile["recommended_context_window"],
                            "max_output_tokens": profile["recommended_max_output_tokens"]}
+        defaults = default_limits(model)
         return {"profile": profile, "recommended": recommended,
+                "defaults": {"context_window": defaults[0], "max_output_tokens": defaults[1]},
                 "effective": effective_limits(model, body.context_window, body.max_output_tokens),
                 "warnings": limit_warnings(model, body.context_window, body.max_output_tokens),
                 "note": limits_note(model)}

@@ -28,7 +28,7 @@ from .tools import LIMIT as FILE_LIMIT
 from .tools import write_limit_setting
 from . import diagnostics, notebooks
 from .edits import clip_result, preview_diff, split_lines
-from .config import DEFAULT_APPROVAL_MINUTES, DEFAULT_MAX_AGENT_STEPS
+from .config import DEFAULT_APPROVAL_MINUTES, DEFAULT_MAX_AGENT_STEPS, follow_limits
 from .instructions import load_project_instructions
 from .jobs import JobManager, validate_command_options
 from .command_exec import prepare_command
@@ -924,12 +924,14 @@ class AgentManager:
         return limits["context_window"], limits["max_output_tokens"]
 
     def base_limits(self, session):
+        """The Settings budgets, with those left at the Settings model's defaults following the chat's
+        endpoint (before the endpoint's maxima apply). A followed value that would not fit with the
+        other budget keeps the Settings value (config.follow_limits)."""
         values = self.settings.values
         defaults = default_limits(values["model"])
-        context_window, max_output_tokens = values["context_window"], values["max_output_tokens"]
-        model_defaults = default_limits(session.get("model") or values["model"])
-        return (model_defaults[0] if context_window == defaults[0] else context_window,
-                model_defaults[1] if max_output_tokens == defaults[1] else max_output_tokens)
+        current = (values["context_window"], values["max_output_tokens"])
+        follow = [current[0] == defaults[0], current[1] == defaults[1]]
+        return follow_limits(follow, default_limits(session.get("model") or values["model"]), current)
 
     async def limits_notice(self, session):
         """One notice per chat when its endpoint supports less than Settings asks for. Never a wire message."""
@@ -941,11 +943,14 @@ class AgentManager:
         if effective == session.get("clamped_limits"):
             return
         session["clamped_limits"] = effective
-        values = self.settings.values
+        # Name only what the endpoint caps. A capped value always comes from Settings: the endpoint's own
+        # defaults fit its maxima.
+        capped = [text for text, used, asked in (
+            (f"a {effective[0]:,}-token context budget (Settings: {base[0]:,})", effective[0], base[0]),
+            (f"{effective[1]:,} max output tokens (Settings: {base[1]:,})", effective[1], base[1])) if used != asked]
         await self.event(session, "notice", text=(
-            f"This chat's endpoint ({session['model']}) supports less than Settings asks for, so its requests use a "
-            f"{effective[0]:,}-token context budget and {effective[1]:,} max output tokens (Settings: "
-            f"{values['context_window']:,} and {values['max_output_tokens']:,})."))
+            f"This chat's endpoint ({session['model']}) supports less than Settings asks for, so its requests use "
+            + " and ".join(capped) + "."))
 
     @staticmethod
     def agent_job(session, job_id):

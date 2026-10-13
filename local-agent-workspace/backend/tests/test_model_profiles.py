@@ -11,6 +11,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from local_agent import agents as agents_module
 from local_agent import model_profiles
 from local_agent.agents import AgentManager, output_limit_text
 from local_agent.api import create_app
@@ -52,6 +53,7 @@ def test_a_fresh_install_without_a_model_uses_opus_5_5_at_its_recommended_limits
     assert settings.values["model"] == OPUS == DEFAULT_MODEL
     assert limits(settings) == (200_000, 16_384)
     assert settings.public()["default_model"] == OPUS
+    assert settings.public()["default_limits"] == {"context_window": 200_000, "max_output_tokens": 16_384}
     assert "model_migrated_from" not in settings.public()
 
 
@@ -159,6 +161,16 @@ def test_an_output_default_that_would_not_fit_stays(gpt_settings):
     gpt_settings.update({**gpt_settings.values, "context_window": 16_384})
     public = gpt_settings.update({**gpt_settings.values, "model": OPUS})
     assert (public["context_window"], public["max_output_tokens"]) == (16_384, 8_192)
+
+
+@pytest.mark.parametrize("model", [GPT, "my-endpoint"])
+def test_a_context_default_that_a_custom_output_does_not_fit_is_not_followed(app_root, monkeypatch, model):
+    monkeypatch.delenv("LOCAL_AGENT_MODEL")
+    settings = Settings(app_root / "state")
+    settings.values["workspace"] = str(app_root)
+    settings.update({**settings.values, "max_output_tokens": 130_000})
+    public = settings.update({**settings.values, "model": model})
+    assert (public["model"], public["context_window"], public["max_output_tokens"]) == (model, 200_000, 130_000)
 
 
 def test_an_output_edited_in_the_same_save_is_kept(gpt_settings):
@@ -311,7 +323,7 @@ async def test_a_chat_on_a_smaller_endpoint_is_capped_with_one_notice(runtime, m
     assert session["context_info"]["context_window"] == 131_072
     clamp = [text for text in notices(session) if "131,072-token context budget" in text]
     assert clamp == [f"This chat's endpoint ({GPT}) supports less than Settings asks for, so its requests use a "
-                     "131,072-token context budget and 16,384 max output tokens (Settings: 200,000 and 16,384)."]
+                     "131,072-token context budget (Settings: 200,000)."]
     assert not any(message.get("content") == clamp[0] for message in session["wire"])  # Never a wire message.
     manager.settings.values["context_window"] = 100_000
     await manager.run(session, "Third")
@@ -333,6 +345,76 @@ async def test_budgets_at_the_settings_models_defaults_follow_the_chats_endpoint
     assert session["context_info"]["context_window"] == 200_000
     assert not notices(session)
     assert manager.request_limits(session) == (200_000, 16_384)
+
+
+@pytest.mark.parametrize("chat_model, expected", [("my-endpoint", (200_000, 130_000)), (GPT, (131_072, 129_023))])
+def test_a_followed_context_default_that_the_custom_output_does_not_fit_keeps_settings(runtime, chat_model, expected):
+    manager, session = runtime
+    manager.settings.values.update(model=OPUS, context_window=200_000, max_output_tokens=130_000)
+    session["model"] = chat_model
+    assert manager.base_limits(session) == (200_000, 130_000)
+    assert manager.request_limits(session) == expected  # GPT OSS accepts at most 131,072 tokens of context.
+
+
+async def test_the_clamp_notice_names_only_what_the_endpoint_caps(runtime, monkeypatch):
+    manager, session = runtime
+    manager.settings.values.update(model=OPUS, context_window=300_000, max_output_tokens=16_384)
+    session["model"] = GPT
+    requests = gateway(monkeypatch)
+    await manager.run(session, "Go")
+    assert requests[-1]["max_tokens"] == 8_192  # GPT OSS's default output, not a cap.
+    assert [text for text in notices(session) if "supports less" in text] == [
+        f"This chat's endpoint ({GPT}) supports less than Settings asks for, so its requests use a 131,072-token "
+        "context budget (Settings: 300,000)."]
+    manager.settings.values.update(model="test-endpoint", context_window=1_048_576, max_output_tokens=131_072)
+    session.pop("clamped_limits")
+    await manager.run(session, "Again")
+    assert notices(session)[-1].endswith("use a 131,072-token context budget (Settings: 1,048,576) and 129,023 max "
+                                         "output tokens (Settings: 131,072).")
+
+
+async def test_manual_compaction_on_a_capped_chat_gives_the_notice(runtime, monkeypatch):
+    manager, session = runtime
+    manager.settings.values.update(context_window=200_000, max_output_tokens=16_384)
+    session["model"] = GPT
+    session["wire"] = [{"role": "user", "content": "Earlier"}, {"role": "assistant", "content": "Reply"}] * 3
+    gateway(monkeypatch)
+    await manager.manual_compact(session)
+    assert [text for text in notices(session) if "supports less" in text]
+
+
+async def test_requests_size_context_with_the_chats_limits_and_its_endpoints_default_output(runtime, monkeypatch):
+    manager, session = runtime
+    seen = []
+    prepare = agents_module.prepare_context
+
+    async def recording(wire, state, system, definitions, context_window, *args, **options):
+        seen.append((context_window, options.get("default_reply_reserve"), options.get("reply_reserve")))
+        return await prepare(wire, state, system, definitions, context_window, *args, **options)
+    monkeypatch.setattr(agents_module, "prepare_context", recording)
+    manager.settings.values.update(model=GPT, context_window=1_048_576, max_output_tokens=8_192)
+    session["model"] = OPUS
+    gateway(monkeypatch)
+    await manager.run(session, "Go")
+    assert seen[-1] == (1_000_000, 16_384, 16_384)
+    session["wire"] = [{"role": "user", "content": "Earlier"}, {"role": "assistant", "content": "Reply"}] * 3
+    await manager.manual_compact(session)
+    assert seen[-1] == (1_000_000, 16_384, 16_384)
+    session["model"] = GPT
+    manager.store.save(session)
+    await manager.side_question(session["id"], "Where?")
+    assert seen[-1][0] == 131_072
+
+
+async def test_read_file_pages_follow_the_chats_context_budget(runtime, monkeypatch):
+    manager, session = runtime
+    (Path(session["workspace"]) / "a.txt").write_text("hello\n")
+    seen = []
+    monkeypatch.setattr(agents_module, "read_page_bytes", lambda context_window: seen.append(context_window) or 4096)
+    manager.settings.values.update(context_window=1_048_576, max_output_tokens=8_192)
+    session["model"] = GPT
+    await manager.execute_tool(session, manager.session_tools(session), "read_file", {"path": "a.txt"}, "r")
+    assert seen == [131_072]
 
 
 async def test_the_clamp_notice_never_saves_the_prompt_before_it_is_marked_in_the_wire(runtime, monkeypatch):
@@ -496,10 +578,12 @@ def test_the_limits_route(tmp_path, monkeypatch):
         assert result["profile"]["output_concurrency_limit"] == 20_000
         assert result["recommended"] == {"context_window": 200_000, "max_output_tokens": 16_384}
         assert result["warnings"] == [] and result["effective"]["clamped"] is False
+        assert result["defaults"] == {"context_window": 200_000, "max_output_tokens": 16_384}
         result = check({"model": f" {OPUS} ", "context_window": 300_000, "max_output_tokens": 30_000})
         assert [item["code"] for item in result["warnings"]] == ["output_concurrency", "context_itpm"]
         result = check({"model": "unknown-endpoint", "context_window": 65_536, "max_output_tokens": 8_192})
         assert result["profile"] is None and result["recommended"] is None
+        assert result["defaults"] == {"context_window": 131_072, "max_output_tokens": 8_192}
         assert result["note"].startswith("No built-in limits")
         result = check({"model": "databricks-claude-opus-4-8", "context_window": 65_536, "max_output_tokens": 8_192})
         assert result["recommended"] is None

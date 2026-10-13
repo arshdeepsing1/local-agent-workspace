@@ -36,8 +36,16 @@ def _absolute(value):
     return Path(os.path.abspath(expanded))
 
 
+def _resolve(path):
+    """path.resolve() (non-strict), with a symbolic link loop refused as a ValueError like any other bad path."""
+    try:
+        return Path(path).resolve()
+    except RuntimeError:
+        raise ValueError("This path runs through a symbolic link loop.") from None
+
+
 def _state_checks(resolved, state_dir):
-    state = Path(state_dir).expanduser().resolve()
+    state = _resolve(Path(state_dir).expanduser())
     if _within(resolved, state):
         raise ValueError("This is the app's state folder or inside it, which holds conversations and settings.")
     if _within(state, resolved):
@@ -47,7 +55,7 @@ def _state_checks(resolved, state_dir):
 def check_coding_dir(value, *, state_dir, env_file="", app_root, home):
     """(resolved folder, missing) for a default code folder, or ValueError with the reason it is refused."""
     path = _absolute(value)
-    resolved = path.resolve()
+    resolved = _resolve(path)
     if resolved.parent == resolved:
         raise ValueError("The filesystem root is too broad; choose a folder for your code.")
     if any(_within(resolved, Path(system)) for system in SYSTEM_DIRS):
@@ -55,7 +63,7 @@ def check_coding_dir(value, *, state_dir, env_file="", app_root, home):
     if home is not None and _within(home, resolved):
         raise ValueError("Your home folder (or a folder containing it) is too broad; choose a folder inside it.")
     _state_checks(resolved, state_dir)
-    if _within(resolved, Path(app_root).resolve()):
+    if _within(resolved, _resolve(app_root)):
         raise ValueError("This is inside the app's own folder; choose a folder outside it.")
     kind = excluded(resolved.parts) or excluded(path.parts)
     if kind == "credential":
@@ -65,7 +73,10 @@ def check_coding_dir(value, *, state_dir, env_file="", app_root, home):
     if home is not None and resolved.is_relative_to(home) and resolved.relative_to(home).parts[0].startswith("."):
         raise ValueError("This is inside a hidden configuration folder in your home folder (such as ~/.config or ~/.ssh).")
     if env_file:
-        credential = Path(env_file).expanduser().resolve()
+        try:
+            credential = Path(env_file).expanduser().resolve()
+        except RuntimeError:  # An unknown ~user or a link loop: the file cannot be read, so compare it as written.
+            credential = Path(os.path.abspath(env_file))
         if _within(credential, resolved):
             raise ValueError("This folder contains your Databricks credential file.")
     if resolved.exists() and not resolved.is_dir():
@@ -137,13 +148,13 @@ def check_python_venv(value, *, state_dir, app_root):
     """{path, python, version} for a virtual environment folder, or ValueError with the reason it is refused.
     path is absolute but not resolved: a venv's programs find it by the name they were started under."""
     venv = _absolute(value)
-    resolved = venv.resolve()
+    resolved = _resolve(venv)
     if resolved.parent == resolved:
         raise ValueError("The filesystem root is not a virtual environment.")
     if not resolved.is_dir():
         raise ValueError("This folder does not exist.")
     _state_checks(resolved, state_dir)
-    if _within(resolved, Path(app_root).resolve()):
+    if _within(resolved, _resolve(app_root)):
         raise ValueError("This is the app's own Python environment (or inside the app's folder); create a separate one "
                          "for your projects.")
     if sys.prefix != sys.base_prefix:

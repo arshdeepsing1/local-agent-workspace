@@ -188,6 +188,65 @@ def test_an_invalid_env_folder_never_blocks_other_saves(layout, monkeypatch):
     assert settings.update({"coding_dir": ""})["coding_dir_status"]["state"] == "off"
 
 
+def put_settings(client, headers, **values):
+    current = client.get("/api/settings", headers=headers).json()
+    body = {key: current[key] for key in ("workspace", "model", "env_file")}
+    return client.put("/api/settings", json={**body, **values}, headers=headers)
+
+
+@pytest.mark.parametrize("key, name, label", [("coding_dir", "LOCAL_AGENT_CODING_DIR", "Default code folder"),
+                                              ("python_venv", "LOCAL_AGENT_PYTHON_VENV", "Python environment")])
+def test_a_path_through_a_symbolic_link_loop_is_reported_as_not_used(layout, monkeypatch, key, name, label):
+    loop = layout.home / "loop"
+    loop.symlink_to(loop)
+    monkeypatch.setenv(name, str(loop / "x"))
+    settings = settings_for(layout)
+    with TestClient(create_app(settings)) as client:
+        boot = client.get("/api/bootstrap")
+        assert boot.status_code == 200
+        status = boot.json()["settings"][f"{key}_status"]
+        assert status["state"] == "invalid"
+        assert status["message"] == "Not used: This path runs through a symbolic link loop."
+        assert client.app.state.manager.standing_directories() == []
+        assert client.app.state.manager.python_venv() is None
+        headers = {"X-Local-Token": boot.json()["token"]}
+        assert put_settings(client, headers, max_agent_steps=10).status_code == 200
+        (layout.home / "self").symlink_to("self")
+        refused = put_settings(client, headers, **{key: str(layout.home / "self")})
+        assert refused.status_code == 400
+        assert refused.json()["detail"] == f"{label}: This path runs through a symbolic link loop."
+    assert check(layout, str(layout.home / "code"), env_file=str(loop / "db.txt"))[0] == layout.home / "code"
+
+
+def test_the_settings_route_saves_both_paths(layout):
+    coding, venv = layout.home / "code", make_venv(layout.tmp / "venvs" / "v")
+    coding.mkdir()
+    settings = settings_for(layout)
+    with TestClient(create_app(settings)) as client:
+        headers = {"X-Local-Token": client.get("/api/bootstrap").json()["token"]}
+        saved = put_settings(client, headers, coding_dir=" ~/code ", python_venv=str(venv))
+        assert saved.status_code == 200
+        public = saved.json()
+        assert public["coding_dir"] == str(coding.resolve()) and public["coding_dir_status"]["state"] == "ready"
+        assert public["python_venv"] == str(venv) and public["python_venv_status"]["state"] == "ready"
+        stored = json.loads(settings.path.read_text())
+        assert stored["coding_dir"] == str(coding.resolve()) and stored["python_venv"] == str(venv)
+        refused = put_settings(client, headers, coding_dir=str(layout.state / "x"))
+        assert refused.status_code == 400 and refused.json()["detail"].startswith("Default code folder: ")
+        assert put_settings(client, headers, coding_dir=5).status_code == 422
+        assert put_settings(client, headers, python_venv=["/srv/v"]).status_code == 422
+    assert json.loads(settings.path.read_text())["coding_dir"] == str(coding.resolve())
+
+
+def test_saving_the_checked_form_of_an_env_value_keeps_following_env(layout, monkeypatch):
+    (layout.home / "code").mkdir()
+    monkeypatch.setenv("LOCAL_AGENT_CODING_DIR", "~/code")
+    settings = settings_for(layout)
+    settings.update({"coding_dir": str((layout.home / "code").resolve())})
+    assert "coding_dir" not in json.loads(settings.path.read_text())
+    assert settings.public()["coding_dir_status"]["source"] == "env"
+
+
 def test_the_coding_dir_check_uses_the_env_file_saved_in_the_same_request(layout):
     keys = layout.home / "keys"
     keys.mkdir()
@@ -300,6 +359,16 @@ async def test_subagents_get_the_standing_folder(layout, runtime):
     child = manager.store.create(manager.settings.values)
     child.update(is_subagent=True, parent_session_id=session["id"], allowed_directories=[])
     assert coding.resolve() in manager.session_tools(child).allowed_directories
+
+
+async def test_change_review_keeps_the_standing_folder_next_to_earlier_folders(layout, runtime, monkeypatch):
+    coding, earlier = layout.home / "code", layout.home / "earlier"
+    coding.mkdir()
+    earlier.mkdir()
+    manager, session, _ = runtime(coding_dir=str(coding))
+    monkeypatch.setattr(manager.changes, "outside_folders", lambda session_id, tools: [str(earlier)])
+    allowed = manager.review_tools(session).allowed_directories
+    assert coding.resolve() in allowed and earlier.resolve() in allowed
 
 
 def system_text(manager, session, tools):
