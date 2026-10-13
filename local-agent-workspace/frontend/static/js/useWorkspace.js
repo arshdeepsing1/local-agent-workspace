@@ -246,7 +246,7 @@ export function useWorkspace() {
   }
   const saveSettings = async next => {
     const { workspace, model, env_file, context_window, max_output_tokens, max_agent_steps, compaction_handoffs, approval_timeout_minutes,
-      system_notifications, user_instructions, write_limit_kb, command_env, rate_limit_auto_continue } = next
+      system_notifications, user_instructions, write_limit_kb, command_env, rate_limit_auto_continue, auto_keep_changes } = next
     const saved = await api('/settings', 'PUT', {
       workspace, model, env_file, context_window, max_output_tokens, max_agent_steps,
       ...(typeof compaction_handoffs === 'boolean' ? { compaction_handoffs } : {}),
@@ -256,6 +256,7 @@ export function useWorkspace() {
       ...(Number.isInteger(write_limit_kb) ? { write_limit_kb } : {}),
       ...(Array.isArray(command_env) ? { command_env } : {}),
       ...(typeof rate_limit_auto_continue === 'boolean' ? { rate_limit_auto_continue } : {}),
+      ...(typeof auto_keep_changes === 'boolean' ? { auto_keep_changes } : {}),
     })
     setSettings(saved)
     void checkConnection().catch(e => setError(e.message))

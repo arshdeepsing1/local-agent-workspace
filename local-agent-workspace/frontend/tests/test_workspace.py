@@ -134,10 +134,10 @@ def test_settings_edit_and_save_only_databricks_fields(ui, page):
     # No agent runtime options: CLAUDE.md is named only as a project instruction file.
     expect(dialog.get_by_text(re.compile(r"Claude(?!\.md)|MCP|skills", re.I))).to_have_count(0)
     checkboxes = dialog.get_by_role("checkbox")
-    expect(checkboxes).to_have_count(3)
+    expect(checkboxes).to_have_count(4)
     expect(dialog.locator("label:has(input[type=checkbox])")).to_have_text([
         "Save a detailed handoff at each compaction", "Desktop notification when no browser tab is open",
-        "Continue automatically after rate limits"])
+        "Keep agent changes automatically when a reply finishes", "Continue automatically after rate limits"])
     dialog.get_by_label("Project folder").fill("/updated-project")
     endpoint.fill("databricks-gpt-oss-120b")
     dialog.get_by_label("Credential file").fill("/credentials/env_vars.txt")

@@ -2,7 +2,8 @@
 //
 // Settings: { workspace, model, env_file, context_window, max_output_tokens,
 //   max_agent_steps, compaction_handoffs?, approval_timeout_minutes? (0 = no limit),
-//   system_notifications? (server notifications while no page is open), host, configured }
+//   system_notifications? (server notifications while no page is open),
+//   auto_keep_changes? (true: Keep every listed change when a chat's reply ends), host, configured }
 // Bootstrap (GET /bootstrap): { token, settings: Settings, storage_problems: StorageProblem[] }
 // StorageProblem: { file, reason } a conversation file in the state folder that could not
 //   be read; it is hidden and left unchanged. reason never quotes the file's contents.
@@ -80,7 +81,10 @@
 //   for a skill shipped with the app)
 // Changes (pushed as { type: 'changes', changes } and returned by Keep/Undo): {
 //   files: [{ path, status: 'created'|'modified'|'deleted'|'unavailable', added, removed,
-//   current_hash: string | null, error? }], added, removed, error? }
+//   current_hash: string | null, error?, via_session_id? (a subagent of this chat made the edit),
+//   source? ('command': a command the agent ran changed the file) }], added, removed, error? }
+// ReviewComment (reviewComments.js, page memory only): { id, path, line, kind: 'added'|'context'|'removed',
+//   text (the line), comment }; sent to the agent as one message by 'Send N comments'.
 // Task (pushed as { type: 'tasks', tasks } when they change and after the snapshot): { id, title,
 //   description, status: 'pending'|'in_progress'|'completed'|'cancelled', depends_on: string[], created, updated }
 // GET /sessions/<id>/transcript.md: the conversation as Markdown (text/markdown, attachment file name

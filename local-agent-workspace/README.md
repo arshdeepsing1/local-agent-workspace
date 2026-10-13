@@ -340,11 +340,11 @@ when opening a conversation or performing restart recovery.
     before it changes any.
   - An undo is itself a file checkpoint: **Agent tools → Recovery → Other file edits** can
     bring the agent's version back. Folders created for a new file are not removed.
-  - Only the agent's `write_file`, `edit_file`, `move_path`, `delete_path`, `notebook_edit`
-    and `insert_activity_log` changes are listed. A move is listed as the new file (created)
+  - The agent's `write_file`, `edit_file`, `move_path`, `delete_path`, `notebook_edit`
+    and `insert_activity_log` changes are listed, and files changed by its foreground
+    `run_command` commands in Git folders (below). A move is listed as the new file (created)
     and the old one (deleted); undo both to put the file back where it was.
-    Shell commands, MCP tools and hooks are not; **Workspace / Changes** shows Git's view.
-    A subagent's edits are listed in the subagent's conversation. Exports, imports and
+    MCP tools and hooks are not listed; **Workspace / Changes** shows Git's view. Exports, imports and
     forks do not copy the list, and deleting a conversation forgets it and leaves the
     files as they are. Before its next request the model is told which files it read or
     wrote changed since, an undo included, and `write_file`, `delete_path` and
@@ -352,6 +352,46 @@ when opening a conversation or performing restart recovery.
     **Tool details**). Recovery's limits apply: regular UTF-8 files up to 1 MB. Line endings
     are kept: an edit to a Windows (CRLF) file keeps CRLF, and a file with mixed endings
     keeps each unchanged line's ending.
+  - **Subagents**: a subagent's edits are listed in the subagent's conversation and in its
+    parent's, marked **Subagent** in the parent's bar, so the parent's **Undo** covers what
+    its subagents changed. Keeping or undoing in one leaves the other showing what differs
+    from its own starting point. A file the parent changed first keeps the parent's starting
+    point.
+  - **Commands**: before and after each foreground `run_command` (including Verify), the app
+    compares `git status` of the project folder, the chat's granted folders and the folders
+    added to **Workspace / Files**, each one that is inside a Git repository. Files the
+    command created, changed or deleted are listed with a **Command** mark. For a file that
+    was already changed before the command, the review compares with its content just before
+    the command; for a file that was clean, with the last commit before the command, so a
+    `git add`, `git commit`, `git checkout` or `git stash` in the command does not hide the
+    change. A file the agent already edited keeps its earlier starting point. The Git calls
+    run without hooks, fsmonitor or the repository's clean and smudge filters, and are
+    bounded (10 seconds per call, 15 seconds per repository after the command).
+    Not covered: folders that are not in a Git repository (**Workspace / Changes** shows Git's
+    view there), background jobs, commands run from **Workspace / Terminal** or as `!`
+    commands, files Git ignores, credential files and folders the file tools exclude, paths
+    through a symbolic link, files over 80 KB or binary, folders with more than 2,000 changed
+    files before or after the command, and commands that change more than 500 files (the
+    rest are not listed). The read-only commands that run without a card (`pwd`, `ls`,
+    `git status` and the like) are not checked at all. Edits that other programs make while
+    a command runs are listed as that command's. Line-ending conversion configured in
+    `.gitattributes` can show a change for a file that was clean. An undo of a command's
+    change is a Recovery checkpoint like any other; Recovery has no checkpoint of the
+    command's own edit.
+  - **Line comments**: in a file's review, the comment button at the start of a line (shown
+    on hover and focus) opens a box for a comment on that line; **Add comment** (or
+    Ctrl+Enter / Cmd+Enter) adds it under the line and Esc cancels. **Send N comments** in
+    the box at the bottom right sends every comment of this conversation, from all files,
+    as one message: the file and line, the line's text and your comment, in file and line
+    order, ending with a request to address each comment and summarize the changes. It
+    waits until the reply finishes; if sending fails, the comments stay. Up to 50 comments
+    at a time. Comments are kept in the page while you switch files or close the panel, but
+    not across a reload.
+  - **Automatic Keep** (Settings, off by default): when a reply finishes, every listed change
+    of that conversation is kept and the bar clears. A manual compaction does not count as
+    a reply, and a subagent's reply clears only the subagent's list. Edits made with the
+    agent's file tools can still be undone from **Agent tools → Recovery**; edits made by
+    commands can no longer be undone from the app.
 - **Workspace / Changes**: inspect Git status and tracked-file diffs. Untracked
   files are listed too. Files are grouped as **Staged changes**, **Changes** (not staged,
   including conflicts) and **Untracked**, each with its count, under the branch name.
@@ -1656,6 +1696,7 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `backend/local_agent/git_tools.py`: Git without a shell or repository-configured programs (worktrees, `/api/git`).
 - `backend/local_agent/notify.py`: optional desktop notifications (status and title only) when no page is open.
 - `backend/local_agent/changes.py`: the agent's file changes per conversation, their diffs, Keep and Undo.
+- `backend/local_agent/shell_changes.py`: the files a foreground `run_command` changed, from Git status before and after it.
 - `backend/local_agent/extensions.py` / `mcp_client.py`: skills, hooks, MCP lifecycle.
 - `backend/local_agent/planning.py` / `feature_tools.py`: tasks and delegated workers.
 - `backend/local_agent/feature_api.py`: scoped feature endpoints.

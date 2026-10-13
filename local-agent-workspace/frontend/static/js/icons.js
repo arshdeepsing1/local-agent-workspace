@@ -32,6 +32,7 @@ export const GitBranch = icon('git-branch', '<line x1="6" x2="6" y1="3" y2="15"/
 export const Laptop = icon('laptop', '<path d="M20 16V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9m16 0H4m16 0 1.28 2.55a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45L4 16"/>')
 export const LoaderCircle = icon('loader-circle', '<path d="M21 12a9 9 0 1 1-6.219-8.56"/>')
 export const Menu = icon('menu', '<line x1="4" x2="20" y1="12" y2="12"/><line x1="4" x2="20" y1="6" y2="6"/><line x1="4" x2="20" y1="18" y2="18"/>')
+export const MessageSquarePlus = icon('message-square-plus', '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><path d="M12 7v6"/><path d="M9 10h6"/>')
 export const PanelRight = icon('panel-right', '<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M15 3v18"/>')
 export const Pencil = icon('pencil', '<path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/><path d="m15 5 4 4"/>')
 export const Plus = icon('plus', '<path d="M5 12h14"/><path d="M12 5v14"/>')
