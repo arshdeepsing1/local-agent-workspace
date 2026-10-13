@@ -13,11 +13,15 @@ frontend that runs without a build step.
   turn stopped at the step or output limit, by Stop, or by a server restart.
 - Databricks model selection, numbered line-range reads, paginated regex/literal
   search, file creation and exact edits, and shell commands with live output.
-- Approval cards with proposed edits and command text. A declined action does not run.
-  Decline with a note the agent reads, or allow one exact command, file edits, one MCP
-  tool or one hook for the rest of a chat.
-- Per-conversation permissions below the composer: Manual, Auto, Accept edits,
+- Approval cards with proposed edits and command text, which you can edit before approving.
+  A declined action does not run. Decline with a note the agent reads, or allow the action
+  for the rest of a chat, for the project or for all projects.
+- Permission rules (allow, Always ask and deny) for a chat, a project or all projects;
+  protected files always ask.
+- Per-conversation permissions below the composer: Manual, Auto, Accept edits, Don't ask,
   Plan and Bypass permissions. Access additional local folders through an approval card.
+- Questions from the agent with options to choose from, and a plan review in Plan mode that
+  approves the plan and switches the mode.
 - Stop an agent response, including its foreground command or pending approval.
 - Conversation status in the sidebar (needs approval, working, error, unread) with a
   Running filter, a "(n)" tab-title count of chats waiting for approval, opt-in browser
@@ -403,8 +407,12 @@ when opening a conversation or performing restart recovery.
   title; **Notify me** also tells you when this page is hidden or another chat is open.
 - **Allow for this chat**: next to Decline and Approve, a card offers **Always allow this
   command in this chat** (commands), **Allow edits in this chat** (`write_file`, `edit_file`,
-  `insert_activity_log`), **Allow this tool in this chat** (one MCP tool) or **Allow this hook
-  in this chat**. It approves the card and stores a rule for this conversation. Rules match
+  `insert_activity_log`, `move_path`, `delete_path`, `notebook_edit`), **Allow this tool in
+  this chat** (one MCP tool), **Allow this hook in this chat**, **Allow subagents in this
+  chat** (`delegate_task`) or **Allow stopping jobs in this chat** (`stop_job`). A card raised
+  by an Always ask rule, an uncertain command or a protected file, or a command that names a
+  credential file or contains your token, has no such button. It approves the card and stores
+  a rule for this conversation. Rules match
   exactly: the same command text (only leading and trailing whitespace is ignored; never a
   prefix), the same MCP tool name, the same hook ID. A later matching action runs without a
   card in Manual, Auto, Accept edits and Don't ask, and its card says "Allowed by a rule for this chat".
@@ -536,9 +544,13 @@ when opening a conversation or performing restart recovery.
   example `pytest -q`, with a time limit (10 to 3,600 seconds, default 600) and fix
   rounds (1 to 3, default 2). After a reply in which the agent changed files inside the
   project folder (edits in other folders do not count), the app runs it as the agent's
-  `run_command` with an output limit of 1,000,000 bytes: Manual, Auto and Accept edits
-  show an approval card unless an "Always allow this command in this chat" rule
-  matches, Bypass runs it, and Plan mode, subagents and restricted tool profiles never run it. Hooks and the
+  `run_command` with an output limit of 1,000,000 bytes, so the permission mode and
+  permission rules apply as to a command the agent chose: Manual, Auto and Accept edits
+  show an approval card unless an allow rule for this chat, the project or all projects
+  matches (Auto also runs it without a card when it is on the read-only list), Bypass runs
+  it unless a deny or ask rule covers it, deny rules block it in every mode, and Don't ask
+  blocks it with a notice unless a rule allows it. Plan mode, subagents and restricted tool
+  profiles never run it. Hooks and the
   project-instruction checks apply as for any command, and **Stop** stops it. A notice
   reports the result. If it fails, the agent gets the last 3,000 characters of its
   output (credentials redacted, fenced and marked as data, not instructions) in a hidden
@@ -965,8 +977,10 @@ must still fit the aggregate tool/schema limits when a chat starts.
 ```
 
 The model sees names such as `mcp__example__tool`. MCP calls require their own
-approval in Manual, Auto, and Accept edits; Plan blocks them and Bypass permits
-them. **Allow this tool in this chat** approves one exact tool name for the rest of the chat. MCP servers and hook commands have the user's OS/network access, not the
+approval in Manual, Auto, and Accept edits; Plan blocks them, Don't ask blocks them unless a
+rule allows them, and Bypass permits them unless a deny or ask rule covers them. **Allow this
+tool in this chat** approves one exact tool name for the rest of the chat; a saved rule for the
+project or all projects can allow one tool or all tools of a server (see **Permission rules**). MCP servers and hook commands have the user's OS/network access, not the
 file tools' folder restrictions. Credential environment variables are stripped
 from local server/hook processes. Up to four servers, 32 tools, and 16 KB of tool
 schemas are supported; each call has a 60-second deadline and bounded 8 KB result.
@@ -1075,8 +1089,10 @@ error/outcome for invoked tools that fail, including MCP `is_error` results. Sch
 policy, and approval rejections and cancelled actions do not launch failure hooks.
 Foreground commands with failed/timed-out results also trigger failure hooks;
 background-job completion does not launch a deferred hook.
-Each hook separately asks for approval except in Bypass; Plan skips hooks.
-**Allow this hook in this chat** stops asking for that hook ID in that chat. A declined
+Each hook separately asks for approval except in Bypass; Plan skips hooks, and Don't ask runs
+only hooks a rule allows (a before-hook without one blocks its tool). **Allow this hook in this
+chat** stops asking for that hook ID in that chat; a saved hook rule does the same for the
+project or all projects. Deny and ask rules for hooks apply in Bypass too. A declined
 or failing before-hook blocks the tool. An after-hook failure displays a warning
 while retaining the completed action/result. Failure-hook errors also preserve the
 original error. Hooks have a 1–30 second timeout and
@@ -1554,6 +1570,17 @@ files (with command jobs, and a file holding another conversation's ID), droppin
 WebSocket that stalls, "Allow for this chat" rules (exact matching, Plan still denying,
 exclusions and folder cards kept, persistence, removal, subagent inheritance, none in forks
 or imports), decline notes reaching the model, and 409 details that name the blocking chat.
+Permission-rule tests cover the rule matcher (exact and prefix allow rules with listed options,
+broad deny and ask rules, short-option clusters, wrappers, inline interpreters and options that
+run other programs never allowed, uncertain commands), project and all-project rules in
+`permission_rules.json` (an unreadable file ignored until reset), the fixed decision order in
+every mode including Don't ask and deny or ask rules in Bypass, protected files, the read-only
+command list, commands allowed by a rule running from an argument vector without a shell,
+read-only Git that runs no repository-configured program, the state folder kept out of the file
+tools, mode and rule changes re-checking waiting cards and reaching a running subagent, edit
+before approving (including a Verify card), turned-off tools, Verify following the mode and
+rules, and `ask_user` and `submit_plan` (answers, skips, expiry, Keep planning, an approved plan
+switching the mode, a mode change superseding the review, export and the Markdown transcript).
 None of these automated
 tests calls a paid model.
 Frontend tests verify that expired local tokens refresh once and that other
@@ -1576,6 +1603,13 @@ checklist follows pushed tasks per conversation, that drafts survive a reload, a
 first, are removed when sent and keep text typed during the send, that code blocks are
 highlighted only when a reply is complete and copy their exact text, and that the Markdown
 transcript downloads and copies.
+Permission-rule UI tests check the **Always allow…** form (only the scopes and prefixes the
+server offers), that cards offering nothing to remember have no chat button, Edit on a card
+(Save edit waits for a change), the Bypass confirmation, Don't ask, mode changes while the chat
+is busy, rules by scope in the Permissions menu with removal, reset and keyboard focus, the
+**Never asks** list, the add-rule dialog and turned-off tools in **Agent tools → Tools**.
+Question and plan tests check the `ask_user` card (options, multi-select, Other, skip, expiry)
+and the `submit_plan` card (approve with a mode, Keep planning with feedback, superseded).
 UI tests also cover a turn that fails during an automatic compaction (notifies) and a manual
 compaction (does not), a turn cut off by a server restart, closing answered notifications,
 read state shared between tabs, and the page's presence connection.
@@ -1600,9 +1634,11 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `backend/local_agent/agents.py`: session/approval events and the Databricks tool loop.
 - `backend/local_agent/tools.py`: scoped file queries/edits and tool definitions.
 - `backend/local_agent/jobs.py`: streamed processes, managed jobs, and cleanup.
-- `backend/local_agent/command_exec.py`: commands run from an argument vector without a shell, and the read-only command list.
-- `backend/local_agent/permissions.py`: shared mode rules and model instructions.
-- `backend/local_agent/approvals.py`: "Allow for this chat" rules, decline-note wording, and 409 details naming a busy chat.
+- `backend/local_agent/command_exec.py`: commands run from an argument vector without a shell (read-only `pwd` and `ls` from `/bin`, hardened Git).
+- `backend/local_agent/rules.py`: the rule engine (command parsing, rule matching, uncertain commands), protected paths, the read-only command list and the saved `permission_rules.json`.
+- `backend/local_agent/permissions.py`: the permission modes, the one decision every tool call and waiting card goes through (turned-off tools, rules, protected files, Don't ask), and model instructions.
+- `backend/local_agent/approvals.py`: rules from cards and the Permissions menu (chat, project and all-project routes, reset), edit before approving, turned-off tools and the tool list, decline-note wording, and 409 details naming a busy chat.
+- `backend/local_agent/interactions.py`: `ask_user` questions and `submit_plan` reviews that wait for the user inside a turn.
 - `backend/local_agent/store.py`: per-conversation JSONL storage, unreadable-file reports, and legacy migration.
 - `backend/local_agent/drafts.py`: bounded periodic streamed-reply checkpoints.
 - `backend/local_agent/portability.py` / `portability_api.py`: validated conversation copies.

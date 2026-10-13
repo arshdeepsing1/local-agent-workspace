@@ -189,7 +189,7 @@ function Verify({ session, workspace, onError }) {
   const folder = project?.workspace || session?.workspace || workspace || 'this workspace'
   return html`<section class="agent-tools-section" aria-label="Verify">
     <h3>Verify command</h3>
-    <p>Runs after a reply in which the agent changed files in this project (${folder}). It runs like the agent's run_command: it asks for approval unless the permission mode or an “Always allow this command in this chat” rule allows it, and never runs in Plan mode. If it fails, the agent sees the end of its output and gets another model request to fix it, up to the fix rounds below. Leave it empty to turn it off.</p>
+    <p>Runs after a reply in which the agent changed files in this project (${folder}). It runs like the agent's run_command, so the permission mode and rules apply: it asks for approval unless the mode or an allow rule (for this chat, this project or all projects) allows it, deny rules block it, Don't ask blocks it unless a rule allows it, and it never runs in Plan mode. If it fails, the agent sees the end of its output and gets another model request to fix it, up to the fix rounds below. Leave it empty to turn it off.</p>
     <form class="agent-tools-form" onSubmit=${save}>
       <label>Command<input disabled=${!project} readOnly=${busy} maxLength=${2000} spellcheck=${false} value=${command} placeholder="pytest -q" onInput=${e => setCommand(e.currentTarget.value)} /></label>
       <label>Time limit (seconds)<input type="number" min="10" max="3600" step="1" required disabled=${!project} readOnly=${busy} value=${seconds} onInput=${e => setSeconds(e.currentTarget.value)} /></label>
