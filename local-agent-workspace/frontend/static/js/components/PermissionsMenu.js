@@ -13,8 +13,8 @@ export const modeLabel = value => modes.find(m => m.value === value)?.label || v
 
 export const BYPASS_CONFIRM = 'Switch this chat to Bypass permissions?\n\nEvery action will run without asking, including commands and edits outside the project, and any approval cards waiting now will be approved. Deny rules, ask rules and credential exclusions still apply.'
 
-// The commands Auto and Plan run without asking (the server's fixed read-only list).
-const READ_ONLY_NOTE = 'Read-only commands: pwd, ls, git status, diff, log, show, branch, rev-parse, ls-files'
+// The commands Auto and Plan run without asking: the server's fixed list of exact forms (README: Read-only commands).
+const READ_ONLY_NOTE = 'A fixed list of read-only command forms, such as pwd, ls -la, git status, git diff --stat, git log --oneline and git show; other arguments still ask'
 const NEVER_ASKS = ['Reading, listing and searching files in the project and granted folders', 'Listing jobs and reading their output',
   'Tasks and skills', 'Questions and plan reviews from the agent']
 
@@ -72,10 +72,16 @@ export default function PermissionsMenu({ mode, busy, locked, onChange, onError,
   const menu = useRef(null)
   const blocked = !!locked || saving
   // After a rule is removed, focus stays in the menu: on the remove button now at the same
-  // place, the one before it, or the selected mode once no rules are left.
+  // place, the one before it, or the selected mode once no rules are left. After a reset the
+  // focused Reset button is gone (unless the reset failed): focus moves to the selected mode.
   const refocus = useRef(null)
   useEffect(() => {
     if (refocus.current === null || saving || !open) return
+    if (refocus.current === 'reset') {
+      refocus.current = null
+      if (!menu.current?.contains(document.activeElement)) menu.current?.querySelector('[aria-checked="true"]')?.focus()
+      return
+    }
     const buttons = menu.current?.querySelectorAll('.allow-rule [role="menuitem"]') || []
     const target = buttons[Math.min(refocus.current, buttons.length - 1)] || menu.current?.querySelector('[aria-checked="true"]')
     refocus.current = null
@@ -147,10 +153,13 @@ export default function PermissionsMenu({ mode, busy, locked, onChange, onError,
         })}
       </div>`) : null}
       ${problem ? html`<div class="rules-problem"><p role="alert">${problem} They are ignored until you reset them.</p>
-        <button role="menuitem" class="outline" aria-disabled=${blocked} onClick=${() => { if (!blocked && onReset) void act(onReset) }}>Reset saved rules</button></div>` : null}
+        <button role="menuitem" class="outline" aria-disabled=${blocked} onClick=${() => { if (!blocked && onReset) void act(onReset, 'reset') }}>Reset saved rules</button></div>` : null}
       ${onAddRule ? html`<button role="menuitem" class="add-rule" aria-disabled=${!!locked}
         onClick=${() => { if (!locked) { setOpen(false); onAddRule() } }}><${Plus} size=${14} />Add a rule…</button>` : null}
-      <details class="never-asks"><summary>Never asks</summary><ul>
+      <details class="never-asks" onToggle=${event => {
+        // The menu scrolls and the note below sticks to its bottom: show the opened list above the note.
+        if (event.currentTarget.open && menu.current) menu.current.scrollTop = menu.current.scrollHeight
+      }}><summary>Never asks</summary><ul>
         ${NEVER_ASKS.map(item => html`<li key=${item}>${item}</li>`)}
         ${mode === 'auto' || mode === 'plan' ? html`<li>${READ_ONLY_NOTE}</li>` : null}
       </ul></details>

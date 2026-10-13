@@ -369,7 +369,8 @@ def test_dont_ask_is_listed_and_selectable(ui, page):
 
 
 def test_never_asks_lists_read_only_commands_in_auto_and_plan(ui, page):
-    read_only = "Read-only commands: pwd, ls, git status, diff, log, show, branch, rev-parse, ls-files"
+    read_only = ("A fixed list of read-only command forms, such as pwd, ls -la, git status, git diff --stat, "
+                 "git log --oneline and git show; other arguments still ask")
     menu = open_menu(ui, page)
     menu.locator(".never-asks>summary").click()
     for text in ("Reading, listing and searching files in the project and granted folders", "Listing jobs and reading their output",
@@ -381,6 +382,20 @@ def test_never_asks_lists_read_only_commands_in_auto_and_plan(ui, page):
         page.get_by_role("button", name=MENU).click()
         page.locator(".never-asks>summary").click()
         expect(page.get_by_text(read_only, exact=True)).to_have_count(1 if shown else 0)
+
+
+def test_opening_never_asks_scrolls_its_list_into_the_menu(ui, page):
+    menu = open_menu(ui, page)
+    menu.locator(".never-asks>summary").click()
+    expect(menu.locator(".never-asks li").last).to_have_text("Questions and plan reviews from the agent")
+    # Every item sits inside the scrolling menu and above the note that sticks to its bottom.
+    hidden = ui.js("""(() => {
+      const menu = document.querySelector('.permissions-menu').getBoundingClientRect()
+      const note = document.querySelector('.permissions-note').getBoundingClientRect()
+      return Array.from(document.querySelectorAll('.never-asks li')).map(li => li.getBoundingClientRect())
+        .filter(box => box.top < menu.top || box.bottom > Math.min(menu.bottom, note.top) + 0.5).length
+    })()""")
+    assert hidden == 0
 
 
 # Rules in the Permissions menu
@@ -533,9 +548,14 @@ def test_an_unreadable_rules_file_shows_the_problem_and_reset_posts(ui, page):
     menu = open_menu(ui, page, setup=setup)
     alert = menu.get_by_role("alert")
     expect(alert).to_have_text("Saved permission rules could not be read: invalid JSON. They are ignored until you reset them.")
-    menu.get_by_role("menuitem", name="Reset saved rules").click()
+    menu.get_by_role("menuitem", name="Reset saved rules").focus()
+    page.keyboard.press("Enter")
     expect(menu.get_by_role("alert")).to_have_count(0)
     assert len(ui.requests("/api/permission-rules/reset?session_id=a", "POST")) == 1
+    # The focused button is gone: focus moves to the selected mode, so the keyboard still works the menu.
+    expect(mode_item(page, "Manual")).to_be_focused()
+    page.keyboard.press("Escape")
+    expect(page.get_by_role("menu")).to_have_count(0)
 
 
 # The add-rule dialog
