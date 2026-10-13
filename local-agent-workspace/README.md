@@ -1141,7 +1141,7 @@ waits (see **Mode changes while the agent works** below).
 | Mode | Agent behavior |
 | --- | --- |
 | Manual | Read approved folders; ask before edits, commands, stopping jobs and subagents. |
-| Auto | Accept file edits and run the fixed list of read-only commands (below) and `stop_job`; ask for other commands and actions. |
+| Auto | Accept file edits, run the fixed list of read-only commands (below), stop jobs and start subagents; ask for other commands and actions. |
 | Accept edits | Accept file edits and start subagents; ask before commands and other actions. |
 | Don't ask | Run only what the mode's reads or a saved rule allows; block everything else without an approval card. |
 | Plan | Read/search approved folders, run the read-only command list, and describe a plan; block file changes and other commands. Subagents still need a card. |
@@ -1149,8 +1149,8 @@ waits (see **Mode changes while the agent works** below).
 
 Reading, listing and searching files, reading job output, waiting for a job, skills and
 structured tasks are available in every mode without a card. Stopping a job is a command
-action: it asks in Manual, Accept edits and Don't ask (unless a rule allows it), runs in Auto
-and Bypass, and is blocked in Plan. Starting a subagent (`delegate_task`) asks in Manual and
+action: it asks in Manual and Accept edits, is blocked in Don't ask unless a rule allows it, runs
+in Auto and Bypass, and is blocked in Plan. Starting a subagent (`delegate_task`) asks in Manual and
 Plan, runs in Accept edits, Auto and Bypass, and is blocked in Don't ask unless a rule allows
 it; the child then follows its own (inherited) mode. Starting a background job follows the
 same command rules as foreground execution. Changing modes does not cancel a previously
@@ -1166,7 +1166,8 @@ A rule turns one kind of action into an automatic approval (**allow**), a card i
 (**ask**, "Always ask") or a refusal (**deny**). Rules have three scopes:
 
 - **This chat**: saved with the conversation (the **Allow for this chat** rules above, at most
-  100). Inherited by subagents; forks and imports start without them.
+  100). Inherited by subagents; forks and imports start without them. A deny or ask rule added
+  to the chat while a subagent runs also reaches that subagent; other chat rule changes do not.
 - **This project**: saved in the app's state folder, in `permission_rules.json`, keyed by the
   project folder's resolved path (at most 200 per project). A managed worktree is a separate
   folder, so it has its own project rules.
@@ -1206,6 +1207,10 @@ runs other programs or code (`sh`, `bash`, `env`, `sudo`, `xargs`, `nohup`, `tim
 `watch` and similar; `python -c`, `node -e` and other inline interpreters; `awk` and `sed`),
 an option that runs other programs (`git -c`, `--git-dir`, `--ext-diff` and similar; `rg --pre`
 and `-z`; `find -exec` and `-delete`), a word naming a credential file, or your Databricks token.
+The same applies to **Allow for this chat** on a card: a command naming a credential file or
+containing your token cannot be remembered, even by its exact text. A card raised by an Always
+ask rule, by an uncertain command (below) or by a protected file offers nothing to remember,
+because an allow rule would never apply to it.
 
 **No shell.** Commands allowed by an exact or prefix rule, and commands on the read-only list,
 run without a shell: shell syntax (`; & | < > ( ) { } [ ] * ? ~ ! # $ ^`, backticks,
@@ -1220,13 +1225,16 @@ only: `pwd`; `ls` with no option or `-l`, `-a`, `-la`, `-al`, `-1`; `git status`
 `--stat`); `git branch` (plain or `--show-current`); `git rev-parse HEAD`,
 `--abbrev-ref HEAD` and `--show-toplevel`; `git ls-files`. There are no test runners, package
 managers, search tools, interpreters or `git remote` on the list. A command on the list runs
-hardened (see **Local access and limits**) whatever allowed it.
+hardened (see **Local access and limits**) whatever mode or rule allowed it; when you approve it
+on a card, it runs through the shell like any approved command.
 
 **Uncertain commands.** A command that a deny or ask rule might cover but that cannot be checked
 exactly gets a card, even in Bypass: shell syntax that contains the rule's program as a word, `$`,
-backticks, backslashes or glob characters; a wrapper such as `env`, `command`, `nohup` or `sh -c`;
-an inline interpreter; or a never-allowed option such as `git -c`. Text that does not mention the
-rule's program (`npm test | tee out` with a deny rule for `git push`) is not uncertain.
+backticks, backslashes or glob characters, or an `alias` or `source` line; a wrapper such as
+`env`, `command`, `nohup` or `sh -c`; an inline interpreter, also with combined or attached
+options (`perl -le`, `python3 -Ic`, `node --eval=…`); or a never-allowed option such as `git -c`.
+Text that does not mention the rule's program (`npm test | tee out` with a deny rule for
+`git push`) is not uncertain.
 
 **Protected files.** Edits always show a card, in every mode except Bypass and even with an allow
 rule, when a path (requested or resolved, inside or outside the project) is in `.vscode`, `.idea`,
@@ -1240,9 +1248,12 @@ Don't ask blocks these edits.
 
 **Mode changes while the agent works.** You can change the mode at any time. A waiting card
 is checked again at once: switching to Accept edits approves a waiting edit, switching to Plan
-or Don't ask blocks waiting cards ("Not run: the user switched this chat to Plan mode while this
-card was waiting."), and switching to Bypass approves waiting cards, including folder access
-(without adding a folder grant). Switching to Bypass asks for confirmation for that reason.
+blocks waiting edits and commands ("Not run: the user switched this chat to Plan mode while this
+card was waiting.") but approves a waiting command from the read-only list and leaves a subagent
+card waiting, switching to Don't ask blocks waiting cards, and switching to Bypass approves
+waiting cards, including folder access (without adding a folder grant). An action that was
+allowed when it started but waited on a before-tool hook's card is checked again after the hook:
+it gets its own card (and a folder-access card outside the project) when the new mode needs one. Switching to Bypass asks for confirmation for that reason.
 Each new model request uses the current mode, and a running subagent follows the parent's
 change, including its waiting cards. Adding or removing a rule, and turning a tool off, re-check
 waiting cards the same way (a new allow rule approves a matching card; a deny rule blocks it).
@@ -1262,7 +1273,10 @@ offered to the agent and calls to them are refused. Subagents, forks and imports
 **Don't ask** never shows a card: actions that the mode or a rule does not allow are refused,
 and the agent is told to continue without them. Folder access outside the project is refused,
 and enabled before-tool hooks block the tools they cover unless a hook
-rule allows the hook.
+rule allows the hook. After-tool and failure hooks do not run unless a hook rule allows them;
+their hook card says so, without a notice after every tool. When Verify is blocked this way (or
+by a deny rule or a turned-off `run_command`), one notice says why and Verify does not run again
+in that turn.
 
 **Limitations.** Rules are a convenience, not a sandbox. A deny rule matches the command the
 agent asks to run. It does not see Git aliases, scripts, Makefiles or programs those start, and

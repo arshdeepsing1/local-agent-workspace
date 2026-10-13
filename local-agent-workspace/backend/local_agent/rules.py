@@ -43,6 +43,8 @@ INTERPRETERS = frozenset({"node", "nodejs", "deno", "bun", "perl", "ruby", "php"
                           "osascript", "Rscript", "tclsh"})
 INTERPRETER_PATTERN = re.compile(r"^(python|pypy)[0-9.]*$")
 INLINE_FLAGS = frozenset({"-c", "-e", "-E", "-p", "-r", "--eval", "--print", "--command", "-Command"})
+INLINE_LETTERS = frozenset("ceEpr")
+INLINE_LONG = ("--eval=", "--print=", "--command=")
 SCRIPT_PROGRAMS = frozenset({"awk", "gawk", "mawk", "nawk", "sed"})
 # Options that make a program run other programs or read or write outside the command's view.
 NEVER_FLAGS = {
@@ -53,7 +55,9 @@ NEVER_FLAGS = {
 }
 CLUSTER = re.compile(r"^-[A-Za-z]{2,}$")
 UNCERTAIN_TEXT = frozenset("$`\\*?[{")
-WORD_SPLIT = re.compile(r"[\s;&|<>()!#^~]+")
+# '=', ',' and ':' too, so the program in an alias definition (alias p='git push') is a word of its own.
+WORD_SPLIT = re.compile(r"[\s;&|<>()!#^~=,:]+")
+UNCERTAIN_WORDS = frozenset({"alias", "source"})
 
 # The fixed list of read-only commands that run without a card in Auto and Plan.
 READ_ONLY_COMMANDS = frozenset(tuple(text.split()) for text in (
@@ -125,10 +129,20 @@ def never_flag(program, token):
                for candidate in candidates for name in names)
 
 
+def inline_flag(token):
+    """True when an interpreter option gives it code to run: -c or -e alone, in a cluster
+    (perl -le, python3 -Ic), with the code attached (-esystem...), or as --eval=..."""
+    if token in INLINE_FLAGS or token.startswith(INLINE_LONG):
+        return True
+    if token.startswith("--") or len(token) < 3 or token[0] != "-":
+        return False
+    if CLUSTER.match(token) and any(letter in INLINE_LETTERS for letter in token[1:]):
+        return True
+    return token[1] in INLINE_LETTERS  # Code attached to the option: '-esystem qw/x/', '-cimport os'.
+
+
 def inline_interpreter(argv):
-    program = basename(argv[0])
-    return ((INTERPRETER_PATTERN.match(program) is not None or program in INTERPRETERS)
-            and any(token in INLINE_FLAGS for token in argv[1:]))
+    return interpreter_name(argv[0]) and any(inline_flag(token) for token in argv[1:])
 
 
 def interpreter_name(program):
@@ -161,6 +175,14 @@ def names_credential(token, credential_file=None):
         if configured and (candidate == configured or os.path.expanduser(candidate) == configured):
             return True
     return False
+
+
+def text_names_credential(text, credential_file=None):
+    """True when any word of command text (quotes removed, split at shell syntax and '=') names a credential file."""
+    if not isinstance(text, str):
+        return False
+    return any(word and names_credential(word, credential_file)
+               for word in WORD_SPLIT.split(text.replace("'", "").replace('"', "")))
 
 
 def read_only_argv(argv):
@@ -249,7 +271,7 @@ def _check_allow_command(words, flags, credential_file):
     program = basename(words[0])
     if program in WRAPPERS:
         raise ValueError(f"'{words[0]}' runs other programs; a rule cannot allow it. Allow the program it runs instead.")
-    if program in SCRIPT_PROGRAMS or (interpreter_name(program) and any(t in INLINE_FLAGS for t in words + flags)):
+    if program in SCRIPT_PROGRAMS or (interpreter_name(program) and any(inline_flag(t) for t in words[1:] + flags)):
         raise ValueError(f"'{words[0]}' can run code given on the command line; a rule cannot allow that.")
     for token in [*words[1:], *flags]:
         if never_flag(program, token):
@@ -463,7 +485,8 @@ def uncertain_match(rule, text, argv):
         if not word:
             continue
         name = basename(word)
-        if name in WRAPPERS or interpreter_name(name) or program is None or name == program:
+        if (name in WRAPPERS or name in UNCERTAIN_WORDS or interpreter_name(name) or program is None
+                or name == program):
             return True
     return False
 
@@ -527,11 +550,15 @@ def card_rule_options(name, arguments, *, resolve_path=None, credential_file=Non
             prefixes.append({"prefix": rule["prefix"], "flags": rule["flags"]})
         return {"argv": exact, "prefixes": prefixes if exact is not None else [], "reason": why}
     if kind == "edit":
-        value = arguments.get("path")
+        # The deepest folder holding every path the tool touches (both ends of a move), so a
+        # 'Files under' rule for it matches the card; none when they share only the filesystem root.
+        from .permissions import EDIT_TOOL_PATHS
         folder = None
-        if isinstance(value, str) and resolve_path is not None:
+        values = [arguments.get(key) for key in EDIT_TOOL_PATHS.get(name, ()) if arguments.get(key) is not None]
+        if values and resolve_path is not None and all(isinstance(value, str) for value in values):
             try:
-                folder = str(resolve_path(value).parent)
+                common = Path(os.path.commonpath([str(resolve_path(value).parent) for value in values]))
+                folder = str(common) if common != Path(common.anchor) else None
             except (ValueError, OSError):
                 folder = None
         return {"folder": folder}

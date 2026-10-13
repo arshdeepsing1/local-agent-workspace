@@ -142,6 +142,10 @@ def evaluate(mode, name, arguments, *, chat_rules=(), project_rules=(), user_rul
     # (2) Plan mode: nothing outside its read-only set, whatever a rule says.
     if mode == "plan" and baseline == "deny":
         return Verdict("deny", "plan", PLAN_DENIED_SUBAGENT if subagent else PLAN_DENIED)
+    reason = None
+    if kind == "edit" and protected is not None:
+        reason = next(filter(None, (protected(arguments[key]) for key in EDIT_TOOL_PATHS.get(name, ())
+                                    if isinstance(arguments.get(key), str))), None)
     # (3) Ask rules, and commands a deny or ask rule might cover but that cannot be checked exactly.
     if kind not in NEVER_CARD_KINDS:
         asked, uncertain = None, False
@@ -155,20 +159,18 @@ def evaluate(mode, name, arguments, *, chat_rules=(), project_rules=(), user_rul
         if asked is not None or uncertain:
             if mode == "dontAsk":
                 return Verdict("deny", "dont_ask", DONT_ASK_DENIED)
+            # A protected file keeps its marker on an ask-rule card, so the card is never remembered.
             return Verdict("ask", "rule" if asked else "uncertain", rule=asked and asked[0],
-                           scope=asked and asked[1], uncertain=uncertain)
+                           scope=asked and asked[1], uncertain=uncertain, protected=reason)
     # (4) Protected paths: always a card, except in Bypass; no allow rule skips this.
-    if kind == "edit" and protected is not None:
-        reason = next(filter(None, (protected(arguments[key]) for key in EDIT_TOOL_PATHS.get(name, ())
-                                    if isinstance(arguments.get(key), str))), None)
-        if reason:
-            if mode == "bypassPermissions":
-                return Verdict("allow", "mode", protected=reason)
-            if mode == "dontAsk":
-                return Verdict("deny", "dont_ask", f"Not run: this edit changes a protected file ({reason}), which "
-                               "always needs an approval card, and Don't ask mode does not show cards. Continue "
-                               "without it and tell the user which file needs their approval.", protected=reason)
-            return Verdict("ask", "protected", protected=reason)
+    if reason:
+        if mode == "bypassPermissions":
+            return Verdict("allow", "mode", protected=reason)
+        if mode == "dontAsk":
+            return Verdict("deny", "dont_ask", f"Not run: this edit changes a protected file, {reason}, which "
+                           "always needs an approval card, and Don't ask mode does not show cards. Continue "
+                           "without it and tell the user which file needs their approval.", protected=reason)
+        return Verdict("ask", "protected", protected=reason)
     # (5) The mode's own allowance; read-only list commands run hardened without a shell.
     if baseline == "allow":
         source = "read_only_command" if read_only and mode in ("auto", "plan") else "mode"

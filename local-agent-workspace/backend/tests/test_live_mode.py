@@ -363,3 +363,105 @@ async def test_leaving_bypass_while_a_card_waits_restores_the_folder_boundary(li
     output = await asyncio.wait_for(task, 5)
     assert "needs access approval" in output and not (outside / "a.txt").exists()
     assert tools.unrestricted is False
+
+
+def hook(manager, event="before_tool"):
+    manager.extensions.update_config({"hooks": [{"id": "check", "enabled": True, "event": event, "command": "true"}]})
+
+
+async def test_a_tool_that_needs_a_card_after_its_hook_card_gets_one(live):
+    manager, session, project, tools, client = live
+    hook(manager)
+    session["permission_mode"] = "auto"  # The write runs by mode; the hook asks.
+    task = asyncio.create_task(manager.execute_tool(session, tools, "write_file", {"path": "a.txt", "content": "x"}, "w"))
+    key, event = await card(manager)
+    assert event["name"] == "hook_before_tool"
+    assert (await put_mode(client, session, "manual")).status_code == 200
+    manager.decide(*key, True)
+    key, write = await card(manager, "write_file")  # Manual: the write now has its own card.
+    assert write["call_id"] == "w" and not (project / "a.txt").exists()
+    manager.decide(*key, False)
+    await asyncio.wait_for(task, 5)
+    assert write["approval"] == "declined" and not (project / "a.txt").exists()
+
+
+async def test_leaving_bypass_while_a_hook_card_waits_restores_folder_access_and_cards(live, tmp_path):
+    manager, session, _, tools, client = live
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    hook(manager)
+    session.update(permission_mode="bypassPermissions", allow_rules=[{"behavior": "ask", "tool": "hook", "hook": "check"}])
+    task = asyncio.create_task(manager.execute_tool(session, tools, "write_file", {"path": str(outside / "x.txt"), "content": "x"}, "w"))
+    key, event = await card(manager)
+    assert event["name"] == "hook_before_tool" and tools.unrestricted is True
+    assert (await put_mode(client, session, "manual")).status_code == 200
+    manager.decide(*key, True)
+    key, access = await card(manager, "access_directory")
+    assert tools.unrestricted is False
+    manager.decide(*key, False)
+    output = await asyncio.wait_for(task, 5)
+    assert output.startswith("User declined folder access.")
+    assert not (outside / "x.txt").exists() and session.get("allowed_directories", []) == []
+
+
+async def test_a_tool_turned_off_while_its_hook_card_waits_does_not_run(live):
+    manager, session, project, tools, client = live
+    hook(manager)
+    session["permission_mode"] = "auto"
+    task = asyncio.create_task(manager.execute_tool(session, tools, "write_file", {"path": "a.txt", "content": "x"}, "w"))
+    key, event = await card(manager)
+    disabled = await client.put(f"/api/sessions/{session['id']}/disabled-tools", json={"tools": ["write_file"]})
+    assert disabled.status_code == 200 and key in manager.pending  # The hook card itself is not turned off.
+    manager.decide(*key, True)
+    output = await asyncio.wait_for(task, 5)
+    assert output == "The user turned off write_file in this chat. Use other tools." and not (project / "a.txt").exists()
+
+
+async def running_child(manager, session, project, tools, command):
+    """Start a delegate_task whose child waits on a card for command; return (task, child, outcome)."""
+    seen = {}
+
+    async def worker(child, prompt):
+        child_tools = WorkspaceTools(str(project))
+        child_tools.instruction_signature, child_tools.skill_signature = tools.instruction_signature, ""
+        seen["output"] = await manager.execute_tool(child, child_tools, "run_command", {"command": command}, "child")
+        await manager.event(child, "assistant", text="Done.")
+    manager.run_databricks = worker
+    session["permission_mode"] = "acceptEdits"
+    delegate = asyncio.create_task(manager.execute_tool(session, tools, "delegate_task", {"task": "Build"}, "d"))
+    (child_id, _), _ = await card(manager)
+    assert child_id != session["id"]
+    return delegate, manager.get(child_id), seen
+
+
+async def test_turning_off_a_tool_reaches_a_running_subagent(live):
+    manager, session, project, tools, client = live
+    recorder(manager)
+    delegate, child, seen = await running_child(manager, session, project, tools, "make")
+    response = await client.put(f"/api/sessions/{session['id']}/disabled-tools", json={"tools": ["run_command"]})
+    assert response.status_code == 200
+    await asyncio.wait_for(delegate, 5)
+    assert child["disabled_tools"] == ["run_command"]
+    assert seen["output"] == "The user turned off run_command in this chat. Use other tools."
+
+
+async def test_a_chat_deny_rule_reaches_a_running_subagent(live):
+    manager, session, project, tools, client = live
+    calls = recorder(manager)
+    delegate, child, seen = await running_child(manager, session, project, tools, "git push")
+    added = await client.post("/api/permission-rules", json={"scope": "chat", "session_id": session["id"], "rule": {
+        "tool": "run_command", "behavior": "deny", "text": "git push", "match": "prefix"}})
+    assert added.status_code == 200
+    await asyncio.wait_for(delegate, 5)
+    assert seen["output"].startswith("Blocked by a deny rule for this chat: commands starting with git push")
+    assert {"behavior": "deny", "prefix": ["git", "push"], "tool": "run_command"} in child["allow_rules"]
+    assert calls == []
+
+
+async def test_choosing_the_current_mode_again_changes_nothing(live):
+    manager, session, _, _, client = live
+    manager.statuses[session["id"]] = "running"
+    assert (await put_mode(client, session, "plan")).status_code == 200
+    assert (await put_mode(client, session, "plan")).status_code == 200
+    texts = [item.get("text") for item in session["events"] if item["type"] == "notice"]
+    assert texts == ["Permission mode changed to Plan."]

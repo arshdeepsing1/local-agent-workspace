@@ -15,9 +15,9 @@ from .tools import TOOL_DEFINITIONS, WorkspaceTools, file_error
 from .jobs import (CREDENTIAL_ENV, DENIED_ENV, DENIED_ENV_PREFIXES, ENVIRONMENT_KEYS, ENVIRONMENT_NAME, HEAD_CHARS,
                    JOB_NOTICE_STATES, MIN_HEAD_CHARS, TAIL_CHARS, job_command, job_ending, until_pattern, wait_page)
 from .tools import read_page_bytes
-from .permissions import MODE_LABELS, denied_tools, evaluate, log, mode_prompt
+from .permissions import MODE_LABELS, SCOPE_NAMES, denied_tools, evaluate, log, mode_prompt
 from .rules import (APP_ROOT, RuleStore, card_rule_options, default_rule, normalize_rule, project_key, protected_reason,
-                    rule_matches, same_rule)
+                    rule_label, rule_matches, same_rule, text_names_credential)
 from .activity import ACTIVITY_TOOL, activity_content, activity_log, local_time, redact_secrets
 from .context import (
     DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT_TOKENS, OUTPUT_LIMIT_CONTINUATION, SUMMARY_MAX_TOKENS,
@@ -673,6 +673,9 @@ class AgentManager:
                 await self.update_event(session, event, state="rejected" if event["state"] == "rejected" else "error", output=warning)
                 if phase == "before_tool":
                     raise ValueError(f"Before-tool hook blocked {name}: {warning}") from exc
+                if verdict.decision == "deny":
+                    continue  # Blocked by a rule or Don't ask: the hook card says so; no notice after every tool.
+                warning = warning.rstrip().removesuffix(".")
                 text = (f"Failure-hook warning: {warning}. The original tool error is unchanged." if phase == "tool_failure"
                         else f"After-tool hook warning: {warning}. The tool action already completed.")
                 await self.event(session, "notice", text=text)
@@ -1057,10 +1060,8 @@ class AgentManager:
             if not allowed:
                 raise ValueError("Only an approval can be remembered.")
             rememberable = event.get("rememberable") or []
-            if event.get("protected"):
-                raise ValueError("Protected files are always confirmed; this approval cannot be remembered.")
-            if not rememberable:
-                raise ValueError("This approval cannot be remembered.")
+            if event.get("protected") or not rememberable:
+                raise ValueError(self.not_rememberable(session, event))
             if scope not in rememberable:
                 raise ValueError("This approval can only be remembered for "
                                  + " or ".join({"chat": "this chat", "project": "this project",
@@ -1086,8 +1087,11 @@ class AgentManager:
         elif remember:
             if not allowed:
                 raise ValueError("Only an approval can be remembered for this chat.")
-            if event.get("protected"):
-                raise ValueError("Protected files are always confirmed; this approval cannot be remembered.")
+            if event.get("protected") or ("rememberable" in event and not event["rememberable"]):
+                raise ValueError(self.not_rememberable(session, event))
+            if event.get("name") == "run_command" and (reason := self.legacy_refusal(self.session_tools(session),
+                                                                                      event.get("input"))):
+                raise ValueError(reason)
             rule = rule_for(event.get("name"), event.get("input"))
             if rule is None:
                 raise ValueError("This action cannot be allowed for the whole chat.")
@@ -1145,10 +1149,13 @@ class AgentManager:
     def card_fields(self, tools, name, arguments, verdict, editable=()):
         """The pending-only fields of an approval card: what it can remember and edit, and why it asks."""
         options = card_rule_options(name, arguments, **self.rule_context(tools))
-        if verdict.protected:
+        if verdict.protected or (verdict.decision == "ask" and (verdict.source == "rule" or verdict.uncertain)):
+            # Protected files, Always ask rules and commands that cannot be checked exactly always ask:
+            # a remembered allow rule would never apply to them.
             rememberable = []
         elif name == "run_command":
-            rememberable = ["chat", "project", "user"] if options and options.get("argv") is not None else ["chat"]
+            rememberable = (["chat", "project", "user"] if options and options.get("argv") is not None
+                            else [] if self.legacy_refusal(tools, arguments) else ["chat"])
         else:
             rememberable = ["chat", "project", "user"] if default_rule(name, arguments) is not None else []
         fields = {"rememberable": rememberable, "rule_options": options, "editable": list(editable)}
@@ -1157,6 +1164,28 @@ class AgentManager:
         if verdict.uncertain:
             fields["uncertain"] = True
         return fields
+
+    def legacy_refusal(self, tools, arguments):
+        """Why a command's exact text cannot be allowed for this chat (M1 'Allow for this chat'), or None."""
+        text = arguments.get("command") if isinstance(arguments, dict) else None
+        if isinstance(text, str) and any(token and token in text for token in self.redaction_tokens()):
+            return "A rule cannot contain your Databricks token."
+        if text_names_credential(text, str(tools.credential_file) if tools.credential_file else None):
+            return "Rules cannot allow commands that name credential files."
+        return None
+
+    def not_rememberable(self, session, event):
+        """The message for remembering a card that offers no rule."""
+        if event.get("protected"):
+            return "Protected files are always confirmed; this approval cannot be remembered."
+        tools = self.session_tools(session)
+        verdict = self.permission(session, tools, event.get("name"), event.get("input"))
+        if event.get("uncertain") or (verdict.decision == "ask" and verdict.source == "rule"):
+            return ("An Always ask rule or a command that cannot be checked exactly always asks; "
+                    "this approval cannot be remembered.")
+        if event.get("name") == "run_command" and (reason := self.legacy_refusal(tools, event.get("input"))):
+            return reason
+        return "This approval cannot be remembered."
 
     def blocked_text(self, session, change, message):
         """The model-facing text of a card a change blocked while it waited."""
@@ -1247,6 +1276,8 @@ class AgentManager:
     async def change_mode(self, session, mode, *, notice=True):
         """Switch the permission mode at any time; waiting cards and a running subagent follow."""
         old = session.get("permission_mode", "manual")
+        if mode == old:
+            return  # Choosing the current mode again changes nothing: no notice, no re-check.
         session["permission_mode"] = mode
         self.store.save(session)
         if notice and busy_status(self, session["id"]) != "idle":
@@ -1274,6 +1305,16 @@ class AgentManager:
         """Publish and re-check after a rule change: the chat, every live chat of the project, or every live chat."""
         if scope == "chat":
             affected = [session] if session is not None else []
+            child = self.active_child(session) if session is not None else None
+            if child is not None:
+                # A running subagent copied the chat's rules when it started; new deny and ask rules reach it too.
+                rules = child.setdefault("allow_rules", [])
+                added = [rule for rule in session.get("allow_rules") or [] if rule.get("behavior") in ("deny", "ask")
+                         and not any(same_rule(rule, item) for item in rules)]
+                if added:
+                    rules.extend(dict(rule) for rule in added)
+                    self.store.save(child)
+                    affected.append(child)
         else:
             key = project_key(session["workspace"]) if scope == "project" and session is not None else None
             affected = [item for item in list(self.live.values())
@@ -1459,6 +1500,10 @@ class AgentManager:
             # folder-access, approval, hook and checkpoint rules apply to it.
             activity = None
             if name == ACTIVITY_TOOL:
+                # A deny rule that names the activity log applies before it becomes a write_file.
+                if (named := self.permission(session, tools, name, {"path": arguments["path"]})).decision == "deny":
+                    await self.update_event(session, event, state="rejected", output=named.message)
+                    return named.message
                 activity = {}
                 name, arguments = "write_file", {"path": arguments["path"], "content": ""}
             verdict = self.permission(session, tools, name, arguments)
@@ -1494,9 +1539,8 @@ class AgentManager:
                     if not allowed:
                         return await self.refused(session, event, verdict, declined(event, "this MCP action"))
                     carded = True
-            if name in PATH_TOOLS:
-                # move_path needs access to both ends; the destination is always a file path.
-                paths = [arguments.get("path", ".")] + ([arguments["destination"]] if name == "move_path" else [])
+            async def access_refusal():
+                """The refusal when a path needs folder access the user did not give, else None."""
                 for value in paths:
                     access = {}
                     if not await self.ensure_access(session, tools, value, name in DIRECTORY_TOOLS, access, (name, arguments)):
@@ -1509,6 +1553,12 @@ class AgentManager:
                                                 **({"decline_note": access["decline_note"]} if access.get("decline_note") else {}),
                                                 **({"blocked_reason": output} if access["approval"] == "blocked" else {}))
                         return output
+                return None
+            if name in PATH_TOOLS:
+                # move_path needs access to both ends; the destination is always a file path.
+                paths = [arguments.get("path", ".")] + ([arguments["destination"]] if name == "move_path" else [])
+                if (output := await access_refusal()) is not None:
+                    return output
                 if verdict.decision != "ask":
                     # A folder-access card may have waited while the mode or rules changed.
                     verdict = self.permission(session, tools, name, arguments)
@@ -1586,10 +1636,24 @@ class AgentManager:
             if verdict.decision == "allow" and not carded and (fields := self.verdict_fields(verdict)):
                 await self.update_event(session, event, **fields)
             await self.run_hooks(session, "before_tool", name, arguments, call_id=call_id)
+            # The mode, rules or turned-off tools can change while a card or hook card waits (for example
+            # a switch to Plan, or from Bypass to Manual): follow the current ones before anything runs.
+            tools.unrestricted = session.get("permission_mode", "manual") == "bypassPermissions"
+            if name in PATH_TOOLS and (output := await access_refusal()) is not None:
+                return output
             if (current := self.permission(session, tools, name, arguments)).decision == "deny":
-                # The mode or rules changed while a card or hook waited (for example a switch to Plan).
                 await self.update_event(session, event, state="rejected", output=current.message)
                 return current.message
+            if not carded and current.decision == "ask":
+                # Allowed when it started, but it needs a card now.
+                allowed, verdict = await self.request_approval(session, tools, event, name, arguments)
+                if not allowed:
+                    return await self.refused(session, event, verdict, declined(event))
+                carded = True
+            elif not carded and current != verdict:
+                verdict = current
+                if fields := self.verdict_fields(verdict):
+                    await self.update_event(session, event, **fields)
             # Approval or a hook can change guidance; recheck before any external action.
             if name in FILE_CHANGE_TOOLS + ("run_command",) or name.startswith("mcp__"):
                 if not self.guidance_matches(session, tools):
@@ -2457,6 +2521,10 @@ class AgentManager:
                 reason = "you declined it." + (" No agent step was left to answer your note." if note else "")
             elif approval == "expired":
                 reason = "the approval expired."
+            elif card.get("state") == "rejected" and (refusal := self.verify_refusal(session, tools, card)):
+                # Blocked by the mode, a rule or a turned-off tool: it would be blocked again this turn.
+                state["off"] = True
+                reason = refusal
             elif isinstance(result, dict) and isinstance(result.get("message"), str):
                 reason = clip(self.settings.redact(redact_secrets(result["message"])), 300)
             else:
@@ -2498,6 +2566,22 @@ class AgentManager:
         await self.event(session, "notice", text=(
             f"Verify failed ({outcome}). Asking the agent to fix it (round {state['rounds']} of {rounds})."))
         return "continue"
+
+    def verify_refusal(self, session, tools, card):
+        """The user-facing reason when the permission mode, a rule or a turned-off tool blocked Verify, else None."""
+        verdict = self.permission(session, tools, "run_command", card.get("input") or {})
+        if verdict.decision == "deny":
+            if verdict.source == "disabled":
+                return "run_command is turned off in this chat."
+            if verdict.source == "rule":
+                return f"a deny rule for {SCOPE_NAMES[verdict.scope]} blocks it ({rule_label(verdict.rule)})."
+            if verdict.source == "dont_ask":
+                return "Don't ask mode blocks commands that no rule allows."
+            if verdict.source == "plan":
+                return "Plan mode blocks commands."
+        if card.get("approval") == "blocked":
+            return "the permission mode or the rules changed while its approval card waited."
+        return None
 
     async def _run_databricks(self, session, prompt, external_tools):
         host, token = self.settings.credentials()

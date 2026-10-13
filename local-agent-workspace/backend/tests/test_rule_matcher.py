@@ -95,7 +95,14 @@ def test_deny_rules_win_in_bypass(command):
 
 @pytest.mark.parametrize("command", [
     "env git push", "command git push", "nohup git push", "timeout 5 git push", "xargs git push", 'sh -c "git push"',
-    "noglob git push", "- git push", "git -c alias.p=push p", "git status && git push", "/usr/bin/gi? push"])
+    "noglob git push", "- git push", "git -c alias.p=push p", "git status && git push", "/usr/bin/gi? push",
+    # Inline interpreters with clustered or attached options.
+    'perl -le "system qw/git push/"', "perl '-esystem qw/git push/'", "ruby -we \"system 'git', 'push'\"",
+    'node -pe "x"', "node --eval=x", "node --print=x", 'python3 -Ic "import os"', "python3 '-cimport os'",
+    "lua '-eos.execute\"git push\"'",
+    # Alias definitions name the program after '='.
+    "alias p='git push'\np origin main", "shopt -s expand_aliases\nalias p='git push'\np", "alias p=git\np push",
+    "source ./push.sh\necho done"])
 def test_commands_a_deny_rule_might_cover_ask_even_in_bypass(command):
     verdict = decide(command, "bypassPermissions")
     assert (verdict.decision, verdict.uncertain) == ("ask", True), command
@@ -146,7 +153,12 @@ def test_opaque_commands_and_never_flags():
                  ["pwsh", "-Command", "x"], ["awk", "{print}"], ["sed", "s/a/b/"], ["git", "-ccore.pager=x", "log"],
                  ["rg", "--pre=x", "a"], ["rg", "-nz", "a"], ["find", ".", "-delete"], ["git", "--git-dir=x", "log"]):
         assert opaque(argv), argv
-    for argv in (["python3", "script.py"], ["git", "status"], ["rg", "-n", "x"], ["find", ".", "-name", "x"]):
+    for argv in (["perl", "-le", "x"], ["ruby", "-we", "x"], ["node", "-pe", "x"], ["python3", "-Ic", "x"],
+                 ["perl", "-esystem qw/x/"], ["python3", "-cimport os"], ["node", "--eval=x"], ["deno", "--print=x"]):
+        assert opaque(argv), argv
+    for argv in (["python3", "script.py"], ["git", "status"], ["rg", "-n", "x"], ["find", ".", "-name", "x"],
+                 ["python3", "-m", "pytest", "-q"], ["node", "--version"], ["perl", "-w", "script.pl"],
+                 ["python3", "-OO", "x.py"]):
         assert not opaque(argv), argv
     assert set(NEVER_FLAGS) == {"git", "rg", "find"}
 
@@ -157,6 +169,9 @@ def test_uncertain_matching_of_unparseable_text():
     assert uncertain_match(deny, "git status && git push", None)
     assert uncertain_match(deny, "echo $HOME", None)
     assert uncertain_match(deny, "npm test | sh", None)
+    # A word naming the program after '=' (an alias body, or a variable a Makefile may run) counts.
+    assert uncertain_match(deny, "npm test && make release GIT=git", None)
+    assert uncertain_match(deny, "npm test && make release TOOLS=make,git", None)
     assert uncertain_match({"behavior": "ask", "tool": "run_command"}, "npm test | tee out", None)
     assert not uncertain_match({"behavior": "allow", "tool": "run_command", "argv": ["git"]}, "git x | y", None)
 
@@ -183,6 +198,9 @@ CONTEXT = {"resolve_path": resolve, "credential_file": "/srv/secrets/databricks.
 @pytest.mark.parametrize("draft, message", [
     ({"tool": "run_command", "prefix": ["bash"]}, "runs other programs"),
     ({"tool": "run_command", "prefix": ["python3", "-c"]}, "can run code"),
+    ({"tool": "run_command", "prefix": ["perl"], "flags": ["-le"]}, "can run code"),
+    ({"tool": "run_command", "argv": ["ruby", "-we", "x"]}, "can run code"),
+    ({"tool": "run_command", "argv": ["node", "--eval=x"]}, "can run code"),
     ({"tool": "run_command", "prefix": ["rg"], "flags": ["--pre="]}, "'--pre=' can run other programs; a rule cannot allow it."),
     ({"tool": "run_command", "prefix": ["git", "-c"]}, "'-c' can run other programs; a rule cannot allow it."),
     ({"tool": "run_command", "argv": ["cat", ".env"]}, "Rules cannot allow commands that name credential files."),
