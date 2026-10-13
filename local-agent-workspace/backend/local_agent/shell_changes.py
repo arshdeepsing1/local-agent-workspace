@@ -9,7 +9,8 @@ command when the file was already changed, else the file in the HEAD from before
 (absent when it was not there), so a later `git add`, commit or branch switch cannot move it.
 
 Every Git call goes through git_tools.run_git (no shell, no hooks, no fsmonitor) with the
-repository's clean/smudge filters switched off. A file is tracked only when the chat's tools may
+repository's clean/smudge filters switched off; the filter names are read again before each
+status, so a filter the command itself configures does not run either. A file is tracked only when the chat's tools may
 use it (no credential files, generated folders or ungranted paths) and no symbolic link is on its
 path, so a review row always names the file that actually changed. Everything is bounded: time,
 status size, snapshot count and bytes, candidates and blob reads; past a bound the tracker skips
@@ -45,7 +46,8 @@ OBJECT_ID = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
 # Global options for every call: no index refresh writes, and paths taken literally.
 GLOBAL = ["--no-optional-locks", "--literal-pathspecs"]
 
-# folder -> (expires, repository top, filter names): a burst of commands asks once.
+# folder -> (expires, repository top): a burst of commands asks once. Filter names are not
+# cached: a command can configure a new filter, which must stay off in the next status.
 _locations = {}
 
 
@@ -56,37 +58,46 @@ def read_only_command(command):
 
 
 async def _location(folder):
-    """(repository top, filter names) for a folder inside a Git work tree, else None."""
-    key, now = str(folder), time.monotonic()
-    cached = _locations.get(key)
-    if cached and cached[0] > now:
-        return cached[1], cached[2]
-    code, raw, truncated = await run_git(folder, ["rev-parse", "--show-toplevel"], timeout=GIT_TIMEOUT, limit=16_384)
-    lines = [line for line in raw.decode("utf-8").splitlines() if line.strip()] if code == 0 and not truncated else []
-    top = Path(lines[-1]) if lines else None
-    if top is None or not top.is_absolute():
+    """The repository top for a folder inside a Git work tree, else None. Never raises."""
+    try:
+        key, now = str(folder), time.monotonic()
+        cached = _locations.get(key)
+        if cached and cached[0] > now:
+            return cached[1]
+        if not folder.is_dir():
+            return None
+        code, raw, truncated = await run_git(folder, ["rev-parse", "--show-toplevel"], timeout=GIT_TIMEOUT, limit=16_384)
+        lines = [line for line in raw.decode("utf-8").splitlines() if line.strip()] if code == 0 and not truncated else []
+        top = Path(lines[-1]) if lines else None
+        if top is None or not top.is_absolute() or not folder.is_relative_to(top):
+            return None
+        if len(_locations) >= 256:
+            _locations.clear()
+        _locations[key] = (now + CACHE_SECONDS, top)
+        return top
+    except Exception as error:
+        log.debug("Command change tracking could not locate a repository: %s", type(error).__name__)
         return None
-    filters = await configured_filters(top, timeout=GIT_TIMEOUT)
-    if len(_locations) >= 256:
-        _locations.clear()
-    _locations[key] = (now + CACHE_SECONDS, top, filters)
-    return top, filters
 
 
 class _Repository:
-    def __init__(self, folder, top, filters):
-        self.folder, self.top, self.filters = folder, top, filters
+    def __init__(self, folder, top):
+        self.folder, self.top, self.filters = folder, top, []
         relative = folder.relative_to(top).as_posix() if folder != top else "."
         self.pathspec = relative
         self.head = None
-        self.changed = set()  # Paths (relative to top) that status listed before the command.
+        self.changed = {}  # {path relative to top: status code} that status listed before the command.
         self.snapshots = {}  # Path -> state before the command, or UNSUPPORTED.
 
     async def git(self, arguments, limit=STATUS_LIMIT):
         return await run_git(self.top, [*GLOBAL, *arguments], filters=self.filters, timeout=GIT_TIMEOUT, limit=limit)
 
+    async def read_filters(self):
+        """The repository's filter names as configured now (the command may have added one)."""
+        self.filters = await configured_filters(self.top, timeout=GIT_TIMEOUT)
+
     async def status(self):
-        """The paths status lists, or None when status fails or lists too many."""
+        """{path: status code} as status lists them, or None when status fails or lists too many."""
         code, raw, truncated = await self.git(["status", "--porcelain=v1", "-z", "--untracked-files=all",
                                                "--ignore-submodules=dirty", "--no-renames", "--", self.pathspec])
         if code != 0 or truncated:
@@ -94,11 +105,11 @@ class _Repository:
         entries = [item for item in raw.split(b"\0") if item]
         if len(entries) > MAX_STATUS_ENTRIES:
             return None
-        paths = set()
+        paths = {}
         for item in entries:
             if STATUS_ENTRY.match(item):
                 try:
-                    paths.add(item[3:].decode("utf-8"))
+                    paths[item[3:].decode("utf-8")] = item[:2]
                 except UnicodeDecodeError:
                     continue  # A path that is not UTF-8 cannot be listed in the review.
         return paths
@@ -109,9 +120,13 @@ class _Repository:
         return text[-1] if code == 0 and text and OBJECT_ID.match(text[-1]) else None
 
     async def moved(self, head):
-        """Paths that differ between the HEAD before the command and head."""
-        code, raw, truncated = await self.git(["diff", "--name-only", "-z", "--no-renames", "--no-ext-diff",
-                                               self.head, head, "--", self.pathspec])
+        """Paths that differ between the HEAD before the command and head; every path of head
+        when the repository had no commit before (its first commit)."""
+        if self.head is None:
+            arguments = ["ls-tree", "-r", "-z", "--name-only", head, "--", self.pathspec]
+        else:
+            arguments = ["diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", self.head, head, "--", self.pathspec]
+        code, raw, truncated = await self.git(arguments)
         if code != 0:
             return set()
         items = raw.split(b"\0")
@@ -164,31 +179,32 @@ class ShellChangeTracker:
             extra = [Path(folder).resolve() for folder in folders]
             tools = copy.copy(tools)
             tools.allowed_directories = [*tools.allowed_directories, *extra]
+            # The project first, then the other folders in order, at most MAX_FOLDERS.
+            folders = list(dict.fromkeys([tools.root, *tools.allowed_directories]))[:MAX_FOLDERS]
+            tops = await asyncio.gather(*(_location(folder) for folder in folders))
+            # A folder inside another folder of the same repository is covered by that folder's
+            # status. Folders outside a work tree are left out only now, so a granted parent of the
+            # project that is no repository, or a different repository, never hides the project's.
+            located = sorted(((folder, top) for folder, top in zip(folders, tops) if top is not None),
+                             key=lambda item: len(item[0].parts))
             roots = []
-            for folder in sorted({tools.root, *tools.allowed_directories, *extra}, key=lambda path: len(path.parts)):
-                if not any(folder.is_relative_to(root) for root in roots):
-                    roots.append(folder)  # A folder inside another one is covered by it.
-            # The project first, then the others in order, at most MAX_FOLDERS.
-            roots = [tools.root] + [root for root in roots if root != tools.root] if tools.root in roots else roots
+            for folder, top in located:
+                if not any(top == other_top and folder.is_relative_to(other) for other, other_top in roots):
+                    roots.append((folder, top))
+            roots.sort(key=lambda item: item[0] != tools.root)
             tracker = cls(tools, [])
-            prepared = await asyncio.gather(*(tracker._prepare(folder) for folder in roots[:MAX_FOLDERS]))
+            prepared = await asyncio.gather(*(tracker._prepare(folder, top) for folder, top in roots))
             tracker.repositories = [repository for repository in prepared if repository is not None]
             return tracker if tracker.repositories else None
         except Exception as error:  # Tracking is best effort; the command runs either way.
             log.debug("Command change tracking is off for this command: %s", type(error).__name__)
             return None
 
-    async def _prepare(self, folder):
+    async def _prepare(self, folder, top):
         try:
             async with asyncio.timeout(AFTER_DEADLINE):
-                if not folder.is_dir():
-                    return None
-                location = await _location(folder)
-                if location is None:
-                    return None
-                repository = _Repository(folder, *location)
-                if folder != repository.top and not folder.is_relative_to(repository.top):
-                    return None
+                repository = _Repository(folder, top)
+                await repository.read_filters()
                 changed = await repository.status()
                 if changed is None:
                     return None
@@ -239,18 +255,28 @@ class ShellChangeTracker:
     async def _collect(self, repository, found):
         try:
             async with asyncio.timeout(AFTER_DEADLINE):
+                await repository.read_filters()
                 changed = await repository.status()
                 if changed is None:
                     return
                 head = await repository.current_head()
-                candidates = repository.changed | changed
-                if repository.head and head and head != repository.head:
-                    candidates |= await repository.moved(head)  # git commit, checkout or stash.
-                pending = []
-                for path in sorted(candidates)[:MAX_CANDIDATES]:
+                moved = set()
+                if head and head != repository.head:
+                    moved = await repository.moved(head)  # git commit, checkout, stash or a first commit.
+                # What the command surely touched comes first: paths status lists only now or with
+                # another code, and paths the HEAD change names; then files changed before it.
+                before = repository.changed
+                fresh = {path for path, code in changed.items() if before.get(path) != code} | moved
+                rest = (set(before) | set(changed)) - fresh
+                pending, admitted = [], 0
+                for path in [*sorted(fresh), *sorted(rest)]:
+                    if admitted >= MAX_CANDIDATES:
+                        log.debug("Command change tracking reached its limit of %d files.", MAX_CANDIDATES)
+                        break
                     target = self._admit(repository, path)
                     if target is None:
                         continue
+                    admitted += 1
                     try:
                         current = _snapshot(target, FILE_LIMIT)
                     except (ValueError, OSError, UnicodeError):

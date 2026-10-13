@@ -952,9 +952,11 @@ class AgentManager:
         self.notify_status(session, previous, status, turn_ended)
         await self.delegates.progress(session, status=status)
         if status == "idle":
-            if turn_ended and self.settings.values.get("auto_keep_changes") is True:
-                # Automatic Keep: this chat's list clears when its reply ends (a subagent's end
-                # leaves its parent's rolled-up rows alone). The empty list is pushed.
+            if (turn_ended and self.settings.values.get("auto_keep_changes") is True
+                    and session.get("terminal_reason") in ("completed", "tool_error")):
+                # Automatic Keep: this chat's list clears when its reply finishes (a subagent's end
+                # leaves its parent's rolled-up rows alone). The empty list is pushed. A reply that
+                # was stopped, failed or hit the step limit keeps its list, so Undo stays offered.
                 self.changes.keep_all(session["id"])
                 await self.publish_changes(session)
             else:

@@ -314,3 +314,74 @@ async def test_a_subagent_edit_and_a_parent_command_are_undone_together_in_the_p
         "note.txt": (child["id"], None), "tracked.txt": (None, "command")}
     assert undo(manager, parent, *files)["files"] == []
     assert not (project / "note.txt").exists() and (project / "tracked.txt").read_text() == "old\n"
+
+
+async def test_a_granted_parent_folder_outside_any_repository_does_not_hide_the_project(runtime, tmp_path):
+    manager, session, project = runtime
+    outer = tmp_path.resolve()  # Contains the project and is no Git work tree itself.
+    session["allowed_directories"] = [str(outer)]
+    await run(manager, session, "sed -i.bak 's/old/new/' tracked.txt && rm tracked.txt.bak")
+    assert list(listed(manager, session)) == ["tracked.txt"]
+    assert baseline_text(manager, session, "tracked.txt") == "old\n"
+
+
+async def test_a_granted_parent_repository_does_not_hide_the_nested_project_repository(runtime, tmp_path):
+    manager, session, _ = runtime
+    outer = (tmp_path / "outer").resolve()
+    make_repository(outer, {"o.txt": "outer\n"})
+    inner = outer / "inner"
+    make_repository(inner, {"tracked.txt": "old\n"})
+    session.update(workspace=str(inner), allowed_directories=[str(outer)])
+    await run(manager, session, f"echo more >> tracked.txt && echo more >> {outer}/o.txt")
+    files = listed(manager, session)
+    assert sorted(files) == sorted(["tracked.txt", str(outer / "o.txt")])
+    assert baseline_text(manager, session, "tracked.txt") == "old\n"
+    assert baseline_text(manager, session, str(outer / "o.txt")) == "outer\n"
+
+
+async def test_files_changed_before_the_command_do_not_crowd_out_its_own_edit(runtime):
+    manager, session, project = runtime
+    (project / "build").mkdir()
+    for number in range(shell_changes.MAX_CANDIDATES + 100):
+        (project / "build" / f"{number}.txt").write_text("x")
+    await run(manager, session, "sed -i.bak 's/old/new/' tracked.txt && rm tracked.txt.bak")
+    assert list(listed(manager, session)) == ["tracked.txt"]
+    assert baseline_text(manager, session, "tracked.txt") == "old\n"
+
+
+@pytest.mark.parametrize("same_command", [True, False])
+async def test_a_filter_configured_by_a_command_does_not_run_in_the_apps_status(runtime, tmp_path, same_command):
+    # The filter names are read again before each status, not taken from the 60-second cache.
+    manager, session, project = runtime
+    marker = tmp_path / "markers"
+    marker.mkdir()
+    script = tmp_path / "program.sh"
+    script.write_text(f"#!/bin/sh\ntouch {marker}/$1\ncat\n")
+    script.chmod(0o755)
+    (project / ".gitattributes").write_text("tracked.txt filter=evil\n")
+    git(project, "add", ".gitattributes")
+    git(project, "commit", "-qm", "attributes")
+    configure = f"git config filter.evil.clean '{script} clean-by-app'"
+    stat_dirty = "touch -m -t 200101010000 tracked.txt"  # Status then hashes the file.
+    if same_command:
+        await run(manager, session, f"{configure} && {stat_dirty}")
+    else:
+        await run(manager, session, configure, "configure")
+        os.utime(project / "tracked.txt", (1, 1))
+        await run(manager, session, "true", "next")
+    assert list(marker.iterdir()) == []
+
+
+async def test_files_of_the_first_commit_in_a_new_repository_are_listed(runtime, tmp_path):
+    manager, session, _ = runtime
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    git(fresh, "init", "-q")
+    git(fresh, "config", "user.name", "Test")
+    git(fresh, "config", "user.email", "test@example.invalid")
+    git(fresh, "config", "commit.gpgsign", "false")
+    session["workspace"] = str(fresh)
+    await run(manager, session, "echo x > new.txt && git add new.txt && git commit -qm first")
+    assert listed(manager, session)["new.txt"]["status"] == "created"
+    undo(manager, session, "new.txt")
+    assert not (fresh / "new.txt").exists()

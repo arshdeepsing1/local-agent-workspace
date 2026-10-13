@@ -1,4 +1,5 @@
 """Automatic Keep: an optional setting that keeps a chat's agent changes when its reply ends."""
+import asyncio
 import json
 
 import httpx
@@ -74,6 +75,47 @@ async def test_with_the_setting_on_a_finished_reply_keeps_its_changes_and_pushes
     assert [item["path"] for item in manager.checkpoints.list(session["id"])] == ["a.txt"]
 
 
+def gateway(monkeypatch, after_tool):
+    """A model that writes a.txt, then answers the tool result with after_tool(request)."""
+    async def handler(request):
+        if json.loads(request.content)["messages"][-1]["role"] == "tool":
+            return await after_tool(request)
+        return stream(call={"name": "write_file", "arguments": json.dumps({"path": "a.txt", "content": "agent\n"})})
+    client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client(**kwargs, transport=httpx.MockTransport(handler)))
+
+
+async def test_a_failed_reply_keeps_nothing(runtime, monkeypatch):
+    manager, session, project, socket = runtime
+    manager.settings.values["auto_keep_changes"] = True
+
+    async def failure(request):
+        return httpx.Response(400, json={"error": {"message": "bad request"}})
+    gateway(monkeypatch, failure)
+    await manager.run(session, "Write a.txt")
+    assert (project / "a.txt").read_text() == "agent\n"
+    assert session["terminal_reason"] in ("inference_error", "error")
+    assert manager.changes.has(session["id"])
+    assert [item["path"] for item in socket.changes()[-1]["files"]] == ["a.txt"]
+
+
+async def test_a_stopped_reply_keeps_nothing_so_undo_stays_offered(runtime, monkeypatch):
+    manager, session, project, socket = runtime
+    manager.settings.values["auto_keep_changes"] = True
+    asked = asyncio.Event()
+
+    async def hang(request):
+        asked.set()
+        await asyncio.sleep(30)
+    gateway(monkeypatch, hang)
+    manager.start(session["id"], "Write a.txt")
+    await asyncio.wait_for(asked.wait(), 5)
+    await manager.stop(session["id"])
+    assert manager.get(session["id"])["terminal_reason"] == "stopped"
+    assert manager.changes.has(session["id"])
+    assert [item["path"] for item in socket.changes()[-1]["files"]] == ["a.txt"]
+
+
 async def test_with_the_setting_off_changes_stay_listed(runtime):
     manager, session, project, socket = runtime
     assert manager.settings.values["auto_keep_changes"] is False
@@ -100,6 +142,7 @@ async def test_a_subagent_reply_ending_leaves_the_parents_rolled_up_rows(runtime
     manager.store.save(child)
     edit(manager, child, project)
     assert manager.changes.has(child["id"]) and manager.changes.has(parent["id"])
+    child["terminal_reason"] = parent["terminal_reason"] = "completed"
     await manager.status(child, "idle", turn_ended=True)
     assert not manager.changes.has(child["id"])
     listed = manager.changes.list(parent["id"], manager.review_tools(parent))["files"]
