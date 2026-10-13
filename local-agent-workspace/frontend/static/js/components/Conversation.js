@@ -91,6 +91,8 @@ function toolOutcome(event) {
 export function allowLabel(event) {
   const name = event.name || ''
   if (event.protected) return null  // Protected files are always confirmed.
+  // Always ask rules, uncertain commands and commands naming credentials offer no chat rule (older events lack the list).
+  if (Array.isArray(event.rememberable) && !event.rememberable.includes('chat')) return null
   if (name === 'run_command') return typeof event.input?.command === 'string' && event.input.command.trim() ? 'Always allow this command in this chat' : null
   if (['write_file', 'edit_file', 'insert_activity_log', 'move_path', 'delete_path', 'notebook_edit'].includes(name)) return 'Allow edits in this chat'
   if (name.startsWith('mcp__')) return 'Allow this tool in this chat'

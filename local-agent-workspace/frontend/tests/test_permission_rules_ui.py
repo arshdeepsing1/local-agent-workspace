@@ -152,9 +152,26 @@ def test_protected_cards_show_the_note_and_cannot_be_remembered(ui, page):
 
 
 def test_uncertain_commands_say_why_they_ask(ui, page):
-    show(ui, f"[{GIT_STATUS.replace("editable: ['command']", 'uncertain: true')}]")
+    # The server offers nothing to remember on these cards, so neither the form nor the chat button shows.
+    show(ui, f"[{GIT_STATUS.replace("editable: ['command']", 'uncertain: true').replace(ALL_SCOPES, 'rememberable: []')}]")
     expect(page.get_by_text("This command could not be checked exactly against your deny and ask rules, so it needs your approval.",
                             exact=True)).to_be_visible()
+    expect(page.get_by_role("button", name="Approve", exact=True)).to_be_visible()
+    expect(page.get_by_role("button", name="Always allow…")).to_have_count(0)
+    expect(page.get_by_role("button", name="Always allow this command in this chat")).to_have_count(0)
+
+
+@pytest.mark.parametrize("card", [
+    "{ id: 'card', type: 'tool', name: 'run_command', state: 'pending', preview: 'npm test', input: { command: 'npm test' }, rememberable: [] }",
+    "{ id: 'card', type: 'tool', name: 'write_file', state: 'pending', preview: 'diff', input: { path: 'a.txt', content: 'x' }, rememberable: [] }",
+    "{ id: 'card', type: 'tool', name: 'mcp__docs__search', state: 'pending', preview: 'p', input: {}, rememberable: [] }",
+], ids=["command", "edits", "mcp"])
+def test_cards_that_offer_nothing_to_remember_have_no_chat_button(ui, page, card):
+    # An Always ask rule, or a command that names a credential file: the server refuses to remember them.
+    show(ui, f"[{card}]")
+    expect(page.get_by_role("button", name="Approve", exact=True)).to_be_visible()
+    expect(page.get_by_role("button", name=re.compile("in this chat$"))).to_have_count(0)
+    expect(page.get_by_role("button", name="Always allow…")).to_have_count(0)
 
 
 # Edit before approving
