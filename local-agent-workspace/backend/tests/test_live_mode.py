@@ -332,3 +332,34 @@ async def test_tools_unrestricted_follows_the_mode_on_every_tool_call(live, tmp_
 def test_agent_manager_keeps_a_two_argument_approve():
     import inspect
     assert list(inspect.signature(AgentManager.approve).parameters) == ["self", "session", "event"]
+
+
+async def test_a_write_that_waited_on_folder_access_follows_a_switch_to_accept_edits(live, tmp_path):
+    manager, session, _, tools, client = live
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    task = asyncio.create_task(manager.execute_tool(session, tools, "write_file", {"path": str(outside / "a.txt"), "content": "x"}, "w"))
+    (sid, eid), access = await card(manager)
+    assert access["name"] == "access_directory"
+    assert (await put_mode(client, session, "acceptEdits")).status_code == 200
+    assert (sid, eid) in manager.pending  # Folder access still needs its own answer.
+    manager.decide(sid, eid, True)
+    await asyncio.wait_for(task, 5)  # No second card: the write is evaluated again before its card.
+    write = next(item for item in session["events"] if item.get("call_id") == "w")
+    assert write["state"] == "completed" and "approval" not in write
+    assert (outside / "a.txt").read_text() == "x"
+
+
+async def test_leaving_bypass_while_a_card_waits_restores_the_folder_boundary(live, tmp_path):
+    manager, session, _, tools, client = live
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    session.update(permission_mode="bypassPermissions", allow_rules=[{"behavior": "ask", "tool": "edits"}])
+    task = asyncio.create_task(manager.execute_tool(session, tools, "write_file", {"path": str(outside / "a.txt"), "content": "x"}, "w"))
+    (sid, eid), event = await card(manager)
+    assert event["name"] == "write_file" and tools.unrestricted is True
+    assert (await put_mode(client, session, "manual")).status_code == 200
+    manager.decide(sid, eid, True)
+    output = await asyncio.wait_for(task, 5)
+    assert "needs access approval" in output and not (outside / "a.txt").exists()
+    assert tools.unrestricted is False

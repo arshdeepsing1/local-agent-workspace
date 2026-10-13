@@ -57,6 +57,9 @@ def test_prefix_rules_allow_only_listed_options():
     for mode in ("manual", "auto"):
         assert decide("git -c core.pager=less status", mode).decision == "ask"
     assert decide("rg -n TODO").decision == "allow"
+    # The prefix must come first, word for word: these contain the same words in another order.
+    assert decide("rg TODO -n").decision == "ask"
+    assert decide("git -s status").decision == "ask"
     assert decide("rg --pre=x -n TODO").decision == "ask"
     assert decide("rg --pre x TODO").decision == "ask"
 

@@ -125,14 +125,16 @@ async def test_a_file_edit_rebuilds_the_preview_and_checks_for_drift(live):
 
 async def test_schema_and_size_limits_apply_to_edits(live):
     manager, session, project, tools, client = live
+    tools.write_limit = 1_000_000  # The largest write limit in Settings: the tool's own argument limit still applies.
     task = asyncio.create_task(manager.execute_tool(session, tools, "write_file", {"path": "c.txt", "content": "x"}, "w"))
     key, event = await card(manager)
     over_limit = await edit(client, key, {"content": "y" * (520 * 1024)})
     assert over_limit.status_code == 400 and "limit" in over_limit.json()["detail"]
     too_large = await edit(client, key, {"content": "y" * (601 * 1024)})
     assert too_large.status_code == 400 and too_large.json()["detail"] == "The edited text is too large."
+    tools.write_limit = 80_000
     beyond_write_limit = await edit(client, key, {"content": "y" * 90_000})
-    assert beyond_write_limit.status_code == 400
+    assert beyond_write_limit.json()["detail"] == "File content must be UTF-8 text without NUL bytes and at most 80 KB."
     assert (await client.post(f"/api/sessions/{key[0]}/approvals/{key[1]}/edit",
                               json={"input": {"content": 5}})).status_code == 422
     assert event["input"] == {"path": "c.txt", "content": "x"}

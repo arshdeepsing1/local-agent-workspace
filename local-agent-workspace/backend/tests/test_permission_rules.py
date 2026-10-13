@@ -632,3 +632,38 @@ async def test_always_allow_from_a_card_saves_project_and_user_rules(runtime):
     manager.decide(session_id, event_id, True, scope="user")
     await task
     assert manager.rules.rules("/srv/elsewhere")["user"] == [{"behavior": "allow", "tool": "edits"}]
+
+
+async def test_dont_ask_blocks_hooks_unless_a_hook_rule_allows_them(runtime):
+    manager, session, project, tools = runtime
+    manager.extensions.update_config({"hooks": [{"id": "check", "enabled": True, "event": "before_tool", "command": "true"}]})
+    session["permission_mode"] = "dontAsk"
+    session["allow_rules"] = [{"behavior": "allow", "tool": "edits"}]
+    output, event = await run(manager, session, tools, "write_file", {"path": "a.txt", "content": "x"}, "blocked")
+    assert "Before-tool hook blocked write_file: Not run: Don't ask mode blocks actions" in output
+    hook = next(item for item in session["events"] if item.get("name") == "hook_before_tool")
+    assert (hook["state"], hook["approval"]) == ("rejected", "blocked")
+    assert hook["blocked_reason"].startswith("Not run: Don't ask mode") and not (project / "a.txt").exists()
+    session["allow_rules"].append({"behavior": "allow", "tool": "hook", "hook": "check"})
+    output, event = await run(manager, session, tools, "write_file", {"path": "a.txt", "content": "x"}, "allowed")
+    assert (project / "a.txt").read_text() == "x" and event["allowed_by_rule"] is True
+    hook = [item for item in session["events"] if item.get("name") == "hook_before_tool"][-1]
+    assert (hook["state"], hook["allowed_by_rule"], hook["rule_scope"]) == ("completed", True, "chat")
+    # A deny rule for the hook blocks it in Bypass too.
+    session.update(permission_mode="bypassPermissions",
+                   allow_rules=[{"behavior": "deny", "tool": "hook", "hook": "check"}])
+    output, _ = await run(manager, session, tools, "write_file", {"path": "b.txt", "content": "x"}, "denied")
+    assert "Blocked by a deny rule for this chat: the hook check." in output and not (project / "b.txt").exists()
+
+
+async def test_remembered_rules_are_checked_before_they_are_saved(runtime):
+    manager, session, _, tools = runtime
+    task = asyncio.create_task(manager.execute_tool(session, tools, "run_command", {"command": "make lint"}, "c"))
+    session_id, event_id = await card(manager)
+    with pytest.raises(ValueError, match="too large"):
+        manager.decide(session_id, event_id, True, scope="user", rule={"tool": "run_command", "argv": ["x" * 9000]})
+    with pytest.raises(ValueError, match="runs other programs"):
+        manager.decide(session_id, event_id, True, scope="user", rule={"tool": "run_command", "prefix": ["env"]})
+    assert manager.rules.rules(session["workspace"])["user"] == []
+    manager.decide(session_id, event_id, False)
+    await task
