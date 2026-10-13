@@ -1,0 +1,294 @@
+"""Edit and resend, Retry, Rewind, Fork from here and New chat in worktree (whole app, fake backend)."""
+import json
+import re
+
+from playwright.sync_api import expect
+
+EVENTS = [
+    {"id": "u1", "type": "user", "text": "First task", "in_wire": True},
+    {"id": "a1", "type": "assistant", "text": "First answer."},
+    {"id": "u2", "type": "user", "text": "Second task", "in_wire": True},
+    {"id": "t2", "type": "tool", "name": "read_file", "input": {"path": "a.txt"}, "state": "completed", "output": "x"},
+    {"id": "a2", "type": "assistant", "text": "Second answer."},
+]
+PREVIEW = {"before_event_id": "u2",
+           "conversation": {"possible": True, "reason": None, "events_removed": 3, "messages_removed": 4,
+                            "summary_dropped": False},
+           "code": {"possible": True, "reason": None, "files": [{"path": "a.txt", "status": "restore"},
+                                                                 {"path": "b.txt", "status": "unchanged"}]}}
+SETUP = """
+fake.sessions.set('a', { ...makeSession('a', 'Work'), events: %s, terminal_reason: 'completed' })
+window.preview = %s
+window.rewindError = null
+fake.override = (path, options) => {
+  if (path.startsWith('/api/sessions/a/rewind-preview?')) return fake.json(window.preview)
+  if (path === '/api/sessions/a/rewind' && options.method === 'POST') {
+    if (window.rewindError) return fake.json(window.rewindError.body, window.rewindError.status)
+    const body = JSON.parse(options.body)
+    const events = fake.sessions.get('a').events
+    const updated = { ...fake.sessions.get('a'), events: body.conversation ? events.slice(0, events.findIndex(e => e.id === body.before_event_id)) : events }
+    fake.sessions.set('a', updated)
+    fake.sessions.set('backup', { ...makeSession('backup', 'Work (before rewind)'), events, archived: true })
+    // Like the server: the snapshot is broadcast before the response.
+    if (body.conversation) fake.socketFor('a').emit({ type: 'snapshot', session: updated })
+    return fake.json({ session: updated, backup_session_id: body.conversation ? 'backup' : null, files: [], resent: !!body.resend_text })
+  }
+  if (path === '/api/sessions/a/fork' && options.method === 'POST') {
+    fake.sessions.set('forked', { ...makeSession('forked', 'Work (fork)'), events: fake.sessions.get('a').events.slice(0, 2) })
+    return fake.json(fake.sessions.get('forked'), 201)
+  }
+  if (path === '/api/worktrees' && options.method === 'POST') {
+    return fake.json({ id: 'wt1', branch: JSON.parse(options.body).branch, path: '/srv/state/worktrees/wt1', source_workspace: '/project' })
+  }
+  if (path === '/api/worktrees/wt1/session' && options.method === 'POST') {
+    fake.sessions.set('wtchat', { ...makeSession('wtchat', 'Worktree: chat/x'), worktree: { id: 'wt1', branch: 'chat/x', source_workspace: '/project' } })
+    return fake.json(fake.sessions.get('wtchat'))
+  }
+}
+"""
+
+
+def start(ui, page, events=EVENTS, preview=PREVIEW, extra="", session="a"):
+    ui.app(session=session, scenario="workspace", setup=SETUP % (json.dumps(events), json.dumps(preview)) + extra)
+    expect(page.get_by_role("combobox", name="Model")).to_have_value("test-model")
+    if session:
+        ui.show_session(session)
+        expect(page.get_by_text(events[-1]["text"] or "", exact=True).first).to_be_visible()
+
+
+def message_box(page):
+    return page.get_by_role("textbox", name="Message")
+
+
+def rewind_posts(ui):
+    return ui.bodies("/api/sessions/a/rewind", "POST")
+
+
+def selected(ui, session_id):
+    ui.wait(f"fake.socketsFor({json.dumps(session_id)}).length >= 1")
+    return True
+
+
+def test_edit_and_resend_posts_the_exact_body_and_escape_cancels(ui, page):
+    start(ui, page)
+    page.get_by_role("button", name="Edit message").nth(1).click()
+    editor = page.get_by_role("textbox", name="Edit message")
+    expect(editor).to_have_value("Second task")
+    expect(page.get_by_text("Replaces this message and everything after it. The current version is kept as an archived conversation.")).to_be_visible()
+    editor.press("Escape")
+    expect(editor).to_have_count(0)
+    expect(page.get_by_text("Second task", exact=True)).to_be_visible()
+    assert rewind_posts(ui) == []
+
+    page.get_by_role("button", name="Edit message").nth(1).click()
+    editor.fill("Second task, done better")
+    page.get_by_role("button", name="Send edited message").click()
+    ui.wait("fake.requests('/api/sessions/a/rewind', 'POST').length === 1")
+    assert rewind_posts(ui) == [{"before_event_id": "u2", "conversation": True, "code": False,
+                                 "resend_text": "Second task, done better"}]
+    notice = page.get_by_role("status").filter(has_text="Rewound.")
+    expect(notice).to_have_text(re.compile("archived conversation “Work \\(before rewind\\)”"))
+    expect(notice.get_by_role("button", name="Open earlier version")).to_be_visible()
+
+
+def test_edit_with_code_sends_code_and_keeps_the_editor_open_on_error(ui, page):
+    start(ui, page, extra="window.rewindError = { status: 409, body: { detail: { message: 'Cannot rewind files: a.txt changed after the agent’s last edit.', files: ['a.txt'] } } }")
+    page.get_by_role("button", name="Edit message").first.click()
+    page.get_by_role("checkbox", name="Also undo file changes made from this message on").check()
+    page.get_by_role("textbox", name="Edit message").press("Control+Enter")
+    ui.wait("fake.requests('/api/sessions/a/rewind', 'POST').length === 1")
+    assert rewind_posts(ui) == [{"before_event_id": "u1", "conversation": True, "code": True, "resend_text": "First task"}]
+    alert = page.get_by_role("alert")
+    expect(alert).to_contain_text("Cannot rewind files: a.txt changed")
+    expect(alert.get_by_role("listitem")).to_have_text(["a.txt"])
+    expect(page.get_by_role("textbox", name="Edit message")).to_have_value("First task")
+
+
+def test_rewind_dialog_shows_statuses_disables_impossible_choices_and_sends_flags(ui, page):
+    preview = json.loads(json.dumps(PREVIEW))
+    preview["code"] = {"possible": False, "reason": "Cannot rewind files: b.txt changed between its edits.", "files": [
+        {"path": "a.txt", "status": "restore"}, {"path": "b.txt", "status": "interleaved"},
+        {"path": "c.txt", "status": "drifted"}, {"path": "d.txt", "status": "unchanged"},
+        {"path": "e.txt", "status": "unavailable", "error": "Folder access was removed."}]}
+    preview["conversation"]["summary_dropped"] = True
+    start(ui, page, preview=preview)
+    page.get_by_role("button", name="Rewind to here").nth(1).click()
+    dialog = page.get_by_role("dialog", name="Rewind conversation")
+    expect(dialog.get_by_role("heading", name="Rewind to this message")).to_be_visible()
+    files = dialog.get_by_role("list", name="Files").get_by_role("listitem")
+    expect(files).to_have_text([
+        "a.txtWill be restored", "b.txtAlso changed by something else between the agent's edits",
+        "c.txtChanged since the agent's last edit", "d.txtAlready as it was", "e.txtFolder access was removed."])
+    expect(dialog.get_by_role("radio", name="Conversation and code")).to_be_disabled()
+    expect(dialog.get_by_role("radio", name=re.compile("^Code only"))).to_be_disabled()
+    expect(dialog.get_by_text("Cannot rewind files: b.txt changed between its edits.")).to_be_visible()
+    expect(dialog.get_by_role("radio", name="Conversation only")).to_be_checked()
+    expect(dialog.get_by_text("Removes 2 messages and replies after this point.")).to_be_visible()
+    expect(dialog.get_by_text("The summary of earlier turns covers messages after this point, so it is dropped; the next message may compact again.")).to_be_visible()
+    expect(dialog.get_by_text("Changes made by commands or by subagents are not rewound. The current version is kept as an archived conversation.")).to_be_visible()
+    dialog.get_by_role("button", name="Rewind").click()
+    expect(dialog).to_have_count(0)
+    assert rewind_posts(ui) == [{"before_event_id": "u2", "conversation": True, "code": False}]
+    expect(message_box(page)).to_have_value("Second task")
+    notice = page.get_by_role("status").filter(has_text="Rewound.")
+    expect(notice.locator("span")).to_have_text("Rewound. The earlier version is saved as the archived conversation “Work (before rewind)”.")
+    notice.get_by_role("button", name="Open earlier version").click()
+    assert selected(ui, "backup")
+
+
+def test_rewind_both_by_default_keeps_a_typed_draft(ui, page):
+    start(ui, page)
+    message_box(page).fill("My unsent idea")
+    page.get_by_role("button", name="Rewind to here").nth(1).click()
+    dialog = page.get_by_role("dialog", name="Rewind conversation")
+    expect(dialog.get_by_role("radio", name="Conversation and code")).to_be_checked()
+    dialog.get_by_role("button", name="Rewind").click()
+    expect(dialog).to_have_count(0)
+    assert rewind_posts(ui) == [{"before_event_id": "u2", "conversation": True, "code": True}]
+    expect(message_box(page)).to_have_value("My unsent idea")
+    expect(page.get_by_role("status").filter(has_text="Rewound.")).to_contain_text("Your draft was kept.")
+    page.get_by_role("button", name="Dismiss rewind notice").click()
+    expect(page.get_by_role("status").filter(has_text="Rewound.")).to_have_count(0)
+
+
+def test_code_only_rewind_leaves_the_conversation_and_composer(ui, page):
+    start(ui, page)
+    page.get_by_role("button", name="Rewind to here").nth(1).click()
+    dialog = page.get_by_role("dialog", name="Rewind conversation")
+    dialog.get_by_role("radio", name="Code only").check()
+    expect(dialog.get_by_text("Removes 2 messages and replies after this point.")).to_have_count(0)
+    dialog.get_by_role("button", name="Rewind").click()
+    expect(dialog).to_have_count(0)
+    assert rewind_posts(ui) == [{"before_event_id": "u2", "conversation": False, "code": True}]
+    expect(message_box(page)).to_have_value("")
+    expect(page.get_by_text("Second answer.")).to_be_visible()
+    expect(page.get_by_role("status").filter(has_text="Rewound.")).to_have_count(0)
+
+
+def test_rewind_to_the_first_message_keeps_the_notice_on_the_welcome_screen(ui, page):
+    start(ui, page)
+    page.get_by_role("button", name="Rewind to here").first.click()
+    page.get_by_role("dialog", name="Rewind conversation").get_by_role("button", name="Rewind").click()
+    expect(page.get_by_role("heading", name="What’s up next?")).to_be_visible()
+    notice = page.get_by_role("status").filter(has_text="Rewound.")
+    expect(notice).to_be_visible()
+    expect(message_box(page)).to_have_value("First task")
+    notice.get_by_role("button", name="Open earlier version").click()
+    assert selected(ui, "backup")
+
+
+def test_a_drift_refusal_lists_the_files_in_the_dialog(ui, page):
+    start(ui, page, extra="window.rewindError = { status: 409, body: { detail: { message: 'Cannot rewind files: a.txt, b.txt changed after the agent’s last edit or between its edits. Nothing was changed.', files: ['a.txt', 'b.txt'] } } }")
+    page.get_by_role("button", name="Rewind to here").nth(1).click()
+    dialog = page.get_by_role("dialog", name="Rewind conversation")
+    dialog.get_by_role("button", name="Rewind").click()
+    alert = dialog.get_by_role("alert")
+    expect(alert).to_contain_text("Nothing was changed.")
+    expect(alert.get_by_role("list", name="Files that changed").get_by_role("listitem")).to_have_text(["a.txt", "b.txt"])
+    expect(dialog).to_be_visible()
+    expect(message_box(page)).to_have_value("")
+
+
+def test_retry_only_on_the_last_reply_of_an_idle_chat_without_steering(ui, page):
+    start(ui, page)
+    retry = page.get_by_role("button", name="Retry response")
+    expect(retry).to_have_count(1)
+    expect(page.locator(".reply-content").filter(has_text="Second answer.").get_by_role("button", name="Retry response")).to_be_visible()
+    retry.click()
+    ui.wait("fake.requests('/api/sessions/a/rewind', 'POST').length === 1")
+    assert rewind_posts(ui) == [{"before_event_id": "u2", "conversation": True, "resend_text": "Second task"}]
+    expect(page.get_by_role("status").filter(has_text="Rewound.")).to_be_visible()
+
+
+def test_no_retry_after_steering(ui, page):
+    steered = EVENTS[:4] + [{"id": "s2", "type": "user", "text": "Also this", "in_wire": True, "steered": True},
+                            {"id": "a2", "type": "assistant", "text": "Second answer."}]
+    start(ui, page, events=steered)
+    expect(page.get_by_role("button", name="Edit message")).to_have_count(3)
+    expect(page.get_by_role("button", name="Retry response")).to_have_count(0)
+
+
+def test_actions_are_hidden_while_busy_except_forking_older_replies(ui, page):
+    start(ui, page)
+    expect(page.get_by_role("button", name="Edit message")).to_have_count(2)
+    ui.emit("a", {"type": "status", "status": "running"})
+    expect(page.get_by_role("button", name="Edit message")).to_have_count(0)
+    expect(page.get_by_role("button", name="Rewind to here")).to_have_count(0)
+    expect(page.get_by_role("button", name="Retry response")).to_have_count(0)
+    fork = page.get_by_role("button", name="Fork from here")
+    expect(fork).to_have_count(1)
+    expect(page.locator(".reply-content").filter(has_text="First answer.").get_by_role("button", name="Fork from here")).to_be_visible()
+    expect(page.get_by_role("button", name="Copy message")).to_have_count(2)
+    ui.emit("a", {"type": "status", "status": "awaiting_approval"})
+    expect(page.get_by_role("button", name="Edit message")).to_have_count(0)
+
+
+def test_fork_from_here_posts_the_next_user_message_and_selects_the_fork(ui, page):
+    start(ui, page)
+    page.locator(".reply-content").filter(has_text="First answer.").get_by_role("button", name="Fork from here").click()
+    dialog = page.get_by_role("dialog", name="Fork conversation")
+    expect(dialog.get_by_role("textbox", name="Title")).to_have_value("Work (fork)")
+    expect(dialog.get_by_role("textbox", name="Branch name")).to_have_count(0)
+    dialog.get_by_role("button", name="Fork").click()
+    assert selected(ui, "forked")
+    assert ui.bodies("/api/sessions/a/fork", "POST") == [{"before_event_id": "u2", "title": "Work (fork)"}]
+    expect(dialog).to_have_count(0)
+
+
+def test_fork_of_the_last_reply_into_a_worktree(ui, page):
+    start(ui, page)
+    page.locator(".reply-content").filter(has_text="Second answer.").get_by_role("button", name="Fork from here").click()
+    dialog = page.get_by_role("dialog", name="Fork conversation")
+    dialog.get_by_role("textbox", name="Title").fill("Try another way")
+    dialog.get_by_role("checkbox", name="Create it in a new Git worktree").check()
+    branch = dialog.get_by_role("textbox", name="Branch name")
+    expect(branch).to_have_value(re.compile(r"^fork/\d{4}-\d{2}-\d{2}-\d{4}$"))
+    expect(dialog.get_by_text("The worktree starts from the last commit; uncommitted changes are not copied.")).to_be_visible()
+    branch.fill("fork/other-way")
+    dialog.get_by_role("button", name="Fork").click()
+    assert selected(ui, "forked")
+    assert ui.bodies("/api/sessions/a/fork", "POST") == [{"title": "Try another way", "worktree_branch": "fork/other-way"}]
+
+
+def test_fork_errors_stay_in_the_dialog(ui, page):
+    start(ui, page, extra="""
+const forkOverride = fake.override
+fake.override = (path, options) => path === '/api/sessions/a/fork'
+  ? fake.json({ detail: 'Choose a valid new Git branch name of at most 200 characters.' }, 400) : forkOverride(path, options)
+""")
+    page.locator(".reply-content").filter(has_text="Second answer.").get_by_role("button", name="Fork from here").click()
+    dialog = page.get_by_role("dialog", name="Fork conversation")
+    dialog.get_by_role("button", name="Fork").click()
+    expect(dialog.get_by_role("alert")).to_have_text("Choose a valid new Git branch name of at most 200 characters.")
+    dialog.get_by_role("button", name="Cancel").click()
+    expect(dialog).to_have_count(0)
+
+
+def test_new_chat_in_worktree_from_the_welcome_screen(ui, page):
+    start(ui, page, session=None)
+    page.get_by_role("button", name="New chat in worktree").click()
+    form = page.get_by_role("form", name="New chat in worktree")
+    branch = form.get_by_role("textbox", name="Branch name")
+    expect(branch).to_have_value(re.compile(r"^chat/\d{4}-\d{2}-\d{2}-\d{4}$"))
+    branch.fill("chat/x")
+    form.get_by_role("button", name="Create").click()
+    assert selected(ui, "wtchat")
+    assert [(call["path"], call["method"]) for call in ui.js("fake.calls") if "/worktrees" in call["path"]] == [
+        ("/api/worktrees", "POST"), ("/api/worktrees/wt1/session", "POST")]
+    assert ui.bodies("/api/worktrees", "POST") == [{"branch": "chat/x"}]
+
+
+def test_steered_label_and_attachment_chips(ui, page):
+    events = [{"id": "u1", "type": "user", "text": "Look at these", "in_wire": True, "attachments": [
+                  {"kind": "file", "path": "src/app.py", "start_line": 1, "end_line": 40},
+                  {"kind": "file", "path": "big.log", "start_line": 10, "end_line": 900, "truncated": True},
+                  {"kind": "shell", "command": "pytest -q " + "tests/" * 20, "exit_code": 1}]},
+              {"id": "s1", "type": "user", "text": "Also check the docs", "in_wire": True, "steered": True},
+              {"id": "a1", "type": "assistant", "text": "Checked."}]
+    start(ui, page, events=events)
+    chips = page.get_by_role("list", name="Attachments").get_by_role("listitem")
+    command = ("pytest -q " + "tests/" * 20)[:59] + "…"
+    expect(chips).to_have_text(["@src/app.py · lines 1–40", "@big.log · lines 10–900 · shortened", f"! {command} · exit 1"])
+    steered = page.locator(".user-message").filter(has_text="Also check the docs")
+    expect(steered.locator(".steered-label")).to_have_text("Sent while the agent was working")
+    expect(page.locator(".steered-label")).to_have_count(1)

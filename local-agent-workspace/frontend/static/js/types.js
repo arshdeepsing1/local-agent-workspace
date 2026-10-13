@@ -67,6 +67,23 @@
 //   submit_plan events: { name: 'submit_plan', input: { plan, title? }, plan_outcome?: 'approved'|'keep_planning'|
 //   'expired'|'superseded', plan_mode?, feedback?, approval_expires? }; answered with
 //   POST /sessions/<id>/plans/<event id> { choice, feedback? }.
+//   User events also carry in_wire? (true once the text reached the model history as its own message; false
+//   when the turn failed before that; absent on older events), steered? (true: sent while the agent was
+//   working) and attachments?: Attachment[]. The 'Stopped.' notice carries stop_phase?: 'streaming'|'tools'|'waiting'.
+// Attachment (metadata only, never content): { kind: 'file', path, start_line, end_line, truncated? }
+//   | { kind: 'shell', command (at most 2,000 characters), exit_code }
+// RewindPreview (GET /sessions/<id>/rewind-preview?before_event_id=<user event id>; read-only, also while busy):
+//   { before_event_id, conversation: { possible, reason: string | null, events_removed, messages_removed,
+//   summary_dropped }, code: { possible, reason: string | null, files: [{ path, status: 'restore'|'unchanged'|
+//   'drifted'|'interleaved'|'unavailable', error? }] } }
+// Rewind (POST /sessions/<id>/rewind { before_event_id, conversation?: boolean, code?: boolean, resend_text? };
+//   needs an idle chat, and an idle workspace for code): { session: Session, backup_session_id: string | null,
+//   files: [{ path, status }], resent: boolean, resend_error? }. 409 detail { message, files } when a file
+//   changed; 500 detail { message } when files were rewound but the conversation could not be saved.
+// Fork from a point (POST /sessions/<id>/fork { before_event_id?, title?, worktree_branch? }) -> Session (201).
+//   Without a body, only a completed idle chat forks whole. A rewind backup Session has archived: true and
+//   provenance { kind: 'rewind_backup', source_session_id, copied_at }; worktree chats have
+//   worktree: { id, branch, source_workspace (the root project) }.
 // ApiError: { message, status, detail? }. A 409 that a busy chat causes has
 //   detail { message, session_id, title } naming that chat; other errors have no detail.
 // RequestInfo: { model, status, finish_reason?, http_status?, error_kind?, usage? }
