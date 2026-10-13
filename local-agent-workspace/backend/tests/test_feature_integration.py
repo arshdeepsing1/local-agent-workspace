@@ -171,7 +171,7 @@ async def test_before_hook_changed_file_is_not_overwritten(runtime):
     session['permission_mode'] = 'bypassPermissions'
     (project / 'note.txt').write_text('before')
     manager.remember_file(session, project / 'note.txt')  # As if read: overwriting needs a read first.
-    async def mutate(*args):
+    async def mutate(*args, **kwargs):
         (project / 'note.txt').write_text('hook edit')
         return {'exit_code': 0, 'output': '', 'truncated': False}
     manager.extensions.run_hook = mutate
@@ -184,7 +184,7 @@ async def test_after_hook_failure_keeps_successful_tool_result(runtime):
     manager, session, project, tools = runtime
     configure_hook(manager, 'after_tool')
     session['permission_mode'] = 'bypassPermissions'
-    async def fail(*args):
+    async def fail(*args, **kwargs):
         return {'exit_code': 1, 'output': 'failed check', 'truncated': False}
     manager.extensions.run_hook = fail
     result = await manager.execute_tool(session, tools, 'write_file', {'path': 'note.txt', 'content': 'saved'}, 'edit')
@@ -198,7 +198,7 @@ async def test_plan_skips_hooks_but_can_track_tasks(runtime):
     manager, session, _, tools = runtime
     configure_hook(manager)
     session['permission_mode'] = 'plan'
-    async def unexpected(*args):
+    async def unexpected(*args, **kwargs):
         pytest.fail('Plan must not execute hooks')
     manager.extensions.run_hook = unexpected
     result = await manager.execute_tool(session, tools, 'create_task', {'title': 'Inspect'}, 'plan')

@@ -393,12 +393,14 @@ def wait_page(job, reason, match, from_offset):
 
 
 class JobManager:
-    def __init__(self, store, redact, on_update, redaction_tokens=None, environment=None, mirror_finished=True):
+    def __init__(self, store, redact, on_update, redaction_tokens=None, environment=None, mirror_finished=True,
+                 venv=None):
         self.store = store
         self.redact = redact
         self.on_update = on_update
         self.redaction_tokens = redaction_tokens or (lambda: ())
         self.environment = environment  # Variables passed to commands by name, read at job start.
+        self.venv = venv  # The Python virtual environment commands run with (a path or None), read at job start.
         self._signal = asyncio.Condition()  # Notified after every change to a job (wait_job).
         self._changes = 0
         self._tasks = {}
@@ -458,16 +460,26 @@ class JobManager:
                 if (session_id is None or job["session_id"] == session_id)
                 and (workspace is None or job["workspace"] == workspace)]
 
-    def command_environment(self):
-        """The environment a command started now runs with, including the variables
-        passed through by name in Settings."""
+    def command_environment(self, *, named=True, python_venv=True):
+        """The environment a command started now runs with: with named, the variables
+        passed through by name in Settings; with python_venv, the Python virtual
+        environment from Settings active (user_paths.venv_environment)."""
         extra_env = {}
-        if self.environment is not None:
+        if named and self.environment is not None:
             try:
                 extra_env = dict(self.environment() or {})
             except Exception:
                 extra_env = {}  # A broken setting must not stop the command.
-        return command_environment(extra_env)
+        env = command_environment(extra_env)
+        if python_venv and self.venv is not None:
+            try:
+                path = self.venv()
+            except Exception:
+                path = None  # A broken setting must not stop the command.
+            if isinstance(path, str) and path:
+                from .user_paths import server_bins, venv_environment  # tools imports this module.
+                env = venv_environment(env, path, drop=server_bins())
+        return env
 
     async def start(self, command, workspace, session_id=None, timeout_seconds=60,
                     max_output_bytes=80_000, background=False, *, argv=None, env=None):

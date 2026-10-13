@@ -104,6 +104,27 @@ private state. The example paths must be replaced. The installation command
 installs runtime libraries automatically; add `./backend[test]` instead of
 `./backend` only if you need to run the backend tests.
 
+Without `LOCAL_AGENT_MODEL` the app uses `databricks-claude-opus-5-5` (Claude Opus 5.5,
+with a 200,000-token context budget and 16,384 Max output tokens). An existing `.env`
+that says `LOCAL_AGENT_MODEL=databricks-gpt-oss-120b` keeps GPT OSS 120B; edit that line
+to switch. Saved settings from before Opus 5.5 became the default that still hold GPT OSS
+120B at 131,072 and 8,192 move to Opus 5.5 once (Settings says so; Opus 5.5 costs more per
+token). Choose `databricks-gpt-oss-120b` in Settings or the model picker to switch back; the
+choice is kept after that.
+
+Two optional values can be left empty:
+
+- `LOCAL_AGENT_CODING_DIR`: an absolute folder (or one starting with `~/`) where the agent
+  creates new standalone scripts, tools and projects when you do not say where. See
+  [Local access and limits](#local-access-and-limits).
+- `LOCAL_AGENT_PYTHON_VENV`: a Python virtual environment (the folder that contains
+  `bin/python` and `pyvenv.cfg`) that every command the app runs uses. See the command
+  environment paragraph in [Local access and limits](#local-access-and-limits).
+
+Both are also in Settings. A value changed in Settings overrides `.env`; a value left
+unchanged in Settings keeps following `.env`, so a later edit of `.env` applies after a
+restart. Saving an empty field in Settings turns the value off even when `.env` sets one.
+
 The credential file is plain assignments, parsed as data (never executed):
 
 ```text
@@ -898,6 +919,10 @@ received before an interruption may be partial, not a final count.
 
 For recognized standard pay-per-token endpoints, the Usage section calculates an
 estimated DBU cost from published input, output, cache-read, and cache-write rates.
+The rates are those of 2026-10-13: Claude Opus 5.5 at 57.143 DBU per million input tokens,
+285.714 output, 2.857 cache read and 71.429 cache write (the 5-minute rate; 1-hour cache writes
+at 114.286 cannot be told apart in the usage), and Claude Opus 4.8 at 71.429, 357.143, 7.143 and
+89.286.
 It does not estimate missing token counts. This is not an account-wide report or an
 invoice: regional uplifts, provisioned endpoints, negotiated pricing, credits, and
 delayed billing adjustments can differ. Older chats that predate the ledger show
@@ -972,23 +997,47 @@ retries** tile counts these calls; **429 responses** counts rate-limited calls.
 
 ### Context and project instructions
 
-**Settings → Context budget (tokens)** defaults to 131,072 for new or previously
-unset settings. Explicit saved values, including 32,768 and the former 131,000
-default, are preserved.
+**Settings → Context budget (tokens)** and **Max output tokens** default to the endpoint's
+profile in `backend/local_agent/model_profiles.py`: 200,000 and 16,384 for Claude Opus 5.5
+(`databricks-claude-opus-5-5`, the default model), and 131,072 and 8,192 for GPT OSS 120B and
+for endpoints without a profile. Explicit saved values, including 32,768 and the former 131,000
+default, are preserved. Budgets still at the old model's defaults follow a change of the
+default model (in Settings or the composer's model picker) to the new model's defaults; a value
+you changed stays. A chat whose own endpoint differs from the Settings model uses that
+endpoint's defaults while Settings is at the Settings model's defaults, and your values when
+you changed them.
 The allowed range is 16,384–1,048,576; these are app configuration bounds, not a
 claim that every endpoint supports that range or the default. Set the budget at
-or below your endpoint's actual total context limit; the app cannot infer a
-serving endpoint's limit from its name. Changes apply on the next turn, including
-existing conversations. The configured total includes space for both input and
-reply. **Settings → Max output tokens** defaults to 8,192 and accepts
-1,024–131,072, but must be below the context budget minus the 2,048-token safety
-margin. The output setting is also the reply reserve, so the defaults leave an
-estimated input budget of 120,832 tokens. You can explicitly select 20,000 for one
-long Claude Opus 4.8 response, but that reserves its entire standard 20,000 OTPM
-allowance at admission; subsequent agent/tool-loop requests can receive 429s until
-earlier output leaves the rolling window. The 8,192 default leaves throughput for
-multi-step work, while output-limit responses can continue automatically in smaller
-steps up to the bounded retry limit.
+or below your endpoint's actual total context limit; the app knows the limits only of the
+endpoints in its profile table. Requests to such an endpoint are capped at its maxima (Opus
+5.5: 1,000,000 context and 128,000 output tokens; GPT OSS 120B: 131,072 context), and the
+chat shows a notice once (again only when the capped values change). Changes apply on the next
+turn, including existing conversations. The configured total includes space for both input and
+reply. **Max output tokens** accepts 1,024–131,072, but must be below the context budget minus
+the 2,048-token safety margin. The output setting is also the reply reserve, so the Opus 5.5
+defaults leave an estimated input budget of 181,568 tokens (120,832 at 131,072 and 8,192).
+
+While you edit these fields, Settings shows warnings from the profile (they never block saving)
+and, for an endpoint with recommended values, a **Use … defaults** button. The numbers are
+Databricks's documented pay-per-token defaults for the Enterprise tier, also partner models'
+quota Tier 1 ([limits page](https://docs.databricks.com/gcp/en/machine-learning/foundation-model-apis/limits),
+checked 2026-10-13): Opus 5.5, Opus 4.8 and GPT OSS 120B each allow 1,000,000 input tokens
+(ITPM) and 100,000 output tokens (OTPM) per minute. Your workspace's limits may differ.
+
+- Databricks reserves Max output tokens against OTPM when each request starts. Above 100,000 a
+  request is rejected with HTTP 429 before it starts (an error in Settings). Above 20,000 four
+  requests at once (a chat and up to three subagents, or several chats) can be rejected; the
+  app then waits and retries. 20,000 keeps one fifth of OTPM free; at 16,384, four requests
+  reserve 65,536.
+- Each agent step sends up to the whole context budget. Above 250,000 tokens, four full steps
+  in one minute reach ITPM, so long turns and subagents wait on rate limits, and every step
+  costs more (a note in Settings). You can raise Opus 5.5 to 1,000,000.
+- Opus 5.5 always thinks before it answers, and its thinking counts toward Max output tokens.
+  Below 16,384, complex steps and large file writes can stop at the limit (a note in Settings).
+  The system message tells the model so. Title and `/btw` requests add 4,096 tokens for
+  thinking (a title then asks for up to 5,120).
+
+Output-limit responses can continue automatically in smaller steps up to the bounded retry limit.
 The meter estimates the last prepared model input using roughly one token per
 three ASCII bytes, conservatively counting non-ASCII UTF-8 bytes, plus framing
 overhead. This heuristic varies from the actual model tokenizer and is not a
@@ -1089,7 +1138,7 @@ If the request, its latest tool results, or project guidance alone are too large
 reports an error instead of silently cutting it. The error states the estimated
 tokens needed and the input-budget arithmetic (context budget minus Max output
 tokens minus the 2,048-token safety margin). When Max output tokens is above the
-8,192 default, it suggests lowering that first: for example, 131,000 context with
+endpoint's default (16,384 for Opus 5.5, 8,192 otherwise), it suggests lowering that first: for example, 131,000 context with
 121,000 reserved for output leaves only 7,952 input tokens. Otherwise, increase the
 budget only within your endpoint's limit, or start a new conversation with a smaller request. There
 is no model tokenizer integration. Retained job output is paginated; discarded
@@ -1271,8 +1320,8 @@ press Enter to insert the command). To change it for one project, copy it to
 `my-project/.agents/skills/handoff/SKILL.md`) and edit the copy; that copy then
 replaces the shipped skill in that workspace. It asks for a cold-start
 document in the style of a long working-session memory file, written in parts of
-about half the file text one response can hold (about 20 KB at 20,000 Max output
-tokens, about 8 KB at the 8,192 default) so no single response hits the output limit,
+about half the file text one response can hold (about 16 KB at the 16,384 Opus 5.5
+default, about 8 KB at 8,192) so no single response hits the output limit,
 and ends by calling `insert_activity_log`. Select **Accept edits** first to avoid approving every part.
 The skill uses 6 KB of the 8 KB skill budget. Automatic compaction handoffs (see
 Context and project instructions) are written from the turns being compacted; use the
@@ -1606,9 +1655,9 @@ by name, so a case variant, a bind mount or a firmlink of it is refused too. Com
 by an argv or prefix rule or by the read-only list run without a shell, from the program found
 on the absolute entries of `PATH` (a program named by a path keeps that name, so
 `.venv/bin/python` runs inside its virtual environment); the read-only `pwd` and `ls` run from
-`/bin`, and read-only Git runs a `git` found outside the project and outside folders granted to
-the chat, with repository programs (fsmonitor, hooks, filters, textconv, external diff,
-signature checks, also inside submodules) switched off, no fetch of missing objects in a partial
+`/bin`, and read-only Git runs a `git` found outside the project, outside folders granted to
+the chat and outside the default code folder, with repository programs (fsmonitor, hooks,
+filters, textconv, external diff, signature checks, also inside submodules) switched off, no fetch of missing objects in a partial
 clone, status, diffs and file lists limited to the workspace, and credential files (`.env.*`
 except `.env.example`) left out of diffs. `git log` and `git show` still name commits that change
 only files outside the workspace. With a Git older than the May 2024 security releases, read-only
@@ -1616,11 +1665,28 @@ Git does not run automatically in a partial clone. This is a trusted single-user
 multi-user sandbox. Commands allowed by the selected mode execute with your OS permissions and
 can reach beyond the project. Commands get an environment without model credentials.
 
+**Default code folder.** **Settings → Default folder for new code** (or
+`LOCAL_AGENT_CODING_DIR`) names where the agent creates new standalone scripts, tools and
+projects when you do not say where; files that belong to the open project stay in it, and
+relative paths still mean the project. Every conversation may use the folder without a Folder
+access card, like the project: Plan stays read-only, Manual asks before each edit, Accept edits
+edits without asking, Don't ask refuses what would need a card, and Bypass is unchanged.
+Commands still run in the project folder. A folder that does not exist yet is created by the
+agent's first approved write there. Folder access lists it as "Default code folder · all
+conversations", and Workspace → Files shows it as a root ("Created on first write" until then).
+Settings refuses the filesystem root, system folders (`/etc`, `/usr`, `/System` and similar),
+your home folder or a folder containing it, hidden folders in your home folder (such as
+`~/.config` or `~/.ssh`), the app's state folder (or a folder containing it), the app's own
+folder, credential and generated folders (`.git`, `.venv`, `node_modules` and similar), a folder
+containing your credential file, and a folder whose parent does not exist or cannot be written.
+A refused value from `.env` is shown in Settings as not used and never blocks saving other
+settings.
+
 **Settings → Agent steps** defaults to 32 model requests per user message and accepts
 1–64. This is a model-request ceiling, not a tool-call count: one model response can
 request several tools. Reaching the ceiling preserves completed actions and stops
 until the user continues or raises the setting. **Max output tokens** defaults to
-8,192 per request with the bounds described above. The editor and file edits are
+the endpoint's profile (16,384 for Opus 5.5, 8,192 otherwise) with the bounds described above. The editor and file edits are
 limited by Settings → File write limit (80 KB by default).
 
 Agent reads use `read_file(path, start_line=1, max_lines=400)` and return numbered
@@ -1727,6 +1793,25 @@ variables (`DBRICKS_TOKEN`, `DATABRICKS_TOKEN`, `DBRICKS_URL`, `DATABRICKS_HOST`
 startup variables (`BASH_ENV`, `ENV`, `ZDOTDIR`, `PROMPT_COMMAND`, `SHELLOPTS`,
 `BASHOPTS`, `IFS`, `PYTHONSTARTUP`, `PERL5OPT`, `RUBYOPT`, `NODE_OPTIONS`), and any
 value that contains the Databricks token. Hooks do not get these variables.
+
+**Python environment.** With **Settings → Python virtual environment** (or
+`LOCAL_AGENT_PYTHON_VENV`) set, every command the app runs uses it: the agent's `run_command`
+(through the shell and the argv rules), Verify, hooks, the Terminal panel, `/api/command` and
+`!` commands. `VIRTUAL_ENV` is set to it, its `bin/` comes first on `PATH`, the previous
+`VIRTUAL_ENV`'s `bin/` and the app server's own interpreter folders are removed from `PATH`
+(`run.py` puts the app's `.venv/bin` first, which would otherwise shadow your tools), and
+`PYTHONHOME` is removed. An allow rule for `pytest` then runs `<venv>/bin/pytest`. The read-only
+commands Auto runs without a card (`pwd`, `ls`, read-only Git) never use it. Hooks get the
+environment but still not the variables named in Settings. Agent file edits inside the
+environment (a write, edit, move or delete under it) always ask, also in Accept edits and Auto,
+because a program placed there would run through an allow rule; Don't ask refuses them and Bypass
+allows them. The environment is checked whenever it is used, and it is not used when it is
+missing, has no executable `bin/python`, has neither `pyvenv.cfg` nor `conda-meta/`, is the
+app's state folder (or contains it), is inside the app's own folder, or is the environment the
+app server runs in. The app reads the Python version from `pyvenv.cfg` and never runs that
+`python`. The system message tells the agent which environment commands use, or, without one,
+that `python` may be the app server's own environment and it should ask before installing
+packages.
 
 When a background job that the agent started completes, fails, or times out, its
 conversation gets a notice, also when the chat is idle, and the agent's next model
@@ -1892,6 +1977,8 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `backend/local_agent/portability.py` / `portability_api.py`: validated conversation copies.
 - `backend/local_agent/tool_profiles.py` / `tool_schema.py`: tool ceilings and offline input validation.
 - `backend/local_agent/config.py`: external credentials and portable configuration.
+- `backend/local_agent/model_profiles.py`: per-endpoint limits, default budgets and Settings limit warnings.
+- `backend/local_agent/user_paths.py`: checks for the default code folder and the Python environment, and the environment commands run with.
 - `backend/local_agent/context.py`: request estimates and bounded history compaction.
 - `backend/local_agent/activity.py`: app-generated activity log for handoffs (`insert_activity_log`).
 - `backend/local_agent/transcript.py` / `scripts/conversation_transcript.py`: Markdown transcripts of saved conversations (also `GET /api/sessions/<id>/transcript.md`).

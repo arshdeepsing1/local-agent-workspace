@@ -253,6 +253,14 @@ def test_new_or_unset_context_settings_use_default_context_window(tmp_path, monk
     assert Settings(state).values["max_agent_steps"] == 32
 
 
+def test_a_fresh_install_uses_the_default_models_budgets(tmp_path, monkeypatch):
+    monkeypatch.setattr("local_agent.config.APP_ROOT", tmp_path)
+    monkeypatch.delenv("LOCAL_AGENT_MODEL")
+    settings = Settings(tmp_path / "state")
+    assert settings.values["model"] == "databricks-claude-opus-5-5"
+    assert (settings.values["context_window"], settings.values["max_output_tokens"]) == (200_000, 16_384)
+
+
 @pytest.mark.parametrize("budget", [32768, 131000])
 def test_explicit_saved_context_budget_is_preserved_on_load_and_other_settings_edits(tmp_path, monkeypatch, budget):
     monkeypatch.setattr("local_agent.config.APP_ROOT", tmp_path)

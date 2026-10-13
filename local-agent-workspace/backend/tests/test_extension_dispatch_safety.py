@@ -78,7 +78,7 @@ async def test_hooks_match_exact_selectors_with_stable_call_ids(runtime, selecto
     (tools.root / "note.txt").write_text("hello")
     payloads = []
 
-    async def hook(hook, payload, workspace):
+    async def hook(hook, payload, workspace, env=None):
         payloads.append(payload)
         return {"output": "ok", "exit_code": 0}
 
@@ -101,7 +101,7 @@ async def test_failure_hook_has_original_redacted_error_and_cannot_replace_it(ru
     async def fail(*args, **kwargs):
         raise ValueError("synthetic-token original tool failure")
 
-    async def hook(hook, payload, workspace):
+    async def hook(hook, payload, workspace, env=None):
         payloads.append(payload)
         return {"output": "failure hook also failed", "exit_code": 9}
 
@@ -126,7 +126,7 @@ async def test_mcp_error_result_keeps_after_hook_and_adds_failure_hook(runtime):
     async def invoke(*args):
         return {"output": "Remote action failed", "is_error": True}
 
-    async def hook(hook, payload, workspace):
+    async def hook(hook, payload, workspace, env=None):
         payloads.append(payload)
         return {"output": "ok", "exit_code": 0}
 
@@ -151,7 +151,7 @@ async def test_failure_hook_only_for_returned_foreground_command_failures(runtim
     async def command(*args):
         return result
 
-    async def hook(hook, payload, workspace):
+    async def hook(hook, payload, workspace, env=None):
         payloads.append(payload)
         return {"output": "ok", "exit_code": 0}
 

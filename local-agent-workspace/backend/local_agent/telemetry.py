@@ -11,11 +11,19 @@ USAGE_FIELDS = (
     "cache_creation_input_tokens", "reasoning_tokens",
 )
 PRICING_SOURCE = "https://www.databricks.com/product/pricing/proprietary-foundation-model-serving"
-PRICING_EFFECTIVE_AT = "2026-09-22"
+PRICING_EFFECTIVE_AT = "2026-10-13"
 # Versioned snapshot of the Databricks pay-per-token list rates. These are
 # estimates, not invoice records; account discounts and billing adjustments are
-# intentionally outside this local calculation.
+# intentionally outside this local calculation. Regional processing adds a 10%
+# uplift that is not included. Cache writes use the 5-minute rate: the usage does
+# not tell 1-hour writes (114.286 DBU per million for Opus 5.5) apart.
 MODEL_DBU_PER_MILLION = {
+    "databricks-claude-opus-5-5": {
+        "input_tokens": 57.143,
+        "output_tokens": 285.714,
+        "cache_read_input_tokens": 2.857,
+        "cache_creation_input_tokens": 71.429,
+    },
     "databricks-claude-opus-4-8": {
         "input_tokens": 71.429,
         "output_tokens": 357.143,
