@@ -243,3 +243,18 @@ def test_automatic_keep_is_off_by_default_and_saved_from_settings(ui, page):
     assert ui.bodies("/api/settings", "PUT")[1]["auto_keep_changes"] is True
     page.get_by_role("button", name="Settings", exact=True).click()
     expect(page.get_by_role("dialog").get_by_role("checkbox", name="Keep agent changes automatically when a reply finishes")).to_be_checked()
+
+
+def test_on_a_narrow_screen_the_origin_badges_shrink_and_the_name_stays_readable(ui, page):
+    page.set_viewport_size({"width": 390, "height": 700})
+    mount_bar(ui, changes="""{ added: 120, removed: 0, files: [{ path: 'some_really_long_file_name_for_testing.py', status: 'created',
+      added: 120, removed: 0, current_hash: 'h1', via_session_id: 'child', source: 'command' }] }""")
+    page.get_by_role("button", name=re.compile("^1 file changed")).click()
+    badges = page.locator(".changes-status.subagent, .changes-status.command")
+    expect(badges).to_have_text(["Subagent", "Command"])  # The full words stay in the page for screen readers.
+    shown = badges.evaluate_all("items => items.map(item => getComputedStyle(item, '::before').content)")
+    assert [text.split(" / ")[0] for text in shown] == ['"S"', '"C"']  # The letters shown, with no spoken text.
+    width = page.locator(".changes-name").evaluate("name => name.getBoundingClientRect().width")
+    assert width >= 70, width
+    row = page.locator(".changes-file")
+    assert row.evaluate("row => row.scrollWidth <= row.clientWidth")

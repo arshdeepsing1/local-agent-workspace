@@ -12,7 +12,8 @@ export function DiffStat({ added, removed }) {
 // The files this conversation's agent changed and nobody has kept or undone yet,
 // above the message box (like "N files changed" in an editor's chat view).
 // changes: { files: [{ path, status, added, removed, current_hash, error?, via_session_id?, source? }], added, removed,
-//   error? } | null; via_session_id marks a subagent's edit, source 'command' a file a command changed.
+//   error? } | null; via_session_id marks a subagent's edit, source 'command' a file a command changed
+//   (on narrow screens those badges shrink to S and C, keeping their full word for screen readers).
 // Props: changes, busy (a response is running; Undo waits for it), onOpen(path),
 //   onAction(action, files) -> Promise, onError(message)
 export default function ChangesBar({ changes, busy, onOpen, onAction, onError }) {
@@ -48,8 +49,8 @@ export default function ChangesBar({ changes, busy, onOpen, onAction, onError })
           <${File} size=${14} /><span class="changes-name">${item.path.slice(slash + 1)}</span>
           ${slash > 0 ? html`<span class="changes-dir">${item.path.slice(0, slash)}</span>` : null}
           ${item.status !== 'modified' ? html`<small class=${`changes-status ${item.status}`}>${STATUS_LABELS[item.status] || item.status}</small>` : null}
-          ${item.via_session_id ? html`<small class="changes-status subagent" title="Changed by a subagent of this conversation">Subagent</small>` : null}
-          ${item.source === 'command' ? html`<small class="changes-status command" title="Changed by a command the agent ran">Command</small>` : null}
+          ${item.via_session_id ? html`<small class="changes-status subagent" data-short="S" title="Changed by a subagent of this conversation">Subagent</small>` : null}
+          ${item.source === 'command' ? html`<small class="changes-status command" data-short="C" title="Changed by a command the agent ran">Command</small>` : null}
         </button>
         ${item.error ? html`<span class="changes-unavailable" title=${item.error}>${item.error}</span>` : html`<${DiffStat} added=${item.added} removed=${item.removed} />`}
         <button class="icon-button" aria-label=${`Keep changes to ${item.path}`} title="Keep" disabled=${working} onClick=${() => void run('keep', [item])}><${Check} size=${15} /></button>

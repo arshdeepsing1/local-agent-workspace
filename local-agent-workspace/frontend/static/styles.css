@@ -189,6 +189,14 @@
 .review-comment-form>div{display:flex;justify-content:flex-end;gap:6px}.review-comment-form button{font-size:12px;padding:5px 12px;border-radius:7px}
 .review-comment-orphans{margin-top:10px;padding-top:6px;border-top:1px dashed #e1d2c6}.review-comment-orphans>span{display:block;margin-left:78px;font:11px 'DM Sans',sans-serif;color:var(--muted)}
 .review-bar .review-send{white-space:nowrap}
+.review-comments-unsent{border-top:1px solid var(--border);padding:8px 10px 10px;max-height:min(260px,40dvh);overflow:auto;flex-shrink:0}
+.review-comments-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;color:var(--muted);margin-bottom:6px}
+.review-comments-head .review-send{font-size:12px;padding:5px 12px;border-radius:7px}
+.review-comments-unsent .review-comment{position:static;margin:4px 0;max-width:none}.review-comments-unsent .panel-error{margin:6px 0}
+@media(hover:none){.diff-review .diff-line .line-comment{opacity:.55}}
+@media(pointer:coarse){.diff-review .diff-line .line-comment{width:28px;min-height:24px}}
+@media(max-width:600px){.changes-name{min-width:min(9ch,45%)}.changes-status.subagent,.changes-status.command{font-size:0;padding:0 4px}
+  .changes-status.subagent::before,.changes-status.command::before{content:attr(data-short);content:attr(data-short) / "";font-size:10px}}
 
 /* M1 safety: notice about conversation files the server could not read. */
 .storage-notice{padding:10px 18px;background:#f4ecdf;border-bottom:1px solid #e6d6bd;font-size:12px;color:#796143;display:flex;align-items:flex-start;gap:10px}

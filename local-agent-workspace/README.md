@@ -359,37 +359,53 @@ when opening a conversation or performing restart recovery.
     point.
   - **Commands**: before and after each foreground `run_command` (including Verify), the app
     compares `git status` of the project folder, the chat's granted folders and the folders
-    added to **Workspace / Files**, each one that is inside a Git repository. Files the
+    added to **Workspace / Files**, each one that is inside a Git repository (a granted folder
+    that contains the project does not replace the project's own repository). Files the
     command created, changed or deleted are listed with a **Command** mark. For a file that
     was already changed before the command, the review compares with its content just before
     the command; for a file that was clean, with the last commit before the command, so a
-    `git add`, `git commit`, `git checkout` or `git stash` in the command does not hide the
-    change. A file the agent already edited keeps its earlier starting point. The Git calls
-    run without hooks, fsmonitor or the repository's clean and smudge filters, and are
-    bounded (10 seconds per call, 15 seconds per repository after the command).
+    `git add`, `git commit` (also the first commit of a new repository), `git checkout` or
+    `git stash` in the command does not hide the change. A file the agent already edited
+    keeps its earlier starting point. The Git calls run without hooks, fsmonitor or the
+    repository's clean and smudge filters (also a filter the command itself configures), and
+    are bounded: 10 seconds per Git call, and at most about 25 seconds before the command
+    starts and 15 seconds after it ends (repositories are checked in parallel), so in a very
+    large repository each command can wait that long. After **Stop**, the turn waits up to
+    10 seconds more for this check.
     Not covered: folders that are not in a Git repository (**Workspace / Changes** shows Git's
     view there), background jobs, commands run from **Workspace / Terminal** or as `!`
     commands, files Git ignores, credential files and folders the file tools exclude, paths
     through a symbolic link, files over 80 KB or binary, folders with more than 2,000 changed
-    files before or after the command, and commands that change more than 500 files (the
-    rest are not listed). The read-only commands that run without a card (`pwd`, `ls`,
+    files before or after the command, and more than 500 files per repository: files the
+    command added to `git status`, changed the status of or committed are checked first,
+    then files that were already changed before it, and the rest are not listed. The read-only commands that run without a card (`pwd`, `ls`,
     `git status` and the like) are not checked at all. Edits that other programs make while
     a command runs are listed as that command's. Line-ending conversion configured in
     `.gitattributes` can show a change for a file that was clean. An undo of a command's
     change is a Recovery checkpoint like any other; Recovery has no checkpoint of the
     command's own edit.
   - **Line comments**: in a file's review, the comment button at the start of a line (shown
-    on hover and focus) opens a box for a comment on that line; **Add comment** (or
-    Ctrl+Enter / Cmd+Enter) adds it under the line and Esc cancels. **Send N comments** in
+    on hover and keyboard focus, and always faintly on touch screens) opens a box for a
+    comment on that line; **Add comment** (or Ctrl+Enter / Cmd+Enter) adds it under the
+    line and Esc cancels, and focus returns to the line's button. The line buttons are one
+    Tab stop: the Up and Down arrows (Home, End) move between lines. **Send N comments** in
     the box at the bottom right sends every comment of this conversation, from all files,
     as one message: the file and line, the line's text and your comment, in file and line
     order, ending with a request to address each comment and summarize the changes. It
     waits until the reply finishes; if sending fails, the comments stay. Up to 50 comments
-    at a time. Comments are kept in the page while you switch files or close the panel, but
-    not across a reload.
+    at a time, and the message must stay under 50,000 characters (remove some comments
+    otherwise). Comments are kept in the page while you switch files or close the panel, but
+    not across a reload. A comment belongs to its line's text: when the file changes and that
+    line is gone or moved, it is listed under **Comments on lines no longer in this diff**.
+    Comments on other files are listed under the diff, each with **Remove**. When no review
+    is open, for example after you keep or undo the file or after Automatic Keep, the
+    conversation's unsent comments stay at the bottom of the Workspace panel with
+    **Send N comments**.
   - **Automatic Keep** (Settings, off by default): when a reply finishes, every listed change
-    of that conversation is kept and the bar clears. A manual compaction does not count as
-    a reply, and a subagent's reply clears only the subagent's list. Edits made with the
+    of that conversation is kept and the bar clears. A reply that you stop, that fails or
+    that reaches the step limit keeps its list, so **Undo** stays available. A manual
+    compaction does not count as a reply, and a subagent's reply clears only the subagent's
+    list. Edits made with the
     agent's file tools can still be undone from **Agent tools → Recovery**; edits made by
     commands can no longer be undone from the app.
 - **Workspace / Changes**: inspect Git status and tracked-file diffs. Untracked

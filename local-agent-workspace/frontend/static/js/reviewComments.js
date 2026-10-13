@@ -12,6 +12,7 @@ export const MAX_COMMENTS = 50
 export const MAX_COMMENT_LENGTH = 2000
 export const MAX_MESSAGE_LENGTH = 50000
 export const TOO_MANY = 'Too many comments to send at once; send some first.'
+export const TOO_LONG = 'The comments are too long to send at once; remove some first.'
 
 const save = (sessionId, list) => {
   if (list.length) comments.set(sessionId, list)
