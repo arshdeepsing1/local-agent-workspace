@@ -10,7 +10,7 @@ import ApprovalOptions, { ruleLine } from './ApprovalOptions.js'
 import EditMessage from './EditMessage.js'
 import RewindDialog from './RewindDialog.js'
 import ForkDialog from './ForkDialog.js'
-import { backupTitle, RewindNotice, setRewindNotice } from '../rewindNotice.js'
+import { backupTitle, setRewindNotice } from '../rewindNotice.js'
 
 // A long file is read in pages. Naming the lines each read covered keeps the
 // pages of one file from looking like the same read repeated.
@@ -307,14 +307,22 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
   const rewound = (result, draftKept = false) => {
     if (result.backupId) setRewindNotice(session.id, { title: backupTitle(session.title), backupId: result.backupId, draftKept })
   }
+  // The rewound message is gone from the transcript (and its control with it): the message box is where to go on.
+  const focusMessageBox = () => document.querySelector('textarea[aria-label="Message"]')?.focus()
+  // After a conversation rewind whose resend failed, the text to send waits in the message box.
+  const resent = (result, text) => {
+    const draftKept = result.resend_error && onPrefill ? onPrefill(text) === false : false
+    rewound({ backupId: result.backup_session_id }, draftKept)
+    if (result.resend_error) onError(result.resend_error)
+    focusMessageBox()
+  }
   const retry = async () => {
     if (retrying || !cuts.latestUser) return
     setRetrying(true)
     try {
       const result = await api(`/sessions/${encodeURIComponent(session.id)}/rewind`, 'POST',
         { before_event_id: cuts.latestUser.id, conversation: true, resend_text: cuts.latestUser.text })
-      rewound({ backupId: result.backup_session_id })
-      if (result.resend_error) onError(result.resend_error)
+      resent(result, cuts.latestUser.text)
     } catch (e) { onError(e) }
     finally { setRetrying(false) }
   }
@@ -340,16 +348,12 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
       })}</ol>
     </details>` : null}
     ${session.parent_session_id && onSelectSession ? html`<button class="outline parent-conversation" onClick=${() => onSelectSession(session.parent_session_id)}>Back to parent conversation</button>` : null}
-    <${RewindNotice} sessionId=${session.id} onSelectSession=${onSelectSession} />
     ${session.events.map(event => {
       if (event.type === 'user' && editing === event.id && idle) return html`<${EditMessage} key=${event.id} sessionId=${session.id} event=${event}
         onSelectSession=${onSelectSession}
-        onCancel=${() => { editReturn.current = event.id; setEditing(null) }} onSent=${result => {
+        onCancel=${() => { editReturn.current = event.id; setEditing(null) }} onSent=${(result, text) => {
           setEditing(null)
-          rewound({ backupId: result.backup_session_id })
-          if (result.resend_error) onError(result.resend_error)
-          // The edited message is gone from the transcript; the message box is where to go on.
-          document.querySelector('textarea[aria-label="Message"]')?.focus()
+          resent(result, text)
         }} />`
       if (event.type === 'user') return html`<div class=${`user-message${event.steered ? ' steered' : ''}`} key=${event.id}>${event.steered ? html`<small class="steered-label">Sent while the agent was working</small>` : null}${event.origin?.kind === 'delegated' ? html`<small class="delegation-origin">Delegated by parent conversation</small>` : null}${event.text}<${Attachments} items=${event.attachments} />${event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}${event.text || idle ? html`<div class="message-actions">${event.text ? html`<${CopyAction} text=${event.text} label="Copy message" />` : null}${idle ? html`<${ActionButton} label="Edit message" icon=${Pencil} target=${`edit:${event.id}`} onClick=${() => setEditing(event.id)} /><${ActionButton} label="Rewind to here" icon=${Undo2} onClick=${() => setRewinding(event)} />` : null}</div>` : null}</div>`
       if (event.type === 'tool' && event.name === 'ask_user') return html`<${QuestionCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
@@ -364,6 +368,7 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
       onRewound=${result => {
         setRewinding(null)
         rewound(result, result.conversation && onPrefill ? onPrefill(rewinding.text || '') === false : false)
+        if (result.conversation) focusMessageBox()
       }} />` : null}
     ${forking !== undefined && onSelectSession ? html`<${ForkDialog} session=${session} beforeEventId=${forking.beforeEventId}
       onSelectSession=${onSelectSession} onClose=${() => setForking(undefined)} />` : null}

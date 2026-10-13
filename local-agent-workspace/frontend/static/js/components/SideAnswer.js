@@ -23,7 +23,11 @@ export default function SideAnswer({ side, onDismiss, onError }) {
     <p class="side-note">Not added to the conversation. Uses one model request with the whole conversation as context.</p>
     <div class="side-actions">
       ${side.answer !== null ? html`<button class="outline" onClick=${() => void copy()}>${copied ? 'Copied' : 'Copy answer'}</button>` : null}
-      <button class="outline" onClick=${onDismiss}>Dismiss</button>
+      <button class="outline" onClick=${() => {
+        onDismiss()
+        // The answer and this button go away: the message box is where to go on.
+        document.querySelector('textarea[aria-label="Message"]')?.focus()
+      }}>Dismiss</button>
     </div>
   </section>`
 }

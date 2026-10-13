@@ -2,9 +2,9 @@ import { html, useEffect, useState } from './lib.js'
 import { X } from './icons.js'
 
 // The notice after an in-place rewind (Edit and resend, Retry, Rewind), per conversation:
-// Map<session id, { title (of the archived copy), backupId, draftKept }>. It lives outside
-// the transcript because a rewind to the first message leaves no messages, and App then
-// shows the welcome screen instead of the conversation.
+// Map<session id, { title (of the archived copy), backupId, draftKept }>. It is shown above the
+// message box, not in the transcript: the transcript stays scrolled to its end after a rewind, and
+// a rewind to the first message leaves no messages (App then shows the welcome screen).
 const notices = new Map()
 const subscribers = new Set()
 

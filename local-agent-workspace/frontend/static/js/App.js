@@ -72,7 +72,7 @@ export default function App() {
     if (scope === 'chat' && typeof updated?.updated === 'number') attention.renamed(id, before, updated.updated)
   }
   const composer = html`<${Composer} key=${app.viewKey} value=${draft} setValue=${setDraft} model=${active?.model || app.settings?.model || 'databricks-gpt-oss-120b'}
-    workspace=${active?.workspace || app.settings?.workspace || ''} mode=${app.permissionMode} onMode=${app.setPermissionMode} onProject=${() => setSettingsOpen(true)}
+    workspace=${active?.workspace || app.settings?.workspace || ''} worktree=${active?.worktree} mode=${app.permissionMode} onMode=${app.setPermissionMode} onProject=${() => setSettingsOpen(true)}
     onFolders=${() => setFoldersOpen(true)} rules=${app.rules.chat} onRemoveRule=${removeRule}
     projectRules=${app.rules.project} userRules=${app.rules.user} rulesProblem=${app.rules.problem} onLoadRules=${app.loadRules}
     onAddRule=${done => setRulesOpen({ done })} onResetRules=${app.resetRules}
@@ -109,14 +109,15 @@ export default function App() {
       ${app.connection && !app.connection.connected ? html`<div class="connection-banner"><span>${app.connection.error || 'Configure Databricks to start a conversation.'}</span><button onClick=${() => setSettingsOpen(true)}>Open settings</button></div>` : null}
       ${hasMessages && active ? html`<${Conversation} key=${active.id} session=${active} onError=${showError} onSelectSession=${app.setActiveId} onOpenPath=${openFileAt}
           busy=${busy} onLoadEarlier=${app.loadEarlier} onPrefill=${text => { if (draft.trim()) return false; setDraft(text); return true }} />` :
-        html`<div class="welcome"><div class="welcome-content"><${RewindNotice} sessionId=${app.activeId} onSelectSession=${app.setActiveId} />
+        html`<div class="welcome"><div class="welcome-content">
           <div class="welcome-heading"><${Brand} /><h1>What’s up next?</h1></div>
           <div class="suggestions"><button class="outline" onClick=${() => setDraft('Explore this project. Read the relevant files and explain its structure and how to run it.')}><${Folder} size=${16} />Explore this project</button>
             <button class="outline" onClick=${() => setDraft('Help me make a change in this project: ')}><${Pencil} size=${16} />Make a change</button>
             <button class="outline" onClick=${() => setDraft('Run a command in this workspace: ')}><${Terminal} size=${16} />Run a command</button>
             <${WorktreeChat} key=${app.viewKey} sessionId=${app.activeId} onSelectSession=${app.setActiveId} onError=${showError} /></div>
         </div></div>`}
-      <div class="chat-composer"><div class="composer-bars"><${ChangesBar} key=${`changes-${app.viewKey}`} changes=${app.changes} busy=${busy} onOpen=${openReview} onAction=${app.reviewChanges} onError=${showError} />
+      <div class="chat-composer"><div class="composer-bars"><${RewindNotice} sessionId=${app.activeId} onSelectSession=${app.setActiveId} />
+        <${ChangesBar} key=${`changes-${app.viewKey}`} changes=${app.changes} busy=${busy} onOpen=${openReview} onAction=${app.reviewChanges} onError=${showError} />
         <${TaskChecklist} key=${`tasks-${app.viewKey}`} tasks=${app.tasks} />
         <${ContinueButton} session=${active} disabled=${!app.ready || !app.online || app.modelSaving || !app.settings?.configured} onSend=${app.send} onError=${showError} />
         <${QueueBar} session=${active} onRemove=${app.removeQueued} onSend=${app.sendQueued} onError=${showError}

@@ -31,8 +31,10 @@ export default function WorktreeChat({ sessionId, onSelectSession, onError }) {
       const created = await api(`/worktrees/${encodeURIComponent(record.id)}/session${scope}`, 'POST')
       setOpen(false)
       onSelectSession(created.id)
-    } catch (error) { onError(error) }
-    finally { setSaving(false) }
+    } catch (error) {
+      onError(error)
+      setTimeout(() => input.current?.focus())  // Once enabled again: fix the name and retry.
+    } finally { setSaving(false) }
   }
   const onKeyDown = e => {
     if (e.key === 'Escape' && !saving) { e.preventDefault(); setOpen(false) }

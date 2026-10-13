@@ -76,6 +76,15 @@ def test_chips_show_each_mention_and_remove_its_token(ui, page):
     assert ui.bodies("/api/sessions/a/messages", "POST") == [{"text": "Read , then and `@not/this` or a@b.c"}]
 
 
+def test_tokens_inside_code_spans_of_any_length_get_no_chip(ui, page):
+    """As on the server: a span opened by N backticks closes only at the next run of exactly N, as in the
+    line text a review comment quotes."""
+    start_app(ui, page)
+    message(page).fill("- `README.md:4` (added line: `` Run `make` then @docs/parsing.md ``): see @src/parser.py")
+    expect(page.locator(".mention-chip")).to_have_count(1)
+    expect(page.locator(".mention-chip")).to_contain_text("@src/parser.py")
+
+
 def test_removing_a_chip_keeps_the_rest_of_the_message_as_typed(ui, page):
     start_app(ui, page)
     box = message(page)

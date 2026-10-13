@@ -14,6 +14,7 @@ export function messageKind(text) {
 const clip = (text, limit) => text.length > limit ? `${text.slice(0, limit - 1)}…` : text
 
 // Props: value, setValue, model, models, busy, disabled, modelSaving, onModel, workspace,
+// worktree (Session.worktree of an app-managed worktree chat: the chip names its project and branch),
 // mode, onMode, onProject, onFolders, onSend, onStop, onAttach, onError, loadSkills,
 // onShell(command), onSideQuestion(question), loadFiles(query), pendingContext (Session.pending_context),
 // rules (this chat), projectRules, userRules, rulesProblem, onLoadRules, onAddRule(returnFocus), onRemoveRule(scope, rule), onResetRules
@@ -69,13 +70,17 @@ export default function Composer(p) {
   const hint = kind !== 'shell' ? null : multiline ? 'Shell mode runs one line.'
     : p.busy ? 'Wait for the reply to finish before running a command.'
     : 'Shell command: Enter runs it in the project folder, even in Plan mode. Its output is sent to the agent with your next message.'
+  const folderName = path => (path || '').split('/').filter(Boolean).pop()
+  // A worktree chat's folder is an app-internal ID: show the project it came from and its branch.
+  const project = p.worktree?.branch ? `${folderName(p.worktree.source_workspace) || 'Project'} · ${p.worktree.branch}`
+    : folderName(p.workspace) || 'Project'
   const caretFrom = e => setCaret(e.currentTarget.selectionStart ?? 0)
   // Two menus share the message box; the open one names its list.
   const menuProps = mention.listed ? { ...slash.inputProps, ...mention.inputProps } : slash.inputProps
   return html`<div class="composer-block">
     <div class="project-context">
       <span class="context-chip"><${Laptop} size=${15} />Local</span>
-      <button class="context-chip project-chip" aria-label="Choose project" title=${p.workspace} onClick=${p.onProject}><${Folder} size=${15} /><span>${p.workspace.split('/').filter(Boolean).pop() || 'Project'}</span></button>
+      <button class="context-chip project-chip" aria-label="Choose project" title=${p.workspace} onClick=${p.onProject}><${Folder} size=${15} /><span>${project}</span></button>
       <button class="context-chip folder-access-button" onClick=${p.onFolders}><${FolderPlus} size=${15} /><span>Folder access</span></button>
     </div>
     ${mentions.length || pending.length ? html`<div class="mention-chips">

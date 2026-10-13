@@ -231,7 +231,8 @@ def test_automatic_keep_is_off_by_default_and_saved_from_settings(ui, page):
     dialog = page.get_by_role("dialog")
     box = dialog.get_by_role("checkbox", name="Keep agent changes automatically when a reply finishes")
     expect(box).not_to_be_checked()
-    expect(dialog.get_by_text("The changes bar then clears after each reply. Edits made with the agent's file tools can still "
+    expect(dialog.get_by_text("The changes bar clears when a reply completes; a reply you stop, that fails or that reaches the "
+                              "step limit keeps its list. Edits made with the agent's file tools can still "
                               "be undone from Agent tools → Recovery; edits made by commands can no longer be undone from the app.")).to_be_visible()
     dialog.get_by_role("button", name="Save settings").click()
     expect(page.get_by_role("dialog")).to_have_count(0)

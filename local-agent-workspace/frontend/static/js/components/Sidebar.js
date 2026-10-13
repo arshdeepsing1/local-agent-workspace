@@ -86,6 +86,8 @@ function TagsForm({ session, onSave, onCancel }) {
   const [text, setText] = useState(tagsOf(session).join(', '))
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
+  // After a refused save the input is enabled again: keep typing (and Esc) there.
+  useEffect(() => { if (error && !saving) input.current?.focus() }, [error, saving])
   const save = async () => {
     if (saving) return
     // Tags that differ only in case count as one, as on the server.
@@ -106,10 +108,11 @@ function TagsForm({ session, onSave, onCancel }) {
     onKeyDown=${event => { if (event.key === 'Escape') { event.preventDefault(); if (!saving) onCancel() } }}>
     <label for=${`tags-${session.id}`}>Tags (comma-separated)</label>
     <input ref=${input} id=${`tags-${session.id}`} value=${text} disabled=${saving} spellcheck=${false}
-      aria-invalid=${!!error} onInput=${event => { setText(event.currentTarget.value); setError('') }} />
+      aria-invalid=${!!error} aria-describedby=${error ? `tags-error-${session.id}` : undefined}
+      onInput=${event => { setText(event.currentTarget.value); setError('') }} />
     <div><button type="submit" class="primary" disabled=${saving}>${saving ? 'Saving…' : 'Save tags'}</button>
       <button type="button" class="outline" disabled=${saving} onClick=${onCancel}>Cancel</button></div>
-    ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
+    ${error ? html`<p id=${`tags-error-${session.id}`} class="form-error" role="alert">${error}</p>` : null}
   </form>`
 }
 
@@ -361,7 +364,7 @@ export default function Sidebar(props) {
             value=${query} onInput=${event => setQuery(event.currentTarget.value)}
             onKeyDown=${event => { if (event.key === 'Escape' && query) { event.preventDefault(); setQuery('') } }} /></div>` : null}
         ${tag ? html`<div class="tag-filter"><span>Tag: ${tag}</span><button class="icon-button" aria-label="Clear tag filter"
-          onClick=${() => setTag(null)}><${X} size=${12} /></button></div>` : null}
+          onClick=${() => { setTag(null); aside.current?.querySelector('.conversation-search input')?.focus() }}><${X} size=${12} /></button></div>` : null}
         ${empty ? html`<p class="empty-sessions">${empty}</p>` : null}
         ${view.pinned.length ? html`<section class="pinned-group" aria-label="Pinned"><p class="section-label"><${Pin} size=${12} />Pinned</p>
           ${rows('pinned', view.pinned)}</section>` : null}

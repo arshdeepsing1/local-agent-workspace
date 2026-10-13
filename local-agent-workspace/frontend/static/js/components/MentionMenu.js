@@ -13,7 +13,8 @@ const MENTION = /(?<![\w.@/])@([^\s@`'"<>|]+)/g
 const TRAILING = /[.,;:!?)\]}]+$/
 const RANGE = /^(.+?)(?::(\d+)(?:-(\d+))?|#L(\d+)(?:-L?(\d+))?)$/
 const masked = text => text.replace(/```[\s\S]*?(?:```|$)/g, match => ' '.repeat(match.length))
-  .replace(/`[^`\n]*`/g, match => ' '.repeat(match.length))
+  // A code span on one line: a run of N backticks closes only at the next run of exactly N (as mentions.py).
+  .replace(/(?<!`)(`+)(?!`)[^\n]*?(?<!`)\1(?!`)/g, match => ' '.repeat(match.length))
 
 // [{ token, path, start, end }] of a message, in order and without repeats.
 export function parseMentions(text) {

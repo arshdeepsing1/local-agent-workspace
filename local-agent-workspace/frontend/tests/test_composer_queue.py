@@ -1,5 +1,6 @@
 """The composer while the agent works (queued messages, Esc to stop), ! shell commands and /btw side questions."""
 import json
+import re
 
 from playwright.sync_api import expect
 
@@ -76,6 +77,47 @@ def test_an_idle_chat_offers_to_send_waiting_messages_and_shows_queue_errors(ui,
     expect(bar.get_by_role("alert")).to_have_text("This managed worktree is being removed. Choose another workspace.")
 
 
+def test_queued_message_buttons_name_their_message_and_keep_focus_in_the_page(ui, page):
+    three = [{"id": f"q{number}", "text": text, "created": number, "paused": True}
+             for number, text in ((1, "First note"), (2, "Second note " + "y" * 60), (3, "Third note"))]
+    start_app(ui, page, queued_messages=three, setup="""
+const queueOverride = fake.override
+fake.override = (path, options) => {
+  if (path.startsWith('/api/sessions/a/queue/') && options.method === 'DELETE') {
+    const id = path.split('/').pop()
+    const left = fake.sessions.get('a').queued_messages.filter(item => item.id !== id)
+    fake.sessions.set('a', { ...fake.sessions.get('a'), queued_messages: left })
+    return fake.json({ queued_messages: left })
+  }
+  return queueOverride(path, options)
+}""")
+    bar = queue_bar(page)
+    expect(bar.get_by_role("button", name=re.compile("^Remove queued message: "))).to_have_count(3)
+    expect(bar.get_by_role("button", name="Edit queued message: First note", exact=True)).to_be_visible()
+    second = "Second note " + "y" * 27 + "…"
+    expect(bar.get_by_role("button", name=f"Remove queued message: {second}", exact=True)).to_be_visible()
+    bar.get_by_role("button", name=f"Remove queued message: {second}", exact=True).click()
+    ui.wait("fake.requests('/api/sessions/a/queue/q2', 'DELETE').length === 1")
+    # The Remove button now in that row, never <body>.
+    expect(bar.get_by_role("button", name="Remove queued message: Third note", exact=True)).to_be_focused()
+    page.keyboard.press("Enter")
+    expect(bar.get_by_role("button", name="Remove queued message: First note", exact=True)).to_be_focused()
+    page.keyboard.press("Enter")
+    expect(queue_bar(page)).to_have_count(0)
+    expect(message(page)).to_be_focused()
+
+
+def test_sending_queued_messages_moves_focus_to_the_message_box(ui, page):
+    start_app(ui, page, queued_messages=[{**QUEUED[0], "paused": True}],
+              setup="fake.override = (path, options) => path === '/api/sessions/a/queue/send' ? "
+                    "(fake.sessions.set('a', { ...fake.sessions.get('a'), queued_messages: [] }), fake.json({ ok: true })) : undefined")
+    queue_bar(page).get_by_role("button", name="Send queued messages").click()
+    ui.wait("fake.requests('/api/sessions/a/queue/send', 'POST').length === 1")
+    ui.emit("a", {"type": "queue", "queued_messages": []})
+    expect(queue_bar(page)).to_have_count(0)
+    expect(message(page)).to_be_focused()
+
+
 def test_escape_in_the_message_box_stops_a_busy_chat(ui, page):
     start_app(ui, page, status="running")
     message(page).press("Escape")
@@ -135,6 +177,7 @@ def test_a_side_question_shows_its_answer_without_sending_a_message(ui, page):
     assert ui.js("fake.clipboard") == ["It changed **two** files."]
     region.get_by_role("button", name="Dismiss").click()
     expect(page.get_by_role("region", name="Side question")).to_have_count(0)
+    expect(box).to_be_focused()
     assert not ui.requests("/api/sessions/a/messages")
 
 

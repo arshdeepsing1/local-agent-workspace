@@ -2,10 +2,11 @@ import { html, useEffect, useRef, useState } from '../lib.js'
 import { X } from '../icons.js'
 import { api } from '../api.js'
 
-// A branch name stamped with the local time: <prefix>/YYYY-MM-DD-HHmm.
+// A branch name stamped with the local time: <prefix>/YYYY-MM-DD-HHmmss (to the second, so a second
+// worktree made within the same minute gets its own default name).
 export function stampedBranch(prefix, now = new Date()) {
   const pad = value => String(value).padStart(2, '0')
-  return `${prefix}/${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`
+  return `${prefix}/${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
 }
 
 // Fork from here: a new chat with the conversation up to a reply (POST /sessions/<id>/fork with a body).

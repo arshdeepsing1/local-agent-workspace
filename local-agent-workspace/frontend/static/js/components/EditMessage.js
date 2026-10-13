@@ -9,7 +9,7 @@ export function RefusedFiles({ error }) {
 }
 
 // Edit and resend: replaces a user message and everything after it (POST /rewind with resend_text).
-// Props: sessionId, event (the user event), onSent(result), onCancel, onSelectSession(id) (opens a chat that
+// Props: sessionId, event (the user event), onSent(result, text), onCancel, onSelectSession(id) (opens a chat that
 // blocks the file rewind).
 export default function EditMessage({ sessionId, event, onSent, onCancel, onSelectSession }) {
   const [text, setText] = useState(event.text || '')
@@ -23,7 +23,7 @@ export default function EditMessage({ sessionId, event, onSent, onCancel, onSele
     try {
       const result = await api(`/sessions/${encodeURIComponent(sessionId)}/rewind`, 'POST',
         { before_event_id: event.id, conversation: true, code, resend_text: text })
-      onSent(result)
+      onSent(result, text)
     } catch (e) { setError(e); setSending(false) }
   }
   const onKeyDown = e => {

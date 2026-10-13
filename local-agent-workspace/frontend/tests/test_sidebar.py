@@ -246,6 +246,7 @@ def test_tags_are_edited_and_filter_the_list(ui, page):
     expect(page.locator(".conversation-row")).to_have_count(1)
     page.get_by_role("button", name="Clear tag filter").click()
     expect(page.locator(".conversation-row")).to_have_count(3)
+    expect(page.get_by_role("searchbox", name="Search conversations")).to_be_focused()  # Not <body>.
     # Tags match without regard to case.
     page.locator(".tag-chip", has_text=re.compile("^bug$")).click()
     expect(page.locator(".conversation-row")).to_have_count(2)
@@ -264,6 +265,11 @@ def test_a_rejected_tag_shows_the_reason(ui, page):
     page.get_by_role("textbox", name="Tags (comma-separated)").fill("x" * 40)
     page.get_by_role("button", name="Save tags").click()
     expect(page.get_by_role("alert")).to_have_text("Tags have 1 to 32 characters and no control characters.")
+    field = page.get_by_role("textbox", name="Tags (comma-separated)")
+    expect(field).to_be_focused()  # Enabled again, so typing and Esc still reach the form.
+    expect(field).to_have_accessible_description("Tags have 1 to 32 characters and no control characters.")
+    field.press("Escape")
+    expect(field).to_have_count(0)
 
 
 def test_more_than_ten_tags_are_refused_before_saving(ui, page):

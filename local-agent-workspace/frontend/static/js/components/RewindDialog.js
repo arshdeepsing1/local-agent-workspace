@@ -64,6 +64,8 @@ export default function RewindDialog({ session, event, onRewound, onClose, onSel
     try {
       const result = await api(`/sessions/${encodeURIComponent(session.id)}/rewind`, 'POST',
         { before_event_id: event.id, conversation, code: choice !== 'conversation' })
+      // Closed first: focus returns to the opener, and onRewound can then move it out of the dialog.
+      dialog.current?.close()
       onRewound({ conversation, backupId: result.backup_session_id })
     } catch (e) { setError(e); setSaving(false) }
   }

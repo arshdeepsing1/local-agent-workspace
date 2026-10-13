@@ -20,6 +20,7 @@ SETUP = """
 fake.sessions.set('a', { ...makeSession('a', 'Work'), events: %s, terminal_reason: 'completed' })
 window.preview = %s
 window.rewindError = null
+window.resendError = null
 fake.override = (path, options) => {
   if (path.startsWith('/api/sessions/a/rewind-preview?')) return fake.json(window.preview)
   if (path === '/api/sessions/a/rewind' && options.method === 'POST') {
@@ -31,7 +32,9 @@ fake.override = (path, options) => {
     fake.sessions.set('backup', { ...makeSession('backup', 'Work (before rewind)'), events, archived: true })
     // Like the server: the snapshot is broadcast before the response.
     if (body.conversation) fake.socketFor('a').emit({ type: 'snapshot', session: updated })
-    return fake.json({ session: updated, backup_session_id: body.conversation ? 'backup' : null, files: [], resent: !!body.resend_text })
+    const failed = body.resend_text && window.resendError
+    return fake.json({ session: updated, backup_session_id: body.conversation ? 'backup' : null, files: [], resent: !!body.resend_text && !failed,
+                       ...(failed ? { resend_error: window.resendError } : {}) })
   }
   if (path === '/api/sessions/a/fork' && options.method === 'POST') {
     fake.sessions.set('forked', { ...makeSession('forked', 'Work (fork)'), events: fake.sessions.get('a').events.slice(0, 2) })
@@ -130,6 +133,7 @@ def test_rewind_dialog_shows_statuses_disables_impossible_choices_and_sends_flag
     expect(dialog).to_have_count(0)
     assert rewind_posts(ui) == [{"before_event_id": "u2", "conversation": True, "code": False}]
     expect(message_box(page)).to_have_value("Second task")
+    expect(message_box(page)).to_be_focused()  # The control that opened the dialog is gone.
     notice = page.get_by_role("status").filter(has_text="Rewound.")
     expect(notice.locator("span")).to_have_text("Rewound. The earlier version is saved as the archived conversation “Work (before rewind)”.")
     notice.get_by_role("button", name="Open earlier version").click()
@@ -161,6 +165,7 @@ def test_code_only_rewind_leaves_the_conversation_and_composer(ui, page):
     expect(dialog).to_have_count(0)
     assert rewind_posts(ui) == [{"before_event_id": "u2", "conversation": False, "code": True}]
     expect(message_box(page)).to_have_value("")
+    expect(page.get_by_role("button", name="Rewind to here").nth(1)).to_be_focused()
     expect(page.get_by_text("Second answer.")).to_be_visible()
     expect(page.get_by_role("status").filter(has_text="Rewound.")).to_have_count(0)
 
@@ -194,10 +199,41 @@ def test_retry_only_on_the_last_reply_of_an_idle_chat_without_steering(ui, page)
     retry = page.get_by_role("button", name="Retry response")
     expect(retry).to_have_count(1)
     expect(page.locator(".reply-content").filter(has_text="Second answer.").get_by_role("button", name="Retry response")).to_be_visible()
-    retry.click()
+    retry.focus()
+    page.keyboard.press("Enter")
     ui.wait("fake.requests('/api/sessions/a/rewind', 'POST').length === 1")
     assert rewind_posts(ui) == [{"before_event_id": "u2", "conversation": True, "resend_text": "Second task"}]
     expect(page.get_by_role("status").filter(has_text="Rewound.")).to_be_visible()
+    expect(message_box(page)).to_be_focused()
+    expect(message_box(page)).to_have_value("")
+
+
+def test_a_failed_resend_puts_the_text_in_the_message_box(ui, page):
+    start(ui, page, extra="window.resendError = 'This managed worktree is being removed. Choose another workspace.'")
+    page.get_by_role("button", name="Edit message").nth(1).click()
+    page.get_by_role("textbox", name="Edit message").fill("Second task, edited")
+    page.get_by_role("button", name="Send edited message").click()
+    expect(page.locator(".app-error")).to_contain_text("This managed worktree is being removed.")
+    expect(message_box(page)).to_have_value("Second task, edited")
+    expect(message_box(page)).to_be_focused()
+    # Retry of the then latest message: its text waits in the message box too.
+    page.get_by_role("button", name="Dismiss error").click()
+    message_box(page).fill("")
+    page.get_by_role("button", name="Retry response").click()
+    expect(message_box(page)).to_have_value("First task")
+    ui.run("window.resendError = null")
+
+
+def test_the_rewind_notice_is_in_view_after_a_retry_in_a_long_chat(ui, page):
+    long = [event for number in range(1, 9) for event in (
+        {"id": f"u{number}", "type": "user", "text": f"Task {number}", "in_wire": True},
+        {"id": f"a{number}", "type": "assistant", "text": f"Answer {number}.\n\n" + "Details. " * 120})]
+    start(ui, page, events=long + [{"id": "u9", "type": "user", "text": "Last task", "in_wire": True},
+                                   {"id": "a9", "type": "assistant", "text": "Last answer."}])
+    page.get_by_role("button", name="Retry response").click()
+    notice = page.get_by_role("status").filter(has_text="Rewound.")
+    expect(notice).to_be_in_viewport()
+    expect(notice.get_by_role("button", name="Open earlier version")).to_be_in_viewport()
 
 
 def test_no_retry_after_steering(ui, page):
@@ -310,7 +346,7 @@ def test_fork_of_the_last_reply_into_a_worktree(ui, page):
     dialog.get_by_role("textbox", name="Title").fill("Try another way")
     dialog.get_by_role("checkbox", name="Create it in a new Git worktree").check()
     branch = dialog.get_by_role("textbox", name="Branch name")
-    expect(branch).to_have_value(re.compile(r"^fork/\d{4}-\d{2}-\d{2}-\d{4}$"))
+    expect(branch).to_have_value(re.compile(r"^fork/\d{4}-\d{2}-\d{2}-\d{6}$"))
     expect(dialog.get_by_text("The worktree starts from the last commit; uncommitted changes are not copied.")).to_be_visible()
     branch.fill("fork/other-way")
     dialog.get_by_role("button", name="Fork").click()
@@ -347,13 +383,32 @@ def test_new_chat_in_worktree_from_the_welcome_screen(ui, page):
     form.get_by_role("button", name="Cancel").click()
     expect(toggle).to_be_focused()
     toggle.click()
-    expect(branch).to_have_value(re.compile(r"^chat/\d{4}-\d{2}-\d{2}-\d{4}$"))
+    expect(branch).to_have_value(re.compile(r"^chat/\d{4}-\d{2}-\d{2}-\d{6}$"))
     branch.fill("chat/x")
     form.get_by_role("button", name="Create").click()
     assert selected(ui, "wtchat")
     assert [(call["path"], call["method"]) for call in ui.js("fake.calls") if "/worktrees" in call["path"]] == [
         ("/api/worktrees", "POST"), ("/api/worktrees/wt1/session", "POST")]
     assert ui.bodies("/api/worktrees", "POST") == [{"branch": "chat/x"}]
+    # The project chip names the project and branch, not the worktree's internal folder.
+    ui.show_session("wtchat")
+    chip = page.get_by_role("button", name="Choose project")
+    expect(chip).to_have_text("project · chat/x")
+
+
+def test_a_refused_worktree_branch_keeps_focus_in_the_form(ui, page):
+    start(ui, page, session=None, extra="""
+const worktreeOverride = fake.override
+fake.override = (path, options) => path === '/api/worktrees' && options.method === 'POST'
+  ? fake.json({ detail: 'That branch already exists; choose a fresh branch name.' }, 400) : worktreeOverride(path, options)
+""")
+    page.get_by_role("button", name="New chat in worktree").click()
+    branch = page.get_by_role("form", name="New chat in worktree").get_by_role("textbox", name="Branch name")
+    branch.press("Enter")
+    expect(page.locator(".app-error")).to_contain_text("That branch already exists")
+    expect(branch).to_be_focused()
+    branch.press("Escape")
+    expect(page.get_by_role("form", name="New chat in worktree")).to_have_count(0)
 
 
 def test_steered_label_and_attachment_chips(ui, page):
