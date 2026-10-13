@@ -1317,8 +1317,10 @@ A message you send while the agent works (**steering**) is part of the current t
 turn of its own: compaction never cuts there, keeps it verbatim after the summary together
 with the turn's request, and never summarizes the tool results the model has not answered
 yet. A queued message that would not fit the context budget together with the latest tool
-results waits (not paused) for a later step boundary, with one notice per turn, and starts
-the next turn when this one ends.
+results waits (not paused) for a later step boundary, with one notice per turn. If no
+boundary has room for it before the reply completes, it is sent as the next turn; after
+Stop, an error or the step limit it waits like any queued message (see **Messages while the
+agent works**).
 If the request, its latest tool results, or project guidance alone are too large, the app
 reports an error instead of silently cutting it. The error states the estimated
 tokens needed and the input-budget arithmetic (context budget minus Max output

@@ -1915,8 +1915,9 @@ class AgentManager:
                     notified.clear()
                 notified.add((session["id"], turn))
                 await self.event(session, "notice", text=(
-                    "Your queued message will be sent after the agent's next step: together with the latest tool "
-                    "results it would not fit in the context budget."))
+                    "Your queued message waits for a later step: together with the latest tool results it would not "
+                    "fit in the context budget. If the reply completes first, it is sent as the next message; after "
+                    "Stop, an error or the step limit it stays queued until you click Send queued messages."))
             await self.publish_queue(session)
             return
         sent = {item["id"] for item in entries}

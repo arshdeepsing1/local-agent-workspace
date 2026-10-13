@@ -132,8 +132,9 @@ def queue(session, text):
     session["queued_messages"] = [{"id": "q1", "text": text, "paused": False, "created": 1}]
 
 
-WAIT_NOTICE = ("Your queued message will be sent after the agent's next step: together with the latest tool results "
-               "it would not fit in the context budget.")
+WAIT_NOTICE = ("Your queued message waits for a later step: together with the latest tool results it would not fit "
+               "in the context budget. If the reply completes first, it is sent as the next message; after Stop, an "
+               "error or the step limit it stays queued until you click Send queued messages.")
 
 
 async def test_a_queued_message_that_does_not_fit_waits_unpaused_with_one_notice(runtime):
