@@ -1216,7 +1216,10 @@ modes, and every result has `next_offset`. Query length is capped at 1,000 chara
 Binary (NUL) and non-UTF-8 files are not searched; `skipped_files` counts files over
 2 MB and files that could not be read. Before reading, a search refuses more than
 20,000 files, or more than 64 MB in files of up to 2 MB, after `glob` filtering.
-Reading and matching then have 10 seconds, and each regex match 50 ms. Limit errors
+Reading and matching then have 10 seconds, and each regex match 50 ms. A regular
+expression (also `wait_job`'s `until_regex`) whose counted repeats such as `{1000}` add
+up to more than 100,000 repeated items, nested counts multiplied, is refused before it
+compiles, because compiling it alone could take seconds and gigabytes. Limit errors
 ask for a narrower query rather than claiming no matches. The Python `regex==2026.9.10`
 dependency enforces regex timeouts and is installed by the normal backend installation command.
 

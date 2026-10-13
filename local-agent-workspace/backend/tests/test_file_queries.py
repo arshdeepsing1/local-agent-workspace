@@ -290,6 +290,17 @@ async def test_expensive_regex_has_deadline_without_blocking_event_loop(tmp_path
     assert ticks >= 2
 
 
+def test_a_regex_whose_counted_repeats_expand_too_far_is_refused_before_compiling(tmp_path):
+    (tmp_path / "a.txt").write_text("2026-10-13 aaaa\n")
+    tools = WorkspaceTools(str(tmp_path))
+    for pattern in ("(?:a{3000}){3000}", "(?:x{65535}){65535}", "(?:a{1000}|b{1000}){1000}", "(?:(?:a{100}){100}){100}"):
+        started = time.monotonic()
+        with pytest.raises(ValueError, match="Invalid regular expression: its counted repeats"):
+            tools.search_files(pattern, regex=True)
+        assert time.monotonic() - started < 1
+    assert len(tools.search_files(r"\d{4}-\d{2}-\d{2} a{4}", regex=True)["matches"]) == 1
+
+
 @pytest.mark.parametrize("module, constant, value, message", [(tools_module, "SEARCH_FILE_SCAN_LIMIT", 1, "file scan"),
                                                                (search, "WALK_DIR_LIMIT", 0, "Directory scan"),
                                                                (tools_module, "SEARCH_TOTAL_LIMIT", 1, "byte scan"),

@@ -249,12 +249,63 @@ def job_ending(job):
     return ("completed" if job["state"] == "completed" else "failed") + exit_code
 
 
+# Compiling expands counted repeats by their minimum counts, multiplied when nested:
+# '(?:a{3000}){3000}' takes seconds and gigabytes before any timeout can apply.
+REPEAT_EXPANSION_LIMIT = 100_000
+
+
+def _repeat_expansion(node):
+    """How far the counted repeats in a parsed pattern expand: the minimum counts, multiplied
+    through nesting and added up."""
+    from regex import _regex_core
+    children = []
+    for value in vars(node).values():
+        if isinstance(value, _regex_core.RegexBase):
+            children.append(value)
+        elif isinstance(value, (list, tuple)):
+            children.extend(item for item in value if isinstance(item, _regex_core.RegexBase))
+    inner = sum(_repeat_expansion(child) for child in children)
+    if isinstance(node, _regex_core.GreedyRepeat):  # Also the lazy and possessive repeats.
+        return node.min_count * max(1, inner)
+    return inner
+
+
+def bounded_regex(text, flags):
+    """compile text with the regex module (the engine with match timeouts) unless its counted
+    repeats would make compiling itself take seconds and gigabytes. Raises regex.error."""
+    from regex import _regex_core
+    try:
+        # The parse that regex.compile starts with; it expands nothing.
+        global_flags = flags
+        while True:
+            source = _regex_core.Source(text)
+            info = _regex_core.Info(global_flags, source.char_type, {})
+            info.guess_encoding = _regex_core.UNICODE
+            source.ignore_space = bool(info.flags & safe_regex.VERBOSE)
+            try:
+                parsed = _regex_core._parse_pattern(source, info)
+                break
+            except _regex_core._UnscopedFlagSet:
+                global_flags = info.global_flags
+        expansion = _repeat_expansion(parsed)
+    except (AttributeError, ImportError, TypeError, KeyError, ValueError):
+        # A regex release with another parser, or flags it refuses: compiling reports the latter.
+        expansion = 0
+    if expansion > REPEAT_EXPANSION_LIMIT:
+        raise safe_regex.error(f"its counted repeats ({{n}}) add up to more than {REPEAT_EXPANSION_LIMIT:,} repeated "
+                               "items, nested counts multiplied; use smaller counts, or * and +")
+    try:
+        return safe_regex.compile(text, flags)
+    except MemoryError as error:
+        raise safe_regex.error("it is too large to compile") from error
+
+
 def until_pattern(text):
     """wait_job's until_regex, compiled with the same safe engine as search_files."""
     if not isinstance(text, str) or len(text) > 500:
         raise ValueError("until_regex must be text of at most 500 characters.")
     try:
-        return safe_regex.compile(text, safe_regex.VERSION1)
+        return bounded_regex(text, safe_regex.VERSION1)
     except (safe_regex.error, RecursionError) as error:
         raise ValueError(f"Invalid until_regex: {error}") from error
 

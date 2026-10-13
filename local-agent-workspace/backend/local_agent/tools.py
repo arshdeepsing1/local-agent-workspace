@@ -10,7 +10,7 @@ from pathlib import Path
 import regex as safe_regex
 
 from .edits import plan_change, preview_diff
-from .jobs import run_process
+from .jobs import bounded_regex, run_process
 
 IGNORED = {".git", "node_modules", ".venv", ".codex_venv", "__pycache__", ".local", ".pytest_cache", "dist"}
 SECRET_NAMES = {".env", "env_vars.txt", ".netrc", ".npmrc", "credentials", "credentials.json", "id_rsa", "id_ed25519"}
@@ -334,7 +334,7 @@ class WorkspaceTools:
         pattern = None
         if regex:
             try:
-                pattern = safe_regex.compile(query, safe_regex.VERSION1 | (0 if case_sensitive else safe_regex.IGNORECASE))
+                pattern = bounded_regex(query, safe_regex.VERSION1 | (0 if case_sensitive else safe_regex.IGNORECASE))
             except (safe_regex.error, RecursionError) as error:
                 raise ValueError(f"Invalid regular expression: {error}") from error
         elif not case_sensitive:

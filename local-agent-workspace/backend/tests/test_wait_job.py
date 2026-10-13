@@ -146,6 +146,20 @@ async def test_a_pathological_regex_is_stopped_without_blocking_the_event_loop(r
     assert ticks >= 2
 
 
+async def test_a_regex_whose_counted_repeats_expand_too_far_is_refused_before_compiling(runtime):
+    # Compiling '(?:a{3000}){3000}' alone blocks the event loop for seconds; '(?:x{65535}){65535}' needs gigabytes.
+    manager, session, tools = runtime
+    job = await background(manager, session, "printf 'ready'")
+    await manager.jobs.wait(job["id"])
+    for pattern in ("(?:a{3000}){3000}", "(?:x{65535}){65535}", "(?x)#[\n(?:a{3000}){3000}", "a{10000000}"):
+        started = time.monotonic()
+        result = await wait(manager, session, tools, job_id=job["id"], until_regex=pattern, from_offset=0)
+        assert time.monotonic() - started < 1
+        assert result["error_kind"] == "invalid_arguments" and "counted repeats" in result["message"], result
+    result = await wait(manager, session, tools, job_id=job["id"], until_regex=r"(?:r\w{1,3}){1}y{1}", from_offset=0)
+    assert result["match"]["line"] == "ready"
+
+
 async def test_long_new_output_is_cut_to_its_end(runtime):
     manager, session, tools = runtime
     job = await background(manager, session, "seq 1 5000")
