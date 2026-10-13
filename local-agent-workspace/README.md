@@ -1157,7 +1157,15 @@ The server binds to `127.0.0.1`, checks Host/Origin, and uses a random local acc
 token to protect its API/WebSocket. Databricks credentials stay server-side. File
 tools resolve paths and symlinks before checking the project and approved additional
 folders. Bypass mode skips that folder boundary; credential files and generated
-directories remain excluded. This is a trusted single-user local app, not a multi-user sandbox.
+directories remain excluded. The app's state folder (settings, rules, extensions and
+conversations; `LOCAL_AGENT_STATE_DIR`, `.local` by default) is excluded from file tools in
+every mode, also after a folder grant or through a symbolic link; a workspace inside it, such
+as a worktree, reaches only its own files. Commands allowed by a rule or by the read-only
+list run without a shell, from the program found on the absolute entries of `PATH`; the
+read-only `pwd` and `ls` run from `/bin`, and read-only Git runs a `git` found outside the
+project with repository programs (fsmonitor, hooks, filters, textconv, external diff,
+signature checks) switched off, output limited to the workspace, and credential files left
+out of diffs. This is a trusted single-user local app, not a multi-user sandbox.
 Commands allowed by the selected mode execute with your OS permissions and can reach beyond the project.
 The shell strips model credentials from its inherited environment.
 

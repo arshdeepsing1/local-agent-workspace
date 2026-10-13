@@ -253,6 +253,8 @@ def list_universe(tools, base, *, include_ignored, deadline):
         except (OSError, ValueError):
             continue
         path = base / relative
+        if tools.in_excluded_root(path):
+            continue  # Git lists the app's state folder when it lies inside the repository.
         try:
             info = os.lstat(path)
         except (OSError, ValueError):

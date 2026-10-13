@@ -38,6 +38,7 @@ COUNT_BLOCK = 1_048_576
 INVALID_LINE_NAMES = 20
 ENCODING_NOTE = "Some bytes are not valid UTF-8 and are shown as U+FFFD (\ufffd)."
 FIND_OFFSET_LIMIT = 200_000
+EXCLUDED_ROOT = "The app's settings and conversation folder is excluded from file tools."
 
 
 def _integer(value, name, minimum, maximum=None):
@@ -126,8 +127,10 @@ def _text_cost(text):
 
 class WorkspaceTools:
     def __init__(self, workspace: str, credential_file: str = "", allowed_directories=(), unrestricted=False,
-                 write_limit=DEFAULT_WRITE_LIMIT):
+                 write_limit=DEFAULT_WRITE_LIMIT, *, excluded_roots=()):
         self.root = Path(workspace).expanduser().resolve()
+        # Folders file tools never reach (the app's state folder), except a workspace inside one.
+        self.excluded_roots = [Path(p).expanduser().resolve() for p in excluded_roots]
         self.credential_file = Path(credential_file).expanduser().resolve() if credential_file else None
         self.allowed_directories = [Path(p).expanduser().resolve() for p in allowed_directories]
         self.unrestricted = unrestricted
@@ -151,7 +154,17 @@ class WorkspaceTools:
                 raise ValueError("Credential files are excluded from file tools.")
             if reason == "generated":
                 raise ValueError("This internal or generated directory is excluded.")
+        for candidate in (requested, path):
+            if self.in_excluded_root(candidate):
+                raise ValueError(EXCLUDED_ROOT)
         return path
+
+    def in_excluded_root(self, path) -> bool:
+        """Whether path is inside an excluded root (the app's state folder). A workspace
+        inside that folder (a worktree) still reaches its own files, and only those."""
+        path = Path(path)
+        return any(path.is_relative_to(root) and not (self.root.is_relative_to(root) and path.is_relative_to(self.root))
+                   for root in self.excluded_roots)
 
     def permitted(self, path: Path) -> bool:
         return self.unrestricted or any(path.is_relative_to(root) for root in [self.root, *self.allowed_directories])

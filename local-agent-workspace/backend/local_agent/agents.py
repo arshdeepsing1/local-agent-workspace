@@ -29,6 +29,7 @@ from .edits import clip_result, preview_diff, split_lines
 from .config import DEFAULT_APPROVAL_MINUTES, DEFAULT_MAX_AGENT_STEPS
 from .instructions import load_project_instructions
 from .jobs import JobManager, validate_command_options
+from .command_exec import prepare_command
 from .recovery import CheckpointManager
 from .changes import ChangeReview
 from .worktrees import WorktreeManager
@@ -834,13 +835,26 @@ class AgentManager:
         return "\n".join(text for text in (self.changed_files_notice(session, tools), self.background_jobs_notice(session))
                          if text)
 
-    async def command_tool(self, session, event, arguments):
+    async def command_tool(self, session, event, arguments, *, argv=None, read_only=False):
+        """Run a command: arguments['command'] through the shell, or, with argv, argv
+        without a shell (arguments['command'] is then its display text). read_only
+        runs a read-only command hardened (command_exec.prepare_command)."""
+        options = {}
+        if argv is not None:
+            if read_only and arguments.get("background"):
+                raise ValueError("Read-only commands run in the foreground only.")
+            forbidden = [Path(session["workspace"]).resolve(),
+                         *(Path(p).resolve() for p in session.get("allowed_directories", []))]
+            argv, env = await prepare_command(argv, workspace=session["workspace"], forbidden_roots=forbidden,
+                                              read_only=read_only, env=self.jobs.command_environment())
+            options = {"argv": argv, "env": env}
         job = await self.jobs.start(command=arguments["command"], workspace=session["workspace"],
                                     session_id=session["id"], timeout_seconds=arguments.get("timeout_seconds", 60),
                                     max_output_bytes=arguments.get("max_output_bytes", 80000),
-                                    background=arguments.get("background", False))
+                                    background=arguments.get("background", False), **options)
         try:
-            await self.update_event(session, event, job_id=job["id"], output=job["output"])
+            await self.update_event(session, event, job_id=job["id"], output=job["output"],
+                                    **({"without_shell": True} if argv is not None else {}))
             if not job["background"]:
                 job = await self.jobs.wait(job["id"])
             else:
@@ -907,7 +921,7 @@ class AgentManager:
     def session_tools(self, session):
         return WorkspaceTools(session["workspace"], self.settings.values["env_file"], session.get("allowed_directories", []),
                               session.get("permission_mode", "manual") == "bypassPermissions",
-                              write_limit=write_limit_setting(self.settings.values))
+                              write_limit=write_limit_setting(self.settings.values), excluded_roots=(self.settings.state_dir,))
 
     def review_tools(self, session):
         """Tools for reviewing this chat's agent changes (list, diff, Keep, Undo): the chat's own access plus the
@@ -921,7 +935,7 @@ class AgentManager:
         return WorkspaceTools(session["workspace"], self.settings.values["env_file"],
                               [*session.get("allowed_directories", []), *extra],
                               session.get("permission_mode", "manual") == "bypassPermissions",
-                              write_limit=write_limit_setting(self.settings.values))
+                              write_limit=write_limit_setting(self.settings.values), excluded_roots=(self.settings.state_dir,))
 
     async def publish_changes(self, session, only_tracked=False):
         """Send the conversation's unreviewed agent file changes to its open pages. Always listed with
@@ -1809,7 +1823,8 @@ class AgentManager:
             mode = session.get("permission_mode", "manual")
             tools = WorkspaceTools(session["workspace"], self.settings.values["env_file"],
                                    session.get("allowed_directories", []), mode == "bypassPermissions",
-                                   write_limit=write_limit_setting(self.settings.values))
+                                   write_limit=write_limit_setting(self.settings.values),
+                                   excluded_roots=(self.settings.state_dir,))
             system, guidance = self.context_inputs(session, tools, mode)
             state = session.get("context_state", {})
             definitions = state.get("tool_definitions")
@@ -2106,7 +2121,7 @@ class AgentManager:
     async def _run_databricks(self, session, prompt, external_tools):
         host, token = self.settings.credentials()
         mode = session.get("permission_mode", "manual")
-        tools = WorkspaceTools(session["workspace"], self.settings.values["env_file"], session.get("allowed_directories", []), mode == "bypassPermissions", write_limit=write_limit_setting(self.settings.values))
+        tools = WorkspaceTools(session["workspace"], self.settings.values["env_file"], session.get("allowed_directories", []), mode == "bypassPermissions", write_limit=write_limit_setting(self.settings.values), excluded_roots=(self.settings.state_dir,))
         definitions = filter_tools(session, [*TOOL_DEFINITIONS, *[tool for tool in FEATURE_TOOLS
                        if not session.get("is_subagent") or tool["function"]["name"] != "delegate_task"], *external_tools])
         for skill_id in self.requested_skills(tools, prompt):

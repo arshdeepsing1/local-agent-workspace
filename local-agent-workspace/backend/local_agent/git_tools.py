@@ -15,6 +15,7 @@ import posixpath
 import re
 import shutil
 import stat
+from pathlib import Path
 
 from .jobs import ENVIRONMENT_KEYS, discard_output, kill_group, settle
 from .tools import IGNORED, SECRET_NAMES
@@ -104,6 +105,53 @@ async def configured_filters(workspace, *, timeout=30, git=None):
     _, names, _ = await run_git(workspace, ["config", "--name-only", "-z", "--get-regexp", FILTER_KEYS],
                                 timeout=timeout, git=git)
     return [name for name in names.decode("utf-8", errors="surrogateescape").split("\0") if name]
+
+
+def find_git(env, forbidden_roots):
+    """The git program on the absolute PATH entries of env, refused when it resolves
+    to a program inside one of forbidden_roots (the project and its granted folders)."""
+    entries = [entry for entry in str((env or {}).get("PATH") or "").split(os.pathsep) if os.path.isabs(entry)]
+    found = shutil.which("git", path=os.pathsep.join(entries))
+    if not found:
+        raise ValueError("Git is not installed or not on PATH.")
+    program = Path(found).resolve()
+    if any(program.is_relative_to(Path(root).resolve()) for root in forbidden_roots):
+        raise ValueError("git resolves to a program inside the project, so it does not run automatically.")
+    return found
+
+
+# Options a read-only Git command must not carry: each can run a program or write a file.
+READ_ONLY_REFUSED = ("--ext-diff", "--textconv", "--show-signature", "--output", "--exec-path", "--git-dir",
+                     "--work-tree", "--config-env", "--open-files-in-pager", "--paginate")
+
+
+async def hardened_git_command(workspace, args, forbidden_roots, env=None):
+    """(argv, env) for a read-only Git command: status, diff, show, log, ls-files, branch
+    or rev-parse, with the programs a repository's configuration can name switched off
+    (fsmonitor, hooks, filters, textconv, external diff, signature checks), credential
+    files left out of diffs, and output limited to the workspace (the pathspec '.').
+    Git is found first, so a planted git never runs, not even for the filter query."""
+    git = find_git(env if env is not None else git_environment(), forbidden_roots)
+    if not args:
+        raise ValueError("Not a read-only Git command.")
+    sub, rest = args[0], list(args[1:])
+    if sub not in ("status", "diff", "show", "log", "ls-files", "branch", "rev-parse"):
+        raise ValueError("Not a read-only Git command.")
+    if any(token == "--" or token.startswith("-c") and not token.startswith("--")
+           or token.split("=", 1)[0] in READ_ONLY_REFUSED for token in rest):
+        raise ValueError("This Git option is not allowed in a read-only command.")
+    filters = await configured_filters(workspace, git=git)
+    paths = ["--", ".", *DIFF_EXCLUDES]
+    part = {
+        "status": [sub, "--ignore-submodules=dirty", *rest, *paths],
+        "diff": [sub, "--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty", *rest, *paths],
+        "show": [sub, "--no-ext-diff", "--no-textconv", "--no-show-signature", *rest, *paths],
+        "log": [sub, "--no-show-signature", *rest],
+        "ls-files": [sub, *rest, *paths],
+    }.get(sub, [sub, *rest])
+    argv = [git, *SAFE_OPTIONS, "-c", "log.showSignature=false", *filter_overrides(filters), "--no-optional-locks",
+            *part]
+    return argv, {**git_environment(filters), "GIT_OPTIONAL_LOCKS": "0"}
 
 
 async def working_tree_changes(workspace):
