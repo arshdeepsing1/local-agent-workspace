@@ -1044,9 +1044,9 @@ approval diff, file checkpoint, and `write_file` hooks apply (Plan mode blocks i
 Commands are copied as they ran except that the app's configured credentials and
 common secret shapes (GitHub and Databricks tokens, AWS access keys, bearer tokens,
 `password=`/`token=`-style values, and URL passwords) are replaced with `[REDACTED]`;
-review the file before sharing it. The finished file must stay within the file write
-limit (Settings, 80 KB by default): the
-oldest commands are omitted with a note when needed, so insert the log into a
+review the file before sharing it. The finished file must stay within 80 KB, or within
+the file write limit (Settings) when that is lower; a higher write limit does not raise
+this cap. The oldest commands are omitted with a note when needed, so insert the log into a
 separate file to keep every command. Delegated subagent conversations keep their own
 logs.
 

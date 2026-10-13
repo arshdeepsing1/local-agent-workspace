@@ -296,6 +296,12 @@ async def test_activity_log_reports_the_budget_of_the_current_write_limit(runtim
     output, event = await tool(manager, session, "insert_activity_log", {"path": "handoff.md"}, "log")
     assert event["state"] == "error"
     assert "too close to the 16 KB limit for an activity log" in output
+    # A raised write limit does not raise the activity log's 80 KB cap (README, Activity log).
+    manager.settings.values["write_limit_kb"] = 200
+    (project / "handoff.md").write_text("h" * 100_000)
+    await tool(manager, session, "read_file", {"path": "handoff.md"}, "read again")
+    output, event = await tool(manager, session, "insert_activity_log", {"path": "handoff.md"}, "log again")
+    assert event["state"] == "error" and "too close to the 80 KB limit for an activity log" in output
 
 
 async def test_new_files_get_the_umask_mode_and_existing_files_keep_theirs(runtime):
