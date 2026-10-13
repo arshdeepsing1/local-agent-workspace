@@ -226,11 +226,13 @@ async def test_at_most_three_messages_and_50000_characters_can_wait(runtime):
             await manager.submit_message(sid, f"message {number}")
         with pytest.raises(ValueError, match="At most 3 messages can wait. Remove one or wait for the reply."):
             await manager.submit_message(sid, "fourth")
-        session["queued_messages"] = [{"id": "big", "text": "x" * 49_999, "created": 1, "paused": True}]
+        # The blank line that joins queued messages counts: the joined text must fit one message.
+        session["queued_messages"] = [{"id": "big", "text": "x" * 49_997, "created": 1, "paused": True}]
         with pytest.raises(ValueError, match="at most 50,000 characters in total"):
             await manager.submit_message(sid, "xy")
         await manager.submit_message(sid, "y")
-        assert [len(item["text"]) for item in session["queued_messages"]] == [49_999, 1]
+        assert [len(item["text"]) for item in session["queued_messages"]] == [49_997, 1]
+        assert len("\n\n".join(item["text"] for item in session["queued_messages"])) == 50_000
         with pytest.raises(KeyError):
             await manager.remove_queued(sid, "missing")
         assert [item["text"] for item in await manager.remove_queued(sid, "big")] == ["y"]

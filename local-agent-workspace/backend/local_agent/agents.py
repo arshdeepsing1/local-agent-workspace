@@ -1562,7 +1562,8 @@ class AgentManager:
         queue = self.queue_of(session)
         if len(queue) >= MAX_QUEUED:
             raise ValueError("At most 3 messages can wait. Remove one or wait for the reply.")
-        if sum(len(item.get("text", "")) for item in queue) + len(text) > MAX_QUEUED_CHARS:
+        # Counted as they are sent: joined with a blank line, the limit of a resent message.
+        if sum(len(item.get("text", "")) + 2 for item in queue) + len(text) > MAX_QUEUED_CHARS:
             raise ValueError("Queued messages can contain at most 50,000 characters in total.")
         tools = self.session_tools(session)
         mentions.expand_context(self, session, tools, text, include_pending=False)

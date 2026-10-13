@@ -4,6 +4,39 @@ Notable changes to Local Agent Workspace, newest first. Dates are UTC.
 
 ## Unreleased
 
+Roadmap milestone M4 (conversation control and history):
+
+- Edit, retry and rewind: **Edit message** replaces a message and everything after it (and can
+  undo the agent's file edits from that message on), **Retry response** sends the latest
+  message again, and **Rewind to here** offers **Conversation and code**, **Conversation only**
+  or **Code only**, listing each file it would restore and refusing when a file changed since.
+  The earlier version is kept as an archived `(before rewind)` copy, linked from a notice above
+  the message box. **Fork from here** opens a new chat up to a reply, optionally in a new Git
+  worktree; **New chat in worktree** on the welcome screen does the same for a new chat. All of
+  them need an idle chat.
+- **Stop** keeps the reply's partial text in the model history with a marker saying you stopped
+  it, so the next message knows what was cut short; a server restart marks it the same way.
+- Messages while the agent works: **Queue message** keeps up to 3 messages (50,000 characters in
+  total). They reach the agent at the next step boundary as part of the same turn, or as the
+  next turn after the final reply; after Stop or an error they wait until **Send queued
+  messages**. Queued messages are saved with the chat.
+- `@path` (and `@path:10-40`) attaches a redacted snapshot of a project file, read with the
+  chat's own file access; `!command` runs one shell command as a user action and attaches its
+  output to your next message; `/btw <question>` asks a side question about the conversation
+  without adding to it (billed, listed as **Side question** in the usage panel).
+- Change review: a subagent's edits also show in its parent's changes bar, marked
+  **Subagent**. Files a foreground `run_command` (Verify included) created, changed or deleted
+  in a Git repository of the project, a granted folder or a folder added to Files are listed
+  with a **Command** mark and can be kept or undone. **Automatic Keep** (Settings, off by
+  default) keeps a completed reply's changes. **Line comments** in a file's review are sent
+  together as one message.
+- Sidebar: **Pin**, **Archive** and **Edit tags…** from a row's **More actions**, a tag filter,
+  an amber dot for chats with unreviewed changes, and **Search conversations** that also
+  searches message text (redacted excerpts, bounded at 64 MiB or 3 seconds, no index).
+- Long chats open with their latest 200 messages (extended to the whole latest turn) and
+  **Load earlier messages** loads more. After a clean shutdown the app starts by reading only
+  each conversation's header line.
+
 Roadmap milestone M3 (permission rules, plan hand-off, questions):
 
 - Permission rules: **Always allow…** on an approval card saves a rule for this chat, this
