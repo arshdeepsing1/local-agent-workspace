@@ -1,4 +1,4 @@
-import { html, useState } from '../lib.js'
+import { html, useLayoutEffect, useRef, useState } from '../lib.js'
 
 // Custom instructions (Settings) and the skill index are not files with a folder scope.
 const WIDE_SCOPES = ['all projects', 'this workspace']
@@ -51,6 +51,18 @@ export default function ContextMeter({ info, model, busy = false, onCompact }) {
   const [note, setNote] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
+  // The open details float above the meter: a pointer press or focus outside closes them without moving focus.
+  const details = useRef(null)
+  const [open, setOpen] = useState(false)
+  // The summary's click sets the state before the toggle event (input can run ahead of that event), and a layout
+  // effect adds the listeners at once.
+  useLayoutEffect(() => {
+    if (!open) return
+    const outside = event => { if (details.current && !details.current.contains(event.target)) details.current.open = false }
+    document.addEventListener('pointerdown', outside)
+    document.addEventListener('focusin', outside)
+    return () => { document.removeEventListener('pointerdown', outside); document.removeEventListener('focusin', outside) }
+  }, [open])
   if (!info) return html`<p class="context-empty">Context usage is estimated after the first turn.</p>`
   const legacyEstimate = info.estimate_method === 'conservative_utf8'
   const percent = Math.round(info.estimated_tokens / info.input_budget * 100)
@@ -82,8 +94,14 @@ export default function ContextMeter({ info, model, busy = false, onCompact }) {
   // A calibration report replaced the starting ratio the shown estimate used (a cancelled or partial
   // request, or a small one, does not).
   const priorReplaced = reportedIsCurrent && typeof report.next_estimate_scale === 'number' && report.next_estimate_scale !== info.estimate_scale
-  return html`<details class="context-meter">
-    <summary>
+  return html`<details class="context-meter" ref=${details} onToggle=${event => setOpen(event.currentTarget.open)}
+    onKeyDown=${event => {
+      if (event.key !== 'Escape' || event.isComposing || !details.current?.open) return
+      event.preventDefault()
+      details.current.open = false
+      details.current.querySelector('summary')?.focus()
+    }}>
+    <summary onClick=${() => setOpen(!details.current?.open)}>
       <span>${reportedIsCurrent
         ? `Last model input · ${report.input_tokens.toLocaleString()} tokens · ${report.percent_of_input_budget}%${report.partial ? ' (partial)' : ''}`
         : `${info.prepared_for_next_turn ? 'Context preview' : setupChanged ? 'Next request' : 'Last model input'} · ${legacyEstimate ? 'estimate outdated' : `~${estimated}%`}`}</span>

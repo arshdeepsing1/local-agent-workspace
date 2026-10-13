@@ -795,3 +795,13 @@ def test_a_busy_card_with_edit_and_always_allow_open_fits_a_phone(ui, page):
         box = button.bounding_box()
         if box:
             assert box["x"] + box["width"] <= 390, box
+
+
+@pytest.mark.parametrize("width,height", [(1440, 900), (360, 740)])
+def test_menu_shows_every_mode(ui, page, width, height):
+    page.set_viewport_size({"width": width, "height": height})
+    menu = open_menu(ui, page)
+    expect(menu).to_be_visible()
+    expect(mode_item(page, "Bypass permissions")).to_be_in_viewport(ratio=1)
+    expect(page.get_by_role("menuitem", name="Add a rule…")).to_be_in_viewport(ratio=1)
+    assert menu.bounding_box()["y"] >= ui.js("document.querySelector('.topbar').getBoundingClientRect().bottom")

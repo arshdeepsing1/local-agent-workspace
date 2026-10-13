@@ -160,6 +160,8 @@ def test_keyboard_pin_and_archive_keep_focus_on_the_moved_chat(ui, page):
     start(ui, page, sessions(("a", "First chat", {}), ("b", "Second chat", {})))
     page.get_by_role("button", name="More actions for Second chat").focus()
     page.keyboard.press("Enter")
+    expect(page.get_by_role("menuitem", name="Rename", exact=True)).to_be_focused()
+    page.keyboard.press("ArrowDown")
     expect(page.get_by_role("menuitem", name="Pin", exact=True)).to_be_focused()
     page.keyboard.press("Enter")
     pinned = page.get_by_role("region", name="Pinned")
@@ -167,13 +169,15 @@ def test_keyboard_pin_and_archive_keep_focus_on_the_moved_chat(ui, page):
     # Archive hides the chat: focus goes to the Archived toggle.
     page.keyboard.press("Enter")
     page.keyboard.press("ArrowDown")
+    page.keyboard.press("ArrowDown")
     expect(page.get_by_role("menuitem", name="Archive", exact=True)).to_be_focused()
     page.keyboard.press("Enter")
     expect(page.get_by_role("button", name="Archived (1)")).to_be_focused()
     page.keyboard.press("Enter")
     page.get_by_role("region", name="Archived").get_by_role("button", name="More actions for Second chat").focus()
     page.keyboard.press("Enter")
-    page.keyboard.press("Enter")  # Unarchive, the first item of an archived chat's menu.
+    page.keyboard.press("ArrowDown")
+    page.keyboard.press("Enter")  # Unarchive, the item after Rename in an archived chat's menu.
     expect(page.get_by_role("region", name="Pinned").get_by_role("button", name="More actions for Second chat")).to_be_focused()
 
 
@@ -183,17 +187,19 @@ def test_the_row_menu_works_with_the_keyboard(ui, page):
     trigger.focus()
     page.keyboard.press("Enter")
     item = lambda name: page.get_by_role("menuitem", name=name, exact=True)
+    expect(item("Rename")).to_be_focused()
+    page.keyboard.press("ArrowDown")
     expect(item("Pin")).to_be_focused()
     page.keyboard.press("ArrowDown")
     expect(item("Archive")).to_be_focused()
     page.keyboard.press("End")
-    expect(item("Edit tags…")).to_be_focused()
+    expect(item("Delete…")).to_be_focused()
     page.keyboard.press("ArrowDown")
-    expect(item("Pin")).to_be_focused()
+    expect(item("Rename")).to_be_focused()
     page.keyboard.press("ArrowUp")
-    expect(item("Edit tags…")).to_be_focused()
+    expect(item("Delete…")).to_be_focused()
     page.keyboard.press("Home")
-    expect(item("Pin")).to_be_focused()
+    expect(item("Rename")).to_be_focused()
     page.keyboard.press("Escape")
     expect(page.get_by_role("menu")).to_have_count(0)
     expect(trigger).to_be_focused()
@@ -390,7 +396,7 @@ def test_a_truncated_search_says_so(ui, page):
 def test_deleting_a_chat_with_subagents_asks_what_to_do(ui, page):
     start(ui, page, sessions(("p", "Parent task", {}), ("c", "Child task", {"parent_session_id": "p", "is_subagent": True}),
                              ("q", "Second parent", {}), ("d", "Child two", {"parent_session_id": "q", "is_subagent": True})))
-    page.get_by_role("button", name="Delete Parent task").click()
+    ui.row_action("Parent task", "Delete…")
     dialog = page.get_by_role("dialog", name="Delete conversation")
     expect(dialog).to_contain_text("Delete “Parent task”? It has 1 subagent conversation. Your project files will remain.")
     assert ui.js("fake.confirms") == []
@@ -398,19 +404,19 @@ def test_deleting_a_chat_with_subagents_asks_what_to_do(ui, page):
     expect(dialog).to_have_count(0)
     assert paths(ui, "/^\\/api\\/sessions\\/p/", "DELETE") == ["/api/sessions/p?children=delete"]
 
-    page.get_by_role("button", name="Delete Second parent").click()
+    ui.row_action("Second parent", "Delete…")
     page.get_by_role("dialog", name="Delete conversation").get_by_role("button", name="Delete, keep subagents").click()
     assert paths(ui, "/^\\/api\\/sessions\\/q/", "DELETE") == ["/api/sessions/q"]
 
     expect(row(page, "Child task")).to_be_visible()
-    page.get_by_role("button", name="Delete Child task").click()  # No subagents: the usual question.
+    ui.row_action("Child task", "Delete…")  # No subagents: the usual question.
     assert ui.js("fake.confirms") == ["Delete this conversation? Your project files will remain."]
     assert paths(ui, "/^\\/api\\/sessions\\/c/", "DELETE") == ["/api/sessions/c"]
 
 
 def test_cancel_keeps_the_chat(ui, page):
     start(ui, page, sessions(("p", "Parent task", {}), ("c", "Child task", {"parent_session_id": "p"})))
-    page.get_by_role("button", name="Delete Parent task").click()
+    ui.row_action("Parent task", "Delete…")
     page.get_by_role("dialog", name="Delete conversation").get_by_role("button", name="Cancel").click()
     expect(page.get_by_role("dialog", name="Delete conversation")).to_have_count(0)
     assert paths(ui, "/^\\/api\\/sessions\\/p/", "DELETE") == []
@@ -441,3 +447,131 @@ def test_five_hundred_chats_render_and_filter_quickly(ui, page):
     page.get_by_role("searchbox", name="Search conversations").fill("")
     page.get_by_role("button", name="Show 450 more").click()
     expect(page.locator(".conversation-row")).to_have_count(500)
+
+
+# Rows: one More actions button, full-width titles, an ID only for repeated titles, a menu that stays in the list
+
+LONG = "Refactor the authentication middleware so that expired sessions redirect to the login page"
+
+
+def start_touch(coarse_ui, coarse_page, setup=""):
+    page = coarse_page
+    assert page.evaluate("matchMedia('(pointer: coarse)').matches") and page.evaluate("matchMedia('(hover: none)').matches")
+    start(coarse_ui, page, setup)
+    page.get_by_role("button", name="Open sidebar").click()
+    expect(row(page, LONG)).to_be_visible()
+
+
+def name_fills_the_row(page, title):
+    widths = row(page, title).evaluate("b => [b.querySelector('.conversation-name').getBoundingClientRect().width, b.parentElement.getBoundingClientRect().width]")
+    assert widths[0] >= widths[1] - 60, widths
+
+
+def check_rows(page):
+    name_fills_the_row(page, LONG)
+    badge = row(page, "Waiting chat").locator(".row-badge")
+    expect(badge).to_have_text("Needs approval")
+    assert badge.evaluate("e => e.scrollWidth <= e.clientWidth")
+
+
+ROWS = sessions(("l", LONG, {}), ("w", "Waiting chat", {"status": "awaiting_approval"}), ("s", "Short", {}))
+
+
+def test_titles_use_the_row(ui, page):
+    start(ui, page, ROWS)
+    page.mouse.move(900, 450)  # Not over a row.
+    check_rows(page)
+    # Hovered, the row makes room for its More actions button.
+    row(page, LONG).hover()
+    expect(page.get_by_role("button", name=f"More actions for {LONG}")).to_have_css("opacity", "1")
+
+
+def test_titles_use_the_row_on_touch_screens(coarse_ui, coarse_page):
+    page = coarse_page
+    start_touch(coarse_ui, page, ROWS)
+    check_rows(page)
+    for title in (LONG, "Waiting chat", "Short"):
+        visible = row(page, title).evaluate("b => [...b.parentElement.querySelectorAll('button')].filter(e => e.checkVisibility({ opacityProperty: true }) && e.getBoundingClientRect().width > 0).length")
+        assert visible == 2, (title, visible)  # The row's own button and More actions.
+
+
+def test_session_id_only_for_repeated_titles(ui, page):
+    start(ui, page, sessions(("1f8fbf16-aaaa", "Fix login redirect", {}), ("2c9d0e1f-bbbb", "Fix login redirect", {}),
+                             ("3d0e1f20-cccc", "Unique title", {})))
+    ids = page.locator(".conversation-row .session-id")
+    expect(ids).to_have_text([" · 1f8fbf16", " · 2c9d0e1f"])
+    expect(row(page, "Unique title").locator(".session-id")).to_have_count(0)
+    expect(row(page, "Unique title")).to_have_attribute("title", "Unique title\nSession: 3d0e1f20-cccc")
+
+
+def test_more_actions_lists_every_action(ui, page):
+    start(ui, page, sessions(("p", "Parent task", {}), ("c", "Child task", {"parent_session_id": "p"}),
+                             ("o", "Old chat", {"archived": True}), ("s", "Single chat", {})))
+    items = lambda title: page.get_by_role("menu", name=f"Actions for {title}").get_by_role("menuitem")
+    trigger = page.get_by_role("button", name="More actions for Single chat")
+    trigger.click()
+    expect(items("Single chat")).to_have_text(["Rename", "Pin", "Archive", "Edit tags…", "Delete…"])
+    page.keyboard.press("Escape")
+    page.get_by_role("button", name="Archived (1)").click()
+    page.get_by_role("button", name="More actions for Old chat").click()
+    expect(items("Old chat")).to_have_text(["Rename", "Unarchive", "Edit tags…", "Delete…"])
+    page.keyboard.press("Escape")
+    # Rename opens the form; Escape returns focus to More actions.
+    ui.row_action("Single chat", "Rename")
+    field = page.get_by_role("textbox", name="Conversation name")
+    expect(field).to_be_focused()
+    expect(field).to_have_value("Single chat")
+    field.press("Escape")
+    expect(trigger).to_be_focused()
+    # Edit tags… returns focus the same way.
+    ui.row_action("Single chat", "Edit tags…")
+    page.get_by_role("textbox", name="Tags (comma-separated)").press("Escape")
+    expect(trigger).to_be_focused()
+    # Delete… on a parent asks in the Delete conversation dialog; without subagents it is the usual question.
+    ui.row_action("Parent task", "Delete…")
+    dialog = page.get_by_role("dialog", name="Delete conversation")
+    expect(dialog).to_be_visible()
+    dialog.get_by_role("button", name="Cancel").click()
+    ui.run("fake.confirmAnswer = false")
+    ui.row_action("Single chat", "Delete…")
+    assert ui.js("fake.confirms") == ["Delete this conversation? Your project files will remain."]
+    expect(trigger).to_be_focused()
+    assert ui.requests("/api/sessions/s", "DELETE") == []
+
+
+MANY_ROWS = sessions(*[(f"r{n:02d}", f"Row chat {n:02d}", {"updated": 100 - n}) for n in range(24)])
+
+
+def menu_inside_the_list(ui, page):
+    ui.run("const list = document.querySelector('.conversation-list'); list.scrollTop = list.scrollHeight")
+    last = ui.js("""(() => {
+      const list = document.querySelector('.conversation-list').getBoundingClientRect()
+      const rows = [...document.querySelectorAll('.conversation-row')].filter(r => { const b = r.getBoundingClientRect(); return b.top >= list.top && b.bottom <= list.bottom })
+      return rows.at(-1).querySelector('button').title.split('\\n')[0]
+    })()""")
+    button = page.get_by_role("button", name=f"More actions for {last}", exact=True)
+    button.hover()
+    button.click()
+    menu = page.get_by_role("menu", name=f"Actions for {last}", exact=True)
+    expect(menu.get_by_role("menuitem")).to_have_count(5)
+    expect(menu.get_by_role("menuitem").first).to_be_focused()
+    outside = ui.js("""(() => {
+      const list = document.querySelector('.conversation-list').getBoundingClientRect()
+      return [...document.querySelectorAll('.row-menu [role=menuitem]')].map(item => item.getBoundingClientRect())
+        .filter(b => b.top < list.top - 0.5 || b.bottom > list.bottom + 0.5 || b.left < list.left - 0.5 || b.right > list.right + 0.5).length
+    })()""")
+    assert outside == 0
+
+
+def test_row_menu_stays_inside_the_list(ui, page):
+    start(ui, page, MANY_ROWS)
+    expect(page.locator(".conversation-row")).to_have_count(24)
+    menu_inside_the_list(ui, page)
+
+
+def test_row_menu_stays_inside_the_list_on_a_phone(ui, page):
+    page.set_viewport_size({"width": 390, "height": 844})
+    start(ui, page, MANY_ROWS)
+    page.get_by_role("button", name="Open sidebar").click()
+    expect(page.locator(".conversation-row")).to_have_count(24)
+    menu_inside_the_list(ui, page)

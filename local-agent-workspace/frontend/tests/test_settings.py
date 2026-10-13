@@ -2,6 +2,7 @@
 commands, and continuing after rate limits."""
 import re
 
+import pytest
 from playwright.sync_api import expect
 
 
@@ -143,3 +144,32 @@ def test_a_saved_auto_compact_value_is_shown(ui, page):
     dialog = open_settings(ui, page, setup="fake.settings = { ...fake.settings, auto_compact_percent: 100 }")
     expect(dialog.get_by_role("spinbutton", name="Auto-compact at (% of input budget)")).to_have_value("100")
     expect(dialog.get_by_text(re.compile(r"that is about 120,832 tokens"))).to_be_visible()
+
+
+# Layout: a named dialog, grouped fields and a Save button that stays in view
+
+@pytest.mark.parametrize("width,height", [(1280, 900), (390, 844)])
+def test_save_is_always_visible(ui, page, width, height):
+    page.set_viewport_size({"width": width, "height": height})
+    ui.app(scenario="workspace")
+    expect(page.get_by_role("combobox", name="Model")).to_have_value("test-model")
+    if width <= 600:
+        page.get_by_role("button", name="Open sidebar").click()
+    page.get_by_role("button", name="Settings", exact=True).click()
+    dialog = page.get_by_role("dialog", name="Settings")
+    expect(dialog).to_be_visible()
+    expect(dialog).to_have_accessible_description("Configure your local workspace.")
+    save = dialog.get_by_role("button", name="Save settings")
+    expect(save).to_be_in_viewport(ratio=1)
+    for top in ("dialog.scrollHeight", "0"):
+        ui.run(f"const dialog = document.querySelector('.settings-dialog'); dialog.scrollTop = {top}")
+        expect(save).to_be_in_viewport(ratio=1)
+        expect(dialog.get_by_role("button", name="Cancel", exact=True)).to_be_in_viewport(ratio=1)
+    assert ui.js("(d => d.scrollHeight > d.clientHeight)(document.querySelector('.settings-dialog'))")  # It does scroll.
+    expect(dialog.get_by_role("textbox", name="Custom instructions")).to_have_css("border-radius", "8px")
+    expect(dialog.get_by_role("group", name="Model and context").get_by_role("spinbutton", name="Context budget (tokens)")).to_be_visible()
+    expect(dialog.get_by_role("group", name="Project").get_by_role("textbox", name="Project folder")).to_be_visible()
+    groups = dialog.get_by_role("group")
+    expect(groups).to_have_count(6)
+    assert [groups.nth(n).locator("legend").inner_text() for n in range(6)] == [
+        "Project", "Model and context", "Agent", "Commands and files", "Notifications", "Credentials"]

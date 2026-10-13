@@ -1,7 +1,7 @@
-import { html, useAutoFocus, useEffect, useMemo, useRef, useState } from '../lib.js'
+import { html, useAutoFocus, useEffect, useLayoutEffect, useMemo, useRef, useState } from '../lib.js'
 import {
-  ArrowLeftRight, Bell, BellOff, ChevronDown, ChevronRight, Code2, Ellipsis, Folder, GitBranch, Pencil, Pin, Plus,
-  Search, Settings as SettingsIcon, Trash2, X,
+  ArrowLeftRight, Bell, BellOff, ChevronDown, ChevronRight, Code2, Ellipsis, Folder, GitBranch, Pin, Plus,
+  Search, Settings as SettingsIcon, X,
 } from '../icons.js'
 import DeleteConversationDialog from './DeleteConversationDialog.js'
 
@@ -116,16 +116,25 @@ function TagsForm({ session, onSave, onCancel }) {
   </form>`
 }
 
-// Pin, archive and tags of one chat. onMoved(id) runs once a pin or archive change is saved,
-// since the row then moves to another section.
-function RowMenu({ session, onMeta, onEditTags, onError, onMoved }) {
+// Rename, pin, archive, tags and delete of one chat. onMoved(id) runs once a pin or archive change is
+// saved, since the row then moves to another section.
+function RowMenu({ session, onMeta, onRename, onEditTags, onDelete, onError, onMoved }) {
   const [open, setOpen] = useState(false)
   const root = useRef(null)
   const button = useRef(null)
   const menu = useRef(null)
+  // A row near the bottom of the list opens its menu upwards, so every item stays inside the list.
+  useLayoutEffect(() => {
+    if (!open || !menu.current || !button.current) return
+    const list = root.current?.closest('.conversation-list')?.getBoundingClientRect()
+    const anchor = button.current.getBoundingClientRect()
+    const up = !!list && list.bottom - anchor.bottom < menu.current.offsetHeight + 4 && anchor.top - list.top > list.bottom - anchor.bottom
+    menu.current.classList.toggle('up', up)
+    menu.current.scrollIntoView({ block: 'nearest' })
+  }, [open])
   useEffect(() => {
     if (!open) return
-    menu.current?.querySelector('[role="menuitem"]')?.focus()
+    menu.current?.querySelector('[role="menuitem"]')?.focus({ preventScroll: true })
     const outside = event => { if (!root.current?.contains(event.target)) setOpen(false) }
     document.addEventListener('pointerdown', outside)
     document.addEventListener('focusin', outside)
@@ -152,9 +161,11 @@ function RowMenu({ session, onMeta, onEditTags, onError, onMoved }) {
     <button ref=${button} class="row-more" aria-label=${`More actions for ${session.title}`} title="More actions"
       aria-haspopup="menu" aria-expanded=${open} onClick=${() => setOpen(value => !value)}><${Ellipsis} size=${14} /></button>
     ${open ? html`<div class="row-menu" role="menu" aria-label=${`Actions for ${session.title}`} ref=${menu}>
+      <button role="menuitem" onClick=${() => { setOpen(false); onRename() }}>Rename</button>
       ${!session.archived ? html`<button role="menuitem" onClick=${() => act({ pinned: !session.pinned })}>${session.pinned ? 'Unpin' : 'Pin'}</button>` : null}
       <button role="menuitem" onClick=${() => act({ archived: !session.archived })}>${session.archived ? 'Unarchive' : 'Archive'}</button>
       <button role="menuitem" onClick=${() => { setOpen(false); onEditTags() }}>Edit tags…</button>
+      <button role="menuitem" class="danger" onClick=${() => { setOpen(false); button.current?.focus(); onDelete() }}>Delete…</button>
     </div>` : null}
   </div>`
 }
@@ -172,16 +183,17 @@ function RowStatus({ session, unread, failed }) {
   return changed
 }
 
-function ConversationRow({ session, selected, unread, failed, childCount, onSelect, onDelete, onAskDelete, onRename, onMeta, onMoved, onTag, onError }) {
+function ConversationRow({ session, selected, unread, failed, showId, childCount, onSelect, onDelete, onAskDelete, onRename, onMeta, onMoved, onTag, onError }) {
   const [editing, setEditing] = useState(null)  // null | 'title' | 'tags'
   const [title, setTitle] = useState('')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
-  const renameButton = useRef(null)
+  const rowRef = useRef(null)
   const restoreFocus = useRef(false)
+  // After a rename or tag edit, focus returns to the row's More actions button.
   useEffect(() => {
     if (!editing && restoreFocus.current) {
-      renameButton.current?.focus()
+      rowRef.current?.querySelector('.row-more')?.focus()
       restoreFocus.current = false
     }
   }, [editing])
@@ -195,21 +207,17 @@ function ConversationRow({ session, selected, unread, failed, childCount, onSele
   }
   const branch = typeof session.worktree?.branch === 'string' ? session.worktree.branch : ''
   const tags = tagsOf(session)
-  return html`<div class=${`conversation-row ${selected ? 'selected' : ''}`} data-session-id=${session.id}>
+  return html`<div ref=${rowRef} class=${`conversation-row ${selected ? 'selected' : ''}`} data-session-id=${session.id}>
     ${editing === 'title' ? html`<${RenameForm} session=${session} title=${title} saving=${saving} error=${error}
       setTitle=${value => { setTitle(value); setError('') }} onSave=${() => void save()} onCancel=${finish} />`
     : editing === 'tags' ? html`<${TagsForm} session=${session} onSave=${tags => onMeta(session.id, { tags })} onCancel=${finish} />` : html`
       <button onClick=${onSelect} title=${`${session.title}\nSession: ${session.id}`} aria-current=${selected ? 'page' : undefined}>
-        ${session.status !== 'idle' && session.status !== 'awaiting_approval' ? html`<span class="activity-dot" aria-hidden="true" title=${ACTIVITY[session.status] || 'Working'} />` : null}<span class="conversation-name">${session.title}<small class="session-id"> · ${session.id.slice(0, 8)}</small></span>
+        ${session.status !== 'idle' && session.status !== 'awaiting_approval' ? html`<span class="activity-dot" aria-hidden="true" title=${ACTIVITY[session.status] || 'Working'} />` : null}<span class="conversation-name">${session.title}${showId ? html`<small class="session-id"> · ${session.id.slice(0, 8)}</small>` : null}</span>
         <${RowStatus} session=${session} unread=${unread} failed=${failed} />
       </button>
-      <button ref=${renameButton} class="rename-session" aria-label=${`Rename ${session.title}`} title="Rename conversation"
-        onClick=${() => { setTitle(session.title); setError(''); setEditing('title') }}><${Pencil} size=${14} /></button>
-      <${RowMenu} session=${session} onMeta=${onMeta} onError=${onError} onMoved=${onMoved} onEditTags=${() => setEditing('tags')} />
-      <button class="delete-session" aria-label=${`Delete ${session.title}`} onClick=${() => {
-        if (childCount > 0) onAskDelete()
-        else if (confirm('Delete this conversation? Your project files will remain.')) onDelete()
-      }}><${Trash2} size=${14} /></button>`}
+      <${RowMenu} session=${session} onMeta=${onMeta} onError=${onError} onMoved=${onMoved} onEditTags=${() => setEditing('tags')}
+        onRename=${() => { setTitle(session.title); setError(''); setEditing('title') }}
+        onDelete=${() => { if (childCount > 0) onAskDelete(); else if (confirm('Delete this conversation? Your project files will remain.')) onDelete() }} />`}
   </div>
   ${!editing && (branch || tags.length) ? html`<div class="row-tags">
     ${branch ? html`<span class="branch-badge" title=${`Worktree branch ${branch}`}><${GitBranch} size=${11} /><span>${branch}</span></span>` : null}
@@ -303,8 +311,15 @@ export default function Sidebar(props) {
     target?.focus()
   }, [moved])
 
+  // Titles used by more than one chat: their rows show a short session ID.
+  const repeated = useMemo(() => {
+    const seen = new Set()
+    const twice = new Set()
+    for (const session of props.sessions) (seen.has(session.title) ? twice : seen).add(session.title)
+    return twice
+  }, [props.sessions])
   const select = id => { props.onSelect(id); props.close() }
-  const row = session => html`<${ConversationRow} key=${session.id} session=${session} selected=${props.activeId === session.id}
+  const row = session => html`<${ConversationRow} key=${session.id} session=${session} selected=${props.activeId === session.id} showId=${repeated.has(session.title)}
     unread=${!!props.attention?.unread(session)} failed=${!!props.attention?.failed(session)}
     childCount=${tree.childCount.get(session.id) || 0} onSelect=${() => select(session.id)}
     onDelete=${() => props.onDelete(session.id)} onAskDelete=${() => setDeleting({ session, children: tree.childCount.get(session.id) || 0 })}

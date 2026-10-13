@@ -13,6 +13,13 @@ export function messageKind(text) {
 }
 const clip = (text, limit) => text.length > limit ? `${text.slice(0, limit - 1)}…` : text
 
+// A chip shows the file name in full and shortens its folder first.
+function chipLabel(item) {
+  const label = mentionLabel(item)
+  const slash = label.lastIndexOf('/')
+  return html`<span class="mention-label">${slash > 0 ? html`<span class="mention-dir">${label.slice(0, slash + 1)}</span>` : null}<span class="mention-base">${label.slice(slash + 1)}</span></span>`
+}
+
 // Props: value, setValue, model, models, busy, disabled, modelSaving, onModel, workspace,
 // worktree (Session.worktree of an app-managed worktree chat: the chip names its project and branch),
 // mode, onMode, onProject, onFolders, onSend, onStop, onAttach, onError, loadSkills,
@@ -85,7 +92,7 @@ export default function Composer(p) {
     </div>
     ${mentions.length || pending.length ? html`<div class="mention-chips">
       ${pending.map((item, index) => html`<span class="mention-chip shell-chip" key=${`shell-${index}`}><${Terminal} size=${13} />Output of ! ${clip(item.command || '', 40)} (exit ${item.exit_code ?? '?'}) goes with your next message</span>`)}
-      ${mentions.map(item => html`<span class="mention-chip" key=${item.token} title="A snapshot is attached when you send (files only)">${mentionLabel(item)}
+      ${mentions.map(item => html`<span class="mention-chip" key=${item.token} title=${`${mentionLabel(item)}\nA snapshot is attached when you send (files only)`}>${chipLabel(item)}
         <button class="icon-button" aria-label=${`Remove @${item.path}`} onClick=${() => { p.setValue(current => removeMention(current, item.token)); input.current?.focus() }}><${X} size=${12} /></button></span>`)}
     </div>` : null}
     <div class="composer">

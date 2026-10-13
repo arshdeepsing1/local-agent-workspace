@@ -246,7 +246,9 @@ when opening a conversation or performing restart recovery.
   first message creates a unique session, even if another chat has the same title.
   Select a sidebar conversation to resume it. Each saved chat has a `?session=<uuid>`
   URL, which preserves that selection on refresh and supports browser Back/Forward.
-  The header and sidebar show a short session ID to distinguish repeated titles.
+  The header shows a short session ID when there is room; hover the title for the full title
+  and ID. The sidebar shows the ID after a title that several conversations share. In a narrow
+  window **Agent tools** and **Workspace** show only their icons.
   Drafts stay with their conversation while switching chats and are saved in this
   browser's `localStorage` about half a second after you stop typing (and when the page
   closes), so they survive a reload; the new-conversation view keeps its own draft, which
@@ -286,9 +288,9 @@ when opening a conversation or performing restart recovery.
   - **Subagents**: a subagent chat is listed under its parent behind **Show N subagents**,
     which opens by itself while a subagent is working. A subagent whose parent was deleted
     or is not listed is a chat of its own.
-  - **Pin, archive and tags**: **More actions** (`…`) on a row offers **Pin**, **Archive** and
-    **Edit tags…** (comma-separated, 1 to 32 characters each, at most 10; tags that differ only
-    in case count as one). Pinned chats are listed under **Pinned** above the projects.
+  - **Pin, archive and tags**: **More actions** (`…`) on a row offers **Rename**, **Pin**,
+    **Archive**, **Edit tags…** and **Delete…**. Tags are comma-separated, 1 to 32 characters
+    each, at most 10; tags that differ only in case count as one. Pinned chats are listed under **Pinned** above the projects.
     Archived chats are hidden, also when pinned; **Archived (N)** at the end of the list
     shows them, and **Unarchive** brings one back. Click a tag on a row to show only chats
     with that tag; **Clear tag filter** shows all again. Pinning, archiving and tagging do not
@@ -360,7 +362,8 @@ when opening a conversation or performing restart recovery.
 - **Files in a message (`@`)**: type `@` to pick a project file (↑/↓, Enter or Tab inserts
   `@<path> `, Esc closes); `@src/app.py:10-40` or `@src/app.py#L10-L40` names lines. The menu
   leaves out files whose paths an `@` token cannot spell (spaces, quotes, `<>|@` or a backtick in
-  the path, or a trailing punctuation mark). Chips above the box show the mentions. When the
+  the path, or a trailing punctuation mark). Chips above the box show the mentions. A long path is
+  shortened from the folder side; hover a chip for the full path. When the
   message is sent, the app attaches a snapshot of each mentioned file that exists: up to 1,000
   lines of a range, or the first 200 lines of a whole file, at most 8,000 characters per file, 5
   files and 32,000 characters per message. The agent receives them fenced as data after your text;
@@ -403,14 +406,17 @@ when opening a conversation or performing restart recovery.
   it, the temporary title stays and naming can retry after a later successful reply.
   Older automatically named chats are eligible when resumed; custom and worktree
   titles are preserved.
-  Use the pencil beside a sidebar conversation to rename it (up to 160 characters).
-  **Save name** or Enter saves; **Cancel rename** or Escape discards the edit.
+  Choose **More actions** (`…`) → **Rename** on a sidebar conversation to rename it (up to 160
+  characters). **Save name** or Enter saves; **Cancel rename** or Escape discards the edit.
+  Focus returns to **More actions**.
   Renaming also works during a response and does not change its history, model,
   permissions, or selected conversation. Manual titles persist after restart and
   are never replaced by automatic naming, including a title request already in flight.
 - **Workspace / Files**: browse a folder, edit UTF-8 text files up to the file write limit
   (Settings, 80 KB by default), or use the plus button to reference the file in chat ("Please read the project file: <path>", or
-  "Please read the file: <absolute path>" for a folder outside the project). When the
+  "Please read the file: <absolute path>" for a folder outside the project). On windows narrower
+  than 1,024 px the Workspace panel opens over the chat: focus moves into it, and **Close
+  workspace**, Escape or a click outside it closes it (that first click only closes the panel). When the
   conversation has granted folders (**Folder access**) or you added folders to Files, a row of
   folder buttons at the top switches between **Project**, each granted folder ("Allowed in this
   chat") and each added folder ("Added to Files"). Such a folder is shown by absolute paths and
@@ -715,7 +721,7 @@ when opening a conversation or performing restart recovery.
   jobs continue; stop them individually in Terminal. Approved writes and completed
   shell side effects are retained. Stop also cancels its active subagent. Deleting a
   conversation removes its jobs, tasks, and file checkpoint copies; edited files stay
-  on disk. Deleting a chat that has subagent chats asks first: **Delete with subagents**
+  on disk. Delete a chat with **More actions** → **Delete…**; one that has subagent chats asks first: **Delete with subagents**
   deletes them too (at every depth, each stopped first), and **Delete, keep subagents** keeps
   them as chats of their own (the API default, `DELETE /api/sessions/<id>?children=keep`);
   a subagent turn the deletion stopped is recorded as stopped.
@@ -1331,6 +1337,10 @@ additional model inference and can be cancelled with **Stop**. It does not run
 tools, connect MCP servers, or rewrite the archived conversation. The resulting
 **Context preview** uses the last saved tool definitions (built-ins only for
 older sessions without that snapshot); definitions may change on the next turn.
+The details open above the meter; Escape, a click elsewhere or moving focus away closes them.
+
+**Settings** groups its fields under Project, Model and context, Agent, Commands and files,
+Notifications and Credentials; **Save settings** stays at the bottom while you scroll.
 
 **Settings → Custom instructions** (up to 8,000 characters) are your own instructions for
 every conversation in every project, subagents included. The system message places them

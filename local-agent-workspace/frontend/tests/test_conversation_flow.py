@@ -233,21 +233,20 @@ def test_open_changes_and_tasks_keep_the_message_box_on_screen(ui, page, width, 
         assert transcript[0] >= 0 and transcript[1] >= 56, transcript
 
     on_screen()
-    if meter:  # The open meter scrolls, so the wheel brings Compact now into view.
-        details = page.locator(".context-details").bounding_box()
-        page.mouse.move(details["x"] + 20, details["y"] + 5)
-        for _ in range(20):
-            page.mouse.wheel(0, 200)
-        expect(compact).to_be_in_viewport(ratio=1)
-        on_screen()
-        ui.run("for (const e of document.querySelectorAll('.context-meter, .context-details')) e.scrollTop = 0")
-        if height < 600:  # Out of view again, for the keyboard check below.
-            expect(compact).not_to_be_in_viewport(ratio=1)
+    if meter:  # The open details are a popover above the meter: on screen, one scroller, the meter itself does not scroll.
+        details = ui.js("document.querySelector('.context-details').getBoundingClientRect().toJSON()")
+        summary = ui.js("document.querySelector('.context-meter > summary').getBoundingClientRect().toJSON()")
+        assert details["top"] >= 0 and details["bottom"] <= height and details["right"] <= width, details
+        assert details["bottom"] <= summary["top"], (details, summary)
+        assert ui.js("(e => e.scrollHeight === e.clientHeight)(document.querySelector('.context-meter'))")
+        topbar = ui.js("document.querySelector('.topbar').getBoundingClientRect().bottom")
     # Every bar (or the open meter's button) is still reachable with the keyboard, with its focus shown.
     for control in [compact] if meter else [page.get_by_role("button", name="Undo changes to src/module_11/file_11.py"), continue_button(page)]:
         control.focus()
         expect(control).to_be_in_viewport(ratio=1)
         on_screen()
+        if meter:
+            assert control.bounding_box()["y"] >= topbar
 
 
 # Saved drafts

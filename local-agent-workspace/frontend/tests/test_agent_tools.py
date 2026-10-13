@@ -442,3 +442,61 @@ def test_mcp_results_per_server_and_stale_results_cleared(ui, page):
     page.get_by_role("button", name="Save configuration").click()
     expect(page.get_by_text("Configuration saved.")).to_be_visible()
     expect(page.get_by_text("Connection refused")).to_have_count(0)
+
+
+# The dialog keeps one size: the tabs stay put and only the tab content scrolls
+
+TABS = ["Recovery", "Usage", "Worktrees", "Tasks", "Verify", "Extensions", "Tools", "Conversation"]
+
+
+def tabs_top(ui):
+    return ui.js("document.querySelector('.agent-tools-tabs').getBoundingClientRect().top")
+
+
+@pytest.mark.parametrize("width,height", [(1280, 900), (390, 844)])
+def test_tabs_stay_put(ui, page, width, height):
+    page.set_viewport_size({"width": width, "height": height})
+    open_dialog(ui)
+    expect(page.get_by_role("button", name="Preview checkpoint src/main.py")).to_be_visible()
+    top = tabs_top(ui)
+    for tab in TABS:
+        page.get_by_role("button", name=tab, exact=True).click()
+        expect(page.get_by_role("button", name=tab, exact=True)).to_have_attribute("aria-pressed", "true")
+        assert abs(tabs_top(ui) - top) <= 1, tab
+        if tab in ("Usage", "Conversation"):
+            if tab == "Usage":
+                expect(page.get_by_role("button", name="Refresh usage")).to_be_visible()
+            ui.run("const body = document.querySelector('.agent-tools-body'); body.scrollTop = body.scrollHeight")
+            assert abs(tabs_top(ui) - top) <= 1, tab
+            expect(page.get_by_role("button", name="Close agent tools")).to_be_in_viewport()
+            assert ui.js("(d => d.scrollHeight <= d.clientHeight + 1)(document.querySelector('.agent-tools-dialog'))"), tab
+
+
+def test_phone_tabs_wrap(ui, page):
+    page.set_viewport_size({"width": 360, "height": 740})
+    open_dialog(ui)
+    expect(page.get_by_role("button", name="Preview checkpoint src/main.py")).to_be_visible()
+    assert ui.js("(e => e.scrollWidth <= e.clientWidth)(document.querySelector('.agent-tools-tabs'))")
+    content = ui.js("document.querySelector('.agent-tools-content').getBoundingClientRect().toJSON()")
+    for tab in TABS:
+        b = page.get_by_role("button", name=tab, exact=True).bounding_box()
+        assert b["x"] >= content["left"] - 0.5 and b["x"] + b["width"] <= content["right"] + 0.5, tab
+
+
+@pytest.mark.parametrize("width,height", [(360, 740), (390, 844), (1280, 900)])
+def test_usage_heading_fits(ui, page, width, height):
+    page.set_viewport_size({"width": width, "height": height})
+    open_tab(ui, page, "Usage")
+    expect(page.get_by_role("button", name="Refresh usage")).to_be_visible()
+    result = ui.js("""(() => {
+      const heading = document.querySelector('.usage-panel .agent-tools-section-heading')
+      const content = document.querySelector('.agent-tools-content')
+      const right = content.getBoundingClientRect().right - parseFloat(getComputedStyle(content).paddingRight)
+      const buttons = [...heading.querySelectorAll('button')].map(b => b.getBoundingClientRect())
+      const text = heading.querySelector(':scope > div:first-child').getBoundingClientRect()
+      return { fits: buttons.every(b => b.right <= right + 1), scroll: heading.scrollWidth <= heading.clientWidth,
+               beside: buttons.every(b => b.top < text.bottom) }
+    })()""")
+    assert result["fits"] and result["scroll"], result
+    if width >= 1280:
+        assert result["beside"], result
