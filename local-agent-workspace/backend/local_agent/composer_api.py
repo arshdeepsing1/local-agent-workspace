@@ -10,7 +10,7 @@ from fastapi import HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
 from .approvals import ensure_idle
-from .context import is_continuation
+from .context import is_app_prompt
 
 MAX_QUEUED = 3
 MAX_QUEUED_CHARS = 50_000
@@ -37,8 +37,7 @@ def side_history(wire):
         answered = {message.get("tool_call_id") for message in history[last + 1:] if message.get("role") == "tool"}
         if not wanted <= answered:
             del history[last:]
-    # The merge switches this to context.is_app_prompt.
-    while history and is_continuation(history[-1]):
+    while history and is_app_prompt(history[-1]):
         history.pop()
     return history
 

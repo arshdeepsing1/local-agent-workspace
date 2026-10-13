@@ -55,7 +55,7 @@ from .store import UnreadableConversation
 from .approvals import MAX_ALLOW_RULES, busy_status, declined, rule_for
 from .notify import SystemNotifier, attention_message
 from .context import INCOMPLETE_RESPONSE_CONTINUATION, INVALID_ARGUMENTS_CONTINUATION, VERIFY_CONTINUATION_PREFIX
-from .context import is_continuation
+from .context import is_app_prompt, is_continuation
 from . import history
 from .tool_errors import tool_error_text
 from .projects import ProjectSettings
@@ -1509,8 +1509,8 @@ class AgentManager:
         """Steering: at a step boundary, after every tool result, the unpaused queued messages
         become one user message of this turn."""
         entries = [item for item in self.queue_of(session) if not item.get("paused")]
-        # Never directly after an app-generated prompt (the merge switches this to is_app_prompt).
-        if not entries or not wire or wire[-1].get("role") == "user" or is_continuation(wire[-1]):
+        # Never directly after an app-generated prompt.
+        if not entries or not wire or wire[-1].get("role") == "user" or is_app_prompt(wire[-1]):
             return
         text = "\n\n".join(item["text"] for item in entries)
         try:

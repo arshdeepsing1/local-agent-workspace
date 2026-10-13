@@ -138,7 +138,8 @@ async def test_a_message_queued_during_an_approval_steers_the_same_turn(runtime,
     _validate_wire(live["wire"], complete=True)
     steered = users(live)[-1]
     assert steered["text"] == "Also put a date in it" and steered["steered"] is True and steered["in_wire"] is True
-    assert "in_wire" not in users(live)[0] and live.get("queued_messages") == []
+    # m4-history-branching records in_wire on every user event once its prompt is sent.
+    assert users(live)[0]["in_wire"] is True and live.get("queued_messages") == []
     assert (project / "a.txt").read_text() == "x"
 
 
