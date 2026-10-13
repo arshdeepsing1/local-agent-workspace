@@ -334,3 +334,95 @@ def test_a_blocked_recovery_restore_can_open_the_blocking_chat_from_the_dialog(u
     expect(dialog).to_have_count(0)
     ui.wait("fake.socketsFor('a').length === 1")
     assert ui.js("location.search") == "?session=a"
+
+
+# The split "Always allow" button (one control for the chat rule and the wider scopes)
+
+SPLIT_COMMAND = """{ id: 'cmd', type: 'tool', name: 'run_command', state: 'pending', preview: 'make test',
+  input: { command: 'make test' }, rememberable: ['chat', 'project', 'user'], editable: ['command'],
+  rule_options: { argv: ['make', 'test'], prefixes: [{ prefix: ['make'], flags: [] }], reason: null } }"""
+SPLIT_EDIT = """{ id: 'edit', type: 'tool', name: 'edit_file', state: 'pending', preview: 'diff',
+  input: { path: 'src/a.py' }, rememberable: ['chat', 'project', 'user'], rule_options: { folder: '/project/src' } }"""
+
+
+def approval_app(ui, card):
+    events = f"[{{ id: 'u', type: 'user', text: 'Run the tests' }}, {card}]"
+    ui.app(session="a", scenario="workspace", setup=f"""
+      fake.sessions.set('a', {{ ...makeSession('a', 'Tests'), status: 'awaiting_approval', events: {events} }})
+      fake.override = path => /^\\/api\\/sessions\\/a\\/approvals\\//.test(path) ? fake.json({{ ok: true }}) : undefined""")
+    ui.show_session("a")
+
+
+def button_rows(buttons):
+    tops = sorted(box["y"] for box in (button.bounding_box() for button in buttons))
+    rows = []
+    for top in tops:
+        if not rows or top - rows[-1] > 8:
+            rows.append(top)
+    return len(rows)
+
+
+@pytest.mark.parametrize("width, height, max_rows", [(1440, 900, 1), (820, 1180, 1), (390, 844, 2), (360, 740, 2)])
+def test_the_approval_buttons_stay_compact_and_keep_their_names(ui, page, width, height, max_rows):
+    # B-T27. Mutations: remove the container query (more rows at 360), drop the long button's aria-label
+    # (its name changes at 360), or use 'Allow in this chat' as the short text (fails label in name).
+    page.set_viewport_size({"width": width, "height": height})
+    approval_app(ui, SPLIT_COMMAND)
+    card = page.locator(".tool-card.needs-approval")
+    allow = card.get_by_role("button", name="Always allow this command in this chat", exact=True)
+    expect(allow).to_be_visible()
+    buttons = [button for button in card.locator(".approval-buttons").first.locator("button").all() if button.is_visible()]
+    assert len(buttons) == 5  # Decline, Edit, the split button's two halves, Approve
+    assert button_rows(buttons) <= max_rows, [button.bounding_box() for button in buttons]
+    # The short label belongs to narrow cards (560 px and less), as on phones.
+    narrow = card.bounding_box()["width"] <= 560
+    assert narrow or width > 600
+    expected = "Always allow this command" if narrow else "Always allow this command in this chat"
+    assert allow.evaluate("e => e.innerText.trim()") == expected
+    for button in card.locator("button").all():
+        if not button.is_visible():
+            continue
+        text, name = button.evaluate("e => [e.innerText, e.getAttribute('aria-label') || e.textContent]"
+                                     ".map(value => value.replace(/\\s+/g, ' ').trim().toLowerCase())")
+        assert text in name, (text, name)
+    assert ui.js("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
+
+
+def test_the_split_button_approves_for_the_chat_and_its_arrow_opens_the_scopes(ui, page):
+    approval_app(ui, SPLIT_COMMAND)
+    card = page.locator(".tool-card.needs-approval")
+    expect(card.get_by_role("group", name="Always allow")).to_be_visible()
+    toggle = card.get_by_role("button", name="Always allow…", exact=True)
+    expect(toggle).to_have_attribute("aria-expanded", "false")
+    toggle.click()
+    expect(toggle).to_have_attribute("aria-expanded", "true")
+    form = card.get_by_role("group", name="Remember this approval")
+    expect(form).to_be_visible()
+    expect(form.get_by_role("radio").first).to_be_focused()
+    toggle.click()
+    expect(form).to_have_count(0)
+    expect(toggle).to_be_focused()
+    card.get_by_role("button", name="Always allow this command in this chat", exact=True).click()
+    ui.wait("fake.requests('/api/sessions/a/approvals/cmd', 'POST').length === 1")
+    assert ui.bodies("/api/sessions/a/approvals/cmd", "POST") == [{"allowed": True, "remember": True}]
+
+
+def test_other_cards_keep_their_full_label_or_their_single_buttons(ui, page):
+    page.set_viewport_size({"width": 360, "height": 740})
+    approval_app(ui, SPLIT_EDIT)
+    allow = page.get_by_role("button", name="Allow edits in this chat", exact=True)
+    expect(allow).to_be_visible()
+    assert allow.evaluate("e => e.innerText.trim()") == "Allow edits in this chat"
+
+
+def test_cards_without_saved_scopes_keep_the_single_buttons(ui, page):
+    # An older card (no rememberable list) and a protected file: no split button.
+    show(ui, f"""[{pending('old', 'run_command', ", input: { command: 'make' }")},
+      {pending('protected', 'write_file', ", input: { path: '.env' }, protected: '.env', rememberable: ['chat']")}]""")
+    expect(page.locator(".split-button")).to_have_count(0)
+    old = page.locator(".tool-card").nth(0)
+    expect(old.get_by_role("button", name="Always allow this command in this chat", exact=True)).to_have_text(
+        "Always allow this command in this chat")
+    expect(old.get_by_role("button", name="Always allow…")).to_have_count(0)
+    protected = page.locator(".tool-card").nth(1)
+    expect(protected.get_by_role("button")).to_have_text(["write file.env", "Decline", "Approve"])

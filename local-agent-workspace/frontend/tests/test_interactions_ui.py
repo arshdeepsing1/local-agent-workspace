@@ -294,3 +294,72 @@ def test_cards_fit_a_phone_without_horizontal_scroll(ui, page, card):
         area = button.bounding_box()
         assert area["x"] >= 0 and area["x"] + area["width"] <= 390, button.text_content()
     expect(target.get_by_role("button", name=re.compile("Send answers|Approve and use Accept edits"))).to_be_visible()
+
+
+# The plan card: a heading scale under the card title, no inner scroll, actions in reach
+
+LONG_PLAN = "# Exporter plan\\n\\n## Steps\\n\\n" + "\\n".join(
+    f"{n}. Step {n}: change the exporter so that it writes one more section of the report, keep the existing sections "
+    "in the same order, add a fixture with a long table and a short one, and check both with a test that compares "
+    "the rendered output line by line." for n in range(1, 13))
+
+
+def plan_app(ui, page, width, height, setup=""):
+    page.set_viewport_size({"width": width, "height": height})
+    events = [{"id": "u", "type": "user", "text": "Plan the exporter"}]
+    ui.app(session="a", scenario="workspace",
+           setup=f"fake.sessions.set('a', {{ ...makeSession('a', 'Planning'), status: 'awaiting_approval', "
+                 f"events: [...{json.dumps(events)}, {plan_event(plan=LONG_PLAN)}] }})\n{setup}")
+    ui.show_session("a")
+    card = page.locator(".plan-card")
+    expect(card).to_be_visible()
+    return card
+
+
+def scroll_card_to_top(ui):
+    ui.js("(() => { const list = document.querySelector('.transcript'), card = document.querySelector('.plan-card');"
+          " list.scrollTop += card.getBoundingClientRect().top - list.getBoundingClientRect().top; return true })()")
+
+
+def approve_in_view(ui, page):
+    box = page.get_by_role("button", name="Approve and use Accept edits").bounding_box()
+    view = ui.js("(() => { const r = document.querySelector('.transcript').getBoundingClientRect(); return { top: r.top, bottom: r.bottom } })()")
+    return box["y"] >= view["top"] and box["y"] + box["height"] <= view["bottom"] + 1
+
+
+def font_size(card, selector):
+    return float(card.locator(selector).first.evaluate("e => parseFloat(getComputedStyle(e).fontSize)"))
+
+
+def test_a_long_plan_reads_in_the_transcript_with_its_actions_in_reach(ui, page):
+    # B-T28. Mutations: remove the sticky rule, restore max-height:520px, restore .plan-body h1 at 17 px or more.
+    card = plan_app(ui, page, 1440, 900)
+    title, h1, h2, item = (font_size(card, selector) for selector in ("h3", ".plan-body h1", ".plan-body h2", ".plan-body li"))
+    assert (title, h1, h2, item) == (16, 15, 14, 14)
+    assert h1 < title and h2 <= h1 and item < title
+    body = card.locator(".plan-body")
+    assert body.evaluate("e => e.scrollHeight <= e.clientHeight + 1")
+    assert card.bounding_box()["height"] > ui.js("document.querySelector('.transcript').clientHeight")
+    scroll_card_to_top(ui)
+    assert approve_in_view(ui, page)
+
+
+def test_plan_actions_stick_in_a_wide_column_at_1024(ui, page):
+    plan_app(ui, page, 1024, 768)
+    scroll_card_to_top(ui)
+    assert approve_in_view(ui, page)
+    assert page.locator(".plan-actions").evaluate("e => getComputedStyle(e).position") == "sticky"
+
+
+@pytest.mark.parametrize("width, height, setup", [
+    (360, 740, ""),
+    # 1024 with the Workspace panel open leaves a 434 px chat column (set directly here).
+    (1024, 768, "document.addEventListener('DOMContentLoaded', () => document.head.insertAdjacentHTML('beforeend', "
+                "'<style>.main-area{width:434px;flex:0 0 434px}</style>'))"),
+])
+def test_plan_actions_stay_at_the_end_of_the_card_in_a_narrow_column(ui, page, width, height, setup):
+    # Mutation: use @media(min-width:601px) instead of the container query (fails the narrow column at 1024).
+    plan_app(ui, page, width, height, setup)
+    assert page.locator(".main-area").evaluate("e => e.getBoundingClientRect().width") <= 434
+    assert page.locator(".plan-actions").evaluate("e => getComputedStyle(e).position") == "static"
+    assert ui.js("document.documentElement.scrollWidth <= document.documentElement.clientWidth")

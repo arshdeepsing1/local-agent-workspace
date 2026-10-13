@@ -315,3 +315,35 @@
 .file-roots-form .field-help{font-size:10px;margin:5px 0 0}
 .file-roots .form-error{margin:0;padding:7px 9px;font-size:11px}
 .settings-recommended{justify-self:start;margin:8px 0 0;font-size:12px;padding:7px 12px}
+/* UI behaviour: tool-card status, error and stop notices, approval split button, plan card, connection banners, the Local label. */
+.warning-icon{color:#98492f;flex-shrink:0}
+.tool-status{font-size:11px;color:#98492f;white-space:nowrap;flex-shrink:0}
+.tool-status.neutral{color:var(--muted)}
+.tool-raw>summary{cursor:pointer;font-size:11px;color:var(--muted);margin:8px 0}
+.tool-job-state{font-size:11px;margin:6px 0 0}
+.conversation-notice.error{display:block}
+.notice-summary{margin:0}
+.notice-details>summary{cursor:pointer;font-size:11px;margin-top:6px}
+.notice-details pre{white-space:pre-wrap;overflow-wrap:anywhere;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;max-height:12em;overflow:auto;margin:6px 0 0}
+.conversation-notice.stop-marker{background:none;padding:2px 0;display:flex;align-items:center;gap:10px;font-size:12px;color:var(--muted)}
+.stop-marker::before,.stop-marker::after{content:'';flex:1;border-top:1px solid var(--border)}
+.connection-banner{flex-wrap:wrap}
+.connection-banner>span{flex:1 1 220px;min-width:0;overflow-wrap:anywhere}
+.banner-details summary{cursor:pointer;text-decoration:underline}
+.tool-card.needs-approval{container:approval/inline-size}
+.split-button{display:inline-flex;min-width:0;max-width:100%}
+.split-button>button:first-child{border-top-right-radius:0;border-bottom-right-radius:0;min-width:0}
+.split-button>.split-toggle{border-top-left-radius:0;border-bottom-left-radius:0;margin-left:-1px;padding-inline:8px;flex-shrink:0}
+.label-short{display:none}
+@container approval (max-width:560px){.label-long{display:none}.label-short{display:inline}.approval-buttons{gap:6px}.approval-buttons button{padding-inline:10px}.split-button>.split-toggle{padding-inline:6px}}
+@container approval (max-width:320px){.split-button{flex:1 1 10em}}
+.plan-card h3{font-size:16px;font-weight:600}
+.app-shell .plan-body.markdown{font-size:14px}
+.plan-body{max-height:none;overflow:visible}
+.plan-card .plan-body h1{font-size:15px;font-weight:600;margin:4px 0 8px}
+.plan-card .plan-body h2{font-size:14px;font-weight:600;margin:14px 0 6px}
+.plan-card .plan-body :is(h3,h4){font-size:13px;font-weight:600;margin:12px 0 4px}
+.main-area{container:main/inline-size}
+@container main (min-width:600px){.plan-card.needs-answer .plan-actions{position:sticky;bottom:0;z-index:1;background:#faf3e9;padding:8px 0;box-shadow:0 -8px 8px -8px #0000001f}}
+.context-chip.context-label{border-color:transparent;background:none;padding-left:2px;color:var(--muted);cursor:default}
+@container main (max-width:520px){.context-label{display:none}}

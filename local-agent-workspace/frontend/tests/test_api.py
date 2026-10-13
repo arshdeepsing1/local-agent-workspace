@@ -41,9 +41,9 @@ def test_rejections_and_server_failures_are_not_replayed(ui):
 def test_connection_loss_after_sending_is_not_replayed(ui):
     result = run(ui, """
       fake.handle = () => { throw new TypeError('Connection lost') }
-      const error = await client.api('/command', 'POST', { text: 'do something' }).catch(error => error.message)
-      return [error, fake.calls.length]""")
-    assert result == ["Connection lost", 1]
+      const error = await client.api('/command', 'POST', { text: 'do something' }).catch(error => error)
+      return [error.message, error.status, error.cause?.message, fake.calls.length]""")
+    assert result == ["Cannot reach the local server. Check that it is still running.", 0, "Connection lost", 1]
 
 
 def test_raw_import_json_is_sent_unchanged_through_token_refresh(ui):

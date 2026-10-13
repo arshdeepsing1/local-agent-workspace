@@ -79,7 +79,7 @@ export default function Composer(p) {
   const menuProps = mention.listed ? { ...slash.inputProps, ...mention.inputProps } : slash.inputProps
   return html`<div class="composer-block">
     <div class="project-context">
-      <span class="context-chip"><${Laptop} size=${15} />Local</span>
+      <span class="context-chip context-label" title="This conversation runs on this computer: commands and file edits use your local files."><${Laptop} size=${15} />Local</span>
       <button class="context-chip project-chip" aria-label="Choose project" title=${p.workspace} onClick=${p.onProject}><${Folder} size=${15} /><span>${project}</span></button>
       <button class="context-chip folder-access-button" onClick=${p.onFolders}><${FolderPlus} size=${15} /><span>Folder access</span></button>
     </div>

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from './lib.js'
-import { api, ApiError, refreshToken, setToken, streamProtocols, streamUrl } from './api.js'
+import { api, ApiError, OFFLINE_MESSAGE, refreshToken, setToken, streamProtocols, streamUrl } from './api.js'
 
 // Selection: { id: string | null, key: string, creating?: Promise<Session> }
 const sessionInUrl = () => new URL(window.location.href).searchParams.get('session')
@@ -23,6 +23,8 @@ export function useWorkspace() {
   const activeId = selection.id
   const [error, setError] = useState('')
   const [online, setOnline] = useState(true)
+  // false while the session poll cannot reach the local server (no chat socket is needed to notice).
+  const [reachable, setReachable] = useState(true)
   const [ready, setReady] = useState(false)
   const [storageProblems, setStorageProblems] = useState([])
   const [draftMode, setDraftMode] = useState('manual')
@@ -58,7 +60,14 @@ export function useWorkspace() {
   const refreshSessions = useCallback(async () => {
     const request = ++sessionsRequest.current
     const atStart = new Map(contextUpdates.current)
-    const list = await api('/sessions')
+    let list
+    try { list = await api('/sessions') }
+    catch (e) {
+      // The reconnect banner says it; the poll keeps trying.
+      if (e instanceof ApiError && e.status === 0) { setReachable(false); return }
+      throw e
+    }
+    setReachable(true)
     // Older summaries must not undo a title event and its newer refresh.
     if (request !== sessionsRequest.current) return
     // Preserve context streamed after this summary request began.
@@ -67,9 +76,19 @@ export function useWorkspace() {
       return context && context !== atStart.get(item.id) ? { ...item, context_info: context } : item
     }))
   }, [])
-  const checkConnection = useCallback(async () => {
-    setConnection(null)
-    const result = await api('/connection')
+  // keep: show the last result while checking again (Check again), so its banner and button stay.
+  const [connectionChecking, setConnectionChecking] = useState(false)
+  const checkConnection = useCallback(async ({ keep = false } = {}) => {
+    if (!keep) setConnection(null)
+    setConnectionChecking(true)
+    let result
+    try { result = await api('/connection') }
+    catch (e) {
+      // An HTTP error from /api/connection itself (for example the 400 "macOS denied access" an unreadable credential
+      // file produces through the global OSError handler) is a credentials problem; offline (status 0) stays an error.
+      if (!(e instanceof ApiError) || !(e.status >= 400)) throw e
+      result = { connected: false, models: [], error: e.message, error_kind: 'credentials' }
+    } finally { setConnectionChecking(false) }
     setConnection(result)
     return result
   }, [])
@@ -77,12 +96,30 @@ export function useWorkspace() {
 
   useEffect(() => {
     // Every 1.5 s while a chat is active; every 10 s otherwise, to notice chats started
-    // elsewhere. A failed slow poll stays quiet: the server may just be restarting.
+    // elsewhere; every 2 s while the local server cannot be reached, to notice it is back.
+    // A failed slow poll stays quiet: the server may just be restarting.
     if (!ready) return
-    const timer = hasActiveSessions ? setInterval(() => void refreshSessions().catch(e => setError(e.message)), 1500)
+    const timer = !reachable ? setInterval(() => void refreshSessions().catch(() => {}), 2000)
+      : hasActiveSessions ? setInterval(() => void refreshSessions().catch(e => setError(e.message)), 1500)
       : setInterval(() => void refreshSessions().catch(() => {}), 10000)
     return () => clearInterval(timer)
-  }, [ready, hasActiveSessions, refreshSessions])
+  }, [ready, reachable, hasActiveSessions, refreshSessions])
+
+  // Back online: the offline error is out of date, and Databricks may have changed meanwhile.
+  const wasReachable = useRef(true)
+  useEffect(() => {
+    const back = reachable && !wasReachable.current
+    wasReachable.current = reachable
+    if (!back) return
+    setError(current => current === OFFLINE_MESSAGE ? '' : current)
+    void checkConnection().catch(() => {})
+  }, [reachable, checkConnection])
+  const wasOnline = useRef(true)
+  useEffect(() => {
+    const back = online && !wasOnline.current
+    wasOnline.current = online
+    if (back) setError(current => current === OFFLINE_MESSAGE ? '' : current)
+  }, [online])
 
   useEffect(() => {
     let mounted = true
@@ -492,7 +529,8 @@ export function useWorkspace() {
   const activeSession = session?.id === activeId ? session : null
   const reportError = message => { if (selected.current.key === selection.key) setError(message) }
   const rulesHere = savedRules.key === selection.key ? savedRules : null
-  return { settings, connection, sessions, session: activeSession, activeId, viewKey: selection.key, error, online, ready,
+  return { settings, connection, connectionChecking, sessions, session: activeSession, activeId, viewKey: selection.key, error,
+    online: online && reachable, offlineError: error === OFFLINE_MESSAGE, ready,
     setError: reportError, setActiveId: selectSession, newConversation, send, saveSettings, refreshSettings, deleteSession, renameSession, changeModel,
     runShell, askSide, removeQueued, sendQueued, loadMentionFiles, sideAnswer: sideAnswer.key === selection.key ? sideAnswer.value : null, dismissSide,
     modelSaving: modelSaves.has(selection.key) || (!activeId && defaultModelSave.current !== null),

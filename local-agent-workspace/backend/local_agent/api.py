@@ -281,18 +281,33 @@ def create_app(settings=None):
 
     @app.get("/api/connection")
     async def connection():
+        # error_kind says which step failed: 'credentials' (the credential file), 'http' (Databricks answered
+        # with an error status), 'network' (no answer) or 'invalid_response' (an answer the app cannot read).
+        # An unreadable credential file (OSError) still reaches the global handler (HTTP 400).
         try:
             host, token = settings.credentials()
+        except ValueError as exc:
+            return {"connected": False, "models": [], "error": settings.redact(str(exc)), "error_kind": "credentials"}
+        try:
             async with httpx.AsyncClient(timeout=20, follow_redirects=False) as client:
                 response = await client.get(host + "/api/2.0/serving-endpoints", headers={"Authorization": f"Bearer {token}"})
-            if response.status_code != 200:
-                return {"connected": False, "models": [], "error": f"Databricks returned HTTP {response.status_code}. Check your credentials and access."}
+        except httpx.HTTPError as exc:
+            return {"connected": False, "models": [], "error": settings.redact(str(exc) or type(exc).__name__),
+                    "error_kind": "network"}
+        if response.status_code != 200:
+            return {"connected": False, "models": [], "error": f"Databricks returned HTTP {response.status_code}. Check your credentials and access.",
+                    "error_kind": "http", "http_status": response.status_code}
+        try:
             data = response.json()
-            models = [item.get("name", "") for item in data.get("endpoints", [])]
-            models = [name for name in models if name and not any(term in name for term in ("embedding", "gte-", "bge-"))]
-            return {"connected": True, "models": models, "error": None}
-        except (ValueError, httpx.HTTPError) as exc:
-            return {"connected": False, "models": [], "error": settings.redact(str(exc))}
+        except ValueError:
+            data = None
+        endpoints = data.get("endpoints", []) if isinstance(data, dict) else None
+        if not isinstance(endpoints, list):
+            return {"connected": False, "models": [], "error": "Databricks returned a response the app could not read.",
+                    "error_kind": "invalid_response"}
+        models = [item.get("name", "") if isinstance(item, dict) else "" for item in endpoints]
+        models = [name for name in models if isinstance(name, str) and name and not any(term in name for term in ("embedding", "gte-", "bge-"))]
+        return {"connected": True, "models": models, "error": None}
 
     @app.put("/api/settings")
     async def update_settings(body: SettingsEdit):

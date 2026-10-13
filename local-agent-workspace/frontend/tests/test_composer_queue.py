@@ -2,6 +2,7 @@
 import json
 import re
 
+import pytest
 from playwright.sync_api import expect
 
 QUEUED = [{"id": "q1", "text": "Also update the README", "created": 1, "paused": False},
@@ -265,3 +266,28 @@ def test_the_slash_menu_offers_the_side_question_first(ui, page):
     expect(first).to_contain_text("Ask about this conversation without adding to it (one model request).")
     box.press("Enter")
     expect(box).to_have_value("/btw ")
+
+
+# "Local" is a label, not a button
+
+@pytest.mark.parametrize("width, height", [(1440, 900), (360, 740)])
+def test_local_reads_as_a_label_beside_the_project_buttons(ui, page, width, height):
+    # B-T29. Mutation: restore the border on .context-label.
+    page.set_viewport_size({"width": width, "height": height})
+    start_app(ui, page)
+    expect(page.get_by_role("button", name="Local")).to_have_count(0)
+    local = page.locator(".project-context .context-label")
+    expect(local).to_have_count(1)
+    assert local.evaluate("e => getComputedStyle(e).borderTopColor") == "rgba(0, 0, 0, 0)"
+    assert "runs on this computer" in local.get_attribute("title")
+    if width > 600:
+        expect(local).to_be_visible()
+        expect(local).to_have_text("Local")
+    else:
+        expect(local).to_be_hidden()  # Narrow chat columns hide it.
+    for name in ("Choose project", "Folder access"):
+        chip = page.get_by_role("button", name=name)
+        expect(chip).to_be_visible()
+        color, width_px = chip.evaluate("e => [getComputedStyle(e).borderTopColor, getComputedStyle(e).borderTopWidth]")
+        assert color != "rgba(0, 0, 0, 0)" and width_px != "0px", (name, color, width_px)
+    assert page.locator(".project-context").evaluate("e => e.scrollWidth <= e.clientWidth")

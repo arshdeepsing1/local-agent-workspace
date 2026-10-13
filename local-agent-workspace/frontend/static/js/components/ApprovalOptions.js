@@ -1,5 +1,5 @@
 import { html, useAutoFocus, useEffect, useRef, useState } from '../lib.js'
-import { Check, Pencil, X } from '../icons.js'
+import { Check, ChevronDown, Pencil, X } from '../icons.js'
 import { api } from '../api.js'
 import { modeLabel, quoteArgv } from './PermissionsMenu.js'
 
@@ -7,6 +7,10 @@ import { modeLabel, quoteArgv } from './PermissionsMenu.js'
 const SCOPE_LABELS = { chat: 'This chat', project: 'This project', user: 'All projects' }
 const RULE_SCOPES = { chat: 'this chat', project: 'this project', user: 'all projects' }
 const FIELD_LABELS = { command: 'Command', content: 'File content', new_text: 'Replacement text' }
+// A shorter visible label for narrow cards. It must be the start of the accessible name (WCAG 2.5.3 Label in Name),
+// so a speech-input user who says what they see still matches. Only the command label is long; the others
+// ("Allow edits in this chat", "Allow subagents in this chat", …) keep their full text at every width.
+const SHORT_ALLOW = { 'Always allow this command in this chat': 'Always allow this command' }
 
 // The line under a card's heading that says why it ran without a card, or how its card was answered.
 export function ruleLine(event) {
@@ -123,6 +127,18 @@ export default function ApprovalOptions({ event, sessionId, onError, deciding, o
     editButton.current?.focus()
   }, [editing])
   const closeEditor = () => { refocusEdit.current = true; setEditing(false) }
+  // The same for the "Always allow…" form opened from the split button's arrow: its first choice, then the arrow.
+  const rememberToggle = useRef(null)
+  const rememberForm = useRef(null)
+  const toggledRemember = useRef(false)
+  useEffect(() => {
+    if (!toggledRemember.current) return
+    toggledRemember.current = false
+    if (remembering) rememberForm.current?.querySelector('input[type="radio"]')?.focus()
+    else rememberToggle.current?.focus()
+  }, [remembering])
+  const split = !!allowInChat && canRemember
+  const short = SHORT_ALLOW[allowInChat]
   return html`
     ${event.protected ? html`<p class="tool-protected">Protected file: ${event.protected}. Edits to it always need your approval.</p>` : null}
     ${event.uncertain ? html`<p class="tool-uncertain">This command could not be checked exactly against your deny and ask rules, so it needs your approval.</p>` : null}
@@ -131,8 +147,14 @@ export default function ApprovalOptions({ event, sessionId, onError, deciding, o
     ${declineNote}
     <div class="approval-buttons"><button class="outline" disabled=${locked} onClick=${() => void onDecide(false)}><${X} size=${15} />Decline</button>
       ${canEdit && !editing ? html`<button ref=${editButton} class="outline" disabled=${deciding} onClick=${() => { setRemembering(false); setEditing(true) }}><${Pencil} size=${14} />Edit</button>` : null}
+      ${split ? html`<span class="split-button" role="group" aria-label="Always allow">
+        <button class="outline" disabled=${locked} aria-label=${allowInChat} title=${allowInChat} onClick=${() => void onDecide(true, { remember: true })}>
+          ${short ? html`<span class="label-long">${allowInChat}</span><span class="label-short" aria-hidden="true">${short}</span>` : allowInChat}</button>
+        <button ref=${rememberToggle} class="outline split-toggle" disabled=${locked} aria-label="Always allow…" aria-expanded=${remembering}
+          onClick=${() => { toggledRemember.current = true; setRemembering(v => !v) }}><${ChevronDown} size=${14} /></button>
+      </span>` : html`
       ${canRemember ? html`<button class="outline" disabled=${locked} aria-expanded=${remembering} onClick=${() => setRemembering(v => !v)}>Always allow…</button>` : null}
-      ${allowInChat ? html`<button class="outline" disabled=${locked} onClick=${() => void onDecide(true, { remember: true })}>${allowInChat}</button>` : null}
+      ${allowInChat ? html`<button class="outline" disabled=${locked} onClick=${() => void onDecide(true, { remember: true })}>${allowInChat}</button>` : null}`}
       <button class="primary" disabled=${locked} onClick=${() => void onDecide(true)}><${Check} size=${15} />Approve</button></div>
-    ${canRemember && remembering && !editing ? html`<${RememberOptions} event=${event} disabled=${locked} onApprove=${extra => onDecide(true, extra)} />` : null}`
+    ${canRemember && remembering && !editing ? html`<div ref=${rememberForm}><${RememberOptions} event=${event} disabled=${locked} onApprove=${extra => onDecide(true, extra)} /></div>` : null}`
 }

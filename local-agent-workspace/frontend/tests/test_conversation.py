@@ -364,7 +364,8 @@ def test_task_updates_do_not_claim_requested_status(ui, page):
     expect(page.get_by_role("button", name="update task Verify exported HTML", exact=True)).to_be_visible()
     expect(page.get_by_text("Task: completed")).to_have_count(0)
     ui.rerender(f"{{ onError: fake.spy('onError'), session: makeSession([{create}, {{ ...{update}, state: 'error', output: 'Complete dependencies first.' }}]) }}")
-    page.get_by_role("button", name="update task Verify exported HTML", exact=True).click()
+    # A failed tool names its status after the subject (no error category here: "failed").
+    page.get_by_role("button", name="update task Verify exported HTML failed", exact=True).click()
     expect(page.get_by_label("Output")).to_have_text("Complete dependencies first.")
     expect(page.get_by_text("Task: completed")).to_have_count(0)
 
@@ -470,7 +471,7 @@ def test_pages_of_one_file_show_the_lines_each_read_covered(ui, page):
     show(ui, "[" + ", ".join([read("p1", 1, 108), read("p2", 109, 243), read("p3", 244, state="running", output=""),
                                read("empty", 1, 0), read("failed", 500, state="error", output="Not a file.")]) + "]")
     for name in ("read file notes/v7.md · lines 1–108", "read file notes/v7.md · lines 109–243",
-                 "read file notes/v7.md · from line 244", "read file notes/v7.md · from line 500"):
+                 "read file notes/v7.md · from line 244", "read file notes/v7.md · from line 500 failed"):
         expect(page.get_by_role("button", name=name, exact=True)).to_be_visible()
     expect(page.get_by_role("button", name="read file notes/v7.md", exact=True)).to_be_visible()
     page.get_by_text("Activity · 5 actions").click()

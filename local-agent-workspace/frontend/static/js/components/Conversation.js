@@ -1,5 +1,5 @@
 import { html, useEffect, useLayoutEffect, useMemo, useRef, useState } from '../lib.js'
-import { Check, ChevronDown, ChevronRight, Copy, FileText, GitBranch, LoaderCircle, Pencil, RefreshCw, Terminal, Undo2, X } from '../icons.js'
+import { Check, ChevronDown, ChevronRight, CircleAlert, Copy, FileText, GitBranch, LoaderCircle, Pencil, RefreshCw, Terminal, Undo2, X } from '../icons.js'
 import { api } from '../api.js'
 import { enhanceCodeBlocks, linkPaths, renderMarkdown } from '../markdown.js'
 import QuestionCard from './QuestionCard.js'
@@ -60,21 +60,187 @@ function summarizeTools(events) {
   return summaries
 }
 
-function ToolDetails({ event, pending }) {
+// Results the UI can read: a command or job page ({ job_id, state, exit_code, output, … }, after the edited-command
+// note when there is one) and an MCP result ({ output, is_error, truncated }).
+const JOB_TOOLS = new Set(['run_command', 'user_command', 'wait_job', 'get_job_output', 'stop_job'])
+
+// Which part of the output a job page holds, or null when it holds all of it.
+function shownPart(page) {
+  if (page.excerpt) return 'start and end shown; the agent can read the omitted middle with get_job_output'
+  if ('output_start' in page) {  // wait_job: the end of the output
+    return Number(page.output_start) > 0 ? `latest output shown, from character ${Number(page.output_start).toLocaleString()}` : null
+  }
+  const offset = Number(page.offset ?? 0)
+  const end = offset + page.output.length
+  if (offset === 0 && page.next_offset != null && page.next_offset < page.total_chars) return 'first part shown; the agent can read the rest with get_job_output'
+  if (offset > 0) return `characters ${(offset + 1).toLocaleString()}–${end.toLocaleString()} shown`
+  return null
+}
+
+// { note, text, raw, mcpError, job: { state, exitCode, background, total, shown } | null } for a finished
+// command, job or MCP card whose output parses; null otherwise (older events, plain-text errors).
+export function resultOf(event) {
+  const name = event.name || ''
+  if (!(JOB_TOOLS.has(name) || name.startsWith('mcp__')) || event.state === 'running') return null
+  const text = String(event.output || '')
+  let note = null
+  let json = text
+  if (text.startsWith('[')) {
+    // The note quotes the edited command, which can contain '\n{'; the page is indented JSON whose only
+    // line starting with '{' is its first, so the last '\n{' starts the page.
+    const at = text.lastIndexOf('\n{')
+    if (at < 0) return null
+    note = text.slice(0, at)
+    json = text.slice(at + 1)
+  }
+  let page
+  try { page = JSON.parse(json) } catch { return null }
+  if (!page || typeof page !== 'object' || Array.isArray(page) || typeof page.output !== 'string') return null
+  return { note, text: page.output, raw: json, mcpError: page.is_error === true,
+    job: 'state' in page ? { state: String(page.state), exitCode: page.exit_code, background: !!page.background,
+      total: page.total_chars, shown: shownPart(page) } : null }
+}
+
+const KIND_LABEL = { timeout: 'timed out', not_found: 'not found', edit_mismatch: 'no match', stale_file: 'file changed',
+  excluded: 'excluded', limit: 'too large', command_refused: 'refused', access_required: 'needs access',
+  invalid_arguments: 'invalid arguments', wrong_type: 'wrong type', permission_denied: 'permission denied',
+  guidance_changed: 'instructions changed', unavailable_tool: 'unavailable', encoding: 'encoding' }
+
+// What a failed tool told the agent ({ kind, label, hint }), from its model_output; null when unknown.
+function toolError(event) {
+  if (event.state !== 'error' || typeof event.model_output !== 'string') return null
+  let parsed
+  try { parsed = JSON.parse(event.model_output) } catch { return null }
+  const kind = parsed?.error_kind
+  if (typeof kind !== 'string' || !kind) return null
+  return { kind, label: KIND_LABEL[kind] || kind.replace(/_/g, ' '), hint: typeof parsed.hint === 'string' ? parsed.hint : null }
+}
+
+const exitLabel = code => Number.isInteger(code) ? `exit ${code}` : 'failed'
+// The heading label of a command's own job (run_command, user_command): [tone, label, labelTone].
+function commandJob(job) {
+  if (!job) return null
+  if (job.state === 'failed') return ['warn', exitLabel(job.exitCode), 'warn']
+  if (job.state === 'timed_out') return ['warn', 'timed out', 'warn']
+  if (job.state === 'interrupted') return ['warn', 'interrupted', 'warn']
+  if (job.state === 'cancelled') return ['neutral', 'stopped', 'neutral']
+  if (job.state === 'running' && job.background) return ['neutral', 'running in background', 'neutral']
+  return null
+}
+// The label of the job a wait_job, get_job_output or stop_job card reports on.
+const OTHER_JOB = { timed_out: 'job timed out', running: 'job running', cancelled: 'job stopped', interrupted: 'job interrupted' }
+
+// The card's status: tone (the icon: 'running', 'ok', 'warn', 'neutral' or null), label and labelTone (its colour:
+// 'warn' or 'neutral', set with every label). A job tool can work (ok) while its job failed (a neutral label).
+export function toolStatus(event, result) {
+  const none = { tone: null, label: '', labelTone: null }
+  if (event.state === 'running') return { tone: 'running', label: '', labelTone: null }
+  const isCommand = event.name === 'run_command' || event.name === 'user_command'
+  const own = isCommand ? commandJob(result?.job) : null
+  if (event.state === 'error') {
+    const label = own?.[1] || (result?.mcpError ? 'tool error' : toolError(event)?.label || 'failed')
+    return { tone: 'warn', label, labelTone: 'warn' }
+  }
+  if (event.state !== 'completed') return none
+  if (own) return { tone: own[0], label: own[1], labelTone: own[2] }
+  const job = result?.job
+  if (job && !isCommand && JOB_TOOLS.has(event.name)) {
+    const label = job.state === 'failed' ? `job ${exitLabel(job.exitCode)}` : OTHER_JOB[job.state] || ''
+    return { tone: 'ok', label, labelTone: label ? 'neutral' : null }
+  }
+  return { tone: 'ok', label: '', labelTone: null }
+}
+
+// Parsed results and statuses are cached per event object: an updated event is a new object.
+const statusCache = new WeakMap()
+function toolState(event) {
+  let state = statusCache.get(event)
+  if (!state) {
+    const result = resultOf(event)
+    state = { result, status: toolStatus(event, result) }
+    statusCache.set(event, state)
+  }
+  return state
+}
+
+function ToolDetails({ event, pending, result = null }) {
   const { command, ...options } = event.input || {}
   const hasCommand = typeof command === 'string'
+  const job = result?.job
+  const failure = pending ? null : toolError(event)
   return html`
     <p class="tool-detail-label">${hasCommand ? 'Command' : 'Input'}</p>
     <pre aria-label=${hasCommand ? 'Command' : 'Input'}>${hasCommand ? (pending && event.preview ? event.preview : command) : JSON.stringify(event.input || {}, null, 2)}</pre>
     ${hasCommand && Object.keys(options).length && !(pending && event.preview) ? html`<p class="tool-detail-label">Options</p><pre aria-label="Options">${JSON.stringify(options, null, 2)}</pre>` : null}
     ${pending && !hasCommand && event.preview ? html`<p class="tool-detail-label">Approval preview</p><pre aria-label="Approval preview">${event.preview}</pre>` : null}
-    ${!pending || event.output ? html`<p class="tool-detail-label">Output</p><pre aria-label="Output">${event.output || (event.state === 'running' ? 'Waiting for output…' : 'No output.')}</pre>` : null}`
+    ${result ? html`${result.note ? html`<p class="tool-rule">${result.note}</p>` : null}
+        <p class="tool-detail-label">Output</p><pre aria-label="Output">${result.text || 'No output.'}</pre>
+        ${job ? html`<p class="muted tool-job-state">${[`State: ${job.state.replace(/_/g, ' ')}`, Number.isInteger(job.exitCode) ? `exit ${job.exitCode}` : '',
+          typeof job.total === 'number' ? `${job.total.toLocaleString()} characters` : '', job.shown || ''].filter(Boolean).join(' · ')}</p>` : null}
+        <details class="tool-raw"><summary>Raw result</summary><pre aria-label="Raw result">${result.raw}</pre></details>`
+      : !pending || event.output ? html`<p class="tool-detail-label">Output</p><pre aria-label="Output">${event.output || (event.state === 'running' ? 'Waiting for output…' : 'No output.')}</pre>` : null}
+    ${failure ? html`<p class="tool-detail-label">Error category</p><p>${failure.label}</p>
+      ${failure.hint ? html`<p>Hint given to the agent: ${failure.hint}</p>` : null}` : null}`
 }
 
-const clip = text => {
+const clip = (text, limit = 240) => {
   const flat = String(text || '').trim().replace(/\s+/g, ' ')
-  return flat.slice(0, 240) + (flat.length > 240 ? '…' : '')
+  return flat.slice(0, limit) + (flat.length > limit ? '…' : '')
 }
+
+// The collapsed line of a failed command or tool whose result parses: "Exit 1 · <last output line>".
+const JOB_OUTCOME = { failed: job => `Exit ${Number.isInteger(job.exitCode) ? job.exitCode : '?'}`, timed_out: () => 'Timed out',
+  interrupted: () => 'Interrupted', cancelled: () => 'Stopped' }
+function failureOutcome(event, result, status) {
+  const lastLine = result.text.split('\n').map(line => line.trim()).filter(Boolean).at(-1) || ''
+  const job = result.job
+  if (job && JOB_OUTCOME[job.state] && (status.tone === 'warn' || event.state === 'error')) {
+    return clip([JOB_OUTCOME[job.state](job), lastLine].filter(Boolean).join(' · '))
+  }
+  return event.state === 'error' ? clip(result.text) || 'Tool returned an error' : null
+}
+
+// A Databricks error in plain words: { summary, details } (details: the full text, or null when it is the summary).
+const LEADS = {
+  authentication: () => 'Databricks did not accept your credentials (HTTP 401). Check the token in your credential file.',
+  permission: () => 'Databricks denied access to this model (HTTP 403).',
+  rate_limit: () => 'Databricks rate limited this request.',
+  server: event => `Databricks had a server problem (HTTP ${event.http_status ?? 500}). Try again in a moment.`,
+  invalid_request: event => `Databricks rejected the request (HTTP ${event.http_status ?? 400}).`,
+  network: () => 'Could not reach Databricks. Check your network or VPN connection.',
+}
+export function errorSummary(event) {
+  const text = String(event.text || '')
+  const kind = event.error_kind
+  const http = text.startsWith('Databricks returned HTTP')
+  // The provider's own message from a JSON error body, for HTTP errors and errors without a kind
+  // (compaction failures); other kinds are the app's own sentences and pass through.
+  let message = null
+  let cleaned = null
+  if (http || !kind || LEADS[kind]) {
+    const source = text.replace(' [Error response truncated.]', '')
+    const start = source.indexOf('{')
+    const end = source.lastIndexOf('}')
+    if (start >= 0 && end > start) {
+      let body = null
+      try { body = JSON.parse(source.slice(start, end + 1)) } catch { /* Not JSON, or cut off. */ }
+      message = [body?.message, body?.error?.message, body?.error, body?.detail].find(value => typeof value === 'string' && value.trim()) ?? null
+      if (message) {
+        const after = source.slice(end + 1).trim()
+        cleaned = `${source.slice(0, start).trim().replace(/:\s*$/, '.')} ${clip(message, 300)}${after ? ` ${after}` : ''}`.trim()
+      }
+    }
+  }
+  let summary
+  if ((http || kind === 'network') && LEADS[kind]) summary = [LEADS[kind](event), message && clip(message, 300)].filter(Boolean).join(' ')
+  else if (cleaned) summary = cleaned
+  else summary = text.length > 400 ? clip(text, 300) : text
+  return { summary, details: text !== summary ? text : null }
+}
+
+// A Stop leaves a notice that names what it interrupted (older notices have no stop_phase).
+const STOPPED_TEXT = 'Stopped. You can continue this conversation.'
+const STOP_TEXT = { streaming: 'Stopped while replying', tools: 'Stopped during an action', waiting: 'Stopped' }
 
 function toolOutcome(event) {
   const clipped = clip(event.output)
@@ -148,7 +314,7 @@ function allowanceNote(event) {
   return null
 }
 
-function ToolCard({ event, summary, sessionId, onError, onSelectSession, onOpenPath }) {
+function ToolCard({ event, summary, result, status, sessionId, onError, onSelectSession, onOpenPath }) {
   const [expanded, setExpanded] = useState(false)
   const filePath = event.input?.[FILE_INPUTS[event.name]]
   const startLine = Number.isInteger(event.input?.start_line) && event.input.start_line > 0 ? event.input.start_line : undefined
@@ -169,11 +335,13 @@ function ToolCard({ event, summary, sessionId, onError, onSelectSession, onOpenP
   }
   return html`<div class=${`tool-card ${isTask ? 'tool-task' : ''} ${pending ? 'needs-approval' : ''}`}>
     <button class="tool-heading" onClick=${() => setExpanded(v => !v)} aria-expanded=${expanded || pending}
-      aria-label=${[title, summary.subject, summary.taskStatus ? `Task: ${summary.taskStatus}` : ''].filter(Boolean).join(' ')}>
+      aria-label=${[title, summary.subject, summary.taskStatus ? `Task: ${summary.taskStatus}` : '', status.label].filter(Boolean).join(' ')}>
       ${event.name?.toLowerCase().includes('command') || event.name === 'Bash' ? html`<${Terminal} size=${16} />` : html`<${FileText} size=${16} />`}
       <span class="tool-name">${title}</span><span class="tool-subject" title=${summary.subject}>${summary.subject}</span>
       ${summary.taskStatus ? html`<span class="tool-task-status">Task: ${summary.taskStatus}</span>` : null}
-      ${event.state === 'running' ? html`<${LoaderCircle} size=${14} className="spin" />` : event.state === 'completed' ? html`<${Check} size=${14} className="success-icon" />` : null}
+      ${status.tone === 'running' ? html`<${LoaderCircle} size=${14} className="spin" />` : status.tone === 'ok' ? html`<${Check} size=${14} className="success-icon" />`
+        : status.tone === 'warn' ? html`<${CircleAlert} size=${14} className="warning-icon" />` : null}
+      ${status.label ? html`<span class=${`tool-status ${status.labelTone === 'neutral' ? 'neutral' : ''}`}>${status.label}</span>` : null}
       ${expanded || pending ? html`<${ChevronDown} size=${14} />` : html`<${ChevronRight} size=${14} />`}
     </button>
     <${DelegationStatus} event=${event} onSelectSession=${onSelectSession} />
@@ -186,11 +354,12 @@ function ToolCard({ event, summary, sessionId, onError, onSelectSession, onOpenP
           declineNote=${html`<label class="decline-note"><span>Tell the agent why (optional)</span>
             <textarea rows=${2} maxLength=${2000} spellcheck=${false} value=${note} disabled=${deciding}
               onInput=${e => setNote(e.currentTarget.value)} /></label>`} />`
-        : html`<${ToolDetails} event=${event} pending=${false} /><small class="muted">Action: ${event.state}</small>
+        : html`<${ToolDetails} event=${event} pending=${false} result=${result} /><small class="muted">Action: ${event.state}${status.label ? ` · ${status.label}` : ''}</small>
           ${onOpenPath && typeof filePath === 'string' && filePath ? html`<button class="outline tool-open-file"
             onClick=${() => onOpenPath(startLine ? { path: filePath, line: startLine } : { path: filePath })}><${FileText} size=${14} />Open file</button>` : null}`}
     </div>` : null}
-    ${!expanded && (event.state === 'rejected' || event.state === 'cancelled' || event.state === 'error') ? html`<p class="tool-outcome">${toolOutcome(event)}</p>` : null}
+    ${!expanded && (event.state === 'rejected' || event.state === 'cancelled' || event.state === 'error' || status.tone === 'warn')
+      ? html`<p class="tool-outcome">${(result && failureOutcome(event, result, status)) || toolOutcome(event)}</p>` : null}
     ${!expanded && event.state === 'completed' && allowanceNote(event) ? html`<p class="tool-outcome">${allowanceNote(event)}</p>` : null}
   </div>`
 }
@@ -280,6 +449,8 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
     void Promise.resolve(onLoadEarlier?.()).catch(error => { anchor.current = null; onError?.(error.message) })
   }
   const toolSummaries = useMemo(() => summarizeTools(session.events), [session.events])
+  // Map<event id, { result, status }>: parsed once per event (see toolState).
+  const toolStates = useMemo(() => new Map(session.events.filter(event => event.type === 'tool').map(event => [event.id, toolState(event)])), [session.events])
   const last = session.events[session.events.length - 1]
   useEffect(() => { if (follow.current) bottom.current?.scrollIntoView({ block: 'end' }) }, [last?.id, last?.text, last?.state])
   useEffect(() => { follow.current = true; bottom.current?.scrollIntoView({ block: 'end' }) }, [session.id])
@@ -363,7 +534,7 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
       <ol>${tools.map(event => {
         const summary = toolSummaries.get(event.id)
         return html`<li key=${event.id}><span>${(event.name || 'Tool').replace(/_/g, ' ')}</span>${summary.subject ? html`<span class="activity-subject"> · ${summary.subject}</span>` : null}
-          ${summary.taskStatus ? html`<small>Task: ${summary.taskStatus}</small>` : null}<small>Action: ${event.state}</small></li>`
+          ${summary.taskStatus ? html`<small>Task: ${summary.taskStatus}</small>` : null}<small>Action: ${event.state}${(label => label ? ` · ${label}` : '')(toolStates.get(event.id)?.status.label)}</small></li>`
       })}</ol>
     </details>` : null}
     ${session.parent_session_id && onSelectSession ? html`<button class="outline parent-conversation" onClick=${() => onSelectSession(session.parent_session_id)}>Back to parent conversation</button>` : null}
@@ -377,9 +548,14 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
       if (event.type === 'user') return html`<div class=${`user-message${event.steered ? ' steered' : ''}`} key=${event.id}>${event.steered ? html`<small class="steered-label">Sent while the agent was working</small>` : null}${event.origin?.kind === 'delegated' ? html`<small class="delegation-origin">Delegated by parent conversation</small>` : null}${event.text}<${Attachments} items=${event.attachments} />${event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}${event.text || idle ? html`<div class="message-actions">${event.text ? html`<${CopyAction} text=${event.text} label="Copy message" />` : null}${idle ? html`<${ActionButton} label="Edit message" icon=${Pencil} target=${`edit:${event.id}`} onClick=${() => setEditing(event.id)} /><${ActionButton} label="Rewind to here" icon=${Undo2} onClick=${() => setRewinding(event)} />` : null}</div>` : null}</div>`
       if (event.type === 'tool' && event.name === 'ask_user') return html`<${QuestionCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
       if (event.type === 'tool' && event.name === 'submit_plan') return html`<${PlanCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
-      if (event.type === 'tool') return html`<${ToolCard} key=${event.id} event=${event} summary=${toolSummaries.get(event.id)} sessionId=${session.id} onError=${onError} onSelectSession=${onSelectSession} onOpenPath=${onOpenPath} />`
+      if (event.type === 'tool') return html`<${ToolCard} key=${event.id} event=${event} summary=${toolSummaries.get(event.id)} result=${toolStates.get(event.id).result} status=${toolStates.get(event.id).status} sessionId=${session.id} onError=${onError} onSelectSession=${onSelectSession} onOpenPath=${onOpenPath} />`
       if (event.type === 'assistant') return event.text || event.reasoning_summary || event.request_info ? html`<${Reply} key=${event.id} text=${event.text || ''} reasoning=${event.reasoning_summary} truncated=${event.reasoning_truncated} requestInfo=${event.request_info} onOpenPath=${onOpenPath} actions=${event.text ? replyActions(event) : null} />` : null
-      return html`<div class=${`conversation-notice ${event.type === 'error' ? 'error' : event.compaction ? 'compaction' : ''}`} key=${event.id}>${event.text}<${DelegationStatus} event=${event} onSelectSession=${onSelectSession} />${!event.delegation && event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}</div>`
+      const marker = event.type !== 'error' && (!!event.stop_phase || event.text === STOPPED_TEXT)
+      const classes = ['conversation-notice', event.type === 'error' && 'error', marker && 'stop-marker', event.compaction && 'compaction'].filter(Boolean).join(' ')
+      if (marker) return html`<div class=${classes} key=${event.id} title=${event.text}>${STOP_TEXT[event.stop_phase] || 'Stopped'}</div>`
+      const error = event.type === 'error' ? errorSummary(event) : null
+      return html`<div class=${classes} key=${event.id} role=${error ? 'note' : undefined}>${error ? html`<p class="notice-summary">${error.summary}</p>${error.details
+          ? html`<details class="notice-details"><summary>Details</summary><pre>${error.details}</pre></details>` : null}` : event.text}<${DelegationStatus} event=${event} onSelectSession=${onSelectSession} />${!event.delegation && event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}</div>`
     })}
     ${['running', 'delegating'].includes(session.status) ? html`<div class="working-indicator"><span /><span /><span /><span class="sr-only">Working</span></div>` : null}
     ${rewinding && idle ? html`<${RewindDialog} session=${session} event=${rewinding} onClose=${() => setRewinding(null)}
