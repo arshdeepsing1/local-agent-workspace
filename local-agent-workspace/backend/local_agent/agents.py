@@ -20,7 +20,7 @@ from .rules import (APP_ROOT, RuleStore, card_rule_options, default_rule, normal
                     rule_label, rule_matches, same_rule, text_names_credential)
 from .activity import ACTIVITY_TOOL, activity_content, activity_log, local_time, redact_secrets
 from .context import (
-    DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT_TOKENS, OUTPUT_LIMIT_CONTINUATION, SUMMARY_MAX_TOKENS,
+    OUTPUT_LIMIT_CONTINUATION, SUMMARY_MAX_TOKENS,
     build_condense_messages, build_handoff_messages, build_summary_messages, condense_output_tokens,
     estimate_scale, estimate_tokens, handoff_output_tokens, prepare_context, summary_byte_limit,
 )
@@ -28,14 +28,14 @@ from .tools import LIMIT as FILE_LIMIT
 from .tools import write_limit_setting
 from . import diagnostics, notebooks
 from .edits import clip_result, preview_diff, split_lines
-from .config import DEFAULT_APPROVAL_MINUTES, DEFAULT_MAX_AGENT_STEPS
+from .config import DEFAULT_APPROVAL_MINUTES, DEFAULT_MAX_AGENT_STEPS, follow_limits
 from .instructions import load_project_instructions
 from .jobs import JobManager, validate_command_options
 from .command_exec import prepare_command
 from .recovery import CheckpointManager
 from .changes import ChangeReview
 from .shell_changes import ShellChangeTracker
-from .workspace_folders import WorkspaceFolders
+from .workspace_folders import WorkspaceFolders, _within
 from .worktrees import WorktreeManager
 from .extensions import ExtensionManager
 from .extensions import skill_index
@@ -61,6 +61,8 @@ from .context import is_app_prompt, is_continuation
 from . import history
 from .tool_errors import tool_error_text
 from .projects import ProjectSettings
+from .model_profiles import default_limits, effective_limits, thinking_reserve
+from . import user_paths
 from . import mentions
 from .composer_api import (MAX_QUEUED, MAX_QUEUED_CHARS, SHELL_ONE_LINE, SIDE_QUESTION_PREFIX, SIDE_TOO_LONG,
                            SIDE_TOOL_CALLS, STEER_PREFIX, side_history)
@@ -353,13 +355,15 @@ def changed_files_text(names, total):
             f"{', '.join(names)}{more}. Read a file again before editing it.")
 
 
-def output_limit_text(max_output_tokens):
-    """Lets the model size long file writes to the configured response limit."""
+def output_limit_text(max_output_tokens, thinking=False):
+    """Lets the model size long file writes to the configured response limit. thinking: the
+    model always thinks, and its thinking counts toward the same limit."""
     # Measured file-writing responses averaged about 2.2 bytes per output token;
     # 2 bytes per token leaves room for JSON escaping and chat text.
     return (f"Each of your responses can contain at most {max_output_tokens:,} output tokens, roughly "
             f"{max_output_tokens * 2 // 1000:,} KB of file text in tool arguments; a longer response is cut off "
-            "and its tool calls do not run.")
+            "and its tool calls do not run."
+            + (" Your thinking counts toward this limit, so keep single file writes well below it." if thinking else ""))
 
 
 def model_history(wire):
@@ -546,7 +550,8 @@ class AgentManager:
         except OSError:
             clean = False
         self.jobs = JobManager(store, settings.redact, self.job_update, redaction_tokens=self.redaction_tokens,
-                               environment=self.command_environment, mirror_finished=not clean)
+                               environment=self.command_environment, mirror_finished=not clean,
+                               venv=self.python_venv)
         summaries = store.list()
         full_scan = not clean
         recovered = set()
@@ -737,7 +742,9 @@ class AgentManager:
                     payload["result"] = result
                 if phase == "tool_failure":
                     payload.update(error=error, outcome="error")
-                outcome = await self.extensions.run_hook(hook, payload, session["workspace"])
+                # The Python environment applies; variables named in Settings are not passed to hooks.
+                outcome = await self.extensions.run_hook(hook, payload, session["workspace"],
+                                                         env=self.jobs.command_environment(named=False))
                 output = outcome["output"]
                 if outcome["exit_code"] != 0 or outcome.get("timed_out"):
                     raise ValueError(f"Hook failed (exit {outcome['exit_code']}): {output}")
@@ -899,6 +906,52 @@ class AgentManager:
             values[name] = value
         return values
 
+    def python_venv(self):
+        """The Python virtual environment commands run with (Settings), or None; checked on every call."""
+        return user_paths.usable_python_venv(self.settings)
+
+    def standing_directories(self):
+        """Folders every conversation may use without a folder grant: the default code folder."""
+        return user_paths.standing_directories(self.settings)
+
+    def request_limits(self, session):
+        """(context window, max output tokens) for this chat's requests. Budgets left at the Settings
+        model's defaults follow the chat's own endpoint; customised budgets stay. Both are capped at
+        the endpoint's maxima (model_profiles.effective_limits)."""
+        context_window, max_output_tokens = self.base_limits(session)
+        limits = effective_limits(session.get("model") or self.settings.values["model"], context_window,
+                                  max_output_tokens)
+        return limits["context_window"], limits["max_output_tokens"]
+
+    def base_limits(self, session):
+        """The Settings budgets, with those left at the Settings model's defaults following the chat's
+        endpoint (before the endpoint's maxima apply). A followed value that would not fit with the
+        other budget keeps the Settings value (config.follow_limits)."""
+        values = self.settings.values
+        defaults = default_limits(values["model"])
+        current = (values["context_window"], values["max_output_tokens"])
+        follow = [current[0] == defaults[0], current[1] == defaults[1]]
+        return follow_limits(follow, default_limits(session.get("model") or values["model"]), current)
+
+    async def limits_notice(self, session):
+        """One notice per chat when its endpoint supports less than Settings asks for. Never a wire message."""
+        base = list(self.base_limits(session))
+        effective = list(self.request_limits(session))
+        if base == effective:
+            session.pop("clamped_limits", None)
+            return
+        if effective == session.get("clamped_limits"):
+            return
+        session["clamped_limits"] = effective
+        # Name only what the endpoint caps. A capped value always comes from Settings: the endpoint's own
+        # defaults fit its maxima.
+        capped = [text for text, used, asked in (
+            (f"a {effective[0]:,}-token context budget (Settings: {base[0]:,})", effective[0], base[0]),
+            (f"{effective[1]:,} max output tokens (Settings: {base[1]:,})", effective[1], base[1])) if used != asked]
+        await self.event(session, "notice", text=(
+            f"This chat's endpoint ({session['model']}) supports less than Settings asks for, so its requests use "
+            + " and ".join(capped) + "."))
+
     @staticmethod
     def agent_job(session, job_id):
         """True when the model started this job with run_command in this conversation."""
@@ -952,9 +1005,12 @@ class AgentManager:
             if read_only and arguments.get("background"):
                 raise ValueError("Read-only commands run in the foreground only.")
             forbidden = [Path(session["workspace"]).resolve(),
-                         *(Path(p).resolve() for p in session.get("allowed_directories", []))]
+                         *(Path(p).resolve() for p in session.get("allowed_directories", [])),
+                         *(Path(p) for p in self.standing_directories())]
+            # The read-only path (pwd, ls, hardened Git) never sees the Python environment.
             argv, env = await prepare_command(argv, workspace=session["workspace"], forbidden_roots=forbidden,
-                                              read_only=read_only, env=self.jobs.command_environment())
+                                              read_only=read_only,
+                                              env=self.jobs.command_environment(python_venv=not read_only))
             options = {"argv": argv, "env": env}
         tracker = None
         if not arguments.get("background") and not read_only:
@@ -1047,7 +1103,9 @@ class AgentManager:
         return self.settings.redact(redact_secrets(text))
 
     def session_tools(self, session):
-        return WorkspaceTools(session["workspace"], self.settings.values["env_file"], session.get("allowed_directories", []),
+        """The chat's file tools: its project, its folder grants and the default code folder."""
+        allowed = [*session.get("allowed_directories", []), *self.standing_directories()]
+        return WorkspaceTools(session["workspace"], self.settings.values["env_file"], allowed,
                               session.get("permission_mode", "manual") == "bypassPermissions",
                               write_limit=write_limit_setting(self.settings.values), excluded_roots=(self.settings.state_dir,))
 
@@ -1095,7 +1153,7 @@ class AgentManager:
         if not extra:
             return tools
         return WorkspaceTools(session["workspace"], self.settings.values["env_file"],
-                              [*session.get("allowed_directories", []), *extra],
+                              [*session.get("allowed_directories", []), *self.standing_directories(), *extra],
                               session.get("permission_mode", "manual") == "bypassPermissions",
                               write_limit=write_limit_setting(self.settings.values), excluded_roots=(self.settings.state_dir,))
 
@@ -1276,8 +1334,14 @@ class AgentManager:
                 resolved = tools.resolve(value)
             except (ValueError, OSError):
                 return None  # The tool reports the path error itself.
-            return protected_reason(tools.root / Path(value).expanduser(), resolved, root=tools.root,
-                                    home=Path.home(), app_root=APP_ROOT)
+            requested = tools.root / Path(value).expanduser()
+            reason = protected_reason(requested, resolved, root=tools.root, home=Path.home(), app_root=APP_ROOT)
+            if reason is None and (venv := self.python_venv()):
+                # A program edited or moved into the environment would run through an allow rule (such as `make`).
+                folder = Path(venv).resolve()
+                if _within(Path(os.path.abspath(requested)), folder) or _within(resolved, folder):
+                    return f"the Python environment commands run with ({venv})"
+            return reason
         return evaluate(session.get("permission_mode", "manual"), name, arguments,
                         chat_rules=session.get("allow_rules") or [], project_rules=saved["project"],
                         user_rules=saved["user"], resolve_path=tools.resolve, protected=protected,
@@ -1804,8 +1868,9 @@ class AgentManager:
         system, _ = self.context_inputs(session, tools, mode)
         definitions = state.get("tool_definitions") or filter_tools(session, [*TOOL_DEFINITIONS, *[
             tool for tool in FEATURE_TOOLS if not session.get("is_subagent") or tool["function"]["name"] != "delegate_task"]])
-        max_output_tokens = self.settings.values.get("max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS)
-        reserve = max(1024, min(max_output_tokens, 4096))
+        context_window, max_output_tokens = self.request_limits(session)
+        # A model that always thinks spends part of the reserve on thinking.
+        reserve = min(max_output_tokens, max(1024, min(max_output_tokens, 4096)) + thinking_reserve(session["model"]))
 
         class TooLong(Exception):
             pass
@@ -1814,8 +1879,7 @@ class AgentManager:
             raise TooLong
         try:
             messages, _, _ = await prepare_context(
-                model_history(history), state, system, definitions,
-                self.settings.values.get("context_window", DEFAULT_CONTEXT_WINDOW), summarize,
+                model_history(history), state, system, definitions, context_window, summarize,
                 reply_reserve=reserve, scale=estimate_scale(session.get("inference_calls"), session["model"]))
         except ValueError as exc:
             if isinstance(exc.__cause__, TooLong):
@@ -2301,7 +2365,7 @@ class AgentManager:
                 target = tools.path(arguments["path"])
                 seen = file_fingerprint(target)
                 result = await tools.execute(name, arguments, page_bytes=read_page_bytes(
-                    self.settings.values.get("context_window", DEFAULT_CONTEXT_WINDOW)))
+                    self.request_limits(session)[0]))
                 self.remember_file(session, target, seen)
             else:
                 result = await tools.execute(name, arguments)
@@ -2574,7 +2638,8 @@ class AgentManager:
                   + (f"\nEnforced tool profile: {session['tool_profile']}. Commands, MCP tools and hooks are unavailable."
                      if session.get("tool_profile", "inherit") != "inherit" else "")
                   + "\nWorkspace: " + session["workspace"]
-                  + "\n" + output_limit_text(self.settings.values.get("max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS))
+                  + self.coding_dir_text(session) + self.python_text(session)
+                  + "\n" + output_limit_text(self.request_limits(session)[1], thinking=bool(thinking_reserve(session["model"])))
                   + ("\n" + index if index else "")
                   + "\n" + guidance["text"] + "\n" + tools.skill_signature
                   + ("\nProject instruction warnings: " + json.dumps(guidance["warnings"]) if guidance["warnings"] else "")
@@ -2582,6 +2647,41 @@ class AgentManager:
                   + "\n" + current_time_text()
                   + ("\n" + notice if notice else "")}
         return system, guidance
+
+    def coding_dir_text(self, session):
+        """The system prompt line for the default code folder, or ""."""
+        coding = user_paths.coding_dir_status(self.settings)
+        if coding["state"] not in ("ready", "missing") or coding["path"] == str(Path(session["workspace"]).resolve()):
+            return ""
+        path = coding["path"]
+        return (f"\nDefault folder for new code: {path}. When the user asks for a new standalone script, tool or "
+                f"project without saying where, create it in a new subfolder there using absolute paths (for example "
+                f"{path}/<name>/). New files that belong to the open project (its modules, tests, docs, notes and "
+                "handoffs) stay in the project. Relative paths still mean the project folder, and existing files are "
+                f"edited where they are. Commands run in the project folder, so use `cd {path}/<name> && ...` for code "
+                "there. Every conversation may use this folder without a folder-access request; edits follow the "
+                "permission mode."
+                + (" It does not exist yet; your first write_file there creates it." if coding["state"] == "missing"
+                   else ""))
+
+    def python_text(self, session):
+        """The system prompt line for the Python environment commands run with, or ""."""
+        if session.get("tool_profile", "inherit") != "inherit":
+            return ""
+        venv = user_paths.python_venv_status(self.settings)
+        if venv["state"] == "ready":
+            path = venv["path"]
+            return (f"\nPython: commands run with the virtual environment {path} active (VIRTUAL_ENV set, {path}/bin "
+                    "first on PATH), so python, pip and installed tools resolve there"
+                    + (f" (Python {venv['version']})" if venv["version"] else "")
+                    + ". Install packages with `python -m pip`; do not create another virtual environment unless the "
+                    "user asks. Files inside it can be changed only with the user's approval.")
+        if venv["state"] == "invalid":
+            reason = venv["message"].removeprefix("Not used: ").rstrip(".")
+            return (f"\nPython: the virtual environment set in Settings ({venv['path']}) is not usable ({reason}), so "
+                    "commands use the Python on PATH, which may be the app server's own environment. Ask the user "
+                    "before installing Python packages.")
+        return user_paths.server_python_note(self.settings) or ""
 
     async def summarize_context(self, session, client, url, headers, messages, *, max_tokens=SUMMARY_MAX_TOKENS,
                                 keep_truncated=False):
@@ -2795,10 +2895,7 @@ class AgentManager:
             await self.status(session, "compacting")
             host, token = self.settings.credentials()
             mode = session.get("permission_mode", "manual")
-            tools = WorkspaceTools(session["workspace"], self.settings.values["env_file"],
-                                   session.get("allowed_directories", []), mode == "bypassPermissions",
-                                   write_limit=write_limit_setting(self.settings.values),
-                                   excluded_roots=(self.settings.state_dir,))
+            tools = self.session_tools(session)
             system, guidance = self.context_inputs(session, tools, mode)
             state = session.get("context_state", {})
             definitions = state.get("tool_definitions")
@@ -2809,14 +2906,15 @@ class AgentManager:
                 warnings.append("No saved tool definitions: this preview includes built-in tools only. External tool costs refresh on the next model request.")
             url = host + "/serving-endpoints/" + quote(session["model"], safe="") + "/invocations"
             headers = {"Authorization": f"Bearer {token}"}
-            context_window = self.settings.values.get("context_window", DEFAULT_CONTEXT_WINDOW)
+            context_window, max_output_tokens = self.request_limits(session)
+            await self.limits_notice(session)
             plan = self.handoff_plan(session, context_window)
             async with httpx.AsyncClient(timeout=httpx.Timeout(120, connect=20), follow_redirects=False) as client:
                 summarize, condense = self.compaction_requests(
                     session, client, url, headers, preservation_note, plan and plan["tokens"])
                 _, updated, info = await prepare_context(
                     model_history(session["wire"]), state, system, definitions, context_window, summarize,
-                    reply_reserve=self.settings.values.get("max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS),
+                    reply_reserve=max_output_tokens, default_reply_reserve=default_limits(session["model"])[1],
                     force_compact=True, preservation_note=preservation_note, condense=condense,
                     scale=estimate_scale(session.get("inference_calls"), session["model"]),
                     handoff_path=plan and plan["path"], save_handoff=plan and self.handoff_saver(session, plan))
@@ -3121,7 +3219,7 @@ class AgentManager:
     async def _run_databricks(self, session, prompt, external_tools, content=None):
         host, token = self.settings.credentials()
         mode = session.get("permission_mode", "manual")
-        tools = WorkspaceTools(session["workspace"], self.settings.values["env_file"], session.get("allowed_directories", []), mode == "bypassPermissions", write_limit=write_limit_setting(self.settings.values), excluded_roots=(self.settings.state_dir,))
+        tools = self.session_tools(session)
         definitions = filter_tools(session, [*TOOL_DEFINITIONS, *[tool for tool in FEATURE_TOOLS
                        if not session.get("is_subagent") or tool["function"]["name"] != "delegate_task"], *external_tools])
         for skill_id in self.requested_skills(tools, prompt):
@@ -3144,9 +3242,11 @@ class AgentManager:
             self.store.save(session)
         wire.append({"role": "user", "content": prompt if content is None else content})
         self._content_sent(session)  # Its @ files are now seen and its ! output no longer pending.
-        context_window = self.settings.values.get("context_window", DEFAULT_CONTEXT_WINDOW)
-        max_output_tokens = self.settings.values.get("max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS)
+        context_window, max_output_tokens = self.request_limits(session)
         self.mark_user_in_wire(session)  # No await since the prompt was appended above.
+        # After mark_user_in_wire: the notice saves, and a save must not hold the prompt with in_wire False.
+        await self.limits_notice(session)
+        default_reply_reserve = default_limits(session["model"])[1]
         url = host + "/serving-endpoints/" + quote(session["model"], safe="") + "/invocations"
         headers = {"Authorization": f"Bearer {token}"}
         async with httpx.AsyncClient(timeout=httpx.Timeout(120, connect=20), follow_redirects=False) as client:
@@ -3170,7 +3270,7 @@ class AgentManager:
                                                                handoff_tokens=plan and plan["tokens"])
                 messages, next_context, info = await prepare_context(
                     model_history(wire), context_state, system, definitions, context_window, summarize,
-                    reply_reserve=max_output_tokens, condense=condense,
+                    reply_reserve=max_output_tokens, condense=condense, default_reply_reserve=default_reply_reserve,
                     scale=estimate_scale(session.get("inference_calls"), session["model"]),
                     handoff_path=plan and plan["path"], save_handoff=plan and self.handoff_saver(session, plan))
                 context_state = session["context_state"] = {**next_context, "tool_definitions": definitions}

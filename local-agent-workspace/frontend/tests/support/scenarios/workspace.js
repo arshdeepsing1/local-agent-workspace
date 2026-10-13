@@ -1,7 +1,7 @@
 // Fake backend for whole-app tests (App.js and useWorkspace.js).
 window.baseSettings = {
   workspace: '/project', model: 'test-model', env_file: '', context_window: 131072,
-  max_output_tokens: 8192, max_agent_steps: 32, host: '', configured: true,
+  max_output_tokens: 8192, max_agent_steps: 32, host: '', configured: true, coding_dir: '', python_venv: '',
 }
 window.contextInfo = {
   estimated_tokens: 60380, input_budget: 120832, context_window: 131072, reply_reserve: 8192,
@@ -31,7 +31,30 @@ window.noteDiff = {
 fake.reviewResult = makeChanges()
 fake.sessions = new Map([['a', makeSession('a', 'Other conversation')]])
 // The M2 user settings at their defaults (the server always returns them).
-fake.settings = { ...baseSettings, user_instructions: '', write_limit_kb: 80, command_env: [], rate_limit_auto_continue: true }
+fake.settings = { ...baseSettings, user_instructions: '', write_limit_kb: 80, command_env: [], rate_limit_auto_continue: true,
+  coding_dir_status: { path: null, state: 'off', message: 'Not set. New code goes where you ask, or into the project folder.', source: 'none' },
+  python_venv_status: { path: null, state: 'off', message: 'Not set. Commands use the Python on the server\'s PATH.', python: null, version: null, source: 'none' },
+  default_model: 'databricks-claude-opus-5-5', default_limits: { context_window: 131072, max_output_tokens: 8192 } }
+// POST /api/settings/limits: canned answers like the server's for Claude Opus 5.5; other endpoints have no profile.
+window.opusProfile = { label: 'Claude Opus 5.5', context_max: 1000000, output_max: 128000, itpm: 1000000, otpm: 100000,
+  recommended_context_window: 200000, recommended_max_output_tokens: 16384, thinking_reserve: 4096,
+  model: 'databricks-claude-opus-5-5', output_concurrency_limit: 20000, context_rate_limit: 250000 }
+window.limitsCheck = ({ model, context_window, max_output_tokens }) => {
+  const effective = { context_window, max_output_tokens, clamped: false }
+  if (model.trim().toLowerCase() !== 'databricks-claude-opus-5-5') {
+    return { profile: null, recommended: null, defaults: { context_window: 131072, max_output_tokens: 8192 }, effective, warnings: [],
+      note: 'No built-in limits for this endpoint. Set the context budget at or below its context window.' }
+  }
+  const warnings = []
+  effective.context_window = Math.min(context_window, 1000000)
+  effective.max_output_tokens = Math.min(max_output_tokens, 128000, effective.context_window - 2049)
+  effective.clamped = effective.context_window !== context_window || effective.max_output_tokens !== max_output_tokens
+  if (max_output_tokens > 20000) warnings.push({ code: 'output_concurrency', level: 'warning', text: 'Above 20,000, four requests at once can be rejected with HTTP 429 before they start.' })
+  if (context_window > 250000) warnings.push({ code: 'context_itpm', level: 'note', text: 'Above 250,000 tokens, four full steps in one minute reach the input limit.' })
+  return { profile: opusProfile, recommended: { context_window: 200000, max_output_tokens: 16384 },
+    defaults: { context_window: 200000, max_output_tokens: 16384 }, effective, warnings,
+    note: 'Limits for Claude Opus 5.5 are Databricks\'s documented pay-per-token defaults (Enterprise tier, checked 2026-10-13); your workspace\'s limits may differ.' }
+}
 // Saved project and user permission rules, returned by GET /api/permission-rules with the chat's rules.
 fake.projectRules = []
 fake.userRules = []
@@ -50,6 +73,8 @@ fake.handle = (path, options) => {
     fake.settings = { ...fake.settings, ...body() }
     return fake.json(fake.settings)
   }
+  if (path === '/api/settings' && (options.method || 'GET') === 'GET') return fake.json(fake.settings)
+  if (path === '/api/settings/limits' && options.method === 'POST') return fake.json(limitsCheck(body()))
   if (path === '/api/sessions' && options.method === 'POST') {
     const created = { ...makeSession('created', 'Created conversation'), model: fake.settings.model }
     fake.sessions.set(created.id, created)

@@ -55,7 +55,7 @@ async def test_mcp_rechecks_guidance_after_approval_and_before_hook(runtime, cha
         (tools.root / "AGENTS.md").write_text("Ask for a fresh review before external writes.")
         return True
 
-    async def hook(*args):
+    async def hook(*args, **kwargs):
         (tools.root / "AGENTS.md").write_text("Ask for a fresh review before external writes.")
         return {"exit_code": 0, "output": "", "truncated": False}
 

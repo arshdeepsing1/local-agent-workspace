@@ -205,13 +205,14 @@ def summary_byte_limit(input_budget):
     return max(SUMMARY_MIN_BYTES, min(SUMMARY_MAX_BYTES, input_budget * 3 // 8))
 
 
-def budget_error(problem, context_window, reply_reserve, input_budget):
-    """Explain the input-budget arithmetic and the setting most likely to help."""
+def budget_error(problem, context_window, reply_reserve, input_budget, default_reply_reserve=DEFAULT_MAX_OUTPUT_TOKENS):
+    """Explain the input-budget arithmetic and the setting most likely to help. default_reply_reserve
+    is the endpoint's default Max output tokens (model_profiles.default_limits)."""
     arithmetic = (f"The input budget is {input_budget:,} tokens: {context_window:,} context budget "
                   f"minus {reply_reserve:,} reserved for output minus the {SAFETY_MARGIN:,}-token safety margin.")
-    if reply_reserve > DEFAULT_MAX_OUTPUT_TOKENS:
+    if reply_reserve > default_reply_reserve:
         advice = (f"Lower Max output tokens in Settings (currently {reply_reserve:,}; default "
-                  f"{DEFAULT_MAX_OUTPUT_TOKENS:,}) to free input space, increase the context budget if your "
+                  f"{default_reply_reserve:,}) to free input space, increase the context budget if your "
                   "endpoint supports it, or start a new conversation with a smaller request.")
     else:
         advice = ("Increase the context budget in Settings if your endpoint supports it, or start a new "
@@ -327,7 +328,8 @@ async def fit_summary(summary, limit_bytes, condense=None):
 
 async def prepare_context(wire, state, system_message, tools, context_window, summarize,
                           *, reply_reserve=DEFAULT_MAX_OUTPUT_TOKENS, force_compact=False,
-                          preservation_note="", condense=None, scale=1.0, handoff_path=None, save_handoff=None):
+                          preservation_note="", condense=None, scale=1.0, handoff_path=None, save_handoff=None,
+                          default_reply_reserve=DEFAULT_MAX_OUTPUT_TOKENS):
     if not MIN_CONTEXT_WINDOW <= context_window <= MAX_CONTEXT_WINDOW:
         raise ValueError(f"Choose a context window between {MIN_CONTEXT_WINDOW} and {MAX_CONTEXT_WINDOW}.")
     if (type(reply_reserve) is not int or not MIN_MAX_OUTPUT_TOKENS <= reply_reserve <= MAX_MAX_OUTPUT_TOKENS
@@ -397,7 +399,7 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
                 with_summary = ", including room for a summary of earlier turns," if boundaries else ""
                 problem = (f"The latest turn and project instructions need about {needed:,} estimated input tokens"
                            f"{with_summary or ','} which exceeds the available context budget.")
-            raise budget_error(problem, context_window, reply_reserve, input_budget)
+            raise budget_error(problem, context_window, reply_reserve, input_budget, default_reply_reserve)
 
         archived = wire[state["through"]:cut]
         if in_turn and request_index < state["through"]:
@@ -447,7 +449,8 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
         if estimate > input_budget:
             raise budget_error(
                 f"The summary and latest turns still exceed the context budget: they need about "
-                f"{estimate:,} estimated input tokens.", context_window, reply_reserve, input_budget)
+                f"{estimate:,} estimated input tokens.", context_window, reply_reserve, input_budget,
+                default_reply_reserve)
         if handoff_path:
             saved = bool(save_handoff) and await save_handoff(documents, updated["compactions"])
             if not saved:

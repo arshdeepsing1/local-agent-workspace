@@ -13,15 +13,17 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .agents import AgentManager, public_session
 from .config import APP_ROOT, MAX_APPROVAL_MINUTES, MAX_MAX_AGENT_STEPS, MIN_MAX_AGENT_STEPS, Settings
 from .config import MAX_COMMAND_ENV, MAX_USER_INSTRUCTIONS, MAX_WRITE_LIMIT_KB, MIN_WRITE_LIMIT_KB
 from .context import (
-    MAX_CONTEXT_WINDOW, MAX_MAX_OUTPUT_TOKENS, MIN_CONTEXT_WINDOW, MIN_MAX_OUTPUT_TOKENS,
+    MAX_CONTEXT_WINDOW, MAX_MAX_OUTPUT_TOKENS, MIN_CONTEXT_WINDOW, MIN_MAX_OUTPUT_TOKENS, SAFETY_MARGIN,
 )
+from .model_profiles import default_limits, effective_limits, limit_warnings, limits_note, public_profile
+from .user_paths import standing_directories
 from .store import Store, UnreadableConversation
 from . import conversation_search
 from .git_tools import file_diff, working_tree_changes, working_tree_status
@@ -136,6 +138,22 @@ class SettingsEdit(BaseModel):
     write_limit_kb: int | None = Field(default=None, ge=MIN_WRITE_LIMIT_KB, le=MAX_WRITE_LIMIT_KB, strict=True)
     command_env: list[str] | None = Field(default=None, max_length=MAX_COMMAND_ENV, strict=True)
     rate_limit_auto_continue: bool | None = Field(default=None, strict=True)
+    coding_dir: str | None = Field(default=None, max_length=4096, strict=True)
+    python_venv: str | None = Field(default=None, max_length=4096, strict=True)
+
+
+class LimitsQuery(BaseModel):
+    """Budgets to check against an endpoint's limits (Settings shows the warnings while editing)."""
+    model_config = {"extra": "forbid"}
+    model: str = Field(min_length=1, max_length=256, strict=True)
+    context_window: int = Field(ge=MIN_CONTEXT_WINDOW, le=MAX_CONTEXT_WINDOW, strict=True)
+    max_output_tokens: int = Field(ge=MIN_MAX_OUTPUT_TOKENS, le=MAX_MAX_OUTPUT_TOKENS, strict=True)
+
+    @model_validator(mode="after")
+    def output_below_context(self):
+        if self.max_output_tokens >= self.context_window - SAFETY_MARGIN:
+            raise ValueError("Max output tokens must be below the context budget minus the safety margin.")
+        return self
 
 
 class CommandRequest(BaseModel):
@@ -218,7 +236,8 @@ def create_app(settings=None):
         from .tools import write_limit_setting
         session = session_or_404(session_id) if session_id else {}
         workspace = session.get("workspace", settings.values["workspace"])
-        return WorkspaceTools(workspace, settings.values["env_file"], session.get("allowed_directories", []),
+        return WorkspaceTools(workspace, settings.values["env_file"],
+                              [*session.get("allowed_directories", []), *standing_directories(settings)],
                               session.get("permission_mode") == "bypassPermissions",
                               write_limit=write_limit_setting(settings.values), excluded_roots=(settings.state_dir,))
 
@@ -230,7 +249,8 @@ def create_app(settings=None):
         from .tools import write_limit_setting
         # workspace_folders is assigned by register_workspace_folders below, before any request.
         return WorkspaceTools(workspace, settings.values["env_file"],
-                              [*session.get("allowed_directories", []), *workspace_folders.paths(workspace)],
+                              [*session.get("allowed_directories", []), *standing_directories(settings),
+                               *workspace_folders.paths(workspace)],
                               session.get("permission_mode") == "bypassPermissions",
                               write_limit=write_limit_setting(settings.values), excluded_roots=(settings.state_dir,))
 
@@ -275,6 +295,26 @@ def create_app(settings=None):
     async def update_settings(body: SettingsEdit):
         manager.workspace_available(body.workspace)
         return settings.update(body.model_dump(exclude_none=True))
+
+    @app.get("/api/settings")
+    async def get_settings():
+        # Read again so the Settings dialog and Folder access show current folder states.
+        return settings.public()
+
+    @app.post("/api/settings/limits")
+    async def check_limits(body: LimitsQuery):
+        model = body.model.strip()
+        profile = public_profile(model)
+        recommended = None
+        if profile and profile["recommended_context_window"] and profile["recommended_max_output_tokens"]:
+            recommended = {"context_window": profile["recommended_context_window"],
+                           "max_output_tokens": profile["recommended_max_output_tokens"]}
+        defaults = default_limits(model)
+        return {"profile": profile, "recommended": recommended,
+                "defaults": {"context_window": defaults[0], "max_output_tokens": defaults[1]},
+                "effective": effective_limits(model, body.context_window, body.max_output_tokens),
+                "warnings": limit_warnings(model, body.context_window, body.max_output_tokens),
+                "note": limits_note(model)}
 
     @app.get("/api/sessions")
     async def list_sessions():

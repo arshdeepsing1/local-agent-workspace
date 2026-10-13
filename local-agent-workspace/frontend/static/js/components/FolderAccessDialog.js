@@ -1,9 +1,11 @@
 import { html, useEffect, useRef, useState } from '../lib.js'
 import { Check, Folder, LoaderCircle, X } from '../icons.js'
 import { api } from '../api.js'
+import { standingFolder, inside } from './FileRoots.js'
 
 // Check result: { accessible, path, error, python_executable? }
-export default function FolderAccessDialog({ workspace, folders, busy, bypass, onAllow, onRemove, onClose }) {
+// codingDir: Settings coding_dir_status; the default code folder is allowed in every conversation.
+export default function FolderAccessDialog({ workspace, folders, codingDir = null, busy, bypass, onAllow, onRemove, onClose }) {
   const dialog = useRef(null)
   const [path, setPath] = useState('~/Downloads')
   const [result, setResult] = useState(null)
@@ -22,13 +24,16 @@ export default function FolderAccessDialog({ workspace, folders, busy, bypass, o
     catch (e) { setError(e.message) }
     finally { setWorking(false) }
   }
-  const granted = result && (folders.includes(result.path) || result.path === workspace)
+  const standing = standingFolder(codingDir, workspace)
+  const granted = result && (folders.includes(result.path) || result.path === workspace
+    || (standing && (result.path === standing.path || inside(result.path, standing.path))))
   return html`<dialog ref=${dialog} class="settings-dialog folder-access-dialog" aria-labelledby="folder-access-title"
     onCancel=${onClose} onClick=${e => { if (e.target === dialog.current) onClose() }}>
     <div class="dialog-content">
       <header><div><h2 id="folder-access-title">Folder access</h2><p>Choose folders this conversation can work with.</p></div>
         <button class="icon-button" aria-label="Close folder access" onClick=${onClose}><${X} size=${20} /></button></header>
       <div class="folder-grants"><div class="folder-grant"><${Folder} size=${16} /><span title=${workspace}>${workspace}<small>Project folder</small></span></div>
+        ${standing ? html`<div class="folder-grant"><${Folder} size=${16} /><span title=${standing.path}>${standing.path}<small>Default code folder · all conversations${standing.missing ? ' · created on first write' : ''}</small></span></div>` : null}
         ${folders.map(folder => html`<div class="folder-grant" key=${folder}><${Folder} size=${16} /><span title=${folder}>${folder}<small>Allowed in this conversation</small></span>
           <button class="icon-button" aria-label=${`Remove access to ${folder}`} disabled=${working || busy || bypass} onClick=${() => void change(() => onRemove(folder))}><${X} size=${15} /></button></div>`)}
       </div>
@@ -42,7 +47,7 @@ export default function FolderAccessDialog({ workspace, folders, busy, bypass, o
         ${result.accessible ? html`<${Check} size=${16} /><span>${granted ? 'Allowed for this conversation.' : 'The Python server can read this folder.'}</span>` :
           html`<p>${result.error}</p>${result.python_executable ? html`<details><summary>Python used by this server</summary><code>${result.python_executable}</code></details>` : null}`}
       </div>` : null}
-      <p class="field-help">Allowing a folder lets the agent read its files and send relevant content to your model. File edits follow your selected permission mode. Browser approval cannot change macOS privacy settings.</p>
+      <p class="field-help">Allowing a folder lets the agent read its files and send relevant content to your model. File edits follow your selected permission mode. Browser approval cannot change macOS privacy settings.${standing ? ' The default code folder comes from Settings; change it there.' : ''}</p>
       ${busy ? html`<p class="field-help">Stop the current response before changing folder access.</p>` : null}
       ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
       <footer><button class="outline" onClick=${onClose}>Done</button><button class="primary" disabled=${working || busy || !result?.accessible || !!granted}

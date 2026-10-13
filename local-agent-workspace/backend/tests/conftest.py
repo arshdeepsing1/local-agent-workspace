@@ -8,6 +8,16 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def isolated_defaults(monkeypatch):
+    """No default code folder or Python environment from the developer's environment, and a
+    model without a built-in profile (131,072 and 8,192). Tests of the default model delenv
+    LOCAL_AGENT_MODEL."""
+    monkeypatch.setenv("LOCAL_AGENT_CODING_DIR", "")
+    monkeypatch.setenv("LOCAL_AGENT_PYTHON_VENV", "")
+    monkeypatch.setenv("LOCAL_AGENT_MODEL", "test-endpoint")
+
+
+@pytest.fixture(autouse=True)
 def no_ripgrep(monkeypatch):
     """Search without ripgrep by default, so results do not depend on whether it is
     installed. Tests that need it use real_ripgrep."""

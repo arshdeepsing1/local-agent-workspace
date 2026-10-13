@@ -1,7 +1,7 @@
 import { html, useCallback, useEffect, useRef, useState } from '../lib.js'
 import { ArrowLeft, ChevronRight, Code2, File, FileDiff, Folder, GitBranch, Pencil, Plus, RefreshCw, Save, Terminal, X } from '../icons.js'
 import { api } from '../api.js'
-import FileRoots, { useWorkspaceFolders } from './FileRoots.js'
+import FileRoots, { standingFolder, useWorkspaceFolders } from './FileRoots.js'
 import TerminalPanel from './TerminalPanel.js'
 import DiffReview, { DiffLine, UnsentComments } from './DiffReview.js'
 import { DiffStat } from './ChangesBar.js'
@@ -131,15 +131,19 @@ function GitChanges({ query, workspace, busy, onOpenFile }) {
 // onSelectSession(id) opens a chat that a review error names as blocking.
 // onSendComments(message) sends the review's line comments to the agent (see DiffReview).
 // allowedDirectories: the conversation's granted folders (absolute), offered as other roots of Files.
+// codingDir: Settings coding_dir_status (the default code folder, a root of Files in every chat);
+// pythonVenv: Settings python_venv_status (named in the Terminal).
 // open: { path, line? } opens that file in the editor once, at that line, then onOpened() clears it.
-export default function WorkspacePanel({ sessionId, workspace, allowedDirectories = [], file, setFile, onClose, onAttach, changes: agentChanges, busy, review, onReviewOpened, onReview, onSelectSession, onSendComments, open, onOpened }) {
+export default function WorkspacePanel({ sessionId, workspace, allowedDirectories = [], codingDir = null, pythonVenv = null, file, setFile, onClose, onAttach, changes: agentChanges, busy, review, onReviewOpened, onReview, onSelectSession, onSendComments, open, onOpened }) {
   const [tab, setTab] = useState('files')
   // root '.' is the project; a granted or added folder is browsed by absolute paths and never above itself.
   const [root, setRoot] = useState('.')
   const [directory, setDirectory] = useState('.')
   const chooseRoot = value => { setRoot(value); setDirectory(value) }
   const added = useWorkspaceFolders(sessionId, workspace)
-  const roots = [...allowedDirectories, ...added.folders.filter(folder => !folder.missing).map(folder => folder.path)]
+  const standing = standingFolder(codingDir, workspace)
+  const roots = [...(standing ? [standing.path] : []), ...allowedDirectories,
+    ...added.folders.filter(folder => !folder.missing).map(folder => folder.path)]
   useEffect(() => { if (root !== '.' && !roots.includes(root)) chooseRoot('.') }, [root, roots.join('\n')])
   const parentOf = path => root === '.' ? (path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '.')
     : path.slice(0, path.lastIndexOf('/')).length < root.length ? root : path.slice(0, path.lastIndexOf('/'))
@@ -267,7 +271,7 @@ export default function WorkspacePanel({ sessionId, workspace, allowedDirectorie
           onMouseDown=${leaveLine} onKeyDown=${leaveLine} onInput=${e => { leaveLine(); setFile({ ...file, content: e.currentTarget.value }) }} />
         <div class="editor-status"><span>${file.content.split('\n').length} lines${markedLine?.selected ? ` · Line ${markedLine.line}` : ''}</span><span>${dirty ? 'Unsaved changes' : 'Saved on disk'}</span></div>`}
       </div>` : html`<div class="file-browser">
-        <${FileRoots} workspace=${workspace} root=${root} onChoose=${chooseRoot} granted=${allowedDirectories} folders=${added.folders}
+        <${FileRoots} workspace=${workspace} root=${root} onChoose=${chooseRoot} granted=${allowedDirectories} folders=${added.folders} codingDir=${codingDir}
           onAdd=${added.add} onRemove=${added.remove} changed=${[...changed.keys()]} />
         <div class="file-path"><button class="icon-button" aria-label="Parent folder" disabled=${directory === root} onClick=${() => setDirectory(parentOf(directory))}><${ArrowLeft} size=${15} /></button><span title=${directory === '.' ? workspace : directory}>${directory === '.' ? 'Project files' : directory}</span>
           <button class="icon-button" aria-label="Refresh files" disabled=${loading} onClick=${() => void refresh()}><${RefreshCw} size=${14} className=${loading ? 'spin' : ''} /></button></div>
@@ -284,7 +288,7 @@ export default function WorkspacePanel({ sessionId, workspace, allowedDirectorie
       </div>`)
     : tab === 'changes' ? html`<${GitChanges} query=${query} workspace=${workspace} busy=${busy}
       onOpenFile=${(path, line) => { setTab('files'); void openFile(path, 'edit', line) }} />`
-    : html`<${TerminalPanel} sessionId=${sessionId} workspace=${workspace} />`}
+    : html`<${TerminalPanel} sessionId=${sessionId} workspace=${workspace} pythonVenv=${pythonVenv} />`}
     ${sessionId && !(tab === 'files' && reviewing) ? html`<${UnsentComments} sessionId=${sessionId} busy=${busy} onSendComments=${onSendComments} />` : null}
   </aside>`
 }

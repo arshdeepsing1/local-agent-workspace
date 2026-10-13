@@ -281,7 +281,8 @@ class ExtensionManager:
             return self._app_skill(skill_id)
         return self._skill(tools, skill_id, roots=roots)
 
-    async def run_hook(self, hook, payload, workspace):
+    async def run_hook(self, hook, payload, workspace, env=None):
+        """Run a hook with payload on stdin. env, when given, is the hook's whole environment."""
         selected = next((entry for entry in self.config["hooks"] if entry["id"] == hook.get("id") and entry["enabled"]), None)
         if selected is None or selected != hook:
             raise ValueError("Hook is disabled or changed; refresh its configuration before running it.")
@@ -295,7 +296,7 @@ class ExtensionManager:
                 target.write(data)
             command = f"(\n{selected['command']}\n) < {shlex.quote(filename)}"
             try:
-                result = await run_process(command, workspace, selected["timeout_seconds"], 4096)
+                result = await run_process(command, workspace, selected["timeout_seconds"], 4096, env=env)
             except CommandTimeout as error:
                 result = {**error.result, "timed_out": True}
             # Room for the note that a command did not end, added after redaction.

@@ -114,14 +114,9 @@ def test_settings_edit_and_save_only_databricks_fields(ui, page):
     expect(output).to_have_attribute("max", "131072")
     expect(dialog.get_by_text("Current estimated input budget: 120,832 tokens.", exact=False)).to_be_visible()
     endpoint = dialog.get_by_label("Databricks model endpoint")
-    endpoint.fill("databricks-claude-opus-4-8")
     budget.fill("131000")
     output.fill("121000")
     expect(dialog.get_by_text(re.compile("leaves too little room for a working conversation"))).to_be_visible()
-    expect(dialog.get_by_text(re.compile("reserves max_tokens against a 20,000 output-tokens-per-minute limit"))).to_be_visible()
-    output.fill("20000")
-    expect(dialog.get_by_text(re.compile("reserves the full standard Claude Opus 4.8 output-per-minute quota"))).to_be_visible()
-    expect(dialog.get_by_text(re.compile("8,192 default leaves room for multi-step work"))).to_be_visible()
     endpoint.fill("test-model")
     budget.fill("131072")
     output.fill("8192")
@@ -148,7 +143,7 @@ def test_settings_edit_and_save_only_databricks_fields(ui, page):
     expect(page.get_by_role("dialog")).to_have_count(0)
     assert ui.bodies("/api/settings", "PUT") == [{
         "workspace": "/updated-project", "model": "databricks-gpt-oss-120b", "env_file": "/credentials/env_vars.txt",
-        "context_window": 65536, "max_output_tokens": 32768, "max_agent_steps": 48}]
+        "context_window": 65536, "max_output_tokens": 32768, "max_agent_steps": 48, "coding_dir": "", "python_venv": ""}]
 
 
 def test_settings_open_with_focus_inside_the_dialog(ui, page):
@@ -436,7 +431,8 @@ def test_draft_model_changes_default_before_creating_conversation(ui, page):
     expect(model(page)).to_have_value("other-model")
     assert ui.bodies("/api/settings") == [{"workspace": "/project", "model": "other-model", "env_file": "", "context_window": 131072,
                                            "max_output_tokens": 8192, "max_agent_steps": 32, "user_instructions": "",
-                                           "write_limit_kb": 80, "command_env": [], "rate_limit_auto_continue": True}]
+                                           "write_limit_kb": 80, "command_env": [], "rate_limit_auto_continue": True,
+                                           "coding_dir": "", "python_venv": ""}]
     send(page).click()
     ui.show_session("created")
     assert ui.js("fake.sessions.get('created').model") == "other-model"

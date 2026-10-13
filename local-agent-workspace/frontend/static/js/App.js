@@ -1,4 +1,4 @@
-import { html, resolve, useState } from './lib.js'
+import { html, resolve, useEffect, useState } from './lib.js'
 import { Folder, Laptop, Menu, PanelRight, Pencil, Terminal, X } from './icons.js'
 import { api } from './api.js'
 import { useWorkspace } from './useWorkspace.js'
@@ -10,6 +10,7 @@ import AgentToolsDialog from './components/AgentToolsDialog.js'
 import SettingsDialog from './components/SettingsDialog.js'
 import WorkspacePanel from './components/WorkspacePanel.js'
 import FolderAccessDialog from './components/FolderAccessDialog.js'
+import { inside } from './components/FileRoots.js'
 import PermissionRulesDialog from './components/PermissionRulesDialog.js'
 import ContextMeter from './components/ContextMeter.js'
 import ChangesBar, { plural } from './components/ChangesBar.js'
@@ -62,6 +63,14 @@ export default function App() {
     app.setError(message)
   }
   const changedFiles = app.changes?.files.length || 0
+  // A missing default code folder is created by the agent's first write (a file tool or a command): check it
+  // again when a change lands inside it, when a reply ends and when the Workspace panel opens, so Files keeps it
+  // browsable after the change list empties.
+  const missingCodingDir = app.settings?.coding_dir_status?.state === 'missing' ? app.settings.coding_dir_status.path : null
+  const changedInMissing = !!missingCodingDir && (app.changes?.files || []).some(item => inside(item.path, missingCodingDir))
+  useEffect(() => {
+    if (missingCodingDir && (changedInMissing || !busy)) void app.refreshSettings().catch(() => {})
+  }, [missingCodingDir, changedInMissing, busy, workspaceOpen])
   const openReview = path => { setReview({ path, viewKey: app.viewKey }); setWorkspaceOpen(true) }
   const openFileAt = ({ path, line }) => { setOpenPath({ path, line, viewKey: app.viewKey }); setWorkspaceOpen(true) }
   // Removing a rule saves the chat (a newer 'updated'); like a rename, your own change is not news.
@@ -71,9 +80,9 @@ export default function App() {
     const updated = await app.removeRule(scope, rule)
     if (scope === 'chat' && typeof updated?.updated === 'number') attention.renamed(id, before, updated.updated)
   }
-  const composer = html`<${Composer} key=${app.viewKey} value=${draft} setValue=${setDraft} model=${active?.model || app.settings?.model || 'databricks-gpt-oss-120b'}
+  const composer = html`<${Composer} key=${app.viewKey} value=${draft} setValue=${setDraft} model=${active?.model || app.settings?.model || app.settings?.default_model || 'databricks-claude-opus-5-5'}
     workspace=${active?.workspace || app.settings?.workspace || ''} worktree=${active?.worktree} mode=${app.permissionMode} onMode=${app.setPermissionMode} onProject=${() => setSettingsOpen(true)}
-    onFolders=${() => setFoldersOpen(true)} rules=${app.rules.chat} onRemoveRule=${removeRule}
+    onFolders=${() => { setFoldersOpen(true); void app.refreshSettings().catch(() => {}) }} rules=${app.rules.chat} onRemoveRule=${removeRule}
     projectRules=${app.rules.project} userRules=${app.rules.user} rulesProblem=${app.rules.problem} onLoadRules=${app.loadRules}
     onAddRule=${done => setRulesOpen({ done })} onResetRules=${app.resetRules}
     models=${app.connection?.models || []} busy=${busy} modelSaving=${app.modelSaving}
@@ -134,7 +143,7 @@ export default function App() {
       </div>
     </main>
     ${workspaceOpen && app.settings && (!app.activeId || active) ? html`<${WorkspacePanel} key=${editorKey} sessionId=${app.activeId}
-      allowedDirectories=${active?.allowed_directories || []}
+      allowedDirectories=${active?.allowed_directories || []} codingDir=${app.settings.coding_dir_status} pythonVenv=${app.settings.python_venv_status}
       workspace=${workspace} file=${editorDrafts[editorKey] || null} setFile=${setEditorFile} onClose=${() => setWorkspaceOpen(false)}
       changes=${app.changes} busy=${busy} review=${review?.viewKey === app.viewKey ? review : null} onReviewOpened=${() => setReview(null)} onReview=${app.reviewChanges} onSelectSession=${app.setActiveId}
       onSendComments=${text => app.send(text)}
@@ -143,6 +152,7 @@ export default function App() {
     ${agentToolsOpen && app.settings && (!app.activeId || active) ? html`<${AgentToolsDialog} key=${editorKey} session=${active} onSaveTools=${app.setDisabledTools} workspace=${workspace} onClose=${() => setAgentToolsOpen(false)} onError=${showError} onSelectSession=${id => { setAgentToolsOpen(false); app.setActiveId(id); void app.refreshSessions().catch(e => showError(e.message)) }} />` : null}
     ${settingsOpen && app.settings ? html`<${SettingsDialog} settings=${app.settings} connection=${app.connection} onSave=${app.saveSettings} onClose=${() => setSettingsOpen(false)} />` : null}
     ${foldersOpen && app.settings ? html`<${FolderAccessDialog} key=${app.viewKey} workspace=${active?.workspace || app.settings.workspace} folders=${active?.allowed_directories || []}
+      codingDir=${app.settings.coding_dir_status}
       busy=${busy || (!!app.activeId && !active)} bypass=${app.permissionMode === 'bypassPermissions'} onAllow=${app.allowFolder} onRemove=${app.removeFolder} onClose=${() => setFoldersOpen(false)} />` : null}
     ${rulesOpen && app.settings ? html`<${PermissionRulesDialog} key=${app.viewKey} onAdd=${app.addRule} onClose=${() => setRulesOpen(false)} returnFocus=${rulesOpen.done} />` : null}
   </div>`
