@@ -544,7 +544,9 @@ when opening a conversation or performing restart recovery.
   say that the output was cut. If you decline the approval card, let it expire, or stop
   the command with **Stop job** in Terminal, there is no fix round and Verify does not
   run again in that turn. A note typed on a declined card is passed to the agent, which
-  answers it in another model request when an agent step is left. After the last fix
+  answers it in another model request when an agent step is left. If that request fails
+  or is stopped, the hidden message stays in the model history with a short placeholder
+  reply, so your next message (**Continue**, say) still carries the output or the note. After the last fix
   round, or when no agent step is left, the turn ends with a notice; the full output is in the command
   card. Each fix round uses an agent step. Leave the command empty to turn Verify off.
   The settings are kept in `<state dir>/projects.json` for each resolved workspace path

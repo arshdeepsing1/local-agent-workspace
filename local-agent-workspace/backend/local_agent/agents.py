@@ -80,6 +80,7 @@ MAX_RATE_LIMIT_WAITS = 2  # Extra waits per turn after the retries, when Setting
 RATE_LIMIT_WAIT_CAP = 120.0
 MAX_REPAIR_RETRIES = 2
 # Failures answered with a hidden continuation, and its text.
+UNANSWERED_CONTINUATION = "[No reply: the request after this message failed or was stopped.]"
 REPAIR_CONTINUATIONS = {"invalid_tool_arguments": INVALID_ARGUMENTS_CONTINUATION,
                         "incomplete_response": INCOMPLETE_RESPONSE_CONTINUATION}
 VERIFY_TRIGGER_TOOLS = frozenset({"write_file", "edit_file", "move_path", "delete_path", "notebook_edit"})
@@ -2109,10 +2110,15 @@ class AgentManager:
         session["wire"] = wire
         if "context_state" in session or context_state:
             session["context_state"] = context_state
-        # A cancellation or inference failure can leave the protocol-only retry
-        # prompt unanswered. Do not place the next real user prompt after it.
+        # A cancellation or inference failure can leave an app continuation unanswered. A
+        # protocol-only retry prompt is dropped. A Verify message carries data (the failure
+        # output or the user's note), so it stays, answered by a placeholder: the next real
+        # user prompt never directly follows a continuation.
         if wire and is_continuation(wire[-1]):
-            wire.pop()
+            if wire[-1]["content"].startswith(VERIFY_CONTINUATION_PREFIX):
+                wire.append({"role": "assistant", "content": UNANSWERED_CONTINUATION})
+            else:
+                wire.pop()
             self.store.save(session)
         wire.append({"role": "user", "content": prompt})
         context_window = self.settings.values.get("context_window", DEFAULT_CONTEXT_WINDOW)

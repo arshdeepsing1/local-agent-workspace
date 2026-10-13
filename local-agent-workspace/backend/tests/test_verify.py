@@ -48,15 +48,16 @@ def say(text):
 
 
 def model(monkeypatch, *responses, repeat=None):
-    """Streamed requests get the responses in order (then repeat cycles); bodies are recorded."""
+    """Streamed requests get the responses in order (then repeat cycles); bodies are recorded.
+    A response may be a coroutine, for a request that hangs."""
     requests = []
 
     async def gateway(request):
         requests.append(json.loads(request.content))
         number = len(requests)
-        if number <= len(responses):
-            return responses[number - 1](number)
-        return repeat[(number - len(responses) - 1) % len(repeat)](number)
+        response = responses[number - 1](number) if number <= len(responses) else \
+            repeat[(number - len(responses) - 1) % len(repeat)](number)
+        return await response if asyncio.iscoroutine(response) else response
 
     client = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client(**kwargs, transport=httpx.MockTransport(gateway)))
@@ -270,16 +271,44 @@ async def test_stop_during_verify_cancels_the_turn_and_its_command(runtime, monk
 
 async def test_restart_does_not_turn_a_verify_message_into_a_turn(runtime, monkeypatch):
     manager, session, project = runtime
-    configure(manager, project, "false", verify_max_rounds=1)
+    configure(manager, project, "echo BROKEN-TEST-MARKER; false", verify_max_rounds=1)
     requests = model(monkeypatch, write("a.txt"), say("Done."), lambda number: httpx.Response(500, text="Down"),
                      say("Answered."))
     await manager.run(session, "Write a.txt")
     assert is_continuation(session["wire"][-1])
     restarted = AgentManager(manager.store, manager.settings)
     saved = restarted.get(session["id"])
-    await restarted.run(saved, "Next question")
-    assert requests[-1]["messages"][-1] == {"role": "user", "content": "Next question"}
-    assert not any(is_continuation(message) for message in requests[-1]["messages"])
+    await restarted.run(saved, "Continue from where you stopped.")
+    # The failure output still reaches the model: the unanswered Verify message stays, with a placeholder reply.
+    verify, placeholder, prompt = requests[-1]["messages"][-3:]
+    assert is_continuation(verify) and "BROKEN-TEST-MARKER" in verify["content"]
+    assert placeholder == {"role": "assistant", "content": "[No reply: the request after this message failed or was stopped.]"}
+    assert prompt == {"role": "user", "content": "Continue from where you stopped."}
+    assert sum(is_continuation(message) for message in requests[-1]["messages"]) == 1
+
+
+async def test_a_declined_note_survives_a_stopped_request(runtime, monkeypatch):
+    manager, session, project = runtime
+    configure(manager, project, "pytest -q")
+    session.update(permission_mode="acceptEdits")
+    manager.store.save(session)
+    hanging = asyncio.Event()
+
+    async def hang(number):
+        await hanging.wait()
+
+    requests = model(monkeypatch, write("notes.txt"), say("Done."), hang, say("I will use make lint."))
+    manager.start(session["id"], "Write the notes")
+    session = manager.live[session["id"]]
+    await wait_for(lambda: any(event.get("verify") and event.get("state") == "pending" for event in session["events"]))
+    manager.decide(session["id"], verify_runs(session)[0]["id"], False, note="Use make lint instead, NOTE-123.")
+    await wait_for(lambda: len(requests) == 3)
+    await manager.stop(session["id"])
+    assert manager.store.get(session["id"])["terminal_reason"] == "stopped"
+    await manager.run(manager.get(session["id"]), "Go on")
+    messages = requests[3]["messages"]
+    assert "NOTE-123" in messages[-3]["content"] and messages[-2]["role"] == "assistant"
+    assert messages[-1] == {"role": "user", "content": "Go on"}
 
 
 async def test_the_tail_comes_from_the_real_end_of_output_over_the_default_command_limit(runtime, monkeypatch):
