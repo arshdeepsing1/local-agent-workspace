@@ -62,10 +62,18 @@ class Decision(BaseModel):
     allowed: bool
     remember: bool = Field(default=False, strict=True)  # Approve and store an exact allow rule for this chat.
     note: str | None = Field(default=None, max_length=MAX_DECLINE_NOTE, strict=True)  # Decline only.
+    scope: Literal["chat", "project", "user"] | None = None  # Approve and save an allow rule there.
+    rule: dict | None = None  # The rule to save (at most 8 KB of JSON); the card's default rule when absent.
 
 
 class SessionPermissions(BaseModel):
     permission_mode: PermissionMode = "manual"
+
+
+class PermissionChange(BaseModel):
+    model_config = {"extra": "forbid"}
+    permission_mode: PermissionMode
+    confirm: bool = Field(default=False, strict=True)  # Required to switch to Bypass permissions.
 
 
 class SessionModel(BaseModel):
@@ -240,14 +248,15 @@ def create_app(settings=None):
         return public_session(session)
 
     @app.put("/api/sessions/{session_id}/permissions")
-    async def permissions(session_id: str, body: SessionPermissions):
+    async def permissions(session_id: str, body: PermissionChange):
+        # Allowed while a turn runs: waiting cards are re-checked and a running subagent follows.
+        from .approvals import busy_status
         session = session_or_404(session_id)
-        ensure_idle(manager, session, "changing permissions")
-        session["permission_mode"] = body.permission_mode
-        store.save(session)
-        result = public_session(session)
-        await manager.broadcast(session_id, {"type": "snapshot", "session": result})
-        return result
+        if (body.permission_mode == "bypassPermissions" and not body.confirm
+                and session.get("permission_mode", "manual") != "bypassPermissions"):
+            raise HTTPException(400, "Confirm switching to Bypass permissions.")
+        await manager.change_mode(session, body.permission_mode)
+        return public_session(session, busy_status(manager, session_id))
 
     @app.put("/api/sessions/{session_id}/model")
     async def change_model(session_id: str, body: SessionModel):
@@ -364,8 +373,10 @@ def create_app(settings=None):
 
     @app.post("/api/sessions/{session_id}/approvals/{event_id}")
     async def approval(session_id: str, event_id: str, body: Decision):
-        session_or_404(session_id)
-        manager.decide(session_id, event_id, body.allowed, body.remember, body.note)
+        session = session_or_404(session_id)
+        manager.decide(session_id, event_id, body.allowed, body.remember, body.note, body.scope, body.rule)
+        if body.scope in ("project", "user"):
+            await manager.rules_changed(body.scope, session)
         return {"ok": True}
 
     @app.websocket("/api/sessions/{session_id}/stream")

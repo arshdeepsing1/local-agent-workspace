@@ -107,7 +107,11 @@ async def test_cancel_foreground_stops_job_but_completed_background_launch_survi
     await asyncio.gather(task, return_exceptions=True)
     assert manager.jobs.get(foreground_id)["state"] == "cancelled"
     assert manager.jobs.get(background["job_id"])["state"] == "running"
+    # Stopping a job is a command action: Plan refuses it, Auto runs it without a card.
     session["permission_mode"] = "plan"
+    refused = await manager.execute_tool(session, tools, "stop_job", {"job_id": background["job_id"]}, "plan-stop")
+    assert refused.startswith("Plan mode is read-only") and manager.jobs.get(background["job_id"])["state"] == "running"
+    session["permission_mode"] = "auto"
     stopped = json.loads(await manager.execute_tool(session, tools, "stop_job", {
         "job_id": background["job_id"]}, "stop"))
     assert stopped["state"] == "cancelled"

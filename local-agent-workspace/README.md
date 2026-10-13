@@ -407,12 +407,15 @@ when opening a conversation or performing restart recovery.
   in this chat**. It approves the card and stores a rule for this conversation. Rules match
   exactly: the same command text (only leading and trailing whitespace is ignored; never a
   prefix), the same MCP tool name, the same hook ID. A later matching action runs without a
-  card in Manual, Auto and Accept edits, and its card says "Allowed by a rule for this chat".
+  card in Manual, Auto, Accept edits and Don't ask, and its card says "Allowed by a rule for this chat".
   Plan still blocks it, Bypass is unchanged, and credential exclusions, folder-access cards,
-  project-guidance checks and the changed-file check still apply. Folder-access cards have no
+  protected files, project-guidance checks and the changed-file check still apply. A command
+  allowed by its exact text runs through the shell exactly as approved. Folder-access cards have no
   such button: a folder grant already lasts for the chat. Rules are saved with the chat (at most
-  100), listed under **Allowed in this chat** in the permissions menu (commands with their exact
-  spacing), where each can be removed while the chat is idle, and inherited by subagents. Forks and imports start without rules.
+  100), listed in the permissions menu (commands with their exact spacing), where each can be
+  removed at any time, also while the chat is busy, and inherited by subagents. Forks and imports
+  start without rules. Rules for one project or for all projects, and deny and ask rules, are
+  described in **Permission rules** below.
 - **Decline with a note**: **Tell the agent why (optional)** on a card adds up to 2,000 characters
   to a Decline. The agent receives "User declined this action. Their note: … Do not retry it
   without a new instruction." (similar wording for MCP calls, hooks and folder access), and the
@@ -1091,8 +1094,8 @@ These planning records are available in Plan mode.
 
 The model can use `delegate_task` for one concrete task with explicitly supplied
 context. The child has a separate transcript/context and inherits workspace,
-model, permission mode, folder grants, and "Allow for this chat" rules (a copy: rules the
-child adds stay in the child). Files remain shared: choose independent
+model, permission mode, folder grants, turned-off tools, and "Allow for this chat" rules (a copy: rules the
+child adds stay in the child); project and all-project rules apply to it as to the parent. Files remain shared: choose independent
 work to avoid conflicting edits. One child runs per parent, at most three globally;
 children have 1–8 model steps (default six), cannot delegate again, and cannot start
 managed background jobs. The parent waits for a bounded result and an honest
@@ -1132,24 +1135,140 @@ reasoning-effort setting yet.
 ### Permission modes
 
 Choose a mode beneath the chat input. Existing conversations default to Manual.
-Changes are saved per conversation; stop an active response before switching modes.
+Changes are saved per conversation and apply at once, also while a response runs or a card
+waits (see **Mode changes while the agent works** below).
 
 | Mode | Agent behavior |
 | --- | --- |
-| Manual | Read approved folders; ask before edits and commands. |
-| Auto | Accept file edits and exact `pwd`, `ls`, `ls -la` commands; ask for other commands/actions. |
-| Accept edits | Accept file edits; ask before commands and other actions. |
-| Plan | Read/search approved folders and describe a plan; block file changes and shell commands. |
-| Bypass permissions | Run actions and access external folders without approval cards. Credential/generated-file exclusions still apply to file tools. |
+| Manual | Read approved folders; ask before edits, commands, stopping jobs and subagents. |
+| Auto | Accept file edits and run the fixed list of read-only commands (below) and `stop_job`; ask for other commands and actions. |
+| Accept edits | Accept file edits and start subagents; ask before commands and other actions. |
+| Don't ask | Run only what the mode's reads or a saved rule allows; block everything else without an approval card. |
+| Plan | Read/search approved folders, run the read-only command list, and describe a plan; block file changes and other commands. Subagents still need a card. |
+| Bypass permissions | Run actions and access external folders without approval cards. Deny and ask rules still apply, and credential/generated-file exclusions still apply to file tools. |
 
-An "Allow for this chat" rule (see **Allow for this chat** above) turns a matching card into an
-automatic approval in Manual, Auto and Accept edits only; Plan ignores rules.
-Inspecting/stopping existing jobs, skills, structured tasks, and delegation are available
-in every mode. Delegated tools still follow the child's inherited permission mode.
-Starting a background job follows the same command approval rules as foreground
-execution. Changing modes does not cancel a previously authorized background job.
-Auto uses the app's explicit local rules. Manually saving in the editor or clicking
-Run in the terminal is an explicit user action outside the agent's permission mode.
+Reading, listing and searching files, reading job output, waiting for a job, skills and
+structured tasks are available in every mode without a card. Stopping a job is a command
+action: it asks in Manual, Accept edits and Don't ask (unless a rule allows it), runs in Auto
+and Bypass, and is blocked in Plan. Starting a subagent (`delegate_task`) asks in Manual and
+Plan, runs in Accept edits, Auto and Bypass, and is blocked in Don't ask unless a rule allows
+it; the child then follows its own (inherited) mode. Starting a background job follows the
+same command rules as foreground execution. Changing modes does not cancel a previously
+authorized background job. Manually saving in the editor or clicking Run in the terminal is
+an explicit user action outside the agent's permission mode. The project's Verify command
+runs as the agent's `run_command`, so modes, rules, protected files and Don't ask apply to it
+as to a command the agent chose (Plan never runs it). Diagnostics after edits run inside the
+app and start no commands.
+
+### Permission rules
+
+A rule turns one kind of action into an automatic approval (**allow**), a card in every mode
+(**ask**, "Always ask") or a refusal (**deny**). Rules have three scopes:
+
+- **This chat**: saved with the conversation (the **Allow for this chat** rules above, at most
+  100). Inherited by subagents; forks and imports start without them.
+- **This project**: saved in the app's state folder, in `permission_rules.json`, keyed by the
+  project folder's resolved path (at most 200 per project). A managed worktree is a separate
+  folder, so it has its own project rules.
+- **All projects**: the same file, at most 200 rules.
+
+The rule file is written atomically with mode 0600 and is never read from a repository:
+`.claude/settings*.json` and `.agents/permissions.json` are ignored. A file that cannot be read
+is ignored (no project or all-project rule applies) and the permissions menu says so, without
+quoting it; **Reset saved rules** moves it aside as `permission_rules.json.bad-<time>`.
+Project and all-project rules are app state and are never exported.
+
+Rule kinds:
+
+- **Commands**: an exact command (its words as the shell would split them, for example
+  `npm test`), or commands starting with one to three words followed only by listed options
+  (`git status` with `-s --short`; `--name=` allows any value after `--name=`). Positional
+  arguments must be listed too. Deny and ask rules name a program and up to 16 words, which
+  must all appear somewhere in the command in any order (`git push` also matches
+  `git -C . push --force` and `/usr/bin/git push`), with combined short options split
+  (`rm -rf` matches `rm -r -f` and `rm -fr`); a deny or ask rule without words covers every command.
+- **File edits** (`write_file`, `edit_file`, `insert_activity_log`, `move_path`, `delete_path`,
+  `notebook_edit`), optionally only under one absolute folder. An allow rule needs every path the
+  tool touches inside the folder; a deny or ask rule applies when any of them is (both ends of a move).
+- **Tools**: one MCP tool, every tool of an MCP server (`mcp__server__*`, deny and ask only),
+  a hook ID, `delegate_task` (subagents), `stop_job`, or any other tool name (deny only).
+
+When rules disagree, **deny beats ask, and ask beats allow**, whatever their scope. The fixed
+order is: turned-off tools, deny rules (in every mode, Bypass included), Plan's read-only limit,
+ask rules, protected files, the mode itself, allow rules (never in Plan), Don't ask, and finally
+a card. A tool that a deny rule without conditions covers is not offered to the agent at all.
+
+Rules never override credential and generated-file exclusions, the state-folder exclusion,
+folder-access cards (only Don't ask, which blocks them, and Bypass, which needs none, differ),
+project-guidance checks, the read-before-overwrite guard, the changed-file checks, Plan mode
+(allow rules are ignored there) or protected files. An allow rule cannot cover a program that
+runs other programs or code (`sh`, `bash`, `env`, `sudo`, `xargs`, `nohup`, `timeout`, `ssh`,
+`watch` and similar; `python -c`, `node -e` and other inline interpreters; `awk` and `sed`),
+an option that runs other programs (`git -c`, `--git-dir`, `--ext-diff` and similar; `rg --pre`
+and `-z`; `find -exec` and `-delete`), a word naming a credential file, or your Databricks token.
+
+**No shell.** Commands allowed by an exact or prefix rule, and commands on the read-only list,
+run without a shell: shell syntax (`; & | < > ( ) { } [ ] * ? ~ ! # $ ^`, backticks,
+backslashes, tabs and line breaks) never matches such a rule. A command allowed by its exact
+text in this chat, and any command you approve on a card, still runs through the shell exactly
+as approved.
+
+**Read-only commands.** Auto and Plan run this fixed list without a card, in the foreground
+only: `pwd`; `ls` with no option or `-l`, `-a`, `-la`, `-al`, `-1`; `git status` (plain,
+`--short`, `-s`, `--porcelain`); `git diff` (plain, `--stat`, `--name-only`, `--cached`,
+`--staged`, `--cached --stat`); `git log --oneline` (optionally `-n 20`); `git show` (plain or
+`--stat`); `git branch` (plain or `--show-current`); `git rev-parse HEAD`,
+`--abbrev-ref HEAD` and `--show-toplevel`; `git ls-files`. There are no test runners, package
+managers, search tools, interpreters or `git remote` on the list. A command on the list runs
+hardened (see **Local access and limits**) whatever allowed it.
+
+**Uncertain commands.** A command that a deny or ask rule might cover but that cannot be checked
+exactly gets a card, even in Bypass: shell syntax that contains the rule's program as a word, `$`,
+backticks, backslashes or glob characters; a wrapper such as `env`, `command`, `nohup` or `sh -c`;
+an inline interpreter; or a never-allowed option such as `git -c`. Text that does not mention the
+rule's program (`npm test | tee out` with a deny rule for `git push`) is not uncertain.
+
+**Protected files.** Edits always show a card, in every mode except Bypass and even with an allow
+rule, when a path (requested or resolved, inside or outside the project) is in `.vscode`, `.idea`,
+`.husky`, `.githooks`, `.agents`, `.claude`, `.devcontainer`, `.github/workflows` or
+`.github/actions`, is named `AGENTS.md`, `CLAUDE.md`, `CLAUDE.local.md`, `.gitattributes`,
+`.gitmodules`, `.pre-commit-config.yaml` or `.envrc`, is a shell or Git startup file in your
+home folder (`.bashrc`, `.bash_profile`, `.bash_login`, `.profile`, `.zshrc`, `.zshenv`,
+`.zprofile`, `.zlogin`, `.gitconfig`, `.ssh`, `.config/git`), or is inside this app's own folder.
+These files can make later commands or the app run code. Such a card cannot be remembered.
+Don't ask blocks these edits.
+
+**Mode changes while the agent works.** You can change the mode at any time. A waiting card
+is checked again at once: switching to Accept edits approves a waiting edit, switching to Plan
+or Don't ask blocks waiting cards ("Not run: the user switched this chat to Plan mode while this
+card was waiting."), and switching to Bypass approves waiting cards, including folder access
+(without adding a folder grant). Switching to Bypass asks for confirmation for that reason.
+Each new model request uses the current mode, and a running subagent follows the parent's
+change, including its waiting cards. Adding or removing a rule, and turning a tool off, re-check
+waiting cards the same way (a new allow rule approves a matching card; a deny rule blocks it).
+A card resolved by a mode or rule change runs as that mode or rule allows it (without a shell
+where that applies).
+
+**Edit before approving.** On a waiting card you can change the command, the content of
+`write_file`, or the replacement text of a single `edit_file` edit (not multi-edit `edits`,
+notebook, move, delete, MCP or activity-log cards). The app validates the change, checks the
+rules again, refuses it when the file changed since the card was shown, and shows a new
+preview; the card keeps waiting with the same expiry. The agent is told that you edited the
+action ("It ran as: …" for a command) and that its own proposal did not run.
+
+**Turned-off tools.** **Agent tools → Tools** turns tools off for one chat. They are not
+offered to the agent and calls to them are refused. Subagents, forks and imports keep the setting.
+
+**Don't ask** never shows a card: actions that the mode or a rule does not allow are refused,
+and the agent is told to continue without them. Folder access outside the project is refused,
+and enabled before-tool hooks block the tools they cover unless a hook
+rule allows the hook.
+
+**Limitations.** Rules are a convenience, not a sandbox. A deny rule matches the command the
+agent asks to run. It does not see Git aliases, scripts, Makefiles or programs those start, and
+options are compared literally after splitting combined short options (`--force` and `-f` are
+different words), so deny rules should name the program and subcommand. Project rules are keyed
+by folder path, so a worktree or a moved project starts without them.
 
 ## Local access and limits
 

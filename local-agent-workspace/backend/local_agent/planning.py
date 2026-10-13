@@ -189,7 +189,8 @@ class DelegateManager:
                      tool_profile=profile,
                      permission_mode=parent.get("permission_mode", "manual"),
                      allowed_directories=list(parent.get("allowed_directories", [])),
-                     allow_rules=[dict(rule) for rule in parent.get("allow_rules", [])])
+                     allow_rules=[dict(rule) for rule in parent.get("allow_rules", [])],
+                     disabled_tools=list(parent.get("disabled_tools", [])))
         event_id = parent_event["id"] if parent_event is not None else str(uuid.uuid4())
         child.update(parent_event_id=event_id, parent_call_id=(parent_event or {}).get("call_id"),
                      delegation={"status": "running", "completed_tools": 0})

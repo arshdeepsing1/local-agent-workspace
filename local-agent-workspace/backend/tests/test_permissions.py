@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 
 import pytest
@@ -126,6 +127,8 @@ def test_auto_does_not_classify_arbitrary_shell_as_read_only(command):
     assert tool_decision('auto', 'run_command', {'command': command}) == 'ask'
 
 
+@pytest.mark.skipif('argv' not in inspect.signature(AgentManager.command_tool).parameters,
+                    reason='needs m3-command-sandbox (read-only commands run from /bin without a shell)')
 async def test_auto_runs_basic_command_using_os_binary(setup, monkeypatch):
     settings, store, tools = setup
     (tools.root / 'pwd').write_text('#!/bin/sh\ntouch should-not-run\n')
@@ -153,7 +156,7 @@ async def test_bypass_allows_external_files_but_preserves_credential_exclusions(
     assert not manager.pending
 
 
-def test_permissions_api_validates_persists_and_rejects_active_changes(setup):
+def test_permissions_api_validates_persists_and_allows_changes_while_busy(setup):
     settings, _, _ = setup
     app = create_app(settings)
     with TestClient(app) as client:
@@ -165,8 +168,18 @@ def test_permissions_api_validates_persists_and_rejects_active_changes(setup):
         assert client.put(route, json={'permission_mode': 'invalid'}, headers=headers).status_code == 422
         assert client.put(route, json={'permission_mode': 'acceptEdits'}, headers=headers).status_code == 200
         assert client.get(f'/api/sessions/{sid}', headers=headers).json()['permission_mode'] == 'acceptEdits'
+        # A mode change while the chat is busy succeeds; Bypass needs an explicit confirmation.
         app.state.manager.statuses[sid] = 'awaiting_approval'
-        assert client.put(route, json={'permission_mode': 'bypassPermissions'}, headers=headers).status_code == 409
+        assert client.put(route, json={'permission_mode': 'dontAsk'}, headers=headers).json()['status'] == 'awaiting_approval'
+        response = client.put(route, json={'permission_mode': 'bypassPermissions'}, headers=headers)
+        assert (response.status_code, response.json()['detail']) == (400, 'Confirm switching to Bypass permissions.')
+        assert client.put(route, json={'permission_mode': 'bypassPermissions', 'confirm': 'yes'}, headers=headers).status_code == 422
+        assert client.put(route, json={'permission_mode': 'plan', 'other': 1}, headers=headers).status_code == 422
+        changed = client.put(route, json={'permission_mode': 'bypassPermissions', 'confirm': True}, headers=headers).json()
+        assert changed['permission_mode'] == 'bypassPermissions'
+        # Staying in Bypass needs no new confirmation; creating a Bypass chat needs none either.
+        assert client.put(route, json={'permission_mode': 'bypassPermissions'}, headers=headers).status_code == 200
+        assert client.post('/api/sessions', json={'permission_mode': 'bypassPermissions'}, headers=headers).status_code == 200
 
 
 async def test_os_folder_denial_is_distinct_from_chat_permissions(setup, monkeypatch):

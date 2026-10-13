@@ -94,7 +94,8 @@ async def test_an_allowed_command_runs_again_only_with_the_exact_same_text(runti
     await first
     assert session["allow_rules"] == [{"tool": "run_command", "command": "touch one.txt"}]
     assert {"type": "permissions", "permission_mode": "manual", "allowed_directories": [],
-            "allow_rules": session["allow_rules"]} in socket.messages
+            "allow_rules": session["allow_rules"], "disabled_tools": [], "project_rules": [], "user_rules": [],
+            "rules_problem": None} in socket.messages
     assert manager.store.get(session["id"])["allow_rules"] == session["allow_rules"]
     (project / "one.txt").unlink()
 
@@ -328,7 +329,7 @@ async def test_approving_over_the_api_can_remember_the_action(api):
     manager.store.db.close()
 
 
-def test_rules_are_listed_survive_a_restart_and_are_removed_only_when_idle(api):
+def test_rules_are_listed_survive_a_restart_and_can_be_removed_while_busy(api):
     settings, _, _ = api
     rules = [{"tool": "run_command", "command": "make test"}, {"tool": "edits"}, {"tool": "hook", "hook": "check"}]
     app = create_app(settings)
@@ -351,14 +352,14 @@ def test_rules_are_listed_survive_a_restart_and_are_removed_only_when_idle(api):
         assert "make test" not in header and "allow_rules" not in header
         assert client.post("/api/sessions").json()["allow_rules"] == []
         route = f"/api/sessions/{sid}/allow-rules"
-        app.state.manager.statuses[sid] = "awaiting_approval"
-        response = client.request("DELETE", route, json=rules[0])
-        assert response.status_code == 409
-        assert response.json()["detail"] == {
-            "message": "“Fix the parser” is waiting for your approval. Answer or stop it before changing what this chat allows.",
-            "session_id": sid, "title": "Fix the parser"}
-        app.state.manager.statuses[sid] = "idle"
         assert client.request("DELETE", route, json={"tool": "edits", "extra": 1}).status_code == 422
+        # Removing a rule only makes the agent ask again, so it is allowed while the chat is busy.
+        app.state.manager.statuses[sid] = "awaiting_approval"
+        busy = client.request("DELETE", route, json={"tool": "hook", "hook": "check"})
+        assert busy.status_code == 200 and busy.json()["status"] == "awaiting_approval"
+        assert busy.json()["allow_rules"] == rules[:2]
+        rules = rules[:2]
+        app.state.manager.statuses[sid] = "idle"
         with client.websocket_connect(f"/api/sessions/{sid}/stream",
                                       subprotocols=["local-workspace", client.headers["X-Local-Token"]]) as socket:
             assert socket.receive_json()["session"]["allow_rules"] == rules  # The snapshot carries the rules.
@@ -440,8 +441,7 @@ def test_busy_errors_name_the_blocking_chat_and_why(api):
         assert restore.status_code == 409 and restore.json()["detail"]["session_id"] == blocker["id"]
 
         manager.statuses[blocker["id"]] = "running"
-        cases = [("PUT", f"/api/sessions/{blocker['id']}/permissions", {"permission_mode": "plan"}, "changing permissions"),
-                 ("PUT", f"/api/sessions/{blocker['id']}/model", {"model": "other"}, "changing the model"),
+        cases = [("PUT", f"/api/sessions/{blocker['id']}/model", {"model": "other"}, "changing the model"),
                  ("POST", f"/api/sessions/{blocker['id']}/folders", {"path": str(project)}, "changing folder access"),
                  ("POST", f"/api/sessions/{blocker['id']}/compact", {}, "compacting context"),
                  ("POST", f"/api/sessions/{blocker['id']}/fork", None, "exporting or forking this conversation"),
@@ -452,9 +452,11 @@ def test_busy_errors_name_the_blocking_chat_and_why(api):
             assert response.status_code == 409, path
             assert response.json()["detail"] == {"message": f"“Fix the parser” is still running. Stop it before {action}.",
                                                  "session_id": blocker["id"], "title": "Fix the parser"}, path
+        # Permission modes change at any time, also while a chat runs or compacts.
+        assert client.put(f"/api/sessions/{blocker['id']}/permissions", json={"permission_mode": "plan"}).status_code == 200
         manager.statuses[blocker["id"]] = "compacting"
-        assert client.put(f"/api/sessions/{blocker['id']}/permissions", json={"permission_mode": "plan"}).json()["detail"]["message"] == (
-            "“Fix the parser” is compacting its context. Wait or stop it before changing permissions.")
+        compacting = client.put(f"/api/sessions/{blocker['id']}/permissions", json={"permission_mode": "manual"})
+        assert compacting.status_code == 200 and compacting.json()["status"] == "compacting"
         manager.statuses[blocker["id"]] = "idle"
         assert client.put(f"/api/sessions/{blocker['id']}/permissions", json={"permission_mode": "plan"}).status_code == 200
     finally:
