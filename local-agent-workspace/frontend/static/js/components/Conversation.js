@@ -1,7 +1,7 @@
 import { html, useEffect, useMemo, useRef, useState } from '../lib.js'
 import { Check, ChevronDown, ChevronRight, Copy, FileText, LoaderCircle, Terminal, X } from '../icons.js'
 import { api } from '../api.js'
-import { enhanceCodeBlocks, renderMarkdown } from '../markdown.js'
+import { enhanceCodeBlocks, linkPaths, renderMarkdown } from '../markdown.js'
 import { Brand } from './Sidebar.js'
 import RequestDetails from './RequestDetails.js'
 
@@ -105,8 +105,14 @@ function DelegationStatus({ event, onSelectSession }) {
   </div>`
 }
 
-function ToolCard({ event, summary, sessionId, onError, onSelectSession }) {
+// Tools whose input names one file: the file the card's Open file button opens.
+const FILE_INPUTS = { read_file: 'path', write_file: 'path', edit_file: 'path', insert_activity_log: 'path',
+  notebook_read: 'path', notebook_edit: 'path', move_path: 'destination' }
+
+function ToolCard({ event, summary, sessionId, onError, onSelectSession, onOpenPath }) {
   const [expanded, setExpanded] = useState(false)
+  const filePath = event.input?.[FILE_INPUTS[event.name]]
+  const startLine = Number.isInteger(event.input?.start_line) && event.input.start_line > 0 ? event.input.start_line : undefined
   const [deciding, setDeciding] = useState(false)
   const [note, setNote] = useState('')
   const pending = event.state === 'pending'
@@ -142,7 +148,9 @@ function ToolCard({ event, summary, sessionId, onError, onSelectSession }) {
         <div class="approval-buttons"><button class="outline" disabled=${deciding} onClick=${() => void decide(false)}><${X} size=${15} />Decline</button>
           ${allowInChat ? html`<button class="outline" disabled=${deciding} onClick=${() => void decide(true, true)}>${allowInChat}</button>` : null}
           <button class="primary" disabled=${deciding} onClick=${() => void decide(true)}><${Check} size=${15} />Approve</button></div>`
-        : html`<${ToolDetails} event=${event} pending=${false} /><small class="muted">Action: ${event.state}</small>`}
+        : html`<${ToolDetails} event=${event} pending=${false} /><small class="muted">Action: ${event.state}</small>
+          ${onOpenPath && typeof filePath === 'string' && filePath ? html`<button class="outline tool-open-file"
+            onClick=${() => onOpenPath(startLine ? { path: filePath, line: startLine } : { path: filePath })}><${FileText} size=${14} />Open file</button>` : null}`}
     </div>` : null}
     ${!expanded && (event.state === 'rejected' || event.state === 'cancelled' || event.state === 'error') ? html`<p class="tool-outcome">${toolOutcome(event)}</p>` : null}
   </div>`
@@ -155,28 +163,41 @@ function CopyAction({ text, label }) {
   }}>${copied ? html`<${Check} size=${14} />` : html`<${Copy} size=${14} />`}</button>`
 }
 
-function Markdown({ text, streaming = false }) {
+// onOpenPath({ path, line? }): file paths in the text become links that call it.
+function Markdown({ text, streaming = false, onOpenPath }) {
   // Parsing is the expensive part of a streamed reply, so parse only on change.
   const markup = useMemo(() => renderMarkdown(text), [text])
   const element = useRef(null)
+  const linked = !!onOpenPath
   // Highlight code once the reply is complete; the page keeps unchanged markup,
   // so other replies are not highlighted again on each streamed delta.
-  useEffect(() => { if (!streaming && element.current) enhanceCodeBlocks(element.current) }, [markup, streaming])
-  return html`<div class="markdown" ref=${element} dangerouslySetInnerHTML=${{ __html: markup }} />`
+  useEffect(() => {
+    if (streaming || !element.current) return
+    enhanceCodeBlocks(element.current)
+    if (linked) linkPaths(element.current)
+  }, [markup, streaming, linked])
+  const open = event => {
+    const link = event.target.closest?.('a.path-link')
+    if (!link || !onOpenPath || !element.current?.contains(link)) return
+    event.preventDefault()
+    onOpenPath(link.dataset.line ? { path: link.dataset.path, line: Number(link.dataset.line) } : { path: link.dataset.path })
+  }
+  return html`<div class="markdown" ref=${element} onClick=${open} dangerouslySetInnerHTML=${{ __html: markup }} />`
 }
 
-function Reply({ text, reasoning, truncated, requestInfo }) {
+function Reply({ text, reasoning, truncated, requestInfo, onOpenPath }) {
   const streaming = requestInfo?.status === 'running'
   return html`<div class="assistant-reply"><${Brand} small=${true} />
     <div class="reply-content">${reasoning ? html`<details class="reasoning-summary"><summary>Provider reasoning summary</summary>
       <p class="muted">Supplied by the model endpoint.</p><${Markdown} text=${reasoning} streaming=${streaming} />
-      ${truncated ? html`<p class="muted">Summary display limit reached.</p>` : null}</details>` : null}<${Markdown} text=${text} streaming=${streaming} />
+      ${truncated ? html`<p class="muted">Summary display limit reached.</p>` : null}</details>` : null}<${Markdown} text=${text} streaming=${streaming} onOpenPath=${onOpenPath} />
       ${text ? html`<${CopyAction} text=${text} label="Copy response" />` : null}
       ${requestInfo ? html`<${RequestDetails} info=${requestInfo} />` : null}
     </div></div>`
 }
 
-export default function Conversation({ session, onError, onSelectSession }) {
+// onOpenPath({ path, line? }) opens a file named in a reply or a tool card in the Workspace panel.
+export default function Conversation({ session, onError, onSelectSession, onOpenPath }) {
   const container = useRef(null)
   const bottom = useRef(null)
   const follow = useRef(true)
@@ -199,8 +220,8 @@ export default function Conversation({ session, onError, onSelectSession }) {
     ${session.parent_session_id && onSelectSession ? html`<button class="outline parent-conversation" onClick=${() => onSelectSession(session.parent_session_id)}>Back to parent conversation</button>` : null}
     ${session.events.map(event => {
       if (event.type === 'user') return html`<div class="user-message" key=${event.id}>${event.origin?.kind === 'delegated' ? html`<small class="delegation-origin">Delegated by parent conversation</small>` : null}${event.text}${event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}${event.text ? html`<${CopyAction} text=${event.text} label="Copy message" />` : null}</div>`
-      if (event.type === 'tool') return html`<${ToolCard} key=${event.id} event=${event} summary=${toolSummaries.get(event.id)} sessionId=${session.id} onError=${onError} onSelectSession=${onSelectSession} />`
-      if (event.type === 'assistant') return event.text || event.reasoning_summary || event.request_info ? html`<${Reply} key=${event.id} text=${event.text || ''} reasoning=${event.reasoning_summary} truncated=${event.reasoning_truncated} requestInfo=${event.request_info} />` : null
+      if (event.type === 'tool') return html`<${ToolCard} key=${event.id} event=${event} summary=${toolSummaries.get(event.id)} sessionId=${session.id} onError=${onError} onSelectSession=${onSelectSession} onOpenPath=${onOpenPath} />`
+      if (event.type === 'assistant') return event.text || event.reasoning_summary || event.request_info ? html`<${Reply} key=${event.id} text=${event.text || ''} reasoning=${event.reasoning_summary} truncated=${event.reasoning_truncated} requestInfo=${event.request_info} onOpenPath=${onOpenPath} />` : null
       return html`<div class=${`conversation-notice ${event.type === 'error' ? 'error' : ''}`} key=${event.id}>${event.text}<${DelegationStatus} event=${event} onSelectSession=${onSelectSession} />${!event.delegation && event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}</div>`
     })}
     ${['running', 'delegating'].includes(session.status) ? html`<div class="working-indicator"><span /><span /><span /><span class="sr-only">Working</span></div>` : null}

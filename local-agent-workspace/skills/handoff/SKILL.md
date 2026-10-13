@@ -1,6 +1,6 @@
 ---
 name: handoff
-description: Write a detailed cold-start handoff (often 20-60 KB) so a new session with zero context can resume the work, with an exact app-generated log of every command run. Use when the user asks for a handoff, memory file, or session summary.
+description: Use when the user asks for a handoff, memory file or session summary. Writes a detailed cold-start handoff with an exact log of every command run.
 ---
 
 # Detailed session handoff

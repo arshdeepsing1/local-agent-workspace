@@ -38,6 +38,8 @@ export default function App() {
   const [foldersOpen, setFoldersOpen] = useState(false)
   // A changed file chosen in the changes bar, to open in the Workspace panel's review.
   const [review, setReview] = useState(null)
+  // A file a reply or tool card names, to open in the Workspace editor: { path, line?, viewKey }.
+  const [openPath, setOpenPath] = useState(null)
   const active = app.session
   const workspace = active?.workspace || app.settings?.workspace || ''
   const editorKey = JSON.stringify([app.viewKey, workspace])
@@ -54,6 +56,7 @@ export default function App() {
   }
   const changedFiles = app.changes?.files.length || 0
   const openReview = path => { setReview({ path, viewKey: app.viewKey }); setWorkspaceOpen(true) }
+  const openFileAt = ({ path, line }) => { setOpenPath({ path, line, viewKey: app.viewKey }); setWorkspaceOpen(true) }
   // Removing a rule saves the chat (a newer 'updated'); like a rename, your own change is not news.
   const removeAllowRule = async rule => {
     const id = app.activeId
@@ -93,7 +96,7 @@ export default function App() {
       <${StorageNotice} problems=${app.storageProblems} />
       ${!app.online && app.activeId ? html`<div class="connection-banner">Reconnecting to your local server… Refresh if the server was restarted.</div>` : null}
       ${app.connection && !app.connection.connected ? html`<div class="connection-banner"><span>${app.connection.error || 'Configure Databricks to start a conversation.'}</span><button onClick=${() => setSettingsOpen(true)}>Open settings</button></div>` : null}
-      ${hasMessages && active ? html`<${Conversation} key=${active.id} session=${active} onError=${showError} onSelectSession=${app.setActiveId} />` :
+      ${hasMessages && active ? html`<${Conversation} key=${active.id} session=${active} onError=${showError} onSelectSession=${app.setActiveId} onOpenPath=${openFileAt} />` :
         html`<div class="welcome"><div class="welcome-content"><div class="welcome-heading"><${Brand} /><h1>What’s up next?</h1></div>
           <div class="suggestions"><button class="outline" onClick=${() => setDraft('Explore this project. Read the relevant files and explain its structure and how to run it.')}><${Folder} size=${16} />Explore this project</button>
             <button class="outline" onClick=${() => setDraft('Help me make a change in this project: ')}><${Pencil} size=${16} />Make a change</button>
@@ -116,6 +119,7 @@ export default function App() {
       allowedDirectories=${active?.allowed_directories || []}
       workspace=${workspace} file=${editorDrafts[editorKey] || null} setFile=${setEditorFile} onClose=${() => setWorkspaceOpen(false)}
       changes=${app.changes} busy=${busy} review=${review?.viewKey === app.viewKey ? review : null} onReviewOpened=${() => setReview(null)} onReview=${app.reviewChanges} onSelectSession=${app.setActiveId}
+      open=${openPath?.viewKey === app.viewKey ? openPath : null} onOpened=${() => setOpenPath(null)}
       onAttach=${path => { setDraft(current => `${current}${current ? '\n' : ''}Please read the ${path.startsWith('/') ? 'file' : 'project file'}: ${path}`); setWorkspaceOpen(false) }} />` : null}
     ${agentToolsOpen && app.settings && (!app.activeId || active) ? html`<${AgentToolsDialog} key=${editorKey} session=${active} workspace=${workspace} onClose=${() => setAgentToolsOpen(false)} onError=${showError} onSelectSession=${id => { setAgentToolsOpen(false); app.setActiveId(id); void app.refreshSessions().catch(e => showError(e.message)) }} />` : null}
     ${settingsOpen && app.settings ? html`<${SettingsDialog} settings=${app.settings} connection=${app.connection} onSave=${app.saveSettings} onClose=${() => setSettingsOpen(false)} />` : null}

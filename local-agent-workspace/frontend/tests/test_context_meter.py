@@ -107,3 +107,20 @@ def test_calibrated_estimate_and_summary_adjustments(ui, page):
     expect(page.get_by_text(re.compile(r"part of it was omitted\. Full history is preserved\."))).to_be_visible()
     ui.rerender(f"{{ info: {CONTEXT} }}")
     expect(page.get_by_text(re.compile("over its size limit"))).to_have_count(0)
+
+
+def test_custom_instructions_and_skill_index_apply_beyond_a_folder(ui, page):
+    ui.mount("components/ContextMeter.js", f"""{{ info: {{ ...{INFO}, instruction_sources: [
+        {{ path: 'AGENTS.md', scope: '.', status: 'loaded', estimated_tokens: 54 }},
+        {{ path: 'Custom instructions (Settings)', scope: 'all projects', status: 'loaded', estimated_tokens: 31 }},
+        {{ path: 'Skill index', scope: 'this workspace', status: 'loaded', estimated_tokens: 120 }},
+    ] }} }}""")
+    page.get_by_text(re.compile("Last model input")).click()
+    expect(page.get_by_text("Loaded instructions", exact=True)).to_be_visible()
+    items = page.locator(".context-details li")
+    expect(items).to_have_text([
+        re.compile(r"AGENTS\.md · scope: \. and descendants · ~54 tokens"),
+        re.compile(r"^\s*Custom instructions \(Settings\) · applies to all projects · ~31 tokens\s*$"),
+        re.compile(r"^\s*Skill index · applies to this workspace · ~120 tokens\s*$"),
+    ])
+    expect(items.nth(1).locator("code")).to_have_count(0)

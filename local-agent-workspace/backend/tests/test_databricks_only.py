@@ -19,7 +19,8 @@ def test_legacy_settings_do_not_restore_removed_options(tmp_path, monkeypatch):
     settings = Settings(state)
     settings.credentials = lambda: ("https://gateway.example", "fake-token")
     expected = {**editable, "context_window": 131072, "max_output_tokens": 8192, "max_agent_steps": 32,
-                "compaction_handoffs": True, "approval_timeout_minutes": 60, "system_notifications": False}
+                "compaction_handoffs": True, "approval_timeout_minutes": 60, "system_notifications": False,
+                "user_instructions": "", "write_limit_kb": 80, "command_env": [], "rate_limit_auto_continue": True}
     assert settings.values == expected
     with TestClient(create_app(settings)) as client:
         bootstrap = client.get("/api/bootstrap").json()

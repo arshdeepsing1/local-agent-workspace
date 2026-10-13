@@ -223,3 +223,20 @@
 .hljs-attr,.hljs-attribute,.hljs-property,.hljs-variable,.hljs-params,.hljs-selector-attr,.hljs-selector-pseudo{color:#0f6670}
 .hljs-deletion{color:#8a2b1d;background:#fbe4e0}.hljs-addition{background:#e3f0dc}
 .hljs-emphasis{font-style:italic}.hljs-strong{font-weight:600}
+/* M2 context and UI: file links in replies, the Git view of Workspace / Changes, custom instructions. */
+.markdown a.path-link{color:inherit;text-decoration:underline;text-decoration-color:#b9b2a3;text-underline-offset:2px;cursor:pointer}
+.markdown a.path-link:hover{color:var(--accent);text-decoration-color:currentColor}.markdown a.path-link>code{color:inherit}
+.tool-open-file{display:inline-flex;gap:5px;margin-left:10px;font-size:11px;padding:3px 9px;border-radius:6px}
+.settings-instructions{display:block;width:100%;min-height:90px;resize:vertical;margin-top:5px;font:inherit;font-size:12px;line-height:1.5}
+.field-counter{float:right;margin-left:8px;font-variant-numeric:tabular-nums}
+.git-groups{padding:4px 9px 9px}
+.git-group h3{margin:10px 4px 4px;font-size:11px;font-weight:500;color:var(--muted);text-transform:none}
+.git-row{display:flex;align-items:center;justify-content:flex-start;gap:8px;width:100%;padding:6px 8px;border-radius:6px;font-size:12px;color:#625d52;text-align:left;min-width:0}
+.git-row.hidden{cursor:default;color:var(--muted)}
+.git-letter{flex:none;width:14px;text-align:center;font:600 11px ui-monospace,SFMono-Regular,Menlo,monospace;color:#8b6f2e}
+.git-letter.added,.git-letter.untracked{color:#2b7350}.git-letter.deleted,.git-letter.conflicted{color:#a95640}
+.git-path{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.git-hidden{flex:none;font-size:10px;color:var(--muted)}
+.git-diff-view{display:flex;flex-direction:column;flex:1;min-height:0}.git-diff-view .diff-review-lines{padding-bottom:12px}
+.diff-line.hunk{color:#6b7f99;background:#eef1f5;font-size:11px;padding:2px 0 2px 58px;margin:4px 0}
+.diff-line.hunk:first-child{margin-top:0}

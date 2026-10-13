@@ -3,7 +3,8 @@ import mimetypes
 import secrets
 import sys
 from contextlib import asynccontextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from typing import Literal
 from urllib.parse import urlsplit
 
 import httpx
@@ -15,11 +16,12 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .agents import AgentManager, public_session
 from .config import APP_ROOT, MAX_APPROVAL_MINUTES, MAX_MAX_AGENT_STEPS, MIN_MAX_AGENT_STEPS, Settings
+from .config import MAX_COMMAND_ENV, MAX_USER_INSTRUCTIONS, MAX_WRITE_LIMIT_KB, MIN_WRITE_LIMIT_KB
 from .context import (
     MAX_CONTEXT_WINDOW, MAX_MAX_OUTPUT_TOKENS, MIN_CONTEXT_WINDOW, MIN_MAX_OUTPUT_TOKENS,
 )
 from .store import Store
-from .git_tools import working_tree_changes
+from .git_tools import file_diff, working_tree_changes, working_tree_status
 from .jobs import NOT_STOPPED, TIMEOUT_NOT_STOPPED
 from .tools import WorkspaceTools, file_error
 from .permissions import PermissionMode
@@ -93,6 +95,10 @@ class SettingsEdit(BaseModel):
     compaction_handoffs: bool | None = Field(default=None, strict=True)
     approval_timeout_minutes: int | None = Field(default=None, ge=0, le=MAX_APPROVAL_MINUTES, strict=True)
     system_notifications: bool | None = Field(default=None, strict=True)
+    user_instructions: str | None = Field(default=None, max_length=MAX_USER_INSTRUCTIONS, strict=True)
+    write_limit_kb: int | None = Field(default=None, ge=MIN_WRITE_LIMIT_KB, le=MAX_WRITE_LIMIT_KB, strict=True)
+    command_env: list[str] | None = Field(default=None, max_length=MAX_COMMAND_ENV, strict=True)
+    rate_limit_auto_continue: bool | None = Field(default=None, strict=True)
 
 
 class CommandRequest(BaseModel):
@@ -400,7 +406,9 @@ def create_app(settings=None):
 
     @app.get("/api/file")
     async def file(path: str, session_id: str | None = None):
-        return {"path": path, "content": workspace_tools(session_id).read_file(path)}
+        tools = workspace_tools(session_id)
+        # The absolute path lets the editor offer an "Open in VS Code" link.
+        return {"path": path, "content": tools.read_file(path), "absolute": str(tools.path(path))}
 
     @app.put("/api/file")
     async def save_file(body: FileEdit):
@@ -416,6 +424,50 @@ def create_app(settings=None):
     async def git_changes(session_id: str | None = None):
         # No shell, and no programs named by the repository's configuration.
         return await working_tree_changes(workspace_tools(session_id).root)
+
+    def git_classifier(tools):
+        """'credential', 'generated' or None for a workspace-relative path, as the file tools see it."""
+        def classify(path):
+            name = PurePosixPath(path).name.casefold()
+            if name.endswith(".env") or name.startswith(".env."):
+                return "credential"  # Also left out of every diff by git_tools.DIFF_EXCLUDES.
+            try:
+                tools.resolve(path)
+            except ValueError as exc:
+                return "credential" if str(exc).startswith("Credential") else "generated"
+            except (OSError, RuntimeError):
+                pass
+            return None
+        return classify
+
+    @app.get("/api/git/status")
+    async def git_status(session_id: str | None = None):
+        tools = workspace_tools(session_id)
+        return await working_tree_status(tools.root, git_classifier(tools))
+
+    @app.get("/api/git/diff")
+    async def git_diff(path: str, area: Literal["staged", "unstaged", "untracked"], session_id: str | None = None,
+                       orig_path: str | None = None):
+        tools = workspace_tools(session_id)
+        paths = [path] if orig_path is None or area == "untracked" else [path, orig_path]
+        for value in paths:
+            relative = PurePosixPath(value)
+            if not value or "\0" in value or relative.is_absolute() or ".." in relative.parts or value.startswith("~"):
+                raise ValueError("Choose a file inside this project's repository.")
+        kinds = [git_classifier(tools)(value) for value in paths]
+        if "credential" in kinds:
+            raise ValueError("Credential files are not shown.")
+        if "generated" in kinds:
+            raise ValueError("Files in generated folders are not shown here.")
+        for value in paths:
+            target = tools.root / value
+            if value.endswith("/") or PurePosixPath(value) == PurePosixPath(".") or (target.is_dir() and not target.is_symlink()):
+                raise ValueError("Choose one changed file, not a folder.")
+        # Leave the configured credential file out of the diff even under another name.
+        credential = tools.credential_file
+        excludes = ([f":(exclude,literal){credential.relative_to(tools.root).as_posix()}"]
+                    if credential and credential.is_relative_to(tools.root) and credential != tools.root else [])
+        return await file_diff(tools.root, path, area, paths[1] if len(paths) > 1 else None, tools=tools, excludes=excludes)
 
     @app.post("/api/command")
     async def command(body: Prompt, session_id: str | None = None):

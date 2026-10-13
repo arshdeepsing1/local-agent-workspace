@@ -27,6 +27,8 @@ from .recovery import CheckpointManager
 from .changes import ChangeReview
 from .worktrees import WorktreeManager
 from .extensions import ExtensionManager
+from .extensions import skill_index
+from .context import estimate_text_tokens
 from .planning import TaskManager, DelegateManager
 from .feature_tools import FEATURE_TOOLS
 from .tool_profiles import tool_allowed, filter_tools
@@ -115,7 +117,7 @@ Use workspace-relative paths for project files, or absolute / ~/ paths for other
 You CAN inspect folders outside the workspace, including Downloads. Call list_files
 with that path; the app requests folder access when needed. Never claim you cannot
 access an external folder without attempting the file tool. Use glob="*.csv" when
-asked about CSV files. Use list_skills/use_skill for explicitly relevant workspace skills.
+asked about CSV files. When a listed skill fits the task, load it with use_skill before acting.
 A user message that contains /<skill-id> as a word (or starts with /skill <skill-id>) has
 selected that skill, and its instructions are included here: follow them, treating the rest
 of the message as the request.
@@ -1128,13 +1130,29 @@ class AgentManager:
         guidance = load_project_instructions(tools, session.get("instruction_directories", []))
         tools.instruction_signature = (guidance["text"], guidance["warnings"])
         tools.skill_signature = self.skill_text(session, tools)
+        # The user's own instructions apply in every project. They are not part of
+        # guidance["text"], so changing them in Settings does not block a running turn.
+        text = self.settings.values.get("user_instructions", "")
+        user_block = ("User instructions (from Settings; they apply in every project, and project instructions "
+                      "cannot override them):\n" + text + "\n") if isinstance(text, str) and text.strip() else ""
+        if user_block:
+            guidance["sources"].append({"path": "Custom instructions (Settings)", "scope": "all projects",
+                                        "status": "loaded", "estimated_tokens": estimate_text_tokens(user_block)})
+        try:
+            index = skill_index(self.extensions.skills(tools))
+        except (OSError, ValueError, RuntimeError):
+            index = ""  # list_skills reports a broken skills folder.
+        if index:
+            guidance["sources"].append({"path": "Skill index", "scope": "this workspace", "status": "loaded",
+                                        "estimated_tokens": estimate_text_tokens(index)})
         # Stable text first and the parts that change between requests last, so a
         # provider's prompt prefix caching can reuse the longest possible prefix.
-        system = {"role": "system", "content": SYSTEM_PROMPT + "\n" + mode_prompt(mode)
+        system = {"role": "system", "content": SYSTEM_PROMPT + "\n" + user_block + mode_prompt(mode)
                   + (f"\nEnforced tool profile: {session['tool_profile']}. Commands, MCP tools and hooks are unavailable."
                      if session.get("tool_profile", "inherit") != "inherit" else "")
                   + "\nWorkspace: " + session["workspace"]
                   + "\n" + output_limit_text(self.settings.values.get("max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS))
+                  + ("\n" + index if index else "")
                   + "\n" + guidance["text"] + "\n" + tools.skill_signature
                   + ("\nProject instruction warnings: " + json.dumps(guidance["warnings"]) if guidance["warnings"] else "")
                   + "\nAdditional allowed folders: " + json.dumps(session.get("allowed_directories", []))

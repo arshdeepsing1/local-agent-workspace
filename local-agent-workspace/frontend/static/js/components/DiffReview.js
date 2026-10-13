@@ -13,6 +13,17 @@ import { blockerOf, OpenBlockingChat } from './BlockingChat.js'
 // Props: sessionId, path, version (changes when the file or its review changes),
 //   busy (a response is running; Undo waits for it), onAction(action, files) -> Promise,
 //   onSelectSession(id) (opens a chat that an error names as blocking Undo)
+// One line of a diff: { kind: 'context'|'removed'|'added'|'hunk', text, old?, new?, newline? }.
+// A 'hunk' line is a Git hunk header ('@@ -1,3 +1,4 @@'), shown as a separator.
+export function DiffLine({ line }) {
+  if (line.kind === 'hunk') return html`<div class="diff-line hunk"><span class="line-text">${line.text}</span></div>`
+  return html`<div class=${`diff-line ${line.kind}`}>
+    <span class="line-number">${line.old ?? ''}</span><span class="line-number">${line.new ?? ''}</span>
+    <span class="line-marker" aria-hidden="true">${line.kind === 'added' ? '+' : line.kind === 'removed' ? '−' : ''}</span>
+    <span class="line-text"><span class="sr-only">${line.kind === 'added' ? 'Added: ' : line.kind === 'removed' ? 'Removed: ' : ''}</span>${line.text}${line.newline === false ? html`<small class="no-newline">No newline at end of file</small>` : null}</span>
+  </div>`
+}
+
 export default function DiffReview({ sessionId, path, version, busy, onAction, onSelectSession }) {
   const [diff, setDiff] = useState(null)
   const [loadError, setLoadError] = useState('')
@@ -62,11 +73,7 @@ export default function DiffReview({ sessionId, path, version, busy, onAction, o
             <button aria-label=${`Keep change ${hunk + 1}`} disabled=${working} onClick=${() => { setActive(hunk); void run('keep', hunk) }}>Keep</button>
             <button aria-label=${`Undo change ${hunk + 1}`} title=${undoTitle} disabled=${working || busy} onClick=${() => { setActive(hunk); void run('undo', hunk) }}>Undo</button>
           </div>`}
-          <div key=${index} class=${`diff-line ${line.kind}`}>
-            <span class="line-number">${line.old ?? ''}</span><span class="line-number">${line.new ?? ''}</span>
-            <span class="line-marker" aria-hidden="true">${line.kind === 'added' ? '+' : line.kind === 'removed' ? '−' : ''}</span>
-            <span class="line-text"><span class="sr-only">${line.kind === 'added' ? 'Added: ' : line.kind === 'removed' ? 'Removed: ' : ''}</span>${line.text}${line.newline === false ? html`<small class="no-newline">No newline at end of file</small>` : null}</span>
-          </div>`
+          <${DiffLine} key=${index} line=${line} />`
       })}
     </div>
     <div class="review-bar" role="toolbar" aria-label="Review this file">

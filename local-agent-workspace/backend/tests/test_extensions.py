@@ -75,13 +75,13 @@ def test_hook_selectors_require_unique_exact_tool_names(selectors):
         validate_config({"hooks": [hook("true", tools=selectors)]})
 
 
-def test_skills_discover_only_workspace_agents_and_load_bounded_text(manager, tmp_path):
+def test_skills_discover_workspace_agents_and_load_bounded_text(manager, tmp_path):
     tools = WorkspaceTools(str(tmp_path))
     folder = tmp_path / ".agents/skills/review"
     folder.mkdir(parents=True)
     text = "---\nname: Code review\ndescription: 'Review a proposed change'\n---\nRead the diff.\n"
     (folder / "SKILL.md").write_text(text)
-    other = tmp_path / ".claude/skills/ignored"
+    other = tmp_path / ".codex/skills/ignored"
     other.mkdir(parents=True)
     (other / "SKILL.md").write_text("Not part of this skill catalog.")
     assert manager.skills(tools) == [{"id": "review", "name": "Code review", "description": "Review a proposed change",
@@ -165,6 +165,16 @@ def test_the_app_ships_the_handoff_skill_to_every_workspace(tmp_path):
     assert "insert_activity_log" in manager.load_skill(tools, "handoff")["text"]
 
 
+def test_shipped_skill_descriptions_fit_the_skill_index(tmp_path):
+    # The index clips descriptions; a shipped skill keeps its "Use when" trigger whole.
+    from local_agent.extensions import SKILL_INDEX_DESCRIPTION, skill_index
+    manager = ExtensionManager(SimpleNamespace(state_dir=tmp_path, redact=lambda text: text))
+    skills = manager.skills(WorkspaceTools(str(tmp_path)))
+    assert skills and all(len(skill["description"]) <= SKILL_INDEX_DESCRIPTION for skill in skills)
+    assert "- handoff: Use when the user asks for a handoff" in skill_index(skills)
+    assert "…" not in skill_index(skills)
+
+
 async def test_hook_receives_json_stdin_strips_credentials_and_redacts_output(manager, tmp_path, monkeypatch):
     monkeypatch.setenv("DBRICKS_TOKEN", "never-pass-this")
     source = "import json,os,sys; value=json.load(sys.stdin); print(value['name'],os.environ.get('DBRICKS_TOKEN'),'secret-token')"
@@ -231,3 +241,154 @@ def test_skill_metadata_is_redacted(manager, tmp_path):
     (folder / "SKILL.md").write_text("---\nname: secret-token\ndescription: secret-token\n---\nBody")
     skill = manager.skills(WorkspaceTools(str(tmp_path)))[0]
     assert skill["name"] == skill["description"] == "[REDACTED]"
+
+
+def skill_file(root, skill_id, text):
+    target = root / skill_id / "SKILL.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text)
+    return target
+
+
+def test_claude_skills_are_discovered_and_loaded_read_only(manager, tmp_path):
+    workspace = tmp_path / "workspace"
+    skill_file(workspace / ".claude/skills", "lint", "---\ndescription: Run the linter\n---\nLint rules.")
+    tools = WorkspaceTools(str(workspace))
+    before = sorted(path.name for path in (workspace / ".claude/skills/lint").iterdir())
+    assert manager.skills(tools) == [{"id": "lint", "name": "lint", "description": "Run the linter",
+                                      "path": ".claude/skills/lint/SKILL.md"}]
+    assert manager.load_skill(tools, "lint")["text"].endswith("Lint rules.")
+    assert sorted(path.name for path in (workspace / ".claude/skills/lint").iterdir()) == before
+
+
+def test_agents_skills_win_over_claude_skills_which_win_over_shipped(manager, tmp_path):
+    shipped = tmp_path / "app/skills"
+    manager.app_skills = shipped
+    workspace = tmp_path / "workspace"
+    for skill_id in ("both", "claude-shipped", "shipped-only"):
+        skill_file(shipped, skill_id, f"Shipped {skill_id}.")
+    skill_file(workspace / ".agents/skills", "both", "Agents both.")
+    skill_file(workspace / ".claude/skills", "both", "Claude both.")
+    skill_file(workspace / ".claude/skills", "claude-shipped", "Claude claude-shipped.")
+    tools = WorkspaceTools(str(workspace))
+    listed = {skill["id"]: skill["path"] for skill in manager.skills(tools)}
+    assert listed == {"both": ".agents/skills/both/SKILL.md", "claude-shipped": ".claude/skills/claude-shipped/SKILL.md",
+                      "shipped-only": str(shipped / "shipped-only/SKILL.md")}
+    assert manager.load_skill(tools, "both")["text"] == "Agents both."
+    assert manager.load_skill(tools, "claude-shipped")["text"] == "Claude claude-shipped."
+    assert manager.load_skill(tools, "shipped-only")["text"] == "Shipped shipped-only."
+    # An invalid .claude copy still takes the ID over from the shipped skill.
+    (workspace / ".claude/skills/claude-shipped/SKILL.md").write_text("x" * 8001)
+    assert "claude-shipped" not in {skill["id"] for skill in manager.skills(tools)}
+    with pytest.raises(ValueError, match="8 KB"):
+        manager.load_skill(tools, "claude-shipped")
+
+
+@pytest.mark.parametrize("problem", ["entries", "skills", "file"])
+def test_a_broken_claude_skills_folder_is_skipped(manager, tmp_path, problem):
+    workspace = tmp_path / "workspace"
+    skill_file(workspace / ".agents/skills", "review", "Review.")
+    claude = workspace / ".claude/skills"
+    if problem == "entries":
+        for index in range(101):
+            (claude / f"entry{index}").mkdir(parents=True)
+    elif problem == "skills":
+        for index in range(31):
+            skill_file(claude, f"skill{index}", "Skill.")
+    else:
+        claude.parent.mkdir(parents=True)
+        claude.write_text("not a folder")
+    tools = WorkspaceTools(str(workspace))
+    assert [skill["id"] for skill in manager.skills(tools)] == ["review"]
+
+
+@pytest.mark.parametrize("problem", ["outside", "skills", "file"])
+def test_a_skipped_claude_skills_folder_does_not_take_over_shipped_skills(manager, tmp_path, problem):
+    # A .claude/skills folder that is skipped must not hide or replace the shipped skill
+    # of the same ID, in the list or in load_skill.
+    shipped = tmp_path / "app/skills"
+    manager.app_skills = shipped
+    skill_file(shipped, "handoff", "---\ndescription: Shipped handoff\n---\nShipped text.")
+    workspace = tmp_path / "workspace"
+    claude = workspace / ".claude/skills"
+    if problem == "outside":
+        shared = tmp_path / "home/.claude/skills"
+        skill_file(shared, "handoff", "Shared handoff.")
+        claude.parent.mkdir(parents=True)
+        claude.symlink_to(shared, target_is_directory=True)
+    elif problem == "skills":
+        for index in range(30):
+            skill_file(claude, f"skill{index}", "Skill.")
+        skill_file(claude, "handoff", "Claude handoff.")
+    else:
+        skill_file(claude, "handoff", "Claude handoff.")
+        for index in range(100):
+            (claude / f"entry{index}").mkdir()
+    for unrestricted in (False, True):
+        tools = WorkspaceTools(str(workspace), unrestricted=unrestricted)
+        assert [skill["path"] for skill in manager.skills(tools)] == [str(shipped / "handoff/SKILL.md")]
+        assert manager.load_skill(tools, "handoff")["text"].endswith("Shipped text.")
+
+
+def test_a_broken_agents_skills_folder_still_reports_its_error(manager, tmp_path):
+    workspace = tmp_path / "workspace"
+    for index in range(101):
+        (workspace / f".agents/skills/entry{index}").mkdir(parents=True)
+    with pytest.raises(ValueError, match="at most 100 entries"):
+        manager.skills(WorkspaceTools(str(workspace)))
+
+
+def test_skill_index_is_bounded_and_collapses_descriptions():
+    from local_agent.extensions import skill_index
+    assert skill_index([]) == ""
+    text = skill_index([{"id": "review", "description": "Review\n  a change\twith care"}, {"id": "plain", "description": ""}])
+    assert text == ("Skills you can load with use_skill when one fits the task (list_skills shows details):\n"
+                    "- review: Review a change with care\n- plain")
+    long = skill_index([{"id": "long", "description": "word " * 100}])
+    assert len(long.splitlines()[1]) == len("- long: ") + 150 and long.endswith("…")
+    many = [{"id": f"skill{index:02d}", "description": "A short description."} for index in range(45)]
+    text = skill_index(many)
+    lines = text.splitlines()
+    assert len(lines) == 1 + 30 + 1 and lines[-1] == "- … and 15 more (call list_skills)."
+    wide = [{"id": f"skill{index:02d}", "description": "é" * 200} for index in range(30)]
+    text = skill_index(wide)
+    assert len(text.encode("utf-8")) <= 2000
+    lines = text.splitlines()
+    kept = len(lines) - 2
+    assert 0 < kept < 30 and lines[-1] == f"- … and {30 - kept} more (call list_skills)."
+
+
+async def test_the_skill_index_reaches_the_system_message(tmp_path, monkeypatch):
+    import httpx
+
+    from local_agent.agents import AgentManager
+    from local_agent.config import Settings
+    from local_agent.store import Store
+    monkeypatch.setattr("local_agent.config.APP_ROOT", tmp_path)
+    project = tmp_path / "project"
+    skill_file(project / ".agents/skills", "review", "---\ndescription: Review   a\tchange\n---\nRules.")
+    skill_file(project / ".claude/skills", "lint", "---\ndescription: Run the linter\n---\nLint rules.")
+    settings = Settings(tmp_path / "state")
+    settings.values.update(workspace=str(project), env_file="")
+    settings.credentials = lambda: ("https://gateway.example", "test-token")
+    store = Store(settings.state_dir / "index.sqlite3")
+    manager = AgentManager(store, settings)
+    session = store.create(settings.values)
+    seen = []
+
+    async def handler(request):
+        seen.append(json.loads(request.content)["messages"][0]["content"])
+        chunk = {"choices": [{"delta": {"content": "Done"}, "finish_reason": "stop"}]}
+        return httpx.Response(200, text="data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n")
+    client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client(**kwargs, transport=httpx.MockTransport(handler)))
+    try:
+        await manager.run_databricks(session, "Hello")
+    finally:
+        store.db.close()
+    assert ("Skills you can load with use_skill when one fits the task (list_skills shows details):\n"
+            "- review: Review a change\n- lint: Run the linter\n") in seen[-1]
+    assert "When a listed skill fits the task, load it with use_skill before acting." in seen[-1]
+    assert "Lint rules." not in seen[-1]
+    source = session["context_info"]["instruction_sources"][-1]
+    assert source["path"] == "Skill index" and source["scope"] == "this workspace" and source["estimated_tokens"] > 0

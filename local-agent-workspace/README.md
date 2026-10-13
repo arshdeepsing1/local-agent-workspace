@@ -322,16 +322,33 @@ when opening a conversation or performing restart recovery.
     UTF-8 files up to 80 KB. An agent edit saves a file with Windows (CRLF) line endings
     with LF endings, so every line of such a file shows as changed.
 - **Workspace / Changes**: inspect Git status and tracked-file diffs. Untracked
-  paths appear in status; their contents are available in Files. The server runs Git
-  directly (no shell) with the programs a repository's configuration can name switched
-  off: `core.fsmonitor`, hooks, clean/smudge filters, external diff and text conversion.
-  Git does not look inside submodule work trees, whose own configuration could name
-  filters; a submodule whose commit changed is still listed. The server also limits Git's
-  environment, stops after 60 seconds, and shows at most 80 KB. Credential files at any
+  files are listed too. Files are grouped as **Staged changes**, **Changes** (not staged,
+  including conflicts) and **Untracked**, each with its count, under the branch name.
+  A row shows a status letter (M modified, A added, D deleted, R renamed, C copied, T type
+  changed, ! conflicted, U untracked), the path and the added and removed line counts.
+  Click a row for a read-only diff with a separator per hunk: **Back to changes** returns,
+  **Open file** opens the file in Files, and **Open in VS Code** opens it in VS Code. This
+  is Git's view of the project, so it includes changes made by commands; it refreshes when
+  you open the tab, on Refresh, and when a response ends. There are no staging actions.
+  The server runs Git directly (no shell) with the programs a repository's configuration
+  can name switched off: `core.fsmonitor`, hooks, clean/smudge filters, external diff and
+  text conversion. Git does not look inside submodule work trees, whose own configuration
+  could name filters; a submodule whose commit changed is still listed. The server also
+  limits Git's environment and stops after 60 seconds. It reads status up to 1 MB and
+  lists at most 2,000 files; a diff shows at most 512 KB, and an untracked file is shown
+  up to 1 MB. A diff covers one file: a folder path is refused. Paths are literal, so a
+  file named `*.py` shows only its own diff. A project
+  folder inside a larger repository shows only its own files. Credential files at any
   depth (`.env`, `.env.*` including `.env.example`, `*.env`, `env_vars.txt`, `.netrc`,
-  `.npmrc`, `credentials`, `credentials.json`, `id_rsa`, `id_ed25519`, in any letter case)
-  are left out of the diff; status still names them. A folder that is not a Git
-  repository shows Git's own message.
+  `.npmrc`, `credentials`, `credentials.json`, `id_rsa`, `id_ed25519`, in any letter case,
+  and the configured credential file) are listed as "Credential file: diff hidden",
+  without line counts, and their diffs are refused, also when a rename or copy comes from
+  such a file. Files in generated folders (`node_modules`, `dist`, `.venv` and the like)
+  are listed after the other files, with their own 2,000-entry limit, and their diffs are
+  not shown; an untracked generated folder is one row (`node_modules/`), so it never hides
+  other new files. A folder that is not a Git repository shows
+  "Not a Git repository." For API clients, `GET /api/git` still returns the plain
+  `git status --short` and `git diff` text (at most 80 KB).
 - **Workspace / Terminal**: run a command explicitly and see output while it runs.
   Set the timeout (1–3,600 seconds, default 60) and retained output limit
   (1,024–1,000,000 bytes, default 80,000). A foreground job disables Run until it
@@ -436,6 +453,23 @@ when opening a conversation or performing restart recovery.
   highlighted (highlight.js, common languages). A block tagged with a language is
   highlighted in that language; an untagged block is guessed, up to 20 KB. **Copy code**
   copies a block's exact text.
+- **Open files from replies**: once a reply is complete, file paths in it become links:
+  an inline code span that is a file path with an extension (`src/app.py`,
+  `src/app.py:12`, `app.py:12:5`), and in the text a path with a slash (`docs/guide.md`)
+  or a file name followed by a line number (`app.py:12`). A name without a slash is
+  linked only with a common source or text file extension (`py`, `js`, `ts`, `json`,
+  `md`, `yaml`, `toml`, `txt`, `html`, `css`, `sh`, `sql`, `go`, `rs`, `java`, `c`, `h`
+  and similar), so identifiers such as `os.path.join` or `console.log` and host names
+  such as `db.example.com:5432` stay text. Web addresses, code blocks and
+  reasoning summaries are not linked. A link opens the file in **Workspace / Files** with
+  that line selected and scrolled into view; the status bar shows **Line 12**. Expanded
+  tool cards of file tools (`read_file`, `write_file`, `edit_file`, `insert_activity_log`,
+  the notebook tools, and `move_path`'s destination) have **Open file**, at `read_file`'s
+  start line. Opening goes through the same checks as Files: a folder outside the project
+  needs folder access in that conversation, and credential files and generated folders
+  are refused with the reason. **Open in VS Code** in the editor toolbar opens the file at
+  that line through a `vscode://file/<absolute path>:<line>` link; nothing happens when VS
+  Code is not installed.
 - **Copy and export a conversation**: **Agent tools → Conversation → Export Markdown**
   downloads the conversation as a Markdown transcript (`<date>-<title>-<id>.md`; a secret
   in the title becomes `redacted` in the file name), and
@@ -701,13 +735,24 @@ tools, connect MCP servers, or rewrite the archived conversation. The resulting
 **Context preview** uses the last saved tool definitions (built-ins only for
 older sessions without that snapshot); definitions may change on the next turn.
 
+**Settings → Custom instructions** (up to 8,000 characters) are your own instructions for
+every conversation in every project, subagents included. The system message places them
+right after the app's own instructions, before the permission-mode text and the project
+guidance (`AGENTS.md`, `CLAUDE.md`), which cannot override them. A change applies from the
+next model request; unlike changed project guidance, it does not hold back a write or
+command of a running response. **Loaded instructions** in the context details lists them
+as **Custom instructions (Settings) · applies to all projects**, together with the project
+files and the skill index (see **Agent tools: MCP, skills, and hooks**), each with its
+estimated tokens.
+
 At each model request the app rereads root `AGENTS.md`, then `CLAUDE.md`. File tools
 also discover guidance in the target directory and its ancestors, from broader
 to more specific scopes. These encountered scopes persist for the conversation;
 their guidance applies only to their own directories. More specific rules refine
 broader rules; user instructions and enforced tool permissions retain precedence.
 `CLAUDE.md` is just a supported text filename: it does not enable Claude mode or
-require the Claude SDK. README files, imports, skills, parent directories outside
+require the Claude SDK. README files, imports, skill files (beyond the skill index),
+parent directories outside
 the selected workspace, and external-folder guidance are not automatically loaded.
 Shell commands receive root guidance and scopes already encountered by file tools;
 the app does not infer new instruction scopes from arbitrary shell command text.
@@ -796,11 +841,15 @@ An MCP result with `is_error=true` is displayed as an error even when the server
 request itself succeeded. Its bounded diagnostic remains available to the model;
 the app does not automatically retry the action.
 
-Install workspace skills at `.agents/skills/<skill-id>/SKILL.md`. Skills shipped with
-the app in `skills/<skill-id>/SKILL.md` are available in every workspace; a workspace
-skill with the same ID replaces the shipped one. Other folders, such as
-`.claude/skills`, are not read. Optional simple frontmatter supplies `name` and
-`description`. Enable a discovered skill in the panel, use `/<skill-id>` as a word in a
+Install workspace skills at `.agents/skills/<skill-id>/SKILL.md`. Skills in
+`.claude/skills/<skill-id>/SKILL.md`, the layout another coding tool uses, are read too;
+the app never writes there. Skills shipped with the app in `skills/<skill-id>/SKILL.md`
+are available in every workspace. For one ID, `.agents/skills` wins over
+`.claude/skills`, which wins over the shipped skill; a workspace entry takes the ID over
+even when it fails to load. A `.claude/skills` folder that resolves outside the project
+(for example a link to a shared folder), cannot be read, or has more than 100 entries or
+30 skills, is skipped without an error, and the shipped skills stay available. Optional simple
+frontmatter supplies `name` and `description`. Enable a discovered skill in the panel, use `/<skill-id>` as a word in a
 message (type `/` at the start to choose from the list), begin a message with
 `/skill <skill-id>`, or ask the
 model to use its `list_skills` / `use_skill` tools. Selection persists per chat, instructions reload
@@ -809,6 +858,14 @@ before a write, command, or MCP call. At most three selected skills fit a combin
 8 KB instruction budget. Skills never override user instructions or permissions;
 this version has no marketplace, installer, dependency execution, or automatic
 matching engine.
+
+Every model request's system message includes a skill index: one line per listed skill
+with its ID and description (whitespace collapsed, at most 150 characters), at most 30
+lines and 2,000 bytes, then "… and N more (call list_skills)". The model is told to load
+a listed skill with `use_skill` when it fits the task. Skill descriptions from
+`.agents/skills` and `.claude/skills` therefore reach the system message of every chat in
+that workspace, with the same trust as `AGENTS.md`: review skills you did not write. The
+context details list the index as **Skill index · applies to this workspace**.
 
 The app ships a detailed handoff skill at `skills/handoff/SKILL.md`, available in every
 workspace: send `/handoff Create a handoff for this conversation` (or type `/han` and
