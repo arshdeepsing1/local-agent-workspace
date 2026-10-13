@@ -32,8 +32,17 @@ fake.reviewResult = makeChanges()
 fake.sessions = new Map([['a', makeSession('a', 'Other conversation')]])
 // The M2 user settings at their defaults (the server always returns them).
 fake.settings = { ...baseSettings, user_instructions: '', write_limit_kb: 80, command_env: [], rate_limit_auto_continue: true }
+// Saved project and user permission rules, returned by GET /api/permission-rules with the chat's rules.
+fake.projectRules = []
+fake.userRules = []
+fake.rulesProblem = null
+window.ruleSets = id => ({ chat: fake.sessions.get(id)?.allow_rules || [], project: fake.projectRules, user: fake.userRules,
+  project_path: '/project', problem: fake.rulesProblem })
 fake.handle = (path, options) => {
   const body = () => JSON.parse(options.body)
+  if (path.startsWith('/api/permission-rules') && (options.method || 'GET') === 'GET') {
+    return fake.json(ruleSets(new URLSearchParams(path.split('?')[1] || '').get('session_id')))
+  }
   if (path === '/api/bootstrap') return fake.json({ token: 'test-token', settings: fake.settings })
   if (path === '/api/skills' || path.startsWith('/api/skills?')) return fake.json(skills)
   if (path === '/api/connection') return fake.json({ connected: true, models: ['test-model', 'other-model', 'latest-model'], error: null })
@@ -68,6 +77,12 @@ fake.handle = (path, options) => {
   if (folderId && options.method === 'POST') {
     const updated = { ...fake.sessions.get(folderId), allowed_directories: [body().path] }
     fake.sessions.set(folderId, updated)
+    return fake.json(updated)
+  }
+  const modeId = path.match(/^\/api\/sessions\/([^/]+)\/permissions$/)?.[1]
+  if (modeId && options.method === 'PUT') {
+    const updated = { ...fake.sessions.get(modeId), permission_mode: body().permission_mode }
+    fake.sessions.set(modeId, updated)
     return fake.json(updated)
   }
   const id = path.match(/^\/api\/sessions\/([^/]+)$/)?.[1]

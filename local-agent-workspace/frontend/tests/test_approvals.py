@@ -38,6 +38,8 @@ def decisions(ui, event_id):
     ("notebook_edit", ", input: { path: 'n.ipynb', index: 0, source: 'x' }", "Allow edits in this chat"),
     ("mcp__docs__search", ", input: { query: 'x' }", "Allow this tool in this chat"),
     ("hook_before_tool", ", input: { hook_id: 'check', tool: 'write_file' }", "Allow this hook in this chat"),
+    ("delegate_task", ", input: { task: 'Review the parser' }", "Allow subagents in this chat"),
+    ("stop_job", ", input: { job_id: 'job-1' }", "Allow stopping jobs in this chat"),
 ])
 def test_each_kind_of_card_offers_its_own_allow_for_this_chat(ui, page, name, extra, label):
     show(ui, f"[{pending('card', name, extra)}]")
@@ -102,7 +104,7 @@ def test_a_declined_card_shows_the_clipped_note(ui, page):
     expect(page.get_by_text("Action declined", exact=True)).to_have_count(1)
 
 
-# "Allowed in this chat" in the Permissions menu
+# Chat rules ("This chat") in the Permissions menu
 
 RULES = """window.rules = [{ tool: 'run_command', command: 'make test' }, { tool: 'edits' },
   { tool: 'mcp__docs__search' }, { tool: 'hook', hook: 'check' }]
@@ -121,7 +123,7 @@ def open_permissions(ui, page):
     ui.app(session="a", scenario="workspace", setup=RULES)
     ui.show_session("a")
     page.get_by_role("button", name=re.compile("^Permissions:")).click()
-    return page.get_by_role("group", name="Allowed in this chat")
+    return page.get_by_role("group", name="This chat", exact=True)
 
 
 def test_permissions_menu_lists_and_removes_rules(ui, page):
@@ -140,13 +142,12 @@ def test_permissions_menu_lists_and_removes_rules(ui, page):
     expect(rules.get_by_role("menuitem")).to_have_count(2)
 
 
-def test_rules_cannot_be_removed_while_the_chat_is_busy(ui, page):
+def test_rules_can_be_removed_while_the_chat_is_busy(ui, page):
     rules = open_permissions(ui, page)
     ui.emit("a", {"type": "status", "status": "awaiting_approval"})
     remove = rules.get_by_role("menuitem", name="Remove rule: File edits")
-    expect(remove).to_have_attribute("aria-disabled", "true")
-    remove.click(force=True)
-    note = page.get_by_text("Stop the response before changing modes or removing rules.", exact=True)
+    expect(remove).to_have_attribute("aria-disabled", "false")
+    note = page.get_by_text("Changes apply to the agent's next action.", exact=True)
     expect(note).to_be_visible()
     # to_be_visible ignores clipping by the menu's scroll area; the note must sit inside the menu's
     # visible box at any scroll position, including the top.
@@ -155,12 +156,19 @@ def test_rules_cannot_be_removed_while_the_chat_is_busy(ui, page):
         assert menu.evaluate(f"m => {{ m.scrollTop = {position}; return m.scrollHeight > m.clientHeight }}")
         area, box = menu.bounding_box(), note.bounding_box()
         assert area["y"] <= box["y"] and box["y"] + box["height"] <= area["y"] + area["height"], (position, area, box)
-    assert ui.requests("/api/sessions/a/allow-rules", "DELETE") == []
+    remove.click()
+    expect(rules.get_by_role("menuitem")).to_have_count(3)
+    assert ui.bodies("/api/sessions/a/allow-rules", "DELETE") == [{"tool": "edits"}]
 
 
 def test_removing_rules_with_the_keyboard_keeps_focus_in_the_menu(ui, page):
     rules = open_permissions(ui, page)
+    # End reaches the menu's last items (Add a rule…, Never asks); the last rule is just above them.
     page.keyboard.press("End")
+    expect(page.locator(".never-asks>summary")).to_be_focused()
+    page.keyboard.press("ArrowUp")
+    expect(page.get_by_role("menuitem", name="Add a rule…")).to_be_focused()
+    page.keyboard.press("ArrowUp")
     expect(rules.get_by_role("menuitem", name="Remove rule: Hook: check")).to_be_focused()
     for remaining, focused in ((3, "Tool: mcp__docs__search"), (2, "File edits"), (1, "Command: make test")):
         page.keyboard.press("Enter")
@@ -202,7 +210,7 @@ def test_a_command_rule_shows_its_exact_spacing(ui, page):
     ui.app(session="a", scenario="workspace", setup=RULES + "\nfake.sessions.get('a').allow_rules = [{ tool: 'run_command', command: 'echo  two  spaces' }]")
     ui.show_session("a")
     page.get_by_role("button", name=re.compile("^Permissions:")).click()
-    code = page.get_by_role("group", name="Allowed in this chat").locator("code")
+    code = page.get_by_role("group", name="This chat", exact=True).locator("code")
     expect(code).to_have_text("echo  two  spaces")
     assert code.evaluate("element => element.innerText") == "echo  two  spaces"
 
@@ -212,7 +220,7 @@ def test_a_chat_without_rules_shows_no_rule_list(ui, page):
     ui.show_session("a")
     page.get_by_role("button", name=re.compile("^Permissions:")).click()
     expect(page.get_by_role("menuitemradio", name=re.compile("^Manual"))).to_be_visible()
-    expect(page.get_by_role("group", name="Allowed in this chat")).to_have_count(0)
+    expect(page.get_by_role("group", name="This chat", exact=True)).to_have_count(0)
 
 
 # 409 errors that name the blocking chat
