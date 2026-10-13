@@ -44,7 +44,7 @@ INVALID_ARGUMENT_PHRASES = ("must be an integer", "must be a boolean", "must be 
                             "Use either", "cannot be empty", "Give cell_id or index", "needs source", "Put replace_all",
                             "Invalid until_regex", "Invalid pattern", "Invalid regular expression", "not supported in pattern",
                             "alternatives", "is beyond", "is out of range", "must identify",
-                            "in the foreground only")
+                            "in the foreground only", "without a shell needs")
 # A message that starts with an argument name, e.g. "output_mode must be content, files_with_matches or count."
 ARGUMENT_MESSAGE = re.compile(r"[A-Za-z_]+ must (?:be|contain) ")
 

@@ -84,8 +84,12 @@ from local_agent.tools import WorkspaceTools
     (ValueError("Not a read-only command."), "command_refused", True),
     (ValueError("Not a read-only Git command."), "command_refused", True),
     (ValueError("This Git option is not allowed in a read-only command."), "command_refused", True),
-    (ValueError("git resolves to a program inside the project, so it does not run automatically."),
-     "command_refused", True),
+    (ValueError("git resolves to /srv/x/bin/git, inside the project or a folder granted to this chat, "
+                "so it does not run automatically."), "command_refused", True),
+    (ValueError("This repository is a partial clone, and this Git version cannot switch off fetching missing "
+                "objects, so read-only Git does not run automatically."), "command_refused", True),
+    (ValueError("A command run without a shell needs 1 to 64 arguments, each text of at most 1,000 characters "
+                "without NUL."), "invalid_arguments", True),
     (ValueError("/bin/ls is not available, so this read-only command does not run automatically."),
      "command_refused", True),
     (ValueError("Read-only commands run in the foreground only."), "invalid_arguments", True),

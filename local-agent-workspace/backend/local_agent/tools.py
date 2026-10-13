@@ -112,6 +112,15 @@ def excluded(parts):
     return None
 
 
+def _identity(path):
+    """(device, inode) of an existing path, or None when it cannot be read."""
+    try:
+        info = os.stat(path)
+    except (OSError, ValueError):
+        return None
+    return info.st_dev, info.st_ino
+
+
 def _decode_line(raw):
     """A line as text, and whether it had bytes that are not valid UTF-8."""
     try:
@@ -131,6 +140,9 @@ class WorkspaceTools:
         self.root = Path(workspace).expanduser().resolve()
         # Folders file tools never reach (the app's state folder), except a workspace inside one.
         self.excluded_roots = [Path(p).expanduser().resolve() for p in excluded_roots]
+        self._identities = {}
+        self._excluded = [(root, _identity(root)) for root in self.excluded_roots]
+        self._root_inside = [self._within(self.root, root, identity) for root, identity in self._excluded]
         self.credential_file = Path(credential_file).expanduser().resolve() if credential_file else None
         self.allowed_directories = [Path(p).expanduser().resolve() for p in allowed_directories]
         self.unrestricted = unrestricted
@@ -163,8 +175,28 @@ class WorkspaceTools:
         """Whether path is inside an excluded root (the app's state folder). A workspace
         inside that folder (a worktree) still reaches its own files, and only those."""
         path = Path(path)
-        return any(path.is_relative_to(root) and not (self.root.is_relative_to(root) and path.is_relative_to(self.root))
-                   for root in self.excluded_roots)
+        return any(self._within(path, root, identity)
+                   and not (inside and self._within(path, self.root, self._folder_identity(self.root)))
+                   for (root, identity), inside in zip(self._excluded, self._root_inside))
+
+    def _within(self, path, folder, identity) -> bool:
+        """Whether path is folder or inside it, by name or by file identity: resolve() only
+        follows symbolic links, and a case variant on a case-insensitive disk, a bind mount
+        or a macOS firmlink is another name for the same folder."""
+        if path.is_relative_to(folder):
+            return True
+        return identity is not None and (_identity(path) == identity
+                                         or any(self._folder_identity(item) == identity for item in path.parents))
+
+    def _folder_identity(self, folder):
+        """_identity of a parent folder, remembered: listings and searches ask about the same
+        parents many times."""
+        key = str(folder)
+        if key not in self._identities:
+            if len(self._identities) >= 4096:
+                self._identities.clear()
+            self._identities[key] = _identity(folder)
+        return self._identities[key]
 
     def permitted(self, path: Path) -> bool:
         return self.unrestricted or any(path.is_relative_to(root) for root in [self.root, *self.allowed_directories])

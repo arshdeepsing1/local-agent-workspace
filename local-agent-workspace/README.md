@@ -595,9 +595,9 @@ when opening a conversation or performing restart recovery.
 The default state directory is `local-agent-workspace/.local/`, overridable with
 `LOCAL_AGENT_STATE_DIR` in `.env`. The directory is created at startup. Changing
 the value does not move existing data: stop the server before copying state to a
-new location, update `.env`, and then restart the app. Keep the state directory
-outside the selected project workspace when using a custom name so agent file
-tools cannot browse it.
+new location, update `.env`, and then restart the app. File tools never reach the
+state directory, wherever it is; keep a custom one outside the selected project
+workspace anyway, because commands run in the workspace can still reach it.
 
 - `conversations/<conversation-id>.jsonl`: one complete, private file per chat.
   Records include conversation metadata, user and assistant events, reasoning and
@@ -1160,14 +1160,20 @@ folders. Bypass mode skips that folder boundary; credential files and generated
 directories remain excluded. The app's state folder (settings, rules, extensions and
 conversations; `LOCAL_AGENT_STATE_DIR`, `.local` by default) is excluded from file tools in
 every mode, also after a folder grant or through a symbolic link; a workspace inside it, such
-as a worktree, reaches only its own files. Commands allowed by a rule or by the read-only
-list run without a shell, from the program found on the absolute entries of `PATH`; the
-read-only `pwd` and `ls` run from `/bin`, and read-only Git runs a `git` found outside the
-project with repository programs (fsmonitor, hooks, filters, textconv, external diff,
-signature checks) switched off, output limited to the workspace, and credential files left
-out of diffs. This is a trusted single-user local app, not a multi-user sandbox.
-Commands allowed by the selected mode execute with your OS permissions and can reach beyond the project.
-The shell strips model credentials from its inherited environment.
+as a worktree, reaches only its own files. The folder is compared by file identity as well as
+by name, so a case variant, a bind mount or a firmlink of it is refused too. Commands allowed
+by an argv or prefix rule or by the read-only list run without a shell, from the program found
+on the absolute entries of `PATH` (a program named by a path keeps that name, so
+`.venv/bin/python` runs inside its virtual environment); the read-only `pwd` and `ls` run from
+`/bin`, and read-only Git runs a `git` found outside the project and outside folders granted to
+the chat, with repository programs (fsmonitor, hooks, filters, textconv, external diff,
+signature checks, also inside submodules) switched off, no fetch of missing objects in a partial
+clone, status, diffs and file lists limited to the workspace, and credential files (`.env.*`
+except `.env.example`) left out of diffs. `git log` and `git show` still name commits that change
+only files outside the workspace. With a Git older than the May 2024 security releases, read-only
+Git does not run automatically in a partial clone. This is a trusted single-user local app, not a
+multi-user sandbox. Commands allowed by the selected mode execute with your OS permissions and
+can reach beyond the project. Commands get an environment without model credentials.
 
 **Settings → Agent steps** defaults to 32 model requests per user message and accepts
 1–64. This is a model-request ceiling, not a tool-call count: one model response can
@@ -1417,6 +1423,7 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `backend/local_agent/agents.py`: session/approval events and the Databricks tool loop.
 - `backend/local_agent/tools.py`: scoped file queries/edits and tool definitions.
 - `backend/local_agent/jobs.py`: streamed processes, managed jobs, and cleanup.
+- `backend/local_agent/command_exec.py`: commands run from an argument vector without a shell, and the read-only command list.
 - `backend/local_agent/permissions.py`: shared mode rules and model instructions.
 - `backend/local_agent/approvals.py`: "Allow for this chat" rules, decline-note wording, and 409 details naming a busy chat.
 - `backend/local_agent/store.py`: per-conversation JSONL storage, unreadable-file reports, and legacy migration.

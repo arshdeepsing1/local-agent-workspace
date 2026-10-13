@@ -24,10 +24,13 @@ def absolute_path_entries(env):
 
 def resolve_executable(name, env, cwd):
     """The program argv[0] names: a path (with '/') relative to cwd, or a bare name
-    looked up on the absolute PATH entries of env."""
+    looked up on the absolute PATH entries of env. A path keeps its own name, not the
+    target of a symbolic link: a virtual environment's python finds its environment, and
+    a multi-call program its role, from the name it was started under."""
     if "/" in name:
-        path = Path(cwd, name).resolve()
-        if not path.is_file() or not os.access(path, os.X_OK):
+        path = Path(cwd, name).absolute()
+        target = path.resolve()
+        if not target.is_file() or not os.access(target, os.X_OK):
             raise ValueError(f"Command not found: {name}")
         return str(path)
     found = shutil.which(name, path=os.pathsep.join(absolute_path_entries(env)))

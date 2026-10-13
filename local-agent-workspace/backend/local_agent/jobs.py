@@ -140,13 +140,20 @@ def command_environment(extra_env=None):
     return env
 
 
-def validate_argv(argv):
-    """An argument vector run without a shell: 1 to 64 text tokens, each without NUL
+# A command given to run without a shell has at most 64 tokens (command_exec.prepare_command
+# checks it). The argument vector that runs may be longer: read-only Git adds its own options
+# and pathspecs.
+ARGV_LIMIT = 64
+PREPARED_ARGV_LIMIT = 256
+
+
+def validate_argv(argv, limit=ARGV_LIMIT):
+    """An argument vector run without a shell: 1 to limit text tokens, each without NUL
     and at most 1,000 characters."""
-    if (not isinstance(argv, list) or not 1 <= len(argv) <= 64
+    if (not isinstance(argv, list) or not 1 <= len(argv) <= limit
             or not all(isinstance(token, str) and "\0" not in token and len(token) <= 1000 for token in argv)
             or not argv[0]):
-        raise ValueError("A command run without a shell needs 1 to 64 arguments, each text of at most "
+        raise ValueError(f"A command run without a shell needs 1 to {limit} arguments, each text of at most "
                          "1,000 characters without NUL.")
 
 
@@ -181,7 +188,7 @@ async def run_process(command, workspace, timeout_seconds=60, max_output_bytes=8
     environment (command_environment(extra_env) otherwise)."""
     validate_command_options(command, timeout_seconds, max_output_bytes)
     if argv is not None:
-        validate_argv(argv)
+        validate_argv(argv, PREPARED_ARGV_LIMIT)
     env = env if env is not None else command_environment(extra_env)
     process = await spawn(list(argv) if argv is not None else shell_argv(command), workspace, env)
 
@@ -467,7 +474,7 @@ class JobManager:
         argv and env are never stored or published."""
         validate_command_options(command, timeout_seconds, max_output_bytes)
         if argv is not None:
-            validate_argv(argv)
+            validate_argv(argv, PREPARED_ARGV_LIMIT)
             argv = list(argv)
         if env is not None and (not isinstance(env, dict)
                                 or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items())):

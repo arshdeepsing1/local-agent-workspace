@@ -111,6 +111,75 @@ def test_a_workspace_inside_the_state_folder_reaches_its_own_files_only(layout):
         assert str(caught.value) == MESSAGE
 
 
+def alias_of(monkeypatch, alias, target):
+    """Make alias another name for target, as a bind mount, a macOS firmlink or a case
+    variant on a case-insensitive disk is: the same file identity under another path."""
+    import local_agent.tools as tools_module
+    real = tools_module._identity
+
+    def identity(path):
+        path = Path(path)
+        if path == alias or path.is_relative_to(alias):
+            return real(target / path.relative_to(alias)) if (target / path.relative_to(alias)).exists() else None
+        return real(path)
+    monkeypatch.setattr(tools_module, "_identity", identity)
+
+
+@pytest.mark.parametrize("unrestricted", [False, True])
+def test_another_name_for_the_state_folder_is_refused(layout, tmp_path, monkeypatch, unrestricted):
+    settings, workspace = layout
+    alias = tmp_path / "alias"
+    alias.mkdir()
+    (alias / "permission_rules.json").write_text('{"user": []}\n')
+    (alias / "settings.json").write_text("{}\n")
+    alias_of(monkeypatch, alias, settings.state_dir)
+    tools = WorkspaceTools(str(workspace), "", [str(alias)], unrestricted, excluded_roots=(settings.state_dir,))
+    for path in (str(alias), str(alias / "permission_rules.json"), str(alias / "new.json")):
+        with pytest.raises(ValueError) as caught:
+            tools.path(path)
+        assert str(caught.value) == MESSAGE
+    with pytest.raises(ValueError, match="^The app's settings"):
+        tools.change("write_file", {"path": str(alias / "permission_rules.json"),
+                                    "content": '{"user": ["allow everything"]}\n'}, apply=True)
+    with pytest.raises(ValueError, match="^The app's settings"):
+        tools.read_file(str(alias / "settings.json"))
+    assert (alias / "permission_rules.json").read_text() == '{"user": []}\n'
+    assert "project notes" in json.dumps(tools.read_file("notes.txt"))
+
+
+def test_a_workspace_inside_another_name_for_the_state_folder_reaches_its_own_files_only(layout, tmp_path,
+                                                                                          monkeypatch):
+    settings, _ = layout
+    (settings.state_dir / "worktrees" / "feature").mkdir(parents=True)
+    alias = tmp_path / "alias"
+    worktree = alias / "worktrees" / "feature"
+    worktree.mkdir(parents=True)
+    (worktree / "main.py").write_text("print('worktree')\n")
+    (alias / "settings.json").write_text("{}\n")
+    alias_of(monkeypatch, alias, settings.state_dir)
+    tools = WorkspaceTools(str(worktree), "", [], True, excluded_roots=(settings.state_dir,))
+    assert "worktree" in json.dumps(tools.read_file("main.py"))
+    with pytest.raises(ValueError) as caught:
+        tools.path(str(alias / "settings.json"))
+    assert str(caught.value) == MESSAGE
+
+
+def test_a_case_variant_of_the_state_folder_is_refused_on_a_case_insensitive_disk(tmp_path, monkeypatch):
+    monkeypatch.setattr("local_agent.config.APP_ROOT", tmp_path / "app")
+    state = tmp_path / "AgentState"
+    state.mkdir()
+    (state / "permission_rules.json").write_text('{"user": []}\n')
+    variant = tmp_path / "agentstate"
+    if not variant.exists():
+        pytest.skip("This file system tells letter case apart")
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    tools = WorkspaceTools(str(workspace), "", [], True, excluded_roots=(state,))
+    with pytest.raises(ValueError) as caught:
+        tools.read_file(str(variant / "permission_rules.json"))
+    assert str(caught.value) == MESSAGE
+
+
 def test_the_default_state_folder_stays_excluded(tmp_path):
     app_root = tmp_path / "app"
     (app_root / ".local").mkdir(parents=True)
@@ -160,6 +229,73 @@ async def test_agent_tools_cannot_reach_the_state_folder_in_bypass(runtime, name
     assert after == before
     assert not (state / "notes.txt").exists()
     assert (Path(session["workspace"]) / "notes.txt").exists()
+
+
+def frame(delta, finish=None):
+    return "data: " + json.dumps({"choices": [{"delta": delta, "finish_reason": finish}]}) + "\n\n"
+
+
+async def test_a_model_turn_in_bypass_cannot_read_or_write_the_state_folder(runtime, monkeypatch):
+    """The tools the agent loop builds for a turn, not only session_tools, exclude the state folder."""
+    import httpx
+    manager, session, settings = runtime
+    state = settings.state_dir
+    rules = (state / "permission_rules.json").read_bytes()
+    calls = [("write", "write_file", {"path": str(state / "permission_rules.json"),
+                                      "content": '{"user": ["allow everything"]}\n'}),
+             ("read", "read_file", {"path": str(state / "settings.json")})]
+    requests = []
+
+    async def gateway(request):
+        requests.append(json.loads(request.content))
+        if len(requests) == 1:
+            return httpx.Response(200, text=frame({"tool_calls": [
+                {"index": index, "id": call_id, "function": {"name": name, "arguments": json.dumps(arguments)}}
+                for index, (call_id, name, arguments) in enumerate(calls)]}, "tool_calls") + "data: [DONE]\n\n")
+        return httpx.Response(200, text=frame({"content": "Done."}, "stop") + "data: [DONE]\n\n")
+
+    client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client(**kwargs, transport=httpx.MockTransport(gateway)))
+    session.update(allowed_directories=[], title="Rules", title_generated=True)  # Bypass alone reaches every folder.
+    await manager.run(session, "Change the rules")
+    assert len(requests) == 2
+    for call_id, _, _ in calls:
+        event = next(event for event in session["events"] if event.get("call_id") == call_id)
+        assert MESSAGE in event["output"], event
+    assert (state / "permission_rules.json").read_bytes() == rules
+    sent = json.dumps(requests[1]["messages"])
+    assert "/srv/x" not in sent  # settings.json's contents never reached the model.
+
+
+@pytest.mark.parametrize("outside_change", [False, True])
+def test_review_tools_exclude_the_state_folder(runtime, monkeypatch, outside_change):
+    """Both forms: the chat's own tools, and the wider tools built when the agent changed a
+    file in a folder the chat no longer reaches (here the folder that holds the state folder)."""
+    manager, session, settings = runtime
+    session.update(permission_mode="manual", allowed_directories=[])
+    outside = [str(settings.state_dir.parent)] if outside_change else []
+    monkeypatch.setattr(manager.changes, "outside_folders", lambda session_id, tools: outside)
+    tools = manager.review_tools(session)
+    assert tools.excluded_roots == [settings.state_dir.resolve()]
+    assert tools.permitted(settings.state_dir / "settings.json") is outside_change
+    with pytest.raises(ValueError) as caught:
+        tools.path(str(settings.state_dir / "settings.json"))
+    assert str(caught.value) == MESSAGE
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="Git is not installed")
+def test_the_git_routes_do_not_show_state_folder_files(layout):
+    """A repository that contains the state folder: its files are not shown by /api/git/diff."""
+    settings, workspace = layout
+    parent = workspace.parent
+    subprocess.run(["git", "-C", str(parent), "init", "-q"], check=True, capture_output=True)
+    settings.values["workspace"] = str(parent)
+    with TestClient(create_app(settings)) as client:
+        client.headers["X-Local-Token"] = client.get("/api/bootstrap").json()["token"]
+        response = client.get("/api/git/diff", params={"path": "state/settings.json", "area": "untracked"})
+        assert response.status_code == 400 and "/srv/x" not in response.text
+        shown = client.get("/api/git/diff", params={"path": "project/notes.txt", "area": "untracked"})
+        assert shown.status_code == 200 and "project notes" in shown.text
 
 
 def test_the_api_refuses_the_state_folder(layout):
