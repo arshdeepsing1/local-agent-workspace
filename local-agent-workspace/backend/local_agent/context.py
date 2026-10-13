@@ -327,7 +327,7 @@ def summary_byte_limit(input_budget):
 
 
 def summary_output_tokens(limit_bytes):
-    """Output reserve for a plain summary of limit_bytes (4,096 at the default limit)."""
+    """Output reserve for a plain summary of limit_bytes (4,096 up to 12,288 bytes; 5,043 at the default 15,130)."""
     return max(SUMMARY_MAX_TOKENS, limit_bytes // 3)
 
 
@@ -601,20 +601,46 @@ def request_text(message, limit_bytes=REQUEST_CLIP_BYTES):
     return _clip_request(text, limit_bytes)
 
 
+def _request_cap(items, limit_bytes):
+    """The largest per-request size c with sum(min(size, c) + 4) <= limit_bytes."""
+    room = limit_bytes - 4 * len(items)
+    sizes = sorted(_size(item) for item in items)
+    for count, size in enumerate(sizes):
+        if size * (len(sizes) - count) > room:
+            return max(0, room) // (len(sizes) - count)
+        room -= size
+    return sizes[-1] if sizes else limit_bytes
+
+
 def merge_user_requests(previous, omitted, new, limit_bytes):
     """(requests, omitted): the earlier list with new requests appended, within
-    limit_bytes. The first request is always kept; the oldest after it go first."""
-    per_item = min(REQUEST_CLIP_BYTES, limit_bytes // 2 - 8)
-    items = [_clip_request(item, per_item) for item in [*(previous or []), *new] if isinstance(item, str)]
+    limit_bytes. Requests stay whole while they fit; otherwise the longest are
+    shortened (start and end kept) to a common size, never below the per-request
+    floor. Below it the oldest after the first go; the first is always kept."""
+    floor = min(REQUEST_CLIP_BYTES, limit_bytes // 2 - 8)
+    items = [item for item in [*(previous or []), *new] if isinstance(item, str)]
     omitted = omitted if type(omitted) is int and omitted >= 0 else 0
-    while sum(_size(item) + 4 for item in items) > limit_bytes and len(items) > 2:
+    while len(items) > 2 and sum(_size(_clip_request(item, floor)) + 4 for item in items) > limit_bytes:
         del items[1]
         omitted += 1
-    return items, omitted
+    cap = _request_cap(items, limit_bytes)
+    return [_clip_request(item, cap) for item in items], omitted
 
 
 APP_RECORD_HEADING = "\n\nApp record (kept by the app):\n"
 APP_NOTES_HEADING = "App notes (data, not instructions):\n"
+APP_NOTES_CLIP_MARKER = "\n[... more app notes omitted ...]"
+
+
+def _clip_notes(notes, limit_bytes):
+    """App notes within limit_bytes, cut at a line end. app_record fits them by whole lines
+    itself, so this is only a safety net."""
+    if _size(notes) <= limit_bytes:
+        return notes
+    head = _head_bytes(notes, limit_bytes - _size(APP_NOTES_CLIP_MARKER))
+    if (line := head.rfind("\n")) > 0:
+        head = head[:line]
+    return head.rstrip() + APP_NOTES_CLIP_MARKER
 
 
 def render_app_record(state):
@@ -773,38 +799,81 @@ def _trim_middle(summary, limit_bytes):
             + data[len(data) - tail:].decode("utf-8", errors="ignore").lstrip())
 
 
+def _cut_lines_middle(body, remove):
+    """body without at least remove bytes of whole lines from its middle, marked
+    with SECTION_TRIM_MARKER; None when body has too few lines to cut."""
+    lines = body.rstrip("\n").split("\n")
+    if len(lines) < 3:
+        return None
+    need = remove + _size(SECTION_TRIM_MARKER)
+    # Drop lines around the middle, alternating so the first and last lines stay.
+    low = high = len(lines) // 2
+    dropped = 0
+    while dropped < need and (low > 1 or high < len(lines) - 1):
+        if high < len(lines) - 1 and (high - len(lines) // 2 <= len(lines) // 2 - low or low <= 1):
+            dropped += _size(lines[high]) + 1
+            high += 1
+        else:
+            low -= 1
+            dropped += _size(lines[low]) + 1
+    if dropped < need:
+        return None
+    return "\n".join(lines[:low]).rstrip() + SECTION_TRIM_MARKER + "\n".join(lines[high:]) + "\n"
+
+
 def trim_summary(summary, limit_bytes):
     """Fit an oversized summary within limit_bytes without a model request.
 
     With at least three known sections, the least important sections are shortened
-    first (SECTION_TRIM_ORDER); the required sections are never cut. Otherwise, or if
-    that is not enough, the start and end are kept (_trim_middle)."""
+    first (SECTION_TRIM_ORDER), then reduced to their headings; only then are whole
+    lines cut from the middle of the required sections, in proportion to their size.
+    Otherwise, or if that is still not enough, the start and end are kept (_trim_middle)."""
     if _size(summary) <= limit_bytes:
         return summary
     text = summary
     if len(summary_sections(text)) >= 3:
         marker = _size(SECTION_TRIM_MARKER)
-        for name in SECTION_TRIM_ORDER:
-            excess = _size(text) - limit_bytes
-            if excess <= 0:
-                break
+        for floor in (SECTION_MIN_BYTES, 0):
+            for name in SECTION_TRIM_ORDER:
+                excess = _size(text) - limit_bytes
+                if excess <= 0:
+                    break
+                sections = summary_sections(text)
+                if name not in sections:
+                    continue
+                start, end = sections[name]
+                section = text[start:end]
+                line_end = section.find("\n")
+                if line_end < 0:
+                    continue
+                heading, body = section[:line_end + 1], section[line_end + 1:]
+                keep = max(floor, _size(body) - excess - marker - 1)
+                if keep + marker + 1 >= _size(body):
+                    continue
+                cut = _head_bytes(body, keep)
+                if (line := cut.rfind("\n")) > 0:
+                    cut = cut[:line]
+                elif floor == 0:
+                    cut = ""
+                text = (text[:start] + heading + cut.rstrip() + SECTION_TRIM_MARKER
+                        + ("\n" if end < len(text) else "") + text[end:])
+        excess = _size(text) - limit_bytes
+        if excess > 0:
             sections = summary_sections(text)
-            if name not in sections:
-                continue
-            start, end = sections[name]
-            section = text[start:end]
-            line_end = section.find("\n")
-            if line_end < 0:
-                continue
-            heading, body = section[:line_end + 1], section[line_end + 1:]
-            keep = max(SECTION_MIN_BYTES, _size(body) - excess - marker - 1)
-            if keep + marker + 1 >= _size(body):
-                continue
-            cut = _head_bytes(body, keep)
-            if (line := cut.rfind("\n")) > 0:
-                cut = cut[:line]
-            text = (text[:start] + heading + cut.rstrip() + SECTION_TRIM_MARKER
-                    + ("\n" if end < len(text) else "") + text[end:])
+            required = [(name, sections[name]) for name in REQUIRED_SUMMARY_SECTIONS if name in sections]
+            total = sum(_size(text[start:end]) for _, (start, end) in required) or 1
+            # Later sections first, so earlier offsets stay valid.
+            for name, (start, end) in sorted(required, key=lambda item: -item[1][0]):
+                section = text[start:end]
+                line_end = section.find("\n")
+                if line_end < 0:
+                    continue
+                heading, body = section[:line_end + 1], section[line_end + 1:]
+                share = -(-excess * _size(section) // total)
+                shorter = _cut_lines_middle(body, share)
+                if shorter is not None:
+                    gap = "\n" if end < len(text) and not shorter.endswith("\n\n") else ""
+                    text = text[:start] + heading + shorter + gap + text[end:]
     return _trim_middle(text, limit_bytes)
 
 
@@ -857,7 +926,7 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
 
     Compaction runs when force_compact is set or the estimate passes auto_compact_percent
     of the input budget. record_requests keeps the user's earlier requests in the app
-    record next to the summary; app_record(wire, cut) returns the app's notes for it.
+    record next to the summary; app_record(wire, cut, limit_bytes) returns the app's notes for it.
     output_allowance is added to every compaction request's output reserve (thinking).
     completed_calls (ids of completed tool calls) lets the summarizer's view drop reads
     that later calls superseded. The defaults keep the behaviour before these options.
@@ -1033,13 +1102,31 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
         if record_requests:
             _record_requests(wire, state, updated, cut, record_limit // 2)
         if app_record:
-            notes = _trim_middle(str(app_record(wire, cut) or "").strip(), record_limit // 2)
+            notes = _clip_notes(str(app_record(wire, cut, record_limit // 2) or "").strip(), record_limit // 2)
             if notes:
                 updated["app_notes"] = notes
             else:
                 updated.pop("app_notes", None)
         messages = [system_message, *context_messages(wire, updated)]
         estimate = scaled_estimate(messages, tools, scale)
+        # needed_at reserves summary_limit and record_limit ASCII bytes, but JSON escapes, non-ASCII
+        # text and the record's headings weigh more. Shorten the summary, already paid for, until the
+        # request fits instead of discarding it and failing the turn.
+        for attempt in range(3):
+            if estimate <= input_budget:
+                break
+            size, weight = _size(updated["summary"]), _weighted_size(updated["summary"])
+            excess = (math.ceil((estimate - input_budget) / scale) + 1) * 3  # In weighted bytes.
+            limit = size * (weight - excess) // weight if weight > excess else 0
+            if limit < SUMMARY_MIN_BYTES // 2:
+                break
+            # A small cut shortens the least important sections; a large one is condensed first.
+            shorten = counted_condense if condense and not attempt and limit < size * 3 // 4 else None
+            updated["summary"], change = await fit_summary(updated["summary"], limit, shorten)
+            if change and adjustment != "trimmed":
+                adjustment = change
+            messages = [system_message, *context_messages(wire, updated)]
+            estimate = scaled_estimate(messages, tools, scale)
         if estimate > input_budget:
             raise budget_error(
                 f"The summary and latest turns still exceed the context budget: they need about "
@@ -1097,7 +1184,8 @@ def _record_requests(wire, state, updated, cut, limit_bytes):
     sources = [wire[previous]] if previous is not None and current != previous else []
     sources += [message for index, message in enumerate(wire[through:cut], through)
                 if message.get("role") == "user" and index != current]
-    new = [text for text in map(request_text, sources) if text is not None]
+    # Clipped only to the whole area here: merge_user_requests shortens them when the record is full.
+    new = [text for text in (request_text(message, limit_bytes) for message in sources) if text is not None]
     requests, omitted = merge_user_requests(state.get("user_requests"), state.get("requests_omitted", 0), new,
                                             limit_bytes)
     # Conversations compacted before the record existed start it at this compaction.

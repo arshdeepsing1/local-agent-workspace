@@ -400,6 +400,26 @@ def forget_summarized_reads(file_views, state, forgotten):
     return views, {**state, "summarized_reads": list(dict.fromkeys(earlier + forgotten))[-SUMMARIZED_READS_LIMIT:]}
 
 
+def fit_record_notes(parts, limit=None):
+    """The app notes from parts [(heading, lines, hidden, more(n), footer)], within limit UTF-8 bytes
+    when given. While over it, the last line of the part with the most bytes goes, so every part
+    keeps its heading, its footer and a line saying how many of its lines are not shown."""
+    parts = [[heading, list(lines), hidden, more, footer] for heading, lines, hidden, more, footer in parts]
+
+    def render(part):
+        heading, lines, hidden, more, footer = part
+        return "\n".join([heading, *lines, *([more(hidden)] if hidden else []), *([footer] if footer else [])])
+
+    while limit is not None and len("\n\n".join(map(render, parts)).encode("utf-8")) > limit:
+        longest = max((part for part in parts if part[1]), key=lambda part: len(render(part).encode("utf-8")),
+                      default=None)
+        if longest is None:
+            break
+        longest[1].pop()
+        longest[2] += 1
+    return "\n\n".join(map(render, parts))
+
+
 def auto_compact_percent(values):
     """Settings' auto-compact percentage, or the default when the saved value is not valid."""
     value = values.get("auto_compact_percent", DEFAULT_AUTO_COMPACT_PERCENT)
@@ -2889,11 +2909,13 @@ class AgentManager:
         return summarize, condense
 
     def compaction_record(self, session, tools):
-        """(record, holder): record(wire, cut) returns the app's notes for the app record
-        a compaction keeps next to the summary: the open tasks, the files this
+        """(record, holder): record(wire, cut, limit=None) returns the app's notes for the app
+        record a compaction keeps next to the summary: the open tasks, the files this
         conversation changed in the summarized part, and the files read before the cut
-        whose contents leave the model's context. It stores those files (absolute
-        paths, as file_views keys) in holder["forgotten"]."""
+        whose contents leave the model's context, with those forgotten at earlier
+        compactions until they are read again. It stores this compaction's files
+        (absolute paths, as file_views keys) in holder["forgotten"]. With a limit, the
+        notes are fitted within that many UTF-8 bytes by whole lines (fit_record_notes)."""
         holder = {"forgotten": []}
 
         def shown(value):
@@ -2902,8 +2924,8 @@ class AgentManager:
             except (ValueError, OSError, RuntimeError):
                 return None
 
-        def record(wire, cut):
-            parts = []
+        def record(wire, cut, limit=None):
+            parts = []  # (heading, lines, hidden, more(n), footer) for fit_record_notes.
             try:
                 tasks = self.task_board.list(session["id"])
             except ValueError:
@@ -2914,10 +2936,10 @@ class AgentManager:
                 done = len(tasks) - len(open_tasks)
                 lines = [f"- [{task.get('status')}] {task.get('title')} (task_id {task.get('id')})"
                          for task in open_tasks[:RECORD_TASKS]]
-                if len(open_tasks) > RECORD_TASKS:
-                    lines.append(f"- … {len(open_tasks) - RECORD_TASKS:,} more open tasks")
-                parts.append("Task checklist when this compaction ran (list_tasks shows the current state):\n"
-                             + "\n".join(lines + [f"and {plural(done, 'completed task')}."]))
+                parts.append(("Task checklist when this compaction ran (list_tasks shows the current state):", lines,
+                              max(0, len(open_tasks) - RECORD_TASKS),
+                              lambda n: f"- … {n:,} more open tasks (list_tasks shows them)",
+                              f"and {plural(done, 'completed task')}."))
             issued = {call.get("id") for message in wire[:cut] if message.get("role") == "assistant"
                       for call in message.get("tool_calls") or [] if isinstance(call, dict) and call.get("id")}
             changed = []
@@ -2928,8 +2950,9 @@ class AgentManager:
                         if (name := shown(value)) and name not in changed:
                             changed.append(name)
             if changed:
-                parts.append("Files this conversation changed before this point (newest first):\n"
-                             + "\n".join(f"- {name}" for name in changed[:RECORD_FILES]))
+                parts.append(("Files this conversation changed before this point (newest first):",
+                              [f"- {name}" for name in changed[:RECORD_FILES]], max(0, len(changed) - RECORD_FILES),
+                              lambda n: f"- … {n:,} more", None))
             completed = completed_call_ids(session)
             seen = set()
             for message in wire[cut:]:
@@ -2956,11 +2979,20 @@ class AgentManager:
             views = session.get("file_views") if isinstance(session.get("file_views"), dict) else {}
             forgotten = [path for path in views if path not in still]
             holder["forgotten"] = forgotten
-            if forgotten:
-                names = [tools.display_path(Path(path)) for path in reversed(forgotten)][:RECORD_FILES]
-                parts.append("Files read before this compaction whose contents are no longer in your context "
-                             "(read them again before editing):\n" + "\n".join(f"- {name}" for name in names))
-            return "\n\n".join(parts)
+            # Files forgotten at an earlier compaction stay listed until read again: this record
+            # replaces the previous one. session["context_state"] is still the state before this
+            # compaction, so its summarized_reads holds them (oldest first).
+            state = session.get("context_state") if isinstance(session.get("context_state"), dict) else {}
+            earlier = [path for path in reversed(state.get("summarized_reads") or []) if isinstance(path, str)
+                       and path not in views and path not in still and os.path.exists(path)]
+            listed = list(dict.fromkeys([*reversed(forgotten), *earlier]))
+            if listed:
+                names = [f"- {tools.display_path(Path(path))}" for path in listed]
+                parts.append(("Files read before this compaction whose contents are no longer in your context "
+                              "(read them again before editing):", names[:RECORD_FILES],
+                              max(0, len(names) - RECORD_FILES),
+                              lambda n: f"- … {n:,} more (read any file again before editing it)", None))
+            return fit_record_notes(parts, limit)
 
         return record, holder
 

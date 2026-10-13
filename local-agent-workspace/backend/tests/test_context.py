@@ -317,9 +317,12 @@ async def test_final_serialized_request_is_checked_before_committing_summary():
     async def summarize(previous, chunk, limit_bytes):
         return "\\" * limit_bytes
 
-    with pytest.raises(ValueError, match="still exceed the context budget"):
-        await prepare_context(wire, state, SYSTEM, TOOLS, COMPACTION_CONTEXT_WINDOW, summarize)
-    assert (wire, state) == original
+    # The billed summary is shortened until the request fits, not discarded.
+    _, updated, info = await prepare_context(wire, state, SYSTEM, TOOLS, COMPACTION_CONTEXT_WINDOW, summarize)
+    assert info["estimated_tokens"] <= info["input_budget"] and info["summary_adjustment"] == "trimmed"
+    assert updated["compactions"] == 1 and (wire, state) == original
+    # Turns that leave too little room even for a much shorter summary still fail without committing
+    # it: test_compaction_review_fixes.test_a_summary_that_cannot_fit_above_the_floor_still_fails_without_committing.
 
 
 @pytest.mark.parametrize("context_window", [MIN_CONTEXT_WINDOW - 1, MAX_CONTEXT_WINDOW + 1])
