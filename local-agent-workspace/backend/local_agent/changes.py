@@ -7,12 +7,12 @@ the current content (the baseline moves forward); Undo writes the baseline back
 through the checkpoint machinery, so an undo can itself be restored from
 Agent tools -> Recovery. Both work on a whole file or on one change (hunk).
 """
-import difflib
 import json
 import re
 import time
 from pathlib import Path
 
+from .edits import line_opcodes
 from .recovery import _bytes, _snapshot, _state
 from .tools import file_error
 
@@ -35,7 +35,7 @@ def _status(baseline, current):
 
 
 def _opcodes(old, new):
-    return difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes()
+    return line_opcodes(old, new)  # difflib's opcodes, without its quadratic cases on large files.
 
 
 def _counts(opcodes):

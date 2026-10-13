@@ -1,5 +1,4 @@
 import asyncio
-import difflib
 import fnmatch
 import json
 import os
@@ -10,11 +9,15 @@ from pathlib import Path
 
 import regex as safe_regex
 
+from .edits import plan_change, preview_diff
 from .jobs import run_process
 
 IGNORED = {".git", "node_modules", ".venv", ".codex_venv", "__pycache__", ".local", ".pytest_cache", "dist"}
 SECRET_NAMES = {".env", "env_vars.txt", ".netrc", ".npmrc", "credentials", "credentials.json", "id_rsa", "id_ed25519"}
 LIMIT = 80_000
+DEFAULT_WRITE_LIMIT = 80_000
+MIN_WRITE_LIMIT = 16_000
+MAX_WRITE_LIMIT = 1_000_000
 QUERY_OUTPUT_LIMIT = 8_000
 READ_SCAN_LIMIT = 8_000_000
 READ_LINE_LIMIT = 128_000
@@ -49,6 +52,14 @@ def _excerpt(line, limit=300):
     return encoded[:limit].decode("utf-8", errors="ignore") + " … [line truncated]", True
 
 
+def write_limit_setting(values):
+    """The file write limit in bytes from Settings (write_limit_kb, 16 to 1,000), else the default."""
+    kilobytes = values.get("write_limit_kb") if isinstance(values, dict) else None
+    if type(kilobytes) is int and MIN_WRITE_LIMIT // 1000 <= kilobytes <= MAX_WRITE_LIMIT // 1000:
+        return kilobytes * 1000
+    return DEFAULT_WRITE_LIMIT
+
+
 def file_error(error: Exception) -> str:
     if isinstance(error, PermissionError) and sys.platform == "darwin":
         return (f"macOS denied access to {error.filename or 'this path'}. "
@@ -60,11 +71,13 @@ def file_error(error: Exception) -> str:
 
 
 class WorkspaceTools:
-    def __init__(self, workspace: str, credential_file: str = "", allowed_directories=(), unrestricted=False):
+    def __init__(self, workspace: str, credential_file: str = "", allowed_directories=(), unrestricted=False,
+                 write_limit=DEFAULT_WRITE_LIMIT):
         self.root = Path(workspace).expanduser().resolve()
         self.credential_file = Path(credential_file).expanduser().resolve() if credential_file else None
         self.allowed_directories = [Path(p).expanduser().resolve() for p in allowed_directories]
         self.unrestricted = unrestricted
+        self.write_limit = min(max(write_limit, MIN_WRITE_LIMIT), MAX_WRITE_LIMIT) if type(write_limit) is int else DEFAULT_WRITE_LIMIT
 
     def resolve(self, value: str = ".") -> Path:
         requested = self.root / Path(value).expanduser()
@@ -137,10 +150,30 @@ class WorkspaceTools:
             result["entries"].append(entry)
         return result
 
+    def read_raw(self, path: str):
+        """The exact text of a file (no newline translation), or None when it does not exist."""
+        target = self.path(path)
+        try:
+            info = target.stat()
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("Only regular UTF-8 files can be edited.")
+        if info.st_size > MAX_WRITE_LIMIT:
+            raise ValueError(f"File is too large to edit ({MAX_WRITE_LIMIT // 1000:,} KB limit).")
+        with target.open("rb") as source:
+            raw = source.read(MAX_WRITE_LIMIT + 1)
+        if len(raw) > MAX_WRITE_LIMIT:
+            raise ValueError(f"File is too large to edit ({MAX_WRITE_LIMIT // 1000:,} KB limit).")
+        if b"\x00" in raw:
+            raise ValueError("Binary files cannot be edited as text.")
+        return raw.decode("utf-8")
+
     def read_file(self, path: str):
         target = self.path(path)
-        if target.stat().st_size > LIMIT:
-            raise ValueError("File is too large for the text editor (80 KB limit).")
+        limit = self.write_limit
+        if target.stat().st_size > limit:
+            raise ValueError(f"File is too large for the text editor ({limit // 1000:,} KB limit).")
         text = target.read_text(encoding="utf-8")
         if "\x00" in text:
             raise ValueError("Binary files cannot be opened in the text editor.")
@@ -194,22 +227,14 @@ class WorkspaceTools:
 
     def change(self, name: str, arguments: dict, apply=False):
         target = self.path(arguments["path"])
-        old = self.read_file(arguments["path"]) if target.exists() else ""
-        if name == "edit_file":
-            needle = arguments["old_text"]
-            if not needle or old.count(needle) != 1:
-                raise ValueError("old_text must match exactly once; include more surrounding context.")
-            new = old.replace(needle, arguments["new_text"], 1)
-        else:
-            new = arguments["content"]
-        if len(new.encode()) > LIMIT:
-            raise ValueError("File content exceeds 80 KB.")
-        diff = "".join(difflib.unified_diff(old.splitlines(True), new.splitlines(True),
-                                           fromfile=arguments["path"], tofile=arguments["path"]))
+        before = self.read_raw(arguments["path"])
+        plan = plan_change(name, arguments, before, self.write_limit)
+        diff = preview_diff(self.display_path(target), before, plan.text)
         if apply:
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(new)
-        return diff or "No changes."
+            target.write_bytes(plan.text.encode("utf-8"))
+            return plan.prefix + diff
+        return diff
 
     def search_files(self, query: str, glob: str = "*", path: str = ".", *,
                      regex: bool = False, case_sensitive: bool = False, context_lines: int = 0,
@@ -369,8 +394,12 @@ TOOL_DEFINITIONS = [
                 "max_results": {"type": "integer", "minimum": 1, "maximum": 100}}, ["query"]),
     definition("write_file", "Create or replace a file subject to the selected permission mode; read existing files first.",
                {"path": STRING, "content": STRING}, ["path", "content"]),
-    definition("edit_file", "Replace one exact text occurrence in a file, subject to the selected permission mode.",
-               {"path": STRING, "old_text": STRING, "new_text": STRING}, ["path", "old_text", "new_text"]),
+    definition("edit_file", "Edit an existing file by exact text replacement. Give old_text and new_text (old_text must match exactly once unless replace_all=true), or edits: a list of such replacements applied in order to the same file, all checked before anything is written, with one approval and one checkpoint. Copy old_text exactly from read_file without the line-number prefixes. Line endings (LF or CRLF) are kept.",
+               {"path": STRING, "old_text": STRING, "new_text": STRING, "replace_all": {"type": "boolean"},
+                "edits": {"type": "array", "minItems": 1, "maxItems": 50,
+                          "items": {"type": "object", "properties": {"old_text": STRING, "new_text": STRING,
+                                                                     "replace_all": {"type": "boolean"}},
+                                    "required": ["old_text", "new_text"], "additionalProperties": False}}}, ["path"]),
     definition("run_command", "Run a noninteractive workspace command under the selected permission mode. Streams output; returns a job ID and bounded first output page. Default foreground Stop cancels the job. Set background=true to continue beyond this turn; use get_job_output/list_jobs/stop_job. Do not daemonize or use shell '&'.",
                {"command": STRING, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "default": 60},
                 "max_output_bytes": {"type": "integer", "minimum": 1024, "maximum": 1000000, "default": 80000},
@@ -382,4 +411,18 @@ TOOL_DEFINITIONS = [
                 "max_chars": {"type": "integer", "minimum": 1, "maximum": 8000, "default": 4000}}, ["job_id"]),
     definition("stop_job", "Stop a managed job belonging to this conversation and retrieve its final status. Does not undo completed side effects.",
                {"job_id": STRING}, ["job_id"]),
+    definition("move_path", "Move or rename one regular UTF-8 text file (within the file write limit) to destination, creating folders as needed. An existing destination is refused unless overwrite=true; read it first. The move appears in the change review with Undo. Use run_command for folders, symbolic links, binary or larger files.",
+               {"path": STRING, "destination": STRING, "overwrite": {"type": "boolean", "default": False}},
+               ["path", "destination"]),
+    definition("delete_path", "Delete one regular UTF-8 text file within the file write limit. Read it first. The deletion appears in the change review, where Undo restores it. Use run_command for folders, symbolic links, binary or larger files.",
+               {"path": STRING}, ["path"]),
+    definition("notebook_read", "Read a Jupyter notebook (.ipynb) as cells: index, id, type, source and a short summary of outputs. Pages of at most 8 KB; follow next_offset. A long cell's source is clipped (source_truncated, source_chars); read the rest with offset=<its index>, source_offset=<its next_source_offset>, which returns that one cell from there. Read a cell in full before replacing its source.",
+               {"path": STRING, "offset": {"type": "integer", "minimum": 0},
+                "max_cells": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+                "source_offset": {"type": "integer", "minimum": 0}}, ["path"]),
+    definition("notebook_edit", "Edit one notebook cell, found by cell_id or index (0-based): replace its source (and optionally its type), insert a new cell at index (or after cell_id), delete it, or clear_outputs (of one cell, or of every cell when neither cell_id nor index is given). Read the notebook first. Edited code cells lose their outputs. Other cells and metadata are kept. One approval and a checkpoint, like edit_file. Notebooks up to 1 MB.",
+               {"path": STRING, "edit_mode": {"type": "string", "enum": ["replace", "insert", "delete", "clear_outputs"],
+                                              "default": "replace"},
+                "cell_id": STRING, "index": {"type": "integer", "minimum": 0}, "source": STRING,
+                "cell_type": {"type": "string", "enum": ["code", "markdown", "raw"]}}, ["path"]),
 ]

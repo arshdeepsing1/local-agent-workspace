@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 MAX_ALLOW_RULES = 100
 MAX_DECLINE_NOTE = 2000
-EDIT_RULE_TOOLS = ("write_file", "edit_file", "insert_activity_log")
+EDIT_RULE_TOOLS = ("write_file", "edit_file", "insert_activity_log", "move_path", "delete_path", "notebook_edit")
 
 
 def rule_for(name, arguments):

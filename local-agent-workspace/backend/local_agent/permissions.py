@@ -4,8 +4,9 @@ from typing import Literal
 PermissionMode = Literal["manual", "auto", "acceptEdits", "plan", "bypassPermissions"]
 
 READ_TOOLS = {"list_files", "read_file", "search_files", "list_jobs", "get_job_output", "stop_job",
-              "list_skills", "use_skill", "list_tasks", "get_task", "create_task", "update_task", "delegate_task"}
-EDIT_TOOLS = {"write_file", "edit_file", "insert_activity_log"}
+              "list_skills", "use_skill", "list_tasks", "get_task", "create_task", "update_task", "delegate_task",
+              "notebook_read"}
+EDIT_TOOLS = {"write_file", "edit_file", "insert_activity_log", "move_path", "delete_path", "notebook_edit"}
 COMMAND_TOOLS = {"run_command"}
 # Exact commands only; never classify arbitrary shell syntax as read-only.
 # Resolve to OS binaries so PATH and shell startup files cannot replace them.

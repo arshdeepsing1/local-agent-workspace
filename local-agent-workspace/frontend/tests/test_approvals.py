@@ -33,6 +33,9 @@ def decisions(ui, event_id):
     ("write_file", ", input: { path: 'a.txt', content: 'x' }", "Allow edits in this chat"),
     ("edit_file", ", input: { path: 'a.txt' }", "Allow edits in this chat"),
     ("insert_activity_log", ", input: { path: 'log.md' }", "Allow edits in this chat"),
+    ("move_path", ", input: { path: 'a.txt', destination: 'b.txt' }", "Allow edits in this chat"),
+    ("delete_path", ", input: { path: 'a.txt' }", "Allow edits in this chat"),
+    ("notebook_edit", ", input: { path: 'n.ipynb', index: 0, source: 'x' }", "Allow edits in this chat"),
     ("mcp__docs__search", ", input: { query: 'x' }", "Allow this tool in this chat"),
     ("hook_before_tool", ", input: { hook_id: 'check', tool: 'write_file' }", "Allow this hook in this chat"),
 ])

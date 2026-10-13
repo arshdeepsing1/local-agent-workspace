@@ -111,6 +111,22 @@ def test_insert_replaces_marker_appends_or_creates_and_rejects_duplicates():
 def test_file_too_close_to_the_limit_asks_for_a_separate_file(tmp_path):
     with pytest.raises(ValueError, match="separate, new file"):
         activity_content({"id": "s", "workspace": str(tmp_path), "events": []}, "x" * 79_500)
+    # The budget follows the limit it is given (the smaller of 80 KB and the write limit).
+    with pytest.raises(ValueError, match="too close to the 16 KB limit"):
+        activity_content({"id": "s", "workspace": str(tmp_path), "events": []}, "x" * 15_500, limit=16_000)
+    content, stats = activity_content({"id": "s", "workspace": str(tmp_path), "events": []}, "x" * 15_500)
+    assert stats["placement"] == "appended"
+
+
+def test_file_groups_name_moves_deletes_notebooks_and_file_searches(tmp_path):
+    events = [tool_event(name, name, 1790238000.0 + number, input={"path": f"{name}.txt", "destination": "d.txt"})
+              for number, name in enumerate(("move_path", "delete_path", "notebook_edit", "notebook_read", "find_files"))]
+    log, stats = activity_log({"id": "s", "workspace": str(tmp_path), "events": events})
+    for label, name in (("Moved", "move_path"), ("Deleted", "delete_path"), ("Edited notebook", "notebook_edit"),
+                        ("Read notebook", "notebook_read"), ("Searched for files in", "find_files")):
+        destination = f" → {tmp_path / 'd.txt'}" if name == "move_path" else ""
+        assert f"**{label}** (`{name}`):\n- `{tmp_path / (name + '.txt')}{destination}`" in log
+    assert stats["files"] == 5 and stats["other_tool_calls"] == 0
 
 
 def test_activity_tool_is_a_file_edit_for_profiles_and_permission_modes():
