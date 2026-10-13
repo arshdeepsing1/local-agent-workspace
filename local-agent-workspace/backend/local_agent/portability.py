@@ -8,7 +8,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from .context import MAX_ESTIMATE_SCALE, SUMMARY_MAX_BYTES, context_boundary
+from .context import LARGE_SUMMARY_MAX_BYTES, MAX_ESTIMATE_SCALE, context_boundary
 
 
 MAX_BUNDLE_BYTES = 16 * 1024 * 1024
@@ -136,7 +136,7 @@ class Message(Record):
 
 
 class ContextState(Record):
-    summary: str = Field(default="", max_length=SUMMARY_MAX_BYTES)
+    summary: str = Field(default="", max_length=LARGE_SUMMARY_MAX_BYTES)
     through: int = Field(default=0, ge=0)
     compactions: int = Field(default=0, ge=0)
 
@@ -289,8 +289,8 @@ def validate_bundle(value):
             raise ValueError("Event IDs must be unique within each conversation.")
         state = session.get("context_state") or {}
         through = state.get("through", 0)
-        if len(state.get("summary", "").encode("utf-8")) > SUMMARY_MAX_BYTES:
-            raise ValueError(f"The conversation summary exceeds the {SUMMARY_MAX_BYTES:,}-byte limit.")
+        if len(state.get("summary", "").encode("utf-8")) > LARGE_SUMMARY_MAX_BYTES:
+            raise ValueError(f"The conversation summary exceeds the {LARGE_SUMMARY_MAX_BYTES:,}-byte limit.")
         if through > len(session["wire"]) or not context_boundary(session["wire"], through):
             raise ValueError("The saved summary must end at a complete turn or tool-exchange boundary.")
         if through and not state.get("summary"):

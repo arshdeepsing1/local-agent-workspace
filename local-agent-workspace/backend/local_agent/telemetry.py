@@ -92,19 +92,29 @@ def reported_usage(value):
         "cache_creation_input_tokens": ("cache_creation_input_tokens",),
         "reasoning_tokens": ("reasoning_tokens",),
     }
-    usage = {}
+    usage, sources = {}, {}
     for name, keys in aliases.items():
         for key in keys:
             count = value.get(key)
             if type(count) is int and count >= 0:
-                usage[name] = count
+                usage[name], sources[name] = count, key
                 break
     for field, key, name in (("prompt_tokens_details", "cached_tokens", "cache_read_input_tokens"),
                              ("completion_tokens_details", "reasoning_tokens", "reasoning_tokens")):
         details = value.get(field)
         count = details.get(key) if isinstance(details, dict) else None
         if name not in usage and type(count) is int and count >= 0:
-            usage[name] = count
+            usage[name], sources[name] = count, field
+    # OpenAI-style usage counts cached tokens inside prompt_tokens (prompt_tokens_details.
+    # cached_tokens), while Claude-style usage reports uncached input, cache reads and
+    # cache writes as separate buckets. input_tokens is kept as the uncached part, so
+    # the cache is not counted twice by totals, DBU estimates and the estimate scale.
+    # Top-level cache fields stay separate buckets. How Claude endpoints on Databricks
+    # fill these fields still needs one live check. Ledger records saved before this
+    # change keep their counts (they hold input_tokens only and cannot be re-split).
+    if (sources.get("input_tokens") == "prompt_tokens" and sources.get("cache_read_input_tokens") == "prompt_tokens_details"
+            and usage["cache_read_input_tokens"] <= usage["input_tokens"]):
+        usage["input_tokens"] -= usage["cache_read_input_tokens"]
     return usage
 
 
@@ -291,10 +301,14 @@ def session_metrics(session):
         group = [call for call in calls if call["model"] == model]
         by_model.append({"key": model, "model": model, **_totals(group)})
 
+    info = session.get("context_info")
+    last_input = info.get("last_request") if isinstance(info, dict) else None
     return {
         "scope": "session",
         "session_id": session.get("id"),
         "complete": complete,
+        # What Databricks reported for the latest agent request, next to the app's estimate.
+        "last_input": last_input if isinstance(last_input, dict) else None,
         "totals": _totals(calls),
         "calls": calls,
         "by_purpose": by_purpose,

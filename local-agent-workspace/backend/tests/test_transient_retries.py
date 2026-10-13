@@ -249,6 +249,24 @@ async def test_compaction_retries_connection_failures_and_gateway_errors(runtime
         ("compaction", "error", None), ("compaction", "completed", "network" if failure == "connect" else "server_error")]
 
 
+async def test_a_summary_cut_off_after_a_retried_connection_keeps_its_own_note(runtime, delays):
+    manager, session = runtime
+    requests = []
+
+    async def gateway(request):
+        requests.append(request)
+        if len(requests) == 1:
+            raise httpx.ConnectError("connection refused", request=request)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "Partial summary"},
+                                                      "finish_reason": "length"}]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(gateway)) as client:
+        text = await manager.summarize_context(session, client, "https://gateway.example/invocations", {},
+                                               [{"role": "user", "content": "Summarize."}], keep_truncated=True,
+                                               document="summary")
+    assert text == "Partial summary\n\n[This summary was cut off at the output limit.]" and len(requests) == 2
+
+
 @pytest.mark.parametrize("error", [httpx.ReadError, httpx.RemoteProtocolError, httpx.ReadTimeout])
 async def test_compaction_does_not_retry_failures_that_may_follow_a_billed_request(runtime, delays, error):
     manager, session = runtime

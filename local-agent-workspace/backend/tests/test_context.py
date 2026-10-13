@@ -101,7 +101,9 @@ async def test_small_context_requires_no_compaction_and_reports_estimated_budget
                     "input_budget": DEFAULT_CONTEXT_WINDOW - REPLY_RESERVE - SAFETY_MARGIN,
                     "context_window": DEFAULT_CONTEXT_WINDOW, "reply_reserve": REPLY_RESERVE,
                     "compactions": 0, "summarized_messages": 0, "estimate_method": "weighted_utf8",
-                    "breakdown": context_breakdown(messages, TOOLS)}
+                    "breakdown": context_breakdown(messages, TOOLS),
+                    "auto_compact_threshold": DEFAULT_CONTEXT_WINDOW - REPLY_RESERVE - SAFETY_MARGIN,
+                    "auto_compact_percent": 100}
 
 
 async def test_dynamic_reply_reserve_is_budgeted_without_mutating_wire():

@@ -10,7 +10,7 @@ from local_agent.agents import AgentManager
 from local_agent.api import create_app
 from local_agent.config import Settings
 from local_agent.context import (
-    MAX_ESTIMATE_SCALE, MIN_CONTEXT_WINDOW, REPLY_RESERVE, SAFETY_MARGIN, SUMMARY_MAX_BYTES,
+    LARGE_SUMMARY_MAX_BYTES, MAX_ESTIMATE_SCALE, MIN_CONTEXT_WINDOW, REPLY_RESERVE, SAFETY_MARGIN, SUMMARY_MAX_BYTES,
     SUMMARY_MAX_TOKENS, SUMMARY_MIN_BYTES, SUMMARY_TRIM_MARKER, build_condense_messages, condense_output_tokens,
     build_summary_messages, context_breakdown, estimate_scale, estimate_tokens, fit_summary,
     prepare_context, summary_byte_limit, trim_summary,
@@ -399,7 +399,10 @@ def test_export_accepts_the_new_summary_limit_and_context_fields(tmp_path, monke
     try:
         source = manager.store.create(settings.values)
         source["wire"] = [user("Earlier"), assistant("Done."), user("Latest")]
-        source["context_state"] = {"summary": "é" * (SUMMARY_MAX_BYTES // 2), "through": 2, "compactions": 1}
+        # The app record and the summarized reads are never exported, so an import cannot inject them.
+        source["context_state"] = {"summary": "é" * (LARGE_SUMMARY_MAX_BYTES // 2), "through": 2, "compactions": 1,
+                                   "user_requests": ["Earlier"], "requests_omitted": 0, "requests_from": 0,
+                                   "app_notes": "Task checklist", "summarized_reads": ["/srv/x/a.py"]}
         source["context_info"] = {
             "estimated_tokens": 5000, "input_budget": 20000, "context_window": WINDOW, "reply_reserve": 8192,
             "compactions": 1, "summarized_messages": 2, "estimate_method": "weighted_utf8",
@@ -408,7 +411,8 @@ def test_export_accepts_the_new_summary_limit_and_context_fields(tmp_path, monke
         exported = bundle["sessions"][0]
         assert exported["context_info"]["estimate_scale"] == 1.265
         assert exported["context_info"]["summary_adjustment"] == "condensed"
-        assert len(exported["context_state"]["summary"].encode()) == SUMMARY_MAX_BYTES
+        assert len(exported["context_state"]["summary"].encode()) == LARGE_SUMMARY_MAX_BYTES == 32_000
+        assert set(exported["context_state"]) == {"summary", "through", "compactions"}
         source["context_state"]["summary"] += "é"
         with pytest.raises(ValueError):
             export_bundle([source], source["id"])

@@ -20,9 +20,12 @@ from .rules import (APP_ROOT, RuleStore, card_rule_options, default_rule, normal
                     rule_label, rule_matches, same_rule, text_names_credential)
 from .activity import ACTIVITY_TOOL, activity_content, activity_log, local_time, redact_secrets
 from .context import (
-    OUTPUT_LIMIT_CONTINUATION, SUMMARY_MAX_TOKENS,
-    build_condense_messages, build_handoff_messages, build_summary_messages, condense_output_tokens,
-    estimate_scale, estimate_tokens, handoff_output_tokens, prepare_context, summary_byte_limit,
+    DEFAULT_AUTO_COMPACT_PERCENT, MAX_AUTO_COMPACT_PERCENT,
+    MIN_AUTO_COMPACT_PERCENT, OUTPUT_LIMIT_CONTINUATION, SUMMARY_MAX_TOKENS,
+    build_condense_messages, build_handoff_messages, build_summary_messages, compaction_output_allowance,
+    condense_output_tokens, estimate_prior, estimate_scale, estimate_tokens, handoff_output_tokens, handoff_with_contents,
+    last_request_report, model_context_window, next_request_estimate, prepare_context, summary_byte_limit,
+    summary_output_tokens, verify_declined_message,
 )
 from .tools import LIMIT as FILE_LIMIT
 from .tools import write_limit_setting
@@ -58,6 +61,7 @@ from .approvals import MAX_ALLOW_RULES, busy_status, declined, rule_for
 from .notify import SystemNotifier, attention_message
 from .context import INCOMPLETE_RESPONSE_CONTINUATION, INVALID_ARGUMENTS_CONTINUATION, VERIFY_CONTINUATION_PREFIX
 from .context import is_app_prompt, is_continuation
+from .context import retained_request as context_retained
 from . import history
 from .tool_errors import tool_error_text
 from .projects import ProjectSettings
@@ -347,6 +351,76 @@ def file_fingerprint(path):
     except (OSError, ValueError):
         return None
     return [info.st_size, info.st_mtime_ns]
+
+
+# The app record a compaction keeps next to the summary (compaction_record).
+RECORD_TASKS = 20
+HANDOFF_CONTENTS_RESERVE = 3_000  # Bytes of a handoff file kept for its Contents list.
+RECORD_FILES = 30
+SUMMARIZED_READS_LIMIT = 200
+TASK_ORDER = {"in_progress": 0, "pending": 1, "cancelled": 2}
+# Tools whose completed calls after a compaction cut keep a file's contents in context.
+SEEN_PATH_TOOLS = ("read_file", "notebook_read", "write_file", "edit_file", "notebook_edit", "move_path")
+
+
+def completed_call_ids(session):
+    """Ids of the tool calls whose tool event finished in state "completed"."""
+    return {event["call_id"] for event in session.get("events", []) if isinstance(event, dict)
+            and event.get("type") == "tool" and event.get("state") == "completed"
+            and isinstance(event.get("call_id"), str) and event["call_id"]}
+
+
+def event_input(event):
+    """A tool event's input as a dict (some records hold it as a JSON string), else {}."""
+    value = event.get("input")
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
+def call_paths(name, arguments):
+    """The path and, for move_path, destination arguments of a file tool call."""
+    keys = ("path", "destination") if name == "move_path" else ("path",)
+    return [arguments[key] for key in keys if isinstance(arguments, dict) and isinstance(arguments.get(key), str)]
+
+
+def forget_summarized_reads(file_views, state, forgotten):
+    """(views, state) after a compaction: the forgotten files leave the read-before-write
+    views and join state["summarized_reads"] (no duplicates, newest last, at most 200).
+    Neither input is changed."""
+    forgotten = [path for path in dict.fromkeys(forgotten or []) if isinstance(path, str)]
+    dropped = set(forgotten)
+    views = {path: seen for path, seen in (file_views or {}).items() if path not in dropped}
+    if not forgotten:
+        return views, state
+    earlier = [path for path in state.get("summarized_reads") or [] if isinstance(path, str) and path not in forgotten]
+    return views, {**state, "summarized_reads": list(dict.fromkeys(earlier + forgotten))[-SUMMARIZED_READS_LIMIT:]}
+
+
+def auto_compact_percent(values):
+    """Settings' auto-compact percentage, or the default when the saved value is not valid."""
+    value = values.get("auto_compact_percent", DEFAULT_AUTO_COMPACT_PERCENT)
+    return (value if type(value) is int and MIN_AUTO_COMPACT_PERCENT <= value <= MAX_AUTO_COMPACT_PERCENT
+            else DEFAULT_AUTO_COMPACT_PERCENT)
+
+
+def last_request(session):
+    """{"last_request": ...} carried from the session's current context info, or {}."""
+    info = session.get("context_info")
+    report = info.get("last_request") if isinstance(info, dict) else None
+    return {"last_request": report} if isinstance(report, dict) else {}
+
+
+def prior_flag(session):
+    """{"estimate_prior": True} while the estimate uses the model's starting scale, else {}."""
+    return {"estimate_prior": True} if estimate_prior(session.get("inference_calls"), session["model"]) else {}
+
+
+def plural(count, word):
+    return f"{count:,} {word}{'' if count == 1 else 's'}"
 
 
 def changed_files_text(names, total):
@@ -2467,6 +2541,10 @@ class AgentManager:
         retry = {"deleting": "Use read_file, then delete it again.",
                  "editing": "Use notebook_read, then edit it again."}.get(verb, "Use read_file, then write again.")
         if str(target) not in views:
+            state = session.get("context_state") if isinstance(session.get("context_state"), dict) else {}
+            if str(target) in (state.get("summarized_reads") or []):
+                return (f"Read {name} again before {verb} it: its earlier contents were summarized out of your "
+                        f"context at compaction. {retry}")
             return f"Read {name} before {verb} it: this conversation has not read it yet. {retry}"
         if views[str(target)] != current:
             return (f"Read {name} again before {verb} it: it changed since you last read or wrote it (for example "
@@ -2684,9 +2762,9 @@ class AgentManager:
         return user_paths.server_python_note(self.settings) or ""
 
     async def summarize_context(self, session, client, url, headers, messages, *, max_tokens=SUMMARY_MAX_TOKENS,
-                                keep_truncated=False):
-        """One compaction request. keep_truncated keeps a handoff cut off at its
-        output limit: the large, already-billed text is still useful."""
+                                keep_truncated=False, document="handoff"):
+        """One compaction request. keep_truncated keeps a handoff or summary (document) cut
+        off at its output limit: the large, already-billed text is still useful."""
         await self.status(session, "compacting")
         estimated_input_tokens = estimate_tokens(messages)
         # A non-streamed handoff can take minutes to generate; Databricks allows
@@ -2744,7 +2822,7 @@ class AgentManager:
                         info["status"] = "completed"
                         finish_inference_call(call, info)
                         self.store.save(session)
-                        return text.rstrip() + "\n\n[This handoff was cut off at the output limit.]"
+                        return text.rstrip() + f"\n\n[This {document} was cut off at the output limit.]"
                 if finish_reason != "stop":
                     info.update(status="error", error_kind=(
                         "output_limit" if finish_reason == "length" else "incomplete_response"))
@@ -2780,23 +2858,104 @@ class AgentManager:
                         continue
                 raise
 
-    def compaction_requests(self, session, client, url, headers, preservation_note="", handoff_tokens=None):
+    def compaction_requests(self, session, client, url, headers, preservation_note="", handoff_tokens=None,
+                            allowance=0):
         """Summary and condense callbacks for prepare_context, sharing one client.
 
         With handoff_tokens, the summary request writes a detailed handoff instead.
+        allowance (compaction_output_allowance) is added to every request's max_tokens,
+        because a model that always thinks spends part of max_tokens on thinking.
         """
         async def summarize(previous, chunk, limit_bytes):
             if handoff_tokens:
                 return await self.summarize_context(session, client, url, headers, build_handoff_messages(
-                    previous, chunk, preservation_note, handoff_tokens), max_tokens=handoff_tokens, keep_truncated=True)
+                    previous, chunk, preservation_note, handoff_tokens), max_tokens=handoff_tokens + allowance,
+                    keep_truncated=True)
             return await self.summarize_context(session, client, url, headers, build_summary_messages(
-                previous, chunk, preservation_note, limit_bytes))
+                previous, chunk, preservation_note, limit_bytes), max_tokens=summary_output_tokens(limit_bytes) + allowance,
+                keep_truncated=True, document="summary")
 
         async def condense(summary, limit_bytes):
             return await self.summarize_context(session, client, url, headers, build_condense_messages(
-                summary, limit_bytes, preservation_note), max_tokens=condense_output_tokens(limit_bytes))
+                summary, limit_bytes, preservation_note), max_tokens=condense_output_tokens(limit_bytes) + allowance)
 
         return summarize, condense
+
+    def compaction_record(self, session, tools):
+        """(record, holder): record(wire, cut) returns the app's notes for the app record
+        a compaction keeps next to the summary: the open tasks, the files this
+        conversation changed in the summarized part, and the files read before the cut
+        whose contents leave the model's context. It stores those files (absolute
+        paths, as file_views keys) in holder["forgotten"]."""
+        holder = {"forgotten": []}
+
+        def shown(value):
+            try:
+                return tools.display_path(tools.path(value))
+            except (ValueError, OSError, RuntimeError):
+                return None
+
+        def record(wire, cut):
+            parts = []
+            try:
+                tasks = self.task_board.list(session["id"])
+            except ValueError:
+                tasks = None
+            if tasks:
+                open_tasks = sorted((task for task in tasks if task.get("status") != "completed"),
+                                    key=lambda task: TASK_ORDER.get(task.get("status"), 3))
+                done = len(tasks) - len(open_tasks)
+                lines = [f"- [{task.get('status')}] {task.get('title')} (task_id {task.get('id')})"
+                         for task in open_tasks[:RECORD_TASKS]]
+                if len(open_tasks) > RECORD_TASKS:
+                    lines.append(f"- … {len(open_tasks) - RECORD_TASKS:,} more open tasks")
+                parts.append("Task checklist when this compaction ran (list_tasks shows the current state):\n"
+                             + "\n".join(lines + [f"and {plural(done, 'completed task')}."]))
+            issued = {call.get("id") for message in wire[:cut] if message.get("role") == "assistant"
+                      for call in message.get("tool_calls") or [] if isinstance(call, dict) and call.get("id")}
+            changed = []
+            for event in reversed(session.get("events", [])):
+                if (isinstance(event, dict) and event.get("type") == "tool" and event.get("state") == "completed"
+                        and event.get("name") in FILE_CHANGE_TOOLS and event.get("call_id") in issued):
+                    for value in reversed(call_paths(event["name"], event_input(event))):
+                        if (name := shown(value)) and name not in changed:
+                            changed.append(name)
+            if changed:
+                parts.append("Files this conversation changed before this point (newest first):\n"
+                             + "\n".join(f"- {name}" for name in changed[:RECORD_FILES]))
+            completed = completed_call_ids(session)
+            seen = set()
+            for message in wire[cut:]:
+                for call in message.get("tool_calls") or [] if message.get("role") == "assistant" else []:
+                    function = call.get("function") if isinstance(call, dict) else None
+                    if not isinstance(function, dict) or call.get("id") not in completed:
+                        continue
+                    if function.get("name") not in SEEN_PATH_TOOLS:
+                        continue
+                    try:
+                        arguments = json.loads(function.get("arguments") or "{}")
+                    except (TypeError, ValueError):
+                        continue
+                    seen.update(call_paths(function["name"], arguments))
+            for message in [*context_retained(wire, cut), *wire[cut:]]:
+                if message.get("role") == "user":
+                    seen.update(mentions.attached_paths(message.get("content")))
+            still = set()
+            for value in seen:
+                try:
+                    still.add(str(tools.path(value)))
+                except (ValueError, OSError, RuntimeError):
+                    pass
+            views = session.get("file_views") if isinstance(session.get("file_views"), dict) else {}
+            forgotten = [path for path in views if path not in still]
+            holder["forgotten"] = forgotten
+            if forgotten:
+                names = [tools.display_path(Path(path)) for path in reversed(forgotten)][:RECORD_FILES]
+                parts.append("Files read before this compaction whose contents are no longer in your context "
+                             "(read them again before editing):\n" + "\n".join(f"- {name}" for name in names))
+            return "\n\n".join(parts)
+
+        return record, holder
 
     def handoff_plan(self, session, context_window):
         """Where the next compaction saves its handoff, or None when disabled."""
@@ -2812,7 +2971,7 @@ class AgentManager:
         return None
 
     def handoff_saver(self, session, plan):
-        async def save(documents, compaction):
+        async def save(documents, compaction, record=""):
             try:
                 root = Path(session["workspace"]).resolve()
                 target = root / plan["path"]
@@ -2831,13 +2990,16 @@ class AgentManager:
                         f"`{session['id']}` was compacted. The model wrote the sections below from the turns being "
                         "summarized; the activity log at the end is generated by the app.\n\n"
                         + clean("\n\n".join(parts)).rstrip() + "\n\n")
-                budget = FILE_LIMIT - len(body.encode("utf-8"))
+                if isinstance(record, str) and record.strip():
+                    body += "## App record (generated by the app)\n" + clean(record.lstrip()).rstrip() + "\n\n"
+                # Room for the activity log after redaction, keeping some for the Contents list.
+                budget = FILE_LIMIT - len(body.encode("utf-8")) - HANDOFF_CONTENTS_RESERVE
                 log, _ = activity_log(session, [*session.get("command_jobs", []), *self.jobs.list(session_id=session["id"])],
                                       redact=self.settings.redact, max_bytes=budget) if budget >= 1000 else (
                     "_Activity log omitted: this handoff already fills the 80 KB file limit. Use insert_activity_log "
                     "with a separate file to record every command._\n", None)
                 with open(target, "x", encoding="utf-8") as handle:
-                    handle.write(body + log)
+                    handle.write(handoff_with_contents(body + log))
                 return True
             except (OSError, ValueError) as exc:
                 await self.event(session, "notice", text=self.settings.redact(
@@ -2846,27 +3008,42 @@ class AgentManager:
         return save
 
     async def summary_adjustment_notice(self, session, info):
-        if info.get("compacted_in_turn"):
-            await self.event(session, "notice", text=(
-                "This request's tool results outgrew the context budget, so its earlier results were summarized "
-                "and it continues. The request and its latest results are kept as they are; the full history is "
-                "preserved."))
-        if info.get("handoff_path"):
-            await self.event(session, "notice", text=(
-                f"Saved a detailed handoff of the summarized turns to {info['handoff_path']} in the workspace."))
-            if info.get("summary_adjustment") == "condensed":
-                return  # Expected: the handoff is condensed into the in-context summary.
-        adjustment = info.get("summary_adjustment")
-        if not adjustment:
+        """One notice per compaction, with its numbers (event field "compaction")."""
+        compaction = info.get("compaction")
+        if not isinstance(compaction, dict):
             return
-        limit = summary_byte_limit(info["input_budget"])
-        if adjustment == "condensed":
-            text = (f"The conversation summary was longer than {limit:,} bytes, so a short extra request "
-                    "condensed it. The full conversation history is preserved.")
+        n, after = compaction["number"], compaction["after_tokens"]
+        summarized = (f"{plural(compaction['summarized_messages'], 'earlier message')} "
+                      f"{'was' if compaction['summarized_messages'] == 1 else 'were'} summarized in "
+                      f"{plural(compaction['requests'], 'request')}")
+        over = (f"about {compaction['before_tokens']:,} estimated input tokens, over the "
+                f"{info.get('auto_compact_percent', 100)}% auto-compact threshold of {compaction['threshold_tokens']:,}")
+        if compaction["trigger"] == "manual":
+            text = (f"Context compacted (compaction {n}): {summarized}; about {after:,} estimated input tokens "
+                    "remain. The full conversation history is preserved.")
+        elif compaction["trigger"] == "in_turn":
+            grew = ("outgrew the context budget" if compaction["before_tokens"] > info["input_budget"]
+                    else "passed the auto-compact threshold")
+            text = (f"This request's tool results {grew}, so its earlier results were summarized "
+                    "and it continues. The request and its latest results are kept as they are; the full history is "
+                    f"preserved. Compaction {n}: the request needed {over}; {summarized}, and it now needs about "
+                    f"{after:,}.")
         else:
-            text = (f"The conversation summary was longer than {limit:,} bytes and could not be condensed, "
-                    "so part of it was omitted from the model's context. The full conversation history is preserved.")
-        await self.event(session, "notice", text=text)
+            text = (f"Context compacted automatically (compaction {n}): the next request needed {over}. "
+                    f"{summarized[0].upper() + summarized[1:]}; the request now needs about {after:,}. The app keeps "
+                    "your earlier requests (long ones shortened), the task checklist and the files touched next to "
+                    "the summary. The full history is preserved.")
+        if info.get("handoff_path"):
+            text += f" Saved a detailed handoff of the summarized turns to {info['handoff_path']} in the workspace."
+        adjustment = info.get("summary_adjustment")
+        limit = summary_byte_limit(info["input_budget"])
+        if adjustment == "condensed" and not info.get("handoff_path"):
+            # With a handoff, condensing it into the summary is expected.
+            text += f" The summary was longer than {limit:,} bytes, so a short extra request condensed it."
+        elif adjustment == "trimmed":
+            text += (f" The summary was longer than {limit:,} bytes and could not be condensed, so part of it was "
+                     "omitted from the model's context.")
+        await self.event(session, "notice", text=text, compaction=compaction)
 
     def start_compaction(self, session_id, preservation_note=""):
         if self.statuses.get(session_id, "idle") != "idle" or (session_id in self.tasks and not self.tasks[session_id].done()):
@@ -2909,24 +3086,29 @@ class AgentManager:
             context_window, max_output_tokens = self.request_limits(session)
             await self.limits_notice(session)
             plan = self.handoff_plan(session, context_window)
+            allowance = compaction_output_allowance(session["model"], context_window)
+            record, holder = self.compaction_record(session, tools)
             async with httpx.AsyncClient(timeout=httpx.Timeout(120, connect=20), follow_redirects=False) as client:
                 summarize, condense = self.compaction_requests(
-                    session, client, url, headers, preservation_note, plan and plan["tokens"])
+                    session, client, url, headers, preservation_note, plan and plan["tokens"], allowance)
                 _, updated, info = await prepare_context(
                     model_history(session["wire"]), state, system, definitions, context_window, summarize,
                     reply_reserve=max_output_tokens, default_reply_reserve=default_limits(session["model"])[1],
                     force_compact=True, preservation_note=preservation_note, condense=condense,
                     scale=estimate_scale(session.get("inference_calls"), session["model"]),
-                    handoff_path=plan and plan["path"], save_handoff=plan and self.handoff_saver(session, plan))
+                    handoff_path=plan and plan["path"], save_handoff=plan and self.handoff_saver(session, plan),
+                    auto_compact_percent=auto_compact_percent(self.settings.values), record_requests=True,
+                    app_record=record, output_allowance=allowance, completed_calls=completed_call_ids(session))
+            views, updated = forget_summarized_reads(session.get("file_views") or {}, updated, holder["forgotten"])
             info = {**info, "instruction_files": guidance["files"], "instruction_sources": guidance["sources"],
-                    "warnings": warnings, "prepared_for_next_turn": True}
-            prepared = {**session, "context_state": updated, "context_info": info}
+                    "warnings": warnings, "prepared_for_next_turn": True, **last_request(session),
+                    **prior_flag(session)}
+            prepared = {**session, "context_state": updated, "context_info": info, "file_views": views}
             self.store.save(prepared)
-            session.update(context_state=updated, context_info=info, updated=prepared["updated"])
+            session.update(context_state=updated, context_info=info, file_views=views, updated=prepared["updated"])
             committed = True
             await self.broadcast(session["id"], {"type": "context", "context_info": session["context_info"]})
             await self.summary_adjustment_notice(session, info)
-            await self.event(session, "notice", text="Context compacted. The full conversation history is preserved.")
         except asyncio.CancelledError:
             await self.event(session, "notice", text=("Context compaction completed. History is preserved." if committed
                              else "Context compaction stopped. The previous context and full history are preserved."))
@@ -3092,12 +3274,48 @@ class AgentManager:
         finally:
             finish_inference_call(call, info)
             await draft.close()
+            if call.get("purpose") == "agent":
+                await self.note_last_request(session, call)
             try:
                 await self.update_event(session, event, request_info=info)
             except STORAGE_ERRORS as exc:
                 info.update(status="error", error_kind="unknown")
                 await self.broadcast(session["id"], {"type": "event", "event": event})
                 raise DraftPersistenceError(exc) from exc
+
+    async def note_last_request(self, session, call):
+        """Show what Databricks reported for this agent request in the context meter. Never raises."""
+        try:
+            info = session.get("context_info")
+            if not isinstance(info, dict):
+                return
+            report = last_request_report(call, info, model_context_window(call.get("model")))
+            if report is None:
+                return
+            # The scale later estimates use, this report included (report["estimate_scale"]
+            # is the one this request's estimate used).
+            report["next_estimate_scale"] = float(estimate_scale(session.get("inference_calls"), call.get("model")))
+            info["last_request"] = report
+            await self.broadcast(session["id"], {"type": "context", "context_info": info})
+        except Exception:
+            pass
+
+    async def refresh_next_estimate(self, session, system, definitions, wire, context_state):
+        """The app's estimate of the next request (before the user's next message). Never raises."""
+        try:
+            info = session.get("context_info")
+            if not isinstance(info, dict):
+                return
+            tokens = next_request_estimate(model_history(wire), context_state, system, definitions,
+                                           estimate_scale(session.get("inference_calls"), session["model"]))
+            budget, threshold = info.get("input_budget"), info.get("auto_compact_threshold")
+            info["next_estimate"] = {
+                "tokens": tokens,
+                "percent_of_input_budget": round(tokens * 100 / budget, 1) if budget else None,
+                "percent_of_threshold": round(tokens * 100 / threshold, 1) if threshold else None}
+            await self.broadcast(session["id"], {"type": "context", "context_info": info})
+        except Exception:
+            pass
 
     async def verify_step(self, session, tools, wire, state, has_another_step):
         """Run the project's Verify command after a reply that changed files in the project.
@@ -3143,10 +3361,7 @@ class AgentManager:
             if isinstance(note, str) and note.strip() and has_another_step:
                 # The card asks for a note to the agent: deliver it and let the model answer.
                 note = self.settings.redact(redact_secrets(note))
-                wire.append({"role": "user", "content": (
-                    f"{VERIFY_CONTINUATION_PREFIX} the user declined the project's verify command `{shown}`, so it "
-                    f"did not run. Their note: {note}\nAnswer the note. Do not run the verify command yourself "
-                    "unless the user asks.")})
+                wire.append({"role": "user", "content": verify_declined_message(shown, note)})
                 self.store.save(session)
                 await self.event(session, "notice", text="Verify did not run: you declined it. Your note was passed to the agent.")
                 return "continue"
@@ -3266,16 +3481,27 @@ class AgentManager:
                 definitions = self.step_definitions(session, external_tools)
                 system, guidance = self.context_inputs(session, tools, mode, self.step_notices(session, tools))
                 plan = self.handoff_plan(session, context_window)
+                allowance = compaction_output_allowance(session["model"], context_window)
                 summarize, condense = self.compaction_requests(session, client, url, headers,
-                                                               handoff_tokens=plan and plan["tokens"])
+                                                               handoff_tokens=plan and plan["tokens"],
+                                                               allowance=allowance)
+                record, holder = self.compaction_record(session, tools)
                 messages, next_context, info = await prepare_context(
                     model_history(wire), context_state, system, definitions, context_window, summarize,
                     reply_reserve=max_output_tokens, condense=condense, default_reply_reserve=default_reply_reserve,
                     scale=estimate_scale(session.get("inference_calls"), session["model"]),
-                    handoff_path=plan and plan["path"], save_handoff=plan and self.handoff_saver(session, plan))
+                    handoff_path=plan and plan["path"], save_handoff=plan and self.handoff_saver(session, plan),
+                    auto_compact_percent=auto_compact_percent(self.settings.values), record_requests=True,
+                    app_record=record, output_allowance=allowance, completed_calls=completed_call_ids(session))
+                if "compaction" in info:
+                    # Files whose contents were summarized away must be read again before a write.
+                    views, next_context = forget_summarized_reads(session.get("file_views") or {}, next_context,
+                                                                  holder["forgotten"])
+                    session["file_views"] = views
                 context_state = session["context_state"] = {**next_context, "tool_definitions": definitions}
                 session["context_info"] = {**info, "instruction_files": guidance["files"], "instruction_sources": guidance["sources"],
-                                           "warnings": guidance["warnings"]}
+                                           "warnings": guidance["warnings"], **last_request(session),
+                                           **prior_flag(session)}
                 self.store.save(session)
                 await self.broadcast(session["id"], {"type": "context", "context_info": session["context_info"]})
                 await self.summary_adjustment_notice(session, info)
@@ -3367,6 +3593,9 @@ class AgentManager:
                     if await self.verify_step(session, tools, wire, verify_state, step_index + 1 < steps) == "continue":
                         retry_reason = "verify"
                         continue
+                    # Only at the end of the turn: mid-turn the next request also carries
+                    # tool results that are not in the history yet.
+                    await self.refresh_next_estimate(session, system, definitions, wire, context_state)
                     return True
                 consecutive_output_retries = consecutive_repairs = 0
                 for call, values in zip(ordered_calls, arguments):
@@ -3375,6 +3604,8 @@ class AgentManager:
                     self.store.save(session)
                 if step_index + 1 < steps:
                     await self.drain_queue(session, wire, tools)
+            if steps > 0:
+                await self.refresh_next_estimate(session, system, definitions, wire, context_state)
         await self.event(session, "error" if session.get("is_subagent") else "notice",
                          text=(f"Reached the {steps}-request agent limit. This counts model requests, not tool "
                                "calls. Completed actions were kept. Increase Agent steps in Settings or send a "

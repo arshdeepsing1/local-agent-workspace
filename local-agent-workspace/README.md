@@ -932,8 +932,25 @@ visible agent-call totals as incomplete because title, summary, and retry attemp
 cannot be reconstructed. A delegated child's requests stay in its own conversation.
 Databricks responses may omit usage.
 See the [Databricks API reference](https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/api-reference)
-for the provider's usage fields. The context meter below remains a separate
-pre-request estimate, but reported input tokens calibrate it (see below).
+for the provider's usage fields. The context meter below shows the input Databricks
+reported for the last request next to the app's own pre-request estimate, and
+reported input tokens calibrate that estimate (see below).
+
+Usage is kept in three input buckets: uncached input, cache reads and cache writes.
+Claude-style usage reports them separately. OpenAI-style usage counts cached tokens
+inside `prompt_tokens` (`prompt_tokens_details.cached_tokens`); the app then records
+`prompt_tokens` minus the cached count as uncached input, so totals, the DBU estimate
+and the estimate scale do not count the cache twice (a cached count larger than
+`prompt_tokens` is left as reported). How Claude endpoints on Databricks fill these
+fields has not yet been checked against a live response. Ledger records saved before
+this change keep the counts they were saved with; those that used OpenAI-style cached
+tokens stay double-counted, because they hold only the combined input count.
+The Usage section starts with a **Last model input** row: the reported input tokens of
+the conversation's latest agent request (cache included), its share of the input
+budget and of the model's window when known, and the app's estimate for the same
+request ("No reported input yet." before the first report). The call table has a
+**Total input** column (uncached input plus cache reads and writes), and **Request
+details** under a reply show **Input incl. cache**.
 
 Every chat, title, and summary call is sent to
 `DBRICKS_URL/serving-endpoints/<selected endpoint>/invocations`; the app does not
@@ -1057,14 +1074,46 @@ read/write tokens are added to input tokens). The scale only raises the heuristi
 never lowers it, and is capped at 2×. In one observed code-heavy chat, Claude
 reported about 26% more input tokens than the heuristic; a scale of about 1.26 makes
 automatic compaction start before the real request outgrows the context budget.
-Context details show the applied scale. A conversation's first request to a model,
-or older requests recorded before this calibration, use the unscaled heuristic.
+Context details show the applied scale. Before a model has reported any counts in a
+conversation, the estimate uses a starting scale: 1.3 for `databricks-claude-opus-5-5`
+(newer Claude tokenizers count up to about 1.35 times as many tokens as older ones),
+and the unscaled heuristic for every other endpoint, including
+`databricks-claude-opus-4-8`. The first reports replace it.
 Expanded context details attribute that same estimate to system/project
 instructions (including selected skills), tool definitions, conversation messages
 and tool results, the retained summary, and request framing/rounding overhead.
 The categories add up to the displayed estimate; they are not tokenizer-derived
-measurements. Automatic compaction is attempted when the estimate exceeds the
-input budget, after the reply and safety reserves have been deducted.
+measurements.
+
+**Settings → Auto-compact at (% of input budget)** (default 90, 50–100) sets when
+automatic compaction runs: when the next request's estimate passes that share of the
+input budget (the budget left after the reply and safety reserves). With the default
+settings that is about 108,748 tokens. Lower values compact sooner and keep requests
+smaller; 100 waits until the input budget is full. Compaction looks for a cut that
+brings the request under the threshold. When no cut does (for example a large first
+request, or a large request after a few short turns) and the request still fits the
+input budget, nothing is summarized: the request is sent as it is and the context
+details say so. Only a request over the input budget, or a manual compaction, falls
+back to a cut that merely fits the budget, so compaction never runs a billed summary
+request that leaves the request over the threshold.
+
+**Last model input** shows what Databricks reported for the latest agent request
+once a report arrives: "Last model input · 10,000 tokens · 8.3%", where the
+percentage is of the input budget, and a bar with a mark at the auto-compact
+threshold. The reported input is uncached input plus cache reads and writes: cached
+tokens still occupy the context window; they are cheaper, not smaller. A stream that
+stopped before it finished is marked "(partial)". Expanded, the meter lists the
+reported input, output, the shares of the input budget, the context budget and the
+model's own window (known for `databricks-claude-opus-5-5`, 1,000,000 tokens, and
+`databricks-gpt-oss-120b`, 131,072; "Not known for this endpoint" otherwise), and how
+far the app's estimate for the same request was from the reported count, with why
+the two differ and the scale later estimates use. After a compaction, or in a
+**Context preview**, the report describes the request before it, so it is headed
+"Before compaction" and the collapsed meter shows the app's estimate (~N%) instead;
+after a change to the input budget or the model it is headed "Earlier request" in the
+same way. When a turn ends, the details also show the estimate for the next request
+before your next message. Title, compaction and side
+question requests never change this report.
 
 The output-token limit is separate from the configurable total context capacity
 and the resulting input budget. Raising it reduces the available input budget and
@@ -1091,40 +1140,94 @@ per response, across at most 64 calls. Oversized or unfinished frames fail befor
 any tool in that response executes; the error is recorded without saving broken
 tool calls into model history.
 
-When older turns no longer fit, the same endpoint summarizes them in bounded
-requests with at most 4,096 output tokens per summary request. Summary chunks use
-that independent reply reserve instead of the main response reserve, so increasing
-the main output setting does not multiply the number of compaction requests. The
-retained summary may use about an eighth of the input budget, between 3,500 and
-12,000 UTF-8 bytes (12,000 with the default settings); that byte cap is not a token
-count. A summary that comes back longer is not discarded, because producing it may
-have required a large billed request: a small extra request, containing only that
-summary, asks the model to condense it, and a second one condenses that result if it
-is shorter but still too long. A condensing request may use about one output token per
-two bytes of the limit (6,000 tokens for 12,000 bytes, at least 4,096), so a slightly
-long reply is not cut off. If condensing fails or is still too long, the
-app keeps the start and end of the summary and omits part of the middle. Either case
-adds a visible notice and is shown in context details. These summary limits are
-separate from the main reply limit and total context budget.
+When older turns are compacted, the same endpoint summarizes them in bounded requests.
+The summarizer reads a shortened copy of the archived messages; the saved history
+never changes. Tool results longer than a limit (3/32 of the summary request's input
+room, at least 8,000 and at most 64,000 bytes, twice that inside one long request; at
+a 131,072-token context budget with handoffs on it is 10,596 bytes, or 9,828 on models
+that always think) keep
+their start and end around a marker; a `read_file` page also keeps the definition
+lines (`class`, `def`, `function` and similar) of its omitted middle with their line
+numbers. File contents in `write_file`, `edit_file` and `notebook_edit` arguments keep
+their first 600 bytes and a marker (the file on disk has the current content), and a
+read whose file was later read again with the same arguments, or changed, moved or
+deleted by a completed call, is replaced by a marker. The app's own hidden messages
+(automatic retries, Verify results) are labelled as the app's, not the user's; the
+note you write when declining Verify stays your words. Your messages are never
+shortened, except for the @ file and ! output attachments in them.
+
+A summary request has at most 4,096 output tokens with the default settings (a third
+of the summary byte limit on large budgets). Summary chunks use that independent
+reply reserve instead of the main response reserve, so increasing the main output
+setting does not multiply the number of compaction requests. The summary uses these
+sections, most important first, so a reply cut off at its limit loses the least:
+Goal and current status; Open tasks and next steps; User requirements, preferences and
+constraints (with your exact words); Decisions and reasons; Errors, causes and fixes;
+Files read and changed; Commands and results. A conversation long enough to need
+several summary requests passes each request's summary on whole to the next one and
+condenses only once, at the end. The retained summary may use about an eighth of the
+input budget, between 3,500 and 12,000 UTF-8 bytes (12,000 with the default settings),
+and up to 32,000 bytes on large budgets (a twelfth of the input budget); that byte cap
+is not a token count. A summary that comes back longer is not discarded, because
+producing it may have required a large billed request: a small extra request,
+containing only that summary, asks the model to condense it, and a second one
+condenses that result if it is shorter but still too long. A condensing request may
+use about one output token per two bytes of the limit (6,000 tokens for 12,000 bytes,
+at least 4,096), so a slightly long reply is not cut off. A condensed summary that
+lost the goal, open tasks or requirements section counts as failed. If condensing
+fails or is still too long, the app shortens the least important sections first
+(never the first three) and, if that is not enough, keeps the start and end of the
+summary. A plain summary cut off at its output limit is kept with a note. These
+summary limits are separate from the main reply limit and total context budget.
+
+Next to the summary, the model gets an **app record** that the app writes itself,
+not the summarizer: your earlier requests in your own words (long ones shortened in
+the middle; the first request is always kept, and the oldest after it give way when
+the record is full), the task checklist when the compaction ran with full task IDs,
+the files the conversation changed before that point, and the files it read whose
+contents are no longer in its context. Those files must be read again before a write
+or edit: the read-before-write check refuses with "its earlier contents were
+summarized out of your context" until they are. A file read or written after the
+compaction point, or attached with @ to the request still in context, stays readable.
+The record is part of the conversation's saved context state but is not exported,
+so an imported conversation starts a new record at its next compaction. Your
+requests are marked as your own words, whose rules and constraints still apply unless
+you changed them later; the app's notes (tasks and files) are marked as data. Each
+compaction adds one notice with its numbers: an automatic or in-turn compaction gives
+the estimate before, the threshold, how many messages were summarized in how many
+requests and the estimate after; a manual one gives the messages, the requests and
+the estimate after. On models
+that always think, such as `databricks-claude-opus-5-5`, thinking counts against
+`max_tokens`, so every summary, condense and handoff request gets an extra
+min(8,192, context budget / 8) output tokens for thinking.
 
 **Settings → Save a detailed handoff at each compaction** is on by default. Each
 automatic or manual compaction then asks the model for a detailed Markdown handoff of
-the turns being summarized (status, decisions, issues and fixes, file changes, key
-facts, open items, next actions) instead of the short summary. The same request that
-already carried those turns writes it, so no extra conversation is resent; it may use
-up to an eighth of the context budget in output tokens (16,000 with the default
-budget), and a non-streamed reply can take a few minutes. A small follow-up request
-condenses the handoff into the in-context summary. The app saves the handoff, with a
-generated activity log of every command and file, to
+the turns being summarized (the summary sections above, then work done in detail and
+key facts and gotchas) instead of the short summary. The same request that already
+carried those turns writes it, so no extra conversation is resent; it may use up to an
+eighth of the context budget in output tokens (16,000 with the default budget), plus
+the thinking allowance above on models that always think, and a non-streamed reply can
+take a few minutes. That stays within Databricks' 597-second execution limit and
+100,000 output tokens per minute for Claude Opus 5.5. A small follow-up request
+condenses the handoff into the in-context summary. The app saves the handoff, with
+the app record (redacted like the rest of the file) and a generated activity log of
+every command and file, to
 `<workspace>/handoffs/auto/<date>-<chat-title>-compaction-<N>.md`, adding a suffix
-instead of overwriting an existing file. After compaction, the summary message lists
-the newest five saved handoffs so the model can read the relevant section with
-`read_file` or `search_files` when it needs details the summary omits. A handoff cut
-off at its output limit is still saved and used, with a note. If the file cannot be
-written (for example, the folder resolves outside the workspace), a notice explains
-it and compaction continues with the summary only. Subagent conversations do not
-write compaction handoffs. Turn the setting off for the previous summary-only
-compaction.
+instead of overwriting an existing file. Each handoff starts with a Contents list
+giving the line of each section. After compaction, the summary message lists the
+newest five saved handoffs so the model can read one section with `read_file`
+`start_line` or find a detail with `search_files` when it needs details the summary
+omits. A handoff cut off at its output limit is still saved and used, with a note. If
+the file cannot be written (for example, the folder resolves outside the workspace), a
+notice explains it and compaction continues with the summary only. Subagent
+conversations do not write compaction handoffs. Turn the setting off for the previous
+summary-only compaction.
+
+Input tokens per minute matter on large budgets: with a 1,000,000-token budget, one
+near-full request uses all of Claude Opus 5.5's default 1,000,000 input tokens per
+minute, so the next step can be rate limited. Lower **Auto-compact at** or the
+context budget for multi-step work.
 The newest turn and its complete tool exchanges are retained verbatim;
 the preceding turn is also retained when space allows. The app's hidden messages
 inside a turn (automatic retries, Verify results) belong to that turn and never count

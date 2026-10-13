@@ -51,6 +51,21 @@ def test_usage_only_accepts_reported_nonnegative_integer_fields():
                            "cache_read_input_tokens": 2, "reasoning_tokens": 3}
 
 
+def test_openai_style_cached_tokens_are_not_counted_twice():
+    # prompt_tokens includes cached tokens: input_tokens keeps the uncached part.
+    openai = reported_usage({"prompt_tokens": 1000, "completion_tokens": 5, "prompt_tokens_details": {"cached_tokens": 800}})
+    assert openai == {"input_tokens": 200, "output_tokens": 5, "cache_read_input_tokens": 800}
+    assert reported_usage(openai) == openai  # Stored records are not split again.
+    # Claude-style buckets are already separate.
+    assert reported_usage({"prompt_tokens": 1000, "cache_read_input_tokens": 800}) == {
+        "input_tokens": 1000, "cache_read_input_tokens": 800}
+    assert reported_usage({"input_tokens": 1000, "prompt_tokens_details": {"cached_tokens": 800}}) == {
+        "input_tokens": 1000, "cache_read_input_tokens": 800}
+    # A cached count above the prompt count is not a subset of it: nothing is subtracted.
+    assert reported_usage({"prompt_tokens": 100, "prompt_tokens_details": {"cached_tokens": 800}}) == {
+        "input_tokens": 100, "cache_read_input_tokens": 800}
+
+
 def test_retry_after_accepts_seconds_http_date_and_nested_json_with_a_cap(monkeypatch):
     assert retry_after_seconds({"retry-after": "3"}, 0) == 3
     assert retry_after_seconds({}, 0, {"error": {"retry_after": 7}}) == 7

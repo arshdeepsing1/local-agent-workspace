@@ -123,6 +123,37 @@ def test_usage_graph_and_estimated_cost(ui, page):
     assert len(ui.requests("/api/sessions/a/metrics")) == requests
 
 
+def test_usage_shows_the_last_reported_input_and_total_input_per_call(ui, page):
+    open_tab(ui, page, "Usage")
+    last = page.locator(".usage-last-input")
+    expect(last).to_contain_text("Last model input")
+    expect(last).to_contain_text("No reported input yet.")
+    header = page.get_by_role("columnheader")
+    expect(header).to_have_text(["Purpose", "Model", "Status", "Total input", "Uncached input", "Cache read",
+                                 "Cache write", "Output", "Est. DBU"])
+    first = page.get_by_role("row").filter(has_text="agent")
+    expect(first.get_by_role("cell").nth(3)).to_have_text("1,600")
+    expect(page.get_by_role("row").filter(has_text="compaction").get_by_role("cell").nth(3)).to_have_text("—")
+
+
+def test_usage_last_model_input_row(ui, page):
+    open_tab(ui, page, "Usage", """fake.override = path => path === '/api/sessions/a/metrics' ? fake.json({ ...metrics,
+      last_input: { input_tokens: 10000, percent_of_input_budget: 8.3, percent_of_model_window: 1, estimated_tokens: 8000,
+        partial: false } }) : undefined""")
+    last = page.get_by_role("group", name="Last model input")
+    expect(last).to_contain_text("10,000 tokens")
+    expect(last).to_contain_text("8.3% of input budget")
+    expect(last).to_contain_text("1% of model window")
+    expect(last).to_contain_text("App estimate ~8,000")
+    page.get_by_role("button", name="Refresh usage").click()
+    ui.run("""fake.override = path => path === '/api/sessions/a/metrics' ? fake.json({ ...metrics,
+      last_input: { input_tokens: 500, percent_of_input_budget: 0.4, percent_of_model_window: null, estimated_tokens: 480,
+        partial: true } }) : undefined""")
+    page.get_by_role("button", name="Refresh usage").click()
+    expect(last).to_contain_text("Model window unknown")
+    expect(last).to_contain_text("Last model input (partial)")
+
+
 def test_verify_tab_loads_and_saves_the_project_command(ui, page):
     open_tab(ui, page, "Verify")
     section = page.get_by_role("region", name="Verify")

@@ -127,7 +127,8 @@ def test_settings_edit_and_save_only_databricks_fields(ui, page):
     expect(dialog.get_by_text(re.compile("not individual tool calls"))).to_be_visible()
     expect(dialog.get_by_label("Agent runtime")).to_have_count(0)
     # No agent runtime options: CLAUDE.md is named only as a project instruction file.
-    expect(dialog.get_by_text(re.compile(r"Claude(?!\.md)|MCP|skills", re.I))).to_have_count(0)
+    # No Claude CLI runtime settings (a model name such as Claude Opus 5.5 in help text is fine).
+    expect(dialog.get_by_text(re.compile(r"Claude(?!\.md| Opus)|MCP|skills", re.I))).to_have_count(0)
     checkboxes = dialog.get_by_role("checkbox")
     expect(checkboxes).to_have_count(4)
     expect(dialog.locator("label:has(input[type=checkbox])")).to_have_text([
@@ -554,6 +555,28 @@ def test_context_estimate_and_instructions_are_per_conversation(ui, page):
     expect(page.get_by_text("Context usage is estimated after the first turn.")).to_be_visible()
     expect(page.get_by_role("progressbar", name="Estimated model input usage")).to_have_count(0)
     expect(page.get_by_text("AGENTS.md", exact=True)).to_have_count(0)
+
+
+def test_reported_input_pushed_over_the_socket_replaces_the_estimate(ui, page):
+    start_app(ui, page, setup="fake.sessions.set('a', { ...makeSession('a', 'Other conversation'), context_info: contextInfo })")
+    row(page, "Other conversation").click()
+    ui.show_session("a")
+    expect(page.get_by_text("Last model input · ~50%")).to_be_visible()
+    ui.emit("a", """{ type: 'context', context_info: { ...contextInfo, auto_compact_percent: 90, auto_compact_threshold: 108748,
+      last_request: { status: 'completed', partial: false, model: 'test-model', input_tokens: 72000, uncached_input_tokens: 72000,
+        cache_read_input_tokens: 0, cache_creation_input_tokens: 0, input_budget: 120832, context_window: 131072,
+        compactions: 1, percent_of_input_budget: 59.6, percent_of_context_budget: 54.9, model_window: null,
+        percent_of_model_window: null, estimated_tokens: 60380, estimate_scale: 1, estimate_gap_percent: 19.2 } } }""")
+    expect(page.get_by_text("Last model input · 72,000 tokens · 59.6%")).to_be_visible()
+    expect(page.get_by_role("progressbar", name="Reported model input usage")).to_have_attribute(
+        "aria-valuetext", "59.6% of input budget: 72,000 of 120,832 tokens reported by Databricks")
+    ui.emit("a", "{ type: 'context', context_info: { ...contextInfo, prepared_for_next_turn: true, compactions: 2 } }")
+    expect(page.get_by_text("Context preview · ~50%")).to_be_visible()
+    ui.emit("a", {"type": "event", "event": {"id": "n1", "type": "notice", "text": "Context compacted (compaction 2).",
+                                             "compaction": {"number": 2, "trigger": "manual"}}})
+    ui.emit("a", {"type": "event", "event": {"id": "n2", "type": "notice", "text": "Verify passed: pytest"}})
+    expect(page.locator(".conversation-notice.compaction")).to_have_text("Context compacted (compaction 2).")
+    expect(page.locator(".conversation-notice", has_text="Verify passed")).not_to_have_class(re.compile("compaction"))
 
 
 def test_byte_based_estimates_are_not_shown_as_tokens(ui, page):

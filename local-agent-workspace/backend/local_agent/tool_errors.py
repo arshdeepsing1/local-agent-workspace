@@ -30,7 +30,8 @@ VALUE_ERROR_RULES = (
     # Before stale_file: 'Project instructions changed before execution' is about guidance, not a file.
     ("guidance_changed", ("instructions changed",)),
     ("stale_file", ("changed while", "changed before execution", "changed since", "changed immediately after",
-                    "now resolves to a different file", "checkpoint was already restored")),
+                    "now resolves to a different file", "checkpoint was already restored",
+                    "summarized out of your context")),
     ("edit_mismatch", ("old_text",)),
     ("not_found", ("was not found", "not found in this conversation", "does not exist", "job not found",
                    "no longer available", "Command not found", "Git is not installed")),

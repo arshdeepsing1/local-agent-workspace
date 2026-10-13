@@ -124,7 +124,8 @@ async def test_manual_compaction_preserves_archive_recent_exchanges_and_never_ru
 @pytest.mark.parametrize("failure", ["http", "empty", "length", "cancel"])
 async def test_manual_failure_or_stop_keeps_previous_summary_and_archive(runtime, monkeypatch, failure):
     manager, session, _ = runtime
-    # A cut-off summary fails compaction; a cut-off handoff is kept (see test_compaction_handoffs).
+    # A summary cut off before any text fails compaction; one with text is kept (test_compaction_quality),
+    # as is a cut-off handoff (test_compaction_handoffs).
     manager.settings.values["compaction_handoffs"] = failure != "length"
     original = copy.deepcopy(session)
     entered = asyncio.Event()
@@ -135,7 +136,7 @@ async def test_manual_failure_or_stop_keeps_previous_summary_and_archive(runtime
             await asyncio.Event().wait()
         if failure == "http":
             return httpx.Response(500)
-        return httpx.Response(200, json={"choices": [{"message": {"content": "" if failure == "empty" else "Partial"},
+        return httpx.Response(200, json={"choices": [{"message": {"content": "" if failure in ("empty", "length") else "Partial"},
             "finish_reason": "length" if failure == "length" else "stop"}]})
 
     mock_gateway(monkeypatch, gateway)
