@@ -198,6 +198,8 @@ class Conversation(Record):
     max_steps: int | None = Field(default=None, ge=1, le=8)
     # Kept by forks and imports, like tool_profile: a copy never gets more tools than its source.
     disabled_tools: list[Annotated[str, Field(min_length=1, max_length=300)]] | None = Field(default=None, max_length=64)
+    # The user's labels. Pinned and archived are view state of this app and are not exported.
+    tags: list[Annotated[str, Field(min_length=1, max_length=32)]] | None = Field(default=None, max_length=10)
 
 
 class Bundle(Record):

@@ -46,7 +46,7 @@ def test_no_notice_when_every_file_was_read(ui, page):
 
 
 # A conversation whose file is unreadable: the server lists it as a storage problem
-# and answers GET /api/sessions/<id> with 400.
+# and answers GET /api/sessions/<id> and its /info existence check with 400.
 UNREADABLE = """
 fake.unreadable = new Set(UNREADABLE_IDS)
 fake.sessions.set('b', makeSession('b', 'Second conversation'))
@@ -56,7 +56,7 @@ fake.override = (path, options) => {
     storage_problems: [...fake.unreadable].map(id => ({ file: `${id}.jsonl`, reason: 'line 1 is not valid JSON' })) })
   if (path === '/api/sessions' && method === 'GET')
     return fake.json([...fake.sessions.values()].filter(item => !fake.unreadable.has(item.id)))
-  const id = path.match(/^\\/api\\/sessions\\/([^/]+)$/)?.[1]
+  const id = path.match(/^\\/api\\/sessions\\/([^/]+?)(?:\\/info)?$/)?.[1]
   if (id && method === 'GET' && fake.unreadable.has(id))
     return fake.json({ detail: `Conversation file ${id}.jsonl could not be read: line 1 is not valid JSON.` }, 400)
 }
@@ -78,9 +78,9 @@ def test_going_back_to_an_unreadable_conversation_explains_it_and_stops(ui, page
     expect(page.get_by_text("Reconnecting to your local server")).to_have_count(0)
     expect(page.locator(".conversation-title")).to_have_text("New conversation")
     assert ui.js("location.search") == ""
-    calls = len(ui.requests("/api/sessions/a", "GET"))
+    calls = len(ui.requests("/api/sessions/a/info", "GET"))
     page.clock.run_for(10000)
-    assert len(ui.requests("/api/sessions/a", "GET")) == calls  # no retry loop
+    assert len(ui.requests("/api/sessions/a/info", "GET")) == calls  # no retry loop
     assert ui.js("fake.socketsFor('a').length") == 1
 
 

@@ -308,9 +308,12 @@ class Store:
         self.save(session)
         return session
 
-    def save(self, session):
+    def save(self, session, *, touch=True):
+        """Write the conversation. touch=False keeps its update time (metadata changes such as
+        pin, archive or tags must not reorder the sidebar or mark the chat unread)."""
         with self._lock:
-            prepared = {**session, "updated": time.time()}
+            updated = time.time() if touch or type(session.get("updated")) not in (int, float) else session["updated"]
+            prepared = {**session, "updated": updated}
             session_id = session["id"]
             jobs = self._known_jobs(session_id)
             merged = self._merge_jobs(jobs, prepared.get("command_jobs", []))
@@ -457,6 +460,59 @@ class Store:
             self._command_jobs[session_id] = self._merge_jobs(
                 self._command_jobs.get(session_id, []), session.get("command_jobs", []))
             return session
+
+    def header(self, session_id):
+        """The conversation's metadata without its events, or None if there is no file.
+
+        Reads only the first line. Raises UnreadableConversation like get() for a file
+        whose header is damaged, names another conversation, or whose full load failed."""
+        if not self._valid_id(session_id):
+            return None
+        path = self._path(session_id)
+        with self._lock:
+            known = self._load_problems.get(path.name)
+            if known is not None:
+                if known[1] == _fingerprint(path):
+                    raise UnreadableConversation(path.name, known[0])
+                del self._load_problems[path.name]  # Changed since; try it again.
+            try:
+                metadata = self._read_lines(path, metadata_only=True)
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                raise UnreadableConversation(path.name, f"it could not be opened ({exc.strerror or type(exc).__name__})") from None
+            if metadata.get("id") != session_id:
+                raise UnreadableConversation(path.name, "its conversation ID does not match the file name")
+            return self.summary(metadata)
+
+    def event_texts(self, session_id):
+        """Yield (event id, type, text) for the user and assistant events with text, in order.
+
+        Parses only event records, never the wire or ledgers. A missing or damaged file
+        ends the generator quietly (search skips what it cannot read)."""
+        if not self._valid_id(session_id):
+            return
+        try:
+            descriptor = os.open(self._path(session_id), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except OSError:
+            return
+        try:
+            source = os.fdopen(descriptor, "r", encoding="utf-8")
+        except BaseException:
+            os.close(descriptor)
+            return
+        with source:
+            try:
+                for line in source:
+                    if not line.startswith('{"record":"event",'):
+                        continue
+                    record = json.loads(line)
+                    event = record.get("data") if isinstance(record, dict) else None
+                    if (isinstance(event, dict) and event.get("type") in ("user", "assistant")
+                            and isinstance(event.get("text"), str) and isinstance(event.get("id"), str)):
+                        yield event["id"], event["type"], event["text"]
+            except (OSError, ValueError, RecursionError):
+                return
 
     def list(self):
         """Readable conversations, newest first. Unreadable files are skipped and

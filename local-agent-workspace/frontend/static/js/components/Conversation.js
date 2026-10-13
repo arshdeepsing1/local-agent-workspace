@@ -1,4 +1,4 @@
-import { html, useEffect, useMemo, useRef, useState } from '../lib.js'
+import { html, useEffect, useLayoutEffect, useMemo, useRef, useState } from '../lib.js'
 import { Check, ChevronDown, ChevronRight, Copy, FileText, GitBranch, LoaderCircle, Pencil, RefreshCw, Terminal, Undo2, X } from '../icons.js'
 import { api } from '../api.js'
 import { enhanceCodeBlocks, linkPaths, renderMarkdown } from '../markdown.js'
@@ -236,15 +236,33 @@ function Reply({ text, reasoning, truncated, requestInfo, onOpenPath, actions = 
 }
 
 // onOpenPath({ path, line? }) opens a file named in a reply or a tool card in the Workspace panel.
+// onLoadEarlier() -> Promise loads the page of messages before the first loaded one (session.events_start > 0).
 // busy: the chat is not idle (message actions other than Copy are hidden).
 // onPrefill(text) puts text in an empty composer and returns false when a typed draft was kept.
-export default function Conversation({ session, onError, onSelectSession, onOpenPath, busy = false, onPrefill }) {
+export default function Conversation({ session, onError, onSelectSession, onOpenPath, busy = false, onPrefill, onLoadEarlier }) {
   const container = useRef(null)
   const bottom = useRef(null)
   const follow = useRef(true)
+  // Prepending earlier messages keeps the visible ones in place: the scroll position moves by the
+  // added height at once (the transcript otherwise scrolls smoothly). When the last page arrives
+  // the focused button is gone, so focus moves to the transcript.
+  const anchor = useRef(null)
+  useLayoutEffect(() => {
+    const el = container.current
+    if (el && anchor.current) {
+      el.scrollTo({ top: anchor.current.top + el.scrollHeight - anchor.current.height, behavior: 'instant' })
+      if (anchor.current.focused && !el.contains(document.activeElement)) el.focus({ preventScroll: true })
+    }
+    anchor.current = null
+  }, [session.events_start])
+  const loadEarlier = event => {
+    const el = container.current
+    anchor.current = el ? { top: el.scrollTop, height: el.scrollHeight, focused: document.activeElement === event?.currentTarget } : null
+    void Promise.resolve(onLoadEarlier?.()).catch(error => { anchor.current = null; onError?.(error.message) })
+  }
   const toolSummaries = useMemo(() => summarizeTools(session.events), [session.events])
   const last = session.events[session.events.length - 1]
-  useEffect(() => { if (follow.current) bottom.current?.scrollIntoView({ block: 'end' }) }, [session.events.length, last?.text, last?.state])
+  useEffect(() => { if (follow.current) bottom.current?.scrollIntoView({ block: 'end' }) }, [last?.id, last?.text, last?.state])
   useEffect(() => { follow.current = true; bottom.current?.scrollIntoView({ block: 'end' }) }, [session.id])
   const tools = session.events.filter(event => event.type === 'tool')
   // Edit and resend, Retry, Rewind and Fork from here (history.py on the server).
@@ -309,10 +327,11 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
         onClick=${() => setForking({ beforeEventId: next >= 0 ? session.events[next].id : null })} />` : null}
       ${canRetry ? html`<${ActionButton} label="Retry response" icon=${RefreshCw} disabled=${retrying} onClick=${() => void retry()} />` : null}`
   }
-  return html`<div class="transcript" ref=${container} onScroll=${() => {
+  return html`<div class="transcript" ref=${container} tabIndex=${-1} onScroll=${() => {
     const el = container.current
     if (el) follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120
   }}><div class="transcript-inner">
+    ${session.events_start > 0 && onLoadEarlier ? html`<button class="outline load-earlier" onClick=${loadEarlier}>Load earlier messages (${session.events_start} more)</button>` : null}
     ${tools.length ? html`<details class="activity-summary"><summary>Activity · ${tools.length} ${tools.length === 1 ? 'action' : 'actions'}</summary>
       <ol>${tools.map(event => {
         const summary = toolSummaries.get(event.id)

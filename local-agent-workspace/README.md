@@ -250,6 +250,40 @@ when opening a conversation or performing restart recovery.
   for approval, the tab title starts with the count, for example `(2) Local — …`.
   The sidebar list refreshes every 1.5 seconds while a chat is working and every 10 seconds
   otherwise, so chats started in another tab also show up.
+  - **Projects**: chats are grouped by project folder. The current project (the one
+    **Settings** selects) comes first and is open; other projects are closed, and their
+    heading shows the folder name, the number of chats and badges such as `1 needs approval`
+    or `2 running`. Click a heading to open or close it. A chat in an app-managed worktree is
+    listed under the project it came from and shows its branch. A group shows 50 chats, then
+    **Show N more**.
+  - **Subagents**: a subagent chat is listed under its parent behind **Show N subagents**,
+    which opens by itself while a subagent is working. A subagent whose parent was deleted
+    or is not listed is a chat of its own.
+  - **Pin, archive and tags**: **More actions** (`…`) on a row offers **Pin**, **Archive** and
+    **Edit tags…** (comma-separated, 1 to 32 characters each, at most 10; tags that differ only
+    in case count as one). Pinned chats are listed under **Pinned** above the projects.
+    Archived chats are hidden, also when pinned; **Archived (N)** at the end of the list
+    shows them, and **Unarchive** brings one back. Click a tag on a row to show only chats
+    with that tag; **Clear tag filter** shows all again. Pinning, archiving and tagging do not
+    change a chat's place in the newest-first order or mark it unread, and work while it is
+    replying. A pinned subagent chat is listed under **Pinned**, not under its parent. Tags are
+    exported with a chat and kept by forks and imports; pin and archive are not.
+  - **Search**: **Search conversations** shows only chats whose titles contain every word you
+    type. From 3 characters, after a short pause, the messages of all chats are searched too
+    (your messages and the agent's replies, not tool output) and listed under **Found in
+    messages** with a short excerpt (chats that match only by title are not listed again
+    there); click one to open its chat. Excerpts have the configured
+    token and common secret shapes replaced with `[REDACTED]`. The search reads the
+    conversation files on demand (there is no index) and stops after 64 MiB or 3 seconds,
+    saying "Search stopped early; refine your words."; archived chats are included and
+    marked, subagent chats are not. Esc clears the search.
+  - **Unreviewed changes**: an amber dot marks a chat with agent file changes you have not yet
+    kept or undone (its title says how many files), including changes its subagents made.
+  - **Long chats**: opening a chat loads its latest 200 messages and actions, extended to the
+    whole latest turn (at most 1,000). **Load earlier messages (N more)** at the top loads the
+    100 before them without moving what you are reading. Until then, the **Activity · N
+    actions** summary and the turn labels of **Agent tools → Recovery** cover only the loaded
+    part. Reconnecting loads the latest part again.
 - **Notifications**: click **Notify me** at the bottom of the sidebar to turn on browser
   notifications; the browser asks for permission only then. The switch shows **On** or
   **Off**. You are notified when a chat starts waiting for approval, finishes a reply,
@@ -649,7 +683,10 @@ when opening a conversation or performing restart recovery.
   jobs continue; stop them individually in Terminal. Approved writes and completed
   shell side effects are retained. Stop also cancels its active subagent. Deleting a
   conversation removes its jobs, tasks, and file checkpoint copies; edited files stay
-  on disk. Child conversations remain separately available in the sidebar.
+  on disk. Deleting a chat that has subagent chats asks first: **Delete with subagents**
+  deletes them too (at every depth, each stopped first), and **Delete, keep subagents** keeps
+  them as chats of their own (the API default, `DELETE /api/sessions/<id>?children=keep`);
+  a subagent turn the deletion stopped is recorded as stopped.
 - **Continue**: when the latest turn of an idle conversation stopped before it finished —
   at the **Agent steps** limit, at the output-token limit after the automatic retries,
   by **Stop**, or because the server restarted before its answer finished (not while it
@@ -815,6 +852,18 @@ deletes, moves or rewrites such a file; a command job of that conversation stays
 server stopped; it is listed again once it can be read. Requesting it through the API
 reports the problem (HTTP 400) instead of a server error, and the page shows that message
 instead of trying to reconnect.
+
+Startup after a clean shutdown reads only the first line (the header) of each conversation
+file. When the server stops normally, it writes `conversations/.clean-shutdown` after every
+response, compaction and command job has stopped; the next start removes that marker first
+and then loads in full only the chats whose header shows a turn that did not finish, plus
+subagent chats whose delegation is still open or whose parent was just repaired. Without the
+marker (after a crash or a kill, a failed shutdown, or on a new or older state folder) every
+conversation is loaded and repaired as before, which takes longer with many chats. One
+consequence: after a clean shutdown, a file whose header is readable but whose later records
+are damaged stays listed until you open it; opening it then reports the problem (HTTP 400) and
+hides it like a file found unreadable at startup. Pin, archive and tags are fields of the
+header (`pinned`, `archived`, `tags`), saved without changing the chat's update time.
 
 New sessions have empty message history and fresh permissions.
 Project files are shared on disk when chats select the same workspace; starting a

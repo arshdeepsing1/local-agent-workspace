@@ -85,9 +85,26 @@ fake.handle = (path, options) => {
     fake.sessions.set(modeId, updated)
     return fake.json(updated)
   }
-  const id = path.match(/^\/api\/sessions\/([^/]+)$/)?.[1]
+  // The existence check before a chat's stream opens: its header, without events.
+  const infoId = path.match(/^\/api\/sessions\/([^/]+)\/info$/)?.[1]
+  if (infoId && (options.method || 'GET') === 'GET') {
+    if (!fake.sessions.has(infoId)) return fake.json({ detail: 'Conversation not found.' }, 404)
+    const { events, ...header } = fake.sessions.get(infoId)
+    return fake.json(header)
+  }
+  // Earlier pages of a chat's events (tests that page override this).
+  const eventsId = path.match(/^\/api\/sessions\/([^/]+)\/events\?/)?.[1]
+  if (eventsId) return fake.json({ events: [], start: 0, total: fake.sessions.get(eventsId)?.events.length || 0 })
+  const metaId = path.match(/^\/api\/sessions\/([^/]+)\/meta$/)?.[1]
+  if (metaId && options.method === 'PUT') {
+    const updated = { ...fake.sessions.get(metaId), ...body() }
+    fake.sessions.set(metaId, updated)
+    return fake.json(updated)
+  }
+  if (path.startsWith('/api/session-search?')) return fake.json({ results: [], truncated: false })
+  const id = path.split('?')[0].match(/^\/api\/sessions\/([^/]+)$/)?.[1]
   if (id) {
-    if (options.method === 'DELETE') { fake.sessions.delete(id); return fake.json({ ok: true }) }
+    if (options.method === 'DELETE') { fake.sessions.delete(id); return fake.json({ ok: true, deleted: [id] }) }
     return fake.sessions.has(id) ? fake.json(fake.sessions.get(id)) : fake.json({ detail: 'Conversation not found.' }, 404)
   }
 }
