@@ -2,13 +2,14 @@ import { html, useEffect, useRef, useState } from '../lib.js'
 import { RefreshCw } from '../icons.js'
 import { api } from '../api.js'
 
-export default function TerminalPanel({ sessionId, workspace }) {
-  return html`<${TerminalJobs} key=${JSON.stringify([sessionId, workspace])} sessionId=${sessionId} />`
+// pythonVenv: Settings python_venv_status, named under the command field.
+export default function TerminalPanel({ sessionId, workspace, pythonVenv = null }) {
+  return html`<${TerminalJobs} key=${JSON.stringify([sessionId, workspace])} sessionId=${sessionId} pythonVenv=${pythonVenv} />`
 }
 
 const jobState = job => `${job.state.replace('_', ' ')}${job.exit_code === null ? '' : ` · exit ${job.exit_code}`}${job.background ? ' · background' : ''}${job.truncated ? ' · output truncated' : ''}`
 
-function TerminalJobs({ sessionId }) {
+function TerminalJobs({ sessionId, pythonVenv }) {
   const query = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''
   const [command, setCommand] = useState('')
   const [timeout, setTimeoutSeconds] = useState(60)
@@ -103,6 +104,8 @@ function TerminalJobs({ sessionId }) {
       <label class="terminal-background"><input type="checkbox" checked=${background} onChange=${e => setBackground(e.currentTarget.checked)} />Run in background</label>
     </form>
     <p class="field-help">Commands can access your machine. Background jobs continue after Stop response; use Stop job to end one. Server shutdown also stops jobs.</p>
+    ${pythonVenv?.state === 'ready' ? html`<p class="field-help">Commands use the Python environment ${pythonVenv.path}.</p>`
+      : pythonVenv?.state === 'invalid' ? html`<p class="field-help">The Python environment in Settings is not used: ${pythonVenv.message.replace(/^Not used: /, '')}</p>` : null}
     ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
     <div class="terminal-history-heading"><span>Job history</span><button class="icon-button" aria-label="Refresh jobs" onClick=${() => { setError(''); setRefresh(current => current + 1) }}><${RefreshCw} size=${14} /></button></div>
     <div class="terminal-jobs" role="list" aria-label="Job history">

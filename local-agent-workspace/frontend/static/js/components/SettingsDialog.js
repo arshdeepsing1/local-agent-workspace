@@ -1,19 +1,61 @@
 import { html, useEffect, useRef, useState } from '../lib.js'
 import { X } from '../icons.js'
+import { api } from '../api.js'
 import { modelLabel } from '../types.js'
+
+const LIMIT_LEVELS = { error: 'form-error', warning: 'settings-note', note: 'field-help' }
+const inRange = (value, low, high) => Number.isInteger(value) && value >= low && value <= high
+
+// The check result of a saved folder (coding_dir_status or python_venv_status); an edited value is checked on save.
+function pathStatus(status, saved, current) {
+  if ((current || '').trim() !== (saved || '').trim()) return html`<p class="field-help">Checked when you save.</p>`
+  if (!status) return null
+  if (status.state === 'invalid') return html`<p class="form-error" role="alert">${status.message}</p>`
+  if (status.state === 'missing') return html`<p class="settings-note" role="status">${status.message}</p>`
+  if (status.state === 'ready') return html`<p class="field-help">${status.message}${status.source === 'env' ? ' From .env.' : ''}</p>`
+  return null
+}
 
 export default function SettingsDialog({ settings, connection, onSave, onClose }) {
   const dialog = useRef(null)
   const [form, setForm] = useState(settings)
+  // Folder states checked again when the dialog opens (a first write creates the default code folder).
+  const [statuses, setStatuses] = useState({ coding_dir: settings.coding_dir_status, python_venv: settings.python_venv_status })
+  const [limits, setLimits] = useState(null)
+  const limitsRequest = useRef(0)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   // The variable names as typed; the form holds them as a list.
   const [envText, setEnvText] = useState((settings.command_env || []).join(' '))
   const instructions = form.user_instructions || ''
   const inputBudget = form.context_window - form.max_output_tokens - 2048
-  const claudeQuotaExceeded = form.model === 'databricks-claude-opus-4-8' && form.max_output_tokens > 20000
-  const claudeQuotaConsumed = form.model === 'databricks-claude-opus-4-8' && form.max_output_tokens === 20000
   useEffect(() => { dialog.current?.showModal() }, [])
+  useEffect(() => {
+    let current = true
+    api('/settings').then(fresh => {
+      if (current) setStatuses({ coding_dir: fresh.coding_dir_status, python_venv: fresh.python_venv_status })
+    }, () => {})
+    return () => { current = false }
+  }, [])
+  // Warnings for these budgets on this endpoint, from the server's limit table. They never block saving.
+  useEffect(() => {
+    const model = (form.model || '').trim()
+    const { context_window: context, max_output_tokens: output } = form
+    if (!model || !inRange(context, 16384, 1048576) || !inRange(output, 1024, 131072) || output >= context - 2048) {
+      limitsRequest.current++
+      setLimits(null)
+      return
+    }
+    const request = ++limitsRequest.current
+    const timer = setTimeout(() => {
+      api('/settings/limits', 'POST', { model, context_window: context, max_output_tokens: output }).then(
+        result => { if (request === limitsRequest.current) setLimits(result) },
+        () => { if (request === limitsRequest.current) setLimits(null) })
+    }, 250)
+    return () => clearTimeout(timer)
+  }, [form.model, form.context_window, form.max_output_tokens])
+  const recommended = limits?.recommended && limits.profile && (limits.recommended.context_window !== form.context_window
+    || limits.recommended.max_output_tokens !== form.max_output_tokens) ? limits.recommended : null
   const field = (key, value) => setForm(current => ({ ...current, [key]: value }))
   const number = key => event => field(key, Number(event.currentTarget.value))
   return html`<dialog ref=${dialog} class="settings-dialog" onCancel=${onClose} onClick=${e => { if (e.target === dialog.current) onClose() }}>
@@ -26,7 +68,16 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
       }}>
         <label>Project folder<input value=${form.workspace} required onInput=${e => field('workspace', e.currentTarget.value)} placeholder="/path/to/project" /></label>
         <p class="field-help">A tool-calling agent for your Databricks models. Reads files, edits code, and runs approved commands.</p>
-        <label>Databricks model endpoint<input list="settings-models" required value=${form.model} onInput=${e => field('model', e.currentTarget.value)} placeholder="databricks-gpt-oss-120b" /></label>
+        <label>Default folder for new code<input value=${form.coding_dir || ''} spellcheck=${false} placeholder="~/code (optional)"
+          onInput=${e => field('coding_dir', e.currentTarget.value)} /></label>
+        <p class="field-help">When you ask for a new standalone script, tool or project without saying where, the agent creates it here; work on the open project stays in the project. Every conversation can use this folder without a Folder access card; edits still follow the permission mode and rules. A value saved here overrides LOCAL_AGENT_CODING_DIR in .env; left unchanged, it follows .env.</p>
+        ${pathStatus(statuses.coding_dir, settings.coding_dir, form.coding_dir)}
+        <label>Python virtual environment<input value=${form.python_venv || ''} spellcheck=${false} placeholder="~/.venvs/project (optional)"
+          onInput=${e => field('python_venv', e.currentTarget.value)} /></label>
+        <p class="field-help">The agent's commands, Verify, hooks and the Terminal run with this environment active: VIRTUAL_ENV is set and its bin/ comes first on PATH. The read-only commands Auto runs without a card are unaffected, and agent edits inside the environment always ask. A value saved here overrides LOCAL_AGENT_PYTHON_VENV in .env; left unchanged, it follows .env.</p>
+        ${pathStatus(statuses.python_venv, settings.python_venv, form.python_venv)}
+        <label>Databricks model endpoint<input list="settings-models" required value=${form.model} onInput=${e => field('model', e.currentTarget.value)} placeholder=${settings.default_model || 'databricks-claude-opus-5-5'} /></label>
+        ${settings.model_migrated_from ? html`<p class="settings-note" role="status">The default model changed from ${modelLabel(settings.model_migrated_from)} to ${modelLabel(settings.model)}, the app's new default. ${modelLabel(settings.model)} costs more per token. To switch back, choose ${settings.model_migrated_from} here or in the model picker.</p>` : null}
         <datalist id="settings-models">${connection?.models.map(m => html`<option key=${m} value=${m}>${modelLabel(m)}</option>`)}</datalist>
         <label>Context budget (tokens)<input type="number" required min=${16384} max=${1048576} step=${1}
           value=${form.context_window || ''} onInput=${number('context_window')} /></label>
@@ -35,8 +86,13 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
           value=${form.max_output_tokens || ''} onInput=${number('max_output_tokens')} /></label>
         <p class="field-help">The endpoint must support this value. A larger response budget leaves less context for input and can increase usage. Current estimated input budget: ${inputBudget.toLocaleString()} tokens.</p>
         ${inputBudget < 16384 ? html`<p class="form-error" role="alert">This leaves too little room for a working conversation. Lower Max output tokens or increase the context budget; raising output does not fix a full context.</p>` : null}
-        ${claudeQuotaExceeded ? html`<p class="form-error" role="alert">Standard Databricks Claude Opus 4.8 pay-per-token quota reserves max_tokens against a 20,000 output-tokens-per-minute limit. Use 20,000 or less unless your workspace quota is higher.</p>` : null}
-        ${claudeQuotaConsumed ? html`<p class="settings-note" role="status">A 20,000-token request reserves the full standard Claude Opus 4.8 output-per-minute quota. It is useful for a single long response, but follow-up agent and tool steps can receive 429 responses until earlier output leaves the rolling window. The 8,192 default leaves room for multi-step work.</p>` : null}
+        ${limits ? html`<div class="settings-limits">
+          ${limits.warnings.map(warning => html`<p key=${warning.code} class=${LIMIT_LEVELS[warning.level] || 'field-help'}
+            role=${warning.level === 'error' ? 'alert' : warning.level === 'warning' ? 'status' : null}>${warning.text}</p>`)}
+          ${recommended ? html`<button type="button" class="outline settings-recommended"
+            onClick=${() => setForm(current => ({ ...current, ...recommended }))}>Use ${limits.profile.label} defaults (${recommended.context_window.toLocaleString('en-US')} context, ${recommended.max_output_tokens.toLocaleString('en-US')} output)</button>` : null}
+          <p class="field-help">${limits.note}</p>
+        </div>` : null}
         <label>Agent steps per message<input type="number" required min=${1} max=${64} step=${1}
           value=${form.max_agent_steps || ''} onInput=${number('max_agent_steps')} /></label>
         <p class="field-help">Limits model round trips for one message, not individual tool calls. One model response can request several tools. The default is 32.</p>

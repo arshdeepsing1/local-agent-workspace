@@ -258,7 +258,8 @@ export function useWorkspace() {
   }
   const saveSettings = async next => {
     const { workspace, model, env_file, context_window, max_output_tokens, max_agent_steps, compaction_handoffs, approval_timeout_minutes,
-      system_notifications, user_instructions, write_limit_kb, command_env, rate_limit_auto_continue, auto_keep_changes } = next
+      system_notifications, user_instructions, write_limit_kb, command_env, rate_limit_auto_continue, auto_keep_changes,
+      coding_dir, python_venv } = next
     const saved = await api('/settings', 'PUT', {
       workspace, model, env_file, context_window, max_output_tokens, max_agent_steps,
       ...(typeof compaction_handoffs === 'boolean' ? { compaction_handoffs } : {}),
@@ -269,9 +270,18 @@ export function useWorkspace() {
       ...(Array.isArray(command_env) ? { command_env } : {}),
       ...(typeof rate_limit_auto_continue === 'boolean' ? { rate_limit_auto_continue } : {}),
       ...(typeof auto_keep_changes === 'boolean' ? { auto_keep_changes } : {}),
+      ...(typeof coding_dir === 'string' ? { coding_dir } : {}),
+      ...(typeof python_venv === 'string' ? { python_venv } : {}),
     })
     setSettings(saved)
     void checkConnection().catch(e => setError(e.message))
+  }
+  // Settings again from the server: the folder states can change without a save (a first write creates
+  // the default code folder; a removed environment becomes invalid).
+  const refreshSettings = async () => {
+    const fresh = await api('/settings')
+    setSettings(fresh)
+    return fresh
   }
   const changeModel = async model => {
     const target = selected.current
@@ -482,7 +492,7 @@ export function useWorkspace() {
   const reportError = message => { if (selected.current.key === selection.key) setError(message) }
   const rulesHere = savedRules.key === selection.key ? savedRules : null
   return { settings, connection, sessions, session: activeSession, activeId, viewKey: selection.key, error, online, ready,
-    setError: reportError, setActiveId: selectSession, newConversation, send, saveSettings, deleteSession, renameSession, changeModel,
+    setError: reportError, setActiveId: selectSession, newConversation, send, saveSettings, refreshSettings, deleteSession, renameSession, changeModel,
     runShell, askSide, removeQueued, sendQueued, loadMentionFiles, sideAnswer: sideAnswer.key === selection.key ? sideAnswer.value : null, dismissSide,
     modelSaving: modelSaves.has(selection.key) || (!activeId && defaultModelSave.current !== null),
     checkConnection, refreshSessions, permissionMode: activeSession?.permission_mode || draftMode, setPermissionMode, allowFolder, removeFolder,

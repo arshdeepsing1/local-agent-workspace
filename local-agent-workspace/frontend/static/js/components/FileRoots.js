@@ -5,6 +5,13 @@ import { plural } from './ChangesBar.js'
 
 // True when an absolute path lies inside the absolute folder `root`.
 export const inside = (path, root) => path.startsWith(root.endsWith('/') ? root : `${root}/`)
+// The default code folder from Settings (coding_dir_status) as a folder every chat may use, or null when it is
+// off, not usable, the project itself or inside the project. { path, missing }.
+export function standingFolder(codingDir, workspace) {
+  if (!codingDir || !['ready', 'missing'].includes(codingDir.state) || typeof codingDir.path !== 'string') return null
+  if (codingDir.path === workspace || inside(codingDir.path, workspace)) return null
+  return { path: codingDir.path, missing: codingDir.state === 'missing' }
+}
 const parentFolder = path => path.slice(0, path.lastIndexOf('/')) || '/'
 const OUTSIDE_SUGGESTIONS = 3
 
@@ -49,7 +56,8 @@ export function useWorkspaceFolders(sessionId, workspace) {
 // The roots of Workspace -> Files: the project, the conversation's granted folders and the
 // folders added to Files, each with a change dot, plus "Add folder…" and a hint for changed
 // files under none of them. changed: paths of unreviewed agent changes (relative = project).
-export default function FileRoots({ workspace, root, onChoose, granted, folders, onAdd, onRemove, changed }) {
+// codingDir: Settings coding_dir_status; the default code folder is a root in every chat, without a remove button.
+export default function FileRoots({ workspace, root, onChoose, granted, folders, onAdd, onRemove, changed, codingDir = null }) {
   const [adding, setAdding] = useState(false)
   const [path, setPath] = useState('')
   const [formError, setFormError] = useState('')
@@ -74,13 +82,19 @@ export default function FileRoots({ workspace, root, onChoose, granted, folders,
     else toggle.current?.focus()
   })
   const added = new Map(folders.map(folder => [folder.path, folder]))
+  const standing = standingFolder(codingDir, workspace)
+  const other = path => !standing || path !== standing.path
   const roots = [
     { value: '.' },
-    ...granted.map(folder => ({ value: folder, granted: true, added: added.has(folder) })),
-    ...folders.filter(folder => !granted.includes(folder.path)).map(folder => ({ value: folder.path, added: true, missing: folder.missing })),
+    // Missing until the agent's first write there; a changed file inside it means it exists now.
+    ...(standing ? [{ value: standing.path, standing: true,
+      missing: standing.missing && !changed.some(item => item.startsWith('/') && inside(item, standing.path)) }] : []),
+    ...granted.filter(other).map(folder => ({ value: folder, granted: true, added: added.has(folder) })),
+    ...folders.filter(folder => !granted.includes(folder.path) && other(folder.path))
+      .map(folder => ({ value: folder.path, added: true, missing: folder.missing })),
   ]
   const outsideProject = changed.filter(item => item.startsWith('/') && !inside(item, workspace))
-  const covering = roots.filter(item => item.value !== '.' && !item.missing).map(item => item.value)
+  const covering = roots.filter(item => item.value !== '.' && (!item.missing || item.standing)).map(item => item.value)
   const outside = outsideProject.filter(item => !covering.some(folder => inside(item, folder)))
   // One per folder of those files; a folder inside another suggestion is covered by it.
   const parents = [...new Set(outside.map(parentFolder))]
@@ -121,9 +135,11 @@ export default function FileRoots({ workspace, root, onChoose, granted, folders,
     ${roots.length > 1 || outsideProject.length ? html`<div class="file-roots-list" role="group" aria-label="Folders in Files">
       ${roots.map(item => {
         const changes = item.missing ? 0 : count(item.value)
-        const kind = item.value === '.' ? null : item.missing ? 'Not found' : item.granted ? 'Allowed in this chat' : 'Added to Files'
-        const label = [item.value === '.' ? 'Project' : `${item.granted ? 'Allowed in this chat' : 'Added to Files'}: ${item.value}`,
-          item.missing ? 'Not found' : null, changes ? plural(changes, 'changed file') : null].filter(Boolean).join(', ')
+        const kind = item.value === '.' ? null : item.standing ? (item.missing ? 'Created on first write' : 'Default code folder')
+          : item.missing ? 'Not found' : item.granted ? 'Allowed in this chat' : 'Added to Files'
+        const prefix = item.standing ? 'Default code folder' : item.granted ? 'Allowed in this chat' : 'Added to Files'
+        const label = [item.value === '.' ? 'Project' : `${prefix}: ${item.value}`,
+          item.missing ? kind : null, changes ? plural(changes, 'changed file') : null].filter(Boolean).join(', ')
         const selected = root === item.value
         return html`<div key=${item.value} class=${`file-roots-item${selected ? ' selected' : ''}`}>
           <button class="file-roots-root" data-root=${item.value} aria-pressed=${selected} aria-label=${label} title=${item.value === '.' ? workspace : item.value}
