@@ -238,6 +238,50 @@ async def test_at_most_three_messages_and_50000_characters_can_wait(runtime):
         await settle(manager, sid)
 
 
+async def test_queued_messages_must_fit_one_message_together(runtime):
+    manager, session, project = runtime
+    sid = session["id"]
+    for number in range(6):
+        (project / f"f{number}.py").write_text(f"x = {number}\n")
+    blocker = asyncio.Event()
+    manager.live[sid] = session
+    manager.tasks[sid] = asyncio.create_task(blocker.wait())
+    try:
+        await manager.submit_message(sid, "Look at @f0.py @f1.py @f2.py")
+        with pytest.raises(ValueError, match=r"^Queued messages are sent as one message\. Attach at most 5 files to one message\.$"):
+            await manager.submit_message(sid, "And @f3.py @f4.py @f5.py")
+        assert [item["text"] for item in session["queued_messages"]] == ["Look at @f0.py @f1.py @f2.py"]
+        await manager.submit_message(sid, "And @f3.py @f4.py, again @f0.py")  # Five distinct files.
+        assert len(session["queued_messages"]) == 2
+    finally:
+        blocker.set()
+        await settle(manager, sid)
+
+
+async def test_stop_while_the_title_is_generated_sends_no_queued_message(runtime, monkeypatch):
+    manager, session, _ = runtime
+    sid = session["id"]
+    session.update(title="New conversation", title_generated=False)
+    manager.store.save(session)
+    hold = asyncio.Event()
+
+    async def final(body):
+        await manager.submit_message(sid, "Queued while answering")
+        return reply("Answer.")
+
+    async def naming(body):
+        await hold.wait()
+    requests = gateway(monkeypatch, [final, naming, lambda body: reply("Not wanted.")])
+    manager.start(sid, "Hello there, please explain the project")
+    await until(lambda: manager.statuses.get(sid) == "naming")
+    await manager.stop(sid)
+    await settle(manager, sid)
+    stored = manager.get(sid)
+    assert len(requests) == 2 and [event["text"] for event in users(stored)] == ["Hello there, please explain the project"]
+    assert [(item["text"], item["paused"]) for item in stored["queued_messages"]] == [("Queued while answering", False)]
+    assert not manager.stop_requested
+
+
 async def test_stop_leaves_the_queue_and_the_next_message_pauses_it(runtime, monkeypatch):
     manager, session, _ = runtime
     sid = session["id"]

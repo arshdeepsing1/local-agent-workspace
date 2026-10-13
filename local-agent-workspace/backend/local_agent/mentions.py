@@ -201,10 +201,18 @@ def expand_context(manager, session, tools, text, include_pending=True, on_error
     return content, attachments, views
 
 
+def mentionable(path):
+    """Whether '@<path>' reads back as exactly this file: no spaces, quotes or other characters
+    that end a token, no trailing punctuation and no ':12'-like suffix taken as a line range."""
+    found = parse_mentions("@" + path)
+    return len(found) == 1 and found[0]["token"] == path and found[0]["path"] == path
+
+
 def find_files(tools, query=""):
     """At most 30 files under tools.root whose path contains query (case-insensitive), best first:
     a basename prefix, then a basename match, then a path match, then shorter paths. Walks at most
-    5,000 entries without following links; ignored folders and refused paths are skipped."""
+    5,000 entries without following links; ignored folders, refused paths and paths an @ token
+    cannot spell (mentionable) are skipped."""
     text = (query or "").casefold()
     ranked, visited = [], 0
     root = tools.root
@@ -234,6 +242,8 @@ def find_files(tools, query=""):
             except (ValueError, OSError, RuntimeError):
                 continue
             relative = path.relative_to(root).as_posix()
+            if not mentionable(relative):
+                continue
             base, whole = name.casefold(), relative.casefold()
             rank = 0 if base.startswith(text) else 1 if text in base else 2 if text in whole else None
             if rank is not None:

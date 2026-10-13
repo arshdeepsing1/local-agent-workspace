@@ -76,6 +76,14 @@ def test_chips_show_each_mention_and_remove_its_token(ui, page):
     assert ui.bodies("/api/sessions/a/messages", "POST") == [{"text": "Read , then and `@not/this` or a@b.c"}]
 
 
+def test_removing_a_chip_keeps_the_rest_of_the_message_as_typed(ui, page):
+    start_app(ui, page)
+    box = message(page)
+    box.fill("Fix @src/a.py so that\n```python\ndef f():\n    return 1\n```\nTable:  a  b\nSee @src/a.py\n@src/a.py first")
+    page.get_by_role("button", name="Remove @src/a.py").click()
+    expect(box).to_have_value("Fix so that\n```python\ndef f():\n    return 1\n```\nTable:  a  b\nSee\nfirst")
+
+
 def test_a_new_conversation_searches_the_default_project(ui, page):
     start_app(ui, page, session=None)
     message(page).press_sequentially("@read")

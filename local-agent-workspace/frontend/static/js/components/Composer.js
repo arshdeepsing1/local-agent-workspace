@@ -1,5 +1,5 @@
 import { html, useEffect, useRef, useState } from '../lib.js'
-import { ArrowUp, ChevronDown, Folder, FolderPlus, Laptop, Plus, Square, Terminal, X } from '../icons.js'
+import { ArrowUp, ChevronDown, Folder, FolderPlus, Laptop, ListPlus, MessageCircleQuestion, Plus, Square, Terminal, X } from '../icons.js'
 import { modelLabel } from '../types.js'
 import PermissionsMenu from './PermissionsMenu.js'
 import { useSlashMenu } from './SlashMenu.js'
@@ -29,12 +29,23 @@ export default function Composer(p) {
   const multiline = kind === 'shell' && /[\r\n]/.test(text)
   // A ! command needs an idle chat and one line; a message or side question can be sent while busy.
   const blocked = kind === 'shell' && (p.busy || multiline || !text.slice(1).trim())
+  // A side question shows above the box at once, so the box is free for the next message while it
+  // is answered; when it fails, its text comes back into an empty box.
+  const askSide = () => {
+    const draft = p.value
+    p.setValue(current => current === draft ? '' : current)
+    input.current?.focus()
+    p.onSideQuestion(text.replace(/^\/btw\s+/, '').trim()).catch(e => {
+      p.setValue(current => current.trim() ? current : draft)
+      p.onError(e.message)
+    })
+  }
   const submit = async () => {
     if (!text || sending || p.modelSaving || p.disabled || blocked) return
+    if (kind === 'side') { askSide(); return }
     setSending(true)
     try {
       if (kind === 'shell') await p.onShell(text.slice(1).trim())
-      else if (kind === 'side') await p.onSideQuestion(text.replace(/^\/btw\s+/, '').trim())
       else await p.onSend(text)
       p.setValue(current => current === p.value ? '' : current)
       input.current?.focus()
@@ -79,7 +90,8 @@ export default function Composer(p) {
         onFocus=${() => { slash.inputProps.onFocus(); mention.inputProps.onFocus() }} onBlur=${() => { slash.inputProps.onBlur(); mention.inputProps.onBlur() }}
         onKeyDown=${keyDown} />
       ${slash.menu}${mention.menu}
-      ${p.busy && text && kind === 'message' ? html`<button class="send-button queue-button" aria-label="Queue message" title="Sent to the agent after its current step" disabled=${sending || p.modelSaving || p.disabled} onClick=${() => void submit()}><${Plus} size=${18} /></button>` : null}
+      ${p.busy && text && kind === 'message' ? html`<button class="send-button queue-button" aria-label="Queue message" title="Sent to the agent after its current step" disabled=${sending || p.modelSaving || p.disabled} onClick=${() => void submit()}><${ListPlus} size=${17} /></button>` : null}
+      ${p.busy && kind === 'side' ? html`<button class="send-button queue-button" aria-label="Ask side question" title="Answered beside the conversation, without adding to it" disabled=${!text.replace(/^\/btw\s+/, '').trim() || p.modelSaving || p.disabled} onClick=${() => void submit()}><${MessageCircleQuestion} size=${17} /></button>` : null}
       ${p.busy ? html`<button class="send-button stop-button" aria-label="Stop response" onClick=${p.onStop}><${Square} size=${15} fill="currentColor" /></button>` :
         html`<button class="send-button" aria-label="Send message" disabled=${!text || sending || p.modelSaving || p.disabled || blocked} onClick=${() => void submit()}><${ArrowUp} size=${19} /></button>`}
     </div>

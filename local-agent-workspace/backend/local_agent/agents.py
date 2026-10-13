@@ -483,10 +483,14 @@ def unanswered(event, declined):
     return declined
 
 
+def pending_summary(session):
+    """pending_context (! output waiting for the next message) as the pages see it: without its text."""
+    return [{"kind": item.get("kind"), "command": item.get("command"), "exit_code": item.get("exit_code")}
+            for item in session.get("pending_context") or [] if isinstance(item, dict)]
+
+
 def public_session(session, status="idle"):
-    # pending_context (! output waiting for the next message) is shown without its text.
-    pending = [{"kind": item.get("kind"), "command": item.get("command"), "exit_code": item.get("exit_code")}
-               for item in session.get("pending_context") or [] if isinstance(item, dict)]
+    pending = pending_summary(session)
     return {"permission_mode": "manual", "allowed_directories": [], "allow_rules": [], "disabled_tools": [],
             **{k: v for k, v in session.items()
                if k not in ("wire", "context_state", "instruction_directories", "inference_calls", "command_jobs",
@@ -509,6 +513,8 @@ class AgentManager:
         self.card_revisers = {}  # (session id, event id) -> async reviser(changes) for Edit before approving
         self.statuses = {}
         self.side_questions = set()  # Chats with a /btw side question being answered.
+        self.stop_requested = set()  # Tasks the user stopped: no queued follow-up, even if they ended normally.
+        self.unsent_views = {}  # Session id -> @ file views recorded once the turn's message enters the wire.
         self.checkpoints = CheckpointManager(store)
         self.changes = ChangeReview(store, self.checkpoints)
         self.worktrees = WorktreeManager(store, settings.state_dir)
@@ -1374,15 +1380,15 @@ class AgentManager:
         if session.get("runtime", "databricks") != "databricks":
             raise ValueError("This conversation uses an unsupported runtime and is read-only. Start a new Databricks conversation.")
         self.workspace_available(session["workspace"])
-        content, attachments = None, None
+        content, attachments, views = None, None, []
         if not (session.get("parent_event_id") and not session["events"]):  # Not a subagent's delegated prompt.
             expanded, attachments, views = mentions.expand_context(
                 self, session, self.session_tools(session), prompt, on_error="inline" if from_queue else "raise")
             content = expanded if expanded != prompt else None
-            for target, seen in views:
-                self.remember_file(session, target, seen)
         if not from_queue:
             self._pause_queue(session)
+        # The files count as seen only once the model receives them (_content_sent).
+        self.unsent_views[session_id] = views
         self.live[session_id] = session
         self.statuses[session_id] = "running"
         task = self.tasks[session_id] = asyncio.create_task(self.run(session, prompt, content, attachments or None))
@@ -1391,6 +1397,7 @@ class AgentManager:
     async def stop(self, session_id):
         task = self.tasks.get(session_id)
         if task and not task.done():
+            self.stop_requested.add(task)  # Even a Stop the task absorbs (title naming) sends no queued follow-up.
             # Cancel the parent before child cleanup can release its awaited result.
             if not task.cancelling():
                 task.cancel()
@@ -1437,7 +1444,16 @@ class AgentManager:
             raise ValueError("At most 3 messages can wait. Remove one or wait for the reply.")
         if sum(len(item.get("text", "")) for item in queue) + len(text) > MAX_QUEUED_CHARS:
             raise ValueError("Queued messages can contain at most 50,000 characters in total.")
-        mentions.expand_context(self, session, self.session_tools(session), text, include_pending=False)
+        tools = self.session_tools(session)
+        mentions.expand_context(self, session, tools, text, include_pending=False)
+        if queue:
+            # Queued messages are sent together (steering, the follow-up, Send queued messages),
+            # so their files must also fit one message.
+            try:
+                mentions.expand_context(self, session, tools, "\n\n".join([*(item.get("text", "") for item in queue), text]),
+                                        include_pending=False, on_error="inline")
+            except ValueError as exc:
+                raise ValueError(f"Queued messages are sent as one message. {exc}") from None
         session["queued_messages"] = [*queue, {"id": str(uuid.uuid4()), "text": text, "created": time.time(),
                                                "paused": False}]
         self.store.save(session)
@@ -1491,7 +1507,7 @@ class AgentManager:
         for target, seen in views:
             self.remember_file(session, target, seen)
         wire.append({"role": "user", "content": STEER_PREFIX + content})
-        session.pop("pending_context", None)
+        self._drop_pending(session)
         # No await between the wire append and the event: event() appends the user event before
         # its first await, so the wire and the events never disagree (m4-history-branching).
         await self.event(session, "user", text=text, steered=True, in_wire=True,
@@ -1514,11 +1530,33 @@ class AgentManager:
         tasks.add(task)
         task.add_done_callback(tasks.discard)
 
+    async def publish_pending(self, session):
+        """Tell open pages which ! outputs wait for the next message (the composer's chips)."""
+        await self.broadcast(session["id"], {"type": "pending_context", "pending_context": pending_summary(session)})
+
+    def _drop_pending(self, session):
+        """The ! outputs were attached to a message just appended to the wire: they no longer wait."""
+        if session.pop("pending_context", None):
+            self._background(self.publish_pending(session))
+
+    def _content_sent(self, session):
+        """A turn's message, with its attachments, is now in the wire: its @ files count as seen
+        (the read-before-overwrite guard) and its ! output no longer waits."""
+        for target, seen in self.unsent_views.pop(session["id"], None) or []:
+            self.remember_file(session, target, seen)
+        self._drop_pending(session)
+
     def _after_task(self, session_id, kind, task):
         """Done-callback of a turn, compaction or ! command: send the unpaused queued messages
         as the next turn, unless the task was stopped or failed. Never raises."""
         try:
-            if self.tasks.get(session_id) is not task or task.cancelled() or task.cancelling() > 0:
+            stopped = task in self.stop_requested
+            self.stop_requested.discard(task)
+            if self.tasks.get(session_id) is not task:
+                return
+            if kind == "turn":
+                self.unsent_views.pop(session_id, None)  # A turn that never sent its message saw no file.
+            if stopped or task.cancelled() or task.cancelling() > 0:
                 return
             try:
                 session = self.get(session_id)
@@ -1578,6 +1616,7 @@ class AgentManager:
 
     async def run_shell(self, session, command, timeout_seconds=60, max_output_bytes=80000):
         event = job = None
+        noted = False
         try:
             await self.status(session, "running")
             event = await self.event(session, "tool", name="user_command", input={"command": command},
@@ -1594,6 +1633,7 @@ class AgentManager:
             note = {"kind": "shell", "command": command, "exit_code": job["exit_code"],
                     "text": text + ("\n[Output shortened.]" if page["next_offset"] is not None else "")}
             session["pending_context"] = [*(session.get("pending_context") or []), note][-mentions.MAX_PENDING:]
+            noted = True
         except asyncio.CancelledError:
             if job is not None:
                 await self.jobs.stop(job["id"])
@@ -1609,6 +1649,8 @@ class AgentManager:
         finally:
             self.store.save(session)
             self.live.pop(session["id"], None)
+            if noted:  # The composer shows the output waiting for the next message.
+                await self.publish_pending(session)
             await self.status(session, "idle")
 
     async def side_question(self, session_id, question):
@@ -2968,7 +3010,7 @@ class AgentManager:
                 wire.pop()
             self.store.save(session)
         wire.append({"role": "user", "content": prompt if content is None else content})
-        session.pop("pending_context", None)  # Its ! output is in the content just appended.
+        self._content_sent(session)  # Its @ files are now seen and its ! output no longer pending.
         context_window = self.settings.values.get("context_window", DEFAULT_CONTEXT_WINDOW)
         max_output_tokens = self.settings.values.get("max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS)
         url = host + "/serving-endpoints/" + quote(session["model"], safe="") + "/invocations"

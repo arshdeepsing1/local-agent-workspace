@@ -31,11 +31,15 @@ export function parseMentions(text) {
 
 export const mentionLabel = item => `@${item.path}${item.start ? `:${item.start === item.end ? item.start : `${item.start}-${item.end}`}` : ''}`
 
-// The message without one token (every place it is a whole token).
+// The message without one token (every place it is a whole token). Only the spaces around each
+// removed token change: one space stays between the words it separated, none at a line end.
 export function removeMention(text, token) {
   const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  return text.replace(new RegExp(`(?<![\\w.@/])@${escaped}(?=$|\\s|[.,;:!?)\\]}]+(?:\\s|$))`, 'g'), '')
-    .replace(/[ \t]{2,}/g, ' ').replace(/^ /, '')
+  const pattern = new RegExp(`([ \\t]*)(?<![\\w.@/])@${escaped}(?=$|\\s|[.,;:!?)\\]}]+(?:\\s|$))([ \\t]*)`, 'g')
+  return text.replace(pattern, (match, before, after, offset, whole) => {
+    const next = whole[offset + match.length]
+    return next === undefined || next === '\n' || next === '\r' ? '' : before
+  })
 }
 
 // The "@word" being typed at the caret: { query, start } or null.

@@ -228,6 +228,27 @@ async def test_a_sent_snapshot_counts_as_read_and_skills_come_only_from_the_type
     assert len(requests) == 2
 
 
+@pytest.mark.parametrize("how", ["credentials", "stop"])
+async def test_a_file_counts_as_seen_only_once_the_model_receives_it(runtime, how):
+    manager, session, project = runtime
+    sid = session["id"]
+    (project / "notes.txt").write_text("old\n")
+    if how == "credentials":
+        def missing():
+            raise ValueError("Databricks credentials are not configured.")
+        manager.settings.credentials = missing
+    manager.start(sid, "Rewrite @notes.txt")
+    if how == "stop":
+        await manager.stop(sid)
+    await finish(manager, sid)
+    await asyncio.sleep(0.02)  # The done-callback.
+    stored = manager.get(sid)
+    assert not any("notes.txt" in str(message.get("content")) for message in stored["wire"])
+    assert str(project / "notes.txt") not in (stored.get("file_views") or {})
+    assert manager.overwrite_refusal(stored, manager.session_tools(stored), "notes.txt").startswith("Read notes.txt before")
+    assert sid not in manager.unsent_views
+
+
 async def test_a_refused_file_is_an_error_before_the_turn_starts(runtime):
     manager, session, project = runtime
     (project / ".env").write_text("A=1\n")
@@ -267,6 +288,26 @@ def test_find_files_ranks_prunes_and_does_not_follow_links(runtime, tmp_path):
     assert find_files(tools, "parser.py")[0] == {"path": "src/parser.py", "name": "parser.py"}
     everything = [item["path"] for item in find_files(tools, "")]
     assert ".env" not in everything and not any(path.startswith(("node_modules", "dist", "linked")) for path in everything)
+
+
+def test_find_files_offers_only_paths_an_at_token_can_name(runtime):
+    manager, session, project = runtime
+    for name in ("my notes.txt", "it's.md", "a<b>.txt", "pipe|x.txt", "tick`x.txt", "at@x.txt", "notes.", "page:12",
+                 "notes.txt", "page-12.md"):
+        (project / name).write_text("x")
+    names = [item["path"] for item in find_files(manager.session_tools(session), "")]
+    assert names == ["notes.txt", "page-12.md"]
+    for path in names:  # Each offered path, inserted as '@path ', names that very file.
+        assert parse_mentions(f"Read @{path} please") == [{"token": path, "path": path, "start": None, "end": None}]
+
+
+def test_the_transcript_shows_attached_paths_as_code(runtime):
+    from local_agent.transcript import transcript
+    manager, session, _ = runtime
+    session["events"] = [{"id": "u", "type": "user", "created": 1, "text": "Look",
+                          "attachments": [{"kind": "file", "path": "backend/local_agent/__init__.py", "start_line": 1,
+                                           "end_line": 20, "truncated": False}]}]
+    assert "_Attached when sent: `@backend/local_agent/__init__.py` lines 1–20_" in transcript(session)
 
 
 def test_find_files_stops_after_5000_entries(runtime, monkeypatch):

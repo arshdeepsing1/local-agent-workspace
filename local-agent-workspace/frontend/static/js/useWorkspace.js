@@ -198,6 +198,7 @@ export function useWorkspace() {
           if (data.status === 'idle') void refreshSessions().catch(e => setError(e.message))
         }
         if (data.type === 'queue') setSession(current => current?.id === activeId ? { ...current, queued_messages: data.queued_messages || [], queue_error: data.error || null } : current)
+        if (data.type === 'pending_context') setSession(current => current?.id === activeId ? { ...current, pending_context: data.pending_context || [] } : current)
         if (data.type === 'title') {
           setSession(current => current?.id === activeId ? { ...current, title: data.title } : current)
           setSessions(current => current.map(item => item.id === activeId ? { ...item, title: data.title } : item))
@@ -370,6 +371,7 @@ export function useWorkspace() {
   }
   // Composer: ! commands, /btw side questions, the message queue and the @ file menu.
   const [sideAnswer, setSideAnswer] = useState({ key: null, value: null })
+  const sidePending = useRef(new Set())  // Chats with a side question being answered (one at a time).
   const runShell = async command => {
     const id = await ensureSession(selected.current)
     await api(`/sessions/${encodeURIComponent(id)}/shell`, 'POST', { command })
@@ -377,6 +379,8 @@ export function useWorkspace() {
   const askSide = async question => {
     const target = selected.current
     if (!target.id) throw new Error('Start a conversation first.')
+    if (sidePending.current.has(target.id)) throw new Error('A side question is already being answered in this conversation.')
+    sidePending.current.add(target.id)
     setSideAnswer({ key: target.key, value: { question, answer: null } })
     try {
       const result = await api(`/sessions/${encodeURIComponent(target.id)}/side-question`, 'POST', { question })
@@ -385,7 +389,7 @@ export function useWorkspace() {
     } catch (error) {
       setSideAnswer(current => current.key === target.key && current.value?.question === question ? { key: null, value: null } : current)
       throw error
-    }
+    } finally { sidePending.current.delete(target.id) }
   }
   const dismissSide = () => setSideAnswer({ key: null, value: null })
   const removeQueued = async itemId => {

@@ -97,11 +97,11 @@ def test_a_shell_command_runs_once_and_its_output_waits_for_the_next_message(ui,
     assert ui.bodies("/api/sessions/a/shell", "POST") == [{"command": "ls -la src"}]
     assert not ui.requests("/api/sessions/a/messages")
     expect(box).to_have_value("")
-    ui.emit("a", {"type": "snapshot", "session": {**{"id": "a", "title": "Work", "workspace": "/project", "model": "test-model",
-                                                      "status": "idle", "events": [], "updated": 2, "permission_mode": "plan",
-                                                      "allowed_directories": []},
-                                                   "pending_context": [{"kind": "shell", "command": "ls -la src", "exit_code": 0}]}})
+    # What the server pushes when the command has finished, and again when a message took the output.
+    ui.emit("a", {"type": "pending_context", "pending_context": [{"kind": "shell", "command": "ls -la src", "exit_code": 0}]})
     expect(page.locator(".shell-chip")).to_have_text("Output of ! ls -la src (exit 0) goes with your next message")
+    ui.emit("a", {"type": "pending_context", "pending_context": []})
+    expect(page.locator(".shell-chip")).to_have_count(0)
     # More than one line is never sent, and neither is a command while the chat is busy.
     box.fill("!echo one\necho two")
     expect(page.get_by_role("status").filter(has_text="Shell mode runs one line.")).to_be_visible()
@@ -136,6 +136,64 @@ def test_a_side_question_shows_its_answer_without_sending_a_message(ui, page):
     region.get_by_role("button", name="Dismiss").click()
     expect(page.get_by_role("region", name="Side question")).to_have_count(0)
     assert not ui.requests("/api/sessions/a/messages")
+
+
+def test_the_queue_button_is_an_outlined_icon_beside_stop(ui, page):
+    start_app(ui, page, status="running")
+    message(page).fill("Also update the README")
+    queue = page.get_by_role("button", name="Queue message")
+    style = queue.evaluate("""button => { const style = getComputedStyle(button), icon = getComputedStyle(button.querySelector('svg'))
+      return { background: style.backgroundColor, color: style.color, stroke: icon.stroke, margin: style.marginRight,
+               icon: button.querySelector('svg').getAttribute('class') } }""")
+    assert style["background"] == "rgb(255, 255, 255)" and style["margin"] == "6px"
+    assert style["color"] == style["stroke"] != style["background"]
+    assert "lucide-list-plus" in style["icon"]
+
+
+def test_a_pending_side_question_leaves_the_box_free(ui, page):
+    start_app(ui, page, status="running", setup="fake.sideAnswer = fake.deferred()")
+    box = message(page)
+    box.fill("/btw how far along?")
+    expect(page.get_by_role("button", name="Queue message")).to_have_count(0)
+    page.get_by_role("button", name="Ask side question").click()
+    ui.wait("fake.requests('/api/sessions/a/side-question', 'POST').length === 1")
+    assert ui.bodies("/api/sessions/a/side-question", "POST") == [{"question": "how far along?"}]
+    region = page.get_by_role("region", name="Side question")
+    expect(region.get_by_role("status")).to_have_text("Answering…")
+    expect(box).to_have_value("")
+    box.fill("Also fix the tests")
+    expect(page.get_by_role("button", name="Queue message")).to_be_enabled()
+    box.press("Enter")
+    ui.wait("fake.requests('/api/sessions/a/messages', 'POST').length === 1")
+    assert ui.bodies("/api/sessions/a/messages", "POST") == [{"text": "Also fix the tests"}]
+    box.fill("/btw and now?")  # One side question at a time: the text stays, with the reason.
+    box.press("Enter")
+    expect(page.get_by_role("alert")).to_contain_text("A side question is already being answered in this conversation.")
+    expect(box).to_have_value("/btw and now?")
+    assert len(ui.requests("/api/sessions/a/side-question", "POST")) == 1
+    ui.run("fake.sideAnswer.resolve(fake.json({ answer: 'Halfway.', request_info: { status: 'completed' } }))")
+    expect(region.get_by_role("status")).to_have_text("Side answer ready.")
+    expect(region.locator(".side-body")).to_have_text("Halfway.")
+
+
+def test_a_failed_side_question_returns_its_text_and_copy_failures_are_reported(ui, page):
+    start_app(ui, page, setup="fake.sideAnswer = fake.deferred()")
+    box = message(page)
+    box.fill("/btw what changed?")
+    box.press("Enter")
+    ui.wait("fake.requests('/api/sessions/a/side-question', 'POST').length === 1")
+    expect(box).to_have_value("")
+    ui.run("fake.sideAnswer.resolve(fake.json({ detail: 'This conversation is too long for a side question right now. Compact it first.' }, 400))")
+    expect(page.get_by_role("alert")).to_contain_text("This conversation is too long for a side question right now.")
+    expect(box).to_have_value("/btw what changed?")
+    expect(page.get_by_role("region", name="Side question")).to_have_count(0)
+    ui.run("fake.sideAnswer = null; navigator.clipboard.writeText = async () => { throw new Error('denied') }")
+    box.press("Enter")
+    region = page.get_by_role("region", name="Side question")
+    copy = region.get_by_role("button", name="Copy answer")
+    copy.click()
+    expect(page.get_by_role("alert")).to_contain_text("Could not copy the answer. Select its text and copy it instead.")
+    expect(copy).to_have_text("Copy answer")
 
 
 def test_a_side_question_while_busy_and_without_a_conversation(ui, page):

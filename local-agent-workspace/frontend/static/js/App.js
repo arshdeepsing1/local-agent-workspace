@@ -115,7 +115,7 @@ export default function App() {
         <${ContinueButton} session=${active} disabled=${!app.ready || !app.online || app.modelSaving || !app.settings?.configured} onSend=${app.send} onError=${showError} />
         <${QueueBar} session=${active} onRemove=${app.removeQueued} onSend=${app.sendQueued} onError=${showError}
           onEdit=${async item => { await app.removeQueued(item.id); setDraft(current => current ? `${current}\n${item.text}` : item.text) }} />
-        <${SideAnswer} side=${app.sideAnswer} onDismiss=${app.dismissSide} /></div>
+        <${SideAnswer} side=${app.sideAnswer} onDismiss=${app.dismissSide} onError=${showError} /></div>
         ${composer}
         ${active?.status === 'awaiting_approval' ? html`<p class="composer-hint" role="status">${(name => name === 'ask_user' ? 'The agent is waiting for your answer above.' : name === 'submit_plan' ? 'A plan is waiting for your review above.' : 'An action is waiting for your approval above.')(active.events?.findLast(event => event.state === 'pending')?.name)}</p>` : null}
         ${active?.status === 'compacting' ? html`<p class="composer-hint" role="status">Compacting context…</p>` : null}

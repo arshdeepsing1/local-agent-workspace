@@ -105,6 +105,38 @@ async def test_the_next_prompt_carries_the_fenced_output_once(runtime, monkeypat
     assert requests[1]["messages"][-1] == {"role": "user", "content": "And now?"}
 
 
+async def test_open_pages_learn_when_output_waits_and_when_it_was_sent(runtime, monkeypatch):
+    manager, session, _ = runtime
+    sent = []
+    broadcast = manager.broadcast
+
+    async def record(session_id, data):
+        sent.append(data)
+        await broadcast(session_id, data)
+    monkeypatch.setattr(manager, "broadcast", record)
+    manager.start_shell(session["id"], "echo hello")
+    await finish(manager, session["id"])
+    pending = [data for data in sent if data.get("type") == "pending_context"]
+    assert pending == [{"type": "pending_context", "pending_context": [{"kind": "shell", "command": "echo hello", "exit_code": 0}]}]
+    # It precedes the idle status, so the chip is there when the composer unlocks.
+    idle = [index for index, data in enumerate(sent) if data.get("type") == "status" and data.get("status") == "idle"]
+    assert idle and sent.index(pending[0]) < idle[-1]
+    sent.clear()
+    client = httpx.AsyncClient
+
+    async def handle(request):
+        return httpx.Response(200, text="data: " + json.dumps({"choices": [{"delta": {"content": "Seen."},
+                                                                             "finish_reason": "stop"}]}) + "\n\ndata: [DONE]\n\n")
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client(**{"transport": httpx.MockTransport(handle), **kwargs}))
+    manager.start(session["id"], "What did it print?")
+    await finish(manager, session["id"])
+    assert [data for data in sent if data.get("type") == "pending_context"] == [{"type": "pending_context", "pending_context": []}]
+    sent.clear()
+    manager.start(session["id"], "And now?")  # Nothing was waiting: nothing to tell.
+    await finish(manager, session["id"])
+    assert not [data for data in sent if data.get("type") == "pending_context"]
+
+
 async def test_a_turn_that_fails_before_sending_keeps_the_output(runtime):
     manager, session, _ = runtime
     manager.start_shell(session["id"], "echo kept")

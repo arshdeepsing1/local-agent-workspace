@@ -77,7 +77,8 @@
 //   output?, truncated, timeout_seconds, max_output_bytes, background,
 //   without_shell? (true: ran from an argument vector without a shell) }
 // Composer (M4): Session.queued_messages?: QueuedMessage[]; Session.pending_context?: [{ kind: 'shell', command,
-//   exit_code }] (! output attached to the next message; its text stays on the server).
+//   exit_code }] (! output attached to the next message; its text stays on the server). Pushed as
+//   { type: 'pending_context', pending_context } when a command adds one and when a message takes them.
 // QueuedMessage: { id, text, created, paused } (paused: left over from a stop or failure; sent only by
 //   'Send queued messages'). POST /sessions/<id>/messages while busy -> { ok, queued: true, queued_messages };
 //   otherwise { ok: true }. 400 when 3 are waiting or their text would exceed 50,000 characters.
@@ -90,7 +91,8 @@
 //   (idle only; runs in every mode; shows a 'user_command' tool event).
 // POST /sessions/<id>/side-question { question (1..4000) } -> { answer, request_info: { status, finish_reason, usage? } };
 //   409 while another side question of the chat is answered.
-// GET /sessions/<id>/mention-files?q= (or /mention-files?q= before a chat exists) -> [{ path, name }] (at most 30).
+// GET /sessions/<id>/mention-files?q= (or /mention-files?q= before a chat exists) -> [{ path, name }] (at most 30;
+//   only paths an @ token can spell). Queued messages must also fit one message's @ limits together.
 // Skill: { id, name, description, path } (path is workspace-relative, or absolute
 //   for a skill shipped with the app)
 // Changes (pushed as { type: 'changes', changes } and returned by Keep/Undo): {
