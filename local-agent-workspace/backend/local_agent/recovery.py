@@ -412,3 +412,91 @@ class CheckpointManager:
         self._save(record)
         return {**self._metadata(record), "reverse_checkpoint_id": reverse["id"],
                 "diff": _diff(current, record["before"], record["path"])}
+
+    def _rewind_files(self, tools, session_id, turn_ids):
+        """Per edited file, its state before the first in-range agent edit and whether it can go back there.
+
+        Internal: the before states never leave the server.
+        """
+        turns = set(turn_ids)
+        records = [json.loads(row[0]) for row in self.store.db.execute(
+            "SELECT data FROM checkpoints WHERE session_id=? AND workspace=?", (session_id, str(tools.root)))]
+        groups = {}
+        for record in sorted(records, key=lambda item: item["created"]):
+            if record.get("turn_id") in turns and record["status"] == "applied":
+                groups.setdefault(record["target"], []).append(record)
+        files = []
+        for target_text, group in groups.items():
+            first, latest = group[0], group[-1]
+            entry = {"path": first["path"], "records": group, "before": first["before"]}
+            try:
+                target = tools.path(first["path"])
+                if str(target) != target_text:
+                    raise ValueError("Checkpoint path now resolves to a different file.")
+                entry.update(target=target, path=tools.display_path(target))
+                current = _snapshot(target)
+            except (ValueError, OSError, UnicodeError) as exc:
+                entry.update(status="unavailable", error=file_error(exc))
+                files.append(entry)
+                continue
+            entry["current"] = current
+            if any(left["after"]["hash"] != right["before"]["hash"] for left, right in zip(group, group[1:])):
+                # Something else wrote the file between two agent edits (an editor save, Undo, a
+                # Recovery restore, a subagent or a command); going back would revert that write too.
+                entry["status"] = "interleaved"
+            elif current["exists"] == first["before"]["exists"] and current["content"] == first["before"]["content"]:
+                entry["status"] = "unchanged"
+            elif not _same(current, latest["after"]):
+                entry["status"] = "drifted"
+            else:
+                entry["status"] = "restore"
+            files.append(entry)
+        return files
+
+    @staticmethod
+    def _rewind_public(files):
+        listed = [{"path": entry["path"], "status": entry["status"], **({"error": entry["error"]} if "error" in entry else {})}
+                  for entry in files]
+        return {"files": listed, "can_rewind": all(entry["status"] in ("restore", "unchanged") for entry in files)}
+
+    def rewind_plan(self, tools, session_id, turn_ids):
+        """What a code rewind of these turns would do, file by file, without changing anything."""
+        return self._rewind_public(self._rewind_files(tools, session_id, turn_ids))
+
+    def rewind(self, tools, session_id, turn_ids):
+        """Restore every file these turns edited to its state before the first of those edits.
+
+        All files are checked before any is written; one write per file, each with a
+        reverse checkpoint, so Recovery can undo the rewind. Only this chat's file-tool
+        edits are rewound; command and subagent edits are not.
+        """
+        files = self._rewind_files(tools, session_id, turn_ids)
+        plan = self._rewind_public(files)
+        if not plan["can_rewind"]:
+            raise ValueError(rewind_refusal([item["path"] for item in plan["files"]
+                                             if item["status"] not in ("restore", "unchanged")]))
+        done = []
+        for entry in files:
+            if entry["status"] == "restore":
+                try:
+                    self.apply_state(tools, entry["records"][0]["path"], entry["target"], entry["current"],
+                                     entry["before"], session_id)
+                except (ValueError, OSError, UnicodeError) as exc:
+                    self._mark_restored(done)
+                    rewound = ", ".join(item["path"] for item in done if item["status"] == "restore") or "no files"
+                    raise ValueError(f"Rewound {rewound}; could not rewind {entry['path']}: {file_error(exc)}. "
+                                     "Rewound files can be restored from Agent tools → Recovery.") from exc
+            done.append(entry)
+        self._mark_restored(done)
+        return plan
+
+    def _mark_restored(self, entries):
+        for entry in entries:
+            for record in entry["records"]:
+                record["status"] = "restored"
+                self._save(record)
+
+
+def rewind_refusal(paths):
+    return (f"Cannot rewind files: {', '.join(paths)} changed after the agent's last edit or between its edits "
+            "(for example you saved them, used Undo, or a command or subagent changed them). Nothing was changed.")

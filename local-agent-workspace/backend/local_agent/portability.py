@@ -60,6 +60,17 @@ class Answer(Record):
     other: str | None = Field(default=None, max_length=1000)
 
 
+class Attachment(Record):
+    """Metadata of an @ file snapshot or a ! command output sent with a user message (never its content)."""
+    kind: Literal["file", "shell"]
+    path: str | None = Field(default=None, max_length=4096)
+    start_line: int | None = Field(default=None, ge=1)
+    end_line: int | None = Field(default=None, ge=0)
+    truncated: bool | None = None
+    command: str | None = Field(default=None, max_length=2000)
+    exit_code: int | None = None
+
+
 class Event(Record):
     id: str = Field(min_length=1, max_length=512)
     type: Literal["user", "assistant", "tool", "notice", "error"]
@@ -97,6 +108,13 @@ class Event(Record):
     plan_mode: Literal["acceptEdits", "manual"] | None = None
     feedback: str | None = Field(default=None, max_length=2000)
     skipped_reason: Literal["dont_ask"] | None = None
+    # User events: in_wire is true once the text reached the model history as its own
+    # message (absent on events saved before it existed); steered marks a message sent
+    # while the agent was working. Notices: stop_phase says what a Stop interrupted.
+    in_wire: bool | None = None
+    steered: bool | None = None
+    attachments: list[Attachment] | None = Field(default=None, max_length=10)
+    stop_phase: Literal["streaming", "tools", "waiting"] | None = None
 
 
 class Function(Record):
@@ -341,20 +359,26 @@ def completed_for_fork(session):
     if any(event.get("state") in ("pending", "running") or (event.get("request_info") or {}).get("status") == "running"
            for event in session["events"]):
         raise ValueError("Only a completed conversation can be forked.")
-    if reason is None:
-        # Older records lack a terminal marker. An archived assistant error or
-        # partial draft is not proof that its latest turn completed.
-        events = session["events"]
-        start = max((index for index, event in enumerate(events) if event["type"] == "user"), default=0)
-        last = events[-1] if events else {}
-        info = last.get("request_info") or {}
-        if (last.get("type") != "assistant" or not last.get("text")
+    if reason is None and not latest_turn_completed(session):
+        raise ValueError("This older conversation has no confirmed completed response to fork.")
+    _validate_wire(wire, complete=True)
+
+
+def latest_turn_completed(session):
+    """Whether the events show the latest turn ended in a completed reply.
+
+    Older records lack a terminal marker. An archived assistant error or
+    partial draft is not proof that its latest turn completed.
+    """
+    events = session["events"]
+    start = max((index for index, event in enumerate(events) if event["type"] == "user"), default=0)
+    last = events[-1] if events else {}
+    info = last.get("request_info") or {}
+    return not (last.get("type") != "assistant" or not last.get("text")
                 or info.get("status", "completed") != "completed"
                 or info.get("finish_reason", "stop") != "stop"
                 or any(event["type"] == "error" or event.get("state") in ("error", "cancelled", "pending", "running")
-                       for event in events[start:])):
-            raise ValueError("This older conversation has no confirmed completed response to fork.")
-    _validate_wire(wire, complete=True)
+                       for event in events[start:]))
 
 
 def _remap_calls(source):
