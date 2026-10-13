@@ -9,11 +9,11 @@
 //   python_venv (virtual environment the agent's commands, Verify, hooks and the Terminal use, '' = off),
 //   coding_dir_status: { path, state: 'off'|'ready'|'missing'|'invalid', message, source: 'settings'|'env'|'none' }
 //     (path: the checked absolute folder; the raw value only when invalid; null when off),
-//   python_venv_status: { path, state: 'off'|'ready'|'invalid', message, python, version, source },
+//   python_venv_status: { path, state: 'off'|'ready'|'invalid', message, python, version, pip (bool when ready), source },
 //   default_model (the app's default endpoint),
 //   default_limits: { context_window, max_output_tokens } (the saved model's defaults; budgets equal to them
-//     follow a model change), model_migrated_from? (set once after the one-time move of
-//   saved settings from the old default model; cleared by the next save) }
+//     follow a model change), model_migrated_from? (set while a legacy settings file at the old default
+//   model is moved at load; cleared by the next save, which writes settings_version 2) }
 // GET /settings -> Settings (the folder states checked again). PUT /settings { ...editable fields } -> Settings.
 // POST /settings/limits { model, context_window, max_output_tokens } -> LimitsCheck:
 //   { profile: { label, context_max, output_max, itpm, otpm, recommended_context_window,

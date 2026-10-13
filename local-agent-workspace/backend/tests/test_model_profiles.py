@@ -63,6 +63,20 @@ def test_an_env_model_without_opus_limits_keeps_131072_and_8192(app_root, monkey
     assert limits(Settings(app_root / "state")) == (131_072, 8_192)
 
 
+@pytest.mark.parametrize("value", ["", "   "])
+def test_an_empty_env_model_line_means_the_default_model(app_root, monkeypatch, value):
+    monkeypatch.setenv("LOCAL_AGENT_MODEL", value)
+    settings = Settings(app_root / "state")
+    assert settings.values["model"] == OPUS and limits(settings) == (200_000, 16_384)
+
+
+def test_an_empty_model_line_in_env_file_means_the_default_model(app_root, monkeypatch):
+    monkeypatch.delenv("LOCAL_AGENT_MODEL")
+    (app_root / "app").mkdir()
+    (app_root / "app" / ".env").write_text("LOCAL_AGENT_MODEL=\n")
+    assert Settings(app_root / "state").values["model"] == OPUS
+
+
 def test_a_versioned_file_without_limits_takes_its_models_defaults(app_root, monkeypatch):
     monkeypatch.delenv("LOCAL_AGENT_MODEL")
     write_settings(app_root / "state", {"model": GPT, "settings_version": 2})
@@ -88,7 +102,7 @@ def test_public_settings_keep_the_budget_keys_in_a_stable_order(app_root):
 # 2 Migration
 
 
-@pytest.mark.parametrize("env_model", [None, GPT])
+@pytest.mark.parametrize("env_model", [None, GPT, OPUS, f" {OPUS} "])
 def test_a_legacy_file_at_the_old_default_moves_to_opus_once(app_root, monkeypatch, env_model):
     if env_model is None:
         monkeypatch.delenv("LOCAL_AGENT_MODEL")

@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from local_agent import permissions
+from local_agent import tools as tools_module
 from local_agent.agents import AgentManager
 from local_agent.api import create_app
 from local_agent.config import Settings
@@ -268,6 +269,24 @@ def test_protected_reason_for_home_app_and_granted_folders():
     assert check(Path("/srv/granted/.vscode/settings.json")) == "editor and repository configuration (.vscode)"
     assert check(root / "src" / "main.py") is None and check(home / "notes.txt") is None
     assert check(root / "src" / "github" / "workflows.txt") is None
+
+
+def test_protected_reason_compares_home_and_app_by_identity(tmp_path, monkeypatch):
+    # A bind mount, a macOS firmlink or a case variant on a case-insensitive disk is another name for the same
+    # folder; resolve() does not map it, so the home and app tests also compare file identity.
+    root, home, app = tmp_path / "project", tmp_path / "home", tmp_path / "app"
+    home_alias, app_alias = tmp_path / "Home", tmp_path / "App"
+    for folder in (root, home / ".ssh", app, home_alias / ".ssh", app_alias / "backend"):
+        folder.mkdir(parents=True, exist_ok=True)
+    real = tools_module._identity
+    names = {home_alias: home, app_alias: app}
+    monkeypatch.setattr(tools_module, "_identity", lambda path: real(names.get(Path(path), path)))
+    check = lambda path: protected_reason(path, path, root=root, home=home, app_root=app)  # noqa: E731
+    assert check(home_alias / ".ssh" / "authorized_keys") == "shell and Git startup files (~/.ssh)"
+    assert check(home_alias / ".bashrc") == "shell and Git startup files (~/.bashrc)"
+    assert check(home_alias / ".config" / "git" / "config") == "Git configuration (~/.config/git)"
+    assert check(app_alias / "backend" / "x.py") == "this app's own files"
+    assert check(home_alias / "notes.txt") is None and check(root / "src" / "a.py") is None
 
 
 @pytest.mark.parametrize("mode, decision", [("acceptEdits", "ask"), ("auto", "ask"), ("manual", "ask"),

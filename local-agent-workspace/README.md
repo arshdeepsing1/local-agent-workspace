@@ -104,15 +104,17 @@ private state. The example paths must be replaced. The installation command
 installs runtime libraries automatically; add `./backend[test]` instead of
 `./backend` only if you need to run the backend tests.
 
-Without `LOCAL_AGENT_MODEL` the app uses `databricks-claude-opus-5-5` (Claude Opus 5.5,
+Without `LOCAL_AGENT_MODEL`, or with it empty, the app uses `databricks-claude-opus-5-5` (Claude Opus 5.5,
 with a 200,000-token context budget and 16,384 Max output tokens). `LOCAL_AGENT_MODEL` in
 `.env` applies only while no model is saved in Settings: once you save Settings (or choose a
 model in the model picker), the saved model wins over `.env`, so change the model there, not
 in `.env`. Saved settings from before Opus 5.5 became the default that still hold GPT OSS 120B
-at 131,072 and 8,192 move to Opus 5.5 once, also when `.env` still says
-`LOCAL_AGENT_MODEL=databricks-gpt-oss-120b` (the old `.env.example` value); Settings says so,
-and Opus 5.5 costs more per token. Choose `databricks-gpt-oss-120b` in Settings or the model
-picker to switch back; the choice is kept after that.
+at 131,072 and 8,192 move to Opus 5.5 once, also when `.env` says
+`LOCAL_AGENT_MODEL=databricks-gpt-oss-120b` (the old `.env.example` value) or
+`databricks-claude-opus-5-5` (the new one); Settings says so, and Opus 5.5 costs more per token.
+To switch back, choose `databricks-gpt-oss-120b` in Settings, or in the model picker of a new
+conversation (in an open conversation the picker changes only that conversation). The choice is
+kept after that, and Settings shows the note until then.
 
 Two optional values can be left empty:
 

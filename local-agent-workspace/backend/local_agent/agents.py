@@ -2749,11 +2749,18 @@ class AgentManager:
         venv = user_paths.python_venv_status(self.settings)
         if venv["state"] == "ready":
             path = venv["path"]
-            return (f"\nPython: commands run with the virtual environment {path} active (VIRTUAL_ENV set, {path}/bin "
-                    "first on PATH), so python, pip and installed tools resolve there"
-                    + (f" (Python {venv['version']})" if venv["version"] else "")
-                    + ". Install packages with `python -m pip`; do not create another virtual environment unless the "
-                    "user asks. Files inside it can be changed only with the user's approval.")
+            version = f" (Python {venv['version']})" if venv["version"] else ""
+            start = (f"\nPython: commands run with the virtual environment {path} active (VIRTUAL_ENV set, {path}/bin "
+                     "first on PATH), so python")
+            if venv.get("pip") is False:
+                return (start + f" and installed tools resolve there{version}. This environment has no pip, so a `pip` "
+                        "found on PATH belongs to another Python: never use it. Install packages with `uv pip install "
+                        "...` (uv targets the active VIRTUAL_ENV); if uv is not available, ask the user before running "
+                        "`python -m ensurepip`. Do not create another virtual environment unless the user asks. Files "
+                        "inside it can be changed only with the user's approval.")
+            return (start + f", pip and installed tools resolve there{version}. Install packages with `python -m pip`; "
+                    "do not create another virtual environment unless the user asks. Files inside it can be changed "
+                    "only with the user's approval.")
         if venv["state"] == "invalid":
             reason = venv["message"].removeprefix("Not used: ").rstrip(".")
             return (f"\nPython: the virtual environment set in Settings ({venv['path']}) is not usable ({reason}), so "

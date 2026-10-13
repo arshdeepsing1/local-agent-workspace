@@ -4,11 +4,12 @@
 Both are checked every time they are used, so a folder that is removed or changed later
 is reported in Settings and not used. Nothing here executes a program.
 """
+import glob
 import os
 import sys
 from pathlib import Path
 
-from .tools import excluded
+from .tools import excluded, parts_below
 from .workspace_folders import _within
 
 SYSTEM_DIRS = ("/etc", "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/boot", "/proc", "/sys", "/dev", "/run",
@@ -70,7 +71,8 @@ def check_coding_dir(value, *, state_dir, env_file="", app_root, home):
         raise ValueError("This path is a credential location, which file tools never use.")
     if kind == "generated":
         raise ValueError("File tools exclude this internal or generated folder (.git, .venv, node_modules and similar).")
-    if home is not None and resolved.is_relative_to(home) and resolved.relative_to(home).parts[0].startswith("."):
+    inside = parts_below(resolved, home) if home is not None else None  # Also under another name for home.
+    if inside and inside[0].startswith("."):
         raise ValueError("This is inside a hidden configuration folder in your home folder (such as ~/.config or ~/.ssh).")
     if env_file:
         try:
@@ -148,6 +150,9 @@ def check_python_venv(value, *, state_dir, app_root):
     """{path, python, version} for a virtual environment folder, or ValueError with the reason it is refused.
     path is absolute but not resolved: a venv's programs find it by the name they were started under."""
     venv = _absolute(value)
+    if os.pathsep in str(venv):  # PATH would split <venv>/bin into other entries (CPython's venv refuses it too).
+        raise ValueError(f"This path contains '{os.pathsep}', which cannot appear in a PATH entry, so commands could "
+                         "not use this environment; move or rename it to a path without it.")
     resolved = _resolve(venv)
     if resolved.parent == resolved:
         raise ValueError("The filesystem root is not a virtual environment.")
@@ -192,6 +197,13 @@ def _pyvenv_version(config_file):
     return None
 
 
+def has_pip(venv):
+    """Whether the pip module is installed in the virtual environment (uv venv and --without-pip leave it out).
+    Looks for the package, as `python -m pip` needs it; nothing runs."""
+    pattern = os.path.join(glob.escape(str(venv)), "lib", "python*", "site-packages", "pip", "__init__.py")
+    return bool(glob.glob(pattern))
+
+
 def _python_venv(value, settings):
     from . import config
     return check_python_venv(value, state_dir=settings.state_dir, app_root=config.APP_ROOT)
@@ -208,16 +220,18 @@ def python_venv_status(settings):
     value = value.strip() if isinstance(value, str) else ""
     if not value:
         return {"path": None, "state": "off", "message": "Not set. Commands use the Python on the server's PATH.",
-                "python": None, "version": None, "source": "none"}
+                "python": None, "version": None, "pip": None, "source": "none"}
     source = _source(settings, "python_venv", value)
     try:
         venv = _python_venv(value, settings)
     except (ValueError, OSError) as exc:
         return {"path": value, "state": "invalid", "message": "Not used: " + str(exc), "python": None, "version": None,
-                "source": source}
+                "pip": None, "source": source}
     version = f" (Python {venv['version']})" if venv["version"] else ""
-    return {"path": venv["path"], "state": "ready", "message": f"Ready: commands use {venv['python']}{version}.",
-            "python": venv["python"], "version": venv["version"], "source": source}
+    pip = has_pip(venv["path"])
+    return {"path": venv["path"], "state": "ready",
+            "message": f"Ready: commands use {venv['python']}{version}." + ("" if pip else " No pip is installed in it."),
+            "python": venv["python"], "version": venv["version"], "pip": pip, "source": source}
 
 
 def usable_python_venv(settings):

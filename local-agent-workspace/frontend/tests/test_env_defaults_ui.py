@@ -181,11 +181,28 @@ def test_the_input_budget_names_what_a_capped_endpoint_gets(ui, page):
     expect(dialog.get_by_text("Current estimated input budget: 281,568 tokens.", exact=False)).to_be_visible()
 
 
+def test_the_auto_compact_hint_names_what_a_capped_endpoint_gets(ui, page):
+    dialog = open_settings(ui, page, settings_setup(model=f"'{OPUS}'"))
+    dialog.get_by_label("Context budget (tokens)").fill("1048576")
+    dialog.get_by_label("Max output tokens per request").fill("16384")
+    expect(dialog.get_by_text("With these settings that is about 927,129 tokens (883,411 for requests to this "
+                              "endpoint).", exact=False)).to_be_visible()
+    dialog.get_by_label("Max output tokens per request").fill("131072")
+    expect(dialog.get_by_text("that is about 823,910 tokens (782,956 for requests to this endpoint).",
+                              exact=False)).to_be_visible()
+    dialog.get_by_label("Context budget (tokens)").fill("300000")
+    expect(dialog.get_by_text("that is about 150,192 tokens (152,956 for requests to this endpoint).",
+                              exact=False)).to_be_visible()  # Output capped at 128,000.
+    dialog.get_by_label("Max output tokens per request").fill("16384")
+    expect(dialog.get_by_text("With these settings that is about 253,411 tokens. Lower", exact=False)).to_be_visible()
+
+
 def test_the_migration_note(ui, page):
     dialog = open_settings(ui, page, settings_setup(model=f"'{OPUS}'", model_migrated_from="'databricks-gpt-oss-120b'"))
     expect(dialog.get_by_role("status").filter(has_text="The default model changed")).to_have_text(
         "The default model changed from GPT OSS 120B to Claude Opus 5.5, the app's new default. Claude Opus 5.5 costs "
-        "more per token. To switch back, choose databricks-gpt-oss-120b here or in the model picker.")
+        "more per token. To switch back, choose databricks-gpt-oss-120b here and save, or in the model picker of a new "
+        "conversation (in an open conversation the picker changes only that conversation).")
     expect(dialog.get_by_label("Databricks model endpoint")).to_have_attribute("placeholder", OPUS)
 
 
