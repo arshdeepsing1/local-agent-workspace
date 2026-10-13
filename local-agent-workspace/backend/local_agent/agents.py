@@ -653,6 +653,16 @@ def repair_tool_history(wire, events, state):
     return repaired, state
 
 
+def card_answers(events, call_id, output):
+    """Whether the newest tool card of call_id is finished with output as what the model receives,
+    so repair_tool_history rebuilds the same tool message from it."""
+    for event in reversed(events):
+        if event.get("type") == "tool" and event.get("call_id") == call_id:
+            return (event.get("state") in ("completed", "error", "rejected")
+                    and event.get("model_output", event.get("output")) == output)
+    return False
+
+
 def unanswered(event, declined):
     """The model-facing result of an approval that was declined, blocked or never answered."""
     if event.get("approval") == "blocked":
@@ -4039,7 +4049,11 @@ class AgentManager:
                     if allowance.settled == settled:
                         allowance.charge(output)  # A refusal or another early return is sent too.
                     wire.append({"role": "tool", "tool_call_id": call["id"], "content": output})
-                    self.store.save(session)
+                    if not card_answers(session["events"], call["id"], output):
+                        # A finished card already saved this result; repair_tool_history rebuilds this
+                        # message from it if the app stops before the next save. Each save rewrites
+                        # the whole conversation file.
+                        self.store.save(session)
                 if step_index + 1 < steps:
                     await self.drain_queue(session, wire, tools, fits=lambda message: in_turn_tokens(
                         [*model_history(wire), message], context_state, system, definitions, input_budget,

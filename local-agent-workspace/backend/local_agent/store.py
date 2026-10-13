@@ -23,6 +23,32 @@ _METER_FIELDS = ("last_request", "next_estimate")
 _SIDECAR_FIELDS = ("file_views", "allow_rules", "queued_messages", "pending_context")
 
 
+# JSON encodings of strings this long are kept between saves of a conversation (Store._encoded):
+# tool results and replies are most of a large conversation's bytes, and each save rewrites the
+# whole file. An entry holds its string, so it can never be stale.
+CACHED_STRING_CHARS = 2048
+_encode_json = json.JSONEncoder(ensure_ascii=False, separators=(",", ":")).encode
+
+
+def _record_line(value, previous, current):
+    """json.dumps(value, ensure_ascii=False, separators=(",", ":")), reusing the encodings of long
+    strings from previous ({id: (string, encoding)}) and recording those it used in current."""
+    kind = type(value)
+    if kind is str:
+        if len(value) < CACHED_STRING_CHARS:
+            return _encode_json(value)
+        entry = previous.get(id(value))
+        text = entry[1] if entry is not None and entry[0] is value else _encode_json(value)
+        current[id(value)] = (value, text)
+        return text
+    if kind is dict and all(type(key) is str for key in value):
+        return "{" + ",".join(_encode_json(key) + ":" + _record_line(item, previous, current)
+                              for key, item in value.items()) + "}"
+    if kind is list:
+        return "[" + ",".join(_record_line(item, previous, current) for item in value) + "]"
+    return _encode_json(value)
+
+
 class UnreadableConversation(ValueError):
     """A conversation file that cannot be loaded. The reason never quotes its contents."""
 
@@ -54,6 +80,8 @@ class Store:
         self._command_jobs = {}
         # The sidecar state last written or read, as JSON text, per conversation ID.
         self._sidecars = {}
+        # Per conversation ID, the long strings encoded at its last save: {id(string): (string, JSON)}.
+        self._encoded = {}
         # Unreadable conversation files: {file name: reason}. They are skipped and
         # reported, never deleted, moved or rewritten.
         self._list_problems = {}
@@ -131,16 +159,19 @@ class Store:
         target = self._path(session["id"])
         temporary = self.conversations / f".{target.stem}.{uuid.uuid4().hex}.tmp"
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        # Rebuilt on every save, so only the strings still in the conversation are kept.
+        previous, current = self._encoded.get(session["id"], {}), {}
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as output:
                 for record in self._records(session):
-                    output.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+                    output.write(_record_line(record, previous, current))
                     output.write("\n")
                 output.flush()
                 os.fsync(output.fileno())
         except BaseException:
             temporary.unlink(missing_ok=True)
             raise
+        self._encoded[session["id"]] = current
         return temporary, target
 
     def _sync_directory(self):
@@ -443,6 +474,7 @@ class Store:
                 for session in prepared:
                     self._state_path(session["id"]).unlink(missing_ok=True)
                     self._sidecars.pop(session["id"], None)
+                    self._encoded.pop(session["id"], None)
                 self._sync_directory()
                 raise
         for original, saved in zip(sessions, prepared):
@@ -588,4 +620,5 @@ class Store:
             self._state_path(session_id).unlink(missing_ok=True)
             self._command_jobs.pop(session_id, None)
             self._sidecars.pop(session_id, None)
+            self._encoded.pop(session_id, None)
             self._sync_directory()

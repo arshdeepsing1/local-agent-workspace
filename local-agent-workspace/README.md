@@ -187,8 +187,11 @@ for jobs, tasks, checkpoints, and worktrees.
 ### Conversation durability and copies
 
 Streamed assistant text and reported usage are checkpointed after 16 KiB of new
-content or one second of dirty state, including when the provider stalls. Normal
-completion and Stop flush the final state. After an abrupt process death, the last
+content or one second of dirty state, including when the provider stalls. Each save
+rewrites the conversation's whole file, so in a long conversation (about 10 MB after some
+180 file reads at the default budget) checkpoints are spaced to at least 20 times the
+last save's duration, keeping saves to about a twentieth of streaming time; the JSON of
+long texts is reused between saves. Normal completion and Stop flush the final state. After an abrupt process death, the last
 saved partial reply is shown as interrupted; the most recent uncheckpointed text
 may be lost. Incomplete streamed tool arguments are never persisted as executable
 requests or replayed. A local storage failure stops the response and reports that
