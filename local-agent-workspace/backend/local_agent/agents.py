@@ -1823,6 +1823,7 @@ class AgentManager:
         # The files count as seen only once the model receives them (_content_sent).
         self.unsent_views[session_id] = views
         self.live[session_id] = session
+        self.store.keep_encodings(session_id)
         self.statuses[session_id] = "running"
         task = self.tasks[session_id] = asyncio.create_task(self.run(session, prompt, content, attachments or None))
         task.add_done_callback(lambda done: self._after_task(session_id, "turn", done))
@@ -1840,6 +1841,7 @@ class AgentManager:
         # A task cancelled before its first scheduling never enters run's finally.
         if task and task.cancelled() and self.tasks.get(session_id) is task:
             session = self.live.pop(session_id, None)
+            self.store.forget_encodings(session_id)
             if session is not None:
                 session.update(terminal_reason="stopped", turn_ended=time.time())
                 self.store.save(session)
@@ -2059,6 +2061,7 @@ class AgentManager:
         self.workspace_available(session["workspace"])
         self._pause_queue(session)
         self.live[session_id] = session
+        self.store.keep_encodings(session_id)
         self.statuses[session_id] = "running"
         task = self.tasks[session_id] = asyncio.create_task(
             self.run_shell(session, command, timeout_seconds, max_output_bytes))
@@ -2099,6 +2102,7 @@ class AgentManager:
         finally:
             self.store.save(session)
             self.live.pop(session["id"], None)
+            self.store.forget_encodings(session["id"])
             if noted:  # The composer shows the output waiting for the next message.
                 await self.publish_pending(session)
             await self.status(session, "idle")
@@ -2343,6 +2347,7 @@ class AgentManager:
                 session["terminal_reason"] = "error"
                 await report_storage_failure(exc)
             self.live.pop(session["id"], None)
+            self.store.forget_encodings(session["id"])
             try:
                 await self.status(session, "idle", turn_ended=True)
             except STORAGE_ERRORS as exc:
@@ -3406,6 +3411,7 @@ class AgentManager:
         self.workspace_available(session["workspace"])
         self._pause_queue(session)
         self.live[session_id] = session
+        self.store.keep_encodings(session_id)
         self.statuses[session_id] = "compacting"
         task = self.tasks[session_id] = asyncio.create_task(self.manual_compact(session, preservation_note.strip()))
         task.add_done_callback(lambda done: self._after_task(session_id, "compaction", done))
@@ -3460,6 +3466,7 @@ class AgentManager:
             await self.event(session, "error", text=self.settings.redact(str(exc))[:1500])
         finally:
             self.live.pop(session["id"], None)
+            self.store.forget_encodings(session["id"])
             await self.status(session, "idle")
 
     async def model_response(self, session, event, client, url, headers, payload, retry_reason=None, body=None):

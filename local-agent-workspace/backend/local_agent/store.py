@@ -23,16 +23,33 @@ _METER_FIELDS = ("last_request", "next_estimate")
 _SIDECAR_FIELDS = ("file_views", "allow_rules", "queued_messages", "pending_context")
 
 
-# JSON encodings of strings this long are kept between saves of a conversation (Store._encoded):
-# tool results and replies are most of a large conversation's bytes, and each save rewrites the
-# whole file. An entry holds its string, so it can never be stale.
+# JSON encodings of strings this long are kept between saves of a running conversation
+# (Store._encoded): tool results and replies are most of a large conversation's bytes, and each save
+# rewrites the whole file. An entry holds its string, so it can never be stale.
 CACHED_STRING_CHARS = 2048
+# Dicts and lists nested deeper than this are encoded in one call, so a deeply nested value (tool
+# arguments are the model's) cannot exhaust Python's recursion. Long strings sit far shallower:
+# record, data, content or tool_calls, block or call, function, arguments.
+WALKED_DEPTH = 8
 _encode_json = json.JSONEncoder(ensure_ascii=False, separators=(",", ":")).encode
 
 
-def _record_line(value, previous, current):
+def _holds_long(container, depth):
+    """Whether a dict or list has a string of CACHED_STRING_CHARS or more within depth levels."""
+    for item in container.values() if type(container) is dict else container:
+        kind = type(item)
+        if kind is str:
+            if len(item) >= CACHED_STRING_CHARS:
+                return True
+        elif depth > 1 and (kind is dict or kind is list) and _holds_long(item, depth - 1):
+            return True
+    return False
+
+
+def _record_line(value, previous, current, depth=WALKED_DEPTH):
     """json.dumps(value, ensure_ascii=False, separators=(",", ":")), reusing the encodings of long
-    strings from previous ({id: (string, encoding)}) and recording those it used in current."""
+    strings from previous ({id: (string, encoding)}) and recording those it used in current.
+    Only the dicts and lists that hold a long string are walked here; the rest is encoded in one call."""
     kind = type(value)
     if kind is str:
         if len(value) < CACHED_STRING_CHARS:
@@ -41,11 +58,12 @@ def _record_line(value, previous, current):
         text = entry[1] if entry is not None and entry[0] is value else _encode_json(value)
         current[id(value)] = (value, text)
         return text
-    if kind is dict and all(type(key) is str for key in value):
-        return "{" + ",".join(_encode_json(key) + ":" + _record_line(item, previous, current)
-                              for key, item in value.items()) + "}"
-    if kind is list:
-        return "[" + ",".join(_record_line(item, previous, current) for item in value) + "]"
+    if depth and (kind is dict or kind is list) and _holds_long(value, depth):
+        if kind is list:
+            return "[" + ",".join([_record_line(item, previous, current, depth - 1) for item in value]) + "]"
+        if all(type(key) is str for key in value):
+            return "{" + ",".join([_encode_json(key) + ":" + _record_line(item, previous, current, depth - 1)
+                                   for key, item in value.items()]) + "}"
     return _encode_json(value)
 
 
@@ -80,7 +98,8 @@ class Store:
         self._command_jobs = {}
         # The sidecar state last written or read, as JSON text, per conversation ID.
         self._sidecars = {}
-        # Per conversation ID, the long strings encoded at its last save: {id(string): (string, JSON)}.
+        # Per running conversation ID (keep_encodings), the long strings encoded at its last save:
+        # {id(string): (string, JSON)}.
         self._encoded = {}
         # Unreadable conversation files: {file name: reason}. They are skipped and
         # reported, never deleted, moved or rewritten.
@@ -160,19 +179,31 @@ class Store:
         temporary = self.conversations / f".{target.stem}.{uuid.uuid4().hex}.tmp"
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         # Rebuilt on every save, so only the strings still in the conversation are kept.
-        previous, current = self._encoded.get(session["id"], {}), {}
+        previous, current = self._encoded.get(session["id"]), {}
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as output:
                 for record in self._records(session):
-                    output.write(_record_line(record, previous, current))
+                    output.write(_encode_json(record) if previous is None else _record_line(record, previous, current))
                     output.write("\n")
                 output.flush()
                 os.fsync(output.fileno())
         except BaseException:
             temporary.unlink(missing_ok=True)
             raise
-        self._encoded[session["id"]] = current
+        if previous is not None:
+            self._encoded[session["id"]] = current
         return temporary, target
+
+    def keep_encodings(self, session_id):
+        """Reuse the JSON of long strings between saves of this conversation until
+        forget_encodings. Only a running turn saves the same string objects again: a
+        conversation loaded anew (store.get) has new ones, so a kept entry would never be used."""
+        with self._lock:
+            self._encoded.setdefault(session_id, {})
+
+    def forget_encodings(self, session_id):
+        with self._lock:
+            self._encoded.pop(session_id, None)
 
     def _sync_directory(self):
         descriptor = os.open(self.conversations, os.O_RDONLY)

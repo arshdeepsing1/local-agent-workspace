@@ -427,8 +427,10 @@ async def test_a_learned_otpm_limit_lets_an_automatic_compaction_turn_complete(o
     assert (False, OPUS_OTPM) in sent and all(max_tokens <= OPUS_OTPM for _, max_tokens in sent)
 
 
-async def test_a_compaction_that_cannot_fit_names_the_settings_that_size_it(opus_otpm):
+@pytest.mark.parametrize("handoffs", [True, False])
+async def test_a_compaction_that_cannot_fit_names_the_context_budget_that_makes_it_fit(opus_otpm, handoffs):
     manager, chat, sent = opus_otpm
+    manager.settings.values["compaction_handoffs"] = handoffs  # Both shrink to the same smallest request.
     session = chat()
     manager.rate_gate.note(session["model"], "another chat", 0,
                            parse_rate_limit({"limit_type": "output_tokens_per_minute", "limit": 10_000}))
@@ -436,5 +438,23 @@ async def test_a_compaction_that_cannot_fit_names_the_settings_that_size_it(opus
     assert sent == []
     error = errors(session)[-1]
     assert "needs max_tokens 12,288" in error and "(10,000)" in error
-    assert "Save a detailed handoff at each compaction" in error and "Settings → Context budget" in error
-    assert "Max output tokens" not in error
+    # 10,000 - 4,096 leaves 5,904 tokens of thinking room: an eighth of a budget of at most 47,239.
+    assert "lower the context budget to at most 47,239 tokens" in error and "workspace admin" in error
+    assert "handoff" not in error and "Max output tokens" not in error
+    # The budget it names makes the same compaction fit.
+    manager.settings.values["context_window"] = 47_239
+    await manager.manual_compact(session)
+    assert len(errors(session)) == 1
+    assert sent and all(max_tokens <= 10_000 for _, max_tokens in sent)
+
+
+async def test_a_compaction_no_setting_can_fit_asks_for_a_higher_limit(opus_otpm):
+    manager, chat, sent = opus_otpm
+    session = chat()
+    manager.rate_gate.note(session["model"], "another chat", 0,
+                           parse_rate_limit({"limit_type": "output_tokens_per_minute", "limit": 4_000}))
+    await manager.manual_compact(session)
+    assert sent == []
+    error = errors(session)[-1]
+    assert "(4,000)" in error and "No setting makes it fit" in error and "workspace admin" in error
+    assert "Context budget" not in error

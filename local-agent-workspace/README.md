@@ -191,7 +191,7 @@ content or one second of dirty state, including when the provider stalls. Each s
 rewrites the conversation's whole file, so in a long conversation (about 10 MB after some
 180 file reads at the default budget) checkpoints are spaced to at least 20 times the
 last save's duration, keeping saves to about a twentieth of streaming time; the JSON of
-long texts is reused between saves. Normal completion and Stop flush the final state. After an abrupt process death, the last
+long texts is reused between the saves of a running turn (it is dropped when the turn ends). Normal completion and Stop flush the final state. After an abrupt process death, the last
 saved partial reply is shown as interrupted; the most recent uncheckpointed text
 may be lost. Incomplete streamed tool arguments are never persisted as executable
 requests or replayed. A local storage failure stops the response and reports that
@@ -1274,7 +1274,7 @@ request over the limit is refused the same way. Agent requests wait up to 300 se
 the next streamed data (a large prefill with thinking can be silent for minutes); a
 request that gets no data for that long ends with an error saying so, which suggests
 sending a message to continue and, if it repeats, a lower context budget or Max output
-tokens. Compaction and `/btw` requests, which are not streamed, up to 600 seconds. Databricks
+tokens. Compaction and `/btw` requests, which are not streamed, wait up to 600 seconds. Databricks
 stops a request after 597 seconds; when a stream ends early after about that long, a
 notice (once per turn) says so and suggests lowering Max output tokens or the context
 budget.
@@ -1297,8 +1297,10 @@ requests to that endpoint, before any compaction, until Settings changes; no **C
 button is offered. A compaction request is sized by the context budget, not by Max output
 tokens: under a reported OTPM limit its handoff or summary shrinks to fit (a first rejection
 is resent once at the reported limit; Databricks does not bill it), and only when even the
-smallest summary plus thinking room cannot fit does compaction stop, with an error naming
-Settings → Save a detailed handoff at each compaction and Settings → Context budget. When Databricks asks one chat to pause, other chats and compaction
+smallest summary plus thinking room cannot fit does compaction stop. The thinking room is an
+eighth of the context budget, up to 8,192 tokens, so the error names the context budget at which
+compaction fits (at most 47,239 tokens under a 10,000 OTPM limit) or, when no budget is small
+enough, asks for a higher limit from the workspace admin. When Databricks asks one chat to pause, other chats and compaction
 requests to the same endpoint wait for that pause too, plus up to 3 seconds of random
 jitter so they do not all retry at once, with a notice; a request with a smaller Max output
 tokens may pass an output-tokens pause, and Stop cancels the wait. `/btw` does not wait: it
