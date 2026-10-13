@@ -1,4 +1,5 @@
 """Header-only startup after a clean shutdown, and the full scan after anything else."""
+import asyncio
 import json
 import os
 import time
@@ -81,6 +82,30 @@ def test_after_a_clean_shutdown_only_headers_are_read_and_the_marker_is_removed(
     # Nothing was rewritten: the files and their <id>.state.json sidecars are unchanged.
     assert {path.name: path.read_bytes() for path in store.conversations.iterdir()} == files
     assert manager.get(sessions[0]["id"])["allow_rules"] == [{"tool": "run_command", "command": "ls"}]
+
+
+def test_chats_that_own_finished_jobs_are_not_read_after_a_clean_shutdown(store, settings, full_reads):
+    """Finished jobs were mirrored into their chats when they ended; only a crash mirrors them again."""
+    sessions = [chat(store, settings, terminal_reason="completed", turn_ended=1.0,
+                     events=[{"id": "u", "type": "user", "text": "Hi", "created": 1.0}]) for _ in range(4)]
+    manager = AgentManager(store, settings)
+
+    async def commands():
+        for session in sessions[:3]:
+            job = await manager.jobs.start("true", settings.values["workspace"], session_id=session["id"])
+            await manager.jobs.wait(job["id"])
+        await manager.jobs.shutdown()
+    asyncio.run(commands())
+    assert all(manager.store.get(session["id"]).get("command_jobs") for session in sessions[:3])
+    for crashed in (False, True):
+        if not crashed:
+            clean_shutdown(store)
+        cold = Store(settings.state_dir / "conversations.sqlite3")  # A restart: nothing cached.
+        full_reads.clear()
+        AgentManager(cold, settings)
+        expected = [f"{session['id']}.jsonl" for session in sessions] if crashed else []
+        assert sorted(set(full_reads)) == sorted(expected)
+        cold.db.close()
 
 
 def test_a_crash_during_this_run_gives_a_full_scan_next_time(store, settings, full_reads):

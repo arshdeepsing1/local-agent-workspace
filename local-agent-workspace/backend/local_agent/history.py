@@ -9,7 +9,7 @@ events saved before the flag existed have no key and are matched by exact text.
 """
 import copy
 
-from . import context, portability
+from . import context, mentions, portability
 
 
 STOP_MARKER = "[The user stopped this response before it finished. Tool calls it was preparing did not run.]"
@@ -116,11 +116,49 @@ def cut_points(session, before_event_id=None):
     return event_cut, wire_cut
 
 
+def _after_turn(event):
+    """Events that can follow a finished turn without being part of its answer: notices (Verify,
+    a finished job, a mode change), Verify's command cards and the user's own ! commands."""
+    if event.get("type") == "notice":
+        return not event.get("stop_phase") and not event.get("terminal_reason")
+    return event.get("type") == "tool" and (event.get("verify") is True or event.get("name") == "user_command")
+
+
+def turn_end(events):
+    """The terminal_reason the latest turn of these events ended with, or None when they do not show it.
+
+    The same reasons run() records: 'stopped' (the Stop notice), 'step_limit', 'interrupted' (a reply a
+    restart cut short), 'inference_error' or 'error', else 'completed' (or 'tool_error' when a tool failed)
+    when the turn's last reply completed."""
+    start = next((index for index in range(len(events) - 1, -1, -1) if events[index].get("type") == "user"), None)
+    if start is None:
+        return None
+    turn = events[start:]
+    for event in reversed(turn):
+        if event.get("type") == "notice" and event.get("stop_phase"):
+            return "stopped"
+        if event.get("terminal_reason") == "step_limit":
+            return "step_limit"
+        info = event.get("request_info") or {}
+        if (info.get("status"), info.get("error_kind")) == ("interrupted", "incomplete_response"):
+            return "interrupted"
+        if event.get("type") == "error":
+            return "inference_error" if event.get("error_kind") else "error"
+    core = list(turn)
+    while core and _after_turn(core[-1]):
+        core.pop()
+    if not portability.latest_turn_completed({"events": core}):
+        return None
+    failed = any(event.get("state") == "error" and event.get("name") != "user_command" for event in turn)
+    return "tool_error" if failed else "completed"
+
+
 def cut_session(session, before_event_id=None, *, keep_local=False):
     """A deep copy cut before the given user message (or whole), and what the cut removed.
 
     keep_local keeps the queued messages and waiting command output, which belong
-    to the user rather than to the history (an in-place rewind keeps them).
+    to the user rather than to the history (an in-place rewind keeps them). The ! output
+    the removed message itself carried waits again too, so a resend attaches it again.
     """
     event_cut, wire_cut = cut_points(session, before_event_id)
     result = copy.deepcopy(session)
@@ -142,13 +180,29 @@ def cut_session(session, before_event_id=None, *, keep_local=False):
         result.pop(key, None)
     # The read-before-write guard must not trust reads the model no longer remembers.
     result["file_views"] = {}
-    if result["events"] and portability.latest_turn_completed(result):
-        result["terminal_reason"] = "completed"
+    reason = turn_end(result["events"])
+    if reason:
+        result["terminal_reason"] = reason
     else:
         result.pop("terminal_reason", None)
+    if keep_local and before_event_id is not None:
+        restored = _carried_output(session, before_event_id)
+        if restored:
+            result["pending_context"] = [*restored, *(result.get("pending_context") or [])][-mentions.MAX_PENDING:]
     info = {"events_removed": len(session["events"]) - event_cut, "messages_removed": len(session["wire"]) - wire_cut,
             "summary_dropped": summary_dropped}
     return result, info
+
+
+def _carried_output(session, event_id):
+    """The ! output the given user message carried to the model, read back from its own wire message."""
+    event = next((item for item in session["events"] if item.get("id") == event_id), None)
+    if not event or not any(isinstance(item, dict) and item.get("kind") == "shell" for item in event.get("attachments") or []):
+        return []
+    turn = next((item for item in user_turns(session) if item["event_id"] == event_id), None)
+    if turn is None or turn["wire_index"] is None:
+        return []
+    return mentions.sent_notes(session["wire"][turn["wire_index"]].get("content"), event.get("text"))
 
 
 def rewind_turn_ids(session, before_event_id, records=()):

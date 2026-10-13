@@ -9,8 +9,8 @@ import uuid
 from fastapi import HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
-from . import approvals
-from .agents import public_session
+from . import approvals, mentions
+from .agents import delegated_prompt, public_session
 from .approvals import busy_status, ensure_idle
 from .history import HistoryError, cut_points, cut_session, rewind_turn_ids
 from .portability import MAX_BUNDLE_BYTES, MAX_SESSIONS, completed_for_fork, export_bundle, fresh_copies, parse_bundle
@@ -238,13 +238,24 @@ def register_portability(app, manager, settings, store, session_or_404):
         ensure_idle(manager, session, "rewinding this conversation")
         try:
             if body.conversation:
-                cut_points(session, body.before_event_id)
+                event_cut, _ = cut_points(session, body.before_event_id)
             if body.code:
                 tools = manager.session_tools(session)
                 approvals.workspace_idle(manager, store, tools.root, "rewinding files")
                 turns = rewind_turn_ids(session, body.before_event_id, checkpoint_records(session, tools))
         except HistoryError as exc:
             raise HTTPException(400, str(exc)) from exc
+        if body.resend_text is not None:
+            # The resend's own checks (a refused @ file, the attachment limits, a missing project folder)
+            # run before anything changes, so a refusal leaves the chat as it was and the edit open.
+            remaining = {**session, "events": session["events"][:event_cut]}
+            try:
+                manager.workspace_available(session["workspace"])
+                if not delegated_prompt(remaining):
+                    mentions.expand_context(manager, remaining, manager.session_tools(session),
+                                            body.resend_text.strip(), include_pending=False)
+            except ValueError as exc:
+                raise HTTPException(400, settings.redact(str(exc))) from exc
         files = []
         if body.code:
             plan = manager.checkpoints.rewind_plan(tools, session_id, turns)

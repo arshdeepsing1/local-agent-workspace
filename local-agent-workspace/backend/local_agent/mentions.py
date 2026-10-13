@@ -20,7 +20,8 @@ MENTION = re.compile(r"(?<![\w.@/])@([^\s@`'\"<>|]+)")
 TRAILING = re.compile(r"[.,;:!?)\]}]+$")
 LINE_RANGE = re.compile(r"^(?P<path>.+?)(?::(?P<a>\d+)(?:-(?P<b>\d+))?|#L(?P<la>\d+)(?:-L?(?P<lb>\d+))?)$")
 FENCED = re.compile(r"```.*?(?:```|\Z)", re.DOTALL)
-INLINE_CODE = re.compile(r"`[^`\n]*`")
+# A CommonMark code span on one line: a run of N backticks closes only at the next run of exactly N.
+INLINE_CODE = re.compile(r"(?<!`)(`+)(?!`)[^\n]*?(?<!`)\1(?!`)")
 
 MAX_FILES = 5
 FILE_CHARS = 8_000
@@ -119,6 +120,8 @@ def _snapshot(manager, session, tools, mention):
         raise MentionError(token, file_error(exc)) from None
     content, last = result["content"], result["end_line"]
     shortened = (last < mention["end"]) if mention["start"] else result["next_line"] is not None
+    # Redacted before it is shortened: a cut through a secret would leave a part no pattern matches.
+    content = manager.settings.redact(redact_secrets(content))
     if len(content) > FILE_CHARS:
         cut = content.rfind("\n", 0, FILE_CHARS + 1)
         content = content[:cut] if cut > 0 else content[:FILE_CHARS]
@@ -128,7 +131,6 @@ def _snapshot(manager, session, tools, mention):
         else:
             last = first
         shortened = True
-    content = manager.settings.redact(redact_secrets(content))
     shown = tools.display_path(target)
     return {"kind": "file", "token": token, "target": target, "seen": seen, "display": shown, "start": first,
             "end": last, "shortened": shortened, "text": content}
@@ -199,6 +201,23 @@ def expand_context(manager, session, tools, text, include_pending=True, on_error
         content += "\n" + "\n\n".join(blocks)
     views = [(item["target"], item["seen"]) for item in items if item["kind"] == "file"]
     return content, attachments, views
+
+
+def sent_notes(content, text):
+    """The ! outputs a sent message carried, as pending_context entries, read back from its model-history
+    content (the format expand_context writes after the message text), or []."""
+    if not isinstance(content, str) or not isinstance(text, str):
+        return []
+    head = text + "\n\n---\n" + HEADER.split("{nonce}", 1)[0]
+    at = content.find(head)
+    nonce = re.match(r"[0-9a-f]{12}(?= )", content[at + len(head):]) if at >= 0 else None
+    if nonce is None:
+        return []
+    block = re.compile(rf"<<<ATTACHMENT {nonce.group(0)} command run by the user with ! \(exit (-?\d+|unknown)\)>>>\n"
+                       rf"\$ ([^\n]*)\n(.*?)\n<<<END {nonce.group(0)}>>>", re.DOTALL)
+    return [{"kind": "shell", "command": match.group(2), "text": match.group(3),
+             "exit_code": None if match.group(1) == "unknown" else int(match.group(1))}
+            for match in block.finditer(content, at + len(head))]
 
 
 def mentionable(path):

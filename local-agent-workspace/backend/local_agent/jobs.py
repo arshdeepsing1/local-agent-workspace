@@ -393,7 +393,7 @@ def wait_page(job, reason, match, from_offset):
 
 
 class JobManager:
-    def __init__(self, store, redact, on_update, redaction_tokens=None, environment=None):
+    def __init__(self, store, redact, on_update, redaction_tokens=None, environment=None, mirror_finished=True):
         self.store = store
         self.redact = redact
         self.on_update = on_update
@@ -413,7 +413,9 @@ class JobManager:
                 job.update(state="interrupted", updated=time.time(),
                            output=job["output"] + "\n[Server restarted; command outcome is unknown. The command was not restarted.]")
                 self._persist(job, mirror=True)
-            else:
+            elif mirror_finished:
+                # Finished jobs were mirrored when they ended; after a clean shutdown that holds, and
+                # mirroring again would fully read each owning conversation (header-only startup).
                 self.store.save_job(job)
             self._jobs[job["id"]] = job
         self._prune()

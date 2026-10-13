@@ -492,6 +492,13 @@ def pending_summary(session):
             for item in session.get("pending_context") or [] if isinstance(item, dict)]
 
 
+def delegated_prompt(session):
+    """Whether the next turn of this chat is a subagent's delegated prompt: its first message, sent by
+    delegate_task. After the delegation ended (an Edit or Retry of that message), it is the user's own."""
+    return bool(session.get("parent_event_id") and not session["events"]
+                and not (session.get("delegation") or {}).get("terminal_reason"))
+
+
 def public_session(session, status="idle"):
     pending = pending_summary(session)
     return {"permission_mode": "manual", "allowed_directories": [], "allow_rules": [], "disabled_tools": [],
@@ -528,7 +535,6 @@ class AgentManager:
         self.interactions = InteractionManager(self)
         self.extension_connections = {}
         self.notifier = SystemNotifier()
-        self.jobs = JobManager(store, settings.redact, self.job_update, redaction_tokens=self.redaction_tokens, environment=self.command_environment)
         self.closing = False
         # The lifespan writes the marker after every task and job stopped. It is removed before
         # anything else, so a crash during this run gives a full scan next time. Without it (a
@@ -539,6 +545,8 @@ class AgentManager:
             marker.unlink(missing_ok=True)
         except OSError:
             clean = False
+        self.jobs = JobManager(store, settings.redact, self.job_update, redaction_tokens=self.redaction_tokens,
+                               environment=self.command_environment, mirror_finished=not clean)
         summaries = store.list()
         full_scan = not clean
         recovered = set()
@@ -1493,7 +1501,7 @@ class AgentManager:
             raise ValueError("This conversation uses an unsupported runtime and is read-only. Start a new Databricks conversation.")
         self.workspace_available(session["workspace"])
         content, attachments, views = None, None, []
-        if not (session.get("parent_event_id") and not session["events"]):  # Not a subagent's delegated prompt.
+        if not delegated_prompt(session):
             expanded, attachments, views = mentions.expand_context(
                 self, session, self.session_tools(session), prompt, on_error="inline" if from_queue else "raise")
             content = expanded if expanded != prompt else None
@@ -1889,7 +1897,7 @@ class AgentManager:
             # ends and tells restart recovery the answer was cut short; turn_ended is None
             # while the turn runs and records when it ended (notifications).
             origin = {}
-            if session.get("parent_event_id") and not session["events"] and not session.get("delegation", {}).get("terminal_reason"):
+            if delegated_prompt(session):
                 origin = {"origin": {"kind": "delegated", "parent_session_id": session["parent_session_id"],
                                      "parent_event_id": session["parent_event_id"], "parent_call_id": session.get("parent_call_id")}}
             # turn_delegated: the parent's delegate_task started this turn and reports its end.

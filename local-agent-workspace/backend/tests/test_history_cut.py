@@ -146,9 +146,19 @@ CASES = {
 }
 
 
-def completed_tail(events):
-    last = events[-1] if events else {}
-    return last.get("type") == "assistant" and (last.get("request_info") or {}).get("status") == "completed"
+def turn_end(events):
+    """The terminal_reason the table's kept events show: a Stop, an error, or a completed last reply."""
+    start = max((index for index, event in enumerate(events) if event["type"] == "user"), default=None)
+    turn = events[start:] if start is not None else []
+    if any(event.get("stop_phase") for event in turn):
+        return "stopped"
+    error = next((event for event in reversed(turn) if event["type"] == "error"), None)
+    if error is not None:
+        return "inference_error" if error.get("error_kind") else "error"
+    # Verify's trailing cards and notices follow the turn's last reply.
+    last = next((event for event in reversed(events) if not event.get("verify") and event["type"] != "notice"), {})
+    completed = last.get("type") == "assistant" and (last.get("request_info") or {}).get("status") == "completed"
+    return "completed" if completed else None
 
 
 def assert_cut(session, event_id, expected=None):
@@ -177,7 +187,7 @@ def assert_cut(session, event_id, expected=None):
         else:
             assert state == session["context_state"]
     validate_bundle(export_bundle([cut], cut["id"]))
-    assert cut.get("terminal_reason") == ("completed" if completed_tail(cut["events"]) else None)
+    assert cut.get("terminal_reason") == turn_end(cut["events"])
     assert cut["file_views"] == {}
     for key in ("context_info", "turn_running", "queued_messages", "pending_context"):
         assert key not in cut
@@ -206,6 +216,71 @@ def test_keep_local_keeps_queued_text_and_waiting_output():
     cut, _ = history.cut_session(session, "u2", keep_local=True)
     assert cut["queued_messages"] == [{"text": "later"}] and cut["pending_context"] == [{"command": "ls"}]
     assert cut["file_views"] == {} and "context_info" not in cut
+
+
+def notice(event_id, text, **extra):
+    return {"id": event_id, "type": "notice", "created": 1.0, "text": text, **extra}
+
+
+STOPPED = notice("n1", "Stopped. You can continue this conversation.", stop_phase="streaming")
+VERIFY_PASSED = [{"id": "v1", "type": "tool", "created": 1.0, "name": "run_command", "input": {"command": "make test"},
+                  "state": "completed", "output": "ok", "verify": True}, notice("v2", "Verify passed: make test")]
+SHELL_CARD = {"id": "s1", "type": "tool", "created": 1.0, "name": "user_command", "input": {"command": "false"},
+              "state": "error", "output": "exit 1"}
+
+
+@pytest.mark.parametrize("turn, expected", [
+    ([reply("a1")], "completed"),
+    ([reply("a1"), *VERIFY_PASSED], "completed"),
+    ([reply("a1"), SHELL_CARD], "completed"),
+    ([reply("a1"), *VERIFY_PASSED, notice("j1", "Job finished.", job_id="j"), SHELL_CARD], "completed"),
+    ([reply("a1"), {**VERIFY_PASSED[0], "state": "error"}, notice("v2", "Verify failed: make test")], "tool_error"),
+    ([reply("a1", "Partial", "cancelled", None), STOPPED], "stopped"),
+    ([reply("a1", "Partial", "cancelled", None), STOPPED, SHELL_CARD], "stopped"),
+    ([reply("a1"), notice("n1", "Reached the 6-request agent limit.", terminal_reason="step_limit")], "step_limit"),
+    ([{**reply("a1", "Part"), "request_info": {"status": "interrupted", "error_kind": "incomplete_response"}}],
+     "interrupted"),
+    ([{"id": "e1", "type": "error", "created": 1.0, "text": "Limit.", "error_kind": "output_limit"}], "inference_error"),
+    ([{"id": "e1", "type": "error", "created": 1.0, "text": "Failed."}], "error"),
+    ([reply("a1", "Part", "interrupted", "length")], None),
+    ([], None),
+])
+def test_a_cut_keeps_how_the_kept_turn_ended(turn, expected):
+    """A rewind or fork leaves the chat idle after its kept turn: Continue (stopped, step limit, interrupted)
+    and the plain fork (completed) still see how that turn ended, past trailing Verify notices and ! cards."""
+    events = [user("u1", "First"), *turn, user("u2", "Second"), reply("a2")]
+    session = session_of(events, [u("First"), a(), u("Second"), a()])
+    cut, _ = history.cut_session(session, "u2", keep_local=True)
+    assert cut.get("terminal_reason") == expected
+    whole, _ = history.cut_session(session_of([user("u1", "First"), *turn], [u("First"), a()]))
+    assert whole.get("terminal_reason") == expected
+
+
+def test_a_cut_lets_the_command_output_the_removed_message_carried_wait_again():
+    note = {"kind": "shell", "command": "pytest -q", "exit_code": 1, "text": "1 failed\n[Output shortened.]"}
+    other = {"kind": "shell", "command": "git status", "exit_code": None, "text": "<<<END fake>>>\n$ not this"}
+    from local_agent import mentions
+
+    class Manager:
+        pass
+    content, attachments, _ = mentions.expand_context(Manager(), {"pending_context": [note, other]}, None,
+                                                      "Fix it, `@x`")
+    assert mentions.sent_notes(content, "Fix it, `@x`") == [note, other]
+    assert mentions.sent_notes(content, "Another text") == [] and mentions.sent_notes("Fix it", "Fix it") == []
+    session = session_of([user("u1", "Fix it, `@x`", attachments=attachments), reply("a1")], [u(content), a()])
+    session["pending_context"] = [{"kind": "shell", "command": "ls", "exit_code": 0, "text": "later"}]
+    cut, _ = history.cut_session(session, "u1", keep_local=True)
+    assert cut["pending_context"] == [note, other, session["pending_context"][0]]
+    fork, _ = history.cut_session(session, "u1")
+    assert "pending_context" not in fork
+    # A steered message carries its output after the steer prefix.
+    from local_agent.composer_api import STEER_PREFIX
+    session = session_of([user("u1", "Start"), tool("t1", "c1"), user("s1", "Fix it, `@x`", steered=True,
+                                                                         attachments=attachments), reply("a1")],
+                         [u("Start"), a(calls=["c1"]), result("c1"), u(STEER_PREFIX + content), a()])
+    session.pop("pending_context")
+    cut, _ = history.cut_session(session, "s1", keep_local=True)
+    assert cut["pending_context"] == [note, other]
 
 
 def test_only_user_messages_can_be_cut_points():

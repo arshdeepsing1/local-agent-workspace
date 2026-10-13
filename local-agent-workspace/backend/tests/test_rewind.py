@@ -1,6 +1,8 @@
 """Rewind to a user message: the agent's file edits (code), the conversation in place (after an
 archived backup), or both, optionally resending an edited message."""
+import asyncio
 import json
+import re
 import time
 
 import httpx
@@ -310,6 +312,119 @@ async def test_rewind_both_and_resend_sends_the_cut_history_plus_the_new_message
                                            {"role": "user", "content": "Do it differently"}]
     saved = manager.store.get(session["id"])
     assert [event["text"] for event in saved["events"] if event["type"] == "user"] == ["Turn 1", "Do it differently"]
+
+
+def gateway_for(monkeypatch, requests):
+    """Answers every model request with 'Answer.' and records the request bodies."""
+    async def gateway(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, text='data: {"choices":[{"delta":{"content":"Answer."},"finish_reason":"stop"}]}'
+                                        "\n\ndata: [DONE]\n\n")
+    client_class = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client_class(
+        **{"transport": httpx.MockTransport(gateway), **kwargs}))
+
+
+async def idle(manager, session_id):
+    for _ in range(500):
+        if not manager.busy_task(session_id) and not [
+                task for task in manager.__dict__.get("_queue_tasks", ()) if not task.done()]:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("The chat did not become idle.")
+
+
+async def test_a_resend_with_a_refused_file_changes_nothing(runtime):
+    """The resend's own checks run before the backup and the cut: a 400 leaves the chat as it was."""
+    app, manager, session, project = runtime
+    chat = standard(runtime)
+    (project / ".env").write_text("TOKEN=abc\n")
+    before = jsonl(manager, session["id"])
+    async with await client_for(app) as client:
+        for text, message in (("Turn 2, see @.env", "@.env: Credential files are excluded from file tools."),
+                              (" ".join(f"@f{n}.txt" for n in range(6)), "Attach at most 5 files to one message.")):
+            if "f0" in text:
+                for n in range(6):
+                    (project / f"f{n}.txt").write_text("x\n")
+            response = await client.post(f"/api/sessions/{session['id']}/rewind", json={
+                "before_event_id": "u2", "conversation": True, "code": True, "resend_text": text})
+            assert (response.status_code, response.json()["detail"]) == (400, message)
+    assert jsonl(manager, session["id"]) == before
+    assert len(manager.store.list()) == 1  # No archived backup.
+    assert chat.files() == {"a.txt": "a3", "b.txt": "b3"}
+    assert session["id"] not in manager.tasks
+
+
+async def test_a_resend_attaches_again_the_command_output_the_removed_message_carried(runtime, monkeypatch):
+    """Retry (and Edit, and a conversation rewind) of a message sent with ! output: the output waits
+    again, so the resend carries it as the first send did."""
+    app, manager, session, _ = runtime
+    requests = []
+    gateway_for(monkeypatch, requests)
+    manager.start_shell(session["id"], "echo UNIQUE-SHELL-OUTPUT; exit 1")
+    await idle(manager, session["id"])
+    manager.start(session["id"], "Fix the failure above")
+    await idle(manager, session["id"])
+    first = requests[-1]["messages"][-1]["content"]
+    assert "UNIQUE-SHELL-OUTPUT" in first and not manager.store.get(session["id"]).get("pending_context")
+    user = [event for event in manager.store.get(session["id"])["events"] if event["type"] == "user"][-1]
+    note = {"kind": "shell", "command": "echo UNIQUE-SHELL-OUTPUT; exit 1", "exit_code": 1, "text": "UNIQUE-SHELL-OUTPUT\n"}
+    async with await client_for(app) as client:
+        # A conversation-only rewind: the output waits for the next message again.
+        preview = await client.get(f"/api/sessions/{session['id']}/rewind-preview", params={"before_event_id": user["id"]})
+        assert preview.json()["conversation"]["possible"] is True
+        response = await client.post(f"/api/sessions/{session['id']}/rewind", json={
+            "before_event_id": user["id"], "conversation": True})
+        assert response.status_code == 200, response.text
+        assert response.json()["session"]["pending_context"] == [{key: note[key] for key in ("kind", "command", "exit_code")}]
+        assert manager.store.get(session["id"])["pending_context"] == [note]
+        manager.start(session["id"], "Fix the failure above")
+        await idle(manager, session["id"])
+        user = [event for event in manager.store.get(session["id"])["events"] if event["type"] == "user"][-1]
+        # What Retry sends.
+        response = await client.post(f"/api/sessions/{session['id']}/rewind", json={
+            "before_event_id": user["id"], "conversation": True, "resend_text": user["text"]})
+        assert response.status_code == 200 and response.json()["resent"] is True
+        await idle(manager, session["id"])
+    nonce = re.compile(r"\b[0-9a-f]{12}\b")  # New for each message.
+    assert nonce.sub("N", requests[-1]["messages"][-1]["content"]) == nonce.sub("N", first)
+    saved = manager.store.get(session["id"])
+    retried = [event for event in saved["events"] if event["type"] == "user"]
+    assert len(retried) == 1 and retried[0]["attachments"] == [{"kind": "shell", "command": note["command"], "exit_code": 1}]
+    assert not saved.get("pending_context")
+
+
+async def test_an_edit_of_a_finished_subagent_chats_first_message_attaches_files_and_output(runtime, monkeypatch):
+    """Only the delegated prompt itself skips @ and ! expansion; after the delegation ended, an Edit or
+    Retry of that first message is the user's own message."""
+    app, manager, _, project = runtime
+    (project / "notes.txt").write_text("hello notes\n")
+    requests = []
+    gateway_for(monkeypatch, requests)
+    child = manager.store.create(manager.settings.values)
+    child.update(title="Child", title_generated=True, is_subagent=True, parent_session_id="parent-x",
+                 parent_event_id="evt-x", parent_call_id="call-x", delegation={"status": "running"})
+    manager.store.save(child)
+    manager.start(child["id"], "Delegated task, see @notes.txt")
+    await idle(manager, child["id"])
+    assert requests[-1]["messages"][-1]["content"] == "Delegated task, see @notes.txt"
+    saved = manager.store.get(child["id"])
+    saved["delegation"] = {"status": "completed", "terminal_reason": "completed"}
+    saved["pending_context"] = [{"kind": "shell", "command": "ls", "exit_code": 0, "text": "UNIQUE-LS-OUTPUT"}]
+    manager.store.save(saved)
+    first = next(event for event in saved["events"] if event["type"] == "user")
+    async with await client_for(app) as client:
+        response = await client.post(f"/api/sessions/{child['id']}/rewind", json={
+            "before_event_id": first["id"], "conversation": True, "resend_text": "Redo it, see @notes.txt"})
+        assert response.status_code == 200 and response.json()["resent"] is True, response.text
+        await idle(manager, child["id"])
+    sent = requests[-1]["messages"][-1]["content"]
+    assert "UNIQUE-LS-OUTPUT" in sent and "hello notes" in sent
+    saved = manager.store.get(child["id"])
+    assert not saved.get("pending_context")
+    user = next(event for event in saved["events"] if event["type"] == "user")
+    assert "origin" not in user and saved["turn_delegated"] is False
+    assert [item["kind"] for item in user["attachments"]] == ["file", "shell"]
 
 
 async def test_request_validation(runtime):
