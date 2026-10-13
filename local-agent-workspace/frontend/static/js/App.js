@@ -37,6 +37,7 @@ export default function App() {
   const [workspaceOpen, setWorkspaceOpen] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [foldersOpen, setFoldersOpen] = useState(false)
+  // The add-rule dialog: false, or { done } that returns focus when it closes.
   const [rulesOpen, setRulesOpen] = useState(false)
   // A changed file chosen in the changes bar, to open in the Workspace panel's review.
   const [review, setReview] = useState(null)
@@ -70,7 +71,7 @@ export default function App() {
     workspace=${active?.workspace || app.settings?.workspace || ''} mode=${app.permissionMode} onMode=${app.setPermissionMode} onProject=${() => setSettingsOpen(true)}
     onFolders=${() => setFoldersOpen(true)} rules=${app.rules.chat} onRemoveRule=${removeRule}
     projectRules=${app.rules.project} userRules=${app.rules.user} rulesProblem=${app.rules.problem} onLoadRules=${app.loadRules}
-    onAddRule=${() => setRulesOpen(true)} onResetRules=${app.resetRules}
+    onAddRule=${done => setRulesOpen({ done })} onResetRules=${app.resetRules}
     models=${app.connection?.models || []} busy=${busy} modelSaving=${app.modelSaving}
     disabled=${!app.ready || (!!app.activeId && !active) || !app.settings?.configured}
     onModel=${app.changeModel}
@@ -129,6 +130,6 @@ export default function App() {
     ${settingsOpen && app.settings ? html`<${SettingsDialog} settings=${app.settings} connection=${app.connection} onSave=${app.saveSettings} onClose=${() => setSettingsOpen(false)} />` : null}
     ${foldersOpen && app.settings ? html`<${FolderAccessDialog} key=${app.viewKey} workspace=${active?.workspace || app.settings.workspace} folders=${active?.allowed_directories || []}
       busy=${busy || (!!app.activeId && !active)} bypass=${app.permissionMode === 'bypassPermissions'} onAllow=${app.allowFolder} onRemove=${app.removeFolder} onClose=${() => setFoldersOpen(false)} />` : null}
-    ${rulesOpen && app.settings ? html`<${PermissionRulesDialog} key=${app.viewKey} onAdd=${app.addRule} onClose=${() => setRulesOpen(false)} />` : null}
+    ${rulesOpen && app.settings ? html`<${PermissionRulesDialog} key=${app.viewKey} onAdd=${app.addRule} onClose=${() => setRulesOpen(false)} returnFocus=${rulesOpen.done} />` : null}
   </div>`
 }

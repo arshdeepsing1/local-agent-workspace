@@ -228,6 +228,29 @@ def test_cards_without_editable_fields_have_no_edit_button(ui, page):
     expect(page.get_by_role("button", name="Edit", exact=True)).to_have_count(0)
 
 
+def focused(ui):
+    return ui.js("[document.activeElement.tagName, document.activeElement.getAttribute('aria-label') || document.activeElement.textContent.trim()]")
+
+
+def test_keyboard_focus_follows_the_editor(ui, page):
+    app_with_card(ui, EDIT_CARD)
+    page.get_by_role("button", name="Edit", exact=True).focus()
+    page.keyboard.press("Enter")
+    command = page.get_by_role("textbox", name="Command", exact=True)
+    expect(command).to_be_focused()
+    page.get_by_role("button", name="Cancel edit").focus()
+    page.keyboard.press("Enter")
+    expect(command).to_have_count(0)
+    expect(page.get_by_role("button", name="Edit", exact=True)).to_be_focused()
+    page.keyboard.press("Enter")
+    expect(command).to_be_focused()
+    command.fill("npm run lint")
+    page.get_by_role("button", name="Save edit").focus()
+    page.keyboard.press("Enter")
+    expect(command).to_have_count(0)
+    expect(page.get_by_role("button", name="Edit", exact=True)).to_be_focused(), focused(ui)
+
+
 # Modes: Bypass confirmation, changes while busy, Don't ask, Never asks
 
 MENU = re.compile("^Permissions:")
@@ -400,6 +423,56 @@ def test_removing_rules_uses_the_scope_route_or_the_chat_route(ui, page):
     assert ui.bodies("/api/sessions/a/allow-rules", "DELETE") == [{"tool": "run_command", "command": "make test"}]
 
 
+NEW_CHAT_RULES = """fake.projectRules = [{ behavior: 'deny', tool: 'run_command', prefix: ['git', 'push'] }]
+fake.override = (path, options) => {
+  if (path === '/api/permission-rules' && ['POST', 'DELETE'].includes(options.method)) {
+    const { scope, session_id, rule } = JSON.parse(options.body)
+    // Like the server: chat and project rules need a conversation.
+    if (scope !== 'user' && !session_id) return fake.json({ detail: 'Choose a conversation for a rule in this chat or project.' }, 400)
+    const keep = item => JSON.stringify(item) !== JSON.stringify(rule)
+    if (options.method === 'DELETE') fake.projectRules = fake.projectRules.filter(keep)
+    else fake.projectRules = [...fake.projectRules, { tool: rule.tool, behavior: rule.behavior, argv: rule.text.split(' ') }]
+    return fake.json(ruleSets(session_id))
+  }
+}"""
+POSTS = "fake.calls.filter(call => call.method !== 'GET').map(call => [call.method, call.path])"
+
+
+def test_a_new_chat_removes_a_project_rule_through_the_chat_it_creates(ui, page):
+    menu = open_menu(ui, page, session=None, setup=NEW_CHAT_RULES)
+    project = menu.get_by_role("group", name="This project", exact=True)
+    project.get_by_role("menuitem", name="Remove rule: Commands starting with git push (any options)").click()
+    ui.wait("fake.projectRules.length === 0")
+    assert ui.js(POSTS) == [["POST", "/api/sessions"], ["DELETE", "/api/permission-rules"]]
+    assert ui.bodies("/api/permission-rules", "DELETE") == [
+        {"scope": "project", "session_id": "created", "rule": {"behavior": "deny", "tool": "run_command", "prefix": ["git", "push"]}}]
+    expect(page.locator(".app-error")).to_have_count(0)
+
+
+def test_a_new_chat_adds_a_project_rule_through_the_chat_it_creates(ui, page):
+    menu = open_menu(ui, page, session=None, setup=NEW_CHAT_RULES)
+    menu.get_by_role("menuitem", name="Add a rule…").click()
+    dialog = page.get_by_role("dialog", name="Add a permission rule")
+    dialog.get_by_role("textbox", name="Command").fill("npm test")
+    dialog.get_by_role("button", name="Add rule").click()
+    expect(dialog).to_have_count(0)
+    assert ui.js(POSTS) == [["POST", "/api/sessions"], ["POST", "/api/permission-rules"]]
+    assert ui.bodies("/api/permission-rules", "POST") == [{"scope": "project", "session_id": "created", "rule": {
+        "tool": "run_command", "behavior": "allow", "text": "npm test", "match": "exact"}}]
+    expect(page.locator(".app-error")).to_have_count(0)
+
+
+def test_badges_stay_small_so_long_rules_are_not_cut_off(ui, page):
+    page.set_viewport_size({"width": 390, "height": 844})
+    prefix = "['docker', 'compose', 'down', '--volumes', '--remove-orphans']"
+    menu = open_menu(ui, page, setup=f"fake.projectRules = [{{ behavior: 'deny', tool: 'run_command', prefix: {prefix} }}]")
+    row = menu.get_by_role("group", name="This project", exact=True).locator(".allow-rule")
+    label, badge = row.locator("span").first, row.locator(".rule-badge")
+    expect(badge).to_have_text("Deny")
+    assert badge.bounding_box()["width"] < 60, badge.bounding_box()
+    assert label.evaluate("node => node.scrollHeight <= node.clientHeight"), label.evaluate("node => [node.scrollHeight, node.clientHeight]")
+
+
 def test_rule_labels(ui):
     ui.start()
     labels = ui.js("""import('/static/js/components/PermissionsMenu.js').then(({ ruleLabel }) => [
@@ -522,6 +595,19 @@ def test_cancel_and_escape_close_the_dialog(ui, page):
     assert ui.requests("/api/permission-rules", "POST") == []
 
 
+def test_closing_the_dialog_returns_focus_to_the_message_box(ui, page):
+    dialog = open_dialog(ui, page)
+    page.keyboard.press("Escape")
+    expect(dialog).to_have_count(0)
+    expect(page.get_by_role("textbox", name="Message")).to_be_focused()
+    page.get_by_role("button", name=MENU).click()
+    page.get_by_role("menuitem", name="Add a rule…").click()
+    dialog.get_by_role("textbox", name="Command").fill("make test")
+    dialog.get_by_role("button", name="Add rule").click()
+    expect(dialog).to_have_count(0)
+    expect(page.get_by_role("textbox", name="Message")).to_be_focused()
+
+
 def test_the_dialog_fits_a_phone(ui, page):
     page.set_viewport_size({"width": 390, "height": 844})
     dialog = open_dialog(ui, page)
@@ -580,6 +666,24 @@ def test_the_tools_tab_loads_toggles_and_saves(ui, page):
     assert ui.bodies("/api/sessions/a/disabled-tools", "PUT") == [{"tools": ["read_file", "mcp__git__push"]}]
 
 
+def test_the_app_saves_turned_off_tools_for_the_open_chat(ui, page):
+    setup = """window.session = () => fake.sessions.get('a')
+    """ + TOOLS.replace("fake.override = (path, options) => {", """fake.override = (path, options) => {
+  if (path === '/api/sessions/a/disabled-tools' && options.method === 'PUT') {
+    fake.sessions.set('a', { ...fake.sessions.get('a'), disabled_tools: JSON.parse(options.body).tools })
+  }""")
+    ui.app(session="a", scenario="workspace", setup=setup)
+    ui.show_session("a")
+    page.get_by_role("button", name="Agent tools", exact=True).click()
+    page.get_by_role("button", name="Tools", exact=True).click()
+    tools = page.get_by_role("region", name="Tools")
+    tools.get_by_role("checkbox", name=re.compile("^read_file")).uncheck()
+    tools.get_by_role("button", name="Save tools").click()
+    expect(tools.get_by_role("status")).to_have_text("Tools saved for this chat.")
+    assert ui.bodies("/api/sessions/a/disabled-tools", "PUT") == [{"tools": ["run_command", "mcp__docs__search", "read_file"]}]
+    expect(tools.get_by_role("list", name="Turned-off MCP tools").get_by_role("listitem")).to_have_text(["mcp__docs__search"])
+
+
 def test_the_tools_tab_needs_a_conversation(ui, page):
     tools = open_tools(ui, page, "null")
     expect(tools).to_have_text("Start a conversation to choose its tools.")
@@ -603,13 +707,21 @@ def test_outcome_lines_name_the_rule_mode_or_block(ui, page):
           output: 'ignored' }""",
         """{ id: 'denied', type: 'tool', name: 'run_command', state: 'rejected', approval: 'blocked', input: { command: 'git push' },
           output: 'Denied by a rule for this project: Commands starting with git push.' }""",
+        # Don't ask refuses before any card, so there is no approval field.
+        """{ id: 'dontask', type: 'tool', name: 'delegate_task', state: 'rejected', input: { task: 'x' },
+          output: "Not run: Don't ask mode blocks actions that no rule allows." }""",
+        """{ id: 'declined', type: 'tool', name: 'run_command', state: 'rejected', approval: 'declined', edited: true, input: { command: 'ls' } }""",
+        """{ id: 'cancelled', type: 'tool', name: 'run_command', state: 'cancelled', edited: true, input: { command: 'ls' } }""",
     ]) + "]")
     for text in ("Allowed by a rule for this chat", "Allowed by a rule for this project · ran without a shell",
                  "Allowed by a rule for all projects", "Ran as a read-only command · ran without a shell",
                  "Approved when you switched to Accept edits", "Edited by you before approval",
                  "Not run: this path is outside the project and folder access needs your approval, which Don't ask mode does not show.",
-                 "Not run: Denied by a rule for this project: Commands starting with git push."):
+                 "Not run: Denied by a rule for this project: Commands starting with git push.",
+                 "Not run: Don't ask mode blocks actions that no rule allows."):
         expect(page.get_by_text(text, exact=True)).to_have_count(1)
+    # Cards edited and then declined or cancelled were never approved.
+    expect(page.get_by_text("Edited by you", exact=True)).to_have_count(2)
     expect(page.get_by_text(re.compile("Not run: Not run"))).to_have_count(0)
 
 

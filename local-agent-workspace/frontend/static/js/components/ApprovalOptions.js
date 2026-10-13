@@ -1,4 +1,4 @@
-import { html, useState } from '../lib.js'
+import { html, useAutoFocus, useEffect, useRef, useState } from '../lib.js'
 import { Check, Pencil, X } from '../icons.js'
 import { api } from '../api.js'
 import { modeLabel, quoteArgv } from './PermissionsMenu.js'
@@ -14,7 +14,8 @@ export function ruleLine(event) {
   if (event.allowed_by_rule) parts.push(`Allowed by a rule for ${RULE_SCOPES[event.rule_scope] || 'this chat'}`)
   if (event.read_only_command) parts.push('Ran as a read-only command')
   if (event.approved_by_mode) parts.push(`Approved when you switched to ${modeLabel(event.approved_by_mode)}`)
-  if (event.edited && event.state !== 'pending') parts.push('Edited by you before approval')
+  // A card edited and then declined, expired, blocked or cancelled was never approved.
+  if (event.edited && event.state !== 'pending') parts.push(event.approval === 'approved' ? 'Edited by you before approval' : 'Edited by you')
   if (event.without_shell) parts.push(parts.length ? 'ran without a shell' : 'Ran without a shell')
   return parts.join(' · ')
 }
@@ -85,6 +86,7 @@ function EditAction({ event, sessionId, onError, onClose }) {
   const fields = (event.editable || []).filter(field => FIELD_LABELS[field])
   const [values, setValues] = useState(() => Object.fromEntries(fields.map(field => [field, typeof event.input?.[field] === 'string' ? event.input[field] : ''])))
   const [saving, setSaving] = useState(false)
+  const first = useAutoFocus()
   const save = async () => {
     setSaving(true)
     try {
@@ -94,7 +96,7 @@ function EditAction({ event, sessionId, onError, onClose }) {
     finally { setSaving(false) }
   }
   return html`<div class="approval-edit">
-    ${fields.map(field => html`<label key=${field}>${FIELD_LABELS[field]}<textarea spellcheck=${false} disabled=${saving}
+    ${fields.map((field, index) => html`<label key=${field}>${FIELD_LABELS[field]}<textarea ref=${index === 0 ? first : null} spellcheck=${false} disabled=${saving}
       rows=${field === 'command' ? 3 : 8} value=${values[field]} onInput=${e => { const value = e.currentTarget.value; setValues(current => ({ ...current, [field]: value })) }} /></label>`)}
     <div class="approval-buttons"><button class="outline" disabled=${saving} onClick=${onClose}>Cancel edit</button>
       <button class="primary" disabled=${saving} onClick=${() => void save()}>Save edit</button></div>
@@ -110,14 +112,23 @@ export default function ApprovalOptions({ event, sessionId, onError, deciding, o
   const canRemember = !event.protected && (event.rememberable || []).length > 0
   const canEdit = (event.editable || []).some(field => FIELD_LABELS[field])
   const locked = deciding || editing
+  // Keyboard focus moves into the editor when it opens and back to Edit when it closes.
+  const editButton = useRef(null)
+  const refocusEdit = useRef(false)
+  useEffect(() => {
+    if (editing || !refocusEdit.current) return
+    refocusEdit.current = false
+    editButton.current?.focus()
+  }, [editing])
+  const closeEditor = () => { refocusEdit.current = true; setEditing(false) }
   return html`
     ${event.protected ? html`<p class="tool-protected">Protected file: ${event.protected}. Edits to it always need your approval.</p>` : null}
     ${event.uncertain ? html`<p class="tool-uncertain">This command could not be checked exactly against your deny and ask rules, so it needs your approval.</p>` : null}
     ${event.edited ? html`<p class="tool-edited">Edited by you</p>` : null}
-    ${editing ? html`<${EditAction} event=${event} sessionId=${sessionId} onError=${onError} onClose=${() => setEditing(false)} />` : details}
+    ${editing ? html`<${EditAction} event=${event} sessionId=${sessionId} onError=${onError} onClose=${closeEditor} />` : details}
     ${declineNote}
     <div class="approval-buttons"><button class="outline" disabled=${locked} onClick=${() => void onDecide(false)}><${X} size=${15} />Decline</button>
-      ${canEdit && !editing ? html`<button class="outline" disabled=${deciding} onClick=${() => { setRemembering(false); setEditing(true) }}><${Pencil} size=${14} />Edit</button>` : null}
+      ${canEdit && !editing ? html`<button ref=${editButton} class="outline" disabled=${deciding} onClick=${() => { setRemembering(false); setEditing(true) }}><${Pencil} size=${14} />Edit</button>` : null}
       ${canRemember ? html`<button class="outline" disabled=${locked} aria-expanded=${remembering} onClick=${() => setRemembering(v => !v)}>Always allow…</button>` : null}
       ${allowInChat ? html`<button class="outline" disabled=${locked} onClick=${() => void onDecide(true, { remember: true })}>${allowInChat}</button>` : null}
       <button class="primary" disabled=${locked} onClick=${() => void onDecide(true)}><${Check} size=${15} />Approve</button></div>

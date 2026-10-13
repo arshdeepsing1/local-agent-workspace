@@ -361,7 +361,9 @@ export function useWorkspace() {
       } : current)
       return updated
     }
-    const result = await api('/permission-rules', 'DELETE', { scope, ...(target.id ? { session_id: target.id } : {}), rule })
+    // Like addRule: chat and project rules need the chat. A new chat lists the project's rules too.
+    const id = scope === 'user' ? target.id : await ensureSession(target)
+    const result = await api('/permission-rules', 'DELETE', { scope, ...(id ? { session_id: id } : {}), rule })
     applyRules(target, result, scope === 'chat')
     return result
   }

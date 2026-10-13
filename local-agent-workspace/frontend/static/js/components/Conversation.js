@@ -76,7 +76,9 @@ function toolOutcome(event) {
       return reason ? `Not run: ${reason}` : 'Action not run'
     }
     // Blocked without an approval card (Plan mode, changed instructions, a tool profile), or an older event.
-    return clipped ? `Not run: ${clipped}` : 'Action not run'
+    // Don't ask and protected-file refusals already start with "Not run:".
+    const reason = clipped.replace(/^Not run:\s*/i, '')
+    return reason ? `Not run: ${reason}` : 'Action not run'
   }
   if (event.state === 'cancelled') return 'Action cancelled'
   return clipped || 'Tool returned an error'

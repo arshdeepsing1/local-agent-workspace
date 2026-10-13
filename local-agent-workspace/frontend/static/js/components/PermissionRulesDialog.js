@@ -15,13 +15,18 @@ export function ruleDraft({ behavior, target, match, text, options, folder, tool
   return { tool: tool.trim(), behavior }
 }
 
-// Props: onAdd(scope, draft) -> Promise, onClose
-export default function PermissionRulesDialog({ onAdd, onClose }) {
+// Props: onAdd(scope, draft) -> Promise, onClose, returnFocus? (called when the dialog goes away)
+export default function PermissionRulesDialog({ onAdd, onClose, returnFocus }) {
   const dialog = useRef(null)
   const [form, setForm] = useState({ behavior: 'allow', scope: 'project', target: 'command', match: 'exact', text: '', options: '', folder: '', tool: '' })
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
-  useEffect(() => { dialog.current?.showModal() }, [])
+  useEffect(() => {
+    const node = dialog.current
+    node?.showModal()
+    // The menu item that opened the dialog is gone, so focus goes back to where the caller says.
+    return () => { if (node?.open) node.close(); returnFocus?.() }
+  }, [])
   const set = (key, value) => { setForm(current => ({ ...current, [key]: value })); setError('') }
   const submit = async event => {
     event.preventDefault()
