@@ -34,6 +34,8 @@ from .jobs import JobManager, validate_command_options
 from .command_exec import prepare_command
 from .recovery import CheckpointManager
 from .changes import ChangeReview
+from .shell_changes import ShellChangeTracker
+from .workspace_folders import WorkspaceFolders
 from .worktrees import WorktreeManager
 from .extensions import ExtensionManager
 from .extensions import skill_index
@@ -910,6 +912,12 @@ class AgentManager:
             argv, env = await prepare_command(argv, workspace=session["workspace"], forbidden_roots=forbidden,
                                               read_only=read_only, env=self.jobs.command_environment())
             options = {"argv": argv, "env": env}
+        tracker = None
+        if not arguments.get("background") and not read_only:
+            # Files the command changes join the change review (Git folders only; see shell_changes).
+            folders = self.__dict__.setdefault("_workspace_folders", WorkspaceFolders(self.settings))
+            tracker = await ShellChangeTracker.before(self.session_tools(session), arguments["command"],
+                                                      folders=folders.paths(session["workspace"]))
         job = await self.jobs.start(command=arguments["command"], workspace=session["workspace"],
                                     session_id=session["id"], timeout_seconds=arguments.get("timeout_seconds", 60),
                                     max_output_bytes=arguments.get("max_output_bytes", 80000),
@@ -919,12 +927,18 @@ class AgentManager:
                                     **({"without_shell": True} if argv is not None else {}))
             if not job["background"]:
                 job = await self.jobs.wait(job["id"])
+                await self.track_shell_changes(session, tracker)
             else:
                 job = self.jobs.get(job["id"])
             return self.first_page(job)
         except asyncio.CancelledError:
             if not job["background"]:
                 await self.jobs.stop(job["id"])
+                if tracker is not None:  # Stopped: what the command changed so far is still listed.
+                    try:
+                        await asyncio.shield(asyncio.wait_for(self.track_shell_changes(session, tracker), 10))
+                    except (asyncio.CancelledError, TimeoutError):
+                        pass
             raise
 
     async def broadcast(self, session_id, data):
@@ -963,8 +977,16 @@ class AgentManager:
         self.notify_status(session, previous, status, turn_ended)
         await self.delegates.progress(session, status=status)
         if status == "idle":
-            # Commands can also change reviewed files; refresh their counts after each turn.
-            await self.publish_changes(session, only_tracked=True)
+            if (turn_ended and self.settings.values.get("auto_keep_changes") is True
+                    and session.get("terminal_reason") in ("completed", "tool_error")):
+                # Automatic Keep: this chat's list clears when its reply finishes (a subagent's end
+                # leaves its parent's rolled-up rows alone). The empty list is pushed. A reply that
+                # was stopped, failed or hit the step limit keeps its list, so Undo stays offered.
+                self.changes.keep_all(session["id"])
+                await self.publish_changes(session)
+            else:
+                # Commands can also change reviewed files; refresh their counts after each turn.
+                await self.publish_changes(session, only_tracked=True)
 
     def notify_status(self, session, previous, status, turn_ended=False):
         """A desktop notification of the change, only if enabled and no page is open."""
@@ -984,6 +1006,40 @@ class AgentManager:
         return WorkspaceTools(session["workspace"], self.settings.values["env_file"], session.get("allowed_directories", []),
                               session.get("permission_mode", "manual") == "bypassPermissions",
                               write_limit=write_limit_setting(self.settings.values), excluded_roots=(self.settings.state_dir,))
+
+    def track_change(self, session, record, tools):
+        """Track an applied agent file edit in this chat's review and, for a subagent, in its parent's."""
+        self.changes.track(record, tools)
+        if session.get("is_subagent") and session.get("parent_session_id"):
+            self.changes.track(record, tools, session_id=session["parent_session_id"], via=session["id"])
+
+    async def track_shell_changes(self, session, tracker):
+        """Add the files a finished command changed to the review (and a subagent's parent's), then push."""
+        if tracker is None:
+            return
+        changed = await tracker.after()
+        parent_id = session.get("parent_session_id") if session.get("is_subagent") else None
+        try:
+            for target, baseline in changed:
+                self.changes.track_state(session["id"], tracker.tools, target, baseline)
+                if parent_id:
+                    self.changes.track_state(parent_id, tracker.tools, target, baseline, via=session["id"])
+        except STORAGE_ERRORS as exc:
+            log.warning("Could not record the files a command changed: %s", type(exc).__name__)
+        if changed:
+            await self.publish_changes(session)
+            await self.publish_parent_changes(session)
+
+    async def publish_parent_changes(self, session):
+        """Push a subagent's parent's changes list, which includes the subagent's rolled-up edits."""
+        if not (session.get("is_subagent") and session.get("parent_session_id")):
+            return
+        try:
+            parent = self.get(session["parent_session_id"])
+        except (ValueError, OSError):
+            return
+        if parent:
+            await self.publish_changes(parent)
 
     def review_tools(self, session):
         """Tools for reviewing this chat's agent changes (list, diff, Keep, Undo): the chat's own access plus the
@@ -2086,7 +2142,7 @@ class AgentManager:
             elif name in ("write_file", "edit_file"):
                 turn_id = next((item["id"] for item in reversed(session["events"]) if item["type"] == "user"), None)
                 result = self.checkpoints.apply_edit(tools, name, arguments, session_id=session["id"], turn_id=turn_id,
-                                                     on_applied=lambda record: self.changes.track(record, tools))
+                                                     on_applied=lambda record: self.track_change(session, record, tools))
                 target = tools.path(arguments["path"])
                 self.remember_file(session, target)
                 if activity is not None:
@@ -2099,14 +2155,14 @@ class AgentManager:
                 source, target = tools.path(arguments["path"]), tools.path(arguments["destination"])
                 result = self.checkpoints.apply_move(tools, arguments["path"], arguments["destination"],
                                                      overwrite=arguments.get("overwrite") is True, session_id=session["id"],
-                                                     turn_id=turn_id, on_applied=lambda record: self.changes.track(record, tools))
+                                                     turn_id=turn_id, on_applied=lambda record: self.track_change(session, record, tools))
                 self.forget_file(session, source)
                 self.remember_file(session, target)
                 result += self.file_diagnostics(tools, target, original.get(str(target)))
             elif name == "delete_path":
                 turn_id = next((item["id"] for item in reversed(session["events"]) if item["type"] == "user"), None)
                 result = self.checkpoints.apply_delete(tools, arguments["path"], session_id=session["id"], turn_id=turn_id,
-                                                       on_applied=lambda record: self.changes.track(record, tools))
+                                                       on_applied=lambda record: self.track_change(session, record, tools))
                 self.forget_file(session, tools.path(arguments["path"]))
             elif name == "notebook_read":
                 # Stat first: a change during the read then counts as unseen.
@@ -2122,7 +2178,7 @@ class AgentManager:
                 before = original.get(str(target))
                 after, summary = notebooks.plan_edit(before, arguments)
                 self.checkpoints.apply_text(tools, arguments["path"], after, before, session_id=session["id"], turn_id=turn_id,
-                                            on_applied=lambda record: self.changes.track(record, tools))
+                                            on_applied=lambda record: self.track_change(session, record, tools))
                 self.remember_file(session, target)
                 result = notebooks.preview(tools.display_path(target), summary, done=True)
                 result = (("No changes. " if after == before else "") + clip_result(result)
@@ -2212,6 +2268,7 @@ class AgentManager:
             await self.update_event(session, event, state="error" if failed else "completed", output=output)
             if name in FILE_CHANGE_TOOLS:
                 await self.publish_changes(session)
+                await self.publish_parent_changes(session)
             await self.run_hooks(session, "after_tool", name, arguments, result, call_id=call_id)
             command_failed = (name == "run_command" and isinstance(result, dict) and not result.get("background")
                               and result.get("state") in {"failed", "timed_out"})

@@ -3,7 +3,7 @@ import { ArrowLeft, ChevronRight, Code2, File, FileDiff, Folder, GitBranch, Penc
 import { api } from '../api.js'
 import FileRoots, { useWorkspaceFolders } from './FileRoots.js'
 import TerminalPanel from './TerminalPanel.js'
-import DiffReview, { DiffLine } from './DiffReview.js'
+import DiffReview, { DiffLine, UnsentComments } from './DiffReview.js'
 import { DiffStat } from './ChangesBar.js'
 
 // A link that opens an absolute path at a line in VS Code (vscode://file/<path>:<line>).
@@ -129,9 +129,10 @@ function GitChanges({ query, workspace, busy, onOpenFile }) {
 // changes: the conversation's unreviewed agent changes (see ChangesBar); review: { path } opens
 // that file's changes once, then onReviewOpened() clears it; onReview(action, files) keeps or undoes;
 // onSelectSession(id) opens a chat that a review error names as blocking.
+// onSendComments(message) sends the review's line comments to the agent (see DiffReview).
 // allowedDirectories: the conversation's granted folders (absolute), offered as other roots of Files.
 // open: { path, line? } opens that file in the editor once, at that line, then onOpened() clears it.
-export default function WorkspacePanel({ sessionId, workspace, allowedDirectories = [], file, setFile, onClose, onAttach, changes: agentChanges, busy, review, onReviewOpened, onReview, onSelectSession, open, onOpened }) {
+export default function WorkspacePanel({ sessionId, workspace, allowedDirectories = [], file, setFile, onClose, onAttach, changes: agentChanges, busy, review, onReviewOpened, onReview, onSelectSession, onSendComments, open, onOpened }) {
   const [tab, setTab] = useState('files')
   // root '.' is the project; a granted or added folder is browsed by absolute paths and never above itself.
   const [root, setRoot] = useState('.')
@@ -260,7 +261,8 @@ export default function WorkspacePanel({ sessionId, workspace, allowedDirectorie
           <button class="icon-button" onClick=${() => onAttach(file.path)} aria-label="Add this file to chat"><${Plus} size=${16} /></button>
           <button class="icon-button" onClick=${() => void save()} disabled=${!dirty || loading || reviewing} aria-label="Save file"><${Save} size=${16} /></button>
         </div>
-        ${reviewing ? html`<${DiffReview} sessionId=${sessionId} path=${file.path} version=${pending.current_hash} busy=${busy} onAction=${onReview} onSelectSession=${onSelectSession} />` : html`
+        ${reviewing ? html`<${DiffReview} key=${file.path} sessionId=${sessionId} path=${file.path} version=${pending.current_hash} busy=${busy} onAction=${onReview} onSelectSession=${onSelectSession}
+          onSendComments=${onSendComments} />` : html`
         <textarea ref=${editor} class="code-editor" aria-label=${`Edit ${file.path}`} value=${file.content} spellcheck=${false}
           onMouseDown=${leaveLine} onKeyDown=${leaveLine} onInput=${e => { leaveLine(); setFile({ ...file, content: e.currentTarget.value }) }} />
         <div class="editor-status"><span>${file.content.split('\n').length} lines${markedLine?.selected ? ` · Line ${markedLine.line}` : ''}</span><span>${dirty ? 'Unsaved changes' : 'Saved on disk'}</span></div>`}
@@ -283,5 +285,6 @@ export default function WorkspacePanel({ sessionId, workspace, allowedDirectorie
     : tab === 'changes' ? html`<${GitChanges} query=${query} workspace=${workspace} busy=${busy}
       onOpenFile=${(path, line) => { setTab('files'); void openFile(path, 'edit', line) }} />`
     : html`<${TerminalPanel} sessionId=${sessionId} workspace=${workspace} />`}
+    ${sessionId && !(tab === 'files' && reviewing) ? html`<${UnsentComments} sessionId=${sessionId} busy=${busy} onSendComments=${onSendComments} />` : null}
   </aside>`
 }

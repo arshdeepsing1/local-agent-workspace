@@ -135,6 +135,7 @@ export default function App() {
       allowedDirectories=${active?.allowed_directories || []}
       workspace=${workspace} file=${editorDrafts[editorKey] || null} setFile=${setEditorFile} onClose=${() => setWorkspaceOpen(false)}
       changes=${app.changes} busy=${busy} review=${review?.viewKey === app.viewKey ? review : null} onReviewOpened=${() => setReview(null)} onReview=${app.reviewChanges} onSelectSession=${app.setActiveId}
+      onSendComments=${text => app.send(text)}
       open=${openPath?.viewKey === app.viewKey ? openPath : null} onOpened=${() => setOpenPath(null)}
       onAttach=${path => { setDraft(current => `${current}${current ? '\n' : ''}Please read the ${path.startsWith('/') ? 'file' : 'project file'}: ${path}`); setWorkspaceOpen(false) }} />` : null}
     ${agentToolsOpen && app.settings && (!app.activeId || active) ? html`<${AgentToolsDialog} key=${editorKey} session=${active} onSaveTools=${app.setDisabledTools} workspace=${workspace} onClose=${() => setAgentToolsOpen(false)} onError=${showError} onSelectSession=${id => { setAgentToolsOpen(false); app.setActiveId(id); void app.refreshSessions().catch(e => showError(e.message)) }} />` : null}

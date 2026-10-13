@@ -107,6 +107,7 @@ class SettingsEdit(BaseModel):
     compaction_handoffs: bool | None = Field(default=None, strict=True)
     approval_timeout_minutes: int | None = Field(default=None, ge=0, le=MAX_APPROVAL_MINUTES, strict=True)
     system_notifications: bool | None = Field(default=None, strict=True)
+    auto_keep_changes: bool | None = Field(default=None, strict=True)
     user_instructions: str | None = Field(default=None, max_length=MAX_USER_INSTRUCTIONS, strict=True)
     write_limit_kb: int | None = Field(default=None, ge=MIN_WRITE_LIMIT_KB, le=MAX_WRITE_LIMIT_KB, strict=True)
     command_env: list[str] | None = Field(default=None, max_length=MAX_COMMAND_ENV, strict=True)

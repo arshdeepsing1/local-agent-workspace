@@ -204,3 +204,57 @@ def test_a_file_outside_the_project_is_listed_by_its_full_path_and_opens_for_rev
     # The file list shows the project folder only, so it has no dot for this file.
     page.get_by_role("button", name="Back to files").click()
     expect(page.get_by_role("img", name=re.compile("Changed by the agent|Contains changed files"))).to_have_count(0)
+
+
+def test_rows_mark_subagent_and_command_changes(ui, page):
+    mount_bar(ui, changes="""{ added: 3, removed: 1, files: [
+      { path: 'a.txt', status: 'modified', added: 1, removed: 1, current_hash: 'h1', via_session_id: 'child' },
+      { path: 'b.txt', status: 'created', added: 1, removed: 0, current_hash: 'h2', source: 'command' },
+      { path: 'c.txt', status: 'modified', added: 1, removed: 0, current_hash: 'h3', via_session_id: 'child', source: 'command' },
+      { path: 'd.txt', status: 'modified', added: 0, removed: 0, current_hash: 'h4' },
+    ] }""")
+    page.get_by_role("button", name=re.compile("^4 files changed")).click()
+    rows = page.get_by_role("listitem")
+    subagent, command = page.locator(".changes-status.subagent"), page.locator(".changes-status.command")
+    expect(rows.nth(0).locator(".changes-status")).to_have_text(["Subagent"])
+    expect(rows.nth(1).locator(".changes-status")).to_have_text(["New file", "Command"])
+    expect(rows.nth(2).locator(".changes-status")).to_have_text(["Subagent", "Command"])
+    expect(rows.nth(3).locator(".changes-status")).to_have_count(0)
+    expect(subagent.first).to_have_attribute("title", "Changed by a subagent of this conversation")
+    expect(command.first).to_have_attribute("title", "Changed by a command the agent ran")
+
+
+def test_automatic_keep_is_off_by_default_and_saved_from_settings(ui, page):
+    ui.app(scenario="workspace")
+    expect(page.get_by_role("combobox", name="Model")).to_have_value("test-model")
+    page.get_by_role("button", name="Settings", exact=True).click()
+    dialog = page.get_by_role("dialog")
+    box = dialog.get_by_role("checkbox", name="Keep agent changes automatically when a reply finishes")
+    expect(box).not_to_be_checked()
+    expect(dialog.get_by_text("The changes bar then clears after each reply. Edits made with the agent's file tools can still "
+                              "be undone from Agent tools → Recovery; edits made by commands can no longer be undone from the app.")).to_be_visible()
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    assert "auto_keep_changes" not in ui.bodies("/api/settings", "PUT")[0]  # Never set: not sent.
+    page.get_by_role("button", name="Settings", exact=True).click()
+    page.get_by_role("dialog").get_by_role("checkbox", name="Keep agent changes automatically when a reply finishes").check()
+    page.get_by_role("dialog").get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    assert ui.bodies("/api/settings", "PUT")[1]["auto_keep_changes"] is True
+    page.get_by_role("button", name="Settings", exact=True).click()
+    expect(page.get_by_role("dialog").get_by_role("checkbox", name="Keep agent changes automatically when a reply finishes")).to_be_checked()
+
+
+def test_on_a_narrow_screen_the_origin_badges_shrink_and_the_name_stays_readable(ui, page):
+    page.set_viewport_size({"width": 390, "height": 700})
+    mount_bar(ui, changes="""{ added: 120, removed: 0, files: [{ path: 'some_really_long_file_name_for_testing.py', status: 'created',
+      added: 120, removed: 0, current_hash: 'h1', via_session_id: 'child', source: 'command' }] }""")
+    page.get_by_role("button", name=re.compile("^1 file changed")).click()
+    badges = page.locator(".changes-status.subagent, .changes-status.command")
+    expect(badges).to_have_text(["Subagent", "Command"])  # The full words stay in the page for screen readers.
+    shown = badges.evaluate_all("items => items.map(item => getComputedStyle(item, '::before').content)")
+    assert [text.split(" / ")[0] for text in shown] == ['"S"', '"C"']  # The letters shown, with no spoken text.
+    width = page.locator(".changes-name").evaluate("name => name.getBoundingClientRect().width")
+    assert width >= 70, width
+    row = page.locator(".changes-file")
+    assert row.evaluate("row => row.scrollWidth <= row.clientWidth")
