@@ -11,6 +11,7 @@ from local_agent.feature_tools import FEATURE_TOOLS
 from local_agent.instructions import load_project_instructions
 from local_agent.interactions import (DONT_ASK, PLAN_EXPIRED, QUESTIONS_EXPIRED, SKIPPED, validate_questions)
 from local_agent.portability import export_bundle
+from local_agent.tool_profiles import filter_tools
 from local_agent.tool_schema import validate_arguments
 from local_agent.tools import WorkspaceTools
 from test_approval_wait import WAIT_FOR, bounded, expire_waits_of
@@ -103,6 +104,13 @@ def tool_reply(name, arguments, call_id):
     return httpx.Response(200, text=frame({"content": "", "tool_calls": [part]}, "tool_calls") + "data: [DONE]\n\n")
 
 
+def tool_calls_reply(*calls):
+    """One model response with several tool calls: (name, arguments, call_id) each, run in order."""
+    parts = [{"index": index, "id": call_id, "function": {"name": name, "arguments": json.dumps(arguments)}}
+             for index, (name, arguments, call_id) in enumerate(calls)]
+    return httpx.Response(200, text=frame({"content": "", "tool_calls": parts}, "tool_calls") + "data: [DONE]\n\n")
+
+
 def scripted(monkeypatch, parent, child=()):
     """Answer the parent's and a delegated child's streamed requests in order; titles get a fixed reply."""
     requests = {"parent": [], "child": []}
@@ -147,6 +155,14 @@ def test_the_schema_bounds_questions_and_options(questions):
 def test_questions_need_text_and_distinct_options(questions):
     with pytest.raises(ValueError, match="Each question needs a text and 2-4 distinct options."):
         validate_questions(questions)
+
+
+@pytest.mark.parametrize("label", ["Other", " other ", "OTHER"])
+def test_an_option_named_other_is_refused(label):
+    # The card always offers its own free-text Other; a second one would get no text.
+    with pytest.raises(ValueError, match="Leave out the Other option"):
+        validate_questions([{"question": "Which?", "options": [{"label": "SQLite"}, {"label": label}]}])
+    validate_questions([{"question": "Which?", "options": [{"label": "SQLite"}, {"label": "Other files"}]}])
 
 
 async def test_duplicate_labels_are_an_error_for_the_model(runtime):
@@ -250,6 +266,7 @@ async def test_skip(runtime):
     assert await bounded(run) == SKIPPED
     event = tool_event(session)
     assert (event["state"], event["question_outcome"]) == ("completed", "skipped") and "answers" not in event
+    assert "skipped_reason" not in event  # The user skipped; the card says so.
 
 
 async def test_an_unanswered_question_expires_after_the_approval_wait(runtime, monkeypatch):
@@ -298,6 +315,7 @@ async def test_in_dont_ask_mode_questions_return_at_once(runtime, monkeypatch):
     event = tool_event(session)
     assert output == DONT_ASK
     assert (event["state"], event["question_outcome"]) == ("completed", "skipped") and "approval_expires" not in event
+    assert event["skipped_reason"] == "dont_ask"  # Not a skip by the user: the card says it was not asked.
     assert not manager.interactions.waiting
 
 
@@ -448,6 +466,24 @@ async def test_a_plan_is_not_approved_once_the_chat_left_plan_mode(runtime):
     assert "Auto mode" in await bounded(run)
 
 
+@pytest.mark.parametrize("menu_mode", ["manual", "auto"])
+async def test_a_menu_mode_chosen_after_the_answer_wins_over_the_approved_plan(runtime, menu_mode):
+    # The user approves, then picks another mode from the menu before the tool task resumes.
+    _, manager, session, _, tools = runtime
+    session["permission_mode"] = "plan"
+    run = call(manager, session, tools, "submit_plan", PLAN)
+    _, event_id = await waiting(manager, "plan")
+    manager.interactions.answer_plan(session["id"], event_id, {"choice": "acceptEdits", "feedback": "Go."})
+    session["permission_mode"] = menu_mode
+    await manager.interactions.mode_changed(session, "plan", menu_mode)
+    output = await bounded(run)
+    label = {"manual": "Manual", "auto": "Auto"}[menu_mode]
+    assert output.startswith(f"The user switched this chat to {label} mode from the menu instead of reviewing the plan")
+    assert session["permission_mode"] == menu_mode
+    assert tool_event(session)["plan_outcome"] == "superseded" and "plan_mode" not in tool_event(session)
+    assert not any(item["type"] == "notice" for item in session["events"])
+
+
 async def test_mode_changes_skip_questions_only_for_dont_ask(runtime):
     _, manager, session, _, tools = runtime
     run = call(manager, session, tools, "ask_user", {"questions": QUESTIONS})
@@ -458,7 +494,7 @@ async def test_mode_changes_skip_questions_only_for_dont_ask(runtime):
     await manager.interactions.mode_changed(session, "acceptEdits", "dontAsk")
     await manager.interactions.mode_changed(session, "acceptEdits", "dontAsk")  # A second change sets nothing twice.
     assert await bounded(run) == DONT_ASK
-    assert tool_event(session)["question_outcome"] == "skipped"
+    assert (tool_event(session)["question_outcome"], tool_event(session)["skipped_reason"]) == ("skipped", "dont_ask")
     with pytest.raises(ValueError, match="This question is no longer waiting for an answer."):
         manager.interactions.answer_questions(session["id"], event_id, {"skip": True})
 
@@ -503,6 +539,73 @@ async def test_an_approved_plan_is_implemented_in_the_same_turn(runtime, monkeyp
         assert session["permission_mode"] == "plan"
     plan_result = next(message for message in requests["parent"][1]["messages"] if message.get("tool_call_id") == "plan")
     assert ("approved the plan" if choice == "acceptEdits" else "keep planning") in plan_result["content"]
+
+
+@pytest.mark.parametrize("second", [
+    ("delete_path", {"path": "keep.txt"}),
+    ("write_file", {"path": "notes.txt", "content": "early"}),
+])
+async def test_calls_after_submit_plan_in_one_response_never_run_under_an_approved_mode(runtime, monkeypatch, second):
+    # Plan still denies: submit_plan must be the response's last call, so a change written in Plan
+    # never runs after an approval the model has not read.
+    _, manager, session, project, _ = runtime
+    (project / "keep.txt").write_text("keep")
+    session["permission_mode"] = "plan"
+    requests = scripted(monkeypatch, [
+        lambda: tool_calls_reply(("submit_plan", PLAN, "plan"), (*second, "second")),
+        lambda: reply("I will submit the plan on its own."),
+    ])
+    manager.start(session["id"], "Tidy up")
+    await WAIT_FOR(manager.tasks[session["id"]], 5)
+    plan, change = tool_event(session, "plan"), tool_event(session, "second")
+    assert plan["state"] == "error" and plan["output"].startswith("submit_plan must be the last tool call")
+    assert change["state"] == "rejected" and change["output"].startswith("Plan mode is read-only.")
+    assert session["permission_mode"] == "plan" and not manager.interactions.waiting
+    assert (project / "keep.txt").read_text() == "keep" and not (project / "notes.txt").exists()
+    plan_result = next(m for m in requests["parent"][1]["messages"] if m.get("tool_call_id") == "plan")
+    assert json.loads(plan_result["content"])["error_kind"] == "call_order"
+
+
+async def test_ask_user_followed_by_other_calls_is_refused(runtime, monkeypatch):
+    _, manager, session, project, _ = runtime
+    session["permission_mode"] = "acceptEdits"
+    scripted(monkeypatch, [
+        lambda: tool_calls_reply(("ask_user", {"questions": QUESTIONS[:1]}, "ask"),
+                                 ("list_files", {"path": "."}, "list")),
+        lambda: reply("Done."),
+    ])
+    manager.start(session["id"], "Set up storage")
+    await WAIT_FOR(manager.tasks[session["id"]], 5)
+    ask = tool_event(session, "ask")
+    assert ask["state"] == "error" and ask["output"].startswith("ask_user must be the last tool call")
+    assert "question_outcome" not in ask and not manager.interactions.waiting
+
+
+async def test_a_card_after_other_calls_in_one_response_still_waits(runtime, monkeypatch):
+    _, manager, session, _, _ = runtime
+    session["permission_mode"] = "plan"
+    requests = scripted(monkeypatch, [
+        lambda: tool_calls_reply(("list_files", {"path": "."}, "list"), ("submit_plan", PLAN, "plan")),
+        lambda: reply("Implemented."),
+    ])
+    manager.start(session["id"], "Add a notes file")
+    session_id, event_id = await waiting(manager, "plan")
+    assert tool_event(session, "list")["state"] == "completed"
+    manager.interactions.answer_plan(session_id, event_id, {"choice": "manual"})
+    await WAIT_FOR(manager.tasks[session["id"]], 5)
+    assert tool_event(session, "plan")["plan_outcome"] == "approved" and len(requests["parent"]) == 2
+
+
+@pytest.mark.parametrize("profile", ["read_only", "file_editor"])
+async def test_restricted_tool_profiles_permit_ask_user(runtime, profile):
+    _, manager, session, _, tools = runtime
+    session["tool_profile"] = profile
+    assert "ask_user" in {item["function"]["name"] for item in filter_tools(session, FEATURE_TOOLS)}
+    run = call(manager, session, tools, "ask_user", {"questions": QUESTIONS[:1]})
+    _, event_id = await waiting(manager, "question")
+    assert tool_event(session)["state"] == "pending"
+    manager.interactions.answer_questions(session["id"], event_id, {"answers": [{"selected": ["SQLite"]}]})
+    assert json.loads(await bounded(run))["answers"][0]["selected"] == ["SQLite"]
 
 
 async def test_a_subagent_question_waits_in_the_child_and_is_answered_there(runtime, monkeypatch):
@@ -559,5 +662,10 @@ async def test_export_keeps_answers_and_outcomes(runtime):
     events = {event.get("call_id"): event for event in bundle["sessions"][0]["events"]}
     assert events["ask"]["answers"] == [{"question": "Which database?", "selected": [], "other": "DuckDB"}]
     assert events["ask"]["question_outcome"] == "answered"
+    session["permission_mode"] = "dontAsk"
+    await bounded(manager.execute_tool(session, tools, "ask_user", {"questions": QUESTIONS[:1]}, "auto"))
+    bundle = export_bundle([session], session["id"])
+    events = {event.get("call_id"): event for event in bundle["sessions"][0]["events"]}
+    assert (events["auto"]["question_outcome"], events["auto"]["skipped_reason"]) == ("skipped", "dont_ask")
     assert (events["plan"]["plan_outcome"], events["plan"]["plan_mode"], events["plan"]["feedback"]) == (
         "approved", "manual", "Go slowly.")

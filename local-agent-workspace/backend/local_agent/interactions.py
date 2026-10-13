@@ -25,6 +25,7 @@ QUESTIONS_EXPIRED = ("The user did not answer in time. Continue with your best j
                      "or ask again later.")
 PLAN_EXPIRED = "The user did not review the plan in time. Stay in Plan mode and ask the user to review it."
 QUESTION_GONE = "This question is no longer waiting for an answer."
+OTHER_LABEL = "other"
 PLAN_GONE = "This plan is no longer waiting for review."
 
 
@@ -50,10 +51,36 @@ def validate_questions(questions):
         if not text or text.casefold() in seen or not all(labels) or len(set(labels)) != len(labels):
             raise InteractionError("Each question needs a text and 2-4 distinct options.", "invalid_arguments",
                                    "Give every question a text and 2-4 options with different labels, then ask again.")
+        if OTHER_LABEL in labels:
+            raise InteractionError("Leave out the Other option; the card always offers one.", "invalid_arguments",
+                                   "Leave out Other; the user can always write their own answer.")
         seen.add(text.casefold())
         result.append({"question": text, "header": str(item.get("header") or "").strip(), "options": options,
                        "multi_select": item.get("multi_select") is True})
     return result
+
+
+def later_calls(session, call_id):
+    """The names of the tool calls that follow call_id in the same model response."""
+    for message in reversed(session.get("wire") or []):
+        calls = message.get("tool_calls") if message.get("role") == "assistant" else None
+        ids = [item.get("id") for item in calls or []]
+        if call_id and call_id in ids:
+            return [item["function"]["name"] for item in calls[ids.index(call_id) + 1:]]
+    return []
+
+
+def require_last_call(session, event, name):
+    """Refuse a card when other tool calls follow it in the same response.
+
+    The tool loop runs a response's calls in order, so a later call would run before the
+    model read the answer, and after an approved plan under the new mode.
+    """
+    if later_calls(session, event.get("call_id")):
+        raise InteractionError(
+            f"{name} must be the last tool call in its response: calls after it would run before you read the "
+            "user's reply. Nothing was shown to the user.", "call_order",
+            f"Call {name} again, after the other calls or in a response of its own.")
 
 
 def wait_seconds(settings):
@@ -93,14 +120,16 @@ class InteractionManager:
     async def ask(self, session, event, arguments):
         questions = validate_questions(arguments["questions"])
         if session.get("permission_mode") == "dontAsk":
-            await self.manager.update_event(session, event, question_outcome="skipped")
+            await self.manager.update_event(session, event, question_outcome="skipped", skipped_reason="dont_ask")
             return DONT_ASK
+        require_last_call(session, event, "ask_user")
         answer = await self.wait(session, event, "question", questions=questions)
         if answer is None:
             await self.manager.update_event(session, event, state="completed", question_outcome="expired")
             result = QUESTIONS_EXPIRED
         elif answer.get("skip"):
-            await self.manager.update_event(session, event, state="completed", question_outcome="skipped")
+            reason = {"skipped_reason": "dont_ask"} if answer.get("dont_ask") else {}
+            await self.manager.update_event(session, event, state="completed", question_outcome="skipped", **reason)
             result = DONT_ASK if answer.get("dont_ask") else SKIPPED
         else:
             await self.manager.update_event(session, event, state="completed", question_outcome="answered",
@@ -115,8 +144,13 @@ class InteractionManager:
                                    "unavailable_tool")
         if session.get("is_subagent"):
             raise InteractionError("Subagents cannot submit plans; return the plan as your final reply.", "unavailable_tool")
+        require_last_call(session, event, "submit_plan")
         answer = await self.wait(session, event, "plan")
         update = self.manager.update_event
+        current = session.get("permission_mode", "manual")
+        if answer is not None and not answer.get("superseded") and answer.get("choice") != "keep_planning" and current != "plan":
+            # The mode changed from the menu after the answer, before this task resumed: the newer choice wins.
+            answer = {"superseded": current}
         if answer is None:
             await update(session, event, state="completed", plan_outcome="expired")
             result = PLAN_EXPIRED

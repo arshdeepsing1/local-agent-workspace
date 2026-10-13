@@ -19,7 +19,9 @@ function outcomeText(event) {
 // A submit_plan tool event: the plan (sanitized Markdown) and, while it waits, the three review choices.
 export default function PlanCard({ event, sessionId, onError }) {
   const plan = typeof event.input?.plan === 'string' ? event.input.plan : ''
-  const title = typeof event.input?.title === 'string' && event.input.title.trim() ? event.input.title.trim() : 'Plan ready for review'
+  const refused = event.state === 'error' || event.state === 'rejected'
+  const title = refused ? 'Plan not submitted'
+    : typeof event.input?.title === 'string' && event.input.title.trim() ? event.input.title.trim() : 'Plan ready for review'
   const markup = useMemo(() => renderMarkdown(plan), [plan])
   const body = useRef(null)
   const [feedback, setFeedback] = useState('')
@@ -37,7 +39,9 @@ export default function PlanCard({ event, sessionId, onError }) {
   return html`<section class=${`plan-card ${pending ? 'needs-answer' : ''}`} aria-label=${title}>
     <h3>${title}</h3>
     ${pending && event.approval_expires ? html`<p class="muted">If you do not review the plan by ${expiryTime(event.approval_expires)}, the agent continues without your review.</p>` : null}
-    <div class="plan-body markdown" ref=${body} dangerouslySetInnerHTML=${{ __html: markup }} />
+    ${refused ? html`<details class="plan-refused"><summary>Show the plan</summary>
+        <div class="plan-body markdown" ref=${body} dangerouslySetInnerHTML=${{ __html: markup }} /></details>`
+      : html`<div class="plan-body markdown" ref=${body} dangerouslySetInnerHTML=${{ __html: markup }} />`}
     ${pending ? html`<label class="decline-note"><span>Feedback for the agent (optional)</span>
         <textarea rows=${2} maxLength=${MAX_FEEDBACK} spellcheck=${false} value=${feedback} disabled=${sending}
           onInput=${e => setFeedback(e.currentTarget.value)} /></label>

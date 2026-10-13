@@ -89,6 +89,7 @@ class Event(Record):
     plan_outcome: Literal["approved", "keep_planning", "expired", "superseded"] | None = None
     plan_mode: Literal["acceptEdits", "manual"] | None = None
     feedback: str | None = Field(default=None, max_length=2000)
+    skipped_reason: Literal["dont_ask"] | None = None
 
 
 class Function(Record):

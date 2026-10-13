@@ -88,6 +88,30 @@ def test_other_replaces_a_single_select_option(ui, page):
     assert sent(ui, "/api/sessions/parent/questions/ask") == [{"answers": [{"selected": [], "other": "DuckDB"}]}]
 
 
+def test_arrow_keys_onto_other_stay_in_the_radio_group(ui, page):
+    show(ui, f"[{question_event(questions=QUESTIONS[:1])}]")
+    card = page.get_by_role("region", name="Local has a question")
+    sqlite = card.get_by_role("radio", name="SQLite", exact=True)
+    other_radio = card.get_by_role("radio", name="Other", exact=True)
+    other = card.get_by_role("textbox", name="Other answer for: Which database?")
+    sqlite.focus()
+    page.keyboard.press("ArrowDown")
+    page.keyboard.press("ArrowDown")
+    expect(other_radio).to_be_checked()
+    expect(other_radio).to_be_focused()  # Arrow keys keep moving within the group.
+    expect(other).to_be_enabled()
+    page.keyboard.press("ArrowDown")  # Wraps back to the first option.
+    expect(sqlite).to_be_checked()
+    expect(sqlite).to_be_focused()
+    page.keyboard.press("ArrowUp")
+    expect(other_radio).to_be_focused()
+    page.keyboard.press("Tab")
+    expect(other).to_be_focused()  # Tab reaches the enabled text box next.
+    sqlite.click()
+    card.get_by_text("Other", exact=True).click()  # A pointer choice, here on the label, moves focus to the text box.
+    expect(other).to_be_focused()
+
+
 def test_skip_sends_skip(ui, page):
     show(ui, f"[{question_event()}]")
     page.get_by_role("button", name="Skip").click()
@@ -121,6 +145,8 @@ def test_the_expiry_sentence(ui, page):
         {"question": "Which checks should run?", "selected": ["Lint", "Tests"], "other": "Docs links"}]},
      ["You answered: SQLite", "You answered: Lint, Tests, Other: Docs links"]),
     ("completed", {"question_outcome": "skipped"}, ["You skipped these questions."]),
+    ("completed", {"question_outcome": "skipped", "skipped_reason": "dont_ask"},
+     ["Skipped automatically: nobody answers questions in Don't ask mode."]),
     ("completed", {"question_outcome": "expired"}, ["Not answered in time."]),
     ("cancelled", {}, ["Question cancelled."]),
 ])
@@ -130,6 +156,7 @@ def test_answered_questions_show_a_summary(ui, page, state, fields, texts):
     expect(card.get_by_text("Which database?")).to_be_visible()
     for text in texts:
         expect(card.get_by_text(text, exact=True)).to_be_visible()
+    expect(card.get_by_text("You skipped these questions.")).to_have_count(1 if texts == ["You skipped these questions."] else 0)
     expect(card.get_by_role("radio")).to_have_count(0)
     expect(card.get_by_role("button")).to_have_count(0)
 
@@ -188,8 +215,6 @@ def test_script_in_a_plan_is_sanitised(ui, page):
     ("completed", {"plan_outcome": "expired"}, ["Not reviewed in time"]),
     ("completed", {"plan_outcome": "superseded"}, ["Not reviewed: you switched modes"]),
     ("cancelled", {}, ["Plan review cancelled."]),
-    ("error", {"output": "submit_plan is only available in Plan mode. Describe the plan in your reply instead."},
-     ["submit_plan is only available in Plan mode. Describe the plan in your reply instead."]),
 ])
 def test_reviewed_plans_show_the_outcome(ui, page, state, fields, texts):
     show(ui, f"[{plan_event(state, **fields)}]")
@@ -198,6 +223,28 @@ def test_reviewed_plans_show_the_outcome(ui, page, state, fields, texts):
     for text in texts:
         expect(card.get_by_text(text, exact=True)).to_be_visible()
     expect(card.get_by_role("button")).to_have_count(0)
+
+
+@pytest.mark.parametrize("state", ["error", "rejected"])
+def test_a_refused_plan_is_not_headed_as_waiting_for_review(ui, page, state):
+    refusal = "submit_plan is only available in Plan mode. Describe the plan in your reply instead."
+    show(ui, f"[{plan_event(state, output=refusal)}]")
+    card = page.get_by_role("region", name="Plan not submitted")
+    expect(card.get_by_role("heading", name="Plan not submitted")).to_be_visible()
+    expect(card.get_by_text(refusal, exact=True)).to_be_visible()
+    expect(page.get_by_text("Plan ready for review")).to_have_count(0)
+    expect(card.locator(".plan-body")).to_be_hidden()  # The plan is folded away.
+    card.get_by_text("Show the plan").click()
+    expect(card.locator(".plan-body").get_by_role("heading", name="Storage plan")).to_be_visible()
+    expect(card.get_by_role("button")).to_have_count(0)
+
+
+def test_a_refused_question_is_not_headed_as_waiting(ui, page):
+    show(ui, f"[{question_event('error', questions=QUESTIONS[:1], output='Each question needs a text and 2-4 distinct options.')}]")
+    card = page.get_by_role("region", name="Question not asked")
+    expect(card.get_by_role("heading", name="Question not asked")).to_be_visible()
+    expect(card.get_by_text("Each question needs a text and 2-4 distinct options.", exact=True)).to_be_visible()
+    expect(page.get_by_text("Local has a question")).to_have_count(0)
 
 
 # The composer hint names what is waiting

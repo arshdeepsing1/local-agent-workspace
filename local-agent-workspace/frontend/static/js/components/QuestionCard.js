@@ -38,13 +38,16 @@ export default function QuestionCard({ event, sessionId, onError }) {
   const [sending, setSending] = useState(false)
   const [focus, setFocus] = useState(null)
   const others = useRef([])
+  const pointer = useRef(false)  // The last choice came from a pointer, not from the keyboard.
   const pending = event.state === 'pending'
   useEffect(() => {
     if (focus === null) return
     others.current[focus]?.focus()
     setFocus(null)
   }, [focus])
-  const heading = questions.length === 1 ? 'Local has a question' : `Local has ${questions.length} questions`
+  const refused = event.state === 'error' || event.state === 'rejected'
+  const heading = refused ? (questions.length === 1 ? 'Question not asked' : 'Questions not asked')
+    : questions.length === 1 ? 'Local has a question' : `Local has ${questions.length} questions`
   const route = `/sessions/${encodeURIComponent(sessionId)}/questions/${encodeURIComponent(event.id)}`
   const update = (index, change) => setChoices(current => current.map((choice, at) => at === index ? { ...choice, ...change(choice) } : choice))
   const send = async body => {
@@ -60,9 +63,10 @@ export default function QuestionCard({ event, sessionId, onError }) {
   if (!pending) {
     const answers = Array.isArray(event.answers) ? event.answers : []
     const outcome = event.state === 'cancelled' ? 'Question cancelled.'
+      : event.question_outcome === 'skipped' && event.skipped_reason === 'dont_ask' ? 'Skipped automatically: nobody answers questions in Don\'t ask mode.'
       : event.question_outcome === 'skipped' ? 'You skipped these questions.'
       : event.question_outcome === 'expired' ? 'Not answered in time.'
-      : event.state === 'error' || event.state === 'rejected' ? event.output || 'The question could not be asked.' : ''
+      : refused ? event.output || 'The question could not be asked.' : ''
     return html`<section class="question-card" aria-label=${heading}>
       <h3>${heading}</h3>
       ${questions.map((question, index) => html`<div class="question-summary" key=${index}>
@@ -84,11 +88,14 @@ export default function QuestionCard({ event, sessionId, onError }) {
       const choose = label => update(index, current => multi
         ? { selected: current.selected.includes(label) ? current.selected.filter(item => item !== label) : [...current.selected, label] }
         : { selected: [label], other: false })
+      // Only a pointer choice moves focus to the text box: arrow keys keep moving within the group,
+      // and Tab reaches the enabled text box next.
       const chooseOther = () => {
         update(index, current => multi ? { other: !current.other } : { selected: [], other: true })
-        setFocus(index)
+        if (pointer.current) setFocus(index)
+        pointer.current = false
       }
-      return html`<fieldset key=${index} disabled=${sending}><${Legend} question=${question} />
+      return html`<fieldset key=${index} disabled=${sending} onKeyDown=${() => { pointer.current = false }}><${Legend} question=${question} />
         ${multi ? html`<p class="muted question-hint">Choose one or more.</p>` : null}
         ${optionsOf(question).map((option, at) => {
           const description = option.description ? `${name}-${at}-description` : undefined
@@ -99,7 +106,7 @@ export default function QuestionCard({ event, sessionId, onError }) {
           </label>`
         })}
         <div class="question-option question-other">
-          <label><input type=${type} name=${name} aria-label="Other" checked=${choice.other} onChange=${chooseOther} /><span>Other</span></label>
+          <label onPointerDown=${() => { pointer.current = true }}><input type=${type} name=${name} aria-label="Other" checked=${choice.other} onChange=${chooseOther} /><span>Other</span></label>
           <input type="text" ref=${element => { others.current[index] = element }} aria-label=${`Other answer for: ${question.question}`}
             maxLength=${MAX_OTHER} spellcheck=${false} disabled=${!choice.other || sending} value=${choice.text}
             onInput=${e => { const text = e.currentTarget.value; update(index, () => ({ text })) }} />
