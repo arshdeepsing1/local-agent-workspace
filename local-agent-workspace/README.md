@@ -105,12 +105,14 @@ installs runtime libraries automatically; add `./backend[test]` instead of
 `./backend` only if you need to run the backend tests.
 
 Without `LOCAL_AGENT_MODEL` the app uses `databricks-claude-opus-5-5` (Claude Opus 5.5,
-with a 200,000-token context budget and 16,384 Max output tokens). An existing `.env`
-that says `LOCAL_AGENT_MODEL=databricks-gpt-oss-120b` keeps GPT OSS 120B; edit that line
-to switch. Saved settings from before Opus 5.5 became the default that still hold GPT OSS
-120B at 131,072 and 8,192 move to Opus 5.5 once (Settings says so; Opus 5.5 costs more per
-token). Choose `databricks-gpt-oss-120b` in Settings or the model picker to switch back; the
-choice is kept after that.
+with a 200,000-token context budget and 16,384 Max output tokens). `LOCAL_AGENT_MODEL` in
+`.env` applies only while no model is saved in Settings: once you save Settings (or choose a
+model in the model picker), the saved model wins over `.env`, so change the model there, not
+in `.env`. Saved settings from before Opus 5.5 became the default that still hold GPT OSS 120B
+at 131,072 and 8,192 move to Opus 5.5 once, also when `.env` still says
+`LOCAL_AGENT_MODEL=databricks-gpt-oss-120b` (the old `.env.example` value); Settings says so,
+and Opus 5.5 costs more per token. Choose `databricks-gpt-oss-120b` in Settings or the model
+picker to switch back; the choice is kept after that.
 
 Two optional values can be left empty:
 
@@ -118,8 +120,8 @@ Two optional values can be left empty:
   creates new standalone scripts, tools and projects when you do not say where. See
   [Local access and limits](#local-access-and-limits).
 - `LOCAL_AGENT_PYTHON_VENV`: a Python virtual environment (the folder that contains
-  `bin/python` and `pyvenv.cfg`) that every command the app runs uses. See the command
-  environment paragraph in [Local access and limits](#local-access-and-limits).
+  `bin/python` and `pyvenv.cfg`) that the agent's commands, Verify, hooks and the Terminal
+  use (stdio MCP servers do not). See the command environment paragraph in [Local access and limits](#local-access-and-limits).
 
 Both are also in Settings. A value changed in Settings overrides `.env`; a value left
 unchanged in Settings keeps following `.env`, so a later edit of `.env` applies after a
@@ -1003,7 +1005,8 @@ profile in `backend/local_agent/model_profiles.py`: 200,000 and 16,384 for Claud
 for endpoints without a profile. Explicit saved values, including 32,768 and the former 131,000
 default, are preserved. Budgets still at the old model's defaults follow a change of the
 default model (in Settings or the composer's model picker) to the new model's defaults; a value
-you changed stays. A chat whose own endpoint differs from the Settings model uses that
+you changed stays, and a default that would not fit with the other budget (Max output tokens
+must stay below the context budget minus 2,048) is not followed. A chat whose own endpoint differs from the Settings model uses that
 endpoint's defaults while Settings is at the Settings model's defaults, and your values when
 you changed them.
 The allowed range is 16,384–1,048,576; these are app configuration bounds, not a
@@ -1011,14 +1014,17 @@ claim that every endpoint supports that range or the default. Set the budget at
 or below your endpoint's actual total context limit; the app knows the limits only of the
 endpoints in its profile table. Requests to such an endpoint are capped at its maxima (Opus
 5.5: 1,000,000 context and 128,000 output tokens; GPT OSS 120B: 131,072 context), and the
-chat shows a notice once (again only when the capped values change). Changes apply on the next
+chat shows a notice once that names the capped values (again only when they change). Changes apply on the next
 turn, including existing conversations. The configured total includes space for both input and
 reply. **Max output tokens** accepts 1,024–131,072, but must be below the context budget minus
 the 2,048-token safety margin. The output setting is also the reply reserve, so the Opus 5.5
 defaults leave an estimated input budget of 181,568 tokens (120,832 at 131,072 and 8,192).
 
 While you edit these fields, Settings shows warnings from the profile (they never block saving)
-and, for an endpoint with recommended values, a **Use … defaults** button. The numbers are
+and, for an endpoint with recommended values, a **Use … defaults** button. When the endpoint
+field changes, budgets still at the saved model's defaults change to the new endpoint's defaults
+in the form, as Save would store them, and the estimated input budget also names what requests
+to an endpoint with lower maxima get. The numbers are
 Databricks's documented pay-per-token defaults for the Enterprise tier, also partner models'
 quota Tier 1 ([limits page](https://docs.databricks.com/gcp/en/machine-learning/foundation-model-apis/limits),
 checked 2026-10-13): Opus 5.5, Opus 4.8 and GPT OSS 120B each allow 1,000,000 input tokens
@@ -1678,9 +1684,10 @@ Settings refuses the filesystem root, system folders (`/etc`, `/usr`, `/System` 
 your home folder or a folder containing it, hidden folders in your home folder (such as
 `~/.config` or `~/.ssh`), the app's state folder (or a folder containing it), the app's own
 folder, credential and generated folders (`.git`, `.venv`, `node_modules` and similar), a folder
-containing your credential file, and a folder whose parent does not exist or cannot be written.
-A refused value from `.env` is shown in Settings as not used and never blocks saving other
-settings.
+containing your credential file, a path through a symbolic link loop, and a folder whose parent
+does not exist or cannot be written. A refused value from `.env` is shown in Settings as not used
+and never blocks saving other settings. Files shows the folder as soon as the agent's first write
+(a file tool or a command) creates it, without a reload.
 
 **Settings → Agent steps** defaults to 32 model requests per user message and accepts
 1–64. This is a model-request ceiling, not a tool-call count: one model response can
@@ -1795,9 +1802,10 @@ startup variables (`BASH_ENV`, `ENV`, `ZDOTDIR`, `PROMPT_COMMAND`, `SHELLOPTS`,
 value that contains the Databricks token. Hooks do not get these variables.
 
 **Python environment.** With **Settings → Python virtual environment** (or
-`LOCAL_AGENT_PYTHON_VENV`) set, every command the app runs uses it: the agent's `run_command`
+`LOCAL_AGENT_PYTHON_VENV`) set, these commands use it: the agent's `run_command`
 (through the shell and the argv rules), Verify, hooks, the Terminal panel, `/api/command` and
-`!` commands. `VIRTUAL_ENV` is set to it, its `bin/` comes first on `PATH`, the previous
+`!` commands. Stdio MCP servers keep the app server's environment; to run one from the
+environment, give `<venv>/bin/python` (or the server's program in `<venv>/bin`) as its command. `VIRTUAL_ENV` is set to it, its `bin/` comes first on `PATH`, the previous
 `VIRTUAL_ENV`'s `bin/` and the app server's own interpreter folders are removed from `PATH`
 (`run.py` puts the app's `.venv/bin` first, which would otherwise shadow your tools), and
 `PYTHONHOME` is removed. An allow rule for `pytest` then runs `<venv>/bin/pytest`. The read-only

@@ -123,10 +123,62 @@ def test_the_recommended_defaults_button(ui, page):
     button = dialog.get_by_role("button", name="Use Claude Opus 5.5 defaults (200,000 context, 16,384 output)")
     expect(button).to_be_visible()
     expect(dialog.get_by_text(re.compile("^Limits for Claude Opus 5.5 are Databricks's documented"))).to_be_visible()
-    button.click()
+    button.focus()
+    page.keyboard.press("Enter")
     expect(dialog.get_by_label("Context budget (tokens)")).to_have_value("200000")
     expect(dialog.get_by_label("Max output tokens per request")).to_have_value("16384")
     expect(button).to_have_count(0)
+    expect(dialog.get_by_label("Context budget (tokens)")).to_be_focused()  # Not lost with the removed button.
+
+
+def test_budgets_at_the_defaults_follow_the_endpoint_field_as_save_does(ui, page):
+    dialog = open_settings(ui, page)  # test-model at its defaults, 131,072 / 8,192.
+    endpoint = dialog.get_by_label("Databricks model endpoint")
+    budget = dialog.get_by_label("Context budget (tokens)")
+    output = dialog.get_by_label("Max output tokens per request")
+    endpoint.fill(OPUS)
+    expect(budget).to_have_value("200000")
+    expect(output).to_have_value("16384")
+    expect(dialog.get_by_role("button", name=re.compile("^Use Claude Opus 5.5 defaults"))).to_have_count(0)
+    expect(dialog.get_by_text("Current estimated input budget: 181,568 tokens.", exact=False)).to_be_visible()
+    endpoint.fill("test-model")  # The saved endpoint again: the saved budgets.
+    expect(budget).to_have_value("131072")
+    expect(output).to_have_value("8192")
+    endpoint.fill(OPUS)
+    expect(output).to_have_value("16384")
+    output.fill("12000")  # Edited: it stays; the context budget still follows.
+    endpoint.fill("other-endpoint")
+    expect(budget).to_have_value("131072")
+    page.wait_for_timeout(400)
+    expect(output).to_have_value("12000")
+    endpoint.fill(OPUS)
+    expect(budget).to_have_value("200000")
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    body = ui.bodies("/api/settings", "PUT")[0]
+    assert (body["model"], body["context_window"], body["max_output_tokens"]) == (OPUS, 200000, 12000)
+
+
+def test_custom_budgets_do_not_follow_the_endpoint_field(ui, page):
+    dialog = open_settings(ui, page, settings_setup(context_window="65536"))
+    dialog.get_by_label("Databricks model endpoint").fill(OPUS)
+    ui.wait("fake.requests('/api/settings/limits').some(request => JSON.parse(request.body).model === 'databricks-claude-opus-5-5')")
+    expect(dialog.get_by_role("button", name=re.compile("^Use Claude Opus 5.5 defaults"))).to_be_visible()
+    expect(dialog.get_by_label("Context budget (tokens)")).to_have_value("65536")
+    expect(dialog.get_by_label("Max output tokens per request")).to_have_value("16384")  # At its default: follows.
+
+
+def test_the_input_budget_names_what_a_capped_endpoint_gets(ui, page):
+    dialog = open_settings(ui, page, settings_setup(model=f"'{OPUS}'"))
+    dialog.get_by_label("Context budget (tokens)").fill("1048576")
+    dialog.get_by_label("Max output tokens per request").fill("131072")
+    expect(dialog.get_by_text("Current estimated input budget: 915,456 tokens (869,952 for requests to this endpoint, "
+                              "which accepts less).", exact=False)).to_be_visible()
+    dialog.get_by_label("Context budget (tokens)").fill("300000")
+    expect(dialog.get_by_text("Current estimated input budget: 166,880 tokens (169,952 for requests to this endpoint, "
+                              "which accepts less).", exact=False)).to_be_visible()  # Output capped at 128,000.
+    dialog.get_by_label("Max output tokens per request").fill("16384")
+    expect(dialog.get_by_text("Current estimated input budget: 281,568 tokens.", exact=False)).to_be_visible()
 
 
 def test_the_migration_note(ui, page):
@@ -186,6 +238,50 @@ def test_files_shows_the_default_folder_and_its_first_write(ui, page):
     expect(root).to_be_enabled()
     expect(root).to_contain_text("Default code folder")
     expect(page.get_by_text(re.compile("outside these folders"))).to_have_count(0)
+
+
+def test_the_default_folder_stays_browsable_after_its_first_changes_are_kept(ui, page):
+    missing = "{ path: '/srv/code', state: 'missing', message: '/srv/code does not exist yet.', source: 'settings' }"
+    ready = "{ path: '/srv/code', state: 'ready', message: 'Ready: every conversation can use /srv/code.', source: 'settings' }"
+    ui.app(session="a", scenario="workspace", setup=settings_setup(coding_dir="'/srv/code'", coding_dir_status=missing))
+    ui.show_session("a")
+    page.get_by_role("button", name=re.compile("^Workspace")).click()
+    root = page.get_by_role("group", name="Folders in Files").locator('.file-roots-root[data-root="/srv/code"]')
+    expect(root).to_be_disabled()
+    ui.run(f"fake.settings = {{ ...fake.settings, coding_dir_status: {ready} }}")  # The agent's write creates it.
+    ui.emit("a", "{ type: 'changes', changes: makeChanges(changedFile('/srv/code/tool/main.py', 3, 0, 'added')) }")
+    expect(root).to_be_enabled()
+    ui.emit("a", "{ type: 'changes', changes: makeChanges() }")  # Kept (or Automatic Keep).
+    expect(root).to_have_accessible_name("Default code folder: /srv/code")
+    expect(root).to_be_enabled()
+
+
+def test_a_reply_that_creates_the_default_folder_with_a_command_makes_it_browsable(ui, page):
+    missing = "{ path: '/srv/code', state: 'missing', message: '/srv/code does not exist yet.', source: 'settings' }"
+    ready = "{ path: '/srv/code', state: 'ready', message: 'Ready: every conversation can use /srv/code.', source: 'settings' }"
+    ui.app(session="a", scenario="workspace", setup=settings_setup(coding_dir="'/srv/code'", coding_dir_status=missing))
+    ui.show_session("a")
+    page.get_by_role("button", name=re.compile("^Workspace")).click()
+    root = page.get_by_role("group", name="Folders in Files").locator('.file-roots-root[data-root="/srv/code"]')
+    expect(root).to_be_disabled()
+    ui.emit("a", "{ type: 'status', status: 'running' }")
+    ui.run(f"fake.settings = {{ ...fake.settings, coding_dir_status: {ready} }}")  # mkdir by a command: no change row.
+    ui.emit("a", "{ type: 'status', status: 'idle' }")
+    expect(root).to_be_enabled()
+
+
+def test_the_default_folder_root_can_be_browsed(ui, page):
+    ready = "{ path: '/srv/code', state: 'ready', message: 'Ready: every conversation can use /srv/code.', source: 'settings' }"
+    ui.app(session="a", scenario="workspace", setup=settings_setup(coding_dir="'/srv/code'", coding_dir_status=ready))
+    ui.show_session("a")
+    page.get_by_role("button", name=re.compile("^Workspace")).click()
+    root = page.get_by_role("group", name="Folders in Files").locator('.file-roots-root[data-root="/srv/code"]')
+    expect(root).to_have_accessible_name("Default code folder: /srv/code")
+    root.click()
+    expect(root).to_have_attribute("aria-pressed", "true")
+    ui.wait("fake.calls.some(call => call.path.startsWith('/api/files?path=%2Fsrv%2Fcode&'))")
+    page.wait_for_timeout(200)
+    expect(root).to_have_attribute("aria-pressed", "true")  # Not reset to the project.
 
 
 def test_the_terminal_names_the_python_environment(ui, page):

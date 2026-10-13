@@ -1,4 +1,4 @@
-import { html, resolve, useState } from './lib.js'
+import { html, resolve, useEffect, useState } from './lib.js'
 import { Folder, Laptop, Menu, PanelRight, Pencil, Terminal, X } from './icons.js'
 import { api } from './api.js'
 import { useWorkspace } from './useWorkspace.js'
@@ -10,6 +10,7 @@ import AgentToolsDialog from './components/AgentToolsDialog.js'
 import SettingsDialog from './components/SettingsDialog.js'
 import WorkspacePanel from './components/WorkspacePanel.js'
 import FolderAccessDialog from './components/FolderAccessDialog.js'
+import { inside } from './components/FileRoots.js'
 import PermissionRulesDialog from './components/PermissionRulesDialog.js'
 import ContextMeter from './components/ContextMeter.js'
 import ChangesBar, { plural } from './components/ChangesBar.js'
@@ -62,6 +63,14 @@ export default function App() {
     app.setError(message)
   }
   const changedFiles = app.changes?.files.length || 0
+  // A missing default code folder is created by the agent's first write (a file tool or a command): check it
+  // again when a change lands inside it, when a reply ends and when the Workspace panel opens, so Files keeps it
+  // browsable after the change list empties.
+  const missingCodingDir = app.settings?.coding_dir_status?.state === 'missing' ? app.settings.coding_dir_status.path : null
+  const changedInMissing = !!missingCodingDir && (app.changes?.files || []).some(item => inside(item.path, missingCodingDir))
+  useEffect(() => {
+    if (missingCodingDir && (changedInMissing || !busy)) void app.refreshSettings().catch(() => {})
+  }, [missingCodingDir, changedInMissing, busy, workspaceOpen])
   const openReview = path => { setReview({ path, viewKey: app.viewKey }); setWorkspaceOpen(true) }
   const openFileAt = ({ path, line }) => { setOpenPath({ path, line, viewKey: app.viewKey }); setWorkspaceOpen(true) }
   // Removing a rule saves the chat (a newer 'updated'); like a rename, your own change is not news.

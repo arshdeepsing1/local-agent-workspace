@@ -5,6 +5,16 @@ import { modelLabel } from '../types.js'
 
 const LIMIT_LEVELS = { error: 'form-error', warning: 'settings-note', note: 'field-help' }
 const inRange = (value, low, high) => Number.isInteger(value) && value >= low && value <= high
+const LIMIT_KEYS = ['context_window', 'max_output_tokens']
+
+// The budgets after those in following take target's values, as the server does on a model change
+// (config.follow_limits): a value that would not fit with the other budget is not followed.
+function followLimits(following, target, form) {
+  let [context, output] = [form.context_window, form.max_output_tokens]
+  if (following[1] && target.max_output_tokens < (following[0] ? target.context_window : context) - 2048) output = target.max_output_tokens
+  if (following[0] && output < target.context_window - 2048) context = target.context_window
+  return { context_window: context, max_output_tokens: output }
+}
 
 // The check result of a saved folder (coding_dir_status or python_venv_status); an edited value is checked on save.
 function pathStatus(status, saved, current) {
@@ -23,12 +33,27 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
   const [statuses, setStatuses] = useState({ coding_dir: settings.coding_dir_status, python_venv: settings.python_venv_status })
   const [limits, setLimits] = useState(null)
   const limitsRequest = useRef(0)
+  // Budgets this dialog set to follow the endpoint field; they keep following until edited.
+  const followed = useRef(null)
+  const contextInput = useRef(null)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   // The variable names as typed; the form holds them as a list.
   const [envText, setEnvText] = useState((settings.command_env || []).join(' '))
   const instructions = form.user_instructions || ''
   const inputBudget = form.context_window - form.max_output_tokens - 2048
+  // Budgets left at the saved model's defaults follow an endpoint change, so the form shows what Save stores:
+  // the new endpoint's defaults, or the saved values when the saved endpoint is chosen again.
+  const following = result => {
+    const saved = settings.default_limits
+    if (!saved || !result.defaults) return null
+    const marks = LIMIT_KEYS.map(key => form[key] === followed.current?.[key] || (form[key] === settings[key] && settings[key] === saved[key]))
+    if (!marks.some(Boolean)) return null
+    const target = (form.model || '').trim() === settings.model ? settings : result.defaults
+    const next = followLimits(marks, target, form)
+    if (!LIMIT_KEYS.some(key => next[key] !== form[key])) return null
+    return { next, followed: Object.fromEntries(LIMIT_KEYS.filter((_, index) => marks[index]).map(key => [key, next[key]])) }
+  }
   useEffect(() => { dialog.current?.showModal() }, [])
   useEffect(() => {
     let current = true
@@ -49,7 +74,14 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
     const request = ++limitsRequest.current
     const timer = setTimeout(() => {
       api('/settings/limits', 'POST', { model, context_window: context, max_output_tokens: output }).then(
-        result => { if (request === limitsRequest.current) setLimits(result) },
+        result => {
+          if (request !== limitsRequest.current) return
+          const follow = following(result)
+          if (!follow) { setLimits(result); return }
+          followed.current = follow.followed
+          setLimits(null)  // The new budgets are checked next.
+          setForm(current => ({ ...current, ...follow.next }))
+        },
         () => { if (request === limitsRequest.current) setLimits(null) })
     }, 250)
     return () => clearTimeout(timer)
@@ -57,6 +89,8 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
   const recommended = limits?.recommended && limits.profile && (limits.recommended.context_window !== form.context_window
     || limits.recommended.max_output_tokens !== form.max_output_tokens) ? limits.recommended : null
   const field = (key, value) => setForm(current => ({ ...current, [key]: value }))
+  const effective = limits?.effective
+  const capped = effective?.clamped ? effective.context_window - effective.max_output_tokens - 2048 : null
   const number = key => event => field(key, Number(event.currentTarget.value))
   return html`<dialog ref=${dialog} class="settings-dialog" onCancel=${onClose} onClick=${e => { if (e.target === dialog.current) onClose() }}>
     <div class="dialog-content"><header><div><h2>Make yourself at home.</h2><p>Configure your local workspace.</p></div><button class="icon-button" onClick=${onClose} aria-label="Close settings"><${X} /></button></header>
@@ -79,18 +113,18 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         <label>Databricks model endpoint<input list="settings-models" required value=${form.model} onInput=${e => field('model', e.currentTarget.value)} placeholder=${settings.default_model || 'databricks-claude-opus-5-5'} /></label>
         ${settings.model_migrated_from ? html`<p class="settings-note" role="status">The default model changed from ${modelLabel(settings.model_migrated_from)} to ${modelLabel(settings.model)}, the app's new default. ${modelLabel(settings.model)} costs more per token. To switch back, choose ${settings.model_migrated_from} here or in the model picker.</p>` : null}
         <datalist id="settings-models">${connection?.models.map(m => html`<option key=${m} value=${m}>${modelLabel(m)}</option>`)}</datalist>
-        <label>Context budget (tokens)<input type="number" required min=${16384} max=${1048576} step=${1}
+        <label>Context budget (tokens)<input ref=${contextInput} type="number" required min=${16384} max=${1048576} step=${1}
           value=${form.context_window || ''} onInput=${number('context_window')} /></label>
         <p class="field-help">Set at or below your endpoint's total context limit, not your account usage quota. We reserve the output budget below plus 2,048 tokens for safety; the remainder is the estimated input budget. Applies on the next turn.</p>
         <label>Max output tokens per request<input type="number" required min=${1024} max=${131072} step=${1}
           value=${form.max_output_tokens || ''} onInput=${number('max_output_tokens')} /></label>
-        <p class="field-help">The endpoint must support this value. A larger response budget leaves less context for input and can increase usage. Current estimated input budget: ${inputBudget.toLocaleString()} tokens.</p>
+        <p class="field-help">The endpoint must support this value. A larger response budget leaves less context for input and can increase usage. Current estimated input budget: ${inputBudget.toLocaleString()} tokens${capped ? ` (${capped.toLocaleString()} for requests to this endpoint, which accepts less)` : ''}.</p>
         ${inputBudget < 16384 ? html`<p class="form-error" role="alert">This leaves too little room for a working conversation. Lower Max output tokens or increase the context budget; raising output does not fix a full context.</p>` : null}
         ${limits ? html`<div class="settings-limits">
           ${limits.warnings.map(warning => html`<p key=${warning.code} class=${LIMIT_LEVELS[warning.level] || 'field-help'}
             role=${warning.level === 'error' ? 'alert' : warning.level === 'warning' ? 'status' : null}>${warning.text}</p>`)}
           ${recommended ? html`<button type="button" class="outline settings-recommended"
-            onClick=${() => setForm(current => ({ ...current, ...recommended }))}>Use ${limits.profile.label} defaults (${recommended.context_window.toLocaleString('en-US')} context, ${recommended.max_output_tokens.toLocaleString('en-US')} output)</button>` : null}
+            onClick=${() => { setForm(current => ({ ...current, ...recommended })); contextInput.current?.focus() }}>Use ${limits.profile.label} defaults (${recommended.context_window.toLocaleString('en-US')} context, ${recommended.max_output_tokens.toLocaleString('en-US')} output)</button>` : null}
           <p class="field-help">${limits.note}</p>
         </div>` : null}
         <label>Agent steps per message<input type="number" required min=${1} max=${64} step=${1}
