@@ -82,6 +82,7 @@ class Settings:
             "write_limit_kb": 80,
             "command_env": [],
             "rate_limit_auto_continue": True,
+            "auto_keep_changes": False,
         }
         if self.path.exists():
             saved = json.loads(self.path.read_text())
@@ -150,6 +151,8 @@ class Settings:
                 raise ValueError(f"{name} changes how programs start and cannot be passed to commands.")
         if type(candidate["rate_limit_auto_continue"]) is not bool:
             raise ValueError("Continue after rate limits must be on or off.")
+        if type(candidate["auto_keep_changes"]) is not bool:
+            raise ValueError("Automatic Keep must be on or off.")
         candidate["workspace"] = str(workspace)
         self.values = candidate
         temp = self.path.with_suffix(".tmp")
