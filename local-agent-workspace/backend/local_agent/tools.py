@@ -22,11 +22,22 @@ QUERY_OUTPUT_LIMIT = 8_000
 READ_SCAN_LIMIT = 8_000_000
 READ_LINE_LIMIT = 128_000
 SEARCH_FILE_LIMIT = 2_000_000
-SEARCH_TOTAL_LIMIT = 16_000_000
-SEARCH_FILE_SCAN_LIMIT = 5_000
-SEARCH_DIR_SCAN_LIMIT = 2_000
+SEARCH_TOTAL_LIMIT = 64_000_000
+SEARCH_FILE_SCAN_LIMIT = 20_000
 QUERY_TIMEOUT = 3.0
 REGEX_TIMEOUT = 0.05
+SEARCH_TIMEOUT = 10.0  # seconds for reading and matching, after the file list is complete
+SEARCH_PAGE_LIMIT = 10_000  # the largest search offset
+OUTPUT_MODES = ("content", "files_with_matches", "count")
+MIN_PAGE_BYTES = 8_000
+MAX_PAGE_BYTES = 32_000
+MAX_READ_LINES = 2_000
+TAIL_FILE_LIMIT = 512_000_000
+TAIL_BLOCK = 65_536
+COUNT_BLOCK = 1_048_576
+INVALID_LINE_NAMES = 20
+ENCODING_NOTE = "Some bytes are not valid UTF-8 and are shown as U+FFFD (\ufffd)."
+FIND_OFFSET_LIMIT = 200_000
 
 
 def _integer(value, name, minimum, maximum=None):
@@ -70,6 +81,49 @@ def file_error(error: Exception) -> str:
     return str(error)
 
 
+def split_lines(text):
+    """Lines separated by LF only, each without its LF and one trailing CR.
+
+    Bare CR, U+2028/2029, form feeds and the other characters str.splitlines()
+    treats as breaks stay inside a line, so line numbers agree with read_file."""
+    lines = text.split("\n")
+    if lines[-1] == "":
+        lines.pop()  # A final LF ends the last line; an empty text has no lines.
+    return [line[:-1] if line.endswith("\r") else line for line in lines]
+
+
+def read_page_bytes(context_window):
+    """read_file's page size for a context budget: a quarter of it, 8,000 to 32,000 bytes."""
+    try:
+        budget = int(context_window)
+    except (TypeError, ValueError, OverflowError):
+        return MIN_PAGE_BYTES
+    return min(MAX_PAGE_BYTES, max(MIN_PAGE_BYTES, budget // 4))
+
+
+def excluded(parts):
+    """'credential', 'generated' or None for the components of a path."""
+    folded = [str(part).casefold() for part in parts]
+    if any(p in SECRET_NAMES or p.startswith(".env.") and p != ".env.example" for p in folded):
+        return "credential"
+    if any(p in IGNORED for p in folded):
+        return "generated"
+    return None
+
+
+def _decode_line(raw):
+    """A line as text, and whether it had bytes that are not valid UTF-8."""
+    try:
+        return raw.decode("utf-8"), False
+    except UnicodeDecodeError:
+        return raw.decode("utf-8", errors="replace"), True
+
+
+def _text_cost(text):
+    """Bytes a string adds inside a JSON string, as _output_size counts them."""
+    return len(json.dumps(text)) - 2
+
+
 class WorkspaceTools:
     def __init__(self, workspace: str, credential_file: str = "", allowed_directories=(), unrestricted=False,
                  write_limit=DEFAULT_WRITE_LIMIT):
@@ -92,10 +146,10 @@ class WorkspaceTools:
             raise ValueError("Credential files are excluded from file tools.")
         for candidate in (requested, path):
             relative = candidate.relative_to(self.root) if candidate.is_relative_to(self.root) else candidate
-            parts = [part.casefold() for part in relative.parts]
-            if any(p in SECRET_NAMES or p.startswith(".env.") and p != ".env.example" for p in parts):
+            reason = excluded(relative.parts)
+            if reason == "credential":
                 raise ValueError("Credential files are excluded from file tools.")
-            if any(p in IGNORED for p in parts):
+            if reason == "generated":
                 raise ValueError("This internal or generated directory is excluded.")
         return path
 
@@ -179,26 +233,46 @@ class WorkspaceTools:
             raise ValueError("Binary files cannot be opened in the text editor.")
         return text
 
-    def read_file_range(self, path: str, start_line: int = 1, max_lines: int = 200):
+    def read_file_range(self, path: str, start_line: int = 1, max_lines: int = 400, *,
+                        tail_lines=None, page_bytes=QUERY_OUTPUT_LIMIT):
         _integer(start_line, "start_line", 1)
-        _integer(max_lines, "max_lines", 1, 1000)
+        _integer(max_lines, "max_lines", 1, MAX_READ_LINES)
+        if tail_lines is not None:
+            _integer(tail_lines, "tail_lines", 1, MAX_READ_LINES)
+            if start_line != 1:
+                raise ValueError("Use either start_line or tail_lines, not both.")
+        limit = min(MAX_PAGE_BYTES, max(MIN_PAGE_BYTES, page_bytes)) if type(page_bytes) is int else QUERY_OUTPUT_LIMIT
+        size_name = f"{limit // 1000} KB"
         target = self.path(path)
-        if not stat.S_ISREG(target.stat().st_mode):
-            raise ValueError("Only regular UTF-8 files can be read.")
+        info = target.stat()
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("Only regular text files can be read.")
         result = {"path": self.display_path(target), "start_line": start_line,
                   "end_line": start_line - 1, "content": "", "next_line": None, "truncated": False}
-        if _output_size(result) > QUERY_OUTPUT_LIMIT:
-            raise ValueError("Path or line offset exceeds the 8 KB ranged output limit.")
+        if tail_lines is not None:
+            result["tail"] = True
+        if _output_size(result) > limit:
+            raise ValueError(f"Path or line offset exceeds the {size_name} ranged output limit.")
         deadline = time.monotonic() + QUERY_TIMEOUT
+        if tail_lines is not None:
+            return self._read_tail(target, info.st_size, tail_lines, result, limit, deadline)
         scanned = 0
-        lines = []
+        lines, cost, invalid = [], 0, []
+
+        def finish(**values):
+            result.update(values)
+            result["content"] = "\n".join(lines)
+            if invalid:
+                result.update(invalid_utf8_lines=invalid[:INVALID_LINE_NAMES], encoding_note=ENCODING_NOTE)
+            return result
+
         with target.open("rb") as source:
             number = 0
             while True:
                 _check_deadline(deadline)
                 raw = source.readline(READ_LINE_LIMIT + 1)
                 if not raw:
-                    return result
+                    return finish()
                 scanned += len(raw)
                 number += 1
                 if scanned > READ_SCAN_LIMIT:
@@ -207,23 +281,28 @@ class WorkspaceTools:
                     raise ValueError(f"Line {number} is too long for ranged reading (128 KB limit).")
                 if b"\x00" in raw:
                     raise ValueError("Binary files cannot be read as text.")
-                line = raw.decode("utf-8").rstrip("\r\n")
                 if number < start_line:
                     continue
-                content = "\n".join([*lines, f"{number}: {line}"])
-                candidate = {**result, "end_line": number, "content": content,
-                             "next_line": max(1000, number + 1), "truncated": False}
-                if _output_size(candidate) > QUERY_OUTPUT_LIMIT:
+                raw = raw[:-1] if raw.endswith(b"\n") else raw
+                line, bad = _decode_line(raw[:-1] if raw.endswith(b"\r") else raw)
+                entry = f"{number}: {line}"
+                entry_cost = _text_cost(entry) + (2 if lines else 0)  # A joining LF is "\n" in JSON.
+                marks = [*invalid, number] if bad else invalid
+                metadata = {**result, "end_line": number, "next_line": max(1000, number + 1), "truncated": False,
+                            **({"invalid_utf8_lines": marks[:INVALID_LINE_NAMES], "encoding_note": ENCODING_NOTE}
+                               if marks else {})}
+                if _output_size(metadata) + cost + entry_cost > limit:
                     if not lines:
-                        raise ValueError(f"Line {number} is too large for the 8 KB ranged output limit.")
-                    result.update(next_line=number, truncated=True)
-                    return result
-                lines.append(f"{number}: {line}")
-                result.update(end_line=number, content=content)
+                        raise ValueError(f"Line {number} is too large for the {size_name} ranged output limit.")
+                    return finish(next_line=number, truncated=True)
+                lines.append(entry)
+                cost += entry_cost
+                invalid = marks
+                result["end_line"] = number
                 if len(lines) >= max_lines:
                     if source.read(1):
-                        result.update(next_line=number + 1, truncated=True)
-                    return result
+                        return finish(next_line=number + 1, truncated=True)
+                    return finish()
 
     def change(self, name: str, arguments: dict, apply=False):
         target = self.path(arguments["path"])
@@ -238,15 +317,19 @@ class WorkspaceTools:
 
     def search_files(self, query: str, glob: str = "*", path: str = ".", *,
                      regex: bool = False, case_sensitive: bool = False, context_lines: int = 0,
-                     offset: int = 0, max_results: int = 50):
+                     offset: int = 0, max_results: int = 50, output_mode: str = "content",
+                     include_ignored: bool = False):
+        from . import search  # Not at module level: search imports git_tools, which imports this module.
         if not isinstance(query, str) or not query:
             raise ValueError("Search text cannot be empty.")
         if len(query) > 1000:
             raise ValueError("Search text exceeds the 1,000 character limit.")
-        if type(regex) is not bool or type(case_sensitive) is not bool:
-            raise ValueError("regex and case_sensitive must be booleans.")
+        if type(regex) is not bool or type(case_sensitive) is not bool or type(include_ignored) is not bool:
+            raise ValueError("regex, case_sensitive and include_ignored must be booleans.")
+        if output_mode not in OUTPUT_MODES:
+            raise ValueError("output_mode must be content, files_with_matches or count.")
         _integer(context_lines, "context_lines", 0, 5)
-        _integer(offset, "offset", 0, 10_000)
+        _integer(offset, "offset", 0, SEARCH_PAGE_LIMIT)
         _integer(max_results, "max_results", 1, 100)
         pattern = None
         if regex:
@@ -254,109 +337,268 @@ class WorkspaceTools:
                 pattern = safe_regex.compile(query, safe_regex.VERSION1 | (0 if case_sensitive else safe_regex.IGNORECASE))
             except (safe_regex.error, RecursionError) as error:
                 raise ValueError(f"Invalid regular expression: {error}") from error
-        needle = query if case_sensitive else query.casefold()
-        def unreadable(error):
-            raise error
+        elif not case_sensitive:
+            # Unicode simple case folding: one character for one character, as rg candidates assume.
+            pattern = safe_regex.compile(safe_regex.escape(query), safe_regex.IGNORECASE | safe_regex.VERSION0)
 
         search_root = self.path(path)
-        if search_root.is_dir():
-            search_base = search_root
-            entries = os.walk(search_root, followlinks=False, onerror=unreadable)
-        elif search_root.is_file():
-            search_base = search_root.parent
-            entries = ((str(search_base), [], [search_root.name]),)
-        else:
+        if not search_root.is_dir() and not search_root.is_file():
             raise ValueError("Search path must be a regular file or directory.")
-        result = {"matches": [], "next_offset": None, "truncated": False, "skipped_files": 0}
-        deadline = time.monotonic() + QUERY_TIMEOUT
-        scanned_files = scanned_dirs = scanned_bytes = found = 0
+        entries, note = search.list_universe(self, search_root, include_ignored=include_ignored,
+                                             deadline=time.monotonic() + search.ENUMERATION_TIMEOUT)
+        entries = [entry for entry in entries if fnmatch.fnmatch(entry.relative, glob)]
+        # The same limits with and without rg: they apply to the files that could be read.
+        if len(entries) > SEARCH_FILE_SCAN_LIMIT:
+            raise ValueError(f"Search file scan limit reached ({SEARCH_FILE_SCAN_LIMIT:,} files); narrow the path or glob.")
+        if sum(entry.size for entry in entries if entry.size <= SEARCH_FILE_LIMIT) > SEARCH_TOTAL_LIMIT:
+            raise ValueError(f"Search byte scan limit reached ({SEARCH_TOTAL_LIMIT // 1_000_000} MB); "
+                             "narrow the path or glob.")
+        deadline = time.monotonic() + SEARCH_TIMEOUT
+        candidates = None
+        if (search_root.is_dir() and not regex and not any(character in query for character in "\n\r\x00")
+                and (case_sensitive or query.isascii())):
+            rg = search.ripgrep()
+            listed = search.rg_candidates(rg, search_root, query, case_sensitive, deadline) if rg else None
+            if listed is not None:
+                # rg does not follow symbolic links; Python reads those itself.
+                candidates = listed | {search.candidate_key(entry.relative) for entry in entries if entry.symlink}
 
-        for base, dirs, files in entries:
+        key = {"content": "matches", "files_with_matches": "files", "count": "counts"}[output_mode]
+        result = {key: [], **({"total_matches": 0} if output_mode == "count" else {}),
+                  "next_offset": None, "truncated": False, "skipped_files": 0, **({"note": note} if note else {})}
+        largest = {"next_offset": SEARCH_PAGE_LIMIT, "skipped_files": SEARCH_FILE_SCAN_LIMIT,
+                   **({"total_matches": 10 ** 12} if output_mode == "count" else {})}
+
+        def remaining():
+            return max(0.001, deadline - time.monotonic())
+
+        def full(item):
+            """The page as it is when item does not fit; None when it does."""
+            candidate = {**result, key: [*result[key], item], **largest}
+            if len(result[key]) < max_results and _output_size(candidate) <= QUERY_OUTPUT_LIMIT:
+                return None
+            if not result[key]:
+                raise ValueError("A search match exceeds the 8 KB output limit; reduce context_lines."
+                                 if output_mode == "content" else
+                                 "A search result exceeds the 8 KB output limit; narrow the path.")
+            next_offset = offset + len(result[key])
+            if next_offset > SEARCH_PAGE_LIMIT:
+                raise ValueError("Search pagination limit reached; narrow the path, glob, or query.")
+            result.update(next_offset=next_offset, truncated=True)
+            return result
+
+        found = 0
+        for item in entries:
             _check_deadline(deadline)
-            scanned_dirs += 1
-            if scanned_dirs > SEARCH_DIR_SCAN_LIMIT:
-                raise ValueError("Search directory scan limit reached; narrow the path.")
-            safe_dirs = []
-            for dirname in sorted(dirs):
+            if item.size > SEARCH_FILE_LIMIT:
+                result["skipped_files"] += 1
+                continue
+            if candidates is not None and search.candidate_key(item.relative) not in candidates:
+                continue
+            try:
+                with open(item.path, "rb") as source:
+                    raw = source.read(SEARCH_FILE_LIMIT + 1)
+            except OSError:
+                result["skipped_files"] += 1
+                continue
+            if len(raw) > SEARCH_FILE_LIMIT:
+                result["skipped_files"] += 1
+                continue
+            if b"\x00" in raw:
+                continue  # Binary: not searched, and not counted.
+            try:
+                content = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                continue  # Not UTF-8: not searched, and not counted.
+            try:
+                if pattern is None and query not in content:
+                    continue
+                if not regex and pattern is not None and not pattern.search(content, timeout=remaining(), concurrent=True):
+                    continue
+            except TimeoutError as error:
+                raise ValueError("File query time limit reached; narrow the path, glob, or line range.") from error
+            lines = split_lines(content)
+            name = self.display_path(item.path)
+            count = 0
+            for index, line in enumerate(lines):
                 _check_deadline(deadline)
-                child = Path(base) / dirname
                 try:
-                    self.path(str(child))
-                    if not child.is_symlink():
-                        safe_dirs.append(dirname)
-                except (OSError, ValueError):
+                    if pattern is None:
+                        matches = query in line
+                    elif regex:
+                        matches = pattern.search(line, timeout=max(0.001, min(REGEX_TIMEOUT, deadline - time.monotonic())),
+                                                 concurrent=True)
+                    else:
+                        matches = pattern.search(line, timeout=remaining(), concurrent=True)
+                except TimeoutError as error:
+                    raise ValueError("Regular expression time limit reached; simplify the pattern or narrow the search."
+                                     if regex else "File query time limit reached; narrow the path, glob, or line range.") from error
+                if not matches:
                     continue
-            dirs[:] = safe_dirs
-            for filename in sorted(files):
+                if output_mode != "content":
+                    count += 1
+                    if output_mode == "files_with_matches":
+                        break
+                    continue
+                found += 1
+                if found <= offset:
+                    continue
+                text, clipped = _excerpt(line)
+                entry = {"path": name, "line": index + 1, "text": text,
+                         "before": [], "after": [], "text_truncated": clipped}
+                for side, positions in (("before", range(max(0, index - context_lines), index)),
+                                        ("after", range(index + 1, min(len(lines), index + context_lines + 1)))):
+                    for position in positions:
+                        text, clipped = _excerpt(lines[position])
+                        entry[side].append({"line": position + 1, "text": text})
+                        entry["text_truncated"] |= clipped
+                if full(entry):
+                    return result
+                result["matches"].append(entry)
+                result["truncated"] |= entry["text_truncated"]
+            if not count:
+                continue
+            found += 1
+            if found > offset:
+                entry = name if output_mode == "files_with_matches" else {"path": name, "count": count}
+                if full(entry):
+                    return result
+                result[key].append(entry)
+            if output_mode == "count":
+                result["total_matches"] += count
+        return result
+
+    def find_files(self, pattern, path=".", *, sort="path", include_ignored=False, offset=0, max_results=200):
+        from . import search  # Not at module level: search imports git_tools, which imports this module.
+        matcher = search.compile_glob(pattern)
+        if sort not in ("path", "modified"):
+            raise ValueError("sort must be path or modified.")
+        if type(include_ignored) is not bool:
+            raise ValueError("include_ignored must be a boolean.")
+        _integer(offset, "offset", 0, FIND_OFFSET_LIMIT)
+        _integer(max_results, "max_results", 1, 500)
+        base = self.path(path)
+        if not base.is_dir() and not base.is_file():
+            raise ValueError("Path must be a regular file or directory.")
+        deadline = time.monotonic() + search.ENUMERATION_TIMEOUT
+        entries, note = search.list_universe(self, base, include_ignored=include_ignored, deadline=deadline)
+
+        def spellings(entry):
+            """The pattern matches the path below `path`; one with a '/' also matches the
+            path as the results show it, or the absolute path."""
+            yield entry.relative
+            if "/" in pattern:
+                yield self.display_path(entry.path)
+                if pattern.startswith("/"):
+                    yield str(entry.path)
+        matched = [entry for entry in entries
+                   if any(search.glob_match(matcher, name, deadline) for name in spellings(entry))]
+        if sort == "modified":
+            stamped = []
+            for entry in matched:
+                search.check_deadline(deadline)
+                try:
+                    stamped.append((os.stat(entry.path).st_mtime, entry))
+                except OSError:
+                    continue  # Removed since it was listed.
+            stamped.sort(key=lambda item: (-item[0], item[1].relative))
+            items = [{"path": self.display_path(entry.path),
+                      "modified": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(modified))}
+                     for modified, entry in stamped]
+        else:
+            items = [self.display_path(entry.path) for entry in matched]
+        total = len(items)
+        if offset > total:
+            raise ValueError(f"offset is beyond the {total:,} matching files.")
+        result = {"files": [], "total": total, "next_offset": None, "truncated": False, **({"note": note} if note else {})}
+        for item in items[offset:]:
+            candidate = {**result, "files": [*result["files"], item], "next_offset": FIND_OFFSET_LIMIT}
+            if len(result["files"]) >= max_results or _output_size(candidate) > QUERY_OUTPUT_LIMIT:
+                if not result["files"]:
+                    raise ValueError("A file path exceeds the 8 KB output limit; choose a shorter path.")
+                result.update(next_offset=offset + len(result["files"]), truncated=True)
+                break
+            result["files"].append(item)
+        return result
+
+    def _read_tail(self, target, size, tail_lines, result, limit, deadline):
+        """The last tail_lines lines of a regular file, read backwards from its end."""
+        size_name = f"{limit // 1000} KB"
+        if size > TAIL_FILE_LIMIT:
+            raise ValueError("tail_lines works on files up to 512 MB; use run_command with tail for larger files.")
+        if size == 0:
+            return result
+        blocks, breaks, position, trailing = [], 0, size, False
+        with target.open("rb") as source:
+            while position > 0 and breaks < tail_lines:
                 _check_deadline(deadline)
-                scanned_files += 1
-                if scanned_files > SEARCH_FILE_SCAN_LIMIT:
-                    raise ValueError("Search file scan limit reached; narrow the path.")
-                child = Path(base) / filename
-                if not fnmatch.fnmatch(str(child.relative_to(search_base)), glob):
-                    continue
-                try:
-                    target = self.path(str(child))
-                    info = target.stat()
-                    if not stat.S_ISREG(info.st_mode) or info.st_size > SEARCH_FILE_LIMIT:
-                        result["skipped_files"] += 1
-                        continue
-                    with target.open("rb") as source:
-                        raw = source.read(SEARCH_FILE_LIMIT + 1)
-                except (OSError, ValueError):
-                    result["skipped_files"] += 1
-                    continue
-                scanned_bytes += len(raw)
-                if scanned_bytes > SEARCH_TOTAL_LIMIT:
-                    raise ValueError("Search byte scan limit reached (16 MB); narrow the path or glob.")
-                if len(raw) > SEARCH_FILE_LIMIT or b"\x00" in raw:
-                    result["skipped_files"] += 1
-                    continue
-                try:
-                    content = raw.decode("utf-8")
-                except UnicodeError:
-                    result["skipped_files"] += 1
-                    continue
-                lines = content.splitlines()
-                for index, line in enumerate(lines):
-                    _check_deadline(deadline)
-                    try:
-                        matches = (pattern.search(line, timeout=max(0.001, min(REGEX_TIMEOUT, deadline - time.monotonic())), concurrent=True)
-                                   if pattern else needle in (line if case_sensitive else line.casefold()))
-                    except TimeoutError as error:
-                        raise ValueError("Regular expression time limit reached; simplify the pattern or narrow the search.") from error
-                    if not matches:
-                        continue
-                    found += 1
-                    if found <= offset:
-                        continue
-                    text, clipped = _excerpt(line)
-                    entry = {"path": self.display_path(child), "line": index + 1, "text": text,
-                             "before": [], "after": [], "text_truncated": clipped}
-                    for key, positions in (("before", range(max(0, index - context_lines), index)),
-                                           ("after", range(index + 1, min(len(lines), index + context_lines + 1)))):
-                        for position in positions:
-                            text, clipped = _excerpt(lines[position])
-                            entry[key].append({"line": position + 1, "text": text})
-                            entry["text_truncated"] |= clipped
-                    candidate = {**result, "matches": [*result["matches"], entry],
-                                 "next_offset": 10_000, "skipped_files": SEARCH_FILE_SCAN_LIMIT}
-                    if len(result["matches"]) >= max_results or _output_size(candidate) > QUERY_OUTPUT_LIMIT:
-                        if not result["matches"]:
-                            raise ValueError("A search match exceeds the 8 KB output limit; reduce context_lines.")
-                        next_offset = offset + len(result["matches"])
-                        if next_offset > 10_000:
-                            raise ValueError("Search pagination limit reached; narrow the path, glob, or query.")
-                        result.update(next_offset=next_offset, truncated=True)
-                        return result
-                    result["matches"].append(entry)
-                    result["truncated"] |= entry["text_truncated"]
+                step = min(TAIL_BLOCK, position, READ_SCAN_LIMIT - (size - position))
+                if step <= 0:
+                    raise ValueError("The last lines exceed 8 MB; use a smaller tail_lines.")
+                position -= step
+                source.seek(position)
+                block = source.read(step)
+                if len(block) != step:
+                    raise ValueError("The file changed while it was read; read it again.")
+                if not blocks:
+                    trailing = block.endswith(b"\n")  # A final LF does not start an empty line.
+                    breaks -= trailing
+                blocks.append(block)
+                breaks += block.count(b"\n")
+            data = b"".join(reversed(blocks))
+            body = data[:-1] if trailing else data
+            start = len(body)
+            for _ in range(tail_lines):
+                start = body.rfind(b"\n", 0, start)
+                if start < 0:
+                    break
+            start += 1  # -1 (the start of the file) becomes 0.
+            number = data.count(b"\n", 0, start) + 1
+            source.seek(0)
+            counted = 0
+            while counted < position:  # Absolute line numbers: count the breaks before the tail.
+                _check_deadline(deadline)
+                chunk = source.read(min(COUNT_BLOCK, position - counted))
+                if not chunk:
+                    raise ValueError("The file changed while it was read; read it again.")
+                counted += len(chunk)
+                number += chunk.count(b"\n")
+        decoded = []
+        for raw in body[start:].split(b"\n"):
+            _check_deadline(deadline)
+            raw = raw[:-1] if raw.endswith(b"\r") else raw
+            if len(raw) > READ_LINE_LIMIT:
+                raise ValueError(f"Line {number} is too long for ranged reading (128 KB limit).")
+            if b"\x00" in raw:
+                raise ValueError("Binary files cannot be read as text.")
+            decoded.append((number, *_decode_line(raw)))
+            number += 1
+        kept, cost, invalid = [], 0, []
+        last = decoded[-1][0]
+        for number, line, bad in reversed(decoded):
+            entry = f"{number}: {line}"
+            entry_cost = _text_cost(entry) + (2 if kept else 0)
+            marks = sorted([*invalid, number])[:INVALID_LINE_NAMES] if bad else invalid
+            metadata = {**result, "start_line": number, "end_line": last,
+                        **({"invalid_utf8_lines": marks, "encoding_note": ENCODING_NOTE} if marks else {})}
+            if _output_size(metadata) + cost + entry_cost > limit:
+                if not kept:
+                    raise ValueError(f"Line {number} is too large for the {size_name} ranged output limit.")
+                result["truncated"] = True  # Keeps the last lines that fit.
+                break
+            kept.append(entry)
+            cost += entry_cost
+            invalid = marks
+            result.update(start_line=number, end_line=last)
+        result["content"] = "\n".join(reversed(kept))
+        if invalid:
+            result.update(invalid_utf8_lines=invalid, encoding_note=ENCODING_NOTE)
         return result
 
     async def run_command(self, command: str, timeout_seconds=60, max_output_bytes=LIMIT, on_output=None):
         return await run_process(command, self.root, timeout_seconds, max_output_bytes, on_output)
 
-    async def execute(self, name: str, arguments: dict):
+    async def execute(self, name: str, arguments: dict, *, page_bytes=QUERY_OUTPUT_LIMIT):
         if name == "run_command":
             return await self.run_command(arguments["command"], arguments.get("timeout_seconds", 60),
                                           arguments.get("max_output_bytes", LIMIT))
@@ -367,10 +609,17 @@ class WorkspaceTools:
                                         arguments.get("glob", "*"), arguments.get("offset", 0))
         if name == "read_file":
             return await asyncio.to_thread(self.read_file_range, arguments["path"],
-                                           arguments.get("start_line", 1), arguments.get("max_lines", 200))
+                                           arguments.get("start_line", 1), arguments.get("max_lines", 400),
+                                           tail_lines=arguments.get("tail_lines"), page_bytes=page_bytes)
         if name == "search_files":
             return await asyncio.to_thread(self.search_files, arguments["query"], arguments.get("glob", "*"), arguments.get("path", "."),
-                                           **{key: arguments[key] for key in ("regex", "case_sensitive", "context_lines", "offset", "max_results") if key in arguments})
+                                           **{key: arguments[key] for key in ("regex", "case_sensitive", "context_lines", "offset",
+                                                                               "max_results", "output_mode", "include_ignored")
+                                              if key in arguments})
+        if name == "find_files":
+            return await asyncio.to_thread(self.find_files, arguments["pattern"], arguments.get("path", "."),
+                                           **{key: arguments[key] for key in ("sort", "include_ignored", "offset", "max_results")
+                                              if key in arguments})
         raise ValueError(f"Unknown tool: {name}")
 
 
@@ -381,17 +630,26 @@ def definition(name, description, properties, required):
 
 STRING = {"type": "string"}
 TOOL_DEFINITIONS = [
-    definition("list_files", "List local files using an absolute, home-relative or workspace-relative path. The app requests access for external folders. Optional glob filters names (e.g. *.csv). Returns entries and next_offset in pages of at most 8 KB; follow next_offset with the same path, depth and glob. If listing_limit_reached is true, narrow the folder or glob to find entries beyond the first 300. Excludes secrets and generated folders.",
+    definition("list_files", "List local files using an absolute, home-relative or workspace-relative path. The app requests access for external folders. Optional glob filters names (e.g. *.csv). Returns entries and next_offset in pages of at most 8 KB; follow next_offset with the same path, depth and glob. If listing_limit_reached is true, narrow the folder or glob to find entries beyond the first 300. Excludes secrets and generated folders. Use find_files for recursive or ** searches.",
                {"path": STRING, "depth": {"type": "integer"}, "glob": STRING,
                 "offset": {"type": "integer", "minimum": 0, "maximum": 300}}, []),
-    definition("read_file", "Read numbered lines from a regular UTF-8 file. Defaults to 200 lines; output is at most 8 KB. Follow next_line for more. Scanning is limited to 8 MB and individual lines to 128 KB. External paths trigger folder access approval.",
+    definition("find_files", "Find files by glob pattern under a path (default: the workspace), at any depth. ** matches any number of folders (src/**/*.test.ts); a pattern without / matches file names anywhere (*.py), and ./*.py only directly in path; a pattern with / matches the path below path or the path as results show it; {a,b} gives alternatives. Case-insensitive. Inside a Git repository that starts within the workspace or granted folder, files ignored by .gitignore are skipped unless include_ignored=true; a note says when .gitignore was not applied. sort=modified lists newest first. Returns files, total and next_offset in pages of at most 8 KB; follow next_offset with the same arguments. Excludes secrets and generated folders. External paths need folder access.",
+               {"pattern": STRING, "path": {"type": "string", "default": "."},
+                "sort": {"type": "string", "enum": ["path", "modified"], "default": "path"},
+                "include_ignored": {"type": "boolean", "default": False},
+                "offset": {"type": "integer", "minimum": 0, "maximum": 200000},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 500, "default": 200}}, ["pattern"]),
+    definition("read_file", "Read numbered lines from a regular text file: from start_line (default 1), or the last tail_lines lines, which suits logs. Pages are up to 8–32 KB depending on the context budget; follow next_line. Bytes that are not valid UTF-8 are shown as � and listed in invalid_utf8_lines. Forward reads scan at most 8 MB from the start; tail_lines works on files up to 512 MB. External paths trigger folder access approval.",
                {"path": STRING, "start_line": {"type": "integer", "minimum": 1},
-                "max_lines": {"type": "integer", "minimum": 1, "maximum": 1000}}, ["path"]),
-    definition("search_files", "Search one UTF-8 file or files under a directory path (defaults to workspace) for literal text or a bounded regular expression. Choose the narrowest path and glob; use regex=false unless regular-expression syntax is needed, and escape literal metacharacters when regex=true. Case insensitive by default. Returns matching lines, optional context, skipped_files, and next_offset for pagination; output is at most 8 KB. Skips binary, unreadable, excluded, and over-2-MB files. Scan and regex time limits return explicit errors. External paths trigger folder access approval.",
+                "max_lines": {"type": "integer", "minimum": 1, "maximum": 2000, "default": 400},
+                "tail_lines": {"type": "integer", "minimum": 1, "maximum": 2000}}, ["path"]),
+    definition("search_files", "Search one UTF-8 file or files under a directory path (default: the workspace) for literal text or a bounded regular expression. Choose the narrowest path and glob; use regex=false unless regular-expression syntax is needed. Case-insensitive by default. output_mode=files_with_matches lists matching files; count gives matches per file. Inside a Git repository that starts within the workspace or granted folder, .gitignored files are skipped unless include_ignored=true; a note says when .gitignore was not applied. Binary and non-UTF-8 files are not searched; skipped_files counts files over 2 MB and unreadable files. Literal searches use ripgrep, when installed, to find candidate files faster; results are the same either way. Returns next_offset for pagination; output is at most 8 KB. External paths trigger folder access approval.",
                {"query": STRING, "glob": STRING, "path": STRING, "regex": {"type": "boolean"},
                 "case_sensitive": {"type": "boolean"}, "context_lines": {"type": "integer", "minimum": 0, "maximum": 5},
                 "offset": {"type": "integer", "minimum": 0, "maximum": 10000},
-                "max_results": {"type": "integer", "minimum": 1, "maximum": 100}}, ["query"]),
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 100},
+                "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"], "default": "content"},
+                "include_ignored": {"type": "boolean", "default": False}}, ["query"]),
     definition("write_file", "Create or replace a file subject to the selected permission mode; read existing files first.",
                {"path": STRING, "content": STRING}, ["path", "content"]),
     definition("edit_file", "Edit an existing file by exact text replacement. Give old_text and new_text (old_text must match exactly once unless replace_all=true), or edits: a list of such replacements applied in order to the same file, all checked before anything is written, with one approval and one checkpoint. Copy old_text exactly from read_file without the line-number prefixes. Line endings (LF or CRLF) are kept.",
@@ -409,6 +667,10 @@ TOOL_DEFINITIONS = [
     definition("get_job_output", "Read a bounded output page for a job in this conversation. Follow next_offset; poll running jobs only when useful. Offsets count characters in retained output; truncated means later process output was discarded.",
                {"job_id": STRING, "offset": {"type": "integer", "minimum": 0, "maximum": 1000000, "default": 0},
                 "max_chars": {"type": "integer", "minimum": 1, "maximum": 8000, "default": 4000}}, ["job_id"]),
+    definition("wait_job", "Wait until a job of this conversation finishes, or until a new output line matches until_regex (Python regular expression, case-sensitive), for at most timeout_seconds (default 60, max 300). Only output after from_offset counts (default: total_chars of the last result for this job you received, so a line printed since then still counts; 0 if none). Returns reason (exited, matched or timeout), the matching line, the new output (its end if long) and next_offset to wait again. Stop ends the wait; the job keeps running.",
+               {"job_id": STRING, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 300, "default": 60},
+                "until_regex": {"type": "string", "maxLength": 500},
+                "from_offset": {"type": "integer", "minimum": 0, "maximum": 1000000}}, ["job_id"]),
     definition("stop_job", "Stop a managed job belonging to this conversation and retrieve its final status. Does not undo completed side effects.",
                {"job_id": STRING}, ["job_id"]),
     definition("move_path", "Move or rename one regular UTF-8 text file (within the file write limit) to destination, creating folders as needed. An existing destination is refused unless overwrite=true; read it first. The move appears in the change review with Undo. Use run_command for folders, symbolic links, binary or larger files.",

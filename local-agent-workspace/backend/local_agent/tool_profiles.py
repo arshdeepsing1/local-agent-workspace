@@ -1,8 +1,8 @@
 """Small, server-enforced capability ceilings for delegated work."""
 
 PROFILES = ("read_only", "file_editor", "inherit")
-READ_TOOLS = frozenset({"list_files", "read_file", "search_files", "list_skills", "use_skill", "list_tasks", "get_task",
-                        "notebook_read"})
+READ_TOOLS = frozenset({"list_files", "find_files", "read_file", "search_files", "list_skills", "use_skill", "list_tasks",
+                        "get_task", "notebook_read"})
 FILE_TOOLS = READ_TOOLS | {"write_file", "edit_file", "insert_activity_log", "move_path", "delete_path", "notebook_edit"}
 
 

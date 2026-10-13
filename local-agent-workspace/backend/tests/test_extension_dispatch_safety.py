@@ -98,7 +98,7 @@ async def test_failure_hook_has_original_redacted_error_and_cannot_replace_it(ru
     configure(manager, "tool_failure", tools=["read_file"])
     payloads = []
 
-    async def fail(*args):
+    async def fail(*args, **kwargs):
         raise ValueError("synthetic-token original tool failure")
 
     async def hook(hook, payload, workspace):
@@ -203,7 +203,7 @@ async def test_stop_during_tool_does_not_launch_failure_hook(runtime):
     configure(manager, "tool_failure")
     started = asyncio.Event()
 
-    async def block(*args):
+    async def block(*args, **kwargs):
         started.set()
         await asyncio.Event().wait()
 

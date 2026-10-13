@@ -12,6 +12,9 @@ from urllib.parse import quote
 import httpx
 
 from .tools import TOOL_DEFINITIONS, WorkspaceTools, file_error
+from .jobs import (CREDENTIAL_ENV, DENIED_ENV, DENIED_ENV_PREFIXES, ENVIRONMENT_KEYS, ENVIRONMENT_NAME, HEAD_CHARS,
+                   JOB_NOTICE_STATES, MIN_HEAD_CHARS, TAIL_CHARS, job_command, job_ending, until_pattern, wait_page)
+from .tools import read_page_bytes
 from .permissions import BASIC_COMMANDS, COMMAND_TOOLS, mode_prompt, tool_decision
 from .activity import ACTIVITY_TOOL, activity_content, activity_log, local_time, redact_secrets
 from .context import (
@@ -107,7 +110,7 @@ selected permission mode and shows any needed approval controls. Do not ask for 
 chat before issuing a tool call. If an approval is denied, respect the decision.
 Commands default to a 60-second timeout; choose timeout_seconds up to 3600 if needed.
 Use background=true for a managed job that must outlive this turn, never shell '&' or daemon detachment.
-Use list_jobs/get_job_output to inspect jobs and stop_job to terminate them. Background jobs
+Use list_jobs/get_job_output to inspect jobs, wait_job to wait until a background job finishes or prints a line you expect, and stop_job to terminate them. A failed command's first result shows the start and the end of its retained output. Use find_files to locate files by name. Background jobs
 continue after this turn is stopped and end on explicit job Stop, timeout, or app shutdown.
 Read files in numbered line ranges and follow next_line; paginate searches and job output
 instead of requesting huge results. A completed command can have a nonzero exit code: check it.
@@ -322,7 +325,7 @@ def public_session(session, status="idle"):
     return {"permission_mode": "manual", "allowed_directories": [], "allow_rules": [],
             **{k: v for k, v in session.items()
                if k not in ("wire", "context_state", "instruction_directories", "inference_calls", "command_jobs",
-                            "file_views", "turn_running")},
+                            "file_views", "turn_running", "jobs_reported_through")},
             "status": status}
 
 
@@ -344,7 +347,7 @@ class AgentManager:
         self.delegates = DelegateManager(self)
         self.extension_connections = {}
         self.notifier = SystemNotifier()
-        self.jobs = JobManager(store, settings.redact, self.job_update, redaction_tokens=self.redaction_tokens)
+        self.jobs = JobManager(store, settings.redact, self.job_update, redaction_tokens=self.redaction_tokens, environment=self.command_environment)
         for summary in store.list():
             try:
                 session = store.get(summary["id"])
@@ -510,7 +513,36 @@ class AgentManager:
             return []
 
     async def job_update(self, job):
+        """Show a job's progress on its tool card, and note when an agent's background job ends.
+
+        Runs within JobManager's update timeout and a broadcast can take longer, so the
+        notice is recorded (appended and saved) before anything is awaited."""
+        notices = self.__dict__.setdefault("_job_notices", set())  # Job ids already noted while running.
         session = self.live.get(job["session_id"])
+        if (job.get("background") and job["state"] in JOB_NOTICE_STATES and job["id"] not in notices
+                and job["session_id"] is not None):
+            stored = session
+            if stored is None:
+                try:
+                    stored = self.store.get(job["session_id"])  # Never creates a conversation.
+                except (*STORAGE_ERRORS, ValueError, TypeError, KeyError, AttributeError):
+                    stored = None
+            if (stored is not None and self.agent_job(stored, job["id"])
+                    and not any(event.get("type") == "notice" and event.get("job_id") == job["id"]
+                                for event in stored["events"])):
+                notices.add(job["id"])
+                text = f"Background job {job_ending(job)}: {job_command(self.redact_title(job['command']), 80)}"
+                if session is not None:
+                    await self.event(session, "notice", text=text, job_id=job["id"])
+                else:
+                    notice = {"id": str(uuid.uuid4()), "type": "notice", "created": time.time(),
+                              "text": text, "job_id": job["id"]}
+                    stored["events"].append(notice)
+                    try:
+                        self.store.save(stored)
+                    except STORAGE_ERRORS:
+                        return
+                    await self.broadcast(stored["id"], {"type": "event", "event": notice})
         if session:
             event = next((event for event in reversed(session["events"])
                           if event.get("job_id") == job["id"] and event.get("state") == "running"), None)
@@ -535,6 +567,7 @@ class AgentManager:
                     "output": content[:length], "offset": offset, "next_offset": end if end < len(job["output"]) else None,
                     "total_chars": len(job["output"]), "truncated": job["truncated"],
                     "background": job["background"]}
+        self.job_seen(job)
         low, high = 0, len(content)
         while low < high:
             middle = (low + high + 1) // 2
@@ -543,6 +576,121 @@ class AgentManager:
             else:
                 high = middle - 1
         return page(low)
+
+    def first_page(self, job):
+        """A command's first result. For a failed, timed-out or stopped command whose
+        output does not fit one page: its start and its end, with the offsets of the
+        omitted middle. Otherwise job_output's first page."""
+        page = self.job_output(job)
+        if job["state"] not in {"failed", "timed_out", "cancelled", "interrupted"} or page["next_offset"] is None:
+            return page
+        output = job["output"]
+        total = len(output)
+        if total <= HEAD_CHARS + TAIL_CHARS:
+            whole = self.job_output(job, 0, 8000)
+            if whole["next_offset"] is None:
+                return whole
+
+        # Output past max_output_bytes was never kept: the end shown is not the command's last output.
+        lost = ("\n[… output after this point was not kept (over max_output_bytes); rerun with a larger "
+                "max_output_bytes, or write it to a file and use read_file with tail_lines …]" if job["truncated"] else "")
+
+        def excerpt(head_chars, tail_chars):
+            head = output[:head_chars]
+            tail = output[total - tail_chars:] if tail_chars else ""
+            start, end = len(head), total - len(tail)
+            return {"job_id": job["id"], "state": job["state"], "exit_code": job["exit_code"],
+                    "output": (head + f"\n[… {end - start:,} characters omitted; read them with "
+                               f"get_job_output offset={start} …]\n" + tail + lost),
+                    "offset": 0, "next_offset": start, "omitted": {"start": start, "end": end},
+                    "total_chars": total, "truncated": job["truncated"], "background": job["background"],
+                    "excerpt": "head_and_tail"}
+
+        def fits(value):
+            return len(json.dumps(value, indent=2).encode("utf-8")) <= 8000
+
+        def largest(low, high, build):
+            """The largest size in low..high whose page fits, or None."""
+            if not fits(build(low)):
+                return None
+            while low < high:
+                middle = (low + high + 1) // 2
+                if fits(build(middle)):
+                    low = middle
+                else:
+                    high = middle - 1
+            return low
+
+        head = min(HEAD_CHARS, total)
+        tail = largest(0, min(TAIL_CHARS, total - head), lambda size: excerpt(head, size))
+        if tail is not None:
+            return excerpt(head, tail)
+        head = largest(min(MIN_HEAD_CHARS, head), head, lambda size: excerpt(size, 0))
+        return excerpt(head, 0) if head is not None else page
+
+    def command_environment(self):
+        """Variables passed to commands by name (Settings), with values from this server's
+        environment. Credentials, loader and shell-startup variables and values that
+        contain the token are never passed. Values are never logged."""
+        names = self.settings.values.get("command_env", [])
+        if (not isinstance(names, list) or len(names) > 32
+                or not all(isinstance(name, str) and ENVIRONMENT_NAME.fullmatch(name) for name in names)):
+            return {}
+        tokens = [token for token in self.redaction_tokens() if isinstance(token, str) and token]
+        values = {}
+        for name in names:
+            if (name in ENVIRONMENT_KEYS or name in CREDENTIAL_ENV or name in DENIED_ENV
+                    or name.startswith(DENIED_ENV_PREFIXES)):
+                continue
+            value = os.environ.get(name)
+            if value is None or len(value) > 32_768 or any(token in value for token in tokens):
+                continue
+            values[name] = value
+        return values
+
+    @staticmethod
+    def agent_job(session, job_id):
+        """True when the model started this job with run_command in this conversation."""
+        return any(event.get("type") == "tool" and event.get("name") == "run_command" and event.get("job_id") == job_id
+                   for event in session.get("events", []))
+
+    def background_jobs_notice(self, session):
+        """One line naming the agent's background jobs that ended since the last step, or ""."""
+        reported = session.get("jobs_reported_through")
+        if type(reported) not in (int, float):
+            # New chats and chats from before this notice start now, without old jobs.
+            session["jobs_reported_through"] = time.time()
+            return ""
+        jobs = sorted((job for job in self.jobs.list(session_id=session["id"])
+                       if job["background"] and job["state"] in JOB_NOTICE_STATES and job["updated"] > reported
+                       and self.agent_job(session, job["id"])), key=lambda job: job["updated"])
+        if not jobs:
+            return ""
+        session["jobs_reported_through"] = max(job["updated"] for job in jobs)
+        # A job whose end a result already showed (wait_job, get_job_output) is not repeated.
+        seen = self.__dict__.get("_job_seen", {})
+        jobs = [job for job in jobs if not seen.get(job["id"], (0, False))[1]]
+        if not jobs:
+            return ""
+        named = [f"{job['id'][:8]} `{job_command(self.redact_title(job['command']), 60)}` {job_ending(job)}"
+                 for job in jobs[:5]]
+        more = f"; and {len(jobs) - 5} more." if len(jobs) > 5 else "."
+        return ("Background jobs finished since your last step: " + "; ".join(named) + more
+                + " Use get_job_output to read their output.")
+
+    def job_seen(self, job):
+        """Remember what the latest result for a job told the model: the output length,
+        which is wait_job's default from_offset, and whether the job had ended."""
+        seen = self.__dict__.setdefault("_job_seen", {})
+        seen[job["id"]] = (len(job["output"]), job["state"] != "running")
+        if len(seen) > 400:  # Jobs are pruned; forget the ones that are gone.
+            for job_id in [key for key in seen if self.jobs.get(key) is None]:
+                seen.pop(job_id, None)
+
+    def step_notices(self, session, tools):
+        """The notices for the next model request: changed files and finished background jobs."""
+        return "\n".join(text for text in (self.changed_files_notice(session, tools), self.background_jobs_notice(session))
+                         if text)
 
     async def command_tool(self, session, event, arguments):
         job = await self.jobs.start(command=arguments["command"], workspace=session["workspace"],
@@ -555,7 +703,7 @@ class AgentManager:
                 job = await self.jobs.wait(job["id"])
             else:
                 job = self.jobs.get(job["id"])
-            return self.job_output(job)
+            return self.first_page(job)
         except asyncio.CancelledError:
             if not job["background"]:
                 await self.jobs.stop(job["id"])
@@ -1071,6 +1219,22 @@ class AgentManager:
                         result["next_offset"] = offset + len(result["jobs"])
                         break
                     result["jobs"].append(item)
+            elif name == "wait_job":
+                job = self.session_job(session, arguments["job_id"])
+                timeout = arguments.get("timeout_seconds", 60)
+                if type(timeout) is not int or not 1 <= timeout <= 300:
+                    raise ValueError("timeout_seconds must be an integer from 1 to 300.")
+                total = len(job["output"])
+                last = self.__dict__.get("_job_seen", {}).get(job["id"], (0, False))[0]
+                start = arguments.get("from_offset", min(last, total))
+                if type(start) is not int or start < 0:
+                    raise ValueError("from_offset must be a non-negative integer.")
+                if start > total:
+                    raise ValueError(f"from_offset is beyond the job output ({total:,} characters).")
+                pattern = until_pattern(arguments["until_regex"]) if "until_regex" in arguments else None
+                job, reason, match = await self.jobs.watch(job["id"], start, pattern, timeout)
+                result = wait_page(job, reason, match, start)
+                self.job_seen(job)
             elif name in ("get_job_output", "stop_job"):
                 job = self.session_job(session, arguments["job_id"])
                 if name == "stop_job":
@@ -1080,7 +1244,8 @@ class AgentManager:
                 # Stat first: a change during the read then counts as unseen.
                 target = tools.path(arguments["path"])
                 seen = file_fingerprint(target)
-                result = await tools.execute(name, arguments)
+                result = await tools.execute(name, arguments, page_bytes=read_page_bytes(
+                    self.settings.values.get("context_window", DEFAULT_CONTEXT_WINDOW)))
                 self.remember_file(session, target, seen)
             else:
                 result = await tools.execute(name, arguments)
@@ -1682,7 +1847,7 @@ class AgentManager:
                      else self.settings.values.get("max_agent_steps", DEFAULT_MAX_AGENT_STEPS))
             consecutive_output_retries = 0
             for step_index in range(steps):
-                system, guidance = self.context_inputs(session, tools, mode, self.changed_files_notice(session, tools))
+                system, guidance = self.context_inputs(session, tools, mode, self.step_notices(session, tools))
                 plan = self.handoff_plan(session, context_window)
                 summarize, condense = self.compaction_requests(session, client, url, headers,
                                                                handoff_tokens=plan and plan["tokens"])

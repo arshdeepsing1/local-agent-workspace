@@ -1,9 +1,29 @@
 import asyncio
 import errno
 import os
+import shutil
 import signal
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def no_ripgrep(monkeypatch):
+    """Search without ripgrep by default, so results do not depend on whether it is
+    installed. Tests that need it use real_ripgrep."""
+    from local_agent import search
+    monkeypatch.setattr(search, "ripgrep", lambda: None)
+
+
+@pytest.fixture
+def real_ripgrep(monkeypatch):
+    """Search with the installed rg; the test is skipped when rg is not installed."""
+    from local_agent import search
+    rg = shutil.which("rg")
+    if not rg:
+        pytest.skip("ripgrep (rg) is not installed")
+    monkeypatch.setattr(search, "ripgrep", lambda: rg)
+    return rg
 
 
 @pytest.fixture(params=["as-is", "eperm"])
@@ -31,7 +51,7 @@ def killpg_answer(request, monkeypatch):
 async def unkillable_group(monkeypatch):
     """Make os.killpg answer EPERM without signalling, as for a command whose running
     processes all belong to another user (for example through sudo), and shorten
-    the grace period after a kill. The groups are killed for real afterwards."""
+    the grace periods after SIGTERM and SIGKILL. The groups are killed for real afterwards."""
     from local_agent import jobs
     killpg = os.killpg
     groups = set()
@@ -41,6 +61,7 @@ async def unkillable_group(monkeypatch):
         raise PermissionError(errno.EPERM, "Operation not permitted")
     monkeypatch.setattr(os, "killpg", not_permitted)
     monkeypatch.setattr(jobs, "KILL_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(jobs, "TERM_GRACE_SECONDS", 0.2)
     yield groups
     for pid in groups:
         try:

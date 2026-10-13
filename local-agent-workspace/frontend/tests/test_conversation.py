@@ -285,6 +285,22 @@ def test_activity_summary_counts_one_action_in_the_singular(ui, page):
     expect(page.get_by_text("Activity · 1 action", exact=True)).to_be_visible()
 
 
+def test_find_files_and_wait_job_cards_name_their_pattern_and_job(ui, page):
+    show(ui, """[
+      { id: 'find', type: 'tool', name: 'find_files', state: 'completed', input: { pattern: 'src/**/*.test.ts', path: 'web' } },
+      { id: 'find-here', type: 'tool', name: 'find_files', state: 'completed', input: { pattern: '*.py', path: '.' } },
+      { id: 'wait', type: 'tool', name: 'wait_job', state: 'completed', input: { job_id: '0123456789abcdef', until_regex: 'ready on [0-9]+' } },
+      { id: 'wait-exit', type: 'tool', name: 'wait_job', state: 'running', input: { job_id: 'fedcba9876543210' } },
+    ]""")
+    expect(page.get_by_role("button", name="find files src/**/*.test.ts in web", exact=True)).to_be_visible()
+    expect(page.get_by_role("button", name="find files *.py", exact=True)).to_be_visible()
+    expect(page.get_by_role("button", name="wait job 01234567 until /ready on [0-9]+/", exact=True)).to_be_visible()
+    expect(page.get_by_role("button", name="wait job fedcba98", exact=True)).to_be_visible()
+    page.get_by_text("Activity · 4 actions").click()
+    expect(page.locator("details.activity-summary").get_by_text("· src/**/*.test.ts in web")).to_be_visible()
+    expect(page.locator("details.activity-summary").get_by_text("· 01234567 until /ready on [0-9]+/")).to_be_visible()
+
+
 def test_activity_summary_keeps_states_and_approval(ui, page):
     states = ["running", "pending", "completed", "rejected", "cancelled", "error"]
     events = "[" + ",".join(f"{{ id: 'tool-{i}', type: 'tool', name: 'action_{i}', state: '{state}', input: {{ path: 'file-{i}' }} }}"
