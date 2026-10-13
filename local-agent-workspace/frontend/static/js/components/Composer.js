@@ -5,7 +5,8 @@ import PermissionsMenu from './PermissionsMenu.js'
 import { useSlashMenu } from './SlashMenu.js'
 
 // Props: value, setValue, model, models, busy, disabled, modelSaving, onModel, workspace,
-// mode, onMode, onProject, onFolders, onSend, onStop, onAttach, onError, loadSkills, rules, onRemoveRule
+// mode, onMode, onProject, onFolders, onSend, onStop, onAttach, onError, loadSkills,
+// rules (this chat), projectRules, userRules, rulesProblem, onLoadRules, onAddRule, onRemoveRule(scope, rule), onResetRules
 export default function Composer(p) {
   const [sending, setSending] = useState(false)
   const input = useRef(null)
@@ -40,8 +41,9 @@ export default function Composer(p) {
     </div>
     <div class="composer-toolbar">
       <button class="attach-button icon-button" aria-label="Add project file" onClick=${p.onAttach}><${Plus} size=${19} /></button>
-      <${PermissionsMenu} mode=${p.mode} busy=${p.busy || p.disabled || sending || p.modelSaving} onChange=${p.onMode} onError=${p.onError} onDone=${() => input.current?.focus()}
-        rules=${p.rules} onRemoveRule=${p.onRemoveRule} />
+      <${PermissionsMenu} mode=${p.mode} busy=${p.busy} locked=${p.disabled || p.modelSaving || sending} onChange=${p.onMode} onError=${p.onError} onDone=${() => input.current?.focus()}
+        rules=${p.rules} projectRules=${p.projectRules} userRules=${p.userRules} problem=${p.rulesProblem} onOpen=${p.onLoadRules}
+        onRemoveRule=${p.onRemoveRule} onAddRule=${p.onAddRule} onReset=${p.onResetRules} />
       <span class="composer-spacer" />
       <div class="model-control">
         <select aria-label="Model" value=${p.model} disabled=${p.disabled || p.busy || sending || p.modelSaving} onChange=${e => void changeModel(e.currentTarget.value)}

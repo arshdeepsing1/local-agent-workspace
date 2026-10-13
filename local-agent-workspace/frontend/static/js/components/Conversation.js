@@ -4,6 +4,7 @@ import { api } from '../api.js'
 import { enhanceCodeBlocks, linkPaths, renderMarkdown } from '../markdown.js'
 import { Brand } from './Sidebar.js'
 import RequestDetails from './RequestDetails.js'
+import ApprovalOptions, { ruleLine } from './ApprovalOptions.js'
 
 // A long file is read in pages. Naming the lines each read covered keeps the
 // pages of one file from looking like the same read repeated.
@@ -69,6 +70,11 @@ function toolOutcome(event) {
   if (event.state === 'rejected') {
     if (event.approval === 'expired') return 'Not answered in time; the action did not run'
     if (event.approval === 'declined') return event.decline_note ? `Action declined: ${clip(event.decline_note)}` : 'Action declined'
+    // Blocked by a rule, Don't ask or a mode change; the reason may already start with "Not run:".
+    if (event.approval === 'blocked') {
+      const reason = clip(event.blocked_reason || event.output).replace(/^Not run:\s*/i, '')
+      return reason ? `Not run: ${reason}` : 'Action not run'
+    }
     // Blocked without an approval card (Plan mode, changed instructions, a tool profile), or an older event.
     return clipped ? `Not run: ${clipped}` : 'Action not run'
   }
@@ -80,10 +86,13 @@ function toolOutcome(event) {
 // its grant already lasts for this chat.
 export function allowLabel(event) {
   const name = event.name || ''
+  if (event.protected) return null  // Protected files are always confirmed.
   if (name === 'run_command') return typeof event.input?.command === 'string' && event.input.command.trim() ? 'Always allow this command in this chat' : null
   if (['write_file', 'edit_file', 'insert_activity_log', 'move_path', 'delete_path', 'notebook_edit'].includes(name)) return 'Allow edits in this chat'
   if (name.startsWith('mcp__')) return 'Allow this tool in this chat'
   if (name.startsWith('hook_')) return 'Allow this hook in this chat'
+  if (name === 'delegate_task') return 'Allow subagents in this chat'
+  if (name === 'stop_job') return 'Allow stopping jobs in this chat'
   return null
 }
 
@@ -121,10 +130,11 @@ function ToolCard({ event, summary, sessionId, onError, onSelectSession, onOpenP
   const title = (event.name || 'Tool').replace(/_/g, ' ')
   const isTask = event.name === 'create_task' || event.name === 'update_task'
   const allowInChat = pending ? allowLabel(event) : null
-  const decide = async (allowed, remember = false) => {
+  const rule = ruleLine(event)
+  const decide = async (allowed, extra = {}) => {
     setDeciding(true)
-    // The note goes to the model with a Decline; remember stores an exact rule for this chat.
-    const body = { allowed, ...(remember ? { remember: true } : {}), ...(!allowed && note.trim() ? { note: note.trim() } : {}) }
+    // The note goes to the model with a Decline; extra is { remember: true } (an exact rule for this chat) or { scope, rule? }.
+    const body = { allowed, ...(allowed ? extra : {}), ...(!allowed && note.trim() ? { note: note.trim() } : {}) }
     try { await api(`/sessions/${sessionId}/approvals/${event.id}`, 'POST', body) }
     catch (e) { onError(e.message) }
     finally { setDeciding(false) }
@@ -139,17 +149,15 @@ function ToolCard({ event, summary, sessionId, onError, onSelectSession, onOpenP
       ${expanded || pending ? html`<${ChevronDown} size=${14} />` : html`<${ChevronRight} size=${14} />`}
     </button>
     <${DelegationStatus} event=${event} onSelectSession=${onSelectSession} />
-    ${event.allowed_by_rule ? html`<p class="tool-rule">Allowed by a rule for this chat</p>` : null}
+    ${rule ? html`<p class="tool-rule">${rule}</p>` : null}
     ${expanded || pending ? html`<div class="tool-body">
       ${pending ? html`<p>Local needs your approval to ${title.toLowerCase()}.${event.approval_expires
           ? ` If you do not answer by ${expiryTime(event.approval_expires)}, it will not run.` : ''}</p>
-        <${ToolDetails} event=${event} pending=${true} />
-        <label class="decline-note"><span>Tell the agent why (optional)</span>
-          <textarea rows=${2} maxLength=${2000} spellcheck=${false} value=${note} disabled=${deciding}
-            onInput=${e => setNote(e.currentTarget.value)} /></label>
-        <div class="approval-buttons"><button class="outline" disabled=${deciding} onClick=${() => void decide(false)}><${X} size=${15} />Decline</button>
-          ${allowInChat ? html`<button class="outline" disabled=${deciding} onClick=${() => void decide(true, true)}>${allowInChat}</button>` : null}
-          <button class="primary" disabled=${deciding} onClick=${() => void decide(true)}><${Check} size=${15} />Approve</button></div>`
+        <${ApprovalOptions} event=${event} sessionId=${sessionId} onError=${onError} deciding=${deciding} onDecide=${decide} allowInChat=${allowInChat}
+          details=${html`<${ToolDetails} event=${event} pending=${true} />`}
+          declineNote=${html`<label class="decline-note"><span>Tell the agent why (optional)</span>
+            <textarea rows=${2} maxLength=${2000} spellcheck=${false} value=${note} disabled=${deciding}
+              onInput=${e => setNote(e.currentTarget.value)} /></label>`} />`
         : html`<${ToolDetails} event=${event} pending=${false} /><small class="muted">Action: ${event.state}</small>
           ${onOpenPath && typeof filePath === 'string' && filePath ? html`<button class="outline tool-open-file"
             onClick=${() => onOpenPath(startLine ? { path: filePath, line: startLine } : { path: filePath })}><${FileText} size=${14} />Open file</button>` : null}`}

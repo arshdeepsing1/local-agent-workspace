@@ -8,19 +8,40 @@
 //   be read; it is hidden and left unchanged. reason never quotes the file's contents.
 // Connection: { connected, models: string[], error: string | null }
 // Session: { id, title, workspace, model, status, events: AgentEvent[], updated,
-//   permission_mode, allowed_directories, allow_rules: AllowRule[], context_info?, active_skills?,
+//   permission_mode: 'manual'|'auto'|'acceptEdits'|'dontAsk'|'plan'|'bypassPermissions', allowed_directories,
+//   allow_rules: Rule[] (this chat's rules), disabled_tools?: string[] (turned-off tools), context_info?, active_skills?,
 //   parent_session_id?, is_subagent?, delegation?, tool_profile?, subagent_tool_profile?,
 //   terminal_reason?: how the last turn ended: 'completed'|'stopped'|'error'|'inference_error'|
 //   'tool_error'|'step_limit'|'interrupted' (also in the /api/sessions summaries),
 //   turn_ended?: epoch seconds when the last turn ended; null while a turn runs (also in summaries),
 //   turn_delegated?: true while the last turn is one a parent's delegate_task started (also in summaries) }
 //   GET /sessions list items omit events and allow_rules.
-// AllowRule ("Allow for this chat", exact matches only): { tool: 'run_command', command }
-//   | { tool: 'edits' } (write_file, edit_file, insert_activity_log) | { tool: 'mcp__<server>__<tool>' }
-//   | { tool: 'hook', hook: <hook id> }. Removed with DELETE /sessions/<id>/allow-rules (body: the rule).
-// Approval answer (POST /sessions/<id>/approvals/<event id>): { allowed, remember?: true (approve only),
-//   note?: string (decline only, at most 2,000 characters) }
-// The 'permissions' socket message: { type: 'permissions', permission_mode, allowed_directories, allow_rules }
+// Rule: { behavior: 'allow'|'ask'|'deny', tool, command?, argv?: string[], prefix?: string[], flags?: string[],
+//   path?: string, hook?: string }. A rule without behavior (an M1 "Allow for this chat" rule) means allow.
+//   tool: 'run_command' (command = M1 exact text, chat and allow only; argv = exact argv; prefix with flags =
+//   the prefix followed only by those options, '--name=' allowing any value; no matcher = every command,
+//   deny and ask only) | 'edits' (every edit tool; path = an absolute folder or file) | 'hook' (hook = id)
+//   | 'delegate_task' | 'stop_job' | 'mcp__<server>__<tool>' | 'mcp__<server>__*' (deny and ask only)
+//   | another tool name (deny only). Deny wins over ask, ask over allow.
+// Rule draft (POST only): { tool: 'run_command', behavior, text, match: 'exact'|'prefix', options?: string }.
+// RuleSets (GET /permission-rules?session_id=; POST /permission-rules { scope: 'chat'|'project'|'user',
+//   session_id, rule: Rule | draft }; DELETE /permission-rules { scope, session_id, rule };
+//   POST /permission-rules/reset): { chat: Rule[], project: Rule[], user: Rule[], project_path,
+//   problem: string | null (the saved rules file could not be read; its rules are ignored until reset) }.
+//   A 400 detail explains a rejected rule. M1 chat rules are also removed with DELETE /sessions/<id>/allow-rules (body: the rule).
+// Approval answer (POST /sessions/<id>/approvals/<event id>): { allowed, remember?: true (approve only: an exact
+//   rule for this chat), note?: string (decline only, at most 2,000 characters), scope?: 'chat'|'project'|'user'
+//   (approve only, one of the card's rememberable), rule?: Rule (from the card's rule_options; without it the
+//   server stores its default rule for the card) }
+// Edit before approving: POST /sessions/<id>/approvals/<event id>/edit { input: { <one of editable>: string } }
+//   -> { ok: true }; the card stays pending and its new input and preview arrive as an event update.
+// Mode change: PUT /sessions/<id>/permissions { permission_mode, confirm?: true }; switching to
+//   bypassPermissions needs confirm (400 'Confirm switching to Bypass permissions.'). POST /sessions
+//   { permission_mode } needs no confirm. Allowed while the chat is busy; waiting cards are re-checked.
+// Turned-off tools: PUT /sessions/<id>/disabled-tools { tools: string[] } -> Session;
+//   GET /tools?session_id= -> { tools: [{ name, description }], disabled: string[] }.
+// The 'permissions' socket message: { type: 'permissions', permission_mode, allowed_directories, allow_rules,
+//   disabled_tools?, project_rules?: Rule[], user_rules?: Rule[], rules_problem?: string | null }
 // Status message: { type: 'status', status, terminal_reason?, turn_ended? (sent with 'idle'
 //   when a turn ended; a manual compaction leaves turn_ended unchanged), turn_delegated? (true, with
 //   turn_ended, when a parent's delegate_task started that turn) }
@@ -28,8 +49,23 @@
 // AgentEvent: { id, type: 'user'|'assistant'|'tool'|'notice'|'error', text?,
 //   reasoning_summary?, reasoning_truncated?, child_session_id?, request_info?,
 //   name?, input?, output?, preview?, state?, delegation?, origin?,
-//   approval?: 'approved'|'declined'|'expired', approval_expires? (epoch seconds, only with a limit),
-//   decline_note? (the user's note sent with Decline), allowed_by_rule? (true: ran by an AllowRule, no card) }
+//   approval?: 'approved'|'declined'|'expired'|'blocked', approval_expires? (epoch seconds, only with a limit),
+//   decline_note? (the user's note sent with Decline), allowed_by_rule? (true: ran by a Rule, no card),
+//   rule_scope?: 'chat'|'project'|'user' (with allowed_by_rule), read_only_command? (true: ran from the fixed
+//   read-only command list), approved_by_mode? (the mode whose switch approved a waiting card),
+//   without_shell? (true: the command ran as an argv without a shell), edited? (true: the user edited the
+//   action before approving it), blocked_reason? (with approval 'blocked': why it did not run),
+//   protected? (the reason a file is protected),
+//   and on pending cards only: rememberable?: ('chat'|'project'|'user')[], rule_options?: { argv: string[] | null,
+//   prefixes: [{ prefix: string[], flags: string[] }], reason: string | null } (commands) | { folder } (edits),
+//   editable?: ('command'|'content'|'new_text')[], uncertain?: true (a command that could not be checked
+//   exactly against deny and ask rules) }
+//   ask_user events: { name: 'ask_user', input: { questions }, answers?: [{ question, selected, other }],
+//   question_outcome?: 'answered'|'skipped'|'expired', approval_expires? }; answered with
+//   POST /sessions/<id>/questions/<event id> { answers?: [{ selected, other? }], skip?: true }.
+//   submit_plan events: { name: 'submit_plan', input: { plan, title? }, plan_outcome?: 'approved'|'keep_planning'|
+//   'expired'|'superseded', plan_mode?, feedback?, approval_expires? }; answered with
+//   POST /sessions/<id>/plans/<event id> { choice, feedback? }.
 // ApiError: { message, status, detail? }. A 409 that a busy chat causes has
 //   detail { message, session_id, title } naming that chat; other errors have no detail.
 // RequestInfo: { model, status, finish_reason?, http_status?, error_kind?, usage? }

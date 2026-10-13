@@ -31,6 +31,8 @@ export function useWorkspace() {
   const changesPushed = useRef(0)
   // The selected conversation's tasks, pushed as { type: 'tasks', tasks }: { id, value: Task[] }.
   const [tasks, setTasks] = useState({ id: null, value: [] })
+  // The saved project and user permission rules of one selection: { key, project, user, project_path, problem }.
+  const [savedRules, setSavedRules] = useState({ key: null, project: [], user: [], project_path: null, problem: null })
 
   const updateUrl = useCallback((id, replace = false) => {
     const url = new URL(window.location.href)
@@ -153,10 +155,17 @@ export function useWorkspace() {
           setSession(data.session)
           void refreshSessions().catch(e => setError(e.message))
         }
-        if (data.type === 'permissions') setSession(current => current?.id === activeId ? {
-          ...current, permission_mode: data.permission_mode, allowed_directories: data.allowed_directories,
-          allow_rules: data.allow_rules || current.allow_rules,
-        } : current)
+        if (data.type === 'permissions') {
+          setSession(current => current?.id === activeId ? {
+            ...current, permission_mode: data.permission_mode, allowed_directories: data.allowed_directories,
+            allow_rules: data.allow_rules || current.allow_rules,
+            ...(Array.isArray(data.disabled_tools) ? { disabled_tools: data.disabled_tools } : {}),
+          } : current)
+          if (Array.isArray(data.project_rules) || Array.isArray(data.user_rules)) setSavedRules(current => ({
+            key: target.key, project: data.project_rules || [], user: data.user_rules || [],
+            project_path: current.key === target.key ? current.project_path : null, problem: data.rules_problem || null,
+          }))
+        }
         if (data.type === 'context') {
           contextUpdates.current.set(activeId, data.context_info)
           setSession(current => current?.id === activeId ? { ...current, context_info: data.context_info } : current)
@@ -293,10 +302,11 @@ export function useWorkspace() {
     setSession(current => current?.id === id ? { ...current, title: updated.title } : current)
     return updated
   }
-  const setPermissionMode = async permission_mode => {
+  // options.confirm: the user confirmed switching to Bypass permissions (the server requires it).
+  const setPermissionMode = async (permission_mode, options = {}) => {
     const target = selected.current
     if (activeId) {
-      const updated = await api(`/sessions/${activeId}/permissions`, 'PUT', { permission_mode })
+      const updated = await api(`/sessions/${activeId}/permissions`, 'PUT', { permission_mode, ...(options.confirm ? { confirm: true } : {}) })
       if (selected.current === target) setSession(current => current?.id === updated.id ? {
         ...current, permission_mode: updated.permission_mode,
       } : current)
@@ -319,13 +329,54 @@ export function useWorkspace() {
       } : current)
     }
   }
-  const removeAllowRule = async rule => {
+  // A permission-rules response: { chat, project, user, project_path, problem }.
+  const applyRules = (target, result, chat = false) => {
+    if (selected.current !== target) return
+    setSavedRules({ key: target.key, project: result.project || [], user: result.user || [], project_path: result.project_path || null, problem: result.problem || null })
+    if (chat && target.id && Array.isArray(result.chat)) setSession(current => current?.id === target.id ? { ...current, allow_rules: result.chat } : current)
+  }
+  const loadRules = async () => {
     const target = selected.current
-    if (!activeId) return
-    const updated = await api(`/sessions/${activeId}/allow-rules`, 'DELETE', rule)
-    if (selected.current === target) setSession(current => current?.id === updated.id ? {
-      ...current, allow_rules: updated.allow_rules,
-    } : current)
+    const result = await api(`/permission-rules${target.id ? `?session_id=${encodeURIComponent(target.id)}` : ''}`)
+    applyRules(target, result)
+    return result
+  }
+  // rule: a canonical Rule or a command draft { tool: 'run_command', behavior, text, match, options? }.
+  // Chat and project rules need the chat, so a draft chat is created first (like a folder grant).
+  const addRule = async (scope, rule) => {
+    const target = selected.current
+    const id = scope === 'user' ? target.id : await ensureSession(target)
+    const result = await api('/permission-rules', 'POST', { scope, ...(id ? { session_id: id } : {}), rule })
+    applyRules(target, result, scope === 'chat')
+    return result
+  }
+  // An M1 chat rule (no behavior) uses the M1 route, which returns the saved Session.
+  const removeRule = async (scope, rule) => {
+    const target = selected.current
+    if (scope === 'chat' && !rule.behavior) {
+      if (!target.id) return
+      const updated = await api(`/sessions/${target.id}/allow-rules`, 'DELETE', rule)
+      if (selected.current === target) setSession(current => current?.id === updated.id ? {
+        ...current, allow_rules: updated.allow_rules,
+      } : current)
+      return updated
+    }
+    const result = await api('/permission-rules', 'DELETE', { scope, ...(target.id ? { session_id: target.id } : {}), rule })
+    applyRules(target, result, scope === 'chat')
+    return result
+  }
+  const resetRules = async () => {
+    const target = selected.current
+    const result = await api(`/permission-rules/reset${target.id ? `?session_id=${encodeURIComponent(target.id)}` : ''}`, 'POST')
+    applyRules(target, result)
+    return result
+  }
+  // Turned-off tools of the selected chat; returns the saved Session.
+  const setDisabledTools = async tools => {
+    const target = selected.current
+    if (!target.id) return null
+    const updated = await api(`/sessions/${target.id}/disabled-tools`, 'PUT', { tools })
+    if (selected.current === target) setSession(current => current?.id === updated.id ? { ...current, disabled_tools: updated.disabled_tools || [] } : current)
     return updated
   }
   const reviewChanges = async (action, files) => {
@@ -339,10 +390,14 @@ export function useWorkspace() {
   }
   const activeSession = session?.id === activeId ? session : null
   const reportError = message => { if (selected.current.key === selection.key) setError(message) }
+  const rulesHere = savedRules.key === selection.key ? savedRules : null
   return { settings, connection, sessions, session: activeSession, activeId, viewKey: selection.key, error, online, ready,
     setError: reportError, setActiveId: selectSession, newConversation, send, saveSettings, deleteSession, renameSession, changeModel,
     modelSaving: modelSaves.has(selection.key) || (!activeId && defaultModelSave.current !== null),
-    checkConnection, refreshSessions, permissionMode: activeSession?.permission_mode || draftMode, setPermissionMode, allowFolder, removeFolder, removeAllowRule,
+    checkConnection, refreshSessions, permissionMode: activeSession?.permission_mode || draftMode, setPermissionMode, allowFolder, removeFolder,
+    rules: { chat: activeSession?.allow_rules || [], project: rulesHere?.project || [], user: rulesHere?.user || [],
+      project_path: rulesHere?.project_path || null, problem: rulesHere?.problem || null },
+    loadRules, addRule, removeRule, resetRules, setDisabledTools,
     changes: activeId && changes.id === activeId ? changes.value : null, reviewChanges, storageProblems,
     tasks: activeId && tasks.id === activeId ? tasks.value : [] }
 }

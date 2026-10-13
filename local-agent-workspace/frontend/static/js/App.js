@@ -10,6 +10,7 @@ import AgentToolsDialog from './components/AgentToolsDialog.js'
 import SettingsDialog from './components/SettingsDialog.js'
 import WorkspacePanel from './components/WorkspacePanel.js'
 import FolderAccessDialog from './components/FolderAccessDialog.js'
+import PermissionRulesDialog from './components/PermissionRulesDialog.js'
 import ContextMeter from './components/ContextMeter.js'
 import ChangesBar, { plural } from './components/ChangesBar.js'
 import StorageNotice from './components/StorageNotice.js'
@@ -36,6 +37,7 @@ export default function App() {
   const [workspaceOpen, setWorkspaceOpen] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [foldersOpen, setFoldersOpen] = useState(false)
+  const [rulesOpen, setRulesOpen] = useState(false)
   // A changed file chosen in the changes bar, to open in the Workspace panel's review.
   const [review, setReview] = useState(null)
   // A file a reply or tool card names, to open in the Workspace editor: { path, line?, viewKey }.
@@ -58,15 +60,17 @@ export default function App() {
   const openReview = path => { setReview({ path, viewKey: app.viewKey }); setWorkspaceOpen(true) }
   const openFileAt = ({ path, line }) => { setOpenPath({ path, line, viewKey: app.viewKey }); setWorkspaceOpen(true) }
   // Removing a rule saves the chat (a newer 'updated'); like a rename, your own change is not news.
-  const removeAllowRule = async rule => {
+  const removeRule = async (scope, rule) => {
     const id = app.activeId
     const before = app.sessions.find(item => item.id === id)?.updated
-    const updated = await app.removeAllowRule(rule)
-    if (typeof updated?.updated === 'number') attention.renamed(id, before, updated.updated)
+    const updated = await app.removeRule(scope, rule)
+    if (scope === 'chat' && typeof updated?.updated === 'number') attention.renamed(id, before, updated.updated)
   }
   const composer = html`<${Composer} key=${app.viewKey} value=${draft} setValue=${setDraft} model=${active?.model || app.settings?.model || 'databricks-gpt-oss-120b'}
     workspace=${active?.workspace || app.settings?.workspace || ''} mode=${app.permissionMode} onMode=${app.setPermissionMode} onProject=${() => setSettingsOpen(true)}
-    onFolders=${() => setFoldersOpen(true)} rules=${active?.allow_rules || []} onRemoveRule=${removeAllowRule}
+    onFolders=${() => setFoldersOpen(true)} rules=${app.rules.chat} onRemoveRule=${removeRule}
+    projectRules=${app.rules.project} userRules=${app.rules.user} rulesProblem=${app.rules.problem} onLoadRules=${app.loadRules}
+    onAddRule=${() => setRulesOpen(true)} onResetRules=${app.resetRules}
     models=${app.connection?.models || []} busy=${busy} modelSaving=${app.modelSaving}
     disabled=${!app.ready || (!!app.activeId && !active) || !app.settings?.configured}
     onModel=${app.changeModel}
@@ -121,9 +125,10 @@ export default function App() {
       changes=${app.changes} busy=${busy} review=${review?.viewKey === app.viewKey ? review : null} onReviewOpened=${() => setReview(null)} onReview=${app.reviewChanges} onSelectSession=${app.setActiveId}
       open=${openPath?.viewKey === app.viewKey ? openPath : null} onOpened=${() => setOpenPath(null)}
       onAttach=${path => { setDraft(current => `${current}${current ? '\n' : ''}Please read the ${path.startsWith('/') ? 'file' : 'project file'}: ${path}`); setWorkspaceOpen(false) }} />` : null}
-    ${agentToolsOpen && app.settings && (!app.activeId || active) ? html`<${AgentToolsDialog} key=${editorKey} session=${active} workspace=${workspace} onClose=${() => setAgentToolsOpen(false)} onError=${showError} onSelectSession=${id => { setAgentToolsOpen(false); app.setActiveId(id); void app.refreshSessions().catch(e => showError(e.message)) }} />` : null}
+    ${agentToolsOpen && app.settings && (!app.activeId || active) ? html`<${AgentToolsDialog} key=${editorKey} session=${active} onSaveTools=${app.setDisabledTools} workspace=${workspace} onClose=${() => setAgentToolsOpen(false)} onError=${showError} onSelectSession=${id => { setAgentToolsOpen(false); app.setActiveId(id); void app.refreshSessions().catch(e => showError(e.message)) }} />` : null}
     ${settingsOpen && app.settings ? html`<${SettingsDialog} settings=${app.settings} connection=${app.connection} onSave=${app.saveSettings} onClose=${() => setSettingsOpen(false)} />` : null}
     ${foldersOpen && app.settings ? html`<${FolderAccessDialog} key=${app.viewKey} workspace=${active?.workspace || app.settings.workspace} folders=${active?.allowed_directories || []}
       busy=${busy || (!!app.activeId && !active)} bypass=${app.permissionMode === 'bypassPermissions'} onAllow=${app.allowFolder} onRemove=${app.removeFolder} onClose=${() => setFoldersOpen(false)} />` : null}
+    ${rulesOpen && app.settings ? html`<${PermissionRulesDialog} key=${app.viewKey} onAdd=${app.addRule} onClose=${() => setRulesOpen(false)} />` : null}
   </div>`
 }
