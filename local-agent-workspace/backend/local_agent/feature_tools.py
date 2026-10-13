@@ -27,4 +27,17 @@ FEATURE_TOOLS = [
                {"task": {"type": "string"}, "context": {"type": "string"},
                 "tool_profile": {"type": "string", "enum": ["inherit", "read_only", "file_editor"]},
                 "max_steps": {"type": "integer", "minimum": 1, "maximum": 8}}, ["task"]),
+    definition("ask_user", "Ask the user 1-4 short multiple-choice questions when a decision is needed to continue. Each question has 2-4 options; the user can always answer 'Other' with their own text. Works in every mode, including Plan. Wait for the answers instead of guessing. Do not add an Other option. Do not use it for permission to run actions; approval cards handle that. Make it the last tool call in its response.",
+               {"questions": {"type": "array", "minItems": 1, "maxItems": 4, "items": {
+                   "type": "object", "properties": {
+                       "question": {"type": "string", "maxLength": 500},
+                       "header": {"type": "string", "maxLength": 40},
+                       "options": {"type": "array", "minItems": 2, "maxItems": 4, "items": {
+                           "type": "object", "properties": {"label": {"type": "string", "maxLength": 80},
+                                                            "description": {"type": "string", "maxLength": 300}},
+                           "required": ["label"], "additionalProperties": False}},
+                       "multi_select": {"type": "boolean"}},
+                   "required": ["question", "options"], "additionalProperties": False}}}, ["questions"]),
+    definition("submit_plan", "Plan mode only: present your finished plan (Markdown) for the user's review. The user can approve it and switch this chat to Accept edits or Manual mode, and you then implement it in this same turn, or ask you to keep planning with feedback. Make it the last tool call in its response.",
+               {"plan": {"type": "string", "maxLength": 20000}, "title": {"type": "string", "maxLength": 120}}, ["plan"]),
 ]

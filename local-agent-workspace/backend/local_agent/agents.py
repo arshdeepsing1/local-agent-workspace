@@ -39,6 +39,7 @@ from .extensions import ExtensionManager
 from .extensions import skill_index
 from .context import estimate_text_tokens
 from .planning import TaskManager, DelegateManager
+from .interactions import InteractionManager
 from .feature_tools import FEATURE_TOOLS
 from .tool_profiles import tool_allowed, filter_tools
 from .reasoning import reasoning_summary
@@ -507,6 +508,7 @@ class AgentManager:
         self.task_board = TaskManager(store)
         self.projects = ProjectSettings(settings.state_dir)
         self.delegates = DelegateManager(self)
+        self.interactions = InteractionManager(self)
         self.extension_connections = {}
         self.notifier = SystemNotifier()
         self.jobs = JobManager(store, settings.redact, self.job_update, redaction_tokens=self.redaction_tokens, environment=self.command_environment)
@@ -1745,6 +1747,8 @@ class AgentManager:
                 task = self.task_board.update(session["id"], arguments["task_id"], {k: v for k, v in arguments.items() if k != "task_id"})
                 result = {key: task[key] for key in ("id", "title", "status", "depends_on")}
                 await self.publish_tasks(session["id"])
+            elif name in ("ask_user", "submit_plan"):
+                result = await self.interactions.handle(session, event, name, arguments)
             elif name == "delegate_task":
                 await self.status(session, "delegating")
                 try:

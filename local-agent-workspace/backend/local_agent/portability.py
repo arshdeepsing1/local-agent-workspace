@@ -53,6 +53,13 @@ class Origin(Record):
     parent_call_id: str | None = None
 
 
+class Answer(Record):
+    """One answer to an ask_user question."""
+    question: str = Field(max_length=500)
+    selected: list[Annotated[str, Field(max_length=80)]] = Field(max_length=4)
+    other: str | None = Field(default=None, max_length=1000)
+
+
 class Event(Record):
     id: str = Field(min_length=1, max_length=512)
     type: Literal["user", "assistant", "tool", "notice", "error"]
@@ -84,6 +91,12 @@ class Event(Record):
     terminal_reason: str | None = None
     error_kind: str | None = None
     http_status: int | None = Field(default=None, ge=100, le=599)
+    answers: list[Answer] | None = Field(default=None, max_length=4)
+    question_outcome: Literal["answered", "skipped", "expired"] | None = None
+    plan_outcome: Literal["approved", "keep_planning", "expired", "superseded"] | None = None
+    plan_mode: Literal["acceptEdits", "manual"] | None = None
+    feedback: str | None = Field(default=None, max_length=2000)
+    skipped_reason: Literal["dont_ask"] | None = None
 
 
 class Function(Record):
