@@ -59,7 +59,9 @@ class UI:
     def mount(self, module: str, props: str = "{}", name: str = "default", **start):
         """Render one module; `props` is a JavaScript expression evaluated in the page."""
         self.start(**start)
-        self.page.evaluate(f"() => mount({json.dumps(module)}, () => ({props}), {json.dumps(name)})")
+        self.page.evaluate(f"() => preload({json.dumps(module)}, {json.dumps(name)})")
+        # Synchronous: no promise is left for DevTools to await while the app starts.
+        self.page.evaluate(f"() => {{ mount({json.dumps(module)}, () => ({props}), {json.dumps(name)}) }}")
 
     def app(self, session: str | None = None, **start):
         """Render the whole app, optionally opened at ?session=<id>."""
@@ -68,7 +70,8 @@ class UI:
     def probe(self, module: str, name: str, session: str | None = None, **start):
         """Run a hook alone; its latest result is `hook` in the page."""
         self.start(query=f"?session={session}" if session else "", **start)
-        self.page.evaluate(f"() => probe({json.dumps(module)}, {json.dumps(name)})")
+        self.page.evaluate(f"() => preload({json.dumps(module)}, {json.dumps(name)})")
+        self.page.evaluate(f"() => {{ probe({json.dumps(module)}, {json.dumps(name)}) }}")
 
     def rerender(self, props: str):
         self.page.evaluate(f"() => rerender(() => ({props}))")

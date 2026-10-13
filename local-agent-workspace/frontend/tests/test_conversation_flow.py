@@ -18,7 +18,8 @@ def remount(ui, page):
     """Reload the page (localStorage stays) and start the app again."""
     page.reload()
     page.wait_for_function("window.harnessReady === true")
-    page.evaluate("() => mount('App.js', () => ({}))")
+    page.evaluate("() => preload('App.js')")
+    page.evaluate("() => { mount('App.js', () => ({})) }")
     expect(page.get_by_role("combobox", name="Model")).to_have_value("test-model")
 
 
