@@ -487,6 +487,21 @@ def test_paths_in_a_reply_become_links_and_urls_do_not(ui, page):
     assert ui.js("location.hash") == ""
 
 
+IDENTIFIER_REPLY = ("Call `os.path.join` and `json.dumps`, read `settings.values`, use `console.log`, set `self.timeout`. "
+                    "Connect to db.example.com:5432 and api.internal.io:8080 or `db.example.com:5432`. "
+                    "Edit `package.json`, `app.ts:3`, `Main.PY` and main.go:7.\n\n"
+                    "```\nsrc/app.py:12\nsee docs/guide.md and main.go:7\n```")
+
+
+def test_identifiers_hosts_and_code_blocks_are_not_linked(ui, page):
+    # Reported: dotted identifiers in inline code and host:port text became broken file links.
+    show(ui, "[{ id: 'reply', type: 'assistant', text: " + json.dumps(IDENTIFIER_REPLY) + " }]",
+         ", onOpenPath: fake.spy('open')")
+    expect(page.locator(".markdown pre")).to_contain_text("src/app.py:12")
+    expect(page.locator(".markdown a.path-link")).to_have_text(["package.json", "app.ts:3", "Main.PY", "main.go:7"])
+    expect(page.locator(".markdown pre a")).to_have_count(0)
+
+
 def test_reasoning_summaries_and_conversations_without_a_handler_have_no_path_links(ui, page):
     show(ui, "[{ id: 'reply', type: 'assistant', text: 'See docs/guide.md.', reasoning_summary: 'Read src/app.py:3 first.' }]",
          ", onOpenPath: fake.spy('open')")
@@ -529,20 +544,24 @@ def test_tool_cards_without_a_file_have_no_open_button(ui, page):
     expect(page.get_by_role("button", name="Open file")).to_have_count(0)
 
 
-def test_a_path_link_opens_the_file_at_its_line_in_the_workspace_panel(ui, page):
+@pytest.mark.parametrize("newline", ["\\n", "\\r\\n"], ids=["lf", "crlf"])
+def test_a_path_link_opens_the_file_at_its_line_in_the_workspace_panel(ui, page, newline):
     reply = json.dumps(PATH_REPLY)
     ui.app(session="a", scenario="workspace", setup=f"""
       fake.sessions.set('a', {{ ...makeSession('a', 'Other conversation'), events: [{{ id: 'r', type: 'assistant', text: {reply} }}] }})
-      window.fileText = Array.from({{ length: 40 }}, (_, index) => `line ${{index + 1}} of the file`).join('\\n')
+      window.fileText = Array.from({{ length: 40 }}, (_, index) => `line ${{index + 1}} of the file`).join('{newline}')
       fake.override = path => path.startsWith('/api/file?') ? fake.json({{ path: 'src/app.py', content: fileText, absolute: '/abs/path/src/app.py' }}) : undefined""")
     ui.show_session("a")
     page.locator(".markdown a.path-link").first.click()
     editor = page.get_by_role("textbox", name="Edit src/app.py")
     expect(editor).to_be_visible()
     assert ui.requests("/api/file?path=src%2Fapp.py&session_id=a")
-    offset = ui.js("fileText.split('\\n').slice(0, 11).join('\\n').length + 1")
+    # The textarea holds CRLF line breaks as LF; the selection indexes that text.
+    offset = ui.js("fileText.split(/\\r?\\n/).slice(0, 11).join('\\n').length + 1")
     ui.wait(f"document.activeElement?.selectionStart === {offset}")
     assert ui.js("document.activeElement.selectionEnd") == offset + len("line 12 of the file")
+    assert ui.js("document.activeElement.value.slice(document.activeElement.selectionStart, "
+                 "document.activeElement.selectionEnd)") == "line 12 of the file"
     expect(editor).to_be_focused()
     expect(page.locator(".editor-status")).to_contain_text("40 lines · Line 12")
     editor.press("End")

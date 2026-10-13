@@ -1,11 +1,16 @@
 """GET /api/git/status and /api/git/diff: Git's view of the project as file
 entries and per-file diffs, without shells, repository programs or credentials."""
+import asyncio
+import os
 import shutil
 import subprocess
 
 import pytest
+from fastapi.testclient import TestClient
 
 from local_agent import git_tools
+from local_agent.api import create_app
+from local_agent.config import Settings
 import test_git_changes as base
 from test_git_changes import git, program
 
@@ -160,10 +165,98 @@ def test_generated_folders_are_listed_but_not_shown(repository):
     client, workspace = repository
     (workspace / "dist").mkdir()
     (workspace / "dist/bundle.js").write_text("generated()\n")
-    entry = entries(status(client))[("untracked", "dist/bundle.js")]
-    assert entry["hidden"] == "generated"
-    response = diff(client, "dist/bundle.js", "untracked")
-    assert response.status_code == 400 and response.json()["detail"] == "Files in generated folders are not shown here."
+    entry = entries(status(client))[("untracked", "dist/")]
+    assert entry["hidden"] == "generated" and entry["status"] == "untracked"
+    for path in ("dist/", "dist/bundle.js"):
+        response = diff(client, path, "untracked")
+        assert response.status_code == 400 and response.json()["detail"] == "Files in generated folders are not shown here."
+
+
+def test_untracked_generated_folders_are_one_entry_each_and_do_not_push_out_real_files(repository):
+    # Reported: an untracked node_modules filled the list up to its limit and hid new files.
+    client, workspace = repository
+    (workspace / "build").mkdir()
+    (workspace / "build/dist").mkdir()
+    (workspace / "build/dist/kept.js").write_text("one\n")
+    git(workspace, "add", "-A")
+    git(workspace, "commit", "-qm", "tracked generated file")
+    (workspace / "build/dist/kept.js").write_text("one\ntwo\n")  # A tracked file in a generated folder.
+    for folder in ("node_modules/pkg/lib", "sub/__pycache__"):
+        (workspace / folder).mkdir(parents=True)
+    for index in range(2100):
+        (workspace / f"node_modules/pkg/lib/f{index}.js").write_text("x\n")
+    (workspace / "sub/__pycache__/m.pyc").write_bytes(b"\0")
+    (workspace / "sub/real.py").write_text("print(1)\n")
+    (workspace / "zz_real_new.py").write_text("print(2)\n")
+    result = status(client)
+    assert result["truncated"] is False
+    files = entries(result)
+    assert sorted(files) == [("unstaged", "build/dist/kept.js"), ("untracked", "node_modules/"),
+                             ("untracked", "sub/__pycache__/"), ("untracked", "sub/real.py"),
+                             ("untracked", "zz_real_new.py")]
+    assert {key: entry["hidden"] for key, entry in files.items()} == {
+        ("unstaged", "build/dist/kept.js"): "generated", ("untracked", "node_modules/"): "generated",
+        ("untracked", "sub/__pycache__/"): "generated", ("untracked", "sub/real.py"): None,
+        ("untracked", "zz_real_new.py"): None}
+    assert [entry["path"] for entry in result["files"]][-3:] == ["build/dist/kept.js", "node_modules/", "sub/__pycache__/"]
+
+
+def test_generated_entries_have_their_own_limit(repository, monkeypatch):
+    client, workspace = repository
+    for index in range(4):
+        (workspace / f"real-{index}.txt").write_text("data\n")
+        (workspace / f"pkg{index}/node_modules").mkdir(parents=True)
+        (workspace / f"pkg{index}/node_modules/x.js").write_text("x\n")
+    monkeypatch.setattr(git_tools, "STATUS_ENTRY_LIMIT", 3)
+    result = status(client)
+    assert result["truncated"] is True
+    assert [entry["path"] for entry in result["files"]] == [
+        "real-0.txt", "real-1.txt", "real-2.txt", "pkg0/node_modules/", "pkg1/node_modules/", "pkg2/node_modules/"]
+
+
+def test_a_diff_shows_one_file_and_never_a_folder(tmp_path, monkeypatch):
+    # Reported: path=. or a folder diffed every file below it, including a configured
+    # credential file with another name that its own diff request refuses.
+    monkeypatch.setattr("local_agent.config.APP_ROOT", tmp_path)
+    workspace = tmp_path / "project"
+    (workspace / "conf").mkdir(parents=True)
+    credential = workspace / "conf/databricks.cfg"
+    credential.write_text("DBRICKS_TOKEN=dapi-old\n")
+    (workspace / "conf/app.cfg").write_text("debug=0\n")
+    (workspace / "old").mkdir()
+    (workspace / "old/data.txt").write_text("old data\n")
+    git(workspace, "init", "-q")
+    git(workspace, "add", "-A")
+    git(workspace, "commit", "-qm", "initial")
+    credential.write_text("DBRICKS_TOKEN=dapi-NEWSECRET\n")
+    (workspace / "conf/app.cfg").write_text("debug=1\n")
+    git(workspace, "add", "-A")
+    git(workspace, "rm", "-rq", "old")  # A folder that no longer exists on disk.
+    settings = Settings(tmp_path / "state")
+    settings.env = {}
+    settings.values.update(workspace=str(workspace), env_file=str(credential))
+    with TestClient(create_app(settings)) as client:
+        client.headers["X-Local-Token"] = client.get("/api/bootstrap").json()["token"]
+        response = client.get("/api/git/status")
+        assert entries(response.json())[("staged", "conf/databricks.cfg")]["hidden"] == "credential"
+        assert "dapi" not in response.text
+        assert diff(client, "conf/databricks.cfg", "staged").json()["detail"] == "Credential files are not shown."
+        for path in (".", "./", "conf", "conf/", "old/"):
+            for area in ("staged", "unstaged", "untracked"):
+                response = diff(client, path, area)
+                assert response.status_code == 400, (path, area)
+                assert response.json()["detail"] == "Choose one changed file, not a folder."
+                assert "dapi" not in response.text and "old data" not in response.text
+        # A folder that is gone from disk is caught by Git listing more than the one file.
+        response = diff(client, "old", "staged")
+        assert response.status_code == 400 and response.json()["detail"] == "Choose one changed file, not a folder."
+        assert "old data" not in response.text
+        lines = diff(client, "conf/app.cfg", "staged").json()["lines"]
+        assert {"kind": "added", "text": "debug=1", "new": 1} in lines
+    # The API also passes the configured credential file as an exclude pathspec.
+    result = asyncio.run(git_tools.file_diff(workspace, "conf/databricks.cfg", "staged",
+                                             excludes=[":(exclude,literal)conf/databricks.cfg"]))
+    assert result["lines"] == [] and result["added"] == 0
 
 
 @pytest.mark.parametrize("path", ["/etc/hosts", "../outside.txt", "a/../../b", "~/notes.txt", ""])
@@ -211,6 +304,27 @@ def test_a_folder_that_is_not_a_repository(client):
     assert client.get("/api/git").status_code == 200  # The older endpoint is unchanged.
 
 
+async def test_not_a_repository_does_not_depend_on_the_language_of_gits_messages(tmp_path, monkeypatch):
+    # Git translates its messages (LANG and LC_ALL are passed to it); a translated
+    # "not a git repository" must still give repository: false.
+    stub = tmp_path / "bin/git"
+    stub.parent.mkdir()
+    stub.write_text("#!/bin/sh\necho 'fatal: Kein Git-Repository (oder irgendeines der Elternverzeichnisse): .git'\nexit 128\n")
+    stub.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{stub.parent}{os.pathsep}{os.environ.get('PATH', '')}")
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    if git_tools._inside_repository(plain):
+        pytest.skip("The temporary folder is inside a Git repository.")
+    assert await git_tools.working_tree_status(plain, lambda path: None) == {
+        "repository": False, "branch": None, "files": [], "truncated": False}
+    # A folder with a .git entry that Git cannot read is an error, in Git's words.
+    broken = tmp_path / "broken"
+    (broken / ".git").mkdir(parents=True)
+    with pytest.raises(ValueError, match="Git could not read this folder: fatal: Kein Git-Repository"):
+        await git_tools.working_tree_status(broken / ".", lambda path: None)
+
+
 def test_status_is_truncated_by_entries_and_output(repository, monkeypatch):
     client, workspace = repository
     for index in range(12):
@@ -250,6 +364,15 @@ async def test_a_workspace_inside_a_repository_sees_paths_relative_to_itself(tmp
     assert result["files"][0]["added"] == 1
     lines = (await git_tools.file_diff(repository / "sub", "a.txt", "unstaged"))["lines"]
     assert {"kind": "added", "text": "b", "new": 2} in lines
+
+
+@pytest.mark.parametrize("prefix", ["", "sub/"])
+def test_a_rename_whose_origin_was_cut_off_is_dropped(prefix):
+    # The output limit can end the output inside a rename's origin path; that entry is
+    # left out instead of being listed without an origin (or failing on an empty path).
+    raw = (b"# branch.head main\x001 .M N... 100644 100644 100644 a b " + prefix.encode() + b"kept.txt\x00"
+           b"2 R. N... 100644 100644 100644 a b R100 " + prefix.encode() + b"notes.txt\x00")
+    assert git_tools.parse_status(raw, prefix) == ("main", [{"path": "kept.txt", "area": "unstaged", "status": "modified"}])
 
 
 def test_parsers_handle_renames_and_tabs():

@@ -67,6 +67,18 @@ const CODE_PATH = /^(?:~\/|\.{1,2}\/|\/)?(?:[\w@+-][\w.@+-]*\/)*[\w@+-][\w.@+-]*
 // In prose: a path with a slash, or a bare file name followed by :line. URLs do not match.
 const TEXT_PATH = /(?<![\w\/.~:@+-])((?:~\/|\.{1,2}\/|\/)?(?:[\w@+-][\w.@+-]*\/)+[\w@+-][\w.@+-]*\.[A-Za-z][A-Za-z0-9_+-]{0,11}|[\w@+-][\w.@+-]*\.[A-Za-z][A-Za-z0-9_+-]{0,11}(?=:\d))(?::(\d{1,7})(?::\d{1,7})?)?(?![\w\/@+-])/g
 
+// A name without a folder (`config.py`, `app.ts:12`) is a file only with one of these
+// extensions, so identifiers (`os.path.join`, `console.log`) and hosts (`db.example.com:5432`)
+// stay text. A path with a slash may have any extension.
+const FILE_EXTENSIONS = new Set(`py pyi ipynb js mjs cjs jsx ts mts cts tsx json jsonc jsonl md mdx rst txt csv tsv
+  yaml yml toml ini cfg xml html htm css scss sass less svg sh bash zsh fish ps1 bat sql go rs java kt kts scala
+  groovy gradle c h cc cpp cxx hpp cs swift rb php lua dart exs erl clj vue svelte astro tf hcl
+  proto graphql gql mk cmake sbt tex`.split(/\s+/))
+
+function isFilePath(path) {
+  return path.includes('/') || FILE_EXTENSIONS.has(path.slice(path.lastIndexOf('.') + 1).toLowerCase())
+}
+
 function pathLink(path, line) {
   const link = document.createElement('a')
   link.className = 'path-link'
@@ -85,8 +97,9 @@ export function linkPaths(root) {
   for (const code of root.querySelectorAll('code')) {
     if (code.closest('pre, a')) continue
     const match = CODE_PATH.exec(code.textContent)
-    if (!match) continue
-    const link = pathLink(code.textContent.split(':')[0], match[1])
+    const path = code.textContent.split(':')[0]
+    if (!match || !isFilePath(path)) continue
+    const link = pathLink(path, match[1])
     code.replaceWith(link)
     link.append(code)
   }
@@ -101,6 +114,7 @@ export function linkPaths(root) {
     const parts = []
     let last = 0
     for (const match of text.matchAll(TEXT_PATH)) {
+      if (!isFilePath(match[1])) continue
       if (match.index > last) parts.push(document.createTextNode(text.slice(last, match.index)))
       const link = pathLink(match[1], match[2])
       link.textContent = match[0]

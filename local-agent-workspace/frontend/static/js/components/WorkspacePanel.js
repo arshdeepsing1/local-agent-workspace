@@ -18,6 +18,17 @@ const GIT_STATUS = {
 }
 const HIDDEN_NOTES = { credential: 'Credential file: diff hidden', generated: 'Generated folder: diff not shown' }
 
+// The line a diff's "Open file" goes to: the first changed line in the new file. For a
+// deletion that is the line before the removed lines (or after them at the top of a file).
+function changedLine(lines) {
+  const index = lines.findIndex(line => line.kind === 'added' || line.kind === 'removed')
+  if (index < 0) return lines.find(line => line.new)?.new || 1
+  const next = lines.slice(index).find(line => line.kind !== 'removed')
+  if (next?.kind === 'added') return next.new
+  const before = lines[index - 1]
+  return (before?.kind === 'context' ? before.new : next?.new) || 1
+}
+
 // Git's view of the project (GET /git/status), grouped like an editor's source control
 // view, and a read-only diff of one file (GET /git/diff). Refreshes when shown, on
 // Refresh, and when a response ends. onOpenFile(path, line) opens the file in the editor.
@@ -27,6 +38,17 @@ function GitChanges({ query, workspace, busy, onOpenFile }) {
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
   const latest = useRef(0)
+  // Keyboard focus moves to Back when a diff opens, and to the row again on Back.
+  const backButton = useRef(null)
+  const list = useRef(null)
+  const returnTo = useRef(null)
+  useEffect(() => {
+    if (selected) { backButton.current?.focus(); return }
+    const target = returnTo.current
+    returnTo.current = null
+    if (target) [...(list.current?.querySelectorAll('button.git-row') || [])]
+      .find(row => row.dataset.area === target.area && row.dataset.path === target.path)?.focus()
+  }, [selected?.entry])
   const refresh = useCallback(async () => {
     const request = ++latest.current
     setLoading(true); setError('')
@@ -40,6 +62,7 @@ function GitChanges({ query, workspace, busy, onOpenFile }) {
   const wasBusy = useRef(busy)
   useEffect(() => { if (wasBusy.current && !busy) void refresh(); wasBusy.current = busy }, [busy])
   const showDiff = async entry => {
+    returnTo.current = entry
     setSelected({ entry })
     const params = new URLSearchParams({ path: entry.path, area: entry.area, ...(entry.orig_path ? { orig_path: entry.orig_path } : {}) })
     try {
@@ -49,10 +72,10 @@ function GitChanges({ query, workspace, busy, onOpenFile }) {
   }
   if (selected) {
     const { entry, diff } = selected
-    const firstLine = diff?.lines.find(line => line.kind === 'added' || line.kind === 'context')?.new || 1
+    const firstLine = diff ? changedLine(diff.lines) : 1
     const exists = entry.status !== 'deleted'
     return html`<div class="git-diff-view">
-      <div class="editor-toolbar"><button class="icon-button" aria-label="Back to changes" title="Back to changes" onClick=${() => setSelected(null)}><${ArrowLeft} size=${16} /></button>
+      <div class="editor-toolbar"><button ref=${backButton} class="icon-button" aria-label="Back to changes" title="Back to changes" onClick=${() => setSelected(null)}><${ArrowLeft} size=${16} /></button>
         <span title=${entry.orig_path ? `${entry.orig_path} → ${entry.path}` : entry.path}>${entry.path}</span>
         ${exists ? html`<button class="editor-mode" onClick=${() => onOpenFile(entry.path, firstLine)}><${File} size=${14} />Open file</button>
           <${VSCodeLink} absolute=${workspace.startsWith('/') ? `${workspace.replace(/\/+$/, '')}/${entry.path}` : null} line=${firstLine} />` : null}
@@ -75,7 +98,7 @@ function GitChanges({ query, workspace, busy, onOpenFile }) {
     <div class="file-path"><${GitBranch} size=${14} /><span title=${status?.branch || ''}>${status?.repository === false ? 'Working tree' : status?.branch || (status ? 'Detached HEAD' : 'Working tree')}</span>
       <button class="icon-button" aria-label="Refresh changes" disabled=${loading} onClick=${() => void refresh()}><${RefreshCw} size=${15} className=${loading ? 'spin' : ''} /></button></div>
     ${error ? html`<div class="panel-error" role="alert">${error}</div>` : null}
-    <div class="git-groups">
+    <div class="git-groups" ref=${list}>
       ${status?.repository === false ? html`<p class="panel-empty">Not a Git repository.</p>`
         : status && !files.length ? html`<p class="panel-empty">Your working tree is clean.</p>`
         : GIT_GROUPS.map(([area, label]) => {
@@ -86,7 +109,7 @@ function GitChanges({ query, workspace, busy, onOpenFile }) {
               const content = html`<span class=${`git-letter ${entry.status}`} title=${name} aria-label=${name}>${letter}</span>
                 <span class="git-path" title=${entry.orig_path ? `${entry.orig_path} → ${entry.path}` : entry.path}>${entry.path}</span>`
               return entry.hidden ? html`<div key=${entry.path} class="git-row hidden" title=${HIDDEN_NOTES[entry.hidden]}>${content}<span class="git-hidden">${HIDDEN_NOTES[entry.hidden]}</span></div>`
-                : html`<button key=${entry.path} class="git-row" onClick=${() => void showDiff(entry)}>${content}
+                : html`<button key=${entry.path} class="git-row" data-area=${entry.area} data-path=${entry.path} onClick=${() => void showDiff(entry)}>${content}
                   ${Number.isInteger(entry.added) && Number.isInteger(entry.removed) ? html`<${DiffStat} added=${entry.added} removed=${entry.removed} />` : null}</button>`
             })}</section>` : null
         })}
@@ -187,7 +210,8 @@ export default function WorkspacePanel({ sessionId, workspace, allowedDirectorie
     const textarea = editor.current
     if (!pending || pending.id !== file?.id || !textarea) return
     pendingLine.current = null
-    const lines = file.content.split('\n')
+    // The textarea's value, which the selection indexes into, has CRLF line breaks as LF.
+    const lines = textarea.value.split('\n')
     const line = Math.min(Math.max(pending.line, 1), lines.length)
     const start = lines.slice(0, line - 1).join('\n').length + (line > 1 ? 1 : 0)
     textarea.focus()

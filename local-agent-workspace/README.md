@@ -336,14 +336,17 @@ when opening a conversation or performing restart recovery.
   could name filters; a submodule whose commit changed is still listed. The server also
   limits Git's environment and stops after 60 seconds. It reads status up to 1 MB and
   lists at most 2,000 files; a diff shows at most 512 KB, and an untracked file is shown
-  up to 1 MB. Paths are literal, so a file named `*.py` shows only its own diff. A project
+  up to 1 MB. A diff covers one file: a folder path is refused. Paths are literal, so a
+  file named `*.py` shows only its own diff. A project
   folder inside a larger repository shows only its own files. Credential files at any
   depth (`.env`, `.env.*` including `.env.example`, `*.env`, `env_vars.txt`, `.netrc`,
   `.npmrc`, `credentials`, `credentials.json`, `id_rsa`, `id_ed25519`, in any letter case,
   and the configured credential file) are listed as "Credential file: diff hidden",
   without line counts, and their diffs are refused, also when a rename or copy comes from
   such a file. Files in generated folders (`node_modules`, `dist`, `.venv` and the like)
-  are listed but their diffs are not shown. A folder that is not a Git repository shows
+  are listed after the other files, with their own 2,000-entry limit, and their diffs are
+  not shown; an untracked generated folder is one row (`node_modules/`), so it never hides
+  other new files. A folder that is not a Git repository shows
   "Not a Git repository." For API clients, `GET /api/git` still returns the plain
   `git status --short` and `git diff` text (at most 80 KB).
 - **Workspace / Terminal**: run a command explicitly and see output while it runs.
@@ -451,9 +454,13 @@ when opening a conversation or performing restart recovery.
   highlighted in that language; an untagged block is guessed, up to 20 KB. **Copy code**
   copies a block's exact text.
 - **Open files from replies**: once a reply is complete, file paths in it become links:
-  an inline code span that is a file name with an extension (`src/app.py`,
+  an inline code span that is a file path with an extension (`src/app.py`,
   `src/app.py:12`, `app.py:12:5`), and in the text a path with a slash (`docs/guide.md`)
-  or a file name followed by a line number (`app.py:12`). Web addresses, code blocks and
+  or a file name followed by a line number (`app.py:12`). A name without a slash is
+  linked only with a common source or text file extension (`py`, `js`, `ts`, `json`,
+  `md`, `yaml`, `toml`, `txt`, `html`, `css`, `sh`, `sql`, `go`, `rs`, `java`, `c`, `h`
+  and similar), so identifiers such as `os.path.join` or `console.log` and host names
+  such as `db.example.com:5432` stay text. Web addresses, code blocks and
   reasoning summaries are not linked. A link opens the file in **Workspace / Files** with
   that line selected and scrolled into view; the status bar shows **Line 12**. Expanded
   tool cards of file tools (`read_file`, `write_file`, `edit_file`, `insert_activity_log`,
@@ -839,8 +846,9 @@ Install workspace skills at `.agents/skills/<skill-id>/SKILL.md`. Skills in
 the app never writes there. Skills shipped with the app in `skills/<skill-id>/SKILL.md`
 are available in every workspace. For one ID, `.agents/skills` wins over
 `.claude/skills`, which wins over the shipped skill; a workspace entry takes the ID over
-even when it fails to load. A `.claude/skills` folder that cannot be read, or that has
-more than 100 entries or 30 skills, is skipped without an error. Optional simple
+even when it fails to load. A `.claude/skills` folder that resolves outside the project
+(for example a link to a shared folder), cannot be read, or has more than 100 entries or
+30 skills, is skipped without an error, and the shipped skills stay available. Optional simple
 frontmatter supplies `name` and `description`. Enable a discovered skill in the panel, use `/<skill-id>` as a word in a
 message (type `/` at the start to choose from the list), begin a message with
 `/skill <skill-id>`, or ask the

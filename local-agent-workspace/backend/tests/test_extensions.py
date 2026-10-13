@@ -165,6 +165,16 @@ def test_the_app_ships_the_handoff_skill_to_every_workspace(tmp_path):
     assert "insert_activity_log" in manager.load_skill(tools, "handoff")["text"]
 
 
+def test_shipped_skill_descriptions_fit_the_skill_index(tmp_path):
+    # The index clips descriptions; a shipped skill keeps its "Use when" trigger whole.
+    from local_agent.extensions import SKILL_INDEX_DESCRIPTION, skill_index
+    manager = ExtensionManager(SimpleNamespace(state_dir=tmp_path, redact=lambda text: text))
+    skills = manager.skills(WorkspaceTools(str(tmp_path)))
+    assert skills and all(len(skill["description"]) <= SKILL_INDEX_DESCRIPTION for skill in skills)
+    assert "- handoff: Use when the user asks for a handoff" in skill_index(skills)
+    assert "…" not in skill_index(skills)
+
+
 async def test_hook_receives_json_stdin_strips_credentials_and_redacts_output(manager, tmp_path, monkeypatch):
     monkeypatch.setenv("DBRICKS_TOKEN", "never-pass-this")
     source = "import json,os,sys; value=json.load(sys.stdin); print(value['name'],os.environ.get('DBRICKS_TOKEN'),'secret-token')"
@@ -290,6 +300,34 @@ def test_a_broken_claude_skills_folder_is_skipped(manager, tmp_path, problem):
         claude.write_text("not a folder")
     tools = WorkspaceTools(str(workspace))
     assert [skill["id"] for skill in manager.skills(tools)] == ["review"]
+
+
+@pytest.mark.parametrize("problem", ["outside", "skills", "file"])
+def test_a_skipped_claude_skills_folder_does_not_take_over_shipped_skills(manager, tmp_path, problem):
+    # A .claude/skills folder that is skipped must not hide or replace the shipped skill
+    # of the same ID, in the list or in load_skill.
+    shipped = tmp_path / "app/skills"
+    manager.app_skills = shipped
+    skill_file(shipped, "handoff", "---\ndescription: Shipped handoff\n---\nShipped text.")
+    workspace = tmp_path / "workspace"
+    claude = workspace / ".claude/skills"
+    if problem == "outside":
+        shared = tmp_path / "home/.claude/skills"
+        skill_file(shared, "handoff", "Shared handoff.")
+        claude.parent.mkdir(parents=True)
+        claude.symlink_to(shared, target_is_directory=True)
+    elif problem == "skills":
+        for index in range(30):
+            skill_file(claude, f"skill{index}", "Skill.")
+        skill_file(claude, "handoff", "Claude handoff.")
+    else:
+        skill_file(claude, "handoff", "Claude handoff.")
+        for index in range(100):
+            (claude / f"entry{index}").mkdir()
+    for unrestricted in (False, True):
+        tools = WorkspaceTools(str(workspace), unrestricted=unrestricted)
+        assert [skill["path"] for skill in manager.skills(tools)] == [str(shipped / "handoff/SKILL.md")]
+        assert manager.load_skill(tools, "handoff")["text"].endswith("Shipped text.")
 
 
 def test_a_broken_agents_skills_folder_still_reports_its_error(manager, tmp_path):

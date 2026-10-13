@@ -876,8 +876,11 @@ def test_git_groups_render_and_a_row_opens_a_read_only_diff(ui, page):
     expect(staged.locator(".git-row")).to_have_text([re.compile(r"^M\s*src/app\.py\s*\+3\s*−1$"), re.compile(r"^R\s*src/new name\.py")])
     expect(panel.get_by_text("Git's view of the project, including changes made by commands. "
                              "Credential files are listed without their contents.")).to_be_visible()
-    staged.get_by_role("button", name=re.compile(r"src\/app\.py")).click()
+    staged.get_by_role("button", name=re.compile(r"src\/app\.py")).focus()
+    page.keyboard.press("Enter")
     assert ui.requests("/api/git/diff?path=src%2Fapp.py&area=staged")
+    # Keyboard focus goes to Back, and on Back to the row it came from.
+    expect(panel.get_by_role("button", name="Back to changes")).to_be_focused()
     lines = panel.get_by_role("region", name="Diff of src/app.py").locator(".diff-line")
     expect(lines).to_have_count(5)
     expect(lines.nth(0)).to_have_text("@@ -9,3 +9,3 @@ def main():")
@@ -885,15 +888,37 @@ def test_git_groups_render_and_a_row_opens_a_read_only_diff(ui, page):
     expect(lines.nth(3)).to_have_class(re.compile(r"\badded\b"))
     expect(lines.nth(4).locator(".no-newline")).to_be_visible()
     expect(panel.locator("textarea")).to_have_count(0)
-    expect(panel.get_by_role("link", name="Open in VS Code")).to_have_attribute("href", "vscode://file/project/src/app.py:9")
-    panel.get_by_role("button", name="Back to changes").click()
+    # The changed line (10), not the hunk's first context line (9).
+    expect(panel.get_by_role("link", name="Open in VS Code")).to_have_attribute("href", "vscode://file/project/src/app.py:10")
+    page.keyboard.press("Enter")
+    expect(staged.get_by_role("button", name=re.compile(r"src\/app\.py"))).to_be_focused()
     panel.get_by_role("region", name="Staged changes").get_by_role("button", name=re.compile(r"src\/new name\.py")).click()
     assert ui.requests("/api/git/diff?path=src%2Fnew+name.py&area=staged&orig_path=src%2Fold.py")
     panel.get_by_role("button", name="Back to changes").click()
     staged.get_by_role("button", name=re.compile(r"src\/app\.py")).click()
     panel.get_by_role("button", name="Open file").click()
     expect(panel.get_by_role("textbox", name="Edit src/app.py")).to_be_visible()
-    expect(panel.locator(".editor-status")).to_contain_text("Line 9")
+    expect(panel.locator(".editor-status")).to_contain_text("Line 10")
+
+
+@pytest.mark.parametrize("lines, line", [
+    # A deletion: the line before the removed lines.
+    ([{"kind": "hunk", "text": "@@ -3,3 +3,2 @@"}, {"kind": "context", "text": "a", "old": 3, "new": 3},
+      {"kind": "context", "text": "b", "old": 4, "new": 4}, {"kind": "removed", "text": "c", "old": 5},
+      {"kind": "context", "text": "d", "old": 6, "new": 5}], 4),
+    # A deletion at the top of the file: the line after it.
+    ([{"kind": "hunk", "text": "@@ -1,2 +1 @@"}, {"kind": "removed", "text": "a", "old": 1},
+      {"kind": "context", "text": "b", "old": 2, "new": 1}], 1),
+    # An addition after context in a later hunk.
+    ([{"kind": "hunk", "text": "@@ -27,3 +27,4 @@"}, {"kind": "context", "text": "a", "old": 27, "new": 27},
+      {"kind": "context", "text": "b", "old": 28, "new": 28}, {"kind": "context", "text": "c", "old": 29, "new": 29},
+      {"kind": "added", "text": "d", "new": 30}], 30),
+])
+def test_open_file_from_a_diff_goes_to_the_changed_line(ui, page, lines, line):
+    diff = {**GIT_DIFF, "lines": lines}
+    panel = open_git(ui, page, diff=diff)
+    panel.get_by_role("region", name="Staged changes").get_by_role("button", name=re.compile(r"src\/app\.py")).click()
+    expect(panel.get_by_role("link", name="Open in VS Code")).to_have_attribute("href", f"vscode://file/project/src/app.py:{line}")
 
 
 def test_hidden_rows_are_not_clickable(ui, page):

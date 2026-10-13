@@ -459,7 +459,15 @@ def create_app(settings=None):
             raise ValueError("Credential files are not shown.")
         if "generated" in kinds:
             raise ValueError("Files in generated folders are not shown here.")
-        return await file_diff(tools.root, path, area, paths[1] if len(paths) > 1 else None, tools=tools)
+        for value in paths:
+            target = tools.root / value
+            if value.endswith("/") or PurePosixPath(value) == PurePosixPath(".") or (target.is_dir() and not target.is_symlink()):
+                raise ValueError("Choose one changed file, not a folder.")
+        # Leave the configured credential file out of the diff even under another name.
+        credential = tools.credential_file
+        excludes = ([f":(exclude,literal){credential.relative_to(tools.root).as_posix()}"]
+                    if credential and credential.is_relative_to(tools.root) and credential != tools.root else [])
+        return await file_diff(tools.root, path, area, paths[1] if len(paths) > 1 else None, tools=tools, excludes=excludes)
 
     @app.post("/api/command")
     async def command(body: Prompt, session_id: str | None = None):

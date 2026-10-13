@@ -17,7 +17,7 @@ import shutil
 import stat
 
 from .jobs import ENVIRONMENT_KEYS, discard_output, kill_group, settle
-from .tools import SECRET_NAMES
+from .tools import IGNORED, SECRET_NAMES
 
 OUTPUT_LIMIT = 80_000
 SAFE_OPTIONS = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
@@ -140,10 +140,29 @@ UNTRACKED_FILE_LIMIT = 1_000_000
 STATUS_ENTRY_LIMIT = 2_000
 STATUS_CODES = {"M": "modified", "T": "type_changed", "A": "added", "D": "deleted", "R": "renamed", "C": "copied"}
 DIFF_OPTIONS = ("--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty", "--relative")
+# Generated folders (the file tools' IGNORED names) are left out of the per-file listing, so
+# a large untracked node_modules neither fills the list nor pushes real files past its limits.
+# A second status lists their changes, with untracked folders collapsed to one entry each.
+GENERATED_FOLDERS = sorted(IGNORED - {".git"})
+GENERATED_EXCLUDES = tuple(f":(exclude,glob,icase)**/{name}/**" for name in GENERATED_FOLDERS)
+GENERATED_ONLY = tuple(f":(glob,icase)**/{name}/**" for name in GENERATED_FOLDERS)
 
 
 def _decode(raw):
     return raw.decode("utf-8", errors="replace")
+
+
+def _inside_repository(workspace):
+    """Whether Git could find a repository from workspace: a .git entry in it or a parent.
+    Decides "not a repository" without reading Git's message, which follows the locale."""
+    folder = os.path.realpath(workspace)
+    while True:
+        if os.path.lexists(os.path.join(folder, ".git")):
+            return True
+        parent = os.path.dirname(folder)
+        if parent == folder:
+            return False
+        folder = parent
 
 
 def _git_failure(output):
@@ -181,8 +200,8 @@ def parse_status(raw, prefix=""):
                 continue
             original = None
             if kind == b"2 ":
-                if index >= len(records):
-                    break  # Cut off by the output limit.
+                if index >= len(records) or not records[index]:
+                    break  # Cut off by the output limit: drop the rename without its origin.
                 original = relative(records[index])
                 index += 1
             path = relative(fields[-1])
@@ -233,20 +252,23 @@ async def working_tree_status(workspace, classify):
             code, output, _ = await run_git(workspace, ["rev-parse", "--show-prefix"], timeout=CHANGES_TIMEOUT)
             if code != 0:
                 error = _git_failure(output)
-                if error is None:
+                if error is None or not await asyncio.to_thread(_inside_repository, workspace):
                     return {"repository": False, "branch": None, "files": [], "truncated": False}
                 raise error
             prefix = _decode(output).strip()
             filters = await configured_filters(workspace, timeout=CHANGES_TIMEOUT)
-            code, output, truncated = await run_git(
-                workspace, ["--no-optional-locks", "status", "--porcelain=v2", "-z", "--branch",
-                            "--untracked-files=all", "--ignore-submodules=dirty", "--", "."],
-                filters=filters, timeout=CHANGES_TIMEOUT, limit=STATUS_OUTPUT_LIMIT)
-            if code != 0 and not truncated:
-                raise _git_failure(output) or ValueError("Git could not read this folder.")
-            if truncated:
-                output = output[:output.rfind(b"\0") + 1]  # Drop the record that was cut off.
-            branch, entries = parse_status(output, prefix)
+            listings = []
+            for untracked, pathspecs in (("all", (".", *GENERATED_EXCLUDES)), ("normal", GENERATED_ONLY)):
+                code, output, cut = await run_git(
+                    workspace, ["--no-optional-locks", "status", "--porcelain=v2", "-z", "--branch",
+                                f"--untracked-files={untracked}", "--ignore-submodules=dirty", "--", *pathspecs],
+                    filters=filters, timeout=CHANGES_TIMEOUT, limit=STATUS_OUTPUT_LIMIT)
+                if code != 0 and not cut:
+                    raise _git_failure(output) or ValueError("Git could not read this folder.")
+                if cut:
+                    output = output[:output.rfind(b"\0") + 1]  # Drop the record that was cut off.
+                listings.append((*parse_status(output, prefix), cut))
+            (branch, entries, truncated), (_, generated, generated_cut) = listings
             counts = {}
             for area, extra in (("unstaged", []), ("staged", ["--cached"])):
                 _, numstat, _ = await run_git(
@@ -256,8 +278,13 @@ async def working_tree_status(workspace, classify):
                 counts[area] = parse_numstat(numstat)
     except TimeoutError as exc:
         raise ValueError(f"Git did not finish within {CHANGES_TIMEOUT} seconds.") from exc
+    # Each listing has its own limit, so generated folders never push real files out.
     if len(entries) > STATUS_ENTRY_LIMIT:
         entries, truncated = entries[:STATUS_ENTRY_LIMIT], True
+    if len(generated) > STATUS_ENTRY_LIMIT:
+        generated, generated_cut = generated[:STATUS_ENTRY_LIMIT], True
+    entries += generated
+    truncated = truncated or generated_cut
     files = []
     for entry in entries:
         kinds = [classify(path) for path in (entry["path"], entry.get("orig_path")) if path is not None]
@@ -328,22 +355,29 @@ def _untracked_diff(tools, path):
     return False, lines
 
 
-async def file_diff(workspace, path, area, orig_path=None, tools=None):
+async def file_diff(workspace, path, area, orig_path=None, tools=None, excludes=()):
     """One file's changes in the staged or unstaged area, or an untracked file's lines.
 
     Paths are workspace-relative; the caller validates them and refuses credential
-    and generated-folder files."""
+    and generated-folder files. excludes are extra pathspecs to leave out (the
+    configured credential file). A path that names a folder is refused: only the
+    requested file (and a rename's origin) may appear in the diff."""
     truncated = False
     if area == "untracked":
         binary, lines = await asyncio.to_thread(_untracked_diff, tools, path)
     elif area in ("staged", "unstaged"):
-        pathspecs = [f":(literal){path}", *([f":(literal){orig_path}"] if orig_path else [])]
+        pathspecs = [f":(literal){path}", *([f":(literal){orig_path}"] if orig_path else []), *DIFF_EXCLUDES, *excludes]
+        cached = ["--cached"] if area == "staged" else []
         try:
             async with asyncio.timeout(CHANGES_TIMEOUT):
                 filters = await configured_filters(workspace, timeout=CHANGES_TIMEOUT)
+                code, names, cut = await run_git(
+                    workspace, ["--no-optional-locks", "diff", *cached, "--name-only", "-z", *DIFF_OPTIONS, "--", *pathspecs],
+                    filters=filters, timeout=CHANGES_TIMEOUT, limit=64_000)
+                if code == 0 and (cut or {_decode(name) for name in names.split(b"\0") if name} - {path, orig_path}):
+                    raise ValueError("Choose one changed file, not a folder.")
                 code, output, truncated = await run_git(
-                    workspace, ["--no-optional-locks", "diff", *(["--cached"] if area == "staged" else []),
-                                *DIFF_OPTIONS, "--no-color", "-U3", "--", *pathspecs, *DIFF_EXCLUDES],
+                    workspace, ["--no-optional-locks", "diff", *cached, *DIFF_OPTIONS, "--no-color", "-U3", "--", *pathspecs],
                     filters=filters, timeout=CHANGES_TIMEOUT, limit=FILE_DIFF_LIMIT)
         except TimeoutError as exc:
             raise ValueError(f"Git did not finish within {CHANGES_TIMEOUT} seconds.") from exc

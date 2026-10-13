@@ -63,3 +63,41 @@ def test_a_rejected_name_shows_the_server_message(ui, page):
     dialog.get_by_role("button", name="Save settings").click()
     expect(dialog.get_by_role("alert")).to_have_text("LD_PRELOAD changes how programs start and cannot be passed to commands.")
     assert ui.bodies("/api/settings", "PUT")[0]["command_env"] == ["LD_PRELOAD"]
+
+
+def test_more_than_32_names_or_repeated_names_need_no_server_round_trip(ui, page):
+    # Reported: 33 names showed the server's raw validation JSON as the error.
+    dialog = open_settings(ui, page)
+    names = dialog.get_by_role("textbox", name="Environment variables for commands")
+    names.fill(" ".join(f"VAR{index}" for index in range(33)))
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(dialog.get_by_role("alert")).to_have_text("List at most 32 environment variable names.")
+    assert ui.bodies("/api/settings", "PUT") == []
+    # A repeated name is sent once.
+    names.fill("JAVA_HOME JAVA_HOME, NVM_DIR JAVA_HOME")
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    assert ui.bodies("/api/settings", "PUT")[0]["command_env"] == ["JAVA_HOME", "NVM_DIR"]
+
+
+def test_the_instructions_counter_describes_the_field_without_announcing_each_key(ui, page):
+    dialog = open_settings(ui, page)
+    instructions = dialog.get_by_role("textbox", name="Custom instructions")
+    instructions.fill("Be brief.")
+    expect(instructions).to_have_accessible_description(re.compile(r"^9 / 8,000"))
+    expect(dialog.locator("[aria-live]").filter(has_text="8,000")).to_have_count(0)
+
+
+def test_a_cleared_file_write_limit_stays_empty_and_is_not_saved(ui, page):
+    # Reported: clearing the field put a 0 back into it.
+    dialog = open_settings(ui, page)
+    limit = dialog.get_by_role("spinbutton", name="File write limit (KB)")
+    limit.select_text()
+    limit.press("Backspace")
+    expect(limit).to_have_value("")
+    limit.press_sequentially("64")
+    expect(limit).to_have_value("64")
+    limit.fill("")
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(dialog).to_be_visible()
+    assert ui.bodies("/api/settings", "PUT") == []

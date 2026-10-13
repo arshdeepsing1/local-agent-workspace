@@ -176,10 +176,10 @@ class ExtensionManager:
         async with self.turn() as connection:
             return await connection.call(name, arguments)
 
-    def _skill(self, tools, skill_id, root=None):
+    def _skill(self, tools, skill_id, root=None, roots=WORKSPACE_SKILL_ROOTS):
         if not isinstance(skill_id, str) or not SKILL_IDENTIFIER.fullmatch(skill_id):
             raise ValueError("Choose a skill ID from this workspace's skill list.")
-        root = root or next((folder for folder in WORKSPACE_SKILL_ROOTS
+        root = root or next((folder for folder in roots
                              if os.path.lexists(tools.root / folder / skill_id / "SKILL.md")), WORKSPACE_SKILL_ROOTS[0])
         target = tools.path(f"{root}/{skill_id}/SKILL.md")
         if not target.is_relative_to(tools.root) or not stat.S_ISREG(target.stat().st_mode):
@@ -240,6 +240,23 @@ class ExtensionManager:
                 raise ValueError("At most 30 workspace skills can be discovered.")
         return skills
 
+    def _claude_skills(self, tools):
+        """Skills in .claude/skills, or None when that folder is missing or unusable
+        (outside the workspace, not a folder, too many entries or skills, unreadable).
+        Problems in this other tool's folder skip it, as for the shipped skills; only
+        a usable folder takes skill IDs over from the shipped skills."""
+        try:
+            folder = tools.path(WORKSPACE_SKILL_ROOTS[1])
+            if not folder.is_relative_to(tools.root) or not folder.is_dir():
+                return None
+            return self._discover(folder, lambda skill_id: self._skill(tools, skill_id, WORKSPACE_SKILL_ROOTS[1]))
+        except (OSError, ValueError, RuntimeError):
+            return None
+
+    @staticmethod
+    def _usable_roots(claude):
+        return WORKSPACE_SKILL_ROOTS if claude is not None else WORKSPACE_SKILL_ROOTS[:1]
+
     def skills(self, tools):
         folder = tools.path(".agents/skills")
         skills = []
@@ -247,25 +264,22 @@ class ExtensionManager:
             if not folder.is_relative_to(tools.root) or not folder.is_dir():
                 raise ValueError("Skills must be in this workspace's .agents/skills directory.")
             skills = self._discover(folder, lambda skill_id: self._skill(tools, skill_id, WORKSPACE_SKILL_ROOTS[0]))
-        # Problems in .claude/skills, another tool's folder, skip it as for the shipped skills.
-        try:
-            folder = tools.path(WORKSPACE_SKILL_ROOTS[1])
-            claude = (self._discover(folder, lambda skill_id: self._skill(tools, skill_id, WORKSPACE_SKILL_ROOTS[1]))
-                      if folder.is_relative_to(tools.root) and folder.is_dir() else [])
-        except (OSError, ValueError, RuntimeError):
-            claude = []
+        claude = self._claude_skills(tools)
+        roots = self._usable_roots(claude)
         try:
             shipped = self._discover(self.app_skills, self._app_skill) if self.app_skills.is_dir() else []
         except (OSError, ValueError):
             shipped = []
-        return (skills + [skill for skill in claude if not self._in_workspace(tools, skill["id"], WORKSPACE_SKILL_ROOTS[:1])]
-                + [skill for skill in shipped if not self._in_workspace(tools, skill["id"])])
+        return (skills + [skill for skill in claude or [] if not self._in_workspace(tools, skill["id"], WORKSPACE_SKILL_ROOTS[:1])]
+                + [skill for skill in shipped if not self._in_workspace(tools, skill["id"], roots)])
 
     def load_skill(self, tools, skill_id):
-        if (isinstance(skill_id, str) and SKILL_IDENTIFIER.fullmatch(skill_id) and not self._in_workspace(tools, skill_id)
-                and os.path.lexists(self.app_skills / skill_id / "SKILL.md")):
+        if not isinstance(skill_id, str) or not SKILL_IDENTIFIER.fullmatch(skill_id):
+            return self._skill(tools, skill_id)
+        roots = self._usable_roots(self._claude_skills(tools))
+        if not self._in_workspace(tools, skill_id, roots) and os.path.lexists(self.app_skills / skill_id / "SKILL.md"):
             return self._app_skill(skill_id)
-        return self._skill(tools, skill_id)
+        return self._skill(tools, skill_id, roots=roots)
 
     async def run_hook(self, hook, payload, workspace):
         selected = next((entry for entry in self.config["hooks"] if entry["id"] == hook.get("id") and entry["enabled"]), None)
