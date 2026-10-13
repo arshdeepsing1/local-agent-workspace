@@ -100,19 +100,19 @@ def register_features(app, manager, settings, store, session_or_404, workspace_t
     @app.get("/api/sessions/{session_id}/changes")
     async def changes(session_id: str):
         session_or_404(session_id)
-        return manager.changes.list(session_id, workspace_tools(session_id))
+        return manager.changes.list(session_id, manager.review_tools(session_or_404(session_id)))
 
     @app.get("/api/sessions/{session_id}/changes/diff")
     async def change_diff(session_id: str, path: str):
         session_or_404(session_id)
-        return manager.changes.diff(session_id, workspace_tools(session_id), path)
+        return manager.changes.diff(session_id, manager.review_tools(session_or_404(session_id)), path)
 
     @app.post("/api/sessions/{session_id}/changes/{action}")
     async def review_changes(session_id: str, action: str, body: ChangeAction):
         session = session_or_404(session_id)
         if action not in ("keep", "undo"):
             raise HTTPException(404, "Unknown review action.")
-        tools = workspace_tools(session_id)
+        tools = manager.review_tools(session)
         if action == "undo":
             workspace_idle(tools, "undoing agent changes")
         try:

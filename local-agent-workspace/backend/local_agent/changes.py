@@ -117,6 +117,12 @@ class ChangeReview:
         return {"path": entry["path"], "status": _status(entry["baseline"], current),
                 "added": added, "removed": removed, "current_hash": current["hash"]}
 
+    def outside_folders(self, session_id, tools):
+        """Folders of this conversation's tracked changes outside the project (absolute paths)."""
+        rows = self.store.db.execute("SELECT target FROM agent_changes WHERE session_id=? AND workspace=?",
+                                     (session_id, str(tools.root))).fetchall()
+        return sorted({str(Path(target).parent) for (target,) in rows if not Path(target).is_relative_to(tools.root)})
+
     def list(self, session_id, tools):
         rows = self.store.db.execute("SELECT data FROM agent_changes WHERE session_id=? AND workspace=?",
                                      (session_id, str(tools.root))).fetchall()

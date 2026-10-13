@@ -300,8 +300,8 @@ when opening a conversation or performing restart recovery.
   exists or cannot be reached shows "Not found". When the agent changed files under none of these folders,
   "N changed files outside these folders" offers **Add <folder>** for up to three of their
   folders. **Agent tools → Recovery** can preview and restore saves and agent edits in an
-  added folder. Reviewing an agent change there (**Keep** or **Undo**) still uses the
-  conversation's own access: outside Bypass permissions the folder needs **Folder access**.
+  added folder. You can review (**Keep** or **Undo**) the agent's changes there whatever the
+  chat's folder access.
   The list is kept in `workspace_folders.json` in the state directory. The choice
   goes back to **Project** for another conversation or when the folder's grant or entry is
   removed. Save detects concurrent disk edits.
@@ -316,8 +316,12 @@ when opening a conversation or performing restart recovery.
   The **Keep** and **Undo** buttons on the bar act on every listed file; the check and
   arrow buttons on a row act on that file only.
   In **Workspace / Files**, a dot marks each changed file and each folder that contains
-  one. Changes in a granted folder outside the project get their dots when you choose
-  that folder in **Browse**, whose entry then ends with "(changed files)". Click a file, in the bar or in the file list, to review it: removed lines are red
+  one. Changes in a granted or added folder outside the project get their dots when you
+  choose that folder with its button at the top of Files, which shows a dot too; changes
+  under none of these folders are offered as **Add <folder>** there. You can review every
+  file the agent changed, also outside the folders the chat may use now (for example after
+  leaving Bypass permissions or removing a grant): the review reads and writes only those
+  files, and the agent itself gets no access back. Click a file, in the bar or in the file list, to review it: removed lines are red
   and added lines green, and each change has its own **Keep** and **Undo**. The box at the
   bottom right shows the position (`1 of 3`), moves between changes with its arrows, and
   keeps or undoes the whole file. **Edit** switches to the text editor (an unsaved draft is
@@ -1040,7 +1044,8 @@ approval diff, file checkpoint, and `write_file` hooks apply (Plan mode blocks i
 Commands are copied as they ran except that the app's configured credentials and
 common secret shapes (GitHub and Databricks tokens, AWS access keys, bearer tokens,
 `password=`/`token=`-style values, and URL passwords) are replaced with `[REDACTED]`;
-review the file before sharing it. The finished file must stay within 80 KB: the
+review the file before sharing it. The finished file must stay within the file write
+limit (Settings, 80 KB by default): the
 oldest commands are omitted with a note when needed, so insert the log into a
 separate file to keep every command. Delegated subagent conversations keep their own
 logs.

@@ -5,6 +5,7 @@ The conversation card keeps the plain message; the model receives
 a missing file or an exclusion it must not work around.
 """
 import json
+import re
 
 
 HINTS = {
@@ -25,13 +26,23 @@ VALUE_ERROR_RULES = (
     ("access_required", ("needs access approval",)),
     # Before stale_file: 'Project instructions changed before execution' is about guidance, not a file.
     ("guidance_changed", ("instructions changed",)),
-    ("stale_file", ("changed while waiting", "changed before execution", "changed since")),
+    ("stale_file", ("changed while", "changed before execution", "changed since", "changed immediately after",
+                    "now resolves to a different file", "checkpoint was already restored")),
     ("edit_mismatch", ("old_text",)),
-    ("not_found", ("was not found", "not found in this conversation")),
+    ("not_found", ("was not found", "not found in this conversation", "does not exist", "job not found",
+                   "no longer available")),
     ("unavailable_tool", ("not available",)),
-    ("limit", ("limit reached", "exceeds", "too large", "more than")),
+    ("wrong_type", ("Not a directory", "must be a regular file", "Only regular", "Binary files cannot",
+                    "Not a Jupyter notebook", "destination is a folder")),
+    ("limit", ("limit reached", "exceeds", "too large", "more than", "More than", "took longer than", "took too long",
+               "over the file write limit", "larger than", "commands can run at once", "is too long")),
 )
-INVALID_ARGUMENT_PHRASES = ("must be an integer", "must be a boolean", "must be booleans", "must be true or false", "Give either")
+INVALID_ARGUMENT_PHRASES = ("must be an integer", "must be a boolean", "must be booleans", "must be true or false", "Give either",
+                            "Use either", "cannot be empty", "Give cell_id or index", "needs source", "Put replace_all",
+                            "Invalid until_regex", "Invalid pattern", "Invalid regular expression", "not supported in pattern",
+                            "alternatives", "is beyond", "is out of range", "must identify")
+# A message that starts with an argument name, e.g. "output_mode must be content, files_with_matches or count."
+ARGUMENT_MESSAGE = re.compile(r"[A-Za-z_]+ must (?:be|contain) ")
 
 
 def _kind(exc, message):
@@ -48,7 +59,8 @@ def _kind(exc, message):
     if isinstance(exc, (KeyError, TypeError)):
         return "invalid_arguments"
     if isinstance(exc, ValueError):
-        if message.startswith("Invalid tool arguments") or any(phrase in message for phrase in INVALID_ARGUMENT_PHRASES):
+        if (message.startswith("Invalid tool arguments") or ARGUMENT_MESSAGE.match(message)
+                or any(phrase in message for phrase in INVALID_ARGUMENT_PHRASES)):
             return "invalid_arguments"
         for kind, phrases in VALUE_ERROR_RULES:
             if any(phrase in message for phrase in phrases):

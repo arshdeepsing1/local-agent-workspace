@@ -318,3 +318,32 @@ def test_an_agent_edit_of_a_crlf_file_is_one_change_and_undo_restores_its_bytes(
     assert [line["text"] for line in diff["lines"] if line["kind"] != "context"] == ["line 7", "line seven"]
     act(review, "undo", "win.txt")
     assert target.read_bytes() == original
+
+
+def test_changes_made_outside_the_chat_folders_stay_reviewable(client, tmp_path):
+    # An edit made in Bypass permissions outside every folder of the chat: after the chat leaves
+    # Bypass, the review can still list, diff and undo it, but nothing else in that folder.
+    client, manager, workspace = client
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "notes.txt").write_text("old\n")
+    (outside / "other.txt").write_text("untouched\n")
+    session_id = client.post("/api/sessions").json()["id"]
+    session = manager.get(session_id)
+    session["permission_mode"] = "bypassPermissions"
+    bypass = manager.session_tools(session)
+    manager.checkpoints.apply_edit(bypass, "write_file", {"path": str(outside / "notes.txt"), "content": "new\n"},
+                                   session_id=session_id, turn_id="turn",
+                                   on_applied=lambda record: manager.changes.track(record, bypass))
+    session["permission_mode"] = "manual"
+    assert not manager.session_tools(session).permitted(outside / "notes.txt")  # The agent gets no access back.
+    base = f"/api/sessions/{session_id}/changes"
+    listed = client.get(base).json()["files"]
+    assert [(item["path"], item["status"], "error" in item) for item in listed] == [(str(outside / "notes.txt"), "modified", False)]
+    diff = client.get(base + "/diff", params={"path": str(outside / "notes.txt")})
+    assert diff.status_code == 200 and [line["kind"] for line in diff.json()["lines"]] == ["removed", "added"]
+    assert client.get(base + "/diff", params={"path": str(outside / "other.txt")}).status_code == 400
+    undo = {"files": [{"path": str(outside / "notes.txt"), "current_hash": listed[0]["current_hash"]}]}
+    assert client.post(base + "/undo", json=undo).json()["files"] == []
+    assert (outside / "notes.txt").read_text() == "old\n"
+    assert manager.review_tools(session).root == manager.session_tools(session).root

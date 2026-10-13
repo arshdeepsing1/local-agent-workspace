@@ -99,12 +99,13 @@ async def test_invalid_arguments_and_other_conversations(runtime):
     manager, session, tools = runtime
     job = await background(manager, session, "printf 'twelve chars'")
     await manager.jobs.wait(job["id"])
-    assert "Invalid until_regex" in await wait(manager, session, tools, job_id=job["id"], until_regex="(")
-    assert "from_offset is beyond the job output (12 characters)." in await wait(
-        manager, session, tools, job_id=job["id"], from_offset=13)
+    invalid = await wait(manager, session, tools, job_id=job["id"], until_regex="(")
+    assert invalid["error_kind"] == "invalid_arguments" and invalid["message"].startswith("Invalid until_regex")
+    beyond = await wait(manager, session, tools, job_id=job["id"], from_offset=13)
+    assert beyond["message"] == "from_offset is beyond the job output (12 characters)."
     other = manager.store.create(manager.settings.values)
     foreign = await manager.jobs.start("sleep 30", session["workspace"], session_id=other["id"], background=True)
-    assert "Job not found in this conversation." in await wait(manager, session, tools, job_id=foreign["id"])
+    assert (await wait(manager, session, tools, job_id=foreign["id"]))["message"] == "Job not found in this conversation."
     assert manager.jobs.get(foreign["id"])["state"] == "running"
 
 
@@ -141,7 +142,7 @@ async def test_a_pathological_regex_is_stopped_without_blocking_the_event_loop(r
     finally:
         beating.cancel()
         await asyncio.gather(beating, return_exceptions=True)
-    assert result == "until_regex took too long; simplify it."
+    assert result["message"] == "until_regex took too long; simplify it." and result["error_kind"] == "limit"
     assert ticks >= 2
 
 

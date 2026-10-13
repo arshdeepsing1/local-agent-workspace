@@ -908,6 +908,20 @@ class AgentManager:
                               session.get("permission_mode", "manual") == "bypassPermissions",
                               write_limit=write_limit_setting(self.settings.values))
 
+    def review_tools(self, session):
+        """Tools for reviewing this chat's agent changes (list, diff, Keep, Undo): the chat's own access plus the
+        folders of files the agent already changed there, so a change made in Bypass permissions or in a folder
+        whose grant was removed can still be reviewed. The review reads and writes only tracked files; the
+        agent's own tools are unchanged."""
+        tools = self.session_tools(session)
+        extra = [folder for folder in self.changes.outside_folders(session["id"], tools) if not tools.permitted(Path(folder))]
+        if not extra:
+            return tools
+        return WorkspaceTools(session["workspace"], self.settings.values["env_file"],
+                              [*session.get("allowed_directories", []), *extra],
+                              session.get("permission_mode", "manual") == "bypassPermissions",
+                              write_limit=write_limit_setting(self.settings.values))
+
     async def publish_changes(self, session, tools=None, only_tracked=False):
         """Send the conversation's unreviewed agent file changes to its open pages."""
         if not self.listeners.get(session["id"]):
@@ -915,7 +929,7 @@ class AgentManager:
         try:
             if only_tracked and not self.changes.has(session["id"]):
                 return
-            changes = self.changes.list(session["id"], tools or self.session_tools(session))
+            changes = self.changes.list(session["id"], tools or self.review_tools(session))
         except (*STORAGE_ERRORS, ValueError, UnicodeError) as exc:
             changes = {"files": [], "added": 0, "removed": 0, "error": self.settings.redact(file_error(exc))}
         await self.broadcast(session["id"], {"type": "changes", "changes": changes})
