@@ -296,8 +296,8 @@ def outline_file(tools, path, *, offset=0, max_level=6, page_bytes=QUERY_OUTPUT_
     kind = outline_format(target)
     if kind == "notebook":
         raise ValueError("Only regular text files can be outlined; use notebook_read for Jupyter notebooks.")
-    too_large = ("This file exceeds the 8 MB outline limit; use search_files (for example regex=true with ^#{1,3} "
-                 "or ^\\s*(def|class)) to find sections.")
+    too_large = ("This file exceeds the 8 MB outline and search limit; use read_file with tail_lines for its end, or "
+                 "run_command with grep -n (if available) to find lines.")
     if info.st_size > OUTLINE_SCAN_LIMIT:
         raise ValueError(too_large)
     with target.open("rb") as source:

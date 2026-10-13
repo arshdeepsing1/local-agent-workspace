@@ -430,10 +430,16 @@ class WorkspaceTools:
         entries, note = search.list_universe(self, search_root, include_ignored=include_ignored,
                                              deadline=time.monotonic() + search.ENUMERATION_TIMEOUT)
         entries = [entry for entry in entries if fnmatch.fnmatch(entry.relative, glob)]
+        # One file named as the path is searched as far as read_file and outline_file reach.
+        file_limit = READ_SCAN_LIMIT if search_root.is_file() else SEARCH_FILE_LIMIT
+        if search_root.is_file() and entries and entries[0].size > file_limit:
+            raise ValueError(f"This file is {entries[0].size / 1_000_000:.1f} MB, larger than the 8 MB limit for "
+                             "searching one file. Use read_file with tail_lines for its end, or run_command with grep -n "
+                             "(if available) to find lines.")
         # The same limits with and without rg: they apply to the files that could be read.
         if len(entries) > SEARCH_FILE_SCAN_LIMIT:
             raise ValueError(f"Search file scan limit reached ({SEARCH_FILE_SCAN_LIMIT:,} files); narrow the path or glob.")
-        if sum(entry.size for entry in entries if entry.size <= SEARCH_FILE_LIMIT) > SEARCH_TOTAL_LIMIT:
+        if sum(entry.size for entry in entries if entry.size <= file_limit) > SEARCH_TOTAL_LIMIT:
             raise ValueError(f"Search byte scan limit reached ({SEARCH_TOTAL_LIMIT // 1_000_000} MB); "
                              "narrow the path or glob.")
         deadline = time.monotonic() + SEARCH_TIMEOUT
@@ -473,18 +479,18 @@ class WorkspaceTools:
         found = 0
         for item in entries:
             _check_deadline(deadline)
-            if item.size > SEARCH_FILE_LIMIT:
+            if item.size > file_limit:
                 result["skipped_files"] += 1
                 continue
             if candidates is not None and search.candidate_key(item.relative) not in candidates:
                 continue
             try:
                 with open(item.path, "rb") as source:
-                    raw = source.read(SEARCH_FILE_LIMIT + 1)
+                    raw = source.read(file_limit + 1)
             except OSError:
                 result["skipped_files"] += 1
                 continue
-            if len(raw) > SEARCH_FILE_LIMIT:
+            if len(raw) > file_limit:
                 result["skipped_files"] += 1
                 continue
             if b"\x00" in raw:
@@ -740,7 +746,7 @@ TOOL_DEFINITIONS = [
     definition("outline_file", "List the structure of one text file with line numbers so you can read only the parts you need: Markdown headings (with the line where each section ends), Python classes and functions (with end lines), and declarations found by a line scan in JavaScript/TypeScript, Go, Rust, Java/Kotlin/C#/Swift, C/C++, Ruby, PHP, shell, SQL, TOML/INI, YAML and Makefiles (heuristic; may miss some). Entries read \"start-end text\" (or \"start text\"); then call read_file with start_line=start and max_lines=end-start+1. max_level limits heading or nesting depth. Follow next_offset. Files up to 8 MB. Outlining does not count as reading the file before write_file.",
                {"path": STRING, "max_level": {"type": "integer", "minimum": 1, "maximum": 6, "default": 6},
                 "offset": {"type": "integer", "minimum": 0, "maximum": 20000, "default": 0}}, ["path"]),
-    definition("search_files", "Search one UTF-8 file or files under a directory path (default: the workspace) for literal text or a bounded regular expression. Choose the narrowest path and glob; use regex=false unless regular-expression syntax is needed. Case-insensitive by default. output_mode=files_with_matches lists matching files; count gives matches per file. Inside a Git repository that starts within the workspace or granted folder, .gitignored files are skipped unless include_ignored=true; a note says when .gitignore was not applied. Binary and non-UTF-8 files are not searched; skipped_files counts files over 2 MB and unreadable files. Literal searches use ripgrep, when installed, to find candidate files faster; results are the same either way. Returns next_offset for pagination; output is at most 8 KB. External paths trigger folder access approval.",
+    definition("search_files", "Search one UTF-8 file or files under a directory path (default: the workspace) for literal text or a bounded regular expression. Choose the narrowest path and glob; use regex=false unless regular-expression syntax is needed. Case-insensitive by default. output_mode=files_with_matches lists matching files; count gives matches per file. Inside a Git repository that starts within the workspace or granted folder, .gitignored files are skipped unless include_ignored=true; a note says when .gitignore was not applied. Binary and non-UTF-8 files are not searched; A folder search skips files over 2 MB (skipped_files counts them and unreadable files); give one file as path to search it up to 8 MB. Literal searches use ripgrep, when installed, to find candidate files faster; results are the same either way. Returns next_offset for pagination; output is at most 8 KB. External paths trigger folder access approval.",
                {"query": STRING, "glob": STRING, "path": STRING, "regex": {"type": "boolean"},
                 "case_sensitive": {"type": "boolean"}, "context_lines": {"type": "integer", "minimum": 0, "maximum": 5},
                 "offset": {"type": "integer", "minimum": 0, "maximum": 10000},

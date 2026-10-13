@@ -297,7 +297,8 @@ def test_errors_have_their_kinds(workspace, monkeypatch):
     assert error_kind(lambda: outline_file(tools, "missing.md"))[0] == "not_found"
     monkeypatch.setattr(outline, "OUTLINE_SCAN_LIMIT", 3)
     kind, message = error_kind(lambda: outline_file(tools, "doc.md"))
-    assert kind == "limit" and "8 MB outline limit" in message
+    assert kind == "limit" and "8 MB outline and search limit" in message and "tail_lines" in message
+    assert "search_files" not in message  # It cannot read a file over 8 MB either.
 
 
 def test_invalid_utf8_is_replaced_with_a_note(workspace):
@@ -542,3 +543,30 @@ async def test_a_handoff_of_the_stated_size_costs_about_a_third_of_the_budget_on
         assert again["content"] == system["content"]
     finally:
         store.db.close()
+
+
+# --- search_files on one large file (integration review B, finding 5) ------------------------------
+
+def test_one_file_between_2_and_8_mb_is_searched_to_its_end(workspace):
+    root, tools = workspace
+    body = "".join(f"## Section {number}\n" + "detail text line\n" * 20 for number in range(8_000))
+    write(root, "big-handoff.md", body + "## Next actions\nShip it.\n")
+    assert 2_000_000 < (root / "big-handoff.md").stat().st_size < 8_000_000
+    result = tools.search_files("Next actions", path="big-handoff.md")
+    assert result["skipped_files"] == 0 and [match["line"] for match in result["matches"]] == [8_000 * 21 + 1]
+    # outline_file stops at 20,000 entries on such a file; search still finds a late definition.
+    write(root, "generated_big.py", "".join(f"def func_{number}(value):\n    return value + {number:08d}\n"
+                                           for number in range(30_000)) + "# " + "x" * 600_000 + "\n")
+    assert (root / "generated_big.py").stat().st_size > 2_000_000
+    found = tools.search_files("def func_29999", path="generated_big.py")
+    assert [match["line"] for match in found["matches"]] == [59_999]
+    # A folder search keeps its 2 MB cap per file and counts what it skipped.
+    folder = tools.search_files("Next actions", path=".")
+    assert folder["matches"] == [] and folder["skipped_files"] == 2
+
+
+def test_one_file_over_8_mb_is_a_limit_error_naming_tail_lines(workspace):
+    root, tools = workspace
+    write(root, "app.log", "log line\n" * 1_000_000)
+    kind, message = error_kind(lambda: tools.search_files("Next actions", path="app.log"))
+    assert kind == "limit" and "9.0 MB" in message and "tail_lines" in message

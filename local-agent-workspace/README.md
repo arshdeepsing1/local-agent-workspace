@@ -2001,8 +2001,10 @@ expressions use full case folding and find it. `output_mode` chooses the result:
 `files_with_matches` lists the matching files; `count` gives matching lines per file
 and `total_matches`. `offset` counts matches in `content` mode and files in the other
 modes, and every result has `next_offset`. Query length is capped at 1,000 characters.
-Binary (NUL) and non-UTF-8 files are not searched; `skipped_files` counts files over
-2 MB and files that could not be read. Before reading, a search refuses more than
+Binary (NUL) and non-UTF-8 files are not searched; a folder search skips files over 2 MB,
+and `skipped_files` counts them and files that could not be read. One file given as `path`
+is searched up to 8 MB, as far as `read_file` and `outline_file` reach; a larger one gets an
+error pointing to `read_file` with `tail_lines` or `grep -n`. Before reading, a search refuses more than
 20,000 files, or more than 64 MB in files of up to 2 MB, after `glob` filtering.
 Reading and matching then have 10 seconds, and each regex match 50 ms. A regular
 expression (also `wait_job`'s `until_regex`) whose counted repeats such as `{1000}` add
