@@ -42,7 +42,11 @@ class SubagentProfileRequest(BaseModel):
     tool_profile: str = Field(strict=True, max_length=32)
 
 
-def register_features(app, manager, settings, store, session_or_404, workspace_tools):
+def register_features(app, manager, settings, store, session_or_404, workspace_tools, ui_tools=None):
+    # Recovery previews and restores are the user's own actions, like editor saves: they may reach the
+    # folders added to Workspace -> Files (ui_tools). The agent's tools never do.
+    recovery_tools = ui_tools or workspace_tools
+
     def idle(session, action="changing this conversation"):
         ensure_idle(manager, session, action)
 
@@ -59,12 +63,12 @@ def register_features(app, manager, settings, store, session_or_404, workspace_t
 
     @app.get("/api/checkpoints/{checkpoint_id}/preview")
     async def preview(checkpoint_id: str, session_id: str | None = None):
-        return manager.checkpoints.preview(checkpoint_id, workspace_tools(session_id), session_id=session_id)
+        return manager.checkpoints.preview(checkpoint_id, recovery_tools(session_id), session_id=session_id)
 
     @app.get("/api/checkpoint-turns/{turn_id}/preview")
     async def preview_turn(turn_id: str, session_id: str, offset: int = 0):
         session_or_404(session_id)
-        result = manager.checkpoints.preview_turn(turn_id, workspace_tools(session_id), session_id, offset)
+        result = manager.checkpoints.preview_turn(turn_id, recovery_tools(session_id), session_id, offset)
         for preview in result["previews"]:
             if "error" in preview:
                 preview["error"] = settings.redact(preview["error"])
@@ -86,7 +90,7 @@ def register_features(app, manager, settings, store, session_or_404, workspace_t
 
     @app.post("/api/checkpoints/{checkpoint_id}/restore")
     async def restore(checkpoint_id: str, body: RestoreRequest, session_id: str | None = None):
-        tools = workspace_tools(session_id)
+        tools = recovery_tools(session_id)
         workspace_idle(tools, "restoring a checkpoint")
         result = manager.checkpoints.restore(checkpoint_id, tools, body.expected_current_hash, session_id=session_id)
         if session_id:

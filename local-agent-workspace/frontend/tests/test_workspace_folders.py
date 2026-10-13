@@ -86,9 +86,11 @@ def test_add_a_folder_through_the_form_browse_it_and_remove_it(ui, page):
     parent.click()
     expect(parent).to_be_disabled()
 
-    page.get_by_role("button", name="Remove /srv/other from Files").click()
+    page.get_by_role("button", name="Remove /srv/other from Files").focus()
+    page.keyboard.press("Enter")
     expect(roots(page)).to_have_count(0)
     assert ui.bodies("/api/workspace-folders?session_id=a", "DELETE") == [{"path": "/srv/other"}]
+    expect(page.get_by_role("button", name="Add folder…")).to_be_focused()  # Only the project is left.
     expect(page.get_by_role("button", name="note.txt")).to_be_visible()  # Back to the project.
 
 
@@ -115,15 +117,20 @@ def test_the_outside_hint_adds_and_selects_the_folder_of_a_changed_file(ui, page
     push(ui, "changedFile('/srv/notes/todo.md', 3, 0, 'created')", "changedFile('/srv/notes/other.md')",
          "changedFile('/var/a/one.txt')", "changedFile('/var/b/two.txt')", "changedFile('/var/c/three.txt')")
     expect(page.get_by_text("5 changed files outside these folders")).to_be_visible()
-    # One button per distinct folder, at most three.
-    expect(page.get_by_role("button", name=re.compile(r"^Add \/"))).to_have_text(["Add /srv/notes", "Add /var/a", "Add /var/b"])
+    # One button per distinct folder, at most three; the full path is in the accessible name and title.
+    suggestions = page.get_by_role("button", name=re.compile(r"^Add \/"))
+    expect(suggestions).to_have_text(["Add notes", "Add a", "Add b"])
+    assert ui.js("[...document.querySelectorAll('.file-roots-outside button')].map(b => [b.getAttribute('aria-label'), b.title])") == [
+        ["Add /srv/notes", "/srv/notes"], ["Add /var/a", "/var/a"], ["Add /var/b", "/var/b"]]
     expect(roots(page).get_by_role("button", name="Project", exact=True)).to_have_attribute("aria-pressed", "true")
-    page.get_by_role("button", name="Add /srv/notes").click()
+    page.get_by_role("button", name="Add /srv/notes").focus()
+    page.keyboard.press("Enter")
     notes = roots(page).get_by_role("button", name="Added to Files: /srv/notes, 2 changed files")
     expect(notes).to_have_attribute("aria-pressed", "true")
+    expect(notes).to_be_focused()  # Not lost when the hint button goes away.
     assert ui.bodies("/api/workspace-folders?session_id=a", "POST") == [{"path": "/srv/notes"}]
     expect(page.get_by_text("3 changed files outside these folders")).to_be_visible()
-    expect(page.get_by_role("button", name=re.compile(r"^Add \/"))).to_have_text(["Add /var/a", "Add /var/b", "Add /var/c"])
+    expect(suggestions).to_have_text(["Add a", "Add b", "Add c"])
     todo = page.get_by_role("button", name="todo.md")
     expect(todo.get_by_role("img", name="Changed by the agent")).to_be_visible()
     todo.click()
@@ -152,9 +159,17 @@ def test_server_refusals_are_shown_inline(ui, page):
 
     push(ui, "changedFile('/srv/state/settings.json')")
     page.get_by_role("button", name="Add /srv/state").click()
-    expect(page.locator(".file-roots > [role=alert]")).to_have_text(refusal)
-    expect(roots(page).get_by_role("button", name="Project, 0 changed files")).to_have_count(0)
+    hint = page.locator(".file-roots-outside")
+    expect(hint.get_by_role("alert")).to_have_text(refusal)
+    # Nothing was added: the group still holds only the selected Project, and the hint stays.
+    expect(roots(page).get_by_role("button")).to_have_count(1)
     expect(roots(page).get_by_role("button", name="Project", exact=True)).to_have_attribute("aria-pressed", "true")
+    expect(page.get_by_text("1 changed file outside these folders")).to_be_visible()
+    expect(page.get_by_role("button", name="Add /srv/state")).to_be_visible()
+    # The refusal goes away with the hint, for example after Keep.
+    push(ui)
+    expect(hint).to_have_count(0)
+    expect(page.get_by_role("alert")).to_have_count(0)
 
 
 def test_the_new_chat_view_uses_the_project_from_settings(ui, page):
@@ -180,3 +195,28 @@ def test_narrow_layout_has_no_horizontal_page_overflow(ui, page):
     assert widths[0] <= widths[1] and widths[2] <= widths[3] and widths[4] <= widths[5], widths
     # The file list stays reachable below the roots.
     expect(page.get_by_role("button", name="note.txt")).to_be_in_viewport()
+
+
+def test_suggestions_skip_folders_inside_another_suggestion(ui, page):
+    start(ui, page)
+    push(ui, "changedFile('/srv/other/readme.md')", "changedFile('/srv/other/docs/guide.md')",
+         "changedFile('/srv/other/docs/deep/x.md')", "changedFile('/srv/notes/todo.md')", "changedFile('/var/a/one.txt')")
+    expect(page.get_by_text("5 changed files outside these folders")).to_be_visible()
+    expect(page.get_by_role("button", name=re.compile(r"^Add \/"))).to_have_text(["Add other", "Add notes", "Add a"])
+
+
+def test_folders_with_a_shared_prefix_have_distinct_visible_names(ui, page):
+    folders = ["/srv/workspaces/team-projects/client-alpha-api", "/srv/workspaces/team-projects/client-alpha-web",
+               "/srv/one/app", "/srv/two/app"]
+    start(ui, page, setup=f"fake.workspaceFolders = {json.dumps([{'path': path, 'missing': False} for path in folders])}")
+    group = roots(page)
+    expect(group.locator(".file-roots-name")).to_have_text(["Project", "client-alpha-api", "client-alpha-web", "one/app", "two/app"])
+    for path in folders:
+        button = group.get_by_role("button", name=f"Added to Files: {path}", exact=True)
+        expect(button).to_have_attribute("title", path)
+    # Removing a folder moves focus to the next one, not to the page.
+    group.get_by_role("button", name=f"Remove {folders[1]} from Files").click()
+    expect(group.get_by_role("button", name=f"Added to Files: {folders[2]}", exact=True)).to_be_focused()
+    group.get_by_role("button", name=f"Remove {folders[3]} from Files").click()
+    expect(group.get_by_role("button", name=f"Added to Files: {folders[2]}", exact=True)).to_be_focused()
+    expect(group.locator(".file-roots-name")).to_have_text(["Project", "client-alpha-api", "app"])

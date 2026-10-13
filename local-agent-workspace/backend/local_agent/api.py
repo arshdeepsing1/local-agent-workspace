@@ -165,7 +165,7 @@ def create_app(settings=None):
                               session.get("permission_mode") == "bypassPermissions")
 
     def ui_tools(session_id=None):
-        """workspace_tools plus the folders added to Files, for the user's own browsing and editor saves only.
+        """workspace_tools plus the folders added to Files, for the user's own browsing, editor saves and Recovery only.
         The agent's tools and every other route keep the conversation's own grants."""
         session = session_or_404(session_id) if session_id else {}
         workspace = session.get("workspace", settings.values["workspace"])
@@ -477,7 +477,7 @@ def create_app(settings=None):
         scoped_job(job_id, session_id)
         return await manager.jobs.stop(job_id)
 
-    register_features(app, manager, settings, store, session_or_404, workspace_tools)
+    register_features(app, manager, settings, store, session_or_404, workspace_tools, ui_tools)
     register_portability(app, manager, settings, store, session_or_404)
     register_approvals(app, manager, store, session_or_404)
     workspace_folders = register_workspace_folders(app, settings, session_or_404)

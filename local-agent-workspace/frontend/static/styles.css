@@ -234,7 +234,7 @@
 .file-roots-root small{flex-shrink:0;font-size:9px;color:var(--muted);white-space:nowrap}
 .file-roots-remove{height:24px;width:24px;padding:4px;margin-right:2px}
 .file-roots-outside{display:flex;flex-wrap:wrap;align-items:center;gap:5px;color:#956545}
-.file-roots-outside>span{flex-basis:100%}
+.file-roots-outside>span,.file-roots-outside>.form-error{flex-basis:100%}
 .file-roots-outside button{font-size:11px;padding:4px 8px;border-radius:7px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block}
 .file-roots-add{align-self:flex-start;gap:6px;padding:4px 7px;font-size:11px;border-radius:6px;color:#625d52}
 .file-roots-form label{display:block;font-size:11px;font-weight:500;color:var(--ink);margin-bottom:5px}

@@ -354,3 +354,152 @@ async def test_an_agent_turn_does_not_read_an_added_folder_without_access(setup,
         assert session.get("allowed_directories", []) == []
     finally:
         store.db.close()
+
+
+# Review fixes: unreachable folders, other names for the same folder, excluded folders, Recovery.
+
+def test_an_unreachable_added_folder_never_breaks_files(setup, monkeypatch):
+    settings, project, other = setup
+    with app_client(settings) as raw:
+        client = Client(raw)
+        sid = client.session()
+        assert paths(client.post(ROUTE, {"path": str(other)}, session_id=sid)) == [str(other)]
+        # Later the folder cannot be reached: its parent lost search permission, a macOS privacy
+        # refusal (EPERM), or a dropped network share (EIO).
+        real_stat = os.stat
+        for error in (PermissionError(13, "Permission denied"), OSError(5, "Input/output error")):
+            def stat_(path, *args, **kwargs):
+                name = os.fspath(path)
+                if name == str(other) or name.startswith(str(other) + os.sep):
+                    raise error
+                return real_stat(path, *args, **kwargs)
+            monkeypatch.setattr(os, "stat", stat_)
+            listed = client.get(ROUTE, session_id=sid)
+            assert listed.status_code == 200, listed.text
+            assert listed.json()["folders"] == [{"path": str(other), "missing": True}]
+            project_files = client.get("/api/files", path=".", session_id=sid)
+            assert project_files.status_code == 200, project_files.text
+            assert client.get("/api/file", path="main.py", session_id=sid).json()["content"] == "print('project')\n"
+            saved = client.put("/api/file", {"path": "main.py", "content": "print(1)\n",
+                                             "original": "print('project')\n", "session_id": sid})
+            assert saved.status_code == 200, saved.text
+            (project / "main.py").write_text("print('project')\n")
+            # It can still be removed from Files.
+            assert paths(client.delete(ROUTE, {"path": str(other)}, session_id=sid)) == []
+            monkeypatch.setattr(os, "stat", real_stat)
+            assert paths(client.post(ROUTE, {"path": str(other)}, session_id=sid)) == [str(other)]
+
+
+def test_adding_a_folder_the_app_cannot_open_is_a_plain_refusal(setup, monkeypatch):
+    settings, _, other = setup
+    real_stat = os.stat
+
+    def stat_(path, *args, **kwargs):
+        if os.fspath(path) == str(other / "sub"):
+            raise PermissionError(13, "Permission denied")
+        return real_stat(path, *args, **kwargs)
+    with app_client(settings) as raw:
+        client = Client(raw)
+        monkeypatch.setattr(os, "stat", stat_)
+        response = client.post(ROUTE, {"path": str(other / "sub")})
+        monkeypatch.setattr(os, "stat", real_stat)
+        assert response.status_code == 400, response.text
+        assert response.json()["detail"] == f"The app cannot open this folder (Permission denied): {other / 'sub'}"
+        assert paths(client.get(ROUTE)) == []
+
+
+def _aliases(monkeypatch, mapping):
+    """Make each alias path report the file identity of its target, like a case variant on a
+    case-insensitive disk, a macOS firmlink or a bind mount (no symbolic link involved)."""
+    import local_agent.workspace_folders as module
+    real = module._identity
+    monkeypatch.setattr(module, "_identity", lambda path: real(mapping.get(str(path), path)))
+
+
+def test_another_name_for_the_state_folder_or_the_project_is_refused(setup, tmp_path, monkeypatch):
+    settings, project, other = setup
+    state_alias, project_alias, parent_alias = (tmp_path / name for name in ("State-Alias", "Project-Alias", "parent"))
+    inner_alias = state_alias / "conversations"  # A folder inside the state folder, reached by its other name.
+    for folder in (inner_alias, project_alias, parent_alias):
+        folder.mkdir(parents=True)
+    _aliases(monkeypatch, {str(state_alias): settings.state_dir, str(project_alias): project})
+    with app_client(settings) as raw:
+        client = Client(raw)
+        for path, message in ((state_alias, "state folder or inside it"), (inner_alias, "state folder or inside it"),
+                              (project_alias, "inside the project")):
+            response = client.post(ROUTE, {"path": str(path)})
+            assert response.status_code == 400, (path, response.text)
+            assert message in response.json()["detail"]
+        # A folder whose other name contains the state folder.
+        _aliases(monkeypatch, {str(parent_alias): settings.state_dir.parent})
+        response = client.post(ROUTE, {"path": str(parent_alias)})
+        assert response.status_code == 400 and "contains the app's state folder" in response.json()["detail"]
+        assert paths(client.get(ROUTE)) == []
+        # Checked again on each use: a listed folder that becomes another name for the state folder.
+        assert paths(client.post(ROUTE, {"path": str(other)})) == [str(other)]
+        _aliases(monkeypatch, {str(other): settings.state_dir})
+        assert client.get("/api/files", path=str(other)).status_code == 400
+
+
+def test_a_bind_mount_of_the_state_folder_is_refused(setup, tmp_path):
+    import subprocess
+    settings, _, _ = setup
+    alias = tmp_path / "alias"
+    alias.mkdir()
+    try:
+        mounted = subprocess.run(["mount", "--bind", str(settings.state_dir), str(alias)],
+                                 capture_output=True, timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        mounted = False
+    if not mounted:
+        pytest.skip("bind mounts need root and mount permission")
+    try:
+        with app_client(settings) as raw:
+            client = Client(raw)
+            response = client.post(ROUTE, {"path": str(alias)})
+            assert response.status_code == 400 and "state folder or inside it" in response.json()["detail"]
+            assert client.get("/api/file", path=str(alias / FILE_NAME)).status_code == 400
+    finally:
+        subprocess.run(["umount", str(alias)], capture_output=True, timeout=10)
+
+
+def test_folders_the_file_tools_exclude_are_refused(setup, tmp_path):
+    settings, _, _ = setup
+    cases = {".local/share/tool": "This internal or generated directory is excluded.",
+             "build/dist": "This internal or generated directory is excluded.",
+             "env/.venv/lib": "This internal or generated directory is excluded.",
+             "keys/credentials": "Credential files are excluded from file tools."}
+    with app_client(settings) as raw:
+        client = Client(raw)
+        for relative, message in cases.items():
+            folder = tmp_path / "home" / relative
+            folder.mkdir(parents=True)
+            response = client.post(ROUTE, {"path": str(folder)})
+            assert response.status_code == 400, relative
+            assert response.json()["detail"] == message
+        assert paths(client.get(ROUTE)) == []
+
+
+def test_recovery_previews_and_restores_an_editor_save_in_an_added_folder(setup):
+    settings, _, other = setup
+    with app_client(settings) as raw:
+        client = Client(raw)
+        sid = client.session()  # Manual permissions, no folder grants.
+        client.post(ROUTE, {"path": str(other)}, session_id=sid)
+        saved = client.put("/api/file", {"path": str(other / "notes.txt"), "content": "edited\n",
+                                         "original": "outside notes\n", "session_id": sid})
+        assert saved.status_code == 200, saved.text
+        checkpoints = client.get("/api/checkpoints", session_id=sid).json()
+        assert [(item["path"], item["status"]) for item in checkpoints] == [(str(other / "notes.txt"), "applied")]
+        preview = client.get(f"/api/checkpoints/{checkpoints[0]['id']}/preview", session_id=sid)
+        assert preview.status_code == 200, preview.text
+        assert preview.json()["can_restore"] is True
+        restored = client.post(f"/api/checkpoints/{checkpoints[0]['id']}/restore",
+                               {"expected_current_hash": preview.json()["expected_current_hash"]}, session_id=sid)
+        assert restored.status_code == 200, restored.text
+        assert (other / "notes.txt").read_text() == "outside notes\n"
+        # Recovery never widens the conversation's own grants.
+        assert client.get(f"/api/sessions/{sid}").json()["allowed_directories"] == []
+        # Once the folder is removed from Files, its checkpoint is out of reach again.
+        client.delete(ROUTE, {"path": str(other)}, session_id=sid)
+        assert client.get(f"/api/checkpoints/{checkpoints[0]['id']}/preview", session_id=sid).status_code == 400

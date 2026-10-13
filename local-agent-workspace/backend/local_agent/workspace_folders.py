@@ -13,6 +13,8 @@ from pathlib import Path
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
+from .tools import WorkspaceTools
+
 FILE_NAME = "workspace_folders.json"
 VERSION = 1
 MAX_FOLDERS = 20
@@ -32,6 +34,25 @@ class UnreadableList(Exception):
 
 def project_key(workspace) -> str:
     return str(Path(workspace).expanduser().resolve())
+
+
+def _identity(path):
+    """(device, inode) of an existing path, or None when it cannot be read."""
+    try:
+        info = os.stat(path)
+    except (OSError, ValueError):
+        return None
+    return info.st_dev, info.st_ino
+
+
+def _within(folder: Path, other: Path) -> bool:
+    """True when folder is other or inside it. Compared by file identity as well as by name, because
+    resolve() only follows symbolic links: a case variant on a case-insensitive disk, a bind mount or a
+    macOS firmlink is another name for the same folder."""
+    if folder == other or folder.is_relative_to(other):
+        return True
+    target = _identity(other)
+    return target is not None and any(_identity(item) == target for item in (folder, *folder.parents))
 
 
 def _valid(data) -> bool:
@@ -99,7 +120,9 @@ class WorkspaceFolders:
 
     def list(self, workspace):
         """Entries in insertion order; a folder that no longer exists is kept and flagged."""
-        return [{"path": folder, "missing": not Path(folder).is_dir()}
+        # os.path.isdir is False for any error: a folder the app can no longer reach (permission denied,
+        # a dropped network share) is flagged like a missing one and never fails the request.
+        return [{"path": folder, "missing": not os.path.isdir(folder)}
                 for folder in self._read().get(project_key(workspace), [])]
 
     def paths(self, workspace):
@@ -113,10 +136,10 @@ class WorkspaceFolders:
         if folder.parent == folder:
             return "The filesystem root cannot be added to Files."
         state = Path(self.settings.state_dir).expanduser().resolve()
-        if folder == state or folder.is_relative_to(state):
+        if _within(folder, state):
             return ("This folder is the app's state folder or inside it. It holds conversations and settings "
                     "and is never shown in Files.")
-        if state.is_relative_to(folder):
+        if _within(state, folder):
             return ("This folder contains the app's state folder, which holds conversations and settings "
                     "and is never shown in Files. Add a folder inside it instead.")
         return None
@@ -130,15 +153,21 @@ class WorkspaceFolders:
             raise ValueError("Enter a folder path; ~name is not a known user here.")
         try:
             folder = (project / requested).resolve(strict=True)
+            directory = folder.is_dir()
         except FileNotFoundError:
             raise ValueError(f"This folder does not exist: {value}")
-        if not folder.is_dir():
+        except OSError as exc:
+            raise ValueError(f"The app cannot open this folder ({exc.strerror or 'error'}): {value}")
+        if not directory:
             raise ValueError(f"This is not a folder: {folder}")
-        if folder == project or folder.is_relative_to(project):
+        if _within(folder, project):
             raise ValueError("This folder is inside the project; it is already in Files.")
         problem = self.refusal(folder)
         if problem:
             raise ValueError(problem)
+        # The same exclusions as the file tools (.git, .venv, .local, dist, credentials, ...): such a
+        # folder could be added but never browsed.
+        WorkspaceTools(str(project), self.settings.values.get("env_file", "")).resolve(str(folder))
         if not os.access(folder, os.R_OK | os.X_OK):
             raise ValueError(f"The app cannot list this folder (permission denied): {folder}")
         return folder

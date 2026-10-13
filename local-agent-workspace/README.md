@@ -291,12 +291,18 @@ when opening a conversation or performing restart recovery.
   files the agent changed there, for example in Bypass permissions, which needs no grant.
   Adding a folder does not give the agent access: it still needs **Folder access** to read or
   change it. Credential files stay hidden in added folders too. The filesystem root, folders
-  inside the project, and the app's state directory, a folder inside it or a folder containing
-  it cannot be added, and a project can have up to 20 added folders. The × beside an added
+  inside the project, the app's state directory, a folder inside it or a folder containing
+  it (also when reached by another name, such as a different letter case or a bind mount),
+  and folders the file tools exclude (such as `.git`, `.venv`, `.local` or `dist`) cannot be
+  added, and a project can have up to 20 added folders. A folder button shows the folder's
+  name, with parent folders when two names match; the full path is in its tooltip. The × beside an added
   folder removes it from Files and leaves the folder itself alone; a folder that no longer
-  exists shows "Not found". When the agent changed files under none of these folders,
+  exists or cannot be reached shows "Not found". When the agent changed files under none of these folders,
   "N changed files outside these folders" offers **Add <folder>** for up to three of their
-  folders. The list is kept in `workspace_folders.json` in the state directory. The choice
+  folders. **Agent tools → Recovery** can preview and restore saves and agent edits in an
+  added folder. Reviewing an agent change there (**Keep** or **Undo**) still uses the
+  conversation's own access: outside Bypass permissions the folder needs **Folder access**.
+  The list is kept in `workspace_folders.json` in the state directory. The choice
   goes back to **Project** for another conversation or when the folder's grant or entry is
   removed. Save detects concurrent disk edits.
   Unsaved editor text stays with its conversation when closing the workspace panel,
