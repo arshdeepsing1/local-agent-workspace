@@ -17,13 +17,15 @@ function share(percent, whole) {
   return typeof percent === 'number' && typeof whole === 'number' ? `${percent}% of ${whole.toLocaleString()}` : 'Unavailable'
 }
 
-function ReportedInput({ report, current }) {
+function ReportedInput({ report, current, heading }) {
   const gap = report.estimate_gap_percent
   const cached = report.cache_read_input_tokens > 0 || report.cache_creation_input_tokens > 0
   const estimate = typeof report.estimated_tokens === 'number' ? `~${report.estimated_tokens.toLocaleString()}` : 'unavailable'
-  const scale = typeof report.estimate_scale === 'number' ? report.estimate_scale.toFixed(2) : '1.00'
+  // The scale later estimates use, with this report counted; older reports lack it.
+  const next = report.next_estimate_scale
+  const later = typeof next === 'number' ? `Later estimates are scaled from these reports (×${next.toFixed(2)}).` : 'Later estimates are scaled from these reports.'
   return html`
-    <p class="context-heading">${current ? 'Last request' : 'Before compaction'} · reported by Databricks</p>
+    <p class="context-heading">${heading} · reported by Databricks</p>
     <dl class="context-breakdown context-reported">
       <div><dt>Input tokens</dt><dd>${inputParts(report)}</dd></div>
       <div><dt>Output tokens</dt><dd>${count(report.output_tokens)}${typeof report.reasoning_tokens === 'number' ? ` (reasoning ${report.reasoning_tokens.toLocaleString()})` : ''}</dd></div>
@@ -33,13 +35,14 @@ function ReportedInput({ report, current }) {
       <div><dt>Status</dt><dd>${report.status ?? 'unknown'}${report.finish_reason ? ` · ${report.finish_reason}` : ''}${report.partial ? ' · partial (the response ended early; counts may be incomplete)' : ''}</dd></div>
     </dl>
     ${current && typeof gap === 'number' ? html`<p>${gap > 2
-      ? `Databricks counted ${gap}% more input tokens than the app's estimate for this request (${estimate}). The app estimates from text size before sending; the provider counts with the model's tokenizer and adds its own formatting for messages and tools. Later estimates are scaled from these reports (×${scale}).`
+      ? `Databricks counted ${gap}% more input tokens than the app's estimate for this request (${estimate}). The app estimates from text size before sending; the provider counts with the model's tokenizer and adds its own formatting for messages and tools. ${later}`
       : gap < -2
-        ? `Databricks counted ${Math.abs(gap)}% fewer input tokens than the app's estimate for this request (${estimate}). The app never scales its estimate below the text-size heuristic, so compaction may start slightly early.`
+        ? `Databricks counted ${Math.abs(gap)}% fewer input tokens than the app's estimate for this request (${estimate}). ${next === 1
+          ? 'The app never scales its estimate below the text-size heuristic, so compaction may start slightly early.' : later}`
         : "The app's estimate matched the reported count within 2%."}${cached ? ' Cached tokens still occupy the context window; they are cheaper, not smaller.' : ''}</p>` : null}`
 }
 
-export default function ContextMeter({ info, busy = false, onCompact }) {
+export default function ContextMeter({ info, model, busy = false, onCompact }) {
   const [note, setNote] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
@@ -48,9 +51,12 @@ export default function ContextMeter({ info, busy = false, onCompact }) {
   const percent = Math.round(info.estimated_tokens / info.input_budget * 100)
   const safetyReserve = info.context_window - info.input_budget - info.reply_reserve
   const report = info.last_request
-  // A report describes the request as sent; after a compaction or in a preview it is history.
+  // A report describes the request as sent; after a compaction, in a preview, or after
+  // the input budget or the model changed it is history.
+  const sameSetup = !!report && report.input_budget === info.input_budget && (!model || !report.model || report.model === model)
   const reportedIsCurrent = !!report && !info.prepared_for_next_turn && report.compactions === info.compactions
-    && typeof report.input_tokens === 'number' && typeof report.percent_of_input_budget === 'number'
+    && sameSetup && typeof report.input_tokens === 'number' && typeof report.percent_of_input_budget === 'number'
+  const reportHeading = reportedIsCurrent ? 'Last request' : report && report.compactions !== info.compactions ? 'Before compaction' : 'Earlier request'
   const value = reportedIsCurrent ? report.percent_of_input_budget : percent
   const mark = info.auto_compact_percent
   const modelShare = reportedIsCurrent && typeof report.percent_of_model_window === 'number'
@@ -70,13 +76,13 @@ export default function ContextMeter({ info, busy = false, onCompact }) {
       ${info.warnings.length > 0 ? html`<span> · ${info.warnings.length} ${info.warnings.length === 1 ? 'warning' : 'warnings'}</span>` : null}
     </summary>
     <div class="context-details">
-      ${report && typeof report.input_tokens === 'number' ? html`<${ReportedInput} report=${report} current=${reportedIsCurrent} />
+      ${report && typeof report.input_tokens === 'number' ? html`<${ReportedInput} report=${report} current=${reportedIsCurrent} heading=${reportHeading} />
         <p class="context-heading">App estimate</p>` : null}
       ${legacyEstimate ? html`<p>The saved meter counted bytes as tokens and can overstate context use. It will refresh on the next model request.</p>` : html`
         <p>Approximately ${info.estimated_tokens.toLocaleString()} of ${info.input_budget.toLocaleString()} input tokens used.</p>
         <p>${info.estimate_scale && info.estimate_prior ? `Text-size estimate scaled ×${info.estimate_scale.toFixed(2)}, this model's starting ratio until Databricks reports input tokens for it. Not billing usage.` : info.estimate_scale ? `Text-size estimate scaled ×${info.estimate_scale.toFixed(2)} to match the input tokens Databricks reported for recent requests to this model. Not billing usage.` : 'Heuristic text-size estimate, not a provider token count or billing usage. Actual token counts vary by model.'} ${info.prepared_for_next_turn ? 'Preview after compaction using saved tool definitions, or built-in tools when unavailable. Definitions and instructions may change on the next model request.' : 'Estimate for the last request; updates each model call.'}</p>
         ${next && typeof next.tokens === 'number' ? html`<p>Next request: ~${next.tokens.toLocaleString()} tokens (${next.percent_of_input_budget}% of the input budget) before your next message. Automatic compaction runs when it passes ~${threshold.toLocaleString()} tokens.</p>` : null}
-        ${info.compaction_deferred ? html`<p>The estimate passed the auto-compact threshold, but there were no earlier turns to summarize, so the request was sent as it is.</p>` : null}
+        ${info.compaction_deferred ? html`<p>The estimate passed the auto-compact threshold, but summarizing earlier turns would not bring it under the threshold, so the request was sent as it is. Compaction runs when it would, or when the request no longer fits the input budget.</p>` : null}
         ${info.summary_adjustment ? html`<p>${info.summary_adjustment === 'condensed' ? 'The latest conversation summary was over its size limit and was condensed by a short extra request.' : 'The latest conversation summary was over its size limit and part of it was omitted.'} Full history is preserved.</p>` : null}`}
       ${!legacyEstimate && info.breakdown ? html`
         <p class="context-heading">Approximate input breakdown (app estimate)</p>

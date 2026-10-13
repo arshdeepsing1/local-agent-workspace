@@ -11,6 +11,8 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
   const [envText, setEnvText] = useState((settings.command_env || []).join(' '))
   const instructions = form.user_instructions || ''
   const inputBudget = form.context_window - form.max_output_tokens - 2048
+  const compactPercent = form.auto_compact_percent ?? 90
+  const compactPercentValid = Number.isInteger(compactPercent) && compactPercent >= 50 && compactPercent <= 100
   const claudeQuotaExceeded = form.model === 'databricks-claude-opus-4-8' && form.max_output_tokens > 20000
   const claudeQuotaConsumed = form.model === 'databricks-claude-opus-4-8' && form.max_output_tokens === 20000
   useEffect(() => { dialog.current?.showModal() }, [])
@@ -47,8 +49,8 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
           onChange=${e => field('compaction_handoffs', e.currentTarget.checked)} />Save a detailed handoff at each compaction</label>
         <p class="field-help">When earlier turns are compacted, the model writes a detailed handoff (up to 16,000 output tokens, plus up to 8,192 for thinking on models that always think, such as Claude Opus 5.5) that the app saves to handoffs/auto/ in the project folder with an exact log of every command. The model is told where to find it after compaction. Compaction then takes a few minutes longer and uses more output tokens.</p>
         <label>Auto-compact at (% of input budget)<input type="number" required min=${50} max=${100} step=${1}
-          value=${form.auto_compact_percent ?? 90} onInput=${number('auto_compact_percent')} /></label>
-        <p class="field-help">Earlier turns are summarized automatically when the next request's estimated input passes this share of the input budget (default 90). With these settings that is about ${Math.floor(inputBudget * (form.auto_compact_percent ?? 90) / 100).toLocaleString()} tokens. Lower values compact sooner and keep requests smaller; 100 waits until the input budget is full.</p>
+          value=${form.auto_compact_percent === undefined ? 90 : form.auto_compact_percent || ''} onInput=${number('auto_compact_percent')} /></label>
+        <p class="field-help">Earlier turns are summarized automatically when the next request's estimated input passes this share of the input budget (default 90). ${compactPercentValid ? `With these settings that is about ${Math.floor(inputBudget * compactPercent / 100).toLocaleString()} tokens.` : 'Enter a whole number from 50 to 100.'} Lower values compact sooner and keep requests smaller; 100 waits until the input budget is full.</p>
         <label class="settings-checkbox"><input type="checkbox" checked=${form.system_notifications === true}
           onChange=${e => field('system_notifications', e.currentTarget.checked)} />Desktop notification when no browser tab is open</label>
         <p class="field-help">When no page of this app is open, the server shows a system notification when a conversation needs approval, finishes, or stops with an error (notify-send on Linux, osascript on macOS). It names only the status and the conversation title.</p>

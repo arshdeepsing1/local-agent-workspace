@@ -116,6 +116,17 @@ def test_the_auto_compact_field_explains_the_token_threshold_and_is_saved(ui, pa
     field.fill("60")
     expect(dialog.get_by_text(re.compile(r"that is about 72,499 tokens"))).to_be_visible()
     field.fill("40")
+    expect(dialog.get_by_text(re.compile(r"Enter a whole number from 50 to 100\."))).to_be_visible()
+    expect(dialog.get_by_text(re.compile(r"that is about 48,"))).to_have_count(0)
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_be_visible()
+    assert ui.bodies("/api/settings", "PUT") == []
+    # Clearing the field leaves it empty (no 0 put back) and claims no token count.
+    field.select_text()
+    field.press("Backspace")
+    expect(field).to_have_value("")
+    expect(dialog.get_by_text(re.compile(r"Enter a whole number from 50 to 100\."))).to_be_visible()
+    expect(dialog.get_by_text(re.compile(r"about 0 tokens"))).to_have_count(0)
     dialog.get_by_role("button", name="Save settings").click()
     expect(page.get_by_role("dialog")).to_be_visible()
     assert ui.bodies("/api/settings", "PUT") == []

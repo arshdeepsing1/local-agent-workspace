@@ -106,10 +106,10 @@
 //   compactions, summarized_messages, estimate_method, instruction_files, warnings,
 //   instruction_sources?, prepared_for_next_turn?, breakdown?, estimate_scale?, summary_adjustment?,
 //   estimate_prior? (true: estimate_scale is the model's starting ratio, not yet from reported counts),
-//   auto_compact_threshold?, auto_compact_percent?, compaction_deferred? (over the threshold with nothing earlier
-//   to summarize: sent as it was), compaction?: Compaction (when this request compacted), last_request?: LastRequest,
+//   auto_compact_threshold?, auto_compact_percent?, compaction_deferred? (over the threshold but within the input
+//   budget, and no cut brings it under the threshold: sent as it was), compaction?: Compaction (when this request compacted), last_request?: LastRequest,
 //   next_estimate?: { tokens, percent_of_input_budget, percent_of_threshold } (the app's estimate of the next
-//   request before the user's next message) }
+//   request before the user's next message; set when a turn ends) }
 // Compaction: { number, trigger: 'manual'|'in_turn'|'auto', before_tokens, after_tokens, threshold_tokens,
 //   summarized_messages, requests (summary and condense requests), elided_bytes, superseded_results }
 // LastRequest (what Databricks reported for the latest agent request): { call_id, model, status, finish_reason?,
@@ -118,8 +118,10 @@
 //   reasoning_tokens?, context_window, input_budget, auto_compact_threshold, auto_compact_percent, compactions
 //   (the info's compactions when it was sent; a different value means a compaction ran since),
 //   percent_of_input_budget, percent_of_context_budget, percent_of_threshold, model_window (null when unknown),
-//   percent_of_model_window, estimated_tokens (the app's estimate of the same request), estimate_scale,
-//   estimate_gap_percent }. Percentages are rounded to one decimal, or null without a denominator.
+//   percent_of_model_window, estimated_tokens (the app's estimate of the same request), estimate_scale (the scale
+//   that estimate used), next_estimate_scale? (the scale later estimates use, this report counted),
+//   estimate_gap_percent }. Percentages are rounded to one decimal, or null without a denominator. The meter
+//   treats it as current only while compactions, input_budget and model match the session's.
 // Metrics (GET /sessions/<id>/metrics): { scope, session_id, complete, totals, calls, by_purpose, by_model,
 //   pricing, last_input: LastRequest | null }
 // Job: { id, session_id, workspace, command, state, created, updated, exit_code,

@@ -135,7 +135,7 @@ REPORT = """{ call_id: 'c1', model: 'databricks-claude-opus-5-5', status: 'compl
   output_tokens: 50, reasoning_tokens: 20, context_window: 131072, input_budget: 120832, auto_compact_threshold: 108748,
   auto_compact_percent: 90, compactions: 1, percent_of_input_budget: 8.3, percent_of_context_budget: 7.6,
   percent_of_threshold: 9.2, model_window: 1000000, percent_of_model_window: 1, estimated_tokens: 8000,
-  estimate_scale: 1.3, estimate_gap_percent: 25 }"""
+  estimate_scale: 1.3, next_estimate_scale: 1.25, estimate_gap_percent: 25 }"""
 REPORTED = f"""{{ ...{CONTEXT}, estimated_tokens: 8000, auto_compact_threshold: 108748, auto_compact_percent: 90,
   last_request: {REPORT} }}"""
 
@@ -161,8 +161,10 @@ def test_reported_input_is_shown_with_percentages_and_the_threshold_mark(ui, pag
     expect(definition(reported, "Status")).to_have_text("completed · stop")
     expect(page.get_by_text(re.compile(
         r"^Databricks counted 25% more input tokens than the app's estimate for this request \(~8,000\)\. .*"
-        r"Later estimates are scaled from these reports \(×1\.30\)\. Cached tokens still occupy the context window; "
+        r"Later estimates are scaled from these reports \(×1\.25\)\. Cached tokens still occupy the context window; "
         r"they are cheaper, not smaller\.$"))).to_be_visible()
+    # The scale this request used (×1.30) is not the one later estimates use.
+    expect(page.get_by_text(re.compile("×1\\.30"))).to_have_count(0)
     expect(page.get_by_text("App estimate", exact=True)).to_be_visible()
     expect(page.get_by_text("Approximately 8,000 of 120,832 input tokens used.")).to_be_visible()
     expect(page.get_by_text("Automatic compaction at 90% of the input budget: about 108,748 input tokens "
@@ -184,6 +186,25 @@ def test_a_report_from_before_a_compaction_is_labelled_and_the_estimate_leads(ui
     expect(page.get_by_text("Before compaction · reported by Databricks")).to_be_visible()
 
 
+def test_a_report_from_another_budget_or_model_is_not_shown_as_current(ui, page):
+    # The input budget changed in Settings since the report: its share is of the old budget.
+    ui.mount("components/ContextMeter.js", f"""{{ info: {{ ...{REPORTED}, input_budget: 989760, context_window: 1000000,
+        estimated_tokens: 99000 }}, model: 'databricks-claude-opus-5-5' }}""")
+    summary = page.get_by_text("Last model input · ~10%")
+    expect(summary).to_be_visible()
+    expect(page.get_by_role("progressbar", name="Reported model input usage")).to_have_count(0)
+    summary.click()
+    expect(page.get_by_text("Earlier request · reported by Databricks")).to_be_visible()
+    expect(page.get_by_text(re.compile("Databricks counted"))).to_have_count(0)
+    # The conversation switched models since the report.
+    ui.rerender(f"{{ info: {REPORTED}, model: 'databricks-gpt-oss-120b' }}")
+    expect(page.get_by_text("Last model input · ~7%")).to_be_visible()
+    expect(page.get_by_text("Earlier request · reported by Databricks")).to_be_visible()
+    ui.rerender(f"{{ info: {REPORTED}, model: 'databricks-claude-opus-5-5' }}")
+    expect(page.get_by_text("Last model input · 10,000 tokens · 8.3%")).to_be_visible()
+    expect(page.get_by_text("Last request · reported by Databricks")).to_be_visible()
+
+
 def test_partial_fewer_and_matching_reports(ui, page):
     ui.mount("components/ContextMeter.js", f"""{{ info: {{ ...{REPORTED}, last_request: {{ ...{REPORT}, partial: true,
         status: 'cancelled', finish_reason: undefined, estimate_gap_percent: -4.5, cache_read_input_tokens: 0,
@@ -197,9 +218,18 @@ def test_partial_fewer_and_matching_reports(ui, page):
     expect(definition(reported, "Input tokens")).to_have_text("10,000")
     expect(definition(reported, "Model window")).to_have_text("Not known for this endpoint")
     expect(definition(reported, "Status")).to_have_text(re.compile("^cancelled · partial"))
-    expect(page.get_by_text(re.compile(r"^Databricks counted 4\.5% fewer input tokens .* compaction may start "
-                                       r"slightly early\.$"))).to_be_visible()
+    # Below the scaled estimate but above the text-size heuristic: later estimates are scaled down.
+    expect(page.get_by_text(re.compile(r"^Databricks counted 4\.5% fewer input tokens .*\(~8,000\)\. Later estimates "
+                                       r"are scaled from these reports \(×1\.25\)\.$"))).to_be_visible()
     expect(page.get_by_text(re.compile("Cached tokens still occupy"))).to_have_count(0)
+    ui.rerender(f"""{{ info: {{ ...{REPORTED}, last_request: {{ ...{REPORT}, estimate_gap_percent: -4.5,
+        estimate_scale: 1, next_estimate_scale: 1 }} }} }}""")
+    expect(page.get_by_text(re.compile(r"^Databricks counted 4\.5% fewer input tokens .* The app never scales its "
+                                       r"estimate below the text-size heuristic, so compaction may start slightly "
+                                       r"early\."))).to_be_visible()
+    # A report saved before the next scale was recorded names no number.
+    ui.rerender(f"{{ info: {{ ...{REPORTED}, last_request: {{ ...{REPORT}, next_estimate_scale: undefined }} }} }}")
+    expect(page.get_by_text(re.compile(r"Later estimates are scaled from these reports\. Cached"))).to_be_visible()
     ui.rerender(f"{{ info: {{ ...{REPORTED}, last_request: {{ ...{REPORT}, estimate_gap_percent: 1.5 }} }} }}")
     expect(page.get_by_text(re.compile(r"^The app's estimate matched the reported count within 2%\."))).to_be_visible()
 
@@ -219,8 +249,9 @@ def test_next_estimate_and_deferred_compaction_are_explained(ui, page):
     page.get_by_text("Last model input · ~5%").click()
     expect(page.get_by_text("Next request: ~7,200 tokens (6% of the input budget) before your next message. "
                             "Automatic compaction runs when it passes ~108,748 tokens.")).to_be_visible()
-    expect(page.get_by_text("The estimate passed the auto-compact threshold, but there were no earlier turns to "
-                            "summarize, so the request was sent as it is.")).to_be_visible()
+    expect(page.get_by_text("The estimate passed the auto-compact threshold, but summarizing earlier turns would not "
+                            "bring it under the threshold, so the request was sent as it is. Compaction runs when it "
+                            "would, or when the request no longer fits the input budget.")).to_be_visible()
     expect(page.get_by_text(re.compile("reported by Databricks"))).to_have_count(0)
 
 
