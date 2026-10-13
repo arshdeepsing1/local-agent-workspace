@@ -322,7 +322,7 @@ async def test_below_the_budget_a_cut_that_misses_the_threshold_is_not_taken():
     wire = [user("hi"), assistant("Hello."), user("thanks"), assistant("Sure."), user("word " * 66_000)]
     messages, state, info = await prepare_context(
         wire, {}, SYSTEM, TOOLS, context.DEFAULT_CONTEXT_WINDOW, never, auto_compact_percent=90,
-        record_requests=True, app_record=lambda wire, cut: "")
+        record_requests=True, app_record=lambda wire, cut, limit: "")
     assert info["auto_compact_threshold"] < info["estimated_tokens"] <= info["input_budget"]
     assert info["compaction_deferred"] is True and state["compactions"] == 0 and messages == [SYSTEM, *wire]
     # A manual compaction still may use a cut that only fits the budget.
@@ -331,7 +331,7 @@ async def test_below_the_budget_a_cut_that_misses_the_threshold_is_not_taken():
 
     _, state, info = await prepare_context(
         wire, {}, SYSTEM, TOOLS, context.DEFAULT_CONTEXT_WINDOW, summarize, auto_compact_percent=90,
-        force_compact=True, record_requests=True, app_record=lambda wire, cut: "")
+        force_compact=True, record_requests=True, app_record=lambda wire, cut, limit: "")
     assert state["compactions"] == 1 and info["compaction"]["trigger"] == "manual"
 
 
@@ -348,7 +348,7 @@ async def test_a_large_request_over_the_threshold_does_not_compact_at_every_tool
     for step in range(1, 13):
         _, state, info = await prepare_context(
             wire, state, SYSTEM, TOOLS, window, summarize, auto_compact_percent=50, record_requests=True,
-            app_record=lambda wire, cut: "")
+            app_record=lambda wire, cut, limit: "")
         if "compaction" in info:
             compactions.append(info["compaction"])
         else:
@@ -369,10 +369,13 @@ async def test_app_notes_are_clipped_to_half_the_record_limit():
     notes = "\n".join(f"- src/package_{n}/module_with_a_long_name_{n}.py" for n in range(500))
     assert len(notes.encode()) > 20_000
     _, state, _ = await prepare_context(history([100, 100]), {}, SYSTEM, TOOLS, window, summarize,
-                                        force_compact=True, app_record=lambda wire, cut: notes)
+                                        force_compact=True, app_record=lambda wire, cut, limit: notes)
     assert len(state["app_notes"].encode()) <= app_record_limit(budget) // 2
-    assert context.SUMMARY_TRIM_MARKER in state["app_notes"]
-    assert state["app_notes"].startswith("- src/package_0/") and state["app_notes"].endswith("module_with_a_long_name_499.py")
+    # A safety net cut at a line end, marked as the app's notes (app_record fits them by whole lines itself).
+    assert context.SUMMARY_TRIM_MARKER not in state["app_notes"]
+    kept, marker = state["app_notes"].rsplit("\n", 1)
+    assert "\n" + marker == context.APP_NOTES_CLIP_MARKER and kept.startswith("- src/package_0/")
+    assert set(kept.split("\n")) <= set(notes.split("\n"))
 
 
 async def test_a_cut_reserves_room_for_the_app_record():
@@ -398,7 +401,7 @@ async def test_a_cut_reserves_room_for_the_app_record():
     assert threshold < estimate_tokens([SYSTEM, *wire], TOOLS) <= budget
     big_notes = "n" * 50_000
     _, state, info = await prepare_context(wire, {}, SYSTEM, TOOLS, window, never, auto_compact_percent=percent,
-                                           record_requests=True, app_record=lambda wire, cut: big_notes)
+                                           record_requests=True, app_record=lambda wire, cut, limit: big_notes)
     assert info["compaction_deferred"] is True and state["compactions"] == 0
 
 

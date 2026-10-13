@@ -9,11 +9,11 @@
 //   python_venv (virtual environment the agent's commands, Verify, hooks and the Terminal use, '' = off),
 //   coding_dir_status: { path, state: 'off'|'ready'|'missing'|'invalid', message, source: 'settings'|'env'|'none' }
 //     (path: the checked absolute folder; the raw value only when invalid; null when off),
-//   python_venv_status: { path, state: 'off'|'ready'|'invalid', message, python, version, source },
+//   python_venv_status: { path, state: 'off'|'ready'|'invalid', message, python, version, pip (when ready: bool, or null if no site-packages folder is found), source },
 //   default_model (the app's default endpoint),
 //   default_limits: { context_window, max_output_tokens } (the saved model's defaults; budgets equal to them
-//     follow a model change), model_migrated_from? (set once after the one-time move of
-//   saved settings from the old default model; cleared by the next save) }
+//     follow a model change), model_migrated_from? (set while a legacy settings file at the old default
+//   model is moved at load; cleared by the next save, which writes settings_version 2) }
 // GET /settings -> Settings (the folder states checked again). PUT /settings { ...editable fields } -> Settings.
 // POST /settings/limits { model, context_window, max_output_tokens } -> LimitsCheck:
 //   { profile: { label, context_max, output_max, itpm, otpm, recommended_context_window,
@@ -130,13 +130,17 @@
 //   'output_tokens_over_limit' (Max output tokens above the endpoint's reported OTPM limit).
 // ContextInfo: { estimated_tokens, input_budget, context_window, reply_reserve,
 //   compactions, summarized_messages, estimate_method, instruction_files, warnings,
-//   instruction_sources?, prepared_for_next_turn?, breakdown?, estimate_scale?, summary_adjustment?,
+//   instruction_sources?, prepared_for_next_turn?, breakdown?, estimate_scale?, summary_adjustment? (the summary was over its
+//   byte limit), summary_fitted_to_budget?: 'condensed'|'trimmed' (shortened because the request after compaction
+//   was over the input budget),
 //   estimate_prior? (true: estimate_scale is the model's starting ratio, not yet from reported counts),
 //   auto_compact_threshold?, auto_compact_percent?, compaction_deferred? (over the threshold but within the input
 //   budget, and no cut brings it under the threshold: sent as it was), compaction?: Compaction (when this request compacted), last_request?: LastRequest,
-//   next_estimate?: { tokens, percent_of_input_budget, percent_of_threshold } (the app's estimate of the next
-//   request before the user's next message; set when a turn ends), payload_bytes? (the size of the request
-//   body sent), payload_limit_bytes? (the Databricks per-request limit, 4,000,000) }
+//   next_estimate?: { tokens, scale?, percent_of_input_budget, percent_of_threshold } (the app's estimate of the
+//   next request before the user's next message; set when a turn ends), payload_bytes? (the size of the request
+//   body sent), payload_limit_bytes? (the Databricks per-request limit, 4,000,000) }. After a model change or a
+//   Settings save the budget fields, the threshold and next_estimate of an idle chat follow the new setup;
+//   estimated_tokens, estimate_scale and last_request still describe the last request.
 // Compaction: { number, trigger: 'manual'|'in_turn'|'auto', before_tokens, after_tokens, threshold_tokens,
 //   summarized_messages, requests (summary and condense requests), elided_bytes, superseded_results }
 // LastRequest (what Databricks reported for the latest agent request): { call_id, model, status, finish_reason?,
@@ -148,7 +152,8 @@
 //   percent_of_model_window, estimated_tokens (the app's estimate of the same request), estimate_scale (the scale
 //   that estimate used), next_estimate_scale? (the scale later estimates use, this report counted),
 //   estimate_gap_percent }. Percentages are rounded to one decimal, or null without a denominator. The meter
-//   treats it as current only while compactions, input_budget and model match the session's.
+//   treats it as current only while compactions and input_budget match the session's, and the model too once a
+//   request to another model has been prepared (estimated_tokens no longer the report's).
 // Metrics (GET /sessions/<id>/metrics): { scope, session_id, complete, totals, calls, by_purpose, by_model,
 //   pricing, last_input: LastRequest | null }
 // Job: { id, session_id, workspace, command, state, created, updated, exit_code,

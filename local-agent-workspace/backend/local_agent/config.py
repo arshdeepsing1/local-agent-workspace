@@ -89,7 +89,8 @@ class Settings:
         self.path = self.state_dir / "settings.json"
         self.values = {
             "workspace": self.env.get("LOCAL_AGENT_WORKSPACE", str(APP_ROOT.parent)),
-            "model": self.env.get("LOCAL_AGENT_MODEL", DEFAULT_MODEL),
+            # An empty LOCAL_AGENT_MODEL= line means the default, as the migration below treats it.
+            "model": self.env.get("LOCAL_AGENT_MODEL", "").strip() or DEFAULT_MODEL,
             "env_file": self.env.get("LOCAL_AGENT_ENV_FILE", ""),
             **{key: self.env.get(name, "").strip() for key, name in ENV_KEYS.items()},
             "max_agent_steps": DEFAULT_MAX_AGENT_STEPS,
@@ -109,11 +110,12 @@ class Settings:
             keys = set(self.values) | set(LIMIT_KEYS)
             # A file from before the default model changed that still holds the old default model and
             # budgets moves to the new default once; the next save writes SETTINGS_VERSION, so a user
-            # who then picks the old model keeps it.
+            # who then picks the old model keeps it. LOCAL_AGENT_MODEL may be unset, the old default or
+            # the new default (the current .env.example value).
             if ("settings_version" not in saved and saved.get("model") == LEGACY_DEFAULT_MODEL
                     and (saved.get("context_window", LEGACY_DEFAULT_LIMITS[0]),
                          saved.get("max_output_tokens", LEGACY_DEFAULT_LIMITS[1])) == LEGACY_DEFAULT_LIMITS
-                    and self.env.get("LOCAL_AGENT_MODEL", "").strip() in ("", LEGACY_DEFAULT_MODEL)):
+                    and self.env.get("LOCAL_AGENT_MODEL", "").strip() in ("", LEGACY_DEFAULT_MODEL, DEFAULT_MODEL)):
                 saved = {key: value for key, value in saved.items() if key not in LIMIT_KEYS}
                 saved["model"] = DEFAULT_MODEL
                 self.migrated_from = LEGACY_DEFAULT_MODEL

@@ -136,6 +136,21 @@ def _identity(path):
     return info.st_dev, info.st_ino
 
 
+def parts_below(path, folder):
+    """The parts of path below folder (() for folder itself), or None when path is not folder or inside it.
+    Matched by name, then by file identity of path and its parents: resolve() only follows symbolic links, so a
+    case variant on a case-insensitive disk, a bind mount or a macOS firmlink is another name for the same folder."""
+    path, folder = Path(path), Path(folder)
+    if path.is_relative_to(folder):
+        return path.relative_to(folder).parts
+    target = _identity(folder)
+    if target is not None:
+        for ancestor in (path, *path.parents):
+            if _identity(ancestor) == target:
+                return path.relative_to(ancestor).parts
+    return None
+
+
 def _decode_line(raw):
     """A line as text, and whether it had bytes that are not valid UTF-8."""
     try:

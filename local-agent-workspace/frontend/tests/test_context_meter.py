@@ -109,8 +109,16 @@ def test_calibrated_estimate_and_summary_adjustments(ui, page):
     ui.rerender(f"{{ info: {{ ...{CONTEXT}, summary_adjustment: 'trimmed' }} }}")
     expect(page.get_by_text(re.compile("Heuristic text-size estimate"))).to_be_visible()
     expect(page.get_by_text(re.compile(r"part of it was omitted\. Full history is preserved\."))).to_be_visible()
+    # Within its own limit, but the request after compaction was over the input budget.
+    ui.rerender(f"{{ info: {{ ...{CONTEXT}, summary_fitted_to_budget: 'trimmed' }} }}")
+    expect(page.get_by_text(re.compile(r"^The request after the latest compaction was over the input budget .*so part "
+                                       r"of the summary was omitted to fit\. Full history is preserved\.$"))).to_be_visible()
+    expect(page.get_by_text(re.compile("over its size limit"))).to_have_count(0)
+    ui.rerender(f"{{ info: {{ ...{CONTEXT}, summary_fitted_to_budget: 'condensed' }} }}")
+    expect(page.get_by_text(re.compile("a short extra request condensed the summary to fit"))).to_be_visible()
     ui.rerender(f"{{ info: {CONTEXT} }}")
     expect(page.get_by_text(re.compile("over its size limit"))).to_have_count(0)
+    expect(page.get_by_text(re.compile("over the input budget"))).to_have_count(0)
 
 
 def test_custom_instructions_and_skill_index_apply_beyond_a_folder(ui, page):
@@ -197,13 +205,82 @@ def test_a_report_from_another_budget_or_model_is_not_shown_as_current(ui, page)
     summary.click()
     expect(page.get_by_text("Earlier request · reported by Databricks")).to_be_visible()
     expect(page.get_by_text(re.compile("Databricks counted"))).to_have_count(0)
-    # The conversation switched models since the report.
+    # The conversation switched models since the report, at the same budget. Until a request to the new model is
+    # prepared, the info and the report describe the same request, so the reported value stays.
     ui.rerender(f"{{ info: {REPORTED}, model: 'databricks-gpt-oss-120b' }}")
+    expect(page.get_by_text("Last model input · 10,000 tokens · 8.3%")).to_be_visible()
+    expect(page.get_by_text("Last request · reported by Databricks")).to_be_visible()
+    # A request to the new model was prepared (streaming, or it failed): the report is history.
+    ui.rerender(f"{{ info: {{ ...{REPORTED}, estimated_tokens: 8800 }}, model: 'databricks-gpt-oss-120b' }}")
     expect(page.get_by_text("Last model input · ~7%")).to_be_visible()
     expect(page.get_by_text("Earlier request · reported by Databricks")).to_be_visible()
     ui.rerender(f"{{ info: {REPORTED}, model: 'databricks-claude-opus-5-5' }}")
     expect(page.get_by_text("Last model input · 10,000 tokens · 8.3%")).to_be_visible()
     expect(page.get_by_text("Last request · reported by Databricks")).to_be_visible()
+
+
+# After one Opus 5.5 turn at default Settings (report 138,403 tokens, 76.2% of 181,568), the picker switched
+# the chat to GPT OSS: the backend moved the budgets and rescaled the next-request estimate, but the last
+# request's estimate (139,084 at ×1.3) is still Opus-scaled.
+SWITCHED = """{ estimated_tokens: 139084, estimate_scale: 1.3, input_budget: 120832, context_window: 131072,
+  reply_reserve: 8192, compactions: 0, summarized_messages: 0, estimate_method: 'weighted_utf8',
+  instruction_files: [], warnings: [], auto_compact_percent: 90, auto_compact_threshold: 108748,
+  next_estimate: { tokens: 107003, scale: 1, percent_of_input_budget: 88.6, percent_of_threshold: 98.4 },
+  last_request: { call_id: 'c1', model: 'databricks-claude-opus-5-5', status: 'completed', finish_reason: 'stop',
+    partial: false, input_tokens: 138403, uncached_input_tokens: 138403, cache_read_input_tokens: 0,
+    cache_creation_input_tokens: 0, output_tokens: 50, context_window: 200000, input_budget: 181568,
+    auto_compact_threshold: 163411, auto_compact_percent: 90, compactions: 0, percent_of_input_budget: 76.2,
+    percent_of_context_budget: 69.2, model_window: 1000000, percent_of_model_window: 13.8, estimated_tokens: 139084,
+    estimate_scale: 1.3, next_estimate_scale: 1.3, estimate_gap_percent: -0.5 } }"""
+
+
+def test_a_switch_to_a_model_with_another_budget_shows_the_next_requests_share(ui, page):
+    ui.mount("components/ContextMeter.js", f"{{ info: {SWITCHED}, model: 'databricks-gpt-oss-120b' }}")
+    # Not the Opus-scaled estimate over the GPT OSS budget (~115%, marked over the threshold).
+    summary = page.get_by_text("Next request · ~89%")
+    expect(summary).to_be_visible()
+    expect(page.get_by_text(re.compile("115%"))).to_have_count(0)
+    expect(page.locator(".context-bar")).not_to_have_class(re.compile("over"))
+    expect(page.get_by_role("progressbar", name="Estimated next request input usage")).to_have_attribute(
+        "aria-valuetext", "Approximately 89% of input budget")
+    summary.click()
+    expect(page.get_by_text("Earlier request · reported by Databricks")).to_be_visible()
+    expect(page.get_by_text(re.compile(r"^Next request: ~107,003 tokens \(88\.6% of the input budget\)"))).to_be_visible()
+    # Once a request to the new model is prepared, the meter shows that request's own estimate again.
+    ui.rerender(f"{{ info: {{ ...{SWITCHED}, estimated_tokens: 107500, estimate_scale: undefined }}, "
+                "model: 'databricks-gpt-oss-120b' }")
+    expect(page.get_by_text("Last model input · ~89%")).to_be_visible()
+
+
+FIRST_OPUS = f"""{{ ...{CONTEXT}, estimated_tokens: 9722, estimate_scale: 1.3, estimate_prior: true,
+  last_request: {{ ...{REPORT}, input_tokens: 7211, uncached_input_tokens: 7211, cache_read_input_tokens: 0,
+  percent_of_input_budget: 6, estimated_tokens: 9722, estimate_scale: 1.3, next_estimate_scale: 1,
+  estimate_gap_percent: -25.8 }} }}"""
+
+
+def test_a_first_report_that_replaces_the_starting_ratio_says_so(ui, page):
+    # A new Opus 5.5 chat's first request: estimated at the ×1.30 starting ratio, reported below the plain
+    # text-size heuristic. The report replaces the starting ratio, so later estimates are unscaled.
+    ui.mount("components/ContextMeter.js", f"{{ info: {FIRST_OPUS} }}")
+    page.get_by_text("Last model input · 7,211 tokens · 6%").click()
+    expect(page.get_by_text(re.compile(r"^Databricks counted 25\.8% fewer input tokens .*\(~9,722\)\. That estimate "
+                                       r"was scaled ×1\.30; later estimates use the unscaled text-size heuristic "
+                                       r"\(×1\.00\)\. The app never scales its estimate below the text-size "
+                                       r"heuristic, so compaction may start slightly early\.$"))).to_be_visible()
+    expect(page.get_by_text(re.compile(r"scaled ×1\.30, this model's starting ratio before Databricks reported input "
+                                       r"tokens for it; later estimates use ×1\.00\."))).to_be_visible()
+    expect(page.get_by_text(re.compile("until Databricks reports"))).to_have_count(0)
+    # A cancelled request is no calibration sample: the starting ratio still applies.
+    ui.rerender(f"""{{ info: {{ ...{FIRST_OPUS}, last_request: {{ ...{FIRST_OPUS}.last_request, status: 'cancelled',
+        partial: true, finish_reason: undefined, next_estimate_scale: 1.3 }} }} }}""")
+    expect(page.get_by_text(re.compile(r"scaled ×1\.30, this model's starting ratio until Databricks reports input "
+                                       r"tokens for it"))).to_be_visible()
+    # A calibrated scale (no starting ratio) that falls to 1: no "starting ratio" wording.
+    ui.rerender(f"""{{ info: {{ ...{FIRST_OPUS}, estimate_scale: 1.1, estimate_prior: false, last_request: {{
+        ...{FIRST_OPUS}.last_request, estimate_scale: 1.1, estimate_gap_percent: -9.1 }} }} }}""")
+    expect(page.get_by_text(re.compile(r"That estimate was scaled ×1\.10; later estimates use the unscaled "
+                                       r"text-size heuristic \(×1\.00\)\."))).to_be_visible()
+    expect(page.get_by_text(re.compile("starting ratio"))).to_have_count(0)
 
 
 def test_partial_fewer_and_matching_reports(ui, page):

@@ -20,7 +20,7 @@ import uuid
 from pathlib import Path, PurePosixPath
 
 from .config import APP_ROOT  # noqa: F401  (agents.py checks protected paths against it)
-from .tools import SECRET_NAMES
+from .tools import SECRET_NAMES, parts_below
 
 MAX_COMMAND_TEXT = 50_000
 MAX_TOKENS = 64
@@ -583,13 +583,15 @@ def protected_reason(requested, resolved, *, root, home, app_root):
                 return f"CI configuration (.github/{second})"
         if parts and parts[-1] in PROTECTED_FILES:
             return f"agent and repository configuration ({candidate.name})"
-        if home is not None and candidate.is_relative_to(home):
-            inside = [str(part).casefold() for part in candidate.relative_to(home).parts]
-            if inside and inside[0] in HOME_FILES:
-                return f"shell and Git startup files (~/{candidate.relative_to(home).parts[0]})"
+        # By name and by file identity, so another name for home or the app folder is not a way around.
+        below = parts_below(candidate, home) if home is not None else None
+        if below:
+            inside = [str(part).casefold() for part in below]
+            if inside[0] in HOME_FILES:
+                return f"shell and Git startup files (~/{below[0]})"
             if inside[:2] == [".config", "git"]:
                 return "Git configuration (~/.config/git)"
-        if app_root is not None and candidate.is_relative_to(app_root):
+        if app_root is not None and parts_below(candidate, app_root) is not None:
             return "this app's own files"
     return None
 

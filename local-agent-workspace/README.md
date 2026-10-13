@@ -104,15 +104,17 @@ private state. The example paths must be replaced. The installation command
 installs runtime libraries automatically; add `./backend[test]` instead of
 `./backend` only if you need to run the backend tests.
 
-Without `LOCAL_AGENT_MODEL` the app uses `databricks-claude-opus-5-5` (Claude Opus 5.5,
+Without `LOCAL_AGENT_MODEL`, or with it empty, the app uses `databricks-claude-opus-5-5` (Claude Opus 5.5,
 with a 200,000-token context budget and 16,384 Max output tokens). `LOCAL_AGENT_MODEL` in
 `.env` applies only while no model is saved in Settings: once you save Settings (or choose a
 model in the model picker), the saved model wins over `.env`, so change the model there, not
 in `.env`. Saved settings from before Opus 5.5 became the default that still hold GPT OSS 120B
-at 131,072 and 8,192 move to Opus 5.5 once, also when `.env` still says
-`LOCAL_AGENT_MODEL=databricks-gpt-oss-120b` (the old `.env.example` value); Settings says so,
-and Opus 5.5 costs more per token. Choose `databricks-gpt-oss-120b` in Settings or the model
-picker to switch back; the choice is kept after that.
+at 131,072 and 8,192 move to Opus 5.5 once, also when `.env` says
+`LOCAL_AGENT_MODEL=databricks-gpt-oss-120b` (the old `.env.example` value) or
+`databricks-claude-opus-5-5` (the new one); Settings says so, and Opus 5.5 costs more per token.
+To switch back, choose `databricks-gpt-oss-120b` in Settings, or in the model picker of a new
+conversation (in an open conversation the picker changes only that conversation). The choice is
+kept after that, and Settings shows the note until then.
 
 Two optional values can be left empty:
 
@@ -1102,8 +1104,8 @@ back to a cut that merely fits the budget, so compaction never runs a billed sum
 request that leaves the request over the threshold.
 
 **Last model input** shows what Databricks reported for the latest agent request
-once a report arrives: "Last model input · 10,000 tokens · 8.3%", where the
-percentage is of the input budget, and a bar with a mark at the auto-compact
+once a report arrives: "Last model input · 10,000 tokens · 5.5%", where the
+percentage is of the input budget (of the default 181,568-token input budget), and a bar with a mark at the auto-compact
 threshold. The reported input is uncached input plus cache reads and writes: cached
 tokens still occupy the context window; they are cheaper, not smaller. A stream that
 stopped before it finished is marked "(partial)". Expanded, the meter lists the
@@ -1114,9 +1116,14 @@ far the app's estimate for the same request was from the reported count, with wh
 the two differ and the scale later estimates use. After a compaction, or in a
 **Context preview**, the report describes the request before it, so it is headed
 "Before compaction" and the collapsed meter shows the app's estimate (~N%) instead;
-after a change to the input budget or the model it is headed "Earlier request" in the
-same way. When a turn ends, the details also show the estimate for the next request
-before your next message. Title, compaction and side
+after the input budget changes, or once a request to another model has been prepared,
+it is headed "Earlier request" in the same way. A model change or a Settings save
+moves the meter to the budgets, auto-compact mark and next-request estimate of the
+chat's next request right away (a running chat follows when its turn ends; budgets apply
+from its next turn). When that changed the input budget, the collapsed meter reads
+**Next request · ~N%**: the next request's estimate, rescaled to the chat's model, as a
+share of the new input budget. When a turn ends, the details also show the
+estimate for the next request before your next message. Title, compaction and side
 question requests never change this report.
 
 The output-token limit is separate from the configurable total context capacity
@@ -1160,8 +1167,10 @@ deleted by a completed call, is replaced by a marker. The app's own hidden messa
 note you write when declining Verify stays your words. Your messages are never
 shortened, except for the @ file and ! output attachments in them.
 
-A summary request has at most 4,096 output tokens with the default settings (a third
-of the summary byte limit on large budgets). Summary chunks use that independent
+A plain summary request (with handoffs off, and in subagents) may use 4,096 output tokens,
+or a third of the summary byte limit on large budgets: 5,043 at the default 200,000 and
+16,384 on Claude Opus 5.5, plus the thinking allowance described below, 13,235 in all.
+With handoffs on (the default), that request writes the handoff instead; see below. Summary chunks use that independent
 reply reserve instead of the main response reserve, so increasing the main output
 setting does not multiply the number of compaction requests. The summary uses these
 sections, most important first, so a reply cut off at its limit loses the least:
@@ -1170,26 +1179,36 @@ constraints (with your exact words); Decisions and reasons; Errors, causes and f
 Files read and changed; Commands and results. A conversation long enough to need
 several summary requests passes each request's summary on whole to the next one and
 condenses only once, at the end. The retained summary may use about an eighth of the
-input budget, between 3,500 and 12,000 UTF-8 bytes (12,000 with the default settings),
-and up to 32,000 bytes on large budgets (a twelfth of the input budget); that byte cap
-is not a token count. A summary that comes back longer is not discarded, because
+input budget, between 3,500 and 12,000 UTF-8 bytes, and up to 32,000 bytes on large
+budgets (a twelfth of the input budget): 15,130 bytes with the default settings, 12,000 at
+131,072 and 8,192. That byte cap is not a token count. A summary that comes back longer is not discarded, because
 producing it may have required a large billed request: a small extra request,
 containing only that summary, asks the model to condense it, and a second one
 condenses that result if it is shorter but still too long. A condensing request may
 use about one output token per two bytes of the limit (6,000 tokens for 12,000 bytes,
-at least 4,096), so a slightly long reply is not cut off. A condensed summary that
+7,565 for the default 15,130; at least 4,096), so a slightly long reply is not cut off. A condensed summary that
 lost the goal, open tasks or requirements section counts as failed. If condensing
-fails or is still too long, the app shortens the least important sections first
-(never the first three) and, if that is not enough, keeps the start and end of the
-summary. A plain summary cut off at its output limit is kept with a note. These
+fails or is still too long, the app shortens the least important sections first, then
+reduces them to their headings; only then does it remove whole lines from the middle of
+the first three sections, in proportion to their size, keeping each one's first and last
+lines; a share that a short section cannot give goes to the others. Only if whole lines
+are not enough (for example a summary without those sections) does it keep the start
+and end of the summary. The summary's room is reserved in bytes,
+but escapes and non-ASCII text count more toward the estimate: when the request after a
+compaction is still over the input budget, the summary, already paid for, is shortened
+(or condensed once) to fit rather than discarded, and the compaction notice and the meter
+say why; only when even a summary of about 1,750 bytes would not fit does the turn stop
+with the context-budget error. A plain summary cut off at its output limit is kept with a note. These
 summary limits are separate from the main reply limit and total context budget.
 
 Next to the summary, the model gets an **app record** that the app writes itself,
-not the summarizer: your earlier requests in your own words (long ones shortened in
-the middle; the first request is always kept, and the oldest after it give way when
-the record is full), the task checklist when the compaction ran with full task IDs,
-the files the conversation changed before that point, and the files it read whose
-contents are no longer in its context. Those files must be read again before a write
+not the summarizer: your earlier requests in your own words (kept whole while the record
+has room; when it is full the longest are shortened in the middle, the first request is
+always kept, and the oldest after it give way), the task checklist when the compaction
+ran with full task IDs, the files the conversation changed before that point, and the
+files it read whose contents are no longer in its context, including those from earlier
+compactions until they are read again. When these notes are longer than their half of the
+record, whole lines go from the longest list, which then ends with how many more there are. Those files must be read again before a write
 or edit: the read-before-write check refuses with "its earlier contents were
 summarized out of your context" until they are. A file read or written after the
 compaction point, or attached with @ to the request still in context, stays readable.

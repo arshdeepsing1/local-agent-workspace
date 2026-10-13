@@ -451,6 +451,26 @@ def forget_summarized_reads(file_views, state, forgotten):
     return views, {**state, "summarized_reads": list(dict.fromkeys(earlier + forgotten))[-SUMMARIZED_READS_LIMIT:]}
 
 
+def fit_record_notes(parts, limit=None):
+    """The app notes from parts [(heading, lines, hidden, more(n), footer)], within limit UTF-8 bytes
+    when given. While over it, the last line of the part with the most bytes goes, so every part
+    keeps its heading, its footer and a line saying how many of its lines are not shown."""
+    parts = [[heading, list(lines), hidden, more, footer] for heading, lines, hidden, more, footer in parts]
+
+    def render(part):
+        heading, lines, hidden, more, footer = part
+        return "\n".join([heading, *lines, *([more(hidden)] if hidden else []), *([footer] if footer else [])])
+
+    while limit is not None and len("\n\n".join(map(render, parts)).encode("utf-8")) > limit:
+        longest = max((part for part in parts if part[1]), key=lambda part: len(render(part).encode("utf-8")),
+                      default=None)
+        if longest is None:
+            break
+        longest[1].pop()
+        longest[2] += 1
+    return "\n\n".join(map(render, parts))
+
+
 def auto_compact_percent(values):
     """Settings' auto-compact percentage, or the default when the saved value is not valid."""
     value = values.get("auto_compact_percent", DEFAULT_AUTO_COMPACT_PERCENT)
@@ -1268,6 +1288,8 @@ class AgentManager:
             else:
                 # Commands can also change reviewed files; refresh their counts after each turn.
                 await self.publish_changes(session, only_tracked=True)
+            # A Settings save during the turn or compaction skipped this chat's meter; follow it now.
+            await self.refresh_meter_limits(session)
 
     def notify_status(self, session, previous, status, turn_ended=False):
         """A desktop notification of the change, only if enabled and no page is open."""
@@ -2957,11 +2979,18 @@ class AgentManager:
         venv = user_paths.python_venv_status(self.settings)
         if venv["state"] == "ready":
             path = venv["path"]
-            return (f"\nPython: commands run with the virtual environment {path} active (VIRTUAL_ENV set, {path}/bin "
-                    "first on PATH), so python, pip and installed tools resolve there"
-                    + (f" (Python {venv['version']})" if venv["version"] else "")
-                    + ". Install packages with `python -m pip`; do not create another virtual environment unless the "
-                    "user asks. Files inside it can be changed only with the user's approval.")
+            version = f" (Python {venv['version']})" if venv["version"] else ""
+            start = (f"\nPython: commands run with the virtual environment {path} active (VIRTUAL_ENV set, {path}/bin "
+                     "first on PATH), so python")
+            if venv.get("pip") is False:
+                return (start + f" and installed tools resolve there{version}. This environment has no pip, so a `pip` "
+                        "found on PATH belongs to another Python: never use it. Install packages with `uv pip install "
+                        "...` (uv targets the active VIRTUAL_ENV); if uv is not available, ask the user before running "
+                        "`python -m ensurepip`. Do not create another virtual environment unless the user asks. Files "
+                        "inside it can be changed only with the user's approval.")
+            return (start + f", pip and installed tools resolve there{version}. Install packages with `python -m pip`; "
+                    "do not create another virtual environment unless the user asks. Files inside it can be changed "
+                    "only with the user's approval.")
         if venv["state"] == "invalid":
             reason = venv["message"].removeprefix("Not used: ").rstrip(".")
             return (f"\nPython: the virtual environment set in Settings ({venv['path']}) is not usable ({reason}), so "
@@ -3107,11 +3136,13 @@ class AgentManager:
         return summarize, condense
 
     def compaction_record(self, session, tools):
-        """(record, holder): record(wire, cut) returns the app's notes for the app record
-        a compaction keeps next to the summary: the open tasks, the files this
+        """(record, holder): record(wire, cut, limit=None) returns the app's notes for the app
+        record a compaction keeps next to the summary: the open tasks, the files this
         conversation changed in the summarized part, and the files read before the cut
-        whose contents leave the model's context. It stores those files (absolute
-        paths, as file_views keys) in holder["forgotten"]."""
+        whose contents leave the model's context, with those forgotten at earlier
+        compactions until they are read again. It stores this compaction's files
+        (absolute paths, as file_views keys) in holder["forgotten"]. With a limit, the
+        notes are fitted within that many UTF-8 bytes by whole lines (fit_record_notes)."""
         holder = {"forgotten": []}
 
         def shown(value):
@@ -3120,8 +3151,8 @@ class AgentManager:
             except (ValueError, OSError, RuntimeError):
                 return None
 
-        def record(wire, cut):
-            parts = []
+        def record(wire, cut, limit=None):
+            parts = []  # (heading, lines, hidden, more(n), footer) for fit_record_notes.
             try:
                 tasks = self.task_board.list(session["id"])
             except ValueError:
@@ -3132,10 +3163,10 @@ class AgentManager:
                 done = len(tasks) - len(open_tasks)
                 lines = [f"- [{task.get('status')}] {task.get('title')} (task_id {task.get('id')})"
                          for task in open_tasks[:RECORD_TASKS]]
-                if len(open_tasks) > RECORD_TASKS:
-                    lines.append(f"- … {len(open_tasks) - RECORD_TASKS:,} more open tasks")
-                parts.append("Task checklist when this compaction ran (list_tasks shows the current state):\n"
-                             + "\n".join(lines + [f"and {plural(done, 'completed task')}."]))
+                parts.append(("Task checklist when this compaction ran (list_tasks shows the current state):", lines,
+                              max(0, len(open_tasks) - RECORD_TASKS),
+                              lambda n: f"- … {n:,} more open tasks (list_tasks shows them)",
+                              f"and {plural(done, 'completed task')}."))
             issued = {call.get("id") for message in wire[:cut] if message.get("role") == "assistant"
                       for call in message.get("tool_calls") or [] if isinstance(call, dict) and call.get("id")}
             changed = []
@@ -3146,8 +3177,9 @@ class AgentManager:
                         if (name := shown(value)) and name not in changed:
                             changed.append(name)
             if changed:
-                parts.append("Files this conversation changed before this point (newest first):\n"
-                             + "\n".join(f"- {name}" for name in changed[:RECORD_FILES]))
+                parts.append(("Files this conversation changed before this point (newest first):",
+                              [f"- {name}" for name in changed[:RECORD_FILES]], max(0, len(changed) - RECORD_FILES),
+                              lambda n: f"- … {n:,} more", None))
             completed = completed_call_ids(session)
             seen = set()
             for message in wire[cut:]:
@@ -3174,11 +3206,20 @@ class AgentManager:
             views = session.get("file_views") if isinstance(session.get("file_views"), dict) else {}
             forgotten = [path for path in views if path not in still]
             holder["forgotten"] = forgotten
-            if forgotten:
-                names = [tools.display_path(Path(path)) for path in reversed(forgotten)][:RECORD_FILES]
-                parts.append("Files read before this compaction whose contents are no longer in your context "
-                             "(read them again before editing):\n" + "\n".join(f"- {name}" for name in names))
-            return "\n\n".join(parts)
+            # Files forgotten at an earlier compaction stay listed until read again: this record
+            # replaces the previous one. session["context_state"] is still the state before this
+            # compaction, so its summarized_reads holds them (oldest first).
+            state = session.get("context_state") if isinstance(session.get("context_state"), dict) else {}
+            earlier = [path for path in reversed(state.get("summarized_reads") or []) if isinstance(path, str)
+                       and path not in views and path not in still and os.path.exists(path)]
+            listed = list(dict.fromkeys([*reversed(forgotten), *earlier]))
+            if listed:
+                names = [f"- {tools.display_path(Path(path))}" for path in listed]
+                parts.append(("Files read before this compaction whose contents are no longer in your context "
+                              "(read them again before editing):", names[:RECORD_FILES],
+                              max(0, len(names) - RECORD_FILES),
+                              lambda n: f"- … {n:,} more (read any file again before editing it)", None))
+            return fit_record_notes(parts, limit)
 
         return record, holder
 
@@ -3268,6 +3309,12 @@ class AgentManager:
         elif adjustment == "trimmed":
             text += (f" The summary was longer than {limit:,} bytes and could not be condensed, so part of it was "
                      "omitted from the model's context.")
+        fitted = info.get("summary_fitted_to_budget")
+        if fitted:
+            # The summary was within its byte limit; the whole request was not.
+            text += (" The request after compaction was over the input budget (non-ASCII text and escapes count more "
+                     "than plain text), so " + ("a short extra request condensed the summary to fit." if fitted == "condensed"
+                                                else "part of the summary was omitted to fit."))
         await self.event(session, "notice", text=text, compaction=compaction)
 
     def start_compaction(self, session_id, preservation_note=""):
@@ -3547,14 +3594,52 @@ class AgentManager:
             info = session.get("context_info")
             if not isinstance(info, dict):
                 return
-            tokens = next_request_estimate(model_history(wire), context_state, system, definitions,
-                                           estimate_scale(session.get("inference_calls"), session["model"]))
+            scale = float(estimate_scale(session.get("inference_calls"), session["model"]))
+            tokens = next_request_estimate(model_history(wire), context_state, system, definitions, scale)
             budget, threshold = info.get("input_budget"), info.get("auto_compact_threshold")
             info["next_estimate"] = {
-                "tokens": tokens,
+                "tokens": tokens, "scale": scale,  # The scale, so a model change can rescale the estimate.
                 "percent_of_input_budget": round(tokens * 100 / budget, 1) if budget else None,
                 "percent_of_threshold": round(tokens * 100 / threshold, 1) if threshold else None}
             await self.broadcast(session["id"], {"type": "context", "context_info": info})
+        except Exception:
+            pass
+
+    async def refresh_meter_limits(self, session):
+        """After a model change or a Settings save, bring an idle chat's context meter to the budgets
+        its next request will use (prepare_context's formulas, so that request records the same values),
+        rescale the next-request estimate to the chat's model, save and broadcast. The last request's
+        estimate and report stay as they were, so a report from another budget shows as an earlier
+        request. A running chat is left alone until status() makes it idle: note_last_request reads the
+        in-flight request's budget from the stored info, and a turn keeps its budgets. Never raises."""
+        import math
+        from .context import SAFETY_MARGIN, compaction_threshold
+        try:
+            info = session.get("context_info")
+            if (not isinstance(info, dict) or type(info.get("input_budget")) is not int
+                    or self.statuses.get(session["id"], "idle") != "idle" or session.get("turn_running")):
+                return
+            context_window, reply_reserve = self.request_limits(session)
+            budget = context_window - reply_reserve - SAFETY_MARGIN
+            percent = auto_compact_percent(self.settings.values)
+            threshold = compaction_threshold(budget, percent)
+            updated = {**info, "context_window": context_window, "reply_reserve": reply_reserve, "input_budget": budget,
+                       "auto_compact_percent": percent, "auto_compact_threshold": threshold}
+            estimate = info.get("next_estimate")
+            if isinstance(estimate, dict) and type(estimate.get("tokens")) is int:
+                tokens, scale = estimate["tokens"], estimate.get("scale")
+                if type(scale) is float and scale > 0:
+                    current = float(estimate_scale(session.get("inference_calls"), session.get("model")))
+                    tokens, scale = (tokens, scale) if current == scale else (math.ceil(tokens * current / scale), current)
+                updated["next_estimate"] = {
+                    **estimate, "tokens": tokens, **({"scale": scale} if scale is not None else {}),
+                    "percent_of_input_budget": round(tokens * 100 / budget, 1) if budget > 0 else None,
+                    "percent_of_threshold": round(tokens * 100 / threshold, 1) if threshold > 0 else None}
+            if updated == info:
+                return
+            self.store.save({**session, "context_info": updated}, touch=False)
+            session["context_info"] = updated
+            await self.broadcast(session["id"], {"type": "context", "context_info": updated})
         except Exception:
             pass
 

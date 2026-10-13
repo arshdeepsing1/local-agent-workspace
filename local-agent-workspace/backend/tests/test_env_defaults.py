@@ -16,6 +16,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from local_agent import agents as agents_module
+from local_agent import tools as tools_module
 from local_agent import user_paths, workspace_folders
 from local_agent.agents import AgentManager
 from local_agent.api import create_app
@@ -137,6 +138,23 @@ def test_refused_default_code_folders(layout, value, reason):
     value = value.format(home=layout.home, tmp=layout.tmp, state=layout.state, app=layout.app)
     with pytest.raises(ValueError, match=reason.replace("(", r"\(").replace(")", r"\)")):
         check(layout, value, env_file=str(layout.home / "keys" / "db.txt"))
+
+
+def alias_of(monkeypatch, alias, folder):
+    """Make alias another name for folder, as a bind mount or a case variant on a case-insensitive disk is."""
+    real = tools_module._identity
+    monkeypatch.setattr(tools_module, "_identity", lambda path: real(folder) if Path(path) == alias else real(path))
+
+
+def test_a_hidden_home_folder_under_another_name_is_refused(layout, monkeypatch):
+    alias = layout.tmp / "alias"
+    (alias / ".ssh").mkdir(parents=True)
+    (layout.home / ".ssh").mkdir()
+    (alias / "code").mkdir()
+    alias_of(monkeypatch, alias, layout.home.resolve())
+    with pytest.raises(ValueError, match="hidden configuration folder"):
+        check(layout, str(alias / ".ssh"))
+    assert check(layout, str(alias / "code")) == ((alias / "code").resolve(), False)
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root can write to read-only folders")
@@ -534,6 +552,23 @@ def test_refused_virtual_environments(layout, monkeypatch, case, reason):
         check_venv(layout, value)
 
 
+def test_a_venv_path_with_the_path_separator_is_refused(layout):
+    # PATH would split it into other entries, and commands would not find its bin/python.
+    venv = make_venv(layout.tmp / f"proj{os.pathsep}v2" / ".venv")
+    with pytest.raises(ValueError, match=f"contains '{os.pathsep}', which cannot appear in a PATH entry"):
+        check_venv(layout, str(venv))
+
+
+async def test_a_venv_path_with_the_path_separator_is_invalid_and_not_used(layout, runtime):
+    venv = make_venv(layout.tmp / f"proj{os.pathsep}v2" / ".venv")
+    manager, _, _ = runtime(python_venv=str(venv))
+    status = manager.settings.public()["python_venv_status"]
+    assert status["state"] == "invalid" and "cannot appear in a PATH entry" in status["message"]
+    assert manager.python_venv() is None
+    environment = manager.jobs.command_environment()
+    assert environment.get("VIRTUAL_ENV") != str(venv) and str(venv) not in environment.get("PATH", "")
+
+
 # 30-33, 36, 37 Every app-run command uses the venv
 
 
@@ -655,6 +690,41 @@ async def test_edits_inside_the_venv_are_protected(layout, runtime):
     manager.decide(*key, False)
     await task
     assert (venv / "bin" / "pytest").exists() and not (venv / "bin" / "make").exists()
+
+
+# 35a A venv without pip (uv venv, --without-pip): a pip on PATH belongs to another Python
+
+
+@pytest.mark.parametrize("site", ["lib/python3.12/site-packages", "lib/pypy3.10/site-packages",
+                                  "lib64/python3.12/site-packages", "site-packages"])
+async def test_the_system_prompt_names_a_venv_without_pip(layout, runtime, site):
+    venv = make_venv(layout.tmp / "venvs" / "v")
+    (venv / site).mkdir(parents=True)  # uv venv and --without-pip create site-packages without pip.
+    manager, session, tools = runtime(python_venv=str(venv))
+    text = system_text(manager, session, tools)
+    assert f"commands run with the virtual environment {venv} active" in text
+    assert "Install packages with `python -m pip`" not in text and "python, pip and installed tools" not in text
+    assert "This environment has no pip" in text and "uv pip install" in text
+    assert "Files inside it can be changed only with the user's approval." in text
+    status = manager.settings.public()["python_venv_status"]
+    assert status["pip"] is False and "No pip is installed in it." in status["message"]
+    # Checked again on every use: once pip is installed, the usual line comes back.
+    package = venv / site / "pip"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    text = system_text(manager, session, tools)
+    assert "python, pip and installed tools resolve there" in text and "Install packages with `python -m pip`" in text
+    assert "has no pip" not in text
+    assert manager.settings.public()["python_venv_status"]["pip"] is True
+
+
+async def test_a_venv_layout_without_site_packages_keeps_the_usual_pip_line(layout, runtime):
+    venv = make_venv(layout.tmp / "venvs" / "v")  # No site-packages folder the app recognises.
+    manager, session, tools = runtime(python_venv=str(venv))
+    text = system_text(manager, session, tools)
+    assert "Install packages with `python -m pip`" in text and "has no pip" not in text
+    status = manager.settings.public()["python_venv_status"]
+    assert status["pip"] is None and "No pip" not in status["message"]
 
 
 # 35 An invalid venv is not used
