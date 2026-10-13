@@ -1111,13 +1111,35 @@ Unfinished delegated runs are marked interrupted on restart rather than left run
 **Tasks → New subagent tool ceiling** selects `inherit`, `read_only`, or `file_editor`
 for future children while the parent is idle. The model may request a narrower
 `tool_profile` in `delegate_task` but cannot widen the parent's ceiling. Read-only
-permits file listing/reading/search, skill discovery/selection, and task listing/reading;
-file-editor additionally permits file writes/edits under normal approval rules.
+permits file listing/reading/search, skill discovery/selection, task listing/reading, and
+`ask_user`; file-editor additionally permits file writes/edits under normal approval rules.
 Both file-only profiles exclude shell commands, jobs, MCP startup/calls, hooks,
 task mutations, and further delegation. Restrictions persist on child continuation,
 imports, and forks. Existing children are unchanged by a new ceiling. These are
 server-enforced model-tool limits, not an OS sandbox or restrictions on the user's
 explicit editor/terminal actions.
+
+**Questions and plan review.** With `ask_user` the model asks 1–4 short multiple-choice
+questions when it needs a decision. Each question has 2–4 options (single or multiple
+choice), and **Other** takes your own text (up to 1,000 characters). **Send answers** is
+enabled once every question is answered; **Skip** tells the model to continue with its
+best judgment and state its assumptions. The card waits like an approval card: the
+sidebar shows **Needs approval**, notifications and the busy-chat checks treat it the
+same way, the message box names what is waiting, the Approval wait in Settings applies
+(after it the model is told you did not answer), and Stop cancels it. `ask_user` works
+in every mode, including Plan; in Don't ask mode it returns at once without a card, and
+switching a chat to Don't ask skips its waiting questions. A subagent's question appears
+in the subagent's own conversation (the parent card reads **Waiting for approval**; use
+**Open subagent**), is answered there, and is never copied into the parent's context. In
+Plan mode the model can present its finished plan with `submit_plan` (Plan only, never
+in subagents). The plan card renders the plan as Markdown with an optional feedback box
+and three choices: **Keep planning** (the model gets your feedback and stays in Plan),
+**Approve and use Manual** or **Approve and use Accept edits**, which switch the chat to
+that mode, and the model then implements the plan in the same turn under the new mode's
+rules. Changing the mode from the Permissions menu while a plan waits closes the card as
+not reviewed, and the model is told to ask before implementing it. The plan is not
+written to any file; it stays in the conversation, and exports keep answers and review
+outcomes.
 
 **Activity** collapses a list of actual tool actions and their states; existing
 approval cards remain usable independently. A separate **Provider reasoning

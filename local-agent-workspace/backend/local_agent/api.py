@@ -33,6 +33,7 @@ from .transcript import transcript, transcript_file_name
 from .feature_api import register_features
 from .portability_api import register_portability
 from .approvals import MAX_DECLINE_NOTE, ensure_idle, register_approvals
+from .interactions import register_interactions
 from .projects import register_projects
 
 
@@ -537,6 +538,7 @@ def create_app(settings=None):
     register_features(app, manager, settings, store, session_or_404, workspace_tools, ui_tools)
     register_portability(app, manager, settings, store, session_or_404)
     register_approvals(app, manager, store, session_or_404)
+    register_interactions(app, manager, session_or_404)
     register_projects(app, manager, settings, workspace_tools)
     workspace_folders = register_workspace_folders(app, settings, session_or_404)
 
