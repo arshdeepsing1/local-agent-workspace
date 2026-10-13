@@ -43,6 +43,15 @@ Default model, code folder, Python environment, large inputs and compaction:
   share of the input budget, with the components (cached input included once) and how far the
   app's estimate was off; it says when it shows an estimate instead, and follows model and
   Settings changes. A request-size line shows the body size against the 4 MB limit.
+- Large files and limits, continued: `search_files` searches one named file up to 8 MB (a
+  folder search still skips files over 2 MB); a compaction under a low output-tokens-per-minute
+  limit is sized to fit it, and when nothing fits the error names the context budget that would;
+  a message over 50,000 characters is not sent and suggests saving it as a file and attaching it
+  with `@`; a stream that sends nothing for 300 seconds says so.
+- Safety and speed: the configured token and secret shapes are redacted before any tool result,
+  outline entry or search excerpt is shortened; hooks for `read_file`, `list_files` or
+  `find_files` also run for `outline_file` and `project_overview`; long conversations save
+  faster, and outlining a large Python file or starting a compaction pauses the app much less.
 
 Roadmap milestone M4 (conversation control and history):
 
