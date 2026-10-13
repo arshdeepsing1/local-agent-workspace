@@ -23,7 +23,7 @@ MODEL_DBU_PER_MILLION = {
         "cache_creation_input_tokens": 89.286,
     },
 }
-PURPOSE_LABELS = {"agent": "Agent", "compaction": "Compaction", "title": "Title"}
+PURPOSE_LABELS = {"agent": "Agent", "compaction": "Compaction", "title": "Title", "side_question": "Side question"}
 # Databricks AI Gateway stores these tags in system.ai_gateway.usage.request_tags,
 # so each ledger record can be joined to the provider's usage rows exactly.
 REQUEST_TAGS_HEADER = "Databricks-Ai-Gateway-Request-Tags"

@@ -58,6 +58,9 @@ from .context import INCOMPLETE_RESPONSE_CONTINUATION, INVALID_ARGUMENTS_CONTINU
 from .context import is_continuation
 from .tool_errors import tool_error_text
 from .projects import ProjectSettings
+from . import mentions
+from .composer_api import (MAX_QUEUED, MAX_QUEUED_CHARS, SHELL_ONE_LINE, SIDE_QUESTION_PREFIX, SIDE_TOO_LONG,
+                           SIDE_TOOL_CALLS, STEER_PREFIX, side_history)
 import random
 
 
@@ -481,10 +484,14 @@ def unanswered(event, declined):
 
 
 def public_session(session, status="idle"):
+    # pending_context (! output waiting for the next message) is shown without its text.
+    pending = [{"kind": item.get("kind"), "command": item.get("command"), "exit_code": item.get("exit_code")}
+               for item in session.get("pending_context") or [] if isinstance(item, dict)]
     return {"permission_mode": "manual", "allowed_directories": [], "allow_rules": [], "disabled_tools": [],
             **{k: v for k, v in session.items()
                if k not in ("wire", "context_state", "instruction_directories", "inference_calls", "command_jobs",
-                            "file_views", "turn_running", "jobs_reported_through")},
+                            "file_views", "turn_running", "jobs_reported_through", "pending_context")},
+            **({"pending_context": pending} if pending else {}),
             "status": status}
 
 
@@ -501,6 +508,7 @@ class AgentManager:
         self.pending_checks = {}  # (session id, event id) -> recheck(change) of a waiting card
         self.card_revisers = {}  # (session id, event id) -> async reviser(changes) for Edit before approving
         self.statuses = {}
+        self.side_questions = set()  # Chats with a /btw side question being answered.
         self.checkpoints = CheckpointManager(store)
         self.changes = ChangeReview(store, self.checkpoints)
         self.worktrees = WorktreeManager(store, settings.state_dir)
@@ -1354,7 +1362,10 @@ class AgentManager:
         return [item for item in definitions if item["function"]["name"] not in denied
                 and (offer_plan or item["function"]["name"] != "submit_plan")]
 
-    def start(self, session_id, prompt):
+    def start(self, session_id, prompt, *, from_queue=False):
+        """Start a turn. @ files and pending ! output are attached now, so a refused file is an
+        error before anything runs (from_queue: queued messages, refused files become a note).
+        Queued messages still waiting are leftovers of a stop or failure: they are paused."""
         if session_id in self.tasks and not self.tasks[session_id].done():
             raise ValueError("A response is already running in this conversation.")
         session = self.get(session_id)
@@ -1363,9 +1374,19 @@ class AgentManager:
         if session.get("runtime", "databricks") != "databricks":
             raise ValueError("This conversation uses an unsupported runtime and is read-only. Start a new Databricks conversation.")
         self.workspace_available(session["workspace"])
+        content, attachments = None, None
+        if not (session.get("parent_event_id") and not session["events"]):  # Not a subagent's delegated prompt.
+            expanded, attachments, views = mentions.expand_context(
+                self, session, self.session_tools(session), prompt, on_error="inline" if from_queue else "raise")
+            content = expanded if expanded != prompt else None
+            for target, seen in views:
+                self.remember_file(session, target, seen)
+        if not from_queue:
+            self._pause_queue(session)
         self.live[session_id] = session
         self.statuses[session_id] = "running"
-        self.tasks[session_id] = asyncio.create_task(self.run(session, prompt))
+        task = self.tasks[session_id] = asyncio.create_task(self.run(session, prompt, content, attachments or None))
+        task.add_done_callback(lambda done: self._after_task(session_id, "turn", done))
 
     async def stop(self, session_id):
         task = self.tasks.get(session_id)
@@ -1385,7 +1406,316 @@ class AgentManager:
                 await self.delegates.progress(session, terminal_reason="stopped")
                 await self.status(session, "idle", turn_ended=True)
 
-    async def run(self, session, prompt):
+    def busy_task(self, session_id):
+        task = self.tasks.get(session_id)
+        return task is not None and not task.done()
+
+    async def submit_message(self, session_id, text):
+        """Send a message: start it when the chat is idle, else queue it for the running task."""
+        if self.busy_task(session_id):
+            return await self.enqueue(session_id, text)
+        self.start(session_id, text)
+        return {"ok": True}
+
+    @staticmethod
+    def queue_of(session):
+        queue = session.get("queued_messages")
+        return queue if isinstance(queue, list) else []
+
+    async def publish_queue(self, session, error=None):
+        await self.broadcast(session["id"], {"type": "queue", "queued_messages": self.queue_of(session),
+                                             **({"error": error} if error else {})})
+
+    async def enqueue(self, session_id, text):
+        """Queue a message while a turn, compaction or ! command runs. @ tokens are checked now;
+        their snapshot is taken when the message is sent."""
+        session = self.get(session_id)
+        if not session:
+            raise ValueError("Conversation not found.")
+        queue = self.queue_of(session)
+        if len(queue) >= MAX_QUEUED:
+            raise ValueError("At most 3 messages can wait. Remove one or wait for the reply.")
+        if sum(len(item.get("text", "")) for item in queue) + len(text) > MAX_QUEUED_CHARS:
+            raise ValueError("Queued messages can contain at most 50,000 characters in total.")
+        mentions.expand_context(self, session, self.session_tools(session), text, include_pending=False)
+        session["queued_messages"] = [*queue, {"id": str(uuid.uuid4()), "text": text, "created": time.time(),
+                                               "paused": False}]
+        self.store.save(session)
+        await self.publish_queue(session)
+        return {"ok": True, "queued": True, "queued_messages": session["queued_messages"]}
+
+    async def remove_queued(self, session_id, item_id):
+        """Remove one queued message; KeyError when it is no longer queued."""
+        session = self.get(session_id)
+        queue = self.queue_of(session or {})
+        if not any(item.get("id") == item_id for item in queue):
+            raise KeyError(item_id)
+        session["queued_messages"] = [item for item in queue if item.get("id") != item_id]
+        self.store.save(session)
+        await self.publish_queue(session)
+        return session["queued_messages"]
+
+    async def send_queued(self, session_id, entries=None):
+        """Start the given queued messages (default: all of them) as one turn, then remove them.
+        Files are attached when the turn starts; a file refused by then becomes a note."""
+        session = self.get(session_id)
+        entries = list(self.queue_of(session or {}) if entries is None else entries)
+        if not entries:
+            raise ValueError("No messages are queued.")
+        self.start(session_id, "\n\n".join(item["text"] for item in entries), from_queue=True)
+        session = self.live[session_id]
+        sent = {item["id"] for item in entries}
+        session["queued_messages"] = [item for item in self.queue_of(session) if item.get("id") not in sent]
+        self.store.save(session)
+        await self.publish_queue(session)
+
+    async def drain_queue(self, session, wire, tools):
+        """Steering: at a step boundary, after every tool result, the unpaused queued messages
+        become one user message of this turn."""
+        entries = [item for item in self.queue_of(session) if not item.get("paused")]
+        # Never directly after an app-generated prompt (the merge switches this to is_app_prompt).
+        if not entries or not wire or wire[-1].get("role") == "user" or is_continuation(wire[-1]):
+            return
+        text = "\n\n".join(item["text"] for item in entries)
+        try:
+            content, attachments, views = mentions.expand_context(self, session, tools, text, on_error="inline")
+        except ValueError as exc:
+            # A limit error (too many or too large files) does not fail the turn: the messages wait, paused.
+            for item in entries:
+                item["paused"] = True
+            self.store.save(session)
+            await self.publish_queue(session, self.settings.redact(str(exc)))
+            return
+        sent = {item["id"] for item in entries}
+        session["queued_messages"] = [item for item in self.queue_of(session) if item.get("id") not in sent]
+        for target, seen in views:
+            self.remember_file(session, target, seen)
+        wire.append({"role": "user", "content": STEER_PREFIX + content})
+        session.pop("pending_context", None)
+        # No await between the wire append and the event: event() appends the user event before
+        # its first await, so the wire and the events never disagree (m4-history-branching).
+        await self.event(session, "user", text=text, steered=True, in_wire=True,
+                         **({"attachments": attachments} if attachments else {}))
+        await self.publish_queue(session)
+
+    def _pause_queue(self, session):
+        """Mark every queued message paused (a leftover of a stop, failure or restart); saves and
+        broadcasts when anything changed. Paused messages leave only by Send, Edit or Remove."""
+        queue = self.queue_of(session)
+        if not any(not item.get("paused") for item in queue):
+            return
+        session["queued_messages"] = [{**item, "paused": True} for item in queue]
+        self.store.save(session)
+        self._background(self.publish_queue(session))
+
+    def _background(self, coroutine):
+        tasks = self.__dict__.setdefault("_queue_tasks", set())
+        task = asyncio.get_running_loop().create_task(coroutine)
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    def _after_task(self, session_id, kind, task):
+        """Done-callback of a turn, compaction or ! command: send the unpaused queued messages
+        as the next turn, unless the task was stopped or failed. Never raises."""
+        try:
+            if self.tasks.get(session_id) is not task or task.cancelled() or task.cancelling() > 0:
+                return
+            try:
+                session = self.get(session_id)
+            except Exception:  # An unreadable conversation: nothing to send.
+                return
+            if session is None:
+                return
+            if kind == "turn" and session.get("terminal_reason") not in ("completed", "tool_error"):
+                return
+            if kind == "compaction" and session["events"] and session["events"][-1].get("type") == "error":
+                return
+            if not any(not item.get("paused") for item in self.queue_of(session)):
+                return
+            self._background(self._send_after(session_id))
+        except Exception:
+            log.exception("Could not schedule the queued messages of a conversation.")
+
+    async def _send_after(self, session_id):
+        if self.busy_task(session_id):
+            return  # Something else started first; it paused the queue.
+        session = self.get(session_id)
+        entries = [item for item in self.queue_of(session or {}) if not item.get("paused")]
+        if not entries:
+            return
+        try:
+            await self.send_queued(session_id, entries)
+        except ValueError as exc:
+            session = self.get(session_id)
+            if session is None:
+                return
+            sent = {item["id"] for item in entries}
+            session["queued_messages"] = [{**item, "paused": True} if item.get("id") in sent else item
+                                          for item in self.queue_of(session)]
+            self.store.save(session)
+            await self.publish_queue(session, self.settings.redact(str(exc)))
+
+    def start_shell(self, session_id, command, timeout_seconds=60, max_output_bytes=80000):
+        """Run one line typed with ! in the chat's project folder, as Workspace → Terminal Run does.
+        Its output waits in pending_context and is attached to the next message."""
+        if self.busy_task(session_id) or self.statuses.get(session_id, "idle") != "idle":
+            raise ValueError("Wait for the reply to finish before running a command.")
+        session = self.get(session_id)
+        if not session:
+            raise ValueError("Conversation not found.")
+        if session.get("runtime", "databricks") != "databricks":
+            raise ValueError("This conversation uses an unsupported runtime and is read-only.")
+        if "\n" in command or "\r" in command:
+            raise ValueError(SHELL_ONE_LINE)
+        validate_command_options(command, timeout_seconds, max_output_bytes)
+        self.workspace_available(session["workspace"])
+        self._pause_queue(session)
+        self.live[session_id] = session
+        self.statuses[session_id] = "running"
+        task = self.tasks[session_id] = asyncio.create_task(
+            self.run_shell(session, command, timeout_seconds, max_output_bytes))
+        task.add_done_callback(lambda done: self._after_task(session_id, "shell", done))
+
+    async def run_shell(self, session, command, timeout_seconds=60, max_output_bytes=80000):
+        event = job = None
+        try:
+            await self.status(session, "running")
+            event = await self.event(session, "tool", name="user_command", input={"command": command},
+                                     state="running", output="")
+            job = await self.jobs.start(command=command, workspace=session["workspace"], session_id=session["id"],
+                                        timeout_seconds=timeout_seconds, max_output_bytes=max_output_bytes,
+                                        background=False)
+            await self.update_event(session, event, job_id=job["id"])
+            job = await self.jobs.wait(job["id"])
+            page = self.job_output(job)
+            await self.update_event(session, event, state="completed" if job["state"] == "completed" else "error",
+                                    output=json.dumps(page, indent=2))
+            text = self.settings.redact(redact_secrets(page["output"]))
+            note = {"kind": "shell", "command": command, "exit_code": job["exit_code"],
+                    "text": text + ("\n[Output shortened.]" if page["next_offset"] is not None else "")}
+            session["pending_context"] = [*(session.get("pending_context") or []), note][-mentions.MAX_PENDING:]
+        except asyncio.CancelledError:
+            if job is not None:
+                await self.jobs.stop(job["id"])
+            if event is not None:
+                await self.update_event(session, event, state="cancelled")
+            raise
+        except (ValueError, OSError) as exc:
+            text = self.settings.redact(file_error(exc))[:1500]
+            if event is not None:
+                await self.update_event(session, event, state="error", output=text)
+            else:
+                await self.event(session, "error", text=text)
+        finally:
+            self.store.save(session)
+            self.live.pop(session["id"], None)
+            await self.status(session, "idle")
+
+    async def side_question(self, session_id, question):
+        """/btw: answer a question from the conversation so far in one non-streamed request.
+        Nothing is added to the conversation; the request is recorded in the usage ledger."""
+        session = self.get(session_id)
+        if not session:
+            raise ValueError("Conversation not found.")
+        self.side_questions.add(session_id)
+        try:
+            return await self._side_question(session, question)
+        finally:
+            self.side_questions.discard(session_id)
+
+    async def _side_question(self, session, question):
+        # Earlier interrupted exchanges are completed in the copy, as before a turn.
+        history, state = repair_tool_history(side_history(session["wire"]), session["events"],
+                                             session.get("context_state") or {})
+        text = SIDE_QUESTION_PREFIX + question
+        merge = bool(history) and history[-1].get("role") == "user" and len(history) - 1 >= state.get("through", 0)
+        if merge:
+            history[-1] = {**history[-1], "content": visible_text(history[-1].get("content")) + "\n\n" + text}
+        if state.get("through", 0) > len(history):
+            state["through"] = len(history)
+        if not merge:
+            history.append({"role": "user", "content": text})
+        host, token = self.settings.credentials()
+        mode = session.get("permission_mode", "manual")
+        tools = self.session_tools(session)
+        system, _ = self.context_inputs(session, tools, mode)
+        definitions = state.get("tool_definitions") or filter_tools(session, [*TOOL_DEFINITIONS, *[
+            tool for tool in FEATURE_TOOLS if not session.get("is_subagent") or tool["function"]["name"] != "delegate_task"]])
+        max_output_tokens = self.settings.values.get("max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS)
+        reserve = max(1024, min(max_output_tokens, 4096))
+
+        class TooLong(Exception):
+            pass
+
+        async def summarize(*args):
+            raise TooLong
+        try:
+            messages, _, _ = await prepare_context(
+                model_history(history), state, system, definitions,
+                self.settings.values.get("context_window", DEFAULT_CONTEXT_WINDOW), summarize,
+                reply_reserve=reserve, scale=estimate_scale(session.get("inference_calls"), session["model"]))
+        except ValueError as exc:
+            if isinstance(exc.__cause__, TooLong):
+                raise ValueError(SIDE_TOO_LONG) from None
+            raise
+        scratch = {"id": session["id"], "inference_calls": []}
+        call = begin_inference_call(scratch, "side_question", session["model"], max_output_tokens=reserve, attempt=1,
+                                    estimated_input_tokens=estimate_tokens(messages, definitions))
+        info = {"status": "running"}
+        url = host + "/serving-endpoints/" + quote(session["model"], safe="") + "/invocations"
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(120, connect=20), follow_redirects=False) as client:
+                response = await client.post(url, headers={"Authorization": f"Bearer {token}",
+                                                           **request_tag_headers(scratch, call)},
+                                             json={"messages": messages, "tools": definitions, "stream": False,
+                                                   "max_tokens": reserve})
+            info["http_status"] = response.status_code
+            try:
+                payload = response.json()
+            except (json.JSONDecodeError, TypeError, ValueError):
+                payload = None
+            if isinstance(payload, dict):
+                record_response_id(call, payload.get("id"))
+                if usage := reported_usage(payload.get("usage")):
+                    info["usage"] = usage
+            if response.status_code != 200:
+                info.update(status="error", error_kind=http_error_kind(response.status_code))
+                detail = self.settings.redact(response.text)[:1000]
+                raise ValueError(f"Databricks returned HTTP {response.status_code}" + (f": {detail}" if detail else "."))
+            choices = payload.get("choices") if isinstance(payload, dict) else None
+            choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else None
+            if choice is None:
+                info.update(status="error", error_kind="invalid_response")
+                raise ValueError("The model returned a malformed response.")
+            message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+            finish = choice.get("finish_reason")
+            info["finish_reason"] = self.settings.redact(str(finish))[:100] if finish is not None else "unavailable"
+            answer = self.settings.redact(visible_text(message.get("content"))).strip()
+            if not answer and message.get("tool_calls"):
+                answer = SIDE_TOOL_CALLS
+            if finish == "length":
+                answer += "\n\n[Answer cut off at the output limit.]"
+            info["status"] = "completed"
+            return {"answer": answer, "request_info": {key: info[key] for key in ("status", "finish_reason", "usage")
+                                                       if key in info}}
+        except httpx.HTTPError as exc:
+            info.update(status="error", error_kind="network")
+            raise ValueError("The connection to Databricks failed: " + self.settings.redact(str(exc) or type(exc).__name__)) from None
+        except asyncio.CancelledError:
+            info["status"] = "cancelled"
+            raise
+        finally:
+            if info["status"] == "running":
+                info.update(status="error", error_kind="unknown")
+            finish_inference_call(call, info)
+            # The live conversation while a turn runs; no await between reading and saving it.
+            current = self.get(session["id"])
+            if current is not None:
+                current.setdefault("inference_calls", []).append(call)
+                current["inference_ledger_version"] = scratch["inference_ledger_version"]
+                self.store.save(current)
+
+    async def run(self, session, prompt, content=None, attachments=None):
         terminal_reason = "completed"
         first_event = len(session["events"])
         storage_error_reported = False
@@ -1411,12 +1741,13 @@ class AgentManager:
             # turn_delegated: the parent's delegate_task started this turn and reports its end.
             session.update(turn_running=True, turn_ended=None, turn_delegated=bool(origin))
             await self.status(session, "running")
-            await self.event(session, "user", text=prompt, **origin)
+            await self.event(session, "user", text=prompt, **origin, **({"attachments": attachments} if attachments else {}))
             if session["title"] == "New conversation" and not session.get("title_generated"):
                 session["title"] = fallback_title(prompt, self.redact_title)
                 self.store.save(session)
                 await self.broadcast(session["id"], {"type": "title", "title": session["title"]})
-            completed = await self.run_databricks(session, prompt)
+            # content (the message with its attachments) is passed only when it differs from the prompt.
+            completed = await self.run_databricks(session, prompt, **({"content": content} if content is not None else {}))
             session.pop("turn_running", None)  # The answer is finished; naming is not part of it.
             if completed and needs_title(session, self.redact_title):
                 previous_title = session["title"]
@@ -2033,16 +2364,17 @@ class AgentManager:
         await self.publish_permissions(session)
         return True
 
-    async def run_databricks(self, session, prompt):
+    async def run_databricks(self, session, prompt, content=None):
         if session.get("tool_profile", "inherit") != "inherit":
             # Restricted children must not start external servers during discovery.
-            return await self._run_databricks(session, prompt, [])
+            return await self._run_databricks(session, prompt, [], **({"content": content} if content is not None else {}))
         async with self.extensions.turn() as connection:
             definitions = await connection.discover()
             connection.tool_names = {item["function"]["name"] for item in definitions}
             self.extension_connections[session["id"]] = connection
             try:
-                return await self._run_databricks(session, prompt, definitions)
+                return await self._run_databricks(session, prompt, definitions,
+                                                  **({"content": content} if content is not None else {}))
             finally:
                 self.extension_connections.pop(session["id"], None)
 
@@ -2280,9 +2612,11 @@ class AgentManager:
                    for index, message in enumerate(session["wire"])):
             raise ValueError("No earlier turns to compact. The latest turn is kept intact.")
         self.workspace_available(session["workspace"])
+        self._pause_queue(session)
         self.live[session_id] = session
         self.statuses[session_id] = "compacting"
-        self.tasks[session_id] = asyncio.create_task(self.manual_compact(session, preservation_note.strip()))
+        task = self.tasks[session_id] = asyncio.create_task(self.manual_compact(session, preservation_note.strip()))
+        task.add_done_callback(lambda done: self._after_task(session_id, "compaction", done))
 
     async def manual_compact(self, session, preservation_note=""):
         committed = False
@@ -2609,7 +2943,7 @@ class AgentManager:
             return "the permission mode or the rules changed while its approval card waited."
         return None
 
-    async def _run_databricks(self, session, prompt, external_tools):
+    async def _run_databricks(self, session, prompt, external_tools, content=None):
         host, token = self.settings.credentials()
         mode = session.get("permission_mode", "manual")
         tools = WorkspaceTools(session["workspace"], self.settings.values["env_file"], session.get("allowed_directories", []), mode == "bypassPermissions", write_limit=write_limit_setting(self.settings.values), excluded_roots=(self.settings.state_dir,))
@@ -2633,7 +2967,8 @@ class AgentManager:
             else:
                 wire.pop()
             self.store.save(session)
-        wire.append({"role": "user", "content": prompt})
+        wire.append({"role": "user", "content": prompt if content is None else content})
+        session.pop("pending_context", None)  # Its ! output is in the content just appended.
         context_window = self.settings.values.get("context_window", DEFAULT_CONTEXT_WINDOW)
         max_output_tokens = self.settings.values.get("max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS)
         url = host + "/serving-endpoints/" + quote(session["model"], safe="") + "/invocations"
@@ -2762,6 +3097,8 @@ class AgentManager:
                     output = await self.execute_tool(session, tools, call["function"]["name"], values, call["id"])
                     wire.append({"role": "tool", "tool_call_id": call["id"], "content": output})
                     self.store.save(session)
+                if step_index + 1 < steps:
+                    await self.drain_queue(session, wire, tools)
         await self.event(session, "error" if session.get("is_subagent") else "notice",
                          text=(f"Reached the {steps}-request agent limit. This counts model requests, not tool "
                                "calls. Completed actions were kept. Increase Agent steps in Settings or send a "

@@ -33,6 +33,7 @@ from .transcript import transcript, transcript_file_name
 from .feature_api import register_features
 from .portability_api import register_portability
 from .approvals import MAX_DECLINE_NOTE, ensure_idle, register_approvals
+from .composer_api import register_composer
 from .interactions import register_interactions
 from .projects import register_projects
 
@@ -357,8 +358,8 @@ def create_app(settings=None):
         session_or_404(session_id)
         if not body.text.strip():
             raise ValueError("Enter a message.")
-        manager.start(session_id, body.text.strip())
-        return {"ok": True}
+        # Starts the message, or queues it while a turn, compaction or ! command runs.
+        return await manager.submit_message(session_id, body.text.strip())
 
     @app.post("/api/sessions/{session_id}/stop")
     async def stop(session_id: str):
@@ -549,6 +550,7 @@ def create_app(settings=None):
     register_features(app, manager, settings, store, session_or_404, workspace_tools, ui_tools)
     register_portability(app, manager, settings, store, session_or_404)
     register_approvals(app, manager, store, session_or_404)
+    register_composer(app, manager, settings, store, session_or_404)
     register_interactions(app, manager, session_or_404)
     register_projects(app, manager, settings, workspace_tools)
     workspace_folders = register_workspace_folders(app, settings, session_or_404)
