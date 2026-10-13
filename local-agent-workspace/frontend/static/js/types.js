@@ -1,7 +1,8 @@
 // Shapes of the main API objects, for reference while editing (JSDoc only).
 //
 // Settings: { workspace, model, env_file, context_window, max_output_tokens,
-//   max_agent_steps, compaction_handoffs?, approval_timeout_minutes? (0 = no limit),
+//   max_agent_steps, compaction_handoffs?, auto_compact_percent? (50-100, default 90: automatic compaction runs
+//   when the next request's estimate passes this share of the input budget), approval_timeout_minutes? (0 = no limit),
 //   system_notifications? (server notifications while no page is open),
 //   auto_keep_changes? (true: Keep every listed change when a chat's reply ends), host, configured }
 // Bootstrap (GET /bootstrap): { token, settings: Settings, storage_problems: StorageProblem[] }
@@ -83,6 +84,7 @@
 //   User events also carry in_wire? (true once the text reached the model history as its own message; false
 //   when the turn failed before that; absent on older events), steered? (true: sent while the agent was
 //   working) and attachments?: Attachment[]. The 'Stopped.' notice carries stop_phase?: 'streaming'|'tools'|'waiting'.
+//   A compaction's notice carries compaction?: Compaction (one notice per compaction).
 // Attachment (metadata only, never content): { kind: 'file', path, start_line, end_line, truncated? }
 //   | { kind: 'shell', command (at most 2,000 characters), exit_code }
 // RewindPreview (GET /sessions/<id>/rewind-preview?before_event_id=<user event id>; read-only, also while busy):
@@ -102,7 +104,24 @@
 // RequestInfo: { model, status, finish_reason?, http_status?, error_kind?, usage? }
 // ContextInfo: { estimated_tokens, input_budget, context_window, reply_reserve,
 //   compactions, summarized_messages, estimate_method, instruction_files, warnings,
-//   instruction_sources?, prepared_for_next_turn?, breakdown?, estimate_scale?, summary_adjustment? }
+//   instruction_sources?, prepared_for_next_turn?, breakdown?, estimate_scale?, summary_adjustment?,
+//   estimate_prior? (true: estimate_scale is the model's starting ratio, not yet from reported counts),
+//   auto_compact_threshold?, auto_compact_percent?, compaction_deferred? (over the threshold with nothing earlier
+//   to summarize: sent as it was), compaction?: Compaction (when this request compacted), last_request?: LastRequest,
+//   next_estimate?: { tokens, percent_of_input_budget, percent_of_threshold } (the app's estimate of the next
+//   request before the user's next message) }
+// Compaction: { number, trigger: 'manual'|'in_turn'|'auto', before_tokens, after_tokens, threshold_tokens,
+//   summarized_messages, requests (summary and condense requests), elided_bytes, superseded_results }
+// LastRequest (what Databricks reported for the latest agent request): { call_id, model, status, finish_reason?,
+//   partial (ended without a finish reason: counts may be incomplete), input_tokens (= uncached + cache read +
+//   cache write), uncached_input_tokens, cache_read_input_tokens, cache_creation_input_tokens, output_tokens?,
+//   reasoning_tokens?, context_window, input_budget, auto_compact_threshold, auto_compact_percent, compactions
+//   (the info's compactions when it was sent; a different value means a compaction ran since),
+//   percent_of_input_budget, percent_of_context_budget, percent_of_threshold, model_window (null when unknown),
+//   percent_of_model_window, estimated_tokens (the app's estimate of the same request), estimate_scale,
+//   estimate_gap_percent }. Percentages are rounded to one decimal, or null without a denominator.
+// Metrics (GET /sessions/<id>/metrics): { scope, session_id, complete, totals, calls, by_purpose, by_model,
+//   pricing, last_input: LastRequest | null }
 // Job: { id, session_id, workspace, command, state, created, updated, exit_code,
 //   output?, truncated, timeout_seconds, max_output_bytes, background,
 //   without_shell? (true: ran from an argument vector without a shell) }

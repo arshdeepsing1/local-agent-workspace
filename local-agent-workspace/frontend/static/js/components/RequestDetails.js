@@ -9,6 +9,12 @@ const usageLabels = {
   reasoning_tokens: 'Reasoning tokens',
 }
 
+// Uncached input plus cache reads and writes: everything the request put in the context window.
+function inputWithCache(usage) {
+  if (typeof usage?.input_tokens !== 'number') return null
+  return usage.input_tokens + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0)
+}
+
 export default function RequestDetails({ info }) {
   return html`<details class="request-details">
     <summary>Request details · ${info.status}</summary>
@@ -24,7 +30,7 @@ export default function RequestDetails({ info }) {
       <dl>${Object.entries(usageLabels).map(([key, label]) => {
         const value = info.usage?.[key]
         return html`<div key=${key}><dt>${label}</dt><dd>${value?.toLocaleString() ?? 'Unavailable'}</dd></div>`
-      })}</dl>
+      })}<div><dt>Input incl. cache</dt><dd>${inputWithCache(info.usage)?.toLocaleString() ?? 'Unavailable'}</dd></div></dl>
       <p>Unavailable means the endpoint has not reported a value.</p>
       ${info.status !== 'completed' && info.usage ? html`<p>Usage received before completion may be partial.</p>` : null}
       <p>Per-request snapshot; excludes title and summary calls. This is not account usage or billing.</p>

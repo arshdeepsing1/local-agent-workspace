@@ -101,3 +101,34 @@ def test_a_cleared_file_write_limit_stays_empty_and_is_not_saved(ui, page):
     dialog.get_by_role("button", name="Save settings").click()
     expect(dialog).to_be_visible()
     assert ui.bodies("/api/settings", "PUT") == []
+
+
+def test_the_auto_compact_field_explains_the_token_threshold_and_is_saved(ui, page):
+    dialog = open_settings(ui, page)
+    field = dialog.get_by_role("spinbutton", name="Auto-compact at (% of input budget)")
+    expect(field).to_have_value("90")
+    expect(field).to_have_attribute("min", "50")
+    expect(field).to_have_attribute("max", "100")
+    expect(dialog.get_by_text(re.compile(r"With these settings that is about 108,748 tokens\. Lower values compact "
+                                         r"sooner"))).to_be_visible()
+    expect(dialog.get_by_text(re.compile(r"plus up to 8,192 for thinking on models that always think, such as "
+                                         r"Claude Opus 5\.5"))).to_be_visible()
+    field.fill("60")
+    expect(dialog.get_by_text(re.compile(r"that is about 72,499 tokens"))).to_be_visible()
+    field.fill("40")
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_be_visible()
+    assert ui.bodies("/api/settings", "PUT") == []
+    field.fill("101")
+    dialog.get_by_role("button", name="Save settings").click()
+    assert ui.bodies("/api/settings", "PUT") == []
+    field.fill("75")
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    assert ui.bodies("/api/settings", "PUT")[0]["auto_compact_percent"] == 75
+
+
+def test_a_saved_auto_compact_value_is_shown(ui, page):
+    dialog = open_settings(ui, page, setup="fake.settings = { ...fake.settings, auto_compact_percent: 100 }")
+    expect(dialog.get_by_role("spinbutton", name="Auto-compact at (% of input budget)")).to_have_value("100")
+    expect(dialog.get_by_text(re.compile(r"that is about 120,832 tokens"))).to_be_visible()
