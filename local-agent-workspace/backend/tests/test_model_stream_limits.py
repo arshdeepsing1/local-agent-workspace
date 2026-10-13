@@ -144,7 +144,7 @@ async def test_overflow_preserves_typed_failure_without_executing_valid_prefix_a
                 "name": "write_file" if number == 0 else "", "arguments": "x" * 65536}}]}) for number in range(9)]
         return httpx.Response(200, stream=Chunks([prefix, *tail]))
 
-    async def execute(*args):
+    async def execute(*args, **_):
         pytest.fail("No call from an oversized response may execute, including its complete prefix")
 
     manager.execute_tool = execute
@@ -187,7 +187,7 @@ async def test_maximum_existing_file_size_with_json_escaping_still_executes(runt
             return httpx.Response(200, stream=Chunks([*chunks, event({}, "tool_calls"), b"data: [DONE]\n\n"]))
         return httpx.Response(200, content=event({"content": "Done."}, "stop") + b"data: [DONE]\n\n")
 
-    async def execute(session, tools, name, values, call_id):
+    async def execute(session, tools, name, values, call_id, **_):
         calls.append((name, values, call_id))
         return "File written."
 

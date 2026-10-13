@@ -172,6 +172,10 @@ def finish_inference_call(call, info):
     usage = reported_usage(info.get("usage"))
     if usage:
         call["usage"] = usage
+    rate_limit = info.get("rate_limit")
+    limit_type = rate_limit.get("limit_type") if isinstance(rate_limit, dict) else None
+    if isinstance(limit_type, str) and 0 < len(limit_type) <= 64:
+        call["limit_type"] = limit_type  # Which Databricks rate limit a 429 named (rate_limits.parse_rate_limit).
     call["finished"] = _now()
     return call
 
@@ -220,7 +224,7 @@ def _public_call(call, *, fallback=False):
     for key in ("http_status", "attempt", "max_output_tokens"):
         if type(call.get(key)) is int:
             result[key] = call[key]
-    for key in ("error_kind", "finish_reason", "retry_reason"):
+    for key in ("error_kind", "finish_reason", "retry_reason", "limit_type"):
         if isinstance(call.get(key), str):
             result[key] = call[key]
     usage = reported_usage(call.get("usage"))

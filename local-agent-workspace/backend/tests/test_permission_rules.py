@@ -837,3 +837,83 @@ async def test_after_tool_hook_warnings_have_one_period(runtime):
     await run(manager, session, tools, "write_file", {"path": "a.txt", "content": "x"})
     notice = next(item["text"] for item in session["events"] if item["type"] == "notice")
     assert notice == "After-tool hook warning: Hook failed (exit 1): Lint failed. The tool action already completed."
+
+
+# --- outline_file and project_overview (u-large-inputs item 7) -------------------------------------
+
+def test_the_large_input_tools_are_read_tools_everywhere():
+    from local_agent import tool_profiles
+    from local_agent.tool_schema import validate_arguments
+    for name, arguments in (("outline_file", {"path": "docs/h.md", "max_level": 2, "offset": 0}),
+                            ("project_overview", {"path": ".", "include_ignored": True})):
+        assert TOOL_KINDS[name] == "read" and name in permissions.READ_TOOLS and name in tool_profiles.READ_TOOLS
+        assert name in tool_profiles.FILE_TOOLS
+        for mode in ("plan", "dontAsk", "manual", "auto"):
+            assert evaluate(mode, name, arguments).decision == "allow"
+        definition = next(item["function"] for item in TOOL_DEFINITIONS if item["function"]["name"] == name)
+        validate_arguments(definition["parameters"], arguments)
+
+
+def test_rules_and_turned_off_tools_for_read_file_and_listing_cover_the_new_tools():
+    deny_read = {"behavior": "deny", "tool": "read_file"}
+    verdict = evaluate("bypassPermissions", "outline_file", {"path": "a.md"}, project_rules=[deny_read])
+    assert verdict.decision == "deny" and verdict.message == (
+        "Blocked by a deny rule for this project: the tool read_file, which also covers outline_file. Do not retry it or "
+        "work around it.")
+    assert permissions.denied_tools([], [deny_read], [], ["outline_file", "project_overview"]) == {"outline_file"}
+    deny_find = {"behavior": "deny", "tool": "find_files"}
+    assert evaluate("manual", "project_overview", {}, user_rules=[deny_find]).decision == "deny"
+    assert permissions.denied_tools([], [], [deny_find], ["project_overview"]) == {"project_overview"}
+    verdict = evaluate("manual", "outline_file", {"path": "a.md"}, disabled={"read_file"})
+    assert verdict.decision == "deny" and verdict.message == ("The user turned off read_file in this chat, which "
+                                                              "also covers outline_file. Use other tools.")
+    assert evaluate("manual", "project_overview", {}, disabled={"list_files"}).decision == "deny"
+    assert evaluate("manual", "outline_file", {"path": "a.md"}, disabled={"list_files"}).decision == "allow"
+
+
+async def test_a_turned_off_read_file_hides_and_refuses_outline_file(tmp_path, monkeypatch):
+    monkeypatch.setattr("local_agent.config.APP_ROOT", tmp_path)
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "a.md").write_text("# A\n")
+    settings = Settings(tmp_path / "state")
+    settings.values.update(workspace=str(project), env_file="")
+    store = Store(settings.state_dir / "rules.sqlite3")
+    try:
+        manager = AgentManager(store, settings)
+        session = store.create(settings.values)
+        session["disabled_tools"] = ["read_file"]
+        offered = [item["function"]["name"] for item in manager.step_definitions(session, [])]
+        assert "outline_file" not in offered and "project_overview" in offered
+        output = await manager.execute_tool(session, manager.session_tools(session), "outline_file", {"path": "a.md"},
+                                            "c1")
+        assert output == "The user turned off read_file in this chat, which also covers outline_file. Use other tools."
+    finally:
+        store.db.close()
+
+
+def test_large_input_guidance_follows_the_offered_tools(tmp_path, monkeypatch):
+    from local_agent.agents import large_input_guidance
+    from local_agent.context import HANDOFF_POINTER
+    both = large_input_guidance({"outline_file", "project_overview", "read_file"})
+    assert "call project_overview first" in both and "call outline_file" in both and "File write limit" in both
+    only_outline = large_input_guidance({"outline_file"})
+    assert "project_overview" not in only_outline and "outline_file" in only_outline
+    only_overview = large_input_guidance({"project_overview"})
+    assert "outline_file" not in only_overview and "project_overview" in only_overview
+    assert large_input_guidance({"read_file"}) == ""
+    assert "outline_file" in HANDOFF_POINTER
+    monkeypatch.setattr("local_agent.config.APP_ROOT", tmp_path)
+    settings = Settings(tmp_path / "state")
+    settings.values.update(workspace=str(tmp_path), env_file="")
+    store = Store(settings.state_dir / "guidance.sqlite3")
+    try:
+        manager = AgentManager(store, settings)
+        session = store.create(settings.values)
+        tools = manager.session_tools(session)
+        system, _ = manager.context_inputs(session, tools, "manual", available={"read_file"})
+        assert "project_overview" not in system["content"] and "outline_file" not in system["content"]
+        system, _ = manager.context_inputs(session, tools, "manual")
+        assert "call project_overview first" in system["content"]
+    finally:
+        store.db.close()

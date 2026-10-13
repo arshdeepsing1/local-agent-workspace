@@ -10,8 +10,7 @@ from local_agent.agents import AgentManager
 from local_agent.api import create_app
 from local_agent.composer_api import STEER_PREFIX
 from local_agent.config import Settings
-from local_agent.context import (OUTPUT_LIMIT_CONTINUATION, context_boundary, is_continuation, prepare_context,
-                                 turn_start)
+from local_agent.context import OUTPUT_LIMIT_CONTINUATION, context_boundary, is_continuation, prepare_context
 from local_agent.portability import _validate_wire
 from local_agent.store import Store
 
@@ -490,9 +489,9 @@ async def test_compaction_after_a_steered_message_ends_on_a_valid_boundary(runti
 
 
 @pytest.mark.parametrize("after", [1, 4])
-async def test_in_turn_compaction_keeps_the_steered_message_as_the_turn_request(after):
-    """A steered message is a turn start for compaction: with little after it the summary ends there;
-    with many large results after it, they are summarized in the turn and it is kept as the request."""
+async def test_in_turn_compaction_keeps_the_request_and_the_steered_message_verbatim(after):
+    """A steered message is not a turn start for compaction (u-large-inputs item 6): the summary
+    ends inside the turn, and both the turn's request and the steered message stay verbatim."""
     big = "data " * 3000
     wire = [{"role": "user", "content": "Inspect the files"}]
     for number in range(2 + after):
@@ -508,9 +507,9 @@ async def test_in_turn_compaction_keeps_the_steered_message_as_the_turn_request(
     messages, state, info = await prepare_context(wire, {}, {"role": "system", "content": "s"}, [], 16384, summarize,
                                                   reply_reserve=1024)
     through = state["through"]
-    assert context_boundary(wire, through) and turn_start(wire, through) == steered
-    assert bool(info.get("compacted_in_turn")) == (after == 4)
-    assert any(message.get("content") == wire[steered]["content"] for message in messages)
+    assert context_boundary(wire, through) and through > steered and wire[through]["role"] == "assistant"
+    assert info.get("compacted_in_turn") is True
+    assert [message["content"] for message in messages[2:4]] == [wire[0]["content"], wire[steered]["content"]]
 
 
 async def test_the_api_queues_while_busy_and_guards_the_queue_routes(runtime, monkeypatch):

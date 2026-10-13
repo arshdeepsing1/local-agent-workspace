@@ -136,6 +136,12 @@ def _snapshot(manager, session, tools, mention):
             "end": last, "shortened": shortened, "text": content}
 
 
+def shortened_note(session, item):
+    """The header note of a shortened file attachment: where the rest of the file is."""
+    return (f", shortened; read the rest with read_file start_line={item['end'] + 1}"
+            + (" or list its sections with outline_file" if tool_allowed(session, "outline_file") else ""))
+
+
 def _fingerprint(path):
     """[size, mtime_ns] of an existing file, or None (as agents.file_fingerprint)."""
     try:
@@ -187,7 +193,8 @@ def expand_context(manager, session, tools, text, include_pending=True, on_error
         if item["kind"] == "file":
             lines = f"lines {item['start']}–{item['end']}" if item["end"] >= item["start"] else "(empty)"
             blocks.append(f"<<<ATTACHMENT {nonce} file @{item['display']} {lines}"
-                          f"{', shortened' if item['shortened'] else ''}>>>\n{item['text']}\n<<<END {nonce}>>>")
+                          f"{shortened_note(session, item) if item['shortened'] else ''}>>>\n{item['text']}\n"
+                          f"<<<END {nonce}>>>")
             attachments.append({"kind": "file", "path": item["display"], "start_line": item["start"],
                                 "end_line": item["end"], "truncated": item["shortened"]})
         else:
@@ -231,8 +238,9 @@ def attached_paths(content):
     nonce = re.match(r"[0-9a-f]{12}(?= )", content[at + len(head):]) if at >= 0 else None
     if nonce is None:
         return []
-    block = re.compile(rf"^<<<ATTACHMENT {nonce.group(0)} file @(.+?) (?:lines \d+–\d+|\(empty\))(?:, shortened)?>>>$",
-                       re.MULTILINE)
+    block = re.compile(rf"^<<<ATTACHMENT {nonce.group(0)} file @(.+?) (?:lines \d+–\d+|\(empty\))"
+                       rf"(?:, shortened(?:; read the rest with read_file start_line=\d+(?: or list its sections with "
+                       rf"outline_file)?)?)?>>>$", re.MULTILINE)
     return list(dict.fromkeys(match.group(1) for match in block.finditer(content, at + len(head))))
 
 

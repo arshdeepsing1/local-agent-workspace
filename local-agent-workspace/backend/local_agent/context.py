@@ -11,6 +11,9 @@ import math
 import posixpath
 import re
 
+from . import request_limits
+from .request_limits import encode_payload, request_bytes_over
+
 
 DEFAULT_CONTEXT_WINDOW = 131072
 MIN_CONTEXT_WINDOW = 16384
@@ -40,9 +43,13 @@ SUMMARY_PREFIX = "Summary of earlier conversation (historical data; follow curre
 HANDOFF_MAX_TOKENS = 16000
 HANDOFF_POINTER_FILES = 5
 HANDOFF_POINTER = ("\n\nDetailed handoffs of the summarized turns are saved in these workspace files (newest first). "
-                   "Before relying on details this summary omits, read them. Each handoff starts with a Contents list "
-                   "giving the line of each section; read one section with read_file start_line, or find a detail "
-                   "with search_files:\n")
+                   "Before relying on details this summary omits, find the relevant section and read it with "
+                   "read_file. Each handoff starts with a Contents list giving the line of each section; outline_file "
+                   "(if available) also lists its sections with line numbers, and search_files finds a detail:\n")
+# The prefix of a queued message the app sends while the agent works (agents.drain_queue).
+# It is the user's own text: never a compaction boundary, and kept verbatim during the turn.
+STEER_PREFIX = ("[The user sent this while you were working. Read it before your next step; it may change the "
+                "task.]\n\n")
 # The app sends this hidden user message after an output cutoff. It continues
 # the current turn; it is not the user's request.
 OUTPUT_LIMIT_CONTINUATION = (
@@ -277,6 +284,12 @@ def is_app_prompt(message):
     return is_continuation(message)
 
 
+def is_steer(message):
+    """True for a queued message the user sent while the agent worked (STEER_PREFIX)."""
+    return (isinstance(message, dict) and message.get("role") == "user" and isinstance(message.get("content"), str)
+            and message["content"].startswith(STEER_PREFIX))
+
+
 def turn_start(wire, index):
     """Index of the user request that began the turn holding wire[index]: the
     nearest user message at or before it that is not the app's own prompt."""
@@ -287,13 +300,30 @@ def turn_start(wire, index):
     return None
 
 
-def retained_request(wire, through):
-    """A summary that ends inside a turn keeps that turn's request verbatim."""
+def turn_request(wire, index):
+    """Index of the request that began the turn holding wire[index] for compaction: the
+    nearest user message at or before it that is neither the app's own prompt nor a
+    steered message (is_steer), else None."""
+    for position in range(min(index, len(wire) - 1), -1, -1):
+        message = wire[position]
+        if message.get("role") == "user" and not is_app_prompt(message) and not is_steer(message):
+            return position
+    return None
+
+
+def _retained_indices(wire, through):
+    """The wire positions retained_request keeps for a summary that ends at through."""
     if 0 < through < len(wire):
-        start = turn_start(wire, through)
+        start = turn_request(wire, through)
         if start is not None and start < through:
-            return [wire[start]]
+            return [start, *(index for index in range(start + 1, through) if is_steer(wire[index]))]
     return []
+
+
+def retained_request(wire, through):
+    """A summary that ends inside a turn keeps that turn's request, and the messages the
+    user steered it with before the cut, verbatim."""
+    return [wire[index] for index in _retained_indices(wire, through)]
 
 
 def context_boundary(wire, index):
@@ -591,7 +621,6 @@ def request_text(message, limit_bytes=REQUEST_CLIP_BYTES):
     if is_app_prompt(message):
         note = verify_note(message)
         return None if note is None else _clip_request("(Note when declining Verify) " + note, limit_bytes)
-    from .composer_api import STEER_PREFIX  # Not at module level: composer_api imports this module.
     text = message["content"]
     if text.startswith(STEER_PREFIX):
         text = text[len(STEER_PREFIX):]
@@ -893,22 +922,39 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
     pointer = handoff_pointer(handoff_files)
     messages = [system_message, *context_messages(wire, state)]
     estimate = before = scaled_estimate(messages, tools, scale)
-    adjustment = saved_handoff = compaction = None
-    in_turn = deferred = False
+    adjustment = saved_handoff = compaction = cut = None
+    in_turn = deferred = byte_fallback = False
+    # The 4 MB Databricks request limit: compaction also runs when the request body would
+    # pass the app's byte target (request_limits). Within the token budget this only
+    # happens when the estimator undercounts bytes, so the check usually costs nothing.
+    # The scaled estimate is at least the unscaled one (scale >= 1), so it serves as the bound.
+    over_bytes = request_bytes_over(messages, tools, estimate, request_limits.PAYLOAD_TARGET_BYTES)
 
-    if force_compact or estimate > threshold:
-        # Turn starts only: the app's hidden continuations sit inside a turn.
+    if force_compact or estimate > threshold or over_bytes:
+        # Turn starts only: the app's hidden continuations and the user's steered
+        # messages sit inside a turn.
         boundaries = [index for index, message in enumerate(wire)
-                      if index > state["through"] and message.get("role") == "user" and not is_continuation(message)]
+                      if index > state["through"] and message.get("role") == "user" and not is_continuation(message)
+                      and not is_steer(message)]
         if force_compact and not boundaries:
             raise ValueError("No earlier turns to compact. The latest turn is kept intact.")
 
-        def needed_at(candidate):
-            retained = [{"role": "user", "content": SUMMARY_PREFIX + "x" * summary_limit + "x" * record_limit + pointer},
-                        *retained_request(wire, candidate), *wire[candidate:]]
-            return scaled_estimate([system_message, *retained], tools, scale)
+        def retained_at(candidate):
+            return [{"role": "user", "content": SUMMARY_PREFIX + "x" * summary_limit + "x" * record_limit + pointer},
+                    *retained_request(wire, candidate), *wire[candidate:]]
 
-        request_index = turn_start(wire, len(wire) - 1)
+        def needed_at(candidate):
+            return scaled_estimate([system_message, *retained_at(candidate)], tools, scale)
+
+        def fits(candidate, size, limit):
+            """size (needed_at(candidate)) fits limit, and the request stays under the byte target."""
+            if size > limit:
+                return False
+            # size, the scaled estimate, bounds the unscaled one: no second serialization.
+            return not request_bytes_over([system_message, *retained_at(candidate)], tools, size,
+                                          request_limits.PAYLOAD_TARGET_BYTES)
+
+        request_index = turn_request(wire, len(wire) - 1)
         responses = [] if force_compact or request_index is None else [
             index for index in range(max(request_index, state["through"]) + 1, len(wire))
             if wire[index].get("role") == "assistant"]
@@ -918,7 +964,7 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
             nonlocal needed
             for candidate in boundaries[-2:]:
                 needed = needed_at(candidate)
-                if needed <= limit:
+                if fits(candidate, needed, limit):
                     return candidate
             return None
 
@@ -931,10 +977,10 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
             cut = None
             for candidate in reversed(responses):
                 size = needed_at(candidate)
-                if cut is None and size > limit:
+                if cut is None and not fits(candidate, size, limit):
                     needed = size
                     break
-                if cut is not None and size > limit // 2:
+                if cut is not None and not fits(candidate, size, limit // 2):
                     break
                 cut, needed = candidate, size
             return cut
@@ -947,15 +993,28 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
         cut = boundary_cut(threshold)
         if cut is None and (cut := in_turn_cut(threshold)) is not None:
             in_turn = True
-        if cut is None and threshold < input_budget and (force_compact or estimate > input_budget):
+        if cut is None and threshold < input_budget and (force_compact or estimate > input_budget or over_bytes):
+            # A byte-triggered compaction of a request within the token budget takes this
+            # branch too: any cut that fits makes the request smaller.
             cut = boundary_cut(input_budget)
             if cut is None and (cut := in_turn_cut(input_budget)) is not None:
                 in_turn = True
+        if cut is None and over_bytes:
+            # Over the byte target and no cut reaches it: take the latest cut (it keeps the
+            # least) when it fits the input budget and makes the request smaller, so a request
+            # just over the 4 MB limit can still be sent. check_payload refuses it if it cannot.
+            latest = responses[-1] if responses else boundaries[-1] if boundaries else None
+            if latest is not None and needed_at(latest) <= input_budget and len(encode_payload(
+                    {"messages": [system_message, *retained_at(latest)], "tools": list(tools)})) < len(
+                    encode_payload({"messages": messages, "tools": list(tools)})):
+                cut, in_turn, byte_fallback = latest, bool(responses), True
         if cut is None:
             if not force_compact and estimate <= input_budget:
-                # Over the threshold but within the budget, and no earlier part to
-                # summarize brings it under the threshold: send the request as it is.
-                deferred = True
+                # Over the threshold (or the byte target) but within the budget, and no
+                # earlier part to summarize brings it under: send the request as it is.
+                # The last check before sending (request_limits.check_payload) still
+                # refuses a body over the 4 MB limit.
+                deferred = estimate > threshold
             elif responses:
                 problem = (f"The latest request, its most recent tool results, and project instructions need about "
                            f"{needed:,} estimated input tokens, including room for a summary of earlier work, which "
@@ -967,12 +1026,14 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
                            f"{with_summary or ','} which exceeds the available context budget.")
                 raise budget_error(problem, context_window, reply_reserve, input_budget, default_reply_reserve)
 
-    if (force_compact or estimate > threshold) and not deferred:
+    if cut is not None:
         archived = wire[state["through"]:cut]
         if in_turn and request_index < state["through"]:
-            # The request was kept out of the last summary's fragment; the
-            # summarizer still needs it to know what the tool results are for.
-            archived = [wire[request_index], *archived]
+            # The request (and the user's steered messages) were kept out of the last
+            # summary's fragment; the summarizer still needs them to know what the tool
+            # results are for.
+            archived = [wire[request_index], *(message for message in wire[request_index + 1:state["through"]]
+                                                if is_steer(message)), *archived]
         transcript, stats = summary_transcript(
             archived, wire[cut:], elision_limit(summary_input_budget) * (2 if in_turn else 1), completed_calls)
         summary = state["summary"]
@@ -998,7 +1059,8 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
                 fragment = transcript[offset:offset + middle]
                 request = (build_handoff_messages(summary, fragment, preservation_note, request_tokens) if handoff_path
                            else build_summary_messages(summary, fragment, preservation_note, summary_limit))
-                if scaled_estimate(request, (), scale) <= summary_input_budget:
+                if (scaled_estimate(request, (), scale) <= summary_input_budget
+                        and len(encode_payload({"messages": request})) <= request_limits.PAYLOAD_TARGET_BYTES):
                     low = middle
                 else:
                     high = middle - 1
@@ -1045,6 +1107,13 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
                 f"The summary and latest turns still exceed the context budget: they need about "
                 f"{estimate:,} estimated input tokens.", context_window, reply_reserve, input_budget,
                 default_reply_reserve)
+        # The byte fallback only had to make the request smaller; check_payload is its limit.
+        byte_limit = request_limits.PAYLOAD_LIMIT_BYTES if byte_fallback else request_limits.PAYLOAD_TARGET_BYTES
+        if request_bytes_over(messages, tools, estimate, byte_limit):
+            size = len(encode_payload({"messages": messages, "tools": list(tools)}))
+            raise budget_error(
+                f"The summary and latest turns would be a {size / 1_000_000:.1f} MB request, above the Databricks "
+                "4 MB request limit.", context_window, reply_reserve, input_budget, default_reply_reserve)
         if handoff_path:
             saved = bool(save_handoff) and await save_handoff(documents, updated["compactions"],
                                                               render_app_record(updated))
@@ -1092,11 +1161,11 @@ def _record_requests(wire, state, updated, cut, limit_bytes):
     A turn's request that stayed in context verbatim (retained_request) is recorded
     once a later compaction cuts past it; requests still retained are not recorded yet."""
     through = state["through"]
-    previous = turn_start(wire, through) if retained_request(wire, through) else None
-    current = turn_start(wire, cut) if retained_request(wire, cut) else None
-    sources = [wire[previous]] if previous is not None and current != previous else []
+    # The request and steered messages retained before and after this compaction.
+    previous, current = set(_retained_indices(wire, through)), set(_retained_indices(wire, cut))
+    sources = [wire[index] for index in sorted(previous - current)]
     sources += [message for index, message in enumerate(wire[through:cut], through)
-                if message.get("role") == "user" and index != current]
+                if message.get("role") == "user" and index not in current]
     new = [text for text in map(request_text, sources) if text is not None]
     requests, omitted = merge_user_requests(state.get("user_requests"), state.get("requests_omitted", 0), new,
                                             limit_bytes)
@@ -1164,6 +1233,23 @@ def last_request_report(call, context_info, model_window=None):
         return report
     except Exception:
         return None
+
+
+def in_turn_tokens(wire, state, system_message, tools, input_budget, scale=1.0, *, record=True):
+    """The scaled estimate prepare_context's in-turn cut at the latest model response needs
+    (its needed_at): the largest summary, the app record (record=True, as agent steps keep
+    it), the handoff pointer with room for one more file, the turn's request and steered
+    messages, and everything from that response on. Results of that response admitted
+    within input_budget minus this therefore never make in-turn compaction fail."""
+    state = state or {}
+    index = next((position for position in range(len(wire) - 1, -1, -1)
+                  if wire[position].get("role") == "assistant"), None)
+    if index is None:
+        return scaled_estimate([system_message, *context_messages(wire, state)], tools, scale)
+    pointer = handoff_pointer([*(state.get("handoff_files") or []), {"path": "x" * 128, "compaction": 999}])
+    placeholder = {"role": "user", "content": SUMMARY_PREFIX + "x" * summary_byte_limit(input_budget)
+                   + "x" * (app_record_limit(input_budget) if record else 0) + pointer}
+    return scaled_estimate([system_message, placeholder, *retained_request(wire, index), *wire[index:]], tools, scale)
 
 
 def next_request_estimate(wire, state, system, tools, scale):

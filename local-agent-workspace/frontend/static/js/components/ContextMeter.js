@@ -13,6 +13,11 @@ function inputParts(report) {
     ? `${total} = ${parts.map(([value, label]) => `${value.toLocaleString()} ${label}`).join(' + ')}` : total
 }
 
+// The request body actually sent, next to the Databricks 4 MB per-request limit.
+function requestSize(bytes) {
+  return bytes >= 1_000_000 ? `${(bytes / 1e6).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1000))} KB`
+}
+
 function share(percent, whole) {
   return typeof percent === 'number' && typeof whole === 'number' ? `${percent}% of ${whole.toLocaleString()}` : 'Unavailable'
 }
@@ -99,6 +104,7 @@ export default function ContextMeter({ info, model, busy = false, onCompact }) {
       <p>Of the ${info.context_window.toLocaleString()}-token context window, ${info.reply_reserve.toLocaleString()} tokens are reserved for the response and ${safetyReserve.toLocaleString()} for safety.</p>
       <p>The response limit is separate from the context window. Increasing the context budget does not increase the response limit.</p>
       <p>Compactions: ${info.compactions}. Messages summarized: ${info.summarized_messages}.</p>
+      ${Number.isInteger(info.payload_bytes) ? html`<p>Request size: ${requestSize(info.payload_bytes)} of Databricks' ${(info.payload_limit_bytes ?? 4_000_000) / 1e6} MB limit.</p>` : null}
       <p class="context-heading">Loaded instructions</p>
       ${info.instruction_sources?.length ? html`
         <ul>${info.instruction_sources.map(source => html`<li key=${source.path}>

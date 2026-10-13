@@ -244,5 +244,5 @@ async def test_the_model_is_told_at_the_end_of_the_system_message(runtime, monke
     # Stable text first; the folder list, time and notice last.
     assert (system.index("Workspace: ") < system.index("Each of your responses can contain")
             < system.index("Project rule: keep tests green.") < system.index("Additional allowed folders: ")
-            < system.index("Current local date and time: ") < system.index("Files changed since"))
+            < system.index("Current local date: ") < system.index("Files changed since"))
     assert "cache_control" not in json.dumps(requests[-1])

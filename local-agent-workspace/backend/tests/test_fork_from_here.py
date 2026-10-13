@@ -141,6 +141,43 @@ async def test_event_contract_fields_survive_a_fork(runtime):
     assert history.cut_points(fork, steered["id"]) == (3, 2)
 
 
+async def test_withheld_shortened_and_error_results_keep_what_the_model_saw_in_a_fork(runtime):
+    """event.get("model_output", output) equals the wire's tool message in the copy too (spec 11(b))."""
+    app, manager, project = runtime
+    deferred = json.dumps({"error_kind": "result_deferred", "message": "m", "hint": "h"})
+    shortened = json.dumps({"output": "a…z", "result_shortened": True, "omitted_bytes": 900, "hint": "h"})
+    failed = json.dumps({"error_kind": "not_found", "message": "No such file", "hint": "h"})
+    calls = [{"id": f"c{index}", "type": "function", "function": {"name": name, "arguments": "{}"}}
+             for index, name in enumerate(("read_file", "run_command", "read_file"))]
+    events = [{"id": "u1", "type": "user", "text": "Go", "in_wire": True},
+              {"id": "t0", "type": "tool", "name": "read_file", "call_id": "c0", "input": {}, "state": "completed",
+               "output": '{"content": "full"}', "model_output": deferred,
+               "result_withheld": {"estimated_tokens": 9000, "allowance_tokens": 4000}},
+              {"id": "t1", "type": "tool", "name": "run_command", "call_id": "c1", "input": {}, "state": "completed",
+               "output": '{"output": "a long output z"}', "model_output": shortened, "result_shortened": True},
+              {"id": "t2", "type": "tool", "name": "read_file", "call_id": "c2", "input": {}, "state": "error",
+               "output": "No such file", "model_output": failed},
+              {"id": "a1", "type": "assistant", "text": "Done.",
+               "request_info": {"model": "test-model", "status": "completed"}}]
+    wire = [{"role": "user", "content": "Go"}, {"role": "assistant", "content": None, "tool_calls": calls},
+            {"role": "tool", "tool_call_id": "c0", "content": deferred},
+            {"role": "tool", "tool_call_id": "c1", "content": shortened},
+            {"role": "tool", "tool_call_id": "c2", "content": failed},
+            {"role": "assistant", "content": "Done."}]
+    source = stored(manager, project, events, wire)
+    async with await client_for(app) as client:
+        response = await client.post(f"/api/sessions/{source['id']}/fork", json={})
+        assert response.status_code == 201, response.text
+    fork = manager.store.get(response.json()["id"])
+    tools = [event for event in fork["events"] if event["type"] == "tool"]
+    assert tools[0]["result_withheld"] == {"estimated_tokens": 9000, "allowance_tokens": 4000}
+    assert tools[1]["result_shortened"] is True
+    sent = {message["tool_call_id"]: message["content"] for message in fork["wire"] if message["role"] == "tool"}
+    for event in tools:
+        assert event.get("model_output", event["output"]) == sent[event["call_id"]]
+    assert [event["model_output"] for event in tools] == [deferred, shortened, failed]
+
+
 async def test_title_override_and_validation(runtime):
     app, manager, project = runtime
     template, _ = CASES["a_plain"]

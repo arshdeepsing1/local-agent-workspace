@@ -10,12 +10,10 @@ from fastapi import HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
 from .approvals import ensure_idle
-from .context import is_app_prompt
+from .context import STEER_PREFIX, is_app_prompt  # noqa: F401 (STEER_PREFIX is re-exported here)
 
 MAX_QUEUED = 3
 MAX_QUEUED_CHARS = 50_000
-STEER_PREFIX = ("[The user sent this while you were working. Read it before your next step; it may change the "
-                "task.]\n\n")
 SHELL_ONE_LINE = "Shell mode runs one line. Remove the line breaks or use Workspace → Terminal."
 SIDE_QUESTION_PREFIX = ("Side question from the user. Answer it briefly from the conversation so far. Do not call "
                         "tools. Your answer is not saved in the conversation.\n\n")

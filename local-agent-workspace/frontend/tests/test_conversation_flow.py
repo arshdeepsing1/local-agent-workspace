@@ -108,6 +108,11 @@ def test_continue_follows_live_turn_endings(ui, page):
     # An automatic output-limit retry marks a reply interrupted; that turn then completed.
     ("[{ type: 'assistant', text: 'Part', request_info: { status: 'interrupted' } }, { type: 'assistant', text: 'All' }]",
      {"terminal_reason": "completed"}, None),
+    # Requests that would fail the same way until Settings change get no Continue.
+    ("[{ type: 'error', text: 'Too large', error_kind: 'payload_too_large' }]", {"terminal_reason": "inference_error"},
+     None),
+    ("[{ type: 'error', text: 'OTPM', error_kind: 'output_tokens_over_limit', http_status: 429 }]",
+     {"terminal_reason": "inference_error"}, None),
     ("[]", {"terminal_reason": "step_limit", "status": "running"}, None),
     ("[]", {"terminal_reason": "step_limit", "status": "awaiting_approval"}, None),
     ("[]", {}, None),

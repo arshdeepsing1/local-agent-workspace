@@ -130,3 +130,15 @@ def test_questions_show_the_answers_and_plans_show_in_full_with_their_review():
     assert "- Plan \"Add notes\" (not reviewed: the mode was changed from the menu):" in text
     assert "- Plan \"Add notes\" (pending):" in text
     assert '"questions"' not in text and '"plan"' not in text
+
+
+def test_outline_and_overview_lines():
+    events = [{"id": "o", "type": "tool", "name": "outline_file", "state": "completed", "output": "{}",
+               "input": {"path": "docs/h.md", "max_level": 2}},
+              {"id": "p", "type": "tool", "name": "project_overview", "state": "completed", "output": "{}",
+               "input": {"path": "."}},
+              {"id": "q", "type": "tool", "name": "outline_file", "state": "completed", "output": "{}",
+               "input": {"path": "a.py", "max_level": 6}}]
+    text = transcript({"id": "c1", "title": "Outline", "events": events})
+    assert "- Outlined `docs/h.md` to level 2\n" in text and "- Project overview of `.`\n" in text
+    assert "- Outlined `a.py`\n" in text

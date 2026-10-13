@@ -31,6 +31,10 @@ SEARCH_PAGE_LIMIT = 10_000  # the largest search offset
 OUTPUT_MODES = ("content", "files_with_matches", "count")
 MIN_PAGE_BYTES = 8_000
 MAX_PAGE_BYTES = 32_000
+MAX_LARGE_PAGE_BYTES = 128_000  # read_file pages from a 262,144-token context budget up
+LARGE_PAGE_WINDOW = 262_144
+DEFAULT_READ_LINES = 400
+OUTLINE_HINT_BYTES = 64_000  # First pages of files at least this large point at outline_file.
 MAX_READ_LINES = 2_000
 TAIL_FILE_LIMIT = 512_000_000
 TAIL_BLOCK = 65_536
@@ -94,12 +98,23 @@ def split_lines(text):
 
 
 def read_page_bytes(context_window):
-    """read_file's page size for a context budget: a quarter of it, 8,000 to 32,000 bytes."""
+    """read_file's page size for a context budget: a quarter of it, 8,000 to 32,000 bytes;
+    from a 262,144-token budget up, an eighth of it, at most 128,000 bytes."""
     try:
         budget = int(context_window)
     except (TypeError, ValueError, OverflowError):
         return MIN_PAGE_BYTES
+    if budget >= LARGE_PAGE_WINDOW:
+        return min(MAX_LARGE_PAGE_BYTES, budget // 8)
     return min(MAX_PAGE_BYTES, max(MIN_PAGE_BYTES, budget // 4))
+
+
+def default_read_lines(page_bytes):
+    """read_file's max_lines when the model omits it: 400, or more on large pages (fewer steps
+    over a long file means fewer resends of the whole context)."""
+    if type(page_bytes) is not int or page_bytes <= MAX_PAGE_BYTES:
+        return DEFAULT_READ_LINES
+    return min(MAX_READ_LINES, page_bytes // 64)
 
 
 def excluded(parts):
@@ -279,14 +294,15 @@ class WorkspaceTools:
         return text
 
     def read_file_range(self, path: str, start_line: int = 1, max_lines: int = 400, *,
-                        tail_lines=None, page_bytes=QUERY_OUTPUT_LIMIT):
+                        tail_lines=None, page_bytes=QUERY_OUTPUT_LIMIT, outline_hint=False):
         _integer(start_line, "start_line", 1)
         _integer(max_lines, "max_lines", 1, MAX_READ_LINES)
         if tail_lines is not None:
             _integer(tail_lines, "tail_lines", 1, MAX_READ_LINES)
             if start_line != 1:
                 raise ValueError("Use either start_line or tail_lines, not both.")
-        limit = min(MAX_PAGE_BYTES, max(MIN_PAGE_BYTES, page_bytes)) if type(page_bytes) is int else QUERY_OUTPUT_LIMIT
+        limit = (min(MAX_LARGE_PAGE_BYTES, max(MIN_PAGE_BYTES, page_bytes)) if type(page_bytes) is int
+                 else QUERY_OUTPUT_LIMIT)
         size_name = f"{limit // 1000} KB"
         target = self.path(path)
         info = target.stat()
@@ -301,6 +317,13 @@ class WorkspaceTools:
         deadline = time.monotonic() + QUERY_TIMEOUT
         if tail_lines is not None:
             return self._read_tail(target, info.st_size, tail_lines, result, limit, deadline)
+        if outline_hint and start_line == 1 and info.st_size >= OUTLINE_HINT_BYTES and info.st_size > limit:
+            from .outline import outline_format  # outline imports this module.
+            if outline_format(target) not in ("text", "notebook"):
+                # Before the scan, so the page is sized with these fields.
+                result["file_bytes"] = info.st_size
+                result["hint"] = (f"This file is {info.st_size // 1000:,} KB. outline_file lists its sections with "
+                                  "line numbers; read the ones you need with start_line and max_lines.")
         scanned = 0
         lines, cost, invalid = [], 0, []
 
@@ -643,7 +666,7 @@ class WorkspaceTools:
     async def run_command(self, command: str, timeout_seconds=60, max_output_bytes=LIMIT, on_output=None):
         return await run_process(command, self.root, timeout_seconds, max_output_bytes, on_output)
 
-    async def execute(self, name: str, arguments: dict, *, page_bytes=QUERY_OUTPUT_LIMIT):
+    async def execute(self, name: str, arguments: dict, *, page_bytes=QUERY_OUTPUT_LIMIT, outline_hint=False):
         if name == "run_command":
             return await self.run_command(arguments["command"], arguments.get("timeout_seconds", 60),
                                           arguments.get("max_output_bytes", LIMIT))
@@ -654,8 +677,19 @@ class WorkspaceTools:
                                         arguments.get("glob", "*"), arguments.get("offset", 0))
         if name == "read_file":
             return await asyncio.to_thread(self.read_file_range, arguments["path"],
-                                           arguments.get("start_line", 1), arguments.get("max_lines", 400),
-                                           tail_lines=arguments.get("tail_lines"), page_bytes=page_bytes)
+                                           arguments.get("start_line", 1),
+                                           arguments.get("max_lines", default_read_lines(page_bytes)),
+                                           tail_lines=arguments.get("tail_lines"), page_bytes=page_bytes,
+                                           outline_hint=outline_hint)
+        if name == "outline_file":
+            from . import outline  # outline imports this module.
+            return await asyncio.to_thread(outline.outline_file, self, arguments["path"],
+                                           offset=arguments.get("offset", 0), max_level=arguments.get("max_level", 6),
+                                           page_bytes=page_bytes)
+        if name == "project_overview":
+            from . import overview  # overview imports this module.
+            return await asyncio.to_thread(overview.project_overview, self, arguments.get("path", "."),
+                                           include_ignored=arguments.get("include_ignored", False))
         if name == "search_files":
             return await asyncio.to_thread(self.search_files, arguments["query"], arguments.get("glob", "*"), arguments.get("path", "."),
                                            **{key: arguments[key] for key in ("regex", "case_sensitive", "context_lines", "offset",
@@ -684,10 +718,13 @@ TOOL_DEFINITIONS = [
                 "include_ignored": {"type": "boolean", "default": False},
                 "offset": {"type": "integer", "minimum": 0, "maximum": 200000},
                 "max_results": {"type": "integer", "minimum": 1, "maximum": 500, "default": 200}}, ["pattern"]),
-    definition("read_file", "Read numbered lines from a regular text file: from start_line (default 1), or the last tail_lines lines, which suits logs. Pages are up to 8–32 KB depending on the context budget; follow next_line. Bytes that are not valid UTF-8 are shown as � and listed in invalid_utf8_lines. Forward reads scan at most 8 MB from the start; tail_lines works on files up to 512 MB. External paths trigger folder access approval.",
+    definition("read_file", "Read numbered lines from a regular text file: from start_line (default 1), or the last tail_lines lines, which suits logs. Pages are up to 8–128 KB depending on the context budget; max_lines defaults to 400, or more (up to 2,000) on large budgets; follow next_line. Bytes that are not valid UTF-8 are shown as � and listed in invalid_utf8_lines. Forward reads scan at most 8 MB from the start; tail_lines works on files up to 512 MB. External paths trigger folder access approval.",
                {"path": STRING, "start_line": {"type": "integer", "minimum": 1},
-                "max_lines": {"type": "integer", "minimum": 1, "maximum": 2000, "default": 400},
+                "max_lines": {"type": "integer", "minimum": 1, "maximum": 2000},
                 "tail_lines": {"type": "integer", "minimum": 1, "maximum": 2000}}, ["path"]),
+    definition("outline_file", "List the structure of one text file with line numbers so you can read only the parts you need: Markdown headings (with the line where each section ends), Python classes and functions (with end lines), and declarations found by a line scan in JavaScript/TypeScript, Go, Rust, Java/Kotlin/C#/Swift, C/C++, Ruby, PHP, shell, SQL, TOML/INI, YAML and Makefiles (heuristic; may miss some). Entries read \"start-end text\" (or \"start text\"); then call read_file with start_line=start and max_lines=end-start+1. max_level limits heading or nesting depth. Follow next_offset. Files up to 8 MB. Outlining does not count as reading the file before write_file.",
+               {"path": STRING, "max_level": {"type": "integer", "minimum": 1, "maximum": 6, "default": 6},
+                "offset": {"type": "integer", "minimum": 0, "maximum": 20000, "default": 0}}, ["path"]),
     definition("search_files", "Search one UTF-8 file or files under a directory path (default: the workspace) for literal text or a bounded regular expression. Choose the narrowest path and glob; use regex=false unless regular-expression syntax is needed. Case-insensitive by default. output_mode=files_with_matches lists matching files; count gives matches per file. Inside a Git repository that starts within the workspace or granted folder, .gitignored files are skipped unless include_ignored=true; a note says when .gitignore was not applied. Binary and non-UTF-8 files are not searched; skipped_files counts files over 2 MB and unreadable files. Literal searches use ripgrep, when installed, to find candidate files faster; results are the same either way. Returns next_offset for pagination; output is at most 8 KB. External paths trigger folder access approval.",
                {"query": STRING, "glob": STRING, "path": STRING, "regex": {"type": "boolean"},
                 "case_sensitive": {"type": "boolean"}, "context_lines": {"type": "integer", "minimum": 0, "maximum": 5},
@@ -727,6 +764,8 @@ TOOL_DEFINITIONS = [
                {"path": STRING, "offset": {"type": "integer", "minimum": 0},
                 "max_cells": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
                 "source_offset": {"type": "integer", "minimum": 0}}, ["path"]),
+    definition("project_overview", "Summarize a project folder (default: the workspace) without reading files: file counts and sizes by language and by top-level folder, key files (README, build and configuration files, CI workflows) and the largest files. Inside a Git repository that starts within the workspace or granted folder, .gitignored files are skipped unless include_ignored=true. Very large folders give a partial, top-level overview. Use it first in an unfamiliar or large project, then find_files/search_files/outline_file. Excludes secrets and generated folders. External paths need folder access.",
+               {"path": {"type": "string", "default": "."}, "include_ignored": {"type": "boolean", "default": False}}, []),
     definition("notebook_edit", "Edit one notebook cell, found by cell_id or index (0-based): replace its source (and optionally its type), insert a new cell at index (or after cell_id), delete it, or clear_outputs (of one cell, or of every cell when neither cell_id nor index is given). Read the notebook first. Edited code cells lose their outputs. Other cells and metadata are kept. One approval and a checkpoint, like edit_file. Notebooks up to 1 MB.",
                {"path": STRING, "edit_mode": {"type": "string", "enum": ["replace", "insert", "delete", "clear_outputs"],
                                               "default": "replace"},

@@ -461,3 +461,17 @@ async def test_agent_reads_use_the_context_budget(tmp_path, monkeypatch):
     result = next(message for message in requests[-1]["messages"] if message["role"] == "tool")["content"]
     assert 8_000 < len(result.encode()) <= 32_000
     assert json.loads(result)["start_line"] == 1
+
+
+def test_activity_groups_name_the_large_input_tools():
+    from local_agent.activity import FILE_GROUPS
+    assert ("outline_file", "Outlined") in FILE_GROUPS and ("project_overview", "Surveyed") in FILE_GROUPS
+
+
+def test_the_large_input_tools_run_through_workspace_tools(tmp_path):
+    (tmp_path / "doc.md").write_text("# Title\n## Part\n")
+    tools = WorkspaceTools(str(tmp_path))
+    outlined = asyncio.run(tools.execute("outline_file", {"path": "doc.md", "max_level": 1}))
+    assert outlined["entries"] == ["1-2 Title"] and outlined["max_level"] == 1
+    surveyed = asyncio.run(tools.execute("project_overview", {}))
+    assert surveyed["files"] == 1 and surveyed["key_files"] == []

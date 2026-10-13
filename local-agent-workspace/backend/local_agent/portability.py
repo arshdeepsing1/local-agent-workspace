@@ -30,6 +30,14 @@ class Usage(Record):
     reasoning_tokens: int | None = Field(default=None, ge=0)
 
 
+class RateLimitDetails(Record):
+    """The fields of a final 429 Databricks named (rate_limits.request_info_fields)."""
+    limit_type: str = Field(min_length=1, max_length=64)
+    limit: int | None = Field(default=None, ge=0)
+    current: int | None = Field(default=None, ge=0)
+    retry_after: float | None = Field(default=None, ge=0)
+
+
 class RequestInfo(Record):
     model: str = Field(max_length=256)
     status: Literal["running", "completed", "error", "cancelled", "interrupted"]
@@ -37,6 +45,7 @@ class RequestInfo(Record):
     http_status: int | None = Field(default=None, ge=100, le=599)
     error_kind: str | None = None
     usage: Usage | None = None
+    rate_limit: RateLimitDetails | None = None
 
 
 class Progress(Record):
@@ -71,6 +80,12 @@ class Attachment(Record):
     exit_code: int | None = None
 
 
+class Withheld(Record):
+    """A read result the model did not get (result_budget): its estimate and the allowance."""
+    estimated_tokens: int = Field(ge=0)
+    allowance_tokens: int = Field(ge=0)
+
+
 class Event(Record):
     id: str = Field(min_length=1, max_length=512)
     type: Literal["user", "assistant", "tool", "notice", "error"]
@@ -82,6 +97,11 @@ class Event(Record):
     name: str | None = None
     input: dict[str, Any] | None = None
     output: str | None = None
+    # What the model received when it differs from output (a tool error's hint, a withheld
+    # or shortened result); the wire's tool message holds the same text.
+    model_output: str | None = None
+    result_withheld: Withheld | None = None
+    result_shortened: bool | None = None
     preview: str | None = None
     state: Literal["pending", "running", "completed", "rejected", "cancelled", "error"] | None = None
     approval: Literal["approved", "declined", "expired", "blocked"] | None = None

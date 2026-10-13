@@ -56,7 +56,7 @@ async def test_incomplete_batch_never_executes_or_poisons_next_turn(runtime, mon
             return response(calls, finish, "I started preparing the change.")
         return response(finish="stop", text="Ready to continue.")
 
-    async def execute(*args):
+    async def execute(*args, **_):
         pytest.fail("No call in an incomplete or invalid batch may execute")
 
     manager.execute_tool = execute
@@ -97,7 +97,7 @@ async def test_no_input_call_runs_with_its_batch_and_replays_as_valid_json(runti
                 frame({}, "tool_calls"), "data: [DONE]\n\n"]))
         return response(finish="stop", text="Found them.")
 
-    async def execute(session, tools, name, values, call_id):
+    async def execute(session, tools, name, values, call_id, **_):
         executed.append((name, values, call_id))
         return "{}"
 
@@ -123,7 +123,7 @@ async def test_output_limit_retry_history_is_bounded_persisted_and_resets_after_
             return response([call("compact")])
         return response(finish="stop", text="Finished in smaller steps.")
 
-    async def execute(session, tools, name, values, call_id):
+    async def execute(session, tools, name, values, call_id, **_):
         executed.append((name, values, call_id))
         return "Compact file written."
 
@@ -269,7 +269,7 @@ async def test_legacy_malformed_request_is_omitted_without_losing_archive_or_com
                 assert isinstance(json.loads(tool_call["function"]["arguments"]), dict)
         return response(finish="stop", text="The first file is complete; I will inspect the remaining work.")
 
-    async def execute(*args):
+    async def execute(*args, **_):
         pytest.fail("Continuing old history must not rerun completed or broken tool calls")
 
     manager.execute_tool = execute
