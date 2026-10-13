@@ -9,6 +9,7 @@ import logging
 from dataclasses import dataclass
 from typing import Literal
 
+from .tool_profiles import COVERED_BY
 from .rules import (EDIT_KINDS_RULE, behavior_of, has_matcher, parse_command, read_only_argv, rule_label, rule_matches,
                     uncertain_match)
 
@@ -20,7 +21,7 @@ MODE_LABELS = {"manual": "Manual", "auto": "Auto", "acceptEdits": "Accept edits"
 
 TOOL_KINDS = {
     **dict.fromkeys(("list_files", "find_files", "read_file", "search_files", "list_jobs", "get_job_output", "wait_job",
-                     "notebook_read"), "read"),
+                     "notebook_read", "outline_file", "project_overview"), "read"),
     **dict.fromkeys(("list_skills", "use_skill", "list_tasks", "get_task", "create_task", "update_task"), "task"),
     "ask_user": "question",
     "submit_plan": "plan",
@@ -129,15 +130,33 @@ def evaluate(mode, name, arguments, *, chat_rules=(), project_rules=(), user_rul
         except (ValueError, OSError, TypeError, KeyError, AttributeError):
             return behavior_of(rule) != "allow"  # A rule that cannot be checked never allows.
 
-    # (0) Tools the user turned off in this chat.
+    covers = COVERED_BY.get(name, ())
+    # (0) Tools the user turned off in this chat, directly or through a tool that covers this one.
     if name in set(disabled or ()):
         return Verdict("deny", "disabled", f"The user turned off {name} in this chat. Use other tools.")
-    # (1) Deny rules win in every mode, Bypass included.
+    for cover in covers:
+        if cover in set(disabled or ()):
+            return Verdict("deny", "disabled", f"The user turned off {cover} in this chat, which also covers {name}. "
+                           "Use other tools.")
+    # (1) Deny rules win in every mode, Bypass included; a deny rule for a covering tool covers this one too.
     for scope, rules in scoped:
         for rule in rules:
             if behavior_of(rule) == "deny" and matches(rule):
                 return Verdict("deny", "rule", f"Blocked by a deny rule for {SCOPE_NAMES[scope]}: {rule_label(rule)}. "
                                "Do not retry it or work around it.", rule=rule, scope=scope)
+    for cover in covers:
+        for scope, rules in scoped:
+            for rule in rules:
+                if behavior_of(rule) != "deny":
+                    continue
+                try:
+                    hit = rule_matches(rule, cover, arguments, resolve_path=resolve_path, credential_file=credential_file)
+                except (ValueError, OSError, TypeError, KeyError, AttributeError):
+                    hit = True  # A deny rule that cannot be checked counts.
+                if hit:
+                    return Verdict("deny", "rule", f"Blocked by a deny rule for {SCOPE_NAMES[scope]}: "
+                                   f"{rule_label(rule)}, which also covers {name}. Do not retry it or work around it.",
+                                   rule=rule, scope=scope)
     baseline = tool_decision(mode, name, arguments)
     # (2) Plan mode: nothing outside its read-only set, whatever a rule says.
     if mode == "plan" and baseline == "deny":
@@ -200,7 +219,8 @@ def denied_tools(chat_rules, project_rules, user_rules, names):
                 continue
             tool = rule.get("tool")
             for name in names:
-                if (name == tool or (tool == EDIT_KINDS_RULE and tool_kind(name) == "edit")
+                if (name == tool or tool in COVERED_BY.get(name, ())
+                        or (tool == EDIT_KINDS_RULE and tool_kind(name) == "edit")
                         or (isinstance(tool, str) and tool.startswith("mcp__") and tool.endswith("__*")
                             and name.startswith(tool[:-1]))):
                     denied.add(name)

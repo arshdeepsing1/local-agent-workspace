@@ -137,11 +137,14 @@ def test_activity_tool_is_a_file_edit_for_profiles_and_permission_modes():
     assert tool_decision("plan", "insert_activity_log", {}) == "deny"
 
 
-def test_current_time_text_states_local_date_time_and_offset():
-    moment = datetime(2026, 9, 24, 13, 55, tzinfo=timezone(timedelta(hours=5, minutes=30)))
-    text = current_time_text(moment)
-    assert text.startswith("Current local date and time: 2026-09-24 13:55 ")
-    assert "(UTC+05:30)" in text and "do not infer today's date from file names" in text
+def test_current_time_text_states_the_local_date_and_offset_without_the_time():
+    """Day precision: a minute in the system message would miss the provider's prompt cache once a minute."""
+    zone = timezone(timedelta(hours=5, minutes=30))
+    text = current_time_text(datetime(2026, 9, 24, 13, 55, tzinfo=zone))
+    assert text.startswith("Current local date: 2026-09-24 (")
+    assert "UTC+05:30)" in text and "do not infer today's date from file names" in text
+    assert "run `date` when the exact time matters" in text and "13:55" not in text
+    assert current_time_text(datetime(2026, 9, 24, 0, 1, tzinfo=zone)) == text
 
 
 # --- Agent integration --------------------------------------------------------------
@@ -258,7 +261,7 @@ async def test_system_prompt_states_the_date_and_that_documents_need_not_be_shor
     mock_gateway(monkeypatch, gateway)
     await manager.run(session, "Hello")
     system = requests[0]["messages"][0]["content"]
-    assert re.search(r"Current local date and time: \d{4}-\d{2}-\d{2} \d{2}:\d{2} .*\(UTC[+-]\d{2}:\d{2}\)", system)
+    assert re.search(r"Current local date: \d{4}-\d{2}-\d{2} \(.*UTC[+-]\d{2}:\d{2}\)", system)
     assert "Keep chat replies concise" in system
     assert "conciseness\napplies to chat replies, not to those files" in system
     assert "instead of shortening their" in system

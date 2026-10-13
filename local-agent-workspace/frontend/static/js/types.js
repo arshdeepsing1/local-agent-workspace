@@ -53,7 +53,8 @@
 //   the prefix followed only by those options, '--name=' allowing any value; no matcher = every command,
 //   deny and ask only) | 'edits' (every edit tool; path = an absolute folder or file) | 'hook' (hook = id)
 //   | 'delegate_task' | 'stop_job' | 'mcp__<server>__<tool>' | 'mcp__<server>__*' (deny and ask only)
-//   | another tool name (deny only). Deny wins over ask, ask over allow.
+//   | another tool name (deny only). Deny wins over ask, ask over allow. A deny rule for read_file also covers
+//   outline_file, and one for list_files or find_files also covers project_overview.
 // Rule draft (POST only): { tool: 'run_command', behavior, text, match: 'exact'|'prefix', options?: string }.
 // RuleSets (GET /permission-rules?session_id=; POST /permission-rules { scope: 'chat'|'project'|'user',
 //   session_id, rule: Rule | draft }; DELETE /permission-rules { scope, session_id, rule };
@@ -70,7 +71,9 @@
 //   bypassPermissions needs confirm (400 'Confirm switching to Bypass permissions.'). POST /sessions
 //   { permission_mode } needs no confirm. Allowed while the chat is busy; waiting cards are re-checked.
 // Turned-off tools: PUT /sessions/<id>/disabled-tools { tools: string[] } -> Session;
-//   GET /tools?session_id= -> { tools: [{ name, description }], disabled: string[] }.
+//   GET /tools?session_id= -> { tools: [{ name, description }], disabled: string[] }. The list includes the read
+//   tools outline_file and project_overview; turning off read_file also turns off outline_file, and turning off
+//   list_files or find_files also turns off project_overview.
 // The 'permissions' socket message: { type: 'permissions', permission_mode, allowed_directories, allow_rules,
 //   disabled_tools?, project_rules?: Rule[], user_rules?: Rule[], rules_problem?: string | null }
 // Status message: { type: 'status', status, terminal_reason?, turn_ended? (sent with 'idle'
@@ -86,7 +89,10 @@
 //   read-only command list), approved_by_mode? (the mode whose switch approved a waiting card),
 //   without_shell? (true: the command ran as an argv without a shell), edited? (true: the user edited the
 //   action before approving it), blocked_reason? (with approval 'blocked': why it did not run),
-//   protected? (the reason a file is protected),
+//   protected? (the reason a file is protected), model_output? (what the agent received when it differs from
+//   output), result_withheld?: { estimated_tokens, allowance_tokens } (a read whose result did not fit the
+//   response's context allowance: the agent got a result_deferred message), result_shortened?: true (an action's
+//   result was shortened for the agent),
 //   and on pending cards only: rememberable?: ('chat'|'project'|'user')[], rule_options?: { argv: string[] | null,
 //   prefixes: [{ prefix: string[], flags: string[] }], reason: string | null } (commands) | { folder } (edits),
 //   editable?: ('command'|'content'|'new_text')[], uncertain?: true (a command that could not be checked
@@ -118,7 +124,10 @@
 //   copied_at }; worktree chats, and their backups, have worktree: { id, branch, source_workspace (the root project) }.
 // ApiError: { message, status, detail? }. A 409 that a busy chat causes has
 //   detail { message, session_id, title } naming that chat; other errors have no detail.
-// RequestInfo: { model, status, finish_reason?, http_status?, error_kind?, usage? }
+// RequestInfo: { model, status, finish_reason?, http_status?, error_kind?, usage?,
+//   rate_limit?: { limit_type, limit?, current?, retry_after? } (only on a final, not retried, 429) }.
+//   error_kind includes 'rate_limit', 'payload_too_large' (over the 4 MB request limit; not sent) and
+//   'output_tokens_over_limit' (Max output tokens above the endpoint's reported OTPM limit).
 // ContextInfo: { estimated_tokens, input_budget, context_window, reply_reserve,
 //   compactions, summarized_messages, estimate_method, instruction_files, warnings,
 //   instruction_sources?, prepared_for_next_turn?, breakdown?, estimate_scale?, summary_adjustment?,
@@ -126,7 +135,8 @@
 //   auto_compact_threshold?, auto_compact_percent?, compaction_deferred? (over the threshold but within the input
 //   budget, and no cut brings it under the threshold: sent as it was), compaction?: Compaction (when this request compacted), last_request?: LastRequest,
 //   next_estimate?: { tokens, percent_of_input_budget, percent_of_threshold } (the app's estimate of the next
-//   request before the user's next message; set when a turn ends) }
+//   request before the user's next message; set when a turn ends), payload_bytes? (the size of the request
+//   body sent), payload_limit_bytes? (the Databricks per-request limit, 4,000,000) }
 // Compaction: { number, trigger: 'manual'|'in_turn'|'auto', before_tokens, after_tokens, threshold_tokens,
 //   summarized_messages, requests (summary and condense requests), elided_bytes, superseded_results }
 // LastRequest (what Databricks reported for the latest agent request): { call_id, model, status, finish_reason?,

@@ -582,3 +582,37 @@ def test_a_path_link_opens_the_file_at_its_line_in_the_workspace_panel(ui, page,
     expect(page.locator(".editor-status")).to_contain_text("40 lines · Line 12")
     editor.press("End")
     expect(page.locator(".editor-status")).not_to_contain_text("Line 12")
+
+
+def test_outline_and_overview_cards_name_their_subject(ui, page):
+    show(ui, """[
+      { id: 'outline', type: 'tool', name: 'outline_file', state: 'completed', output: '{}',
+        input: { path: 'docs/handoff.md', max_level: 2 } },
+      { id: 'outline-next', type: 'tool', name: 'outline_file', state: 'completed', output: '{}',
+        input: { path: 'src/app.py', offset: 120, max_level: 6 } },
+      { id: 'here', type: 'tool', name: 'project_overview', state: 'completed', output: '{}', input: { path: '.' } },
+      { id: 'default', type: 'tool', name: 'project_overview', state: 'completed', output: '{}', input: {} },
+      { id: 'backend', type: 'tool', name: 'project_overview', state: 'completed', output: '{}', input: { path: 'backend' } },
+    ]""", ", onOpenPath: fake.spy('open')")
+    expect(page.get_by_role("button", name="outline file docs/handoff.md · to level 2", exact=True)).to_be_visible()
+    expect(page.get_by_role("button", name="outline file src/app.py · from entry 120", exact=True)).to_be_visible()
+    expect(page.get_by_role("button", name="project overview workspace", exact=True)).to_have_count(2)
+    expect(page.get_by_role("button", name="project overview backend", exact=True)).to_be_visible()
+    page.get_by_role("button", name="outline file docs/handoff.md · to level 2", exact=True).click()
+    page.get_by_role("button", name="Open file").click()
+    assert ui.spy("open") == [[{"path": "docs/handoff.md"}]]
+
+
+def test_collapsed_cards_say_when_the_agent_got_less_than_the_card(ui, page):
+    show(ui, """[
+      { id: 'withheld', type: 'tool', name: 'read_file', state: 'completed', output: '{"content": "1: a"}',
+        input: { path: 'a.txt' }, model_output: '{"error_kind": "result_deferred"}',
+        result_withheld: { estimated_tokens: 9000, allowance_tokens: 4000 } },
+      { id: 'shortened', type: 'tool', name: 'run_command', state: 'completed', output: '{"output": "long"}',
+        input: { command: 'make test' }, model_output: '{"result_shortened": true}', result_shortened: true },
+      { id: 'plain', type: 'tool', name: 'read_file', state: 'completed', output: '{}', input: { path: 'b.txt' } },
+    ]""")
+    expect(page.locator(".tool-outcome")).to_have_count(2)
+    expect(page.get_by_text("Result not sent to the agent: earlier results in the same step filled its context "
+                            "allowance. The agent can run it again.", exact=True)).to_be_visible()
+    expect(page.get_by_text("Result shortened for the agent to fit its context allowance.", exact=True)).to_be_visible()

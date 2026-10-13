@@ -42,6 +42,19 @@ from local_agent.tools import WorkspaceTools
     (ValueError("Tool is not available in this turn."), "unavailable_tool", False),
     (ValueError("Search scan limit reached: narrow the path."), "limit", True),
     (ValueError("Content exceeds the 80 KB write limit."), "limit", True),
+    # outline_file and project_overview (u-large-inputs).
+    (ValueError("Only regular files can be outlined, and this is a folder; use project_overview or find_files for "
+                "folders."), "wrong_type", False),
+    (ValueError("Only regular text files can be outlined."), "wrong_type", False),
+    (ValueError("Only regular text files can be outlined; use notebook_read for Jupyter notebooks."), "wrong_type",
+     False),
+    (ValueError("This file exceeds the 8 MB outline limit; use search_files (for example regex=true with ^#{1,3} or "
+                "^\\s*(def|class)) to find sections."), "limit", True),
+    (ValueError("Binary files cannot be outlined."), "wrong_type", False),
+    (ValueError("Outlining this file took longer than 3 seconds; use search_files to find sections."), "limit", True),
+    (ValueError("offset is beyond the 2 outline entries."), "invalid_arguments", True),
+    (ValueError("Not a directory: project_overview needs a folder; use outline_file for a file."), "wrong_type", False),
+    (ValueError("include_ignored must be a boolean."), "invalid_arguments", True),
     # Messages of the M2 tools (search, read, jobs, file edits, notebooks, move/delete).
     (ValueError("output_mode must be content, files_with_matches or count."), "invalid_arguments", True),
     (ValueError("sort must be path or modified."), "invalid_arguments", True),

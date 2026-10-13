@@ -159,6 +159,11 @@ def _tool(event, excerpt_chars):
         detail = f"Deleted {_code(path)}"
     elif name in ("notebook_edit", "notebook_read"):
         detail = ("Edited notebook " if name == "notebook_edit" else "Read notebook ") + _code(path)
+    elif name == "outline_file":
+        level = arguments.get("max_level")
+        detail = f"Outlined {_code(path)}" + (f" to level {level}" if type(level) is int and level < 6 else "")
+    elif name == "project_overview":
+        detail = f"Project overview of {_code(path)}"
     elif name == "list_files":
         detail = f"Listed {_code(path)}" + (f" matching {_code(arguments['glob'])}" if arguments.get("glob") else "")
     elif name == "search_files":

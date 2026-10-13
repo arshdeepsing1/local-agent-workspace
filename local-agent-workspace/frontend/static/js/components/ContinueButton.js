@@ -19,6 +19,10 @@ export const CONTINUE_MESSAGE = 'Continue from where you stopped.'
 //       error_kind 'content_filter', is never retried and gets no Continue.)
 //     'rate_limit': Databricks still rate limited the request after the automatic
 //       retries and waits. (No code path sets terminal_reason 'rate_limit'.)
+//     No Continue for 'payload_too_large' (the request is over the 4 MB Databricks
+//       limit and was not sent) or 'output_tokens_over_limit' (Max output tokens is
+//       above the endpoint's output-tokens-per-minute limit): Continue would fail
+//       the same way until the user changes Settings or sends smaller steps.
 // - Older records cut short by a restart keep a stale terminal_reason; their
 //   latest turn has request_info { status: 'interrupted', error_kind:
 //   'incomplete_response' }. (An automatic output-limit retry marks a reply

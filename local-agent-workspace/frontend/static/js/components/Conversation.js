@@ -36,6 +36,11 @@ function summarizeTools(events) {
     if (event.name === 'read_file') subject += readRange(event)
     if (event.name === 'find_files') subject = `${input.pattern ?? ''}` + (input.path && input.path !== '.' ? ` in ${input.path}` : '')
     if (event.name === 'wait_job') subject = String(input.job_id ?? '').slice(0, 8) + (input.until_regex ? ` until /${input.until_regex}/` : '')
+    if (event.name === 'outline_file') {
+      subject += (Number.isInteger(input.max_level) && input.max_level < 6 ? ` · to level ${input.max_level}` : '')
+        + (Number.isInteger(input.offset) && input.offset > 0 ? ` · from entry ${input.offset}` : '')
+    }
+    if (event.name === 'project_overview') subject = input.path && input.path !== '.' ? String(input.path) : 'workspace'
     let taskStatus
     if (event.name === 'create_task' || event.name === 'update_task') {
       let task = {}
@@ -128,7 +133,14 @@ function DelegationStatus({ event, onSelectSession }) {
 
 // Tools whose input names one file: the file the card's Open file button opens.
 const FILE_INPUTS = { read_file: 'path', write_file: 'path', edit_file: 'path', insert_activity_log: 'path',
-  notebook_read: 'path', notebook_edit: 'path', move_path: 'destination' }
+  notebook_read: 'path', notebook_edit: 'path', move_path: 'destination', outline_file: 'path' }
+
+// What the agent received when it differs from the card (the per-response context allowance).
+function allowanceNote(event) {
+  if (event.result_withheld) return 'Result not sent to the agent: earlier results in the same step filled its context allowance. The agent can run it again.'
+  if (event.result_shortened) return 'Result shortened for the agent to fit its context allowance.'
+  return null
+}
 
 function ToolCard({ event, summary, sessionId, onError, onSelectSession, onOpenPath }) {
   const [expanded, setExpanded] = useState(false)
@@ -173,6 +185,7 @@ function ToolCard({ event, summary, sessionId, onError, onSelectSession, onOpenP
             onClick=${() => onOpenPath(startLine ? { path: filePath, line: startLine } : { path: filePath })}><${FileText} size=${14} />Open file</button>` : null}`}
     </div>` : null}
     ${!expanded && (event.state === 'rejected' || event.state === 'cancelled' || event.state === 'error') ? html`<p class="tool-outcome">${toolOutcome(event)}</p>` : null}
+    ${!expanded && event.state === 'completed' && allowanceNote(event) ? html`<p class="tool-outcome">${allowanceNote(event)}</p>` : null}
   </div>`
 }
 

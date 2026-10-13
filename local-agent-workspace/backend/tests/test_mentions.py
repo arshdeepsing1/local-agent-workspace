@@ -73,7 +73,8 @@ def test_a_range_and_a_whole_file_attach_numbered_snapshots(runtime):
         {"kind": "file", "path": "short.txt", "start_line": 1, "end_line": 3, "truncated": False}]
     found = blocks(content)
     assert found[0] == ("file @src/a.py lines 3–5", "3: line 3\n4: line 4\n5: line 5")
-    assert found[1][0] == "file @src/a.py lines 1–200, shortened" and found[1][1].endswith("200: line 200")
+    assert found[1][0] == ("file @src/a.py lines 1–200, shortened; read the rest with read_file start_line=201 or "
+                           "list its sections with outline_file") and found[1][1].endswith("200: line 200")
     assert found[2] == ("file @short.txt lines 1–3", "1: line 1\n2: line 2\n3: line 3")
     assert [str(path) for path, _ in views] == [str(project / "src/a.py")] * 2 + [str(project / "short.txt")]
 

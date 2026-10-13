@@ -22,6 +22,7 @@ FILE_GROUPS = (
     ("write_file", "Created or replaced"), ("edit_file", "Edited"), ("move_path", "Moved"), ("delete_path", "Deleted"),
     ("notebook_edit", "Edited notebook"), ("read_file", "Read"), ("notebook_read", "Read notebook"),
     ("list_files", "Listed"), ("search_files", "Searched"), ("find_files", "Searched for files in"),
+    ("outline_file", "Outlined"), ("project_overview", "Surveyed"),
 )
 
 

@@ -1,5 +1,6 @@
 import re
 
+import pytest
 from playwright.sync_api import expect
 
 INFO = """{ estimated_tokens: 6000, input_budget: 22768, context_window: 33008, reply_reserve: 8192,
@@ -270,3 +271,28 @@ def test_request_details_add_the_input_including_cache(ui, page):
     expect(definition(page, "Input incl. cache")).to_have_text("10,200")
     ui.rerender("{ info: { model: 'm', status: 'error', usage: { output_tokens: 5 } } }")
     expect(definition(page, "Input incl. cache")).to_have_text("Unavailable")
+
+
+@pytest.mark.parametrize("size, shown", [(1_234_567, "1.2 MB"), (245_300, "245 KB"), (120, "1 KB")])
+def test_the_request_size_is_shown_against_the_databricks_limit(ui, page, size, shown):
+    ui.mount("components/ContextMeter.js", f"""{{ info: {{ ...{CONTEXT}, payload_bytes: {size},
+        payload_limit_bytes: 4000000 }} }}""")
+    page.get_by_text(re.compile("Last model input")).click()
+    expect(page.get_by_text(f"Request size: {shown} of Databricks' 4 MB limit.", exact=True)).to_be_visible()
+
+
+def test_no_request_size_without_a_measured_body(ui, page):
+    ui.mount("components/ContextMeter.js", f"{{ info: {CONTEXT} }}")
+    page.get_by_text(re.compile("Last model input")).click()
+    expect(page.get_by_text(re.compile("Request size"))).to_have_count(0)
+
+
+def test_request_details_show_the_rate_limit_of_a_final_429(ui, page):
+    ui.mount("components/RequestDetails.js", """{ info: { model: 'm', status: 'error', http_status: 429,
+        error_kind: 'rate_limit', rate_limit: { limit_type: 'input_tokens_per_minute', limit: 1000000, current: 1200000,
+        retry_after: 12 } } }""")
+    page.get_by_text("Request details · error").click()
+    expect(definition(page, "Rate limit")).to_have_text(
+        "input tokens per minute: limit 1,000,000, current 1,200,000, retry after 12 s")
+    ui.rerender("{ info: { model: 'm', status: 'error', http_status: 429, error_kind: 'rate_limit' } }")
+    expect(page.locator("dt", has_text="Rate limit")).to_have_count(0)

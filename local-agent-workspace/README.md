@@ -663,7 +663,9 @@ when opening a conversation or performing restart recovery.
   any changed or were deleted (your editor saves, an Undo, a command), adds one line at
   the end of the system message naming up to 10 of them. A deleted file is named once.
   The system message keeps its stable parts first and puts the folder grants, the current
-  time and this line last, so a provider that caches prompt prefixes can reuse more.
+  date and this line last, so a provider that caches prompt prefixes can reuse more. It
+  gives the local date and time zone but not the time of day, so it changes once a day
+  rather than once a minute; the model runs `date` when it needs the exact time.
 - **Request details**: expand the details below an assistant response or tool-only
   model request to inspect its endpoint, completion status, stop reason, and
   provider-reported token usage when available. Failed requests distinguish invalid
@@ -679,7 +681,8 @@ when opening a conversation or performing restart recovery.
   after the three retries, the app waits up to twice per message (the provider's
   `Retry-After` up to 2 minutes, otherwise until just after the next minute) and tries
   again, so a request makes at most six attempts. The notice shows the time, and
-  **Stop** cancels the wait. Turn the waits off with **Settings → Continue
+  **Stop** cancels the wait (see **Rate limits** under **Context and project
+  instructions** for the limit a 429 names and the wait shared by chats). Turn the waits off with **Settings → Continue
   automatically after rate limits**. When a reply's tool calls had invalid or
   incomplete arguments, or the reply ended without a finish reason, none of its tools
   run, and the app asks the model in a hidden message to issue them again or to
@@ -1217,9 +1220,11 @@ every command and file, to
 `<workspace>/handoffs/auto/<date>-<chat-title>-compaction-<N>.md`, adding a suffix
 instead of overwriting an existing file. Each handoff starts with a Contents list
 giving the line of each section. After compaction, the summary message lists the
-newest five saved handoffs so the model can read one section with `read_file`
-`start_line` or find a detail with `search_files` when it needs details the summary
-omits. A handoff cut off at its output limit is still saved and used, with a note. If
+newest five saved handoffs so the model can find the section it needs (from the Contents
+list, with `outline_file` when it is offered, or with `search_files`) and read it with
+`read_file` `start_line` when it needs details the summary omits. An @ file attachment
+that was shortened says the same: its header names the `read_file` `start_line` where the
+rest begins and, when available, `outline_file`. A handoff cut off at its output limit is still saved and used, with a note. If
 the file cannot be written (for example, the folder resolves outside the workspace), a
 notice explains it and compaction continues with the summary only. Subagent
 conversations do not write compaction handoffs. Turn the setting off for the previous
@@ -1229,6 +1234,45 @@ Input tokens per minute matter on large budgets: with a 1,000,000-token budget, 
 near-full request uses all of Claude Opus 5.5's default 1,000,000 input tokens per
 minute, so the next step can be rate limited. Lower **Auto-compact at** or the
 context budget for multi-step work.
+
+**Request size.** Databricks accepts at most 4 MB per request. The app encodes each
+request body itself (compact UTF-8 JSON) and sends exactly those bytes, so it knows the
+size it sends; the context details show "Request size: 245 KB of Databricks' 4 MB limit."
+for the latest request. Compaction also runs when a request would pass 3.8 MB, a check
+that costs nothing today because the token estimate already bounds the size (at most three
+bytes per estimated token, about 3.1 MB at the 1,048,576-token maximum). A request still
+over 4 MB is not sent: the turn ends with a `payload_too_large` error that suggests smaller
+steps or a lower context budget, without a **Continue** button; a compaction or `/btw`
+request over the limit is refused the same way. Agent requests wait up to 300 seconds for
+the next streamed data (a large prefill with thinking can be silent for minutes);
+compaction and `/btw` requests, which are not streamed, up to 600 seconds. Databricks
+stops a request after 597 seconds; when a stream ends early after about that long, a
+notice (once per turn) says so and suggests lowering Max output tokens or the context
+budget.
+
+**Rate limits.** A Databricks 429 body names the limit it hit: `limit_type` (input or output
+tokens per minute, queries per hour or second), `limit`, `current` and `retry_after`. Retry
+notices name it, for example "Databricks rate limited the model request (output tokens per
+minute (OTPM): limit 100,000, current 100,500). Retrying in 3 seconds (1 of 3).", and a
+429 that names a limit is retried even when its message does not say "rate limit". Request
+details show a **Rate limit** row for a final 429 (one that was not retried); the ledger
+records its `limit_type`. When a final 429 names the input-tokens-per-minute limit, the
+error adds the arithmetic: each agent step resends the whole conversation, so the context
+budget times the steps per minute must stay under ITPM (at about 400,000 tokens per request,
+1,000,000 ITPM allows about 2 requests per minute; keep the budget near 200,000 tokens for
+about five steps a minute). Databricks reserves Max output tokens against OTPM, so a
+request whose Max output tokens is above the reported OTPM limit can never start: the app
+stops at once with an `output_tokens_over_limit` error naming the limit and a per-request
+value for four requests at once, remembers that limit for an hour, and refuses further
+requests to that endpoint, before any compaction, until Settings changes; no **Continue**
+button is offered. When Databricks asks one chat to pause, other chats and compaction
+requests to the same endpoint wait for that pause too, plus up to 3 seconds of random
+jitter so they do not all retry at once, with a notice; a request with a smaller Max output
+tokens may pass an output-tokens pause, and Stop cancels the wait. `/btw` does not wait: it
+says when to ask again. These pauses and learned limits live in memory and start empty when
+the app starts. The app does not pace requests by tokens per minute itself: limits vary by
+tier and workspace, a rejected 429 is not billed, Databricks returns `retry_after`, and the
+app's token counts are estimates.
 The newest turn and its complete tool exchanges are retained verbatim;
 the preceding turn is also retained when space allows. The app's hidden messages
 inside a turn (automatic retries, Verify results) belong to that turn and never count
@@ -1244,6 +1288,12 @@ restarts, while the full display transcript and original model/tool history rema
 in that conversation's JSONL file. Summary requests are additional billed inference. A failed or stopped
 summary leaves the previous summary state intact and performs no tools. Summaries
 can lose details; they are not an exact substitute for the original transcript.
+A message you send while the agent works (**steering**) is part of the current turn, not a
+turn of its own: compaction never cuts there, keeps it verbatim after the summary together
+with the turn's request, and never summarizes the tool results the model has not answered
+yet. A queued message that would not fit the context budget together with the latest tool
+results waits (not paused) for a later step boundary, with one notice per turn, and starts
+the next turn when this one ends.
 If the request, its latest tool results, or project guidance alone are too large, the app
 reports an error instead of silently cutting it. The error states the estimated
 tokens needed and the input-budget arithmetic (context budget minus Max output
@@ -1800,10 +1850,16 @@ until the user continues or raises the setting. **Max output tokens** defaults t
 the endpoint's profile (16,384 for Opus 5.5, 8,192 otherwise) with the bounds described above. The editor and file edits are
 limited by Settings → File write limit (80 KB by default).
 
-Agent reads use `read_file(path, start_line=1, max_lines=400)` and return numbered
+Agent reads use `read_file(path, start_line=1, max_lines)` and return numbered
 lines plus `next_line`; `max_lines` can be 1–2,000. A page holds at most a quarter of
 **Context window** in bytes of serialized JSON, from 8 KB to 32 KB (32 KB with a
-128K-token window). `tail_lines` (1–2,000) returns the last lines instead, with their
+128K-token window); from a 262,144-token budget up, an eighth of it, at most 128 KB
+(32,768 bytes at 262,144 tokens, 128,000 from 1,024,000 up). `max_lines` defaults to
+400, and on those larger pages to the page size / 64 (512 at 32,768 bytes, 2,000 at
+128 KB), so a long file takes fewer steps, and each step resends the whole context. The
+first page of a file of at least 64 KB that does not fit one page, and that
+`outline_file` can outline, also reports `file_bytes` and a `hint` to outline it and read
+the sections needed; the hint is left out when `outline_file` is turned off or denied. `tail_lines` (1–2,000) returns the last lines instead, with their
 absolute line numbers, which suits logs: it reads backwards from the end, works on files
 up to 512 MB, and needs those lines to fit in 8 MB. Forward reads scan at most 8 MB from
 the start of a regular file. Lines longer than 128 KB are refused. Lines end at LF only,
@@ -1840,6 +1896,62 @@ names, generated folders, symbolic links to folders and every file below them (a
 when Git still lists such a file), and the configured credential file under any name,
 including hard links to it. Listing
 stops with an error after 10 seconds, 20,000 folders, or 200,000 files.
+
+**Large files and projects.** `outline_file(path, max_level=6, offset=0)` lists the
+structure of one text file of up to 8 MB with line numbers, so the agent reads only the
+sections it needs: Markdown headings with the line where each section ends (front matter
+and fenced code are skipped), Python classes and functions from the parser with their end
+lines (files over 1 MB, files with a carriage return that is not a line ending, and files
+that do not parse use a line scan), and declarations found by a line scan in
+JavaScript/TypeScript, Go, Rust, Java/Kotlin/C#/Swift/Scala/Dart, C/C++, Ruby, PHP, shell,
+SQL, TOML/INI, YAML and Makefiles (heuristic; it can miss some). Entries read
+`start-end text` (or `start text`); line numbers match `read_file`. It refuses folders,
+notebooks (use `notebook_read`) and binary files, pages its entries (at most 20,000) like
+`read_file` pages, and stops after 3 seconds with an error that suggests `search_files`.
+Outlining is not a read: `write_file` still refuses to replace a file the conversation has
+only outlined. `project_overview(path=".", include_ignored=false)` summarizes a folder from
+file names and sizes, without reading any file: files and bytes by language and by
+top-level folder, key files (README, build and configuration files, CI workflows, up to
+three folders deep) and the largest files, in at most 12,000 bytes (longer lists are cut,
+with the counts left out in `omitted`). It lists the same files as `find_files` (the same
+`.gitignore` handling and exclusions); a folder too large to list (more than 200,000
+files, 20,000 folders or 10 seconds) gives a partial overview of its top level with a note
+instead of an error. Both are read tools: no card, allowed in Plan and Don't ask, and
+external paths need folder access. A deny rule or a turned-off tool covers them through
+the tool that shows the same content: rules for `read_file` cover `outline_file`, and
+rules for `list_files` or `find_files` cover `project_overview`. With both tools offered,
+the system message asks the model to start an unfamiliar or large project with
+`project_overview`, to outline long files, to read a handoff smaller than about a third of
+its context budget completely (otherwise its status, next actions and open questions in
+full, and other sections as needed), and to split a handoff longer than **Settings → File
+write limit** into numbered parts listed at the top of the first.
+
+**Tool output bounds.** Most tools already return at most about 8 KB: `list_files`,
+`find_files`, `search_files`, `notebook_read`, `get_job_output`, a `wait_job` page, the
+first page of `run_command` (start and end), `list_jobs` (7.5 KB), `list_skills`,
+`list_tasks`, MCP results and the diffs of edits and moves. `read_file` pages are 8–32 KB,
+up to 128 KB on large budgets; `delegate_task` returns at most 6 KB; hook output on cards
+and notices 3.8 KB; task descriptions 4,000 characters; skills 8 KB combined; the model's
+own tool arguments 512 KiB and 64 calls per response. Every tool result, for the card and
+the model alike, is also capped at 128 KiB: the longest text values keep their start and
+end around a marker, and the result says `truncated` with `omitted_bytes`.
+
+The results of one model response also share a **context allowance**: what the input
+budget leaves after the latest exchange, with room for the largest summary, the app
+record, a handoff line, the tool definitions and 1,024 tokens for the next step's notices,
+and at most half the input budget. A compaction inside that turn can therefore always keep
+every result it was given. A read (`read_file`, `outline_file`, `search_files` and the
+other read tools) that does not fit runs but is not sent: the model gets a short
+`result_deferred` message asking it to request the result again in its next response (or
+a smaller range, when one result alone is larger than the allowance), its card says
+"Result not sent to the agent", and a `read_file` or `notebook_read` that was not sent
+does not count as a read for `write_file`. Results of actions that already ran (commands,
+edits, MCP calls, subagents) are never withheld but shortened: short fields such as a
+command's `job_id`, `state` and `exit_code` are kept, long text keeps its start and end
+(the end of a command's output, where failures appear), and the card says "Result
+shortened for the agent". `wait_job`, `get_job_output` and `list_jobs` results are always
+sent, because they move the job's read position. The card always shows the full result.
+Nothing in the history is shortened later; compaction is the only way history shrinks.
 
 `search_files` supports literal search by default, `regex=true`, `case_sensitive`,
 `context_lines` (0–5), `offset` (0–10,000), and `max_results` (1–100, default 50).
@@ -2092,6 +2204,10 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `backend/local_agent/model_profiles.py`: per-endpoint limits, default budgets and Settings limit warnings.
 - `backend/local_agent/user_paths.py`: checks for the default code folder and the Python environment, and the environment commands run with.
 - `backend/local_agent/context.py`: request estimates and bounded history compaction.
+- `backend/local_agent/request_limits.py`: the request body as sent, the 4 MB request limit and request timeouts.
+- `backend/local_agent/rate_limits.py`: Databricks 429 details, the learned OTPM limit and the wait shared by chats.
+- `backend/local_agent/outline.py` / `overview.py`: `outline_file` and `project_overview`.
+- `backend/local_agent/result_budget.py`: the 128 KiB tool-result cap and the per-response context allowance.
 - `backend/local_agent/activity.py`: app-generated activity log for handoffs (`insert_activity_log`).
 - `backend/local_agent/transcript.py` / `scripts/conversation_transcript.py`: Markdown transcripts of saved conversations (also `GET /api/sessions/<id>/transcript.md`).
 - `backend/local_agent/redaction.py`: common secret shapes replaced in logs, handoffs and transcripts.

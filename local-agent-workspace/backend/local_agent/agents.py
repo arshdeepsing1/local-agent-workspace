@@ -70,7 +70,18 @@ from . import user_paths
 from . import mentions
 from .composer_api import (MAX_QUEUED, MAX_QUEUED_CHARS, SHELL_ONE_LINE, SIDE_QUESTION_PREFIX, SIDE_TOO_LONG,
                            SIDE_TOOL_CALLS, STEER_PREFIX, side_history)
+import math
 import random
+from . import request_limits
+from .request_limits import LONG_REQUEST_TIMEOUT, STREAM_READ_TIMEOUT, PayloadTooLarge, check_payload, encode_payload
+from .rate_limits import (ITPM, OTPM, RATE_LIMIT_WAIT_CAP, RateLimitGate, describe, otpm_too_low,
+                          parse_rate_limit, request_info_fields)
+from .context import in_turn_tokens
+from .model_profiles import CONCURRENT_REQUESTS
+from .result_budget import (ALLOWANCE_MARGIN_TOKENS, JOB_TOOLS, TOOL_RESULT_HARD_LIMIT, ResultAllowance, bound_result,
+                            cap_text, deferred_text, shorten_result)
+from .permissions import tool_kind
+from .tool_profiles import covering_tool
 
 
 MAX_OUTPUT_LIMIT_RETRIES = 2
@@ -93,7 +104,10 @@ NETWORK_RETRY_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTime
 # Compaction is not streamed: a read failure there may follow an accepted, billed request.
 SUMMARY_NETWORK_RETRY_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout, httpx.WriteError)
 MAX_RATE_LIMIT_WAITS = 2  # Extra waits per turn after the retries, when Settings allows them.
-RATE_LIMIT_WAIT_CAP = 120.0
+# RATE_LIMIT_WAIT_CAP (120 s) is imported from rate_limits above.
+# A request still running near Databricks' execution limit gets one notice per turn.
+EXECUTION_NOTICE_MARGIN = 10
+request_clock = time.monotonic  # Request durations (tests replace it, never time.monotonic itself).
 MAX_REPAIR_RETRIES = 2
 # Failures answered with a hidden continuation, and its text.
 UNANSWERED_CONTINUATION = "[No reply: the request after this message failed or was stopped.]"
@@ -187,7 +201,8 @@ def retry_notice(error, delay, number, budget, purpose="the model request"):
     status = error.http_status if isinstance(getattr(error, "http_status", None), int) else None
     reason = getattr(error, "retry_reason", None)
     if reason == "rate_limit":
-        what = f"Databricks rate limited {purpose}."
+        described = describe(getattr(error, "rate_limit", None))
+        what = f"Databricks rate limited {purpose}" + (f" ({described})." if described else ".")
     elif reason == "server_error":
         what = f"Databricks returned HTTP {status} before the reply started."
     else:
@@ -249,8 +264,10 @@ Commands default to a 60-second timeout; choose timeout_seconds up to 3600 if ne
 Use background=true for a managed job that must outlive this turn, never shell '&' or daemon detachment.
 Use list_jobs/get_job_output to inspect jobs, wait_job to wait until a background job finishes or prints a line you expect, and stop_job to terminate them. A failed command's first result shows the start and the end of its retained output. Use find_files to locate files by name. Background jobs
 continue after this turn is stopped and end on explicit job Stop, timeout, or app shutdown.
-Read files in numbered line ranges and follow next_line; paginate searches and job output
-instead of requesting huge results. A completed command can have a nonzero exit code: check it.
+Read files in numbered line ranges and follow next_line; paginate searches and job output instead of
+requesting huge results. The results of one response share a context allowance: prefer a few large reads per
+response, and when a result says it was deferred, request it again in the next response.
+A completed command can have a nonzero exit code: check it.
 Keep tool arguments small enough to finish in one response. Write long files in parts
 (an initial write_file, then focused edit_file additions) instead of shortening their
 content; do not wait for an output cutoff before breaking up the work. Prefer one write or
@@ -315,20 +332,45 @@ def tool_arguments(calls):
 
 
 def current_time_text(now=None):
-    """The model otherwise guesses today's date, for example from file names."""
+    """The model otherwise guesses today's date, for example from file names. Day precision:
+    a minute in the system message would change it, and miss the provider's prompt cache for
+    everything after it, once a minute."""
     now = datetime.now().astimezone() if now is None else now
     offset = now.strftime("%z")
     offset = f"{offset[:3]}:{offset[3:]}" if len(offset) == 5 else offset
-    return (f"Current local date and time: {now:%Y-%m-%d %H:%M} {now.tzname()} (UTC{offset}). "
-            "Use it for dates; do not infer today's date from file names.")
+    return (f"Current local date: {now:%Y-%m-%d} ({now.tzname()}, UTC{offset}). Use it for dates; do not infer "
+            "today's date from file names; run `date` when the exact time matters.")
+
+
+# Appended to the system message when outline_file or project_overview is offered
+# (context_inputs); the sentences that name a tool that is not offered are left out.
+LARGE_INPUT_OVERVIEW = ("In an unfamiliar or large project, call project_overview first, then locate code with "
+                        "find_files and search_files (output_mode=files_with_matches narrows quickly) before reading.")
+LARGE_INPUT_OUTLINE = ("For a long file (read_file reports file_bytes and a hint), call outline_file and read only the "
+                       "line ranges you need. A handoff you are asked to resume from: read it completely when it is "
+                       "smaller than about a third of your context budget; otherwise outline it, read its current "
+                       "status, next actions and open questions completely, and read other sections as you need them.")
+LARGE_INPUT_WRITES = ("A file you write is limited by Settings → File write limit; split a longer handoff into "
+                      "numbered parts and list them at the top of the first.")
+
+
+def large_input_guidance(available=None):
+    """The large-project guidance for the offered tools (None: every tool), or ""."""
+    overview = available is None or "project_overview" in available
+    outline = available is None or "outline_file" in available
+    if not overview and not outline:
+        return ""
+    return " ".join(part for part, wanted in ((LARGE_INPUT_OVERVIEW, overview), (LARGE_INPUT_OUTLINE, outline),
+                                              (LARGE_INPUT_WRITES, True)) if wanted)
 
 
 FILE_VIEW_LIMIT = 500  # files whose last read or write a conversation remembers
 FILE_VIEW_CHECK_LIMIT = 200  # of those, the most recent checked before each model request
 CHANGED_FILE_NAMES = 10
 FILE_CHANGE_TOOLS = ("write_file", "edit_file", "move_path", "delete_path", "notebook_edit")
-PATH_TOOLS = ("list_files", "find_files", "read_file", "search_files", "notebook_read", *FILE_CHANGE_TOOLS)
-DIRECTORY_TOOLS = ("list_files", "find_files", "search_files")
+PATH_TOOLS = ("list_files", "find_files", "read_file", "search_files", "notebook_read", "outline_file",
+              "project_overview", *FILE_CHANGE_TOOLS)
+DIRECTORY_TOOLS = ("list_files", "find_files", "search_files", "project_overview")
 DELETE_PREVIEW_LINES = 200
 # Edit before approving: the one argument the user may change on each kind of card.
 EDITABLE = {"run_command": ("command",), "write_file": ("content",), "edit_file": ("new_text",)}
@@ -603,6 +645,9 @@ class AgentManager:
         self.side_questions = set()  # Chats with a /btw side question being answered.
         self.stop_requested = set()  # Tasks the user stopped: no queued follow-up, even if they ended normally.
         self.unsent_views = {}  # Session id -> @ file views recorded once the turn's message enters the wire.
+        # In memory only: Databricks pauses per endpoint shared by every chat, and learned limits.
+        self.rate_gate = RateLimitGate()
+        self.rate_rng = random.Random()
         self.checkpoints = CheckpointManager(store)
         self.changes = ChangeReview(store, self.checkpoints)
         self.worktrees = WorktreeManager(store, settings.state_dir)
@@ -1064,6 +1109,59 @@ class AgentManager:
         if len(seen) > 400:  # Jobs are pruned; forget the ones that are gone.
             for job_id in [key for key in seen if self.jobs.get(key) is None]:
                 seen.pop(job_id, None)
+
+    async def wait_for_rate_limit(self, session, purpose, max_tokens):
+        """Wait while Databricks asked another chat to pause requests to this endpoint, plus a
+        little jitter so waiting chats do not all retry at once. Stop cancels the wait."""
+        seconds = self.rate_gate.remaining(session["model"], session["id"], max_tokens)
+        if seconds < 0.5:
+            return
+        jitter = self.rate_rng.uniform(0, min(3.0, seconds * 0.25))
+        await self.event(session, "notice", text=(
+            f"Waiting {math.ceil(seconds)} seconds before {purpose}: Databricks rate-limited another chat's request "
+            f"to {session['model']}."))
+        await asyncio.sleep(seconds + jitter)
+
+    def otpm_preflight(self, session, max_tokens):
+        """OTPM_TOO_LOW as an InferenceError when max_tokens can never fit the output-tokens-per-minute
+        limit Databricks reported for this endpoint within the last hour, else None. Nothing is sent."""
+        limit = self.rate_gate.learned_limit(session["model"], OTPM)
+        if limit and max_tokens > limit:
+            return InferenceError(otpm_too_low(session["model"], max_tokens, limit, CONCURRENT_REQUESTS),
+                                  "output_tokens_over_limit", None)
+        return None
+
+    def rate_limit_error(self, session, error, headers, payload, max_tokens, diagnostic):
+        """Classify a 429 (error, an InferenceError): mark it retryable, with its RateLimitInfo as
+        error.rate_limit, or return the impossible-OTPM error to raise instead. Returns (error, info)."""
+        info = parse_rate_limit(payload)
+        error.rate_limit = info
+        if (info.limit_type == OTPM and info.limit is not None and type(max_tokens) is int
+                and max_tokens > info.limit):
+            # Databricks reserves max_tokens against OTPM, so a retry would be rejected the same way.
+            self.rate_gate.note(session["model"], session["id"], 0, info)
+            refused = InferenceError(otpm_too_low(session["model"], max_tokens, info.limit, CONCURRENT_REQUESTS),
+                                     "output_tokens_over_limit", error.http_status)
+            refused.rate_limit = info
+            return refused, info
+        if retryable_rate_limit(diagnostic) or info.limit_type is not None:
+            mark_retryable(error, "rate_limit", headers)
+            error.retry_payload = payload
+        return error, info
+
+    @staticmethod
+    def itpm_advice(session, info):
+        """The sentences a final input-tokens-per-minute 429 adds to its error, or ""."""
+        if info is None or info.limit_type != ITPM or not info.limit:
+            return ""
+        context_info = session.get("context_info")
+        estimate = context_info.get("estimated_tokens") if isinstance(context_info, dict) else None
+        advice = (f" For about five steps a minute, keep Settings → Context budget near {info.limit // 5:,} tokens.")
+        if type(estimate) is int and estimate > 0:
+            advice = (f" Each agent step resends the whole conversation: at about {estimate:,} input tokens per "
+                      f"request, the per-minute input limit of {info.limit:,} allows about "
+                      f"{max(1, info.limit // estimate)} requests per minute." + advice)
+        return advice
 
     def step_notices(self, session, tools):
         """The notices for the next model request: changed files and finished background jobs."""
@@ -1744,9 +1842,11 @@ class AgentManager:
         self.store.save(session)
         await self.publish_queue(session)
 
-    async def drain_queue(self, session, wire, tools):
+    async def drain_queue(self, session, wire, tools, fits=None):
         """Steering: at a step boundary, after every tool result, the unpaused queued messages
-        become one user message of this turn."""
+        become one user message of this turn. fits(message) says whether that message still fits
+        the context budget with the latest tool results; when it does not, the messages stay
+        queued (not paused) until a later step boundary, or the end of the turn."""
         entries = [item for item in self.queue_of(session) if not item.get("paused")]
         # Never directly after an app-generated prompt.
         if not entries or not wire or wire[-1].get("role") == "user" or is_app_prompt(wire[-1]):
@@ -1760,6 +1860,19 @@ class AgentManager:
                 item["paused"] = True
             self.store.save(session)
             await self.publish_queue(session, self.settings.redact(str(exc)))
+            return
+        if fits is not None and not fits({"role": "user", "content": STEER_PREFIX + content}):
+            notified = self.__dict__.setdefault("_steer_wait_notices", set())
+            turn = next((event["id"] for event in reversed(session["events"]) if event.get("type") == "user"
+                         and not event.get("steered")), None)
+            if (session["id"], turn) not in notified:
+                if len(notified) > 1000:
+                    notified.clear()
+                notified.add((session["id"], turn))
+                await self.event(session, "notice", text=(
+                    "Your queued message will be sent after the agent's next step: together with the latest tool "
+                    "results it would not fit in the context budget."))
+            await self.publish_queue(session)
             return
         sent = {item["id"] for item in entries}
         session["queued_messages"] = [item for item in self.queue_of(session) if item.get("id") not in sent]
@@ -1959,17 +2072,29 @@ class AgentManager:
             if isinstance(exc.__cause__, TooLong):
                 raise ValueError(SIDE_TOO_LONG) from None
             raise
+        # Nothing is sent when it could not succeed: over the 4 MB request limit, while Databricks
+        # asked another chat to pause requests to this endpoint, or above the learned OTPM limit.
+        try:
+            body = check_payload({"messages": messages, "tools": definitions, "stream": False, "max_tokens": reserve})
+        except PayloadTooLarge as exc:
+            raise ValueError(str(exc)) from None
+        waiting = self.rate_gate.remaining(session["model"], session["id"], reserve)
+        if waiting >= 0.5:
+            raise ValueError(f"Databricks is rate limiting {session['model']}; ask again in {math.ceil(waiting)} seconds.")
+        if (refusal := self.otpm_preflight(session, reserve)) is not None:
+            raise ValueError(str(refusal))
         scratch = {"id": session["id"], "inference_calls": []}
         call = begin_inference_call(scratch, "side_question", session["model"], max_output_tokens=reserve, attempt=1,
                                     estimated_input_tokens=estimate_tokens(messages, definitions))
         info = {"status": "running"}
         url = host + "/serving-endpoints/" + quote(session["model"], safe="") + "/invocations"
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(120, connect=20), follow_redirects=False) as client:
+            # Not streamed, and a model that always thinks cannot skip thinking: allow a long answer time.
+            async with httpx.AsyncClient(timeout=httpx.Timeout(LONG_REQUEST_TIMEOUT, connect=20),
+                                         follow_redirects=False) as client:
                 response = await client.post(url, headers={"Authorization": f"Bearer {token}",
-                                                           **request_tag_headers(scratch, call)},
-                                             json={"messages": messages, "tools": definitions, "stream": False,
-                                                   "max_tokens": reserve})
+                                                           **request_tag_headers(scratch, call),
+                                                           "Content-Type": "application/json"}, content=body)
             info["http_status"] = response.status_code
             try:
                 payload = response.json()
@@ -1982,7 +2107,20 @@ class AgentManager:
             if response.status_code != 200:
                 info.update(status="error", error_kind=http_error_kind(response.status_code))
                 detail = self.settings.redact(response.text)[:1000]
-                raise ValueError(f"Databricks returned HTTP {response.status_code}" + (f": {detail}" if detail else "."))
+                described = ""
+                if response.status_code == 429:
+                    limited, rate = self.rate_limit_error(
+                        session, InferenceError("", "rate_limit", 429), response.headers, payload, reserve, detail)
+                    if limited.kind == "output_tokens_over_limit":
+                        info["error_kind"] = limited.kind
+                        raise ValueError(str(limited))
+                    delay = requested_delay(response.headers, payload)
+                    self.rate_gate.note(session["model"], session["id"], delay if delay is not None else 0, rate, reserve)
+                    if rate.limit_type is not None:
+                        info["rate_limit"] = request_info_fields(rate)
+                    described = describe(rate)
+                raise ValueError(f"Databricks returned HTTP {response.status_code}" + (f": {detail}" if detail else "")
+                                 + (f" ({described})" if described else "") + ("" if detail or described else "."))
             choices = payload.get("choices") if isinstance(payload, dict) else None
             choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else None
             if choice is None:
@@ -2132,16 +2270,23 @@ class AgentManager:
             except STORAGE_ERRORS as exc:
                 await report_storage_failure(exc)
 
-    async def execute_tool(self, session, tools, name, arguments, call_id, origin=None):
+    async def execute_tool(self, session, tools, name, arguments, call_id, origin=None, allowance=None):
+        """Run one tool call and return what the model receives. allowance (a ResultAllowance) is
+        the context the results of the current model response may still use: a read that does not
+        fit is withheld (the model may ask again), other results are shortened."""
         event = await self.event(session, "tool", name=name, input=arguments, call_id=call_id, state="running", output="",
                                  **({"verify": True} if origin == "verify" else {}))
         invoked = False
+        views_key = views_prev = None
         try:
             # The mode can change while a turn runs; folder checks follow the current one.
             tools.unrestricted = session.get("permission_mode", "manual") == "bypassPermissions"
             if not tool_allowed(session, name):
-                output = (f"The user turned off {name} in this chat. Use other tools."
-                          if name in (session.get("disabled_tools") or []) else
+                disabled = session.get("disabled_tools") or []
+                cover = covering_tool(name, disabled)
+                output = (f"The user turned off {name} in this chat. Use other tools." if name in disabled else
+                          f"The user turned off {cover} in this chat, which also covers {name}. Use other tools."
+                          if cover else
                           f"The {session['tool_profile']} tool profile does not permit {name}. Use only the available tools.")
                 await self.update_event(session, event, state="rejected", output=output)
                 return output
@@ -2319,6 +2464,10 @@ class AgentManager:
                     for guard in guarded:
                         if refusal := self.overwrite_refusal(session, tools, *guard):
                             raise ValueError(refusal)
+            if allowance is not None and name in ("read_file", "notebook_read"):
+                # A withheld read must not count as seen by the write_file overwrite guard.
+                views_key = str(tools.path(arguments["path"]))
+                views_prev = (session.get("file_views") or {}).get(views_key)
             invoked = True
             if name.startswith("mcp__"):
                 result = await connection.call(name, arguments)
@@ -2438,17 +2587,50 @@ class AgentManager:
                 # Stat first: a change during the read then counts as unseen.
                 target = tools.path(arguments["path"])
                 seen = file_fingerprint(target)
+                # The first page of a large file points at outline_file, unless that tool is turned off or denied.
+                hint = (tool_allowed(session, "outline_file")
+                        and self.permission(session, tools, "outline_file", {"path": arguments["path"]}).decision != "deny")
                 result = await tools.execute(name, arguments, page_bytes=read_page_bytes(
-                    self.request_limits(session)[0]))
+                    self.request_limits(session)[0]), outline_hint=hint)
                 self.remember_file(session, target, seen)
+            elif name == "outline_file":
+                # Not remember_file: an outline is not a read for the write_file overwrite guard.
+                result = await tools.execute(name, arguments, page_bytes=read_page_bytes(self.request_limits(session)[0]))
             else:
                 result = await tools.execute(name, arguments)
+            # The hard cap applies to the card and the model alike, before redaction.
+            result = bound_result(result, TOOL_RESULT_HARD_LIMIT)
             output = result if isinstance(result, str) else json.dumps(result, indent=2)
             if edited_note and origin != "verify":  # Verify reads the JSON result; its card says it was edited.
                 output = edited_note + "\n" + output
-            output = self.settings.redact(output)
+            output = cap_text(self.settings.redact(output))
             failed = name.startswith("mcp__") and isinstance(result, dict) and result.get("is_error") is True
-            await self.update_event(session, event, state="error" if failed else "completed", output=output)
+            model_output, extra = output, {}
+            if allowance is not None:
+                if name in JOB_TOOLS:
+                    allowance.charge(output)  # job_seen() has advanced: what it returned must reach the model.
+                elif tool_kind(name) == "read":
+                    if not allowance.admit(output):
+                        cost = allowance.cost(output)
+                        model_output = deferred_text(name, cost, allowance.total)
+                        extra = {"model_output": model_output,
+                                 "result_withheld": {"estimated_tokens": cost, "allowance_tokens": allowance.total}}
+                        if views_key is not None:
+                            views = dict(session.get("file_views") or {})
+                            if views_prev is None:
+                                views.pop(views_key, None)
+                            else:
+                                views[views_key] = views_prev
+                            session["file_views"] = views
+                elif not allowance.admit(output):
+                    # The action ran; its result is shortened, never withheld.
+                    text = json.dumps(shorten_result(result), indent=2)
+                    if edited_note and origin != "verify":
+                        text = edited_note + "\n" + text
+                    model_output = cap_text(self.settings.redact(text))
+                    extra = {"model_output": model_output, "result_shortened": True}
+                    allowance.charge(model_output)
+            await self.update_event(session, event, state="error" if failed else "completed", output=output, **extra)
             if name in FILE_CHANGE_TOOLS:
                 await self.publish_changes(session)
                 await self.publish_parent_changes(session)
@@ -2457,10 +2639,13 @@ class AgentManager:
                               and result.get("state") in {"failed", "timed_out"})
             if failed or command_failed:
                 await self.run_hooks(session, "tool_failure", name, arguments, result, call_id=call_id, error=output)
+            output = model_output
         except (ValueError, OSError, UnicodeError, KeyError, TypeError, TimeoutError) as exc:
-            output = self.settings.redact(file_error(exc)) or "The command timed out after 60 seconds."
+            output = cap_text(self.settings.redact(file_error(exc)) or "The command timed out after 60 seconds.")
             # The card keeps the plain message; the model gets its category and a recovery hint.
-            model_output = self.settings.redact(tool_error_text(exc, output))
+            model_output = cap_text(self.settings.redact(tool_error_text(exc, output)))
+            if allowance is not None:
+                allowance.charge(model_output)
             await self.update_event(session, event, state="error", output=output, model_output=model_output)
             if invoked:
                 await self.run_hooks(session, "tool_failure", name, arguments, call_id=call_id, error=output)
@@ -2691,7 +2876,9 @@ class AgentManager:
             finally:
                 self.extension_connections.pop(session["id"], None)
 
-    def context_inputs(self, session, tools, mode, notice=""):
+    def context_inputs(self, session, tools, mode, notice="", *, available=None):
+        """(system message, guidance). available: the names of the tools offered in this request
+        (None: all, as for a side question); guidance about tools that are not offered is left out."""
         guidance = load_project_instructions(tools, session.get("instruction_directories", []))
         tools.instruction_signature = (guidance["text"], guidance["warnings"])
         tools.skill_signature = self.skill_text(session, tools)
@@ -2718,6 +2905,7 @@ class AgentManager:
                   + "\nWorkspace: " + session["workspace"]
                   + self.coding_dir_text(session) + self.python_text(session)
                   + "\n" + output_limit_text(self.request_limits(session)[1], thinking=bool(thinking_reserve(session["model"])))
+                  + (("\n" + guidance_text) if (guidance_text := large_input_guidance(available)) else "")
                   + ("\n" + index if index else "")
                   + "\n" + guidance["text"] + "\n" + tools.skill_signature
                   + ("\nProject instruction warnings: " + json.dumps(guidance["warnings"]) if guidance["warnings"] else "")
@@ -2767,11 +2955,18 @@ class AgentManager:
         off at its output limit: the large, already-billed text is still useful."""
         await self.status(session, "compacting")
         estimated_input_tokens = estimate_tokens(messages)
-        # A non-streamed handoff can take minutes to generate; Databricks allows
+        # Not streamed: a summary of a large context can take minutes; Databricks allows
         # up to 597 seconds per request.
-        timeout = httpx.Timeout(600, connect=20) if max_tokens > SUMMARY_MAX_TOKENS else None
+        timeout = httpx.Timeout(LONG_REQUEST_TIMEOUT, connect=20)
+        body = encode_payload({"messages": messages, "stream": False, "max_tokens": max_tokens})
+        if len(body) > request_limits.PAYLOAD_LIMIT_BYTES:
+            raise ValueError(f"The context compaction request would be {len(body) / 1_000_000:.1f} MB, above the "
+                             "Databricks 4 MB request limit, so it was not sent. History is preserved.")
+        if (refusal := self.otpm_preflight(session, max_tokens)) is not None:
+            raise ValueError(str(refusal))
         retry_reason = None
         for attempt in range(MAX_TRANSIENT_RETRIES + 1):
+            await self.wait_for_rate_limit(session, "context compaction", max_tokens)
             call = begin_inference_call(
                 session, "compaction", session["model"], max_output_tokens=max_tokens,
                 attempt=attempt + 1, estimated_input_tokens=estimated_input_tokens, retry_reason=retry_reason)
@@ -2779,9 +2974,9 @@ class AgentManager:
             # exit cannot erase a request that Databricks may already have billed.
             self.store.save(session)
             try:
-                response = await client.post(url, headers={**headers, **request_tag_headers(session, call)}, json={
-                    "messages": messages, "stream": False, "max_tokens": max_tokens,
-                }, **({"timeout": timeout} if timeout else {}))
+                response = await client.post(url, headers={**headers, **request_tag_headers(session, call),
+                                                           "Content-Type": "application/json"},
+                                             content=body, timeout=timeout)
                 info = {"status": "running", "http_status": response.status_code}
                 try:
                     payload = response.json()
@@ -2794,15 +2989,25 @@ class AgentManager:
                 diagnostic = self.settings.redact(response.text)[:1000]
                 if response.status_code != 200:
                     info.update(status="error", error_kind=http_error_kind(response.status_code))
+                    error = InferenceError("", http_error_kind(response.status_code), response.status_code)
+                    if response.status_code == 429:
+                        error, rate = self.rate_limit_error(session, error, response.headers, payload, max_tokens,
+                                                            diagnostic)
+                        info["error_kind"] = error.kind
+                        if rate.limit_type is not None:
+                            info["rate_limit"] = request_info_fields(rate)
+                    elif response.status_code in SERVER_RETRY_STATUSES:
+                        mark_retryable(error, "server_error", response.headers)
+                        error.retry_payload = payload
                     finish_inference_call(call, info)
                     self.store.save(session)
-                    reason = ("rate_limit" if response.status_code == 429 and retryable_rate_limit(diagnostic)
-                              else "server_error" if response.status_code in SERVER_RETRY_STATUSES else None)
+                    if error.kind == "output_tokens_over_limit":
+                        raise ValueError(str(error) + " History is preserved.")
+                    reason = getattr(error, "retry_reason", None)
                     if reason and attempt < MAX_TRANSIENT_RETRIES:
-                        error = InferenceError("", http_error_kind(response.status_code), response.status_code)
-                        mark_retryable(error, reason, response.headers)
-                        error.retry_payload = payload
                         delay = transient_retry_delay(error, attempt)
+                        if reason == "rate_limit":
+                            self.rate_gate.note(session["model"], session["id"], delay, error.rate_limit, max_tokens)
                         await self.event(session, "notice", text=retry_notice(
                             error, delay, attempt + 1, MAX_TRANSIENT_RETRIES, "context compaction"))
                         await asyncio.sleep(delay)
@@ -3118,8 +3323,11 @@ class AgentManager:
             self.live.pop(session["id"], None)
             await self.status(session, "idle")
 
-    async def model_response(self, session, event, client, url, headers, payload, retry_reason=None):
-        """One streamed agent request. retry_reason (ledger only) names why the app sent it automatically."""
+    async def model_response(self, session, event, client, url, headers, payload, retry_reason=None, body=None):
+        """One streamed agent request. retry_reason (ledger only) names why the app sent it automatically.
+        body is payload already encoded (request_limits.encode_payload); those exact bytes are sent."""
+        body = encode_payload(payload) if body is None else body
+        started = request_clock()
         info = dict(event["request_info"])
         event["request_info"] = info
         attempt = 1 + sum(
@@ -3138,13 +3346,14 @@ class AgentManager:
         draft = StreamDraft(self.store, session)
         tool_buffer, finish, appended = ToolCallBuffer(), None, False
         try:
-            async with client.stream("POST", url, headers={**headers, **request_tag_headers(session, call)},
-                                     json=payload) as response:
+            async with client.stream("POST", url, headers={**headers, **request_tag_headers(session, call),
+                                                           "Content-Type": "application/json"},
+                                     content=body) as response:
                 info["http_status"] = response.status_code
                 draft.changed()
                 if response.status_code != 200:
-                    body, truncated = await error_body_prefix(response)
-                    diagnostic = self.settings.redact(body)
+                    error_text, truncated = await error_body_prefix(response)
+                    diagnostic = self.settings.redact(error_text)
                     clipped = truncated or len(diagnostic) > 1000
                     error = InferenceError(
                         f"Databricks returned HTTP {response.status_code}: {diagnostic[:1000]}"
@@ -3153,10 +3362,17 @@ class AgentManager:
                     # Only a request rejected before its SSE stream began is safe
                     # to repeat automatically. Partial text and tool fragments are
                     # never retried because their effects may be ambiguous.
-                    if response.status_code == 429 and retryable_rate_limit(diagnostic):
-                        mark_retryable(error, "rate_limit", response.headers, body)
+                    if response.status_code == 429:
+                        try:
+                            parsed = json.loads(error_text)
+                        except (json.JSONDecodeError, TypeError, ValueError):
+                            parsed = None
+                        error, rate = self.rate_limit_error(session, error, response.headers, parsed,
+                                                            payload.get("max_tokens"), diagnostic)
+                        if rate.limit_type is not None:
+                            info["rate_limit"] = request_info_fields(rate)
                     elif response.status_code in SERVER_RETRY_STATUSES:
-                        mark_retryable(error, "server_error", response.headers, body)
+                        mark_retryable(error, "server_error", response.headers, error_text)
                     raise error
                 async for data in sse_data(response):
                     if data == "[DONE]":
@@ -3266,6 +3482,11 @@ class AgentManager:
                     exc = InferenceError(str(exc), "unknown")
             if exc.http_status is None:
                 exc.http_status = info.get("http_status")
+            elapsed = request_clock() - started
+            if ((exc.kind == "incomplete_response" or (exc.kind == "network" and "http_status" in info))
+                    and elapsed >= request_limits.EXECUTION_LIMIT_SECONDS - EXECUTION_NOTICE_MARGIN):
+                # Databricks ends a request after its execution limit; a stream cut near it likely was.
+                exc.execution_limit, exc.elapsed = True, elapsed
             info.update(status="error", error_kind=exc.kind)
             if exc.kind in REPAIR_CONTINUATIONS and not appended:
                 # A hidden retry request follows the reply; two user messages must never be adjacent.
@@ -3464,7 +3685,9 @@ class AgentManager:
         default_reply_reserve = default_limits(session["model"])[1]
         url = host + "/serving-endpoints/" + quote(session["model"], safe="") + "/invocations"
         headers = {"Authorization": f"Bearer {token}"}
-        async with httpx.AsyncClient(timeout=httpx.Timeout(120, connect=20), follow_redirects=False) as client:
+        # A prefill of a large context with adaptive thinking can stay silent for minutes.
+        timeout = httpx.Timeout(connect=20, read=STREAM_READ_TIMEOUT, write=120, pool=20)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
             steps = (session.get("max_steps", 6) if session.get("is_subagent")
                      else self.settings.values.get("max_agent_steps", DEFAULT_MAX_AGENT_STEPS))
             # Hidden repairs, auto-continue waits after rate limits, the reason the next
@@ -3474,22 +3697,29 @@ class AgentManager:
             verify_state = {"rounds": 0, "since": next(
                 (index for index in range(len(turn_events) - 1, -1, -1) if turn_events[index].get("type") == "user"), 0)}
             consecutive_output_retries = 0
+            execution_noticed = False
             for step_index in range(steps):
+                # Before any compaction is billed: a max_tokens above the output-tokens-per-minute
+                # limit Databricks reported for this endpoint can never be admitted.
+                if (refusal := self.otpm_preflight(session, max_output_tokens)) is not None:
+                    raise refusal
                 # The mode, rules and turned-off tools can change while a turn runs; each step follows them.
                 mode = session.get("permission_mode", "manual")
                 tools.unrestricted = mode == "bypassPermissions"
                 definitions = self.step_definitions(session, external_tools)
-                system, guidance = self.context_inputs(session, tools, mode, self.step_notices(session, tools))
+                system, guidance = self.context_inputs(session, tools, mode, self.step_notices(session, tools),
+                                                       available={item["function"]["name"] for item in definitions})
                 plan = self.handoff_plan(session, context_window)
                 allowance = compaction_output_allowance(session["model"], context_window)
                 summarize, condense = self.compaction_requests(session, client, url, headers,
                                                                handoff_tokens=plan and plan["tokens"],
                                                                allowance=allowance)
                 record, holder = self.compaction_record(session, tools)
+                scale = estimate_scale(session.get("inference_calls"), session["model"])
                 messages, next_context, info = await prepare_context(
                     model_history(wire), context_state, system, definitions, context_window, summarize,
                     reply_reserve=max_output_tokens, condense=condense, default_reply_reserve=default_reply_reserve,
-                    scale=estimate_scale(session.get("inference_calls"), session["model"]),
+                    scale=scale,
                     handoff_path=plan and plan["path"], save_handoff=plan and self.handoff_saver(session, plan),
                     auto_compact_percent=auto_compact_percent(self.settings.values), record_requests=True,
                     app_record=record, output_allowance=allowance, completed_calls=completed_call_ids(session))
@@ -3499,17 +3729,23 @@ class AgentManager:
                                                                   holder["forgotten"])
                     session["file_views"] = views
                 context_state = session["context_state"] = {**next_context, "tool_definitions": definitions}
+                input_budget = info["input_budget"]
+                # The exact bytes sent: the meter shows the size of this request in the same update.
+                payload = {"messages": messages,
+                           "tools": definitions, "stream": True, "max_tokens": max_output_tokens}
+                body = encode_payload(payload)
                 session["context_info"] = {**info, "instruction_files": guidance["files"], "instruction_sources": guidance["sources"],
                                            "warnings": guidance["warnings"], **last_request(session),
-                                           **prior_flag(session)}
+                                           **prior_flag(session), "payload_bytes": len(body),
+                                           "payload_limit_bytes": request_limits.PAYLOAD_LIMIT_BYTES}
                 self.store.save(session)
                 await self.broadcast(session["id"], {"type": "context", "context_info": session["context_info"]})
+                if len(body) > request_limits.PAYLOAD_LIMIT_BYTES:
+                    raise PayloadTooLarge(len(body))  # Never sent, so no ledger entry.
                 await self.summary_adjustment_notice(session, info)
                 await self.status(session, "running")
                 event = await self.event(session, "assistant", text="",
                                          request_info={"model": session["model"], "status": "running"})
-                payload = {"messages": messages,
-                           "tools": definitions, "stream": True, "max_tokens": max_output_tokens}
                 try:
                     # Requests that got no usable status (429, 502/503/504, a failed connection)
                     # are repeated unchanged, sharing one budget; then, for a rate limit only,
@@ -3517,8 +3753,10 @@ class AgentManager:
                     transient_attempt = 0
                     while True:
                         try:
+                            # Another chat's 429 on this endpoint: wait with it instead of adding to the overload.
+                            await self.wait_for_rate_limit(session, "the model request", max_output_tokens)
                             ordered_calls, arguments = await self.model_response(
-                                session, event, client, url, headers, payload, retry_reason=retry_reason)
+                                session, event, client, url, headers, payload, retry_reason=retry_reason, body=body)
                             break
                         except InferenceError as exc:
                             if not getattr(exc, "retryable", False):
@@ -3533,12 +3771,20 @@ class AgentManager:
                                 rate_limit_waits += 1
                                 delay = rate_limit_wait_seconds(exc.retry_headers, exc.retry_payload)
                                 resume = datetime.fromtimestamp(time.time() + delay).strftime("%H:%M:%S")
-                                notice = (f"Databricks is still rate limiting this chat. Continuing automatically at "
-                                          f"{resume} ({rate_limit_waits} of {MAX_RATE_LIMIT_WAITS}). "
-                                          "Press Stop to cancel.")
+                                described = describe(getattr(exc, "rate_limit", None))
+                                notice = ("Databricks is still rate limiting this chat"
+                                          + (f" ({described})" if described else "")
+                                          + f". Continuing automatically at {resume} ({rate_limit_waits} of "
+                                          f"{MAX_RATE_LIMIT_WAITS}). Press Stop to cancel.")
                                 retry_reason = "rate_limit_wait"
                             else:
+                                if exc.retry_reason == "rate_limit" and (
+                                        advice := self.itpm_advice(session, getattr(exc, "rate_limit", None))):
+                                    exc.args = (str(exc) + advice,)
                                 raise
+                            if exc.retry_reason == "rate_limit":
+                                self.rate_gate.note(session["model"], session["id"], delay,
+                                                    getattr(exc, "rate_limit", None), max_output_tokens)
                             await self.update_event(
                                 session, event,
                                 request_info={"model": session["model"], "status": "running"})
@@ -3546,6 +3792,12 @@ class AgentManager:
                             await asyncio.sleep(delay)
                     retry_reason = None
                 except InferenceError as exc:
+                    if getattr(exc, "execution_limit", False) and not execution_noticed:
+                        execution_noticed = True
+                        await self.event(session, "notice", text=(
+                            f"Databricks stops a request after {request_limits.EXECUTION_LIMIT_SECONDS} seconds, and "
+                            f"this one ran {int(exc.elapsed)} seconds. If this repeats, lower Settings → Max output "
+                            "tokens or Settings → Context budget."))
                     has_another_step = step_index + 1 < steps
                     continuation = REPAIR_CONTINUATIONS.get(exc.kind)
                     if event["request_info"].get("finish_reason") == "content_filter":
@@ -3598,12 +3850,20 @@ class AgentManager:
                     await self.refresh_next_estimate(session, system, definitions, wire, context_state)
                     return True
                 consecutive_output_retries = consecutive_repairs = 0
+                # The results of this response share what the input budget leaves after the
+                # latest exchange, so in-turn compaction can always keep them (result_budget).
+                fixed = in_turn_tokens(model_history(wire), context_state, system, definitions, input_budget, scale)
+                allowance = ResultAllowance(
+                    max(0, min(input_budget // 2, input_budget - fixed - ALLOWANCE_MARGIN_TOKENS)), scale)
                 for call, values in zip(ordered_calls, arguments):
-                    output = await self.execute_tool(session, tools, call["function"]["name"], values, call["id"])
+                    output = await self.execute_tool(session, tools, call["function"]["name"], values, call["id"],
+                                                     allowance=allowance)
                     wire.append({"role": "tool", "tool_call_id": call["id"], "content": output})
                     self.store.save(session)
                 if step_index + 1 < steps:
-                    await self.drain_queue(session, wire, tools)
+                    await self.drain_queue(session, wire, tools, fits=lambda message: in_turn_tokens(
+                        [*model_history(wire), message], context_state, system, definitions, input_budget,
+                        scale) <= input_budget)
             if steps > 0:
                 await self.refresh_next_estimate(session, system, definitions, wire, context_state)
         await self.event(session, "error" if session.get("is_subagent") else "notice",

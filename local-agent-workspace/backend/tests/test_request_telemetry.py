@@ -234,7 +234,7 @@ async def test_bad_streams_are_typed_and_never_execute_tools(runtime, monkeypatc
         requests.append(request)
         return httpx.Response(200, text=body)
 
-    async def execute(*args):
+    async def execute(*args, **_):
         pytest.fail("A failed response must not execute tools")
 
     manager.execute_tool = execute
@@ -344,7 +344,7 @@ async def test_stopping_tool_execution_does_not_cancel_completed_inference(runti
             {"index": 0, "id": "read", "function": {"name": "list_files", "arguments": "{}"}}]},
             "finish_reason": "tool_calls"}], "usage": {"prompt_tokens": 20, "completion_tokens": 5}}))
 
-    async def execute(*args):
+    async def execute(*args, **_):
         executing.set()
         await asyncio.Event().wait()
 
@@ -367,7 +367,7 @@ async def test_malformed_tail_retains_usage_without_executing_complete_tool_pref
     async def gateway(request):
         return httpx.Response(200, text="data: " + json.dumps(prefix) + '\n\ndata: {"usage":')
 
-    async def execute(*args):
+    async def execute(*args, **_):
         pytest.fail("A malformed stream must not execute the complete tool-call prefix")
 
     manager.execute_tool = execute
