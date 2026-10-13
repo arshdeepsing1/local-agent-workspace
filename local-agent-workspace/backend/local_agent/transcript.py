@@ -229,6 +229,7 @@ def transcript(session, *, excerpt_chars=EXCERPT_CHARS, redact=lambda text: text
             lines += ["---", "", f"## Turn {turn} · {_when(event.get('created'))}", "",
                       f"**User{' (delegated by the parent conversation)' if delegated else ''}:**", "",
                       _demote_headings(text) or "(empty message)", ""]
+            lines += ["_Attached when sent: " + "; ".join((f"{_code('@' + str(item.get('path')))} lines {item.get('start_line')}–{item.get('end_line')}" + (", shortened" if item.get("truncated") else "")) if item.get("kind") == "file" else f"output of {_code('! ' + str(item.get('command', '')))} (exit {item.get('exit_code')})" for item in event["attachments"] if isinstance(item, dict)) + "_", ""] if isinstance(event.get("attachments"), list) and event["attachments"] else []
         elif kind == "assistant" and text:
             lines += ["**Assistant:**", "", _demote_headings(text), ""]
         elif kind in ("notice", "error") and text:

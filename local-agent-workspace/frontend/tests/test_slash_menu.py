@@ -26,12 +26,14 @@ def sent(ui, session="created"):
 def test_slash_lists_skills_for_a_new_conversation_and_filters(ui, page):
     start_app(ui, page)
     message(page).press_sequentially("/")
-    expect(options(page)).to_have_count(2)
-    expect(options(page).nth(0)).to_contain_text("/review")
-    expect(options(page).nth(0)).to_contain_text("Code review")
-    expect(options(page).nth(0)).to_contain_text("Review the current diff for correctness bugs.")
-    expect(options(page).nth(1)).to_contain_text("/handoff")
-    expect(options(page).nth(1)).to_contain_text("Write a detailed cold-start handoff.")
+    # The built-in /btw (side question) comes first, then the skills.
+    expect(options(page)).to_have_count(3)
+    expect(options(page).nth(0)).to_contain_text("/btw")
+    expect(options(page).nth(1)).to_contain_text("/review")
+    expect(options(page).nth(1)).to_contain_text("Code review")
+    expect(options(page).nth(1)).to_contain_text("Review the current diff for correctness bugs.")
+    expect(options(page).nth(2)).to_contain_text("/handoff")
+    expect(options(page).nth(2)).to_contain_text("Write a detailed cold-start handoff.")
     # A new conversation uses the default workspace's skills.
     assert len(ui.requests("/api/skills")) == 1
     message(page).press_sequentially("han")
@@ -55,9 +57,10 @@ def test_arrows_choose_and_enter_inserts_before_a_second_enter_sends(ui, page):
     expect(options(page).nth(0)).to_have_attribute("aria-selected", "false")
     expect(box).to_have_attribute("aria-activedescendant", options(page).nth(1).get_attribute("id"))
     box.press("ArrowDown")
+    box.press("ArrowDown")
     expect(options(page).nth(0)).to_have_attribute("aria-selected", "true")
     box.press("ArrowUp")
-    expect(options(page).nth(1)).to_have_attribute("aria-selected", "true")
+    expect(options(page).nth(2)).to_have_attribute("aria-selected", "true")
     box.press("Enter")
     expect(box).to_have_value("/handoff ")
     expect(skills(page)).to_have_count(0)
@@ -121,14 +124,14 @@ def test_an_open_conversation_lists_its_own_skills_again_on_each_opening(ui, pag
     ui.show_session("a")
     box = message(page)
     box.press_sequentially("/")
-    expect(options(page)).to_have_count(1)
-    expect(options(page)).to_contain_text("/worktree-skill")
-    expect(options(page)).to_contain_text("Worktree skill")
+    expect(options(page)).to_have_count(2)
+    expect(options(page).nth(1)).to_contain_text("/worktree-skill")
+    expect(options(page).nth(1)).to_contain_text("Worktree skill")
     assert len(ui.requests("/api/skills?session_id=a")) == 1 and not ui.requests("/api/skills")
     box.press_sequentially(" ")
     expect(page.locator(".slash-menu")).to_have_count(0)
     box.press("Backspace")
-    expect(options(page)).to_have_count(1)
+    expect(options(page)).to_have_count(2)
     assert len(ui.requests("/api/skills?session_id=a")) == 2
 
 
@@ -139,7 +142,7 @@ def test_loading_empty_and_error_states(ui, page):
     box.press_sequentially("/")
     expect(page.get_by_role("status").filter(has_text="Loading skills…")).to_be_visible()
     ui.run("fake.deferreds.skills.resolve(fake.json(skills))")
-    expect(options(page)).to_have_count(2)
+    expect(options(page)).to_have_count(3)
     # A failed reload shows its error instead of the earlier list.
     ui.run("""fake.override = path => path === '/api/skills'
       ? fake.json({ detail: 'Skill discovery scans at most 100 entries; reduce the skills directory.' }, 400) : undefined""")
@@ -154,7 +157,9 @@ def test_loading_empty_and_error_states(ui, page):
     box.press("Backspace")
     expect(page.get_by_role("status").filter(
         has_text="No skills found. Add one at .agents/skills/<skill-id>/SKILL.md in your project.")).to_be_visible()
-    # Neither state blocks sending.
+    # The built-in /btw is still listed; with the list closed, Enter sends the text as typed.
+    expect(options(page)).to_have_count(1)
+    box.press("Escape")
     box.press("Enter")
     ui.wait("fake.requests('/api/sessions/created/messages').length === 1")
     assert sent(ui) == ["/"]
@@ -164,11 +169,11 @@ def test_menu_closes_when_the_message_box_loses_focus(ui, page):
     start_app(ui, page)
     box = message(page)
     box.press_sequentially("/")
-    expect(options(page)).to_have_count(2)
+    expect(options(page)).to_have_count(3)
     page.get_by_role("heading", name="What’s up next?").click()
     expect(page.locator(".slash-menu")).to_have_count(0)
     box.click()
-    expect(options(page)).to_have_count(2)
+    expect(options(page)).to_have_count(3)
 
 
 def test_matching_ranks_id_prefixes_then_name_prefixes_then_substrings(ui):

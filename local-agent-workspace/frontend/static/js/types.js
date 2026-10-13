@@ -93,6 +93,23 @@
 // Job: { id, session_id, workspace, command, state, created, updated, exit_code,
 //   output?, truncated, timeout_seconds, max_output_bytes, background,
 //   without_shell? (true: ran from an argument vector without a shell) }
+// Composer (M4): Session.queued_messages?: QueuedMessage[]; Session.pending_context?: [{ kind: 'shell', command,
+//   exit_code }] (! output attached to the next message; its text stays on the server). Pushed as
+//   { type: 'pending_context', pending_context } when a command adds one and when a message takes them.
+// QueuedMessage: { id, text, created, paused } (paused: left over from a stop or failure; sent only by
+//   'Send queued messages'). POST /sessions/<id>/messages while busy -> { ok, queued: true, queued_messages };
+//   otherwise { ok: true }. 400 when 3 are waiting or their text would exceed 50,000 characters.
+//   DELETE /sessions/<id>/queue/<item id> -> { queued_messages } (404 'This queued message was already sent.');
+//   POST /sessions/<id>/queue/send (idle only) sends all of them as one message.
+//   Socket: { type: 'queue', queued_messages, error? } (error: why a queue could not start; stored as session.queue_error).
+// User AgentEvent extras: attachments?: [{ kind: 'file', path, start_line, end_line, truncated } |
+//   { kind: 'shell', command, exit_code }]; steered?, in_wire? (true: queued, sent mid-turn).
+// POST /sessions/<id>/shell { command (one line, 1..2000), timeout_seconds?, max_output_bytes? } -> 202 { ok }
+//   (idle only; runs in every mode; shows a 'user_command' tool event).
+// POST /sessions/<id>/side-question { question (1..4000) } -> { answer, request_info: { status, finish_reason, usage? } };
+//   409 while another side question of the chat is answered.
+// GET /sessions/<id>/mention-files?q= (or /mention-files?q= before a chat exists) -> [{ path, name }] (at most 30;
+//   only paths an @ token can spell). Queued messages must also fit one message's @ limits together.
 // Skill: { id, name, description, path } (path is workspace-relative, or absolute
 //   for a skill shipped with the app)
 // Changes (pushed as { type: 'changes', changes } and returned by Keep/Undo): {

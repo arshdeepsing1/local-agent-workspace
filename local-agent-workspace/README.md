@@ -282,6 +282,49 @@ when opening a conversation or performing restart recovery.
   use /handoff to …`), selects that skill for the whole message. Other text with `/`,
   such as a path (`/tmp/x.log`, `~/handoff/`), is sent unchanged.
   See **Agent tools: MCP, skills, and hooks** below.
+- **Messages while the agent works (queue and steering)**: while a reply, a compaction or a `!`
+  command runs, the box keeps **Stop response** and adds **Queue message**; Enter queues too, and
+  Esc in the box stops the reply. At most 3 messages (50,000 characters in total) can wait; they
+  are listed above the box, where **Edit** moves one back into the box and **Remove** drops it. At
+  the next step boundary, after every result of the agent's current tool calls, the waiting
+  messages reach the agent as one message of the same turn, marked as sent while it was working
+  ("steered"). A message queued during the final reply is sent as the next turn once the reply
+  completes (also when a tool failed in it). After **Stop**, an error, the step limit or a server
+  restart, queued messages are not sent: they wait, marked **Paused** once you send something
+  else, until you click **Send queued messages** (which sends all of them as one message), edit or
+  remove them. Because queued messages are sent together, their `@` files must fit the limits of
+  one message (see below) when you queue them. A message queued while a question or plan card
+  waits stays queued; it never answers the card. Queued messages are saved with the chat (in its
+  `<id>.state.json`) and are not exported.
+- **Files in a message (`@`)**: type `@` to pick a project file (↑/↓, Enter or Tab inserts
+  `@<path> `, Esc closes); `@src/app.py:10-40` or `@src/app.py#L10-L40` names lines. The menu
+  leaves out files whose paths an `@` token cannot spell (spaces, quotes, `<>|@` or a backtick in
+  the path, or a trailing punctuation mark). Chips above the box show the mentions. When the
+  message is sent, the app attaches a snapshot of each mentioned file that exists: up to 1,000
+  lines of a range, or the first 200 lines of a whole file, at most 8,000 characters per file, 5
+  files and 32,000 characters per message. The agent receives them fenced as data after your text;
+  the message shows only your text and the file names. Snapshots follow the chat's own file
+  access: credential files, generated folders, the app's state folder, folders the chat may not
+  read (use **Folder access** first) and read deny rules or a turned-off `read_file` refuse the
+  message with an error. Missing paths, folders and words such as `@dist` stay plain text. Secrets
+  in snapshots are redacted like command output. An attached file counts as read, so the agent may
+  edit it without reading it again. Only your typed text selects skills.
+- **Shell commands (`!`)**: a message starting with `!` runs the rest as one shell command in the
+  project folder, like **Workspace → Terminal** Run, when the chat is idle, for at most 60 seconds
+  (use **Workspace → Terminal** for longer commands). It is an explicit user action, so it runs in
+  every permission mode, Plan included, and permission rules (allow, ask and deny) do not apply to
+  it: they govern the agent's actions. Text with a line break is not run. The command shows as a
+  card with its output; the output (up to 8 KB, with the configured token and common secret shapes
+  redacted; at most 5 commands kept) is attached to your next message, so the agent sees it then;
+  a chip above the box shows it until then. **Stop** ends the command and attaches nothing.
+- **Side questions (`/btw`)**: `/btw <question>` (also listed first in the `/` menu) asks the
+  model about the conversation without adding to it: one non-streamed request with the whole
+  conversation as context and no tool use, also while a reply runs (one side question at a time
+  per chat; while it is answered, the box stays free for other messages; while a reply runs, the
+  **Ask side question** button next to **Stop response** sends it too). The answer appears above
+  the box with **Copy answer** and **Dismiss**; it is not saved, and the next message does not see
+  it. The request is billed and listed as **Side question** in the usage panel. A conversation too
+  long for its context budget needs a compaction first.
 - **Model selection**: the dropdown below the message box changes the model for
   the current conversation. Its history, title, folder access, and permissions are
   preserved, and the next reply uses the selected endpoint with the retained chat

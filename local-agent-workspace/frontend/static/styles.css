@@ -105,6 +105,13 @@
 .slash-command{display:flex;align-items:baseline;gap:8px;font-size:14px;line-height:20px;overflow-wrap:anywhere}.slash-command small{font-size:11px;color:var(--muted)}
 .slash-description{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;font-size:11px;line-height:1.45;margin-top:1px;color:var(--muted)}
 .slash-menu-note{margin:0;padding:3px 7px 4px;font-size:12px;line-height:1.5;color:var(--muted);overflow-wrap:anywhere}
+/* Composer: @ file chips, ! hints, the message queue and /btw side answers. */
+.mention-chips{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 7px}.mention-chip{display:inline-flex;align-items:center;gap:4px;max-width:100%;padding:3px 4px 3px 9px;border:1px solid #dededb;border-radius:999px;background:#f6f6f3;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}.mention-chip .icon-button{width:20px;height:20px;border-radius:50%}.shell-chip{padding-right:9px;font-family:inherit;color:#5d5e58}
+.app-shell .queue-button{background:#fff;color:var(--accent);border:1px solid var(--accent);margin:0 6px 9px 0}.app-shell .queue-button:hover:not(:disabled){background:#fbf3ef}.app-shell .queue-button:disabled{border-color:#c9c9c4}
+.queue-bar,.side-answer{margin:0 0 10px;padding:8px 10px;border:1px solid #e2e2dd;border-radius:12px;background:var(--surface);font-size:12px;color:#62635e}
+.queue-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:4px}.queue-heading button,.side-actions button{font-size:12px;padding:5px 12px;border-radius:7px;flex-shrink:0}
+.queue-item{display:flex;align-items:center;gap:6px;padding:3px 0}.queue-text{flex:1;min-width:0;overflow-wrap:anywhere;color:#2f302c}.queue-paused{font-size:10px;color:#956545;border:1px solid #e4cdb9;border-radius:5px;padding:0 5px}.queue-item .icon-button{width:24px;height:24px}
+.queue-error{margin:0 0 6px;color:#904d38}.side-question{margin:0 0 6px;color:#2f302c;overflow-wrap:anywhere}.side-pending{margin:0}.side-body{max-height:240px;overflow:auto;font-size:13px;color:#2f302c}.side-note{margin:6px 0;font-size:11px}.side-actions{display:flex;justify-content:flex-end;gap:8px}
 .folder-access-button{flex-shrink:0}.project-context>.context-chip:first-child{flex-shrink:0}
 .folder-grants{border:1px solid var(--border);border-radius:9px;overflow:hidden}
 .folder-grant{display:flex;align-items:center;gap:9px;padding:10px 12px;font-size:12px;border-bottom:1px solid var(--border)}.folder-grant:last-child{border-bottom:0}
