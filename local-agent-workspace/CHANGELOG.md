@@ -4,6 +4,52 @@ Notable changes to Local Agent Workspace, newest first. Dates are UTC.
 
 ## Unreleased
 
+Roadmap milestone M2 (agent quality):
+
+- Search and reading: a new `find_files` tool (globs with `**` and `{a,b}`, sort by path or
+  last change, paging). `search_files` honours `.gitignore` inside Git repositories by
+  default (`include_ignored` turns it off), has output modes (matching lines, matching
+  files, counts) and uses ripgrep when it is installed, with the same results without it.
+  Case-insensitive literal search now uses simple case folding ("STRASSE" no longer finds
+  "Straße"; regular expressions keep full folding), and results come in path order.
+  `read_file` pages grow with the context window (8–32 KB), read up to 2,000 lines, can
+  read the last lines of a file (`tail_lines`) and replace invalid UTF-8 with a note. Lines
+  are split at LF only, so line numbers match editors.
+- Commands: a failed or timed-out command shows the start and the end of its output;
+  Settings → Command environment passes named variables to commands (credential and loader
+  variables are refused); Stop and time limits send SIGTERM and wait 2 seconds before
+  killing. A new `wait_job` tool waits for a background job to end or to print a line
+  matching a pattern, and background jobs the agent started post a notice when they end.
+- File edits: `edit_file` can replace every match (`replace_all`) and make several edits in
+  one call (`edits`); edits keep a file's line endings (CRLF stays CRLF). Settings → File
+  write limit (16–1,000 KB, 80 KB by default) governs new file content and the editor. New
+  `move_path` and `delete_path` tools for single text files, with Undo, and
+  `notebook_read`/`notebook_edit` for Jupyter notebooks. After an edit the app checks the
+  file offline (Python syntax, JSON, TOML, notebooks, merge-conflict markers) and tells the
+  agent only about problems the edit introduced. Diffs stay fast on large files.
+- Agent loop: 502/503/504 responses and connection errors before a response starts are
+  retried (up to 3 times, each recorded in Agent tools → Usage). After those retries, a
+  rate limit is waited out (Retry-After up to 120 seconds, at most 2 extra waits; Stop
+  cancels; Settings toggle, on by default). Invalid tool arguments or an incomplete reply
+  get up to 2 hidden repair requests. Tool errors reach the agent as
+  `{error_kind, message, hint}`. A per-project **Verify** command (Agent tools → Verify) runs
+  after the agent changes files, through the normal approvals, for at most 3 rounds.
+- Context: Settings → Custom instructions (up to 8,000 characters) apply to every chat. A
+  short index of available skills (at most 2 KB) is part of the system prompt, and skills in
+  `.claude/skills` are read (never written).
+- Replies: `path:line` mentions become links that open the file at that line in Workspace →
+  Files, which also offers **Open in VS Code**.
+- Workspace → Changes shows Git's view as **Staged changes**, **Changes** and **Untracked**
+  with counts and per-file diffs; generated folders are grouped and credential files never
+  show a diff.
+- Workspace → Files: **Add folder…** adds a folder to Files for the project (view only: the
+  agent still needs Folder access), with change dots, and offers **Add <folder>** for changed
+  files outside every folder. Every file the agent changed can be reviewed, kept or undone,
+  also after leaving Bypass permissions or removing a folder grant.
+- Safety: regular expressions whose counted repeats would expand too far are refused, and
+  paths a Git index lists outside the searched folder are skipped.
+- CI installs ripgrep on Ubuntu and macOS.
+
 Roadmap milestone M1 (attention, approval quick wins, safety):
 
 - Notifications: opt-in browser notifications when a chat needs approval, finishes, reaches the
