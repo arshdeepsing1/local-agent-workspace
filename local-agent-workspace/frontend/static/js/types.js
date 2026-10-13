@@ -15,7 +15,19 @@
 //   'tool_error'|'step_limit'|'interrupted' (also in the /api/sessions summaries),
 //   turn_ended?: epoch seconds when the last turn ended; null while a turn runs (also in summaries),
 //   turn_delegated?: true while the last turn is one a parent's delegate_task started (also in summaries) }
-//   GET /sessions list items omit events and allow_rules.
+//   GET /sessions list items omit events and allow_rules, and add unreviewed_changes (files with agent
+//   changes not yet kept or undone, including rows rolled up from its subagents).
+//   pinned?, archived? (hidden in the sidebar; wins over pinned), tags?: string[] (at most 10, 1-32 characters),
+//   parent_deleted? (a subagent chat whose parent was deleted; its parent links are gone),
+//   worktree?: { id, branch, source_workspace } (a chat in an app-managed worktree; grouped under source_workspace).
+//   The first stream snapshot carries only the latest events: events_start (index of events[0]; 0 = complete)
+//   and events_total. Later snapshots are complete and have no events_start.
+// GET /sessions/<id>/info: the list item of one chat (header and status, no events); 404 if missing, 400 if unreadable.
+// GET /sessions/<id>/events?before=<event id>&limit=1..500 (100) -> { events, start, total }: the page before that event.
+// PUT /sessions/<id>/meta { pinned?, archived?, tags? } -> Session; pushed as { type: 'meta', pinned, archived, tags }.
+// DELETE /sessions/<id>?children=keep|delete (keep) -> { ok, deleted: string[] }: delete also deletes its subagent chats.
+// GET /session-search?q=2..200 chars&workspace?&include_subagents?&limit=1..50 (20) -> { results: [{ id, title, updated,
+//   workspace, archived, matches: [{ event_id, role: 'user'|'assistant', snippet }] }], truncated }.
 // Rule: { behavior: 'allow'|'ask'|'deny', tool, command?, argv?: string[], prefix?: string[], flags?: string[],
 //   path?: string, hook?: string }. A rule without behavior (an M1 "Allow for this chat" rule) means allow.
 //   tool: 'run_command' (command = M1 exact text, chat and allow only; argv = exact argv; prefix with flags =

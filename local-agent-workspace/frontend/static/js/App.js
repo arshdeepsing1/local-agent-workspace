@@ -86,7 +86,8 @@ export default function App() {
         const before = app.sessions.find(item => item.id === id)?.updated
         attention.renamed(id, before, (await app.renameSession(id, title)).updated)
       }}
-      onDelete=${id => void app.deleteSession(id).then(() => removeDraft(id)).catch(e => showError(e.message))} />
+      onMeta=${app.setMeta} onSearch=${app.searchConversations} onError=${showError}
+      onDelete=${(id, children) => app.deleteSession(id, children).then(deleted => deleted.forEach(removeDraft)).catch(e => showError(e.message))} />
     <main class="main-area">
       <header class="topbar"><button class="icon-button mobile-only" aria-label="Open sidebar" onClick=${() => setSidebarOpen(true)}><${Menu} size=${20} /></button>
         <${Laptop} size=${18} className="topbar-device" />
@@ -101,7 +102,7 @@ export default function App() {
       <${StorageNotice} problems=${app.storageProblems} />
       ${!app.online && app.activeId ? html`<div class="connection-banner">Reconnecting to your local server… Refresh if the server was restarted.</div>` : null}
       ${app.connection && !app.connection.connected ? html`<div class="connection-banner"><span>${app.connection.error || 'Configure Databricks to start a conversation.'}</span><button onClick=${() => setSettingsOpen(true)}>Open settings</button></div>` : null}
-      ${hasMessages && active ? html`<${Conversation} key=${active.id} session=${active} onError=${showError} onSelectSession=${app.setActiveId} onOpenPath=${openFileAt} />` :
+      ${hasMessages && active ? html`<${Conversation} key=${active.id} session=${active} onError=${showError} onSelectSession=${app.setActiveId} onOpenPath=${openFileAt} onLoadEarlier=${app.loadEarlier} />` :
         html`<div class="welcome"><div class="welcome-content"><div class="welcome-heading"><${Brand} /><h1>What’s up next?</h1></div>
           <div class="suggestions"><button class="outline" onClick=${() => setDraft('Explore this project. Read the relevant files and explain its structure and how to run it.')}><${Folder} size=${16} />Explore this project</button>
             <button class="outline" onClick=${() => setDraft('Help me make a change in this project: ')}><${Pencil} size=${16} />Make a change</button>

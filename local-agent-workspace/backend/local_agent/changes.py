@@ -71,6 +71,11 @@ class ChangeReview:
         self.store.db.execute("DELETE FROM agent_changes WHERE session_id=?", (session_id,))
         self.store.db.commit()
 
+    def counts(self):
+        """{session id: number of files with unreviewed agent changes}, for the sidebar. Rows rolled
+        up from subagents are stored under the parent's ID, so they count for the parent."""
+        return dict(self.store.db.execute("SELECT session_id, COUNT(*) FROM agent_changes GROUP BY session_id"))
+
     def has(self, session_id):
         return self.store.db.execute("SELECT 1 FROM agent_changes WHERE session_id=? LIMIT 1", (session_id,)).fetchone() is not None
 

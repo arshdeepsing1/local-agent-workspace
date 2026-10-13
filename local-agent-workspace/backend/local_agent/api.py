@@ -1,14 +1,16 @@
 import asyncio
 import mimetypes
+import os
 import secrets
 import sys
+import unicodedata
 from contextlib import asynccontextmanager
 from pathlib import Path, PurePosixPath
 from typing import Literal
 from urllib.parse import urlsplit
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -20,7 +22,8 @@ from .config import MAX_COMMAND_ENV, MAX_USER_INSTRUCTIONS, MAX_WRITE_LIMIT_KB, 
 from .context import (
     MAX_CONTEXT_WINDOW, MAX_MAX_OUTPUT_TOKENS, MIN_CONTEXT_WINDOW, MIN_MAX_OUTPUT_TOKENS,
 )
-from .store import Store
+from .store import Store, UnreadableConversation
+from . import conversation_search
 from .git_tools import file_diff, working_tree_changes, working_tree_status
 from .jobs import NOT_STOPPED, TIMEOUT_NOT_STOPPED
 from .tools import WorkspaceTools, file_error
@@ -85,6 +88,27 @@ class SessionTitle(BaseModel):
     title: str = Field(min_length=1, max_length=160, strict=True)
 
 
+class SessionMeta(BaseModel):
+    model_config = {"extra": "forbid"}
+    pinned: bool | None = Field(default=None, strict=True)
+    archived: bool | None = Field(default=None, strict=True)
+    tags: list[str] | None = Field(default=None, max_length=10, strict=True)
+
+
+def clean_tags(tags):
+    """NFC, whitespace collapsed, 1 to 32 characters, no control characters; the first of
+    tags that differ only in case is kept."""
+    result, seen = [], set()
+    for raw in tags:
+        tag = " ".join(unicodedata.normalize("NFC", raw).split())
+        if not 1 <= len(tag) <= 32 or any(unicodedata.category(char) == "Cc" for char in tag):
+            raise ValueError("Tags have 1 to 32 characters and no control characters.")
+        if tag.casefold() not in seen:
+            seen.add(tag.casefold())
+            result.append(tag)
+    return result
+
+
 class FolderAccess(BaseModel):
     path: str = Field(min_length=1, max_length=4096)
 
@@ -129,8 +153,16 @@ def create_app(settings=None):
     @asynccontextmanager
     async def lifespan(app):
         yield
+        manager.closing = True  # A Stop during shutdown records the reply as interrupted.
         await asyncio.gather(*(manager.stop(sid) for sid in list(manager.tasks)))
         await manager.jobs.shutdown()
+        # Everything stopped: the next start reads only conversation headers. If a stop raised,
+        # no marker is written and the next start loads every conversation (the safe direction).
+        try:
+            os.close(os.open(store.conversations / ".clean-shutdown",
+                             os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600))
+        except OSError:
+            pass
         store.db.close()
 
     app = FastAPI(title="Local workspace", lifespan=lifespan, docs_url=None, redoc_url=None)
@@ -169,7 +201,13 @@ def create_app(settings=None):
     def session_or_404(session_id):
         if session_id in deleting_sessions:
             raise HTTPException(404, "Conversation is being deleted.")
-        session = manager.get(session_id)
+        try:
+            session = manager.get(session_id)
+        except UnreadableConversation as exc:
+            # After a clean shutdown startup reads only headers, so a damaged body is found when the
+            # chat is opened: hide it and report it like a file found unreadable at startup.
+            store.record_problem(exc.file, exc.reason)
+            raise
         if not session:
             raise HTTPException(404, "Conversation not found.")
         return session
@@ -238,7 +276,9 @@ def create_app(settings=None):
 
     @app.get("/api/sessions")
     async def list_sessions():
-        return [{**s, "status": manager.statuses.get(s["id"], "idle")} for s in store.list()]
+        counts = manager.changes.counts()
+        return [{**s, "status": manager.statuses.get(s["id"], "idle"), "unreviewed_changes": counts.get(s["id"], 0)}
+                for s in store.list()]
 
     @app.post("/api/sessions")
     async def create_session(body: SessionPermissions | None = None):
@@ -286,6 +326,53 @@ def create_app(settings=None):
         session.update(title=title, title_generated=True, updated=updated["updated"])
         await manager.broadcast(session_id, {"type": "title", "title": title})
         return public_session(session, manager.statuses.get(session_id, "idle"))
+
+    @app.get("/api/sessions/{session_id}/info")
+    async def session_info(session_id: str):
+        """The conversation's metadata and status without loading its events."""
+        if session_id in deleting_sessions:
+            raise HTTPException(404, "Conversation not found.")
+        live = manager.live.get(session_id)
+        header = Store.summary(live) if live else store.header(session_id)
+        if header is None:
+            raise HTTPException(404, "Conversation not found.")
+        return {**header, "status": manager.statuses.get(session_id, "idle")}
+
+    @app.get("/api/sessions/{session_id}/events")
+    async def session_events(session_id: str, before: str, limit: int = Query(default=100, ge=1, le=500)):
+        """The page of up to limit events just before the event `before` (earlier history)."""
+        events = session_or_404(session_id)["events"]
+        index = next((number for number, event in enumerate(events) if event.get("id") == before), None)
+        if index is None:
+            raise ValueError("That message is no longer in this conversation.")
+        start = max(0, index - limit)
+        return {"events": events[start:index], "start": start, "total": len(events)}
+
+    @app.put("/api/sessions/{session_id}/meta")
+    async def session_meta(session_id: str, body: SessionMeta):
+        """Pin, archive or tag a chat. Allowed during a response; keeps the sort order and unread state."""
+        session = session_or_404(session_id)
+        changes = body.model_dump(exclude_none=True)
+        if not changes:
+            raise HTTPException(400, "Change pin, archive or tags.")
+        if "tags" in changes:
+            changes["tags"] = clean_tags(changes["tags"])
+        # Persist first, like a rename, so a failed save changes nothing.
+        updated = {**session, **changes}
+        store.save(updated, touch=False)
+        session.update(changes)
+        await manager.broadcast(session_id, {"type": "meta", "pinned": session.get("pinned") is True,
+                                             "archived": session.get("archived") is True,
+                                             "tags": session.get("tags") or []})
+        return public_session(session, manager.statuses.get(session_id, "idle"))
+
+    @app.get("/api/session-search")
+    async def session_search(q: str = Query(min_length=2, max_length=200), workspace: str | None = None,
+                             include_subagents: bool = False, limit: int = Query(default=20, ge=1, le=50)):
+        if workspace is not None and not Path(workspace).is_absolute():
+            raise ValueError("Choose a project by its absolute path.")
+        return await asyncio.to_thread(conversation_search.search, store, q, workspace=workspace,
+                                       include_subagents=include_subagents, limit=limit, redact=settings.redact)
 
     @app.post("/api/sessions/{session_id}/folders")
     async def allow_folder(session_id: str, body: FolderAccess):
@@ -336,21 +423,46 @@ def create_app(settings=None):
             "Cache-Control": "no-store"})
 
     @app.delete("/api/sessions/{session_id}")
-    async def delete_session(session_id: str):
+    async def delete_session(session_id: str, children: Literal["keep", "delete"] = "keep"):
+        """children=delete also deletes its subagent chats; keep (the default) detaches them."""
         session_or_404(session_id)
+        family = [session_id]
         deleting_sessions.add(session_id)
         try:
-            await manager.stop(session_id)
-            await manager.jobs.remove_session(session_id)
-            manager.task_board.delete_session(session_id)
-            manager.checkpoints.delete_session(session_id)
-            manager.changes.delete_session(session_id)
-            store.delete(session_id)
-            manager.live.pop(session_id, None)
-            manager.statuses.pop(session_id, None)
+            await manager.stop(session_id)  # Also stops its active subagent.
+            # Listed after the stop, so a subagent started meanwhile is included.
+            if children == "delete":
+                family = [*manager.descendants(session_id), session_id]  # Deepest first.
+                deleting_sessions.update(family)
+            for member in family:
+                await manager.stop(member)
+                await manager.jobs.remove_session(member)
+                manager.task_board.delete_session(member)
+                manager.checkpoints.delete_session(member)
+                manager.changes.delete_session(member)
+                store.delete(member)
+                manager.live.pop(member, None)
+                manager.statuses.pop(member, None)
         finally:
-            deleting_sessions.discard(session_id)
-        return {"ok": True}
+            deleting_sessions.difference_update(family)
+        if children == "keep":
+            for summary in store.list():
+                if summary.get("parent_session_id") != session_id:
+                    continue
+                try:
+                    child = manager.get(summary["id"])  # The live dict while it runs.
+                except (ValueError, OSError):
+                    continue  # Unreadable: left unchanged and reported by the store.
+                if not child:
+                    continue
+                for key in ("parent_session_id", "parent_event_id", "parent_call_id"):
+                    child.pop(key, None)
+                child["parent_deleted"] = True
+                delegation = child.get("delegation")
+                if isinstance(delegation, dict) and not delegation.get("terminal_reason"):
+                    child["delegation"] = {**delegation, "status": "cancelled", "terminal_reason": "stopped"}
+                store.save(child, touch=False)
+        return {"ok": True, "deleted": family}
 
     @app.post("/api/sessions/{session_id}/messages")
     async def message(session_id: str, body: Prompt):
@@ -388,6 +500,9 @@ def create_app(settings=None):
             return
         try:
             session = manager.get(session_id)
+        except UnreadableConversation as exc:
+            store.record_problem(exc.file, exc.reason)  # Its next /info answers 400 instead of reconnecting.
+            session = None
         except (ValueError, OSError):
             session = None  # An unreadable conversation file.
         if not session:
@@ -396,7 +511,16 @@ def create_app(settings=None):
         await socket.accept(subprotocol="local-workspace")
         manager.listeners.setdefault(session_id, set()).add(socket)
         try:
-            await socket.send_json({"type": "snapshot", "session": public_session(session, manager.statuses.get(session_id, "idle"))})
+            # The first snapshot carries the latest 200 events, extended to the whole latest turn
+            # (at most 1,000); the page loads earlier ones from /events. Later snapshots are complete.
+            snapshot = public_session(session, manager.statuses.get(session_id, "idle"))
+            events, total = snapshot["events"], len(snapshot["events"])
+            start = max(0, total - 200)
+            latest_user = next((index for index in range(total - 1, -1, -1) if events[index].get("type") == "user"), None)
+            if latest_user is not None and latest_user < start:
+                start = max(latest_user, total - 1000)
+            snapshot.update(events=events[start:], events_start=start, events_total=total)
+            await socket.send_json({"type": "snapshot", "session": snapshot})
             await manager.publish_changes(session)
             try:
                 tasks = manager.task_board.list(session_id)

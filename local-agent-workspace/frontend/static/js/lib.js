@@ -6,11 +6,11 @@
 // - booleans such as `disabled=${busy}` and `aria-*` values work as in React;
 // - SVG attributes keep their SVG spelling, for example `text-anchor`.
 import { h, render } from 'preact'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks'
 import htm from 'htm'
 
 export const html = htm.bind(h)
-export { render, useCallback, useEffect, useMemo, useRef, useState }
+export { render, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState }
 
 // Apply a React-style state update (a value or an updater function).
 export const resolve = (value, current) => typeof value === 'function' ? value(current) : value

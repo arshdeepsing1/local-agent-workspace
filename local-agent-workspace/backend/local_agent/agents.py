@@ -512,7 +512,24 @@ class AgentManager:
         self.extension_connections = {}
         self.notifier = SystemNotifier()
         self.jobs = JobManager(store, settings.redact, self.job_update, redaction_tokens=self.redaction_tokens, environment=self.command_environment)
-        for summary in store.list():
+        self.closing = False
+        # The lifespan writes the marker after every task and job stopped. It is removed before
+        # anything else, so a crash during this run gives a full scan next time. Without it (a
+        # crash, a failed shutdown, a fresh or older state folder) every conversation is loaded.
+        marker = store.conversations / ".clean-shutdown"
+        clean = marker.exists()
+        try:
+            marker.unlink(missing_ok=True)
+        except OSError:
+            clean = False
+        summaries = store.list()
+        full_scan = not clean
+        recovered = set()
+        for summary in summaries:
+            # After a clean shutdown only a turn the stop did not finish needs repair.
+            if not (full_scan or summary.get("turn_running") is True
+                    or ("turn_ended" in summary and summary["turn_ended"] is None)):
+                continue
             try:
                 session = store.get(summary["id"])
                 if session is None:
@@ -526,7 +543,8 @@ class AgentManager:
                 continue
             if interrupted:
                 store.save(session)
-        self.delegates.recover()
+                recovered.add(session["id"])
+        self.delegates.recover(summaries, full_scan=full_scan, recovered=recovered)
 
     @staticmethod
     def mark_interrupted(session):
@@ -547,7 +565,10 @@ class AgentManager:
         for event in session["events"]:
             if event.get("state") in ("running", "pending"):
                 event["state"] = "cancelled"
-                changed = cut_short = True
+                changed = True
+                # A ! command is the user's own action, not an agent turn: nothing to continue.
+                if not (event.get("type") == "tool" and event.get("name") == "user_command"):
+                    cut_short = True
             if event.get("request_info", {}).get("status") == "running":
                 event["request_info"].update(status="interrupted", error_kind="incomplete_response")
                 changed = cut_short = True
@@ -560,6 +581,21 @@ class AgentManager:
             session["turn_ended"] = time.time()  # The turn ended when the server stopped.
             changed = True
         return changed
+
+    def descendants(self, session_id):
+        """IDs of the conversation's subagent chats at every depth, deepest first, from the headers."""
+        children = {}
+        for summary in self.store.list():
+            parent = summary.get("parent_session_id")
+            if isinstance(parent, str):
+                children.setdefault(parent, []).append(summary["id"])
+        order, seen, level = [], {session_id}, [session_id]
+        while level:
+            # seen guards against a cycle in damaged or hand-edited headers.
+            level = [child for parent in level for child in children.get(parent, [])
+                     if child not in seen and not seen.add(child)]
+            order = level + order  # Each deeper level goes first.
+        return order
 
     def workspace_available(self, workspace):
         from pathlib import Path

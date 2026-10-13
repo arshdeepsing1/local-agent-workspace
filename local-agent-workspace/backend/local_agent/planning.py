@@ -111,8 +111,15 @@ class DelegateManager:
         except (ValueError, OSError):
             return None  # Reported by the store; recovery skips it.
 
-    def recover(self):
-        for summary in self.manager.store.list():
+    def recover(self, summaries=None, full_scan=True, recovered=()):
+        """Close delegations a restart cut short. After a clean shutdown (full_scan False) only
+        children whose delegation is still open or whose parent was just recovered are loaded."""
+        for summary in self.manager.store.list() if summaries is None else summaries:
+            header = summary.get("delegation")
+            if not isinstance(header, dict) or not summary.get("parent_event_id"):
+                continue
+            if not (full_scan or not header.get("terminal_reason") or summary.get("parent_session_id") in recovered):
+                continue
             child = self._readable(summary["id"])
             progress = (child or {}).get("delegation")
             if not progress or not child.get("parent_event_id"):
@@ -129,6 +136,8 @@ class DelegateManager:
                 self.manager.store.save(parent)
 
     async def progress(self, child, status=None, terminal_reason=None):
+        if not child.get("parent_session_id") or not child.get("parent_event_id"):
+            return  # A child whose parent was deleted (its links were cleared).
         previous = child.get("delegation")
         if previous is None or previous.get("terminal_reason"):
             return

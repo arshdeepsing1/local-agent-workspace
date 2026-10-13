@@ -125,8 +125,8 @@ export function useWorkspace() {
       try {
         if (reconnect) await refreshToken()
         // A rejected WebSocket handshake cannot distinguish a missing chat
-        // from an expired token. Check existence before opening or retrying it.
-        await api(`/sessions/${activeId}`)
+        // from an expired token. Check existence (the header only) before opening or retrying it.
+        await api(`/sessions/${activeId}/info`)
       } catch (error) {
         if (!isCurrent()) return
         if (error instanceof ApiError && error.status === 404) {
@@ -152,7 +152,10 @@ export function useWorkspace() {
           // A reconnect can reveal a model update missed while disconnected.
           if (reconnect) modelVersions.current.set(activeId, (modelVersions.current.get(activeId) || 0) + 1)
           if (data.session.context_info) contextUpdates.current.set(activeId, data.session.context_info)
-          setSession(data.session)
+          // The first snapshot holds only the latest events (events_start > 0 when earlier ones exist);
+          // a snapshot without events_start is the complete history.
+          setSession({ ...data.session, events_start: data.session.events_start || 0,
+            events_total: data.session.events_total ?? data.session.events.length })
           void refreshSessions().catch(e => setError(e.message))
         }
         if (data.type === 'permissions') {
@@ -177,9 +180,16 @@ export function useWorkspace() {
         if (data.type === 'event') setSession(current => {
           if (!current || current.id !== activeId) return current
           const event = data.event
-          return { ...current, events: current.events.some(e => e.id === event.id)
-            ? current.events.map(e => e.id === event.id ? event : e) : [...current.events, event] }
+          if (current.events.some(e => e.id === event.id)) return { ...current, events: current.events.map(e => e.id === event.id ? event : e) }
+          // An update to an event on a page that is not loaded yet: it arrives with that page.
+          if (current.events_start > 0 && current.events.length && event.created < current.events[0].created) return current
+          return { ...current, events: [...current.events, event], events_total: (current.events_total ?? current.events.length) + 1 }
         })
+        if (data.type === 'meta') {
+          const meta = { pinned: data.pinned, archived: data.archived, tags: data.tags }
+          setSession(current => current?.id === activeId ? { ...current, ...meta } : current)
+          setSessions(current => current.map(item => item.id === activeId ? { ...item, ...meta } : item))
+        }
         if (data.type === 'delta') setSession(current => current?.id === activeId ? {
           ...current, events: current.events.map(e => e.id === data.id ? { ...e, text: (e.text || '') + data.text } : e),
         } : current)
@@ -288,11 +298,46 @@ export function useWorkspace() {
       }
     } finally { setModelSaves(current => { const next = new Set(current); next.delete(scope); return next }) }
   }
-  const deleteSession = async id => {
-    await api(`/sessions/${id}`, 'DELETE')
-    if (selected.current.id === id) newConversation()
+  // children: 'delete' also deletes its subagent chats; otherwise they are kept as separate chats.
+  const deleteSession = async (id, children) => {
+    const result = await api(`/sessions/${id}${children === 'delete' ? '?children=delete' : ''}`, 'DELETE')
+    const deleted = Array.isArray(result?.deleted) ? result.deleted : [id]
+    if (deleted.includes(selected.current.id)) newConversation()
     await refreshSessions()
+    return deleted
   }
+  // Loads the page of up to 100 events before the first loaded one; one request at a time.
+  const earlierRequest = useRef(null)
+  const loadEarlier = async () => {
+    const target = selected.current
+    const current = session?.id === target.id ? session : null
+    const first = current?.events[0]
+    if (!first || !(current.events_start > 0) || earlierRequest.current === target) return
+    earlierRequest.current = target
+    try {
+      const page = await api(`/sessions/${encodeURIComponent(current.id)}/events?before=${encodeURIComponent(first.id)}&limit=100`)
+      if (selected.current !== target) return
+      setSession(value => {
+        // A newer snapshot (a reconnect, a complete history) replaced what this page extends.
+        if (value?.id !== current.id || !(value.events_start > 0) || value.events[0]?.id !== first.id) return value
+        const known = new Set(value.events.map(event => event.id))
+        return { ...value, events: [...page.events.filter(event => !known.has(event.id)), ...value.events],
+          events_start: page.start, events_total: page.total }
+      })
+    } finally { if (earlierRequest.current === target) earlierRequest.current = null }
+  }
+  // changes: { pinned?, archived?, tags? }; saved without changing the chat's order or unread state.
+  const setMeta = async (id, changes) => {
+    const updated = await api(`/sessions/${encodeURIComponent(id)}/meta`, 'PUT', changes)
+    const meta = { pinned: updated.pinned, archived: updated.archived, tags: updated.tags }
+    sessionsRequest.current++  // An older list response must not undo it.
+    setSessions(current => current.map(item => item.id === id ? { ...item, ...meta } : item))
+    setSession(current => current?.id === id ? { ...current, ...meta } : current)
+    return updated
+  }
+  // Full-text search of titles and messages: { results: SearchResult[], truncated }.
+  const searchConversations = (q, workspace) =>
+    api(`/session-search?${new URLSearchParams({ q, ...(workspace ? { workspace } : {}) })}`)
   const renameSession = async (id, title) => {
     const updated = await api(`/sessions/${encodeURIComponent(id)}/title`, 'PUT', { title })
     // A summary captured before the rename must not restore the old title.
@@ -397,6 +442,7 @@ export function useWorkspace() {
     setError: reportError, setActiveId: selectSession, newConversation, send, saveSettings, deleteSession, renameSession, changeModel,
     modelSaving: modelSaves.has(selection.key) || (!activeId && defaultModelSave.current !== null),
     checkConnection, refreshSessions, permissionMode: activeSession?.permission_mode || draftMode, setPermissionMode, allowFolder, removeFolder,
+    loadEarlier, setMeta, searchConversations,
     rules: { chat: activeSession?.allow_rules || [], project: rulesHere?.project || [], user: rulesHere?.user || [],
       project_path: rulesHere?.project_path || null, problem: rulesHere?.problem || null },
     loadRules, addRule, removeRule, resetRules, setDisabledTools,
