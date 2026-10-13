@@ -178,10 +178,12 @@ def create_app(settings=None):
         The agent's tools and every other route keep the conversation's own grants."""
         session = session_or_404(session_id) if session_id else {}
         workspace = session.get("workspace", settings.values["workspace"])
+        from .tools import write_limit_setting
         # workspace_folders is assigned by register_workspace_folders below, before any request.
         return WorkspaceTools(workspace, settings.values["env_file"],
                               [*session.get("allowed_directories", []), *workspace_folders.paths(workspace)],
-                              session.get("permission_mode") == "bypassPermissions")
+                              session.get("permission_mode") == "bypassPermissions",
+                              write_limit=write_limit_setting(settings.values))
 
     @app.get("/api/bootstrap")
     async def bootstrap():

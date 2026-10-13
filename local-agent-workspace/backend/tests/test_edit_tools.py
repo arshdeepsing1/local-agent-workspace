@@ -137,6 +137,31 @@ def test_editor_save_of_lf_text_over_a_mixed_file_keeps_its_endings(tmp_path, mo
     assert target.read_bytes() == b"a\r\nB\r\nc\r\nd\n"
 
 
+def test_the_editor_follows_the_write_limit_setting(tmp_path, monkeypatch):
+    monkeypatch.setattr("local_agent.config.APP_ROOT", tmp_path)
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    settings = Settings(tmp_path / "state")
+    settings.env = {}
+    settings.values.update(workspace=str(workspace), env_file="")
+    settings.credentials = lambda: ("https://fake.example", "synthetic-test-token")
+    (workspace / "big.txt").write_text("x" * 115_000)
+    (workspace / "mid.txt").write_text("m" * 26_000)
+    with TestClient(create_app(settings)) as client:
+        client.headers["X-Local-Token"] = client.get("/api/bootstrap").json()["token"]
+        session_id = client.post("/api/sessions").json()["id"]
+        settings.update({"write_limit_kb": 200})
+        for params in ({}, {"session_id": session_id}):
+            opened = client.get("/api/file", params={"path": "big.txt", **params})
+            assert opened.status_code == 200, opened.text
+            body = {"path": "big.txt", "original": opened.json()["content"], "content": "y" * 115_000, **params}
+            assert client.put("/api/file", json=body).status_code == 200
+        settings.update({"write_limit_kb": 16})
+        refused = client.get("/api/file", params={"path": "mid.txt", "session_id": session_id})
+        assert refused.status_code == 400 and "16 KB limit" in refused.json()["detail"]
+    assert (workspace / "big.txt").read_text() == "y" * 115_000
+
+
 def test_preview_diff_uses_lf_views_and_names_ending_only_changes():
     assert preview_diff("f", "a\r\nb\r\n", "a\nb\n") == "Only line endings change."
     assert preview_diff("f", "a\n", "a\n") == "No changes."
