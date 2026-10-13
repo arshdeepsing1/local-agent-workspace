@@ -240,3 +240,23 @@
 .git-diff-view{display:flex;flex-direction:column;flex:1;min-height:0}.git-diff-view .diff-review-lines{padding-bottom:12px}
 .diff-line.hunk{color:#6b7f99;background:#eef1f5;font-size:11px;padding:2px 0 2px 58px;margin:4px 0}
 .diff-line.hunk:first-child{margin-top:0}
+/* M2 workspace folders */
+.file-roots{display:flex;flex-direction:column;gap:7px;padding:8px 10px;border-bottom:1px solid #e3dfd5;font-size:11px;color:var(--muted);max-height:min(260px,38dvh);overflow:auto;flex-shrink:0}
+.file-roots-list{display:flex;flex-wrap:wrap;gap:5px;min-width:0}
+.file-roots-item{display:flex;align-items:center;min-width:0;max-width:100%;border:1px solid var(--border);border-radius:7px;background:var(--surface)}
+.file-roots-item.selected{border-color:var(--accent);background:#f6ebe5}
+.file-roots-root{min-width:0;gap:5px;padding:4px 7px;font-size:11px;border-radius:6px;color:#625d52}
+.file-roots-item.selected .file-roots-root{color:var(--ink)}
+.file-roots-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.file-roots-root small{flex-shrink:0;font-size:9px;color:var(--muted);white-space:nowrap}
+.file-roots-remove{height:24px;width:24px;padding:4px;margin-right:2px}
+.file-roots-outside{display:flex;flex-wrap:wrap;align-items:center;gap:5px;color:#956545}
+.file-roots-outside>span,.file-roots-outside>.form-error{flex-basis:100%}
+.file-roots-outside button{font-size:11px;padding:4px 8px;border-radius:7px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block}
+.file-roots-add{align-self:flex-start;gap:6px;padding:4px 7px;font-size:11px;border-radius:6px;color:#625d52}
+.file-roots-form label{display:block;font-size:11px;font-weight:500;color:var(--ink);margin-bottom:5px}
+.file-roots-form>div{display:flex;gap:5px;min-width:0}
+.file-roots-form input{flex:1;min-width:0;border:1px solid var(--border);border-radius:6px;background:var(--surface);padding:5px 7px;font-size:12px}
+.file-roots-form button{font-size:11px;padding:5px 9px;border-radius:6px;flex-shrink:0}
+.file-roots-form .field-help{font-size:10px;margin:5px 0 0}
+.file-roots .form-error{margin:0;padding:7px 9px;font-size:11px}

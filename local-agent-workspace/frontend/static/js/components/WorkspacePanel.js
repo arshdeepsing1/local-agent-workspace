@@ -1,6 +1,7 @@
 import { html, useCallback, useEffect, useRef, useState } from '../lib.js'
 import { ArrowLeft, ChevronRight, Code2, File, FileDiff, Folder, GitBranch, Pencil, Plus, RefreshCw, Save, Terminal, X } from '../icons.js'
 import { api } from '../api.js'
+import FileRoots, { useWorkspaceFolders } from './FileRoots.js'
 import TerminalPanel from './TerminalPanel.js'
 import DiffReview, { DiffLine } from './DiffReview.js'
 import { DiffStat } from './ChangesBar.js'
@@ -127,11 +128,13 @@ function GitChanges({ query, workspace, busy, onOpenFile }) {
 // open: { path, line? } opens that file in the editor once, at that line, then onOpened() clears it.
 export default function WorkspacePanel({ sessionId, workspace, allowedDirectories = [], file, setFile, onClose, onAttach, changes: agentChanges, busy, review, onReviewOpened, onReview, onSelectSession, open, onOpened }) {
   const [tab, setTab] = useState('files')
-  // root '.' is the project; a granted folder is browsed by absolute paths and never above itself.
+  // root '.' is the project; a granted or added folder is browsed by absolute paths and never above itself.
   const [root, setRoot] = useState('.')
   const [directory, setDirectory] = useState('.')
   const chooseRoot = value => { setRoot(value); setDirectory(value) }
-  useEffect(() => { if (root !== '.' && !allowedDirectories.includes(root)) chooseRoot('.') }, [root, allowedDirectories.join('\n')])
+  const added = useWorkspaceFolders(sessionId, workspace)
+  const roots = [...allowedDirectories, ...added.folders.filter(folder => !folder.missing).map(folder => folder.path)]
+  useEffect(() => { if (root !== '.' && !roots.includes(root)) chooseRoot('.') }, [root, roots.join('\n')])
   const parentOf = path => root === '.' ? (path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '.')
     : path.slice(0, path.lastIndexOf('/')).length < root.length ? root : path.slice(0, path.lastIndexOf('/'))
   const [files, setFiles] = useState([])
@@ -257,10 +260,8 @@ export default function WorkspacePanel({ sessionId, workspace, allowedDirectorie
           onMouseDown=${leaveLine} onKeyDown=${leaveLine} onInput=${e => { leaveLine(); setFile({ ...file, content: e.currentTarget.value }) }} />
         <div class="editor-status"><span>${file.content.split('\n').length} lines${markedLine?.selected ? ` · Line ${markedLine.line}` : ''}</span><span>${dirty ? 'Unsaved changes' : 'Saved on disk'}</span></div>`}
       </div>` : html`<div class="file-browser">
-        ${allowedDirectories.length ? html`<div class="file-root"><label for="files-root">Browse</label><select id="files-root" value=${root} title=${root === '.' ? workspace : root} onChange=${e => chooseRoot(e.currentTarget.value)}>
-          <option value=".">Project</option>
-          ${allowedDirectories.map(folder => html`<option key=${folder} value=${folder}>${folder}${[...changed.keys()].some(path => path.startsWith(`${folder}/`)) ? ' (changed files)' : ''}</option>`)}
-        </select></div>` : null}
+        <${FileRoots} workspace=${workspace} root=${root} onChoose=${chooseRoot} granted=${allowedDirectories} folders=${added.folders}
+          onAdd=${added.add} onRemove=${added.remove} changed=${[...changed.keys()]} />
         <div class="file-path"><button class="icon-button" aria-label="Parent folder" disabled=${directory === root} onClick=${() => setDirectory(parentOf(directory))}><${ArrowLeft} size=${15} /></button><span title=${directory === '.' ? workspace : directory}>${directory === '.' ? 'Project files' : directory}</span>
           <button class="icon-button" aria-label="Refresh files" disabled=${loading} onClick=${() => void refresh()}><${RefreshCw} size=${14} className=${loading ? 'spin' : ''} /></button></div>
         <div class="file-list">${files.map(entry => {

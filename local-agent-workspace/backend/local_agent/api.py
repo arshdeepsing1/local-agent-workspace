@@ -24,6 +24,7 @@ from .store import Store
 from .git_tools import file_diff, working_tree_changes, working_tree_status
 from .jobs import NOT_STOPPED, TIMEOUT_NOT_STOPPED
 from .tools import WorkspaceTools, file_error
+from .workspace_folders import register_workspace_folders
 from .permissions import PermissionMode
 from .telemetry import session_metrics
 from .activity import redact_secrets
@@ -167,6 +168,16 @@ def create_app(settings=None):
         session = session_or_404(session_id) if session_id else {}
         workspace = session.get("workspace", settings.values["workspace"])
         return WorkspaceTools(workspace, settings.values["env_file"], session.get("allowed_directories", []),
+                              session.get("permission_mode") == "bypassPermissions")
+
+    def ui_tools(session_id=None):
+        """workspace_tools plus the folders added to Files, for the user's own browsing, editor saves and Recovery only.
+        The agent's tools and every other route keep the conversation's own grants."""
+        session = session_or_404(session_id) if session_id else {}
+        workspace = session.get("workspace", settings.values["workspace"])
+        # workspace_folders is assigned by register_workspace_folders below, before any request.
+        return WorkspaceTools(workspace, settings.values["env_file"],
+                              [*session.get("allowed_directories", []), *workspace_folders.paths(workspace)],
                               session.get("permission_mode") == "bypassPermissions")
 
     @app.get("/api/bootstrap")
@@ -402,17 +413,17 @@ def create_app(settings=None):
 
     @app.get("/api/files")
     async def files(path: str = ".", session_id: str | None = None):
-        return workspace_tools(session_id).list_files(path)
+        return ui_tools(session_id).list_files(path)
 
     @app.get("/api/file")
     async def file(path: str, session_id: str | None = None):
-        tools = workspace_tools(session_id)
+        tools = ui_tools(session_id)
         # The absolute path lets the editor offer an "Open in VS Code" link.
         return {"path": path, "content": tools.read_file(path), "absolute": str(tools.path(path))}
 
     @app.put("/api/file")
     async def save_file(body: FileEdit):
-        tools = workspace_tools(body.session_id)
+        tools = ui_tools(body.session_id)
         if tools.read_file(body.path) != body.original:
             raise HTTPException(409, "This file changed on disk. Reopen it before saving.")
         manager.checkpoints.apply_edit(tools, "write_file", {"path": body.path, "content": body.content}, session_id=body.session_id)
@@ -518,9 +529,10 @@ def create_app(settings=None):
         scoped_job(job_id, session_id)
         return await manager.jobs.stop(job_id)
 
-    register_features(app, manager, settings, store, session_or_404, workspace_tools)
+    register_features(app, manager, settings, store, session_or_404, workspace_tools, ui_tools)
     register_portability(app, manager, settings, store, session_or_404)
     register_approvals(app, manager, store, session_or_404)
+    workspace_folders = register_workspace_folders(app, settings, session_or_404)
 
     # The browser loads the frontend source files directly; there is no build step.
     frontend = APP_ROOT / "frontend"

@@ -31,7 +31,7 @@ frontend that runs without a build step.
   request's earlier tool results), and a visible context meter. Full conversation history
   stays on disk, and a script turns it into Markdown transcripts.
 - Automatic workspace-scoped `AGENTS.md` and `CLAUDE.md` guidance loading.
-- Workspace file explorer (the project and the conversation's granted folders), text
+- Workspace file explorer (the project, the conversation's granted folders and folders you add), text
   editor with stale-file detection, Git status/diff, and a non-interactive command runner.
 - File checkpoints with reviewed, reversible restore and managed Git worktrees.
 - Review of the agent's file edits, as in an editor's chat: a "files changed" bar with
@@ -280,11 +280,31 @@ when opening a conversation or performing restart recovery.
   are never replaced by automatic naming, including a title request already in flight.
 - **Workspace / Files**: browse a folder, edit UTF-8 text files up to 80 KB, or use
   the plus button to reference the file in chat ("Please read the project file: <path>", or
-  "Please read the file: <absolute path>" for a granted folder). When the conversation has granted
-  folders (**Folder access**), **Browse** at the top switches between **Project** and each
-  granted folder; a granted folder is shown by absolute paths and the parent button stops
-  at that folder. The choice goes back to **Project** for another conversation or when the
-  folder's grant is removed. Save detects concurrent disk edits.
+  "Please read the file: <absolute path>" for a folder outside the project). When the
+  conversation has granted folders (**Folder access**) or you added folders to Files, a row of
+  folder buttons at the top switches between **Project**, each granted folder ("Allowed in this
+  chat") and each added folder ("Added to Files"). Such a folder is shown by absolute paths and
+  the parent button stops at that folder. A folder button shows a dot when the folder contains
+  files the agent changed (screen readers hear the count). **Add folder…** adds a folder to Files for the
+  project (every chat of the project shares the list; a worktree chat has its own), like an
+  editor's "Add Folder to Workspace": you can browse it, edit its files and see the dots for
+  files the agent changed there, for example in Bypass permissions, which needs no grant.
+  Adding a folder does not give the agent access: it still needs **Folder access** to read or
+  change it. Credential files stay hidden in added folders too. The filesystem root, folders
+  inside the project, the app's state directory, a folder inside it or a folder containing
+  it (also when reached by another name, such as a different letter case or a bind mount),
+  and folders the file tools exclude (such as `.git`, `.venv`, `.local` or `dist`) cannot be
+  added, and a project can have up to 20 added folders. A folder button shows the folder's
+  name, with parent folders when two names match; the full path is in its tooltip. The × beside an added
+  folder removes it from Files and leaves the folder itself alone; a folder that no longer
+  exists or cannot be reached shows "Not found". When the agent changed files under none of these folders,
+  "N changed files outside these folders" offers **Add <folder>** for up to three of their
+  folders. **Agent tools → Recovery** can preview and restore saves and agent edits in an
+  added folder. Reviewing an agent change there (**Keep** or **Undo**) still uses the
+  conversation's own access: outside Bypass permissions the folder needs **Folder access**.
+  The list is kept in `workspace_folders.json` in the state directory. The choice
+  goes back to **Project** for another conversation or when the folder's grant or entry is
+  removed. Save detects concurrent disk edits.
   Unsaved editor text stays with its conversation when closing the workspace panel,
   attaching a file, or switching chats. Text entered during a save remains unsaved
   until the next save. Editor drafts are kept in the current page, not across reloads.
