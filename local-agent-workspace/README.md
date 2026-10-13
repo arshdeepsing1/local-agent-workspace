@@ -667,7 +667,8 @@ when opening a conversation or performing restart recovery.
   The system message keeps its stable parts first and puts the folder grants, the current
   date and this line last, so a provider that caches prompt prefixes can reuse more. It
   gives the local date and time zone but not the time of day, so it changes once a day
-  rather than once a minute; the model runs `date` when it needs the exact time.
+  rather than once a minute; the model runs `date` when it needs the exact time (a chat
+  without `run_command`, such as a `read_only` subagent, is not told to).
 - **Request details**: expand the details below an assistant response or tool-only
   model request to inspect its endpoint, completion status, stop reason, and
   provider-reported token usage when available. Failed requests distinguish invalid
@@ -1945,11 +1946,14 @@ external paths need folder access. A deny rule or a turned-off tool covers them 
 the tool that shows the same content: rules for `read_file` cover `outline_file`, and
 rules for `list_files` or `find_files` cover `project_overview`. With both tools offered,
 the system message asks the model to start an unfamiliar or large project with
-`project_overview`, to outline long files, to read a handoff smaller than about a third of
-its input budget completely (the message gives that size in tokens and bytes, from
-**Settings → Context budget** and **Max output tokens**) (otherwise its status, next actions and open questions in
-full, and other sections as needed), and to split a handoff longer than **Settings → File
-write limit** into numbered parts listed at the top of the first.
+`project_overview`, to outline long files, to read a handoff completely when a full read
+costs at most about a third of its input budget (the message gives that size in bytes of
+`file_bytes`, from **Settings → Context budget**, **Max output tokens** and the model's
+starting token estimate scale, allowing about a quarter more for `read_file`'s line numbers
+and JSON escaping: about 111,000 bytes at the Claude Opus 5.5 default) (otherwise its status,
+next actions and open questions in full, and other sections as needed), and, when it can
+write files, to split a handoff longer than **Settings → File write limit** into numbered
+parts listed at the top of the first.
 
 **Tool output bounds.** Most tools already return at most about 8 KB: `list_files`,
 `find_files`, `search_files`, `notebook_read`, `get_job_output`, a `wait_job` page, the

@@ -461,11 +461,84 @@ async def test_the_system_message_guidance_follows_the_offered_tools_and_the_inp
     system = requests[0]["messages"][0]["content"]
     budget = 65536 - 8192 - 2048
     assert "call outline_file" in system and "call project_overview first" in system
-    assert (f"smaller than about {budget // 3:,} tokens (roughly {budget // 3 * 3:,} bytes; a third of your "
-            f"{budget:,}-token input budget)") in system
+    # test-endpoint starts at estimate scale 1.0: 55,296 / 1.25 for read_file's overhead.
+    assert ("smaller than about 44,000 bytes (read_file's file_bytes; about a third of your "
+            f"{budget:,}-token input budget once read)") in system
     # Turning off read_file also turns off outline_file (it covers it): the guidance leaves it out.
     session["disabled_tools"] = ["read_file"]
     requests = script(monkeypatch, [("list_files", {"path": "."})])
     await manager.run(session, "Hello again")
     system = requests[0]["messages"][0]["content"]
     assert "outline_file" not in system and "call project_overview first" in system
+
+
+# --- The handoff size in the system message (integration review B, findings 2 and 7) -------------
+
+def markdown_handoff(size):
+    """A Markdown handoff of just under size bytes: headings, blank and short lines, quotes and
+    backslashes, which read_file's line numbers and JSON escaping make costlier than plain text."""
+    words = 'the app keeps state in sqlite and "quoted" paths like src/billing/db.py with \\ escapes — →'.split()
+    lines, total, number = [], 0, 0
+    while True:
+        number += 1
+        kind = number % 7
+        line = ("" if kind == 0 else "## " + " ".join(words[number % 5:number % 5 + 3]) if kind == 1
+                else "    " + " ".join(words[:number % 9 + 2]) if kind == 2
+                else "- " + " ".join(words[(number + i) % len(words)] for i in range(4 + number % 21)))
+        if total + len(line.encode()) + 1 > size:
+            return "\n".join(lines) + "\n"
+        lines.append(line)
+        total += len(line.encode()) + 1
+
+
+async def test_a_handoff_of_the_stated_size_costs_about_a_third_of_the_budget_once_read(tmp_path, monkeypatch):
+    import re
+
+    from local_agent.context import estimate_scale, prepare_context, scaled_estimate
+    monkeypatch.delenv("LOCAL_AGENT_MODEL")  # The Opus 5.5 default (200,000 / 16,384, scale 1.3).
+    monkeypatch.setattr("local_agent.config.APP_ROOT", tmp_path)
+    project = tmp_path / "project"
+    project.mkdir()
+    settings = Settings(tmp_path / "state")
+    settings.values.update(workspace=str(project), env_file="")
+    store = Store(tmp_path / "handoff.sqlite3")
+    try:
+        manager = AgentManager(store, settings)
+        session = store.create(settings.values)
+        tools = manager.session_tools(session)
+        definitions = manager.step_definitions(session, [])
+        available = {item["function"]["name"] for item in definitions}
+        system, _ = manager.context_inputs(session, tools, "manual", available=available)
+        size = int(re.search(r"smaller than about ([\d,]+) bytes \(read_file's file_bytes", system["content"])
+                   .group(1).replace(",", ""))
+        assert size == 111_000
+        (project / "handoff.md").write_text(markdown_handoff(size - 1), encoding="utf-8")
+        window, output = manager.request_limits(session)
+        budget = manager.input_budget(session)
+        scale = estimate_scale([], session["model"])
+        wire, state, compactions, start = [{"role": "user", "content": "Resume from handoff.md"}], {}, [], 1
+        base = scaled_estimate([system, *wire], definitions, scale)
+
+        async def summarize(previous, chunk, limit):
+            return "## Goal and current status\nsummary"
+        while start:
+            result = tools.read_file_range("handoff.md", start, 2000, page_bytes=read_page_bytes(window))
+            call = f"c{start}"
+            wire += [{"role": "assistant", "content": None, "tool_calls": [{"id": call, "type": "function", "function": {
+                "name": "read_file", "arguments": json.dumps({"path": "handoff.md", "start_line": start})}}]},
+                     {"role": "tool", "tool_call_id": call, "content": json.dumps(result, indent=2)}]
+            _, state, info = await prepare_context(wire, state, system, definitions, window, summarize,
+                                                   reply_reserve=output, scale=scale, auto_compact_percent=50)
+            compactions += ["compaction" in info]
+            start = result["next_line"]
+        # Read as advised, it neither reaches the lowest Auto-compact (50%) nor costs much more than a third.
+        assert not any(compactions)
+        assert scaled_estimate([system, *wire], definitions, scale) - base <= 0.40 * budget
+        # The text uses the model's starting scale, so calibration does not change the system message.
+        session["inference_calls"] = [{"purpose": "agent", "model": session["model"], "status": "completed",
+                                       "estimated_input_tokens": 100_000, "usage": {"input_tokens": 117_000}}]
+        assert estimate_scale(session["inference_calls"], session["model"]) == 1.17
+        again, _ = manager.context_inputs(session, tools, "manual", available=available)
+        assert again["content"] == system["content"]
+    finally:
+        store.db.close()

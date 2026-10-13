@@ -914,8 +914,10 @@ async def test_a_turned_off_read_file_hides_and_refuses_outline_file(tmp_path, m
 def test_large_input_guidance_follows_the_offered_tools(tmp_path, monkeypatch):
     from local_agent.agents import large_input_guidance
     from local_agent.context import HANDOFF_POINTER
-    both = large_input_guidance({"outline_file", "project_overview", "read_file"})
+    both = large_input_guidance({"outline_file", "project_overview", "read_file", "write_file"})
     assert "call project_overview first" in both and "call outline_file" in both and "File write limit" in both
+    # A read_only chat cannot write a file: no write-limit guidance.
+    assert "File write limit" not in large_input_guidance({"outline_file", "project_overview"})
     only_outline = large_input_guidance({"outline_file"})
     assert "project_overview" not in only_outline and "outline_file" in only_outline
     only_overview = large_input_guidance({"project_overview"})

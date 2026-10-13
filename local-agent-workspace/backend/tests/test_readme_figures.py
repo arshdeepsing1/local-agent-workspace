@@ -53,3 +53,11 @@ def test_the_default_figures_in_the_readme_match_the_code():
 def test_the_summary_floor_in_the_readme_matches_the_code():
     # prepare_context stops shortening a billed summary below half the summary minimum.
     assert f"even a summary of about {context.SUMMARY_MIN_BYTES // 2:,} bytes would not fit" in readme()
+
+
+def test_the_readme_handoff_read_size_matches_the_code():
+    from local_agent.agents import handoff_read_bytes
+    from local_agent.context import estimate_scale
+    window, output = default_limits(DEFAULT_MODEL)
+    size = handoff_read_bytes(window - output - SAFETY_MARGIN, estimate_scale([], DEFAULT_MODEL))
+    assert f"about {size:,} bytes at the Claude Opus 5.5 default" in readme()

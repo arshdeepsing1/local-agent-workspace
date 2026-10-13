@@ -331,15 +331,16 @@ def tool_arguments(calls):
     return arguments
 
 
-def current_time_text(now=None):
+def current_time_text(now=None, *, commands=True):
     """The model otherwise guesses today's date, for example from file names. Day precision:
     a minute in the system message would change it, and miss the provider's prompt cache for
-    everything after it, once a minute."""
+    everything after it, once a minute. commands: run_command is offered, so the model can run
+    `date` for the time (a restricted subagent gets the time from its parent if it needs it)."""
     now = datetime.now().astimezone() if now is None else now
     offset = now.strftime("%z")
     offset = f"{offset[:3]}:{offset[3:]}" if len(offset) == 5 else offset
     return (f"Current local date: {now:%Y-%m-%d} ({now.tzname()}, UTC{offset}). Use it for dates; do not infer "
-            "today's date from file names; run `date` when the exact time matters.")
+            "today's date from file names" + ("; run `date` when the exact time matters." if commands else "."))
 
 
 # Appended to the system message when outline_file or project_overview is offered
@@ -354,21 +355,34 @@ LARGE_INPUT_WRITES = ("A file you write is limited by Settings → File write li
                       "numbered parts and list them at the top of the first.")
 
 
-def large_input_guidance(available=None, input_budget=None):
+# A full read with read_file costs more than file_bytes / 3 estimated tokens: its line numbers
+# and JSON-escaped newlines add about a quarter (measured x1.24 on Markdown handoffs).
+HANDOFF_READ_OVERHEAD = 1.25
+
+
+def handoff_read_bytes(input_budget, scale=1.0):
+    """The file_bytes of a handoff whose full read costs about a third of input_budget as the app
+    estimates it: 3 bytes per token, times the estimate scale and read_file's overhead, rounded
+    down to thousands (111,000 at the Opus 5.5 default with its 1.3 starting scale)."""
+    return int(input_budget // 3 * 3 / scale / HANDOFF_READ_OVERHEAD) // 1000 * 1000
+
+
+def large_input_guidance(available=None, input_budget=None, scale=1.0):
     """The large-project guidance for the offered tools (None: every tool), or "". input_budget
-    (the request's input budget in tokens) gives the model the handoff size in numbers."""
+    (the request's input budget in tokens) gives the model the handoff size in numbers. scale is
+    the model's starting estimate scale, not the calibrated one: that changes after most responses,
+    and this text sits early in the system message, where a change misses the prompt cache."""
     overview = available is None or "project_overview" in available
     outline = available is None or "outline_file" in available
     if not overview and not outline:
         return ""
-    # The app estimates about 3 bytes of text per token, so a third of the budget in
-    # tokens is about the budget in bytes (read_file's file_bytes).
     handoff_size = ("about a third of your context budget" if input_budget is None else
-                    f"about {input_budget // 3:,} tokens (roughly {input_budget // 3 * 3:,} bytes; a third of your "
-                    f"{input_budget:,}-token input budget)")
+                    f"about {handoff_read_bytes(input_budget, scale):,} bytes (read_file's file_bytes; about a third "
+                    f"of your {input_budget:,}-token input budget once read)")
     return " ".join(part for part, wanted in ((LARGE_INPUT_OVERVIEW, overview),
                                               (LARGE_INPUT_OUTLINE.format(handoff_size=handoff_size), outline),
-                                              (LARGE_INPUT_WRITES, True)) if wanted)
+                                              (LARGE_INPUT_WRITES, available is None or "write_file" in available))
+                    if wanted)
 
 
 FILE_VIEW_LIMIT = 500  # files whose last read or write a conversation remembers
@@ -2942,12 +2956,13 @@ class AgentManager:
                   + self.coding_dir_text(session) + self.python_text(session)
                   + "\n" + output_limit_text(self.request_limits(session)[1], thinking=bool(thinking_reserve(session["model"])))
                   + (("\n" + guidance_text) if (guidance_text := large_input_guidance(
-                      available, input_budget=self.input_budget(session))) else "")
+                      available, input_budget=self.input_budget(session),
+                      scale=estimate_scale([], session["model"]))) else "")
                   + ("\n" + index if index else "")
                   + "\n" + guidance["text"] + "\n" + tools.skill_signature
                   + ("\nProject instruction warnings: " + json.dumps(guidance["warnings"]) if guidance["warnings"] else "")
                   + "\nAdditional allowed folders: " + json.dumps(session.get("allowed_directories", []))
-                  + "\n" + current_time_text()
+                  + "\n" + current_time_text(commands=available is None or "run_command" in available)
                   + ("\n" + notice if notice else "")}
         return system, guidance
 
