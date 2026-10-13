@@ -3313,14 +3313,52 @@ class AgentManager:
             info = session.get("context_info")
             if not isinstance(info, dict):
                 return
-            tokens = next_request_estimate(model_history(wire), context_state, system, definitions,
-                                           estimate_scale(session.get("inference_calls"), session["model"]))
+            scale = float(estimate_scale(session.get("inference_calls"), session["model"]))
+            tokens = next_request_estimate(model_history(wire), context_state, system, definitions, scale)
             budget, threshold = info.get("input_budget"), info.get("auto_compact_threshold")
             info["next_estimate"] = {
-                "tokens": tokens,
+                "tokens": tokens, "scale": scale,  # The scale, so a model change can rescale the estimate.
                 "percent_of_input_budget": round(tokens * 100 / budget, 1) if budget else None,
                 "percent_of_threshold": round(tokens * 100 / threshold, 1) if threshold else None}
             await self.broadcast(session["id"], {"type": "context", "context_info": info})
+        except Exception:
+            pass
+
+    async def refresh_meter_limits(self, session):
+        """After a model change or a Settings save, bring an idle chat's context meter to the budgets
+        its next request will use (prepare_context's formulas, so that request records the same values),
+        rescale the next-request estimate to the chat's model, save and broadcast. The last request's
+        estimate and report stay as they were, so a report from another budget shows as an earlier
+        request. A running chat is left alone: its next step prepares its own info, and note_last_request
+        reads the in-flight request's budget from the stored info. Never raises."""
+        import math
+        from .context import SAFETY_MARGIN, compaction_threshold
+        try:
+            info = session.get("context_info")
+            if (not isinstance(info, dict) or type(info.get("input_budget")) is not int
+                    or self.statuses.get(session["id"], "idle") != "idle" or session.get("turn_running")):
+                return
+            context_window, reply_reserve = self.request_limits(session)
+            budget = context_window - reply_reserve - SAFETY_MARGIN
+            percent = auto_compact_percent(self.settings.values)
+            threshold = compaction_threshold(budget, percent)
+            updated = {**info, "context_window": context_window, "reply_reserve": reply_reserve, "input_budget": budget,
+                       "auto_compact_percent": percent, "auto_compact_threshold": threshold}
+            estimate = info.get("next_estimate")
+            if isinstance(estimate, dict) and type(estimate.get("tokens")) is int:
+                tokens, scale = estimate["tokens"], estimate.get("scale")
+                if type(scale) is float and scale > 0:
+                    current = float(estimate_scale(session.get("inference_calls"), session.get("model")))
+                    tokens, scale = (tokens, scale) if current == scale else (math.ceil(tokens * current / scale), current)
+                updated["next_estimate"] = {
+                    **estimate, "tokens": tokens, **({"scale": scale} if scale is not None else {}),
+                    "percent_of_input_budget": round(tokens * 100 / budget, 1) if budget > 0 else None,
+                    "percent_of_threshold": round(tokens * 100 / threshold, 1) if threshold > 0 else None}
+            if updated == info:
+                return
+            self.store.save({**session, "context_info": updated}, touch=False)
+            session["context_info"] = updated
+            await self.broadcast(session["id"], {"type": "context", "context_info": updated})
         except Exception:
             pass
 

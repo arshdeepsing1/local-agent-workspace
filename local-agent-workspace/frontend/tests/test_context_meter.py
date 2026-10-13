@@ -196,13 +196,49 @@ def test_a_report_from_another_budget_or_model_is_not_shown_as_current(ui, page)
     summary.click()
     expect(page.get_by_text("Earlier request · reported by Databricks")).to_be_visible()
     expect(page.get_by_text(re.compile("Databricks counted"))).to_have_count(0)
-    # The conversation switched models since the report.
+    # The conversation switched models since the report, at the same budget. Until a request to the new model is
+    # prepared, the info and the report describe the same request, so the reported value stays.
     ui.rerender(f"{{ info: {REPORTED}, model: 'databricks-gpt-oss-120b' }}")
+    expect(page.get_by_text("Last model input · 10,000 tokens · 8.3%")).to_be_visible()
+    expect(page.get_by_text("Last request · reported by Databricks")).to_be_visible()
+    # A request to the new model was prepared (streaming, or it failed): the report is history.
+    ui.rerender(f"{{ info: {{ ...{REPORTED}, estimated_tokens: 8800 }}, model: 'databricks-gpt-oss-120b' }}")
     expect(page.get_by_text("Last model input · ~7%")).to_be_visible()
     expect(page.get_by_text("Earlier request · reported by Databricks")).to_be_visible()
     ui.rerender(f"{{ info: {REPORTED}, model: 'databricks-claude-opus-5-5' }}")
     expect(page.get_by_text("Last model input · 10,000 tokens · 8.3%")).to_be_visible()
     expect(page.get_by_text("Last request · reported by Databricks")).to_be_visible()
+
+
+FIRST_OPUS = f"""{{ ...{CONTEXT}, estimated_tokens: 9722, estimate_scale: 1.3, estimate_prior: true,
+  last_request: {{ ...{REPORT}, input_tokens: 7211, uncached_input_tokens: 7211, cache_read_input_tokens: 0,
+  percent_of_input_budget: 6, estimated_tokens: 9722, estimate_scale: 1.3, next_estimate_scale: 1,
+  estimate_gap_percent: -25.8 }} }}"""
+
+
+def test_a_first_report_that_replaces_the_starting_ratio_says_so(ui, page):
+    # A new Opus 5.5 chat's first request: estimated at the ×1.30 starting ratio, reported below the plain
+    # text-size heuristic. The report replaces the starting ratio, so later estimates are unscaled.
+    ui.mount("components/ContextMeter.js", f"{{ info: {FIRST_OPUS} }}")
+    page.get_by_text("Last model input · 7,211 tokens · 6%").click()
+    expect(page.get_by_text(re.compile(r"^Databricks counted 25\.8% fewer input tokens .*\(~9,722\)\. That estimate "
+                                       r"was scaled ×1\.30; later estimates use the unscaled text-size heuristic "
+                                       r"\(×1\.00\)\. The app never scales its estimate below the text-size "
+                                       r"heuristic, so compaction may start slightly early\.$"))).to_be_visible()
+    expect(page.get_by_text(re.compile(r"scaled ×1\.30, this model's starting ratio before Databricks reported input "
+                                       r"tokens for it; later estimates use ×1\.00\."))).to_be_visible()
+    expect(page.get_by_text(re.compile("until Databricks reports"))).to_have_count(0)
+    # A cancelled request is no calibration sample: the starting ratio still applies.
+    ui.rerender(f"""{{ info: {{ ...{FIRST_OPUS}, last_request: {{ ...{FIRST_OPUS}.last_request, status: 'cancelled',
+        partial: true, finish_reason: undefined, next_estimate_scale: 1.3 }} }} }}""")
+    expect(page.get_by_text(re.compile(r"scaled ×1\.30, this model's starting ratio until Databricks reports input "
+                                       r"tokens for it"))).to_be_visible()
+    # A calibrated scale (no starting ratio) that falls to 1: no "starting ratio" wording.
+    ui.rerender(f"""{{ info: {{ ...{FIRST_OPUS}, estimate_scale: 1.1, estimate_prior: false, last_request: {{
+        ...{FIRST_OPUS}.last_request, estimate_scale: 1.1, estimate_gap_percent: -9.1 }} }} }}""")
+    expect(page.get_by_text(re.compile(r"That estimate was scaled ×1\.10; later estimates use the unscaled "
+                                       r"text-size heuristic \(×1\.00\)\."))).to_be_visible()
+    expect(page.get_by_text(re.compile("starting ratio"))).to_have_count(0)
 
 
 def test_partial_fewer_and_matching_reports(ui, page):

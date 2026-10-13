@@ -38,7 +38,7 @@ function ReportedInput({ report, current, heading }) {
       ? `Databricks counted ${gap}% more input tokens than the app's estimate for this request (${estimate}). The app estimates from text size before sending; the provider counts with the model's tokenizer and adds its own formatting for messages and tools. ${later}`
       : gap < -2
         ? `Databricks counted ${Math.abs(gap)}% fewer input tokens than the app's estimate for this request (${estimate}). ${next === 1
-          ? 'The app never scales its estimate below the text-size heuristic, so compaction may start slightly early.' : later}`
+          ? `${report.estimate_scale > 1 ? `That estimate was scaled ×${report.estimate_scale.toFixed(2)}; later estimates use the unscaled text-size heuristic (×1.00). ` : ''}The app never scales its estimate below the text-size heuristic, so compaction may start slightly early.` : later}`
         : "The app's estimate matched the reported count within 2%."}${cached ? ' Cached tokens still occupy the context window; they are cheaper, not smaller.' : ''}</p>` : null}`
 }
 
@@ -52,8 +52,12 @@ export default function ContextMeter({ info, model, busy = false, onCompact }) {
   const safetyReserve = info.context_window - info.input_budget - info.reply_reserve
   const report = info.last_request
   // A report describes the request as sent; after a compaction, in a preview, or after
-  // the input budget or the model changed it is history.
-  const sameSetup = !!report && report.input_budget === info.input_budget && (!model || !report.model || report.model === model)
+  // the input budget changed it is history. Until the next request is prepared, the info and the
+  // report describe the same request (the model picker does not prepare one), so a model switch
+  // alone makes it history only once a request to the new model has been prepared.
+  const sameRequest = !!report && report.estimated_tokens === info.estimated_tokens
+  const sameSetup = !!report && report.input_budget === info.input_budget
+    && (sameRequest || !model || !report.model || report.model === model)
   const reportedIsCurrent = !!report && !info.prepared_for_next_turn && report.compactions === info.compactions
     && sameSetup && typeof report.input_tokens === 'number' && typeof report.percent_of_input_budget === 'number'
   const reportHeading = reportedIsCurrent ? 'Last request' : report && report.compactions !== info.compactions ? 'Before compaction' : 'Earlier request'
@@ -63,6 +67,9 @@ export default function ContextMeter({ info, model, busy = false, onCompact }) {
     ? `; ${report.percent_of_model_window}% of the model's ${report.model_window.toLocaleString()}-token window` : ''
   const next = info.next_estimate
   const threshold = info.auto_compact_threshold ?? info.input_budget
+  // A calibration report replaced the starting ratio the shown estimate used (a cancelled or partial
+  // request, or a small one, does not).
+  const priorReplaced = reportedIsCurrent && typeof report.next_estimate_scale === 'number' && report.next_estimate_scale !== info.estimate_scale
   return html`<details class="context-meter">
     <summary>
       <span>${reportedIsCurrent
@@ -80,7 +87,7 @@ export default function ContextMeter({ info, model, busy = false, onCompact }) {
         <p class="context-heading">App estimate</p>` : null}
       ${legacyEstimate ? html`<p>The saved meter counted bytes as tokens and can overstate context use. It will refresh on the next model request.</p>` : html`
         <p>Approximately ${info.estimated_tokens.toLocaleString()} of ${info.input_budget.toLocaleString()} input tokens used.</p>
-        <p>${info.estimate_scale && info.estimate_prior ? `Text-size estimate scaled ×${info.estimate_scale.toFixed(2)}, this model's starting ratio until Databricks reports input tokens for it. Not billing usage.` : info.estimate_scale ? `Text-size estimate scaled ×${info.estimate_scale.toFixed(2)} to match the input tokens Databricks reported for recent requests to this model. Not billing usage.` : 'Heuristic text-size estimate, not a provider token count or billing usage. Actual token counts vary by model.'} ${info.prepared_for_next_turn ? 'Preview after compaction using saved tool definitions, or built-in tools when unavailable. Definitions and instructions may change on the next model request.' : 'Estimate for the last request; updates each model call.'}</p>
+        <p>${info.estimate_scale && info.estimate_prior ? `Text-size estimate scaled ×${info.estimate_scale.toFixed(2)}, this model's starting ratio ${priorReplaced ? `before Databricks reported input tokens for it; later estimates use ×${report.next_estimate_scale.toFixed(2)}` : 'until Databricks reports input tokens for it'}. Not billing usage.` : info.estimate_scale ? `Text-size estimate scaled ×${info.estimate_scale.toFixed(2)} to match the input tokens Databricks reported for recent requests to this model. Not billing usage.` : 'Heuristic text-size estimate, not a provider token count or billing usage. Actual token counts vary by model.'} ${info.prepared_for_next_turn ? 'Preview after compaction using saved tool definitions, or built-in tools when unavailable. Definitions and instructions may change on the next model request.' : 'Estimate for the last request; updates each model call.'}</p>
         ${next && typeof next.tokens === 'number' ? html`<p>Next request: ~${next.tokens.toLocaleString()} tokens (${next.percent_of_input_budget}% of the input budget) before your next message. Automatic compaction runs when it passes ~${threshold.toLocaleString()} tokens.</p>` : null}
         ${info.compaction_deferred ? html`<p>The estimate passed the auto-compact threshold, but summarizing earlier turns would not bring it under the threshold, so the request was sent as it is. Compaction runs when it would, or when the request no longer fits the input budget.</p>` : null}
         ${info.summary_adjustment ? html`<p>${info.summary_adjustment === 'condensed' ? 'The latest conversation summary was over its size limit and was condensed by a short extra request.' : 'The latest conversation summary was over its size limit and part of it was omitted.'} Full history is preserved.</p>` : null}`}

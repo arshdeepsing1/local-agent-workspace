@@ -297,7 +297,16 @@ def create_app(settings=None):
     @app.put("/api/settings")
     async def update_settings(body: SettingsEdit):
         manager.workspace_available(body.workspace)
-        return settings.update(body.model_dump(exclude_none=True))
+        result = settings.update(body.model_dump(exclude_none=True))
+        # Open chats' meters follow the new budgets and threshold; others follow when opened (stream).
+        for session_id in [key for key, sockets in manager.listeners.items() if sockets]:
+            try:
+                session = manager.get(session_id)
+            except (ValueError, OSError):
+                continue
+            if session:
+                await manager.refresh_meter_limits(session)
+        return result
 
     @app.get("/api/settings")
     async def get_settings():
@@ -353,9 +362,9 @@ def create_app(settings=None):
             raise ValueError("Enter a model endpoint name.")
         session["model"] = model
         store.save(session)
-        result = public_session(session)
         await manager.broadcast(session_id, {"type": "model", "model": model})
-        return result
+        await manager.refresh_meter_limits(session)  # The meter follows the new endpoint's budgets.
+        return public_session(session)
 
     @app.put("/api/sessions/{session_id}/title")
     async def rename_session(session_id: str, body: SessionTitle):
@@ -554,6 +563,7 @@ def create_app(settings=None):
             await socket.close(code=1008)
             return
         await socket.accept(subprotocol="local-workspace")
+        await manager.refresh_meter_limits(session)  # Settings may have changed since it was last open.
         manager.listeners.setdefault(session_id, set()).add(socket)
         try:
             # The first snapshot carries the latest 200 events, extended to the whole latest turn

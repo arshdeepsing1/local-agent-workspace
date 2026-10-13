@@ -1113,9 +1113,12 @@ far the app's estimate for the same request was from the reported count, with wh
 the two differ and the scale later estimates use. After a compaction, or in a
 **Context preview**, the report describes the request before it, so it is headed
 "Before compaction" and the collapsed meter shows the app's estimate (~N%) instead;
-after a change to the input budget or the model it is headed "Earlier request" in the
-same way. When a turn ends, the details also show the estimate for the next request
-before your next message. Title, compaction and side
+after the input budget changes, or once a request to another model has been prepared,
+it is headed "Earlier request" in the same way. A model change or a Settings save
+moves the meter to the budgets, auto-compact mark and next-request estimate of the
+chat's next request right away (a running chat follows on its next request), so the
+~N% is then of the new input budget. When a turn ends, the details also show the
+estimate for the next request before your next message. Title, compaction and side
 question requests never change this report.
 
 The output-token limit is separate from the configurable total context capacity
