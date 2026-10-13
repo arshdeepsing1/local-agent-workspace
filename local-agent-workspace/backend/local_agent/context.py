@@ -1157,17 +1157,26 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
                 adjustment = change
             return result
 
+        def fragment_fits(fragment):
+            # The summary carried over from the previous chunk, as it is when called.
+            request = (build_handoff_messages(summary, fragment, preservation_note, request_tokens) if handoff_path
+                       else build_summary_messages(summary, fragment, preservation_note, summary_limit))
+            return (scaled_estimate(request, (), scale) <= summary_input_budget
+                    and len(encode_payload({"messages": request})) <= request_limits.PAYLOAD_TARGET_BYTES)
+
         while offset < len(transcript):
             # Find a whole-character fragment whose estimated serialized request fits,
-            # including the previous summary and JSON escaping of Unicode/text.
+            # including the previous summary and JSON escaping of Unicode/text. The rest of
+            # the transcript usually fits whole: one probe instead of a search, each of whose
+            # probes serializes about the whole transcript on the event loop.
             low, high = 0, len(transcript) - offset
+            if fragment_fits(transcript[offset:]):
+                low = high
+            else:
+                high -= 1
             while low < high:
                 middle = (low + high + 1) // 2
-                fragment = transcript[offset:offset + middle]
-                request = (build_handoff_messages(summary, fragment, preservation_note, request_tokens) if handoff_path
-                           else build_summary_messages(summary, fragment, preservation_note, summary_limit))
-                if (scaled_estimate(request, (), scale) <= summary_input_budget
-                        and len(encode_payload({"messages": request})) <= request_limits.PAYLOAD_TARGET_BYTES):
+                if fragment_fits(transcript[offset:offset + middle]):
                     low = middle
                 else:
                     high = middle - 1
