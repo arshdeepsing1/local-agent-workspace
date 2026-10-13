@@ -431,7 +431,7 @@ def create_app(settings=None):
             raise HTTPException(409, "This file changed on disk. Reopen it before saving.")
         manager.checkpoints.apply_edit(tools, "write_file", {"path": body.path, "content": body.content}, session_id=body.session_id)
         if body.session_id:
-            await manager.publish_changes(session_or_404(body.session_id), tools, only_tracked=True)
+            await manager.publish_changes(session_or_404(body.session_id), only_tracked=True)
         return {"ok": True}
 
     @app.get("/api/git")

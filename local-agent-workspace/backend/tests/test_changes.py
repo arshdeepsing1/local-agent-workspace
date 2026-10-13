@@ -347,3 +347,38 @@ def test_changes_made_outside_the_chat_folders_stay_reviewable(client, tmp_path)
     assert client.post(base + "/undo", json=undo).json()["files"] == []
     assert (outside / "notes.txt").read_text() == "old\n"
     assert manager.review_tools(session).root == manager.session_tools(session).root
+
+
+def test_live_pushes_list_changes_outside_the_chat_folders_like_the_review(client, tmp_path):
+    # After the chat leaves Bypass permissions, an agent file tool and an editor save push the changes
+    # list the review shows, not one built from the turn's or the editor's narrower folders.
+    from local_agent.instructions import load_project_instructions
+
+    client, manager, workspace = client
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "notes.txt").write_text("old\n")
+    (workspace / "b.txt").write_text("b")
+    session_id = client.post("/api/sessions").json()["id"]
+    session = manager.get(session_id)
+    session["permission_mode"] = "bypassPermissions"
+    bypass = manager.session_tools(session)
+    manager.checkpoints.apply_edit(bypass, "write_file", {"path": str(outside / "notes.txt"), "content": "new\n"},
+                                   session_id=session_id, turn_id="turn",
+                                   on_applied=lambda record: manager.changes.track(record, bypass))
+    session["permission_mode"] = "acceptEdits"
+    tools = manager.session_tools(session)
+    guidance = load_project_instructions(tools)
+    tools.instruction_signature = (guidance["text"], guidance["warnings"])
+    summary = lambda changes: [(item["path"], item["status"], item["added"]) for item in changes["files"]]  # noqa: E731
+    with client.websocket_connect(f"/api/sessions/{session_id}/stream", subprotocols=["local-workspace", client.token]) as socket:
+        socket.receive_json(), socket.receive_json()
+        client.portal.call(manager.execute_tool, session, tools, "write_file", {"path": "a.txt", "content": "x\n"}, "write")
+        message = socket.receive_json()
+        while message["type"] != "changes":  # The tool event's updates come first.
+            message = socket.receive_json()
+        listed = client.get(f"/api/sessions/{session_id}/changes").json()
+        assert summary(message["changes"]) == summary(listed) == [(str(outside / "notes.txt"), "modified", 1), ("a.txt", "created", 1)]
+        body = {"path": "b.txt", "original": "b", "content": "b2", "session_id": session_id}
+        assert client.put("/api/file", json=body).status_code == 200
+        assert summary(socket.receive_json()["changes"]) == summary(listed)

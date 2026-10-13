@@ -922,14 +922,15 @@ class AgentManager:
                               session.get("permission_mode", "manual") == "bypassPermissions",
                               write_limit=write_limit_setting(self.settings.values))
 
-    async def publish_changes(self, session, tools=None, only_tracked=False):
-        """Send the conversation's unreviewed agent file changes to its open pages."""
+    async def publish_changes(self, session, only_tracked=False):
+        """Send the conversation's unreviewed agent file changes to its open pages. Always listed with
+        review_tools, like the review routes, so a change outside the folders the chat may use now stays listed."""
         if not self.listeners.get(session["id"]):
             return
         try:
             if only_tracked and not self.changes.has(session["id"]):
                 return
-            changes = self.changes.list(session["id"], tools or self.review_tools(session))
+            changes = self.changes.list(session["id"], self.review_tools(session))
         except (*STORAGE_ERRORS, ValueError, UnicodeError) as exc:
             changes = {"files": [], "added": 0, "removed": 0, "error": self.settings.redact(file_error(exc))}
         await self.broadcast(session["id"], {"type": "changes", "changes": changes})
@@ -1410,7 +1411,7 @@ class AgentManager:
             failed = name.startswith("mcp__") and isinstance(result, dict) and result.get("is_error") is True
             await self.update_event(session, event, state="error" if failed else "completed", output=output)
             if name in FILE_CHANGE_TOOLS:
-                await self.publish_changes(session, tools)
+                await self.publish_changes(session)
             await self.run_hooks(session, "after_tool", name, arguments, result, call_id=call_id)
             command_failed = (name == "run_command" and isinstance(result, dict) and not result.get("background")
                               and result.get("state") in {"failed", "timed_out"})
