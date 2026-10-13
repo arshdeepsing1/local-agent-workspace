@@ -20,6 +20,8 @@ def child_profile(parent, requested=None):
 
 
 def tool_allowed(session, name):
+    if name in (session.get("disabled_tools") or []):
+        return False  # Turned off by the user in this chat.
     profile = validate_profile(session.get("tool_profile", "inherit"))
     return profile == "inherit" or name in (READ_TOOLS if profile == "read_only" else FILE_TOOLS)
 

@@ -4,7 +4,7 @@ import json
 import math
 import time
 import uuid
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -66,10 +66,17 @@ class Event(Record):
     output: str | None = None
     preview: str | None = None
     state: Literal["pending", "running", "completed", "rejected", "cancelled", "error"] | None = None
-    approval: Literal["approved", "declined", "expired"] | None = None
+    approval: Literal["approved", "declined", "expired", "blocked"] | None = None
     approval_expires: float | None = None
     decline_note: str | None = None
     allowed_by_rule: bool | None = None
+    approved_by_mode: Literal["manual", "auto", "acceptEdits", "plan", "bypassPermissions", "dontAsk"] | None = None
+    read_only_command: bool | None = None
+    rule_scope: Literal["chat", "project", "user"] | None = None
+    without_shell: bool | None = None
+    blocked_reason: str | None = Field(default=None, max_length=4000)
+    edited: bool | None = None
+    protected: str | None = Field(default=None, max_length=500)
     call_id: str | None = None
     child_session_id: str | None = None
     origin: Origin | None = None
@@ -158,6 +165,8 @@ class Conversation(Record):
     tool_profile: Profile = "inherit"
     subagent_tool_profile: Profile = "inherit"
     max_steps: int | None = Field(default=None, ge=1, le=8)
+    # Kept by forks and imports, like tool_profile: a copy never gets more tools than its source.
+    disabled_tools: list[Annotated[str, Field(min_length=1, max_length=300)]] | None = Field(default=None, max_length=64)
 
 
 class Bundle(Record):

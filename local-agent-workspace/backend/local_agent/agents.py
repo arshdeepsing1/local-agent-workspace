@@ -15,7 +15,9 @@ from .tools import TOOL_DEFINITIONS, WorkspaceTools, file_error
 from .jobs import (CREDENTIAL_ENV, DENIED_ENV, DENIED_ENV_PREFIXES, ENVIRONMENT_KEYS, ENVIRONMENT_NAME, HEAD_CHARS,
                    JOB_NOTICE_STATES, MIN_HEAD_CHARS, TAIL_CHARS, job_command, job_ending, until_pattern, wait_page)
 from .tools import read_page_bytes
-from .permissions import BASIC_COMMANDS, COMMAND_TOOLS, mode_prompt, tool_decision
+from .permissions import MODE_LABELS, SCOPE_NAMES, denied_tools, evaluate, log, mode_prompt
+from .rules import (APP_ROOT, RuleStore, card_rule_options, default_rule, normalize_rule, project_key, protected_reason,
+                    rule_label, rule_matches, same_rule, text_names_credential)
 from .activity import ACTIVITY_TOOL, activity_content, activity_log, local_time, redact_secrets
 from .context import (
     DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT_TOKENS, OUTPUT_LIMIT_CONTINUATION, SUMMARY_MAX_TOKENS,
@@ -49,7 +51,7 @@ from .model_stream import ToolCallBuffer, error_body_prefix, sse_data
 from .tool_schema import validate_arguments
 from .drafts import DraftPersistenceError, STORAGE_ERRORS, StreamDraft
 from .store import UnreadableConversation
-from .approvals import MAX_ALLOW_RULES, allowed_by_rule, declined, rule_for
+from .approvals import MAX_ALLOW_RULES, busy_status, declined, rule_for
 from .notify import SystemNotifier, attention_message
 from .context import INCOMPLETE_RESPONSE_CONTINUATION, INVALID_ARGUMENTS_CONTINUATION, VERIFY_CONTINUATION_PREFIX
 from .context import is_continuation
@@ -315,6 +317,18 @@ FILE_CHANGE_TOOLS = ("write_file", "edit_file", "move_path", "delete_path", "not
 PATH_TOOLS = ("list_files", "find_files", "read_file", "search_files", "notebook_read", *FILE_CHANGE_TOOLS)
 DIRECTORY_TOOLS = ("list_files", "find_files", "search_files")
 DELETE_PREVIEW_LINES = 200
+# Edit before approving: the one argument the user may change on each kind of card.
+EDITABLE = {"run_command": ("command",), "write_file": ("content",), "edit_file": ("new_text",)}
+EDIT_ONLY = {"run_command": "Only the command can be edited.", "write_file": "Only the file content can be edited.",
+             "edit_file": "Only the replacement text can be edited."}
+EDITED_NOTES = {
+    "run_command": "[The user edited this command before approving it. It ran as: {command}. Your proposed command did not run.]",
+    "write_file": "[The user edited the file content before approving it. Read the file before editing it again.]",
+    "edit_file": "[The user edited the replacement text before approving it. Read the file before editing it again.]"}
+# Card fields that only matter while a card waits; they are removed once it is answered.
+PENDING_FIELDS = ("rememberable", "rule_options", "editable", "uncertain")
+DONT_ASK_ACCESS = ("Not run: this path is outside the project and folder access needs your approval, which Don't ask "
+                   "mode does not show.")
 
 
 def file_fingerprint(path):
@@ -456,7 +470,9 @@ def repair_tool_history(wire, events, state):
 
 
 def unanswered(event, declined):
-    """The model-facing result of an approval that was declined or never answered."""
+    """The model-facing result of an approval that was declined, blocked or never answered."""
+    if event.get("approval") == "blocked":
+        return event["blocked_reason"]
     if event.get("approval") == "expired":
         return ("The user did not answer this approval request in time, so it did not run. "
                 "Ask the user before trying it again.")
@@ -464,7 +480,7 @@ def unanswered(event, declined):
 
 
 def public_session(session, status="idle"):
-    return {"permission_mode": "manual", "allowed_directories": [], "allow_rules": [],
+    return {"permission_mode": "manual", "allowed_directories": [], "allow_rules": [], "disabled_tools": [],
             **{k: v for k, v in session.items()
                if k not in ("wire", "context_state", "instruction_directories", "inference_calls", "command_jobs",
                             "file_views", "turn_running", "jobs_reported_through")},
@@ -480,6 +496,9 @@ class AgentManager:
         self.closing_sockets = set()
         self.pages = set()  # Presence sockets: one per open page, with or without a chat selected.
         self.pending = {}
+        self.rules = RuleStore(settings.state_dir)
+        self.pending_checks = {}  # (session id, event id) -> recheck(change) of a waiting card
+        self.card_revisers = {}  # (session id, event id) -> async reviser(changes) for Edit before approving
         self.statuses = {}
         self.checkpoints = CheckpointManager(store)
         self.changes = ChangeReview(store, self.checkpoints)
@@ -616,15 +635,28 @@ class AgentManager:
                 return
             if not hook["enabled"] or hook["event"] != phase or ("tools" in hook and name not in hook["tools"]):
                 continue
-            by_rule = (session.get("permission_mode") != "bypassPermissions"
-                       and allowed_by_rule(session, f"hook_{phase}", {"hook_id": hook["id"]}))
+            hook_tools = self.session_tools(session)
+            verdict = self.permission(session, hook_tools, f"hook_{phase}", {"hook_id": hook["id"]})
             event = await self.event(session, "tool", name=f"hook_{phase}", state="running", input={"hook_id": hook["id"], "tool": name, "call_id": call_id},
                                      preview=f"Hook: {hook['id']}\nFor tool: {name}\nCommand: {hook['command']}\nTimeout: {hook['timeout_seconds']} seconds", output="",
-                                     **({"allowed_by_rule": True} if by_rule else {}))
+                                     **(self.verdict_fields(verdict) if verdict.decision == "allow" else {}))
             try:
-                if session.get("permission_mode") != "bypassPermissions" and not by_rule and not await self.approve(session, event):
-                    raise ValueError("Hook approval was not answered in time." if event.get("approval") == "expired"
-                                     else declined(event, "this hook", f"Do not retry {name} without a new instruction."))
+                if verdict.decision == "deny":
+                    # A deny rule, or Don't ask with no allow rule: the hook does not run.
+                    await self.update_event(session, event, state="rejected", approval="blocked",
+                                            blocked_reason=verdict.message)
+                    raise ValueError(verdict.message)
+                if verdict.decision == "ask":
+                    allowed, _ = await self.request_approval(session, hook_tools, event, f"hook_{phase}",
+                                                             {"hook_id": hook["id"]})
+                    if not allowed:
+                        approval = event.get("approval")
+                        if approval is None:  # Denied by a fresh check just before the card.
+                            await self.update_event(session, event, approval="blocked", blocked_reason=event["output"])
+                        raise ValueError(
+                            "Hook approval was not answered in time." if approval == "expired"
+                            else declined(event, "this hook", f"Do not retry {name} without a new instruction.")
+                            if approval == "declined" else event["blocked_reason"])
                 if asyncio.current_task().cancelling():
                     return
                 payload = {"event": phase, "session_id": session["id"], "tool": name, "arguments": arguments, "call_id": call_id}
@@ -642,6 +674,9 @@ class AgentManager:
                 await self.update_event(session, event, state="rejected" if event["state"] == "rejected" else "error", output=warning)
                 if phase == "before_tool":
                     raise ValueError(f"Before-tool hook blocked {name}: {warning}") from exc
+                if verdict.decision == "deny":
+                    continue  # Blocked by a rule or Don't ask: the hook card says so; no notice after every tool.
+                warning = warning.rstrip().removesuffix(".")
                 text = (f"Failure-hook warning: {warning}. The original tool error is unchanged." if phase == "tool_failure"
                         else f"After-tool hook warning: {warning}. The tool action already completed.")
                 await self.event(session, "notice", text=text)
@@ -978,7 +1013,12 @@ class AgentManager:
         await self.broadcast(session["id"], {"type": "delta", "id": event["id"], "text": text})
 
     async def approve(self, session, event):
-        """Wait for the user's answer; event["approval"] records approved, declined or expired."""
+        """Wait for the user's answer; event["approval"] records approved, declined, expired or blocked.
+
+        An answer is True/False or a dict: {allowed, rule?, note?} from the user (M1),
+        {allowed: True, by: 'mode', mode} or {allowed: True, by: 'rule', scope} when a mode or
+        rule change re-checked the card, or {allowed: False, blocked: text} when it now blocks it.
+        """
         future = asyncio.get_running_loop().create_future()
         key = (session["id"], event["id"])
         self.pending[key] = future
@@ -991,33 +1031,81 @@ class AgentManager:
             answer = await asyncio.wait_for(future, timeout=seconds)
             answer = answer if isinstance(answer, dict) else {"allowed": bool(answer)}
             allowed = answer["allowed"]
-            outcome = "approved" if allowed else "declined"
+            outcome = "approved" if allowed else "blocked" if answer.get("blocked") else "declined"
         except TimeoutError:
             allowed, outcome, answer = False, "expired", {}
         finally:
             self.pending.pop(key, None)
         rule = answer.get("rule") if allowed else None
-        if rule and rule not in session.setdefault("allow_rules", []):
+        if rule and not any(same_rule(rule, item) for item in session.setdefault("allow_rules", [])):
             session["allow_rules"].append(rule)
-        await self.update_event(session, event, state="running" if allowed else "rejected", approval=outcome,
-                                **({"decline_note": answer["note"]} if not allowed and answer.get("note") else {}))
+        details = {}
+        if allowed and answer.get("by") == "mode":
+            details["approved_by_mode"] = answer["mode"]
+        elif allowed and answer.get("by") == "rule":
+            details.update(allowed_by_rule=True, rule_scope=answer["scope"])
+        elif outcome == "blocked":
+            details["blocked_reason"] = answer["blocked"]
+        elif not allowed and answer.get("note"):
+            details["decline_note"] = answer["note"]
+        await self.update_event(session, event, state="running" if allowed else "rejected", approval=outcome, **details)
         if rule:
             await self.publish_permissions(session)
         await self.status(session, "running")
         return allowed
 
-    def decide(self, session_id, event_id, allowed, remember=False, note=None):
-        """Answer a pending card. remember stores an exact allow rule for this chat;
-        note (Decline only) is returned to the model with the decline."""
+    def rule_context(self, tools):
+        """What normalizing and matching rules needs from the conversation's file tools."""
+        return {"resolve_path": tools.resolve,
+                "credential_file": str(tools.credential_file) if tools.credential_file else None,
+                "credential_tokens": self.redaction_tokens()}
+
+    def decide(self, session_id, event_id, allowed, remember=False, note=None, scope=None, rule=None):
+        """Answer a pending card. remember stores an exact allow rule for this chat (M1); scope
+        ('chat', 'project' or 'user') stores rule, or the card's default rule, as an allow rule
+        there; note (Decline only) is returned to the model with the decline."""
         future = self.pending.get((session_id, event_id))
         if not future or future.done():
             raise ValueError("This approval is no longer pending.")
         answer = {"allowed": bool(allowed)}
-        if remember:
+        session = self.get(session_id) or {}
+        event = next((item for item in session.get("events", []) if item.get("id") == event_id), {})
+        if scope is not None:
+            if not allowed:
+                raise ValueError("Only an approval can be remembered.")
+            rememberable = event.get("rememberable") or []
+            if event.get("protected") or not rememberable:
+                raise ValueError(self.not_rememberable(session, event))
+            if scope not in rememberable:
+                raise ValueError("This approval can only be remembered for "
+                                 + " or ".join({"chat": "this chat", "project": "this project",
+                                                "user": "all projects"}[item] for item in rememberable) + ".")
+            if rule is not None and len(json.dumps(rule)) > 8192:
+                raise ValueError("This rule is too large.")
+            tools = self.session_tools(session)
+            context = self.rule_context(tools)
+            draft = rule if rule is not None else default_rule(event.get("name"), event.get("input"))
+            if not isinstance(draft, dict):
+                raise ValueError("This action cannot be remembered as a rule.")
+            rule = normalize_rule({**draft, "behavior": "allow"}, **context)
+            if not rule_matches(rule, event.get("name"), event.get("input"), resolve_path=tools.resolve,
+                                credential_file=context["credential_file"]):
+                raise ValueError("This rule does not match the action on the card.")
+            if scope == "chat":
+                rules = session.get("allow_rules") or []
+                if not any(same_rule(rule, item) for item in rules) and len(rules) >= MAX_ALLOW_RULES:
+                    raise ValueError(f"This chat already allows {MAX_ALLOW_RULES} actions. Remove one in the Permissions menu first.")
+                answer["rule"] = rule
+            else:
+                self.rules.add(scope, session["workspace"], rule)
+        elif remember:
             if not allowed:
                 raise ValueError("Only an approval can be remembered for this chat.")
-            session = self.get(session_id) or {}
-            event = next((item for item in session.get("events", []) if item.get("id") == event_id), {})
+            if event.get("protected") or ("rememberable" in event and not event["rememberable"]):
+                raise ValueError(self.not_rememberable(session, event))
+            if event.get("name") == "run_command" and (reason := self.legacy_refusal(self.session_tools(session),
+                                                                                      event.get("input"))):
+                raise ValueError(reason)
             rule = rule_for(event.get("name"), event.get("input"))
             if rule is None:
                 raise ValueError("This action cannot be allowed for the whole chat.")
@@ -1030,12 +1118,239 @@ class AgentManager:
             if allowed:
                 raise ValueError("A note can only be sent with Decline.")
             answer["note"] = self.settings.redact(note)
+        if future.done():
+            raise ValueError("This approval is no longer pending.")
         future.set_result(answer)
 
     async def publish_permissions(self, session):
+        rules = self.rules.rules(session["workspace"])
         await self.broadcast(session["id"], {"type": "permissions", "permission_mode": session.get("permission_mode", "manual"),
                                                "allowed_directories": session.get("allowed_directories", []),
-                                               "allow_rules": session.get("allow_rules", [])})
+                                               "allow_rules": session.get("allow_rules", []),
+                                               "disabled_tools": session.get("disabled_tools", []),
+                                               "project_rules": rules["project"], "user_rules": rules["user"],
+                                               "rules_problem": self.rules.problem})
+
+    def permission(self, session, tools, name, arguments):
+        """The Verdict for one tool call in this conversation, with its chat, project and user rules."""
+        saved = self.rules.rules(session["workspace"])
+
+        def protected(value):
+            try:
+                resolved = tools.resolve(value)
+            except (ValueError, OSError):
+                return None  # The tool reports the path error itself.
+            return protected_reason(tools.root / Path(value).expanduser(), resolved, root=tools.root,
+                                    home=Path.home(), app_root=APP_ROOT)
+        return evaluate(session.get("permission_mode", "manual"), name, arguments,
+                        chat_rules=session.get("allow_rules") or [], project_rules=saved["project"],
+                        user_rules=saved["user"], resolve_path=tools.resolve, protected=protected,
+                        disabled=set(session.get("disabled_tools") or []), subagent=bool(session.get("is_subagent")),
+                        credential_file=str(tools.credential_file) if tools.credential_file else None)
+
+    @staticmethod
+    def verdict_fields(verdict):
+        """Event fields for an action that runs without a card."""
+        fields = {}
+        if verdict.source == "rule" and verdict.decision == "allow":
+            fields.update(allowed_by_rule=True, rule_scope=verdict.scope)
+        if verdict.source == "read_only_command":
+            fields["read_only_command"] = True
+        if verdict.argv is not None:
+            fields["without_shell"] = True
+        return fields
+
+    def card_fields(self, tools, name, arguments, verdict, editable=()):
+        """The pending-only fields of an approval card: what it can remember and edit, and why it asks."""
+        options = card_rule_options(name, arguments, **self.rule_context(tools))
+        if verdict.protected or (verdict.decision == "ask" and (verdict.source == "rule" or verdict.uncertain)):
+            # Protected files, Always ask rules and commands that cannot be checked exactly always ask:
+            # a remembered allow rule would never apply to them.
+            rememberable = []
+        elif name == "run_command":
+            rememberable = (["chat", "project", "user"] if options and options.get("argv") is not None
+                            else [] if self.legacy_refusal(tools, arguments) else ["chat"])
+        else:
+            rememberable = ["chat", "project", "user"] if default_rule(name, arguments) is not None else []
+        fields = {"rememberable": rememberable, "rule_options": options, "editable": list(editable)}
+        if verdict.protected:
+            fields["protected"] = verdict.protected
+        if verdict.uncertain:
+            fields["uncertain"] = True
+        return fields
+
+    def legacy_refusal(self, tools, arguments):
+        """Why a command's exact text cannot be allowed for this chat (M1 'Allow for this chat'), or None."""
+        text = arguments.get("command") if isinstance(arguments, dict) else None
+        if isinstance(text, str) and any(token and token in text for token in self.redaction_tokens()):
+            return "A rule cannot contain your Databricks token."
+        if text_names_credential(text, str(tools.credential_file) if tools.credential_file else None):
+            return "Rules cannot allow commands that name credential files."
+        return None
+
+    def not_rememberable(self, session, event):
+        """The message for remembering a card that offers no rule."""
+        if event.get("protected"):
+            return "Protected files are always confirmed; this approval cannot be remembered."
+        tools = self.session_tools(session)
+        verdict = self.permission(session, tools, event.get("name"), event.get("input"))
+        if event.get("uncertain") or (verdict.decision == "ask" and verdict.source == "rule"):
+            return ("An Always ask rule or a command that cannot be checked exactly always asks; "
+                    "this approval cannot be remembered.")
+        if event.get("name") == "run_command" and (reason := self.legacy_refusal(tools, event.get("input"))):
+            return reason
+        return "This approval cannot be remembered."
+
+    def blocked_text(self, session, change, message):
+        """The model-facing text of a card a change blocked while it waited."""
+        if change != "mode":
+            return message
+        label = MODE_LABELS.get(session.get("permission_mode", "manual"), "another")
+        return (f"Not run: the user switched this chat to {label} mode while this card was waiting. "
+                + message.removeprefix("Not run: "))
+
+    async def request_approval(self, session, tools, event, name, arguments, *, reviser=None, card=None):
+        """Show an approval card for a tool call and wait; returns (allowed, verdict).
+
+        The decision is evaluated again immediately before the card, and a waiting card is
+        re-checked after every mode, rule or turned-off-tool change. The returned verdict is
+        the one execution must use: a card resolved by a switch to Auto or by a new allow rule
+        runs like an action that mode or rule allows (without a shell where it applies).
+        """
+        card = card if card is not None else {"arguments": arguments}
+        verdict = self.permission(session, tools, name, card["arguments"])
+        if verdict.decision == "allow":
+            await self.update_event(session, event, **self.verdict_fields(verdict))
+            return True, verdict
+        if verdict.decision == "deny":
+            await self.update_event(session, event, state="rejected", output=verdict.message)
+            return False, verdict
+        holder = {}
+
+        def recheck(change=None):
+            current = self.permission(session, tools, name, card["arguments"])
+            if current.decision == "allow":
+                holder["verdict"] = current
+                if current.source == "rule":
+                    return "allow", {"by": "rule", "scope": current.scope}
+                return "allow", {"by": "mode", "mode": session.get("permission_mode", "manual")}
+            if current.decision == "deny":
+                return "deny", self.blocked_text(session, change, current.message)
+            return None
+        key = (session["id"], event["id"])
+        editable = EDITABLE.get(name, ()) if reviser is not None else ()
+        event.update(self.card_fields(tools, name, card["arguments"], verdict, editable))
+        self.pending_checks[key] = recheck
+        if reviser is not None:
+            self.card_revisers[key] = reviser
+        try:
+            allowed = await self.approve(session, event)
+        finally:
+            self.pending_checks.pop(key, None)
+            self.card_revisers.pop(key, None)
+            for field in PENDING_FIELDS:
+                event.pop(field, None)
+        tools.unrestricted = session.get("permission_mode") == "bypassPermissions"
+        return allowed, holder.get("verdict") or verdict
+
+    async def recheck_pending(self, session, change=None):
+        """Re-check this conversation's waiting cards after a mode, rule or turned-off-tool change. Never raises."""
+        for key, future in list(self.pending.items()):
+            if key[0] != session["id"] or future.done():
+                continue
+            check = self.pending_checks.get(key)
+            if check is None:
+                continue
+            try:
+                result = check(change)
+            except Exception:  # A card that cannot be re-checked stays waiting for the user.
+                log.warning("A waiting approval card could not be re-checked; it stays pending.")
+                continue
+            if result is None or future.done():
+                continue
+            kind, info = result
+            future.set_result({"allowed": True, **info} if kind == "allow" else {"allowed": False, "blocked": info})
+
+    async def revise_card(self, session_id, event_id, changes):
+        """Edit before approving: change a waiting card's command, file content or replacement text."""
+        key = (session_id, event_id)
+        future = self.pending.get(key)
+        if not future or future.done():
+            raise ValueError("This approval is no longer pending.")
+        reviser = self.card_revisers.get(key)
+        if reviser is None:
+            raise ValueError("This action cannot be edited.")
+        await reviser(changes)
+
+    def active_child(self, session):
+        entry = self.delegates.active.get(session["id"])
+        child = self.get(entry["child_session_id"]) if entry else None
+        return child if child is not None and child is not session else None
+
+    async def change_mode(self, session, mode, *, notice=True):
+        """Switch the permission mode at any time; waiting cards and a running subagent follow."""
+        old = session.get("permission_mode", "manual")
+        if mode == old:
+            return  # Choosing the current mode again changes nothing: no notice, no re-check.
+        session["permission_mode"] = mode
+        self.store.save(session)
+        if notice and busy_status(self, session["id"]) != "idle":
+            await self.event(session, "notice", text=f"Permission mode changed to {MODE_LABELS[mode]}.")
+        await self.publish_permissions(session)
+        await self.recheck_pending(session, "mode")
+        interactions = getattr(self, "interactions", None)
+        if interactions is not None:
+            await interactions.mode_changed(session, old, mode)
+        child = self.active_child(session)
+        if child is not None:
+            await self.change_mode(child, mode, notice=notice)
+
+    async def set_disabled_tools(self, session, names):
+        """Turn tools off (or on again) for this conversation and a running subagent."""
+        session["disabled_tools"] = list(names)
+        self.store.save(session)
+        await self.publish_permissions(session)
+        await self.recheck_pending(session, "tools")
+        child = self.active_child(session)
+        if child is not None:
+            await self.set_disabled_tools(child, names)
+
+    async def rules_changed(self, scope, session=None):
+        """Publish and re-check after a rule change: the chat, every live chat of the project, or every live chat."""
+        if scope == "chat":
+            affected = [session] if session is not None else []
+            child = self.active_child(session) if session is not None else None
+            if child is not None:
+                # A running subagent copied the chat's rules when it started; new deny and ask rules reach it too.
+                rules = child.setdefault("allow_rules", [])
+                added = [rule for rule in session.get("allow_rules") or [] if rule.get("behavior") in ("deny", "ask")
+                         and not any(same_rule(rule, item) for item in rules)]
+                if added:
+                    rules.extend(dict(rule) for rule in added)
+                    self.store.save(child)
+                    affected.append(child)
+        else:
+            key = project_key(session["workspace"]) if scope == "project" and session is not None else None
+            affected = [item for item in list(self.live.values())
+                        if key is None or project_key(item["workspace"]) == key]
+            if session is not None and not any(item is session for item in affected):
+                affected.append(session)
+        for item in affected:
+            await self.publish_permissions(item)
+            await self.recheck_pending(item, "rules")
+
+    def step_definitions(self, session, external_tools):
+        """The tool definitions offered in the next model request: the profile's tools, without
+        turned-off tools, tools an unconditional deny rule covers, and submit_plan outside Plan."""
+        definitions = filter_tools(session, [*TOOL_DEFINITIONS, *[tool for tool in FEATURE_TOOLS
+                                   if not session.get("is_subagent") or tool["function"]["name"] != "delegate_task"],
+                                   *external_tools])
+        saved = self.rules.rules(session["workspace"])
+        names = [item["function"]["name"] for item in definitions]
+        denied = denied_tools(session.get("allow_rules") or [], saved["project"], saved["user"], names)
+        offer_plan = session.get("permission_mode", "manual") == "plan" and not session.get("is_subagent")
+        return [item for item in definitions if item["function"]["name"] not in denied
+                and (offer_plan or item["function"]["name"] != "submit_plan")]
 
     def start(self, session_id, prompt):
         if session_id in self.tasks and not self.tasks[session_id].done():
@@ -1181,8 +1496,12 @@ class AgentManager:
                                  **({"verify": True} if origin == "verify" else {}))
         invoked = False
         try:
+            # The mode can change while a turn runs; folder checks follow the current one.
+            tools.unrestricted = session.get("permission_mode", "manual") == "bypassPermissions"
             if not tool_allowed(session, name):
-                output = f"The {session['tool_profile']} tool profile does not permit {name}. Use only the available tools."
+                output = (f"The user turned off {name} in this chat. Use other tools."
+                          if name in (session.get("disabled_tools") or []) else
+                          f"The {session['tool_profile']} tool profile does not permit {name}. Use only the available tools.")
                 await self.update_event(session, event, state="rejected", output=output)
                 return output
             connection = self.extension_connections.get(session["id"])
@@ -1195,42 +1514,71 @@ class AgentManager:
             # folder-access, approval, hook and checkpoint rules apply to it.
             activity = None
             if name == ACTIVITY_TOOL:
+                # A deny rule that names the activity log applies before it becomes a write_file.
+                if (named := self.permission(session, tools, name, {"path": arguments["path"]})).decision == "deny":
+                    await self.update_event(session, event, state="rejected", output=named.message)
+                    return named.message
                 activity = {}
                 name, arguments = "write_file", {"path": arguments["path"], "content": ""}
-            mode = session.get("permission_mode", "manual")
-            decision = tool_decision(mode, name, arguments)
-            if decision == "deny":
-                output = "Plan mode is read-only. Explain the plan; the user must switch modes before making changes or running commands."
-                await self.update_event(session, event, state="rejected", output=output)
-                return output
+            verdict = self.permission(session, tools, name, arguments)
+            if verdict.decision == "deny":
+                await self.update_event(session, event, state="rejected", output=verdict.message)
+                return verdict.message
             if session.get("is_subagent") and (name == "delegate_task" or (name == "run_command" and arguments.get("background"))):
                 raise ValueError("Subagents cannot delegate or leave background jobs.")
+            carded = False  # An "ask" verdict must have shown a card before anything runs.
+            if name in ("delegate_task", "stop_job") and verdict.decision == "ask":
+                if name == "delegate_task":
+                    preview = (f"Start a subagent (separate paid model requests, at most {arguments.get('max_steps', 6)} steps)"
+                               f"\n\nTask: {arguments['task']}"
+                               + (f"\nContext: {arguments['context']}" if arguments.get("context") else "")
+                               + (f"\nTool profile: {arguments['tool_profile']}" if arguments.get("tool_profile") else ""))
+                else:
+                    job = self.session_job(session, arguments["job_id"])
+                    preview = f"Stop job {job['id']}: {job['command']}"
+                await self.update_event(session, event, preview=preview)
+                allowed, verdict = await self.request_approval(session, tools, event, name, arguments)
+                if not allowed:
+                    return await self.refused(session, event, verdict, declined(event))
+                carded = True
             mcp_names = getattr(connection, "tool_names", set()) if connection else set()
             if name.startswith("mcp__"):
                 if not self.guidance_matches(session, tools):
                     raise ValueError("Project or skill instructions changed. Review refreshed guidance before using MCP tools.")
                 if name not in mcp_names:
                     raise ValueError("MCP tool is not available in this turn.")
-                by_rule = decision == "ask" and allowed_by_rule(session, name, arguments)
-                await self.update_event(session, event, preview=json.dumps(arguments, indent=2),
-                                        **({"allowed_by_rule": True} if by_rule else {}))
-                if decision == "ask" and not by_rule and not await self.approve(session, event):
-                    output = unanswered(event, declined(event, "this MCP action"))
-                    await self.update_event(session, event, output=output)
-                    return output
-            if name in PATH_TOOLS:
-                # move_path needs access to both ends; the destination is always a file path.
-                paths = [arguments.get("path", ".")] + ([arguments["destination"]] if name == "move_path" else [])
+                await self.update_event(session, event, preview=json.dumps(arguments, indent=2))
+                if verdict.decision == "ask":
+                    allowed, verdict = await self.request_approval(session, tools, event, name, arguments)
+                    if not allowed:
+                        return await self.refused(session, event, verdict, declined(event, "this MCP action"))
+                    carded = True
+            async def access_refusal():
+                """The refusal when a path needs folder access the user did not give, else None."""
                 for value in paths:
                     access = {}
-                    if not await self.ensure_access(session, tools, value, name in DIRECTORY_TOOLS, access):
-                        output = ("The user did not answer the folder access request in time, so this file tool did not run. "
+                    if not await self.ensure_access(session, tools, value, name in DIRECTORY_TOOLS, access, (name, arguments)):
+                        output = (access["blocked_reason"] if access["approval"] == "blocked" else
+                                  "The user did not answer the folder access request in time, so this file tool did not run. "
                                   "Ask the user before trying again." if access["approval"] == "expired" else
                                   declined(access, "folder access", "Do not retry or use a command to circumvent this decision."))
                         # The file tool did not run because of the access card's answer; show the same outcome on it.
                         await self.update_event(session, event, state="rejected", output=output, approval=access["approval"],
-                                                **({"decline_note": access["decline_note"]} if access.get("decline_note") else {}))
+                                                **({"decline_note": access["decline_note"]} if access.get("decline_note") else {}),
+                                                **({"blocked_reason": output} if access["approval"] == "blocked" else {}))
                         return output
+                return None
+            if name in PATH_TOOLS:
+                # move_path needs access to both ends; the destination is always a file path.
+                paths = [arguments.get("path", ".")] + ([arguments["destination"]] if name == "move_path" else [])
+                if (output := await access_refusal()) is not None:
+                    return output
+                if verdict.decision != "ask":
+                    # A folder-access card may have waited while the mode or rules changed.
+                    verdict = self.permission(session, tools, name, arguments)
+                    if verdict.decision == "deny":
+                        await self.update_event(session, event, state="rejected", output=verdict.message)
+                        return verdict.message
                 for value in paths:
                     target = tools.path(value)
                     if target.is_relative_to(tools.root):
@@ -1239,6 +1587,7 @@ class AgentManager:
                         directories = session.setdefault("instruction_directories", [])
                         if relative not in directories:
                             directories.append(relative)
+            edited_note = None
             if name in FILE_CHANGE_TOOLS + ("run_command",):
                 if not self.guidance_matches(session, tools):
                     output = "Project instructions were discovered or changed. Review the refreshed project guidance in the next model request before retrying this action. No file was changed and no command ran."
@@ -1271,17 +1620,23 @@ class AgentManager:
                     validate_command_options(arguments["command"], arguments.get("timeout_seconds", 60), arguments.get("max_output_bytes", 80000))
                     if type(arguments.get("background", False)) is not bool:
                         raise ValueError("background must be true or false.")
-                    preview = (arguments["command"] + f"\n\nTimeout: {arguments.get('timeout_seconds', 60)} seconds"
-                               + f" · Output limit: {arguments.get('max_output_bytes', 80000)} bytes"
-                               + ("\nBackground job: continues after this chat turn; stop it in Terminal or with stop_job." if arguments.get("background") else "\nForeground command: Stop response also stops this job."))
+                    preview = self.command_preview(arguments)
                 else:
                     preview = self.file_change_preview(tools, name, arguments)
-                by_rule = decision == "ask" and allowed_by_rule(session, name, arguments)
-                await self.update_event(session, event, preview=preview, **({"allowed_by_rule": True} if by_rule else {}))
-                if decision == "ask" and not by_rule and not await self.approve(session, event):
-                    output = unanswered(event, declined(event))
-                    await self.update_event(session, event, output=output)
-                    return output
+                await self.update_event(session, event, preview=preview)
+                if verdict.decision == "ask":
+                    card = {"arguments": arguments}
+                    reviser = None
+                    if activity is None and name in EDITABLE and (name != "edit_file" or "new_text" in arguments):
+                        reviser = self.card_reviser(session, tools, event, name, definition, card, original)
+                    allowed, verdict = await self.request_approval(session, tools, event, name, arguments,
+                                                                   reviser=reviser, card=card)
+                    arguments = card["arguments"]
+                    if not allowed:
+                        return await self.refused(session, event, verdict, declined(event))
+                    carded = True
+                    if event.get("edited"):
+                        edited_note = EDITED_NOTES[name].format(command=arguments.get("command", ""))
                 if not self.guidance_matches(session, tools):
                     raise ValueError("Project instructions changed while preparing this action. Review the refreshed guidance before retrying. No file was changed and no command ran.")
                 if name != "run_command":
@@ -1290,9 +1645,29 @@ class AgentManager:
                     for guard in guarded:
                         if refusal := self.overwrite_refusal(session, tools, *guard):
                             raise ValueError(refusal)
-            if mode == "auto" and name in COMMAND_TOOLS and decision == "allow":
-                arguments = {**arguments, "command": BASIC_COMMANDS[arguments["command"].strip()]}
+            if verdict.decision == "ask" and not carded:
+                raise ValueError("This action needs an approval card, which this tool cannot show.")
+            if verdict.decision == "allow" and not carded and (fields := self.verdict_fields(verdict)):
+                await self.update_event(session, event, **fields)
             await self.run_hooks(session, "before_tool", name, arguments, call_id=call_id)
+            # The mode, rules or turned-off tools can change while a card or hook card waits (for example
+            # a switch to Plan, or from Bypass to Manual): follow the current ones before anything runs.
+            tools.unrestricted = session.get("permission_mode", "manual") == "bypassPermissions"
+            if name in PATH_TOOLS and (output := await access_refusal()) is not None:
+                return output
+            if (current := self.permission(session, tools, name, arguments)).decision == "deny":
+                await self.update_event(session, event, state="rejected", output=current.message)
+                return current.message
+            if not carded and current.decision == "ask":
+                # Allowed when it started, but it needs a card now.
+                allowed, verdict = await self.request_approval(session, tools, event, name, arguments)
+                if not allowed:
+                    return await self.refused(session, event, verdict, declined(event))
+                carded = True
+            elif not carded and current != verdict:
+                verdict = current
+                if fields := self.verdict_fields(verdict):
+                    await self.update_event(session, event, **fields)
             # Approval or a hook can change guidance; recheck before any external action.
             if name in FILE_CHANGE_TOOLS + ("run_command",) or name.startswith("mcp__"):
                 if not self.guidance_matches(session, tools):
@@ -1377,7 +1752,11 @@ class AgentManager:
                 finally:
                     await self.status(session, "running")
             elif name == "run_command":
-                result = await self.command_tool(session, event, arguments)
+                if verdict.argv is not None and verdict.decision == "allow":
+                    result = await self.command_tool(session, event, arguments, argv=list(verdict.argv),
+                                                     read_only=verdict.read_only)
+                else:
+                    result = await self.command_tool(session, event, arguments)
             elif name == "list_jobs":
                 offset = arguments.get("offset", 0)
                 if type(offset) is not int or not 0 <= offset <= 104:
@@ -1422,6 +1801,8 @@ class AgentManager:
             else:
                 result = await tools.execute(name, arguments)
             output = result if isinstance(result, str) else json.dumps(result, indent=2)
+            if edited_note:
+                output = edited_note + "\n" + output
             output = self.settings.redact(output)
             failed = name.startswith("mcp__") and isinstance(result, dict) and result.get("is_error") is True
             await self.update_event(session, event, state="error" if failed else "completed", output=output)
@@ -1441,6 +1822,50 @@ class AgentManager:
                 await self.run_hooks(session, "tool_failure", name, arguments, call_id=call_id, error=output)
             output = model_output
         return output
+
+    async def refused(self, session, event, verdict, declined_text):
+        """The result of a card that did not approve: blocked before it was shown, declined, blocked or expired."""
+        if verdict.decision == "deny":
+            return verdict.message  # request_approval already rejected the event with this text.
+        output = unanswered(event, declined_text)
+        await self.update_event(session, event, output=output)
+        return output
+
+    @staticmethod
+    def command_preview(arguments):
+        return (arguments["command"] + f"\n\nTimeout: {arguments.get('timeout_seconds', 60)} seconds"
+                + f" · Output limit: {arguments.get('max_output_bytes', 80000)} bytes"
+                + ("\nBackground job: continues after this chat turn; stop it in Terminal or with stop_job."
+                   if arguments.get("background") else "\nForeground command: Stop response also stops this job."))
+
+    def card_reviser(self, session, tools, event, name, definition, card, original):
+        """Edit before approving: the closure that checks and applies a change to a waiting card."""
+        async def revise(changes):
+            if (not isinstance(changes, dict) or not changes or set(changes) - set(EDITABLE[name])
+                    or any(type(value) is not str for value in changes.values())):
+                raise ValueError(EDIT_ONLY[name])
+            new = {**card["arguments"], **changes}
+            validate_arguments(definition["parameters"], new, limit=512 * 1024)
+            if name == "run_command":
+                validate_command_options(new["command"], new.get("timeout_seconds", 60), new.get("max_output_bytes", 80000))
+            verdict = self.permission(session, tools, name, new)
+            if verdict.decision == "deny":
+                raise ValueError("The edited action is blocked: " + verdict.message)
+            if name == "run_command":
+                preview = self.command_preview(new)
+            else:
+                if self.change_targets(tools, name, new) != original:
+                    raise ValueError("The file changed since this card was shown. Decline it and ask the agent to read the file again.")
+                preview = self.file_change_preview(tools, name, new)  # Enforces the write limit.
+            future = self.pending.get((session["id"], event["id"]))
+            if not future or future.done():
+                raise ValueError("This approval is no longer pending.")
+            card["arguments"] = new
+            fields = self.card_fields(tools, name, new, verdict, EDITABLE[name])
+            event.pop("uncertain", None)
+            await self.update_event(session, event, input=new, preview=preview, edited=True,
+                                    **{key: fields[key] for key in ("rule_options", "rememberable", "uncertain") if key in fields})
+        return revise
 
     @staticmethod
     def remember_file(session, target, fingerprint=None):
@@ -1545,19 +1970,54 @@ class AgentManager:
         session["file_views"] = {path: seen for path, seen in views.items() if path not in missing}
         return changed_files_text(changed[:CHANGED_FILE_NAMES], len(changed))
 
-    async def ensure_access(self, session, tools, value, directory=False, outcome=None):
+    async def ensure_access(self, session, tools, value, directory=False, outcome=None, tool=None):
+        """True when a file tool may use this path, after a folder-access card when needed.
+
+        tool is the file tool's (name, arguments): a waiting access card is re-checked against
+        the tool's own verdict, so a switch to Plan blocks it. Don't ask shows no card. A card
+        approved by switching to Bypass adds no folder grant.
+        """
         target = tools.resolve(value)  # Exclusions apply before any access prompt.
         if tools.permitted(target):
             return True
+        if session.get("permission_mode") == "dontAsk":
+            if outcome is not None:
+                outcome.update(approval="blocked", blocked_reason=DONT_ASK_ACCESS)
+            return False
         folder = target if directory and not target.is_file() else target.parent
         event = await self.event(session, "tool", name="access_directory", input={"path": str(folder)},
                                  state="running", output="", preview=f"Allow file tools to access {folder} for this conversation?\n\nReads may send file contents to your configured model. Edits follow the selected permission mode.")
-        if not await self.approve(session, event):
-            expired = event.get("approval") == "expired"
+
+        def recheck(change=None):
+            mode = session.get("permission_mode", "manual")
+            if tool is not None:
+                verdict = self.permission(session, tools, *tool)
+                if verdict.decision == "deny" and verdict.source != "dont_ask":
+                    return "deny", self.blocked_text(session, change, verdict.message)
+            if mode == "bypassPermissions":
+                return "allow", {"by": "mode", "mode": mode}
+            if mode == "dontAsk":
+                return "deny", DONT_ASK_ACCESS
+            return None
+        key = (session["id"], event["id"])
+        self.pending_checks[key] = recheck
+        try:
+            allowed = await self.approve(session, event)
+        finally:
+            self.pending_checks.pop(key, None)
+        if not allowed:
+            approval = event.get("approval")
             if outcome is not None:
-                outcome.update(approval="expired" if expired else "declined", decline_note=event.get("decline_note"))
-            await self.update_event(session, event, output="Folder access was not answered in time." if expired else "Folder access declined.")
+                outcome.update(approval=approval, decline_note=event.get("decline_note"),
+                               **({"blocked_reason": event["blocked_reason"]} if approval == "blocked" else {}))
+            await self.update_event(session, event, output=event["blocked_reason"] if approval == "blocked" else
+                                    "Folder access was not answered in time." if approval == "expired" else "Folder access declined.")
             return False
+        if event.get("approved_by_mode"):
+            tools.unrestricted = True
+            await self.update_event(session, event, state="completed",
+                                    output="Allowed by Bypass permissions mode; no folder grant was added.")
+            return True
         tools.allowed_directories.append(folder)
         session.setdefault("allowed_directories", []).append(str(folder))
         await self.update_event(session, event, state="completed", output="Folder access granted for this conversation.")
@@ -1598,7 +2058,7 @@ class AgentManager:
                                         "estimated_tokens": estimate_text_tokens(index)})
         # Stable text first and the parts that change between requests last, so a
         # provider's prompt prefix caching can reuse the longest possible prefix.
-        system = {"role": "system", "content": SYSTEM_PROMPT + "\n" + user_block + mode_prompt(mode)
+        system = {"role": "system", "content": SYSTEM_PROMPT + "\n" + user_block + mode_prompt(mode, bool(session.get("is_subagent")))
                   + (f"\nEnforced tool profile: {session['tool_profile']}. Commands, MCP tools and hooks are unavailable."
                      if session.get("tool_profile", "inherit") != "inherit" else "")
                   + "\nWorkspace: " + session["workspace"]
@@ -2076,6 +2536,10 @@ class AgentManager:
                 reason = "you declined it." + (" No agent step was left to answer your note." if note else "")
             elif approval == "expired":
                 reason = "the approval expired."
+            elif card.get("state") == "rejected" and (refusal := self.verify_refusal(session, tools, card)):
+                # Blocked by the mode, a rule or a turned-off tool: it would be blocked again this turn.
+                state["off"] = True
+                reason = refusal
             elif isinstance(result, dict) and isinstance(result.get("message"), str):
                 reason = clip(self.settings.redact(redact_secrets(result["message"])), 300)
             else:
@@ -2118,6 +2582,22 @@ class AgentManager:
             f"Verify failed ({outcome}). Asking the agent to fix it (round {state['rounds']} of {rounds})."))
         return "continue"
 
+    def verify_refusal(self, session, tools, card):
+        """The user-facing reason when the permission mode, a rule or a turned-off tool blocked Verify, else None."""
+        verdict = self.permission(session, tools, "run_command", card.get("input") or {})
+        if verdict.decision == "deny":
+            if verdict.source == "disabled":
+                return "run_command is turned off in this chat."
+            if verdict.source == "rule":
+                return f"a deny rule for {SCOPE_NAMES[verdict.scope]} blocks it ({rule_label(verdict.rule)})."
+            if verdict.source == "dont_ask":
+                return "Don't ask mode blocks commands that no rule allows."
+            if verdict.source == "plan":
+                return "Plan mode blocks commands."
+        if card.get("approval") == "blocked":
+            return "the permission mode or the rules changed while its approval card waited."
+        return None
+
     async def _run_databricks(self, session, prompt, external_tools):
         host, token = self.settings.credentials()
         mode = session.get("permission_mode", "manual")
@@ -2158,6 +2638,10 @@ class AgentManager:
                 (index for index in range(len(turn_events) - 1, -1, -1) if turn_events[index].get("type") == "user"), 0)}
             consecutive_output_retries = 0
             for step_index in range(steps):
+                # The mode, rules and turned-off tools can change while a turn runs; each step follows them.
+                mode = session.get("permission_mode", "manual")
+                tools.unrestricted = mode == "bypassPermissions"
+                definitions = self.step_definitions(session, external_tools)
                 system, guidance = self.context_inputs(session, tools, mode, self.step_notices(session, tools))
                 plan = self.handoff_plan(session, context_window)
                 summarize, condense = self.compaction_requests(session, client, url, headers,
