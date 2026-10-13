@@ -7,6 +7,10 @@ import { html, useEffect, useRef, useState } from '../lib.js'
 
 let menus = 0
 
+// Built into the app, listed before the skills: "/btw <question>" asks a side question
+// (Composer sends it to /side-question; the server never treats it as a skill command).
+export const BUILT_IN = [{ id: 'btw', name: 'Side question', description: 'Ask about this conversation without adding to it (one model request).', builtIn: true }]
+
 // The command typed so far, or null. Only a message that is just "/" and one
 // word opens the menu, so paths such as /tmp/output.log are left alone.
 export const slashQuery = value => /^\/([^\s/]*)$/.exec(value)?.[1] ?? null
@@ -47,7 +51,7 @@ export function useSlashMenu({ value, setValue, loadSkills }) {
     load.current().then(list => { if (current) setSkills(list) }, e => { if (current) { setSkills(null); setError(e.message) } })
     return () => { current = false }
   }, [open])
-  const matches = open && skills ? matchingSkills(skills, query) : []
+  const matches = open && skills ? matchingSkills([...BUILT_IN, ...skills], query) : []
   const index = highlight.query === query ? Math.min(highlight.index, Math.max(matches.length - 1, 0)) : 0
   useEffect(() => { if (open) menu.current?.querySelector('[aria-selected="true"]')?.scrollIntoView({ block: 'nearest' }) }, [open, index, query])
   const choose = skill => setValue(`/${skill.id} `)
@@ -77,12 +81,13 @@ export function useSlashMenu({ value, setValue, loadSkills }) {
   // Keep focus in the message box while the pointer chooses an option.
   const view = open ? html`<div class="slash-menu" ref=${menu} onMouseDown=${e => e.preventDefault()}>
     <div class="slash-menu-heading">Skills</div>
-    ${listed ? html`<div role="listbox" id=${id} aria-label="Skills">${matches.map((skill, i) => html`<div key=${skill.id} id=${`${id}-${i}`}
+    ${listed ? html`<div role="listbox" id=${id} aria-label="Skills">${matches.map((skill, i) => html`<div key=${skill.builtIn ? `built-in-${skill.id}` : skill.id} id=${`${id}-${i}`}
       role="option" aria-selected=${i === index} class="slash-option" onMouseMove=${() => { if (i !== index) setHighlight({ query, index: i }) }}
       onClick=${() => choose(skill)}>
       <span class="slash-command">/${skill.id}${skill.name && skill.name !== skill.id ? html`<small>${skill.name}</small>` : null}</span>
       ${skill.description ? html`<span class="slash-description">${skill.description}</span>` : null}
-    </div>`)}</div>` : html`<p class="slash-menu-note" role=${error ? 'alert' : 'status'}>${note}</p>`}
+    </div>`)}</div>` : null}
+    ${!listed || (skills && !skills.length) ? html`<p class="slash-menu-note" role=${error ? 'alert' : 'status'}>${note}</p>` : null}
   </div>` : null
   return { inputProps, keyDown, menu: view }
 }

@@ -17,6 +17,8 @@ import StorageNotice from './components/StorageNotice.js'
 import { blockerOf, OpenBlockingChat } from './components/BlockingChat.js'
 import TaskChecklist from './components/TaskChecklist.js'
 import ContinueButton from './components/ContinueButton.js'
+import QueueBar from './components/QueueBar.js'
+import SideAnswer from './components/SideAnswer.js'
 import { removeDraft, useSavedDrafts } from './drafts.js'
 
 export default function App() {
@@ -76,6 +78,7 @@ export default function App() {
     disabled=${!app.ready || (!!app.activeId && !active) || !app.settings?.configured}
     onModel=${app.changeModel}
     onSend=${send} onError=${showError} onAttach=${() => setWorkspaceOpen(true)}
+    onShell=${app.runShell} onSideQuestion=${app.askSide} loadFiles=${app.loadMentionFiles} pendingContext=${active?.pending_context}
     loadSkills=${() => api(`/skills${app.activeId ? `?session_id=${encodeURIComponent(app.activeId)}` : ''}`)}
     onStop=${() => { if (active) void api(`/sessions/${active.id}/stop`, 'POST').catch(e => showError(e.message)) }} />`
   return html`<div class=${`app-shell ${workspaceOpen ? 'workspace-visible' : ''}`}>
@@ -109,7 +112,10 @@ export default function App() {
         </div></div>`}
       <div class="chat-composer"><div class="composer-bars"><${ChangesBar} key=${`changes-${app.viewKey}`} changes=${app.changes} busy=${busy} onOpen=${openReview} onAction=${app.reviewChanges} onError=${showError} />
         <${TaskChecklist} key=${`tasks-${app.viewKey}`} tasks=${app.tasks} />
-        <${ContinueButton} session=${active} disabled=${!app.ready || !app.online || app.modelSaving || !app.settings?.configured} onSend=${app.send} onError=${showError} /></div>
+        <${ContinueButton} session=${active} disabled=${!app.ready || !app.online || app.modelSaving || !app.settings?.configured} onSend=${app.send} onError=${showError} />
+        <${QueueBar} session=${active} onRemove=${app.removeQueued} onSend=${app.sendQueued} onError=${showError}
+          onEdit=${async item => { await app.removeQueued(item.id); setDraft(current => current ? `${current}\n${item.text}` : item.text) }} />
+        <${SideAnswer} side=${app.sideAnswer} onDismiss=${app.dismissSide} /></div>
         ${composer}
         ${active?.status === 'awaiting_approval' ? html`<p class="composer-hint" role="status">${(name => name === 'ask_user' ? 'The agent is waiting for your answer above.' : name === 'submit_plan' ? 'A plan is waiting for your review above.' : 'An action is waiting for your approval above.')(active.events?.findLast(event => event.state === 'pending')?.name)}</p>` : null}
         ${active?.status === 'compacting' ? html`<p class="composer-hint" role="status">Compacting context…</p>` : null}

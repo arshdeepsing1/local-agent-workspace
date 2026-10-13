@@ -197,6 +197,7 @@ export function useWorkspace() {
           } : item))
           if (data.status === 'idle') void refreshSessions().catch(e => setError(e.message))
         }
+        if (data.type === 'queue') setSession(current => current?.id === activeId ? { ...current, queued_messages: data.queued_messages || [], queue_error: data.error || null } : current)
         if (data.type === 'title') {
           setSession(current => current?.id === activeId ? { ...current, title: data.title } : current)
           setSessions(current => current.map(item => item.id === activeId ? { ...item, title: data.title } : item))
@@ -367,6 +368,43 @@ export function useWorkspace() {
     applyRules(target, result, scope === 'chat')
     return result
   }
+  // Composer: ! commands, /btw side questions, the message queue and the @ file menu.
+  const [sideAnswer, setSideAnswer] = useState({ key: null, value: null })
+  const runShell = async command => {
+    const id = await ensureSession(selected.current)
+    await api(`/sessions/${encodeURIComponent(id)}/shell`, 'POST', { command })
+  }
+  const askSide = async question => {
+    const target = selected.current
+    if (!target.id) throw new Error('Start a conversation first.')
+    setSideAnswer({ key: target.key, value: { question, answer: null } })
+    try {
+      const result = await api(`/sessions/${encodeURIComponent(target.id)}/side-question`, 'POST', { question })
+      setSideAnswer(current => current.key === target.key && current.value?.question === question
+        ? { key: target.key, value: { question, answer: result.answer } } : current)
+    } catch (error) {
+      setSideAnswer(current => current.key === target.key && current.value?.question === question ? { key: null, value: null } : current)
+      throw error
+    }
+  }
+  const dismissSide = () => setSideAnswer({ key: null, value: null })
+  const removeQueued = async itemId => {
+    const id = selected.current.id
+    if (!id) return
+    const result = await api(`/sessions/${encodeURIComponent(id)}/queue/${encodeURIComponent(itemId)}`, 'DELETE')
+    setSession(current => current?.id === id ? { ...current, queued_messages: result.queued_messages, queue_error: null } : current)
+  }
+  const sendQueued = async () => {
+    const id = selected.current.id
+    if (!id) return
+    await api(`/sessions/${encodeURIComponent(id)}/queue/send`, 'POST')
+    setSession(current => current?.id === id ? { ...current, queue_error: null } : current)
+  }
+  const loadMentionFiles = q => {
+    const id = selected.current.id
+    const query = `q=${encodeURIComponent(q.slice(0, 200))}`
+    return api(id ? `/sessions/${encodeURIComponent(id)}/mention-files?${query}` : `/mention-files?${query}`)
+  }
   const resetRules = async () => {
     const target = selected.current
     const result = await api(`/permission-rules/reset${target.id ? `?session_id=${encodeURIComponent(target.id)}` : ''}`, 'POST')
@@ -395,6 +433,7 @@ export function useWorkspace() {
   const rulesHere = savedRules.key === selection.key ? savedRules : null
   return { settings, connection, sessions, session: activeSession, activeId, viewKey: selection.key, error, online, ready,
     setError: reportError, setActiveId: selectSession, newConversation, send, saveSettings, deleteSession, renameSession, changeModel,
+    runShell, askSide, removeQueued, sendQueued, loadMentionFiles, sideAnswer: sideAnswer.key === selection.key ? sideAnswer.value : null, dismissSide,
     modelSaving: modelSaves.has(selection.key) || (!activeId && defaultModelSave.current !== null),
     checkConnection, refreshSessions, permissionMode: activeSession?.permission_mode || draftMode, setPermissionMode, allowFolder, removeFolder,
     rules: { chat: activeSession?.allow_rules || [], project: rulesHere?.project || [], user: rulesHere?.user || [],
