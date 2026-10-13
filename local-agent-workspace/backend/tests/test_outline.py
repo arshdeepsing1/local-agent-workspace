@@ -6,7 +6,7 @@ import time
 import httpx
 import pytest
 
-from local_agent import outline
+from local_agent import outline, outline_ast
 from local_agent.agents import AgentManager
 from local_agent.config import Settings
 from local_agent.outline import outline_file, outline_format
@@ -189,7 +189,7 @@ def test_large_python_files_and_recursion_errors_use_the_line_scan(workspace, mo
 
     def deep(text):
         raise RecursionError("too deep")
-    monkeypatch.setattr(outline.ast, "parse", deep)
+    monkeypatch.setattr(outline_ast.ast, "parse", deep)
     result = outline_file(tools, "p.py")
     assert result["note"] == "Python could not parse this file; this outline comes from a line scan."
     assert "5 class Parser:" in result["entries"]
@@ -570,3 +570,82 @@ def test_one_file_over_8_mb_is_a_limit_error_naming_tail_lines(workspace):
     write(root, "app.log", "log line\n" * 1_000_000)
     kind, message = error_kind(lambda: tools.search_files("Next actions", path="app.log"))
     assert kind == "limit" and "9.0 MB" in message and "tail_lines" in message
+
+
+# --- Large Python files are parsed in a child process (integration review B, finding 15) ---------
+
+COMPLEX_PYTHON = """import functools
+
+
+@functools.cache
+@other
+def top():
+    pass
+
+
+class Outer:
+    class Inner:
+        async def deep(self):
+            def inner_most():
+                pass
+
+    if True:
+        def in_if(self):
+            pass
+    else:
+        def in_else(self):
+            pass
+
+    try:
+        def in_try(self):
+            pass
+    except ValueError:
+        def in_except(self):
+            pass
+
+    def matched(self, value):
+        match value:
+            case 1:
+                def in_case():
+                    pass
+
+
+async def last():
+    pass
+"""
+
+
+def test_the_child_parser_gives_the_same_outline(workspace, monkeypatch):
+    root, tools = workspace
+    write(root, "c.py", COMPLEX_PYTHON)
+    inline = outline_file(tools, "c.py")
+    calls = []
+    run = outline.subprocess.run
+    monkeypatch.setattr(outline.subprocess, "run", lambda *args, **kwargs: calls.append(args) or run(*args, **kwargs))
+    monkeypatch.setattr(outline, "AST_CHILD_BYTES", 10)
+    child = outline_file(tools, "c.py")
+    assert len(calls) == 1 and child == inline and "note" not in child
+    assert "4-7 def top():" in child["entries"] and "13-14       def inner_most():" in child["entries"]
+    write(root, "bad.py", COMPLEX_PYTHON + "def broken(:\n")
+    result = outline_file(tools, "bad.py")
+    assert result["note"].startswith("Python could not parse this file (line 39)")
+    assert "10 class Outer:" in result["entries"]
+
+
+def test_a_slow_or_broken_child_parser_falls_back_to_the_line_scan(workspace, monkeypatch, tmp_path):
+    root, tools = workspace
+    write(root, "c.py", COMPLEX_PYTHON)
+    monkeypatch.setattr(outline, "AST_CHILD_BYTES", 10)
+    slow = tmp_path / "slow.py"
+    slow.write_text("import time\ntime.sleep(30)\n")
+    monkeypatch.setattr(outline, "AST_CHILD_SCRIPT", slow)
+    monkeypatch.setattr(outline, "AST_CHILD_TIMEOUT", 0.5)
+    started = time.monotonic()
+    result = outline_file(tools, "c.py")
+    assert time.monotonic() - started < 2.5  # Stopped at its timeout, well within the outline deadline.
+    assert result["note"] == outline.LARGE_PYTHON_NOTE and "10 class Outer:" in result["entries"]
+    for script in (tmp_path / "missing.py", tmp_path / "noise.py"):
+        (tmp_path / "noise.py").write_text("print('not json')\n")
+        monkeypatch.setattr(outline, "AST_CHILD_SCRIPT", script)
+        result = outline_file(tools, "c.py")
+        assert result["note"] == outline.LARGE_PYTHON_NOTE and "10 class Outer:" in result["entries"]

@@ -1939,7 +1939,8 @@ structure of one text file of up to 8 MB with line numbers, so the agent reads o
 sections it needs: Markdown headings with the line where each section ends (front matter
 and fenced code are skipped), Python classes and functions from the parser with their end
 lines (files over 1 MB, files with a carriage return that is not a line ending, and files
-that do not parse use a line scan), and declarations found by a line scan in
+that do not parse use a line scan; a file over 100 KB is parsed in a separate process, so
+the parser does not pause the app, and one that takes over 2.5 seconds uses the line scan), and declarations found by a line scan in
 JavaScript/TypeScript, Go, Rust, Java/Kotlin/C#/Swift/Scala/Dart, C/C++, Ruby, PHP, shell,
 SQL, TOML/INI, YAML and Makefiles (heuristic; it can miss some). Entries read
 `start-end text` (or `start text`); line numbers match `read_file`. It refuses folders,
@@ -2257,7 +2258,8 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `backend/local_agent/context.py`: request estimates and bounded history compaction.
 - `backend/local_agent/request_limits.py`: the request body as sent, the 4 MB request limit and request timeouts.
 - `backend/local_agent/rate_limits.py`: Databricks 429 details, the learned OTPM limit and the wait shared by chats.
-- `backend/local_agent/outline.py` / `overview.py`: `outline_file` and `project_overview`.
+- `backend/local_agent/outline.py` / `overview.py`: `outline_file` and `project_overview`
+  (`outline_ast.py`: the Python definitions, also run as a child process for large files).
 - `backend/local_agent/result_budget.py`: the 128 KiB tool-result cap and the per-response context allowance.
 - `backend/local_agent/activity.py`: app-generated activity log for handoffs (`insert_activity_log`).
 - `backend/local_agent/transcript.py` / `scripts/conversation_transcript.py`: Markdown transcripts of saved conversations (also `GET /api/sessions/<id>/transcript.md`).
