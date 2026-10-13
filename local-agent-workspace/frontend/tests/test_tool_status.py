@@ -219,3 +219,6 @@ def test_a_withheld_result_keeps_the_tick(ui, page):
     expect(card.locator(".warning-icon")).to_have_count(0)
     expect(card.locator(".tool-status")).to_have_count(0)
     expect(card.locator(".tool-outcome")).to_contain_text("Result not sent to the agent")
+    card.locator(".tool-heading").click()
+    expect(card.get_by_text("Error category")).to_have_count(0)
+    expect(card.get_by_text("Action: completed", exact=True)).to_be_visible()

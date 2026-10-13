@@ -165,6 +165,12 @@ To change the model in an existing conversation, use the dropdown below its mess
 box while the conversation is idle.
 The credential URL must be the Databricks workspace root, and the selected serving
 endpoint must support streaming and function calling.
+The sidebar footer shows the connection: **Checking Databricks…**, **Databricks connected**
+or **Connection needs attention** (hover it for the error). When the check fails, a banner
+above the chat says why: for a network failure **Can't reach Databricks at <host>. Check
+your network or VPN connection.** with the error under **Details**, for a credential or HTTP
+problem the error itself, and **Could not check the Databricks connection.** when no reason
+came back. **Check again** repeats the check and **Open settings** opens Settings.
 
 The app runs with Python and its runtime dependencies only
 (`python -m pip install -c constraints.txt -e ./backend`).
@@ -260,6 +266,12 @@ when opening a conversation or performing restart recovery.
   The message box stays editable while connecting. The permissions menu opens above
   the composer; clicking the input closes it, and choosing a mode returns focus to chat.
   Open tabs reconnect after a server restart without discarding the current draft.
+  While the local server cannot be reached, the banner **Reconnecting to your local
+  server…** shows on every screen and the sidebar shows **Local server offline**; both clear
+  when it answers again, and the Databricks connection is checked again. A request that
+  cannot reach the server reports **Cannot reach the local server. Check that it is still
+  running.**; a response the app cannot read reports **The local server sent an unexpected
+  response (HTTP N).**
   A tab that does not accept an update within 5 seconds is disconnected, so it cannot
   hold up a reply, Stop or saving; it reconnects and reloads the conversation.
 - **Conversation status**: each sidebar row shows what its chat is doing.
@@ -606,6 +618,8 @@ when opening a conversation or performing restart recovery.
   removed at any time, also while the chat is busy, and inherited by subagents. Forks and imports
   start without rules. Rules for one project or for all projects, and deny and ask rules, are
   described in **Permission rules** below.
+  The button is joined to the **Always allow…** arrow, which offers the project and
+  all-project scopes; on a narrow command card it reads **Always allow this command**.
 - **Decline with a note**: **Tell the agent why (optional)** on a card adds up to 2,000 characters
   to a Decline. The agent receives "User declined this action. Their note: … Do not retry it
   without a new instruction." (similar wording for MCP calls, hooks and folder access), and the
@@ -615,6 +629,15 @@ when opening a conversation or performing restart recovery.
   action does not mean the task itself is finished. Expand command cards to see the
   full command (including inline Python), options, and output separately. A long file
   is read in pages, so a read card names the lines it covered (`lines 109–243`).
+  A command that exits non-zero, times out or is interrupted shows a warning icon and its
+  exit code (`exit 1`), and its last output line under the collapsed card (`Exit 1 · …`); a
+  failed tool shows its error category, and its expanded card shows **Error category** and
+  the **Hint given to the agent**. Expanded command and job cards show the output as text,
+  then a **State** line (state, exit code, size, and which part the result holds: the first
+  part, the start and end, the latest output from a character, or a character range; the
+  agent reads the rest with `get_job_output`), and **Raw result** with the full result the
+  agent received. On `wait_job`, `get_job_output` and `stop_job` cards a green tick means
+  the tool worked; a muted label such as `job exit 1` reports the job itself.
   **Read before overwriting:** the conversation remembers the size and modification time
   of each file the agent read (`read_file` any page, or `notebook_read`) or wrote, up to 500 files.
   `write_file` on an existing file is refused, before any approval card, unless the
@@ -692,6 +715,9 @@ when opening a conversation or performing restart recovery.
   provider's content filter, an empty reply and a stream cut off mid-message are not
   retried; the turn ends with the error. A content filter stop says so, and no
   **Continue** button is offered for it.
+  An error notice in the transcript shows a short reason (for Databricks HTTP and network
+  errors a plain sentence such as "Databricks rejected the request (HTTP 400)." followed by
+  the provider's message); **Details** shows the full error text.
 - **Other folders**: ask, for example, `Are there any CSV files in
   ~/Downloads?`. The agent can list, read and search absolute or `~/`
   paths. The first file-tool request outside the project opens a folder-access card.
@@ -711,6 +737,8 @@ when opening a conversation or performing restart recovery.
   expand **Python used by this server** to see the actual executable and compare it
   with the permission you enabled. Browser folder approval does not grant macOS access
   to a separate Python process.
+  Beside it, **Local** (hidden when the chat column is narrow) says the conversation runs on
+  this computer; hover it for the explanation.
 - **Stop**: cancel the current agent turn and its foreground command. Background
   jobs continue; stop them individually in Terminal. Approved writes and completed
   shell side effects are retained. Stop also cancels its active subagent. Deleting a
@@ -781,8 +809,10 @@ when opening a conversation or performing restart recovery.
     complete history at once. A turn cut short by a shutdown or a restart gets `[This
     response was cut off when the app stopped. …]` instead. A Stop before the message
     reached the model history (for example while MCP servers start) adds nothing. The
-    **Stopped.** notice records what was interrupted (`stop_phase`: `streaming`, `tools`
-    for a tool or a waiting card, or `waiting` for a retry wait or context preparation).
+    transcript marks the stop with a divider that names what was interrupted (**Stopped
+    while replying**, **Stopped during an action** for a tool or a waiting card, or
+    **Stopped** for a retry wait or context preparation; recorded as `stop_phase`
+    `streaming`, `tools` or `waiting`).
 - **Verify**: **Agent tools → Verify** sets a command for the project folder, for
   example `pytest -q`, with a time limit (10 to 3,600 seconds, default 600) and fix
   rounds (1 to 3, default 2). After a reply in which the agent changed files inside the
