@@ -588,7 +588,8 @@ when opening a conversation or performing restart recovery.
   **Copy conversation** copies the same text. It is the transcript the
   `scripts/conversation_transcript.py` script writes (see **Agent tools: MCP, skills,
   and hooks**): messages and replies in full, one line per tool call with its main
-  input, and command output shortened to 600 characters. Common secret shapes and the
+  input, `ask_user` questions with your answers, `submit_plan` plans in full with how you
+  reviewed them and your feedback, and command output shortened to 600 characters. Common secret shapes and the
   configured Databricks token are replaced with `[REDACTED]`; review it before sharing.
   Both work during a response and show what has been saved so far; their result is shown
   right under the two buttons.
@@ -1029,7 +1030,8 @@ python3 scripts/conversation_transcript.py .local/conversations/<id>.jsonl [more
 ```
 
 Each conversation becomes `<date>-<title>-<id>.md` (an existing file is never replaced):
-the messages and replies in full, one line per tool call with its main input, and
+the messages and replies in full, one line per tool call with its main input, questions
+with the user's answers, plans in full with their review outcome and feedback, and
 command output shortened to 600 characters (`--excerpt`). `--out all.md` joins them,
 oldest first. The script needs only Python 3 and replaces common secret shapes with
 `[REDACTED]`, but transcripts contain whatever the conversations did: review them before

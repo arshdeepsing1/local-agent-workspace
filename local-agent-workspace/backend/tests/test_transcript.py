@@ -101,3 +101,32 @@ def test_find_files_and_wait_job_lines():
     text = transcript({"id": "c1", "title": "Tests", "events": events})
     assert "- Found files matching `src/**/*.test.ts` in `web`\n" in text
     assert "- Waited for job `01234567`\n" in text
+
+
+def test_questions_show_the_answers_and_plans_show_in_full_with_their_review():
+    question = {"question": "Which database?", "header": "", "multi_select": False,
+                "options": [{"label": "Postgres", "description": ""}, {"label": "SQLite", "description": ""}]}
+    plan = "# Plan\n\n1. Add `notes.txt`.\n2. Check it.\n" + "More detail. " * 100
+    asked = {"type": "tool", "name": "ask_user", "input": {"questions": [question]}}
+    reviewed = {"type": "tool", "name": "submit_plan", "input": {"title": "Add notes", "plan": plan}}
+    session = {"events": [
+        {**asked, "state": "completed", "question_outcome": "answered", "output": "{}",
+         "answers": [{"question": "Which database?", "selected": [], "other": "DuckDB please"}]},
+        {**asked, "state": "completed", "question_outcome": "skipped", "skipped_reason": "dont_ask"},
+        {**asked, "state": "completed", "question_outcome": "expired"},
+        {**reviewed, "state": "completed", "plan_outcome": "keep_planning", "feedback": "Use fewer steps"},
+        {**reviewed, "state": "completed", "plan_outcome": "approved", "plan_mode": "acceptEdits"},
+        {**reviewed, "state": "completed", "plan_outcome": "superseded"},
+        {**reviewed, "state": "pending"},
+    ]}
+    text = transcript(session)
+    assert "- Asked the user (answered):\n  - Which database?\n    Answer: Other: DuckDB please\n" in text
+    assert "- Asked the user (skipped in Don't ask mode):\n  - Which database?\n" in text
+    assert "- Asked the user (not answered in time):" in text
+    assert "- Plan \"Add notes\" (kept planning):\n  ```\n  # Plan\n" in text
+    assert text.count("More detail.") == 400 and "more characters]" not in text
+    assert "  Feedback: Use fewer steps\n" in text
+    assert "- Plan \"Add notes\" (approved; mode: Accept edits):" in text
+    assert "- Plan \"Add notes\" (not reviewed: the mode was changed from the menu):" in text
+    assert "- Plan \"Add notes\" (pending):" in text
+    assert '"questions"' not in text and '"plan"' not in text
