@@ -113,6 +113,16 @@ def clip_title(title, limit=80):
     return title if len(title) <= limit else title[:limit - 1] + "…"
 
 
+def short_description(text, limit=160):
+    """A tool description for the Tools panel: cut at a word boundary with an ellipsis, at most limit characters."""
+    text = " ".join(str(text).split())
+    if len(text) <= limit:
+        return text
+    kept = text[:limit]
+    kept = kept[:kept.rfind(" ")] if " " in kept else kept[:limit - 1]
+    return kept.rstrip(" ,;:(-") + "…"
+
+
 def busy_status(manager, session_id):
     status = manager.statuses.get(session_id, "idle")
     task = manager.tasks.get(session_id)
@@ -238,6 +248,6 @@ def register_approvals(app, manager, store, session_or_404):
     @app.get("/api/tools")
     async def list_tools(session_id: str | None = None):
         session = session_or_404(session_id) if session_id else None
-        tools = [{"name": item["function"]["name"], "description": item["function"].get("description", "")[:160]}
+        tools = [{"name": item["function"]["name"], "description": short_description(item["function"].get("description", ""))}
                  for item in [*TOOL_DEFINITIONS, *FEATURE_TOOLS]]
         return {"tools": tools, "disabled": list((session or {}).get("disabled_tools", []))}

@@ -591,6 +591,12 @@ def test_disabled_tools_and_tool_list_routes(api):
     assert listed["disabled"] == [] and {"name", "description"} == set(listed["tools"][0])
     assert "run_command" in {item["name"] for item in listed["tools"]}
     assert all(len(item["description"]) <= 160 for item in listed["tools"])
+    # A long description is cut at a word boundary and marked with an ellipsis, never mid-word.
+    full = {item["function"]["name"]: item["function"]["description"] for item in [*TOOL_DEFINITIONS, *FEATURE_TOOLS]}
+    cut = [item for item in listed["tools"] if item["description"] != full[item["name"]]]
+    assert cut and all(item["description"].endswith("…") for item in cut)
+    assert all(full[item["name"]].startswith(item["description"][:-1]) and
+               not full[item["name"]][len(item["description"]) - 1].isalnum() for item in cut), cut
     app.state.manager.statuses[sid] = "running"
     route = f"/api/sessions/{sid}/disabled-tools"
     saved = client.put(route, json={"tools": ["run_command", "run_command", "mcp__docs__search", "ask_user"]}).json()

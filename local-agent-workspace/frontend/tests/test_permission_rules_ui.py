@@ -692,8 +692,10 @@ def test_the_tools_tab_loads_toggles_and_saves(ui, page):
     assert tabs.index("Tools") == tabs.index("Extensions") + 1
     expect(tools).to_contain_text("Turned-off tools are not offered to the agent in this chat, and calls to them are refused. "
                                   "Changes apply from the agent's next step. Subagents, forks and imports keep this setting.")
-    read = tools.get_by_role("checkbox", name=re.compile("^read_file"))
-    run = tools.get_by_role("checkbox", name=re.compile("^run_command"))
+    # Each checkbox is named by its tool alone; the description describes it.
+    read = tools.get_by_role("checkbox", name="read_file", exact=True)
+    run = tools.get_by_role("checkbox", name="run_command", exact=True)
+    expect(read).to_have_accessible_description("Read a text file.")
     expect(read).to_be_checked()
     expect(run).not_to_be_checked()
     expect(tools.get_by_text("Read a text file.")).to_be_visible()
@@ -727,7 +729,7 @@ def test_the_app_saves_turned_off_tools_for_the_open_chat(ui, page):
     page.get_by_role("button", name="Agent tools", exact=True).click()
     page.get_by_role("button", name="Tools", exact=True).click()
     tools = page.get_by_role("region", name="Tools")
-    tools.get_by_role("checkbox", name=re.compile("^read_file")).uncheck()
+    tools.get_by_role("checkbox", name="read_file", exact=True).uncheck()
     tools.get_by_role("button", name="Save tools").click()
     expect(tools.get_by_role("status")).to_have_text("Tools saved for this chat.")
     assert ui.bodies("/api/sessions/a/disabled-tools", "PUT") == [{"tools": ["run_command", "mcp__docs__search", "read_file"]}]

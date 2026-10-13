@@ -265,8 +265,9 @@ function ToolsPanel({ session, onError, onSaveTools }) {
     <p>Turned-off tools are not offered to the agent in this chat, and calls to them are refused. Changes apply from the agent's next step. Subagents, forks and imports keep this setting.</p>
     ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
     <div class="agent-tools-list">${(tools || []).map(tool => html`<div class="agent-tools-row" key=${tool.name}><label class="tools-toggle">
-      <input type="checkbox" disabled=${busy} checked=${!off.includes(tool.name)} onChange=${e => toggle(tool.name, e.currentTarget.checked)} />
-      <span><strong>${tool.name}</strong>${tool.description ? html`<small>${tool.description}</small>` : null}</span></label></div>`)}</div>
+      <input type="checkbox" aria-label=${tool.name} aria-describedby=${tool.description ? `tool-description-${tool.name}` : null}
+        disabled=${busy} checked=${!off.includes(tool.name)} onChange=${e => toggle(tool.name, e.currentTarget.checked)} />
+      <span><strong>${tool.name}</strong>${tool.description ? html`<small id=${`tool-description-${tool.name}`}>${tool.description}</small>` : null}</span></label></div>`)}</div>
     <form class="agent-tools-form" onSubmit=${e => { e.preventDefault(); addMcp() }}>
       <label>Turn off an MCP tool by name<input spellcheck=${false} disabled=${busy} value=${mcpName} placeholder="mcp__docs__search"
         onInput=${e => { setMcpName(e.currentTarget.value); setMcpError('') }} /></label>
