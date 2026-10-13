@@ -166,7 +166,7 @@ def _text_cost(text):
 
 class WorkspaceTools:
     def __init__(self, workspace: str, credential_file: str = "", allowed_directories=(), unrestricted=False,
-                 write_limit=DEFAULT_WRITE_LIMIT, *, excluded_roots=()):
+                 write_limit=DEFAULT_WRITE_LIMIT, *, excluded_roots=(), secrets=()):
         self.root = Path(workspace).expanduser().resolve()
         # Folders file tools never reach (the app's state folder), except a workspace inside one.
         self.excluded_roots = [Path(p).expanduser().resolve() for p in excluded_roots]
@@ -177,6 +177,14 @@ class WorkspaceTools:
         self.allowed_directories = [Path(p).expanduser().resolve() for p in allowed_directories]
         self.unrestricted = unrestricted
         self.write_limit = min(max(write_limit, MIN_WRITE_LIMIT), MAX_WRITE_LIMIT) if type(write_limit) is int else DEFAULT_WRITE_LIMIT
+        # The configured token, resolved once: replaced in text a tool cuts (outline entries, search
+        # excerpts) before the cut, which would leave a part the later exact match cannot find.
+        self.secrets = tuple(secret for secret in secrets if isinstance(secret, str) and secret)
+
+    def redact(self, text):
+        for secret in self.secrets:
+            text = text.replace(secret, "[REDACTED]")
+        return text
 
     def resolve(self, value: str = ".") -> Path:
         requested = self.root / Path(value).expanduser()
@@ -532,13 +540,13 @@ class WorkspaceTools:
                 found += 1
                 if found <= offset:
                     continue
-                text, clipped = _excerpt(line)
+                text, clipped = _excerpt(self.redact(line))
                 entry = {"path": name, "line": index + 1, "text": text,
                          "before": [], "after": [], "text_truncated": clipped}
                 for side, positions in (("before", range(max(0, index - context_lines), index)),
                                         ("after", range(index + 1, min(len(lines), index + context_lines + 1)))):
                     for position in positions:
-                        text, clipped = _excerpt(lines[position])
+                        text, clipped = _excerpt(self.redact(lines[position]))
                         entry[side].append({"line": position + 1, "text": text})
                         entry["text_truncated"] |= clipped
                 if full(entry):

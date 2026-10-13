@@ -331,6 +331,20 @@ def tool_arguments(calls):
     return arguments
 
 
+def redact_value(value, tokens):
+    """value with each token replaced by [REDACTED] in every string inside dicts and lists."""
+    if isinstance(value, str):
+        for token in tokens:
+            if token:
+                value = value.replace(token, "[REDACTED]")
+        return value
+    if isinstance(value, dict):
+        return {key: redact_value(item, tokens) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_value(item, tokens) for item in value]
+    return value
+
+
 def current_time_text(now=None, *, commands=True):
     """The model otherwise guesses today's date, for example from file names. Day precision:
     a minute in the system message would change it, and miss the provider's prompt cache for
@@ -1324,7 +1338,8 @@ class AgentManager:
         allowed = [*session.get("allowed_directories", []), *self.standing_directories()]
         return WorkspaceTools(session["workspace"], self.settings.values["env_file"], allowed,
                               session.get("permission_mode", "manual") == "bypassPermissions",
-                              write_limit=write_limit_setting(self.settings.values), excluded_roots=(self.settings.state_dir,))
+                              write_limit=write_limit_setting(self.settings.values), excluded_roots=(self.settings.state_dir,),
+                              secrets=self.redaction_tokens())
 
     def track_change(self, session, record, tools):
         """Track an applied agent file edit in this chat's review and, for a subagent, in its parent's."""
@@ -1372,7 +1387,8 @@ class AgentManager:
         return WorkspaceTools(session["workspace"], self.settings.values["env_file"],
                               [*session.get("allowed_directories", []), *self.standing_directories(), *extra],
                               session.get("permission_mode", "manual") == "bypassPermissions",
-                              write_limit=write_limit_setting(self.settings.values), excluded_roots=(self.settings.state_dir,))
+                              write_limit=write_limit_setting(self.settings.values), excluded_roots=(self.settings.state_dir,),
+                              secrets=self.redaction_tokens())
 
     async def publish_changes(self, session, only_tracked=False):
         """Send the conversation's unreviewed agent file changes to its open pages. Always listed with
@@ -2644,8 +2660,9 @@ class AgentManager:
                 result = await tools.execute(name, arguments, page_bytes=read_page_bytes(self.request_limits(session)[0]))
             else:
                 result = await tools.execute(name, arguments)
-            # The hard cap applies to the card and the model alike, before redaction.
-            result = bound_result(result, TOOL_RESULT_HARD_LIMIT)
+            # Redacted before the hard cap and any shortening: a cut through the token leaves a part
+            # the exact match no longer finds. The cap applies to the card and the model alike.
+            result = bound_result(redact_value(result, self.redaction_tokens()), TOOL_RESULT_HARD_LIMIT)
             output = result if isinstance(result, str) else json.dumps(result, indent=2)
             if edited_note and origin != "verify":  # Verify reads the JSON result; its card says it was edited.
                 output = edited_note + "\n" + output

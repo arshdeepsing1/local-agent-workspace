@@ -278,8 +278,9 @@ def _clip(text):
     return text if len(text) <= ENTRY_TEXT_CHARS else text[:ENTRY_TEXT_CHARS - 1] + "…"
 
 
-def _entry(line, end, level, text):
+def _entry(line, end, level, text, redact=None):
     indent = "  " * (level - 1)
+    text = redact(text) if redact else text  # Before the cut, which could split the configured token.
     return f"{line}-{end} {indent}{_clip(text)}" if end is not None else f"{line} {indent}{_clip(text)}"
 
 
@@ -361,7 +362,8 @@ def outline_file(tools, path, *, offset=0, max_level=6, page_bytes=QUERY_OUTPUT_
         result["note"] = " ".join(notes)
     if scan.full:
         result["outline_limit_reached"] = True
-    return _page(result, [_entry(*entry) for entry in selected[offset:]], offset, page_bytes)
+    redact = getattr(tools, "redact", None)
+    return _page(result, [_entry(*entry, redact) for entry in selected[offset:]], offset, page_bytes)
 
 
 def _page(result, entries, offset, page_bytes):
