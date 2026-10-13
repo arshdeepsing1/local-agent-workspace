@@ -22,7 +22,7 @@ from .context import (
 from .tools import LIMIT as FILE_LIMIT
 from .tools import write_limit_setting
 from . import diagnostics, notebooks
-from .edits import preview_diff, split_lines
+from .edits import clip_result, preview_diff, split_lines
 from .config import DEFAULT_APPROVAL_MINUTES, DEFAULT_MAX_AGENT_STEPS
 from .instructions import load_project_instructions
 from .jobs import JobManager, validate_command_options
@@ -1014,7 +1014,8 @@ class AgentManager:
                 target = tools.path(arguments["path"])
                 seen = file_fingerprint(target)
                 result = await asyncio.to_thread(notebooks.read_notebook, tools, arguments["path"],
-                                                 arguments.get("offset", 0), arguments.get("max_cells", 20))
+                                                 arguments.get("offset", 0), arguments.get("max_cells", 20),
+                                                 arguments.get("source_offset"))
                 self.remember_file(session, target, seen)
             elif name == "notebook_edit":
                 turn_id = next((item["id"] for item in reversed(session["events"]) if item["type"] == "user"), None)
@@ -1024,7 +1025,8 @@ class AgentManager:
                 self.checkpoints.apply_text(tools, arguments["path"], after, before, session_id=session["id"], turn_id=turn_id,
                                             on_applied=lambda record: self.changes.track(record, tools))
                 self.remember_file(session, target)
-                result = (notebooks.preview(tools.display_path(target), summary)
+                result = notebooks.preview(tools.display_path(target), summary, done=True)
+                result = (("No changes. " if after == before else "") + clip_result(result)
                           + diagnostics.report(tools.display_path(target), before, after))
             elif name == "list_skills":
                 result = self.metadata_page(self.extensions.skills(tools), arguments.get("offset", 0), "skills")
@@ -1120,11 +1122,13 @@ class AgentManager:
             return None
         views = session.get("file_views") if isinstance(session.get("file_views"), dict) else {}
         name = tools.display_path(target)
+        retry = {"deleting": "Use read_file, then delete it again.",
+                 "editing": "Use notebook_read, then edit it again."}.get(verb, "Use read_file, then write again.")
         if str(target) not in views:
-            return f"Read {name} before {verb} it: this conversation has not read it yet. Use read_file, then write again."
+            return f"Read {name} before {verb} it: this conversation has not read it yet. {retry}"
         if views[str(target)] != current:
             return (f"Read {name} again before {verb} it: it changed since you last read or wrote it (for example "
-                    "the user edited it, undid an agent change, or a command changed it). Use read_file, then write again.")
+                    f"the user edited it, undid an agent change, or a command changed it). {retry}")
         return None
 
     @staticmethod
@@ -1158,13 +1162,18 @@ class AgentManager:
             target = tools.path(arguments["destination"])
             preview = f"Move {tools.display_path(source)} → {tools.display_path(target)}"
             replaced = tools.read_raw(arguments["destination"])
-            if replaced is not None:
+            if replaced == text:
+                preview += "\n\nReplaces an identical file."
+            elif replaced is not None:
                 preview += f"\n\nReplaces the existing file:\n{preview_diff(tools.display_path(target), replaced, text)}"
             return preview
+        if not text:
+            return f"Delete {tools.display_path(source)} (empty file)"
         lines = preview_diff(tools.display_path(source), text, "").splitlines(True)
         if len(lines) > DELETE_PREVIEW_LINES:
             lines = lines[:DELETE_PREVIEW_LINES] + [f"… {len(lines) - DELETE_PREVIEW_LINES:,} more lines\n"]
-        return f"Delete {tools.display_path(source)} ({len(split_lines(text)):,} lines)\n\n" + "".join(lines)
+        count = len(split_lines(text))
+        return f"Delete {tools.display_path(source)} ({count:,} line{'' if count == 1 else 's'})\n\n" + "".join(lines)
 
     @staticmethod
     def file_diagnostics(tools, target, before):

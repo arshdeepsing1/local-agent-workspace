@@ -1,6 +1,5 @@
 """Bounded, file-level recovery for edits made through the application."""
 import base64
-import difflib
 import hashlib
 import json
 import os
@@ -11,7 +10,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from .edits import plan_change, preview_diff
+from .edits import clip_result, plan_change, preview_diff, unified_diff
 from .tools import MAX_WRITE_LIMIT, file_error
 
 CHECKPOINT_BYTES_LIMIT = 256 * 1024 * 1024
@@ -109,10 +108,10 @@ def _same(current, expected):
 
 
 def _diff(before, after, path):
-    result = "".join(difflib.unified_diff(_lines(_bytes(before).decode("utf-8")),
-                                          _lines(_bytes(after).decode("utf-8")),
-                                          fromfile=path if before["exists"] else "/dev/null",
-                                          tofile=path if after["exists"] else "/dev/null"))
+    result = "".join(unified_diff(_lines(_bytes(before).decode("utf-8")),
+                                  _lines(_bytes(after).decode("utf-8")),
+                                  fromfile=path if before["exists"] else "/dev/null",
+                                  tofile=path if after["exists"] else "/dev/null"))
     if not result and before["exists"] != after["exists"]:
         return ("Create" if after["exists"] else "Delete") + f" empty file: {path}"
     return result or "No changes."
@@ -279,7 +278,8 @@ class CheckpointManager:
         if on_applied is not None:
             on_applied(record)
         diff = preview_diff(tools.display_path(target), before_text, plan.text)
-        return plan.prefix + (diff if diff != "No changes." else _diff(before, after, tools.display_path(target)))
+        # The model gets a bounded result; the change review shows the whole diff.
+        return clip_result(plan.prefix + (diff if diff != "No changes." else _diff(before, after, tools.display_path(target))))
 
     @staticmethod
     def check_file_operation(tools, name, arguments):
@@ -291,9 +291,13 @@ class CheckpointManager:
         verb = "moves" if name == "move_path" else "deletes"
         names = [("path", arguments["path"])] + ([("destination", arguments["destination"])] if name == "move_path" else [])
         for label, value in names:
-            # Check the link itself, before tools.path resolves it to its target.
+            # Check the link itself, before tools.path resolves it to its target. The
+            # folders above it are resolved first, so "link/../link" names the link too.
+            unresolved = tools.root / Path(value).expanduser()
+            if unresolved.name in ("", ".."):
+                continue  # A folder; refused below.
             try:
-                info = os.lstat(tools.root / Path(value).expanduser())
+                info = os.lstat(unresolved.parent.resolve() / unresolved.name)
             except (FileNotFoundError, NotADirectoryError):
                 continue
             if stat.S_ISLNK(info.st_mode):

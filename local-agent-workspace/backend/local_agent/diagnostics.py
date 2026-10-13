@@ -68,6 +68,22 @@ def _conflicts(text):
     return [(("conflict",), f"line{'s' if len(lines) > 1 else ''} {shown}: unresolved merge-conflict markers")]
 
 
+def _cells(text):
+    """Conflict markers inside notebook cells, which the JSON text hides behind quotes and indentation."""
+    try:
+        cells = json.loads(text).get("cells")
+    except (ValueError, RecursionError, AttributeError):
+        return []
+    problems = []
+    for index, cell in enumerate(cells if isinstance(cells, list) else []):
+        source = cell.get("source") if isinstance(cell, dict) else None
+        source = "".join(part for part in source if isinstance(part, str)) if isinstance(source, list) else source
+        if isinstance(source, str) and _conflicts(source):
+            # Keyed by the cell's text: a cell that already had markers is not reported again.
+            problems.append((("conflict", "cell", source), f"cell {index}: unresolved merge-conflict markers"))
+    return problems
+
+
 def _problems(name, text):
     suffix = PurePath(name).suffix.lower()
     problems = []
@@ -75,6 +91,8 @@ def _problems(name, text):
         problems += _python(text)
     elif suffix in (".json", ".ipynb"):
         problems += _json(text)
+        if suffix == ".ipynb" and not problems:
+            problems += _cells(text)
     elif suffix == ".toml":
         problems += _toml(text)
     return problems + _conflicts(text)

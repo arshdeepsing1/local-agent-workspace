@@ -383,7 +383,7 @@ when opening a conversation or performing restart recovery.
   full command (including inline Python), options, and output separately. A long file
   is read in pages, so a read card names the lines it covered (`lines 109–243`).
   **Read before overwriting:** the conversation remembers the size and modification time
-  of each file the agent read (`read_file`, any page) or wrote, up to 500 files.
+  of each file the agent read (`read_file` any page, or `notebook_read`) or wrote, up to 500 files.
   `write_file` on an existing file is refused, before any approval card, unless the
   conversation has read or written it and it has not changed since; the card shows
   "Not run:" and the reason, and the model reads the file and writes again. The check
@@ -399,7 +399,13 @@ when opening a conversation or performing restart recovery.
   (5 replacements)." Line endings are kept: unchanged text stays byte-identical and new
   lines take the file's most common ending (CRLF on a tie). `write_file` and editor saves
   of LF text over a CRLF file keep CRLF; over a file with mixed endings they keep the
-  endings of the unchanged first and last lines. Matching is linear, also for 1 MB files.
+  endings of the unchanged first and last lines. Matching is linear, also for 1 MB files,
+  and diffs (approval card, change review, recovery) stay fast on large files: a large
+  changed region that cannot be matched quickly is shown as one change. The
+  model gets at most 8 KB of an edit's diff; the change review shows all of it. One
+  `write_file` call carries at most about 500 KB (tool arguments are capped at 512 KiB),
+  so larger files are built with `edit_file`. An `edit_file` on a file already over the
+  write limit is refused with the file's size and the limit.
   **Diagnostics:** after `write_file`, `edit_file`, `move_path` and `notebook_edit` the app
   checks the file offline: Python syntax with the server's own Python parser (the code
   never runs, and the message names the Python version, so a project on a newer Python
@@ -413,10 +419,15 @@ when opening a conversation or performing restart recovery.
   for those. Each path needs folder access, credential files stay excluded, and both
   follow the permission mode like edits (**Allow edits in this chat** covers them).
   **Notebooks:** `notebook_read` reads a Jupyter notebook as cells (index, id, type,
-  source and a short summary of outputs) in pages of at most 8 KB. `notebook_edit`
-  replaces, inserts or deletes one cell, found by id or index, or clears outputs; an
-  edited code cell loses its outputs, and the file keeps its JSON formatting. It works on
-  notebooks up to 1 MB whatever the write limit, with one approval card and a checkpoint.
+  source and a short summary of outputs) in pages of at most 8 KB; a cell longer than
+  4,000 characters is clipped, and `source_offset` reads the rest of that one cell.
+  `notebook_edit` replaces, inserts or deletes one cell, found by id or index, or clears
+  outputs; an edited code cell loses its outputs. A notebook in Jupyter's format (or
+  written by `json.dumps` with indent 1, 2 or 4) stays byte-identical outside the edited
+  cell; any other notebook is rewritten in Jupyter's format, and the card says so. It
+  works on notebooks up to 1 MB whatever the write limit, with one approval card and a
+  checkpoint. Diagnostics also report merge-conflict markers inside notebook cells.
+  **Changed files:** the conversation keeps remembering the files it read or wrote.
   Before each model request the app checks the 200 most recent of these files and, if
   any changed or were deleted (your editor saves, an Undo, a command), adds one line at
   the end of the system message naming up to 10 of them. A deleted file is named once.

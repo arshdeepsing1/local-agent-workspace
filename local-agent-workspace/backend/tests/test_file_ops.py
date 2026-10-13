@@ -77,7 +77,8 @@ async def test_delete_needs_a_read_and_undo_restores_the_file(runtime):
     manager, session, project, tools, _ = runtime
     output, event = await tool(runtime, "delete_path", {"path": "note.txt"}, "unread")
     assert event["state"] == "rejected"
-    assert output.startswith("Read note.txt before deleting it: this conversation has not read it yet.")
+    assert output == ("Read note.txt before deleting it: this conversation has not read it yet. "
+                      "Use read_file, then delete it again.")
     assert (project / "note.txt").exists()
 
     await read(runtime)
@@ -110,6 +111,19 @@ async def test_manual_mode_asks_once_with_a_preview_and_plan_mode_denies(runtime
     output, event = await tool(runtime, "delete_path", {"path": "keep.txt"}, "plan")
     assert event["state"] == "rejected" and "Plan mode is read-only" in output
     assert (project / "keep.txt").exists() and len(cards) == 2
+
+
+def test_cards_count_lines_and_name_empty_and_identical_files(runtime):
+    manager, session, project, tools, _ = runtime
+    (project / "one.txt").write_text("only\n")
+    (project / "empty.txt").write_text("")
+    (project / "same.txt").write_text(NOTE)
+    assert manager.file_change_preview(tools, "delete_path", {"path": "one.txt"}).startswith("Delete one.txt (1 line)\n\n")
+    assert manager.file_change_preview(tools, "delete_path", {"path": "empty.txt"}) == "Delete empty.txt (empty file)"
+    assert manager.file_change_preview(tools, "move_path", {"path": "note.txt", "destination": "same.txt"}) == (
+        "Move note.txt → same.txt\n\nReplaces an identical file.")
+    assert manager.file_change_preview(tools, "move_path", {"path": "note.txt", "destination": "new.txt"}) == (
+        "Move note.txt → new.txt")
 
 
 def test_permission_modes_and_the_edits_rule_cover_move_and_delete():
@@ -205,11 +219,17 @@ async def test_symbolic_links_are_refused_and_their_targets_stay_intact(runtime,
     assert event["state"] == "error"
     assert "path is a symbolic link; move_path and delete_path work on regular files only." in output
     assert (project / "link.txt").is_symlink() and (project / "note.txt").read_text() == NOTE
+    # ".." after the link still names the link, not its target.
+    output, _ = await tool(runtime, name, {"path": "link.txt/../link.txt", **extra}, "dotdot")
+    assert "path is a symbolic link" in output
+    assert (project / "link.txt").is_symlink() and (project / "note.txt").read_text() == NOTE
     if name == "move_path":
         os.symlink(project / "other.txt", project / "dangling.txt")
-        output, _ = await tool(runtime, name, {"path": "note.txt", "destination": "dangling.txt", "overwrite": True}, "dest")
-        assert "destination is a symbolic link" in output
-        assert (project / "dangling.txt").is_symlink() and not (project / "other.txt").exists()
+        for destination in ("dangling.txt", "link.txt/../dangling.txt"):
+            output, _ = await tool(runtime, name, {"path": "note.txt", "destination": destination, "overwrite": True},
+                                   destination)
+            assert "destination is a symbolic link" in output
+            assert (project / "dangling.txt").is_symlink() and not (project / "other.txt").exists()
     assert manager.checkpoints.list(session["id"]) == []
 
 
@@ -241,11 +261,16 @@ async def test_credential_files_are_excluded_at_both_ends(runtime):
 
 async def test_activity_log_and_transcript_name_moves_and_deletes(runtime):
     manager, session, project, tools, _ = runtime
-    await tool(runtime, "move_path", {"path": "note.txt", "destination": "moved.txt"}, "move")
+    (project / "old.txt").write_text("replaced\n")
+    await read(runtime, "old.txt")
+    await tool(runtime, "move_path", {"path": "note.txt", "destination": "old.txt", "overwrite": True}, "replace")
+    await tool(runtime, "move_path", {"path": "old.txt", "destination": "moved.txt"}, "move")
     await read(runtime, "moved.txt")
     await tool(runtime, "delete_path", {"path": "moved.txt"}, "delete")
     log, _ = activity_log(session)
-    assert f"**Moved** (`move_path`):\n- `{project / 'note.txt'}`" in log
+    # Both ends of a move are named, so a replaced destination shows as changed.
+    assert (f"**Moved** (`move_path`):\n- `{project / 'note.txt'} → {project / 'old.txt'}`\n"
+            f"- `{project / 'old.txt'} → {project / 'moved.txt'}`") in log
     assert f"**Deleted** (`delete_path`):\n- `{project / 'moved.txt'}`" in log
     text = transcript(session)
-    assert "- Moved `note.txt` to `moved.txt`" in text and "- Deleted `moved.txt`" in text
+    assert "- Moved `note.txt` to `old.txt`" in text and "- Deleted `moved.txt`" in text

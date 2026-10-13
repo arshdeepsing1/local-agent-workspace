@@ -140,14 +140,17 @@ async def test_a_change_during_the_approval_wait_is_refused(runtime):
 
 def test_refusals_name_the_action_and_forgetting_drops_a_view(runtime):
     manager, session, project, tools = runtime
-    for verb in ("overwriting", "deleting", "editing"):
-        assert manager.overwrite_refusal(session, tools, "note.txt", verb).startswith(
-            f"Read note.txt before {verb} it: this conversation has not read it yet.")
+    retries = {"overwriting": "Use read_file, then write again.", "deleting": "Use read_file, then delete it again.",
+               "editing": "Use notebook_read, then edit it again."}
+    for verb, retry in retries.items():
+        refusal = manager.overwrite_refusal(session, tools, "note.txt", verb)
+        assert refusal == f"Read note.txt before {verb} it: this conversation has not read it yet. {retry}"
     manager.remember_file(session, project / "note.txt")
     assert manager.overwrite_refusal(session, tools, "note.txt", "deleting") is None
     os.utime(project / "note.txt", ns=(1, 1))
-    assert manager.overwrite_refusal(session, tools, "note.txt", "editing").startswith(
-        "Read note.txt again before editing it: it changed since you last read or wrote it")
+    refusal = manager.overwrite_refusal(session, tools, "note.txt", "editing")
+    assert refusal.startswith("Read note.txt again before editing it: it changed since you last read or wrote it")
+    assert refusal.endswith("Use notebook_read, then edit it again.")
     manager.forget_file(session, project / "note.txt")
     assert session["file_views"] == {}
 

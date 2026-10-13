@@ -1,6 +1,8 @@
 """edit_file (replace_all, edits[]), line endings, the file write limit and new-file modes."""
+import difflib
 import json
 import os
+import random
 import stat
 import time
 
@@ -10,7 +12,8 @@ from fastapi.testclient import TestClient
 from local_agent.agents import AgentManager
 from local_agent.api import create_app
 from local_agent.config import Settings
-from local_agent.edits import plan_change, preview_diff
+from local_agent.activity import activity_content
+from local_agent.edits import line_opcodes, plan_change, preview_diff
 from local_agent.instructions import load_project_instructions
 from local_agent.recovery import CheckpointManager
 from local_agent.store import Store
@@ -223,11 +226,22 @@ async def test_an_error_in_any_edit_writes_nothing(runtime):
     ({"old_text": "", "new_text": "b"}, "old_text cannot be empty."),
     ({"edits": [{"old_text": "a a a", "new_text": "b"}, {"old_text": "", "new_text": "c"}]}, "edits[1]: old_text cannot be empty."),
     ({"old_text": "a", "new_text": "b"}, "old_text matches 3 times; include more surrounding context"),
+    ({"edits": [{"old_text": "a a a", "new_text": "b"}], "replace_all": True},
+     "Put replace_all inside each edit when using edits."),
 ])
 def test_edit_argument_errors(arguments, message):
     with pytest.raises(ValueError) as error:
         plan_change("edit_file", arguments, "a a a\n", 80_000)
     assert message in str(error.value)
+
+
+@pytest.mark.parametrize("defaults", [{"replace_all": False}, {"old_text": None, "new_text": None},
+                                      {"replace_all": None, "old_text": None}])
+def test_schema_defaults_next_to_edits_count_as_absent(defaults):
+    plan = plan_change("edit_file", {"edits": [{"old_text": "a a a", "new_text": "b"}], **defaults}, "a a a\n", 80_000)
+    assert plan == ("b\n", "Applied 1 edit (1 replacement).\n\n")
+    plan = plan_change("edit_file", {"old_text": "a a a", "new_text": "b", "edits": None}, "a a a\n", 80_000)
+    assert plan == ("b\n", "")
 
 
 async def test_edit_file_needs_an_existing_file(runtime):
@@ -305,3 +319,115 @@ def test_edit_file_definition_offers_replace_all_and_edits():
     assert parameters["properties"]["edits"]["items"]["additionalProperties"] is False
     assert "Line endings (LF or CRLF) are kept." in definition["description"]
     json.dumps(parameters)  # Serializable for the request.
+
+
+# --- Large files: diffs stay fast, results stay bounded ------------------------------------
+
+class Page:
+    """An open conversation page: execute_tool then publishes the change review to it."""
+    def __init__(self):
+        self.sent = []
+
+    async def send_json(self, data):
+        self.sent.append(data)
+
+
+def valid_opcodes(old, new, codes):
+    i = j = 0
+    for tag, i1, i2, j1, j2 in codes:
+        assert (i1, j1) == (i, j)
+        if tag == "equal":
+            assert old[i1:i2] == new[j1:j2]
+        i, j = i2, j2
+    assert (i, j) == (len(old), len(new))
+
+
+def test_line_opcodes_match_difflib_on_small_inputs_and_stay_fast_on_large_ones():
+    generator = random.Random(7)
+    for _ in range(300):
+        old = [generator.choice("abcd") + "\n" for _ in range(generator.randint(0, 12))]
+        new = [generator.choice("abcd") + "\n" for _ in range(generator.randint(0, 12))]
+        assert line_opcodes(old, new) == difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes()
+    renamed = [f"name_{i} = {i}\n" if i % 2 else f"keep {i}\n" for i in range(20_000)]
+    blank = ["\n"] * 50_000
+    edited_blank = blank[:100] + ["x\n", "y\n"] + blank[101:45_000] + ["z\n"] + blank[45_001:]
+    cases = {
+        "every other line changed": (renamed, [line.replace("name_", "renamed_") for line in renamed]),
+        "identical lines, two distant changes": (blank, edited_blank),
+        "nothing in common": ([f"{i}\n" for i in range(20_000)], [f"other {i}\n" for i in range(20_003)]),
+    }
+    for label, (old, new) in cases.items():
+        started = time.monotonic()
+        codes = line_opcodes(old, new)
+        assert time.monotonic() - started < 1, label
+        valid_opcodes(old, new, codes)
+    changed = [code for code in line_opcodes(blank, edited_blank) if code[0] != "equal"]
+    assert len(changed) == 2  # Two small changes, not one block of 45,000 lines.
+
+
+async def test_scattered_changes_in_a_large_file_do_not_block_the_server(runtime):
+    manager, session, project = runtime
+    manager.settings.values["write_limit_kb"] = 1000
+    manager.listeners[session["id"]] = {page := Page()}
+    # A name on every other line of a 400 KB file: difflib alone is quadratic on this.
+    text = "".join(f"value_{i} = old_name({i})\n" if i % 2 else f"# note {i}\n" for i in range(20_000))
+    assert len(text) > 400_000
+    (project / "big.py").write_text(text)
+    started = time.monotonic()
+    output, event = await tool(manager, session, "edit_file",
+                               {"path": "big.py", "old_text": "old_name", "new_text": "new_name", "replace_all": True})
+    assert time.monotonic() - started < 3
+    assert event["state"] == "completed"
+    assert output.startswith("Applied 1 edit (10000 replacements).")
+    assert (project / "big.py").read_text() == text.replace("old_name", "new_name")
+    review = next(item["changes"] for item in page.sent if item["type"] == "changes")
+    assert review["files"][0]["added"] == review["files"][0]["removed"] == 10_000
+    tools = tools_for(manager, session)
+    started = time.monotonic()
+    diff = manager.changes.diff(session["id"], tools, "big.py")
+    assert time.monotonic() - started < 2 and len(diff["hunks"]) == 10_000
+    # Recovery's preview of the same checkpoint is fast too.
+    [record] = manager.checkpoints.list(session["id"])
+    started = time.monotonic()
+    preview = manager.checkpoints.preview(record["id"], tools, session["id"])
+    assert time.monotonic() - started < 2 and preview["can_restore"] is True
+
+
+async def test_the_model_gets_a_bounded_diff_and_the_review_shows_all_of_it(runtime):
+    manager, session, project = runtime
+    text = "".join(f"counter_{i} += step\n" for i in range(3_000))
+    (project / "loop.py").write_text(text)
+    output, _ = await tool(manager, session, "edit_file",
+                           {"path": "loop.py", "old_text": "step", "new_text": "increment", "replace_all": True})
+    assert output.startswith("Applied 1 edit (3000 replacements).\n\n--- loop.py")
+    assert len(output.encode()) < 8_300
+    assert output.endswith("more lines); the change review shows it in full.")
+    assert "Diagnostics" not in output
+    diff = manager.changes.diff(session["id"], tools_for(manager, session), "loop.py")
+    assert diff["added"] == diff["removed"] == 3_000
+    # A small edit's result is unchanged.
+    output, _ = await tool(manager, session, "edit_file",
+                           {"path": "loop.py", "old_text": "counter_7 +=", "new_text": "counter_7 -="}, "small")
+    assert "truncated" not in output
+    assert changed_lines(output) == (["-counter_7 += increment"], ["+counter_7 -= increment"])
+
+
+async def test_an_edit_to_a_file_already_over_the_limit_names_its_size_and_the_setting(runtime):
+    manager, session, project = runtime
+    (project / "large.py").write_text("UNIQUE = 1\n" + "# padding line\n" * 8_000)
+    output, event = await tool(manager, session, "edit_file", {"path": "large.py", "old_text": "UNIQUE = 1", "new_text": "UNIQUE = 2"})
+    assert event["state"] == "error"
+    assert "The file is 120 KB, over the file write limit (80 KB, set in Settings)." in output
+    assert "run_command" in output and "UNIQUE = 1" in (project / "large.py").read_text()
+    # New content over the limit keeps the content message.
+    (project / "small.txt").write_text("x\n")
+    with pytest.raises(ValueError, match="at most 80 KB"):
+        plan_change("edit_file", {"old_text": "x", "new_text": "y" * 90_000}, "x\n", 80_000)
+
+
+def test_the_activity_log_names_the_limit_it_was_trimmed_to(tmp_path):
+    events = [{"id": str(number), "type": "tool", "name": "run_command", "state": "completed", "created": 1790238000.0,
+               "input": {"command": f"echo {number} " + "x" * 200}} for number in range(200)]
+    content, stats = activity_content({"id": "s", "workspace": str(tmp_path), "events": events}, None, limit=16_000)
+    assert stats["commands_omitted"] > 0 and len(content.encode()) <= 16_000
+    assert f"{stats['commands_omitted']} earlier commands were omitted to stay within the 16 KB file limit." in content

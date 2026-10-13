@@ -1,4 +1,6 @@
 """notebook_read and notebook_edit: paging, cell edits that keep the file's format, limits and guards."""
+import asyncio
+import difflib
 import json
 import os
 
@@ -189,6 +191,7 @@ async def test_edit_needs_a_current_read_and_makes_one_checkpoint_with_review_un
     original = path.read_bytes()
     output, event = await tool(runtime, "notebook_edit", {"path": "analysis.ipynb", "index": 2, "source": "x = 2\n"}, "unread")
     assert event["state"] == "rejected" and output.startswith("Read analysis.ipynb before editing it")
+    assert output.endswith("Use notebook_read, then edit it again.")
 
     output, event = await tool(runtime, "notebook_read", {"path": "analysis.ipynb"}, "read")
     assert event["state"] == "completed" and json.loads(output)["total_cells"] == 3
@@ -272,3 +275,123 @@ async def test_notebook_read_is_logged_and_allowed_in_plan_mode(runtime):
     from local_agent.transcript import transcript
     assert "**Read notebook** (`notebook_read`)" in activity_log(session)[0]
     assert "- Read notebook `analysis.ipynb`" in transcript(session)
+
+
+# --- Review findings: long cells, format, ids, results, diagnostics, large notebooks --------
+
+def test_a_long_cell_is_read_in_full_through_source_offset(tmp_path):
+    tools = WorkspaceTools(str(tmp_path))
+    source = "".join(f"value_{n} = {n}\n" for n in range(1_500))
+    (tmp_path / "long.ipynb").write_text(jupyter(notebook([("code", source, []), ("markdown", "end\n", [])])))
+    page = read_notebook(tools, "long.ipynb")
+    first = page["cells"][0]
+    assert first["source_truncated"] is True and first["source_chars"] == len(source)
+    assert first["next_source_offset"] == len(first["source"]) == 4_000
+    pieces, start = [first["source"]], first["next_source_offset"]
+    while start is not None:
+        part = read_notebook(tools, "long.ipynb", offset=0, source_offset=start)
+        assert len(json.dumps(part, indent=2).encode()) <= 8_000
+        [cell] = part["cells"]
+        assert cell["index"] == 0 and cell["source_offset"] == start and part["next_offset"] == 1
+        pieces.append(cell["source"])
+        start = cell.get("next_source_offset")
+    assert "".join(pieces) == source
+    with pytest.raises(ValueError, match="offset 5 is out of range"):
+        read_notebook(tools, "long.ipynb", offset=5, source_offset=0)
+    from local_agent.tools import TOOL_DEFINITIONS
+    definition = next(item["function"] for item in TOOL_DEFINITIONS if item["function"]["name"] == "notebook_read")
+    assert "source_offset" in definition["parameters"]["properties"] and "source_offset" in definition["description"]
+
+
+async def test_the_notebook_read_tool_passes_source_offset(runtime):
+    manager, session, project, tools, _ = runtime
+    output, event = await tool(runtime, "notebook_read", {"path": "analysis.ipynb", "offset": 1, "source_offset": 6})
+    assert event["state"] == "completed", output
+    assert json.loads(output)["cells"] == [{"index": 1, "id": "cell0001", "cell_type": "code", "source": "'hello')\nplot()\n",
+                                            "source_offset": 6, "execution_count": 2,
+                                            "outputs": "2 outputs: stream, display_data (image/png)"}]
+
+
+@pytest.mark.parametrize("dump", [
+    lambda value: json.dumps(value, indent=2, ensure_ascii=False) + "\n",  # Unsorted keys, as some tools write.
+    lambda value: json.dumps(value, indent=1, sort_keys=True, ensure_ascii=True) + "\n",  # Escaped non-ASCII.
+])
+def test_other_json_layouts_are_kept_outside_the_edited_cell(dump):
+    value = notebook([("markdown", "# Notes – café\n", []), ("code", "x = 1\n", [])])
+    value = {"nbformat": value["nbformat"], "nbformat_minor": 5, "metadata": value["metadata"], "cells": value["cells"]}
+    before = dump(value)
+    after, summary = plan_edit(before, {"index": 0, "source": "# Notes v2\n"})
+    changed = [line for line in difflib.ndiff(before.splitlines(), after.splitlines()) if line[:1] in "+-"]
+    assert len(changed) == 2 and changed[0].startswith("-") and "# Notes" in changed[0]
+    assert changed[1].startswith("+") and changed[1].endswith('"# Notes v2\\n"')
+    assert summary["reformatted"] is False
+    assert "rewritten" not in preview("n.ipynb", summary)
+
+
+def test_a_notebook_that_cannot_be_reproduced_says_it_will_be_rewritten():
+    before = json.dumps(SAMPLE, indent=3) + "\n"
+    after, summary = plan_edit(before, {"index": 0, "source": "# New title\n"})
+    assert after == jupyter(json.loads(after))
+    card = preview("n.ipynb", summary)
+    assert card.endswith("The notebook's JSON will be rewritten in Jupyter's format (indent 1, sorted keys), "
+                         "so lines outside this cell may change too.")
+    assert "JSON was rewritten" in preview("n.ipynb", summary, done=True)
+
+
+async def test_an_inserted_cell_has_the_id_the_card_showed(runtime):
+    manager, session, project, tools, cards = runtime
+    session["permission_mode"] = "manual"
+    await tool(runtime, "notebook_read", {"path": "analysis.ipynb"}, "read")
+    output, event = await tool(runtime, "notebook_edit", {"path": "analysis.ipynb", "edit_mode": "insert", "index": 1,
+                                                          "source": "y = 2\n"})
+    assert event["state"] == "completed", output
+    written = cells_of((project / "analysis.ipynb").read_text())[1]["id"]
+    assert len(written) == 8 and int(written, 16) >= 0
+    assert cards[0]["preview"].startswith(f"Notebook analysis.ipynb: insert cell 1 (code, id {written})")
+    assert output.startswith(f"Notebook analysis.ipynb: insert cell 1 (code, id {written})")
+    assert written not in {cell.get("id") for cell in SAMPLE["cells"]}
+
+
+async def test_results_say_what_happened(runtime):
+    manager, session, project, tools, _ = runtime
+    await tool(runtime, "notebook_read", {"path": "analysis.ipynb"}, "read")
+    output, _ = await tool(runtime, "notebook_edit", {"path": "analysis.ipynb", "index": 0, "source": "# Title\n"}, "same")
+    assert output.startswith("No changes. Notebook analysis.ipynb: replace cell 0 (markdown, id cell0000)")
+    output, _ = await tool(runtime, "notebook_edit", {"path": "analysis.ipynb", "index": 1, "source": "plot()\n"}, "edit")
+    assert output.endswith("Its outputs were cleared.") and "will be" not in output
+
+
+async def test_conflict_markers_added_to_a_cell_are_reported(runtime):
+    manager, session, project, tools, _ = runtime
+    await tool(runtime, "notebook_read", {"path": "analysis.ipynb"}, "read")
+    source = "<<<<<<< HEAD\nx = 1\n=======\nx = 2\n>>>>>>> branch\n"
+    output, event = await tool(runtime, "notebook_edit", {"path": "analysis.ipynb", "index": 2, "source": source})
+    assert event["state"] == "completed"
+    assert output.endswith("\n\nDiagnostics for analysis.ipynb:\n- cell 2: unresolved merge-conflict markers")
+    # Another cell edited while cell 2 still has its markers: they are not reported again.
+    output, _ = await tool(runtime, "notebook_edit", {"path": "analysis.ipynb", "index": 0, "source": "# T\n"}, "next")
+    assert "Diagnostics" not in output
+
+
+class Page:
+    def __init__(self):
+        self.sent = []
+
+    async def send_json(self, data):
+        self.sent.append(data)
+
+
+async def test_an_edit_in_a_large_notebook_does_not_block_the_server(runtime):
+    manager, session, project, tools, _ = runtime
+    manager.listeners[session["id"]] = {page := Page()}
+    stream = {"name": "stdout", "output_type": "stream", "text": ["1\n"]}
+    path = project / "many.ipynb"
+    path.write_text(jupyter(notebook([("code", f"x{n} = compute({n})\nprint(x{n})\n", [stream]) for n in range(1_500)])))
+    assert path.stat().st_size > 400_000
+    await tool(runtime, "notebook_read", {"path": "many.ipynb"}, "read")
+    started = asyncio.get_running_loop().time()
+    output, event = await tool(runtime, "notebook_edit", {"path": "many.ipynb", "index": 700, "source": "y = 2\n"})
+    assert asyncio.get_running_loop().time() - started < 2, "the change review diff blocked the event loop"
+    assert event["state"] == "completed", output
+    [entry] = next(item["changes"] for item in page.sent if item["type"] == "changes")["files"]
+    assert entry["added"] + entry["removed"] < 20  # The one cell, not the whole file.

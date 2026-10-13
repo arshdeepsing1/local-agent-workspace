@@ -124,7 +124,8 @@ def test_file_groups_name_moves_deletes_notebooks_and_file_searches(tmp_path):
     log, stats = activity_log({"id": "s", "workspace": str(tmp_path), "events": events})
     for label, name in (("Moved", "move_path"), ("Deleted", "delete_path"), ("Edited notebook", "notebook_edit"),
                         ("Read notebook", "notebook_read"), ("Searched for files in", "find_files")):
-        assert f"**{label}** (`{name}`):\n- `{tmp_path / (name + '.txt')}`" in log
+        destination = f" → {tmp_path / 'd.txt'}" if name == "move_path" else ""
+        assert f"**{label}** (`{name}`):\n- `{tmp_path / (name + '.txt')}{destination}`" in log
     assert stats["files"] == 5 and stats["other_tool_calls"] == 0
 
 

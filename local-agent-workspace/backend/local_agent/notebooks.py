@@ -1,8 +1,8 @@
 """Jupyter notebooks as cells: a paged reader and one-cell edits that keep the file's format."""
 import difflib
+import hashlib
 import json
 import re
-import secrets
 import stat
 
 from .tools import MAX_WRITE_LIMIT, QUERY_OUTPUT_LIMIT, _integer, _output_size
@@ -10,6 +10,7 @@ from .tools import MAX_WRITE_LIMIT, QUERY_OUTPUT_LIMIT, _integer, _output_size
 NOTEBOOK_LIMIT = MAX_WRITE_LIMIT  # Before and after an edit, whatever the write limit setting.
 READ_LIMIT = 16_000_000
 SOURCE_CHARS = 4_000
+SOURCE_PAGE_CHARS = 7_000  # One cell read from source_offset; shrunk to fit the 8 KB page.
 MODES = ("replace", "insert", "delete", "clear_outputs")
 CELL_TYPES = ("code", "markdown", "raw")
 LINES = re.compile(r"[^\n]*\n|[^\n]+")
@@ -62,9 +63,11 @@ def _language(notebook):
     return ""
 
 
-def read_notebook(tools, path, offset=0, max_cells=20):
+def read_notebook(tools, path, offset=0, max_cells=20, source_offset=None):
     _integer(offset, "offset", 0)
     _integer(max_cells, "max_cells", 1, 100)
+    if source_offset is not None:
+        _integer(source_offset, "source_offset", 0)
     target = tools.path(path)
     info = target.stat()
     if not stat.S_ISREG(info.st_mode):
@@ -85,14 +88,17 @@ def read_notebook(tools, path, offset=0, max_cells=20):
               "nbformat": f"{notebook.get('nbformat', '?')}.{notebook.get('nbformat_minor', '?')}",
               "language": _language(notebook), "total_cells": len(cells), "cells": [], "next_offset": None}
 
-    def entry(index, limit):
+    def entry(index, limit, start=0):
         cell = cells[index]
         item = {"index": index, **({"id": cell["id"]} if isinstance(cell.get("id"), str) else {}),
                 "cell_type": cell.get("cell_type", "code")}
         source = _source(cell)
-        item["source"] = source[:limit]
-        if len(source) > limit:
-            item["source_truncated"] = True
+        item["source"] = source[start:start + limit]
+        if start:
+            item["source_offset"] = start
+        if start + limit < len(source):
+            # The rest of a long cell: notebook_read with offset=index, max_cells=1, source_offset=next_source_offset.
+            item.update(source_truncated=True, source_chars=len(source), next_source_offset=start + limit)
         if item["cell_type"] == "code":
             item.update(execution_count=cell.get("execution_count"), outputs=_outputs(cell))
         return item
@@ -100,6 +106,18 @@ def read_notebook(tools, path, offset=0, max_cells=20):
     def fits(item):
         return _output_size({**result, "cells": [*result["cells"], item], "next_offset": len(cells)}) <= QUERY_OUTPUT_LIMIT
 
+    if source_offset is not None:
+        # One cell, from a character offset in its source.
+        if offset >= len(cells):
+            raise ValueError(f"offset {offset} is out of range (the notebook has {len(cells)} cells).")
+        limit = SOURCE_PAGE_CHARS
+        item = entry(offset, limit, source_offset)
+        while not fits(item) and limit:
+            limit //= 2
+            item = entry(offset, limit, source_offset)
+        result["cells"] = [item]
+        result["next_offset"] = offset + 1 if offset + 1 < len(cells) else None
+        return result
     for index in range(offset, len(cells)):
         if len(result["cells"]) >= max_cells:
             result["next_offset"] = index
@@ -119,12 +137,15 @@ def read_notebook(tools, path, offset=0, max_cells=20):
 
 
 def _format(text, notebook):
-    """The json.dumps settings that reproduce the original text, or Jupyter's own."""
+    """The json.dumps settings that reproduce the original text, or None for Jupyter's own."""
     for indent in (1, 2, 4):
-        dumped = json.dumps(notebook, indent=indent, sort_keys=True, ensure_ascii=False)
-        if text in (dumped, dumped + "\n"):
-            return indent, text.endswith("\n")
-    return 1, True
+        for sort_keys in (True, False):
+            for ensure_ascii in (False, True):
+                options = {"indent": indent, "sort_keys": sort_keys, "ensure_ascii": ensure_ascii}
+                dumped = json.dumps(notebook, **options)
+                if text in (dumped, dumped + "\n"):
+                    return options, text.endswith("\n")
+    return None, True
 
 
 def _size_error(size):
@@ -143,10 +164,12 @@ def check_size(target):
         raise _size_error(size)
 
 
-def _new_id(cells):
+def _new_id(cells, seed):
+    """An unused 8-hex-digit id derived from seed, so the approval card and the write agree."""
     used = {cell.get("id") for cell in cells}
-    while (value := secrets.token_hex(4)) in used:
-        pass
+    counter = 0
+    while (value := hashlib.sha256(f"{counter}:{seed}".encode()).hexdigest()[:8]) in used:
+        counter += 1
     return value
 
 
@@ -182,7 +205,7 @@ def plan_edit(before_text, arguments):
     if size > NOTEBOOK_LIMIT:
         raise _size_error(size)
     notebook = _parse(before_text)
-    indent, newline = _format(before_text, notebook)
+    options, newline = _format(before_text, notebook)
     cells = notebook["cells"]
     mode = arguments.get("edit_mode", "replace")
     if mode not in MODES:
@@ -204,7 +227,8 @@ def plan_edit(before_text, arguments):
         if type(index) is not int or index < 0 or index >= len(cells) + (mode == "insert"):
             raise ValueError(f"index {index} is out of range (the notebook has {len(cells)} cells).")
         position = index
-    summary = {"mode": mode, "index": position, "old_source": "", "new_source": "", "cleared": False}
+    summary = {"mode": mode, "index": position, "old_source": "", "new_source": "", "cleared": False,
+               "reformatted": options is None}
     if mode == "clear_outputs":
         targets = range(len(cells)) if position is None else [position]
         summary["cleared"] = sum(_clear(cells[number]) for number in targets)
@@ -220,7 +244,7 @@ def plan_edit(before_text, arguments):
             position += 1  # After the named cell.
         cell = {"cell_type": cell_type or "code", "metadata": {}, "source": LINES.findall(source)}
         if _wants_ids(notebook, cells):
-            cell["id"] = _new_id(cells)
+            cell["id"] = _new_id(cells, f"{position}:{before_text}")
         _set_type(cell, cell["cell_type"])
         cells.insert(position, cell)
         summary.update(index=position, new_source=source, cell_type=cell["cell_type"], id=cell.get("id"))
@@ -245,15 +269,16 @@ def plan_edit(before_text, arguments):
             if had_outputs and "outputs" not in cell:
                 summary["cleared"] = True  # Changed away from code.
             summary.update(new_source=source, cell_type=cell.get("cell_type"))
-    after = json.dumps(notebook, indent=indent, sort_keys=True, ensure_ascii=False) + ("\n" if newline else "")
+    options = options or {"indent": 1, "sort_keys": True, "ensure_ascii": False}  # Jupyter's own format.
+    after = json.dumps(notebook, **options) + ("\n" if newline else "")
     size = len(after.encode("utf-8"))
     if size > NOTEBOOK_LIMIT:
         raise _size_error(size)
     return after, summary
 
 
-def preview(display_path, summary):
-    """What an edit does, for the approval card and the tool result."""
+def preview(display_path, summary, done=False):
+    """What an edit does, for the approval card, or (done) what it did, for the tool result."""
     mode = summary["mode"]
     if mode == "clear_outputs" and summary["index"] is None:
         return f"Notebook {display_path}: clear outputs of all {summary['cells']} cells"
@@ -270,5 +295,8 @@ def preview(display_path, summary):
         if diff:
             lines.append(diff.rstrip("\n"))
     if summary["cleared"] and mode in ("replace", "clear_outputs"):
-        lines.append("Its outputs will be cleared.")
+        lines.append("Its outputs were cleared." if done else "Its outputs will be cleared.")
+    if summary.get("reformatted"):
+        lines.append(("The notebook's JSON was" if done else "The notebook's JSON will be") + " rewritten in Jupyter's"
+                     " format (indent 1, sorted keys), so lines outside this cell may change too.")
     return "\n".join(lines)
