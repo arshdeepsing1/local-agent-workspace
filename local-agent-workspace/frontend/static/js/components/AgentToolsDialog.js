@@ -68,7 +68,11 @@ function AgentToolsScope(props) {
   useEffect(() => { nav.current?.querySelector('[aria-pressed="true"]')?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' }) }, [tab])
   const open = useCallback(name => { setTab(name); rememberTab(name) }, [])
   const sections = {
-    Overview: () => html`<${Overview} ...${props} onOpen=${open} />`,
+    // An Open button goes away with the Overview: keyboard focus moves to the opened section's button.
+    Overview: () => html`<${Overview} ...${props} onOpen=${name => {
+      open(name)
+      setTimeout(() => nav.current?.querySelector('[aria-pressed="true"]')?.focus())
+    }} />`,
     Tasks: () => html`<${Tasks} ...${props} />`,
     Subagents: () => html`<${Subagents} ...${props} />`,
     Tools: () => html`<${ToolsPanel} ...${props} />`,

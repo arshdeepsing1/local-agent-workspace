@@ -57,6 +57,11 @@ function arrange(sessions, tree, { runningOnly, terms, tags, hashes, current }) 
   }
   // While filtering, matching subagent chats are listed on their own.
   const pool = filtering ? sessions.filter(passes) : tree.topLevel
+  // The chats a tag filter allows, for the message search results (null: no tag filter).
+  const tagged = chosen.length || hashes.length ? new Set(sessions.filter(session => {
+    const own = tagsOf(session).map(fold)
+    return (!chosen.length || chosen.some(item => own.includes(item))) && hashes.every(hash => own.some(item => item.startsWith(hash)))
+  }).map(session => session.id)) : null
   const pinned = []
   const archived = []
   const groups = new Map()
@@ -71,7 +76,7 @@ function arrange(sessions, tree, { runningOnly, terms, tags, hashes, current }) 
   }
   // Groups keep the order of their newest chat, with the current project first.
   const ordered = [...groups.entries()].sort(([a], [b]) => (b === current) - (a === current))
-  return { filtering, pinned, archived, groups: ordered, listed: pool.length - archived.length }
+  return { filtering, pinned, archived, groups: ordered, listed: pool.length - archived.length, tagged }
 }
 
 function RenameForm({ session, title, setTitle, saving, error, onSave, onCancel }) {
@@ -292,10 +297,12 @@ function badges(sessions, children) {
 
 // Chats whose messages match, from the server, opened with a click. Title matches are
 // left out: the title filter above already lists them.
-const messageHits = found => (found?.results || []).filter(result => Array.isArray(result.matches) && result.matches.length > 0)
-function FoundInMessages({ found, onOpen }) {
+// tagged: the IDs a tag filter allows (null: no tag filter); other chats' hits are left out too.
+const messageHits = (found, tagged = null) => (found?.results || []).filter(result => Array.isArray(result.matches)
+  && result.matches.length > 0 && (!tagged || tagged.has(result.id)))
+function FoundInMessages({ found, tagged, onOpen }) {
   if (!found) return null
-  const hits = messageHits(found)
+  const hits = messageHits(found, tagged)
   return html`<section class="found-in-messages" aria-label="Found in messages"><p class="section-label">Found in messages</p>
     ${found.error ? html`<p class="empty-sessions" role="alert">${found.error}</p>`
       : hits.length === 0 ? html`<p class="empty-sessions">No messages match.</p>`
@@ -407,7 +414,7 @@ export default function Sidebar(props) {
   const searching = text.length >= SEARCH_MIN_CHARS
   const empty = props.sessions.length === 0 ? 'Your conversations will appear here.'
     : view.listed === 0 && runningOnly ? 'No conversation is running.'
-      : view.listed === 0 && view.filtering && !view.archived.length && !(searching && messageHits(found).length)
+      : view.listed === 0 && view.filtering && !view.archived.length && !(searching && messageHits(found, view.tagged).length)
         ? (terms.length ? 'No titles match.' : 'No conversation matches.') : ''
   return html`
     ${props.open ? html`<button class="sidebar-scrim" aria-label="Close sidebar" onClick=${props.close} />` : null}
@@ -434,7 +441,7 @@ export default function Sidebar(props) {
         ${view.pinned.length ? html`<section class="pinned-group" aria-label="Pinned"><p class="section-label"><${Pin} size=${12} />Pinned</p>
           ${rows('pinned', view.pinned)}</section>` : null}
         ${view.groups.map(group)}
-        <${FoundInMessages} found=${searching ? found : null} onOpen=${select} />
+        <${FoundInMessages} found=${searching ? found : null} tagged=${view.tagged} onOpen=${select} />
         ${view.archived.length ? html`<button class="archived-toggle" aria-expanded=${showArchived}
           onClick=${() => setShowArchived(value => !value)}>${showArchived ? html`<${ChevronDown} size=${13} />` : html`<${ChevronRight} size=${13} />`}Archived (${view.archived.length})</button>
           ${showArchived ? html`<section class="archived-group" aria-label="Archived">${rows('archived', view.archived)}</section>` : null}` : null}

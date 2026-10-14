@@ -356,7 +356,9 @@ function DelegationStatus({ event, onSelectSession, onOpenPath }) {
   const status = DELEGATION_STATUS[progress.status] || String(progress.status || '').replace(/_/g, ' ')
   const kind = progress.agent_type || event.input?.agent_type
   const started = typeof progress.started === 'number' ? progress.started : null
-  const elapsed = started == null ? null : (typeof progress.ended === 'number' ? progress.ended : Math.max(now, started)) - started
+  // Ended without an end time (a restart interrupted it): no duration, rather than one that grows with every reload.
+  const elapsed = started == null ? null : typeof progress.ended === 'number' ? progress.ended - started
+    : running ? Math.max(now, started) - started : null
   const result = delegationResult(event)
   const files = Array.isArray(result?.changed_files) ? result.changed_files : []
   return html`<div class=${`delegation-progress ${progress.terminal_reason ? `delegation-${progress.status}` : 'delegation-live'}`} aria-label="Subagent progress">
@@ -512,7 +514,9 @@ function Thinking({ text, truncated, started, seconds, streaming, answering, rea
     const timer = setInterval(() => setNow(Date.now()), 1000)
     return () => clearInterval(timer)
   }, [thinking, started])
-  const elapsed = typeof seconds === 'number' ? seconds : typeof started === 'number' ? Math.max(0, now / 1000 - started) : null
+  // Timed from its start only while the response streams; a finished reply without a duration (cut short by a
+  // restart) shows none, rather than one that grows with every reload.
+  const elapsed = typeof seconds === 'number' ? seconds : streaming && typeof started === 'number' ? Math.max(0, now / 1000 - started) : null
   const label = thinking ? `Thinking…${elapsed >= 1 ? ` ${Math.floor(elapsed)} s` : ''}`
     : elapsed !== null ? `Thought for ${wholeSeconds(elapsed)} s` : 'Thought'
   if (!text) {

@@ -438,7 +438,8 @@ export function useWorkspace() {
       setSessions(current => current.map(item => item.id === id ? { ...item, reasoning_effort: value } : item))
     }
     const id = target.id || (await target.creating).id
-    const before = session?.id === id ? session.reasoning_effort : undefined
+    // The level the server has: before the first save, then each saved one, so a failed later save never undoes an earlier one.
+    let saved = session?.id === id ? session.reasoning_effort : undefined
     show(id, reasoning_effort)
     if (effortSaves.current.has(scope)) { effortSaves.current.set(scope, reasoning_effort); return }
     effortSaves.current.set(scope, null)
@@ -446,12 +447,13 @@ export function useWorkspace() {
     try {
       while (next) {
         const updated = await api(`/sessions/${encodeURIComponent(id)}/reasoning-effort`, 'PUT', { reasoning_effort: next })
+        saved = updated.reasoning_effort
         next = effortSaves.current.get(scope)
         effortSaves.current.set(scope, null)
         if (!next) show(id, updated.reasoning_effort)
       }
     } catch (error) {
-      show(id, before)
+      show(id, saved)
       throw error
     } finally { effortSaves.current.delete(scope) }
   }

@@ -139,11 +139,12 @@ function savedWidth() {
 function saveWidth(value) {
   try { if (value === null) localStorage.removeItem(PANEL_WIDTH_KEY); else localStorage.setItem(PANEL_WIDTH_KEY, String(Math.round(value))) } catch {}
 }
-// The widest the panel may be: docked, it leaves the chat column at least 420 px; over the chat, 120 px of the window.
+// The widest the panel may be: docked, it leaves the chat column at least 420 px; over the chat (601 to
+// 1,023 px), it stops at the sidebar like the stylesheet's drawer (8 px from it).
 function widest() {
   const docked = window.innerWidth >= 1024
-  const sidebar = docked ? (document.querySelector('.app-shell > .sidebar')?.getBoundingClientRect().width || 0) : 0
-  return Math.max(PANEL_MIN, Math.floor(window.innerWidth - sidebar - (docked ? 420 : 120)))
+  const sidebar = window.innerWidth > 600 ? (document.querySelector('.app-shell > .sidebar')?.getBoundingClientRect().width || 0) : 0
+  return Math.max(PANEL_MIN, Math.floor(window.innerWidth - sidebar - (docked ? 420 : 8)))
 }
 export function usePanelWidth() {
   const [width, setWidth] = useState(savedWidth)
@@ -210,6 +211,14 @@ export default function WorkspacePanel({ sessionId, workspace, worktree = null, 
   const [tab, setTab] = useState('files')
   const panel = useRef(null)
   const sizing = usePanelWidth()
+  // The drawer's error alert (outside the panel) is as wide as the panel.
+  useEffect(() => {
+    const shell = panel.current?.closest('.app-shell')
+    if (!shell) return undefined
+    if (sizing.width === null) shell.style.removeProperty('--panel-width')
+    else shell.style.setProperty('--panel-width', `${sizing.width}px`)
+    return () => shell.style.removeProperty('--panel-width')
+  }, [sizing.width])
   // root '.' is the project; a granted or added folder is browsed by absolute paths and never above itself.
   const [root, setRoot] = useState('.')
   const [directory, setDirectory] = useState('.')
