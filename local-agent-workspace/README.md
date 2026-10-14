@@ -596,7 +596,8 @@ when opening a conversation or performing restart recovery.
   (1,024–1,000,000 bytes, default 80,000). A foreground job disables Run until it
   finishes; **Run in background** lets you launch another command. Select a job
   to inspect output, or use **Stop job**. History survives closing/reopening the
-  panel and refreshing the browser. Jobs belong to the selected conversation;
+  panel and refreshing the browser; a long command cut off in the history shows in full
+  in its tooltip, as does a long name in **Files**. Jobs belong to the selected conversation;
   commands launched before creating a chat belong to the selected workspace.
   This remains a noninteractive command runner: stdin is closed, with no PTY.
   Closing the panel does not cancel a job. Errors pause polling until **Refresh jobs**.

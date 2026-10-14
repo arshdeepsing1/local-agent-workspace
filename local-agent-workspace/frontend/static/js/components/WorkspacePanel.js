@@ -279,7 +279,7 @@ export default function WorkspacePanel({ sessionId, workspace, allowedDirectorie
           // Like an editor's explorer: a dot on files the agent changed, and on folders containing them.
           const dot = entry.directory ? [...changed.keys()].some(path => path.startsWith(`${entry.path}/`)) : changed.has(entry.path)
           return html`<button key=${entry.path} class="file-row" onClick=${() => entry.directory ? setDirectory(entry.path) : void openFile(entry.path)}>
-          ${entry.directory ? html`<${Folder} size=${16} />` : html`<${File} size=${16} />`}<span>${entry.name}</span>
+          ${entry.directory ? html`<${Folder} size=${16} />` : html`<${File} size=${16} />`}<span title=${entry.name}>${entry.name}</span>
           ${dot ? html`<span class="change-dot" role="img" aria-label=${entry.directory ? 'Contains changed files' : 'Changed by the agent'} title=${entry.directory ? 'Contains files the agent changed' : 'Changed by the agent: open it to review'} />` : null}
           ${entry.directory ? html`<${ChevronRight} size=${13} />` : null}
         </button>`

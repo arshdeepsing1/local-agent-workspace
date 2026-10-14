@@ -356,3 +356,17 @@ def test_composer_bars_are_capped(ui, page, width, height, transcript):
     assert bars["height"] <= 0.4 * height + 1 and bars["scrolls"], bars
     assert box(ui, ".transcript")["height"] >= transcript
 
+
+
+def test_a_long_file_name_has_its_full_name_as_a_tooltip(ui, page):
+    # A Files row cuts a long name with an ellipsis. Mutation: drop the name span's title.
+    name = "very_long_directory_name_for_generated_client_bindings_and_more_words"
+    page.set_viewport_size({"width": 1440, "height": 900})
+    setup = (CHAT % "") + ("; const base = fake.handle; fake.handle = (path, options) => path.startsWith('/api/files?') ? "
+                           f"fake.json([{{ path: '{name}', name: '{name}', directory: true }}]) : base(path, options)")
+    ui.app(session="a", scenario="workspace", setup=setup)
+    ui.show_session("a")
+    open_panel(page)
+    row = page.locator(".file-row", has_text=name).locator("span").first
+    expect(row).to_have_attribute("title", name)
+    assert row.evaluate("e => e.scrollWidth > e.clientWidth")
