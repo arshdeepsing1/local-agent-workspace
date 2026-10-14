@@ -7,6 +7,9 @@ const sessionInUrl = () => new URL(window.location.href).searchParams.get('sessi
 export function useWorkspace() {
   const [settings, setSettings] = useState(null)
   const [connection, setConnection] = useState(null)
+  // The last check, for the chat socket (a turn that ends while it failed checks again).
+  const connectionRef = useRef(null)
+  connectionRef.current = connection
   const [sessions, setSessions] = useState([])
   const [session, setSession] = useState(null)
   const [selection, setSelection] = useState(() => {
@@ -65,6 +68,8 @@ export function useWorkspace() {
     catch (e) {
       // The reconnect banner says it; the poll keeps trying.
       if (e instanceof ApiError && e.status === 0) { setReachable(false); return }
+      // Any HTTP answer means the server is there, even when it reports a problem (the caller shows it).
+      if (e instanceof ApiError && e.status > 0) setReachable(true)
       throw e
     }
     setReachable(true)
@@ -97,9 +102,10 @@ export function useWorkspace() {
   useEffect(() => {
     // Every 1.5 s while a chat is active; every 10 s otherwise, to notice chats started
     // elsewhere; every 2 s while the local server cannot be reached, to notice it is back.
-    // A failed slow poll stays quiet: the server may just be restarting.
+    // A failed slow poll stays quiet: the server may just be restarting. An HTTP error while unreachable is
+    // reported: the server is back but has a problem.
     if (!ready) return
-    const timer = !reachable ? setInterval(() => void refreshSessions().catch(() => {}), 2000)
+    const timer = !reachable ? setInterval(() => void refreshSessions().catch(e => setError(e.message)), 2000)
       : hasActiveSessions ? setInterval(() => void refreshSessions().catch(e => setError(e.message)), 1500)
       : setInterval(() => void refreshSessions().catch(() => {}), 10000)
     return () => clearInterval(timer)
@@ -243,6 +249,9 @@ export function useWorkspace() {
             ...(data.turn_ended ? { turn_ended: data.turn_ended, turn_delegated: !!data.turn_delegated } : {}),
           } : item))
           if (data.status === 'idle') void refreshSessions().catch(e => setError(e.message))
+          // A turn ended while the last check failed (for example a passing Databricks outage): check once more, so
+          // the banner and the sidebar do not keep reporting a problem that has gone.
+          if (data.status === 'idle' && connectionRef.current?.connected === false) void checkConnection({ keep: true }).catch(() => {})
         }
         if (data.type === 'queue') setSession(current => current?.id === activeId ? { ...current, queued_messages: data.queued_messages || [], queue_error: data.error || null } : current)
         if (data.type === 'pending_context') setSession(current => current?.id === activeId ? { ...current, pending_context: data.pending_context || [] } : current)
@@ -264,7 +273,7 @@ export function useWorkspace() {
     }
     void connect()
     return () => { closed = true; clearTimeout(timer); socket?.close() }
-  }, [activeId, selection.key, ready, refreshSessions, clearMissingSession])
+  }, [activeId, selection.key, ready, refreshSessions, clearMissingSession, checkConnection])
 
   const newConversation = () => selectSession(null)
   const ensureSession = async target => {

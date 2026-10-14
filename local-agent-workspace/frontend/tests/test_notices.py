@@ -29,6 +29,10 @@ def test_an_http_error_reads_as_a_sentence_and_the_provider_message(ui):
      "Could not reach Databricks. Check your network or VPN connection."),
     ({"text": "Databricks returned HTTP 503: upstream unavailable", "error_kind": "server", "http_status": 503},
      "Databricks had a server problem (HTTP 503). Try again in a moment."),
+    ({"text": "Databricks returned HTTP 403: <html>Forbidden</html>", "error_kind": "permission", "http_status": 403},
+     "Databricks denied access to this model (HTTP 403)."),
+    ({"text": "Databricks returned HTTP 429: Too Many Requests", "error_kind": "rate_limit", "http_status": 429},
+     "Databricks rate limited this request."),
 ])
 def test_authentication_network_and_server_errors_lead_with_a_plain_sentence(ui, event, lead):
     # B-T12. Mutation: drop the lead table.
@@ -52,8 +56,27 @@ def test_a_compaction_failure_keeps_the_text_after_the_body(ui):
     # B-T14. Mutation: drop the text after '}'.
     text = 'Context compaction failed (HTTP 400): {"message":"x"} History is preserved; retry or adjust the context budget in Settings.'
     result = summary(ui, {"type": "error", "text": text})
-    assert result == {"summary": "Context compaction failed (HTTP 400). x History is preserved; retry or adjust the "
+    assert result == {"summary": "Context compaction failed (HTTP 400). x. History is preserved; retry or adjust the "
                                  "context budget in Settings.", "details": text}
+
+
+ITPM_ADVICE = ("Each agent step resends the whole conversation: at about 400,000 input tokens per request, the per-minute "
+               "input limit of 1,000,000 allows about 2 requests per minute. For about five steps a minute, keep "
+               "Settings → Context budget near 200,000 tokens.")
+
+
+@pytest.mark.parametrize("body, provider", [
+    ('{"error": {"message": "Rate limit exceeded: ITPM limit of 1,000,000 tokens reached", "limit_type": '
+     '"input_tokens_per_minute"}}', " Rate limit exceeded: ITPM limit of 1,000,000 tokens reached."),
+    ("Too Many Requests", ""),
+])
+def test_a_final_rate_limit_error_keeps_its_advice_in_the_summary(ui, body, provider):
+    # agents.py appends the ITPM advice to a final 429 (test_rate_limit_details.py pins the text): it is what the user
+    # needs to stop repeated failures, so it is not hidden under Details. Mutation: drop `after` from the lead summary.
+    text = f"Databricks returned HTTP 429: {body} {ITPM_ADVICE}"
+    result = summary(ui, {"type": "error", "text": text, "error_kind": "rate_limit", "http_status": 429})
+    assert result == {"summary": f"Databricks rate limited this request.{provider} {ITPM_ADVICE}", "details": text}
+    assert result["summary"].endswith("keep Settings → Context budget near 200,000 tokens.")
 
 
 def test_a_long_unreadable_body_is_clipped_to_300_characters(ui, page):

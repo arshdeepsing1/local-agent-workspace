@@ -301,7 +301,7 @@ def test_cards_fit_a_phone_without_horizontal_scroll(ui, page, card):
 LONG_PLAN = "# Exporter plan\\n\\n## Steps\\n\\n" + "\\n".join(
     f"{n}. Step {n}: change the exporter so that it writes one more section of the report, keep the existing sections "
     "in the same order, add a fixture with a long table and a short one, and check both with a test that compares "
-    "the rendered output line by line." for n in range(1, 13))
+    "the rendered output line by line." for n in range(1, 13)) + "\\n\\n### Checks\\n\\nRun the tests.\\n\\n#### Fixtures\\n\\nTwo tables."
 
 
 def plan_app(ui, page, width, height, setup=""):
@@ -337,6 +337,10 @@ def test_a_long_plan_reads_in_the_transcript_with_its_actions_in_reach(ui, page)
     title, h1, h2, item = (font_size(card, selector) for selector in ("h3", ".plan-body h1", ".plan-body h2", ".plan-body li"))
     assert (title, h1, h2, item) == (16, 15, 14, 14)
     assert h1 < title and h2 <= h1 and item < title
+    # h3 and h4 sit under h2 (13/600). Mutation: drop the .plan-body :is(h3,h4) rule.
+    for selector in (".plan-body h3", ".plan-body h4"):
+        assert font_size(card, selector) == 13
+        assert card.locator(selector).evaluate("e => getComputedStyle(e).fontWeight") == "600"
     body = card.locator(".plan-body")
     assert body.evaluate("e => e.scrollHeight <= e.clientHeight + 1")
     assert card.bounding_box()["height"] > ui.js("document.querySelector('.transcript').clientHeight")
@@ -363,3 +367,36 @@ def test_plan_actions_stay_at_the_end_of_the_card_in_a_narrow_column(ui, page, w
     assert page.locator(".main-area").evaluate("e => e.getBoundingClientRect().width") <= 434
     assert page.locator(".plan-actions").evaluate("e => getComputedStyle(e).position") == "static"
     assert ui.js("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
+
+
+LINKED_PLAN = "# Exporter plan\\n\\n## Steps\\n\\n" + "\\n".join(
+    f"{n}. Step {n}: change [the exporter](https://example.com/{n}) so that it writes one more section of the report, keep "
+    "the existing sections in the same order, and check it with a test." for n in range(1, 25))
+
+
+def test_sticky_plan_actions_dock_at_the_edge_and_never_hide_the_focused_link(ui, page):
+    # The bar sits on the transcript's visible bottom edge (no strip of plan under it), and tabbing through the plan's
+    # links never leaves the focused one behind the bar (WCAG 2.4.11). Mutations: bottom:0 on the sticky actions, or
+    # drop the transcript's scroll-padding while a plan waits.
+    page.set_viewport_size({"width": 1440, "height": 900})
+    events = [{"id": "u", "type": "user", "text": "Plan the exporter"}]
+    ui.app(session="a", scenario="workspace",
+           setup=f"fake.sessions.set('a', {{ ...makeSession('a', 'Planning'), status: 'awaiting_approval', "
+                 f"events: [...{json.dumps(events)}, {plan_event(plan=LINKED_PLAN)}] }})")
+    ui.show_session("a")
+    expect(page.locator(".plan-card")).to_be_visible()
+    scroll_card_to_top(ui)
+    edges = ui.js("(() => { const bar = document.querySelector('.plan-actions').getBoundingClientRect();"
+                  " const list = document.querySelector('.transcript').getBoundingClientRect();"
+                  " return [bar.bottom, list.bottom] })()")
+    assert abs(edges[0] - edges[1]) <= 1, edges
+    links = page.locator(".plan-body a")
+    assert links.count() == 24
+    links.first.focus()
+    for _ in range(links.count() - 1):
+        page.keyboard.press("Tab")
+        # The transcript scrolls smoothly: wait for the focused link to settle above the bar.
+        ui.wait("""(() => { const active = document.activeElement;
+          if (active.tagName !== 'A') return true
+          return active.getBoundingClientRect().bottom <= document.querySelector('.plan-actions').getBoundingClientRect().top + 0.5
+        })()""")

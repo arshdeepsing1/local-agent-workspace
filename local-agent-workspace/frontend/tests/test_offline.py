@@ -1,5 +1,6 @@
 """Offline and connection messages: one reconnect banner, the sidebar status, the Databricks banner and API errors."""
 import json
+import re
 
 import pytest
 from playwright.sync_api import expect
@@ -150,6 +151,13 @@ def test_an_unreadable_credential_file_is_a_connection_problem(ui, page):
     ({"connected": False, "models": [], "error": None}, "Could not check the Databricks connection.", True),
     ({"connected": False, "models": [], "error": "Databricks returned HTTP 401. Check your credentials and access.",
       "error_kind": "http", "http_status": 401}, "Databricks returned HTTP 401. Check your credentials and access.", False),
+    # A server problem, a rate limit or an unreadable answer may pass: Check again is offered.
+    ({"connected": False, "models": [], "error": "Databricks had a server problem (HTTP 503). Try again in a moment.",
+      "error_kind": "http", "http_status": 503}, "Databricks had a server problem (HTTP 503). Try again in a moment.", True),
+    ({"connected": False, "models": [], "error": "Databricks rate limited the check (HTTP 429). Try again in a moment.",
+      "error_kind": "http", "http_status": 429}, "Databricks rate limited the check (HTTP 429). Try again in a moment.", True),
+    ({"connected": False, "models": [], "error": "Databricks returned a response the app could not read.",
+      "error_kind": "invalid_response"}, "Databricks returned a response the app could not read.", True),
 ])
 def test_other_connection_problems_show_their_text(ui, page, answer, text, recheck):
     ui.app(scenario="workspace", setup=CONNECTION_QUEUE + f"fake.connectionAnswers.push(() => fake.json({json.dumps(answer)}))")
@@ -210,3 +218,99 @@ def test_an_unexpected_test_request_is_not_mistaken_for_offline(ui, page):
     expect(page.get_by_text(OFFLINE)).to_have_count(0)
     expect(page.locator(".connection-banner")).to_have_count(0)
     expect(footer(page)).to_have_text("Databricks connected")
+
+
+HTTP_401 = {"connected": False, "models": [], "error": "Databricks returned HTTP 401. Check your credentials and access.",
+            "error_kind": "http", "http_status": 401}
+
+
+@pytest.mark.parametrize("second, message", [
+    (f"fake.json({json.dumps(HTTP_401)})", "Databricks returned HTTP 401. Check your credentials and access."),
+    ("fake.json({ detail: 'macOS denied access to the credential file.' }, 400)", "macOS denied access to the credential file."),
+])
+def test_check_again_keeps_focus_on_the_banner_when_the_problem_changes(ui, page, second, message):
+    # B-T23, network -> another kind: Check again goes away, focus moves to Open settings instead of <body>.
+    # Mutation: move focus only when the result is connected.
+    ui.app(scenario="workspace", setup=CONNECTION_QUEUE + f"""
+      fake.connectionAnswers.push(() => fake.json({json.dumps(NETWORK)}), () => {second})""")
+    banner = page.locator(".connection-banner")
+    expect(banner).to_contain_text("Can't reach Databricks")
+    check = page.get_by_role("button", name="Check again")
+    check.focus()
+    check.press("Enter")
+    expect(banner).to_contain_text(message)
+    expect(check).to_have_count(0)
+    expect(banner.get_by_role("button", name="Open settings")).to_be_focused()
+    assert ui.js("document.activeElement !== document.body")
+
+
+def test_check_again_shows_that_it_checks_and_what_it_found(ui, page):
+    # A sighted user sees the check and its outcome: "Checking…" and a dimmed button while it runs, then the time of
+    # a check that failed again. Mutations: drop the outcome text, or the [aria-busy=true] rule.
+    ui.app(scenario="workspace", setup=CONNECTION_QUEUE + f"""
+      fake.connectionAnswers.push(() => fake.json({json.dumps(NETWORK)}), () => fake.defer('second').promise)""")
+    banner = page.locator(".connection-banner")
+    outcome = banner.locator(".banner-checked")
+    expect(outcome).to_have_attribute("role", "status")
+    expect(outcome).to_have_text("")
+    check = page.get_by_role("button", name="Check again")
+    check.click()
+    expect(outcome).to_have_text("Checking…")
+    # Opacity has a transition: wait for its end value instead of reading it once.
+    expect(check).to_have_css("opacity", "0.6")
+    expect(check).to_have_css("cursor", "progress")
+    ui.run(f"fake.deferreds.second.resolve(fake.json({json.dumps(NETWORK)}))")
+    expect(outcome).to_have_text(re.compile(r"^Still not connected \(checked \d{1,2}:\d{2}:\d{2}( [AP]M)?\)\.$"))
+    expect(check).to_have_attribute("aria-busy", "false")
+    expect(check).to_have_css("opacity", "1")
+
+
+def test_the_banner_actions_stay_together_on_a_phone(ui, page):
+    # Check again and Open settings wrap as one group, right-aligned, instead of at opposite corners.
+    page.set_viewport_size({"width": 360, "height": 740})
+    ui.app(scenario="workspace", setup=CONNECTION_QUEUE + f"""
+      fake.settings = {{ ...fake.settings, host: 'https://adb-1234567890123456.7.azuredatabricks.net' }}
+      fake.connectionAnswers.push(() => fake.json({json.dumps(NETWORK)}))""")
+    banner = page.locator(".connection-banner")
+    check = banner.get_by_role("button", name="Check again").bounding_box()
+    settings = banner.get_by_role("button", name="Open settings").bounding_box()
+    assert abs(check["y"] - settings["y"]) < 2, (check, settings)
+    assert check["x"] < settings["x"]
+    outer = banner.bounding_box()
+    assert outer["x"] + outer["width"] - (settings["x"] + settings["width"]) < 30
+
+
+def test_an_http_error_after_being_offline_means_the_server_is_back(ui, page):
+    # The server answers again, but /api/sessions reports a problem: the reconnect banner goes and the problem shows.
+    # Mutation: set reachable only after a successful list (or keep swallowing errors in the unreachable poll).
+    ui.app(scenario="workspace", clock=True)
+    ui.run(GO_OFFLINE)
+    ui.tick(10_000)
+    expect(page.locator(".connection-banner")).to_have_text(RECONNECTING)
+    ui.run("fake.override = path => path.startsWith('/api/sessions') ? fake.json({ detail: 'macOS denied access to the state folder.' }, 400) : undefined")
+    ui.tick(2_000)
+    expect(page.locator(".connection-banner")).to_have_count(0)
+    expect(footer(page)).to_have_text("Databricks connected")
+    expect(page.locator(".app-error")).to_contain_text("macOS denied access to the state folder.")
+
+
+SERVER_503 = {"connected": False, "models": [], "error": "Databricks had a server problem (HTTP 503). Try again in a moment.",
+              "error_kind": "http", "http_status": 503}
+
+
+@pytest.mark.parametrize("first, checks", [(SERVER_503, 1), (CONNECTED, 0)])
+def test_a_turn_that_ends_while_the_check_failed_checks_again(ui, page, first, checks):
+    # Databricks had a passing outage and a reply then worked: the banner and footer follow at the end of the turn.
+    # A turn that ends while connected does not check. Mutation: drop the check on status 'idle'.
+    open_chat(ui, status="running", setup=CONNECTION_QUEUE + f"""
+      fake.connectionAnswers.push(() => fake.json({json.dumps(first)}), () => fake.json({json.dumps(CONNECTED)}))""")
+    expect(footer(page)).to_have_text("Connection needs attention" if checks else "Databricks connected")
+    before = len(ui.requests("/api/connection"))
+    ui.run("fake.socketFor('a').emit({ type: 'status', status: 'idle' })")
+    if checks:
+        ui.wait(f"fake.requests('/api/connection').length === {before + 1}")
+        expect(page.locator(".connection-banner")).to_have_count(0)
+        expect(footer(page)).to_have_text("Databricks connected")
+    else:
+        page.wait_for_timeout(300)
+        assert len(ui.requests("/api/connection")) == before

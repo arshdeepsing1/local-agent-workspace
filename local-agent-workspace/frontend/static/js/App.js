@@ -158,23 +158,36 @@ export default function App() {
   </div>`
 }
 
-// Why Databricks cannot be used, with Check again (keeps focus while it checks) and Open settings.
+// Why Databricks cannot be used, with Check again (keeps focus while it checks and says what it found) and Open settings.
 function ConnectionBanner({ app, onSettings, onError }) {
   const connection = app.connection
   const network = connection.error_kind === 'network'
-  const recheckable = network || (!connection.error && app.settings?.configured)
-  const recheck = async () => {
+  // A network failure, a Databricks server problem or rate limit, or an unreadable answer may pass: offer to check again.
+  const passing = connection.error_kind === 'invalid_response'
+    || (connection.error_kind === 'http' && (connection.http_status >= 500 || connection.http_status === 429))
+  const recheckable = network || passing || (!connection.error && app.settings?.configured)
+  // { connection, time } of the last Check again that did not connect; shown while that result is current.
+  const [checked, setChecked] = useState(null)
+  const recheck = async event => {
     if (app.connectionChecking) return
+    const banner = event.currentTarget.closest('.connection-banner')
     try {
       const result = await app.checkConnection({ keep: true })
-      // The banner (and the focused button) goes away: continue in the message box.
-      if (result.connected && document.activeElement === document.body) document.querySelector('.chat-composer textarea')?.focus()
+      if (!result.connected) setChecked({ connection: result, time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) })
     } catch (e) { onError(e) }
+    // Check again goes away with the banner (connected) or when the new problem cannot be checked again: keep
+    // keyboard focus on the banner's remaining button, or continue in the message box.
+    if (document.activeElement && document.activeElement !== document.body) return
+    const next = banner?.isConnected ? banner.querySelector('button') : null
+    ;(next || document.querySelector('.chat-composer textarea'))?.focus()
   }
   const text = network ? html`Can't reach Databricks${app.settings?.host ? ` at ${app.settings.host}` : ''}. Check your network or VPN connection.
       <details class="banner-details"><summary>Details</summary>${connection.error}</details>`
     : connection.error || (!app.settings?.configured ? 'Configure Databricks to start a conversation.' : 'Could not check the Databricks connection.')
-  return html`<div class="connection-banner"><span>${text}</span>
-    ${recheckable ? html`<button aria-busy=${app.connectionChecking ? 'true' : 'false'} aria-disabled=${app.connectionChecking ? 'true' : 'false'} onClick=${recheck}>Check again</button>` : null}
-    <button onClick=${onSettings}>Open settings</button></div>`
+  const outcome = app.connectionChecking ? 'Checking…'
+    : checked?.connection === connection ? `Still not connected (checked ${checked.time}).` : ''
+  return html`<div class="connection-banner"><span class="banner-text">${text}
+      ${recheckable ? html`<span class="banner-checked" role="status">${outcome}</span>` : null}</span>
+    <div class="banner-actions">${recheckable ? html`<button aria-busy=${app.connectionChecking ? 'true' : 'false'} aria-disabled=${app.connectionChecking ? 'true' : 'false'} onClick=${recheck}>Check again</button>` : null}
+      <button onClick=${onSettings}>Open settings</button></div></div>`
 }

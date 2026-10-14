@@ -43,13 +43,21 @@ def test_missing_credentials_are_a_credentials_problem(tmp_path, monkeypatch):
     assert requests == []
 
 
-def test_http_error_status_is_reported_with_its_status(tmp_path, monkeypatch):
+@pytest.mark.parametrize("status, error", [
+    (401, "Databricks returned HTTP 401. Check your credentials and access."),
+    (403, "Databricks returned HTTP 403. Check your credentials and access."),
+    (404, "Databricks returned HTTP 404. Check your credentials and access."),
+    (429, "Databricks rate limited the check (HTTP 429). Try again in a moment."),
+    (500, "Databricks had a server problem (HTTP 500). Try again in a moment."),
+    (503, "Databricks had a server problem (HTTP 503). Try again in a moment."),
+])
+def test_http_error_status_is_reported_with_its_status(tmp_path, monkeypatch, status, error):
+    # A server problem or a rate limit is not blamed on the credentials.
     async def gateway(request):
-        return httpx.Response(401, json={"message": "bad token"})
+        return httpx.Response(status, json={"message": "bad token"})
 
     result, _ = check(tmp_path, monkeypatch, gateway)
-    assert result == {"connected": False, "models": [], "error_kind": "http", "http_status": 401,
-                      "error": "Databricks returned HTTP 401. Check your credentials and access."}
+    assert result == {"connected": False, "models": [], "error_kind": "http", "http_status": status, "error": error}
 
 
 @pytest.mark.parametrize("error, text", [
@@ -85,3 +93,13 @@ def test_success_has_no_error_kind(tmp_path, monkeypatch):
     result, requests = check(tmp_path, monkeypatch, gateway)
     assert result == {"connected": True, "models": ["test-chat"], "error": None}
     assert requests == ["https://gateway.example/api/2.0/serving-endpoints"]
+
+
+def test_a_token_that_cannot_go_in_a_header_is_a_credentials_problem(tmp_path, monkeypatch):
+    # httpx raises UnicodeEncodeError (a ValueError) while it encodes the Authorization header; the answer keeps the
+    # Connection shape and does not quote the offending character.
+    result, requests = check(tmp_path, monkeypatch, unused, credentials=("https://gateway.example", "tokén"))
+    assert result == {"connected": False, "models": [], "error_kind": "credentials",
+                      "error": "The Databricks host or token in your credential file contains characters that cannot "
+                               "be sent in a request."}
+    assert requests == []

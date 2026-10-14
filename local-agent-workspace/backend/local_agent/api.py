@@ -294,9 +294,19 @@ def create_app(settings=None):
         except httpx.HTTPError as exc:
             return {"connected": False, "models": [], "error": settings.redact(str(exc) or type(exc).__name__),
                     "error_kind": "network"}
+        except ValueError as exc:
+            # The request could not be built from the credentials, for example a token with a non-ASCII character
+            # (not allowed in an HTTP header). A UnicodeError's message quotes that character, so it is not shown.
+            error = ("The Databricks host or token in your credential file contains characters that cannot be sent in a request."
+                     if isinstance(exc, UnicodeError) else settings.redact(str(exc)))
+            return {"connected": False, "models": [], "error": error, "error_kind": "credentials"}
         if response.status_code != 200:
-            return {"connected": False, "models": [], "error": f"Databricks returned HTTP {response.status_code}. Check your credentials and access.",
-                    "error_kind": "http", "http_status": response.status_code}
+            status = response.status_code
+            # A server problem or a rate limit usually passes; other statuses point at the credentials or access.
+            error = (f"Databricks had a server problem (HTTP {status}). Try again in a moment." if status >= 500
+                     else f"Databricks rate limited the check (HTTP {status}). Try again in a moment." if status == 429
+                     else f"Databricks returned HTTP {status}. Check your credentials and access.")
+            return {"connected": False, "models": [], "error": error, "error_kind": "http", "http_status": status}
         try:
             data = response.json()
         except ValueError:

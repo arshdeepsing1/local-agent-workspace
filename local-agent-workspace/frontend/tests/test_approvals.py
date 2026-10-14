@@ -398,7 +398,10 @@ def test_the_split_button_approves_for_the_chat_and_its_arrow_opens_the_scopes(u
     expect(toggle).to_have_attribute("aria-expanded", "true")
     form = card.get_by_role("group", name="Remember this approval")
     expect(form).to_be_visible()
-    expect(form.get_by_role("radio").first).to_be_focused()
+    # Focus enters the scope choices on the checked one (the default scope), not on the first radio.
+    checked = form.get_by_role("radio", checked=True).first
+    expect(checked).to_be_focused()
+    expect(checked).to_have_accessible_name("This project")
     toggle.click()
     expect(form).to_have_count(0)
     expect(toggle).to_be_focused()
@@ -413,6 +416,11 @@ def test_other_cards_keep_their_full_label_or_their_single_buttons(ui, page):
     allow = page.get_by_role("button", name="Allow edits in this chat", exact=True)
     expect(allow).to_be_visible()
     assert allow.evaluate("e => e.innerText.trim()") == "Allow edits in this chat"
+    page.get_by_role("button", name="Always allow…", exact=True).click()
+    focused = page.get_by_role("group", name="Remember this approval").get_by_role("radio", checked=True).first
+    expect(focused).to_be_focused()
+    expect(focused).to_have_accessible_name("This project")
+    expect(page.get_by_role("radio", name="This chat")).not_to_be_checked()
 
 
 def test_cards_without_saved_scopes_keep_the_single_buttons(ui, page):

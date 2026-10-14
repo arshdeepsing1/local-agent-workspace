@@ -169,8 +169,12 @@ The sidebar footer shows the connection: **Checking Databricks…**, **Databrick
 or **Connection needs attention** (hover it for the error). When the check fails, a banner
 above the chat says why: for a network failure **Can't reach Databricks at <host>. Check
 your network or VPN connection.** with the error under **Details**, for a credential or HTTP
-problem the error itself, and **Could not check the Databricks connection.** when no reason
-came back. **Check again** repeats the check and **Open settings** opens Settings.
+problem the error itself (a Databricks server problem or rate limit says **Try again in a
+moment.**), and **Could not check the Databricks connection.** when no reason came back.
+**Check again**, offered for a network failure, a server problem, a rate limit, an unreadable
+answer and the no-reason case, repeats the check (the banner says **Checking…**, then the time
+of a check that still failed); **Open settings** opens Settings. When a turn ends while the last
+check failed, the connection is checked again.
 
 The app runs with Python and its runtime dependencies only
 (`python -m pip install -c constraints.txt -e ./backend`).
@@ -268,8 +272,8 @@ when opening a conversation or performing restart recovery.
   Open tabs reconnect after a server restart without discarding the current draft.
   While the local server cannot be reached, the banner **Reconnecting to your local
   server…** shows on every screen and the sidebar shows **Local server offline**; both clear
-  when it answers again, and the Databricks connection is checked again. A request that
-  cannot reach the server reports **Cannot reach the local server. Check that it is still
+  when it answers again (an error it answers with is shown), and the Databricks connection is
+  checked again. A request that cannot reach the server reports **Cannot reach the local server. Check that it is still
   running.**; a response the app cannot read reports **The local server sent an unexpected
   response (HTTP N).**
   A tab that does not accept an update within 5 seconds is disconnected, so it cannot
@@ -618,8 +622,10 @@ when opening a conversation or performing restart recovery.
   removed at any time, also while the chat is busy, and inherited by subagents. Forks and imports
   start without rules. Rules for one project or for all projects, and deny and ask rules, are
   described in **Permission rules** below.
-  The button is joined to the **Always allow…** arrow, which offers the project and
-  all-project scopes; on a narrow command card it reads **Always allow this command**.
+  The button is joined to the **Always allow…** arrow when the action allows more: the project
+  and all-project scopes, or a rule that matches the command or a folder; on a narrow command
+  card it reads **Always allow this command**. A command that can only be allowed as this exact
+  text in this chat (shell syntax) offers the button alone.
 - **Decline with a note**: **Tell the agent why (optional)** on a card adds up to 2,000 characters
   to a Decline. The agent receives "User declined this action. Their note: … Do not retry it
   without a new instruction." (similar wording for MCP calls, hooks and folder access), and the
@@ -629,14 +635,18 @@ when opening a conversation or performing restart recovery.
   action does not mean the task itself is finished. Expand command cards to see the
   full command (including inline Python), options, and output separately. A long file
   is read in pages, so a read card names the lines it covered (`lines 109–243`).
-  A command that exits non-zero, times out or is interrupted shows a warning icon and its
-  exit code (`exit 1`), and its last output line under the collapsed card (`Exit 1 · …`); a
-  failed tool shows its error category, and its expanded card shows **Error category** and
-  the **Hint given to the agent**. Expanded command and job cards show the output as text,
-  then a **State** line (state, exit code, size, and which part the result holds: the first
-  part, the start and end, the latest output from a character, or a character range; the
-  agent reads the rest with `get_job_output`), and **Raw result** with the full result the
-  agent received. On `wait_job`, `get_job_output` and `stop_job` cards a green tick means
+  A command that exits non-zero, times out or is interrupted shows a warning icon, a label
+  (`exit 1`, `signal 9` for a process ended by a signal, `timed out` or `interrupted`) and its
+  last output line under the collapsed card (`Exit 1 · …`; when output past `max_output_bytes`
+  was not kept, it says so instead). A command started with `background` is labelled
+  `started in background`. A failed tool shows its error category, and its expanded card shows
+  **Error category** and the **Hint given to the agent**. Expanded command and job cards show the
+  output as text, then a **State** line (state, exit code, size, and which part the result
+  holds: the first part, the start and end, the latest output from a character, or a character
+  range, counted from 1; the agent reads the rest with `get_job_output`), and **Raw result**
+  with the full result (with the edited-command note for a command you edited; when a result
+  was shortened for the agent or not sent to it, the card says so). On `wait_job`,
+  `get_job_output` and `stop_job` cards a green tick means
   the tool worked; a muted label such as `job exit 1` reports the job itself.
   **Read before overwriting:** the conversation remembers the size and modification time
   of each file the agent read (`read_file` any page, or `notebook_read`) or wrote, up to 500 files.
@@ -717,7 +727,8 @@ when opening a conversation or performing restart recovery.
   **Continue** button is offered for it.
   An error notice in the transcript shows a short reason (for Databricks HTTP and network
   errors a plain sentence such as "Databricks rejected the request (HTTP 400)." followed by
-  the provider's message); **Details** shows the full error text.
+  the provider's message, and for a final rate-limit error its advice on the context budget);
+  **Details** shows the full error text.
 - **Other folders**: ask, for example, `Are there any CSV files in
   ~/Downloads?`. The agent can list, read and search absolute or `~/`
   paths. The first file-tool request outside the project opens a folder-access card.
