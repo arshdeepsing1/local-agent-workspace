@@ -319,13 +319,16 @@ when opening a conversation or performing restart recovery.
     **Archive**, **Edit tags…** and **Delete…**. Tags are comma-separated, 1 to 32 characters
     each, at most 10; tags that differ only in case count as one. Pinned chats are listed under **Pinned** above the projects.
     Archived chats are hidden, also when pinned; **Archived (N)** at the end of the list
-    shows them, and **Unarchive** brings one back. Click a tag on a row to show only chats
-    with that tag; **Clear tag filter** shows all again. Pinning, archiving and tagging do not
+    shows them, and **Unarchive** brings one back. **Tags** (next to **Running**, when any chat
+    has tags) lists every tag with its number of chats; check tags to list only chats with any
+    of them. Clicking a tag on a row adds it to that filter; **Clear tag filter** shows all
+    again. Pinning, archiving and tagging do not
     change a chat's place in the newest-first order or mark it unread, and work while it is
     replying. A pinned subagent chat is listed under **Pinned**, not under its parent. Tags are
     exported with a chat and kept by forks and imports; pin and archive are not.
   - **Search**: **Search conversations** shows only chats whose titles contain every word you
-    type. From 3 characters, after a short pause, the messages of all chats are searched too
+    type; a `#word` filters by tag instead (chats with a tag starting with word) and is not
+    searched in messages. From 3 characters, after a short pause, the messages of all chats are searched too
     (your messages and the agent's replies, not tool output) and listed under **Found in
     messages** with a short excerpt (chats that match only by title are not listed again
     there); click one to open its chat. Excerpts have the configured
@@ -444,7 +447,13 @@ when opening a conversation or performing restart recovery.
   "Please read the file: <absolute path>" for a folder outside the project). On windows narrower
   than 1,024 px the Workspace panel opens over the chat (from 601 px it stops at the sidebar, which stays usable with the keyboard and the mouse and is not dimmed): focus moves into it, and
   **Close workspace**, Escape (in the panel or the sidebar) or a click on the dimmed chat closes it (that first
-  click only closes the panel). An error that comes up while it is open shows at the bottom of the panel. When the
+  click only closes the panel). An error that comes up while it is open shows at the bottom of the panel.
+  From 601 px wide, drag the panel's left edge to make it wider or narrower, or focus that edge
+  and use the arrow keys (Shift for bigger steps, Home and End for the narrowest and widest);
+  the width is kept in this browser, and Enter or a double-click on the edge restores the
+  default. **Expand** in the panel header makes it as wide as the chat column allows (a docked
+  panel leaves the chat at least 420 px); **Restore workspace width** undoes it. In a worktree
+  chat the header names the project and the worktree's branch. When the
   conversation has granted folders (**Folder access**) or you added folders to Files, a row of
   folder buttons at the top switches between **Project**, each granted folder ("Allowed in this
   chat") and each added folder ("Added to Files"). Such a folder is shown by absolute paths and
@@ -478,7 +487,10 @@ when opening a conversation or performing restart recovery.
   line counts. **Keep** accepts the changes. **Undo** puts the file back as it was before
   the agent first changed it in this conversation; a file the agent created is removed.
   The **Keep** and **Undo** buttons on the bar act on every listed file; the check and
-  arrow buttons on a row act on that file only.
+  arrow buttons on a row act on that file only. A file you keep while the agent still works
+  is listed again when the agent changes it again; if it is open in the Workspace panel,
+  its review opens again, and an open file without unsaved edits follows the agent's later
+  edits.
   In **Workspace / Files**, a dot marks each changed file and each folder that contains
   one. Changes in a granted or added folder outside the project get their dots when you
   choose that folder with its button at the top of Files, which shows a dot too; changes
@@ -903,7 +915,14 @@ when opening a conversation or performing restart recovery.
   needs folder access in that conversation, and credential files and generated folders
   are refused with the reason. **Open in VS Code** in the editor toolbar opens the file at
   that line through a `vscode://file/<absolute path>:<line>` link; nothing happens when VS
-  Code is not installed.
+  Code is not installed. A path inside the project is opened by its project path; when a
+  reply names a file that does not exist as written, the editor opens the one project file
+  the name most likely means (a path starting with the project's own folder name, or the
+  folders above it from the repository root; in a worktree chat, the worktree's copy of a
+  file named by the source project's path, which is always preferred over the source
+  project's own file) and says which file it opened. Otherwise it reports that the file does
+  not exist in the project folder. A file with unkept agent changes that cannot be read
+  opens its review.
 - **Copy and export a conversation**: **Agent tools → Export → Export Markdown**
   downloads the conversation as a Markdown transcript (`<date>-<title>-<id>.md`; a secret
   in the title becomes `redacted` in the file name), and

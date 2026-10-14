@@ -51,6 +51,14 @@ def test_reasoning_fields_follow_the_documented_endpoint_rules(simulator):
     assert read("databricks-gpt-oss-120b", {"reasoning_effort": "max"}, "both") == ("high", True)
     with pytest.raises(simulator.Rejected, match="output_config"):
         read("databricks-gpt-oss-120b", {"output_config": {"effort": "low"}}, "both")
+    assert read("databricks-gpt-oss-20b", {"reasoning_effort": "low"}, "anthropic") == ("low", True)
+    # Other names follow the family the app's Automatic format guesses; plain models refuse the fields.
+    assert read("my-claude-endpoint", {}, "both") == (None, False)
+    assert read("my-claude-endpoint", {"thinking": {"type": "adaptive"}, "output_config": {"effort": "low"}}, "both") == ("low", False)
+    assert read("team-gpt-5-mini", {"reasoning_effort": "high"}, "both") == ("high", True)
+    assert read("llama-endpoint", {}, "both") == (None, False)
+    with pytest.raises(simulator.Rejected, match="reasoning_effort"):
+        read("llama-endpoint", {"reasoning_effort": "low"}, "both")
     # The route modes rehearse a chat-completions route that refuses one style of field.
     with pytest.raises(simulator.Rejected, match="reasoning_effort"):
         read(opus, {"reasoning_effort": "low"}, "anthropic")

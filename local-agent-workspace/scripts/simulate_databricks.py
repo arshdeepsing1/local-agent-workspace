@@ -15,7 +15,10 @@ can be rehearsed before using a paid workspace:
   summary, anything else returns empty reasoning text. budget_tokens or a disabled
   thinking type is refused with HTTP 400.
 - databricks-claude-opus-4-8: no thinking unless thinking.type is "adaptive"; same levels.
-- databricks-gpt-oss-120b: reasoning_effort low|medium|high (xhigh and max count as high).
+- databricks-gpt-oss-120b and -20b: reasoning_effort low|medium|high (xhigh and max count as high).
+- Any other endpoint name (Settings → Other endpoint…) follows the family the app guesses from
+  the name (claude: thinking only when adaptive; gpt-oss, gpt-5, o1/o3/o4: reasoning_effort);
+  other names are plain models that refuse reasoning fields.
 
 --claude-fields chooses which reasoning fields the simulated chat-completions route accepts
 for Claude endpoints (the real route is not verified yet): both (default), anthropic
@@ -55,7 +58,21 @@ ENDPOINTS = {
     "databricks-claude-opus-5-5": {"family": "claude", "always_thinks": True, "default": "medium"},
     "databricks-claude-opus-4-8": {"family": "claude", "always_thinks": False, "default": "high"},
     "databricks-gpt-oss-120b": {"family": "openai", "always_thinks": True, "default": "medium"},
+    "databricks-gpt-oss-20b": {"family": "openai", "always_thinks": True, "default": "medium"},
 }
+
+
+def endpoint_profile(endpoint):
+    """A listed endpoint's rules; for another name (Settings → Other endpoint…) the family the app's
+    Automatic format guesses from the name, and a plain model for anything else."""
+    if endpoint in ENDPOINTS:
+        return ENDPOINTS[endpoint]
+    name = endpoint.lower()
+    if "claude" in name:
+        return {"family": "claude", "always_thinks": False, "default": "high"}
+    if "gpt-oss" in name or re.search(r"(?:^|[-_.])(?:gpt-5|o[134])(?:[-_.]|$)", name):
+        return {"family": "openai", "always_thinks": True, "default": "medium"}
+    return {"family": "plain", "always_thinks": False, "default": None}
 SCENARIO_HINT = ("Try a message with one of these words: edit, job, delegate, parallel, ask, task, read, "
                  "rate limit, long.")
 
@@ -72,8 +89,13 @@ def log(text):
 
 def reasoning_request(endpoint, body, claude_fields):
     """(effort or None, summarized) as the simulated endpoint reads the request; Rejected for invalid fields."""
-    profile = ENDPOINTS.get(endpoint, {"family": "claude", "always_thinks": True, "default": "medium"})
+    profile = endpoint_profile(endpoint)
     thinking, output_config, effort = body.get("thinking"), body.get("output_config"), body.get("reasoning_effort")
+    if profile["family"] == "plain":
+        present = [key for key in ("thinking", "output_config", "reasoning_effort") if key in body]
+        if present:
+            raise Rejected(400, f"Unrecognized request argument supplied: {present[0]}")
+        return None, False
     if profile["family"] == "openai":
         if thinking is not None or output_config is not None:
             field = "thinking" if thinking is not None else "output_config"
