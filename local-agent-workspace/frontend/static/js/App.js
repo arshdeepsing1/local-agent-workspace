@@ -65,24 +65,36 @@ export default function App() {
     return () => query.removeEventListener('change', update)
   }, [])
   const drawerOpen = drawerTier && workspaceOpen && !!app.settings && (!app.activeId || !!active)
+  // Focus moves in when the drawer is asked for (opened, or the window narrowed with it open), not when it only
+  // comes back after a chat chosen in the sidebar has loaded.
+  const drawerWanted = drawerTier && workspaceOpen
   const workspaceToggle = useRef(null)
   const drawerWasOpen = useRef(false)
+  const drawerWasWanted = useRef(false)
+  const drawerFocusPending = useRef(false)
   useEffect(() => {
     const was = drawerWasOpen.current
     drawerWasOpen.current = drawerOpen
-    if (drawerOpen && !was) {
+    if (drawerWanted !== drawerWasWanted.current) drawerFocusPending.current = drawerWanted
+    drawerWasWanted.current = drawerWanted
+    if (drawerOpen && drawerFocusPending.current) {
+      drawerFocusPending.current = false
       const panel = document.querySelector('.workspace-panel')
       if (panel && !panel.contains(document.activeElement)) panel.querySelector('[aria-label="Close workspace"]')?.focus()
+    } else if (drawerOpen && !was) {
+      // Back after that chat loaded: its message box took focus and is inert now, so focus returns to its row.
+      const focused = document.activeElement
+      if (!focused || focused === document.body || document.querySelector('.main-area')?.contains(focused)) document.querySelector('.sidebar [aria-current="page"]')?.focus()
     } else if (was && !workspaceOpen && (!document.activeElement || document.activeElement === document.body)) {
       workspaceToggle.current?.focus()
     }
-  }, [drawerOpen, workspaceOpen])
+  }, [drawerOpen, drawerWanted, workspaceOpen])
   useEffect(() => {
     if (!drawerOpen) return
     const onKeyDown = event => {
       if (event.key !== 'Escape' || event.defaultPrevented || event.isComposing || document.querySelector('dialog[open]')) return
-      const panel = document.querySelector('.workspace-panel')
-      if (event.target !== document.body && !panel?.contains(event.target)) return
+      // From the drawer, the sidebar beside it or its error; the chat column is inert.
+      if (event.target !== document.body && !event.target.closest?.('.workspace-panel, .sidebar, .drawer-alert')) return
       event.preventDefault()
       setWorkspaceOpen(false)
     }
@@ -176,6 +188,8 @@ export default function App() {
           } : undefined} />
       </div>
     </main>
+    ${drawerOpen && app.error ? html`<div class="drawer-alert" role="alert"><span>${app.error}</span>
+      <${OpenBlockingChat} blocker=${blocker?.message === app.error ? blocker : null} currentId=${app.activeId} onSelect=${app.setActiveId} /><button class="icon-button" aria-label="Dismiss error" onClick=${() => { app.setError(''); document.querySelector('.workspace-panel [aria-label="Close workspace"]')?.focus() }}><${X} size=${16} /></button></div>` : null}
     ${workspaceOpen && app.settings && (!app.activeId || active) ? html`<div class="workspace-scrim" aria-hidden="true" onClick=${() => setWorkspaceOpen(false)} />` : null}
     ${workspaceOpen && app.settings && (!app.activeId || active) ? html`<${WorkspacePanel} key=${editorKey} sessionId=${app.activeId}
       allowedDirectories=${active?.allowed_directories || []} codingDir=${app.settings.coding_dir_status} pythonVenv=${app.settings.python_venv_status}

@@ -415,8 +415,9 @@ when opening a conversation or performing restart recovery.
 - **Workspace / Files**: browse a folder, edit UTF-8 text files up to the file write limit
   (Settings, 80 KB by default), or use the plus button to reference the file in chat ("Please read the project file: <path>", or
   "Please read the file: <absolute path>" for a folder outside the project). On windows narrower
-  than 1,024 px the Workspace panel opens over the chat: focus moves into it, and **Close
-  workspace**, Escape or a click outside it closes it (that first click only closes the panel). When the
+  than 1,024 px the Workspace panel opens over the chat (from 601 px it stops at the sidebar, which stays reachable from the keyboard): focus moves into it, and
+  **Close workspace**, Escape (in the panel or the sidebar) or a click outside it closes it (that first
+  click only closes the panel). An error that comes up while it is open shows at the bottom of the panel. When the
   conversation has granted folders (**Folder access**) or you added folders to Files, a row of
   folder buttons at the top switches between **Project**, each granted folder ("Allowed in this
   chat") and each added folder ("Added to Files"). Such a folder is shown by absolute paths and
@@ -1340,7 +1341,8 @@ older sessions without that snapshot); definitions may change on the next turn.
 The details open above the meter; Escape, a click elsewhere or moving focus away closes them.
 
 **Settings** groups its fields under Project, Model and context, Agent, Commands and files,
-Notifications and Credentials; **Save settings** stays at the bottom while you scroll.
+Notifications and Credentials; **Save settings** stays at the bottom while you scroll, and a
+failed save shows its reason just above it.
 
 **Settings → Custom instructions** (up to 8,000 characters) are your own instructions for
 every conversation in every project, subagents included. The system message places them

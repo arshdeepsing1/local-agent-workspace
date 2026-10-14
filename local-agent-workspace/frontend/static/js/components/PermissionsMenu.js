@@ -89,6 +89,12 @@ export default function PermissionsMenu({ mode, busy, locked, onChange, onError,
   })
   useEffect(() => {
     if (!open) return
+    // The menu opens upwards from the message box, which grows with the draft: its top stays below the top bar.
+    const topbar = document.querySelector('.topbar')
+    if (menu.current && topbar) {
+      const room = menu.current.getBoundingClientRect().bottom - topbar.getBoundingClientRect().bottom - 8
+      menu.current.style.maxHeight = `${Math.max(160, Math.min(560, Math.floor(room)))}px`
+    }
     menu.current?.querySelector('[aria-checked="true"]')?.focus()
     const outside = event => { if (!container.current?.contains(event.target)) setOpen(false) }
     document.addEventListener('pointerdown', outside)

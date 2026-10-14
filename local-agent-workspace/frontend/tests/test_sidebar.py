@@ -462,13 +462,15 @@ def start_touch(coarse_ui, coarse_page, setup=""):
     expect(row(page, LONG)).to_be_visible()
 
 
-def name_fills_the_row(page, title):
+def name_fills_the_row(page, title, slack):
     widths = row(page, title).evaluate("b => [b.querySelector('.conversation-name').getBoundingClientRect().width, b.parentElement.getBoundingClientRect().width]")
-    assert widths[0] >= widths[1] - 60, widths
+    assert widths[0] >= widths[1] - slack, widths
 
 
-def check_rows(page):
-    name_fills_the_row(page, LONG)
+def check_rows(page, slack):
+    # At rest only the row's padding is taken (20 px with a pointer; touch screens keep room for the always-visible
+    # More actions button): no other button takes layout width.
+    name_fills_the_row(page, LONG, slack)
     badge = row(page, "Waiting chat").locator(".row-badge")
     expect(badge).to_have_text("Needs approval")
     assert badge.evaluate("e => e.scrollWidth <= e.clientWidth")
@@ -480,19 +482,28 @@ ROWS = sessions(("l", LONG, {}), ("w", "Waiting chat", {"status": "awaiting_appr
 def test_titles_use_the_row(ui, page):
     start(ui, page, ROWS)
     page.mouse.move(900, 450)  # Not over a row.
-    check_rows(page)
+    check_rows(page, 24)
     # Hovered, the row makes room for its More actions button.
     row(page, LONG).hover()
     expect(page.get_by_role("button", name=f"More actions for {LONG}")).to_have_css("opacity", "1")
+    name_clear_of_more_actions(page, LONG)
+
+
+def name_clear_of_more_actions(page, title):
+    """The title's text ends before the More actions button starts."""
+    gap = row(page, title).evaluate("""b => b.parentElement.querySelector('.row-more').getBoundingClientRect().left
+      - b.querySelector('.conversation-name').getBoundingClientRect().right""")
+    assert gap >= -0.5, gap
 
 
 def test_titles_use_the_row_on_touch_screens(coarse_ui, coarse_page):
     page = coarse_page
     start_touch(coarse_ui, page, ROWS)
-    check_rows(page)
+    check_rows(page, 60)
     for title in (LONG, "Waiting chat", "Short"):
         visible = row(page, title).evaluate("b => [...b.parentElement.querySelectorAll('button')].filter(e => e.checkVisibility({ opacityProperty: true }) && e.getBoundingClientRect().width > 0).length")
         assert visible == 2, (title, visible)  # The row's own button and More actions.
+    name_clear_of_more_actions(page, LONG)
 
 
 def test_session_id_only_for_repeated_titles(ui, page):
@@ -551,10 +562,14 @@ def menu_inside_the_list(ui, page):
     })()""")
     button = page.get_by_role("button", name=f"More actions for {last}", exact=True)
     button.hover()
+    scrolled = ui.js("document.querySelector('.conversation-list').scrollTop")
     button.click()
     menu = page.get_by_role("menu", name=f"Actions for {last}", exact=True)
     expect(menu.get_by_role("menuitem")).to_have_count(5)
     expect(menu.get_by_role("menuitem").first).to_be_focused()
+    # It opens upwards, so the list does not scroll the chosen row away.
+    assert ui.js("document.querySelector('.conversation-list').scrollTop") == scrolled
+    assert menu.bounding_box()["y"] + menu.bounding_box()["height"] <= button.bounding_box()["y"] + 0.5
     outside = ui.js("""(() => {
       const list = document.querySelector('.conversation-list').getBoundingClientRect()
       return [...document.querySelectorAll('.row-menu [role=menuitem]')].map(item => item.getBoundingClientRect())

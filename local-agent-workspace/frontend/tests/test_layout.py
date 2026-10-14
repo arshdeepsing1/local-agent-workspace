@@ -117,6 +117,82 @@ def test_drawer_works_with_the_keyboard(ui, page, width, height):
         assert not ui.js("document.querySelector('.main-area').contains(document.activeElement)")
 
 
+@pytest.mark.parametrize("width", [640, 700, 760])
+def test_drawer_leaves_the_sidebar_uncovered(ui, page, width):
+    """The sidebar stays reachable from the keyboard beside the drawer, so the drawer must not cover it."""
+    start(ui, page, width, 900)
+    workspace_button(page).focus()
+    page.keyboard.press("Enter")
+    expect(page.get_by_role("button", name="Close workspace")).to_be_focused()
+    left = box(ui, ".workspace-panel")["left"]
+    assert left >= box(ui, ".sidebar")["right"] and box(ui, ".workspace-panel")["width"] >= 360
+    seen, covered = set(), []
+    for _ in range(80):
+        page.keyboard.press("Tab")
+        state = ui.js("""(a => ({ inSidebar: !!a.closest('.sidebar'), name: a.getAttribute('aria-label') || a.textContent.trim().slice(0, 40),
+          right: a.getBoundingClientRect().right }))(document.activeElement)""")
+        if not state["inSidebar"]:
+            continue
+        seen.add(state["name"])
+        if state["right"] > left + 0.5:
+            covered.append(state)
+    assert {"New conversation", "More actions for Fix the login redirect after a password reset"} <= seen, seen
+    assert covered == []
+
+
+def test_choosing_a_chat_in_the_sidebar_keeps_focus_on_it(ui, page):
+    page.set_viewport_size({"width": 820, "height": 1180})
+    ui.app(session="a", scenario="workspace", setup=CHAT % "" + "; fake.sessions.set('b', makeSession('b', 'Second chat'))")
+    ui.show_session("a")
+    workspace_button(page).focus()
+    page.keyboard.press("Enter")
+    expect(page.get_by_role("button", name="Close workspace")).to_be_focused()
+    second = page.locator(".conversation-row > button:first-child", has_text="Second chat")
+    second.focus()
+    page.keyboard.press("Enter")
+    ui.show_session("b")
+    expect(page.locator(".conversation-title")).to_contain_text("Second chat")
+    expect(panel(page)).to_be_visible()
+    ui.wait("document.querySelector('.main-area').inert")  # The drawer is back once the chat has loaded.
+    expect(second).to_be_focused()
+    # Escape there still closes the drawer, as from the panel.
+    page.keyboard.press("Escape")
+    expect(panel(page)).to_have_count(0)
+    expect(second).to_be_focused()
+
+
+@pytest.mark.parametrize("width,height", [(820, 1180), (390, 844)])
+def test_an_error_while_the_drawer_is_open_is_announced_and_visible(ui, page, width, height):
+    start(ui, page, width, height)
+    if width <= 600:
+        workspace_button(page).click()
+    else:
+        open_panel(page)
+    expect(page.get_by_role("button", name="Close workspace")).to_be_focused()
+    ui.run("fake.override = (path, options) => path === '/api/sessions' && (options.method || 'GET') === 'GET' "
+           "? fake.json({ detail: 'Could not list conversations.' }, 500) : undefined")
+    ui.emit("a", {"type": "status", "status": "idle"})
+    alert = page.locator(".drawer-alert")
+    expect(alert).to_have_text(re.compile("Could not list conversations."))
+    expect(alert).to_have_attribute("role", "alert")
+    # It is outside the inert chat column, so it is in the accessibility tree (the column's own banner is not).
+    assert ui.js("document.querySelector('.main-area').inert") is True
+    assert alert.evaluate("e => !e.closest('[inert]')")
+    cdp = page.context.new_cdp_session(page)
+    nodes = cdp.send("Accessibility.getFullAXTree")["nodes"]
+    alerts = [n for n in nodes if not n.get("ignored") and n.get("role", {}).get("value") == "alert"]
+    assert len(alerts) == 1, alerts
+    expect(alert).to_be_in_viewport(ratio=1)
+    assert alert.evaluate("e => { const r = e.getBoundingClientRect(); return e.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2)) }")
+    aside = box(ui, ".workspace-panel")
+    inside = alert.bounding_box()
+    assert inside["x"] >= aside["left"] and inside["x"] + inside["width"] <= aside["right"], (inside, aside)
+    alert.get_by_role("button", name="Dismiss error").click()
+    expect(page.locator(".drawer-alert")).to_have_count(0)
+    expect(page.locator(".app-error")).to_have_count(0)
+    expect(page.get_by_role("button", name="Close workspace")).to_be_focused()
+
+
 def test_wide_panel_keeps_focus_and_ignores_escape(ui, page):
     start(ui, page, 1280, 800)
     workspace_button(page).focus()
@@ -197,10 +273,13 @@ def test_welcome_sits_above_the_composer(ui, page, width, height):
     assert 0 <= gap <= 60, gap
 
 
-def test_short_welcome_scrolls_from_the_top(ui, page):
-    page.set_viewport_size({"width": 844, "height": 390})
+@pytest.mark.parametrize("height", [390, 300])
+def test_short_welcome_scrolls_from_the_top(ui, page, height):
+    page.set_viewport_size({"width": 844, "height": height})
     ui.app(scenario="workspace")
-    expect(page.get_by_role("heading", name="What’s up next?")).to_be_visible()
+    expect(page.get_by_role("heading", name="What’s up next?")).to_be_attached()
+    if height == 300:  # Clearly taller than its box, so content pushed to the end (align-items:flex-end) would be cut off.
+        assert ui.js("(e => e.scrollHeight - e.clientHeight)(document.querySelector('.welcome'))") >= 40
     assert ui.js("document.querySelector('.welcome').scrollTop") == 0
     assert box(ui, ".welcome-heading")["top"] >= box(ui, ".welcome")["top"]
     explore = page.get_by_role("button", name="Explore this project")
@@ -249,3 +328,17 @@ def test_context_details_popover(ui, page, width, height):
     page.keyboard.press("Shift+Tab")
     ui.wait("!document.querySelector('.context-meter').open")
     assert ui.js("(a => a !== document.body && !document.querySelector('.context-meter').contains(a) && document.querySelector('.chat-composer').contains(a))(document.activeElement)")
+
+
+@pytest.mark.parametrize("width,height,transcript", [(360, 740, 200), (1024, 768, 200), (390, 664, 160)])
+def test_composer_bars_are_capped(ui, page, width, height, transcript):
+    """A long changes list and the task list scroll inside the bars, which take at most 40% of the window."""
+    start(ui, page, width, height, meter=True, files=12)
+    page.get_by_role("button", name=re.compile("files changed")).click()
+    page.get_by_role("button", name=re.compile(r"^Tasks 0\/3 done")).click()
+    page.locator(".context-meter > summary").click()
+    expect(page.get_by_role("button", name="Compact now")).to_be_attached()
+    bars = ui.js("(e => ({ height: e.getBoundingClientRect().height, scrolls: e.scrollHeight > e.clientHeight }))(document.querySelector('.composer-bars'))")
+    assert bars["height"] <= 0.4 * height + 1 and bars["scrolls"], bars
+    assert box(ui, ".transcript")["height"] >= transcript
+
