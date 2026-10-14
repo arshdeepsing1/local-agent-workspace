@@ -1,8 +1,9 @@
 """Per-endpoint facts and default limits for Databricks model serving endpoints.
 
 The one table of model facts: default budgets for a new install or a model change,
-the endpoint maxima requests are capped at, the Settings warnings, and the thinking
-allowance of small auxiliary requests (titles and /btw side questions). Pure: no I/O.
+the endpoint maxima requests are capped at, the Settings warnings, the thinking
+allowance of small auxiliary requests (titles and /btw side questions), and how each
+endpoint takes a reasoning effort (reasoning.py builds the request fields). Pure: no I/O.
 """
 from .context import DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT_TOKENS, SAFETY_MARGIN
 
@@ -34,23 +35,46 @@ LIMITS_CHECKED = "2026-10-13"
 #   all. A full step costs about 11.4 DBU at 57.143 DBU per million input tokens, against about
 #   57 at 1,000,000. Users may raise it to 1,000,000 (a note-level warning).
 # GPT OSS 120B keeps 131,072 and 8,192.
+#
+# Reasoning (checked 2026-10-14: the Databricks "Query reasoning models" page and the Anthropic API
+# reference). reasoning_format is how the endpoint takes an effort: "anthropic" (top-level
+# thinking: {"type": "adaptive"} and output_config: {"effort": level}) or "openai" (top-level
+# reasoning_effort). effort_levels are the levels it accepts; effort_map sends the others as one it
+# accepts; default_effort is what it uses when the request names none (None: no thinking at all).
+# thinking: "always" (adaptive thinking runs on every request; "disabled" and budget_tokens are
+# rejected with HTTP 400) or "adaptive" (thinks only when the request sends thinking: adaptive).
+# Claude Opus 5.5 omits its thinking text unless thinking.display is "summarized" (visibility only,
+# not billing). Databricks documents the Anthropic fields on its Anthropic Messages route; that its
+# chat-completions route (the one this app uses) passes them on is unverified, so a 400 naming one
+# of them makes the app resend without them (AgentManager.model_response, reasoning.rejected_field).
+CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 MODEL_PROFILES = {
     "databricks-claude-opus-5-5": {
         "label": "Claude Opus 5.5", "context_max": 1_000_000, "output_max": 128_000,
         "itpm": 1_000_000, "otpm": 100_000,
         "recommended_context_window": 200_000, "recommended_max_output_tokens": 16_384,
-        "thinking_reserve": 4_096},
+        "thinking_reserve": 4_096,
+        "reasoning_format": "anthropic", "effort_levels": CLAUDE_EFFORTS, "default_effort": "medium",
+        "thinking": "always", "effort_map": {}},
     "databricks-claude-opus-4-8": {
         "label": "Claude Opus 4.8", "context_max": None, "output_max": None,
         "itpm": 1_000_000, "otpm": 100_000,
         "recommended_context_window": None, "recommended_max_output_tokens": None,
-        "thinking_reserve": None},
+        "thinking_reserve": None,
+        "reasoning_format": "anthropic", "effort_levels": CLAUDE_EFFORTS, "default_effort": None,
+        "thinking": "adaptive", "effort_map": {}},
     "databricks-gpt-oss-120b": {
         "label": "GPT OSS 120B", "context_max": 131_072, "output_max": None,
         "itpm": 1_000_000, "otpm": 100_000,
         "recommended_context_window": 131_072, "recommended_max_output_tokens": 8_192,
-        "thinking_reserve": None},
+        "thinking_reserve": None,
+        # Databricks maps minimal to low and xhigh or max to high; the app sends high itself.
+        "reasoning_format": "openai", "effort_levels": ("low", "medium", "high"), "default_effort": "medium",
+        "thinking": None, "effort_map": {"xhigh": "high", "max": "high"}},
 }
+# Endpoints that take reasoning like a profiled one but whose limits are not in the table.
+REASONING_ALIASES = {"databricks-gpt-oss-20b": ("databricks-gpt-oss-120b", "GPT OSS 20B")}
+REASONING_KEYS = ("reasoning_format", "effort_levels", "default_effort", "thinking", "effort_map")
 
 
 def profile_for(model):
@@ -59,6 +83,17 @@ def profile_for(model):
         return None
     profile = MODEL_PROFILES.get(model.strip().lower())
     return dict(profile) if profile is not None else None
+
+
+def reasoning_profile(model):
+    """{label, reasoning_format, effort_levels, default_effort, thinking, effort_map} for an endpoint
+    whose reasoning is known, or None."""
+    name = model.strip().lower() if isinstance(model, str) else ""
+    source, label = REASONING_ALIASES.get(name, (name, None))
+    profile = MODEL_PROFILES.get(source)
+    if profile is None or not profile.get("reasoning_format"):
+        return None
+    return {"label": label or profile["label"], **{key: profile[key] for key in REASONING_KEYS}}
 
 
 def default_limits(model):

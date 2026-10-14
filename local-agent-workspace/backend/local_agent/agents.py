@@ -47,7 +47,8 @@ from .planning import TaskManager, DelegateManager
 from .interactions import InteractionManager
 from .feature_tools import FEATURE_TOOLS
 from .tool_profiles import tool_allowed, filter_tools
-from .reasoning import reasoning_summary
+from . import reasoning
+from .reasoning import reasoning_delta
 from .titles import fallback_title, generate_title, needs_title
 from .telemetry import (
     InferenceError, begin_inference_call, finish_inference_call, http_error_kind,
@@ -108,6 +109,7 @@ MAX_RATE_LIMIT_WAITS = 2  # Extra waits per turn after the retries, when Setting
 # A request still running near Databricks' execution limit gets one notice per turn.
 EXECUTION_NOTICE_MARGIN = 10
 request_clock = time.monotonic  # Request durations (tests replace it, never time.monotonic itself).
+thinking_clock = time.monotonic  # How long a reply thought (the Thinking block); tests replace it.
 MAX_REPAIR_RETRIES = 2
 # Failures answered with a hidden continuation, and its text.
 UNANSWERED_CONTINUATION = "[No reply: the request after this message failed or was stopped.]"
@@ -731,6 +733,9 @@ class AgentManager:
         self.extension_connections = {}
         self.notifier = SystemNotifier()
         self.closing = False
+        # In memory only: {(endpoint, request format): field} for reasoning fields Databricks rejected
+        # with HTTP 400. Requests to that endpoint go without them until a restart or a Settings save.
+        self.reasoning_rejections = {}
         # The lifespan writes the marker after every task and job stopped. It is removed before
         # anything else, so a crash during this run gives a full scan next time. Without it (a
         # crash, a failed shutdown, a fresh or older state folder) every conversation is loaded.
@@ -1779,6 +1784,32 @@ class AgentManager:
         child = self.active_child(session)
         if child is not None:
             await self.set_disabled_tools(child, names)
+
+    async def change_effort(self, session, effort):
+        """Set the chat's reasoning effort; its next model request (and a running subagent's) uses it."""
+        if session.get("reasoning_effort") == effort:
+            return
+        session["reasoning_effort"] = effort
+        self.store.save(session)
+        await self.broadcast(session["id"], {"type": "reasoning_effort", "reasoning_effort": effort})
+        if busy_status(self, session["id"]) != "idle" and not session.get("is_subagent"):
+            await self.event(session, "notice", text=f"Reasoning effort changed to {reasoning.EFFORT_LABELS[effort]}. "
+                             "It applies from the agent's next model request.")
+        child = self.active_child(session)
+        if child is not None:
+            await self.change_effort(child, effort)
+
+    def reasoning_request(self, session):
+        """The reasoning fields the chat's next agent request carries (reasoning.effort_request): the
+        chat's own effort, or the Settings default for a chat saved without one (subagents too)."""
+        values = self.settings.values
+        effort = reasoning.valid_effort(session.get("reasoning_effort")) or reasoning.valid_effort(
+            values.get("reasoning_effort")) or reasoning.DEFAULT_EFFORT
+        setting = values.get("reasoning_format")
+        setting = setting if setting in reasoning.REQUEST_FORMATS else reasoning.DEFAULT_FORMAT
+        model = session["model"]
+        rejected = self.reasoning_rejections.get((model, reasoning.request_format(model, setting)))
+        return reasoning.effort_request(model, effort, setting, values.get("thinking_summaries") is not False, rejected)
 
     async def rules_changed(self, scope, session=None):
         """Publish and re-check after a rule change: the chat, every live chat of the project, or every live chat."""
@@ -3485,12 +3516,18 @@ class AgentManager:
             self.store.forget_encodings(session["id"])
             await self.status(session, "idle")
 
-    async def model_response(self, session, event, client, url, headers, payload, retry_reason=None, body=None):
+    async def model_response(self, session, event, client, url, headers, payload, retry_reason=None, body=None,
+                             effort=None):
         """One streamed agent request. retry_reason (ledger only) names why the app sent it automatically.
-        body is payload already encoded (request_limits.encode_payload); those exact bytes are sent."""
+        body is payload already encoded (request_limits.encode_payload); those exact bytes are sent.
+        effort is the request's reasoning (AgentManager.reasoning_request), recorded in request_info and
+        the ledger; a 400 that names one of its fields marks the error with reasoning_rejected."""
         body = encode_payload(payload) if body is None else body
         started = request_clock()
         info = dict(event["request_info"])
+        # Recorded unless the request is the plain default (no effort chosen, nothing sent or skipped).
+        if effort is not None and not reasoning.plain_default(effort):
+            info["reasoning"] = reasoning.request_record(effort)
         event["request_info"] = info
         attempt = 1 + sum(
             isinstance(item, dict) and item.get("event_id") == event["id"]
@@ -3502,11 +3539,28 @@ class AgentManager:
             estimated_input_tokens=(estimate_tokens(messages, payload.get("tools", ()))
                                     if isinstance(messages, list) else None),
             retry_reason=retry_reason)
+        if effort is not None and not reasoning.plain_default(effort):
+            call["effort"] = effort["effort"]
+            for key, name in (("effort_field", "effort_field"), ("skipped", "reasoning_skipped")):
+                if effort.get(key):
+                    call[name] = effort[key]
         # Record the attempt durably before sending it to the provider. Later
         # stream checkpoints replace this running state with the final outcome.
         self.store.save(session)
         draft = StreamDraft(self.store, session)
         tool_buffer, finish, appended = ToolCallBuffer(), None, False
+        # thinking_clock() when the request was sent, when reasoning began and when the answer (text or a tool call) began.
+        thinking = {"sent": thinking_clock(), "since": None, "output": None}
+
+        async def answer_begins():
+            if thinking["output"] is not None:
+                return
+            thinking["output"] = thinking_clock()
+            if thinking["since"] is not None and "reasoning_seconds" not in event:
+                # The Thinking block collapses to "Thought for N s" when the answer starts.
+                event["reasoning_seconds"] = round(max(0.0, thinking["output"] - thinking["since"]), 1)
+                draft.changed()
+                await self.broadcast(session["id"], {"type": "event", "event": event})
         try:
             async with client.stream("POST", url, headers={**headers, **request_tag_headers(session, call),
                                                            "Content-Type": "application/json"},
@@ -3535,6 +3589,8 @@ class AgentManager:
                             info["rate_limit"] = request_info_fields(rate)
                     elif response.status_code in SERVER_RETRY_STATUSES:
                         mark_retryable(error, "server_error", response.headers, error_text)
+                    elif response.status_code == 400 and effort is not None:
+                        error.reasoning_rejected = reasoning.rejected_field(error_text, effort)
                     raise error
                 async for data in sse_data(response):
                     if data == "[DONE]":
@@ -3555,18 +3611,28 @@ class AgentManager:
                         raise InferenceError("The model returned invalid streaming choices.", "invalid_response")
                     for choice in choices:
                         delta = choice.get("delta", {})
-                        summary = reasoning_summary(delta.get("content"))
+                        summary, thought = reasoning_delta(delta)
+                        if thought and thinking["since"] is None:
+                            # Even an item with no text (thinking the endpoint does not show) starts the clock.
+                            thinking["since"] = thinking_clock()
+                            event["reasoning_started"] = time.time()
+                            draft.changed()
+                            if not summary:
+                                await self.broadcast(session["id"], {"type": "event", "event": event})
                         if summary:
                             previous = event.get("reasoning_summary", "")
                             combined = previous + summary
-                            event.update(reasoning_summary=self.settings.redact(combined)[:12000],
-                                         reasoning_truncated=len(combined) > 12000 or event.get("reasoning_truncated", False))
+                            limit = reasoning.SUMMARY_LIMIT
+                            event.update(reasoning_summary=self.settings.redact(combined)[:limit],
+                                         reasoning_truncated=len(combined) > limit or event.get("reasoning_truncated", False))
                             draft.changed(len(summary.encode("utf-8")))
                             await self.broadcast(session["id"], {"type": "event", "event": event})
                         text = visible_text(delta.get("content"))
                         if text:
+                            await answer_begins()
                             await self.delta(session, event, text, draft)
                         for part in delta.get("tool_calls", []):
+                            await answer_begins()
                             tool_buffer.add(part)
                         reason = choice.get("finish_reason")
                         if reason is not None:
@@ -3662,6 +3728,13 @@ class AgentManager:
                 session["wire"].append({"role": "assistant", "content": (event["text"] + "\n\n[" + str(exc) + "]").strip()})
             raise exc
         finally:
+            if "reasoning_seconds" not in event:
+                end = thinking["output"] if thinking["output"] is not None else thinking_clock()
+                if thinking["since"] is not None:
+                    event["reasoning_seconds"] = round(max(0.0, end - thinking["since"]), 1)
+                elif (info.get("usage") or {}).get("reasoning_tokens"):
+                    # Reasoning the endpoint counted but did not show: about the time before the answer began.
+                    event["reasoning_seconds"] = round(max(0.0, end - thinking["sent"]), 1)
             finish_inference_call(call, info)
             await draft.close()
             if call.get("purpose") == "agent":
@@ -3937,9 +4010,11 @@ class AgentManager:
                     session["file_views"] = views
                 context_state = session["context_state"] = {**next_context, "tool_definitions": definitions}
                 input_budget = info["input_budget"]
+                # Read at each step, so an effort chosen while the turn runs applies from this request.
+                effort = self.reasoning_request(session)
                 # The exact bytes sent: the meter shows the size of this request in the same update.
-                payload = {"messages": messages,
-                           "tools": definitions, "stream": True, "max_tokens": max_output_tokens}
+                payload = {"messages": messages, "tools": definitions, "stream": True,
+                           "max_tokens": max_output_tokens, **effort["fields"]}
                 body = encode_payload(payload)
                 session["context_info"] = {**info, "instruction_files": guidance["files"], "instruction_sources": guidance["sources"],
                                            "warnings": guidance["warnings"], **last_request(session),
@@ -3957,16 +4032,34 @@ class AgentManager:
                     # Requests that got no usable status (429, 502/503/504, a failed connection)
                     # are repeated unchanged, sharing one budget; then, for a rate limit only,
                     # up to MAX_RATE_LIMIT_WAITS longer waits per turn when Settings allows them.
-                    transient_attempt = 0
+                    transient_attempt, reasoning_resent = 0, False
                     while True:
                         try:
                             # Another chat's 429 on this endpoint: wait with it instead of adding to the overload.
                             await self.wait_for_rate_limit(session, "the model request", max_output_tokens)
                             await self.reply_after_notices(session, event)
                             ordered_calls, arguments = await self.model_response(
-                                session, event, client, url, headers, payload, retry_reason=retry_reason, body=body)
+                                session, event, client, url, headers, payload, retry_reason=retry_reason, body=body,
+                                effort=effort)
                             break
                         except InferenceError as exc:
+                            field = getattr(exc, "reasoning_rejected", None)
+                            if field and not reasoning_resent:
+                                # A 400 before any stream that names a reasoning field this request added: the
+                                # guess about the endpoint's fields was wrong. Send it once more without them, and
+                                # skip them for this endpoint and format until a restart or a Settings save.
+                                reasoning_resent = True
+                                self.reasoning_rejections[(session["model"], effort["format"])] = field
+                                payload = {key: value for key, value in payload.items() if key not in effort["fields"]}
+                                body = encode_payload(payload)
+                                effort = reasoning.without_fields(effort, field)
+                                retry_reason = "reasoning_rejected"
+                                await self.event(session, "notice", text=(
+                                    f"Databricks rejected the reasoning field {field} for {session['model']} (HTTP 400), "
+                                    "so the app sent the request again without reasoning fields. Requests to this "
+                                    "endpoint skip them until the app restarts or Settings are saved. To send them "
+                                    "another way, change Settings → Reasoning → Request format."))
+                                continue
                             if not getattr(exc, "retryable", False):
                                 raise
                             waited = None

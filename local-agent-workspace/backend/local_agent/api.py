@@ -24,6 +24,7 @@ from .context import (
 )
 from .context import MAX_AUTO_COMPACT_PERCENT, MIN_AUTO_COMPACT_PERCENT
 from .model_profiles import default_limits, effective_limits, limit_warnings, limits_note, public_profile
+from . import reasoning
 from .user_paths import standing_directories
 from .store import Store, UnreadableConversation
 from . import conversation_search
@@ -74,8 +75,27 @@ class Decision(BaseModel):
     rule: dict | None = None  # The rule to save (at most 8 KB of JSON); the card's default rule when absent.
 
 
+Effort = Literal["default", "low", "medium", "high", "xhigh", "max"]  # reasoning.EFFORT_LEVELS
+RequestFormat = Literal["auto", "anthropic", "openai", "none"]  # reasoning.REQUEST_FORMATS
+
+
 class SessionPermissions(BaseModel):
     permission_mode: PermissionMode = "manual"
+    reasoning_effort: Effort | None = None  # A new chat's effort; Settings' default when absent.
+
+
+class SessionEffort(BaseModel):
+    model_config = {"extra": "forbid"}
+    reasoning_effort: Effort
+
+
+class ReasoningQuery(BaseModel):
+    """What agent requests to an endpoint would carry (Settings → Reasoning and the effort picker)."""
+    model_config = {"extra": "forbid"}
+    model: str = Field(min_length=1, max_length=256, strict=True)
+    reasoning_effort: Effort = "default"
+    reasoning_format: RequestFormat = "auto"
+    thinking_summaries: bool = Field(default=True, strict=True)
 
 
 class PermissionChange(BaseModel):
@@ -141,6 +161,9 @@ class SettingsEdit(BaseModel):
     write_limit_kb: int | None = Field(default=None, ge=MIN_WRITE_LIMIT_KB, le=MAX_WRITE_LIMIT_KB, strict=True)
     command_env: list[str] | None = Field(default=None, max_length=MAX_COMMAND_ENV, strict=True)
     rate_limit_auto_continue: bool | None = Field(default=None, strict=True)
+    reasoning_effort: Effort | None = None
+    reasoning_format: RequestFormat | None = None
+    thinking_summaries: bool | None = Field(default=None, strict=True)
     coding_dir: str | None = Field(default=None, max_length=4096, strict=True)
     python_venv: str | None = Field(default=None, max_length=4096, strict=True)
 
@@ -323,6 +346,8 @@ def create_app(settings=None):
     async def update_settings(body: SettingsEdit):
         manager.workspace_available(body.workspace)
         result = settings.update(body.model_dump(exclude_none=True))
+        # A request format Databricks rejected is tried again after any Settings save.
+        manager.reasoning_rejections.clear()
         # Open chats' meters follow the new budgets and threshold; others follow when opened (stream).
         for session_id in [key for key, sockets in manager.listeners.items() if sockets]:
             try:
@@ -353,6 +378,17 @@ def create_app(settings=None):
                 "warnings": limit_warnings(model, body.context_window, body.max_output_tokens),
                 "note": limits_note(model)}
 
+    @app.post("/api/settings/reasoning")
+    async def reasoning_preview(body: ReasoningQuery):
+        """The reasoning fields agent requests to this endpoint carry for these choices, computed by the
+        code that builds the requests, and each level's label for the effort picker."""
+        model = body.model.strip()
+        if not model:
+            raise ValueError("Enter a model endpoint name.")
+        fmt = reasoning.request_format(model, body.reasoning_format)
+        return reasoning.preview(model, body.reasoning_effort, body.reasoning_format, body.thinking_summaries,
+                                 manager.reasoning_rejections.get((model, fmt)))
+
     @app.get("/api/sessions")
     async def list_sessions():
         counts = manager.changes.counts()
@@ -364,6 +400,8 @@ def create_app(settings=None):
         manager.workspace_available(settings.values["workspace"])
         session = store.create(settings.values)
         session["permission_mode"] = body.permission_mode if body else "manual"
+        if body and body.reasoning_effort:
+            session["reasoning_effort"] = body.reasoning_effort
         store.save(session)
         return public_session(session)
 
@@ -390,6 +428,14 @@ def create_app(settings=None):
         await manager.broadcast(session_id, {"type": "model", "model": model})
         await manager.refresh_meter_limits(session)  # The meter follows the new endpoint's budgets.
         return public_session(session)
+
+    @app.put("/api/sessions/{session_id}/reasoning-effort")
+    async def change_effort(session_id: str, body: SessionEffort):
+        # Allowed while a turn runs: the agent's next model request uses it (and a running subagent's).
+        from .approvals import busy_status
+        session = session_or_404(session_id)
+        await manager.change_effort(session, body.reasoning_effort)
+        return public_session(session, busy_status(manager, session_id))
 
     @app.put("/api/sessions/{session_id}/title")
     async def rename_session(session_id: str, body: SessionTitle):

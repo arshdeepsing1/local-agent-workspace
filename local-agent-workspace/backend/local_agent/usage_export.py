@@ -17,7 +17,7 @@ from .telemetry import session_metrics
 
 COLUMNS = (
     "n", "started_local", "started_utc", "finished_local", "seconds", "purpose", "model", "status",
-    "http_status", "finish_reason", "error_kind", "attempt", "retry_reason", "max_output_tokens",
+    "http_status", "finish_reason", "error_kind", "attempt", "retry_reason", "max_output_tokens", "effort",
     "estimated_input_tokens", "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens",
     "reasoning_tokens", "estimated_dbu", "call_id", "conversation_id", "event_id", "response_id",
     "tools_called", "reply_excerpt",
@@ -82,7 +82,7 @@ def usage_rows(session, redact=lambda text: text):
             "http_status": call.get("http_status", ""), "finish_reason": call.get("finish_reason", ""),
             "error_kind": call.get("error_kind", ""), "attempt": call.get("attempt", ""),
             "retry_reason": call.get("retry_reason", ""),
-            "max_output_tokens": call.get("max_output_tokens", ""),
+            "max_output_tokens": call.get("max_output_tokens", ""), "effort": call.get("effort", ""),
             "estimated_input_tokens": record.get("estimated_input_tokens", ""),
             **{key: usage.get(key, "") for key in ("input_tokens", "cache_read_input_tokens",
                                                   "cache_creation_input_tokens", "output_tokens", "reasoning_tokens")},
