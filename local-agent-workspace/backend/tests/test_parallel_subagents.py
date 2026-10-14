@@ -400,6 +400,23 @@ async def test_restart_closes_parallel_delegations_and_their_index_entries(runti
         await restarted.jobs.shutdown()
 
 
+async def test_restart_closes_a_delegation_that_was_waiting_for_a_slot(runtime):
+    manager, parent, _ = runtime
+    parent["events"] = [{"id": "u", "type": "user", "text": "Delegate", "in_wire": True},
+                        {"id": "d", "type": "tool", "name": "delegate_task", "call_id": "c", "state": "running",
+                         "input": {"task": "Waits"}, "delegation": {"status": "queued", "completed_tools": 0, "agent_type": "general"}}]
+    parent.update(turn_running=True, turn_ended=None)
+    manager.store.save(parent)
+    restarted = AgentManager(manager.store, manager.settings)
+    try:
+        saved = manager.store.get(parent["id"])
+        assert card(saved, "c")["state"] == "cancelled"
+        assert card(saved, "c")["delegation"] == {"status": "interrupted", "completed_tools": 0, "agent_type": "general",
+                                                  "terminal_reason": "interrupted"}
+    finally:
+        await restarted.jobs.shutdown()
+
+
 async def test_the_index_survives_header_only_reads_and_a_deleted_child_is_marked(runtime):
     manager, parent, _ = runtime
 

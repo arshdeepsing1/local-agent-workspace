@@ -806,6 +806,11 @@ class AgentManager:
             if event.get("request_info", {}).get("status") == "running":
                 event["request_info"].update(status="interrupted", error_kind="incomplete_response")
                 changed = cut_short = True
+            progress = event.get("delegation")
+            if isinstance(progress, dict) and not progress.get("terminal_reason") and not event.get("child_session_id"):
+                # Still waiting for a subagent slot: no child exists whose recovery would close it.
+                event["delegation"] = {**progress, "status": "interrupted", "terminal_reason": "interrupted"}
+                changed = True
         if cut_short:
             session["terminal_reason"] = "interrupted"  # Continue is offered; notifications report it.
             newest = next((event for event in reversed(session["events"]) if event.get("type") == "user"), None)
