@@ -2,6 +2,7 @@ import { html, useEffect, useRef, useState } from '../lib.js'
 import { ArrowUp, ChevronDown, Folder, FolderPlus, Laptop, ListPlus, MessageCircleQuestion, Plus, Square, Terminal, X } from '../icons.js'
 import { modelLabel } from '../types.js'
 import PermissionsMenu from './PermissionsMenu.js'
+import EffortPicker from './EffortPicker.js'
 import { useSlashMenu } from './SlashMenu.js'
 import { mentionLabel, parseMentions, removeMention, useMentionMenu } from './MentionMenu.js'
 import { MAX_MESSAGE_LENGTH } from '../reviewComments.js'
@@ -25,7 +26,9 @@ function chipLabel(item) {
 // worktree (Session.worktree of an app-managed worktree chat: the chip names its project and branch),
 // mode, onMode, onProject, onFolders, onSend, onStop, onAttach, onError, loadSkills,
 // onShell(command), onSideQuestion(question), loadFiles(query), pendingContext (Session.pending_context),
-// rules (this chat), projectRules, userRules, rulesProblem, onLoadRules, onAddRule(returnFocus), onRemoveRule(scope, rule), onResetRules
+// rules (this chat), projectRules, userRules, rulesProblem, onLoadRules, onAddRule(returnFocus), onRemoveRule(scope, rule), onResetRules,
+// effort (this chat's reasoning effort), onEffort(level) (allowed while busy), reasoningFormat and
+// thinkingSummaries (Settings → Reasoning, for the picker's labels)
 export default function Composer(p) {
   const [sending, setSending] = useState(false)
   const [caret, setCaret] = useState(0)
@@ -124,6 +127,9 @@ export default function Composer(p) {
         rules=${p.rules} projectRules=${p.projectRules} userRules=${p.userRules} problem=${p.rulesProblem} onOpen=${p.onLoadRules}
         onRemoveRule=${p.onRemoveRule} onAddRule=${p.onAddRule && (() => p.onAddRule(() => input.current?.focus()))} onReset=${p.onResetRules} />
       <span class="composer-spacer" />
+      ${p.onEffort ? html`<${EffortPicker} model=${p.model} effort=${p.effort || 'default'} format=${p.reasoningFormat || 'auto'}
+        summaries=${p.thinkingSummaries !== false} disabled=${p.disabled} onChange=${p.onEffort}
+        onError=${p.onError} />` : null}
       <div class="model-control">
         <select aria-label="Model" value=${p.model} disabled=${p.disabled || p.busy || sending || p.modelSaving} onChange=${e => void changeModel(e.currentTarget.value)}
           title=${p.modelSaving ? 'Saving model…' : p.busy ? 'Stop the response before changing models.' : 'Choose model'}>

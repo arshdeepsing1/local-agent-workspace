@@ -181,10 +181,12 @@ def test_save_is_always_visible(ui, page, width, height):
     expect(dialog.get_by_role("textbox", name="Custom instructions")).to_have_css("border-radius", "8px")
     expect(dialog.get_by_role("group", name="Model and context").get_by_role("spinbutton", name="Context budget (tokens)")).to_be_visible()
     expect(dialog.get_by_role("group", name="Project").get_by_role("textbox", name="Project folder")).to_be_visible()
-    groups = dialog.get_by_role("group")
-    expect(groups).to_have_count(6)
-    assert [groups.nth(n).locator("legend").inner_text() for n in range(6)] == [
-        "Project", "Model and context", "Agent", "Commands and files", "Notifications", "Credentials"]
+    groups = dialog.locator("fieldset.settings-group")
+    expect(groups).to_have_count(7)
+    assert [groups.nth(n).locator("legend").inner_text() for n in range(7)] == [
+        "Project", "Model and context", "Reasoning", "Agent", "Commands and files", "Notifications", "Credentials"]
+    for n in range(7):
+        expect(dialog.get_by_role("group", name=groups.nth(n).locator("legend").inner_text(), exact=True)).to_have_count(1)
     # The footer spans the dialog's padding without making it scroll sideways (phones have less padding).
     fits = ui.js("""(d => { const box = d.getBoundingClientRect(), footer = d.querySelector('form > footer').getBoundingClientRect()
       return { sideways: d.scrollWidth - d.clientWidth, inside: footer.left >= box.left && footer.right <= box.right } })(document.querySelector('.settings-dialog'))""")

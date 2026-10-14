@@ -38,6 +38,20 @@ class RateLimitDetails(Record):
     retry_after: float | None = Field(default=None, ge=0)
 
 
+Effort = Literal["default", "low", "medium", "high", "xhigh", "max"]  # reasoning.EFFORT_LEVELS
+
+
+class ReasoningInfo(Record):
+    """The reasoning a request asked for (reasoning.request_record)."""
+    effort: Effort
+    format: Literal["anthropic", "openai", "none"]
+    fields: dict[str, Any] = Field(default_factory=dict)
+    sent_effort: str | None = Field(default=None, max_length=16)
+    effort_field: str | None = Field(default=None, max_length=64)
+    skipped: Literal["rejected", "rejected_earlier"] | None = None
+    rejected_field: str | None = Field(default=None, max_length=64)
+
+
 class RequestInfo(Record):
     model: str = Field(max_length=256)
     status: Literal["running", "completed", "error", "cancelled", "interrupted"]
@@ -46,6 +60,7 @@ class RequestInfo(Record):
     error_kind: str | None = None
     usage: Usage | None = None
     rate_limit: RateLimitDetails | None = None
+    reasoning: ReasoningInfo | None = None
 
 
 class Progress(Record):
@@ -93,6 +108,9 @@ class Event(Record):
     text: str | None = None
     reasoning_summary: str | None = None
     reasoning_truncated: bool | None = None
+    # When the reply's thinking began (epoch seconds) and how long it took (the Thinking block's label).
+    reasoning_started: float | None = Field(default=None, ge=0)
+    reasoning_seconds: float | None = Field(default=None, ge=0)
     request_info: RequestInfo | None = None
     name: str | None = None
     input: dict[str, Any] | None = None
@@ -215,6 +233,7 @@ class Conversation(Record):
     title_generated: bool | None = None
     tool_profile: Profile = "inherit"
     subagent_tool_profile: Profile = "inherit"
+    reasoning_effort: Effort | None = None  # Kept by forks and imports, like the model.
     max_steps: int | None = Field(default=None, ge=1, le=8)
     # Kept by forks and imports, like tool_profile: a copy never gets more tools than its source.
     disabled_tools: list[Annotated[str, Field(min_length=1, max_length=300)]] | None = Field(default=None, max_length=64)

@@ -76,13 +76,12 @@ def test_copies_raw_user_and_assistant_text(ui, page):
 
 def test_reasoning_is_collapsed_and_separate_from_the_answer(ui, page):
     show(ui, """[{ id: 'reply', type: 'assistant', text: 'The answer is ready.', reasoning_summary: 'Provider considered **two approaches**.' }]""")
-    summary = page.get_by_text("Provider reasoning summary")
-    details = page.locator("details.reasoning-summary")
+    summary = page.get_by_text("Thought", exact=True)
+    details = page.locator("details.thinking")
     expect(details).not_to_have_attribute("open", "")
     expect(details.get_by_text("The answer is ready.")).to_have_count(0)
     summary.click()
     expect(details).to_have_attribute("open", "")
-    expect(details.get_by_text("Supplied by the model endpoint.")).to_be_visible()
     expect(details.locator("strong", has_text="two approaches")).to_be_visible()
     expect(page.get_by_text("The answer is ready.")).to_have_count(1)
     summary.click()
@@ -94,9 +93,9 @@ def test_ordinary_messages_have_no_invented_reasoning_or_activity(ui, page):
     show(ui, """[{ id: 'user', type: 'user', text: 'Please explain the parser.' },
       { id: 'reply', type: 'assistant', text: 'I considered two approaches. Here is the answer.' }]""")
     expect(page.get_by_text("I considered two approaches. Here is the answer.")).to_be_visible()
-    expect(page.get_by_text("Provider reasoning summary")).to_have_count(0)
+    expect(page.locator(".thinking, .thinking-line")).to_have_count(0)
     expect(page.get_by_text(re.compile("Activity ·"))).to_have_count(0)
-    expect(page.get_by_text("Summary display limit reached.")).to_have_count(0)
+    expect(page.get_by_text("Thinking display limit reached.")).to_have_count(0)
     expect(page.get_by_text(re.compile("Request details"))).to_have_count(0)
 
 
@@ -273,11 +272,11 @@ def test_usage_before_failure_is_marked_partial(ui, page):
 def test_reasoning_display_limit_notice(ui, page, truncated):
     show(ui, f"""[{{ id: 'reply', type: 'assistant', reasoning_summary: 'A provider-supplied partial summary.',
       reasoning_truncated: {json.dumps(truncated)} }}]""")
-    summary = page.get_by_text("Provider reasoning summary")
-    expect(page.locator("details.reasoning-summary")).not_to_have_attribute("open", "")
+    summary = page.get_by_text("Thought", exact=True)
+    expect(page.locator("details.thinking")).not_to_have_attribute("open", "")
     summary.click()
     expect(page.get_by_text("A provider-supplied partial summary.")).to_be_visible()
-    expect(page.get_by_text("Summary display limit reached.")).to_have_count(1 if truncated else 0)
+    expect(page.get_by_text("Thinking display limit reached.")).to_have_count(1 if truncated else 0)
 
 
 def test_activity_summary_counts_one_action_in_the_singular(ui, page):
@@ -522,8 +521,8 @@ def test_identifiers_hosts_and_code_blocks_are_not_linked(ui, page):
 def test_reasoning_summaries_and_conversations_without_a_handler_have_no_path_links(ui, page):
     show(ui, "[{ id: 'reply', type: 'assistant', text: 'See docs/guide.md.', reasoning_summary: 'Read src/app.py:3 first.' }]",
          ", onOpenPath: fake.spy('open')")
-    page.get_by_text("Provider reasoning summary").click()
-    expect(page.locator(".reasoning-summary a.path-link")).to_have_count(0)
+    page.get_by_text("Thought", exact=True).click()
+    expect(page.locator(".thinking a.path-link")).to_have_count(0)
     expect(page.locator(".markdown a.path-link")).to_have_count(1)
     ui.rerender("{ session: makeSession([{ id: 'other', type: 'assistant', text: 'See docs/other.md.' }]), onError: fake.spy('onError') }")
     expect(page.get_by_text("See docs/other.md.")).to_be_visible()
@@ -650,7 +649,7 @@ def test_markdown_table_cells_keep_code_whole_at_phone_width(ui, page):
     assert codes.evaluate_all("els => els.map(el => el.getClientRects().length)") == [1, 1]
     assert page.locator(".markdown table").evaluate("e => e.scrollWidth >= e.clientWidth")
     assert ui.js("document.documentElement.scrollWidth") <= 390
-    page.get_by_text("Provider reasoning summary").click()
+    page.get_by_text("Thought", exact=True).click()
     paragraphs = page.locator(".markdown p", has_text="The file is")
     expect(paragraphs).to_have_count(3)  # the reply, its reasoning summary and the plan
     for paragraph in paragraphs.all():

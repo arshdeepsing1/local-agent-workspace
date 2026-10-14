@@ -51,7 +51,10 @@ frontend that runs without a build step.
   and bounded subagents in separate conversations.
 - Markdown transcripts of a conversation: download or copy one from the app, or write
   them for many saved conversations with a script.
-- Collapsible activity and persisted provider reasoning summaries when returned by the endpoint.
+- A reasoning effort per conversation (Default, Fast, Medium, High, Extra high, Max) sent in the
+  fields each endpoint takes, and a collapsible Thinking block with the endpoint's thinking
+  summary and how long it thought.
+- Collapsible activity.
 - Responsive desktop/mobile UI, bundled fonts, and no credential storage in the browser.
 
 This release does not include a browser automation engine, OS computer control,
@@ -891,7 +894,7 @@ when opening a conversation or performing restart recovery.
   `md`, `yaml`, `toml`, `txt`, `html`, `css`, `sh`, `sql`, `go`, `rs`, `java`, `c`, `h`
   and similar), so identifiers such as `os.path.join` or `console.log` and host names
   such as `db.example.com:5432` stay text. Web addresses, code blocks and
-  reasoning summaries are not linked. A link opens the file in **Workspace / Files** with
+  Thinking blocks are not linked. A link opens the file in **Workspace / Files** with
   that line selected and scrolled into view; the status bar shows **Line 12**. Expanded
   tool cards of file tools (`read_file`, `write_file`, `edit_file`, `insert_activity_log`,
   the notebook tools, and `move_path`'s destination) have **Open file**, at `read_file`'s
@@ -1079,8 +1082,65 @@ The ledger and the CSV (the `retry_reason` column, after `attempt`) record why t
 sent a request automatically: `rate_limit`, `server_error` or `network` for a repeat
 of the same request, `rate_limit_wait` after an automatic wait, `output_limit`,
 `invalid_tool_arguments` or `incomplete_response` for the request after a hidden
-continuation, and `verify` for a Verify fix round. The Usage section's **Automatic
-retries** tile counts these calls; **429 responses** counts rate-limited calls.
+continuation, `verify` for a Verify fix round, and `reasoning_rejected` for the resend
+without reasoning fields (see **Reasoning effort and thinking**). The Usage section's **Automatic
+retries** tile counts these calls; **429 responses** counts rate-limited calls. The CSV's
+`effort` column (after `max_output_tokens`) and the call table name the reasoning effort a
+request asked for; it is empty for a request at Default that sent no reasoning fields.
+
+### Reasoning effort and thinking
+
+Each conversation has a **reasoning effort**, chosen in the picker beside the model picker
+under the message box: **Default**, **Fast**, **Medium**, **High**, **Extra high** or **Max**.
+A new conversation starts at **Settings → Reasoning → Default effort for new chats**
+(Default unless you change it), and keeps its own level in its file like its model; forks and
+imports keep it, and a conversation saved before this existed uses the Settings default. A
+change applies from the agent's next model request, also while a response runs (a notice
+says so) and for a running subagent. The picker names what Default means where it is known,
+for example **Default (Medium)**. Levels above Default make the model think longer, which
+uses more output tokens (thinking counts toward **Max output tokens**) and costs more.
+
+What agent requests to each endpoint carry (top-level fields of the chat-completions body):
+
+| Endpoint | Default | Fast … Max |
+| --- | --- | --- |
+| Claude Opus 5.5 (`databricks-claude-opus-5-5`) | `thinking: {"type": "adaptive", "display": "summarized"}` (it always thinks; its own default is medium) | `thinking` as for Default and `output_config: {"effort": "low"…"max"}` |
+| Claude Opus 4.8 (`databricks-claude-opus-4-8`) | nothing (no thinking) | the same as Opus 5.5 (it thinks only when `thinking` is sent) |
+| GPT OSS 120B and 20B | nothing (its default is medium) | `reasoning_effort: "low"`, `"medium"` or `"high"`; Extra high and Max are sent as `"high"` (the picker says so) |
+| Other endpoints | nothing | by the request format below; offered unverified |
+
+**Settings → Reasoning → Request format** chooses how requests ask for an effort:
+**Automatic (per endpoint)** (the table above; for an endpoint without a profile the format is
+guessed from its name: `claude` → Anthropic fields, `gpt-oss`, `gpt-5`, `o1`, `o3`, `o4` →
+OpenAI field, anything else → none), **Anthropic fields** (`thinking` and `output_config.effort`),
+**OpenAI field** (`reasoning_effort`) or **Don't send reasoning fields**. Settings shows the
+exact JSON the endpoint and level in the form add to agent requests, computed by the same code
+that builds them. Titles, `/btw` side questions and compaction requests never carry reasoning
+fields: they use the endpoint's default, which their output allowance is sized for.
+
+Databricks documents the Anthropic fields for its Anthropic Messages route; whether its
+chat-completions route, which this app uses, passes them on has not been checked against a
+live endpoint. So when Databricks answers HTTP 400 before any reply streams and the error
+names a reasoning field the request added (`thinking`, `output_config`, `effort`,
+`reasoning_effort`, `display` or `budget_tokens`), the app sends that request once more
+without reasoning fields (a rejected request is not billed), posts one notice naming the
+field and **Settings → Reasoning → Request format**, and sends no reasoning fields to that
+endpoint in that format until the app restarts or you save Settings. Both attempts are in the
+usage ledger; the second has `retry_reason` `reasoning_rejected`. A 400 that names none of
+them is shown as an error and not repeated.
+
+**Show thinking summaries** (on by default) adds `"display": "summarized"` to `thinking`.
+Claude Opus 5.5 omits its thinking text unless asked, so without it no thinking is shown; the
+setting changes what is shown, not how much the model thinks or what it costs. A reply's
+thinking appears in a **Thinking** block at its top: open with the live text and "Thinking… 12 s"
+while the model thinks, then collapsed to "Thought for 12 s" when the answer or a tool call
+starts or the response ends (a block you opened or closed yourself stays as you left it). The
+duration is saved with the reply. An endpoint that reported reasoning tokens or thinking
+without text gets one line instead, "Thought for N s · the endpoint did not return a summary".
+The app shows thinking text only as the endpoint returns it (redacted, up to 12,000
+characters) and never sends earlier thinking back to the model. **Request details** under a
+reply show **Effort**, for example "High (output_config.effort)", and the reasoning fields
+sent.
 
 ### Context and project instructions
 
@@ -1106,7 +1166,8 @@ the 2,048-token safety margin. The output setting is also the reply reserve, so 
 defaults leave an estimated input budget of 181,568 tokens (120,832 at 131,072 and 8,192).
 
 While you edit these fields, Settings shows warnings from the profile (they never block saving)
-and, for an endpoint with recommended values, a **Use … defaults** button. When the endpoint
+and, for an endpoint with recommended values, a **Use … defaults** button, which reads **Using …
+defaults** while the form holds them. When the endpoint
 field changes, budgets still at the saved model's defaults change to the new endpoint's defaults
 in the form, as Save would store them, and the estimated input budget also names what requests
 to an endpoint with lower maxima get. The numbers are
@@ -1406,9 +1467,12 @@ tools, connect MCP servers, or rewrite the archived conversation. The resulting
 older sessions without that snapshot); definitions may change on the next turn.
 The details open above the meter; Escape, a click elsewhere or moving focus away closes them.
 
-**Settings** groups its fields under Project, Model and context, Agent, Commands and files,
-Notifications and Credentials; **Save settings** stays at the bottom while you scroll, and a
-failed save shows its reason just above it.
+**Settings** groups its fields under Project, Model and context, Reasoning, Agent, Commands and
+files, Notifications and Credentials; on a wide screen a list of these sections beside them
+jumps to each one. Longer explanations wait behind **More**. **Settings → Databricks model
+endpoint** lists the endpoints with built-in facts (label and name) and those your workspace
+serves; **Other endpoint…** opens a field for any other name. **Save settings** stays at the
+bottom while you scroll, and a failed save shows its reason just above it.
 
 **Settings → Custom instructions** (up to 8,000 characters) are your own instructions for
 every conversation in every project, subagents included. The system message places them
@@ -1725,14 +1789,14 @@ tells the model to ask before implementing it. The plan is not written to any fi
 stays in the conversation, and exports keep answers and review outcomes.
 
 **Activity** collapses a list of actual tool actions and their states; existing
-approval cards remain usable independently. A separate **Provider reasoning
-summary** disclosure appears only when the Databricks stream supplies documented
-`reasoning` content blocks with `summary_text` entries. Summaries persist with the
-conversation, display separately from the answer, and have a 12,000-character
-limit. Opaque/encrypted reasoning is ignored. Summaries are not replayed as model
-history, and the app never fabricates hidden reasoning. Endpoint support varies;
-ordinary responses legitimately have no reasoning disclosure. There is no
-reasoning-effort setting yet.
+approval cards remain usable independently. A reply's **Thinking** block appears only when
+the Databricks stream supplies thinking: `reasoning` content blocks with `summary_text`
+entries, `thinking` blocks, or `reasoning_content` / `reasoning` delta fields (see
+**Reasoning effort and thinking**). The text persists with the conversation, displays
+separately from the answer, and has a 12,000-character limit. Opaque/encrypted reasoning
+is ignored. Thinking is not replayed as model history, and the app never fabricates
+hidden reasoning. Endpoint support varies; ordinary responses legitimately have no
+Thinking block.
 
 ### Permission modes
 
@@ -2384,7 +2448,8 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `backend/local_agent/extensions.py` / `mcp_client.py`: skills, hooks, MCP lifecycle.
 - `backend/local_agent/planning.py` / `feature_tools.py`: tasks and delegated workers.
 - `backend/local_agent/feature_api.py`: scoped feature endpoints.
-- `backend/local_agent/reasoning.py`: provider reasoning-summary extraction.
+- `backend/local_agent/reasoning.py`: reasoning effort request fields per endpoint and format, the rejection
+  check, and the thinking text of streamed deltas.
 - `frontend/static/js/`: browser interface (Preact + htm, no build), conversation state, editor and settings;
   `attention.js` holds browser notifications, the tab-title count and unread tracking, `drafts.js` saves
   message drafts, and `markdown.js` renders and highlights replies.

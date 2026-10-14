@@ -224,9 +224,15 @@ def _public_call(call, *, fallback=False):
     for key in ("http_status", "attempt", "max_output_tokens"):
         if type(call.get(key)) is int:
             result[key] = call[key]
-    for key in ("error_kind", "finish_reason", "retry_reason", "limit_type"):
+    # effort: the reasoning effort the request asked for (reasoning.EFFORT_LEVELS); effort_field: the
+    # field that carried it; reasoning_skipped: why none was sent ('rejected', 'rejected_earlier').
+    for key in ("error_kind", "finish_reason", "retry_reason", "limit_type", "effort", "effort_field",
+                "reasoning_skipped"):
         if isinstance(call.get(key), str):
             result[key] = call[key]
+    fields = call.get("reasoning_fields")  # The top-level reasoning fields the request sent.
+    if isinstance(fields, list) and all(isinstance(name, str) for name in fields):
+        result["reasoning_fields"] = fields
     usage = reported_usage(call.get("usage"))
     if usage:
         result["usage"] = usage

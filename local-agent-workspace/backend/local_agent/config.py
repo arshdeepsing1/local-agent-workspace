@@ -9,7 +9,8 @@ from .context import (
     MAX_CONTEXT_WINDOW, MAX_MAX_OUTPUT_TOKENS, MIN_CONTEXT_WINDOW, MIN_MAX_OUTPUT_TOKENS, SAFETY_MARGIN,
 )
 from .context import DEFAULT_AUTO_COMPACT_PERCENT, MAX_AUTO_COMPACT_PERCENT, MIN_AUTO_COMPACT_PERCENT
-from .model_profiles import DEFAULT_MODEL, LEGACY_DEFAULT_LIMITS, LEGACY_DEFAULT_MODEL, default_limits
+from .model_profiles import DEFAULT_MODEL, LEGACY_DEFAULT_LIMITS, LEGACY_DEFAULT_MODEL, default_limits, known_endpoints
+from .reasoning import DEFAULT_EFFORT, DEFAULT_FORMAT, EFFORT_LEVELS, REQUEST_FORMATS
 
 APP_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MAX_AGENT_STEPS = 32
@@ -103,6 +104,11 @@ class Settings:
             "command_env": [],
             "rate_limit_auto_continue": True,
             "auto_keep_changes": False,
+            # Settings → Reasoning (reasoning.py): the effort new chats start with, how requests ask
+            # for it, and whether adaptive Claude endpoints are asked to return thinking summaries.
+            "reasoning_effort": DEFAULT_EFFORT,
+            "reasoning_format": DEFAULT_FORMAT,
+            "thinking_summaries": True,
         }
         self.migrated_from = None
         if self.path.exists():
@@ -153,6 +159,7 @@ class Settings:
                 "coding_dir_status": user_paths.coding_dir_status(self),
                 "python_venv_status": user_paths.python_venv_status(self), "default_model": DEFAULT_MODEL,
                 "default_limits": dict(zip(LIMIT_KEYS, default_limits(self.values["model"]))),
+                "endpoint_profiles": known_endpoints(),
                 **({"model_migrated_from": self.migrated_from} if self.migrated_from is not None else {})}
 
     def env_equivalent(self, key, value, candidate=None):
@@ -230,6 +237,12 @@ class Settings:
             raise ValueError("Continue after rate limits must be on or off.")
         if type(candidate["auto_keep_changes"]) is not bool:
             raise ValueError("Automatic Keep must be on or off.")
+        if candidate["reasoning_effort"] not in EFFORT_LEVELS:
+            raise ValueError("Default reasoning effort must be one of: " + ", ".join(EFFORT_LEVELS) + ".")
+        if candidate["reasoning_format"] not in REQUEST_FORMATS:
+            raise ValueError("Reasoning request format must be one of: " + ", ".join(REQUEST_FORMATS) + ".")
+        if type(candidate["thinking_summaries"]) is not bool:
+            raise ValueError("Show thinking summaries must be on or off.")
         for key, label, check in (("coding_dir", "Default code folder", user_paths.check_coding_dir_setting),
                                   ("python_venv", "Python environment", user_paths.check_python_venv_setting)):
             value = candidate[key]

@@ -1,11 +1,19 @@
 import { html, useEffect, useRef, useState } from '../lib.js'
-import { X } from '../icons.js'
+import { Check, X } from '../icons.js'
 import { api } from '../api.js'
-import { modelLabel } from '../types.js'
+import { EFFORT_LABELS, modelLabel } from '../types.js'
+import { levelLabel, useReasoningPreview } from './EffortPicker.js'
 
 const LIMIT_LEVELS = { error: 'form-error', warning: 'settings-note', note: 'field-help' }
 const inRange = (value, low, high) => Number.isInteger(value) && value >= low && value <= high
 const LIMIT_KEYS = ['context_window', 'max_output_tokens']
+// The dialog's sections, in order: [id, title]. On wide screens a list beside them jumps to each.
+const SECTIONS = [['project', 'Project'], ['model', 'Model and context'], ['reasoning', 'Reasoning'], ['agent', 'Agent'],
+  ['commands', 'Commands and files'], ['notifications', 'Notifications'], ['credentials', 'Credentials']]
+const FORMATS = [['auto', 'Automatic (per endpoint)'], ['anthropic', 'Anthropic fields (thinking + output_config.effort)'],
+  ['openai', 'OpenAI field (reasoning_effort)'], ['none', 'Don\'t send reasoning fields']]
+const OTHER_ENDPOINT = '\u0000other'
+const FALLBACK_LEVELS = Object.entries(EFFORT_LABELS).map(([value, label]) => ({ value, label }))
 
 // The budgets after those in following take target's values, as the server does on a model change
 // (config.follow_limits): a value that would not fit with the other budget is not followed.
@@ -26,6 +34,19 @@ function pathStatus(status, saved, current) {
   return null
 }
 
+// Details that most people do not need on every visit.
+function More({ topic, children }) {
+  return html`<details class="field-more"><summary aria-label=${`More about ${topic}`}>More</summary><p class="field-help">${children}</p></details>`
+}
+
+// The endpoints the chooser lists: the app's profiles (label and name), the workspace's endpoints and the saved one.
+function endpointChoices(settings, connection) {
+  const profiles = Array.isArray(settings.endpoint_profiles) ? settings.endpoint_profiles : []
+  const labels = new Map(profiles.map(item => [item.model, item.label]))
+  const names = [...new Set([...profiles.map(item => item.model), ...(connection?.models || []), settings.model].filter(Boolean))]
+  return names.map(name => ({ value: name, label: `${labels.get(name) || modelLabel(name)} · ${name}` }))
+}
+
 export default function SettingsDialog({ settings, connection, onSave, onClose }) {
   const dialog = useRef(null)
   const [form, setForm] = useState(settings)
@@ -40,8 +61,20 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
   const [error, setError] = useState('')
   // The variable names as typed; the form holds them as a list.
   const [envText, setEnvText] = useState((settings.command_env || []).join(' '))
+  const choices = endpointChoices(settings, connection)
+  // Other endpoint…: a typed name. It stays open while chosen, so typing never switches the list back.
+  const [otherEndpoint, setOtherEndpoint] = useState(() => !choices.some(choice => choice.value === settings.model))
+  const otherInput = useRef(null)
+  const otherFocus = useRef(false)
+  const sections = useRef({})
+  const [activeSection, setActiveSection] = useState(SECTIONS[0][0])
+  const jumping = useRef(0)
   const instructions = form.user_instructions || ''
   const inputBudget = form.context_window - form.max_output_tokens - 2048
+  const model = (form.model || '').trim()
+  const effort = form.reasoning_effort || 'default'
+  const preview = useReasoningPreview(model, form.reasoning_format || 'auto', form.thinking_summaries !== false, effort, !!model, false)
+  const levels = preview?.levels || FALLBACK_LEVELS
   // Budgets left at the saved model's defaults follow an endpoint change, so the form shows what Save stores:
   // the new endpoint's defaults, or the saved values when the saved endpoint is chosen again.
   const following = result => {
@@ -64,9 +97,11 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
     }, () => {})
     return () => { current = false }
   }, [])
+  useEffect(() => {
+    if (otherEndpoint && otherFocus.current) { otherFocus.current = false; otherInput.current?.focus() }
+  }, [otherEndpoint])
   // Warnings for these budgets on this endpoint, from the server's limit table. They never block saving.
   useEffect(() => {
-    const model = (form.model || '').trim()
     const { context_window: context, max_output_tokens: output } = form
     if (!model || !inRange(context, 16384, 1048576) || !inRange(output, 1024, 131072) || output >= context - 2048) {
       limitsRequest.current++
@@ -88,48 +123,94 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
     }, 250)
     return () => clearTimeout(timer)
   }, [form.model, form.context_window, form.max_output_tokens])
-  const recommended = limits?.recommended && limits.profile && (limits.recommended.context_window !== form.context_window
-    || limits.recommended.max_output_tokens !== form.max_output_tokens) ? limits.recommended : null
+  // The endpoint's recommended budgets stay offered; once the form holds them the button says so instead.
+  const recommended = limits?.recommended && limits.profile ? limits.recommended : null
+  const usingRecommended = !!recommended && recommended.context_window === form.context_window
+    && recommended.max_output_tokens === form.max_output_tokens
+  const recommendedText = recommended ? `${limits.profile.label} defaults (${recommended.context_window.toLocaleString('en-US')} context, ${recommended.max_output_tokens.toLocaleString('en-US')} output)` : ''
   const field = (key, value) => setForm(current => ({ ...current, [key]: value }))
   const effective = limits?.effective
   const capped = effective?.clamped ? effective.context_window - effective.max_output_tokens - 2048 : null
   const number = key => event => field(key, Number(event.currentTarget.value))
-  return html`<dialog ref=${dialog} class="settings-dialog app-settings" aria-label="Settings" aria-describedby="settings-description" onCancel=${onClose} onClick=${e => { if (e.target === dialog.current) onClose() }}>
-    <div class="dialog-content"><header><div><h2>Make yourself at home.</h2><p id="settings-description">Configure your local workspace.</p></div><button class="icon-button" onClick=${onClose} aria-label="Close settings"><${X} /></button></header>
+  const jump = id => {
+    const section = sections.current[id]
+    if (!section) return
+    jumping.current = Date.now()
+    setActiveSection(id)
+    section.scrollIntoView({ block: 'start' })
+    section.focus({ preventScroll: true })
+  }
+  // The section list follows scrolling (not the scroll a jump itself causes).
+  const scrolled = () => {
+    const box = dialog.current
+    if (!box || Date.now() - jumping.current < 300) return
+    const top = box.getBoundingClientRect().top
+    let current = SECTIONS[0][0]
+    for (const [id] of SECTIONS) {
+      const section = sections.current[id]
+      if (section && section.getBoundingClientRect().top - top <= 120) current = id
+    }
+    if (box.scrollTop + box.clientHeight >= box.scrollHeight - 2) current = SECTIONS[SECTIONS.length - 1][0]
+    setActiveSection(current)
+  }
+  const group = (id, children) => html`<fieldset class="settings-group" id=${`settings-${id}`} tabIndex=${-1}
+    ref=${element => { sections.current[id] = element }}><legend>${SECTIONS.find(item => item[0] === id)[1]}</legend>${children}</fieldset>`
+  const fields = preview?.fields || {}
+  const currentLevel = levels.find(level => level.value === effort) || levels[0]
+  return html`<dialog ref=${dialog} class="settings-dialog app-settings" aria-label="Settings" aria-describedby="settings-description" onCancel=${onClose} onScroll=${scrolled} onClick=${e => { if (e.target === dialog.current) onClose() }}>
+    <div class="dialog-content"><header><div><h2>Settings</h2><p id="settings-description">Configure your local workspace.</p></div><button class="icon-button" onClick=${onClose} aria-label="Close settings"><${X} /></button></header>
       <form onSubmit=${e => {
         e.preventDefault()
         // The server checks this too; saying it here avoids its raw validation error.
         if ((form.command_env || []).length > 32) { setError('List at most 32 environment variable names.'); return }
         setSaving(true); setError(''); void onSave(form).then(onClose).catch(e => setError(e.message)).finally(() => setSaving(false))
       }}>
-        <fieldset class="settings-group"><legend>Project</legend>
+        <div class="settings-layout">
+        <nav class="settings-nav" aria-label="Settings sections"><ul>
+          ${SECTIONS.map(([id, title]) => html`<li key=${id}><button type="button" aria-current=${activeSection === id ? 'true' : null}
+            onClick=${() => jump(id)}>${title}</button></li>`)}
+        </ul></nav>
+        <div class="settings-sections">
+        ${group('project', html`
         <label>Project folder<input value=${form.workspace} required onInput=${e => field('workspace', e.currentTarget.value)} placeholder="/path/to/project" /></label>
-        <p class="field-help">A tool-calling agent for your Databricks models. Reads files, edits code, and runs approved commands.</p>
+        <p class="field-help">New conversations work in this folder: the agent reads files, edits code and runs approved commands here.</p>
         <label>Default folder for new code<input value=${form.coding_dir || ''} spellcheck=${false} placeholder="~/code (optional)"
           onInput=${e => field('coding_dir', e.currentTarget.value)} /></label>
-        <p class="field-help">When you ask for a new standalone script, tool or project without saying where, the agent creates it here; work on the open project stays in the project. Every conversation can use this folder without a Folder access card; edits still follow the permission mode and rules. A value saved here overrides LOCAL_AGENT_CODING_DIR in .env; left unchanged, it follows .env.</p>
+        <p class="field-help">When you ask for a new standalone script, tool or project without saying where, the agent creates it here; work on the open project stays in the project.</p>
+        <${More} topic="Default folder for new code">Every conversation can use this folder without a Folder access card; edits still follow the permission mode and rules. A value saved here overrides LOCAL_AGENT_CODING_DIR in .env; left unchanged, it follows .env.<//>
         ${pathStatus(statuses.coding_dir, settings.coding_dir, form.coding_dir)}
         <label>Python virtual environment<input value=${form.python_venv || ''} spellcheck=${false} placeholder="~/.venvs/project (optional)"
           onInput=${e => field('python_venv', e.currentTarget.value)} /></label>
-        <p class="field-help">The agent's commands, Verify, hooks and the Terminal run with this environment active: VIRTUAL_ENV is set and its bin/ comes first on PATH. The read-only commands Auto runs without a card are unaffected, and agent edits inside the environment always ask. A value saved here overrides LOCAL_AGENT_PYTHON_VENV in .env; left unchanged, it follows .env.</p>
-        ${pathStatus(statuses.python_venv, settings.python_venv, form.python_venv)}
-        </fieldset>
-        <fieldset class="settings-group"><legend>Model and context</legend>
-        <label>Databricks model endpoint<input list="settings-models" required value=${form.model} onInput=${e => field('model', e.currentTarget.value)} placeholder=${settings.default_model || 'databricks-claude-opus-5-5'} /></label>
+        <p class="field-help">The agent's commands, Verify, hooks and the Terminal run with this environment active: VIRTUAL_ENV is set and its bin/ comes first on PATH.</p>
+        <${More} topic="Python virtual environment">The read-only commands Auto runs without a card are unaffected, and agent edits inside the environment always ask. A value saved here overrides LOCAL_AGENT_PYTHON_VENV in .env; left unchanged, it follows .env.<//>
+        ${pathStatus(statuses.python_venv, settings.python_venv, form.python_venv)}`)}
+        ${group('model', html`
+        <label>Databricks model endpoint<select value=${otherEndpoint ? OTHER_ENDPOINT : form.model} onChange=${e => {
+          const value = e.currentTarget.value
+          if (value === OTHER_ENDPOINT) { otherFocus.current = true; setOtherEndpoint(true); return }
+          setOtherEndpoint(false)
+          field('model', value)
+        }}>
+          ${choices.map(choice => html`<option key=${choice.value} value=${choice.value}>${choice.label}</option>`)}
+          <option value=${OTHER_ENDPOINT}>Other endpoint…</option>
+        </select></label>
+        ${otherEndpoint ? html`<label>Endpoint name<input ref=${otherInput} required spellcheck=${false} value=${form.model}
+          onInput=${e => field('model', e.currentTarget.value)} placeholder=${settings.default_model || 'databricks-claude-opus-5-5'} /></label>` : null}
+        <p class="field-help">Endpoints with built-in limits and the ones your Databricks workspace lists. Choose Other endpoint… to type a serving endpoint name.</p>
         ${settings.model_migrated_from ? html`<p class="settings-note" role="status">The default model changed from ${modelLabel(settings.model_migrated_from)} to ${modelLabel(settings.model)}, the app's new default. ${modelLabel(settings.model)} costs more per token. To switch back, choose ${settings.model_migrated_from} here and save, or in the model picker of a new conversation (in an open conversation the picker changes only that conversation).</p>` : null}
-        <datalist id="settings-models">${connection?.models.map(m => html`<option key=${m} value=${m}>${modelLabel(m)}</option>`)}</datalist>
         <label>Context budget (tokens)<input ref=${contextInput} type="number" required min=${16384} max=${1048576} step=${1}
           value=${form.context_window || ''} onInput=${number('context_window')} /></label>
-        <p class="field-help">Set at or below your endpoint's total context limit, not your account usage quota. We reserve the output budget below plus 2,048 tokens for safety; the remainder is the estimated input budget. Applies on the next turn.</p>
+        <p class="field-help">Set at or below your endpoint's total context limit, not your account usage quota. We reserve the output budget below plus 2,048 tokens for safety; the remainder is the estimated input budget.</p>
         <label>Max output tokens per request<input type="number" required min=${1024} max=${131072} step=${1}
           value=${form.max_output_tokens || ''} onInput=${number('max_output_tokens')} /></label>
-        <p class="field-help">The endpoint must support this value. A larger response budget leaves less context for input and can increase usage. Current estimated input budget: ${inputBudget.toLocaleString()} tokens${capped ? ` (${capped.toLocaleString()} for requests to this endpoint, which accepts less)` : ''}.</p>
+        <p class="field-help">Current estimated input budget: ${inputBudget.toLocaleString()} tokens${capped ? ` (${capped.toLocaleString()} for requests to this endpoint, which accepts less)` : ''}. The endpoint must support this value; a larger response budget leaves less room for input and can increase usage.</p>
         ${inputBudget < 16384 ? html`<p class="form-error" role="alert">This leaves too little room for a working conversation. Lower Max output tokens or increase the context budget; raising output does not fix a full context.</p>` : null}
         ${limits ? html`<div class="settings-limits">
           ${limits.warnings.map(warning => html`<p key=${warning.code} class=${LIMIT_LEVELS[warning.level] || 'field-help'}
             role=${warning.level === 'error' ? 'alert' : warning.level === 'warning' ? 'status' : null}>${warning.text}</p>`)}
-          ${recommended ? html`<button type="button" class="outline settings-recommended"
-            onClick=${() => { setForm(current => ({ ...current, ...recommended })); contextInput.current?.focus() }}>Use ${limits.profile.label} defaults (${recommended.context_window.toLocaleString('en-US')} context, ${recommended.max_output_tokens.toLocaleString('en-US')} output)</button>` : null}
+          ${recommended ? html`<button type="button" class=${`outline settings-recommended${usingRecommended ? ' applied' : ''}`}
+            aria-disabled=${usingRecommended ? 'true' : null} onClick=${() => { if (!usingRecommended) setForm(current => ({ ...current, ...recommended })) }}>
+            ${usingRecommended ? html`<${Check} size=${14} />Using ${recommendedText}` : `Use ${recommendedText}`}</button>` : null}
           <p class="field-help">${limits.note}</p>
         </div>` : null}
         <label>Auto-compact at (% of input budget)<input type="number" required min=${50} max=${100} step=${1}
@@ -137,43 +218,64 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         <p class="field-help">Earlier turns are summarized automatically when the next request's estimated input passes this share of the input budget (default 90). ${compactPercentValid ? `With these settings that is about ${Math.floor(inputBudget * compactPercent / 100).toLocaleString()} tokens${capped ? ` (${Math.floor(capped * compactPercent / 100).toLocaleString()} for requests to this endpoint)` : ''}.` : 'Enter a whole number from 50 to 100.'} Lower values compact sooner and keep requests smaller; 100 waits until the input budget is full.</p>
         <label class="settings-checkbox"><input type="checkbox" checked=${form.compaction_handoffs !== false}
           onChange=${e => field('compaction_handoffs', e.currentTarget.checked)} />Save a detailed handoff at each compaction</label>
-        <p class="field-help">When earlier turns are compacted, the model writes a detailed handoff (up to 16,000 output tokens, plus up to 8,192 for thinking on models that always think, such as Claude Opus 5.5) that the app saves to handoffs/auto/ in the project folder with an exact log of every command. The model is told where to find it after compaction. Compaction then takes a few minutes longer and uses more output tokens.</p>
-        </fieldset>
-        <fieldset class="settings-group"><legend>Agent</legend>
+        <p class="field-help">The model writes a detailed handoff (up to 16,000 output tokens, plus up to 8,192 for thinking on models that always think, such as Claude Opus 5.5) that the app saves to handoffs/auto/ in the project folder.</p>
+        <${More} topic="compaction handoffs">The handoff includes an exact log of every command, and the model is told where to find it after compaction. Compaction then takes a few minutes longer and uses more output tokens.<//>`)}
+        ${group('reasoning', html`
+        <label>Default effort for new chats<select value=${effort} onChange=${e => field('reasoning_effort', e.currentTarget.value)}>
+          ${levels.map(level => html`<option key=${level.value} value=${level.value}>${levelLabel(level)}</option>`)}
+        </select></label>
+        <p class="field-help">Each chat can change its own effort beside the model picker. Default sends no effort field, so the endpoint uses its own; higher levels think longer and use more output tokens.</p>
+        <label>Request format<select value=${form.reasoning_format || 'auto'} onChange=${e => field('reasoning_format', e.currentTarget.value)}>
+          ${FORMATS.map(([value, label]) => html`<option key=${value} value=${value}>${label}</option>`)}
+        </select></label>
+        <p class="field-help">Automatic sends what each endpoint is documented to take. If Databricks rejects a reasoning field, the app sends that request again once without reasoning fields and skips them for the endpoint until it restarts or you save Settings.</p>
+        <label class="settings-checkbox"><input type="checkbox" checked=${form.thinking_summaries !== false}
+          onChange=${e => field('thinking_summaries', e.currentTarget.checked)} />Show thinking summaries</label>
+        <p class="field-help">Asks endpoints with adaptive thinking (Claude Opus 5.5 and 4.8) for a summary of their thinking (thinking.display: summarized), shown in a Thinking block above each reply. It changes what is shown, not how much the model thinks or costs.</p>
+        <div class="settings-preview">
+          <p class="settings-preview-title">Added to agent requests to ${preview?.label || model || 'this endpoint'} at ${levelLabel(currentLevel)}</p>
+          ${!preview ? html`<p class="field-help">${model ? 'Checking…' : 'Choose an endpoint.'}</p>`
+            : Object.keys(fields).length ? html`<pre class="settings-preview-json"><code>${JSON.stringify(fields, null, 2)}</code></pre>`
+            : html`<p class="settings-preview-empty">No reasoning fields.</p>`}
+          ${(preview?.notes || []).map((note, index) => html`<p key=${index} class="field-help">${note}</p>`)}
+        </div>`)}
+        ${group('agent', html`
         <label>Agent steps per message<input type="number" required min=${1} max=${64} step=${1}
           value=${form.max_agent_steps || ''} onInput=${number('max_agent_steps')} /></label>
         <p class="field-help">Limits model round trips for one message, not individual tool calls. One model response can request several tools. The default is 32.</p>
         <label>Approval wait (minutes)<input type="number" required min=${0} max=${1440} step=${1}
           value=${form.approval_timeout_minutes ?? 60} onInput=${number('approval_timeout_minutes')} /></label>
-        <p class="field-help">How long an approval card waits for your answer (default 60). After that the action does not run and the agent is told nobody answered. 0 waits until you answer or press Stop, but a waiting card keeps the chat busy, which blocks Undo and Recovery in this project.</p>
+        <p class="field-help">How long an approval card waits for your answer (default 60); after that the action does not run and the agent is told nobody answered. 0 waits until you answer or press Stop.</p>
+        <${More} topic="approval wait">A waiting card keeps the chat busy, which blocks Undo and Recovery in this project, so 0 can hold them up.<//>
         <label class="settings-checkbox"><input type="checkbox" checked=${form.auto_keep_changes === true}
           onChange=${e => field('auto_keep_changes', e.currentTarget.checked)} />Keep agent changes automatically when a reply finishes</label>
-        <p class="field-help">The changes bar clears when a reply completes; a reply you stop, that fails or that reaches the step limit keeps its list. Edits made with the agent's file tools can still be undone from Agent tools → Recovery; edits made by commands can no longer be undone from the app.</p>
+        <p class="field-help">The changes bar clears when a reply completes; a reply you stop, that fails or that reaches the step limit keeps its list.</p>
+        <${More} topic="automatic Keep">Edits made with the agent's file tools can still be undone from Agent tools → Recovery; edits made by commands can no longer be undone from the app.<//>
         <label class="settings-checkbox"><input type="checkbox" checked=${form.rate_limit_auto_continue !== false}
           onChange=${e => field('rate_limit_auto_continue', e.currentTarget.checked)} />Continue automatically after rate limits</label>
         <p class="field-help">After three quick retries, wait for Databricks's rate limit to reset (up to two minutes, at most twice per message) instead of stopping. Stop cancels the wait.</p>
         <label>Custom instructions<textarea class="settings-instructions" rows=${5} maxLength=${8000} spellcheck=${false} value=${instructions} aria-describedby="settings-instructions-count"
           onInput=${e => field('user_instructions', e.currentTarget.value)} placeholder="How you want the agent to work in every project" /></label>
-        <p class="field-help"><span class="field-counter" id="settings-instructions-count">${instructions.length.toLocaleString('en-US')} / 8,000</span> Added to every conversation in every project, before project instructions (AGENTS.md, CLAUDE.md), which cannot override them. Their size is counted in the context meter.</p>
-        </fieldset>
-        <fieldset class="settings-group"><legend>Commands and files</legend>
+        <p class="field-help"><span class="field-counter" id="settings-instructions-count">${instructions.length.toLocaleString('en-US')} / 8,000</span> Added to every conversation in every project, before project instructions (AGENTS.md, CLAUDE.md), which cannot override them. Their size is counted in the context meter.</p>`)}
+        ${group('commands', html`
         <label>File write limit (KB)<input type="number" required min=${16} max=${1000} step=${1}
           value=${form.write_limit_kb === undefined ? 80 : form.write_limit_kb || ''} onInput=${number('write_limit_kb')} /></label>
-        <p class="field-help">Largest file the agent can edit or create and the editor can open (default 80). One write_file call carries at most about 500 KB, so larger files are built with edits. Larger files cost more tokens to rewrite. Recovery keeps copies of edited files, up to 256 MB in total; change review keeps one copy per changed file until you Keep or Undo.</p>
+        <p class="field-help">Largest file the agent can edit or create and the editor can open (default 80). One write_file call carries at most about 500 KB, so larger files are built with edits.</p>
+        <${More} topic="file write limit">Larger files cost more tokens to rewrite. Recovery keeps copies of edited files, up to 256 MB in total; change review keeps one copy per changed file until you Keep or Undo.<//>
         <label>Environment variables for commands<input value=${envText} spellcheck=${false} placeholder="JAVA_HOME NVM_DIR CONDA_PREFIX"
           onInput=${e => { const text = e.currentTarget.value; setEnvText(text); field('command_env', [...new Set(text.split(/[\s,]+/).filter(Boolean))]) }} /></label>
-        <p class="field-help">Commands get a minimal environment. Names listed here are passed from the environment the server was started with. Never list secrets you do not want commands to see; the Databricks token and variables that change how programs start (LD_*, BASH_ENV, NODE_OPTIONS and similar) are never passed.</p>
-        </fieldset>
-        <fieldset class="settings-group"><legend>Notifications</legend>
+        <p class="field-help">Commands get a minimal environment; names listed here are passed from the environment the server was started with. Never list secrets you do not want commands to see; the Databricks token and variables that change how programs start (LD_*, BASH_ENV, NODE_OPTIONS and similar) are never passed.</p>`)}
+        ${group('notifications', html`
         <label class="settings-checkbox"><input type="checkbox" checked=${form.system_notifications === true}
           onChange=${e => field('system_notifications', e.currentTarget.checked)} />Desktop notification when no browser tab is open</label>
-        <p class="field-help">When no page of this app is open, the server shows a system notification when a conversation needs approval, finishes, or stops with an error (notify-send on Linux, osascript on macOS). It names only the status and the conversation title.</p>
-        </fieldset>
-        <fieldset class="settings-group"><legend>Credentials</legend>
+        <p class="field-help">When no page of this app is open, the server shows a system notification when a conversation needs approval, finishes, or stops with an error.</p>
+        <${More} topic="desktop notifications">It uses notify-send on Linux and osascript on macOS, and names only the status and the conversation title.<//>`)}
+        ${group('credentials', html`
         <label>Credential file<input value=${form.env_file} onInput=${e => field('env_file', e.currentTarget.value)} placeholder="/path/to/env_vars.txt" /></label>
-        <p class="field-help">Read on the server. Use DBRICKS_URL and DBRICKS_TOKEN assignments. Environment variables also work.</p>
-        </fieldset>
-        <p class="settings-note">Project and model changes apply to new conversations. Use Folder access above the chat input to allow additional folders. Commands run according to your selected permission mode.</p>
+        <p class="field-help">Read on the server. Use DBRICKS_URL and DBRICKS_TOKEN assignments. Environment variables also work.</p>`)}
+        <p class="settings-note">Project, model and effort changes apply to new conversations; each chat keeps its own model and effort. Use Folder access above the chat input to allow additional folders. Commands run according to your selected permission mode.</p>
+        </div>
+        </div>
         <footer>${error ? html`<p class="form-error" role="alert">${error}</p>` : null}<button type="button" class="outline" onClick=${onClose}>Cancel</button><button class="primary" disabled=${saving}>${saving ? 'Saving…' : 'Save settings'}</button></footer>
       </form>
     </div>

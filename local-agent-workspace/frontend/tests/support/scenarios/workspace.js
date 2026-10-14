@@ -34,7 +34,10 @@ fake.sessions = new Map([['a', makeSession('a', 'Other conversation')]])
 fake.settings = { ...baseSettings, user_instructions: '', write_limit_kb: 80, command_env: [], rate_limit_auto_continue: true,
   coding_dir_status: { path: null, state: 'off', message: 'Not set. New code goes where you ask, or into the project folder.', source: 'none' },
   python_venv_status: { path: null, state: 'off', message: 'Not set. Commands use the Python on the server\'s PATH.', python: null, version: null, source: 'none' },
-  default_model: 'databricks-claude-opus-5-5', default_limits: { context_window: 131072, max_output_tokens: 8192 } }
+  default_model: 'databricks-claude-opus-5-5', default_limits: { context_window: 131072, max_output_tokens: 8192 },
+  reasoning_effort: 'default', reasoning_format: 'auto', thinking_summaries: true,
+  endpoint_profiles: [{ model: 'databricks-claude-opus-5-5', label: 'Claude Opus 5.5' }, { model: 'databricks-claude-opus-4-8', label: 'Claude Opus 4.8' },
+    { model: 'databricks-gpt-oss-120b', label: 'GPT OSS 120B' }, { model: 'databricks-gpt-oss-20b', label: 'GPT OSS 20B' }] }
 // POST /api/settings/limits: canned answers like the server's for Claude Opus 5.5; other endpoints have no profile.
 window.opusProfile = { label: 'Claude Opus 5.5', context_max: 1000000, output_max: 128000, itpm: 1000000, otpm: 100000,
   recommended_context_window: 200000, recommended_max_output_tokens: 16384, thinking_reserve: 4096,
@@ -76,7 +79,9 @@ fake.handle = (path, options) => {
   if (path === '/api/settings' && (options.method || 'GET') === 'GET') return fake.json(fake.settings)
   if (path === '/api/settings/limits' && options.method === 'POST') return fake.json(limitsCheck(body()))
   if (path === '/api/sessions' && options.method === 'POST') {
-    const created = { ...makeSession('created', 'Created conversation'), model: fake.settings.model }
+    const requested = options.body ? body().reasoning_effort : undefined
+    const created = { ...makeSession('created', 'Created conversation'), model: fake.settings.model,
+      reasoning_effort: requested || fake.settings.reasoning_effort || 'default' }
     fake.sessions.set(created.id, created)
     return fake.json(created)
   }
@@ -90,6 +95,12 @@ fake.handle = (path, options) => {
   if (titleId && options.method === 'PUT') {
     const updated = { ...fake.sessions.get(titleId), title: body().title.trim().replace(/\s+/g, ' ') }
     fake.sessions.set(titleId, updated)
+    return fake.json(updated)
+  }
+  const effortId = path.match(/^\/api\/sessions\/([^/]+)\/reasoning-effort$/)?.[1]
+  if (effortId && options.method === 'PUT') {
+    const updated = { ...fake.sessions.get(effortId), reasoning_effort: body().reasoning_effort }
+    fake.sessions.set(effortId, updated)
     return fake.json(updated)
   }
   const modelId = path.match(/^\/api\/sessions\/([^/]+)\/model$/)?.[1]
