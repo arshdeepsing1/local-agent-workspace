@@ -290,7 +290,8 @@ when opening a conversation or performing restart recovery.
   **Needs approval** marks a chat waiting for an approval card; a pulsing dot marks a chat
   that is working (replying, compacting, naming itself or waiting for a subagent); **Error**
   marks a chat whose last reply ended with an error, or was cut off because the server
-  stopped, and that you have not opened since; a
+  stopped, and that you have not opened since (in the narrower sidebar of 601–1,120 px windows
+  these two badges are small coloured dots with a tooltip, so the title keeps its room); a
   blue dot marks a chat that changed since you last opened it. **Running** above the list
   shows only chats that are not idle; click it again to show all. The browser remembers when
   you last opened each chat (in `localStorage`, on this browser only, shared by its tabs: a

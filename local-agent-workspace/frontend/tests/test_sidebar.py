@@ -95,6 +95,16 @@ def test_a_worktree_chat_with_badges_keeps_its_title_visible(ui, page):
     check()
     page.set_viewport_size({"width": 1280, "height": 900})
     expect(row(page, "Fix the parser for nested arrays").locator(".row-badge")).to_have_text("Needs approval")
+    # In the narrower sidebar (601-1,120 px) the badge is a dot with a tooltip and the title gets the room.
+    # Mutation: drop the dot rule.
+    page.set_viewport_size({"width": 1024, "height": 768})
+    badge = row(page, "Fix the parser for nested arrays").locator(".row-badge")
+    expect(badge).to_have_text("Needs approval")
+    expect(badge).to_have_attribute("title", "Waiting for your approval")
+    assert badge.evaluate("e => e.getBoundingClientRect().width") <= 8
+    expect(row(page, "Fix the parser for nested arrays")).to_have_accessible_name(re.compile("Needs approval"))
+    assert row(page, "Fix the parser for nested arrays").locator(".conversation-name").evaluate(
+        "el => el.getBoundingClientRect().width") > 120
 
 
 def test_subagent_chats_nest_under_their_parent(ui, page):
