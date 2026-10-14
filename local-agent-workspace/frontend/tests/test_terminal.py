@@ -142,3 +142,49 @@ def test_polling_stops_on_error_until_refresh(ui, page):
     page.get_by_role("button", name="Refresh jobs").click()
     expect(page.get_by_role("alert")).to_have_count(0)
     assert ui.js("fake.calls.length") == calls + 1
+
+
+def test_the_shell_command_shows_keyboard_focus(ui, page):
+    # V-T14. The input itself has no outline; its .terminal-command box shows the ring. Mutation: delete
+    # .terminal-command:focus-within.
+    open_terminal(ui)
+    command = page.get_by_role("textbox", name="Shell command")
+    expect(command).to_be_visible()
+    page.keyboard.press("Shift")
+    command.focus()
+    box = page.locator(".terminal-command")
+    assert box.evaluate("e => [getComputedStyle(e).outlineStyle, getComputedStyle(e).outlineWidth]") == ["solid", "2px"]
+    command.evaluate("e => e.blur()")
+    assert box.evaluate("e => getComputedStyle(e).outlineStyle") == "none"
+
+
+RING = ["solid", "2px", "rgb(163, 90, 64)"]  # the 2 px accent ring
+
+
+def test_the_terminal_options_show_keyboard_focus(ui, page):
+    # Mutation: delete the .terminal-options/.terminal-background input:focus-visible rule (.terminal-view input's
+    # outline:none hides the ring).
+    open_terminal(ui)
+    page.get_by_role("textbox", name="Shell command").focus()
+    for name in ("Timeout (seconds)", "Output limit (bytes)", "Run in background"):
+        page.keyboard.press("Tab")
+        field = page.get_by_label(name)
+        assert field.evaluate("e => document.activeElement === e && e.matches(':focus-visible')"), name
+        assert field.evaluate("e => [getComputedStyle(e).outlineStyle, getComputedStyle(e).outlineWidth, "
+                              "getComputedStyle(e).outlineColor]") == RING, name
+
+
+def test_the_job_output_shows_keyboard_focus_outside_its_dark_box(ui, page):
+    # Mutation: delete .terminal-output:focus-visible{outline-offset:2px} (the inset ring is lost on the dark box).
+    open_terminal(ui, "fake.jobs.set('one', makeJob('one', { output: Array.from({ length: 200 }, (_, n) => `line ${n}`).join('\\n') }))")
+    page.get_by_role("button", name=re.compile("command-one")).first.click()
+    output = page.get_by_label("Job output")
+    expect(output).to_contain_text("line 199")
+    page.locator(".terminal-view").evaluate("e => { e.style.height = '480px' }")  # the drawer's height in the app
+    assert output.evaluate("e => e.scrollHeight > e.clientHeight")
+    page.keyboard.press("Shift")
+    output.focus()
+    assert output.evaluate("e => document.activeElement === e && e.matches(':focus-visible')")
+    style = output.evaluate("e => [getComputedStyle(e).outlineStyle, getComputedStyle(e).outlineWidth, "
+                            "getComputedStyle(e).outlineColor, getComputedStyle(e).outlineOffset]")
+    assert style == RING + ["2px"], style
