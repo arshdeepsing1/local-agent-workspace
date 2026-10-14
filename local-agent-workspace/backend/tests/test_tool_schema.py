@@ -1,3 +1,5 @@
+import types
+
 import pytest
 
 from local_agent.feature_tools import FEATURE_TOOLS
@@ -84,6 +86,9 @@ def test_unique_complex_items_use_bounded_linear_validation(monkeypatch):
         charge()
 
     monkeypatch.setattr(module, "_charge", counted)
+    # The work is what is counted here; a garbage-collection pause in a long test run must not
+    # trip the 0.25-second deadline, so this test's clock stands still.
+    monkeypatch.setattr(module, "time", types.SimpleNamespace(monotonic=lambda: 0.0))
     schema = {"properties": {"values": {"uniqueItems": True}}}
     validate_arguments(schema, {"values": [{"id": n} for n in range(1500)]})
     assert calls < 4000
