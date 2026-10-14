@@ -91,7 +91,21 @@ def test_tablet_drawer_and_scrim(ui, page):
     page.mouse.click(260, 400)  # The dimmed strip of the chat between the sidebar and the drawer.
     expect(panel(page)).to_have_count(0)
     open_panel(page)
-    page.mouse.click(100, 400)  # The dimmed sidebar: only closes the drawer.
+    # The scrim covers only the chat: the sidebar, which Tab reaches from the drawer, takes the mouse too.
+    # Mutation: drop the sidebar's z-index above the scrim.
+    row = page.locator(".conversation-row > button:first-child", has_text="Fix the login redirect")
+    assert row.evaluate("b => { const r = b.getBoundingClientRect(); return b.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2)) }")
+    page.get_by_role("button", name="New conversation").hover()
+    page.mouse.click(100, 400)  # Empty sidebar space: the drawer stays open.
+    expect(panel(page)).to_be_visible()
+    page.get_by_role("button", name="Running").focus()
+    page.keyboard.press("Shift+Tab")
+    page.keyboard.press("Tab")
+    focused = page.get_by_role("button", name="Running")
+    expect(focused).to_be_focused()
+    assert focused.evaluate("b => getComputedStyle(b).outlineStyle === 'solid' && parseFloat(getComputedStyle(b).outlineWidth) >= 2")
+    assert focused.evaluate("b => { const r = b.getBoundingClientRect(); return b.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2)) }")
+    page.mouse.click(260, 400)
     expect(panel(page)).to_have_count(0)
     assert ui.js("location.search") == "?session=a"
     expect(page.locator(".workspace-scrim")).to_have_count(0)

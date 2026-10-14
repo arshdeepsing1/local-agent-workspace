@@ -437,8 +437,8 @@ when opening a conversation or performing restart recovery.
 - **Workspace / Files**: browse a folder, edit UTF-8 text files up to the file write limit
   (Settings, 80 KB by default), or use the plus button to reference the file in chat ("Please read the project file: <path>", or
   "Please read the file: <absolute path>" for a folder outside the project). On windows narrower
-  than 1,024 px the Workspace panel opens over the chat (from 601 px it stops at the sidebar, which stays reachable from the keyboard): focus moves into it, and
-  **Close workspace**, Escape (in the panel or the sidebar) or a click outside it closes it (that first
+  than 1,024 px the Workspace panel opens over the chat (from 601 px it stops at the sidebar, which stays usable with the keyboard and the mouse and is not dimmed): focus moves into it, and
+  **Close workspace**, Escape (in the panel or the sidebar) or a click on the dimmed chat closes it (that first
   click only closes the panel). An error that comes up while it is open shows at the bottom of the panel. When the
   conversation has granted folders (**Folder access**) or you added folders to Files, a row of
   folder buttons at the top switches between **Project**, each granted folder ("Allowed in this
