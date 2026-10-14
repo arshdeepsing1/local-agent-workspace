@@ -269,6 +269,9 @@ function noticeError(event) {
   return error
 }
 
+// A wait notice saved by an older version still asks for Stop; once the chat is idle there is nothing to stop.
+const idleNotice = text => typeof text === 'string' ? text.replace(/ Press Stop to cancel\.$/, '') : text
+
 // A Stop leaves a notice that names what it interrupted (older notices have no stop_phase).
 const STOPPED_TEXT = 'Stopped. You can continue this conversation.'
 const STOP_TEXT = { streaming: 'Stopped while replying', tools: 'Stopped during an action', waiting: 'Stopped' }
@@ -590,7 +593,7 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
       if (marker) return html`<div class=${classes} key=${event.id} title=${event.text}>${STOP_TEXT[event.stop_phase] || 'Stopped'}</div>`
       const error = event.type === 'error' ? noticeError(event) : null
       return html`<div class=${classes} key=${event.id} role=${error ? 'note' : undefined}>${error ? html`<p class="notice-summary">${error.summary}</p>${error.details
-          ? html`<details class="notice-details"><summary>Details</summary><pre>${error.details}</pre></details>` : null}` : event.text}<${DelegationStatus} event=${event} onSelectSession=${onSelectSession} />${!event.delegation && event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}</div>`
+          ? html`<details class="notice-details"><summary>Details</summary><pre>${error.details}</pre></details>` : null}` : idle ? idleNotice(event.text) : event.text}<${DelegationStatus} event=${event} onSelectSession=${onSelectSession} />${!event.delegation && event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}</div>`
     })}
     ${['running', 'delegating'].includes(session.status) ? html`<div class="working-indicator"><span /><span /><span /><span class="sr-only">Working</span></div>` : null}
     ${rewinding && idle ? html`<${RewindDialog} session=${session} event=${rewinding} onClose=${() => setRewinding(null)}

@@ -345,8 +345,8 @@ async def test_the_automatic_continue_notice_names_the_limit(runtime, monkeypatc
     waiting = [text for text in notices(session) if text.startswith("Databricks is still rate limiting this chat")]
     assert len(waiting) == 1 and waiting[0].startswith(
         "Databricks is still rate limiting this chat (input tokens per minute (ITPM): limit 1,000,000, current "
-        "1,003,000). Continuing automatically at ")
-    assert waiting[0].endswith("(1 of 2). Press Stop to cancel.")
+        "1,003,000). Continued automatically at ")
+    assert waiting[0].endswith("(1 of 2).") and "Continued automatically at " in waiting[0]
 
 
 def test_the_gate_keeps_at_most_64_endpoints():

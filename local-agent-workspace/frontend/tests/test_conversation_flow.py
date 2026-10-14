@@ -450,3 +450,34 @@ def test_drafts_work_without_storage(ui, page):
     page.get_by_role("button", name="Send message").click()
     ui.wait("fake.requests('/api/sessions/a/messages', 'POST').length === 1")
     expect(message(page)).to_have_value("")
+
+
+# Rate-limit waits
+
+WAIT = "Databricks is still rate limiting this chat. Continuing automatically at 10:00:00 (1 of 2). Press Stop to cancel."
+
+
+def test_a_reply_that_waited_moves_below_the_wait_notices(ui, page):
+    # agents.py moves the reply's empty event after each wait notice with a new created time (test_transient_retries.py);
+    # the page follows. Mutation: keep an updated event in place.
+    start_app(ui, page, session="a", setup=with_turn("[{ id: 'r0', type: 'assistant', text: 'Earlier.', created: 1 }]"))
+    ui.show_session("a")
+    ui.emit("a", {"type": "status", "status": "running"})
+    ui.emit("a", {"type": "event", "event": {"id": "r", "type": "assistant", "text": "", "created": 10,
+                                              "request_info": {"model": "test-model", "status": "running"}}})
+    ui.emit("a", {"type": "event", "event": {"id": "n", "type": "notice", "text": WAIT, "created": 11}})
+    ui.emit("a", {"type": "event", "event": {"id": "r", "type": "assistant", "text": "", "created": 12,
+                                              "request_info": {"model": "test-model", "status": "running"}}})
+    ui.emit("a", {"type": "delta", "id": "r", "text": "The answer."})
+    expect(page.get_by_text("The answer.")).to_be_visible()
+    notice = page.locator(".conversation-notice", has_text="still rate limiting")
+    expect(notice).to_contain_text("Press Stop to cancel.")  # Still busy.
+    order = page.evaluate("""() => {
+      const notice = document.querySelector('.conversation-notice')
+      const reply = [...document.querySelectorAll('.transcript-inner *')].find(el => el.textContent === 'The answer.')
+      return notice.compareDocumentPosition(reply) & Node.DOCUMENT_POSITION_FOLLOWING }""")
+    assert order
+    assert page.locator(".transcript-inner").get_by_text("Earlier.").count() == 1
+    # A notice saved without its finished text stops asking for Stop once the chat is idle.
+    ui.emit("a", {"type": "status", "status": "idle", "terminal_reason": "completed"})
+    expect(notice).to_have_text("Databricks is still rate limiting this chat. Continuing automatically at 10:00:00 (1 of 2).")

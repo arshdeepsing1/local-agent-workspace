@@ -197,6 +197,11 @@ def rate_limit_wait_seconds(headers, payload=None, now=None):
     return 60 - now % 60 + random.uniform(1, 5)
 
 
+def seconds_text(value):
+    """'1 second', '2.5 seconds'."""
+    return f"{value:g} second" + ("" if value == 1 else "s")
+
+
 def retry_notice(error, delay, number, budget, purpose="the model request"):
     status = error.http_status if isinstance(getattr(error, "http_status", None), int) else None
     reason = getattr(error, "retry_reason", None)
@@ -207,7 +212,7 @@ def retry_notice(error, delay, number, budget, purpose="the model request"):
         what = f"Databricks returned HTTP {status} before the reply started."
     else:
         what = "The connection to Databricks failed before the reply started."
-    return f"{what} Retrying in {delay:g} seconds ({number} of {budget})."
+    return f"{what} Retrying in {seconds_text(delay)} ({number} of {budget})."
 
 
 def mark_retryable(error, reason, headers=None, body=None):
@@ -1191,7 +1196,7 @@ class AgentManager:
             return
         jitter = self.rate_rng.uniform(0, min(3.0, seconds * 0.25))
         await self.event(session, "notice", text=(
-            f"Waiting {math.ceil(seconds)} seconds before {purpose}: Databricks rate-limited another chat's request "
+            f"Waiting {seconds_text(math.ceil(seconds))} before {purpose}: Databricks rate-limited another chat's request "
             f"to {session['model']}."))
         await asyncio.sleep(seconds + jitter)
 
@@ -1441,6 +1446,17 @@ class AgentManager:
         await self.broadcast(session["id"], {"type": "event", "event": event})
         if event["type"] == "tool":
             await self.delegates.progress(session)
+
+    async def reply_after_notices(self, session, event):
+        """A reply waiting to start (rate limit, retry) stays below the notices of its waits: its still
+        empty event moves to the end of the transcript with a new creation time, which the page follows."""
+        events = session["events"]
+        if events and events[-1] is not event:
+            place = next((index for index, item in enumerate(events) if item is event), None)
+            if place is not None:
+                events.append(events.pop(place))
+                await self.update_event(session, event, created=time.time(),
+                                        request_info={"model": session["model"], "status": "running"})
 
     def mark_user_in_wire(self, session):
         """The newest user event's text is now the wire's latest user message (history.py).
@@ -2162,7 +2178,7 @@ class AgentManager:
             raise ValueError(str(exc)) from None
         waiting = self.rate_gate.remaining(session["model"], session["id"], reserve)
         if waiting >= 0.5:
-            raise ValueError(f"Databricks is rate limiting {session['model']}; ask again in {math.ceil(waiting)} seconds.")
+            raise ValueError(f"Databricks is rate limiting {session['model']}; ask again in {seconds_text(math.ceil(waiting))}.")
         if (refusal := self.otpm_preflight(session, reserve)) is not None:
             raise ValueError(str(refusal))
         scratch = {"id": session["id"], "inference_calls": []}
@@ -3946,12 +3962,14 @@ class AgentManager:
                         try:
                             # Another chat's 429 on this endpoint: wait with it instead of adding to the overload.
                             await self.wait_for_rate_limit(session, "the model request", max_output_tokens)
+                            await self.reply_after_notices(session, event)
                             ordered_calls, arguments = await self.model_response(
                                 session, event, client, url, headers, payload, retry_reason=retry_reason, body=body)
                             break
                         except InferenceError as exc:
                             if not getattr(exc, "retryable", False):
                                 raise
+                            waited = None
                             if transient_attempt < MAX_TRANSIENT_RETRIES:
                                 delay = transient_retry_delay(exc, transient_attempt)
                                 transient_attempt += 1
@@ -3963,10 +3981,13 @@ class AgentManager:
                                 delay = rate_limit_wait_seconds(exc.retry_headers, exc.retry_payload)
                                 resume = datetime.fromtimestamp(time.time() + delay).strftime("%H:%M:%S")
                                 described = describe(getattr(exc, "rate_limit", None))
-                                notice = ("Databricks is still rate limiting this chat"
-                                          + (f" ({described})" if described else "")
-                                          + f". Continuing automatically at {resume} ({rate_limit_waits} of "
-                                          f"{MAX_RATE_LIMIT_WAITS}). Press Stop to cancel.")
+                                limited = ("Databricks is still rate limiting this chat"
+                                           + (f" ({described})" if described else ""))
+                                count = f"({rate_limit_waits} of {MAX_RATE_LIMIT_WAITS})"
+                                notice = f"{limited}. Continuing automatically at {resume} {count}. Press Stop to cancel."
+                                # Once the wait is over the notice no longer asks for Stop.
+                                waited = (f"{limited}. Continued automatically at {resume} {count}.",
+                                          f"{limited}. Stopped while waiting to continue at {resume} {count}.")
                                 retry_reason = "rate_limit_wait"
                             else:
                                 if exc.retry_reason == "rate_limit" and (
@@ -3976,11 +3997,15 @@ class AgentManager:
                             if exc.retry_reason == "rate_limit":
                                 self.rate_gate.note(session["model"], session["id"], delay,
                                                     getattr(exc, "rate_limit", None), max_output_tokens)
-                            await self.update_event(
-                                session, event,
-                                request_info={"model": session["model"], "status": "running"})
-                            await self.event(session, "notice", text=notice)
-                            await asyncio.sleep(delay)
+                            notice_event = await self.event(session, "notice", text=notice)
+                            await self.reply_after_notices(session, event)
+                            finished = False
+                            try:
+                                await asyncio.sleep(delay)
+                                finished = True
+                            finally:
+                                if waited:
+                                    await self.update_event(session, notice_event, text=waited[0 if finished else 1])
                     retry_reason = None
                 except InferenceError as exc:
                     if getattr(exc, "execution_limit", False) and not execution_noticed:

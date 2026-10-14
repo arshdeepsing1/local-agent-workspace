@@ -730,7 +730,10 @@ when opening a conversation or performing restart recovery.
   after the three retries, the app waits up to twice per message (the provider's
   `Retry-After` up to 2 minutes, otherwise until just after the next minute) and tries
   again, so a request makes at most six attempts. The notice shows the time, and
-  **Stop** cancels the wait (see **Rate limits** under **Context and project
+  **Stop** cancels the wait; once the wait is over the notice reads "Continued
+  automatically at ..." (or that Stop ended it) and no longer mentions **Stop**. The
+  notices of these waits come before the reply they held up, live and in the saved
+  and exported conversation (see **Rate limits** under **Context and project
   instructions** for the limit a 429 names and the wait shared by chats). Turn the waits off with **Settings → Continue
   automatically after rate limits**. When a reply's tool calls had invalid or
   incomplete arguments, or the reply ended without a finish reason, none of its tools
