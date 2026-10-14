@@ -311,11 +311,16 @@ async def test_auto_continue_waits_for_the_next_minute_twice_then_succeeds(runti
     wait = 60 - NOW % 60 + 2.5
     assert delays == [5.0, 15.0, 40.0, wait, wait]
     at = datetime.fromtimestamp(NOW + wait).strftime("%H:%M:%S")
+    # A finished wait no longer asks for Stop.
     assert notices(session)[3:] == [
-        f"Databricks is still rate limiting this chat. Continuing automatically at {at} ({number} of 2). Press Stop to cancel."
+        f"Databricks is still rate limiting this chat. Continued automatically at {at} ({number} of 2)."
         for number in (1, 2)]
     replies = [event for event in session["events"] if event["type"] == "assistant"]
     assert [reply["text"] for reply in replies] == ["Finally."] and session["terminal_reason"] == "completed"
+    # The reply comes after the notices of the waits before it, in the stored (and exported) order.
+    assert [event["type"] for event in session["events"]] == ["user"] + ["notice"] * 5 + ["assistant"]
+    created = [event["created"] for event in session["events"]]
+    assert created == sorted(created)
     assert [call.get("retry_reason") for call in agent_calls(session)] == [
         None, "rate_limit", "rate_limit", "rate_limit", "rate_limit_wait", "rate_limit_wait"]
 
@@ -346,7 +351,7 @@ async def test_auto_continue_waits_are_counted_per_turn_not_per_request(runtime,
     mock_gateway(monkeypatch, gateway)
     await manager.run(session, "List the files")
     assert len(requests) == 6 + 4  # Step 2: the first attempt and three retries, then no more waits.
-    assert sum("Continuing automatically" in text for text in notices(session)) == 2
+    assert sum("Continued automatically" in text for text in notices(session)) == 2
     assert [event["state"] for event in session["events"] if event["type"] == "tool"] == ["completed"]
     assert session["events"][-1]["error_kind"] == "rate_limit" and session["terminal_reason"] == "inference_error"
     assert [call.get("retry_reason") for call in agent_calls(session)][6:] == [
@@ -379,6 +384,27 @@ async def test_stop_cancels_an_auto_continue_wait(runtime, monkeypatch, clock):
     await manager.stop(session["id"])
     saved = manager.store.get(session["id"])
     assert saved["terminal_reason"] == "stopped" and len(requests) == 4
+    waits = [text for text in notices(saved) if text.startswith("Databricks is still rate limiting")]
+    assert len(waits) == 1 and "Stopped while waiting to continue at" in waits[0] and "Press Stop" not in waits[0]
+
+
+async def test_a_wait_notice_asks_for_stop_only_while_it_waits(runtime, monkeypatch, clock):
+    manager, session = runtime
+    requests, seen = [], []
+
+    async def sleep(delay):
+        seen.append((delay, [event["text"] for event in session["events"] if event["type"] == "notice"][-1],
+                     session["events"][-1]["type"]))
+    monkeypatch.setattr("local_agent.agents.asyncio.sleep", sleep)
+    mock_gateway(monkeypatch, rate_limited_gateway(requests, 4, {"Retry-After": "1"}))
+    await manager.run(session, "Hello")
+    # While it waits, the newest notice is the one it is waiting on and the reply placeholder sits below it.
+    assert [item[0] for item in seen] == [1.0, 1.0, 1.0, 1.0] and {item[2] for item in seen} == {"assistant"}
+    assert seen[0][1].endswith("Retrying in 1 second (1 of 3).")
+    assert seen[3][1].endswith("(1 of 2). Press Stop to cancel.")
+    assert notices(session)[3].endswith("Continued automatically at "
+                                        + datetime.fromtimestamp(NOW + 1).strftime("%H:%M:%S") + " (1 of 2).")
+    assert session["events"][-1]["type"] == "assistant" and session["events"][-1]["text"] == "Finally."
 
 
 async def test_a_stalled_stream_names_the_read_timeout(runtime, monkeypatch):

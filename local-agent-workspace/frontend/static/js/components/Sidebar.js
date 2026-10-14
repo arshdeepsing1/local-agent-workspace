@@ -176,7 +176,7 @@ const ACTIVITY = { running: 'Running', compacting: 'Compacting', naming: 'Naming
 function RowStatus({ session, unread, failed }) {
   const changed = session.unreviewed_changes > 0 ? html`<span class="changes-dot"
     title=${`${plural(session.unreviewed_changes, 'file')} with unreviewed agent changes`}><span class="sr-only">Unreviewed changes</span></span>` : null
-  if (session.status === 'awaiting_approval') return html`${changed}<span class="row-badge approval">Needs approval</span>`
+  if (session.status === 'awaiting_approval') return html`${changed}<span class="row-badge approval" title="Waiting for your approval">Needs approval</span>`
   if (session.status !== 'idle') return html`${changed}<span class="sr-only">${ACTIVITY[session.status] || 'Working'}</span>`
   if (failed) return html`${changed}<span class="row-badge error" title="The last reply ended with an error">Error</span>`
   if (unread) return html`${changed}<span class="unread-dot" title="Changed since you last opened it"><span class="sr-only">Unread</span></span>`

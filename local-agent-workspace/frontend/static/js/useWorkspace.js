@@ -223,7 +223,10 @@ export function useWorkspace() {
         if (data.type === 'event') setSession(current => {
           if (!current || current.id !== activeId) return current
           const event = data.event
-          if (current.events.some(e => e.id === event.id)) return { ...current, events: current.events.map(e => e.id === event.id ? event : e) }
+          const known = current.events.find(e => e.id === event.id)
+          // A reply that waited (rate limit, retry) comes back with a new creation time: it moves below the wait's notices.
+          if (known && known.created !== event.created) return { ...current, events: [...current.events.filter(e => e.id !== event.id), event] }
+          if (known) return { ...current, events: current.events.map(e => e.id === event.id ? event : e) }
           // An update to an event on a page that is not loaded yet: it arrives with that page.
           if (current.events_start > 0 && current.events.length && event.created < current.events[0].created) return current
           return { ...current, events: [...current.events, event], events_total: (current.events_total ?? current.events.length) + 1 }

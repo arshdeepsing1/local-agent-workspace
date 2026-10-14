@@ -290,7 +290,8 @@ when opening a conversation or performing restart recovery.
   **Needs approval** marks a chat waiting for an approval card; a pulsing dot marks a chat
   that is working (replying, compacting, naming itself or waiting for a subagent); **Error**
   marks a chat whose last reply ended with an error, or was cut off because the server
-  stopped, and that you have not opened since; a
+  stopped, and that you have not opened since (in the narrower sidebar of 601–1,120 px windows
+  these two badges are small coloured dots with a tooltip, so the title keeps its room); a
   blue dot marks a chat that changed since you last opened it. **Running** above the list
   shows only chats that are not idle; click it again to show all. The browser remembers when
   you last opened each chat (in `localStorage`, on this browser only, shared by its tabs: a
@@ -437,8 +438,8 @@ when opening a conversation or performing restart recovery.
 - **Workspace / Files**: browse a folder, edit UTF-8 text files up to the file write limit
   (Settings, 80 KB by default), or use the plus button to reference the file in chat ("Please read the project file: <path>", or
   "Please read the file: <absolute path>" for a folder outside the project). On windows narrower
-  than 1,024 px the Workspace panel opens over the chat (from 601 px it stops at the sidebar, which stays reachable from the keyboard): focus moves into it, and
-  **Close workspace**, Escape (in the panel or the sidebar) or a click outside it closes it (that first
+  than 1,024 px the Workspace panel opens over the chat (from 601 px it stops at the sidebar, which stays usable with the keyboard and the mouse and is not dimmed): focus moves into it, and
+  **Close workspace**, Escape (in the panel or the sidebar) or a click on the dimmed chat closes it (that first
   click only closes the panel). An error that comes up while it is open shows at the bottom of the panel. When the
   conversation has granted folders (**Folder access**) or you added folders to Files, a row of
   folder buttons at the top switches between **Project**, each granted folder ("Allowed in this
@@ -596,7 +597,8 @@ when opening a conversation or performing restart recovery.
   (1,024–1,000,000 bytes, default 80,000). A foreground job disables Run until it
   finishes; **Run in background** lets you launch another command. Select a job
   to inspect output, or use **Stop job**. History survives closing/reopening the
-  panel and refreshing the browser. Jobs belong to the selected conversation;
+  panel and refreshing the browser; a long command cut off in the history shows in full
+  in its tooltip, as does a long name in **Files**. Jobs belong to the selected conversation;
   commands launched before creating a chat belong to the selected workspace.
   This remains a noninteractive command runner: stdin is closed, with no PTY.
   Closing the panel does not cancel a job. Errors pause polling until **Refresh jobs**.
@@ -651,7 +653,8 @@ when opening a conversation or performing restart recovery.
   A command that exits non-zero, times out or is interrupted shows a warning icon, a label
   (`exit 1`, `signal 9` for a process ended by a signal, `timed out` or `interrupted`) and its
   last output line under the collapsed card (`Exit 1 · …`; when output past `max_output_bytes`
-  was not kept, it says so instead). A command started with `background` is labelled
+  was not kept, it says so instead); its expanded card's **Action** line reads `ran · exit 1`,
+  not `completed`. A command started with `background` is labelled
   `started in background`. A failed tool shows its error category, and its expanded card shows
   **Error category** and the **Hint given to the agent**. Expanded command and job cards show the
   output as text, then a **State** line (state, exit code, size, and which part the result
@@ -660,7 +663,9 @@ when opening a conversation or performing restart recovery.
   with the full result (with the edited-command note for a command you edited; when a result
   was shortened for the agent or not sent to it, the card says so). On `wait_job`,
   `get_job_output` and `stop_job` cards a green tick means
-  the tool worked; a muted label such as `job exit 1` reports the job itself.
+  the tool worked; a muted label such as `job exit 1` reports the job itself. A `wait_job` card
+  first says how the wait ended: `matched` (the **State** line quotes the matching line),
+  `wait timed out` (no tick) or `job ended`.
   **Read before overwriting:** the conversation remembers the size and modification time
   of each file the agent read (`read_file` any page, or `notebook_read`) or wrote, up to 500 files.
   `write_file` on an existing file is refused, before any approval card, unless the
@@ -730,7 +735,10 @@ when opening a conversation or performing restart recovery.
   after the three retries, the app waits up to twice per message (the provider's
   `Retry-After` up to 2 minutes, otherwise until just after the next minute) and tries
   again, so a request makes at most six attempts. The notice shows the time, and
-  **Stop** cancels the wait (see **Rate limits** under **Context and project
+  **Stop** cancels the wait; once the wait is over the notice reads "Continued
+  automatically at ..." (or that Stop ended it) and no longer mentions **Stop**. The
+  notices of these waits come before the reply they held up, live and in the saved
+  and exported conversation (see **Rate limits** under **Context and project
   instructions** for the limit a 429 names and the wait shared by chats). Turn the waits off with **Settings → Continue
   automatically after rate limits**. When a reply's tool calls had invalid or
   incomplete arguments, or the reply ended without a finish reason, none of its tools

@@ -102,7 +102,9 @@ export function resultOf(event) {
   if (!page || typeof page !== 'object' || Array.isArray(page) || typeof page.output !== 'string') return null
   return { note, text: page.output, raw: text, mcpError: page.is_error === true,
     job: 'state' in page ? { state: String(page.state), exitCode: page.exit_code, background: !!page.background,
-      total: page.total_chars, truncated: page.truncated === true, shown: shownPart(page) } : null }
+      total: page.total_chars, truncated: page.truncated === true, shown: shownPart(page),
+      // wait_job: why the wait ended ('matched', 'timeout' or 'exited') and the line that matched.
+      wait: typeof page.reason === 'string' ? page.reason : null, match: typeof page.match?.line === 'string' ? page.match.line : null } : null }
 }
 
 const KIND_LABEL = { timeout: 'timed out', not_found: 'not found', edit_mismatch: 'no match', stale_file: 'file changed',
@@ -150,11 +152,17 @@ export function toolStatus(event, result) {
   if (own) return { tone: own[0], label: own[1], labelTone: own[2] }
   const job = result?.job
   if (job && !isCommand && JOB_TOOLS.has(event.name)) {
-    const label = job.state === 'failed' ? `job ${exitLabel(job.exitCode)}` : OTHER_JOB[job.state] || ''
+    // A wait reports its outcome first: its line matched, or it timed out (no tick: what it waited for did not come).
+    if (job.wait === 'matched') return { tone: 'ok', label: 'matched', labelTone: 'neutral' }
+    if (job.wait === 'timeout') return { tone: 'neutral', label: 'wait timed out', labelTone: 'neutral' }
+    const label = job.state === 'failed' ? `job ${exitLabel(job.exitCode)}` : OTHER_JOB[job.state] || (job.wait === 'exited' ? 'job ended' : '')
     return { tone: 'ok', label, labelTone: label ? 'neutral' : null }
   }
   return { tone: 'ok', label: '', labelTone: null }
 }
+
+// The Action word: a command that ran and then failed says 'ran', not 'completed' beside its failed state.
+const actionText = (event, status) => event.state === 'completed' && status?.tone === 'warn' ? 'ran' : event.state
 
 // Parsed results, statuses and errors are cached per event object: an updated event is a new object.
 const statusCache = new WeakMap()
@@ -170,8 +178,10 @@ function toolState(event) {
 
 // The State line of an expanded command or job card.
 const KILLED = new Set(['timed_out', 'cancelled', 'interrupted'])  // the app ended the process: its code says nothing more
+const WAIT_LINE = { matched: 'wait matched', timeout: 'wait timed out', exited: 'job ended during the wait' }
 function jobStateLine(job) {
-  return [`State: ${job.state.replace(/_/g, ' ')}`, Number.isInteger(job.exitCode) && !KILLED.has(job.state) ? exitLabel(job.exitCode) : '',
+  const wait = WAIT_LINE[job.wait] ? WAIT_LINE[job.wait] + (job.wait === 'matched' && job.match ? `: ${clip(job.match, 80)}` : '') : ''
+  return [`State: ${job.state.replace(/_/g, ' ')}`, wait, Number.isInteger(job.exitCode) && !KILLED.has(job.state) ? exitLabel(job.exitCode) : '',
     typeof job.total === 'number' ? `${job.total.toLocaleString()} characters` : '',
     job.truncated && typeof job.total === 'number' ? `output after ${job.total.toLocaleString()} characters not kept` : '',
     job.shown || ''].filter(Boolean).join(' · ')
@@ -268,6 +278,9 @@ function noticeError(event) {
   if (!error) summaryCache.set(event, error = errorSummary(event))
   return error
 }
+
+// A wait notice saved by an older version still asks for Stop; once the chat is idle there is nothing to stop.
+const idleNotice = text => typeof text === 'string' ? text.replace(/ Press Stop to cancel\.$/, '') : text
 
 // A Stop leaves a notice that names what it interrupted (older notices have no stop_phase).
 const STOPPED_TEXT = 'Stopped. You can continue this conversation.'
@@ -389,7 +402,7 @@ function ToolCard({ event, summary, result, status, failure = null, sessionId, o
             <textarea rows=${2} maxLength=${2000} spellcheck=${false} value=${note} disabled=${deciding}
               onInput=${e => setNote(e.currentTarget.value)} /></label>`} />`
         : html`${event.state === 'completed' && allowanceNote(event) ? html`<p class="tool-allowance">${allowanceNote(event)}</p>` : null}
-          <${ToolDetails} event=${event} pending=${false} result=${result} failure=${failure} /><small class="muted">Action: ${event.state}${status.label ? html` · <span class="tool-status-text">${status.label}</span>` : ''}</small>
+          <${ToolDetails} event=${event} pending=${false} result=${result} failure=${failure} /><small class="muted">Action: ${actionText(event, status)}${status.label ? html` · <span class="tool-status-text">${status.label}</span>` : ''}</small>
           ${onOpenPath && typeof filePath === 'string' && filePath ? html`<button class="outline tool-open-file"
             onClick=${() => onOpenPath(startLine ? { path: filePath, line: startLine } : { path: filePath })}><${FileText} size=${14} />Open file</button>` : null}`}
     </div>` : null}
@@ -569,7 +582,7 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
       <ol>${tools.map(event => {
         const summary = toolSummaries.get(event.id)
         return html`<li key=${event.id}><span>${(event.name || 'Tool').replace(/_/g, ' ')}</span>${summary.subject ? html`<span class="activity-subject"> · ${summary.subject}</span>` : null}
-          ${summary.taskStatus ? html`<small>Task: ${summary.taskStatus}</small>` : null}<small>Action: ${event.state}${(label => label ? ` · ${label}` : '')(toolStates.get(event.id)?.status.label)}</small></li>`
+          ${summary.taskStatus ? html`<small>Task: ${summary.taskStatus}</small>` : null}<small>Action: ${actionText(event, toolStates.get(event.id)?.status)}${(label => label ? ` · ${label}` : '')(toolStates.get(event.id)?.status.label)}</small></li>`
       })}</ol>
     </details>` : null}
     ${session.parent_session_id && onSelectSession ? html`<button class="outline parent-conversation" onClick=${() => onSelectSession(session.parent_session_id)}>Back to parent conversation</button>` : null}
@@ -590,7 +603,7 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
       if (marker) return html`<div class=${classes} key=${event.id} title=${event.text}>${STOP_TEXT[event.stop_phase] || 'Stopped'}</div>`
       const error = event.type === 'error' ? noticeError(event) : null
       return html`<div class=${classes} key=${event.id} role=${error ? 'note' : undefined}>${error ? html`<p class="notice-summary">${error.summary}</p>${error.details
-          ? html`<details class="notice-details"><summary>Details</summary><pre>${error.details}</pre></details>` : null}` : event.text}<${DelegationStatus} event=${event} onSelectSession=${onSelectSession} />${!event.delegation && event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}</div>`
+          ? html`<details class="notice-details"><summary>Details</summary><pre>${error.details}</pre></details>` : null}` : idle ? idleNotice(event.text) : event.text}<${DelegationStatus} event=${event} onSelectSession=${onSelectSession} />${!event.delegation && event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}</div>`
     })}
     ${['running', 'delegating'].includes(session.status) ? html`<div class="working-indicator"><span /><span /><span /><span class="sr-only">Working</span></div>` : null}
     ${rewinding && idle ? html`<${RewindDialog} session=${session} event=${rewinding} onClose=${() => setRewinding(null)}

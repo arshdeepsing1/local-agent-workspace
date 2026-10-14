@@ -110,7 +110,7 @@ function TerminalJobs({ sessionId, pythonVenv }) {
     <div class="terminal-history-heading"><span>Job history</span><button class="icon-button" aria-label="Refresh jobs" onClick=${() => { setError(''); setRefresh(current => current + 1) }}><${RefreshCw} size=${14} /></button></div>
     <div class="terminal-jobs" role="list" aria-label="Job history">
       ${jobs.map(job => html`<div class="terminal-job" role="listitem" key=${job.id}>
-        <button class="terminal-job-select" aria-label=${`Show job ${job.command} · ${jobState(job)}`} aria-pressed=${job.id === selectedId} onClick=${() => setSelectedId(job.id)}><span>${job.command}</span><small>${jobState(job)}</small></button>
+        <button class="terminal-job-select" aria-label=${`Show job ${job.command} · ${jobState(job)}`} aria-pressed=${job.id === selectedId} onClick=${() => setSelectedId(job.id)}><span title=${job.command}>${job.command}</span><small>${jobState(job)}</small></button>
         ${job.state === 'running' ? html`<button class="outline terminal-stop" aria-label=${`Stop job ${job.command}`} disabled=${stopping.includes(job.id)} onClick=${() => void stop(job.id)}>${stopping.includes(job.id) ? 'Stopping…' : 'Stop job'}</button>` : null}
       </div>`)}
       ${!jobs.length ? html`<p>No jobs in this workspace scope yet.</p>` : null}

@@ -188,3 +188,12 @@ def test_the_job_output_shows_keyboard_focus_outside_its_dark_box(ui, page):
     style = output.evaluate("e => [getComputedStyle(e).outlineStyle, getComputedStyle(e).outlineWidth, "
                             "getComputedStyle(e).outlineColor, getComputedStyle(e).outlineOffset]")
     assert style == RING + ["2px"], style
+
+
+def test_a_long_command_in_the_job_history_has_its_full_text_as_a_tooltip(ui, page):
+    # The history row cuts a long command with an ellipsis. Mutation: drop the span's title.
+    command = "python -m pytest tests/" + "very_long_test_module_name_" * 6 + ".py -q"
+    open_terminal(ui)
+    run(page, command)
+    item = page.get_by_role("listitem").locator(".terminal-job-select > span")
+    expect(item).to_have_attribute("title", command)
