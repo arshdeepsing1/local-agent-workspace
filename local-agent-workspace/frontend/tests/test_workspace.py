@@ -996,3 +996,27 @@ def test_git_view_refreshes_on_refresh_and_when_a_response_ends(ui, page):
     ui.emit("a", {"type": "status", "status": "idle"})
     expect(panel.get_by_text("Your working tree is clean.")).to_be_visible()
     assert len(ui.requests("/api/git/status?session_id=a")) == 3
+
+
+def test_subagent_progress_refreshes_the_sidebar_only_when_a_subagent_appears_or_changes_status(ui, page):
+    start_app(ui, page, session="a")
+    ui.show_session("a")
+
+    def card(child, status, done):
+        return ("{ type: 'event', event: { id: 'd-%s', type: 'tool', name: 'delegate_task', input: { task: 'x' }, state: 'running', "
+                "child_session_id: '%s', delegation: { status: '%s', completed_tools: %d } } }") % (child, child, status, done)
+
+    def lists():
+        return len(ui.requests("/api/sessions", "GET"))
+    before = lists()
+    ui.emit("a", card("one", "running", 0))
+    ui.wait(f"fake.requests('/api/sessions', 'GET').length === {before + 1}")
+    for done in (1, 2, 3):  # Only its count of completed actions changes.
+        ui.emit("a", card("one", "running", done))
+    ui.emit("a", card("two", "running", 0))  # A parallel subagent appears.
+    ui.wait(f"fake.requests('/api/sessions', 'GET').length === {before + 2}")
+    ui.emit("a", card("one", "awaiting_approval", 3))
+    ui.wait(f"fake.requests('/api/sessions', 'GET').length === {before + 3}")
+    expect(page.get_by_label("Subagent progress").first).to_contain_text("Waiting for approval")
+    ui.js("new Promise(done => setTimeout(done, 50))")
+    assert lists() == before + 3

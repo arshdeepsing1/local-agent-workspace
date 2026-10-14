@@ -5,7 +5,7 @@ that edit (its baseline). Later edits keep the baseline, so the review always
 compares the file on disk with its state before the agent touched it. Keep accepts
 the current content (the baseline moves forward); Undo writes the baseline back
 through the checkpoint machinery, so an undo can itself be restored from
-Agent tools -> Recovery. Both work on a whole file or on one change (hunk).
+Agent tools -> Checkpoints. Both work on a whole file or on one change (hunk).
 """
 import json
 import re

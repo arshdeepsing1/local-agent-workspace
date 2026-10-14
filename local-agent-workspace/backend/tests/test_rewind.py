@@ -459,7 +459,7 @@ async def test_a_failed_save_after_files_were_rewound_says_so(runtime):
     assert response.status_code == 500
     message = response.json()["detail"]["message"]
     assert message.startswith("Files were rewound, but the conversation could not be saved:")
-    assert message.endswith("Rewound files can be restored from Agent tools → Recovery.")
+    assert message.endswith("Rewound files can be restored from Agent tools → Checkpoints.")
     assert chat.files() == {"a.txt": "a1", "b.txt": None}
 
 

@@ -36,6 +36,7 @@ export function useWorkspace() {
   // Unreviewed agent file changes of one conversation: { id, value: Changes }.
   const [changes, setChanges] = useState({ id: null, value: null })
   const changesPushed = useRef(0)
+  const childStates = useRef(new Map())  // Card event id -> its subagent and status, as last seen.
   // The selected conversation's tasks, pushed as { type: 'tasks', tasks }: { id, value: Task[] }.
   const [tasks, setTasks] = useState({ id: null, value: [] })
   // The saved project and user permission rules of one selection: { key, project, user, project_path, problem }.
@@ -221,7 +222,15 @@ export function useWorkspace() {
         }
         if (data.type === 'changes') { changesPushed.current++; setChanges({ id: activeId, value: data.changes }) }
         if (data.type === 'tasks') setTasks({ id: activeId, value: data.tasks })
-        if (data.type === 'event' && data.event.child_session_id) void refreshSessions().catch(e => setError(e.message))
+        if (data.type === 'event' && data.event.child_session_id) {
+          // Parallel subagents update their cards with every action: refresh the sidebar only when a
+          // subagent appears or its status changes, not for each completed action.
+          const state = `${data.event.child_session_id}:${data.event.delegation?.status ?? ''}`
+          if (childStates.current.get(data.event.id) !== state) {
+            childStates.current.set(data.event.id, state)
+            void refreshSessions().catch(e => setError(e.message))
+          }
+        }
         if (data.type === 'event') setSession(current => {
           if (!current || current.id !== activeId) return current
           const event = data.event

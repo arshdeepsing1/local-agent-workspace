@@ -485,7 +485,7 @@ class CheckpointManager:
                     self._mark_restored(done)
                     rewound = ", ".join(item["path"] for item in done if item["status"] == "restore") or "no files"
                     raise ValueError(f"Rewound {rewound}; could not rewind {entry['path']}: {error_clause(exc)}. "
-                                     "Rewound files can be restored from Agent tools → Recovery.") from exc
+                                     "Rewound files can be restored from Agent tools → Checkpoints.") from exc
             done.append(entry)
         self._mark_restored(done)
         return plan

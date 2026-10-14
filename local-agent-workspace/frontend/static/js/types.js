@@ -44,6 +44,8 @@
 //   permission_mode: 'manual'|'auto'|'acceptEdits'|'dontAsk'|'plan'|'bypassPermissions', allowed_directories,
 //   allow_rules: Rule[] (this chat's rules), disabled_tools?: string[] (turned-off tools), context_info?, active_skills?,
 //   parent_session_id?, is_subagent?, delegation?, tool_profile?, subagent_tool_profile?,
+//   agent_type?: 'explore'|'general'|'editor' (a subagent), subagents?: SubagentEntry[] (a parent's index of its
+//   subagent chats; left out of GET /sessions list items),
 //   terminal_reason?: how the last turn ended: 'completed'|'stopped'|'error'|'inference_error'|
 //   'tool_error'|'step_limit'|'interrupted' (also in the /api/sessions summaries),
 //   turn_ended?: epoch seconds when the last turn ended; null while a turn runs (also in summaries),
@@ -105,6 +107,7 @@
 //   thought: until answer text or a tool call began, or the response ended; also set when the endpoint reported
 //   reasoning tokens without text), child_session_id?, request_info?,
 //   name?, input?, output?, preview?, state?, delegation?, origin?,
+//   (delegation: Delegation, on a delegate_task card or a notice with child_session_id),
 //   approval?: 'approved'|'declined'|'expired'|'blocked', approval_expires? (epoch seconds, only with a limit),
 //   decline_note? (the user's note sent with Decline), allowed_by_rule? (true: ran by a Rule, no card),
 //   rule_scope?: 'chat'|'project'|'user' (with allowed_by_rule), read_only_command? (true: ran from the fixed
@@ -130,6 +133,13 @@
 //   when the turn failed before that; absent on older events), steered? (true: sent while the agent was
 //   working) and attachments?: Attachment[]. The 'Stopped.' notice carries stop_phase?: 'streaming'|'tools'|'waiting'.
 //   A compaction's notice carries compaction?: Compaction (one notice per compaction).
+// Delegation: { status: 'queued'|'running'|'awaiting_approval'|...|'completed'|'failed'|'cancelled'|'interrupted',
+//   completed_tools, last_tool?, terminal_reason?, agent_type?, started?, ended? (epoch seconds) }. A finished
+//   delegate_task card's output is the JSON result { child_session_id, agent_type, tool_profile, status,
+//   terminal_reason, steps_used, tool_calls, changed_files, changed_files_total?, transcript, output }.
+// SubagentEntry: { id, task (200 characters), agent_type, status, created, ended, transcript ('conversations/<id>.jsonl'
+//   in the state folder, null once deleted), steps_used?, tool_calls?, deleted? }.
+// GET /sessions/<id>/children -> list items of its subagent chats, each with status, transcript and subagent?: SubagentEntry.
 // Attachment (metadata only, never content): { kind: 'file', path, start_line, end_line, truncated? }
 //   | { kind: 'shell', command (at most 2,000 characters), exit_code }
 // RewindPreview (GET /sessions/<id>/rewind-preview?before_event_id=<user event id>; read-only, also while busy):

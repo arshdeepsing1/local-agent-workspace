@@ -9,6 +9,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .context import LARGE_SUMMARY_MAX_BYTES, MAX_ESTIMATE_SCALE, context_boundary
+from .planning import MAX_STEPS, subagent_index
 
 
 MAX_BUNDLE_BYTES = 16 * 1024 * 1024
@@ -68,6 +69,9 @@ class Progress(Record):
     completed_tools: int = Field(ge=0)
     last_tool: str | None = None
     terminal_reason: str | None = None
+    agent_type: Literal["explore", "general", "editor"] | None = None
+    started: float | None = None
+    ended: float | None = None
 
 
 class Origin(Record):
@@ -234,7 +238,8 @@ class Conversation(Record):
     tool_profile: Profile = "inherit"
     subagent_tool_profile: Profile = "inherit"
     reasoning_effort: Effort | None = None  # Kept by forks and imports, like the model.
-    max_steps: int | None = Field(default=None, ge=1, le=8)
+    max_steps: int | None = Field(default=None, ge=1, le=MAX_STEPS)
+    agent_type: Literal["explore", "general", "editor"] | None = None
     # Kept by forks and imports, like tool_profile: a copy never gets more tools than its source.
     disabled_tools: list[Annotated[str, Field(min_length=1, max_length=300)]] | None = Field(default=None, max_length=64)
     # The user's labels. Pinned and archived are view state of this app and are not exported.
@@ -524,4 +529,8 @@ def fresh_copies(bundle, workspace, *, kind="import"):
                 source["terminal_reason"] = "interrupted"
             if event.get("delegation") and not event["delegation"].get("terminal_reason"):
                 event["delegation"].update(status="interrupted", terminal_reason="interrupted")
+    # The subagents index of each copied parent lists its copied children (a bundle does not carry it).
+    by_id = {source["id"]: source for source in sessions}
+    for parent_id, index in subagent_index(sessions).items():
+        by_id[parent_id]["subagents"] = index
     return sessions, ids[bundle["root_session_id"]]

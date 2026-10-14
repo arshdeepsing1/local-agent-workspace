@@ -327,6 +327,7 @@ def test_a_blocked_recovery_restore_can_open_the_blocking_chat_from_the_dialog(u
     ui.show_session("b")
     page.get_by_role("button", name="Agent tools", exact=True).click()
     dialog = page.get_by_role("dialog", name="Agent tools")
+    dialog.get_by_role("button", name="Checkpoints", exact=True).click()
     dialog.get_by_role("button", name="Preview checkpoint src/main.py").click()
     dialog.get_by_role("button", name="Restore checkpoint").click()
     expect(dialog.get_by_role("alert")).to_contain_text("“Other conversation” is still running. Stop it before restoring checkpoints.")

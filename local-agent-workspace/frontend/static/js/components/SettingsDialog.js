@@ -250,7 +250,7 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         <label class="settings-checkbox"><input type="checkbox" checked=${form.auto_keep_changes === true}
           onChange=${e => field('auto_keep_changes', e.currentTarget.checked)} />Keep agent changes automatically when a reply finishes</label>
         <p class="field-help">The changes bar clears when a reply completes; a reply you stop, that fails or that reaches the step limit keeps its list.</p>
-        <${More} topic="automatic Keep">Edits made with the agent's file tools can still be undone from Agent tools → Recovery; edits made by commands can no longer be undone from the app.<//>
+        <${More} topic="automatic Keep">Edits made with the agent's file tools can still be undone from Agent tools → Checkpoints; edits made by commands can no longer be undone from the app.<//>
         <label class="settings-checkbox"><input type="checkbox" checked=${form.rate_limit_auto_continue !== false}
           onChange=${e => field('rate_limit_auto_continue', e.currentTarget.checked)} />Continue automatically after rate limits</label>
         <p class="field-help">After three quick retries, wait for Databricks's rate limit to reset (up to two minutes, at most twice per message) instead of stopping. Stop cancels the wait.</p>

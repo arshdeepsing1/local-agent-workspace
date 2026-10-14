@@ -277,7 +277,7 @@ async def test_child_title_cancellation_preserves_completed_handback_unless_pare
     delegated = asyncio.create_task(manager.delegates.delegate(parent, "Inspect the parser."))
     try:
         await asyncio.wait_for(naming_started.wait(), 2)
-        child_id = manager.delegates.active[parent["id"]]["child_session_id"]
+        child_id = manager.delegates.active[parent["id"]][0]["child_session_id"]
         assert manager.statuses[child_id] == "naming"
         if cancel_parent:
             await asyncio.wait_for(manager.delegates.cancel_parent(parent["id"]), 2)
@@ -285,9 +285,10 @@ async def test_child_title_cancellation_preserves_completed_handback_unless_pare
             await asyncio.wait_for(manager.stop(child_id), 2)
         result = await asyncio.wait_for(delegated, 2)
         assert result == {
-            "child_session_id": child_id,
+            "child_session_id": child_id, "agent_type": "general", "tool_profile": "inherit",
             "status": "cancelled" if cancel_parent else "completed",
             "terminal_reason": "stopped" if cancel_parent else "completed",
+            "steps_used": 1, "tool_calls": 0, "changed_files": [], "transcript": f"conversations/{child_id}.jsonl",
             "output": "The parser handles all inspected inputs.",
         }
         saved = manager.store.get(child_id)

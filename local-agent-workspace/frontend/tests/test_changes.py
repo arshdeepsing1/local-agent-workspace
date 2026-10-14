@@ -234,7 +234,7 @@ def test_automatic_keep_is_off_by_default_and_saved_from_settings(ui, page):
     expect(dialog.get_by_text("The changes bar clears when a reply completes; a reply you stop, that fails or that reaches the "
                               "step limit keeps its list.")).to_be_visible()
     dialog.get_by_label("More about automatic Keep").click()
-    expect(dialog.get_by_text("Edits made with the agent's file tools can still be undone from Agent tools → Recovery; edits "
+    expect(dialog.get_by_text("Edits made with the agent's file tools can still be undone from Agent tools → Checkpoints; edits "
                               "made by commands can no longer be undone from the app.")).to_be_visible()
     dialog.get_by_role("button", name="Save settings").click()
     expect(page.get_by_role("dialog")).to_have_count(0)

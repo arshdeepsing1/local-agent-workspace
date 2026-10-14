@@ -6,6 +6,22 @@ window.task = { id: 'task', title: 'Inspect source', description: 'Find the pars
 window.config = { servers: [], hooks: [] }
 window.skill = { id: 'skill', name: 'Review code', description: 'Review changes carefully', path: '/skills/review/SKILL.md' }
 window.projectSettings = { workspace: '/project', verify_command: 'pytest -q', verify_timeout_seconds: 600, verify_max_rounds: 2 }
+window.toolList = { tools: [
+  { name: 'read_file', description: 'Read numbered lines from a text file. Pages follow next_line.' },
+  { name: 'write_file', description: 'Create or replace a file.' },
+  { name: 'find_files', description: 'Find files by glob pattern.' },
+  { name: 'run_command', description: 'Run a command.' },
+  { name: 'delegate_task', description: 'Hand a self-contained task to a subagent.' },
+  { name: 'list_skills', description: 'List workspace skills.' },
+  { name: 'ask_user', description: 'Ask the user short questions.' },
+], disabled: ['run_command'] }
+// A running explore subagent, as /sessions/<id>/children lists it.
+window.child = { ...session('child'), title: 'Child review', status: 'awaiting_approval', parent_session_id: 'a', is_subagent: true,
+  agent_type: 'explore', tool_profile: 'read_only', max_steps: 10, created: 1000,
+  delegation: { status: 'awaiting_approval', completed_tools: 3, agent_type: 'explore', started: 1000 },
+  transcript: 'conversations/child.jsonl',
+  subagent: { id: 'child', task: 'Review the parser module', agent_type: 'explore', status: 'running', created: 1000, ended: null,
+    transcript: 'conversations/child.jsonl' } }
 window.metrics = {
   scope: 'session', complete: true,
   totals: { calls: 2, successful: 1, errors: 1, rate_limited: 1, retries: 3, input_tokens: 1200, output_tokens: 300, cache_read_input_tokens: 300, cache_creation_input_tokens: 100, reasoning_tokens: 20, estimated_dbu: 0.2039292 },
@@ -29,7 +45,9 @@ fake.handle = (path, options) => {
   if (path.includes('/worktrees/worktree') && options.method === 'DELETE') return fake.json({ ok: true })
   if (path.endsWith('/tasks')) return fake.json(options.method === 'POST' ? { ...task, id: 'new-task', ...body() } : [task])
   if (path.includes('/tasks/')) return fake.json({ ...task, ...body() })
-  if (path.endsWith('/children')) return fake.json([{ ...session('child'), title: 'Child review', status: 'awaiting_approval' }])
+  if (path.endsWith('/children')) return fake.json([child])
+  if (path.startsWith('/api/tools')) return fake.json(toolList)
+  if (path.endsWith('/disabled-tools')) return fake.json({ ...session(), disabled_tools: body().tools })
   if (path.endsWith('/subagent-profile')) return fake.json({ ...session(), subagent_tool_profile: body().tool_profile })
   if (path.endsWith('/metrics')) return fake.json(metrics)
   if (path.startsWith('/api/project-settings')) return fake.json(options.method === 'PUT' ? { ...projectSettings, ...body() } : projectSettings)
