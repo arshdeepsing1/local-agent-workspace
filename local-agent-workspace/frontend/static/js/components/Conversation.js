@@ -11,6 +11,7 @@ import EditMessage from './EditMessage.js'
 import RewindDialog from './RewindDialog.js'
 import ForkDialog from './ForkDialog.js'
 import { backupTitle, setRewindNotice } from '../rewindNotice.js'
+import { AGENT_TYPE_LABELS, elapsedText } from '../subagents.js'
 
 // A long file is read in pages. Naming the lines each read covered keeps the
 // pages of one file from looking like the same read repeated.
@@ -329,15 +330,49 @@ export function expiryTime(seconds, now = new Date()) {
     : when.toLocaleString([], { weekday: 'short', ...options })
 }
 
-function DelegationStatus({ event, onSelectSession }) {
+// The finished delegate_task result ({ status, output, changed_files, ... }) the parent agent received, or null.
+function delegationResult(event) {
+  if (event.name !== 'delegate_task' || event.state !== 'completed' || typeof event.output !== 'string') return null
+  try {
+    const result = JSON.parse(event.output)
+    return result && typeof result === 'object' && typeof result.output === 'string' ? result : null
+  } catch { return null }
+}
+
+const DELEGATION_STATUS = { awaiting_approval: 'Waiting for approval', queued: 'waiting for a free slot' }
+
+function DelegationStatus({ event, onSelectSession, onOpenPath }) {
   const progress = event.delegation
+  const running = !!progress && !progress.terminal_reason && typeof progress.started === 'number'
+  const [now, setNow] = useState(() => Date.now() / 1000)
+  useEffect(() => {
+    if (!running) return undefined
+    setNow(Date.now() / 1000)
+    const timer = setInterval(() => setNow(Date.now() / 1000), 1000)
+    return () => clearInterval(timer)
+  }, [running])
   if (!progress) return null
-  const status = progress.status === 'awaiting_approval' ? 'Waiting for approval' : progress.status.replace(/_/g, ' ')
-  return html`<div class="delegation-progress" aria-label="Subagent progress">
-    <span>Subagent: ${status}</span><span>${progress.completed_tools} completed ${progress.completed_tools === 1 ? 'action' : 'actions'}</span>
+  const status = DELEGATION_STATUS[progress.status] || String(progress.status || '').replace(/_/g, ' ')
+  const kind = progress.agent_type || event.input?.agent_type
+  const started = typeof progress.started === 'number' ? progress.started : null
+  const elapsed = started == null ? null : (typeof progress.ended === 'number' ? progress.ended : Math.max(now, started)) - started
+  const result = delegationResult(event)
+  const files = Array.isArray(result?.changed_files) ? result.changed_files : []
+  return html`<div class=${`delegation-progress ${progress.terminal_reason ? `delegation-${progress.status}` : 'delegation-live'}`} aria-label="Subagent progress">
+    <span class="delegation-status">Subagent: ${status}</span>
+    ${kind ? html`<span class="delegation-type">${AGENT_TYPE_LABELS[kind] || kind}</span>` : null}
+    <span>${progress.completed_tools} completed ${progress.completed_tools === 1 ? 'action' : 'actions'}</span>
     ${progress.last_tool ? html`<span>Last tool: ${progress.last_tool.replace(/_/g, ' ')}</span>` : null}
+    ${elapsed != null ? html`<span class="delegation-elapsed" title=${progress.terminal_reason ? 'Time it ran' : 'Time running'}>${elapsedText(elapsed)}</span>` : null}
     ${progress.terminal_reason ? html`<span>Reason: ${progress.terminal_reason.replace(/_/g, ' ')}</span>` : null}
     ${event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}
+    ${result ? html`<details class="delegation-report"><summary>Report</summary>
+      <${Markdown} text=${result.output} onOpenPath=${onOpenPath} />
+      ${files.length ? html`<p class="delegation-files"><strong>Files changed:</strong> ${files.join(', ')}${result.changed_files_total > files.length ? ` and ${result.changed_files_total - files.length} more` : ''}</p>` : null}
+      <small class="muted">${[Number.isInteger(result.steps_used) ? `${result.steps_used} ${result.steps_used === 1 ? 'step' : 'steps'}` : '',
+        Number.isInteger(result.tool_calls) ? `${result.tool_calls} tool ${result.tool_calls === 1 ? 'call' : 'calls'}` : '',
+        result.transcript ? `Transcript: ${result.transcript}` : ''].filter(Boolean).join(' · ')}</small>
+    </details>` : null}
   </div>`
 }
 
@@ -391,7 +426,7 @@ function ToolCard({ event, summary, result, status, failure = null, sessionId, o
       ${status.label ? html`<span class=${`tool-status ${status.labelTone === 'neutral' ? 'neutral' : ''}`} data-short=${SHORT_STATUS[status.label]}>${status.label}</span>` : null}
       ${expanded || pending ? html`<${ChevronDown} size=${14} />` : html`<${ChevronRight} size=${14} />`}
     </button>
-    <${DelegationStatus} event=${event} onSelectSession=${onSelectSession} />
+    <${DelegationStatus} event=${event} onSelectSession=${onSelectSession} onOpenPath=${onOpenPath} />
     ${rule ? html`<p class="tool-rule">${rule}</p>` : null}
     ${expanded || pending ? html`<div class="tool-body">
       ${pending ? html`<p>Local needs your approval to ${title.toLowerCase()}.${event.approval_expires

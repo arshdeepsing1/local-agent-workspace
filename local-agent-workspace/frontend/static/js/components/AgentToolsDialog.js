@@ -4,11 +4,35 @@ import { api } from '../api.js'
 import ConversationTransfer from './ConversationTransfer.js'
 import UsagePanel from './UsagePanel.js'
 import { blockerOf, OpenBlockingChat } from './BlockingChat.js'
+import { modeLabel } from './PermissionsMenu.js'
+import { AGENT_TYPE_LABELS, elapsedText } from '../subagents.js'
 
-// Props: session, workspace?, onClose, onSelectSession, onError, onSaveTools?(tools) -> Session
+// Props: session, workspace?, changedFiles? (files with unreviewed agent changes in this chat, from the
+// changes bar; null when unknown), onClose, onSelectSession, onError, onSaveTools?(tools) -> Session
 const profileLabels = { inherit: 'Inherit permitted tools', read_only: 'Read-only files', file_editor: 'Read and edit files' }
 const taskStatuses = ['pending', 'in_progress', 'completed', 'cancelled']
 const scopeQuery = session => session ? `?session_id=${encodeURIComponent(session.id)}` : ''
+const plural = (count, one, many = `${one}s`) => `${count.toLocaleString('en-US')} ${count === 1 ? one : many}`
+
+// The sections, grouped in the navigation on the left (one scrolling row below 640 px).
+export const SECTIONS = [
+  { group: 'This chat', tabs: ['Overview', 'Tasks', 'Subagents', 'Tools', 'Usage', 'Export'] },
+  { group: 'Project', tabs: ['Checkpoints', 'Verify', 'Worktrees', 'Extensions'] },
+]
+const TABS = SECTIONS.flatMap(section => section.tabs)
+const TAB_KEY = 'agent-tools-tab'
+
+// The section shown last, remembered in this browser; Overview when none (or storage is unavailable).
+function rememberedTab() {
+  try {
+    const value = localStorage.getItem(TAB_KEY)
+    return TABS.includes(value) ? value : 'Overview'
+  } catch { return 'Overview' }
+}
+
+function rememberTab(tab) {
+  try { localStorage.setItem(TAB_KEY, tab) } catch { /* Blocked storage: the choice is not remembered. */ }
+}
 
 function useRequest(onError) {
   const [busy, setBusy] = useState(false)
@@ -36,19 +60,117 @@ export default function AgentToolsDialog(props) {
 
 function AgentToolsScope(props) {
   const dialog = useRef(null)
-  const [tab, setTab] = useState('Recovery')
+  const nav = useRef(null)
+  const [tab, setTab] = useState(rememberedTab)
   useEffect(() => { dialog.current?.showModal() }, [])
+  // In the narrow layout the navigation is one scrolling row: keep the open section's button in view.
+  useEffect(() => { nav.current?.querySelector('[aria-pressed="true"]')?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' }) }, [tab])
+  const open = useCallback(name => { setTab(name); rememberTab(name) }, [])
+  const sections = {
+    Overview: () => html`<${Overview} ...${props} onOpen=${open} />`,
+    Tasks: () => html`<${Tasks} ...${props} />`,
+    Subagents: () => html`<${Subagents} ...${props} />`,
+    Tools: () => html`<${ToolsPanel} ...${props} />`,
+    Usage: () => html`<${UsagePanel} session=${props.session} onError=${props.onError} />`,
+    Export: () => html`<${ConversationTransfer} sessionId=${props.session?.id} workspace=${props.session?.workspace || props.workspace || ''}
+      busy=${!!props.session && props.session.status !== 'idle'} onError=${props.onError} onSelectSession=${id => { props.onSelectSession(id); props.onClose() }} />`,
+    Checkpoints: () => html`<${Checkpoints} ...${props} />`,
+    Verify: () => html`<${Verify} ...${props} />`,
+    Worktrees: () => html`<${Worktrees} ...${props} />`,
+    Extensions: () => html`<${ExtensionsPanel} ...${props} />`,
+  }
   return html`<dialog class="agent-tools-dialog" ref=${dialog} aria-label="Agent tools" onCancel=${props.onClose} onClick=${e => { if (e.target === dialog.current) props.onClose() }}>
     <div class="agent-tools-content">
       <header class="agent-tools-header"><div><h2>Agent tools</h2><p>${props.session?.title || 'Default workspace'}</p></div><button class="icon-button" aria-label="Close agent tools" onClick=${props.onClose}><${X} size=${18} /></button></header>
-      <nav class="agent-tools-tabs" aria-label="Agent tools sections">${['Recovery', 'Usage', 'Worktrees', 'Tasks', 'Verify', 'Extensions', 'Tools', 'Conversation'].map(name => html`<button key=${name} aria-pressed=${tab === name} onClick=${() => setTab(name)}>${name}</button>`)}</nav>
-      <div class="agent-tools-body">${tab === 'Recovery' ? html`<${Recovery} ...${props} />` : tab === 'Usage' ? html`<${UsagePanel} session=${props.session} onError=${props.onError} />` : tab === 'Worktrees' ? html`<${Worktrees} ...${props} />` : tab === 'Tasks' ? html`<${Tasks} ...${props} />` : tab === 'Verify' ? html`<${Verify} ...${props} />` : tab === 'Extensions' ? html`<${ExtensionsPanel} ...${props} />` : tab === 'Tools' ? html`<${ToolsPanel} ...${props} />` :
-        html`<${ConversationTransfer} sessionId=${props.session?.id} workspace=${props.session?.workspace || props.workspace || ''} busy=${!!props.session && props.session.status !== 'idle'} onError=${props.onError} onSelectSession=${id => { props.onSelectSession(id); props.onClose() }} />`}</div>
+      <div class="agent-tools-layout">
+        <nav class="agent-tools-tabs" ref=${nav} aria-label="Agent tools sections">${SECTIONS.map(section => html`<div class="agent-tools-group" role="group" aria-label=${section.group} key=${section.group}>
+          <span class="agent-tools-group-label" aria-hidden="true">${section.group}</span>
+          ${section.tabs.map(name => html`<button key=${name} aria-pressed=${tab === name} onClick=${() => open(name)}>${name}</button>`)}
+        </div>`)}</nav>
+        <div class="agent-tools-body">${sections[tab]()}</div>
+      </div>
     </div>
   </dialog>`
 }
 
-function Recovery({ session, onError, onSelectSession }) {
+// Overview: this chat and its project at a glance, from the routes the sections use (nothing new or
+// heavy). A value that cannot be loaded says so here; its section shows the error.
+function useOverview(session) {
+  const [data, setData] = useState({})
+  const id = session?.id
+  useEffect(() => {
+    let alive = true
+    const query = id ? `?session_id=${encodeURIComponent(id)}` : ''
+    const path = id ? `/sessions/${encodeURIComponent(id)}` : null
+    const requests = {
+      checkpoints: () => api(`/checkpoints${query}`), project: () => api(`/project-settings${query}`),
+      extensions: () => api('/extensions'), worktrees: () => api(`/worktrees${query}`),
+      ...(path ? { tools: () => api(`/tools${query}`), children: () => api(`${path}/children`), tasks: () => api(`${path}/tasks`) } : {}),
+    }
+    for (const [key, request] of Object.entries(requests)) {
+      Promise.resolve().then(request).then(value => { if (alive) setData(current => ({ ...current, [key]: { value } })) },
+        () => { if (alive) setData(current => ({ ...current, [key]: { failed: true } })) })
+    }
+    return () => { alive = false }
+  }, [id])
+  return data
+}
+
+function toolsText({ tools = [], disabled = [] }) {
+  const names = tools.map(tool => tool.name)
+  const off = names.filter(name => disabled.includes(name)).length
+  const mcp = disabled.filter(name => !names.includes(name)).length
+  return `${names.length - off} of ${names.length} on` + (mcp ? ` · ${plural(mcp, 'MCP tool')} off` : '')
+}
+
+function subagentsText(children) {
+  if (!children.length) return 'None yet'
+  const running = children.filter(child => child.status && child.status !== 'idle').length
+  return `${running.toLocaleString('en-US')} running · ${(children.length - running).toLocaleString('en-US')} finished`
+}
+
+function extensionsText({ servers = [], hooks = [] }) {
+  if (!servers.length && !hooks.length) return 'None configured'
+  const on = items => items.filter(item => item.enabled !== false).length
+  return [servers.length ? `${plural(servers.length, 'MCP server')} (${on(servers)} on)` : '',
+    hooks.length ? `${plural(hooks.length, 'hook')} (${on(hooks)} on)` : ''].filter(Boolean).join(' · ')
+}
+
+function Overview({ session, workspace, changedFiles, onOpen }) {
+  const data = useOverview(session)
+  const value = (key, show) => data[key]?.failed ? 'Could not load' : data[key] ? show(data[key].value) : 'Loading…'
+  const chat = session ? [
+    { label: 'Model', text: session.model },
+    { label: 'Permission mode', text: modeLabel(session.permission_mode || 'manual') },
+    { label: 'Tools', tab: 'Tools', text: value('tools', toolsText) },
+    { label: 'Subagents', tab: 'Subagents', text: value('children', subagentsText) },
+    { label: 'Tasks', tab: 'Tasks', text: value('tasks', tasks => tasks.length
+      ? `${tasks.filter(task => task.status === 'completed').length} of ${tasks.length} done` : 'None yet') },
+    ...(typeof changedFiles === 'number' ? [{ label: 'Unreviewed changes', text: changedFiles ? plural(changedFiles, 'file') : 'None' }] : []),
+    { label: 'Usage', tab: 'Usage', text: 'Model calls, tokens and estimated cost' },
+    { label: 'Export', tab: 'Export', text: 'Markdown transcript, conversation file, fork' },
+  ] : []
+  const project = [
+    { label: 'Checkpoints', tab: 'Checkpoints', text: value('checkpoints', items => items.length ? plural(items.length, 'file checkpoint') : 'None yet') },
+    { label: 'Verify', tab: 'Verify', text: value('project', settings => settings.verify_command ? html`<code>${settings.verify_command}</code>` : 'Off') },
+    { label: 'Worktrees', tab: 'Worktrees', text: value('worktrees', items => items.length ? plural(items.length, 'managed worktree') : 'None') },
+    { label: 'Extensions', tab: 'Extensions', text: value('extensions', extensionsText) },
+  ]
+  const row = item => html`<div class="overview-row" key=${item.label}><dt>${item.label}</dt><dd><span class="overview-value">${item.text}</span>
+    ${item.tab ? html`<button class="outline" aria-label=${`Open ${item.tab}`} onClick=${() => onOpen(item.tab)}>Open</button>` : null}</dd></div>`
+  const folder = data.project?.value?.workspace || session?.workspace || workspace || ''
+  return html`<section class="agent-tools-section overview-panel" aria-label="Overview">
+    <h3>This chat</h3>
+    ${session ? html`<dl class="overview-list" aria-label="This chat">${chat.map(row)}</dl>`
+      : html`<p>Start a conversation to see its tools, tasks, subagents and usage here.</p>`}
+    <h3>Project</h3>
+    ${folder ? html`<p class="field-help overview-folder">${folder}</p>` : null}
+    <dl class="overview-list" aria-label="Project">${project.map(row)}</dl>
+  </section>`
+}
+
+// File checkpoints: preview and restore by user turn or by file.
+function Checkpoints({ session, onError, onSelectSession }) {
   const query = scopeQuery(session)
   const { busy, error, blocker, run } = useRequest(onError)
   const [items, setItems] = useState([])
@@ -65,12 +187,12 @@ function Recovery({ session, onError, onSelectSession }) {
   const previewTurn = (turnId, offset = 0) => {
     setNotice('')
     if (!offset) { setPreviews([]); setTurnPreview(null) }
-    void run(() => api(`/checkpoint-turns/${encodeURIComponent(turnId)}/preview${query}&offset=${offset}`), result => {
+    void run(() => api(`/checkpoint-turns/${encodeURIComponent(turnId)}/preview${query ? `${query}&` : '?'}offset=${offset}`), result => {
       setTurnPreview(result)
       setPreviews(current => offset ? [...current, ...result.previews] : result.previews)
     })
   }
-  return html`<section class="agent-tools-section" aria-label="Recovery">
+  return html`<section class="agent-tools-section" aria-label="Checkpoints">
     <div class="agent-tools-section-heading"><h3>File checkpoints</h3><button class="outline" disabled=${busy} onClick=${() => void refresh()}>Refresh checkpoints</button></div>
     <p>Preview file checkpoints by user turn, then restore individual files. Commands and MCP side effects are not reversible here.</p>
     ${error ? html`<p class=${`form-error ${blocker ? 'blocked-error' : ''}`} role="alert"><span>${error}</span>
@@ -109,7 +231,7 @@ function Worktrees({ session, onError, onSelectSession, onClose }) {
     <form class="agent-tools-form" onSubmit=${e => { e.preventDefault(); void run(async () => {
       await api(`/worktrees${query}`, 'POST', { branch: branch.trim() })
       return api(`/worktrees${query}`)
-    }, items => { setItems(items); setBranch('') }) }}><label>New branch<input required disabled=${busy} value=${branch} onInput=${e => setBranch(e.currentTarget.value)} placeholder="codex/my-change" /></label><button class="primary" disabled=${busy || !branch.trim()}>Create worktree</button></form>
+    }, items => { setItems(items); setBranch('') }) }}><label>New branch<input required disabled=${busy} value=${branch} onInput=${e => setBranch(e.currentTarget.value)} placeholder="feature/my-change" /></label><button class="primary" disabled=${busy || !branch.trim()}>Create worktree</button></form>
     ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
     <div class="agent-tools-list">${items.map(item => html`<div class="agent-tools-row" key=${item.id}><div><strong>${item.branch}</strong><small>${item.path}</small></div><div class="agent-tools-actions">
       <button class="outline" disabled=${busy} aria-label=${`Open conversation in ${item.branch}`} onClick=${() => void run(() => api(`/worktrees/${encodeURIComponent(item.id)}/session${query}`, 'POST'), created => { onSelectSession(created.id); onClose() })}>Open conversation</button>
@@ -120,25 +242,25 @@ function Worktrees({ session, onError, onSelectSession, onClose }) {
   </section>`
 }
 
+
 function Tasks(props) {
-  return props.session ? html`<${SessionTasks} ...${props} />` : html`<section class="agent-tools-section"><p>Start a conversation to manage tasks and subagents.</p></section>`
+  return props.session ? html`<${SessionTasks} ...${props} />` : html`<section class="agent-tools-section" aria-label="Tasks"><p>Start a conversation to manage its tasks.</p></section>`
 }
 
-function SessionTasks({ session, onError, onSelectSession, onClose }) {
+function SessionTasks({ session, onError }) {
   const path = `/sessions/${encodeURIComponent(session.id)}`
   const { busy, error, run } = useRequest(onError)
   const [tasks, setTasks] = useState([])
-  const [children, setChildren] = useState([])
   const [title, setTitle] = useState('')
   const [description, setDescription] = useState('')
   const [dependencies, setDependencies] = useState([])
-  const [profile, setProfile] = useState(session.subagent_tool_profile || 'inherit')
-  const [profileNotice, setProfileNotice] = useState('')
-  const refresh = useCallback(() => run(() => Promise.all([api(`${path}/tasks`), api(`${path}/children`)]), ([tasks, children]) => { setTasks(tasks); setChildren(children) }), [path, run])
+  const refresh = useCallback(() => run(() => api(`${path}/tasks`), setTasks), [path, run])
   useEffect(() => { void refresh() }, [refresh])
   const update = (task, status) => void run(() => api(`${path}/tasks/${encodeURIComponent(task.id)}`, 'PATCH', { status }), updated => setTasks(current => current.map(item => item.id === updated.id ? updated : item)))
+  const done = tasks.filter(task => task.status === 'completed').length
   return html`<section class="agent-tools-section" aria-label="Tasks">
-    <div class="agent-tools-section-heading"><h3>Conversation tasks</h3><button class="outline" disabled=${busy} onClick=${() => void refresh()}>Refresh tasks and subagents</button></div>
+    <div class="agent-tools-section-heading"><h3>Conversation tasks</h3><button class="outline" disabled=${busy} onClick=${() => void refresh()}>Refresh tasks</button></div>
+    <p>The agent records multi-step work here with create_task and update_task; the checklist above the message box shows the same tasks.${tasks.length ? ` ${done} of ${tasks.length} done.` : ''}</p>
     <form class="agent-tools-form" onSubmit=${e => { e.preventDefault(); void run(() => api(`${path}/tasks`, 'POST', { title: title.trim(), description, depends_on: dependencies }), task => { setTasks(current => [...current, task]); setTitle(''); setDescription(''); setDependencies([]) }) }}>
       <label>Task title<input required disabled=${busy} maxLength=${200} value=${title} onInput=${e => setTitle(e.currentTarget.value)} /></label>
       <label>Task description<textarea disabled=${busy} maxLength=${4000} value=${description} onInput=${e => setDescription(e.currentTarget.value)} /></label>
@@ -151,17 +273,64 @@ function SessionTasks({ session, onError, onSelectSession, onClose }) {
       <select aria-label=${`Status for ${task.title}`} disabled=${busy} value=${task.status} onChange=${e => update(task, e.currentTarget.value)}>${taskStatuses.map(status => html`<option key=${status} value=${status}>${status.replace('_', ' ')}</option>`)}</select>
     </div>`)}</div>
     ${!busy && !tasks.length ? html`<p class="muted">No tasks in this conversation yet.</p>` : null}
-    <h3>Subagents</h3><p class="field-help">Open a child conversation to review its progress or approve a pending action.</p>
+  </section>`
+}
+
+function Subagents(props) {
+  return props.session ? html`<${SessionSubagents} ...${props} />` : html`<section class="agent-tools-section" aria-label="Subagents"><p>Start a conversation to see its subagents.</p></section>`
+}
+
+// A child's status: what it is doing now, else how its delegation ended.
+function childStatus(child) {
+  if (child.status === 'awaiting_approval') return 'Waiting for approval'
+  if (child.status && child.status !== 'idle') return child.status.replace(/_/g, ' ')
+  return String(child.delegation?.status || child.subagent?.status || 'idle').replace(/_/g, ' ')
+}
+
+const moment = seconds => new Date(seconds * 1000).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+
+function SubagentRow({ child, onOpen }) {
+  const entry = child.subagent || {}
+  const progress = child.delegation || {}
+  const kind = child.agent_type || entry.agent_type || progress.agent_type
+  const started = typeof progress.started === 'number' ? progress.started : typeof entry.created === 'number' ? entry.created : child.created
+  const ended = typeof progress.ended === 'number' ? progress.ended : typeof entry.ended === 'number' ? entry.ended : null
+  const work = [Number.isInteger(entry.steps_used) ? `${entry.steps_used} of ${child.max_steps ?? '?'} steps`
+    : Number.isInteger(child.max_steps) ? `up to ${child.max_steps} steps` : '',
+  Number.isInteger(entry.tool_calls) ? plural(entry.tool_calls, 'tool call')
+    : Number.isInteger(progress.completed_tools) ? plural(progress.completed_tools, 'completed action') : '']
+  return html`<div class="agent-tools-row subagent-row"><div>
+    <strong>${entry.task || child.title}</strong>
+    <small>${[AGENT_TYPE_LABELS[kind] || kind, childStatus(child), profileLabels[child.tool_profile || 'inherit']].filter(Boolean).join(' · ')}</small>
+    <small>${work.filter(Boolean).join(' · ')}</small>
+    ${typeof started === 'number' ? html`<small>Started ${moment(started)}${ended != null ? ` · ended ${moment(ended)} (${elapsedText(ended - started)})` : ''}</small>` : null}
+    <small class="subagent-transcript" title="In the app's state folder">Transcript: <code>${child.transcript || `conversations/${child.id}.jsonl`}</code></small>
+  </div><button class="outline" aria-label=${`Open subagent ${child.title}`} onClick=${onOpen}>Open</button></div>`
+}
+
+function SessionSubagents({ session, onError, onSelectSession, onClose }) {
+  const path = `/sessions/${encodeURIComponent(session.id)}`
+  const { busy, error, run } = useRequest(onError)
+  const [children, setChildren] = useState([])
+  const [profile, setProfile] = useState(session.subagent_tool_profile || 'inherit')
+  const [profileNotice, setProfileNotice] = useState('')
+  const refresh = useCallback(() => run(() => api(`${path}/children`), setChildren), [path, run])
+  useEffect(() => { void refresh() }, [refresh])
+  return html`<section class="agent-tools-section" aria-label="Subagents">
+    <div class="agent-tools-section-heading"><h3>Subagents of this chat</h3><button class="outline" disabled=${busy} onClick=${() => void refresh()}>Refresh subagents</button></div>
+    <p>The agent hands self-contained work (exploring code, wide searches, reading many files, summarizing a long command) to subagents, several at once when the work is independent, so only their reports enter this chat's context. Each subagent is a chat of its own: open it to follow its work or approve its actions.</p>
+    ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
+    <div class="agent-tools-list">${children.map(child => html`<${SubagentRow} key=${child.id} child=${child} onOpen=${() => { onSelectSession(child.id); onClose() }} />`)}</div>
+    ${!busy && !children.length ? html`<p class="muted">No subagents in this conversation.</p>` : null}
+    <h3>Tool ceiling</h3>
     ${session.is_subagent ? html`<p>Tool profile: ${profileLabels[session.tool_profile || 'inherit']}. This child cannot widen its inherited tool access.</p>` : html`
       <label class="agent-tools-profile">New subagent tool ceiling<select aria-label="New subagent tool ceiling" disabled=${busy || session.status !== 'idle'} value=${profile} onChange=${e => {
         const selected = e.currentTarget.value
         setProfileNotice('')
         void run(() => api(`${path}/subagent-profile`, 'PUT', { tool_profile: selected }), updated => { setProfile(updated.subagent_tool_profile || 'inherit'); setProfileNotice('Tool ceiling saved for new subagents.') })
       }}>${Object.entries(profileLabels).map(([value, label]) => html`<option key=${value} value=${value}>${label}</option>`)}</select></label>
-      <p class="field-help">Applies to new subagents only. File-only profiles disable commands, MCP and hooks; normal approvals still apply. This limits agent tools, not your editor or terminal.</p>
+      <p class="field-help">The widest tools a new subagent of this chat gets: explore subagents are read-only and editor subagents edit files without commands, but neither gets more than this. File-only profiles disable commands, MCP and hooks; normal approvals still apply. Applies to new subagents only, and limits agent tools, not your editor or terminal.</p>
       ${profileNotice ? html`<p role="status">${profileNotice}</p>` : null}`}
-    <div class="agent-tools-list">${children.map(child => html`<div class="agent-tools-row" key=${child.id}><div><strong>${child.title}</strong><small>${child.status === 'awaiting_approval' ? 'Waiting for approval' : child.status}</small><small>${profileLabels[child.tool_profile || 'inherit']}</small></div><button class="outline" aria-label=${`Open subagent ${child.title}`} onClick=${() => { onSelectSession(child.id); onClose() }}>Open</button></div>`)}</div>
-    ${!busy && !children.length ? html`<p class="muted">No subagents in this conversation.</p>` : null}
   </section>`
 }
 
@@ -230,14 +399,34 @@ function ExtensionsPanel({ session, onError }) {
   </section>`
 }
 
+
 // MCP tool names the server accepts in a chat's turned-off list.
 const MCP_TOOL = /^mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_.-]+$/
+
+// The Tools section's groups; a tool in none of them is under Other.
+const TOOL_GROUPS = [
+  { name: 'Files', tools: ['list_files', 'read_file', 'outline_file', 'write_file', 'edit_file', 'move_path', 'delete_path',
+    'notebook_read', 'notebook_edit', 'insert_activity_log'] },
+  { name: 'Search', tools: ['find_files', 'search_files', 'project_overview'] },
+  { name: 'Commands and jobs', tools: ['run_command', 'list_jobs', 'get_job_output', 'wait_job', 'stop_job'] },
+  { name: 'Git', match: name => /^git_/.test(name) },
+  { name: 'Tasks and subagents', tools: ['list_tasks', 'get_task', 'create_task', 'update_task', 'delegate_task'] },
+  { name: 'Skills', tools: ['list_skills', 'use_skill'] },
+]
+
+export function toolGroup(name) {
+  return TOOL_GROUPS.find(group => group.tools?.includes(name) || group.match?.(name))?.name || 'Other'
+}
+
+// The first sentence of a tool's description; the whole (shortened by the server) shows on hover.
+const firstSentence = text => /^(.+?[.!?])(?:\s|$)/.exec(text || '')?.[1] || text || ''
 
 // Turned-off tools of this chat: GET /tools?session_id= lists the built-in and feature tools.
 function ToolsPanel({ session, onError, onSaveTools }) {
   const { busy, error, run } = useRequest(onError)
   const [tools, setTools] = useState(null)
   const [off, setOff] = useState([])
+  const [filter, setFilter] = useState('')
   const [mcpName, setMcpName] = useState('')
   const [mcpError, setMcpError] = useState('')
   const [notice, setNotice] = useState('')
@@ -249,6 +438,17 @@ function ToolsPanel({ session, onError, onSaveTools }) {
   const names = new Set((tools || []).map(tool => tool.name))
   const extra = off.filter(name => !names.has(name))
   const toggle = (name, available) => { setNotice(''); setOff(current => available ? current.filter(item => item !== name) : [...current, name]) }
+  const setGroup = (group, available) => {
+    setNotice('')
+    const members = group.tools.map(tool => tool.name)
+    setOff(current => available ? current.filter(item => !members.includes(item)) : [...current, ...members.filter(item => !current.includes(item))])
+  }
+  const query = filter.trim().toLowerCase()
+  const shown = (tools || []).filter(tool => !query || [tool.name, tool.description || '', toolGroup(tool.name)]
+    .some(text => text.toLowerCase().includes(query)))
+  const groups = [...TOOL_GROUPS.map(group => group.name), 'Other']
+    .map(name => ({ name, tools: shown.filter(tool => toolGroup(tool.name) === name) })).filter(group => group.tools.length)
+  const enabled = (tools || []).filter(tool => !off.includes(tool.name)).length
   const addMcp = () => {
     const name = mcpName.trim()
     if (!MCP_TOOL.test(name)) { setMcpError('Enter an MCP tool name such as mcp__docs__search.'); return }
@@ -264,10 +464,28 @@ function ToolsPanel({ session, onError, onSaveTools }) {
     <h3>Tools in this chat</h3>
     <p>Turned-off tools are not offered to the agent in this chat, and calls to them are refused. Changes apply from the agent's next step. Subagents, forks and imports keep this setting.</p>
     ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
-    <div class="agent-tools-list">${(tools || []).map(tool => html`<div class="agent-tools-row" key=${tool.name}><label class="tools-toggle">
-      <input type="checkbox" aria-label=${tool.name} aria-describedby=${tool.description ? `tool-description-${tool.name}` : null}
-        disabled=${busy} checked=${!off.includes(tool.name)} onChange=${e => toggle(tool.name, e.currentTarget.checked)} />
-      <span><strong>${tool.name}</strong>${tool.description ? html`<small id=${`tool-description-${tool.name}`}>${tool.description}</small>` : null}</span></label></div>`)}</div>
+    <div class="tools-filter-row">
+      <label class="tools-filter">Filter tools<input type="search" spellcheck=${false} value=${filter} placeholder="Name, group or description"
+        onInput=${e => setFilter(e.currentTarget.value)} /></label>
+      ${tools ? html`<span class="tools-count">${enabled} of ${tools.length} on</span>` : null}
+    </div>
+    ${groups.map(group => {
+      const on = group.tools.filter(tool => !off.includes(tool.name)).length
+      return html`<div class="tools-group" role="group" aria-label=${group.name} key=${group.name}>
+        <div class="tools-group-heading"><h4>${group.name}<small>${on} of ${group.tools.length} on</small></h4>
+          <div class="agent-tools-actions">
+            <button class="outline" disabled=${busy || on === group.tools.length} aria-label=${`Turn on all ${group.name} tools`} onClick=${() => setGroup(group, true)}>All on</button>
+            <button class="outline" disabled=${busy || on === 0} aria-label=${`Turn off all ${group.name} tools`} onClick=${() => setGroup(group, false)}>All off</button>
+          </div></div>
+        <div class="agent-tools-list">${group.tools.map(tool => html`<div class="agent-tools-row" key=${tool.name}><label class="tools-toggle" title=${tool.description || ''}>
+          <input type="checkbox" aria-label=${tool.name} aria-describedby=${tool.description ? `tool-description-${tool.name}` : null}
+            disabled=${busy} checked=${!off.includes(tool.name)} onChange=${e => toggle(tool.name, e.currentTarget.checked)} />
+          <span><strong>${tool.name}</strong>${tool.description ? html`<small id=${`tool-description-${tool.name}`}>${firstSentence(tool.description)}</small>` : null}</span></label></div>`)}</div>
+      </div>`
+    })}
+    ${tools && query && !groups.length ? html`<p class="muted">No tools match “${filter.trim()}”.</p>` : null}
+    <h4 class="tools-mcp-heading">MCP tools</h4>
+    <p class="field-help">MCP tools are offered once a turn starts their server (Agent tools → Extensions). Turn one off by its full name.</p>
     <form class="agent-tools-form" onSubmit=${e => { e.preventDefault(); addMcp() }}>
       <label>Turn off an MCP tool by name<input spellcheck=${false} disabled=${busy} value=${mcpName} placeholder="mcp__docs__search"
         onInput=${e => { setMcpName(e.currentTarget.value); setMcpError('') }} /></label>
@@ -276,7 +494,7 @@ function ToolsPanel({ session, onError, onSaveTools }) {
     ${mcpError ? html`<p class="form-error" role="alert">${mcpError}</p>` : null}
     ${extra.length ? html`<ul class="tool-chips" aria-label="Turned-off MCP tools">${extra.map(name => html`<li key=${name}><span>${name}</span>
       <button class="icon-button" disabled=${busy} aria-label=${`Turn on ${name}`} onClick=${() => toggle(name, true)}><${X} size=${13} /></button></li>`)}</ul>` : null}
-    <div class="agent-tools-actions"><button class="primary" disabled=${busy || tools === null} onClick=${save}>Save tools</button></div>
+    <div class="agent-tools-actions tools-save"><button class="primary" disabled=${busy || tools === null} onClick=${save}>Save tools</button></div>
     ${notice ? html`<p role="status">${notice}</p>` : null}
   </section>`
 }
