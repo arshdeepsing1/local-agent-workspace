@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .edits import clip_result, plan_change, preview_diff, unified_diff
-from .tools import MAX_WRITE_LIMIT, file_error
+from .tools import MAX_WRITE_LIMIT, error_clause, file_error
 
 CHECKPOINT_BYTES_LIMIT = 256 * 1024 * 1024
 CHECKPOINT_PRUNE_TARGET = 192 * 1024 * 1024
@@ -338,7 +338,7 @@ class CheckpointManager:
         try:
             removed = self._apply(tools, path, source, before, _state(), session_id, turn_id=turn_id)
         except (ValueError, OSError) as error:
-            raise ValueError(f"Created {destination} but could not remove {path}: {file_error(error)}. "
+            raise ValueError(f"Created {destination} but could not remove {path}: {error_clause(error)}. "
                              "Both files exist now; review them in the change review.") from error
         if on_applied is not None:
             on_applied(removed)
@@ -484,7 +484,7 @@ class CheckpointManager:
                 except (ValueError, OSError, UnicodeError) as exc:
                     self._mark_restored(done)
                     rewound = ", ".join(item["path"] for item in done if item["status"] == "restore") or "no files"
-                    raise ValueError(f"Rewound {rewound}; could not rewind {entry['path']}: {file_error(exc)}. "
+                    raise ValueError(f"Rewound {rewound}; could not rewind {entry['path']}: {error_clause(exc)}. "
                                      "Rewound files can be restored from Agent tools → Recovery.") from exc
             done.append(entry)
         self._mark_restored(done)

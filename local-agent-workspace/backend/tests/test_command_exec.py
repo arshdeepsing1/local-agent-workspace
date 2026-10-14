@@ -52,19 +52,27 @@ def store(tmp_path):
 
 def alive(pid):
     """Whether a process runs (a zombie waiting to be reaped does not count)."""
-    try:
-        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-        return state not in ("Z", "X")
-    except FileNotFoundError:
-        return False
-    except OSError:
-        pass
+    if Path("/proc/self/stat").exists():
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+            return state not in ("Z", "X")
+        except FileNotFoundError:
+            return False
+        except OSError:
+            pass
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
         return True
+    if not Path("/proc/self/stat").exists():  # macOS: ask ps whether it is a zombie
+        try:
+            state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True,
+                                   timeout=5).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return True
+        return bool(state) and not state.startswith("Z")
     return True
 
 
@@ -619,8 +627,10 @@ async def test_no_git_on_path_is_reported(tmp_path):
 
 
 @needs_git
-async def test_the_hardened_git_command_line(tmp_path):
+async def test_the_hardened_git_command_line(tmp_path, monkeypatch):
     from local_agent.git_tools import DIFF_EXCLUDES, SAFE_OPTIONS, hardened_git_command
+    # Only this repository's filters: a machine's global Git configuration (Git LFS on CI) adds its own.
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     git(tmp_path, "init", "-q")
     git(tmp_path, "config", "filter.x.clean", "/srv/x/clean")
     argv, env = await hardened_git_command(tmp_path, ["diff", "--stat"], [tmp_path])
@@ -696,7 +706,8 @@ async def test_read_only_git_leaves_out_env_files_but_not_env_example(runtime, n
     manager, session = runtime
     repository = Path(session["workspace"])
     git(repository, "init", "-q")
-    names = [".env.example", ".ENV.Example", "nested/.env.example", ".env.local", ".ENV.PROD", ".env.e",
+    # The upper-case name has its own folder: macOS file systems treat .ENV.Example and .env.example as one file.
+    names = [".env.example", "upper/.ENV.Example", "nested/.env.example", ".env.local", ".ENV.PROD", ".env.e",
              ".env.exampl", ".env.examples", ".env.example.bak", ".env.", "nested/.env.d/inner", "app.env"]
     for name in names:
         (repository / name).parent.mkdir(parents=True, exist_ok=True)
@@ -705,7 +716,7 @@ async def test_read_only_git_leaves_out_env_files_but_not_env_example(runtime, n
     git(repository, "commit", "-qm", "initial")
     for name in names:
         (repository / name).write_text("SETTING=changed\n")
-    visible = {".env.example", ".ENV.Example", "nested/.env.example"}
+    visible = {".env.example", "upper/.ENV.Example", "nested/.env.example"}
     for command in ("git status --short", "git diff --name-only", "git ls-files"):
         result, _ = await run(manager, session, command)
         listed = {line.split()[-1] for line in result["output"].splitlines() if line.strip()}

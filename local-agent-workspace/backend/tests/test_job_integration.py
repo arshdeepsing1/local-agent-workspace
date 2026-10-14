@@ -253,7 +253,7 @@ async def test_commands_get_named_environment_variables_but_never_credentials(ru
                         ("BASH_ENV", "/srv/startup"), ("OTHER_SETTING", "unlisted")):
         monkeypatch.setenv(name, value)
     manager.settings.values["command_env"] = ["MY_TOOL_HOME", "DBRICKS_TOKEN", "LD_PRELOAD", "BASH_ENV"]
-    script = "import os, json; print(json.dumps(sorted(k for k in os.environ if k not in ('PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR', 'SHELL', 'USER', 'LOGNAME', 'VIRTUAL_ENV', 'PWD', 'SHLVL', '_', 'OLDPWD', 'LC_CTYPE'))))"
+    script = "import os, json; print(json.dumps(sorted(k for k in os.environ if k not in ('PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR', 'SHELL', 'USER', 'LOGNAME', 'VIRTUAL_ENV', 'PWD', 'SHLVL', '_', 'OLDPWD', 'LC_CTYPE', '__CF_USER_TEXT_ENCODING'))))"
     command = f"{sys.executable} -c {shlex.quote(script)}"
     result = json.loads(await manager.execute_tool(session, tools, "run_command", {"command": command}, "env"))
     assert json.loads(result["output"]) == ["MY_TOOL_HOME"]

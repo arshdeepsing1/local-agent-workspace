@@ -1,6 +1,7 @@
 import json
 import os
 import stat
+import sys
 
 import pytest
 from fastapi.testclient import TestClient
@@ -9,7 +10,7 @@ from local_agent.api import create_app
 from local_agent.config import Settings
 from local_agent.recovery import CheckpointManager
 from local_agent.store import Store
-from local_agent.tools import WorkspaceTools
+from local_agent.tools import WorkspaceTools, file_error
 
 
 @pytest.fixture
@@ -383,8 +384,10 @@ def test_recovery_diffs_count_lines_by_newline_only(recovery, separator):
     assert diff.endswith(f"@@ -1,2 +1,2 @@\n a{separator}b\n-d\n+c\n")
 
 
-def test_a_move_whose_second_step_fails_says_both_files_exist(recovery, monkeypatch):
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_a_move_whose_second_step_fails_says_both_files_exist(recovery, monkeypatch, platform):
     manager, tools, _ = recovery
+    monkeypatch.setattr(sys, "platform", platform)  # macOS words a PermissionError as a privacy setting
     (tools.root / "a.txt").write_text("text\n")
     applied = []
     real = manager._apply
@@ -397,6 +400,9 @@ def test_a_move_whose_second_step_fails_says_both_files_exist(recovery, monkeypa
     monkeypatch.setattr(manager, "_apply", fail_second)
     with pytest.raises(ValueError) as error:
         manager.apply_move(tools, "a.txt", "b.txt", session_id="chat")
-    assert str(error.value) == ("Created b.txt but could not remove a.txt: synthetic removal denial. "
+    reason = ("synthetic removal denial" if platform == "linux" else
+              file_error(PermissionError("synthetic removal denial")).rstrip("."))
+    assert str(error.value) == (f"Created b.txt but could not remove a.txt: {reason}. "
                                 "Both files exist now; review them in the change review.")
+    assert ".." not in str(error.value)
     assert (tools.root / "a.txt").exists() and (tools.root / "b.txt").read_text() == "text\n"

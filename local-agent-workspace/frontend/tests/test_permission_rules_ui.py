@@ -407,14 +407,16 @@ def test_opening_never_asks_scrolls_its_list_into_the_menu(ui, page):
     menu = open_menu(ui, page)
     menu.locator(".never-asks>summary").click()
     expect(menu.locator(".never-asks li").last).to_have_text("Questions and plan reviews from the agent")
-    # Every item sits inside the scrolling menu and above the note that sticks to its bottom.
-    hidden = ui.js("""(() => {
+    # Every item sits inside the scrolling menu and above the note that sticks to its bottom. The list
+    # scrolls in on the details' toggle event, which runs after the click, so wait for it (3 s at most).
+    hidden = """(() => {
       const menu = document.querySelector('.permissions-menu').getBoundingClientRect()
       const note = document.querySelector('.permissions-note').getBoundingClientRect()
       return Array.from(document.querySelectorAll('.never-asks li')).map(li => li.getBoundingClientRect())
         .filter(box => box.top < menu.top || box.bottom > Math.min(menu.bottom, note.top) + 0.5).length
-    })()""")
-    assert hidden == 0
+    })()"""
+    ui.wait(f"{hidden} === 0")
+    assert ui.js(hidden) == 0
 
 
 # Rules in the Permissions menu

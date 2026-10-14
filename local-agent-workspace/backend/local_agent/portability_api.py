@@ -15,7 +15,7 @@ from .approvals import busy_status, ensure_idle
 from .history import HistoryError, cut_points, cut_session, rewind_turn_ids
 from .portability import MAX_BUNDLE_BYTES, MAX_SESSIONS, completed_for_fork, export_bundle, fresh_copies, parse_bundle
 from .recovery import rewind_refusal
-from .tools import WorkspaceTools, file_error
+from .tools import WorkspaceTools, error_clause, file_error
 
 
 class ForkRequest(BaseModel):
@@ -294,7 +294,7 @@ def register_portability(app, manager, settings, store, session_or_404):
             except Exception as exc:
                 if body.code:
                     raise HTTPException(500, detail={"message": settings.redact(
-                        f"Files were rewound, but the conversation could not be saved: {file_error(exc)}. "
+                        f"Files were rewound, but the conversation could not be saved: {error_clause(exc)}. "
                         "Rewound files can be restored from Agent tools → Recovery.")}) from exc
                 drop_backup()
                 raise

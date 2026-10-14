@@ -76,6 +76,11 @@ def write_limit_setting(values):
     return DEFAULT_WRITE_LIMIT
 
 
+def error_clause(error: Exception) -> str:
+    """file_error without its final period, for a message that continues after it."""
+    return file_error(error).rstrip(".")
+
+
 def file_error(error: Exception) -> str:
     if isinstance(error, PermissionError) and sys.platform == "darwin":
         return (f"macOS denied access to {error.filename or 'this path'}. "
