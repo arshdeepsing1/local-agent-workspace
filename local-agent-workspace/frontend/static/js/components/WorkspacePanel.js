@@ -153,10 +153,11 @@ export function usePanelWidth() {
     window.addEventListener('resize', resize)
     return () => window.removeEventListener('resize', resize)
   }, [])
-  const set = value => {
+  // keep false while dragging: the width is saved once, when the drag ends.
+  const set = (value, keep = true) => {
     const next = value === null ? null : Math.min(Math.max(Math.round(value), PANEL_MIN), widest())
     setWidth(next)
-    saveWidth(next)
+    if (keep) saveWidth(next)
   }
   return { width: width === null ? null : Math.min(width, limit), limit, set }
 }
@@ -173,9 +174,14 @@ function PanelResizer({ panel, width, limit, onWidth }) {
   }
   const onPointerMove = event => {
     if (!drag.current) return
-    onWidth(drag.current.width + drag.current.x - event.clientX)  // Dragging left widens the panel.
+    drag.current.moved = drag.current.width + drag.current.x - event.clientX  // Dragging left widens the panel.
+    onWidth(drag.current.moved, false)
   }
-  const end = () => { drag.current = null; document.body.classList.remove('panel-resizing') }
+  const end = () => {
+    if (drag.current?.moved !== undefined) onWidth(drag.current.moved)
+    drag.current = null
+    document.body.classList.remove('panel-resizing')
+  }
   const onKeyDown = event => {
     const step = event.shiftKey ? PANEL_STEP * 4 : PANEL_STEP
     const next = { ArrowLeft: current() + step, ArrowRight: current() - step, Home: PANEL_MIN, End: limit }[event.key]
