@@ -366,3 +366,19 @@
 @container main (max-width:520px){.context-label{display:none}}
 /* UI visual: touch-size controls. */
 @media(pointer:coarse){button,summary,select,[role=menuitem],[role=option],[role=switch]{min-height:24px}button,a.icon-button{min-width:24px}.terminal-view input{min-height:28px}}
+/* workspace panel, tags and file review (2026-10-14) */
+@media(min-width:1024px){.workspace-panel{position:relative}}
+@media(min-width:601px){.workspace-panel.sized{width:var(--panel-width);max-width:none}}
+.panel-resizer{position:absolute;left:-5px;top:0;bottom:0;width:10px;cursor:col-resize;z-index:3;touch-action:none}
+.panel-resizer::after{content:'';position:absolute;left:4px;top:0;bottom:0;width:2px;background:transparent;transition:background .12s}
+.panel-resizer:hover::after,.panel-resizer:focus-visible::after,body.panel-resizing .panel-resizer::after{background:var(--accent)}
+.panel-resizer:focus-visible{outline-offset:-2px}
+body.panel-resizing{cursor:col-resize;user-select:none}
+@media(pointer:coarse){.panel-resizer{width:24px;left:-12px}.panel-resizer::after{left:11px}}
+.workspace-panel header .workspace-project{display:flex;align-items:center;gap:6px;min-width:0;max-width:none;overflow:visible}
+.workspace-project>span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.workspace-project .branch-badge{flex-shrink:1}
+.workspace-panel>header>div:first-child{min-width:0}
+.workspace-header-actions{display:flex;align-items:flex-start;gap:2px;flex-shrink:0}
+@media(max-width:600px){.panel-resizer,.panel-expand{display:none}}
+.editor-note{margin:0;padding:6px 14px;font-size:11px;color:var(--muted);border-top:1px solid var(--border)}

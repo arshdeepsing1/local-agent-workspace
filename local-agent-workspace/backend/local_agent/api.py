@@ -166,6 +166,37 @@ class CommandRequest(BaseModel):
     background: bool = Field(default=False, strict=True)
 
 
+def locate_file(tools, path, worktree=None):
+    """The project file a not-found path most likely names, as a workspace path, or None: a path that
+    starts with the project's own last folders (`<project>/src/app.py`, or `<sub>/src/app.py` from the
+    Git repository's root) without them, or in a worktree chat the same file under the worktree
+    instead of its source project (by absolute path or by the source folder's name)."""
+    value = PurePosixPath(path.replace("\\", "/"))
+    candidates = []
+    source = worktree.get("source_workspace") if isinstance(worktree, dict) else None
+    roots = [PurePosixPath(str(tools.root)).parts]
+    if isinstance(source, str) and source:
+        roots.append(PurePosixPath(source).parts)
+        if value.is_absolute():
+            try:
+                candidates.append(str(value.relative_to(PurePosixPath(source))))
+            except ValueError:
+                pass
+    if not value.is_absolute():
+        parts = tuple(part for part in value.parts if part != ".")
+        candidates += ["/".join(parts[count:]) for root in roots for count in range(1, min(4, len(parts)))
+                       if len(root) > count and parts[:count] == root[-count:]]
+    for candidate in candidates:
+        if not candidate or ".." in PurePosixPath(candidate).parts:
+            continue
+        try:
+            if tools.path(candidate).is_file():
+                return candidate
+        except (ValueError, OSError):
+            continue
+    return None
+
+
 def create_app(settings=None):
     settings = settings or Settings()
     store = Store(settings.state_dir / "conversations.sqlite3")
@@ -639,8 +670,20 @@ def create_app(settings=None):
     @app.get("/api/file")
     async def file(path: str, session_id: str | None = None):
         tools = ui_tools(session_id)
+        session = session_or_404(session_id) if session_id else {}
+        try:
+            content = tools.read_file(path)
+        except FileNotFoundError:
+            # Replies and tool cards name files in other ways: from the project's own folder name
+            # (demo/src/app.py), from the Git repository's root, or in a worktree chat by the source
+            # project's absolute path. Open the one existing file such a name means, else say so.
+            found = locate_file(tools, path, session.get("worktree"))
+            if found is None:
+                raise ValueError(f"{path} does not exist in {tools.root}. It may have been moved or deleted, "
+                                 "or it was named relative to another folder.") from None
+            path, content = found, tools.read_file(found)
         # The absolute path lets the editor offer an "Open in VS Code" link.
-        return {"path": path, "content": tools.read_file(path), "absolute": str(tools.path(path))}
+        return {"path": path, "content": content, "absolute": str(tools.path(path))}
 
     @app.put("/api/file")
     async def save_file(body: FileEdit):
