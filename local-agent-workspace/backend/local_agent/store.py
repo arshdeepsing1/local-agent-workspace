@@ -14,10 +14,57 @@ log = logging.getLogger(__name__)
 
 _SAFE_SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 # Kept out of the header record so list and metadata reads stay small.
-_SEPARATE_FIELDS = ("context_state", "instruction_directories", "file_views", "allow_rules", "inference_calls", "command_jobs")
+_SEPARATE_FIELDS = ("context_state", "instruction_directories", "file_views", "allow_rules", "inference_calls", "command_jobs",
+                    "queued_messages", "pending_context")
+# Context meter fields left out of list summaries and headers (see Store.summary).
+_METER_FIELDS = ("last_request", "next_estimate")
 # Kept in <id>.state.json beside the conversation file, never in field records: versions
 # before these fields existed reject unknown field records but only read *.jsonl files.
-_SIDECAR_FIELDS = ("file_views", "allow_rules")
+_SIDECAR_FIELDS = ("file_views", "allow_rules", "queued_messages", "pending_context")
+
+
+# JSON encodings of strings this long are kept between saves of a running conversation
+# (Store._encoded): tool results and replies are most of a large conversation's bytes, and each save
+# rewrites the whole file. An entry holds its string, so it can never be stale.
+CACHED_STRING_CHARS = 2048
+# Dicts and lists nested deeper than this are encoded in one call, so a deeply nested value (tool
+# arguments are the model's) cannot exhaust Python's recursion. Long strings sit far shallower:
+# record, data, content or tool_calls, block or call, function, arguments.
+WALKED_DEPTH = 8
+_encode_json = json.JSONEncoder(ensure_ascii=False, separators=(",", ":")).encode
+
+
+def _holds_long(container, depth):
+    """Whether a dict or list has a string of CACHED_STRING_CHARS or more within depth levels."""
+    for item in container.values() if type(container) is dict else container:
+        kind = type(item)
+        if kind is str:
+            if len(item) >= CACHED_STRING_CHARS:
+                return True
+        elif depth > 1 and (kind is dict or kind is list) and _holds_long(item, depth - 1):
+            return True
+    return False
+
+
+def _record_line(value, previous, current, depth=WALKED_DEPTH):
+    """json.dumps(value, ensure_ascii=False, separators=(",", ":")), reusing the encodings of long
+    strings from previous ({id: (string, encoding)}) and recording those it used in current.
+    Only the dicts and lists that hold a long string are walked here; the rest is encoded in one call."""
+    kind = type(value)
+    if kind is str:
+        if len(value) < CACHED_STRING_CHARS:
+            return _encode_json(value)
+        entry = previous.get(id(value))
+        text = entry[1] if entry is not None and entry[0] is value else _encode_json(value)
+        current[id(value)] = (value, text)
+        return text
+    if depth and (kind is dict or kind is list) and _holds_long(value, depth):
+        if kind is list:
+            return "[" + ",".join([_record_line(item, previous, current, depth - 1) for item in value]) + "]"
+        if all(type(key) is str for key in value):
+            return "{" + ",".join([_encode_json(key) + ":" + _record_line(item, previous, current, depth - 1)
+                                   for key, item in value.items()]) + "}"
+    return _encode_json(value)
 
 
 class UnreadableConversation(ValueError):
@@ -51,6 +98,9 @@ class Store:
         self._command_jobs = {}
         # The sidecar state last written or read, as JSON text, per conversation ID.
         self._sidecars = {}
+        # Per running conversation ID (keep_encodings), the long strings encoded at its last save:
+        # {id(string): (string, JSON)}.
+        self._encoded = {}
         # Unreadable conversation files: {file name: reason}. They are skipped and
         # reported, never deleted, moved or rewritten.
         self._list_problems = {}
@@ -76,8 +126,13 @@ class Store:
 
     @staticmethod
     def summary(session):
-        return {k: v for k, v in session.items()
-                if k not in ("wire", "events", *_SEPARATE_FIELDS)}
+        summary = {k: v for k, v in session.items()
+                   if k not in ("wire", "events", *_SEPARATE_FIELDS)}
+        info = summary.get("context_info")
+        if isinstance(info, dict) and any(key in info for key in _METER_FIELDS):
+            # The context meter's reported input lives only in the full session.
+            summary["context_info"] = {k: v for k, v in info.items() if k not in _METER_FIELDS}
+        return summary
 
     @staticmethod
     def _valid_id(session_id):
@@ -123,17 +178,32 @@ class Store:
         target = self._path(session["id"])
         temporary = self.conversations / f".{target.stem}.{uuid.uuid4().hex}.tmp"
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        # Rebuilt on every save, so only the strings still in the conversation are kept.
+        previous, current = self._encoded.get(session["id"]), {}
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as output:
                 for record in self._records(session):
-                    output.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+                    output.write(_encode_json(record) if previous is None else _record_line(record, previous, current))
                     output.write("\n")
                 output.flush()
                 os.fsync(output.fileno())
         except BaseException:
             temporary.unlink(missing_ok=True)
             raise
+        if previous is not None:
+            self._encoded[session["id"]] = current
         return temporary, target
+
+    def keep_encodings(self, session_id):
+        """Reuse the JSON of long strings between saves of this conversation until
+        forget_encodings. Only a running turn saves the same string objects again: a
+        conversation loaded anew (store.get) has new ones, so a kept entry would never be used."""
+        with self._lock:
+            self._encoded.setdefault(session_id, {})
+
+    def forget_encodings(self, session_id):
+        with self._lock:
+            self._encoded.pop(session_id, None)
 
     def _sync_directory(self):
         descriptor = os.open(self.conversations, os.O_RDONLY)
@@ -307,9 +377,12 @@ class Store:
         self.save(session)
         return session
 
-    def save(self, session):
+    def save(self, session, *, touch=True):
+        """Write the conversation. touch=False keeps its update time (metadata changes such as
+        pin, archive or tags must not reorder the sidebar or mark the chat unread)."""
         with self._lock:
-            prepared = {**session, "updated": time.time()}
+            updated = time.time() if touch or type(session.get("updated")) not in (int, float) else session["updated"]
+            prepared = {**session, "updated": updated}
             session_id = session["id"]
             jobs = self._known_jobs(session_id)
             merged = self._merge_jobs(jobs, prepared.get("command_jobs", []))
@@ -432,6 +505,7 @@ class Store:
                 for session in prepared:
                     self._state_path(session["id"]).unlink(missing_ok=True)
                     self._sidecars.pop(session["id"], None)
+                    self._encoded.pop(session["id"], None)
                 self._sync_directory()
                 raise
         for original, saved in zip(sessions, prepared):
@@ -456,6 +530,59 @@ class Store:
             self._command_jobs[session_id] = self._merge_jobs(
                 self._command_jobs.get(session_id, []), session.get("command_jobs", []))
             return session
+
+    def header(self, session_id):
+        """The conversation's metadata without its events, or None if there is no file.
+
+        Reads only the first line. Raises UnreadableConversation like get() for a file
+        whose header is damaged, names another conversation, or whose full load failed."""
+        if not self._valid_id(session_id):
+            return None
+        path = self._path(session_id)
+        with self._lock:
+            known = self._load_problems.get(path.name)
+            if known is not None:
+                if known[1] == _fingerprint(path):
+                    raise UnreadableConversation(path.name, known[0])
+                del self._load_problems[path.name]  # Changed since; try it again.
+            try:
+                metadata = self._read_lines(path, metadata_only=True)
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                raise UnreadableConversation(path.name, f"it could not be opened ({exc.strerror or type(exc).__name__})") from None
+            if metadata.get("id") != session_id:
+                raise UnreadableConversation(path.name, "its conversation ID does not match the file name")
+            return self.summary(metadata)
+
+    def event_texts(self, session_id):
+        """Yield (event id, type, text) for the user and assistant events with text, in order.
+
+        Parses only event records, never the wire or ledgers. A missing or damaged file
+        ends the generator quietly (search skips what it cannot read)."""
+        if not self._valid_id(session_id):
+            return
+        try:
+            descriptor = os.open(self._path(session_id), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except OSError:
+            return
+        try:
+            source = os.fdopen(descriptor, "r", encoding="utf-8")
+        except BaseException:
+            os.close(descriptor)
+            return
+        with source:
+            try:
+                for line in source:
+                    if not line.startswith('{"record":"event",'):
+                        continue
+                    record = json.loads(line)
+                    event = record.get("data") if isinstance(record, dict) else None
+                    if (isinstance(event, dict) and event.get("type") in ("user", "assistant")
+                            and isinstance(event.get("text"), str) and isinstance(event.get("id"), str)):
+                        yield event["id"], event["type"], event["text"]
+            except (OSError, ValueError, RecursionError):
+                return
 
     def list(self):
         """Readable conversations, newest first. Unreadable files are skipped and
@@ -524,4 +651,5 @@ class Store:
             self._state_path(session_id).unlink(missing_ok=True)
             self._command_jobs.pop(session_id, None)
             self._sidecars.pop(session_id, None)
+            self._encoded.pop(session_id, None)
             self._sync_directory()

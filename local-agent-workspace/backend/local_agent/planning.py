@@ -111,8 +111,15 @@ class DelegateManager:
         except (ValueError, OSError):
             return None  # Reported by the store; recovery skips it.
 
-    def recover(self):
-        for summary in self.manager.store.list():
+    def recover(self, summaries=None, full_scan=True, recovered=()):
+        """Close delegations a restart cut short. After a clean shutdown (full_scan False) only
+        children whose delegation is still open or whose parent was just recovered are loaded."""
+        for summary in self.manager.store.list() if summaries is None else summaries:
+            header = summary.get("delegation")
+            if not isinstance(header, dict) or not summary.get("parent_event_id"):
+                continue
+            if not (full_scan or not header.get("terminal_reason") or summary.get("parent_session_id") in recovered):
+                continue
             child = self._readable(summary["id"])
             progress = (child or {}).get("delegation")
             if not progress or not child.get("parent_event_id"):
@@ -129,6 +136,8 @@ class DelegateManager:
                 self.manager.store.save(parent)
 
     async def progress(self, child, status=None, terminal_reason=None):
+        if not child.get("parent_session_id") or not child.get("parent_event_id"):
+            return  # A child whose parent was deleted (its links were cleared).
         previous = child.get("delegation")
         if previous is None or previous.get("terminal_reason"):
             return
@@ -189,7 +198,11 @@ class DelegateManager:
                      tool_profile=profile,
                      permission_mode=parent.get("permission_mode", "manual"),
                      allowed_directories=list(parent.get("allowed_directories", [])),
-                     allow_rules=[dict(rule) for rule in parent.get("allow_rules", [])])
+                     allow_rules=[dict(rule) for rule in parent.get("allow_rules", [])],
+                     disabled_tools=list(parent.get("disabled_tools", [])))
+        if isinstance(parent.get("worktree"), dict):
+            # Display metadata only: the subagent of a worktree chat is listed under the same project.
+            child["worktree"] = dict(parent["worktree"])
         event_id = parent_event["id"] if parent_event is not None else str(uuid.uuid4())
         child.update(parent_event_id=event_id, parent_call_id=(parent_event or {}).get("call_id"),
                      delegation={"status": "running", "completed_tools": 0})

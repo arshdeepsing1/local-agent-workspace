@@ -34,6 +34,15 @@ jobs:
         run: python scripts/check_personal_data.py
       - name: Lint (errors and unused names)
         run: python -m ruff check --select F,E9 backend frontend/tests scripts
+      # ripgrep is optional for the app; the tests compare search results with and without it.
+      - name: Install ripgrep (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - name: Install ripgrep (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ripgrep
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
       - name: Backend tests
         working-directory: local-agent-workspace/backend
         run: python -m pytest -q

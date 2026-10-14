@@ -1,27 +1,36 @@
 import asyncio
 import mimetypes
+import os
 import secrets
 import sys
+import unicodedata
 from contextlib import asynccontextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from typing import Literal
 from urllib.parse import urlsplit
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .agents import AgentManager, public_session
 from .config import APP_ROOT, MAX_APPROVAL_MINUTES, MAX_MAX_AGENT_STEPS, MIN_MAX_AGENT_STEPS, Settings
+from .config import MAX_COMMAND_ENV, MAX_USER_INSTRUCTIONS, MAX_WRITE_LIMIT_KB, MIN_WRITE_LIMIT_KB
 from .context import (
-    MAX_CONTEXT_WINDOW, MAX_MAX_OUTPUT_TOKENS, MIN_CONTEXT_WINDOW, MIN_MAX_OUTPUT_TOKENS,
+    MAX_CONTEXT_WINDOW, MAX_MAX_OUTPUT_TOKENS, MIN_CONTEXT_WINDOW, MIN_MAX_OUTPUT_TOKENS, SAFETY_MARGIN,
 )
-from .store import Store
-from .git_tools import working_tree_changes
+from .context import MAX_AUTO_COMPACT_PERCENT, MIN_AUTO_COMPACT_PERCENT
+from .model_profiles import default_limits, effective_limits, limit_warnings, limits_note, public_profile
+from .user_paths import standing_directories
+from .store import Store, UnreadableConversation
+from . import conversation_search
+from .git_tools import file_diff, working_tree_changes, working_tree_status
 from .jobs import NOT_STOPPED, TIMEOUT_NOT_STOPPED
 from .tools import WorkspaceTools, file_error
+from .workspace_folders import register_workspace_folders
 from .permissions import PermissionMode
 from .telemetry import session_metrics
 from .activity import redact_secrets
@@ -30,6 +39,9 @@ from .transcript import transcript, transcript_file_name
 from .feature_api import register_features
 from .portability_api import register_portability
 from .approvals import MAX_DECLINE_NOTE, ensure_idle, register_approvals
+from .composer_api import register_composer
+from .interactions import register_interactions
+from .projects import register_projects
 
 
 # Browsers refuse ES modules served with a non-JavaScript type, and some systems
@@ -58,10 +70,18 @@ class Decision(BaseModel):
     allowed: bool
     remember: bool = Field(default=False, strict=True)  # Approve and store an exact allow rule for this chat.
     note: str | None = Field(default=None, max_length=MAX_DECLINE_NOTE, strict=True)  # Decline only.
+    scope: Literal["chat", "project", "user"] | None = None  # Approve and save an allow rule there.
+    rule: dict | None = None  # The rule to save (at most 8 KB of JSON); the card's default rule when absent.
 
 
 class SessionPermissions(BaseModel):
     permission_mode: PermissionMode = "manual"
+
+
+class PermissionChange(BaseModel):
+    model_config = {"extra": "forbid"}
+    permission_mode: PermissionMode
+    confirm: bool = Field(default=False, strict=True)  # Required to switch to Bypass permissions.
 
 
 class SessionModel(BaseModel):
@@ -72,13 +92,34 @@ class SessionTitle(BaseModel):
     title: str = Field(min_length=1, max_length=160, strict=True)
 
 
+class SessionMeta(BaseModel):
+    model_config = {"extra": "forbid"}
+    pinned: bool | None = Field(default=None, strict=True)
+    archived: bool | None = Field(default=None, strict=True)
+    tags: list[str] | None = Field(default=None, max_length=10, strict=True)
+
+
+def clean_tags(tags):
+    """NFC, whitespace collapsed, 1 to 32 characters, no control characters; the first of
+    tags that differ only in case is kept."""
+    result, seen = [], set()
+    for raw in tags:
+        tag = " ".join(unicodedata.normalize("NFC", raw).split())
+        if not 1 <= len(tag) <= 32 or any(unicodedata.category(char) == "Cc" for char in tag):
+            raise ValueError("Tags have 1 to 32 characters and no control characters.")
+        if tag.casefold() not in seen:
+            seen.add(tag.casefold())
+            result.append(tag)
+    return result
+
+
 class FolderAccess(BaseModel):
     path: str = Field(min_length=1, max_length=4096)
 
 
 class FileEdit(BaseModel):
     path: str
-    content: str = Field(max_length=80000)
+    content: str = Field(max_length=1_000_000)  # The write limit (bytes) is checked by apply_edit.
     original: str
     session_id: str | None = None
 
@@ -91,8 +132,31 @@ class SettingsEdit(BaseModel):
     max_output_tokens: int | None = Field(default=None, ge=MIN_MAX_OUTPUT_TOKENS, le=MAX_MAX_OUTPUT_TOKENS, strict=True)
     max_agent_steps: int | None = Field(default=None, ge=MIN_MAX_AGENT_STEPS, le=MAX_MAX_AGENT_STEPS, strict=True)
     compaction_handoffs: bool | None = Field(default=None, strict=True)
+    auto_compact_percent: int | None = Field(default=None, ge=MIN_AUTO_COMPACT_PERCENT, le=MAX_AUTO_COMPACT_PERCENT,
+                                             strict=True)
     approval_timeout_minutes: int | None = Field(default=None, ge=0, le=MAX_APPROVAL_MINUTES, strict=True)
     system_notifications: bool | None = Field(default=None, strict=True)
+    auto_keep_changes: bool | None = Field(default=None, strict=True)
+    user_instructions: str | None = Field(default=None, max_length=MAX_USER_INSTRUCTIONS, strict=True)
+    write_limit_kb: int | None = Field(default=None, ge=MIN_WRITE_LIMIT_KB, le=MAX_WRITE_LIMIT_KB, strict=True)
+    command_env: list[str] | None = Field(default=None, max_length=MAX_COMMAND_ENV, strict=True)
+    rate_limit_auto_continue: bool | None = Field(default=None, strict=True)
+    coding_dir: str | None = Field(default=None, max_length=4096, strict=True)
+    python_venv: str | None = Field(default=None, max_length=4096, strict=True)
+
+
+class LimitsQuery(BaseModel):
+    """Budgets to check against an endpoint's limits (Settings shows the warnings while editing)."""
+    model_config = {"extra": "forbid"}
+    model: str = Field(min_length=1, max_length=256, strict=True)
+    context_window: int = Field(ge=MIN_CONTEXT_WINDOW, le=MAX_CONTEXT_WINDOW, strict=True)
+    max_output_tokens: int = Field(ge=MIN_MAX_OUTPUT_TOKENS, le=MAX_MAX_OUTPUT_TOKENS, strict=True)
+
+    @model_validator(mode="after")
+    def output_below_context(self):
+        if self.max_output_tokens >= self.context_window - SAFETY_MARGIN:
+            raise ValueError("Max output tokens must be below the context budget minus the safety margin.")
+        return self
 
 
 class CommandRequest(BaseModel):
@@ -112,8 +176,16 @@ def create_app(settings=None):
     @asynccontextmanager
     async def lifespan(app):
         yield
+        manager.closing = True  # A Stop during shutdown records the reply as interrupted.
         await asyncio.gather(*(manager.stop(sid) for sid in list(manager.tasks)))
         await manager.jobs.shutdown()
+        # Everything stopped: the next start reads only conversation headers. If a stop raised,
+        # no marker is written and the next start loads every conversation (the safe direction).
+        try:
+            os.close(os.open(store.conversations / ".clean-shutdown",
+                             os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600))
+        except OSError:
+            pass
         store.db.close()
 
     app = FastAPI(title="Local workspace", lifespan=lifespan, docs_url=None, redoc_url=None)
@@ -152,16 +224,38 @@ def create_app(settings=None):
     def session_or_404(session_id):
         if session_id in deleting_sessions:
             raise HTTPException(404, "Conversation is being deleted.")
-        session = manager.get(session_id)
+        try:
+            session = manager.get(session_id)
+        except UnreadableConversation as exc:
+            # After a clean shutdown startup reads only headers, so a damaged body is found when the
+            # chat is opened: hide it and report it like a file found unreadable at startup.
+            store.record_problem(exc.file, exc.reason)
+            raise
         if not session:
             raise HTTPException(404, "Conversation not found.")
         return session
 
     def workspace_tools(session_id=None):
+        from .tools import write_limit_setting
         session = session_or_404(session_id) if session_id else {}
         workspace = session.get("workspace", settings.values["workspace"])
-        return WorkspaceTools(workspace, settings.values["env_file"], session.get("allowed_directories", []),
-                              session.get("permission_mode") == "bypassPermissions")
+        return WorkspaceTools(workspace, settings.values["env_file"],
+                              [*session.get("allowed_directories", []), *standing_directories(settings)],
+                              session.get("permission_mode") == "bypassPermissions",
+                              write_limit=write_limit_setting(settings.values), excluded_roots=(settings.state_dir,))
+
+    def ui_tools(session_id=None):
+        """workspace_tools plus the folders added to Files, for the user's own browsing, editor saves and Recovery only.
+        The agent's tools and every other route keep the conversation's own grants."""
+        session = session_or_404(session_id) if session_id else {}
+        workspace = session.get("workspace", settings.values["workspace"])
+        from .tools import write_limit_setting
+        # workspace_folders is assigned by register_workspace_folders below, before any request.
+        return WorkspaceTools(workspace, settings.values["env_file"],
+                              [*session.get("allowed_directories", []), *standing_directories(settings),
+                               *workspace_folders.paths(workspace)],
+                              session.get("permission_mode") == "bypassPermissions",
+                              write_limit=write_limit_setting(settings.values), excluded_roots=(settings.state_dir,))
 
     @app.get("/api/bootstrap")
     async def bootstrap():
@@ -169,7 +263,7 @@ def create_app(settings=None):
         return {"token": local_token, "settings": settings.public(), "storage_problems": store.problems()}
 
     def check_folder(path, workspace):
-        folder = WorkspaceTools(workspace, settings.values["env_file"]).resolve(path)
+        folder = WorkspaceTools(workspace, settings.values["env_file"], excluded_roots=(settings.state_dir,)).resolve(path)
         if not folder.is_dir():
             raise ValueError("Choose an existing folder.")
         # Probe directory access without reading any file contents or returning names.
@@ -187,27 +281,83 @@ def create_app(settings=None):
 
     @app.get("/api/connection")
     async def connection():
+        # error_kind says which step failed: 'credentials' (the credential file), 'http' (Databricks answered
+        # with an error status), 'network' (no answer) or 'invalid_response' (an answer the app cannot read).
+        # An unreadable credential file (OSError) still reaches the global handler (HTTP 400).
         try:
             host, token = settings.credentials()
+        except ValueError as exc:
+            return {"connected": False, "models": [], "error": settings.redact(str(exc)), "error_kind": "credentials"}
+        try:
             async with httpx.AsyncClient(timeout=20, follow_redirects=False) as client:
                 response = await client.get(host + "/api/2.0/serving-endpoints", headers={"Authorization": f"Bearer {token}"})
-            if response.status_code != 200:
-                return {"connected": False, "models": [], "error": f"Databricks returned HTTP {response.status_code}. Check your credentials and access."}
+        except httpx.HTTPError as exc:
+            return {"connected": False, "models": [], "error": settings.redact(str(exc) or type(exc).__name__),
+                    "error_kind": "network"}
+        except ValueError as exc:
+            # The request could not be built from the credentials, for example a token with a non-ASCII character
+            # (not allowed in an HTTP header). A UnicodeError's message quotes that character, so it is not shown.
+            error = ("The Databricks host or token in your credential file contains characters that cannot be sent in a request."
+                     if isinstance(exc, UnicodeError) else settings.redact(str(exc)))
+            return {"connected": False, "models": [], "error": error, "error_kind": "credentials"}
+        if response.status_code != 200:
+            status = response.status_code
+            # A server problem or a rate limit usually passes; other statuses point at the credentials or access.
+            error = (f"Databricks had a server problem (HTTP {status}). Try again in a moment." if status >= 500
+                     else f"Databricks rate limited the check (HTTP {status}). Try again in a moment." if status == 429
+                     else f"Databricks returned HTTP {status}. Check your credentials and access.")
+            return {"connected": False, "models": [], "error": error, "error_kind": "http", "http_status": status}
+        try:
             data = response.json()
-            models = [item.get("name", "") for item in data.get("endpoints", [])]
-            models = [name for name in models if name and not any(term in name for term in ("embedding", "gte-", "bge-"))]
-            return {"connected": True, "models": models, "error": None}
-        except (ValueError, httpx.HTTPError) as exc:
-            return {"connected": False, "models": [], "error": settings.redact(str(exc))}
+        except ValueError:
+            data = None
+        endpoints = data.get("endpoints", []) if isinstance(data, dict) else None
+        if not isinstance(endpoints, list):
+            return {"connected": False, "models": [], "error": "Databricks returned a response the app could not read.",
+                    "error_kind": "invalid_response"}
+        models = [item.get("name", "") if isinstance(item, dict) else "" for item in endpoints]
+        models = [name for name in models if isinstance(name, str) and name and not any(term in name for term in ("embedding", "gte-", "bge-"))]
+        return {"connected": True, "models": models, "error": None}
 
     @app.put("/api/settings")
     async def update_settings(body: SettingsEdit):
         manager.workspace_available(body.workspace)
-        return settings.update(body.model_dump(exclude_none=True))
+        result = settings.update(body.model_dump(exclude_none=True))
+        # Open chats' meters follow the new budgets and threshold; others follow when opened (stream).
+        for session_id in [key for key, sockets in manager.listeners.items() if sockets]:
+            try:
+                session = manager.get(session_id)
+            except (ValueError, OSError):
+                continue
+            if session:
+                await manager.refresh_meter_limits(session)
+        return result
+
+    @app.get("/api/settings")
+    async def get_settings():
+        # Read again so the Settings dialog and Folder access show current folder states.
+        return settings.public()
+
+    @app.post("/api/settings/limits")
+    async def check_limits(body: LimitsQuery):
+        model = body.model.strip()
+        profile = public_profile(model)
+        recommended = None
+        if profile and profile["recommended_context_window"] and profile["recommended_max_output_tokens"]:
+            recommended = {"context_window": profile["recommended_context_window"],
+                           "max_output_tokens": profile["recommended_max_output_tokens"]}
+        defaults = default_limits(model)
+        return {"profile": profile, "recommended": recommended,
+                "defaults": {"context_window": defaults[0], "max_output_tokens": defaults[1]},
+                "effective": effective_limits(model, body.context_window, body.max_output_tokens),
+                "warnings": limit_warnings(model, body.context_window, body.max_output_tokens),
+                "note": limits_note(model)}
 
     @app.get("/api/sessions")
     async def list_sessions():
-        return [{**s, "status": manager.statuses.get(s["id"], "idle")} for s in store.list()]
+        counts = manager.changes.counts()
+        return [{**s, "status": manager.statuses.get(s["id"], "idle"), "unreviewed_changes": counts.get(s["id"], 0)}
+                for s in store.list()]
 
     @app.post("/api/sessions")
     async def create_session(body: SessionPermissions | None = None):
@@ -218,14 +368,15 @@ def create_app(settings=None):
         return public_session(session)
 
     @app.put("/api/sessions/{session_id}/permissions")
-    async def permissions(session_id: str, body: SessionPermissions):
+    async def permissions(session_id: str, body: PermissionChange):
+        # Allowed while a turn runs: waiting cards are re-checked and a running subagent follows.
+        from .approvals import busy_status
         session = session_or_404(session_id)
-        ensure_idle(manager, session, "changing permissions")
-        session["permission_mode"] = body.permission_mode
-        store.save(session)
-        result = public_session(session)
-        await manager.broadcast(session_id, {"type": "snapshot", "session": result})
-        return result
+        if (body.permission_mode == "bypassPermissions" and not body.confirm
+                and session.get("permission_mode", "manual") != "bypassPermissions"):
+            raise HTTPException(400, "Confirm switching to Bypass permissions.")
+        await manager.change_mode(session, body.permission_mode)
+        return public_session(session, busy_status(manager, session_id))
 
     @app.put("/api/sessions/{session_id}/model")
     async def change_model(session_id: str, body: SessionModel):
@@ -236,9 +387,9 @@ def create_app(settings=None):
             raise ValueError("Enter a model endpoint name.")
         session["model"] = model
         store.save(session)
-        result = public_session(session)
         await manager.broadcast(session_id, {"type": "model", "model": model})
-        return result
+        await manager.refresh_meter_limits(session)  # The meter follows the new endpoint's budgets.
+        return public_session(session)
 
     @app.put("/api/sessions/{session_id}/title")
     async def rename_session(session_id: str, body: SessionTitle):
@@ -254,6 +405,53 @@ def create_app(settings=None):
         session.update(title=title, title_generated=True, updated=updated["updated"])
         await manager.broadcast(session_id, {"type": "title", "title": title})
         return public_session(session, manager.statuses.get(session_id, "idle"))
+
+    @app.get("/api/sessions/{session_id}/info")
+    async def session_info(session_id: str):
+        """The conversation's metadata and status without loading its events."""
+        if session_id in deleting_sessions:
+            raise HTTPException(404, "Conversation not found.")
+        live = manager.live.get(session_id)
+        header = Store.summary(live) if live else store.header(session_id)
+        if header is None:
+            raise HTTPException(404, "Conversation not found.")
+        return {**header, "status": manager.statuses.get(session_id, "idle")}
+
+    @app.get("/api/sessions/{session_id}/events")
+    async def session_events(session_id: str, before: str, limit: int = Query(default=100, ge=1, le=500)):
+        """The page of up to limit events just before the event `before` (earlier history)."""
+        events = session_or_404(session_id)["events"]
+        index = next((number for number, event in enumerate(events) if event.get("id") == before), None)
+        if index is None:
+            raise ValueError("That message is no longer in this conversation.")
+        start = max(0, index - limit)
+        return {"events": events[start:index], "start": start, "total": len(events)}
+
+    @app.put("/api/sessions/{session_id}/meta")
+    async def session_meta(session_id: str, body: SessionMeta):
+        """Pin, archive or tag a chat. Allowed during a response; keeps the sort order and unread state."""
+        session = session_or_404(session_id)
+        changes = body.model_dump(exclude_none=True)
+        if not changes:
+            raise HTTPException(400, "Change pin, archive or tags.")
+        if "tags" in changes:
+            changes["tags"] = clean_tags(changes["tags"])
+        # Persist first, like a rename, so a failed save changes nothing.
+        updated = {**session, **changes}
+        store.save(updated, touch=False)
+        session.update(changes)
+        await manager.broadcast(session_id, {"type": "meta", "pinned": session.get("pinned") is True,
+                                             "archived": session.get("archived") is True,
+                                             "tags": session.get("tags") or []})
+        return public_session(session, manager.statuses.get(session_id, "idle"))
+
+    @app.get("/api/session-search")
+    async def session_search(q: str = Query(min_length=2, max_length=200), workspace: str | None = None,
+                             include_subagents: bool = False, limit: int = Query(default=20, ge=1, le=50)):
+        if workspace is not None and not Path(workspace).is_absolute():
+            raise ValueError("Choose a project by its absolute path.")
+        return await asyncio.to_thread(conversation_search.search, store, q, workspace=workspace,
+                                       include_subagents=include_subagents, limit=limit, redact=settings.redact)
 
     @app.post("/api/sessions/{session_id}/folders")
     async def allow_folder(session_id: str, body: FolderAccess):
@@ -304,29 +502,54 @@ def create_app(settings=None):
             "Cache-Control": "no-store"})
 
     @app.delete("/api/sessions/{session_id}")
-    async def delete_session(session_id: str):
+    async def delete_session(session_id: str, children: Literal["keep", "delete"] = "keep"):
+        """children=delete also deletes its subagent chats; keep (the default) detaches them."""
         session_or_404(session_id)
+        family = [session_id]
         deleting_sessions.add(session_id)
         try:
-            await manager.stop(session_id)
-            await manager.jobs.remove_session(session_id)
-            manager.task_board.delete_session(session_id)
-            manager.checkpoints.delete_session(session_id)
-            manager.changes.delete_session(session_id)
-            store.delete(session_id)
-            manager.live.pop(session_id, None)
-            manager.statuses.pop(session_id, None)
+            await manager.stop(session_id)  # Also stops its active subagent.
+            # Listed after the stop, so a subagent started meanwhile is included.
+            if children == "delete":
+                family = [*manager.descendants(session_id), session_id]  # Deepest first.
+                deleting_sessions.update(family)
+            for member in family:
+                await manager.stop(member)
+                await manager.jobs.remove_session(member)
+                manager.task_board.delete_session(member)
+                manager.checkpoints.delete_session(member)
+                manager.changes.delete_session(member)
+                store.delete(member)
+                manager.live.pop(member, None)
+                manager.statuses.pop(member, None)
         finally:
-            deleting_sessions.discard(session_id)
-        return {"ok": True}
+            deleting_sessions.difference_update(family)
+        if children == "keep":
+            for summary in store.list():
+                if summary.get("parent_session_id") != session_id:
+                    continue
+                try:
+                    child = manager.get(summary["id"])  # The live dict while it runs.
+                except (ValueError, OSError):
+                    continue  # Unreadable: left unchanged and reported by the store.
+                if not child:
+                    continue
+                for key in ("parent_session_id", "parent_event_id", "parent_call_id"):
+                    child.pop(key, None)
+                child["parent_deleted"] = True
+                delegation = child.get("delegation")
+                if isinstance(delegation, dict) and not delegation.get("terminal_reason"):
+                    child["delegation"] = {**delegation, "status": "cancelled", "terminal_reason": "stopped"}
+                store.save(child, touch=False)
+        return {"ok": True, "deleted": family}
 
     @app.post("/api/sessions/{session_id}/messages")
     async def message(session_id: str, body: Prompt):
         session_or_404(session_id)
         if not body.text.strip():
             raise ValueError("Enter a message.")
-        manager.start(session_id, body.text.strip())
-        return {"ok": True}
+        # Starts the message, or queues it while a turn, compaction or ! command runs.
+        return await manager.submit_message(session_id, body.text.strip())
 
     @app.post("/api/sessions/{session_id}/stop")
     async def stop(session_id: str):
@@ -342,8 +565,10 @@ def create_app(settings=None):
 
     @app.post("/api/sessions/{session_id}/approvals/{event_id}")
     async def approval(session_id: str, event_id: str, body: Decision):
-        session_or_404(session_id)
-        manager.decide(session_id, event_id, body.allowed, body.remember, body.note)
+        session = session_or_404(session_id)
+        manager.decide(session_id, event_id, body.allowed, body.remember, body.note, body.scope, body.rule)
+        if body.scope in ("project", "user"):
+            await manager.rules_changed(body.scope, session)
         return {"ok": True}
 
     @app.websocket("/api/sessions/{session_id}/stream")
@@ -354,15 +579,28 @@ def create_app(settings=None):
             return
         try:
             session = manager.get(session_id)
+        except UnreadableConversation as exc:
+            store.record_problem(exc.file, exc.reason)  # Its next /info answers 400 instead of reconnecting.
+            session = None
         except (ValueError, OSError):
             session = None  # An unreadable conversation file.
         if not session:
             await socket.close(code=1008)
             return
         await socket.accept(subprotocol="local-workspace")
+        await manager.refresh_meter_limits(session)  # Settings may have changed since it was last open.
         manager.listeners.setdefault(session_id, set()).add(socket)
         try:
-            await socket.send_json({"type": "snapshot", "session": public_session(session, manager.statuses.get(session_id, "idle"))})
+            # The first snapshot carries the latest 200 events, extended to the whole latest turn
+            # (at most 1,000); the page loads earlier ones from /events. Later snapshots are complete.
+            snapshot = public_session(session, manager.statuses.get(session_id, "idle"))
+            events, total = snapshot["events"], len(snapshot["events"])
+            start = max(0, total - 200)
+            latest_user = next((index for index in range(total - 1, -1, -1) if events[index].get("type") == "user"), None)
+            if latest_user is not None and latest_user < start:
+                start = max(latest_user, total - 1000)
+            snapshot.update(events=events[start:], events_start=start, events_total=total)
+            await socket.send_json({"type": "snapshot", "session": snapshot})
             await manager.publish_changes(session)
             try:
                 tasks = manager.task_board.list(session_id)
@@ -396,26 +634,72 @@ def create_app(settings=None):
 
     @app.get("/api/files")
     async def files(path: str = ".", session_id: str | None = None):
-        return workspace_tools(session_id).list_files(path)
+        return ui_tools(session_id).list_files(path)
 
     @app.get("/api/file")
     async def file(path: str, session_id: str | None = None):
-        return {"path": path, "content": workspace_tools(session_id).read_file(path)}
+        tools = ui_tools(session_id)
+        # The absolute path lets the editor offer an "Open in VS Code" link.
+        return {"path": path, "content": tools.read_file(path), "absolute": str(tools.path(path))}
 
     @app.put("/api/file")
     async def save_file(body: FileEdit):
-        tools = workspace_tools(body.session_id)
+        tools = ui_tools(body.session_id)
         if tools.read_file(body.path) != body.original:
             raise HTTPException(409, "This file changed on disk. Reopen it before saving.")
         manager.checkpoints.apply_edit(tools, "write_file", {"path": body.path, "content": body.content}, session_id=body.session_id)
         if body.session_id:
-            await manager.publish_changes(session_or_404(body.session_id), tools, only_tracked=True)
+            await manager.publish_changes(session_or_404(body.session_id), only_tracked=True)
         return {"ok": True}
 
     @app.get("/api/git")
     async def git_changes(session_id: str | None = None):
         # No shell, and no programs named by the repository's configuration.
         return await working_tree_changes(workspace_tools(session_id).root)
+
+    def git_classifier(tools):
+        """'credential', 'generated' or None for a workspace-relative path, as the file tools see it."""
+        def classify(path):
+            name = PurePosixPath(path).name.casefold()
+            if name.endswith(".env") or name.startswith(".env."):
+                return "credential"  # Also left out of every diff by git_tools.DIFF_EXCLUDES.
+            try:
+                tools.resolve(path)
+            except ValueError as exc:
+                return "credential" if str(exc).startswith("Credential") else "generated"
+            except (OSError, RuntimeError):
+                pass
+            return None
+        return classify
+
+    @app.get("/api/git/status")
+    async def git_status(session_id: str | None = None):
+        tools = workspace_tools(session_id)
+        return await working_tree_status(tools.root, git_classifier(tools))
+
+    @app.get("/api/git/diff")
+    async def git_diff(path: str, area: Literal["staged", "unstaged", "untracked"], session_id: str | None = None,
+                       orig_path: str | None = None):
+        tools = workspace_tools(session_id)
+        paths = [path] if orig_path is None or area == "untracked" else [path, orig_path]
+        for value in paths:
+            relative = PurePosixPath(value)
+            if not value or "\0" in value or relative.is_absolute() or ".." in relative.parts or value.startswith("~"):
+                raise ValueError("Choose a file inside this project's repository.")
+        kinds = [git_classifier(tools)(value) for value in paths]
+        if "credential" in kinds:
+            raise ValueError("Credential files are not shown.")
+        if "generated" in kinds:
+            raise ValueError("Files in generated folders are not shown here.")
+        for value in paths:
+            target = tools.root / value
+            if value.endswith("/") or PurePosixPath(value) == PurePosixPath(".") or (target.is_dir() and not target.is_symlink()):
+                raise ValueError("Choose one changed file, not a folder.")
+        # Leave the configured credential file out of the diff even under another name.
+        credential = tools.credential_file
+        excludes = ([f":(exclude,literal){credential.relative_to(tools.root).as_posix()}"]
+                    if credential and credential.is_relative_to(tools.root) and credential != tools.root else [])
+        return await file_diff(tools.root, path, area, paths[1] if len(paths) > 1 else None, tools=tools, excludes=excludes)
 
     @app.post("/api/command")
     async def command(body: Prompt, session_id: str | None = None):
@@ -466,9 +750,13 @@ def create_app(settings=None):
         scoped_job(job_id, session_id)
         return await manager.jobs.stop(job_id)
 
-    register_features(app, manager, settings, store, session_or_404, workspace_tools)
+    register_features(app, manager, settings, store, session_or_404, workspace_tools, ui_tools)
     register_portability(app, manager, settings, store, session_or_404)
     register_approvals(app, manager, store, session_or_404)
+    register_composer(app, manager, settings, store, session_or_404)
+    register_interactions(app, manager, session_or_404)
+    register_projects(app, manager, settings, workspace_tools)
+    workspace_folders = register_workspace_folders(app, settings, session_or_404)
 
     # The browser loads the frontend source files directly; there is no build step.
     frontend = APP_ROOT / "frontend"

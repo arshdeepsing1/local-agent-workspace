@@ -1,5 +1,6 @@
 """How long an approval card waits, and how an unanswered card is reported."""
 import asyncio
+import json
 
 import pytest
 
@@ -158,7 +159,7 @@ async def test_unanswered_mcp_calls_and_hooks_are_not_called_declined(runtime, m
     manager.extensions.update_config({"hooks": [{"id": "check", "enabled": True, "event": "before_tool", "command": "true"}]})
     session["permission_mode"] = "acceptEdits"
     output = await bounded(manager.execute_tool(session, tools, "write_file", {"path": "note.txt", "content": "x"}, "edit"))
-    assert output.endswith("Hook approval was not answered in time.") and not (project / "note.txt").exists()
+    assert json.loads(output)["message"].endswith("Hook approval was not answered in time.") and not (project / "note.txt").exists()
 
 
 def test_the_wait_is_a_validated_setting(tmp_path, monkeypatch):
@@ -179,3 +180,64 @@ def test_the_wait_is_a_validated_setting(tmp_path, monkeypatch):
     assert Settings(tmp_path / "state").values["approval_timeout_minutes"] == 45
     with pytest.raises(ValueError, match="Approval wait"):
         settings.update({"approval_timeout_minutes": False})
+
+
+# Cards added with permission rules (subagents, stopping jobs, protected files) wait the same way.
+
+async def test_subagent_job_and_protected_file_cards_expire_after_the_configured_wait(runtime, monkeypatch):
+    manager, session, project, tools = runtime
+    tools.skill_signature = ""
+    manager.settings.values["approval_timeout_minutes"] = 10
+    expire_waits_of(monkeypatch, 600)
+    started = []
+
+    async def worker(child, prompt):
+        started.append(prompt)
+    manager.run_databricks = worker
+    output = await bounded(manager.execute_tool(session, tools, "delegate_task", {"task": "Count files"}, "delegate"))
+    assert "did not answer this approval request in time" in output and started == []
+    job = await manager.jobs.start(command="sleep 30", workspace=str(project), session_id=session["id"], background=True)
+    try:
+        output = await bounded(manager.execute_tool(session, tools, "stop_job", {"job_id": job["id"]}, "stop"))
+        assert "did not answer this approval request in time" in output
+        assert manager.jobs.get(job["id"])["state"] == "running"
+    finally:
+        await manager.jobs.stop(job["id"])
+        await manager.jobs.shutdown()
+    session["permission_mode"] = "acceptEdits"
+    output = await bounded(manager.execute_tool(session, tools, "write_file", {"path": "AGENTS.md", "content": "x"}, "protected"))
+    assert "did not answer this approval request in time" in output and not (project / "AGENTS.md").exists()
+    for call_id in ("delegate", "stop", "protected"):
+        event = next(item for item in session["events"] if item.get("call_id") == call_id)
+        assert (event["state"], event["approval"]) == ("rejected", "expired"), call_id
+        assert event["approval_expires"] > event["created"] + 590
+
+
+async def test_a_card_resolved_by_a_mode_change_returns_before_its_expiry(runtime):
+    manager, session, project, tools = runtime
+    manager.settings.values["approval_timeout_minutes"] = 60
+    run = asyncio.create_task(manager.execute_tool(session, tools, "write_file", {"path": "a.txt", "content": "x"}, "call"))
+    while not manager.pending:
+        await asyncio.sleep(0.01)
+    await manager.change_mode(session, "acceptEdits")
+    await bounded(run)
+    event = next(item for item in session["events"] if item.get("call_id") == "call")
+    assert (event["approval"], event["approved_by_mode"]) == ("approved", "acceptEdits")
+    assert (project / "a.txt").read_text() == "x"
+
+
+async def test_an_edited_card_keeps_its_expiry(runtime):
+    manager, session, project, tools = runtime
+    manager.settings.values["approval_timeout_minutes"] = 15
+    run = asyncio.create_task(manager.execute_tool(session, tools, "write_file", {"path": "a.txt", "content": "x"}, "call"))
+    while not manager.pending:
+        await asyncio.sleep(0.01)
+    (session_id, event_id), = manager.pending
+    event = next(item for item in session["events"] if item["id"] == event_id)
+    expires = event["approval_expires"]
+    await manager.revise_card(session_id, event_id, {"content": "edited"})
+    assert event["approval_expires"] == expires and event["edited"] is True
+    manager.decide(session_id, event_id, True)
+    output = await bounded(run)
+    assert output.startswith("[The user edited the file content before approving it.")
+    assert (project / "a.txt").read_text() == "edited"

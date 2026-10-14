@@ -1,5 +1,7 @@
 import asyncio
 import json
+import shlex
+import sys
 import time
 from unittest.mock import AsyncMock
 
@@ -105,7 +107,11 @@ async def test_cancel_foreground_stops_job_but_completed_background_launch_survi
     await asyncio.gather(task, return_exceptions=True)
     assert manager.jobs.get(foreground_id)["state"] == "cancelled"
     assert manager.jobs.get(background["job_id"])["state"] == "running"
+    # Stopping a job is a command action: Plan refuses it, Auto runs it without a card.
     session["permission_mode"] = "plan"
+    refused = await manager.execute_tool(session, tools, "stop_job", {"job_id": background["job_id"]}, "plan-stop")
+    assert refused.startswith("Plan mode is read-only") and manager.jobs.get(background["job_id"])["state"] == "running"
+    session["permission_mode"] = "auto"
     stopped = json.loads(await manager.execute_tool(session, tools, "stop_job", {
         "job_id": background["job_id"]}, "stop"))
     assert stopped["state"] == "cancelled"
@@ -184,3 +190,286 @@ def test_app_shutdown_stops_background_jobs(settings):
         headers = {"X-Local-Token": restarted.get("/api/bootstrap").json()["token"]}
         restored = restarted.get(f"/api/jobs/{job['id']}", headers=headers).json()
         assert restored["state"] == "cancelled"
+
+
+async def test_a_failed_command_shows_the_start_and_the_end_of_its_output(runtime):
+    manager, session, tools = runtime
+    session["permission_mode"] = "bypassPermissions"
+    result = json.loads(await manager.execute_tool(session, tools, "run_command", {"command": "seq 1 20000; exit 3",
+                                                                                      "max_output_bytes": 200_000}, "f"))
+    assert result["state"] == "failed" and result["excerpt"] == "head_and_tail"
+    assert result["output"].startswith("1\n2\n") and result["output"].endswith("19999\n20000\n")
+    head = result["output"].split("\n[… ")[0]
+    assert result["next_offset"] == result["omitted"]["start"] == len(head) <= 1500
+    assert result["omitted"]["end"] == result["total_chars"] - len(result["output"].split(" …]\n", 1)[1])
+    assert f"read them with get_job_output offset={result['next_offset']}" in result["output"]
+    assert len(json.dumps(result, indent=2).encode()) <= 8000
+    middle = json.loads(await manager.execute_tool(session, tools, "get_job_output", {
+        "job_id": result["job_id"], "offset": result["next_offset"]}, "m"))
+    assert middle["offset"] == result["next_offset"] and middle["output"]
+
+    passed = json.loads(await manager.execute_tool(session, tools, "run_command", {
+        "command": "seq 1 20000", "max_output_bytes": 200_000}, "p"))
+    assert passed["state"] == "completed" and "excerpt" not in passed
+    assert passed["output"].startswith("1\n2\n") and passed["next_offset"] == len(passed["output"])
+
+    script = "import sys; sys.stdout.write('\\u00e9\\u4e2d' * 10000); sys.exit(1)"
+    command = f"{sys.executable} -c {shlex.quote(script)}"
+    wide = json.loads(await manager.execute_tool(session, tools, "run_command", {"command": command}, "w"))
+    assert wide["state"] == "failed" and len(json.dumps(wide, indent=2).encode()) <= 8000
+    assert wide["excerpt"] == "head_and_tail" and wide["output"].startswith("é中")
+
+
+async def test_head_and_tail_says_when_the_end_of_the_output_was_not_kept(runtime):
+    manager, session, tools = runtime
+    session["permission_mode"] = "bypassPermissions"
+    result = json.loads(await manager.execute_tool(session, tools, "run_command", {
+        "command": "seq 1 30000; echo 'ERROR: the real failure'; exit 2"}, "t"))
+    assert result["truncated"] is True and result["excerpt"] == "head_and_tail"
+    assert "ERROR" not in result["output"]
+    assert result["output"].endswith("[… output after this point was not kept (over max_output_bytes); rerun with a "
+                                     "larger max_output_bytes, or write it to a file and use read_file with tail_lines …]")
+    assert len(json.dumps(result, indent=2).encode()) <= 8000
+
+
+def test_head_and_tail_falls_back_to_the_first_page_or_the_whole_output(runtime):
+    manager, _, _ = runtime
+    job = {"id": "j", "state": "failed", "exit_code": 1, "truncated": False, "background": False, "output": "x" * 5000}
+    page = manager.first_page(job)
+    assert page["output"] == "x" * 5000 and page["next_offset"] is None and "excerpt" not in page
+    job["output"] = "\U0001f600" * 20000  # 12 bytes of JSON each: only a shorter start fits, and no end.
+    page = manager.first_page(job)
+    assert page["excerpt"] == "head_and_tail" and 200 <= page["next_offset"] < 1500
+    assert page["output"].endswith(f"read them with get_job_output offset={page['next_offset']} …]\n")
+    assert len(json.dumps(page, indent=2).encode()) <= 8000
+    job.update(output="y" * 20000, state="completed")
+    assert manager.first_page(job) == manager.job_output(job)
+
+
+async def test_commands_get_named_environment_variables_but_never_credentials(runtime, monkeypatch):
+    manager, session, tools = runtime
+    session["permission_mode"] = "bypassPermissions"
+    for name, value in (("MY_TOOL_HOME", "/srv/tools"), ("DBRICKS_TOKEN", "never"), ("LD_PRELOAD", "/srv/x.so"),
+                        ("BASH_ENV", "/srv/startup"), ("OTHER_SETTING", "unlisted")):
+        monkeypatch.setenv(name, value)
+    manager.settings.values["command_env"] = ["MY_TOOL_HOME", "DBRICKS_TOKEN", "LD_PRELOAD", "BASH_ENV"]
+    script = "import os, json; print(json.dumps(sorted(k for k in os.environ if k not in ('PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR', 'SHELL', 'USER', 'LOGNAME', 'VIRTUAL_ENV', 'PWD', 'SHLVL', '_', 'OLDPWD', 'LC_CTYPE', '__CF_USER_TEXT_ENCODING'))))"
+    command = f"{sys.executable} -c {shlex.quote(script)}"
+    result = json.loads(await manager.execute_tool(session, tools, "run_command", {"command": command}, "env"))
+    assert json.loads(result["output"]) == ["MY_TOOL_HOME"]
+    assert manager.command_environment() == {"MY_TOOL_HOME": "/srv/tools"}
+
+    monkeypatch.setenv("MY_TOOL_HOME", "/srv/synthetic-secret-token/bin")  # Contains the configured token.
+    assert manager.command_environment() == {}
+    for setting in ("MY_TOOL_HOME", ["1BAD"], ["A"] * 33, [7]):
+        manager.settings.values["command_env"] = setting
+        assert manager.command_environment() == {}
+
+    monkeypatch.setenv("MY_TOOL_HOME", "/srv/tools")
+    manager.settings.values["command_env"] = ["MY_TOOL_HOME"]
+    manager.extensions.update_config({"hooks": [{"id": "envcheck", "event": "after_tool", "enabled": True,
+                                                 "command": command, "timeout_seconds": 10}]})
+    hook = manager.extensions.public_config()["hooks"][0]
+    outcome = await manager.extensions.run_hook(hook, {"event": "after_tool"}, session["workspace"])
+    assert json.loads(outcome["output"]) == []  # Hooks get no pass-through.
+
+
+async def wait_for_turn_end(manager, session):
+    manager.store.save(session)
+    manager.live.pop(session["id"], None)
+
+
+async def test_a_background_job_that_ends_after_the_turn_leaves_one_notice(runtime):
+    manager, session, tools = runtime
+    session["permission_mode"] = "bypassPermissions"
+    sent = []
+
+    async def broadcast(session_id, data):
+        sent.append(data)
+    manager.broadcast = broadcast
+    started = json.loads(await manager.execute_tool(session, tools, "run_command", {
+        "command": "sleep .3;   printf  finished;\n exit 2", "background": True}, "bg"))
+    await wait_for_turn_end(manager, session)
+    await asyncio.wait_for(manager.jobs.wait(started["job_id"]), 10)
+    stored = manager.store.get(session["id"])
+    notices = [event for event in stored["events"] if event["type"] == "notice"]
+    assert [event["text"] for event in notices] == [
+        "Background job failed (exit 2): sleep .3; printf finished; exit 2"]
+    assert notices[0]["job_id"] == started["job_id"]
+    assert [data["event"]["id"] for data in sent if data.get("event", {}).get("type") == "notice"] == [notices[0]["id"]]
+    await manager.job_update(manager.jobs.get(started["job_id"]))  # A repeated update adds nothing.
+    assert len([event for event in manager.store.get(session["id"])["events"] if event["type"] == "notice"]) == 1
+    assert manager.live.get(session["id"]) is None  # The conversation was not made live.
+
+
+async def test_a_slow_page_does_not_lose_the_notice(runtime, monkeypatch):
+    from local_agent import jobs
+    manager, session, tools = runtime
+    session["permission_mode"] = "bypassPermissions"
+    monkeypatch.setattr(jobs, "UPDATE_TIMEOUT_SECONDS", .3)
+    started = json.loads(await manager.execute_tool(session, tools, "run_command", {
+        "command": "sleep .3; printf done", "background": True}, "bg"))
+    await wait_for_turn_end(manager, session)
+
+    class SlowSocket:
+        async def send_json(self, data):
+            await asyncio.sleep(5)
+
+        async def close(self, code=1000):
+            pass
+    manager.listeners[session["id"]] = {SlowSocket()}
+    begun = time.monotonic()
+    await asyncio.wait_for(manager.jobs.wait(started["job_id"]), 10)
+    assert time.monotonic() - begun < 3
+    stored = manager.store.get(session["id"])
+    assert [event["text"] for event in stored["events"] if event["type"] == "notice"] == [
+        "Background job completed (exit 0): sleep .3; printf done"]
+
+
+async def test_terminal_and_cancelled_jobs_get_no_notice(runtime):
+    manager, session, tools = runtime
+    session["permission_mode"] = "bypassPermissions"
+    session["jobs_reported_through"] = 0.0
+    terminal = await manager.jobs.start("printf mine", session["workspace"], session_id=session["id"], background=True)
+    stopped = json.loads(await manager.execute_tool(session, tools, "run_command", {
+        "command": "sleep 30", "background": True}, "bg"))
+    await wait_for_turn_end(manager, session)
+    await manager.jobs.wait(terminal["id"])
+    await manager.jobs.stop(stopped["job_id"])
+    stored = manager.store.get(session["id"])
+    assert not [event for event in stored["events"] if event["type"] == "notice"]
+    assert manager.background_jobs_notice(stored) == ""
+    assert "printf mine" not in json.dumps(stored["events"])
+
+
+async def test_a_deleted_conversation_gets_no_notice_and_is_not_recreated(runtime):
+    manager, session, tools = runtime
+    session["permission_mode"] = "bypassPermissions"
+    started = json.loads(await manager.execute_tool(session, tools, "run_command", {
+        "command": "sleep 30", "background": True}, "bg"))
+    await wait_for_turn_end(manager, session)
+    await manager.jobs.remove_session(session["id"])
+    manager.store.delete(session["id"])
+    assert manager.jobs.get(started["job_id"]) is None
+    assert manager.store.get(session["id"]) is None
+    await asyncio.sleep(.1)
+    assert not manager.store._path(session["id"]).exists()
+    assert not [event for event in session["events"] if event["type"] == "notice"]
+
+
+async def test_finished_jobs_are_reported_once_and_never_on_a_first_step(runtime):
+    manager, session, tools = runtime
+    session["permission_mode"] = "bypassPermissions"
+    old = json.loads(await manager.execute_tool(session, tools, "run_command", {
+        "command": "printf old", "background": True}, "old"))
+    await manager.jobs.wait(old["job_id"])
+    assert "jobs_reported_through" not in session
+    assert manager.background_jobs_notice(session) == ""  # The first step only starts the clock.
+    assert manager.background_jobs_notice(session) == ""
+    jobs = []
+    for index in range(7):
+        jobs.append(json.loads(await manager.execute_tool(session, tools, "run_command", {
+            "command": f"printf {index}; exit {index % 2}", "background": True}, f"n{index}")))
+        await manager.jobs.wait(jobs[-1]["job_id"])
+    text = manager.background_jobs_notice(session)
+    assert text.startswith(f"Background jobs finished since your last step: {jobs[0]['job_id'][:8]} `printf 0; exit 0` "
+                           "completed (exit 0); " + f"{jobs[1]['job_id'][:8]} `printf 1; exit 1` failed (exit 1); ")
+    assert text.endswith("; and 2 more. Use get_job_output to read their output.")
+    assert old["job_id"][:8] not in text
+    assert manager.background_jobs_notice(session) == ""
+    assert "jobs_reported_through" not in public_session(session)
+
+
+async def test_the_next_model_request_reports_a_finished_background_job_once(settings, monkeypatch):
+    import httpx
+    store = Store(settings.state_dir / "notices.sqlite3")
+    manager = AgentManager(store, settings)
+    session = store.create(settings.values)
+    session["permission_mode"] = "bypassPermissions"
+    requests = []
+    replies = [{"tool_calls": [{"index": 0, "id": "c1", "type": "function", "function": {
+                   "name": "run_command", "arguments": json.dumps({"command": "sleep .2; printf built", "background": True})}}]},
+               {"content": "Started."},
+               {"tool_calls": [{"index": 0, "id": "c2", "type": "function", "function": {
+                   "name": "list_jobs", "arguments": "{}"}}]},
+               {"content": "Done."},
+               {"tool_calls": [{"index": 0, "id": "c3", "type": "function", "function": {
+                   "name": "run_command", "arguments": json.dumps({"command": "sleep .2; printf again", "background": True})}}]},
+               None,  # wait_job on that job: filled in below.
+               {"content": "Built again."}]
+
+    async def gateway(request):
+        payload = json.loads(request.content)
+        if "tools" not in payload:
+            return httpx.Response(200, text='data: {"choices": [{"delta": {"content": "Title"}, "finish_reason": "stop"}]}\n\ndata: [DONE]\n\n')
+        requests.append(payload)
+        delta = replies[len(requests) - 1]
+        if delta is None:
+            again = next(event["job_id"] for event in reversed(session["events"]) if event.get("name") == "run_command")
+            delta = {"tool_calls": [{"index": 0, "id": "c4", "type": "function", "function": {
+                "name": "wait_job", "arguments": json.dumps({"job_id": again, "timeout_seconds": 10})}}]}
+        chunk = {"choices": [{"delta": delta, "finish_reason": "tool_calls" if "tool_calls" in delta else "stop"}]}
+        return httpx.Response(200, text="data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n")
+
+    client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client(**kwargs, transport=httpx.MockTransport(gateway)))
+    try:
+        await manager.run(session, "Build it in the background")
+        job_id = next(event["job_id"] for event in session["events"] if event.get("name") == "run_command")
+        await asyncio.wait_for(manager.jobs.wait(job_id), 10)
+        session = store.get(session["id"])  # As the app loads an idle conversation.
+        await manager.run(session, "Is it done?")
+        systems = [payload["messages"][0]["content"] for payload in requests]
+        assert [text.count("Background jobs finished") for text in systems] == [0, 0, 1, 0]
+        assert (f"Background jobs finished since your last step: {job_id[:8]} `sleep .2; printf built` completed (exit 0). "
+                "Use get_job_output to read their output.") in systems[2]
+        assert [event["text"] for event in session["events"] if event["type"] == "notice"] == [
+            "Background job completed (exit 0): sleep .2; printf built"]
+        # wait_job already showed that the next job ended: the following request does not repeat it.
+        await manager.run(session, "Build it again and wait")
+        systems = [payload["messages"][0]["content"] for payload in requests]
+        waited = next(event for event in session["events"] if event.get("name") == "wait_job")
+        assert json.loads(waited["output"])["reason"] == "exited"
+        assert [text.count("Background jobs finished") for text in systems] == [0, 0, 1, 0, 0, 0, 0]
+    finally:
+        await manager.jobs.shutdown()
+        store.db.close()
+
+
+async def test_a_job_ending_while_its_chat_is_live_leaves_one_notice(runtime):
+    manager, session, tools = runtime
+    session["permission_mode"] = "bypassPermissions"
+    sent = []
+
+    async def broadcast(session_id, data):
+        sent.append((session_id, data))
+    manager.broadcast = broadcast
+    started = json.loads(await manager.execute_tool(session, tools, "run_command", {
+        "command": "sleep .2; printf ready", "background": True}, "bg"))
+    waited = json.loads(await asyncio.wait_for(manager.execute_tool(session, tools, "wait_job", {
+        "job_id": started["job_id"], "timeout_seconds": 10}, "w"), 10))
+    assert waited["reason"] == "exited"
+    assert manager.live[session["id"]] is session  # Still live: the turn goes on.
+    notices = [event for event in session["events"] if event["type"] == "notice"]
+    assert [(event["text"], event["job_id"]) for event in notices] == [
+        ("Background job completed (exit 0): sleep .2; printf ready", started["job_id"])]
+    stored = manager.store.get(session["id"])
+    assert [event["id"] for event in stored["events"] if event["type"] == "notice"] == [notices[0]["id"]]
+    assert [data["event"]["id"] for sid, data in sent
+            if sid == session["id"] and data.get("event", {}).get("type") == "notice"] == [notices[0]["id"]]
+
+
+async def test_notices_redact_secret_shapes_in_the_command(runtime):
+    manager, session, tools = runtime
+    session["permission_mode"] = "bypassPermissions"
+    secret = "ghp_" + "A1b2" * 6  # A token shape that redact_secrets replaces.
+    session["jobs_reported_through"] = 0.0
+    started = json.loads(await manager.execute_tool(session, tools, "run_command", {
+        "command": f"sleep .2; printf ok # {secret}", "background": True}, "bg"))
+    await wait_for_turn_end(manager, session)
+    await asyncio.wait_for(manager.jobs.wait(started["job_id"]), 10)
+    stored = manager.store.get(session["id"])
+    texts = [event["text"] for event in stored["events"] if event["type"] == "notice"]
+    assert texts == ["Background job completed (exit 0): sleep .2; printf ok # [REDACTED]"]
+    report = manager.background_jobs_notice(stored)
+    assert started["job_id"][:8] in report and "[REDACTED]" in report and secret not in report

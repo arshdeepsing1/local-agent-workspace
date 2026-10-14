@@ -10,7 +10,7 @@ from local_agent.api import create_app
 from local_agent.config import Settings
 from local_agent.context import (
     DEFAULT_CONTEXT_WINDOW, MIN_CONTEXT_WINDOW, SUMMARY_MAX_TOKENS, build_summary_messages, estimate_tokens,
-    handoff_output_tokens, prepare_context,
+    VERIFY_CONTINUATION_PREFIX, handoff_output_tokens, prepare_context,
 )
 from local_agent.instructions import load_project_instructions
 from local_agent.store import Store
@@ -124,7 +124,8 @@ async def test_manual_compaction_preserves_archive_recent_exchanges_and_never_ru
 @pytest.mark.parametrize("failure", ["http", "empty", "length", "cancel"])
 async def test_manual_failure_or_stop_keeps_previous_summary_and_archive(runtime, monkeypatch, failure):
     manager, session, _ = runtime
-    # A cut-off summary fails compaction; a cut-off handoff is kept (see test_compaction_handoffs).
+    # A summary cut off before any text fails compaction; one with text is kept (test_compaction_quality),
+    # as is a cut-off handoff (test_compaction_handoffs).
     manager.settings.values["compaction_handoffs"] = failure != "length"
     original = copy.deepcopy(session)
     entered = asyncio.Event()
@@ -135,7 +136,7 @@ async def test_manual_failure_or_stop_keeps_previous_summary_and_archive(runtime
             await asyncio.Event().wait()
         if failure == "http":
             return httpx.Response(500)
-        return httpx.Response(200, json={"choices": [{"message": {"content": "" if failure == "empty" else "Partial"},
+        return httpx.Response(200, json={"choices": [{"message": {"content": "" if failure in ("empty", "length") else "Partial"},
             "finish_reason": "length" if failure == "length" else "stop"}]})
 
     mock_gateway(monkeypatch, gateway)
@@ -234,6 +235,11 @@ async def test_manual_compaction_save_failure_does_not_publish_or_later_persist_
 def test_manual_compaction_rejects_no_earlier_turn_and_busy_sessions_before_inference(runtime):
     manager, session, _ = runtime
     session["context_state"]["through"] = 6
+    manager.store.save(session)
+    with pytest.raises(ValueError, match="No earlier turns"):
+        manager.start_compaction(session["id"])
+    # A hidden app continuation after the cut is part of the latest turn, not an earlier one.
+    session["wire"].append({"role": "user", "content": VERIFY_CONTINUATION_PREFIX + " the verify command failed."})
     manager.store.save(session)
     with pytest.raises(ValueError, match="No earlier turns"):
         manager.start_compaction(session["id"])

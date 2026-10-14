@@ -125,6 +125,20 @@ async def test_delegation_reads_authoritative_ceiling_and_persists_child_profile
     assert len(manager.store.list()) == 2
 
 
+async def test_a_subagent_of_a_worktree_chat_is_listed_under_the_same_project(runtime):
+    manager, parent, _ = runtime
+    header = {'id': 'abc', 'branch': 'agent/x', 'source_workspace': '/project'}
+    parent['worktree'] = dict(header)
+    manager.store.save(parent)
+    async def worker(session, prompt):
+        await manager.event(session, 'assistant', text='Done')
+    manager.run_databricks = worker
+    result = await manager.delegates.delegate(parent, 'Read')
+    child = manager.store.get(result['child_session_id'])
+    assert child['worktree'] == header and child['workspace'] == parent['workspace']
+    assert next(item for item in manager.store.list() if item['id'] == child['id'])['worktree'] == header
+
+
 def test_profile_api_requires_idle_parent_and_valid_value(runtime):
     manager, _, _ = runtime
     app = create_app(manager.settings)

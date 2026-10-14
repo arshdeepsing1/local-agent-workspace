@@ -50,6 +50,20 @@ def event(session, call_id):
     return next(item for item in reversed(session["events"]) if item.get("call_id") == call_id)
 
 
+async def test_a_read_summarized_at_compaction_must_be_read_again(runtime):
+    manager, session, project, tools = runtime
+    await read(manager, session, tools)
+    target = str((project / "note.txt").resolve())
+    session["file_views"], session["context_state"] = agents.forget_summarized_reads(
+        session["file_views"], {"summary": "s", "through": 2, "compactions": 1}, [target])
+    output = await write(manager, session, tools, "new\n")
+    assert "Read note.txt again before overwriting it: its earlier contents were summarized out of your context" in output
+    assert (project / "note.txt").read_text() == "original\n"
+    await read(manager, session, tools)
+    await write(manager, session, tools, "new\n")
+    assert (project / "note.txt").read_text() == "new\n"
+
+
 async def test_overwriting_is_refused_before_a_read_without_asking_the_user(runtime):
     manager, session, project, tools = runtime
     session["permission_mode"] = "manual"
@@ -138,6 +152,23 @@ async def test_a_change_during_the_approval_wait_is_refused(runtime):
     assert (project / "note.txt").read_text() == "original\n"
 
 
+def test_refusals_name_the_action_and_forgetting_drops_a_view(runtime):
+    manager, session, project, tools = runtime
+    retries = {"overwriting": "Use read_file, then write again.", "deleting": "Use read_file, then delete it again.",
+               "editing": "Use notebook_read, then edit it again."}
+    for verb, retry in retries.items():
+        refusal = manager.overwrite_refusal(session, tools, "note.txt", verb)
+        assert refusal == f"Read note.txt before {verb} it: this conversation has not read it yet. {retry}"
+    manager.remember_file(session, project / "note.txt")
+    assert manager.overwrite_refusal(session, tools, "note.txt", "deleting") is None
+    os.utime(project / "note.txt", ns=(1, 1))
+    refusal = manager.overwrite_refusal(session, tools, "note.txt", "editing")
+    assert refusal.startswith("Read note.txt again before editing it: it changed since you last read or wrote it")
+    assert refusal.endswith("Use notebook_read, then edit it again.")
+    manager.forget_file(session, project / "note.txt")
+    assert session["file_views"] == {}
+
+
 def test_views_are_bounded_and_private(runtime, monkeypatch):
     manager, session, project, _ = runtime
     monkeypatch.setattr(agents, "FILE_VIEW_LIMIT", 3)
@@ -213,5 +244,5 @@ async def test_the_model_is_told_at_the_end_of_the_system_message(runtime, monke
     # Stable text first; the folder list, time and notice last.
     assert (system.index("Workspace: ") < system.index("Each of your responses can contain")
             < system.index("Project rule: keep tests green.") < system.index("Additional allowed folders: ")
-            < system.index("Current local date and time: ") < system.index("Files changed since"))
+            < system.index("Current local date: ") < system.index("Files changed since"))
     assert "cache_control" not in json.dumps(requests[-1])

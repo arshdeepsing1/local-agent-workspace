@@ -12,12 +12,22 @@ export const CONTINUE_MESSAGE = 'Continue from where you stopped.'
 //   'stopped': Stop ("Stopped. You can continue this conversation.").
 //   'interrupted': a server restart (or an import) found the turn still running
 //     and marked its events cancelled / its request_info interrupted.
-//   'inference_error' with an error event whose error_kind is 'output_limit':
-//     the reply still hit the output-token limit after automatic retries.
+//   'inference_error' with the turn's last error event's error_kind:
+//     'output_limit': the reply still hit the output-token limit after automatic retries;
+//     'invalid_tool_arguments' or 'incomplete_response': the reply could not be used
+//       even after the hidden automatic retries. (A provider content filter stop has
+//       error_kind 'content_filter', is never retried and gets no Continue.)
+//     'rate_limit': Databricks still rate limited the request after the automatic
+//       retries and waits. (No code path sets terminal_reason 'rate_limit'.)
+//     No Continue for 'payload_too_large' (the request is over the 4 MB Databricks
+//       limit and was not sent) or 'output_tokens_over_limit' (Max output tokens is
+//       above the endpoint's output-tokens-per-minute limit): Continue would fail
+//       the same way until the user changes Settings or sends smaller steps.
 // - Older records cut short by a restart keep a stale terminal_reason; their
 //   latest turn has request_info { status: 'interrupted', error_kind:
 //   'incomplete_response' }. (An automatic output-limit retry marks a reply
-//   'interrupted' without error_kind, and its turn goes on.)
+//   'interrupted' without error_kind, and its turn goes on. A hidden retry after
+//   invalid arguments or an incomplete reply leaves that reply's status 'error'.)
 export function stopReason(session) {
   if (!session || session.status !== 'idle') return null
   const events = session.events || []
@@ -28,8 +38,11 @@ export function stopReason(session) {
   if (reason === 'step_limit') return 'The agent reached its step limit.'
   if (reason === 'stopped') return 'The response was stopped.'
   if (reason === 'interrupted') return 'The response was interrupted.'
-  if (reason === 'inference_error' && turn.findLast(event => event.type === 'error')?.error_kind === 'output_limit') {
-    return 'The reply reached the output limit.'
+  if (reason === 'inference_error') {
+    const kind = turn.findLast(event => event.type === 'error')?.error_kind
+    if (kind === 'output_limit') return 'The reply reached the output limit.'
+    if (kind === 'invalid_tool_arguments' || kind === 'incomplete_response') return 'The model\'s reply could not be used.'
+    if (kind === 'rate_limit') return 'Databricks rate limited this chat.'
   }
   if (turn.some(event => event.request_info?.status === 'interrupted' && event.request_info.error_kind === 'incomplete_response')) {
     return 'The response was interrupted.'

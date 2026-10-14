@@ -55,6 +55,20 @@ function TokenChart({ calls }) {
   </figure>`
 }
 
+// The latest agent request as Databricks reported it, next to the app's own estimate.
+function LastInput({ report }) {
+  if (!report || typeof report.input_tokens !== 'number') {
+    return html`<div class="usage-last-input"><small>Last model input</small><p class="muted">No reported input yet.</p></div>`
+  }
+  return html`<div class="usage-last-input" role="group" aria-label="Last model input">
+    <small>Last model input${report.partial ? ' (partial)' : ''}</small>
+    <strong>${integer.format(report.input_tokens)} tokens</strong>
+    <span>${typeof report.percent_of_input_budget === 'number' ? `${report.percent_of_input_budget}% of input budget` : 'Input budget unknown'}</span>
+    <span>${typeof report.percent_of_model_window === 'number' ? `${report.percent_of_model_window}% of model window` : 'Model window unknown'}</span>
+    <span>${typeof report.estimated_tokens === 'number' ? `App estimate ~${integer.format(report.estimated_tokens)}` : 'No app estimate'}</span>
+  </div>`
+}
+
 export default function UsagePanel({ session, onError }) {
   const sessionId = session?.id
   const [metrics, setMetrics] = useState(null)
@@ -102,6 +116,7 @@ export default function UsagePanel({ session, onError }) {
     ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
     ${!metrics && loading ? html`<p role="status">Loading usage…</p>` : null}
     ${metrics ? html`
+      <${LastInput} report=${metrics.last_input} />
       <div class="usage-cards">
         <div><small>Model calls</small><strong>${integer.format(metrics.totals.calls)}</strong></div>
         <div><small>Uncached input</small><strong>${formatTokens(metrics.totals.input_tokens)}</strong></div>
@@ -109,14 +124,15 @@ export default function UsagePanel({ session, onError }) {
         <div><small>Cache write</small><strong>${formatTokens(metrics.totals.cache_creation_input_tokens)}</strong></div>
         <div><small>Output tokens</small><strong>${formatTokens(metrics.totals.output_tokens)}</strong></div>
         <div><small>429 responses</small><strong>${integer.format(metrics.totals.rate_limited)}</strong></div>
+        <div><small>Automatic retries</small><strong>${integer.format(metrics.totals.retries ?? 0)}</strong></div>
         <div><small>Estimated cost</small><strong>${metrics.totals.estimated_dbu == null ? 'Unavailable' : `${formatDbu(metrics.totals.estimated_dbu)} DBU`}</strong></div>
       </div>
       ${!metrics.complete ? html`<p class="usage-warning" role="status">This older conversation has no complete inference ledger. Totals include visible agent calls only; title, compaction, and retry attempts may be missing.</p>` : null}
       ${metrics.calls.length ? html`<${TokenChart} calls=${metrics.calls} />` : html`<p class="muted">No model calls have been recorded for this conversation.</p>`}
       <div class="usage-breakdown">
         <h3>Call breakdown</h3>
-        <div class="usage-table-scroll"><table><caption class="sr-only">Model calls for this conversation</caption><thead><tr><th>Purpose</th><th>Model</th><th>Status</th><th>Uncached input</th><th>Cache read</th><th>Cache write</th><th>Output</th><th>Est. DBU</th></tr></thead><tbody>
-          ${metrics.calls.slice().reverse().map(call => html`<tr key=${call.id}><td>${call.purpose}</td><td>${call.model}</td><td>${call.status}${call.http_status ? ` · ${call.http_status}` : ''}</td><td>${formatCallTokens(tokenValue(call, 'input_tokens'))}</td><td>${formatCallTokens(tokenValue(call, 'cache_read_input_tokens'))}</td><td>${formatCallTokens(tokenValue(call, 'cache_creation_input_tokens'))}</td><td>${formatCallTokens(tokenValue(call, 'output_tokens'))}</td><td>${call.estimated_dbu == null ? '—' : formatDbu(call.estimated_dbu)}</td></tr>`)}
+        <div class="usage-table-scroll"><table><caption class="sr-only">Model calls for this conversation</caption><thead><tr><th>Purpose</th><th>Model</th><th>Status</th><th>Total input</th><th>Uncached input</th><th>Cache read</th><th>Cache write</th><th>Output</th><th>Est. DBU</th></tr></thead><tbody>
+          ${metrics.calls.slice().reverse().map(call => html`<tr key=${call.id}><td>${call.purpose}</td><td>${call.model}</td><td>${call.status}${call.http_status ? ` · ${call.http_status}` : ''}</td><td>${formatCallTokens(totalInput(call))}</td><td>${formatCallTokens(tokenValue(call, 'input_tokens'))}</td><td>${formatCallTokens(tokenValue(call, 'cache_read_input_tokens'))}</td><td>${formatCallTokens(tokenValue(call, 'cache_creation_input_tokens'))}</td><td>${formatCallTokens(tokenValue(call, 'output_tokens'))}</td><td>${call.estimated_dbu == null ? '—' : formatDbu(call.estimated_dbu)}</td></tr>`)}
         </tbody></table></div>
       </div>
       <p class="field-help usage-cost-note">Cost is a near-real-time estimate from provider-reported tokens and published pay-per-token DBU rates, not an invoice. Databricks billing records can lag and may apply contract pricing, credits, or regional uplifts. Unknown or provisioned endpoints show cost as unavailable. <a href=${metrics.pricing.source_url} target="_blank" rel="noreferrer">Pricing source</a>.</p>` : null}

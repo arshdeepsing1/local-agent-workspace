@@ -52,26 +52,28 @@ async def test_incomplete_batch_never_executes_or_poisons_next_turn(runtime, mon
 
     async def gateway(request):
         requests.append(json.loads(request.content))
-        if len(requests) == 1:
+        if len(requests) <= 3:  # The first response and both hidden retries fail the same way.
             return response(calls, finish, "I started preparing the change.")
         return response(finish="stop", text="Ready to continue.")
 
-    async def execute(*args):
+    async def execute(*args, **_):
         pytest.fail("No call in an incomplete or invalid batch may execute")
 
     manager.execute_tool = execute
     mock_gateway(monkeypatch, gateway)
     with pytest.raises(ValueError, match=expected_error):
         await manager.run_databricks(session, "Make the change.")
-    assert len(requests) == 1
+    assert len(requests) == 3
     assert not any(message.get("tool_calls") for message in session["wire"])
     assert "I started preparing the change." in session["wire"][-1]["content"]
     assert "No tool calls from this response ran" in session["wire"][-1]["content"]
     saved = manager.store.get(session["id"])
     restarted = AgentManager(manager.store, manager.settings)
     assert await restarted.run_databricks(saved, "Continue in smaller steps.") is True
-    assert len(requests) == 2
+    assert len(requests) == 4
     assert not any(message.get("tool_calls") for message in requests[-1]["messages"])
+    roles = [message["role"] for message in requests[-1]["messages"]]
+    assert all(not (a == b == "user") for a, b in zip(roles, roles[1:]))
 
 
 async def test_no_input_call_runs_with_its_batch_and_replays_as_valid_json(runtime, monkeypatch):
@@ -95,7 +97,7 @@ async def test_no_input_call_runs_with_its_batch_and_replays_as_valid_json(runti
                 frame({}, "tool_calls"), "data: [DONE]\n\n"]))
         return response(finish="stop", text="Found them.")
 
-    async def execute(session, tools, name, values, call_id):
+    async def execute(session, tools, name, values, call_id, **_):
         executed.append((name, values, call_id))
         return "{}"
 
@@ -121,7 +123,7 @@ async def test_output_limit_retry_history_is_bounded_persisted_and_resets_after_
             return response([call("compact")])
         return response(finish="stop", text="Finished in smaller steps.")
 
-    async def execute(session, tools, name, values, call_id):
+    async def execute(session, tools, name, values, call_id, **_):
         executed.append((name, values, call_id))
         return "Compact file written."
 
@@ -219,12 +221,12 @@ async def test_unanswered_internal_continuation_is_removed_before_next_real_user
         if len(requests) == 1:
             return response([call(arguments='{"path":')], "length", "Visible partial draft")
         if len(requests) == 2:
-            return httpx.Response(503, text="Unavailable")
+            return httpx.Response(500, text="Unavailable")  # Not retried, unlike 502/503/504.
         return response(finish="stop", text="Recovered on the next user turn.")
 
     manager.execute_tool = lambda *args: pytest.fail("No tool from the limited response may execute")
     mock_gateway(monkeypatch, gateway)
-    with pytest.raises(ValueError, match="HTTP 503"):
+    with pytest.raises(ValueError, match="HTTP 500"):
         await manager.run_databricks(session, "Start the task.")
     assert session["wire"][-1] == {"role": "user", "content": OUTPUT_LIMIT_CONTINUATION}
     assert manager.store.get(session["id"])["wire"][-1]["content"] == OUTPUT_LIMIT_CONTINUATION
@@ -267,7 +269,7 @@ async def test_legacy_malformed_request_is_omitted_without_losing_archive_or_com
                 assert isinstance(json.loads(tool_call["function"]["arguments"]), dict)
         return response(finish="stop", text="The first file is complete; I will inspect the remaining work.")
 
-    async def execute(*args):
+    async def execute(*args, **_):
         pytest.fail("Continuing old history must not rerun completed or broken tool calls")
 
     manager.execute_tool = execute

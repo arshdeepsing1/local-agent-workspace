@@ -3,10 +3,13 @@ import codecs
 import copy
 import json
 import os
+import re
 import signal
 import time
 import uuid
 from pathlib import Path
+
+import regex as safe_regex
 
 
 MAX_ACTIVE_JOBS = 4
@@ -18,6 +21,23 @@ NOT_STOPPED = ("[The command did not end when it was stopped and may still be ru
 TIMEOUT_NOT_STOPPED = "Command exceeded its time limit and did not end when it was stopped; it may still be running."
 DRAINING = set()  # Output readers of commands that did not end when stopped.
 ENVIRONMENT_KEYS = {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SHELL", "USER", "LOGNAME", "VIRTUAL_ENV"}
+# Never passed to commands by name (Settings -> Environment variables for commands):
+# model credentials, and loader or shell-startup variables that would change what
+# even Auto mode's basic commands do. config.py validates the same sets.
+CREDENTIAL_ENV = {"DBRICKS_TOKEN", "DATABRICKS_TOKEN", "DBRICKS_URL", "DATABRICKS_HOST", "LOCAL_AGENT_ENV_FILE"}
+DENIED_ENV = {"BASH_ENV", "ENV", "ZDOTDIR", "PROMPT_COMMAND", "SHELLOPTS", "BASHOPTS", "IFS", "PYTHONSTARTUP",
+              "PERL5OPT", "RUBYOPT", "NODE_OPTIONS"}
+DENIED_ENV_PREFIXES = ("LD_", "DYLD_")
+TERM_GRACE_SECONDS = 2
+ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+JOB_NOTICE_STATES = {"completed", "failed", "timed_out"}  # Background jobs that get a finished notice.
+HEAD_CHARS = 1_500  # A failed command's first result: up to this much of the start,
+TAIL_CHARS = 4_500  # and this much of the end,
+MIN_HEAD_CHARS = 200  # or at least this much of the start alone.
+WAIT_SCAN_SECONDS = 1.0  # wait_job's regular-expression budget per batch of new output
+WAIT_THREAD_CHARS = 65_536  # larger batches are scanned in a worker thread
+WAIT_OUTPUT_CHARS = 4_000
+PAGE_BYTES = 8_000
 
 
 def shell_argv(command):
@@ -70,6 +90,23 @@ async def settle(reader):
     return reader.done(), cancellation
 
 
+async def terminate(reader, pid):
+    """Ask a command's process group to end (SIGTERM), give it TERM_GRACE_SECONDS,
+    then kill what is left and settle(). Returns (ended, cancellation) like settle()."""
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    cancellation = None
+    try:
+        await asyncio.wait({reader}, timeout=TERM_GRACE_SECONDS)
+    except asyncio.CancelledError as error:
+        cancellation = error
+    kill_group(pid)
+    ended, later = await settle(reader)
+    return ended, cancellation or later
+
+
 def drained(reader):
     DRAINING.discard(reader)
     if not reader.cancelled():
@@ -95,19 +132,43 @@ class CommandTimeout(TimeoutError):
         self.result = result
 
 
-async def run_process(command, workspace, timeout_seconds=60, max_output_bytes=80_000, on_output=None):
-    """Run a noninteractive command, retaining bounded output while draining its pipe."""
-    validate_command_options(command, timeout_seconds, max_output_bytes)
+def command_environment(extra_env=None):
+    """The environment commands run with: the variables named in ENVIRONMENT_KEYS, plus
+    extra_env, the variables passed through by name (the caller has filtered them)."""
     env = {key: value for key, value in os.environ.items() if key in ENVIRONMENT_KEYS}
+    env.update(extra_env or {})
+    return env
+
+
+# A command given to run without a shell has at most 64 tokens (command_exec.prepare_command
+# checks it). The argument vector that runs may be longer: read-only Git adds its own options
+# and pathspecs.
+ARGV_LIMIT = 64
+PREPARED_ARGV_LIMIT = 256
+
+
+def validate_argv(argv, limit=ARGV_LIMIT):
+    """An argument vector run without a shell: 1 to limit text tokens, each without NUL
+    and at most 1,000 characters."""
+    if (not isinstance(argv, list) or not 1 <= len(argv) <= limit
+            or not all(isinstance(token, str) and "\0" not in token and len(token) <= 1000 for token in argv)
+            or not argv[0]):
+        raise ValueError(f"A command run without a shell needs 1 to {limit} arguments, each text of at most "
+                         "1,000 characters without NUL.")
+
+
+async def spawn(argv, workspace, env):
+    """Start argv in its own session with no stdin and stdout and stderr on one pipe.
+
+    Process creation can finish after its caller is cancelled. That process is then
+    acquired and reaped before the cancellation propagates."""
     spawning = asyncio.create_task(asyncio.create_subprocess_exec(
-        *shell_argv(command), cwd=workspace, env=env,
+        *argv, cwd=workspace, env=env,
         stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT, start_new_session=True))
     try:
-        process = await asyncio.shield(spawning)
+        return await asyncio.shield(spawning)
     except asyncio.CancelledError as error:
-        # Process creation can finish after its caller is cancelled. Acquire and
-        # reap that process before propagating cancellation.
         process = await spawning
         kill_group(process.pid)
         ended, cancellation = await settle(asyncio.ensure_future(discard_output(process)))
@@ -115,6 +176,21 @@ async def run_process(command, workspace, timeout_seconds=60, max_output_bytes=8
         if not ended:
             error.result = {"exit_code": None, "output": "", "truncated": False, "stopped": False}
         raise error
+
+
+async def run_process(command, workspace, timeout_seconds=60, max_output_bytes=80_000, on_output=None,
+                      extra_env=None, *, argv=None, env=None):
+    """Run a noninteractive command, retaining bounded output while draining its pipe.
+
+    command is the text run by the shell, or with argv the display text of argv,
+    which then runs without a shell. extra_env holds variables passed through by
+    name; the caller has filtered them. env, when given, replaces the whole
+    environment (command_environment(extra_env) otherwise)."""
+    validate_command_options(command, timeout_seconds, max_output_bytes)
+    if argv is not None:
+        validate_argv(argv, PREPARED_ARGV_LIMIT)
+    env = env if env is not None else command_environment(extra_env)
+    process = await spawn(list(argv) if argv is not None else shell_argv(command), workspace, env)
 
     output = ""
     retained = 0
@@ -173,10 +249,10 @@ async def run_process(command, workspace, timeout_seconds=60, max_output_bytes=8
             await asyncio.shield(reader)
             await publisher
     except BaseException as error:
-        # Always kill the group, even when the shell itself has already exited:
+        # Always stop the group, even when the shell itself has already exited:
         # its children may still be running and holding the output pipe open.
-        kill_group(process.pid)
-        stopped, cancellation = await settle(reader)
+        # SIGTERM first, so that they can clean up; SIGKILL after the grace period.
+        stopped, cancellation = await terminate(reader, process.pid)
         publisher.cancel()
         await asyncio.gather(publisher, return_exceptions=True)
         if stopped:
@@ -194,12 +270,139 @@ async def run_process(command, workspace, timeout_seconds=60, max_output_bytes=8
     return result()
 
 
+def job_command(command, limit):
+    """A job's command on one line, at most limit characters."""
+    text = " ".join(str(command).split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def job_ending(job):
+    """How a finished job ended, for notices: 'completed (exit 0)', 'failed (exit 2)' or 'timed out'."""
+    if job["state"] == "timed_out":
+        return "timed out"
+    exit_code = f" (exit {job['exit_code']})" if type(job.get("exit_code")) is int else ""
+    return ("completed" if job["state"] == "completed" else "failed") + exit_code
+
+
+# Compiling expands counted repeats by their minimum counts, multiplied when nested:
+# '(?:a{3000}){3000}' takes seconds and gigabytes before any timeout can apply.
+REPEAT_EXPANSION_LIMIT = 100_000
+
+
+def _repeat_expansion(node):
+    """How far the counted repeats in a parsed pattern expand: the minimum counts, multiplied
+    through nesting and added up."""
+    from regex import _regex_core
+    children = []
+    for value in vars(node).values():
+        if isinstance(value, _regex_core.RegexBase):
+            children.append(value)
+        elif isinstance(value, (list, tuple)):
+            children.extend(item for item in value if isinstance(item, _regex_core.RegexBase))
+    inner = sum(_repeat_expansion(child) for child in children)
+    if isinstance(node, _regex_core.GreedyRepeat):  # Also the lazy and possessive repeats.
+        return node.min_count * max(1, inner)
+    return inner
+
+
+def bounded_regex(text, flags):
+    """compile text with the regex module (the engine with match timeouts) unless its counted
+    repeats would make compiling itself take seconds and gigabytes. Raises regex.error."""
+    from regex import _regex_core
+    try:
+        # The parse that regex.compile starts with; it expands nothing.
+        global_flags = flags
+        while True:
+            source = _regex_core.Source(text)
+            info = _regex_core.Info(global_flags, source.char_type, {})
+            info.guess_encoding = _regex_core.UNICODE
+            source.ignore_space = bool(info.flags & safe_regex.VERBOSE)
+            try:
+                parsed = _regex_core._parse_pattern(source, info)
+                break
+            except _regex_core._UnscopedFlagSet:
+                global_flags = info.global_flags
+        expansion = _repeat_expansion(parsed)
+    except (AttributeError, ImportError, TypeError, KeyError, ValueError):
+        # A regex release with another parser, or flags it refuses: compiling reports the latter.
+        expansion = 0
+    if expansion > REPEAT_EXPANSION_LIMIT:
+        raise safe_regex.error(f"its counted repeats ({{n}}) add up to more than {REPEAT_EXPANSION_LIMIT:,} repeated "
+                               "items, nested counts multiplied; use smaller counts, or * and +")
+    try:
+        return safe_regex.compile(text, flags)
+    except MemoryError as error:
+        raise safe_regex.error("it is too large to compile") from error
+
+
+def until_pattern(text):
+    """wait_job's until_regex, compiled with the same safe engine as search_files."""
+    if not isinstance(text, str) or len(text) > 500:
+        raise ValueError("until_regex must be text of at most 500 characters.")
+    try:
+        return bounded_regex(text, safe_regex.VERSION1)
+    except (safe_regex.error, RecursionError) as error:
+        raise ValueError(f"Invalid until_regex: {error}") from error
+
+
+def scan_lines(text, start, pattern, timeout):
+    """The first line of text that pattern matches, as (line, offset of the line), or None.
+
+    text holds only complete lines, except at the end of a finished job's output.
+    start is the offset of text in the job output."""
+    from .tools import REGEX_TIMEOUT
+    deadline = time.monotonic() + timeout
+    position = 0
+    lines = text.split("\n")
+    if text.endswith("\n"):
+        lines.pop()  # A final LF ends the last line; it does not start an empty one.
+    for line in lines:
+        stripped = line[:-1] if line.endswith("\r") else line
+        remaining = deadline - time.monotonic()
+        try:
+            if remaining <= 0:
+                raise TimeoutError
+            if pattern.search(stripped, timeout=min(REGEX_TIMEOUT, remaining), concurrent=True):
+                return stripped, start + position
+        except TimeoutError:
+            raise ValueError("until_regex took too long; simplify it.") from None
+        position += len(line) + 1
+    return None
+
+
+def wait_page(job, reason, match, from_offset):
+    """wait_job's result: the new output since from_offset (its end when long), at most 8,000 bytes of JSON."""
+    from .tools import _excerpt
+    output = job["output"]
+    total = len(output)
+
+    def page(begin):
+        return {"job_id": job["id"], "state": job["state"], "exit_code": job["exit_code"], "reason": reason,
+                "match": match and {"line": _excerpt(match[0])[0], "offset": match[1]},
+                "output": output[begin:], "output_start": begin, "next_offset": total, "total_chars": total}
+
+    low = min(total, max(from_offset, total - WAIT_OUTPUT_CHARS))
+    high = total
+    while low < high:  # The smallest start whose page fits.
+        middle = (low + high) // 2
+        if len(json.dumps(page(middle), indent=2).encode("utf-8")) <= PAGE_BYTES:
+            high = middle
+        else:
+            low = middle + 1
+    return page(low)
+
+
 class JobManager:
-    def __init__(self, store, redact, on_update, redaction_tokens=None):
+    def __init__(self, store, redact, on_update, redaction_tokens=None, environment=None, mirror_finished=True,
+                 venv=None):
         self.store = store
         self.redact = redact
         self.on_update = on_update
         self.redaction_tokens = redaction_tokens or (lambda: ())
+        self.environment = environment  # Variables passed to commands by name, read at job start.
+        self.venv = venv  # The Python virtual environment commands run with (a path or None), read at job start.
+        self._signal = asyncio.Condition()  # Notified after every change to a job (wait_job).
+        self._changes = 0
         self._tasks = {}
         self._jobs = {}
         self._removing_sessions = set()
@@ -212,7 +415,9 @@ class JobManager:
                 job.update(state="interrupted", updated=time.time(),
                            output=job["output"] + "\n[Server restarted; command outcome is unknown. The command was not restarted.]")
                 self._persist(job, mirror=True)
-            else:
+            elif mirror_finished:
+                # Finished jobs were mirrored when they ended; after a clean shutdown that holds, and
+                # mirroring again would fully read each owning conversation (header-only startup).
                 self.store.save_job(job)
             self._jobs[job["id"]] = job
         self._prune()
@@ -223,6 +428,11 @@ class JobManager:
         self.store.db.commit()
         if mirror:
             self.store.save_job(job)
+
+    async def _changed(self):
+        self._changes += 1
+        async with self._signal:
+            self._signal.notify_all()
 
     async def _notify(self, job):
         if self.on_update is not None:
@@ -250,9 +460,39 @@ class JobManager:
                 if (session_id is None or job["session_id"] == session_id)
                 and (workspace is None or job["workspace"] == workspace)]
 
+    def command_environment(self, *, named=True, python_venv=True):
+        """The environment a command started now runs with: with named, the variables
+        passed through by name in Settings; with python_venv, the Python virtual
+        environment from Settings active (user_paths.venv_environment)."""
+        extra_env = {}
+        if named and self.environment is not None:
+            try:
+                extra_env = dict(self.environment() or {})
+            except Exception:
+                extra_env = {}  # A broken setting must not stop the command.
+        env = command_environment(extra_env)
+        if python_venv and self.venv is not None:
+            try:
+                path = self.venv()
+            except Exception:
+                path = None  # A broken setting must not stop the command.
+            if isinstance(path, str) and path:
+                from .user_paths import server_bins, venv_environment  # tools imports this module.
+                env = venv_environment(env, path, drop=server_bins())
+        return env
+
     async def start(self, command, workspace, session_id=None, timeout_seconds=60,
-                    max_output_bytes=80_000, background=False):
+                    max_output_bytes=80_000, background=False, *, argv=None, env=None):
+        """Start a job. command is the shell text, or with argv its display text: argv
+        then runs without a shell, with env as its whole environment when given.
+        argv and env are never stored or published."""
         validate_command_options(command, timeout_seconds, max_output_bytes)
+        if argv is not None:
+            validate_argv(argv, PREPARED_ARGV_LIMIT)
+            argv = list(argv)
+        if env is not None and (not isinstance(env, dict)
+                                or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items())):
+            raise ValueError("A command environment must map names to text.")
         if self._closed:
             raise ValueError("Command manager is shutting down.")
         if session_id in self._removing_sessions:
@@ -281,6 +521,8 @@ class JobManager:
                "command": sanitize(command), "state": "running", "created": now, "updated": now,
                "exit_code": None, "output": "", "truncated": False, "timeout_seconds": timeout_seconds,
                "max_output_bytes": max_output_bytes, "background": bool(background)}
+        if argv is not None:
+            job["without_shell"] = True
         self._jobs[job["id"]] = job
         self._persist(job, mirror=True)
         # Publication precedes execution. A concurrent stop during publication
@@ -291,21 +533,24 @@ class JobManager:
             await self.stop(job["id"])
             raise
         if job["state"] == "running":
-            task = asyncio.create_task(self._run(job, command, sanitize))
+            task = asyncio.create_task(self._run(job, command, sanitize, argv, env and dict(env)))
             self._tasks[job["id"]] = task
             task.add_done_callback(lambda done: self._tasks.pop(job["id"], None))
         return copy.deepcopy(job)
 
-    async def _run(self, job, command, sanitize):
+    async def _run(self, job, command, sanitize, argv=None, env=None):
         async def output(text, truncated):
             job.update(output=sanitize(text, partial=True), truncated=truncated, updated=time.time())
             self._persist(job)
+            await self._changed()
             await self._notify(job)
 
         result = None
         try:
+            if env is None:
+                env = self.command_environment()
             result = await run_process(command, job["workspace"], job["timeout_seconds"],
-                                       job["max_output_bytes"], output)
+                                       job["max_output_bytes"], output, argv=argv, env=env)
             job["state"] = "completed" if result["exit_code"] == 0 else "failed"
         except CommandTimeout as error:
             result = error.result
@@ -323,6 +568,7 @@ class JobManager:
             job["updated"] = time.time()
             self._persist(job, mirror=True)
             self._prune()
+            await self._changed()
             await self._notify(job)
 
     async def wait(self, job_id):
@@ -348,8 +594,46 @@ class JobManager:
                 job.update(state="cancelled", updated=time.time())
                 self._persist(job, mirror=True)
                 self._prune()
+                await self._changed()
                 await self._notify(job)
         return copy.deepcopy(job)
+
+    async def watch(self, job_id, offset, pattern, timeout):
+        """Wait until the job ends, a new complete output line after offset matches
+        pattern, or timeout seconds pass. Returns (job copy, reason, (line, offset) or None).
+        Each wake-up scans only output not scanned before. Cancelling the wait leaves the job running."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        cursor = offset
+        while True:
+            seen = self._changes
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise ValueError("The job is no longer available.")
+            running = job["state"] == "running"
+            output = job["output"]
+            cursor = min(cursor, len(output))  # Retained output can shrink (a withheld secret prefix).
+            if pattern is not None:
+                end = len(output) if not running else output.rfind("\n", cursor) + 1
+                if end > cursor:
+                    text = output[cursor:end]
+                    if len(text) > WAIT_THREAD_CHARS:
+                        found = await asyncio.to_thread(scan_lines, text, cursor, pattern, WAIT_SCAN_SECONDS)
+                    else:
+                        found = scan_lines(text, cursor, pattern, WAIT_SCAN_SECONDS)
+                    if found is not None:
+                        return copy.deepcopy(job), "matched", found
+                    cursor = end
+            if not running:
+                return copy.deepcopy(job), "exited", None
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return copy.deepcopy(job), "timeout", None
+            async with self._signal:
+                try:
+                    await asyncio.wait_for(self._signal.wait_for(lambda: self._changes != seen), remaining)
+                except TimeoutError:
+                    pass
 
     async def shutdown(self):
         self._closed = True

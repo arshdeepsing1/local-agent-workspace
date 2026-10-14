@@ -1,6 +1,7 @@
 import json
 import os
 import stat
+import sys
 
 import pytest
 from fastapi.testclient import TestClient
@@ -9,7 +10,7 @@ from local_agent.api import create_app
 from local_agent.config import Settings
 from local_agent.recovery import CheckpointManager
 from local_agent.store import Store
-from local_agent.tools import WorkspaceTools
+from local_agent.tools import WorkspaceTools, file_error
 
 
 @pytest.fixture
@@ -37,7 +38,8 @@ def test_edit_restore_exact_bytes_mode_and_reverse(recovery):
     target.write_bytes(b"first\r\nsecond\r\n")
     target.chmod(0o751)
     diff = manager.apply_edit(tools, "edit_file", {"path": "script.py", "old_text": "second", "new_text": "changed"})
-    assert "changed" in diff and target.read_bytes() == b"first\nchanged\n"
+    # Line endings are kept: the edit replaces only the matched text.
+    assert "changed" in diff and target.read_bytes() == b"first\r\nchanged\r\n"
     assert stat.S_IMODE(target.stat().st_mode) == 0o751
     checkpoint_id = first(manager)
     metadata = manager.list()[0]
@@ -47,7 +49,7 @@ def test_edit_restore_exact_bytes_mode_and_reverse(recovery):
     assert stat.S_IMODE(target.stat().st_mode) == 0o751
     assert not manager.preview(checkpoint_id, tools)["can_restore"]
     restore(manager, tools, result["reverse_checkpoint_id"])
-    assert target.read_bytes() == b"first\nchanged\n"
+    assert target.read_bytes() == b"first\r\nchanged\r\n"
 
 
 @pytest.mark.parametrize("content", ["hello", ""])
@@ -208,7 +210,7 @@ def test_parent_symlink_swap_cannot_write_external_file(recovery, tmp_path, monk
     assert manager.list() == []
 
 
-@pytest.mark.parametrize("raw", [b"x" * 80001, b"binary\x00", b"\xff"])
+@pytest.mark.parametrize("raw", [b"x" * 1_000_001, b"binary\x00", b"\xff"])
 def test_unsupported_original_files_have_no_checkpoint(recovery, raw):
     manager, tools, _ = recovery
     (tools.root / "file").write_bytes(raw)
@@ -316,3 +318,91 @@ def test_turn_preview_api_requires_scoped_session_and_does_not_mutate(tmp_path, 
         assert client.get(f"/api/checkpoint-turns/turn/preview?session_id={other_id}", headers=headers).status_code == 400
         assert client.get("/api/checkpoint-turns/turn/preview", headers=headers).status_code == 422
         assert (tmp_path / "file").read_text() == "new"
+
+
+# --- Bounded store, line splitting and file operations ---------------------------------------------
+
+def sizes(store):
+    return dict(store.db.execute("SELECT id, size FROM checkpoint_sizes"))
+
+
+def test_the_store_prunes_the_oldest_finished_records_and_keeps_pending_ones(recovery, monkeypatch):
+    from local_agent import recovery as module
+    manager, tools, store = recovery
+    # A record whose write never finished (pending) must survive pruning.
+    pending = {"id": "pending-record", "workspace": str(tools.root), "session_id": "chat", "path": "p", "target": "p",
+               "created": 0.0, "status": "pending", "before": module._state(), "after": module._state(),
+               "restores": None, "turn_id": None}
+    manager._save(pending)
+    for number in range(6):
+        manager.apply_edit(tools, "write_file", {"path": f"f{number}.txt", "content": "x" * 5_000}, session_id="chat")
+    ids = [row[0] for row in store.db.execute("SELECT id FROM checkpoint_sizes ORDER BY seq")]
+    each = sizes(store)[ids[-1]]
+    assert manager.total == sum(sizes(store).values())
+    monkeypatch.setattr(module, "CHECKPOINT_BYTES_LIMIT", each * 5)
+    monkeypatch.setattr(module, "CHECKPOINT_PRUNE_TARGET", each * 3)
+    manager.apply_edit(tools, "write_file", {"path": "last.txt", "content": "x" * 5_000}, session_id="chat")
+    left = [row[0] for row in store.db.execute("SELECT id FROM checkpoint_sizes ORDER BY seq")]
+    assert "pending-record" in left and manager.total < each * 3 + sizes(store)["pending-record"]
+    assert left[-1] not in ids  # The record just written stays.
+    assert [item for item in ids if item in left] == ["pending-record", *ids[len(ids) - len(left) + 2:]]
+    assert {row[0] for row in store.db.execute("SELECT id FROM checkpoints")} == set(left)
+    assert manager.total == sum(sizes(store).values())
+    # The newest records are still restorable.
+    assert manager.preview(manager.list("chat")[0]["id"], tools, "chat")["can_restore"]
+
+
+def test_a_store_from_before_the_cap_is_backfilled_once(tmp_path):
+    store = Store(tmp_path / "old.sqlite3")
+    store.db.execute("CREATE TABLE checkpoints (id TEXT PRIMARY KEY, workspace TEXT, session_id TEXT, data TEXT)")
+    for checkpoint_id, status in (("a", "applied"), ("b", "pending"), ("c", "restored")):
+        data = json.dumps({"id": checkpoint_id, "status": status, "payload": "é" * 10})
+        store.db.execute("INSERT INTO checkpoints VALUES (?, '/srv/x', 's', ?)", (checkpoint_id, data))
+    store.db.commit()
+    manager = CheckpointManager(store)
+    rows = {row[0]: row[1:] for row in store.db.execute("SELECT id, size, pending, seq FROM checkpoint_sizes")}
+    for checkpoint_id, (size, pending, _) in rows.items():
+        data = store.db.execute("SELECT data FROM checkpoints WHERE id=?", (checkpoint_id,)).fetchone()[0]
+        assert size == len(data.encode("utf-8")) and pending == (checkpoint_id == "b")
+    assert [rows[key][2] for key in "abc"] == sorted(rows[key][2] for key in "abc")
+    assert manager.total == sum(size for size, _, _ in rows.values())
+    CheckpointManager(store)  # Runs again without duplicating.
+    assert store.db.execute("SELECT COUNT(*) FROM checkpoint_sizes").fetchone()[0] == 3
+    manager.delete_session("s")
+    assert store.db.execute("SELECT COUNT(*) FROM checkpoint_sizes").fetchone()[0] == 0 and manager.total == 0
+    store.db.close()
+
+
+@pytest.mark.parametrize("separator", [" ", "\x0c", "\r"])
+def test_recovery_diffs_count_lines_by_newline_only(recovery, separator):
+    manager, tools, _ = recovery
+    target = tools.root / "odd.txt"
+    target.write_text(f"a{separator}b\nc\n", newline="")
+    manager.apply_edit(tools, "edit_file", {"path": "odd.txt", "old_text": "c", "new_text": "d"})
+    diff = manager.preview(first(manager), tools)["diff"]
+    # The preview shows the way back: two lines, not three.
+    assert diff.endswith(f"@@ -1,2 +1,2 @@\n a{separator}b\n-d\n+c\n")
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_a_move_whose_second_step_fails_says_both_files_exist(recovery, monkeypatch, platform):
+    manager, tools, _ = recovery
+    monkeypatch.setattr(sys, "platform", platform)  # macOS words a PermissionError as a privacy setting
+    (tools.root / "a.txt").write_text("text\n")
+    applied = []
+    real = manager._apply
+
+    def fail_second(*args, **kwargs):
+        if applied:
+            raise PermissionError("synthetic removal denial")
+        applied.append(args)
+        return real(*args, **kwargs)
+    monkeypatch.setattr(manager, "_apply", fail_second)
+    with pytest.raises(ValueError) as error:
+        manager.apply_move(tools, "a.txt", "b.txt", session_id="chat")
+    reason = ("synthetic removal denial" if platform == "linux" else
+              file_error(PermissionError("synthetic removal denial")).rstrip("."))
+    assert str(error.value) == (f"Created b.txt but could not remove a.txt: {reason}. "
+                                "Both files exist now; review them in the change review.")
+    assert ".." not in str(error.value)
+    assert (tools.root / "a.txt").exists() and (tools.root / "b.txt").read_text() == "text\n"

@@ -78,7 +78,7 @@ async def test_hooks_match_exact_selectors_with_stable_call_ids(runtime, selecto
     (tools.root / "note.txt").write_text("hello")
     payloads = []
 
-    async def hook(hook, payload, workspace):
+    async def hook(hook, payload, workspace, env=None):
         payloads.append(payload)
         return {"output": "ok", "exit_code": 0}
 
@@ -98,18 +98,19 @@ async def test_failure_hook_has_original_redacted_error_and_cannot_replace_it(ru
     configure(manager, "tool_failure", tools=["read_file"])
     payloads = []
 
-    async def fail(*args):
+    async def fail(*args, **kwargs):
         raise ValueError("synthetic-token original tool failure")
 
-    async def hook(hook, payload, workspace):
+    async def hook(hook, payload, workspace, env=None):
         payloads.append(payload)
         return {"output": "failure hook also failed", "exit_code": 9}
 
     tools.execute = fail
     manager.extensions.run_hook = hook
-    output = await manager.execute_tool(session, tools, "read_file", {"path": "note.txt"}, "failed-call")
+    model_output = await manager.execute_tool(session, tools, "read_file", {"path": "note.txt"}, "failed-call")
+    assert "failure hook also failed" not in model_output and "synthetic-token" not in model_output
+    output = json.loads(model_output)["message"]  # Hooks and the card get the plain message.
     assert "original tool failure" in output and "synthetic-token" not in output
-    assert "failure hook also failed" not in output
     assert payloads == [{"event": "tool_failure", "session_id": session["id"], "tool": "read_file",
         "arguments": {"path": "note.txt"}, "call_id": "failed-call", "error": output, "outcome": "error"}]
     assert session["events"][0]["output"] == output
@@ -125,7 +126,7 @@ async def test_mcp_error_result_keeps_after_hook_and_adds_failure_hook(runtime):
     async def invoke(*args):
         return {"output": "Remote action failed", "is_error": True}
 
-    async def hook(hook, payload, workspace):
+    async def hook(hook, payload, workspace, env=None):
         payloads.append(payload)
         return {"output": "ok", "exit_code": 0}
 
@@ -150,7 +151,7 @@ async def test_failure_hook_only_for_returned_foreground_command_failures(runtim
     async def command(*args):
         return result
 
-    async def hook(hook, payload, workspace):
+    async def hook(hook, payload, workspace, env=None):
         payloads.append(payload)
         return {"output": "ok", "exit_code": 0}
 
@@ -203,7 +204,7 @@ async def test_stop_during_tool_does_not_launch_failure_hook(runtime):
     configure(manager, "tool_failure")
     started = asyncio.Event()
 
-    async def block(*args):
+    async def block(*args, **kwargs):
         started.set()
         await asyncio.Event().wait()
 
@@ -218,3 +219,48 @@ async def test_stop_during_tool_does_not_launch_failure_hook(runtime):
     with pytest.raises(asyncio.CancelledError):
         await task
     assert not any(event.get("name", "").startswith("hook_") for event in session["events"])
+
+
+# --- Hooks follow the tools that cover outline_file and project_overview (integration review B, finding 13)
+
+def recorded_hooks(manager, exit_code):
+    payloads = []
+
+    async def run_hook(hook, payload, workspace, env=None):
+        payloads.append(payload)
+        return {"output": "blocked by policy" if exit_code else "", "exit_code": exit_code}
+    manager.extensions.run_hook = run_hook
+    return payloads
+
+
+@pytest.mark.parametrize("selected, name, arguments", [
+    (["read_file"], "outline_file", {"path": "plan.md"}),
+    (["find_files"], "project_overview", {"path": "."}),
+    (["list_files"], "project_overview", {"path": "."}),
+])
+async def test_a_before_tool_hook_on_a_covering_tool_blocks_the_covered_tool(runtime, selected, name, arguments):
+    manager, session, tools = runtime
+    (tools.root / "plan.md").write_text("# Acquisition\n## Price: 40M\n")
+    configure(manager, tools=selected)
+    payloads = recorded_hooks(manager, 1)
+    output = await manager.execute_tool(session, tools, name, arguments, "c1")
+    assert f"Before-tool hook blocked {name}: Hook failed (exit 1)" in output and "40M" not in output
+    assert payloads == [{"event": "before_tool", "session_id": session["id"], "tool": name, "arguments": arguments,
+                         "call_id": "c1", "covered_by": selected[0]}]
+
+
+async def test_an_after_tool_hook_on_read_file_sees_outline_calls_and_an_empty_list_none(runtime):
+    manager, session, tools = runtime
+    (tools.root / "plan.md").write_text("# Acquisition\n## Price: 40M\n")
+    configure(manager, phase="after_tool", tools=["read_file"])
+    payloads = recorded_hooks(manager, 0)
+    await manager.execute_tool(session, tools, "outline_file", {"path": "plan.md"}, "c1")
+    assert [(payload["tool"], payload["covered_by"]) for payload in payloads] == [("outline_file", "read_file")]
+    assert "Price: 40M" in json.dumps(payloads[0]["result"])
+    # A hook on read_file itself gets no covered_by; an empty tools array still selects nothing.
+    await manager.execute_tool(session, tools, "read_file", {"path": "plan.md"}, "c2")
+    assert payloads[-1]["tool"] == "read_file" and "covered_by" not in payloads[-1]
+    configure(manager, phase="after_tool", tools=[])
+    payloads.clear()
+    await manager.execute_tool(session, tools, "outline_file", {"path": "plan.md"}, "c3")
+    assert payloads == []

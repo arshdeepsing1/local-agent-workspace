@@ -18,7 +18,8 @@ def remount(ui, page):
     """Reload the page (localStorage stays) and start the app again."""
     page.reload()
     page.wait_for_function("window.harnessReady === true")
-    page.evaluate("() => mount('App.js', () => ({}))")
+    page.evaluate("() => preload('App.js')")
+    page.evaluate("() => { mount('App.js', () => ({})) }")
     expect(page.get_by_role("combobox", name="Model")).to_have_value("test-model")
 
 
@@ -86,11 +87,32 @@ def test_continue_follows_live_turn_endings(ui, page):
     # An older record cut short by a restart, with the previous turn's reason.
     ("[{ type: 'assistant', text: 'Part', request_info: { status: 'interrupted', error_kind: 'incomplete_response' } }]",
      {"terminal_reason": "completed"}, "The response was interrupted."),
-    ("[{ type: 'error', text: 'Rate limited', error_kind: 'rate_limit' }]", {"terminal_reason": "inference_error"}, None),
+    ("[{ type: 'error', text: 'Rate limited', error_kind: 'rate_limit' }]", {"terminal_reason": "inference_error"},
+     "Databricks rate limited this chat."),
+    ("[{ type: 'error', text: 'Bad arguments', error_kind: 'invalid_tool_arguments' }]", {"terminal_reason": "inference_error"},
+     "The model's reply could not be used."),
+    ("[{ type: 'error', text: 'Ended early', error_kind: 'incomplete_response' }]", {"terminal_reason": "inference_error"},
+     "The model's reply could not be used."),
+    # A provider content-filter stop is shown as its own error, without Continue.
+    ("[{ type: 'assistant', text: 'No', request_info: { status: 'error', finish_reason: 'content_filter', "
+     "error_kind: 'content_filter' } }, { type: 'error', text: 'Filtered', error_kind: 'content_filter' }]",
+     {"terminal_reason": "inference_error"}, None),
+    # Only the turn's last error counts, and only for an inference error.
+    ("[{ type: 'error', text: 'Old', error_kind: 'rate_limit' }, { type: 'error', text: 'Server', error_kind: 'server' }]",
+     {"terminal_reason": "inference_error"}, None),
+    ("[{ type: 'error', text: 'Bad arguments', error_kind: 'invalid_tool_arguments' }]", {"terminal_reason": "error"}, None),
+    # A hidden automatic retry leaves the earlier reply's status 'error'; the turn then completed.
+    ("[{ type: 'assistant', text: 'Part', request_info: { status: 'error', error_kind: 'invalid_tool_arguments' } }, "
+     "{ type: 'assistant', text: 'All' }]", {"terminal_reason": "completed"}, None),
     ("[{ type: 'error', text: 'Broken' }]", {"terminal_reason": "error"}, None),
     # An automatic output-limit retry marks a reply interrupted; that turn then completed.
     ("[{ type: 'assistant', text: 'Part', request_info: { status: 'interrupted' } }, { type: 'assistant', text: 'All' }]",
      {"terminal_reason": "completed"}, None),
+    # Requests that would fail the same way until Settings change get no Continue.
+    ("[{ type: 'error', text: 'Too large', error_kind: 'payload_too_large' }]", {"terminal_reason": "inference_error"},
+     None),
+    ("[{ type: 'error', text: 'OTPM', error_kind: 'output_tokens_over_limit', http_status: 429 }]",
+     {"terminal_reason": "inference_error"}, None),
     ("[]", {"terminal_reason": "step_limit", "status": "running"}, None),
     ("[]", {"terminal_reason": "step_limit", "status": "awaiting_approval"}, None),
     ("[]", {}, None),
@@ -101,6 +123,18 @@ def test_continue_reasons(ui, events, fields, shown):
     assert ui.js(f"import('/static/js/components/ContinueButton.js').then(m => m.stopReason({session}))") == shown
     # A conversation without a user message has no turn to continue.
     assert ui.js("import('/static/js/components/ContinueButton.js').then(m => m.stopReason({ status: 'idle', events: [], terminal_reason: 'stopped' }))") is None
+
+
+@pytest.mark.parametrize("kind,shown", [("invalid_tool_arguments", "The model's reply could not be used."),
+                                        ("rate_limit", "Databricks rate limited this chat.")])
+def test_continue_bar_after_an_inference_error(ui, page, kind, shown):
+    error = f"[{{ id: 'e', type: 'error', text: 'Request failed.', error_kind: '{kind}' }}]"
+    start_app(ui, page, session="a", setup=with_turn(error, terminal_reason="inference_error"))
+    ui.show_session("a")
+    expect(page.get_by_text(shown)).to_be_visible()
+    continue_button(page).click()
+    ui.wait("fake.requests('/api/sessions/a/messages', 'POST').length === 1")
+    assert ui.bodies("/api/sessions/a/messages", "POST") == [{"text": CONTINUE}]
 
 
 def test_continue_failure_is_reported(ui, page):
@@ -199,21 +233,20 @@ def test_open_changes_and_tasks_keep_the_message_box_on_screen(ui, page, width, 
         assert transcript[0] >= 0 and transcript[1] >= 56, transcript
 
     on_screen()
-    if meter:  # The open meter scrolls, so the wheel brings Compact now into view.
-        details = page.locator(".context-details").bounding_box()
-        page.mouse.move(details["x"] + 20, details["y"] + 5)
-        for _ in range(20):
-            page.mouse.wheel(0, 200)
-        expect(compact).to_be_in_viewport(ratio=1)
-        on_screen()
-        ui.run("for (const e of document.querySelectorAll('.context-meter, .context-details')) e.scrollTop = 0")
-        if height < 600:  # Out of view again, for the keyboard check below.
-            expect(compact).not_to_be_in_viewport(ratio=1)
+    if meter:  # The open details are a popover above the meter: on screen, one scroller, the meter itself does not scroll.
+        details = ui.js("document.querySelector('.context-details').getBoundingClientRect().toJSON()")
+        summary = ui.js("document.querySelector('.context-meter > summary').getBoundingClientRect().toJSON()")
+        assert details["top"] >= 0 and details["bottom"] <= height and details["right"] <= width, details
+        assert details["bottom"] <= summary["top"], (details, summary)
+        assert ui.js("(e => e.scrollHeight === e.clientHeight)(document.querySelector('.context-meter'))")
+        topbar = ui.js("document.querySelector('.topbar').getBoundingClientRect().bottom")
     # Every bar (or the open meter's button) is still reachable with the keyboard, with its focus shown.
     for control in [compact] if meter else [page.get_by_role("button", name="Undo changes to src/module_11/file_11.py"), continue_button(page)]:
         control.focus()
         expect(control).to_be_in_viewport(ratio=1)
         on_screen()
+        if meter:
+            assert control.bounding_box()["y"] >= topbar
 
 
 # Saved drafts
@@ -417,3 +450,34 @@ def test_drafts_work_without_storage(ui, page):
     page.get_by_role("button", name="Send message").click()
     ui.wait("fake.requests('/api/sessions/a/messages', 'POST').length === 1")
     expect(message(page)).to_have_value("")
+
+
+# Rate-limit waits
+
+WAIT = "Databricks is still rate limiting this chat. Continuing automatically at 10:00:00 (1 of 2). Press Stop to cancel."
+
+
+def test_a_reply_that_waited_moves_below_the_wait_notices(ui, page):
+    # agents.py moves the reply's empty event after each wait notice with a new created time (test_transient_retries.py);
+    # the page follows. Mutation: keep an updated event in place.
+    start_app(ui, page, session="a", setup=with_turn("[{ id: 'r0', type: 'assistant', text: 'Earlier.', created: 1 }]"))
+    ui.show_session("a")
+    ui.emit("a", {"type": "status", "status": "running"})
+    ui.emit("a", {"type": "event", "event": {"id": "r", "type": "assistant", "text": "", "created": 10,
+                                              "request_info": {"model": "test-model", "status": "running"}}})
+    ui.emit("a", {"type": "event", "event": {"id": "n", "type": "notice", "text": WAIT, "created": 11}})
+    ui.emit("a", {"type": "event", "event": {"id": "r", "type": "assistant", "text": "", "created": 12,
+                                              "request_info": {"model": "test-model", "status": "running"}}})
+    ui.emit("a", {"type": "delta", "id": "r", "text": "The answer."})
+    expect(page.get_by_text("The answer.")).to_be_visible()
+    notice = page.locator(".conversation-notice", has_text="still rate limiting")
+    expect(notice).to_contain_text("Press Stop to cancel.")  # Still busy.
+    order = page.evaluate("""() => {
+      const notice = document.querySelector('.conversation-notice')
+      const reply = [...document.querySelectorAll('.transcript-inner *')].find(el => el.textContent === 'The answer.')
+      return notice.compareDocumentPosition(reply) & Node.DOCUMENT_POSITION_FOLLOWING }""")
+    assert order
+    assert page.locator(".transcript-inner").get_by_text("Earlier.").count() == 1
+    # A notice saved without its finished text stops asking for Stop once the chat is idle.
+    ui.emit("a", {"type": "status", "status": "idle", "terminal_reason": "completed"})
+    expect(notice).to_have_text("Databricks is still rate limiting this chat. Continuing automatically at 10:00:00 (1 of 2).")

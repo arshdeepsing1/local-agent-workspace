@@ -1,6 +1,6 @@
 ---
 name: handoff
-description: Write a detailed cold-start handoff (often 20-60 KB) so a new session with zero context can resume the work, with an exact app-generated log of every command run. Use when the user asks for a handoff, memory file, or session summary.
+description: Use when the user asks for a handoff, memory file or session summary. Writes a detailed cold-start handoff with an exact log of every command run.
 ---
 
 # Detailed session handoff
@@ -36,7 +36,7 @@ Please read any referenced files listed above and confirm you are oriented befor
 - Destination: `handoffs/YYYY-MM-DD-<short-topic>.md` in the workspace unless the user names another folder. Check the folder with `list_files` first; never overwrite an existing handoff (add `-v2`, `-v3`), and continue any existing version numbering such as `project-v12-...`.
 - Write in parts so no single response gets too long: create the file with `write_file` holding the header and first sections, ending with the line `<!-- handoff continues -->`. Append each next part with `edit_file`, replacing that marker line with the new sections followed by the same marker. Size each part at about half the file text the system prompt says one response can hold (for example about 20 KB when it says about 40 KB): fewer, larger parts mean fewer full-conversation requests. If a part is cut off at the output limit, redo it at half that size. The final edit removes the marker.
 - Last step: call `insert_activity_log` with the handoff's path. If it reports `commands_omitted` above 0 or says the file is too large, call it again with a new `<name>-activity.md` file and link that file from section 5.
-- The app's file limit is 80 KB. If the handoff will exceed it, continue in `<name>-part2.md` and link the parts to each other.
+- Keep each handoff file within the app's file write limit (Settings, 80 KB by default) and within 80 KB, the activity log's cap. If the handoff will exceed that, continue in `<name>-part2.md` and link the parts to each other.
 - Never write secrets: replace tokens, passwords, keys, and connection strings with `<redacted>` and name the variable or file that holds them.
 
 ## Finish

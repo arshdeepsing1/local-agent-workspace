@@ -4,11 +4,11 @@ import json
 import math
 import time
 import uuid
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from .context import MAX_ESTIMATE_SCALE, SUMMARY_MAX_BYTES, context_boundary
+from .context import LARGE_SUMMARY_MAX_BYTES, MAX_ESTIMATE_SCALE, context_boundary
 
 
 MAX_BUNDLE_BYTES = 16 * 1024 * 1024
@@ -30,6 +30,14 @@ class Usage(Record):
     reasoning_tokens: int | None = Field(default=None, ge=0)
 
 
+class RateLimitDetails(Record):
+    """The fields of a final 429 Databricks named (rate_limits.request_info_fields)."""
+    limit_type: str = Field(min_length=1, max_length=64)
+    limit: int | None = Field(default=None, ge=0)
+    current: int | None = Field(default=None, ge=0)
+    retry_after: float | None = Field(default=None, ge=0)
+
+
 class RequestInfo(Record):
     model: str = Field(max_length=256)
     status: Literal["running", "completed", "error", "cancelled", "interrupted"]
@@ -37,6 +45,7 @@ class RequestInfo(Record):
     http_status: int | None = Field(default=None, ge=100, le=599)
     error_kind: str | None = None
     usage: Usage | None = None
+    rate_limit: RateLimitDetails | None = None
 
 
 class Progress(Record):
@@ -53,6 +62,30 @@ class Origin(Record):
     parent_call_id: str | None = None
 
 
+class Answer(Record):
+    """One answer to an ask_user question."""
+    question: str = Field(max_length=500)
+    selected: list[Annotated[str, Field(max_length=80)]] = Field(max_length=4)
+    other: str | None = Field(default=None, max_length=1000)
+
+
+class Attachment(Record):
+    """Metadata of an @ file snapshot or a ! command output sent with a user message (never its content)."""
+    kind: Literal["file", "shell"]
+    path: str | None = Field(default=None, max_length=4096)
+    start_line: int | None = Field(default=None, ge=1)
+    end_line: int | None = Field(default=None, ge=0)
+    truncated: bool | None = None
+    command: str | None = Field(default=None, max_length=2000)
+    exit_code: int | None = None
+
+
+class Withheld(Record):
+    """A read result the model did not get (result_budget): its estimate and the allowance."""
+    estimated_tokens: int = Field(ge=0)
+    allowance_tokens: int = Field(ge=0)
+
+
 class Event(Record):
     id: str = Field(min_length=1, max_length=512)
     type: Literal["user", "assistant", "tool", "notice", "error"]
@@ -64,12 +97,24 @@ class Event(Record):
     name: str | None = None
     input: dict[str, Any] | None = None
     output: str | None = None
+    # What the model received when it differs from output (a tool error's hint, a withheld
+    # or shortened result); the wire's tool message holds the same text.
+    model_output: str | None = None
+    result_withheld: Withheld | None = None
+    result_shortened: bool | None = None
     preview: str | None = None
     state: Literal["pending", "running", "completed", "rejected", "cancelled", "error"] | None = None
-    approval: Literal["approved", "declined", "expired"] | None = None
+    approval: Literal["approved", "declined", "expired", "blocked"] | None = None
     approval_expires: float | None = None
     decline_note: str | None = None
     allowed_by_rule: bool | None = None
+    approved_by_mode: Literal["manual", "auto", "acceptEdits", "plan", "bypassPermissions", "dontAsk"] | None = None
+    read_only_command: bool | None = None
+    rule_scope: Literal["chat", "project", "user"] | None = None
+    without_shell: bool | None = None
+    blocked_reason: str | None = Field(default=None, max_length=4000)
+    edited: bool | None = None
+    protected: str | None = Field(default=None, max_length=500)
     call_id: str | None = None
     child_session_id: str | None = None
     origin: Origin | None = None
@@ -77,6 +122,19 @@ class Event(Record):
     terminal_reason: str | None = None
     error_kind: str | None = None
     http_status: int | None = Field(default=None, ge=100, le=599)
+    answers: list[Answer] | None = Field(default=None, max_length=4)
+    question_outcome: Literal["answered", "skipped", "expired"] | None = None
+    plan_outcome: Literal["approved", "keep_planning", "expired", "superseded"] | None = None
+    plan_mode: Literal["acceptEdits", "manual"] | None = None
+    feedback: str | None = Field(default=None, max_length=2000)
+    skipped_reason: Literal["dont_ask"] | None = None
+    # User events: in_wire is true once the text reached the model history as its own
+    # message (absent on events saved before it existed); steered marks a message sent
+    # while the agent was working. Notices: stop_phase says what a Stop interrupted.
+    in_wire: bool | None = None
+    steered: bool | None = None
+    attachments: list[Attachment] | None = Field(default=None, max_length=10)
+    stop_phase: Literal["streaming", "tools", "waiting"] | None = None
 
 
 class Function(Record):
@@ -98,7 +156,7 @@ class Message(Record):
 
 
 class ContextState(Record):
-    summary: str = Field(default="", max_length=SUMMARY_MAX_BYTES)
+    summary: str = Field(default="", max_length=LARGE_SUMMARY_MAX_BYTES)
     through: int = Field(default=0, ge=0)
     compactions: int = Field(default=0, ge=0)
 
@@ -158,6 +216,10 @@ class Conversation(Record):
     tool_profile: Profile = "inherit"
     subagent_tool_profile: Profile = "inherit"
     max_steps: int | None = Field(default=None, ge=1, le=8)
+    # Kept by forks and imports, like tool_profile: a copy never gets more tools than its source.
+    disabled_tools: list[Annotated[str, Field(min_length=1, max_length=300)]] | None = Field(default=None, max_length=64)
+    # The user's labels. Pinned and archived are view state of this app and are not exported.
+    tags: list[Annotated[str, Field(min_length=1, max_length=32)]] | None = Field(default=None, max_length=10)
 
 
 class Bundle(Record):
@@ -247,8 +309,8 @@ def validate_bundle(value):
             raise ValueError("Event IDs must be unique within each conversation.")
         state = session.get("context_state") or {}
         through = state.get("through", 0)
-        if len(state.get("summary", "").encode("utf-8")) > SUMMARY_MAX_BYTES:
-            raise ValueError(f"The conversation summary exceeds the {SUMMARY_MAX_BYTES:,}-byte limit.")
+        if len(state.get("summary", "").encode("utf-8")) > LARGE_SUMMARY_MAX_BYTES:
+            raise ValueError(f"The conversation summary exceeds the {LARGE_SUMMARY_MAX_BYTES:,}-byte limit.")
         if through > len(session["wire"]) or not context_boundary(session["wire"], through):
             raise ValueError("The saved summary must end at a complete turn or tool-exchange boundary.")
         if through and not state.get("summary"):
@@ -319,20 +381,26 @@ def completed_for_fork(session):
     if any(event.get("state") in ("pending", "running") or (event.get("request_info") or {}).get("status") == "running"
            for event in session["events"]):
         raise ValueError("Only a completed conversation can be forked.")
-    if reason is None:
-        # Older records lack a terminal marker. An archived assistant error or
-        # partial draft is not proof that its latest turn completed.
-        events = session["events"]
-        start = max((index for index, event in enumerate(events) if event["type"] == "user"), default=0)
-        last = events[-1] if events else {}
-        info = last.get("request_info") or {}
-        if (last.get("type") != "assistant" or not last.get("text")
+    if reason is None and not latest_turn_completed(session):
+        raise ValueError("This older conversation has no confirmed completed response to fork.")
+    _validate_wire(wire, complete=True)
+
+
+def latest_turn_completed(session):
+    """Whether the events show the latest turn ended in a completed reply.
+
+    Older records lack a terminal marker. An archived assistant error or
+    partial draft is not proof that its latest turn completed.
+    """
+    events = session["events"]
+    start = max((index for index, event in enumerate(events) if event["type"] == "user"), default=0)
+    last = events[-1] if events else {}
+    info = last.get("request_info") or {}
+    return not (last.get("type") != "assistant" or not last.get("text")
                 or info.get("status", "completed") != "completed"
                 or info.get("finish_reason", "stop") != "stop"
                 or any(event["type"] == "error" or event.get("state") in ("error", "cancelled", "pending", "running")
-                       for event in events[start:])):
-            raise ValueError("This older conversation has no confirmed completed response to fork.")
-    _validate_wire(wire, complete=True)
+                       for event in events[start:]))
 
 
 def _remap_calls(source):

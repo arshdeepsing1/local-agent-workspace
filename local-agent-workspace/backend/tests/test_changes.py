@@ -304,3 +304,81 @@ async def test_agent_tool_edits_are_tracked_and_pushed_but_declined_ones_are_not
     await manager.status(session, "idle")
     assert [item["type"] for item in socket.sent] == ["status", "changes"]
     store.db.close()
+
+
+def test_an_agent_edit_of_a_crlf_file_is_one_change_and_undo_restores_its_bytes(review):
+    changes, _, tools, _ = review
+    target = tools.root / "win.txt"
+    original = b"".join(f"line {number}\r\n".encode() for number in range(20))
+    target.write_bytes(original)
+    agent_edit(review, "edit_file", path="win.txt", old_text="line 7", new_text="line seven")
+    assert target.read_bytes() == original.replace(b"line 7\r\n", b"line seven\r\n")
+    diff = changes.diff("chat", tools, "win.txt")
+    assert len(diff["hunks"]) == 1 and (diff["added"], diff["removed"]) == (1, 1)
+    assert [line["text"] for line in diff["lines"] if line["kind"] != "context"] == ["line 7", "line seven"]
+    act(review, "undo", "win.txt")
+    assert target.read_bytes() == original
+
+
+def test_changes_made_outside_the_chat_folders_stay_reviewable(client, tmp_path):
+    # An edit made in Bypass permissions outside every folder of the chat: after the chat leaves
+    # Bypass, the review can still list, diff and undo it, but nothing else in that folder.
+    client, manager, workspace = client
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "notes.txt").write_text("old\n")
+    (outside / "other.txt").write_text("untouched\n")
+    session_id = client.post("/api/sessions").json()["id"]
+    session = manager.get(session_id)
+    session["permission_mode"] = "bypassPermissions"
+    bypass = manager.session_tools(session)
+    manager.checkpoints.apply_edit(bypass, "write_file", {"path": str(outside / "notes.txt"), "content": "new\n"},
+                                   session_id=session_id, turn_id="turn",
+                                   on_applied=lambda record: manager.changes.track(record, bypass))
+    session["permission_mode"] = "manual"
+    assert not manager.session_tools(session).permitted(outside / "notes.txt")  # The agent gets no access back.
+    base = f"/api/sessions/{session_id}/changes"
+    listed = client.get(base).json()["files"]
+    assert [(item["path"], item["status"], "error" in item) for item in listed] == [(str(outside / "notes.txt"), "modified", False)]
+    diff = client.get(base + "/diff", params={"path": str(outside / "notes.txt")})
+    assert diff.status_code == 200 and [line["kind"] for line in diff.json()["lines"]] == ["removed", "added"]
+    assert client.get(base + "/diff", params={"path": str(outside / "other.txt")}).status_code == 400
+    undo = {"files": [{"path": str(outside / "notes.txt"), "current_hash": listed[0]["current_hash"]}]}
+    assert client.post(base + "/undo", json=undo).json()["files"] == []
+    assert (outside / "notes.txt").read_text() == "old\n"
+    assert manager.review_tools(session).root == manager.session_tools(session).root
+
+
+def test_live_pushes_list_changes_outside_the_chat_folders_like_the_review(client, tmp_path):
+    # After the chat leaves Bypass permissions, an agent file tool and an editor save push the changes
+    # list the review shows, not one built from the turn's or the editor's narrower folders.
+    from local_agent.instructions import load_project_instructions
+
+    client, manager, workspace = client
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "notes.txt").write_text("old\n")
+    (workspace / "b.txt").write_text("b")
+    session_id = client.post("/api/sessions").json()["id"]
+    session = manager.get(session_id)
+    session["permission_mode"] = "bypassPermissions"
+    bypass = manager.session_tools(session)
+    manager.checkpoints.apply_edit(bypass, "write_file", {"path": str(outside / "notes.txt"), "content": "new\n"},
+                                   session_id=session_id, turn_id="turn",
+                                   on_applied=lambda record: manager.changes.track(record, bypass))
+    session["permission_mode"] = "acceptEdits"
+    tools = manager.session_tools(session)
+    guidance = load_project_instructions(tools)
+    tools.instruction_signature = (guidance["text"], guidance["warnings"])
+    summary = lambda changes: [(item["path"], item["status"], item["added"]) for item in changes["files"]]  # noqa: E731
+    with client.websocket_connect(f"/api/sessions/{session_id}/stream", subprotocols=["local-workspace", client.token]) as socket:
+        socket.receive_json(), socket.receive_json()
+        client.portal.call(manager.execute_tool, session, tools, "write_file", {"path": "a.txt", "content": "x\n"}, "write")
+        message = socket.receive_json()
+        while message["type"] != "changes":  # The tool event's updates come first.
+            message = socket.receive_json()
+        listed = client.get(f"/api/sessions/{session_id}/changes").json()
+        assert summary(message["changes"]) == summary(listed) == [(str(outside / "notes.txt"), "modified", 1), ("a.txt", "created", 1)]
+        body = {"path": "b.txt", "original": "b", "content": "b2", "session_id": session_id}
+        assert client.put("/api/file", json=body).status_code == 200
+        assert summary(socket.receive_json()["changes"]) == summary(listed)

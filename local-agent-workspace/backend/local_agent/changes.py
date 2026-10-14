@@ -7,12 +7,12 @@ the current content (the baseline moves forward); Undo writes the baseline back
 through the checkpoint machinery, so an undo can itself be restored from
 Agent tools -> Recovery. Both work on a whole file or on one change (hunk).
 """
-import difflib
 import json
 import re
 import time
 from pathlib import Path
 
+from .edits import line_opcodes
 from .recovery import _bytes, _snapshot, _state
 from .tools import file_error
 
@@ -35,7 +35,7 @@ def _status(baseline, current):
 
 
 def _opcodes(old, new):
-    return difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes()
+    return line_opcodes(old, new)  # difflib's opcodes, without its quadratic cases on large files.
 
 
 def _counts(opcodes):
@@ -48,6 +48,11 @@ def _line(kind, raw, **numbers):
     if kind != "context" and not raw.endswith("\n"):
         line["newline"] = False
     return line
+
+
+def _origin(entry):
+    """Where a listed change came from: a subagent (via_session_id) and/or a command (source)."""
+    return {key: entry[key] for key in ("via_session_id", "source") if entry.get(key)}
 
 
 class ChangeReview:
@@ -71,24 +76,55 @@ class ChangeReview:
         self.store.db.execute("DELETE FROM agent_changes WHERE session_id=?", (session_id,))
         self.store.db.commit()
 
+    def counts(self):
+        """{session id: number of files with unreviewed agent changes}, for the sidebar. Rows rolled
+        up from subagents are stored under the parent's ID, so they count for the parent."""
+        return dict(self.store.db.execute("SELECT session_id, COUNT(*) FROM agent_changes GROUP BY session_id"))
+
     def has(self, session_id):
         return self.store.db.execute("SELECT 1 FROM agent_changes WHERE session_id=? LIMIT 1", (session_id,)).fetchone() is not None
 
-    def track(self, record, tools):
-        """Add an applied model edit (its checkpoint record) to the conversation's review."""
-        if not record.get("session_id"):
-            return
+    def _row(self, session_id, target):
         row = self.store.db.execute("SELECT data FROM agent_changes WHERE session_id=? AND target=?",
-                                    (record["session_id"], record["target"])).fetchone()
+                                    (session_id, str(target))).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def track(self, record, tools, session_id=None, via=None):
+        """Add an applied model edit (its checkpoint record) to a conversation's review: the
+        record's own conversation, or session_id (a subagent's parent, with via = the subagent)."""
+        if not record.get("session_id"):
+            return  # Editor saves are the user's own edits.
+        owner = session_id or record["session_id"]
+        entry = self._row(owner, record["target"])
         now = time.time()
-        if row:
-            entry = json.loads(row[0])
-            entry.update(updated=now, edits=entry.get("edits", 0) + 1)
+        if entry:
+            entry.update(updated=now, edits=entry.get("edits", 0) + 1)  # The older baseline stays.
         else:
-            entry = {"session_id": record["session_id"], "workspace": record["workspace"], "target": record["target"],
+            entry = {"session_id": owner, "workspace": record["workspace"], "target": record["target"],
                      "path": tools.display_path(Path(record["target"])), "baseline": record["before"],
                      "created": now, "updated": now, "edits": 1}
+        if via:
+            entry["via_session_id"] = via
         self._save(entry)
+
+    def track_state(self, session_id, tools, target, baseline, via=None, source="command"):
+        """Add a file a command changed, with its state before the command. A file already in this
+        conversation's review keeps its earlier baseline."""
+        entry = self._row(session_id, target)
+        now = time.time()
+        if entry:
+            entry["updated"] = now
+        else:
+            entry = {"session_id": session_id, "workspace": str(tools.root), "target": str(target),
+                     "path": tools.display_path(Path(target)), "baseline": baseline,
+                     "created": now, "updated": now, "edits": 1, "source": source}
+            if via:
+                entry["via_session_id"] = via
+        self._save(entry)
+
+    def keep_all(self, session_id):
+        """Keep every change of this conversation (automatic Keep at the end of a reply)."""
+        self.delete_session(session_id)
 
     def _resolve(self, entry, tools):
         target = tools.path(entry["path"])
@@ -109,13 +145,19 @@ class ChangeReview:
             current = _snapshot(self._resolve(entry, tools))
         except (ValueError, OSError, UnicodeError) as exc:
             return {"path": entry["path"], "status": "unavailable", "added": 0, "removed": 0,
-                    "current_hash": None, "error": file_error(exc)}
+                    "current_hash": None, "error": file_error(exc), **_origin(entry)}
         if _same_content(entry["baseline"], current):
             self._drop(entry)  # Edited back to where it started: nothing left to review.
             return None
         added, removed = _counts(_opcodes(_lines(entry["baseline"]), _lines(current)))
         return {"path": entry["path"], "status": _status(entry["baseline"], current),
-                "added": added, "removed": removed, "current_hash": current["hash"]}
+                "added": added, "removed": removed, "current_hash": current["hash"], **_origin(entry)}
+
+    def outside_folders(self, session_id, tools):
+        """Folders of this conversation's tracked changes outside the project (absolute paths)."""
+        rows = self.store.db.execute("SELECT target FROM agent_changes WHERE session_id=? AND workspace=?",
+                                     (session_id, str(tools.root))).fetchall()
+        return sorted({str(Path(target).parent) for (target,) in rows if not Path(target).is_relative_to(tools.root)})
 
     def list(self, session_id, tools):
         rows = self.store.db.execute("SELECT data FROM agent_changes WHERE session_id=? AND workspace=?",

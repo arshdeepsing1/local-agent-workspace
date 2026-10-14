@@ -19,16 +19,22 @@ def test_legacy_settings_do_not_restore_removed_options(tmp_path, monkeypatch):
     settings = Settings(state)
     settings.credentials = lambda: ("https://gateway.example", "fake-token")
     expected = {**editable, "context_window": 131072, "max_output_tokens": 8192, "max_agent_steps": 32,
-                "compaction_handoffs": True, "approval_timeout_minutes": 60, "system_notifications": False}
+                "compaction_handoffs": True, "auto_compact_percent": 90, "approval_timeout_minutes": 60, "system_notifications": False,
+                "user_instructions": "", "write_limit_kb": 80, "command_env": [], "rate_limit_auto_continue": True,
+                "auto_keep_changes": False, "coding_dir": "", "python_venv": ""}
     assert settings.values == expected
     with TestClient(create_app(settings)) as client:
         bootstrap = client.get("/api/bootstrap").json()
-        assert set(bootstrap["settings"]) == {*expected, "host", "configured"}
+        assert set(bootstrap["settings"]) == {*expected, "host", "configured", "coding_dir_status",
+                                              "python_venv_status", "default_model", "default_limits"}
+        assert bootstrap["settings"]["default_limits"] == {"context_window": 131072, "max_output_tokens": 8192}
         headers = {"X-Local-Token": bootstrap["token"]}
         # Old clients may still send these keys, but they cannot enable a mode.
         response = client.put("/api/settings", headers=headers, json={**editable, **obsolete})
         assert response.status_code == 200
-        assert json.loads((state / "settings.json").read_text()) == expected
+        # Values equal to .env's (here empty) are not saved, so .env keeps applying.
+        persisted = {key: value for key, value in expected.items() if key not in ("coding_dir", "python_venv")}
+        assert json.loads((state / "settings.json").read_text()) == {**persisted, "settings_version": 2}
         assert client.put("/api/settings", headers=headers, json=editable).status_code == 200
         session = client.post("/api/sessions", headers=headers).json()
         assert "runtime" not in session

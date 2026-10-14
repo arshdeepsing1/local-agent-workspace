@@ -13,11 +13,15 @@ frontend that runs without a build step.
   turn stopped at the step or output limit, by Stop, or by a server restart.
 - Databricks model selection, numbered line-range reads, paginated regex/literal
   search, file creation and exact edits, and shell commands with live output.
-- Approval cards with proposed edits and command text. A declined action does not run.
-  Decline with a note the agent reads, or allow one exact command, file edits, one MCP
-  tool or one hook for the rest of a chat.
-- Per-conversation permissions below the composer: Manual, Auto, Accept edits,
+- Approval cards with proposed edits and command text, which you can edit before approving.
+  A declined action does not run. Decline with a note the agent reads, or allow the action
+  for the rest of a chat, for the project or for all projects.
+- Permission rules (allow, Always ask and deny) for a chat, a project or all projects;
+  protected files always ask.
+- Per-conversation permissions below the composer: Manual, Auto, Accept edits, Don't ask,
   Plan and Bypass permissions. Access additional local folders through an approval card.
+- Questions from the agent with options to choose from, and a plan review in Plan mode that
+  approves the plan and switches the mode.
 - Stop an agent response, including its foreground command or pending approval.
 - Conversation status in the sidebar (needs approval, working, error, unread) with a
   Running filter, a "(n)" tab-title count of chats waiting for approval, opt-in browser
@@ -31,7 +35,7 @@ frontend that runs without a build step.
   request's earlier tool results), and a visible context meter. Full conversation history
   stays on disk, and a script turns it into Markdown transcripts.
 - Automatic workspace-scoped `AGENTS.md` and `CLAUDE.md` guidance loading.
-- Workspace file explorer (the project and the conversation's granted folders), text
+- Workspace file explorer (the project, the conversation's granted folders and folders you add), text
   editor with stale-file detection, Git status/diff, and a non-interactive command runner.
 - File checkpoints with reviewed, reversible restore and managed Git worktrees.
 - Review of the agent's file edits, as in an editor's chat: a "files changed" bar with
@@ -100,6 +104,31 @@ private state. The example paths must be replaced. The installation command
 installs runtime libraries automatically; add `./backend[test]` instead of
 `./backend` only if you need to run the backend tests.
 
+Without `LOCAL_AGENT_MODEL`, or with it empty, the app uses `databricks-claude-opus-5-5` (Claude Opus 5.5,
+with a 200,000-token context budget and 16,384 Max output tokens). `LOCAL_AGENT_MODEL` in
+`.env` applies only while no model is saved in Settings: once you save Settings (or choose a
+model in the model picker), the saved model wins over `.env`, so change the model there, not
+in `.env`. Saved settings from before Opus 5.5 became the default that still hold GPT OSS 120B
+at 131,072 and 8,192 move to Opus 5.5 once, also when `.env` says
+`LOCAL_AGENT_MODEL=databricks-gpt-oss-120b` (the old `.env.example` value) or
+`databricks-claude-opus-5-5` (the new one); Settings says so, and Opus 5.5 costs more per token.
+To switch back, choose `databricks-gpt-oss-120b` in Settings, or in the model picker of a new
+conversation (in an open conversation the picker changes only that conversation). The choice is
+kept after that, and Settings shows the note until then.
+
+Two optional values can be left empty:
+
+- `LOCAL_AGENT_CODING_DIR`: an absolute folder (or one starting with `~/`) where the agent
+  creates new standalone scripts, tools and projects when you do not say where. See
+  [Local access and limits](#local-access-and-limits).
+- `LOCAL_AGENT_PYTHON_VENV`: a Python virtual environment (the folder that contains
+  `bin/python` and `pyvenv.cfg`) that the agent's commands, Verify, hooks and the Terminal
+  use (stdio MCP servers do not). See the command environment paragraph in [Local access and limits](#local-access-and-limits).
+
+Both are also in Settings. A value changed in Settings overrides `.env`; a value left
+unchanged in Settings keeps following `.env`, so a later edit of `.env` applies after a
+restart. Saving an empty field in Settings turns the value off even when `.env` sets one.
+
 The credential file is plain assignments, parsed as data (never executed):
 
 ```text
@@ -136,6 +165,16 @@ To change the model in an existing conversation, use the dropdown below its mess
 box while the conversation is idle.
 The credential URL must be the Databricks workspace root, and the selected serving
 endpoint must support streaming and function calling.
+The sidebar footer shows the connection: **Checking Databricks…**, **Databricks connected**
+or **Connection needs attention** (hover it for the error). When the check fails, a banner
+above the chat says why: for a network failure **Can't reach Databricks at <host>. Check
+your network or VPN connection.** with the error under **Details**, for a credential or HTTP
+problem the error itself (a Databricks server problem or rate limit says **Try again in a
+moment.**), and **Could not check the Databricks connection.** when no reason came back.
+**Check again**, offered for a network failure, a server problem, a rate limit, an unreadable
+answer and the no-reason case, repeats the check (the banner says **Checking…**, then the time
+of a check that still failed); **Open settings** opens Settings. When a turn ends while the last
+check failed, the connection is checked again.
 
 The app runs with Python and its runtime dependencies only
 (`python -m pip install -c constraints.txt -e ./backend`).
@@ -158,8 +197,11 @@ for jobs, tasks, checkpoints, and worktrees.
 ### Conversation durability and copies
 
 Streamed assistant text and reported usage are checkpointed after 16 KiB of new
-content or one second of dirty state, including when the provider stalls. Normal
-completion and Stop flush the final state. After an abrupt process death, the last
+content or one second of dirty state, including when the provider stalls. Each save
+rewrites the conversation's whole file, so in a long conversation (about 10 MB after some
+180 file reads at the default budget) checkpoints are spaced to at least 20 times the
+last save's duration, keeping saves to about a twentieth of streaming time; the JSON of
+long texts is reused between the saves of a running turn (it is dropped when the turn ends). Normal completion and Stop flush the final state. After an abrupt process death, the last
 saved partial reply is shown as interrupted; the most recent uncheckpointed text
 may be lost. Incomplete streamed tool arguments are never persisted as executable
 requests or replayed. A local storage failure stops the response and reports that
@@ -181,9 +223,29 @@ history, oversized bundles, and authority-bearing fields are rejected atomically
 
 **Fork completed conversation** makes a separate full-history copy in the same
 workspace, leaving the original unchanged. Only completed, idle conversations can
-be forked; running/failed turns and arbitrary turn selection are not supported.
-Forks also start in Manual with no folder grants, allow rules or active skills, retain any tool
-profile restrictions, and do not copy child conversations, task-board records, jobs, or file checkpoints.
+be forked this way. **Fork from here** on a reply (see **Edit, retry and rewind**)
+copies the conversation up to that reply instead, also from a stopped or failed turn,
+and can put the copy in a new Git worktree. Every fork starts in Manual with no folder
+grants, allow rules or active skills, retains any tool profile restrictions and turned-off
+tools, and does not copy child conversations, task-board records, jobs, queued messages,
+or file checkpoints.
+
+An in-place rewind (**Edit**, **Retry**, **Rewind to here**) first saves the whole
+conversation as an archived copy titled `<title> (before rewind)`. The copy keeps the
+messages, replies, tool results and summary, starts in Manual with no grants, rules or
+active skills, and does not copy the usage ledger, jobs, queued messages or waiting
+command output. Its own **Usage** view still shows the token counts recorded on its
+replies, as historical calls marked incomplete (like a fork); no view adds usage across
+chats. A worktree chat's copy keeps its `worktree` header, so it is listed with its
+project. Archived copies can be opened from the rewind notice and deleted like any
+conversation.
+
+Each user message records whether its text reached the model history (`in_wire`), so
+a cut before any message maps exactly onto the model history; app-generated prompts
+(automatic continuations and Verify messages) always stay with the turn before them.
+Messages saved by earlier versions have no record and are matched by their exact
+text; when that is not possible, a conversation cut before them is refused with a
+message, while code-only rewinds and whole-chat forks still work.
 
 The sidebar reads the small metadata record at the start of each conversation file
 instead of loading every event and provider-history record. Allow rules are stored as
@@ -193,11 +255,16 @@ when opening a conversation or performing restart recovery.
 ## Working with the app
 
 - **New conversation**: choose a model, then send a task. Enter sends; Shift+Enter adds a line.
+  A message is limited to 50,000 characters. A longer one is not sent (it stays in the box)
+  and the app advises saving long text such as a handoff as a file in the project and
+  attaching it with `@`, so the agent can outline it and read the parts it needs.
   Opening the root URL or clicking **New** starts with an empty context. Sending the
   first message creates a unique session, even if another chat has the same title.
   Select a sidebar conversation to resume it. Each saved chat has a `?session=<uuid>`
   URL, which preserves that selection on refresh and supports browser Back/Forward.
-  The header and sidebar show a short session ID to distinguish repeated titles.
+  The header shows a short session ID when there is room; hover the title for the full title
+  and ID. The sidebar shows the ID after a title that several conversations share. In a narrow
+  window **Agent tools** and **Workspace** show only their icons.
   Drafts stay with their conversation while switching chats and are saved in this
   browser's `localStorage` about half a second after you stop typing (and when the page
   closes), so they survive a reload; the new-conversation view keeps its own draft, which
@@ -211,13 +278,20 @@ when opening a conversation or performing restart recovery.
   The message box stays editable while connecting. The permissions menu opens above
   the composer; clicking the input closes it, and choosing a mode returns focus to chat.
   Open tabs reconnect after a server restart without discarding the current draft.
+  While the local server cannot be reached, the banner **Reconnecting to your local
+  server…** shows on every screen and the sidebar shows **Local server offline**; both clear
+  when it answers again (an error it answers with is shown), and the Databricks connection is
+  checked again. A request that cannot reach the server reports **Cannot reach the local server. Check that it is still
+  running.**; a response the app cannot read reports **The local server sent an unexpected
+  response (HTTP N).**
   A tab that does not accept an update within 5 seconds is disconnected, so it cannot
   hold up a reply, Stop or saving; it reconnects and reloads the conversation.
 - **Conversation status**: each sidebar row shows what its chat is doing.
   **Needs approval** marks a chat waiting for an approval card; a pulsing dot marks a chat
   that is working (replying, compacting, naming itself or waiting for a subagent); **Error**
   marks a chat whose last reply ended with an error, or was cut off because the server
-  stopped, and that you have not opened since; a
+  stopped, and that you have not opened since (in the narrower sidebar of 601–1,120 px windows
+  these two badges are small coloured dots with a tooltip, so the title keeps its room); a
   blue dot marks a chat that changed since you last opened it. **Running** above the list
   shows only chats that are not idle; click it again to show all. The browser remembers when
   you last opened each chat (in `localStorage`, on this browser only, shared by its tabs: a
@@ -226,6 +300,42 @@ when opening a conversation or performing restart recovery.
   for approval, the tab title starts with the count, for example `(2) Local — …`.
   The sidebar list refreshes every 1.5 seconds while a chat is working and every 10 seconds
   otherwise, so chats started in another tab also show up.
+  - **Projects**: chats are grouped by project folder. The current project (the one
+    **Settings** selects) comes first and is open; other projects are closed, and their
+    heading shows the folder name, the number of chats and badges such as `1 needs approval`
+    or `2 running`. Click a heading to open or close it. A chat in an app-managed worktree, and
+    each of its subagent chats, is listed under the project it came from and shows its branch;
+    the project button above the message box shows that project and the branch too. A group
+    shows 50 chats, then
+    **Show N more**.
+  - **Subagents**: a subagent chat is listed under its parent behind **Show N subagents**,
+    which opens by itself while a subagent is working. A subagent whose parent was deleted
+    or is not listed is a chat of its own.
+  - **Pin, archive and tags**: **More actions** (`…`) on a row offers **Rename**, **Pin**,
+    **Archive**, **Edit tags…** and **Delete…**. Tags are comma-separated, 1 to 32 characters
+    each, at most 10; tags that differ only in case count as one. Pinned chats are listed under **Pinned** above the projects.
+    Archived chats are hidden, also when pinned; **Archived (N)** at the end of the list
+    shows them, and **Unarchive** brings one back. Click a tag on a row to show only chats
+    with that tag; **Clear tag filter** shows all again. Pinning, archiving and tagging do not
+    change a chat's place in the newest-first order or mark it unread, and work while it is
+    replying. A pinned subagent chat is listed under **Pinned**, not under its parent. Tags are
+    exported with a chat and kept by forks and imports; pin and archive are not.
+  - **Search**: **Search conversations** shows only chats whose titles contain every word you
+    type. From 3 characters, after a short pause, the messages of all chats are searched too
+    (your messages and the agent's replies, not tool output) and listed under **Found in
+    messages** with a short excerpt (chats that match only by title are not listed again
+    there); click one to open its chat. Excerpts have the configured
+    token and common secret shapes replaced with `[REDACTED]`. The search reads the
+    conversation files on demand (there is no index) and stops after 64 MiB or 3 seconds,
+    saying "Search stopped early; refine your words."; archived chats are included and
+    marked, subagent chats are not. Esc clears the search.
+  - **Unreviewed changes**: an amber dot marks a chat with agent file changes you have not yet
+    kept or undone (its title says how many files), including changes its subagents made.
+  - **Long chats**: opening a chat loads its latest 200 messages and actions, extended to the
+    whole latest turn (at most 1,000). **Load earlier messages (N more)** at the top loads the
+    100 before them without moving what you are reading. Until then, the **Activity · N
+    actions** summary and the turn labels of **Agent tools → Recovery** cover only the loaded
+    part. Reconnecting loads the latest part again.
 - **Notifications**: click **Notify me** at the bottom of the sidebar to turn on browser
   notifications; the browser asks for permission only then. The switch shows **On** or
   **Off**. You are notified when a chat starts waiting for approval, finishes a reply,
@@ -258,6 +368,52 @@ when opening a conversation or performing restart recovery.
   use /handoff to …`), selects that skill for the whole message. Other text with `/`,
   such as a path (`/tmp/x.log`, `~/handoff/`), is sent unchanged.
   See **Agent tools: MCP, skills, and hooks** below.
+- **Messages while the agent works (queue and steering)**: while a reply, a compaction or a `!`
+  command runs, the box keeps **Stop response** and adds **Queue message**; Enter queues too, and
+  Esc in the box stops the reply. At most 3 messages (50,000 characters in total) can wait; they
+  are listed above the box, where **Edit** moves one back into the box and **Remove** drops it. At
+  the next step boundary, after every result of the agent's current tool calls, the waiting
+  messages reach the agent as one message of the same turn, marked as sent while it was working
+  ("steered"). A message queued during the final reply is sent as the next turn once the reply
+  completes (also when a tool failed in it). After **Stop**, an error, the step limit or a server
+  restart, queued messages are not sent: they wait, marked **Paused** once you send something
+  else, until you click **Send queued messages** (which sends all of them as one message), edit or
+  remove them. Because queued messages are sent together, their `@` files must fit the limits of
+  one message (see below) when you queue them. A message queued while a question or plan card
+  waits stays queued; it never answers the card. Queued messages are saved with the chat (in its
+  `<id>.state.json`) and are not exported.
+- **Files in a message (`@`)**: type `@` to pick a project file (↑/↓, Enter or Tab inserts
+  `@<path> `, Esc closes); `@src/app.py:10-40` or `@src/app.py#L10-L40` names lines. The menu
+  leaves out files whose paths an `@` token cannot spell (spaces, quotes, `<>|@` or a backtick in
+  the path, or a trailing punctuation mark). Chips above the box show the mentions. A long path is
+  shortened from the folder side; hover a chip for the full path. When the
+  message is sent, the app attaches a snapshot of each mentioned file that exists: up to 1,000
+  lines of a range, or the first 200 lines of a whole file, at most 8,000 characters per file, 5
+  files and 32,000 characters per message. The agent receives them fenced as data after your text;
+  the message shows only your text and the file names. Snapshots follow the chat's own file
+  access: credential files, generated folders, the app's state folder, folders the chat may not
+  read (use **Folder access** first) and read deny rules or a turned-off `read_file` refuse the
+  message with an error. Missing paths, folders and words such as `@dist` stay plain text, and so
+  do tokens inside code: a fenced block, or a code span on one line (a run of backticks closes
+  only at the next run of the same length, as in the quoted lines of review comments). Secrets in snapshots are redacted like command output, before a snapshot is
+  shortened to 8,000 characters. An attached file counts as read, so the agent may
+  edit it without reading it again. Only your typed text selects skills.
+- **Shell commands (`!`)**: a message starting with `!` runs the rest as one shell command in the
+  project folder, like **Workspace → Terminal** Run, when the chat is idle, for at most 60 seconds
+  (use **Workspace → Terminal** for longer commands). It is an explicit user action, so it runs in
+  every permission mode, Plan included, and permission rules (allow, ask and deny) do not apply to
+  it: they govern the agent's actions. Text with a line break is not run. The command shows as a
+  card with its output; the output (up to 8 KB, with the configured token and common secret shapes
+  redacted; at most 5 commands kept) is attached to your next message, so the agent sees it then;
+  a chip above the box shows it until then. **Stop** ends the command and attaches nothing.
+- **Side questions (`/btw`)**: `/btw <question>` (also listed first in the `/` menu) asks the
+  model about the conversation without adding to it: one non-streamed request with the whole
+  conversation as context and no tool use, also while a reply runs (one side question at a time
+  per chat; while it is answered, the box stays free for other messages; while a reply runs, the
+  **Ask side question** button next to **Stop response** sends it too). The answer appears above
+  the box with **Copy answer** and **Dismiss**; it is not saved, and the next message does not see
+  it. The request is billed and listed as **Side question** in the usage panel. A conversation too
+  long for its context budget needs a compaction first.
 - **Model selection**: the dropdown below the message box changes the model for
   the current conversation. Its history, title, folder access, and permissions are
   preserved, and the next reply uses the selected endpoint with the retained chat
@@ -273,18 +429,42 @@ when opening a conversation or performing restart recovery.
   it, the temporary title stays and naming can retry after a later successful reply.
   Older automatically named chats are eligible when resumed; custom and worktree
   titles are preserved.
-  Use the pencil beside a sidebar conversation to rename it (up to 160 characters).
-  **Save name** or Enter saves; **Cancel rename** or Escape discards the edit.
+  Choose **More actions** (`…`) → **Rename** on a sidebar conversation to rename it (up to 160
+  characters). **Save name** or Enter saves; **Cancel rename** or Escape discards the edit.
+  Focus returns to **More actions**.
   Renaming also works during a response and does not change its history, model,
   permissions, or selected conversation. Manual titles persist after restart and
   are never replaced by automatic naming, including a title request already in flight.
-- **Workspace / Files**: browse a folder, edit UTF-8 text files up to 80 KB, or use
-  the plus button to reference the file in chat ("Please read the project file: <path>", or
-  "Please read the file: <absolute path>" for a granted folder). When the conversation has granted
-  folders (**Folder access**), **Browse** at the top switches between **Project** and each
-  granted folder; a granted folder is shown by absolute paths and the parent button stops
-  at that folder. The choice goes back to **Project** for another conversation or when the
-  folder's grant is removed. Save detects concurrent disk edits.
+- **Workspace / Files**: browse a folder, edit UTF-8 text files up to the file write limit
+  (Settings, 80 KB by default), or use the plus button to reference the file in chat ("Please read the project file: <path>", or
+  "Please read the file: <absolute path>" for a folder outside the project). On windows narrower
+  than 1,024 px the Workspace panel opens over the chat (from 601 px it stops at the sidebar, which stays usable with the keyboard and the mouse and is not dimmed): focus moves into it, and
+  **Close workspace**, Escape (in the panel or the sidebar) or a click on the dimmed chat closes it (that first
+  click only closes the panel). An error that comes up while it is open shows at the bottom of the panel. When the
+  conversation has granted folders (**Folder access**) or you added folders to Files, a row of
+  folder buttons at the top switches between **Project**, each granted folder ("Allowed in this
+  chat") and each added folder ("Added to Files"). Such a folder is shown by absolute paths and
+  the parent button stops at that folder. A folder button shows a dot when the folder contains
+  files the agent changed (screen readers hear the count). **Add folder…** adds a folder to Files for the
+  project (every chat of the project shares the list; a worktree chat has its own), like an
+  editor's "Add Folder to Workspace": you can browse it, edit its files and see the dots for
+  files the agent changed there, for example in Bypass permissions, which needs no grant.
+  Adding a folder does not give the agent access: it still needs **Folder access** to read or
+  change it. Credential files stay hidden in added folders too. The filesystem root, folders
+  inside the project, the app's state directory, a folder inside it or a folder containing
+  it (also when reached by another name, such as a different letter case or a bind mount),
+  and folders the file tools exclude (such as `.git`, `.venv`, `.local` or `dist`) cannot be
+  added, and a project can have up to 20 added folders. A folder button shows the folder's
+  name, with parent folders when two names match; the full path is in its tooltip. The × beside an added
+  folder removes it from Files and leaves the folder itself alone; a folder that no longer
+  exists or cannot be reached shows "Not found". When the agent changed files under none of these folders,
+  "N changed files outside these folders" offers **Add <folder>** for up to three of their
+  folders. **Agent tools → Recovery** can preview and restore saves and agent edits in an
+  added folder. You can review (**Keep** or **Undo**) the agent's changes there whatever the
+  chat's folder access.
+  The list is kept in `workspace_folders.json` in the state directory. The choice
+  goes back to **Project** for another conversation or when the folder's grant or entry is
+  removed. Save detects concurrent disk edits.
   Unsaved editor text stays with its conversation when closing the workspace panel,
   attaching a file, or switching chats. Text entered during a save remains unsaved
   until the next save. Editor drafts are kept in the current page, not across reloads.
@@ -296,8 +476,12 @@ when opening a conversation or performing restart recovery.
   The **Keep** and **Undo** buttons on the bar act on every listed file; the check and
   arrow buttons on a row act on that file only.
   In **Workspace / Files**, a dot marks each changed file and each folder that contains
-  one. Changes in a granted folder outside the project get their dots when you choose
-  that folder in **Browse**, whose entry then ends with "(changed files)". Click a file, in the bar or in the file list, to review it: removed lines are red
+  one. Changes in a granted or added folder outside the project get their dots when you
+  choose that folder with its button at the top of Files, which shows a dot too; changes
+  under none of these folders are offered as **Add <folder>** there. You can review every
+  file the agent changed, also outside the folders the chat may use now (for example after
+  leaving Bypass permissions or removing a grant): the review reads and writes only those
+  files, and the agent itself gets no access back. Click a file, in the bar or in the file list, to review it: removed lines are red
   and added lines green, and each change has its own **Keep** and **Undo**. The box at the
   bottom right shows the position (`1 of 3`), moves between changes with its arrows, and
   keeps or undoes the whole file. **Edit** switches to the text editor (an unsaved draft is
@@ -312,32 +496,109 @@ when opening a conversation or performing restart recovery.
     before it changes any.
   - An undo is itself a file checkpoint: **Agent tools → Recovery → Other file edits** can
     bring the agent's version back. Folders created for a new file are not removed.
-  - Only the agent's `write_file`, `edit_file` and `insert_activity_log` edits are listed.
-    Shell commands, MCP tools and hooks are not; **Workspace / Changes** shows Git's view.
-    A subagent's edits are listed in the subagent's conversation. Exports, imports and
+  - The agent's `write_file`, `edit_file`, `move_path`, `delete_path`, `notebook_edit`
+    and `insert_activity_log` changes are listed, and files changed by its foreground
+    `run_command` commands in Git folders (below). A move is listed as the new file (created)
+    and the old one (deleted); undo both to put the file back where it was.
+    MCP tools and hooks are not listed; **Workspace / Changes** shows Git's view. Exports, imports and
     forks do not copy the list, and deleting a conversation forgets it and leaves the
     files as they are. Before its next request the model is told which files it read or
-    wrote changed since, an undo included, and `write_file` refuses to replace such a file
-    until the model reads it again (see **Tool details**). Recovery's limits apply: regular
-    UTF-8 files up to 80 KB. An agent edit saves a file with Windows (CRLF) line endings
-    with LF endings, so every line of such a file shows as changed.
+    wrote changed since, an undo included, and `write_file`, `delete_path` and
+    `notebook_edit` refuse to change such a file until the model reads it again (see
+    **Tool details**). Recovery's limits apply: regular UTF-8 files up to 1 MB. Line endings
+    are kept: an edit to a Windows (CRLF) file keeps CRLF, and a file with mixed endings
+    keeps each unchanged line's ending.
+  - **Subagents**: a subagent's edits are listed in the subagent's conversation and in its
+    parent's, marked **Subagent** in the parent's bar, so the parent's **Undo** covers what
+    its subagents changed. Keeping or undoing in one leaves the other showing what differs
+    from its own starting point. A file the parent changed first keeps the parent's starting
+    point.
+  - **Commands**: before and after each foreground `run_command` (including Verify), the app
+    compares `git status` of the project folder, the chat's granted folders and the folders
+    added to **Workspace / Files**, each one that is inside a Git repository (a granted folder
+    that contains the project does not replace the project's own repository). Files the
+    command created, changed or deleted are listed with a **Command** mark. For a file that
+    was already changed before the command, the review compares with its content just before
+    the command; for a file that was clean, with the last commit before the command, so a
+    `git add`, `git commit` (also the first commit of a new repository), `git checkout` or
+    `git stash` in the command does not hide the change. A file the agent already edited
+    keeps its earlier starting point. The Git calls run without hooks, fsmonitor or the
+    repository's clean and smudge filters (also a filter the command itself configures), and
+    are bounded: 10 seconds per Git call, and at most about 25 seconds before the command
+    starts and 15 seconds after it ends (repositories are checked in parallel), so in a very
+    large repository each command can wait that long. After **Stop**, the turn waits up to
+    10 seconds more for this check.
+    Not covered: folders that are not in a Git repository (**Workspace / Changes** shows Git's
+    view there), background jobs, commands run from **Workspace / Terminal** or as `!`
+    commands, files Git ignores, credential files and folders the file tools exclude, paths
+    through a symbolic link, files over 80 KB or binary, folders with more than 2,000 changed
+    files before or after the command, and more than 500 files per repository: files the
+    command added to `git status`, changed the status of or committed are checked first,
+    then files that were already changed before it, and the rest are not listed. The read-only commands that run without a card (`pwd`, `ls`,
+    `git status` and the like) are not checked at all. Edits that other programs make while
+    a command runs are listed as that command's. Line-ending conversion configured in
+    `.gitattributes` can show a change for a file that was clean. An undo of a command's
+    change is a Recovery checkpoint like any other; Recovery has no checkpoint of the
+    command's own edit.
+  - **Line comments**: in a file's review, the comment button at the start of a line (shown
+    on hover and keyboard focus, and always faintly on touch screens) opens a box for a
+    comment on that line; **Add comment** (or Ctrl+Enter / Cmd+Enter) adds it under the
+    line and Esc cancels, and focus returns to the line's button. The line buttons are one
+    Tab stop: the Up and Down arrows (Home, End) move between lines. **Send N comments** in
+    the box at the bottom right sends every comment of this conversation, from all files,
+    as one message: the file and line, the line's text and your comment, in file and line
+    order, ending with a request to address each comment and summarize the changes. It
+    waits until the reply finishes; if sending fails, the comments stay. Up to 50 comments
+    at a time, and the message must stay under 50,000 characters (remove some comments
+    otherwise). Comments are kept in the page while you switch files or close the panel, but
+    not across a reload. A comment belongs to its line's text: when the file changes and that
+    line is gone or moved, it is listed under **Comments on lines no longer in this diff**.
+    Comments on other files are listed under the diff, each with **Remove**. When no review
+    is open, for example after you keep or undo the file or after Automatic Keep, the
+    conversation's unsent comments stay at the bottom of the Workspace panel with
+    **Send N comments**.
+  - **Automatic Keep** (Settings, off by default): when a reply finishes, every listed change
+    of that conversation is kept and the bar clears. A reply that you stop, that fails or
+    that reaches the step limit keeps its list, so **Undo** stays available. A manual
+    compaction does not count as a reply, and a subagent's reply clears only the subagent's
+    list. Edits made with the
+    agent's file tools can still be undone from **Agent tools → Recovery**; edits made by
+    commands can no longer be undone from the app.
 - **Workspace / Changes**: inspect Git status and tracked-file diffs. Untracked
-  paths appear in status; their contents are available in Files. The server runs Git
-  directly (no shell) with the programs a repository's configuration can name switched
-  off: `core.fsmonitor`, hooks, clean/smudge filters, external diff and text conversion.
-  Git does not look inside submodule work trees, whose own configuration could name
-  filters; a submodule whose commit changed is still listed. The server also limits Git's
-  environment, stops after 60 seconds, and shows at most 80 KB. Credential files at any
+  files are listed too. Files are grouped as **Staged changes**, **Changes** (not staged,
+  including conflicts) and **Untracked**, each with its count, under the branch name.
+  A row shows a status letter (M modified, A added, D deleted, R renamed, C copied, T type
+  changed, ! conflicted, U untracked), the path and the added and removed line counts.
+  Click a row for a read-only diff with a separator per hunk: **Back to changes** returns,
+  **Open file** opens the file in Files, and **Open in VS Code** opens it in VS Code. This
+  is Git's view of the project, so it includes changes made by commands; it refreshes when
+  you open the tab, on Refresh, and when a response ends. There are no staging actions.
+  The server runs Git directly (no shell) with the programs a repository's configuration
+  can name switched off: `core.fsmonitor`, hooks, clean/smudge filters, external diff and
+  text conversion. Git does not look inside submodule work trees, whose own configuration
+  could name filters; a submodule whose commit changed is still listed. The server also
+  limits Git's environment and stops after 60 seconds. It reads status up to 1 MB and
+  lists at most 2,000 files; a diff shows at most 512 KB, and an untracked file is shown
+  up to 1 MB. A diff covers one file: a folder path is refused. Paths are literal, so a
+  file named `*.py` shows only its own diff. A project
+  folder inside a larger repository shows only its own files. Credential files at any
   depth (`.env`, `.env.*` including `.env.example`, `*.env`, `env_vars.txt`, `.netrc`,
-  `.npmrc`, `credentials`, `credentials.json`, `id_rsa`, `id_ed25519`, in any letter case)
-  are left out of the diff; status still names them. A folder that is not a Git
-  repository shows Git's own message.
+  `.npmrc`, `credentials`, `credentials.json`, `id_rsa`, `id_ed25519`, in any letter case,
+  and the configured credential file) are listed as "Credential file: diff hidden",
+  without line counts, and their diffs are refused, also when a rename or copy comes from
+  such a file. Files in generated folders (`node_modules`, `dist`, `.venv` and the like)
+  are listed after the other files, with their own 2,000-entry limit, and their diffs are
+  not shown; an untracked generated folder is one row (`node_modules/`), so it never hides
+  other new files. A folder that is not a Git repository shows
+  "Not a Git repository." For API clients, `GET /api/git` still returns the plain
+  `git status --short` and `git diff` text (at most 80 KB).
 - **Workspace / Terminal**: run a command explicitly and see output while it runs.
   Set the timeout (1–3,600 seconds, default 60) and retained output limit
   (1,024–1,000,000 bytes, default 80,000). A foreground job disables Run until it
   finishes; **Run in background** lets you launch another command. Select a job
   to inspect output, or use **Stop job**. History survives closing/reopening the
-  panel and refreshing the browser. Jobs belong to the selected conversation;
+  panel and refreshing the browser; a long command cut off in the history shows in full
+  in its tooltip, as does a long name in **Files**. Jobs belong to the selected conversation;
   commands launched before creating a chat belong to the selected workspace.
   This remains a noninteractive command runner: stdin is closed, with no PTY.
   Closing the panel does not cancel a job. Errors pause polling until **Refresh jobs**.
@@ -359,16 +620,27 @@ when opening a conversation or performing restart recovery.
   title; **Notify me** also tells you when this page is hidden or another chat is open.
 - **Allow for this chat**: next to Decline and Approve, a card offers **Always allow this
   command in this chat** (commands), **Allow edits in this chat** (`write_file`, `edit_file`,
-  `insert_activity_log`), **Allow this tool in this chat** (one MCP tool) or **Allow this hook
-  in this chat**. It approves the card and stores a rule for this conversation. Rules match
+  `insert_activity_log`, `move_path`, `delete_path`, `notebook_edit`), **Allow this tool in
+  this chat** (one MCP tool), **Allow this hook in this chat**, **Allow subagents in this
+  chat** (`delegate_task`) or **Allow stopping jobs in this chat** (`stop_job`). A card raised
+  by an Always ask rule, an uncertain command or a protected file, or a command that names a
+  credential file or contains your token, has no such button. It approves the card and stores
+  a rule for this conversation. Rules match
   exactly: the same command text (only leading and trailing whitespace is ignored; never a
   prefix), the same MCP tool name, the same hook ID. A later matching action runs without a
-  card in Manual, Auto and Accept edits, and its card says "Allowed by a rule for this chat".
+  card in Manual, Auto, Accept edits and Don't ask, and its card says "Allowed by a rule for this chat".
   Plan still blocks it, Bypass is unchanged, and credential exclusions, folder-access cards,
-  project-guidance checks and the changed-file check still apply. Folder-access cards have no
+  protected files, project-guidance checks and the changed-file check still apply. A command
+  allowed by its exact text runs through the shell exactly as approved. Folder-access cards have no
   such button: a folder grant already lasts for the chat. Rules are saved with the chat (at most
-  100), listed under **Allowed in this chat** in the permissions menu (commands with their exact
-  spacing), where each can be removed while the chat is idle, and inherited by subagents. Forks and imports start without rules.
+  100), listed in the permissions menu (commands with their exact spacing), where each can be
+  removed at any time, also while the chat is busy, and inherited by subagents. Forks and imports
+  start without rules. Rules for one project or for all projects, and deny and ask rules, are
+  described in **Permission rules** below.
+  The button is joined to the **Always allow…** arrow when the action allows more: the project
+  and all-project scopes, or a rule that matches the command or a folder; on a narrow command
+  card it reads **Always allow this command**. A command that can only be allowed as this exact
+  text in this chat (shell syntax) offers the button alone.
 - **Decline with a note**: **Tell the agent why (optional)** on a card adds up to 2,000 characters
   to a Decline. The agent receives "User declined this action. Their note: … Do not retry it
   without a new instruction." (similar wording for MCP calls, hooks and folder access), and the
@@ -378,24 +650,107 @@ when opening a conversation or performing restart recovery.
   action does not mean the task itself is finished. Expand command cards to see the
   full command (including inline Python), options, and output separately. A long file
   is read in pages, so a read card names the lines it covered (`lines 109–243`).
+  A command that exits non-zero, times out or is interrupted shows a warning icon, a label
+  (`exit 1`, `signal 9` for a process ended by a signal, `timed out` or `interrupted`) and its
+  last output line under the collapsed card (`Exit 1 · …`; when output past `max_output_bytes`
+  was not kept, it says so instead); its expanded card's **Action** line reads `ran · exit 1`,
+  not `completed`. A command started with `background` is labelled
+  `started in background`. A failed tool shows its error category, and its expanded card shows
+  **Error category** and the **Hint given to the agent**. Expanded command and job cards show the
+  output as text, then a **State** line (state, exit code, size, and which part the result
+  holds: the first part, the start and end, the latest output from a character, or a character
+  range, counted from 1; the agent reads the rest with `get_job_output`), and **Raw result**
+  with the full result (with the edited-command note for a command you edited; when a result
+  was shortened for the agent or not sent to it, the card says so). On `wait_job`,
+  `get_job_output` and `stop_job` cards a green tick means
+  the tool worked; a muted label such as `job exit 1` reports the job itself. A `wait_job` card
+  first says how the wait ended: `matched` (the **State** line quotes the matching line),
+  `wait timed out` (no tick) or `job ended`.
   **Read before overwriting:** the conversation remembers the size and modification time
-  of each file the agent read (`read_file`, any page) or wrote, up to 500 files.
+  of each file the agent read (`read_file` any page, or `notebook_read`) or wrote, up to 500 files.
   `write_file` on an existing file is refused, before any approval card, unless the
   conversation has read or written it and it has not changed since; the card shows
   "Not run:" and the reason, and the model reads the file and writes again. The check
   repeats after the approval and before the write. New files, `edit_file` (its
-  `old_text` must match exactly) and `insert_activity_log` are not refused.
+  `old_text` must match exactly) and `insert_activity_log` are not refused. The same check
+  applies before `delete_path` deletes a file, before `notebook_edit` changes a notebook,
+  and before `move_path` with `overwrite=true` replaces an existing destination.
+  **Edits:** `edit_file` takes one `old_text`/`new_text` pair (`replace_all=true` replaces
+  every occurrence), or `edits`: up to 50 replacements applied in order to one file, all
+  checked before anything is written, with one approval card and one checkpoint. A
+  replacement that is not found, or that matches more than once without `replace_all`,
+  changes nothing. With `replace_all` or `edits` the result starts with "Applied 2 edits
+  (5 replacements)." Line endings are kept: unchanged text stays byte-identical and new
+  lines take the file's most common ending (CRLF on a tie). `write_file` and editor saves
+  of LF text over a CRLF file keep CRLF; over a file with mixed endings they keep the
+  endings of the unchanged first and last lines. Matching is linear, also for 1 MB files,
+  and diffs (approval card, change review, recovery) stay fast on large files: a large
+  changed region that cannot be matched quickly is shown as one change. The
+  model gets at most 8 KB of an edit's diff; the change review shows all of it. One
+  `write_file` call carries at most about 500 KB (tool arguments are capped at 512 KiB),
+  so larger files are built with `edit_file`. An `edit_file` on a file already over the
+  write limit is refused with the file's size and the limit.
+  **Diagnostics:** after `write_file`, `edit_file`, `move_path` and `notebook_edit` the app
+  checks the file offline: Python syntax with the server's own Python parser (the code
+  never runs, and the message names the Python version, so a project on a newer Python
+  may see false alarms), JSON and notebooks, TOML, and unresolved merge-conflict markers in
+  any text file. Only problems the change introduced are reported, at most five, after
+  "Diagnostics for <path>:" in the tool result. No project checker runs after each edit.
+  **Move and delete:** `move_path` moves or renames one regular UTF-8 text file within the
+  file write limit, creating folders as needed; an existing destination needs
+  `overwrite=true`. `delete_path` deletes one such file. Both refuse folders, binary or
+  larger files and symbolic links (a link is never followed), and suggest `run_command`
+  for those. Each path needs folder access, credential files stay excluded, and both
+  follow the permission mode like edits (**Allow edits in this chat** covers them).
+  **Notebooks:** `notebook_read` reads a Jupyter notebook as cells (index, id, type,
+  source and a short summary of outputs) in pages of at most 8 KB; a cell longer than
+  4,000 characters is clipped, and `source_offset` reads the rest of that one cell.
+  `notebook_edit` replaces, inserts or deletes one cell, found by id or index, or clears
+  outputs; an edited code cell loses its outputs. A notebook in Jupyter's format (or
+  written by `json.dumps` with indent 1, 2 or 4) stays byte-identical outside the edited
+  cell; any other notebook is rewritten in Jupyter's format, and the card says so. It
+  works on notebooks up to 1 MB whatever the write limit, with one approval card and a
+  checkpoint. Diagnostics also report merge-conflict markers inside notebook cells.
+  **Changed files:** the conversation keeps remembering the files it read or wrote.
   Before each model request the app checks the 200 most recent of these files and, if
   any changed or were deleted (your editor saves, an Undo, a command), adds one line at
   the end of the system message naming up to 10 of them. A deleted file is named once.
   The system message keeps its stable parts first and puts the folder grants, the current
-  time and this line last, so a provider that caches prompt prefixes can reuse more.
+  date and this line last, so a provider that caches prompt prefixes can reuse more. It
+  gives the local date and time zone but not the time of day, so it changes once a day
+  rather than once a minute; the model runs `date` when it needs the exact time (a chat
+  without `run_command`, such as a `read_only` subagent, is not told to).
 - **Request details**: expand the details below an assistant response or tool-only
   model request to inspect its endpoint, completion status, stop reason, and
   provider-reported token usage when available. Failed requests distinguish invalid
   requests, rate limits, output limits, network failures, and other error categories;
   an HTTP status is shown when returned. Interrupted requests remain distinguishable
   after restart, and older conversations without metadata still display normally.
+  A request that got no usable response is sent again unchanged, with a notice that
+  says why and how long it waits: an HTTP 429 rate limit, HTTP 502, 503 or 504 before
+  the reply started, or a connection that failed before any response arrived. These
+  share at most three retries per request. HTTP 500, a read timeout (the model may
+  still be generating, and billing) and any failure after the reply started are never
+  repeated; the turn ends with the error. If Databricks still rate limits the chat
+  after the three retries, the app waits up to twice per message (the provider's
+  `Retry-After` up to 2 minutes, otherwise until just after the next minute) and tries
+  again, so a request makes at most six attempts. The notice shows the time, and
+  **Stop** cancels the wait; once the wait is over the notice reads "Continued
+  automatically at ..." (or that Stop ended it) and no longer mentions **Stop**. The
+  notices of these waits come before the reply they held up, live and in the saved
+  and exported conversation (see **Rate limits** under **Context and project
+  instructions** for the limit a 429 names and the wait shared by chats). Turn the waits off with **Settings → Continue
+  automatically after rate limits**. When a reply's tool calls had invalid or
+  incomplete arguments, or the reply ended without a finish reason, none of its tools
+  run, and the app asks the model in a hidden message to issue them again or to
+  continue: up to twice in a row, with a notice each time. A reply stopped by the
+  provider's content filter, an empty reply and a stream cut off mid-message are not
+  retried; the turn ends with the error. A content filter stop says so, and no
+  **Continue** button is offered for it.
+  An error notice in the transcript shows a short reason (for Databricks HTTP and network
+  errors a plain sentence such as "Databricks rejected the request (HTTP 400)." followed by
+  the provider's message, and for a final rate-limit error its advice on the context budget);
+  **Details** shows the full error text.
 - **Other folders**: ask, for example, `Are there any CSV files in
   ~/Downloads?`. The agent can list, read and search absolute or `~/`
   paths. The first file-tool request outside the project opens a folder-access card.
@@ -415,11 +770,16 @@ when opening a conversation or performing restart recovery.
   expand **Python used by this server** to see the actual executable and compare it
   with the permission you enabled. Browser folder approval does not grant macOS access
   to a separate Python process.
+  Beside it, **Local** (hidden when the chat column is narrow) says the conversation runs on
+  this computer; hover it for the explanation.
 - **Stop**: cancel the current agent turn and its foreground command. Background
   jobs continue; stop them individually in Terminal. Approved writes and completed
   shell side effects are retained. Stop also cancels its active subagent. Deleting a
   conversation removes its jobs, tasks, and file checkpoint copies; edited files stay
-  on disk. Child conversations remain separately available in the sidebar.
+  on disk. Delete a chat with **More actions** → **Delete…**; one that has subagent chats asks first: **Delete with subagents**
+  deletes them too (at every depth, each stopped first), and **Delete, keep subagents** keeps
+  them as chats of their own (the API default, `DELETE /api/sessions/<id>?children=keep`);
+  a subagent turn the deletion stopped is recorded as stopped.
 - **Continue**: when the latest turn of an idle conversation stopped before it finished —
   at the **Agent steps** limit, at the output-token limit after the automatic retries,
   by **Stop**, or because the server restarted before its answer finished (not while it
@@ -427,6 +787,93 @@ when opening a conversation or performing restart recovery.
   the message box sends `Continue from where you stopped.` as an ordinary message. It
   is not shown while the conversation is busy, after a completed turn, or after other
   errors. Your draft is left as it is, and keyboard focus moves to the message box.
+  It is also offered when the model's reply still could not be used after the hidden
+  retries, and when Databricks still rate limited the chat after the automatic retries.
+- **Edit, retry and rewind**: while a conversation is idle, each message shows its
+  actions under it.
+  - **Edit message** (pencil) replaces that message and everything after it with your
+    edited text and sends it. **Also undo file changes made from this message on**
+    rewinds the agent's file edits too. Ctrl+Enter (Cmd+Enter) sends, Esc cancels. The new
+    text is checked like any message before anything changes: an `@` file the chat may not
+    attach, or too many or too large files, is an error in the editor, and the conversation
+    stays as it was. If the message still cannot be sent after the rewind, its text is put in
+    the message box (a typed draft is kept) with the error.
+  - **Retry response** on the last reply sends the same message again in place of
+    everything from it on. It is offered only when that reply answers your latest
+    message: when the latest message failed or was stopped before any reply, use **Edit
+    message** or **Continue** instead. It is not offered when the latest turn included a
+    message sent while the agent was working; use **Edit message** then.
+  - **Rewind to here** opens a dialog: **Conversation and code**, **Conversation
+    only** or **Code only**. It shows how many messages and replies go, whether the
+    summary of earlier turns is dropped (when it covers messages after the point; the
+    next message may compact again), and each file the agent edited from that message
+    on: **Will be restored**, **Already as it was**, **Changed since the agent's last
+    edit**, or **Also changed by something else between the agent's edits** (an editor
+    save, an Undo, a Recovery restore, a subagent or a command wrote it between two
+    agent edits). Any file in the last two states, or one the chat can no longer
+    reach, refuses the whole file rewind and nothing is changed. A rewound file goes
+    back, in one write, to its state before the agent's first edit in that range; each
+    write keeps a reverse checkpoint, so **Agent tools → Recovery → Other file edits**
+    can undo it. Only edits made through the file tools (`write_file`, `edit_file`,
+    `insert_activity_log`, `move_path`, `delete_path`, `notebook_edit`) are rewound,
+    including those of turns an earlier conversation rewind removed; changes made by
+    commands or by subagents are not. After a conversation rewind the message you
+    rewound to is put in an empty message box (a typed draft is kept) and keyboard focus
+    moves there, and a notice above the message box links to the archived earlier version.
+  - The conversation keeps its id, settings, grants, usage ledger, queued messages and
+    waiting command output. The output of `!` commands that the removed message itself
+    carried waits again (its chip shows above the box), so **Retry response** and **Edit
+    message** send it with the message again, and after **Rewind to here** it goes with your
+    next message. `@` files are read again when the message is sent. Each rewound turn's
+    ending is kept: a stopped or cut-short turn still offers **Continue**, and a completed one
+    can still be forked whole. The record of which files the agent read is cleared, so the
+    agent reads files again before overwriting them. All of this needs an idle chat,
+    including no waiting approval, question or plan card, and file rewinds also need the
+    other chats and commands in the workspace to be idle.
+  - **Fork from here** (on the last reply of each turn) opens a new chat with the
+    conversation up to that reply; optionally give it a title and create it in a new
+    Git worktree (a new branch from the chat's checkout at its last commit; uncommitted
+    changes are not copied). Like the other actions, it needs an idle chat with no
+    waiting approval, question or plan card.
+  - **Stop marker**: when you press **Stop**, the reply's partial text is kept in the
+    model history followed by `[The user stopped this response before it finished. Tool
+    calls it was preparing did not run.]`, after any interrupted tool call gets its
+    "Execution interrupted" result, so the next message, an export or a fork sees a
+    complete history at once. A turn cut short by a shutdown or a restart gets `[This
+    response was cut off when the app stopped. …]` instead. A Stop before the message
+    reached the model history (for example while MCP servers start) adds nothing. The
+    transcript marks the stop with a divider that names what was interrupted (**Stopped
+    while replying**, **Stopped during an action** for a tool or a waiting card, or
+    **Stopped** for a retry wait or context preparation; recorded as `stop_phase`
+    `streaming`, `tools` or `waiting`).
+- **Verify**: **Agent tools → Verify** sets a command for the project folder, for
+  example `pytest -q`, with a time limit (10 to 3,600 seconds, default 600) and fix
+  rounds (1 to 3, default 2). After a reply in which the agent changed files inside the
+  project folder (edits in other folders do not count), the app runs it as the agent's
+  `run_command` with an output limit of 1,000,000 bytes, so the permission mode and
+  permission rules apply as to a command the agent chose: Manual, Auto and Accept edits
+  show an approval card unless an allow rule for this chat, the project or all projects
+  matches (Auto also runs it without a card when it is on the read-only list), Bypass runs
+  it unless a deny or ask rule covers it, deny rules block it in every mode, and Don't ask
+  blocks it with a notice unless a rule allows it. Plan mode, subagents and restricted tool
+  profiles never run it. Hooks and the
+  project-instruction checks apply as for any command, and **Stop** stops it. A notice
+  reports the result. If it fails, the agent gets the last 3,000 characters of its
+  output (credentials redacted, fenced and marked as data, not instructions) in a hidden
+  message and another model request to fix it. When the output was longer than the
+  limit, those are the last characters of the kept part, and the message and the notice
+  say that the output was cut. If you decline the approval card, let it expire, or stop
+  the command with **Stop job** in Terminal, there is no fix round and Verify does not
+  run again in that turn. A note typed on a declined card is passed to the agent, which
+  answers it in another model request when an agent step is left. If that request fails
+  or is stopped, the hidden message stays in the model history with a short placeholder
+  reply, so your next message (**Continue**, say) still carries the output or the note. After the last fix
+  round, or when no agent step is left, the turn ends with a notice; the full output is in the command
+  card. When the agent answers a fix round without changing files (it fixed nothing, or fixed it
+  with a command only), Verify does not run again and a notice says the last run failed. Each fix round uses an agent step. Leave the command empty to turn Verify off.
+  The settings are kept in `<state dir>/projects.json` for each resolved workspace path
+  (a worktree is its own project), never in the repository, and are not part of
+  conversation exports.
 - **Task checklist**: when the conversation has tasks (from the model's `create_task` /
   `update_task` or **Agent tools → Tasks**), a **Tasks 2/5 done** bar above the message
   box, under the changes bar, shows the progress and the task in progress. Expand it to
@@ -436,13 +883,31 @@ when opening a conversation or performing restart recovery.
   highlighted (highlight.js, common languages). A block tagged with a language is
   highlighted in that language; an untagged block is guessed, up to 20 KB. **Copy code**
   copies a block's exact text.
+- **Open files from replies**: once a reply is complete, file paths in it become links:
+  an inline code span that is a file path with an extension (`src/app.py`,
+  `src/app.py:12`, `app.py:12:5`), and in the text a path with a slash (`docs/guide.md`)
+  or a file name followed by a line number (`app.py:12`). A name without a slash is
+  linked only with a common source or text file extension (`py`, `js`, `ts`, `json`,
+  `md`, `yaml`, `toml`, `txt`, `html`, `css`, `sh`, `sql`, `go`, `rs`, `java`, `c`, `h`
+  and similar), so identifiers such as `os.path.join` or `console.log` and host names
+  such as `db.example.com:5432` stay text. Web addresses, code blocks and
+  reasoning summaries are not linked. A link opens the file in **Workspace / Files** with
+  that line selected and scrolled into view; the status bar shows **Line 12**. Expanded
+  tool cards of file tools (`read_file`, `write_file`, `edit_file`, `insert_activity_log`,
+  the notebook tools, and `move_path`'s destination) have **Open file**, at `read_file`'s
+  start line. Opening goes through the same checks as Files: a folder outside the project
+  needs folder access in that conversation, and credential files and generated folders
+  are refused with the reason. **Open in VS Code** in the editor toolbar opens the file at
+  that line through a `vscode://file/<absolute path>:<line>` link; nothing happens when VS
+  Code is not installed.
 - **Copy and export a conversation**: **Agent tools → Conversation → Export Markdown**
   downloads the conversation as a Markdown transcript (`<date>-<title>-<id>.md`; a secret
   in the title becomes `redacted` in the file name), and
   **Copy conversation** copies the same text. It is the transcript the
   `scripts/conversation_transcript.py` script writes (see **Agent tools: MCP, skills,
   and hooks**): messages and replies in full, one line per tool call with its main
-  input, and command output shortened to 600 characters. Common secret shapes and the
+  input, `ask_user` questions with your answers, `submit_plan` plans in full with how you
+  reviewed them and your feedback, and command output shortened to 600 characters. Common secret shapes and the
   configured Databricks token are replaced with `[REDACTED]`; review it before sharing.
   Both work during a response and show what has been saved so far; their result is shown
   right under the two buttons.
@@ -452,9 +917,9 @@ when opening a conversation or performing restart recovery.
 The default state directory is `local-agent-workspace/.local/`, overridable with
 `LOCAL_AGENT_STATE_DIR` in `.env`. The directory is created at startup. Changing
 the value does not move existing data: stop the server before copying state to a
-new location, update `.env`, and then restart the app. Keep the state directory
-outside the selected project workspace when using a custom name so agent file
-tools cannot browse it.
+new location, update `.env`, and then restart the app. File tools never reach the
+state directory, wherever it is; keep a custom one outside the selected project
+workspace anyway, because commands run in the workspace can still reach it.
 
 - `conversations/<conversation-id>.jsonl`: one complete, private file per chat.
   Records include conversation metadata, user and assistant events, reasoning and
@@ -492,6 +957,20 @@ server stopped; it is listed again once it can be read. Requesting it through th
 reports the problem (HTTP 400) instead of a server error, and the page shows that message
 instead of trying to reconnect.
 
+Startup after a clean shutdown reads only the first line (the header) of each conversation
+file. When the server stops normally, it writes `conversations/.clean-shutdown` after every
+response, compaction and command job has stopped; the next start removes that marker first
+and then loads in full only the chats whose header shows a turn that did not finish, plus
+subagent chats whose delegation is still open or whose parent was just repaired. Finished
+command jobs were copied into their chats when they ended, so they are not copied again (only
+after a crash are they copied again, which loads each owning chat). Without the
+marker (after a crash or a kill, a failed shutdown, or on a new or older state folder) every
+conversation is loaded and repaired as before, which takes longer with many chats. One
+consequence: after a clean shutdown, a file whose header is readable but whose later records
+are damaged stays listed until you open it; opening it then reports the problem (HTTP 400) and
+hides it like a file found unreadable at startup. Pin, archive and tags are fields of the
+header (`pinned`, `archived`, `tags`), saved without changing the chat's update time.
+
 New sessions have empty message history and fresh permissions.
 Project files are shared on disk when chats select the same workspace; starting a
 new chat does not copy or isolate the project filesystem. On first startup after
@@ -510,6 +989,10 @@ received before an interruption may be partial, not a final count.
 
 For recognized standard pay-per-token endpoints, the Usage section calculates an
 estimated DBU cost from published input, output, cache-read, and cache-write rates.
+The rates are those of 2026-10-13: Claude Opus 5.5 at 57.143 DBU per million input tokens,
+285.714 output, 2.857 cache read and 71.429 cache write (the 5-minute rate; 1-hour cache writes
+at 114.286 cannot be told apart in the usage), and Claude Opus 4.8 at 71.429, 357.143, 7.143 and
+89.286.
 It does not estimate missing token counts. This is not an account-wide report or an
 invoice: regional uplifts, provisioned endpoints, negotiated pricing, credits, and
 delayed billing adjustments can differ. Older chats that predate the ledger show
@@ -517,8 +1000,25 @@ visible agent-call totals as incomplete because title, summary, and retry attemp
 cannot be reconstructed. A delegated child's requests stay in its own conversation.
 Databricks responses may omit usage.
 See the [Databricks API reference](https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/api-reference)
-for the provider's usage fields. The context meter below remains a separate
-pre-request estimate, but reported input tokens calibrate it (see below).
+for the provider's usage fields. The context meter below shows the input Databricks
+reported for the last request next to the app's own pre-request estimate, and
+reported input tokens calibrate that estimate (see below).
+
+Usage is kept in three input buckets: uncached input, cache reads and cache writes.
+Claude-style usage reports them separately. OpenAI-style usage counts cached tokens
+inside `prompt_tokens` (`prompt_tokens_details.cached_tokens`); the app then records
+`prompt_tokens` minus the cached count as uncached input, so totals, the DBU estimate
+and the estimate scale do not count the cache twice (a cached count larger than
+`prompt_tokens` is left as reported). How Claude endpoints on Databricks fill these
+fields has not yet been checked against a live response. Ledger records saved before
+this change keep the counts they were saved with; those that used OpenAI-style cached
+tokens stay double-counted, because they hold only the combined input count.
+The Usage section starts with a **Last model input** row: the reported input tokens of
+the conversation's latest agent request (cache included), its share of the input
+budget and of the model's window when known, and the app's estimate for the same
+request ("No reported input yet." before the first report). The call table has a
+**Total input** column (uncached input plus cache reads and writes), and **Request
+details** under a reply show **Input incl. cache**.
 
 Every chat, title, and summary call is sent to
 `DBRICKS_URL/serving-endpoints/<selected endpoint>/invocations`; the app does not
@@ -564,31 +1064,71 @@ requests, so the app does not send them). Match there on endpoint, `request_time
 within a few seconds of `started_utc`, and the exact token counts. The ledger also
 keeps each response's `id` as `response_id` (Databricks encrypts it) for support
 requests.
-For chat and context-summary calls, an HTTP 429 `REQUEST_LIMIT_EXCEEDED` response
-received before streaming begins is retried at most three times. The app honors numeric or HTTP-date `Retry-After`
-headers and root/nested JSON `retry_after` values, capped at 60 seconds; otherwise
-it waits 5, 15, then 40 seconds. A rate-limit signal after streamed content begins
+For chat calls, an HTTP 429 `REQUEST_LIMIT_EXCEEDED` response, HTTP 502, 503 or 504,
+and a connection failure, received before streaming begins, share at most three
+retries per request (see **Request details**). The app honors numeric or HTTP-date
+`Retry-After` headers and root/nested JSON `retry_after` values, capped at 60 seconds;
+otherwise it waits 5, 15, then 40 seconds after a rate limit and 2, 5, then 15 seconds
+after the others. Context-summary calls are not streamed and can run for minutes: they
+retry the same rate limits and gateway errors, but of connection failures only those
+before the request was sent (connect, pool and write failures), never a read failure
+that may follow an accepted, billed request. A failure after streamed content begins
 is not retried because repeating a partial response could be unsafe.
+
+The ledger and the CSV (the `retry_reason` column, after `attempt`) record why the app
+sent a request automatically: `rate_limit`, `server_error` or `network` for a repeat
+of the same request, `rate_limit_wait` after an automatic wait, `output_limit`,
+`invalid_tool_arguments` or `incomplete_response` for the request after a hidden
+continuation, and `verify` for a Verify fix round. The Usage section's **Automatic
+retries** tile counts these calls; **429 responses** counts rate-limited calls.
 
 ### Context and project instructions
 
-**Settings → Context budget (tokens)** defaults to 131,072 for new or previously
-unset settings. Explicit saved values, including 32,768 and the former 131,000
-default, are preserved.
+**Settings → Context budget (tokens)** and **Max output tokens** default to the endpoint's
+profile in `backend/local_agent/model_profiles.py`: 200,000 and 16,384 for Claude Opus 5.5
+(`databricks-claude-opus-5-5`, the default model), and 131,072 and 8,192 for GPT OSS 120B and
+for endpoints without a profile. Explicit saved values, including 32,768 and the former 131,000
+default, are preserved. Budgets still at the old model's defaults follow a change of the
+default model (in Settings or the composer's model picker) to the new model's defaults; a value
+you changed stays, and a default that would not fit with the other budget (Max output tokens
+must stay below the context budget minus 2,048) is not followed. A chat whose own endpoint differs from the Settings model uses that
+endpoint's defaults while Settings is at the Settings model's defaults, and your values when
+you changed them.
 The allowed range is 16,384–1,048,576; these are app configuration bounds, not a
 claim that every endpoint supports that range or the default. Set the budget at
-or below your endpoint's actual total context limit; the app cannot infer a
-serving endpoint's limit from its name. Changes apply on the next turn, including
-existing conversations. The configured total includes space for both input and
-reply. **Settings → Max output tokens** defaults to 8,192 and accepts
-1,024–131,072, but must be below the context budget minus the 2,048-token safety
-margin. The output setting is also the reply reserve, so the defaults leave an
-estimated input budget of 120,832 tokens. You can explicitly select 20,000 for one
-long Claude Opus 4.8 response, but that reserves its entire standard 20,000 OTPM
-allowance at admission; subsequent agent/tool-loop requests can receive 429s until
-earlier output leaves the rolling window. The 8,192 default leaves throughput for
-multi-step work, while output-limit responses can continue automatically in smaller
-steps up to the bounded retry limit.
+or below your endpoint's actual total context limit; the app knows the limits only of the
+endpoints in its profile table. Requests to such an endpoint are capped at its maxima (Opus
+5.5: 1,000,000 context and 128,000 output tokens; GPT OSS 120B: 131,072 context), and the
+chat shows a notice once that names the capped values (again only when they change). Changes apply on the next
+turn, including existing conversations. The configured total includes space for both input and
+reply. **Max output tokens** accepts 1,024–131,072, but must be below the context budget minus
+the 2,048-token safety margin. The output setting is also the reply reserve, so the Opus 5.5
+defaults leave an estimated input budget of 181,568 tokens (120,832 at 131,072 and 8,192).
+
+While you edit these fields, Settings shows warnings from the profile (they never block saving)
+and, for an endpoint with recommended values, a **Use … defaults** button. When the endpoint
+field changes, budgets still at the saved model's defaults change to the new endpoint's defaults
+in the form, as Save would store them, and the estimated input budget also names what requests
+to an endpoint with lower maxima get. The numbers are
+Databricks's documented pay-per-token defaults for the Enterprise tier, also partner models'
+quota Tier 1 ([limits page](https://docs.databricks.com/gcp/en/machine-learning/foundation-model-apis/limits),
+checked 2026-10-13): Opus 5.5, Opus 4.8 and GPT OSS 120B each allow 1,000,000 input tokens
+(ITPM) and 100,000 output tokens (OTPM) per minute. Your workspace's limits may differ.
+
+- Databricks reserves Max output tokens against OTPM when each request starts. Above 100,000 a
+  request is rejected with HTTP 429 before it starts (an error in Settings). Above 20,000 four
+  requests at once (a chat and up to three subagents, or several chats) can be rejected; the
+  app then waits and retries. 20,000 keeps one fifth of OTPM free; at 16,384, four requests
+  reserve 65,536.
+- Each agent step sends up to the whole context budget. Above 250,000 tokens, four full steps
+  in one minute reach ITPM, so long turns and subagents wait on rate limits, and every step
+  costs more (a note in Settings). You can raise Opus 5.5 to 1,000,000.
+- Opus 5.5 always thinks before it answers, and its thinking counts toward Max output tokens.
+  Below 16,384, complex steps and large file writes can stop at the limit (a note in Settings).
+  The system message tells the model so. Title and `/btw` requests add 4,096 tokens for
+  thinking (a title then asks for up to 5,120).
+
+Output-limit responses can continue automatically in smaller steps up to the bounded retry limit.
 The meter estimates the last prepared model input using roughly one token per
 three ASCII bytes, conservatively counting non-ASCII UTF-8 bytes, plus framing
 overhead. This heuristic varies from the actual model tokenizer and is not a
@@ -602,14 +1142,52 @@ read/write tokens are added to input tokens). The scale only raises the heuristi
 never lowers it, and is capped at 2×. In one observed code-heavy chat, Claude
 reported about 26% more input tokens than the heuristic; a scale of about 1.26 makes
 automatic compaction start before the real request outgrows the context budget.
-Context details show the applied scale. A conversation's first request to a model,
-or older requests recorded before this calibration, use the unscaled heuristic.
+Context details show the applied scale. Before a model has reported any counts in a
+conversation, the estimate uses a starting scale: 1.3 for `databricks-claude-opus-5-5`
+(newer Claude tokenizers count up to about 1.35 times as many tokens as older ones),
+and the unscaled heuristic for every other endpoint, including
+`databricks-claude-opus-4-8`. The first reports replace it.
 Expanded context details attribute that same estimate to system/project
 instructions (including selected skills), tool definitions, conversation messages
 and tool results, the retained summary, and request framing/rounding overhead.
 The categories add up to the displayed estimate; they are not tokenizer-derived
-measurements. Automatic compaction is attempted when the estimate exceeds the
-input budget, after the reply and safety reserves have been deducted.
+measurements.
+
+**Settings → Auto-compact at (% of input budget)** (default 90, 50–100) sets when
+automatic compaction runs: when the next request's estimate passes that share of the
+input budget (the budget left after the reply and safety reserves). With the default
+settings (Claude Opus 5.5 at 200,000 and 16,384) that is about 163,411 tokens; at 131,072 and 8,192 it is
+about 108,748. Lower values compact sooner and keep requests
+smaller; 100 waits until the input budget is full. Compaction looks for a cut that
+brings the request under the threshold. When no cut does (for example a large first
+request, or a large request after a few short turns) and the request still fits the
+input budget, nothing is summarized: the request is sent as it is and the context
+details say so. Only a request over the input budget, or a manual compaction, falls
+back to a cut that merely fits the budget, so compaction never runs a billed summary
+request that leaves the request over the threshold.
+
+**Last model input** shows what Databricks reported for the latest agent request
+once a report arrives: "Last model input · 10,000 tokens · 5.5%", where the
+percentage is of the input budget (of the default 181,568-token input budget), and a bar with a mark at the auto-compact
+threshold. The reported input is uncached input plus cache reads and writes: cached
+tokens still occupy the context window; they are cheaper, not smaller. A stream that
+stopped before it finished is marked "(partial)". Expanded, the meter lists the
+reported input, output, the shares of the input budget, the context budget and the
+model's own window (known for `databricks-claude-opus-5-5`, 1,000,000 tokens, and
+`databricks-gpt-oss-120b`, 131,072; "Not known for this endpoint" otherwise), and how
+far the app's estimate for the same request was from the reported count, with why
+the two differ and the scale later estimates use. After a compaction, or in a
+**Context preview**, the report describes the request before it, so it is headed
+"Before compaction" and the collapsed meter shows the app's estimate (~N%) instead;
+after the input budget changes, or once a request to another model has been prepared,
+it is headed "Earlier request" in the same way. A model change or a Settings save
+moves the meter to the budgets, auto-compact mark and next-request estimate of the
+chat's next request right away (a running chat follows when its turn ends; budgets apply
+from its next turn). When that changed the input budget, the collapsed meter reads
+**Next request · ~N%**: the next request's estimate, rescaled to the chat's model, as a
+share of the new input budget. When a turn ends, the details also show the
+estimate for the next request before your next message. Title, compaction and side
+question requests never change this report.
 
 The output-token limit is separate from the configurable total context capacity
 and the resulting input budget. Raising it reduces the available input budget and
@@ -636,42 +1214,160 @@ per response, across at most 64 calls. Oversized or unfinished frames fail befor
 any tool in that response executes; the error is recorded without saving broken
 tool calls into model history.
 
-When older turns no longer fit, the same endpoint summarizes them in bounded
-requests with at most 4,096 output tokens per summary request. Summary chunks use
-that independent reply reserve instead of the main response reserve, so increasing
-the main output setting does not multiply the number of compaction requests. The
-retained summary may use about an eighth of the input budget, between 3,500 and
-12,000 UTF-8 bytes (12,000 with the default settings); that byte cap is not a token
-count. A summary that comes back longer is not discarded, because producing it may
-have required a large billed request: a small extra request, containing only that
-summary, asks the model to condense it, and a second one condenses that result if it
-is shorter but still too long. A condensing request may use about one output token per
-two bytes of the limit (6,000 tokens for 12,000 bytes, at least 4,096), so a slightly
-long reply is not cut off. If condensing fails or is still too long, the
-app keeps the start and end of the summary and omits part of the middle. Either case
-adds a visible notice and is shown in context details. These summary limits are
-separate from the main reply limit and total context budget.
+When older turns are compacted, the same endpoint summarizes them in bounded requests.
+The summarizer reads a shortened copy of the archived messages; the saved history
+never changes. Tool results longer than a limit (3/32 of the summary request's input
+room, at least 8,000 and at most 64,000 bytes, twice that inside one long request; at
+the default 200,000-token context budget on Claude Opus 5.5 with handoffs on it is 16,290 bytes; at
+131,072 tokens it is 10,596 bytes, or 9,828 on models that always think) keep
+their start and end around a marker; a `read_file` page also keeps the definition
+lines (`class`, `def`, `function` and similar) of its omitted middle with their line
+numbers. File contents in `write_file`, `edit_file` and `notebook_edit` arguments keep
+their first 600 bytes and a marker (the file on disk has the current content), and a
+read whose file was later read again with the same arguments, or changed, moved or
+deleted by a completed call, is replaced by a marker. The app's own hidden messages
+(automatic retries, Verify results) are labelled as the app's, not the user's; the
+note you write when declining Verify stays your words. Your messages are never
+shortened, except for the @ file and ! output attachments in them.
+
+A plain summary request (with handoffs off, and in subagents) may use 4,096 output tokens,
+or a third of the summary byte limit on large budgets: 5,043 at the default 200,000 and
+16,384 on Claude Opus 5.5, plus the thinking allowance described below, 13,235 in all.
+With handoffs on (the default), that request writes the handoff instead; see below. Summary chunks use that independent
+reply reserve instead of the main response reserve, so increasing the main output
+setting does not multiply the number of compaction requests. The summary uses these
+sections, most important first, so a reply cut off at its limit loses the least:
+Goal and current status; Open tasks and next steps; User requirements, preferences and
+constraints (with your exact words); Decisions and reasons; Errors, causes and fixes;
+Files read and changed; Commands and results. A conversation long enough to need
+several summary requests passes each request's summary on whole to the next one and
+condenses only once, at the end. The retained summary may use about an eighth of the
+input budget, between 3,500 and 12,000 UTF-8 bytes, and up to 32,000 bytes on large
+budgets (a twelfth of the input budget): 15,130 bytes with the default settings, 12,000 at
+131,072 and 8,192. That byte cap is not a token count. A summary that comes back longer is not discarded, because
+producing it may have required a large billed request: a small extra request,
+containing only that summary, asks the model to condense it, and a second one
+condenses that result if it is shorter but still too long. A condensing request may
+use about one output token per two bytes of the limit (6,000 tokens for 12,000 bytes,
+7,565 for the default 15,130; at least 4,096), so a slightly long reply is not cut off. A condensed summary that
+lost the goal, open tasks or requirements section counts as failed. If condensing
+fails or is still too long, the app shortens the least important sections first, then
+reduces them to their headings; only then does it remove whole lines from the middle of
+the first three sections, in proportion to their size, keeping each one's first and last
+lines; a share that a short section cannot give goes to the others. Only if whole lines
+are not enough (for example a summary without those sections) does it keep the start
+and end of the summary. The summary's room is reserved in bytes,
+but escapes and non-ASCII text count more toward the estimate: when the request after a
+compaction is still over the input budget, the summary, already paid for, is shortened
+(or condensed once) to fit rather than discarded, and the compaction notice and the meter
+say why; only when even a summary of about 1,750 bytes would not fit does the turn stop
+with the context-budget error. A plain summary cut off at its output limit is kept with a note. These
+summary limits are separate from the main reply limit and total context budget.
+
+Next to the summary, the model gets an **app record** that the app writes itself,
+not the summarizer: your earlier requests in your own words (kept whole while the record
+has room; when it is full the longest are shortened in the middle, the first request is
+always kept, and the oldest after it give way), the task checklist when the compaction
+ran with full task IDs, the files the conversation changed before that point, and the
+files it read whose contents are no longer in its context, including those from earlier
+compactions until they are read again. When these notes are longer than their half of the
+record, whole lines go from the longest list, which then ends with how many more there are. Those files must be read again before a write
+or edit: the read-before-write check refuses with "its earlier contents were
+summarized out of your context" until they are. A file read or written after the
+compaction point, or attached with @ to the request still in context, stays readable.
+The record is part of the conversation's saved context state but is not exported,
+so an imported conversation starts a new record at its next compaction. Your
+requests are marked as your own words, whose rules and constraints still apply unless
+you changed them later; the app's notes (tasks and files) are marked as data. Each
+compaction adds one notice with its numbers: an automatic or in-turn compaction gives
+the estimate before, the threshold, how many messages were summarized in how many
+requests and the estimate after; a manual one gives the messages, the requests and
+the estimate after. On models
+that always think, such as `databricks-claude-opus-5-5`, thinking counts against
+`max_tokens`, so every summary, condense and handoff request gets an extra
+min(8,192, context budget / 8) output tokens for thinking.
 
 **Settings → Save a detailed handoff at each compaction** is on by default. Each
 automatic or manual compaction then asks the model for a detailed Markdown handoff of
-the turns being summarized (status, decisions, issues and fixes, file changes, key
-facts, open items, next actions) instead of the short summary. The same request that
-already carried those turns writes it, so no extra conversation is resent; it may use
-up to an eighth of the context budget in output tokens (16,000 with the default
-budget), and a non-streamed reply can take a few minutes. A small follow-up request
-condenses the handoff into the in-context summary. The app saves the handoff, with a
-generated activity log of every command and file, to
+the turns being summarized (the summary sections above, then work done in detail and
+key facts and gotchas) instead of the short summary. The same request that already
+carried those turns writes it, so no extra conversation is resent; it may use up to an
+eighth of the context budget in output tokens (16,000 with the default budget), plus
+the thinking allowance above on models that always think, and a non-streamed reply can
+take a few minutes. That stays within Databricks' 597-second execution limit and
+100,000 output tokens per minute for Claude Opus 5.5. A small follow-up request
+condenses the handoff into the in-context summary. The app saves the handoff, with
+the app record (redacted like the rest of the file) and a generated activity log of
+every command and file, to
 `<workspace>/handoffs/auto/<date>-<chat-title>-compaction-<N>.md`, adding a suffix
-instead of overwriting an existing file. After compaction, the summary message lists
-the newest five saved handoffs so the model can read the relevant section with
-`read_file` or `search_files` when it needs details the summary omits. A handoff cut
-off at its output limit is still saved and used, with a note. If the file cannot be
-written (for example, the folder resolves outside the workspace), a notice explains
-it and compaction continues with the summary only. Subagent conversations do not
-write compaction handoffs. Turn the setting off for the previous summary-only
-compaction.
+instead of overwriting an existing file. Each handoff starts with a Contents list
+giving the line of each section. After compaction, the summary message lists the
+newest five saved handoffs so the model can find the section it needs (from the Contents
+list, with `outline_file` when it is offered, or with `search_files`) and read it with
+`read_file` `start_line` when it needs details the summary omits. An @ file attachment
+that was shortened says the same: its header names the `read_file` `start_line` where the
+rest begins and, when available, `outline_file`. A handoff cut off at its output limit is still saved and used, with a note. If
+the file cannot be written (for example, the folder resolves outside the workspace), a
+notice explains it and compaction continues with the summary only. Subagent
+conversations do not write compaction handoffs. Turn the setting off for the previous
+summary-only compaction.
+
+Input tokens per minute matter on large budgets: with a 1,000,000-token budget, one
+near-full request uses all of Claude Opus 5.5's default 1,000,000 input tokens per
+minute, so the next step can be rate limited. Lower **Auto-compact at** or the
+context budget for multi-step work.
+
+**Request size.** Databricks accepts at most 4 MB per request. The app encodes each
+request body itself (compact UTF-8 JSON) and sends exactly those bytes, so it knows the
+size it sends; the context details show "Request size: 245 KB of Databricks' 4 MB limit."
+for the latest request. Compaction also runs when a request would pass 3.8 MB, a check
+that costs nothing today because the token estimate already bounds the size (at most three
+bytes per estimated token, about 3.1 MB at the 1,048,576-token maximum). When no
+compaction brings such a request under 3.8 MB, the app still compacts at the latest point
+that fits when that makes the request smaller. A request still over 4 MB is not sent: the turn ends with a `payload_too_large` error that suggests smaller
+steps or a lower context budget, without a **Continue** button; a compaction or `/btw`
+request over the limit is refused the same way. Agent requests wait up to 300 seconds for
+the next streamed data (a large prefill with thinking can be silent for minutes); a
+request that gets no data for that long ends with an error saying so, which suggests
+sending a message to continue and, if it repeats, a lower context budget or Max output
+tokens. Compaction and `/btw` requests, which are not streamed, wait up to 600 seconds. Databricks
+stops a request after 597 seconds; when a stream ends early after about that long, a
+notice (once per turn) says so and suggests lowering Max output tokens or the context
+budget.
+
+**Rate limits.** A Databricks 429 body names the limit it hit: `limit_type` (input or output
+tokens per minute, queries per hour or second), `limit`, `current` and `retry_after`. Retry
+notices name it, for example "Databricks rate limited the model request (output tokens per
+minute (OTPM): limit 100,000, current 100,500). Retrying in 3 seconds (1 of 3).", and a
+429 that names a limit is retried even when its message does not say "rate limit". Request
+details show a **Rate limit** row for a final 429 (one that was not retried); the ledger
+records its `limit_type`. When a final 429 names the input-tokens-per-minute limit, the
+error adds the arithmetic: each agent step resends the whole conversation, so the context
+budget times the steps per minute must stay under ITPM (at about 400,000 tokens per request,
+1,000,000 ITPM allows about 2 requests per minute; keep the budget near 200,000 tokens for
+about five steps a minute). Databricks reserves Max output tokens against OTPM, so a
+request whose Max output tokens is above the reported OTPM limit can never start: the app
+stops at once with an `output_tokens_over_limit` error naming the limit and a per-request
+value for four requests at once, remembers that limit for an hour, and refuses further
+requests to that endpoint, before any compaction, until Settings changes; no **Continue**
+button is offered. A compaction request is sized by the context budget, not by Max output
+tokens: under a reported OTPM limit its handoff or summary shrinks to fit (a first rejection
+is resent once at the reported limit; Databricks does not bill it), and only when even the
+smallest summary plus thinking room cannot fit does compaction stop. The thinking room is an
+eighth of the context budget, up to 8,192 tokens, so the error names the context budget at which
+compaction fits (at most 47,239 tokens under a 10,000 OTPM limit) or, when no budget is small
+enough, asks for a higher limit from the workspace admin. When Databricks asks one chat to pause, other chats and compaction
+requests to the same endpoint wait for that pause too, plus up to 3 seconds of random
+jitter so they do not all retry at once, with a notice; a request with a smaller Max output
+tokens may pass an output-tokens pause, and Stop cancels the wait. `/btw` does not wait: it
+says when to ask again. These pauses and learned limits live in memory and start empty when
+the app starts. The app does not pace requests by tokens per minute itself: limits vary by
+tier and workspace, a rejected 429 is not billed, Databricks returns `retry_after`, and the
+app's token counts are estimates.
 The newest turn and its complete tool exchanges are retained verbatim;
-the preceding turn is also retained when space allows. One request can outgrow the
+the preceding turn is also retained when space allows. The app's hidden messages
+inside a turn (automatic retries, Verify results) belong to that turn and never count
+as a turn of their own. One request can outgrow the
 budget by itself, for example when it reads many large files. The app then summarizes
 that request's earlier tool exchanges and continues instead of stopping: the request
 itself stays verbatim after the summary, followed by its latest exchanges up to half
@@ -683,11 +1379,19 @@ restarts, while the full display transcript and original model/tool history rema
 in that conversation's JSONL file. Summary requests are additional billed inference. A failed or stopped
 summary leaves the previous summary state intact and performs no tools. Summaries
 can lose details; they are not an exact substitute for the original transcript.
+A message you send while the agent works (**steering**) is part of the current turn, not a
+turn of its own: compaction never cuts there, keeps it verbatim after the summary together
+with the turn's request, and never summarizes the tool results the model has not answered
+yet. A queued message that would not fit the context budget together with the latest tool
+results waits (not paused) for a later step boundary, with one notice per turn. If no
+boundary has room for it before the reply completes, it is sent as the next turn; after
+Stop, an error or the step limit it waits like any queued message (see **Messages while the
+agent works**).
 If the request, its latest tool results, or project guidance alone are too large, the app
 reports an error instead of silently cutting it. The error states the estimated
 tokens needed and the input-budget arithmetic (context budget minus Max output
 tokens minus the 2,048-token safety margin). When Max output tokens is above the
-8,192 default, it suggests lowering that first: for example, 131,000 context with
+endpoint's default (16,384 for Opus 5.5, 8,192 otherwise), it suggests lowering that first: for example, 131,000 context with
 121,000 reserved for output leaves only 7,952 input tokens. Otherwise, increase the
 budget only within your endpoint's limit, or start a new conversation with a smaller request. There
 is no model tokenizer integration. Retained job output is paginated; discarded
@@ -700,6 +1404,21 @@ additional model inference and can be cancelled with **Stop**. It does not run
 tools, connect MCP servers, or rewrite the archived conversation. The resulting
 **Context preview** uses the last saved tool definitions (built-ins only for
 older sessions without that snapshot); definitions may change on the next turn.
+The details open above the meter; Escape, a click elsewhere or moving focus away closes them.
+
+**Settings** groups its fields under Project, Model and context, Agent, Commands and files,
+Notifications and Credentials; **Save settings** stays at the bottom while you scroll, and a
+failed save shows its reason just above it.
+
+**Settings → Custom instructions** (up to 8,000 characters) are your own instructions for
+every conversation in every project, subagents included. The system message places them
+right after the app's own instructions, before the permission-mode text and the project
+guidance (`AGENTS.md`, `CLAUDE.md`), which cannot override them. A change applies from the
+next model request; unlike changed project guidance, it does not hold back a write or
+command of a running response. **Loaded instructions** in the context details lists them
+as **Custom instructions (Settings) · applies to all projects**, together with the project
+files and the skill index (see **Agent tools: MCP, skills, and hooks**), each with its
+estimated tokens.
 
 At each model request the app rereads root `AGENTS.md`, then `CLAUDE.md`. File tools
 also discover guidance in the target directory and its ancestors, from broader
@@ -707,7 +1426,8 @@ to more specific scopes. These encountered scopes persist for the conversation;
 their guidance applies only to their own directories. More specific rules refine
 broader rules; user instructions and enforced tool permissions retain precedence.
 `CLAUDE.md` is just a supported text filename: it does not enable Claude mode or
-require the Claude SDK. README files, imports, skills, parent directories outside
+require the Claude SDK. README files, imports, skill files (beyond the skill index),
+parent directories outside
 the selected workspace, and external-folder guidance are not automatically loaded.
 Shell commands receive root guidance and scopes already encountered by file tools;
 the app does not infer new instruction scopes from arbitrary shell command text.
@@ -724,7 +1444,8 @@ of the system-instruction estimate; do not add them again to the overall total.
 ### Agent tools: recovery and worktrees
 
 Open **Agent tools** in the header. **Recovery** lists checkpoints created before
-successful `write_file`, `edit_file`, and editor saves. Preview the reverse diff,
+successful `write_file`, `edit_file`, `move_path`, `delete_path`, `notebook_edit`, and
+editor saves. Preview the reverse diff,
 then click **Restore checkpoint**. Restoring verifies the current file's content,
 mode, type, location, and access scope; conflicting external changes are rejected.
 A restore creates a reverse checkpoint, so it can be undone. Restoring creation
@@ -738,7 +1459,14 @@ atomic whole-turn undo. Earlier edits to the same file may no longer be restorab
 Manual editor saves, reverse checkpoints, and older unassociated records remain
 under **Other file edits**.
 
-Recovery covers regular UTF-8 files up to 80 KB. It preserves existing bytes and
+Recovery covers regular UTF-8 files up to 1 MB. Recovery and the change review read
+files up to 1 MB whatever the file write limit (Settings, 16–1,000 KB, 80 KB by
+default), so lowering the limit never blocks reviewing or undoing an earlier, larger
+edit; the limit applies only to new content. The checkpoint store is capped at 256 MiB:
+past that, the oldest finished checkpoints are removed until it is under 192 MiB, so
+the oldest edits may no longer be restorable here. Change-review baselines are separate
+copies and are not part of this cap. New files get the mode your umask gives (usually
+0644); existing files keep theirs. Recovery preserves existing bytes and
 permissions, uses atomic replacement, and pins directories during writes. It does
 not snapshot shell commands, MCP servers, hooks, Git operations, or whole folders.
 It is not a substitute for Git/backups, nor a filesystem lock against unrelated
@@ -755,6 +1483,25 @@ the worktree) or running command, and keeps the branch and its
 commits. Delete the worktree's conversations and choose another default workspace
 before removal. Git hooks, filters, and fsmonitor are disabled for managed worktree
 operations. This is deliberate workspace isolation, not automatic per-task copies.
+
+**New chat in worktree** on the welcome screen creates a worktree on a new branch
+(default `chat/<date>-<time>`, to the second) from the selected chat's project, or the default
+workspace, and opens a chat in it. **Fork from here** can put a fork in a new worktree
+too; forking a worktree chat starts the new branch from that worktree's last commit,
+and a plain fork of a worktree chat stays in the same worktree. Worktree chats record
+`worktree: {id, branch, source_workspace}`, where `source_workspace` is always the root
+project, never another worktree. Permission rules saved for a project apply to that
+folder only: a worktree chat does not inherit its source project's "Always allow in
+this project" rules, because a worktree is a separate folder (least privilege). Rules
+allowed inside a worktree chat apply to that worktree. An archived `(before rewind)` copy
+of a worktree chat also uses the worktree: delete it too before removing the worktree.
+
+Rewinding files (**Rewind to here**, or **Edit message** with **Also undo file
+changes**) uses the same checkpoints: see **Edit, retry and rewind**. API:
+`GET /api/sessions/<id>/rewind-preview?before_event_id=<user event id>` and
+`POST /api/sessions/<id>/rewind` `{before_event_id, conversation, code, resend_text?}`
+(409 with `{message, files}` when a file changed); `POST /api/sessions/<id>/fork`
+with `{before_event_id?, title?, worktree_branch?}` forks from a point.
 
 ### Agent tools: MCP, skills, and hooks
 
@@ -785,8 +1532,10 @@ must still fit the aggregate tool/schema limits when a chat starts.
 ```
 
 The model sees names such as `mcp__example__tool`. MCP calls require their own
-approval in Manual, Auto, and Accept edits; Plan blocks them and Bypass permits
-them. **Allow this tool in this chat** approves one exact tool name for the rest of the chat. MCP servers and hook commands have the user's OS/network access, not the
+approval in Manual, Auto, and Accept edits; Plan blocks them, Don't ask blocks them unless a
+rule allows them, and Bypass permits them unless a deny or ask rule covers them. **Allow this
+tool in this chat** approves one exact tool name for the rest of the chat; a saved rule for the
+project or all projects can allow one tool or all tools of a server (see **Permission rules**). MCP servers and hook commands have the user's OS/network access, not the
 file tools' folder restrictions. Credential environment variables are stripped
 from local server/hook processes. Up to four servers, 32 tools, and 16 KB of tool
 schemas are supported; each call has a 60-second deadline and bounded 8 KB result.
@@ -796,11 +1545,15 @@ An MCP result with `is_error=true` is displayed as an error even when the server
 request itself succeeded. Its bounded diagnostic remains available to the model;
 the app does not automatically retry the action.
 
-Install workspace skills at `.agents/skills/<skill-id>/SKILL.md`. Skills shipped with
-the app in `skills/<skill-id>/SKILL.md` are available in every workspace; a workspace
-skill with the same ID replaces the shipped one. Other folders, such as
-`.claude/skills`, are not read. Optional simple frontmatter supplies `name` and
-`description`. Enable a discovered skill in the panel, use `/<skill-id>` as a word in a
+Install workspace skills at `.agents/skills/<skill-id>/SKILL.md`. Skills in
+`.claude/skills/<skill-id>/SKILL.md`, the layout another coding tool uses, are read too;
+the app never writes there. Skills shipped with the app in `skills/<skill-id>/SKILL.md`
+are available in every workspace. For one ID, `.agents/skills` wins over
+`.claude/skills`, which wins over the shipped skill; a workspace entry takes the ID over
+even when it fails to load. A `.claude/skills` folder that resolves outside the project
+(for example a link to a shared folder), cannot be read, or has more than 100 entries or
+30 skills, is skipped without an error, and the shipped skills stay available. Optional simple
+frontmatter supplies `name` and `description`. Enable a discovered skill in the panel, use `/<skill-id>` as a word in a
 message (type `/` at the start to choose from the list), begin a message with
 `/skill <skill-id>`, or ask the
 model to use its `list_skills` / `use_skill` tools. Selection persists per chat, instructions reload
@@ -810,6 +1563,14 @@ before a write, command, or MCP call. At most three selected skills fit a combin
 this version has no marketplace, installer, dependency execution, or automatic
 matching engine.
 
+Every model request's system message includes a skill index: one line per listed skill
+with its ID and description (whitespace collapsed, at most 150 characters), at most 30
+lines and 2,000 bytes, then "… and N more (call list_skills)". The model is told to load
+a listed skill with `use_skill` when it fits the task. Skill descriptions from
+`.agents/skills` and `.claude/skills` therefore reach the system message of every chat in
+that workspace, with the same trust as `AGENTS.md`: review skills you did not write. The
+context details list the index as **Skill index · applies to this workspace**.
+
 The app ships a detailed handoff skill at `skills/handoff/SKILL.md`, available in every
 workspace: send `/handoff Create a handoff for this conversation` (or type `/han` and
 press Enter to insert the command). To change it for one project, copy it to
@@ -817,8 +1578,8 @@ press Enter to insert the command). To change it for one project, copy it to
 `my-project/.agents/skills/handoff/SKILL.md`) and edit the copy; that copy then
 replaces the shipped skill in that workspace. It asks for a cold-start
 document in the style of a long working-session memory file, written in parts of
-about half the file text one response can hold (about 20 KB at 20,000 Max output
-tokens, about 8 KB at the 8,192 default) so no single response hits the output limit,
+about half the file text one response can hold (about 16 KB at the 16,384 Opus 5.5
+default, about 8 KB at 8,192) so no single response hits the output limit,
 and ends by calling `insert_activity_log`. Select **Accept edits** first to avoid approving every part.
 The skill uses 6 KB of the 8 KB skill budget. Automatic compaction handoffs (see
 Context and project instructions) are written from the turns being compacted; use the
@@ -838,7 +1599,8 @@ python3 scripts/conversation_transcript.py .local/conversations/<id>.jsonl [more
 ```
 
 Each conversation becomes `<date>-<title>-<id>.md` (an existing file is never replaced):
-the messages and replies in full, one line per tool call with its main input, and
+the messages and replies in full, one line per tool call with its main input, questions
+with the user's answers, plans in full with their review outcome and feedback, and
 command output shortened to 600 characters (`--excerpt`). `--out all.md` joins them,
 oldest first. The script needs only Python 3 and replaces common secret shapes with
 `[REDACTED]`, but transcripts contain whatever the conversations did: review them before
@@ -861,8 +1623,9 @@ approval diff, file checkpoint, and `write_file` hooks apply (Plan mode blocks i
 Commands are copied as they ran except that the app's configured credentials and
 common secret shapes (GitHub and Databricks tokens, AWS access keys, bearer tokens,
 `password=`/`token=`-style values, and URL passwords) are replaced with `[REDACTED]`;
-review the file before sharing it. The finished file must stay within 80 KB: the
-oldest commands are omitted with a note when needed, so insert the log into a
+review the file before sharing it. The finished file must stay within 80 KB, or within
+the file write limit (Settings) when that is lower; a higher write limit does not raise
+this cap. The oldest commands are omitted with a note when needed, so insert the log into a
 separate file to keep every command. Delegated subagent conversations keep their own
 logs.
 
@@ -876,13 +1639,17 @@ input. Existing MCP schema/argument caps remain in force.
 Hooks support `before_tool`, `after_tool`, and `tool_failure`. Each enabled hook receives JSON on
 stdin with the event, conversation ID, tool, arguments, stable `call_id`, and (after execution) result.
 The optional `tools` array selects exact names (including MCP names); omit it for
-all tools, or use an empty array to match none. Failure hooks receive the original
+all tools, or use an empty array to match none. A hook for `read_file` also runs for
+`outline_file`, and one for `list_files` or `find_files` also runs for `project_overview`;
+its input then has `covered_by` naming the selected tool. Failure hooks receive the original
 error/outcome for invoked tools that fail, including MCP `is_error` results. Schema,
 policy, and approval rejections and cancelled actions do not launch failure hooks.
 Foreground commands with failed/timed-out results also trigger failure hooks;
 background-job completion does not launch a deferred hook.
-Each hook separately asks for approval except in Bypass; Plan skips hooks.
-**Allow this hook in this chat** stops asking for that hook ID in that chat. A declined
+Each hook separately asks for approval except in Bypass; Plan skips hooks, and Don't ask runs
+only hooks a rule allows (a before-hook without one blocks its tool). **Allow this hook in this
+chat** stops asking for that hook ID in that chat; a saved hook rule does the same for the
+project or all projects. Deny and ask rules for hooks apply in Bypass too. A declined
 or failing before-hook blocks the tool. An after-hook failure displays a warning
 while retaining the completed action/result. Failure-hook errors also preserve the
 original error. Hooks have a 1–30 second timeout and
@@ -902,8 +1669,8 @@ These planning records are available in Plan mode.
 
 The model can use `delegate_task` for one concrete task with explicitly supplied
 context. The child has a separate transcript/context and inherits workspace,
-model, permission mode, folder grants, and "Allow for this chat" rules (a copy: rules the
-child adds stay in the child). Files remain shared: choose independent
+model, permission mode, folder grants, turned-off tools, and "Allow for this chat" rules (a copy: rules the
+child adds stay in the child); project and all-project rules apply to it as to the parent. Files remain shared: choose independent
 work to avoid conflicting edits. One child runs per parent, at most three globally;
 children have 1–8 model steps (default six), cannot delegate again, and cannot start
 managed background jobs. The parent waits for a bounded result and an honest
@@ -922,13 +1689,40 @@ Unfinished delegated runs are marked interrupted on restart rather than left run
 **Tasks → New subagent tool ceiling** selects `inherit`, `read_only`, or `file_editor`
 for future children while the parent is idle. The model may request a narrower
 `tool_profile` in `delegate_task` but cannot widen the parent's ceiling. Read-only
-permits file listing/reading/search, skill discovery/selection, and task listing/reading;
-file-editor additionally permits file writes/edits under normal approval rules.
+permits file listing/reading/search, skill discovery/selection, task listing/reading, and
+`ask_user`; file-editor additionally permits file writes/edits under normal approval rules.
 Both file-only profiles exclude shell commands, jobs, MCP startup/calls, hooks,
 task mutations, and further delegation. Restrictions persist on child continuation,
 imports, and forks. Existing children are unchanged by a new ceiling. These are
 server-enforced model-tool limits, not an OS sandbox or restrictions on the user's
 explicit editor/terminal actions.
+
+**Questions and plan review.** With `ask_user` the model asks 1–4 short multiple-choice
+questions when it needs a decision. Each question has 2–4 options (single or multiple
+choice), and **Other** takes your own text (up to 1,000 characters); the model may not
+add an option named Other itself. **Send answers** is enabled once every question is
+answered; **Skip** tells the model to continue with its best judgment and state its
+assumptions. The card waits like an approval card: the sidebar shows **Needs approval**,
+notifications and the busy-chat checks treat it the same way, the message box names what
+is waiting, the Approval wait in Settings applies (after it the model is told you did
+not answer), and Stop cancels it. `ask_user` works in every mode, including Plan. In
+Don't ask mode it returns at once without waiting for you, and switching a chat to Don't
+ask skips its waiting questions; the card then notes that they were skipped
+automatically. `ask_user` and `submit_plan` must be the last tool call in a model
+response; otherwise they are refused before any card appears, so no other call from that
+response runs before the model has read your reply, or under a mode an approved plan
+switched to. A subagent's question appears in the subagent's own conversation (the
+parent card reads **Waiting for approval**; use **Open subagent**), is answered there,
+and is never copied into the parent's context. In Plan mode the model can present its
+finished plan with `submit_plan` (Plan only, never in subagents). The plan card renders
+the plan as Markdown with an optional feedback box and three choices: **Keep planning**
+(the model gets your feedback and stays in Plan), **Approve and use Manual** or
+**Approve and use Accept edits**, which switch the chat to that mode, and the model then
+implements the plan in the same turn under the new mode's rules. Changing the mode from
+the Permissions menu while a plan waits, or after you answered but before the agent
+continued, closes the card as not reviewed, keeps the mode you picked from the menu, and
+tells the model to ask before implementing it. The plan is not written to any file; it
+stays in the conversation, and exports keep answers and review outcomes.
 
 **Activity** collapses a list of actual tool actions and their states; existing
 approval cards remain usable independently. A separate **Provider reasoning
@@ -943,24 +1737,169 @@ reasoning-effort setting yet.
 ### Permission modes
 
 Choose a mode beneath the chat input. Existing conversations default to Manual.
-Changes are saved per conversation; stop an active response before switching modes.
+Changes are saved per conversation and apply at once, also while a response runs or a card
+waits (see **Mode changes while the agent works** below).
 
 | Mode | Agent behavior |
 | --- | --- |
-| Manual | Read approved folders; ask before edits and commands. |
-| Auto | Accept file edits and exact `pwd`, `ls`, `ls -la` commands; ask for other commands/actions. |
-| Accept edits | Accept file edits; ask before commands and other actions. |
-| Plan | Read/search approved folders and describe a plan; block file changes and shell commands. |
-| Bypass permissions | Run actions and access external folders without approval cards. Credential/generated-file exclusions still apply to file tools. |
+| Manual | Read approved folders; ask before edits, commands, stopping jobs and subagents. |
+| Auto | Accept file edits, run the fixed list of read-only commands (below), stop jobs and start subagents; ask for other commands and actions. |
+| Accept edits | Accept file edits and start subagents; ask before commands and other actions. |
+| Don't ask | Run only what the mode's reads or a saved rule allows; block everything else without an approval card. |
+| Plan | Read/search approved folders, run the read-only command list, and describe a plan; block file changes and other commands. Subagents still need a card. |
+| Bypass permissions | Run actions and access external folders without approval cards. Deny and ask rules still apply, and credential/generated-file exclusions still apply to file tools. |
 
-An "Allow for this chat" rule (see **Allow for this chat** above) turns a matching card into an
-automatic approval in Manual, Auto and Accept edits only; Plan ignores rules.
-Inspecting/stopping existing jobs, skills, structured tasks, and delegation are available
-in every mode. Delegated tools still follow the child's inherited permission mode.
-Starting a background job follows the same command approval rules as foreground
-execution. Changing modes does not cancel a previously authorized background job.
-Auto uses the app's explicit local rules. Manually saving in the editor or clicking
-Run in the terminal is an explicit user action outside the agent's permission mode.
+Reading, listing and searching files, reading job output, waiting for a job, skills and
+structured tasks are available in every mode without a card. Stopping a job is a command
+action: it asks in Manual and Accept edits, is blocked in Don't ask unless a rule allows it, runs
+in Auto and Bypass, and is blocked in Plan. Starting a subagent (`delegate_task`) asks in Manual and
+Plan, runs in Accept edits, Auto and Bypass, and is blocked in Don't ask unless a rule allows
+it; the child then follows its own (inherited) mode. Starting a background job follows the
+same command rules as foreground execution. Changing modes does not cancel a previously
+authorized background job. Manually saving in the editor or clicking Run in the terminal is
+an explicit user action outside the agent's permission mode. The project's Verify command
+runs as the agent's `run_command`, so modes, rules, protected files and Don't ask apply to it
+as to a command the agent chose (Plan never runs it). Diagnostics after edits run inside the
+app and start no commands.
+
+### Permission rules
+
+A rule turns one kind of action into an automatic approval (**allow**), a card in every mode
+(**ask**, "Always ask") or a refusal (**deny**). Rules have three scopes:
+
+- **This chat**: saved with the conversation (the **Allow for this chat** rules above, at most
+  100). Inherited by subagents; forks and imports start without them. A deny or ask rule added
+  to the chat while a subagent runs also reaches that subagent; other chat rule changes do not.
+- **This project**: saved in the app's state folder, in `permission_rules.json`, keyed by the
+  project folder's resolved path (at most 200 per project). A managed worktree is a separate
+  folder, so it has its own project rules.
+- **All projects**: the same file, at most 200 rules.
+
+The rule file is written atomically with mode 0600 and is never read from a repository:
+`.claude/settings*.json` and `.agents/permissions.json` are ignored. A file that cannot be read
+is ignored (no project or all-project rule applies) and the permissions menu says so, without
+quoting it; **Reset saved rules** moves it aside as `permission_rules.json.bad-<time>`.
+Project and all-project rules are app state and are never exported.
+
+Rule kinds:
+
+- **Commands**: an exact command (its words as the shell would split them, for example
+  `npm test`), or commands starting with one to three words followed only by listed options
+  (`git status` with `-s --short`; `--name=` allows any value after `--name=`). Positional
+  arguments must be listed too. Deny and ask rules name a program and up to 16 words, which
+  must all appear somewhere in the command in any order (`git push` also matches
+  `git -C . push --force` and `/usr/bin/git push`), with combined short options split
+  (`rm -rf` matches `rm -r -f` and `rm -fr`); a deny or ask rule without words covers every command.
+- **File edits** (`write_file`, `edit_file`, `insert_activity_log`, `move_path`, `delete_path`,
+  `notebook_edit`), optionally only under one absolute folder. An allow rule needs every path the
+  tool touches inside the folder; a deny or ask rule applies when any of them is (both ends of a move).
+- **Tools**: one MCP tool, every tool of an MCP server (`mcp__server__*`, deny and ask only),
+  a hook ID, `delegate_task` (subagents), `stop_job`, or any other tool name (deny only).
+
+When rules disagree, **deny beats ask, and ask beats allow**, whatever their scope. The fixed
+order is: turned-off tools, deny rules (in every mode, Bypass included), Plan's read-only limit,
+ask rules, protected files, the mode itself, allow rules (never in Plan), Don't ask, and finally
+a card. A tool that a deny rule without conditions covers is not offered to the agent at all.
+
+Rules never override credential and generated-file exclusions, the state-folder exclusion,
+folder-access cards (only Don't ask, which blocks them, and Bypass, which needs none, differ),
+project-guidance checks, the read-before-overwrite guard, the changed-file checks, Plan mode
+(allow rules are ignored there) or protected files. An allow rule cannot cover a program that
+runs other programs or code (`sh`, `bash`, `env`, `sudo`, `xargs`, `nohup`, `timeout`, `ssh`,
+`watch` and similar; `python -c`, `node -e` and other inline interpreters; `awk` and `sed`),
+an option that runs other programs (`git -c`, `--git-dir`, `--ext-diff` and similar; `rg --pre`
+and `-z`; `find -exec` and `-delete`), a word naming a credential file, or your Databricks token.
+The same applies to **Allow for this chat** on a card: a command naming a credential file or
+containing your token cannot be remembered, even by its exact text. A card raised by an Always
+ask rule, by an uncertain command (below) or by a protected file offers nothing to remember,
+because an allow rule would never apply to it.
+
+**No shell.** Commands allowed by an exact or prefix rule, and commands on the read-only list,
+run without a shell: shell syntax (`; & | < > ( ) { } [ ] * ? ~ ! # $ ^`, backticks,
+backslashes, tabs and line breaks) never matches such a rule. A command allowed by its exact
+text in this chat, and any command you approve on a card, still runs through the shell exactly
+as approved.
+
+**Read-only commands.** Auto and Plan run this fixed list without a card, in the foreground
+only: `pwd`; `ls` with no option or `-l`, `-a`, `-la`, `-al`, `-1`; `git status` (plain,
+`--short`, `-s`, `--porcelain`); `git diff` (plain, `--stat`, `--name-only`, `--cached`,
+`--staged`, `--cached --stat`); `git log --oneline` (optionally `-n 20`); `git show` (plain or
+`--stat`); `git branch` (plain or `--show-current`); `git rev-parse HEAD`,
+`--abbrev-ref HEAD` and `--show-toplevel`; `git ls-files`. There are no test runners, package
+managers, search tools, interpreters or `git remote` on the list. A command on the list runs
+hardened (see **Local access and limits**) whatever mode or rule allowed it; when you approve it
+on a card, it runs through the shell like any approved command.
+
+**Uncertain commands.** A command that a deny or ask rule might cover but that cannot be checked
+exactly gets a card, even in Bypass: shell syntax that contains the rule's program as a word, `$`,
+backticks, backslashes or glob characters, or an `alias` or `source` line; a wrapper such as
+`env`, `command`, `nohup` or `sh -c`; an inline interpreter, also with combined or attached
+options (`perl -le`, `python3 -Ic`, `node --eval=…`); or a never-allowed option such as `git -c`.
+Text that does not mention the rule's program (`npm test | tee out` with a deny rule for
+`git push`) is not uncertain.
+
+**Protected files.** Edits always show a card, in every mode except Bypass and even with an allow
+rule, when a path (requested or resolved, inside or outside the project) is in `.vscode`, `.idea`,
+`.husky`, `.githooks`, `.agents`, `.claude`, `.devcontainer`, `.github/workflows` or
+`.github/actions`, is named `AGENTS.md`, `CLAUDE.md`, `CLAUDE.local.md`, `.gitattributes`,
+`.gitmodules`, `.pre-commit-config.yaml` or `.envrc`, is a shell or Git startup file in your
+home folder (`.bashrc`, `.bash_profile`, `.bash_login`, `.profile`, `.zshrc`, `.zshenv`,
+`.zprofile`, `.zlogin`, `.gitconfig`, `.ssh`, `.config/git`), or is inside this app's own folder.
+These files can make later commands or the app run code. Such a card cannot be remembered.
+Don't ask blocks these edits.
+
+**Mode changes while the agent works.** You can change the mode at any time. A waiting card
+is checked again at once: switching to Accept edits approves a waiting edit, switching to Plan
+blocks waiting edits and commands ("Not run: the user switched this chat to Plan mode while this
+card was waiting.") but approves a waiting command from the read-only list and leaves a subagent
+card waiting, switching to Don't ask blocks waiting cards, and switching to Bypass approves
+waiting cards, including folder access (without adding a folder grant). An action that was
+allowed when it started but waited on a before-tool hook's card is checked again after the hook:
+it gets its own card (and a folder-access card outside the project) when the new mode needs one. Switching to Bypass asks for confirmation for that reason.
+Each new model request uses the current mode, and a running subagent follows the parent's
+change, including its waiting cards. Adding or removing a rule, and turning a tool off, re-check
+waiting cards the same way (a new allow rule approves a matching card; a deny rule blocks it).
+A card resolved by a mode or rule change runs as that mode or rule allows it (without a shell
+where that applies).
+
+**Edit before approving.** On a waiting card you can change the command, the content of
+`write_file`, or the replacement text of a single `edit_file` edit (not multi-edit `edits`,
+notebook, move, delete, MCP or activity-log cards). The app validates the change, checks the
+rules again, refuses it when the file changed since the card was shown, and shows a new
+preview; the card keeps waiting with the same expiry. The agent is told that you edited the
+action ("It ran as: …" for a command) and that its own proposal did not run. **Save edit** stays
+off until the text differs, and changing it back to the agent's own proposal is not an edit. An
+edited Verify card runs the edited command as that Verify run: the Verify notices name it, and a
+failure starts a fix round as usual.
+
+**From a card and the menu.** An approval card's **Always allow…** button opens a form that
+sets where the rule is saved (**This chat**, **This project** or **All projects**; only the
+scopes the server offers) and what it matches: for a command, its exact text or **Commands
+starting with** one of the prefixes the server offers, plus the options allowed after it; for
+edits, all file edits or only files under a folder. **Approve and remember** approves the card
+and saves the rule. A command that cannot be split exactly can be remembered only by its exact
+text, in this chat. An edited card is marked "Edited by you". The **Permissions** menu lists the
+rules by scope, with **Deny** and **Always ask** badges and a remove button each, has **Add a
+rule…** (behavior, scope, a command, file edits or a tool, with options for allow prefixes) and a
+**Never asks** list naming what never needs approval. Adding or removing a chat or project rule
+from a new chat creates the chat first.
+
+**Turned-off tools.** **Agent tools → Tools** turns tools off for one chat. They are not
+offered to the agent and calls to them are refused. Subagents, forks and imports keep the setting.
+
+**Don't ask** never shows a card: actions that the mode or a rule does not allow are refused,
+and the agent is told to continue without them. Folder access outside the project is refused,
+and enabled before-tool hooks block the tools they cover unless a hook
+rule allows the hook. After-tool and failure hooks do not run unless a hook rule allows them;
+their hook card says so, without a notice after every tool. When Verify is blocked this way (or
+by a deny rule or a turned-off `run_command`), one notice says why and Verify does not run again
+in that turn.
+
+**Limitations.** Rules are a convenience, not a sandbox. A deny rule matches the command the
+agent asks to run. It does not see Git aliases, scripts, Makefiles or programs those start, and
+options are compared literally after splitting combined short options (`--force` and `-f` are
+different words), so deny rules should name the program and subcommand. Project rules are keyed
+by folder path, so a worktree or a moved project starts without them.
 
 ## Local access and limits
 
@@ -968,50 +1907,256 @@ The server binds to `127.0.0.1`, checks Host/Origin, and uses a random local acc
 token to protect its API/WebSocket. Databricks credentials stay server-side. File
 tools resolve paths and symlinks before checking the project and approved additional
 folders. Bypass mode skips that folder boundary; credential files and generated
-directories remain excluded. This is a trusted single-user local app, not a multi-user sandbox.
-Commands allowed by the selected mode execute with your OS permissions and can reach beyond the project.
-The shell strips model credentials from its inherited environment.
+directories remain excluded. The app's state folder (settings, rules, extensions and
+conversations; `LOCAL_AGENT_STATE_DIR`, `.local` by default) is excluded from file tools in
+every mode, also after a folder grant or through a symbolic link; a workspace inside it, such
+as a worktree, reaches only its own files. The folder is compared by file identity as well as
+by name, so a case variant, a bind mount or a firmlink of it is refused too. Commands allowed
+by an argv or prefix rule or by the read-only list run without a shell, from the program found
+on the absolute entries of `PATH` (a program named by a path keeps that name, so
+`.venv/bin/python` runs inside its virtual environment); the read-only `pwd` and `ls` run from
+`/bin`, and read-only Git runs a `git` found outside the project, outside folders granted to
+the chat and outside the default code folder, with repository programs (fsmonitor, hooks,
+filters, textconv, external diff, signature checks, also inside submodules) switched off, no fetch of missing objects in a partial
+clone, status, diffs and file lists limited to the workspace, and credential files (`.env.*`
+except `.env.example`) left out of diffs. `git log` and `git show` still name commits that change
+only files outside the workspace. With a Git older than the May 2024 security releases, read-only
+Git does not run automatically in a partial clone. This is a trusted single-user local app, not a
+multi-user sandbox. Commands allowed by the selected mode execute with your OS permissions and
+can reach beyond the project. Commands get an environment without model credentials.
+
+**Default code folder.** **Settings → Default folder for new code** (or
+`LOCAL_AGENT_CODING_DIR`) names where the agent creates new standalone scripts, tools and
+projects when you do not say where; files that belong to the open project stay in it, and
+relative paths still mean the project. Every conversation may use the folder without a Folder
+access card, like the project: Plan stays read-only, Manual asks before each edit, Accept edits
+edits without asking, Don't ask refuses what would need a card, and Bypass is unchanged.
+Commands still run in the project folder. A folder that does not exist yet is created by the
+agent's first approved write there. Folder access lists it as "Default code folder · all
+conversations", and Workspace → Files shows it as a root ("Created on first write" until then).
+Settings refuses the filesystem root, system folders (`/etc`, `/usr`, `/System` and similar),
+your home folder or a folder containing it, hidden folders in your home folder (such as
+`~/.config` or `~/.ssh`), the app's state folder (or a folder containing it), the app's own
+folder, credential and generated folders (`.git`, `.venv`, `node_modules` and similar), a folder
+containing your credential file, a path through a symbolic link loop, and a folder whose parent
+does not exist or cannot be written. A refused value from `.env` is shown in Settings as not used
+and never blocks saving other settings. Files shows the folder as soon as the agent's first write
+(a file tool or a command) creates it, without a reload.
 
 **Settings → Agent steps** defaults to 32 model requests per user message and accepts
 1–64. This is a model-request ceiling, not a tool-call count: one model response can
 request several tools. Reaching the ceiling preserves completed actions and stops
 until the user continues or raises the setting. **Max output tokens** defaults to
-8,192 per request with the bounds described above. The editor and file edits retain
-their 80 KB limit. Agent reads use
-`read_file(path, start_line=1, max_lines=200)` and return numbered lines plus
-`next_line`; `max_lines` can be 1–1,000. Reads scan at most 8 MB from the start of
-a regular UTF-8 file, reject lines over 128 KB, and return at most 8 KB of serialized
-JSON per page. They can therefore inspect larger source files without loading
-those files into the editor. File reads, search results, and job-output pages have
-explicit continuation markers. The filesystem can change between pages.
+the endpoint's profile (16,384 for Opus 5.5, 8,192 otherwise) with the bounds described above. The editor and file edits are
+limited by Settings → File write limit (80 KB by default).
+
+Agent reads use `read_file(path, start_line=1, max_lines)` and return numbered
+lines plus `next_line`; `max_lines` can be 1–2,000. A page holds at most a quarter of
+**Context window** in bytes of serialized JSON, from 8 KB to 32 KB (32 KB with a
+128K-token window); from a 262,144-token budget up, an eighth of it, at most 128 KB
+(32,768 bytes at 262,144 tokens, 128,000 from 1,024,000 up). `max_lines` defaults to
+400, and on those larger pages to the page size / 64 (512 at 32,768 bytes, 2,000 at
+128 KB), so a long file takes fewer steps, and each step resends the whole context. The
+first page of a file of at least 64 KB that does not fit one page, and that
+`outline_file` can outline, also reports `file_bytes` and a `hint` to outline it and read
+the sections needed; the hint is left out when `outline_file` is turned off or denied. `tail_lines` (1–2,000) returns the last lines instead, with their
+absolute line numbers, which suits logs: it reads backwards from the end, works on files
+up to 512 MB, and needs those lines to fit in 8 MB. Forward reads scan at most 8 MB from
+the start of a regular file. Lines longer than 128 KB are refused. Lines end at LF only,
+and one CR before it is dropped, so CRLF files read normally. Bytes that are not valid
+UTF-8 are shown as U+FFFD (�) and the first 20 such lines are listed in
+`invalid_utf8_lines`; files with NUL bytes are refused as binary. Reads can therefore
+inspect larger files without loading them into the editor. File reads, search results,
+and job-output pages have explicit continuation markers. The filesystem can change
+between pages.
 
 The agent's `list_files` returns `entries` in pages of at most 8 KB. Pass the
 returned `next_offset` with the same path, depth, and glob to continue. Discovery
 still stops at 300 matches per query; `listing_limit_reached` indicates that the
 folder or glob should be narrowed to find additional files. The file explorer's
-existing listing API is unchanged.
+existing listing API is unchanged. To find files by name at any depth, the agent uses
+`find_files(pattern)`: `**` matches any number of folders (`src/**/*.test.ts`), a
+pattern without `/` matches file names anywhere (`*.py`), `./*.py` only directly in
+the folder searched, and a pattern with `/` matches the path below that folder or the
+path as the results show it. `{a,b}` gives alternatives, and letter case is ignored. `sort="modified"` lists the newest first, with UTC
+modification times. Pages hold at most 500 paths and 8 KB, with `total` and `next_offset`.
+
+`find_files` and `search_files` see the same files. Inside a Git work tree they use
+`git ls-files --cached --others --exclude-standard`, so files that `.gitignore` excludes
+are skipped unless the call sets `include_ignored=true`; untracked nested repositories
+and submodules are listed in full. Git is used only when the repository's top level is
+inside the workspace or granted folder being searched (in Bypass mode outside every
+folder: anywhere) and is neither your home folder nor `/`, so a dotfiles repository in
+the home folder cannot hide a project's files, also when the workspace is the home
+folder. Outside Git the folder is walked without `.gitignore`. When Git fails, or the
+repository's top level is above the workspace or granted folder (a package folder of a
+larger repository, say), the folder is walked too and the result has a `note` saying
+that `.gitignore` was not applied. Either way the fixed exclusions apply: credential
+names, generated folders, symbolic links to folders and every file below them (also
+when Git still lists such a file), and the configured credential file under any name,
+including hard links to it. Listing
+stops with an error after 10 seconds, 20,000 folders, or 200,000 files.
+
+**Large files and projects.** `outline_file(path, max_level=6, offset=0)` lists the
+structure of one text file of up to 8 MB with line numbers, so the agent reads only the
+sections it needs: Markdown headings with the line where each section ends (front matter
+and fenced code are skipped), Python classes and functions from the parser with their end
+lines (files over 1 MB, files with a carriage return that is not a line ending, and files
+that do not parse use a line scan; a file over 100 KB is parsed in a separate process, so
+the parser does not pause the app, and one that takes over 2.5 seconds uses the line scan), and declarations found by a line scan in
+JavaScript/TypeScript, Go, Rust, Java/Kotlin/C#/Swift/Scala/Dart, C/C++, Ruby, PHP, shell,
+SQL, TOML/INI, YAML and Makefiles (heuristic; it can miss some). Entries read
+`start-end text` (or `start text`); line numbers match `read_file`. It refuses folders,
+notebooks (use `notebook_read`) and binary files, pages its entries (at most 20,000) like
+`read_file` pages, and stops after 3 seconds with an error that suggests `search_files`.
+Outlining is not a read: `write_file` still refuses to replace a file the conversation has
+only outlined. `project_overview(path=".", include_ignored=false)` summarizes a folder from
+file names and sizes, without reading any file: files and bytes by language and by
+top-level folder, key files (README, build and configuration files, CI workflows, up to
+two folders deep) and the largest files, in at most 12,000 bytes (longer lists are cut,
+with the counts left out in `omitted`). It lists the same files as `find_files` (the same
+`.gitignore` handling and exclusions); a folder too large to list (more than 200,000
+files, 20,000 folders or 10 seconds) gives a partial overview of its top level with a note
+instead of an error. Both are read tools: no card, allowed in Plan and Don't ask, and
+external paths need folder access. A deny rule, a turned-off tool or a hook covers them
+through the tool that shows the same content: rules for `read_file` cover `outline_file`, and
+rules for `list_files` or `find_files` cover `project_overview`. With both tools offered,
+the system message asks the model to start an unfamiliar or large project with
+`project_overview`, to outline long files, to read a handoff completely when a full read
+costs at most about a third of its input budget (the message gives that size in bytes of
+`file_bytes`, from **Settings → Context budget**, **Max output tokens** and the model's
+starting token estimate scale, allowing about a quarter more for `read_file`'s line numbers
+and JSON escaping: about 111,000 bytes at the Claude Opus 5.5 default) (otherwise its status,
+next actions and open questions in full, and other sections as needed), and, when it can
+write files, to split a handoff longer than **Settings → File write limit** into numbered
+parts listed at the top of the first.
+
+**Tool output bounds.** Most tools already return at most about 8 KB: `list_files`,
+`find_files`, `search_files`, `notebook_read`, `get_job_output`, a `wait_job` page, the
+first page of `run_command` (start and end), `list_jobs` (7.5 KB), `list_skills`,
+`list_tasks`, MCP results and the diffs of edits and moves. `read_file` pages are 8–32 KB,
+up to 128 KB on large budgets; `delegate_task` returns at most 6 KB; hook output on cards
+and notices 3.8 KB; task descriptions 4,000 characters; skills 8 KB combined; the model's
+own tool arguments 512 KiB and 64 calls per response. Every tool result, for the card and
+the model alike, is also capped at 128 KiB: the longest text values keep their start and
+end around a marker, and the result says `truncated` with `omitted_bytes`.
+
+The results of one model response also share a **context allowance**: what the input
+budget leaves after the latest exchange, with room for the largest summary, the app
+record, a handoff line, the tool definitions and 1,024 tokens for the next step's notices,
+and at most half the input budget. Room for a short notice per tool call of the response is
+kept aside, and every text sent is counted, including notices and refusals. A compaction
+inside that turn can therefore keep every result it was given, as long as the response's
+own tool calls and their notices fit the budget. The allowance uses the estimate scale
+after the response's reported input tokens, as the next request does. A read (`read_file`,
+`outline_file`, `search_files` and the other read tools) that does not fit runs but is not
+sent: the model gets a short `result_deferred` message asking it to request the result
+again in its next response (or a smaller range, when one result alone is larger than the
+allowance), its card says "Result not sent to the agent" (and, for a result larger than
+the whole allowance, that the agent was asked to read a smaller part), and a `read_file`
+or `notebook_read` that was not sent does not count as a read for `write_file`, nor as a
+read that keeps a file's contents in context after a compaction. Results of actions that
+already ran (commands, edits, MCP calls, subagents) are never withheld but shortened:
+short fields such as a command's `job_id`, `state` and `exit_code` are kept, long text
+keeps its start and end (the end of a command's output, where failures appear, which
+`get_job_output` can read in full), and the card says "Result shortened for the agent". A
+result with no long text is sent as it is. `wait_job`, `get_job_output` and `list_jobs`
+results are always sent, because they move the job's read position, and so are your
+`ask_user` answers and `submit_plan` feedback, which are never shortened. The card always
+shows the full result. Forks, exports and imports keep what the model was sent.
+Nothing in the history is shortened later; compaction is the only way history shrinks.
 
 `search_files` supports literal search by default, `regex=true`, `case_sensitive`,
 `context_lines` (0–5), `offset` (0–10,000), and `max_results` (1–100, default 50).
-Results identify file/line, adjacent lines, clipped excerpts, omitted files, and
-`next_offset`. Query length is capped at 1,000 characters. Search skips binary,
-excluded, unreadable, and over-2-MB files; scan limits are 16 MB of file content,
-5,000 files, 2,000 directories, and three seconds. Regex matches have an additional
-50 ms timeout. Limit errors ask for a narrower query rather than claiming no matches.
-The Python `regex==2026.9.10` dependency enforces regex timeouts and is installed
-by the normal backend installation command.
+Case-insensitive literal search uses Unicode simple case folding, one character for
+one: `K` also finds the Kelvin sign, but `STRASSE` does not find `Straße`. Regular
+expressions use full case folding and find it. `output_mode` chooses the result:
+`content` (the default) returns file/line, adjacent lines, and clipped excerpts;
+`files_with_matches` lists the matching files; `count` gives matching lines per file
+and `total_matches`. `offset` counts matches in `content` mode and files in the other
+modes, and every result has `next_offset`. Query length is capped at 1,000 characters.
+Binary (NUL) and non-UTF-8 files are not searched; a folder search skips files over 2 MB,
+and `skipped_files` counts them and files that could not be read. One file given as `path`
+is searched up to 8 MB, as far as `read_file` and `outline_file` reach; a larger one gets an
+error pointing to `read_file` with `tail_lines` or `grep -n`. Before reading, a search refuses more than
+20,000 files, or more than 64 MB in files of up to 2 MB, after `glob` filtering.
+Reading and matching then have 10 seconds, and each regex match 50 ms. A regular
+expression (also `wait_job`'s `until_regex`) whose counted repeats such as `{1000}` add
+up to more than 100,000 repeated items, nested counts multiplied, is refused before it
+compiles, because compiling it alone could take seconds and gigabytes. Limit errors
+ask for a narrower query rather than claiming no matches. The Python `regex==2026.9.10`
+dependency enforces regex timeouts and is installed by the normal backend installation command.
+
+ripgrep (`rg`) is optional. When it is installed, literal searches of a folder use it
+to find candidate files faster, and the results are the same without it: Python reads
+every candidate and produces every match, count, and `skipped_files`, and it always
+reads symbolic links, which rg skips. rg runs without a shell, configuration, or ignore
+files, and never with `-i`: a case-insensitive query becomes character classes built
+from Python's own case folding. Regular expressions, case-insensitive queries with
+non-ASCII letters, and single-file searches do not use rg. When rg fails, for example
+in a folder with an unreadable file, takes more than 5 seconds, or prints too much,
+the search reads every file itself: slower, with the same results.
 
 `run_command` accepts `timeout_seconds`, `max_output_bytes`, and `background`.
-It returns a job ID and the first output page. `list_jobs`, `get_job_output`, and
-`stop_job` inspect, paginate, and stop jobs in the same conversation. The job's
+It returns a job ID and the first output page. When a command failed, timed out, or
+was stopped and its output does not fit one page, the first result shows up to 1,500
+characters of the start and up to 4,500 of the end of the retained output instead
+(`excerpt: "head_and_tail"`), with the omitted range and the `get_job_output` offset
+where it begins; when the command printed more than `max_output_bytes`, the excerpt
+ends with a line saying that the rest was not kept. Successful commands keep their
+first page. `list_jobs`, `get_job_output`, `wait_job`, and
+`stop_job` inspect, paginate, wait for, and stop jobs in the same conversation.
+`wait_job` waits up to 300 seconds (default 60) until the job ends or a new output line
+matches `until_regex`, and returns the new output and `next_offset` to wait again.
+Without `from_offset` it scans from the end of the last result the conversation got
+for that job, so a line printed in between still counts. Stop ends the wait, not the
+job. The job's
 exit code and state distinguish success, failure, timeout, and cancellation.
 Only the configured prefix of output is retained; excess output is drained and
 reported as truncated. Foreground cancellation, timeouts, command completion,
-and normal app shutdown clean up the command's process group. Use managed
+and normal app shutdown clean up the command's process group. A timeout, Stop, or
+shutdown sends SIGTERM to the group first, so commands can clean up, and SIGKILL
+2 seconds later. Use managed
 background mode instead of shell `&`, detached daemons, or commands that escape
 the process group. This is process supervision, not an OS sandbox. After an
 abnormal server death, previously running jobs are marked **interrupted** and
 never replayed; their outcome and surviving processes must be checked manually.
+
+Commands get `PATH`, `HOME`, `LANG`, `LC_ALL`, `TMPDIR`, `SHELL`, `USER`, `LOGNAME`, and
+`VIRTUAL_ENV` from the server's environment, plus the variables named in
+**Settings → Environment variables for commands**, with values from the server's
+environment when each job starts. These are never passed: the model credential
+variables (`DBRICKS_TOKEN`, `DATABRICKS_TOKEN`, `DBRICKS_URL`, `DATABRICKS_HOST`,
+`LOCAL_AGENT_ENV_FILE`), loader variables (`LD_*`, `DYLD_*`), shell and interpreter
+startup variables (`BASH_ENV`, `ENV`, `ZDOTDIR`, `PROMPT_COMMAND`, `SHELLOPTS`,
+`BASHOPTS`, `IFS`, `PYTHONSTARTUP`, `PERL5OPT`, `RUBYOPT`, `NODE_OPTIONS`), and any
+value that contains the Databricks token. Hooks do not get these variables.
+
+**Python environment.** With **Settings → Python virtual environment** (or
+`LOCAL_AGENT_PYTHON_VENV`) set, these commands use it: the agent's `run_command`
+(through the shell and the argv rules), Verify, hooks, the Terminal panel, `/api/command` and
+`!` commands. Stdio MCP servers keep the app server's environment; to run one from the
+environment, give `<venv>/bin/python` (or the server's program in `<venv>/bin`) as its command. `VIRTUAL_ENV` is set to it, its `bin/` comes first on `PATH`, the previous
+`VIRTUAL_ENV`'s `bin/` and the app server's own interpreter folders are removed from `PATH`
+(`run.py` puts the app's `.venv/bin` first, which would otherwise shadow your tools), and
+`PYTHONHOME` is removed. An allow rule for `pytest` then runs `<venv>/bin/pytest`. The read-only
+commands Auto runs without a card (`pwd`, `ls`, read-only Git) never use it. Hooks get the
+environment but still not the variables named in Settings. Agent file edits inside the
+environment (a write, edit, move or delete under it) always ask, also in Accept edits and Auto,
+because a program placed there would run through an allow rule; Don't ask refuses them and Bypass
+allows them. The environment is checked whenever it is used, and it is not used when it is
+missing, has no executable `bin/python`, has neither `pyvenv.cfg` nor `conda-meta/`, is the
+app's state folder (or contains it), is inside the app's own folder, or is the environment the
+app server runs in. The app reads the Python version from `pyvenv.cfg` and never runs that
+`python`. The system message tells the agent which environment commands use, or, without one,
+that `python` may be the app server's own environment and it should ask before installing
+packages.
+
+When a background job that the agent started completes, fails, or times out, its
+conversation gets a notice, also when the chat is idle, and the agent's next model
+request names the job once, unless a `wait_job` or `get_job_output` result already
+showed that it ended. Nothing wakes an idle chat. Jobs started from the
+Terminal panel, and stopped or cancelled jobs, get no notice.
 Automatic compaction adds bounded summary requests beyond the configured agent steps.
 Databricks inference is billed to your workspace. Endpoints must support streaming,
 function calling, and non-streamed text responses for summarization.
@@ -1097,6 +2242,17 @@ files (with command jobs, and a file holding another conversation's ID), droppin
 WebSocket that stalls, "Allow for this chat" rules (exact matching, Plan still denying,
 exclusions and folder cards kept, persistence, removal, subagent inheritance, none in forks
 or imports), decline notes reaching the model, and 409 details that name the blocking chat.
+Permission-rule tests cover the rule matcher (exact and prefix allow rules with listed options,
+broad deny and ask rules, short-option clusters, wrappers, inline interpreters and options that
+run other programs never allowed, uncertain commands), project and all-project rules in
+`permission_rules.json` (an unreadable file ignored until reset), the fixed decision order in
+every mode including Don't ask and deny or ask rules in Bypass, protected files, the read-only
+command list, commands allowed by a rule running from an argument vector without a shell,
+read-only Git that runs no repository-configured program, the state folder kept out of the file
+tools, mode and rule changes re-checking waiting cards and reaching a running subagent, edit
+before approving (including a Verify card), turned-off tools, Verify following the mode and
+rules, and `ask_user` and `submit_plan` (answers, skips, expiry, Keep planning, an approved plan
+switching the mode, a mode change superseding the review, export and the Markdown transcript).
 None of these automated
 tests calls a paid model.
 Frontend tests verify that expired local tokens refresh once and that other
@@ -1119,6 +2275,13 @@ checklist follows pushed tasks per conversation, that drafts survive a reload, a
 first, are removed when sent and keep text typed during the send, that code blocks are
 highlighted only when a reply is complete and copy their exact text, and that the Markdown
 transcript downloads and copies.
+Permission-rule UI tests check the **Always allow…** form (only the scopes and prefixes the
+server offers), that cards offering nothing to remember have no chat button, Edit on a card
+(Save edit waits for a change), the Bypass confirmation, Don't ask, mode changes while the chat
+is busy, rules by scope in the Permissions menu with removal, reset and keyboard focus, the
+**Never asks** list, the add-rule dialog and turned-off tools in **Agent tools → Tools**.
+Question and plan tests check the `ask_user` card (options, multi-select, Other, skip, expiry)
+and the `submit_plan` card (approve with a mode, Keep planning with feedback, superseded).
 UI tests also cover a turn that fails during an automatic compaction (notifies) and a manual
 compaction (does not), a turn cut off by a server restart, closing answered notifications,
 read state shared between tabs, and the page's presence connection.
@@ -1143,14 +2306,24 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `backend/local_agent/agents.py`: session/approval events and the Databricks tool loop.
 - `backend/local_agent/tools.py`: scoped file queries/edits and tool definitions.
 - `backend/local_agent/jobs.py`: streamed processes, managed jobs, and cleanup.
-- `backend/local_agent/permissions.py`: shared mode rules and model instructions.
-- `backend/local_agent/approvals.py`: "Allow for this chat" rules, decline-note wording, and 409 details naming a busy chat.
+- `backend/local_agent/command_exec.py`: commands run from an argument vector without a shell (read-only `pwd` and `ls` from `/bin`, hardened Git).
+- `backend/local_agent/rules.py`: the rule engine (command parsing, rule matching, uncertain commands), protected paths, the read-only command list and the saved `permission_rules.json`.
+- `backend/local_agent/permissions.py`: the permission modes, the one decision every tool call and waiting card goes through (turned-off tools, rules, protected files, Don't ask), and model instructions.
+- `backend/local_agent/approvals.py`: rules from cards and the Permissions menu (chat, project and all-project routes, reset), edit before approving, turned-off tools and the tool list, decline-note wording, and 409 details naming a busy chat.
+- `backend/local_agent/interactions.py`: `ask_user` questions and `submit_plan` reviews that wait for the user inside a turn.
 - `backend/local_agent/store.py`: per-conversation JSONL storage, unreadable-file reports, and legacy migration.
 - `backend/local_agent/drafts.py`: bounded periodic streamed-reply checkpoints.
 - `backend/local_agent/portability.py` / `portability_api.py`: validated conversation copies.
 - `backend/local_agent/tool_profiles.py` / `tool_schema.py`: tool ceilings and offline input validation.
 - `backend/local_agent/config.py`: external credentials and portable configuration.
+- `backend/local_agent/model_profiles.py`: per-endpoint limits, default budgets and Settings limit warnings.
+- `backend/local_agent/user_paths.py`: checks for the default code folder and the Python environment, and the environment commands run with.
 - `backend/local_agent/context.py`: request estimates and bounded history compaction.
+- `backend/local_agent/request_limits.py`: the request body as sent, the 4 MB request limit and request timeouts.
+- `backend/local_agent/rate_limits.py`: Databricks 429 details, the learned OTPM limit and the wait shared by chats.
+- `backend/local_agent/outline.py` / `overview.py`: `outline_file` and `project_overview`
+  (`outline_ast.py`: the Python definitions, also run as a child process for large files).
+- `backend/local_agent/result_budget.py`: the 128 KiB tool-result cap and the per-response context allowance.
 - `backend/local_agent/activity.py`: app-generated activity log for handoffs (`insert_activity_log`).
 - `backend/local_agent/transcript.py` / `scripts/conversation_transcript.py`: Markdown transcripts of saved conversations (also `GET /api/sessions/<id>/transcript.md`).
 - `backend/local_agent/redaction.py`: common secret shapes replaced in logs, handoffs and transcripts.
@@ -1162,6 +2335,7 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `backend/local_agent/git_tools.py`: Git without a shell or repository-configured programs (worktrees, `/api/git`).
 - `backend/local_agent/notify.py`: optional desktop notifications (status and title only) when no page is open.
 - `backend/local_agent/changes.py`: the agent's file changes per conversation, their diffs, Keep and Undo.
+- `backend/local_agent/shell_changes.py`: the files a foreground `run_command` changed, from Git status before and after it.
 - `backend/local_agent/extensions.py` / `mcp_client.py`: skills, hooks, MCP lifecycle.
 - `backend/local_agent/planning.py` / `feature_tools.py`: tasks and delegated workers.
 - `backend/local_agent/feature_api.py`: scoped feature endpoints.

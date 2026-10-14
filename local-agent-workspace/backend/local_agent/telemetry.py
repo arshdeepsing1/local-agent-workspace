@@ -11,11 +11,19 @@ USAGE_FIELDS = (
     "cache_creation_input_tokens", "reasoning_tokens",
 )
 PRICING_SOURCE = "https://www.databricks.com/product/pricing/proprietary-foundation-model-serving"
-PRICING_EFFECTIVE_AT = "2026-09-22"
+PRICING_EFFECTIVE_AT = "2026-10-13"
 # Versioned snapshot of the Databricks pay-per-token list rates. These are
 # estimates, not invoice records; account discounts and billing adjustments are
-# intentionally outside this local calculation.
+# intentionally outside this local calculation. Regional processing adds a 10%
+# uplift that is not included. Cache writes use the 5-minute rate: the usage does
+# not tell 1-hour writes (114.286 DBU per million for Opus 5.5) apart.
 MODEL_DBU_PER_MILLION = {
+    "databricks-claude-opus-5-5": {
+        "input_tokens": 57.143,
+        "output_tokens": 285.714,
+        "cache_read_input_tokens": 2.857,
+        "cache_creation_input_tokens": 71.429,
+    },
     "databricks-claude-opus-4-8": {
         "input_tokens": 71.429,
         "output_tokens": 357.143,
@@ -23,7 +31,7 @@ MODEL_DBU_PER_MILLION = {
         "cache_creation_input_tokens": 89.286,
     },
 }
-PURPOSE_LABELS = {"agent": "Agent", "compaction": "Compaction", "title": "Title"}
+PURPOSE_LABELS = {"agent": "Agent", "compaction": "Compaction", "title": "Title", "side_question": "Side question"}
 # Databricks AI Gateway stores these tags in system.ai_gateway.usage.request_tags,
 # so each ledger record can be joined to the provider's usage rows exactly.
 REQUEST_TAGS_HEADER = "Databricks-Ai-Gateway-Request-Tags"
@@ -84,19 +92,29 @@ def reported_usage(value):
         "cache_creation_input_tokens": ("cache_creation_input_tokens",),
         "reasoning_tokens": ("reasoning_tokens",),
     }
-    usage = {}
+    usage, sources = {}, {}
     for name, keys in aliases.items():
         for key in keys:
             count = value.get(key)
             if type(count) is int and count >= 0:
-                usage[name] = count
+                usage[name], sources[name] = count, key
                 break
     for field, key, name in (("prompt_tokens_details", "cached_tokens", "cache_read_input_tokens"),
                              ("completion_tokens_details", "reasoning_tokens", "reasoning_tokens")):
         details = value.get(field)
         count = details.get(key) if isinstance(details, dict) else None
         if name not in usage and type(count) is int and count >= 0:
-            usage[name] = count
+            usage[name], sources[name] = count, field
+    # OpenAI-style usage counts cached tokens inside prompt_tokens (prompt_tokens_details.
+    # cached_tokens), while Claude-style usage reports uncached input, cache reads and
+    # cache writes as separate buckets. input_tokens is kept as the uncached part, so
+    # the cache is not counted twice by totals, DBU estimates and the estimate scale.
+    # Top-level cache fields stay separate buckets. How Claude endpoints on Databricks
+    # fill these fields still needs one live check. Ledger records saved before this
+    # change keep their counts (they hold input_tokens only and cannot be re-split).
+    if (sources.get("input_tokens") == "prompt_tokens" and sources.get("cache_read_input_tokens") == "prompt_tokens_details"
+            and usage["cache_read_input_tokens"] <= usage["input_tokens"]):
+        usage["input_tokens"] -= usage["cache_read_input_tokens"]
     return usage
 
 
@@ -105,11 +123,13 @@ def _now():
 
 
 def begin_inference_call(session, purpose, model, *, event_id=None, max_output_tokens=None, attempt=None,
-                         estimated_input_tokens=None):
+                         estimated_input_tokens=None, retry_reason=None):
     """Append one provider attempt to the durable per-session inference ledger.
 
     estimated_input_tokens is the app's unscaled heuristic estimate of the
     request; comparing it with provider-reported usage calibrates later budgets.
+    retry_reason names why the app sent this request automatically (a retry of a
+    failed attempt, an automatic continuation or a Verify fix round).
     """
     call = {"id": str(uuid.uuid4()), "purpose": purpose, "model": model,
             "created": _now(), "status": "running"}
@@ -121,6 +141,8 @@ def begin_inference_call(session, purpose, model, *, event_id=None, max_output_t
         call["attempt"] = attempt
     if type(estimated_input_tokens) is int and estimated_input_tokens >= 0:
         call["estimated_input_tokens"] = estimated_input_tokens
+    if isinstance(retry_reason, str):
+        call["retry_reason"] = retry_reason
     session["inference_ledger_version"] = LEDGER_VERSION
     session.setdefault("inference_calls", []).append(call)
     return call
@@ -150,6 +172,10 @@ def finish_inference_call(call, info):
     usage = reported_usage(info.get("usage"))
     if usage:
         call["usage"] = usage
+    rate_limit = info.get("rate_limit")
+    limit_type = rate_limit.get("limit_type") if isinstance(rate_limit, dict) else None
+    if isinstance(limit_type, str) and 0 < len(limit_type) <= 64:
+        call["limit_type"] = limit_type  # Which Databricks rate limit a 429 named (rate_limits.parse_rate_limit).
     call["finished"] = _now()
     return call
 
@@ -198,7 +224,7 @@ def _public_call(call, *, fallback=False):
     for key in ("http_status", "attempt", "max_output_tokens"):
         if type(call.get(key)) is int:
             result[key] = call[key]
-    for key in ("error_kind", "finish_reason"):
+    for key in ("error_kind", "finish_reason", "retry_reason", "limit_type"):
         if isinstance(call.get(key), str):
             result[key] = call[key]
     usage = reported_usage(call.get("usage"))
@@ -217,7 +243,7 @@ def _public_call(call, *, fallback=False):
 
 
 def _totals(calls):
-    totals = {"calls": len(calls), "successful": 0, "errors": 0, "rate_limited": 0,
+    totals = {"calls": len(calls), "successful": 0, "errors": 0, "rate_limited": 0, "retries": 0,
               **{field: 0 for field in USAGE_FIELDS}}
     estimates = []
     usage_complete = True
@@ -225,6 +251,7 @@ def _totals(calls):
         totals["successful"] += call["status"] == "completed"
         totals["errors"] += call["status"] == "error"
         totals["rate_limited"] += call.get("http_status") == 429 or call.get("error_kind") == "rate_limit"
+        totals["retries"] += isinstance(call.get("retry_reason"), str)
         rejected = _explicit_rejection(call)
         usage = {} if rejected else call.get("usage", {})
         if not rejected and not ("input_tokens" in usage and "output_tokens" in usage):
@@ -278,10 +305,14 @@ def session_metrics(session):
         group = [call for call in calls if call["model"] == model]
         by_model.append({"key": model, "model": model, **_totals(group)})
 
+    info = session.get("context_info")
+    last_input = info.get("last_request") if isinstance(info, dict) else None
     return {
         "scope": "session",
         "session_id": session.get("id"),
         "complete": complete,
+        # What Databricks reported for the latest agent request, next to the app's estimate.
+        "last_input": last_input if isinstance(last_input, dict) else None,
         "totals": _totals(calls),
         "calls": calls,
         "by_purpose": by_purpose,

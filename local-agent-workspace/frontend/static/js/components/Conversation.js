@@ -1,9 +1,16 @@
-import { html, useEffect, useMemo, useRef, useState } from '../lib.js'
-import { Check, ChevronDown, ChevronRight, Copy, FileText, LoaderCircle, Terminal, X } from '../icons.js'
+import { html, useEffect, useLayoutEffect, useMemo, useRef, useState } from '../lib.js'
+import { Check, ChevronDown, ChevronRight, CircleAlert, Copy, FileText, GitBranch, LoaderCircle, Pencil, RefreshCw, Terminal, Undo2, X } from '../icons.js'
 import { api } from '../api.js'
-import { enhanceCodeBlocks, renderMarkdown } from '../markdown.js'
+import { enhanceCodeBlocks, linkPaths, renderMarkdown } from '../markdown.js'
+import QuestionCard from './QuestionCard.js'
+import PlanCard from './PlanCard.js'
 import { Brand } from './Sidebar.js'
 import RequestDetails from './RequestDetails.js'
+import ApprovalOptions, { ruleLine } from './ApprovalOptions.js'
+import EditMessage from './EditMessage.js'
+import RewindDialog from './RewindDialog.js'
+import ForkDialog from './ForkDialog.js'
+import { backupTitle, setRewindNotice } from '../rewindNotice.js'
 
 // A long file is read in pages. Naming the lines each read covered keeps the
 // pages of one file from looking like the same read repeated.
@@ -27,6 +34,13 @@ function summarizeTools(events) {
     const input = event.input || {}
     let subject = String(input.path || input.file_path || input.command || input.query || input.task || input.title || '')
     if (event.name === 'read_file') subject += readRange(event)
+    if (event.name === 'find_files') subject = `${input.pattern ?? ''}` + (input.path && input.path !== '.' ? ` in ${input.path}` : '')
+    if (event.name === 'wait_job') subject = String(input.job_id ?? '').slice(0, 8) + (input.until_regex ? ` until /${input.until_regex}/` : '')
+    if (event.name === 'outline_file') {
+      subject += (Number.isInteger(input.max_level) && input.max_level < 6 ? ` · to level ${input.max_level}` : '')
+        + (Number.isInteger(input.offset) && input.offset > 0 ? ` · from entry ${input.offset}` : '')
+    }
+    if (event.name === 'project_overview') subject = input.path && input.path !== '.' ? String(input.path) : 'workspace'
     let taskStatus
     if (event.name === 'create_task' || event.name === 'update_task') {
       let task = {}
@@ -46,29 +60,246 @@ function summarizeTools(events) {
   return summaries
 }
 
-function ToolDetails({ event, pending }) {
+// Results the UI can read: a command or job page ({ job_id, state, exit_code, output, … }, after the edited-command
+// note when there is one) and an MCP result ({ output, is_error, truncated }).
+const JOB_TOOLS = new Set(['run_command', 'user_command', 'wait_job', 'get_job_output', 'stop_job'])
+
+// Which part of the output a job page holds, or null when it holds all of it.
+function shownPart(page) {
+  if (page.excerpt) return 'start and end shown; the agent can read the omitted middle with get_job_output'
+  if ('output_start' in page) {  // wait_job: the end of the output
+    // Characters are counted from 1, as in the get_job_output range below.
+    return Number(page.output_start) > 0 ? `latest output shown, from character ${(Number(page.output_start) + 1).toLocaleString()}` : null
+  }
+  const offset = Number(page.offset ?? 0)
+  // The backend's own counts (code points): JS string lengths count UTF-16 units.
+  const end = Number(page.next_offset ?? page.total_chars ?? offset + page.output.length)
+  if (offset === 0 && page.next_offset != null && page.next_offset < page.total_chars) return 'first part shown; the agent can read the rest with get_job_output'
+  if (offset > 0 && end <= offset) return `no output after character ${offset.toLocaleString()}`
+  if (offset > 0) return `characters ${(offset + 1).toLocaleString()}–${end.toLocaleString()} shown`
+  return null
+}
+
+// { note, text, raw, mcpError, job: { state, exitCode, background, total, truncated, shown } | null } for a finished
+// command, job or MCP card whose output parses; null otherwise (older events, plain-text errors). raw is the whole
+// result the agent received (the edited-command note and the page).
+export function resultOf(event) {
+  const name = event.name || ''
+  if (!(JOB_TOOLS.has(name) || name.startsWith('mcp__')) || event.state === 'running') return null
+  const text = String(event.output || '')
+  let note = null
+  let json = text
+  if (text.startsWith('[')) {
+    // The note quotes the edited command, which can contain '\n{'; the page is indented JSON whose only
+    // line starting with '{' is its first, so the last '\n{' starts the page.
+    const at = text.lastIndexOf('\n{')
+    if (at < 0) return null
+    note = text.slice(0, at)
+    json = text.slice(at + 1)
+  }
+  let page
+  try { page = JSON.parse(json) } catch { return null }
+  if (!page || typeof page !== 'object' || Array.isArray(page) || typeof page.output !== 'string') return null
+  return { note, text: page.output, raw: text, mcpError: page.is_error === true,
+    job: 'state' in page ? { state: String(page.state), exitCode: page.exit_code, background: !!page.background,
+      total: page.total_chars, truncated: page.truncated === true, shown: shownPart(page),
+      // wait_job: why the wait ended ('matched', 'timeout' or 'exited') and the line that matched.
+      wait: typeof page.reason === 'string' ? page.reason : null, match: typeof page.match?.line === 'string' ? page.match.line : null } : null }
+}
+
+const KIND_LABEL = { timeout: 'timed out', not_found: 'not found', edit_mismatch: 'no match', stale_file: 'file changed',
+  excluded: 'excluded', limit: 'too large', command_refused: 'refused', access_required: 'needs access',
+  invalid_arguments: 'invalid arguments', wrong_type: 'wrong type', permission_denied: 'permission denied',
+  guidance_changed: 'instructions changed', unavailable_tool: 'unavailable', encoding: 'encoding' }
+
+// What a failed tool told the agent ({ kind, label, hint }), from its model_output; null when unknown.
+function toolError(event) {
+  if (event.state !== 'error' || typeof event.model_output !== 'string') return null
+  let parsed
+  try { parsed = JSON.parse(event.model_output) } catch { return null }
+  const kind = parsed?.error_kind
+  if (typeof kind !== 'string' || !kind) return null
+  return { kind, label: KIND_LABEL[kind] || kind.replace(/_/g, ' '), hint: typeof parsed.hint === 'string' ? parsed.hint : null }
+}
+
+// A negative exit code is the signal that ended the process (-15: SIGTERM).
+const exitLabel = code => !Number.isInteger(code) ? 'failed' : code < 0 ? `signal ${-code}` : `exit ${code}`
+// The heading label of a command's own job (run_command, user_command): [tone, label, labelTone].
+function commandJob(job) {
+  if (!job) return null
+  if (job.state === 'failed') return ['warn', exitLabel(job.exitCode), 'warn']
+  if (job.state === 'timed_out') return ['warn', 'timed out', 'warn']
+  if (job.state === 'interrupted') return ['warn', 'interrupted', 'warn']
+  if (job.state === 'cancelled') return ['neutral', 'stopped', 'neutral']
+  if (job.state === 'running' && job.background) return ['neutral', 'started in background', 'neutral']
+  return null
+}
+// The label of the job a wait_job, get_job_output or stop_job card reports on.
+const OTHER_JOB = { timed_out: 'job timed out', running: 'job running', cancelled: 'job stopped', interrupted: 'job interrupted' }
+
+// The card's status: tone (the icon: 'running', 'ok', 'warn', 'neutral' or null), label and labelTone (its colour:
+// 'warn' or 'neutral', set with every label). A job tool can work (ok) while its job failed (a neutral label).
+export function toolStatus(event, result) {
+  const none = { tone: null, label: '', labelTone: null }
+  if (event.state === 'running') return { tone: 'running', label: '', labelTone: null }
+  const isCommand = event.name === 'run_command' || event.name === 'user_command'
+  const own = isCommand ? commandJob(result?.job) : null
+  if (event.state === 'error') {
+    const label = own?.[1] || (result?.mcpError ? 'tool error' : toolError(event)?.label || 'failed')
+    return { tone: 'warn', label, labelTone: 'warn' }
+  }
+  if (event.state !== 'completed') return none
+  if (own) return { tone: own[0], label: own[1], labelTone: own[2] }
+  const job = result?.job
+  if (job && !isCommand && JOB_TOOLS.has(event.name)) {
+    // A wait reports its outcome first: its line matched, or it timed out (no tick: what it waited for did not come).
+    if (job.wait === 'matched') return { tone: 'ok', label: 'matched', labelTone: 'neutral' }
+    if (job.wait === 'timeout') return { tone: 'neutral', label: 'wait timed out', labelTone: 'neutral' }
+    const label = job.state === 'failed' ? `job ${exitLabel(job.exitCode)}` : OTHER_JOB[job.state] || (job.wait === 'exited' ? 'job ended' : '')
+    return { tone: 'ok', label, labelTone: label ? 'neutral' : null }
+  }
+  return { tone: 'ok', label: '', labelTone: null }
+}
+
+// The Action word: a command that ran and then failed says 'ran', not 'completed' beside its failed state.
+const actionText = (event, status) => event.state === 'completed' && status?.tone === 'warn' ? 'ran' : event.state
+
+// Parsed results, statuses and errors are cached per event object: an updated event is a new object.
+const statusCache = new WeakMap()
+function toolState(event) {
+  let state = statusCache.get(event)
+  if (!state) {
+    const result = resultOf(event)
+    state = { result, status: toolStatus(event, result), failure: toolError(event) }
+    statusCache.set(event, state)
+  }
+  return state
+}
+
+// The State line of an expanded command or job card.
+const KILLED = new Set(['timed_out', 'cancelled', 'interrupted'])  // the app ended the process: its code says nothing more
+const WAIT_LINE = { matched: 'wait matched', timeout: 'wait timed out', exited: 'job ended during the wait' }
+function jobStateLine(job) {
+  const wait = WAIT_LINE[job.wait] ? WAIT_LINE[job.wait] + (job.wait === 'matched' && job.match ? `: ${clip(job.match, 80)}` : '') : ''
+  return [`State: ${job.state.replace(/_/g, ' ')}`, wait, Number.isInteger(job.exitCode) && !KILLED.has(job.state) ? exitLabel(job.exitCode) : '',
+    typeof job.total === 'number' ? `${job.total.toLocaleString()} characters` : '',
+    job.truncated && typeof job.total === 'number' ? `output after ${job.total.toLocaleString()} characters not kept` : '',
+    job.shown || ''].filter(Boolean).join(' · ')
+}
+
+// failure: what a failed tool told the agent (toolError), or null.
+function ToolDetails({ event, pending, result = null, failure = null }) {
   const { command, ...options } = event.input || {}
   const hasCommand = typeof command === 'string'
+  const job = result?.job
   return html`
     <p class="tool-detail-label">${hasCommand ? 'Command' : 'Input'}</p>
     <pre aria-label=${hasCommand ? 'Command' : 'Input'}>${hasCommand ? (pending && event.preview ? event.preview : command) : JSON.stringify(event.input || {}, null, 2)}</pre>
     ${hasCommand && Object.keys(options).length && !(pending && event.preview) ? html`<p class="tool-detail-label">Options</p><pre aria-label="Options">${JSON.stringify(options, null, 2)}</pre>` : null}
     ${pending && !hasCommand && event.preview ? html`<p class="tool-detail-label">Approval preview</p><pre aria-label="Approval preview">${event.preview}</pre>` : null}
-    ${!pending || event.output ? html`<p class="tool-detail-label">Output</p><pre aria-label="Output">${event.output || (event.state === 'running' ? 'Waiting for output…' : 'No output.')}</pre>` : null}`
+    ${result ? html`${result.note && !event.edited ? html`<p class="tool-rule">${result.note}</p>` : null}
+        <p class="tool-detail-label">Output</p><pre aria-label="Output">${result.text || 'No output.'}</pre>
+        ${job ? html`<p class="muted tool-job-state">${jobStateLine(job)}</p>` : null}
+        <details class="tool-raw"><summary>Raw result</summary><pre aria-label="Raw result">${result.raw}</pre></details>`
+      : !pending || event.output ? html`<p class="tool-detail-label">Output</p><pre aria-label="Output">${event.output || (event.state === 'running' ? 'Waiting for output…' : 'No output.')}</pre>` : null}
+    ${failure ? html`<p class="tool-detail-label">Error category</p><p>${failure.label}</p>
+      ${failure.hint ? html`<p>Hint given to the agent: ${failure.hint}</p>` : null}` : null}`
 }
 
-const clip = text => {
+const clip = (text, limit = 240) => {
   const flat = String(text || '').trim().replace(/\s+/g, ' ')
-  return flat.slice(0, 240) + (flat.length > 240 ? '…' : '')
+  return flat.slice(0, limit) + (flat.length > limit ? '…' : '')
 }
+
+// The collapsed line of a failed command or tool whose result parses: "Exit 1 · <last output line>".
+const JOB_OUTCOME = { failed: job => (label => label[0].toUpperCase() + label.slice(1))(exitLabel(job.exitCode)),
+  timed_out: () => 'Timed out', interrupted: () => 'Interrupted', cancelled: () => 'Stopped' }
+// The note first_page adds when output past max_output_bytes was not kept (agents.py): it is addressed to the agent.
+const NOT_KEPT = '[… output after this point was not kept'
+function failureOutcome(event, result, status) {
+  const job = result.job
+  const lines = result.text.split('\n').map(line => line.trim()).filter(line => line && !line.startsWith(NOT_KEPT))
+  // When the end of the output was not kept, the last kept line is not the command's last line.
+  const lastLine = job?.truncated && typeof job.total === 'number'
+    ? `output after ${job.total.toLocaleString()} characters was not kept` : lines.at(-1) || ''
+  if (job && JOB_OUTCOME[job.state] && (status.tone === 'warn' || event.state === 'error')) {
+    return clip([JOB_OUTCOME[job.state](job), lastLine].filter(Boolean).join(' · '))
+  }
+  return event.state === 'error' ? clip(result.text) || 'Tool returned an error' : null
+}
+
+// A Databricks error in plain words: { summary, details } (details: the full text, or null when it is the summary).
+const LEADS = {
+  authentication: () => 'Databricks did not accept your credentials (HTTP 401). Check the token in your credential file.',
+  permission: () => 'Databricks denied access to this model (HTTP 403).',
+  rate_limit: () => 'Databricks rate limited this request.',
+  server: event => `Databricks had a server problem (HTTP ${event.http_status ?? 500}). Try again in a moment.`,
+  invalid_request: event => `Databricks rejected the request (HTTP ${event.http_status ?? 400}).`,
+  network: () => 'Could not reach Databricks. Check your network or VPN connection.',
+}
+// The advice agents.py (itpm_advice) appends to a final input-tokens-per-minute 429, also after a body that is not JSON.
+const RATE_ADVICE = / (Each agent step resends the whole conversation|For about five steps a minute)/
+// The provider's message ends a sentence before the app's own text that follows it.
+const sentence = value => /[.!?…]$/.test(value) ? value : `${value}.`
+export function errorSummary(event) {
+  const text = String(event.text || '')
+  const kind = event.error_kind
+  const http = text.startsWith('Databricks returned HTTP')
+  // The provider's own message from a JSON error body, for HTTP errors and errors without a kind
+  // (compaction failures); other kinds are the app's own sentences and pass through.
+  let message = null
+  let cleaned = null
+  let after = ''  // the app's own text after the body (a rate-limit error's advice, a compaction note)
+  if (http || !kind || LEADS[kind]) {
+    const source = text.replace(' [Error response truncated.]', '')
+    const start = source.indexOf('{')
+    const end = source.lastIndexOf('}')
+    if (start >= 0 && end > start) {
+      let body = null
+      try { body = JSON.parse(source.slice(start, end + 1)) } catch { /* Not JSON, or cut off. */ }
+      message = [body?.message, body?.error?.message, body?.error, body?.detail].find(value => typeof value === 'string' && value.trim()) ?? null
+      if (message) {
+        after = source.slice(end + 1).trim()
+        cleaned = `${source.slice(0, start).trim().replace(/:\s*$/, '.')} ${after ? `${sentence(clip(message, 300))} ${after}` : clip(message, 300)}`.trim()
+      }
+    }
+    if (!after && kind === 'rate_limit' && RATE_ADVICE.test(text)) after = text.slice(text.search(RATE_ADVICE)).trim()
+  }
+  let summary
+  if ((http || kind === 'network') && LEADS[kind]) summary = [LEADS[kind](event), message && (after ? sentence(clip(message, 300)) : clip(message, 300)), after].filter(Boolean).join(' ')
+  else if (cleaned) summary = cleaned
+  else summary = text.length > 400 ? clip(text, 300) : text
+  return { summary, details: text !== summary ? text : null }
+}
+// Error notices are summarised once per event object (the transcript renders on every streamed delta).
+const summaryCache = new WeakMap()
+function noticeError(event) {
+  let error = summaryCache.get(event)
+  if (!error) summaryCache.set(event, error = errorSummary(event))
+  return error
+}
+
+// A wait notice saved by an older version still asks for Stop; once the chat is idle there is nothing to stop.
+const idleNotice = text => typeof text === 'string' ? text.replace(/ Press Stop to cancel\.$/, '') : text
+
+// A Stop leaves a notice that names what it interrupted (older notices have no stop_phase).
+const STOPPED_TEXT = 'Stopped. You can continue this conversation.'
+const STOP_TEXT = { streaming: 'Stopped while replying', tools: 'Stopped during an action', waiting: 'Stopped' }
 
 function toolOutcome(event) {
   const clipped = clip(event.output)
   if (event.state === 'rejected') {
     if (event.approval === 'expired') return 'Not answered in time; the action did not run'
     if (event.approval === 'declined') return event.decline_note ? `Action declined: ${clip(event.decline_note)}` : 'Action declined'
+    // Blocked by a rule, Don't ask or a mode change; the reason may already start with "Not run:".
+    if (event.approval === 'blocked') {
+      const reason = clip(event.blocked_reason || event.output).replace(/^Not run:\s*/i, '')
+      return reason ? `Not run: ${reason}` : 'Action not run'
+    }
     // Blocked without an approval card (Plan mode, changed instructions, a tool profile), or an older event.
-    return clipped ? `Not run: ${clipped}` : 'Action not run'
+    // Don't ask and protected-file refusals already start with "Not run:".
+    const reason = clipped.replace(/^Not run:\s*/i, '')
+    return reason ? `Not run: ${reason}` : 'Action not run'
   }
   if (event.state === 'cancelled') return 'Action cancelled'
   return clipped || 'Tool returned an error'
@@ -78,10 +309,15 @@ function toolOutcome(event) {
 // its grant already lasts for this chat.
 export function allowLabel(event) {
   const name = event.name || ''
+  if (event.protected) return null  // Protected files are always confirmed.
+  // Always ask rules, uncertain commands and commands naming credentials offer no chat rule (older events lack the list).
+  if (Array.isArray(event.rememberable) && !event.rememberable.includes('chat')) return null
   if (name === 'run_command') return typeof event.input?.command === 'string' && event.input.command.trim() ? 'Always allow this command in this chat' : null
-  if (['write_file', 'edit_file', 'insert_activity_log'].includes(name)) return 'Allow edits in this chat'
+  if (['write_file', 'edit_file', 'insert_activity_log', 'move_path', 'delete_path', 'notebook_edit'].includes(name)) return 'Allow edits in this chat'
   if (name.startsWith('mcp__')) return 'Allow this tool in this chat'
   if (name.startsWith('hook_')) return 'Allow this hook in this chat'
+  if (name === 'delegate_task') return 'Allow subagents in this chat'
+  if (name === 'stop_job') return 'Allow stopping jobs in this chat'
   return null
 }
 
@@ -105,46 +341,74 @@ function DelegationStatus({ event, onSelectSession }) {
   </div>`
 }
 
-function ToolCard({ event, summary, sessionId, onError, onSelectSession }) {
+// Tools whose input names one file: the file the card's Open file button opens.
+const FILE_INPUTS = { read_file: 'path', write_file: 'path', edit_file: 'path', insert_activity_log: 'path',
+  notebook_read: 'path', notebook_edit: 'path', move_path: 'destination', outline_file: 'path' }
+
+// What the agent received when it differs from the card (the per-response context allowance).
+function allowanceNote(event) {
+  const withheld = event.result_withheld
+  if (withheld) {
+    const estimated = Number(withheld.estimated_tokens), allowance = Number(withheld.allowance_tokens)
+    // As result_budget.deferred_text tells the model: one result larger than the whole allowance.
+    if (estimated > allowance) return `Result not sent to the agent: it is larger than the step's context allowance (about ${estimated.toLocaleString('en-US')} of ${allowance.toLocaleString('en-US')} tokens). The agent was asked to read a smaller part.`
+    return 'Result not sent to the agent: earlier results in the same step filled its context allowance. The agent can run it again.'
+  }
+  if (event.result_shortened) return 'Result shortened for the agent to fit its context allowance.'
+  return null
+}
+
+// Shorter heading labels for narrow chat columns (styles.css swaps them in; the heading's name keeps the full label).
+const SHORT_STATUS = { 'started in background': 'background' }
+
+function ToolCard({ event, summary, result, status, failure = null, sessionId, onError, onSelectSession, onOpenPath }) {
   const [expanded, setExpanded] = useState(false)
+  const filePath = event.input?.[FILE_INPUTS[event.name]]
+  const startLine = Number.isInteger(event.input?.start_line) && event.input.start_line > 0 ? event.input.start_line : undefined
   const [deciding, setDeciding] = useState(false)
   const [note, setNote] = useState('')
   const pending = event.state === 'pending'
   const title = (event.name || 'Tool').replace(/_/g, ' ')
   const isTask = event.name === 'create_task' || event.name === 'update_task'
   const allowInChat = pending ? allowLabel(event) : null
-  const decide = async (allowed, remember = false) => {
+  const rule = ruleLine(event)
+  const decide = async (allowed, extra = {}) => {
     setDeciding(true)
-    // The note goes to the model with a Decline; remember stores an exact rule for this chat.
-    const body = { allowed, ...(remember ? { remember: true } : {}), ...(!allowed && note.trim() ? { note: note.trim() } : {}) }
+    // The note goes to the model with a Decline; extra is { remember: true } (an exact rule for this chat) or { scope, rule? }.
+    const body = { allowed, ...(allowed ? extra : {}), ...(!allowed && note.trim() ? { note: note.trim() } : {}) }
     try { await api(`/sessions/${sessionId}/approvals/${event.id}`, 'POST', body) }
     catch (e) { onError(e.message) }
     finally { setDeciding(false) }
   }
   return html`<div class=${`tool-card ${isTask ? 'tool-task' : ''} ${pending ? 'needs-approval' : ''}`}>
     <button class="tool-heading" onClick=${() => setExpanded(v => !v)} aria-expanded=${expanded || pending}
-      aria-label=${[title, summary.subject, summary.taskStatus ? `Task: ${summary.taskStatus}` : ''].filter(Boolean).join(' ')}>
+      aria-label=${[title, summary.subject, summary.taskStatus ? `Task: ${summary.taskStatus}` : '', status.label].filter(Boolean).join(' ')}>
       ${event.name?.toLowerCase().includes('command') || event.name === 'Bash' ? html`<${Terminal} size=${16} />` : html`<${FileText} size=${16} />`}
       <span class="tool-name">${title}</span><span class="tool-subject" title=${summary.subject}>${summary.subject}</span>
       ${summary.taskStatus ? html`<span class="tool-task-status">Task: ${summary.taskStatus}</span>` : null}
-      ${event.state === 'running' ? html`<${LoaderCircle} size=${14} className="spin" />` : event.state === 'completed' ? html`<${Check} size=${14} className="success-icon" />` : null}
+      ${status.tone === 'running' ? html`<${LoaderCircle} size=${14} className="spin" />` : status.tone === 'ok' ? html`<${Check} size=${14} className="success-icon" />`
+        : status.tone === 'warn' ? html`<${CircleAlert} size=${14} className="warning-icon" />` : null}
+      ${status.label ? html`<span class=${`tool-status ${status.labelTone === 'neutral' ? 'neutral' : ''}`} data-short=${SHORT_STATUS[status.label]}>${status.label}</span>` : null}
       ${expanded || pending ? html`<${ChevronDown} size=${14} />` : html`<${ChevronRight} size=${14} />`}
     </button>
     <${DelegationStatus} event=${event} onSelectSession=${onSelectSession} />
-    ${event.allowed_by_rule ? html`<p class="tool-rule">Allowed by a rule for this chat</p>` : null}
+    ${rule ? html`<p class="tool-rule">${rule}</p>` : null}
     ${expanded || pending ? html`<div class="tool-body">
       ${pending ? html`<p>Local needs your approval to ${title.toLowerCase()}.${event.approval_expires
           ? ` If you do not answer by ${expiryTime(event.approval_expires)}, it will not run.` : ''}</p>
-        <${ToolDetails} event=${event} pending=${true} />
-        <label class="decline-note"><span>Tell the agent why (optional)</span>
-          <textarea rows=${2} maxLength=${2000} spellcheck=${false} value=${note} disabled=${deciding}
-            onInput=${e => setNote(e.currentTarget.value)} /></label>
-        <div class="approval-buttons"><button class="outline" disabled=${deciding} onClick=${() => void decide(false)}><${X} size=${15} />Decline</button>
-          ${allowInChat ? html`<button class="outline" disabled=${deciding} onClick=${() => void decide(true, true)}>${allowInChat}</button>` : null}
-          <button class="primary" disabled=${deciding} onClick=${() => void decide(true)}><${Check} size=${15} />Approve</button></div>`
-        : html`<${ToolDetails} event=${event} pending=${false} /><small class="muted">Action: ${event.state}</small>`}
+        <${ApprovalOptions} event=${event} sessionId=${sessionId} onError=${onError} deciding=${deciding} onDecide=${decide} allowInChat=${allowInChat}
+          details=${html`<${ToolDetails} event=${event} pending=${true} />`}
+          declineNote=${html`<label class="decline-note"><span>Tell the agent why (optional)</span>
+            <textarea rows=${2} maxLength=${2000} spellcheck=${false} value=${note} disabled=${deciding}
+              onInput=${e => setNote(e.currentTarget.value)} /></label>`} />`
+        : html`${event.state === 'completed' && allowanceNote(event) ? html`<p class="tool-allowance">${allowanceNote(event)}</p>` : null}
+          <${ToolDetails} event=${event} pending=${false} result=${result} failure=${failure} /><small class="muted">Action: ${actionText(event, status)}${status.label ? html` · <span class="tool-status-text">${status.label}</span>` : ''}</small>
+          ${onOpenPath && typeof filePath === 'string' && filePath ? html`<button class="outline tool-open-file"
+            onClick=${() => onOpenPath(startLine ? { path: filePath, line: startLine } : { path: filePath })}><${FileText} size=${14} />Open file</button>` : null}`}
     </div>` : null}
-    ${!expanded && (event.state === 'rejected' || event.state === 'cancelled' || event.state === 'error') ? html`<p class="tool-outcome">${toolOutcome(event)}</p>` : null}
+    ${!expanded && (event.state === 'rejected' || event.state === 'cancelled' || event.state === 'error' || status.tone === 'warn')
+      ? html`<p class="tool-outcome">${(result && failureOutcome(event, result, status)) || toolOutcome(event)}</p>` : null}
+    ${!expanded && event.state === 'completed' && allowanceNote(event) ? html`<p class="tool-outcome">${allowanceNote(event)}</p>` : null}
   </div>`
 }
 
@@ -155,55 +419,202 @@ function CopyAction({ text, label }) {
   }}>${copied ? html`<${Check} size=${14} />` : html`<${Copy} size=${14} />`}</button>`
 }
 
-function Markdown({ text, streaming = false }) {
+// onOpenPath({ path, line? }): file paths in the text become links that call it.
+function Markdown({ text, streaming = false, onOpenPath }) {
   // Parsing is the expensive part of a streamed reply, so parse only on change.
   const markup = useMemo(() => renderMarkdown(text), [text])
   const element = useRef(null)
+  const linked = !!onOpenPath
   // Highlight code once the reply is complete; the page keeps unchanged markup,
   // so other replies are not highlighted again on each streamed delta.
-  useEffect(() => { if (!streaming && element.current) enhanceCodeBlocks(element.current) }, [markup, streaming])
-  return html`<div class="markdown" ref=${element} dangerouslySetInnerHTML=${{ __html: markup }} />`
+  useEffect(() => {
+    if (streaming || !element.current) return
+    enhanceCodeBlocks(element.current)
+    if (linked) linkPaths(element.current)
+  }, [markup, streaming, linked])
+  const open = event => {
+    const link = event.target.closest?.('a.path-link')
+    if (!link || !onOpenPath || !element.current?.contains(link)) return
+    event.preventDefault()
+    onOpenPath(link.dataset.line ? { path: link.dataset.path, line: Number(link.dataset.line) } : { path: link.dataset.path })
+  }
+  return html`<div class="markdown" ref=${element} onClick=${open} dangerouslySetInnerHTML=${{ __html: markup }} />`
 }
 
-function Reply({ text, reasoning, truncated, requestInfo }) {
+// Chips under a user message for its @ file snapshots and ! command outputs (metadata only).
+export function attachmentLabel(item) {
+  if (item?.kind === 'shell') {
+    const command = String(item.command || '')
+    return `! ${command.length > 60 ? `${command.slice(0, 59)}…` : command} · exit ${item.exit_code ?? '?'}`
+  }
+  const lines = Number.isInteger(item?.start_line) && Number.isInteger(item?.end_line) ? ` · lines ${item.start_line}–${item.end_line}` : ''
+  return `@${item?.path || ''}${lines}${item?.truncated ? ' · shortened' : ''}`
+}
+
+function Attachments({ items }) {
+  if (!Array.isArray(items) || !items.length) return null
+  return html`<ul class="attachment-chips" aria-label="Attachments">${items.map((item, index) => html`<li key=${index} class="attachment-chip">${attachmentLabel(item)}</li>`)}</ul>`
+}
+
+function ActionButton({ label, icon: Icon, onClick, disabled = false, target }) {
+  return html`<button class="icon-button message-action" aria-label=${label} title=${label} disabled=${disabled} data-target=${target} onClick=${onClick}><${Icon} size=${14} /></button>`
+}
+
+function Reply({ text, reasoning, truncated, requestInfo, onOpenPath, actions = null }) {
   const streaming = requestInfo?.status === 'running'
   return html`<div class="assistant-reply"><${Brand} small=${true} />
     <div class="reply-content">${reasoning ? html`<details class="reasoning-summary"><summary>Provider reasoning summary</summary>
       <p class="muted">Supplied by the model endpoint.</p><${Markdown} text=${reasoning} streaming=${streaming} />
-      ${truncated ? html`<p class="muted">Summary display limit reached.</p>` : null}</details>` : null}<${Markdown} text=${text} streaming=${streaming} />
-      ${text ? html`<${CopyAction} text=${text} label="Copy response" />` : null}
+      ${truncated ? html`<p class="muted">Summary display limit reached.</p>` : null}</details>` : null}<${Markdown} text=${text} streaming=${streaming} onOpenPath=${onOpenPath} />
+      ${text || actions ? html`<div class="message-actions">${text ? html`<${CopyAction} text=${text} label="Copy response" />` : null}${actions}</div>` : null}
       ${requestInfo ? html`<${RequestDetails} info=${requestInfo} />` : null}
     </div></div>`
 }
 
-export default function Conversation({ session, onError, onSelectSession }) {
+// onOpenPath({ path, line? }) opens a file named in a reply or a tool card in the Workspace panel.
+// onLoadEarlier() -> Promise loads the page of messages before the first loaded one (session.events_start > 0).
+// busy: the chat is not idle (message actions other than Copy are hidden).
+// onPrefill(text) puts text in an empty composer and returns false when a typed draft was kept.
+export default function Conversation({ session, onError, onSelectSession, onOpenPath, busy = false, onPrefill, onLoadEarlier }) {
   const container = useRef(null)
   const bottom = useRef(null)
   const follow = useRef(true)
+  // Prepending earlier messages keeps the visible ones in place: the scroll position moves by the
+  // added height at once (the transcript otherwise scrolls smoothly). When the last page arrives
+  // the focused button is gone, so focus moves to the transcript.
+  const anchor = useRef(null)
+  useLayoutEffect(() => {
+    const el = container.current
+    if (el && anchor.current) {
+      el.scrollTo({ top: anchor.current.top + el.scrollHeight - anchor.current.height, behavior: 'instant' })
+      if (anchor.current.focused && !el.contains(document.activeElement)) el.focus({ preventScroll: true })
+    }
+    anchor.current = null
+  }, [session.events_start])
+  const loadEarlier = event => {
+    const el = container.current
+    anchor.current = el ? { top: el.scrollTop, height: el.scrollHeight, focused: document.activeElement === event?.currentTarget } : null
+    void Promise.resolve(onLoadEarlier?.()).catch(error => { anchor.current = null; onError?.(error.message) })
+  }
   const toolSummaries = useMemo(() => summarizeTools(session.events), [session.events])
+  // Map<event id, { result, status }>: parsed once per event (see toolState).
+  const toolStates = useMemo(() => new Map(session.events.filter(event => event.type === 'tool').map(event => [event.id, toolState(event)])), [session.events])
   const last = session.events[session.events.length - 1]
-  useEffect(() => { if (follow.current) bottom.current?.scrollIntoView({ block: 'end' }) }, [session.events.length, last?.text, last?.state])
+  useEffect(() => { if (follow.current) bottom.current?.scrollIntoView({ block: 'end' }) }, [last?.id, last?.text, last?.state])
   useEffect(() => { follow.current = true; bottom.current?.scrollIntoView({ block: 'end' }) }, [session.id])
   const tools = session.events.filter(event => event.type === 'tool')
-  return html`<div class="transcript" ref=${container} onScroll=${() => {
+  // Edit and resend, Retry, Rewind and Fork from here (history.py on the server).
+  const [editing, setEditing] = useState(null)  // the user event id being edited
+  const [rewinding, setRewinding] = useState(null)  // the user event to rewind to
+  const [forking, setForking] = useState(undefined)  // { beforeEventId } of the reply to fork from
+  const [retrying, setRetrying] = useState(false)
+  const editReturn = useRef(null)  // the user event whose 'Edit message' button gets focus after Cancel
+  useEffect(() => {
+    if (editing !== null || editReturn.current === null) return
+    const id = editReturn.current
+    editReturn.current = null
+    const button = [...(container.current?.querySelectorAll('[data-target]') ?? [])]
+      .find(item => item.dataset.target === `edit:${id}`)
+    button?.focus()
+  }, [editing])
+  const idle = !busy && session.status === 'idle'
+  const cuts = useMemo(() => {
+    const events = session.events
+    // The message that started the running (or latest) turn: the last one that was not steered.
+    const turnStart = events.findLastIndex(event => event.type === 'user' && !event.steered)
+    const nextUser = new Map()  // reply id -> index of the first user event after it
+    const turnEnds = new Set()  // replies that end a turn (no later reply before the next message)
+    let next = -1, replyAfter = false
+    for (let index = events.length - 1; index >= 0; index--) {
+      const event = events[index]
+      if (event.type === 'user') { next = index; replyAfter = false }
+      else if (event.type === 'assistant' && event.text) {
+        nextUser.set(event.id, next)
+        if (!replyAfter) turnEnds.add(event.id)
+        replyAfter = true
+      }
+    }
+    const lastReplyIndex = events.findLastIndex(event => event.type === 'assistant' && event.text)
+    const latestUserIndex = events.findLastIndex(event => event.type === 'user')
+    const steered = events.slice(turnStart + 1).some(event => event.type === 'user' && event.steered)
+    // Retry resends the latest message, so it is offered only on a reply to that message: after a turn
+    // that failed or was stopped before any reply, the last reply belongs to an earlier turn.
+    const retry = latestUserIndex >= 0 && turnStart >= 0 && !steered && lastReplyIndex > latestUserIndex
+    return { nextUser, turnEnds, lastReply: events[lastReplyIndex], latestUser: events[latestUserIndex], retry }
+  }, [session.events])
+  const rewound = (result, draftKept = false) => {
+    if (result.backupId) setRewindNotice(session.id, { title: backupTitle(session.title), backupId: result.backupId, draftKept })
+  }
+  // The rewound message is gone from the transcript (and its control with it): the message box is where to go on.
+  const focusMessageBox = () => document.querySelector('textarea[aria-label="Message"]')?.focus()
+  // After a conversation rewind whose resend failed, the text to send waits in the message box.
+  const resent = (result, text) => {
+    const draftKept = result.resend_error && onPrefill ? onPrefill(text) === false : false
+    rewound({ backupId: result.backup_session_id }, draftKept)
+    if (result.resend_error) onError(result.resend_error)
+    focusMessageBox()
+  }
+  const retry = async () => {
+    if (retrying || !cuts.latestUser) return
+    setRetrying(true)
+    try {
+      const result = await api(`/sessions/${encodeURIComponent(session.id)}/rewind`, 'POST',
+        { before_event_id: cuts.latestUser.id, conversation: true, resend_text: cuts.latestUser.text })
+      resent(result, cuts.latestUser.text)
+    } catch (e) { onError(e) }
+    finally { setRetrying(false) }
+  }
+  const replyActions = event => {
+    const next = cuts.nextUser.get(event.id) ?? -1
+    const fork = idle && cuts.turnEnds.has(event.id)
+    const canRetry = idle && cuts.retry && cuts.lastReply?.id === event.id
+    if (!fork && !canRetry) return null
+    return html`${fork ? html`<${ActionButton} label="Fork from here" icon=${GitBranch}
+        onClick=${() => setForking({ beforeEventId: next >= 0 ? session.events[next].id : null })} />` : null}
+      ${canRetry ? html`<${ActionButton} label="Retry response" icon=${RefreshCw} disabled=${retrying} onClick=${() => void retry()} />` : null}`
+  }
+  return html`<div class="transcript" ref=${container} tabIndex=${-1} onScroll=${() => {
     const el = container.current
     if (el) follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120
   }}><div class="transcript-inner">
+    ${session.events_start > 0 && onLoadEarlier ? html`<button class="outline load-earlier" onClick=${loadEarlier}>Load earlier messages (${session.events_start} more)</button>` : null}
     ${tools.length ? html`<details class="activity-summary"><summary>Activity · ${tools.length} ${tools.length === 1 ? 'action' : 'actions'}</summary>
       <ol>${tools.map(event => {
         const summary = toolSummaries.get(event.id)
         return html`<li key=${event.id}><span>${(event.name || 'Tool').replace(/_/g, ' ')}</span>${summary.subject ? html`<span class="activity-subject"> · ${summary.subject}</span>` : null}
-          ${summary.taskStatus ? html`<small>Task: ${summary.taskStatus}</small>` : null}<small>Action: ${event.state}</small></li>`
+          ${summary.taskStatus ? html`<small>Task: ${summary.taskStatus}</small>` : null}<small>Action: ${actionText(event, toolStates.get(event.id)?.status)}${(label => label ? ` · ${label}` : '')(toolStates.get(event.id)?.status.label)}</small></li>`
       })}</ol>
     </details>` : null}
     ${session.parent_session_id && onSelectSession ? html`<button class="outline parent-conversation" onClick=${() => onSelectSession(session.parent_session_id)}>Back to parent conversation</button>` : null}
     ${session.events.map(event => {
-      if (event.type === 'user') return html`<div class="user-message" key=${event.id}>${event.origin?.kind === 'delegated' ? html`<small class="delegation-origin">Delegated by parent conversation</small>` : null}${event.text}${event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}${event.text ? html`<${CopyAction} text=${event.text} label="Copy message" />` : null}</div>`
-      if (event.type === 'tool') return html`<${ToolCard} key=${event.id} event=${event} summary=${toolSummaries.get(event.id)} sessionId=${session.id} onError=${onError} onSelectSession=${onSelectSession} />`
-      if (event.type === 'assistant') return event.text || event.reasoning_summary || event.request_info ? html`<${Reply} key=${event.id} text=${event.text || ''} reasoning=${event.reasoning_summary} truncated=${event.reasoning_truncated} requestInfo=${event.request_info} />` : null
-      return html`<div class=${`conversation-notice ${event.type === 'error' ? 'error' : ''}`} key=${event.id}>${event.text}<${DelegationStatus} event=${event} onSelectSession=${onSelectSession} />${!event.delegation && event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}</div>`
+      if (event.type === 'user' && editing === event.id && idle) return html`<${EditMessage} key=${event.id} sessionId=${session.id} event=${event}
+        onSelectSession=${onSelectSession}
+        onCancel=${() => { editReturn.current = event.id; setEditing(null) }} onSent=${(result, text) => {
+          setEditing(null)
+          resent(result, text)
+        }} />`
+      if (event.type === 'user') return html`<div class=${`user-message${event.steered ? ' steered' : ''}`} key=${event.id}>${event.steered ? html`<small class="steered-label">Sent while the agent was working</small>` : null}${event.origin?.kind === 'delegated' ? html`<small class="delegation-origin">Delegated by parent conversation</small>` : null}${event.text}<${Attachments} items=${event.attachments} />${event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}${event.text || idle ? html`<div class="message-actions">${event.text ? html`<${CopyAction} text=${event.text} label="Copy message" />` : null}${idle ? html`<${ActionButton} label="Edit message" icon=${Pencil} target=${`edit:${event.id}`} onClick=${() => setEditing(event.id)} /><${ActionButton} label="Rewind to here" icon=${Undo2} onClick=${() => setRewinding(event)} />` : null}</div>` : null}</div>`
+      if (event.type === 'tool' && event.name === 'ask_user') return html`<${QuestionCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
+      if (event.type === 'tool' && event.name === 'submit_plan') return html`<${PlanCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
+      if (event.type === 'tool') return html`<${ToolCard} key=${event.id} event=${event} summary=${toolSummaries.get(event.id)} result=${toolStates.get(event.id).result} status=${toolStates.get(event.id).status} failure=${toolStates.get(event.id).failure} sessionId=${session.id} onError=${onError} onSelectSession=${onSelectSession} onOpenPath=${onOpenPath} />`
+      if (event.type === 'assistant') return event.text || event.reasoning_summary || event.request_info ? html`<${Reply} key=${event.id} text=${event.text || ''} reasoning=${event.reasoning_summary} truncated=${event.reasoning_truncated} requestInfo=${event.request_info} onOpenPath=${onOpenPath} actions=${event.text ? replyActions(event) : null} />` : null
+      const marker = event.type !== 'error' && (!!event.stop_phase || event.text === STOPPED_TEXT)
+      const classes = ['conversation-notice', event.type === 'error' && 'error', marker && 'stop-marker', event.compaction && 'compaction'].filter(Boolean).join(' ')
+      if (marker) return html`<div class=${classes} key=${event.id} title=${event.text}>${STOP_TEXT[event.stop_phase] || 'Stopped'}</div>`
+      const error = event.type === 'error' ? noticeError(event) : null
+      return html`<div class=${classes} key=${event.id} role=${error ? 'note' : undefined}>${error ? html`<p class="notice-summary">${error.summary}</p>${error.details
+          ? html`<details class="notice-details"><summary>Details</summary><pre>${error.details}</pre></details>` : null}` : idle ? idleNotice(event.text) : event.text}<${DelegationStatus} event=${event} onSelectSession=${onSelectSession} />${!event.delegation && event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}</div>`
     })}
     ${['running', 'delegating'].includes(session.status) ? html`<div class="working-indicator"><span /><span /><span /><span class="sr-only">Working</span></div>` : null}
+    ${rewinding && idle ? html`<${RewindDialog} session=${session} event=${rewinding} onClose=${() => setRewinding(null)}
+      onSelectSession=${onSelectSession}
+      onRewound=${result => {
+        setRewinding(null)
+        rewound(result, result.conversation && onPrefill ? onPrefill(rewinding.text || '') === false : false)
+        if (result.conversation) focusMessageBox()
+      }} />` : null}
+    ${forking !== undefined && onSelectSession ? html`<${ForkDialog} session=${session} beforeEventId=${forking.beforeEventId}
+      onSelectSession=${onSelectSession} onClose=${() => setForking(undefined)} />` : null}
     <div ref=${bottom} />
   </div></div>`
 }

@@ -110,6 +110,7 @@ def test_usage_graph_and_estimated_cost(ui, page):
     expect(cards.locator("div", has_text="Uncached input")).to_contain_text("1,200")
     expect(cards.locator("div", has_text="Cache read")).to_contain_text("300")
     expect(cards.locator("div", has_text="Cache write")).to_contain_text("100")
+    expect(cards.locator("div", has_text="Automatic retries")).to_contain_text("3")
     expect(page.get_by_text("Input incl. cache")).to_be_visible()
     expect(page.get_by_role("img", name=re.compile("Tokens by model call"))).to_be_visible()
     expect(page.get_by_role("cell", name="compaction")).to_be_visible()
@@ -120,6 +121,105 @@ def test_usage_graph_and_estimated_cost(ui, page):
     ui.rerender("{ ...dialogProps({ ...session(), status: 'running' }) }")
     ui.js("new Promise(done => setTimeout(done, 20))")
     assert len(ui.requests("/api/sessions/a/metrics")) == requests
+
+
+def test_usage_shows_the_last_reported_input_and_total_input_per_call(ui, page):
+    open_tab(ui, page, "Usage")
+    last = page.locator(".usage-last-input")
+    expect(last).to_contain_text("Last model input")
+    expect(last).to_contain_text("No reported input yet.")
+    header = page.get_by_role("columnheader")
+    expect(header).to_have_text(["Purpose", "Model", "Status", "Total input", "Uncached input", "Cache read",
+                                 "Cache write", "Output", "Est. DBU"])
+    first = page.get_by_role("row").filter(has_text="agent")
+    expect(first.get_by_role("cell").nth(3)).to_have_text("1,600")
+    expect(page.get_by_role("row").filter(has_text="compaction").get_by_role("cell").nth(3)).to_have_text("—")
+
+
+def test_usage_last_model_input_row(ui, page):
+    open_tab(ui, page, "Usage", """fake.override = path => path === '/api/sessions/a/metrics' ? fake.json({ ...metrics,
+      last_input: { input_tokens: 10000, percent_of_input_budget: 8.3, percent_of_model_window: 1, estimated_tokens: 8000,
+        partial: false } }) : undefined""")
+    last = page.get_by_role("group", name="Last model input")
+    expect(last).to_contain_text("10,000 tokens")
+    expect(last).to_contain_text("8.3% of input budget")
+    expect(last).to_contain_text("1% of model window")
+    expect(last).to_contain_text("App estimate ~8,000")
+    page.get_by_role("button", name="Refresh usage").click()
+    ui.run("""fake.override = path => path === '/api/sessions/a/metrics' ? fake.json({ ...metrics,
+      last_input: { input_tokens: 500, percent_of_input_budget: 0.4, percent_of_model_window: null, estimated_tokens: 480,
+        partial: true } }) : undefined""")
+    page.get_by_role("button", name="Refresh usage").click()
+    expect(last).to_contain_text("Model window unknown")
+    expect(last).to_contain_text("Last model input (partial)")
+
+
+def test_verify_tab_loads_and_saves_the_project_command(ui, page):
+    open_tab(ui, page, "Verify")
+    section = page.get_by_role("region", name="Verify")
+    expect(section.get_by_role("heading", name="Verify command")).to_be_visible()
+    expect(section.get_by_text(re.compile(r"changed files in this project \(/project\)"))).to_be_visible()
+    command = section.get_by_role("textbox", name="Command")
+    expect(command).to_have_value("pytest -q")
+    expect(command).to_have_attribute("placeholder", "pytest -q")
+    expect(section.get_by_role("spinbutton", name="Time limit (seconds)")).to_have_value("600")
+    command.fill("  make check  ")
+    section.get_by_role("spinbutton", name="Time limit (seconds)").fill("120")
+    section.get_by_role("spinbutton", name="Fix rounds").fill("3")
+    section.get_by_role("button", name="Save", exact=True).click()
+    expect(section.get_by_role("status")).to_have_text("Verify command saved for this project.")
+    assert ui.bodies("/api/project-settings?session_id=a", "PUT") == [
+        {"verify_command": "make check", "verify_timeout_seconds": 120, "verify_max_rounds": 3}]
+    expect(command).to_have_value("make check")
+    command.fill("")
+    section.get_by_role("button", name="Save", exact=True).click()
+    expect(section.get_by_role("status")).to_have_text("Verify is off for this project.")
+    assert ui.bodies("/api/project-settings?session_id=a", "PUT")[-1]["verify_command"] == ""
+
+
+def test_verify_tab_reports_a_rejected_value(ui, page):
+    open_tab(ui, page, "Verify", """fake.override = (path, options) => path.startsWith('/api/project-settings') && options.method === 'PUT'
+      ? fake.json({ detail: 'The verify time limit must be an integer from 10 to 3,600 seconds.' }, 400) : undefined""")
+    section = page.get_by_role("region", name="Verify")
+    expect(section.get_by_role("textbox", name="Command")).to_have_value("pytest -q")
+    section.get_by_role("spinbutton", name="Time limit (seconds)").fill("5")
+    section.get_by_role("button", name="Save", exact=True).click()  # The field's own range check stops this one.
+    assert ui.bodies("/api/project-settings?session_id=a", "PUT") == []
+    section.get_by_role("spinbutton", name="Time limit (seconds)").fill("20")
+    section.get_by_role("button", name="Save", exact=True).click()
+    expect(section.get_by_role("alert")).to_have_text("The verify time limit must be an integer from 10 to 3,600 seconds.")
+    expect(section.get_by_role("status")).to_have_count(0)
+
+
+def test_saving_verify_keeps_keyboard_focus_and_ignores_repeat_submits(ui, page):
+    open_tab(ui, page, "Verify", pending("saving", "path.startsWith('/api/project-settings') && options.method === 'PUT'"))
+    section = page.get_by_role("region", name="Verify")
+    command = section.get_by_role("textbox", name="Command")
+    expect(command).to_have_value("pytest -q")
+    command.fill("make check")
+    command.press("Enter")
+    ui.wait("fake.calls.some(call => call.path.startsWith('/api/project-settings') && call.method === 'PUT')")
+    # The fields are read-only while saving, not disabled, so focus stays where it was.
+    expect(command).to_have_attribute("readonly", "")
+    expect(command).to_be_focused()
+    save = section.get_by_role("button", name="Save", exact=True)
+    expect(save).to_have_attribute("aria-disabled", "true")
+    command.press("Enter")
+    save.click(force=True)
+    assert len(ui.bodies("/api/project-settings?session_id=a", "PUT")) == 1
+    ui.run("fake.deferreds.saving.resolve(fake.json({ workspace: '/project', verify_command: 'make check', "
+           "verify_timeout_seconds: 600, verify_max_rounds: 2 }))")
+    expect(section.get_by_role("status")).to_have_text("Verify command saved for this project.")
+    expect(save).to_be_focused()  # The repeat click moved focus to Save, and it stays there.
+    expect(command).not_to_have_attribute("readonly", "")
+    expect(save).to_have_attribute("aria-disabled", "false")
+
+
+def test_verify_tab_without_a_conversation_uses_the_default_workspace(ui, page):
+    open_dialog(ui, selected="null")
+    page.get_by_role("button", name="Verify", exact=True).click()
+    expect(page.get_by_role("textbox", name="Command")).to_have_value("pytest -q")
+    assert ui.requests("/api/project-settings")
 
 
 def test_usage_csv_export_uses_the_local_token(ui, page):
@@ -342,3 +442,74 @@ def test_mcp_results_per_server_and_stale_results_cleared(ui, page):
     page.get_by_role("button", name="Save configuration").click()
     expect(page.get_by_text("Configuration saved.")).to_be_visible()
     expect(page.get_by_text("Connection refused")).to_have_count(0)
+
+
+# The dialog keeps one size: the tabs stay put and only the tab content scrolls
+
+TABS = ["Recovery", "Usage", "Worktrees", "Tasks", "Verify", "Extensions", "Tools", "Conversation"]
+
+
+def tabs_top(ui):
+    return ui.js("document.querySelector('.agent-tools-tabs').getBoundingClientRect().top")
+
+
+@pytest.mark.parametrize("width,height", [(1280, 900), (390, 844)])
+def test_tabs_stay_put(ui, page, width, height):
+    page.set_viewport_size({"width": width, "height": height})
+    open_dialog(ui)
+    expect(page.get_by_role("button", name="Preview checkpoint src/main.py")).to_be_visible()
+    top = tabs_top(ui)
+    for tab in TABS:
+        page.get_by_role("button", name=tab, exact=True).click()
+        expect(page.get_by_role("button", name=tab, exact=True)).to_have_attribute("aria-pressed", "true")
+        assert abs(tabs_top(ui) - top) <= 1, tab
+        if tab in ("Usage", "Conversation"):
+            if tab == "Usage":
+                expect(page.get_by_role("button", name="Refresh usage")).to_be_visible()
+            ui.run("const body = document.querySelector('.agent-tools-body'); body.scrollTop = body.scrollHeight")
+            assert abs(tabs_top(ui) - top) <= 1, tab
+            expect(page.get_by_role("button", name="Close agent tools")).to_be_in_viewport()
+            assert ui.js("(d => d.scrollHeight <= d.clientHeight + 1)(document.querySelector('.agent-tools-dialog'))"), tab
+
+
+def test_phone_tabs_wrap(ui, page):
+    page.set_viewport_size({"width": 360, "height": 740})
+    open_dialog(ui)
+    expect(page.get_by_role("button", name="Preview checkpoint src/main.py")).to_be_visible()
+    assert ui.js("(e => e.scrollWidth <= e.clientWidth)(document.querySelector('.agent-tools-tabs'))")
+    content = ui.js("document.querySelector('.agent-tools-content').getBoundingClientRect().toJSON()")
+    for tab in TABS:
+        b = page.get_by_role("button", name=tab, exact=True).bounding_box()
+        assert b["x"] >= content["left"] - 0.5 and b["x"] + b["width"] <= content["right"] + 0.5, tab
+
+
+@pytest.mark.parametrize("width,height", [(360, 740), (390, 844), (1280, 900)])
+def test_usage_heading_fits(ui, page, width, height):
+    page.set_viewport_size({"width": width, "height": height})
+    open_tab(ui, page, "Usage")
+    expect(page.get_by_role("button", name="Refresh usage")).to_be_visible()
+    result = ui.js("""(() => {
+      const heading = document.querySelector('.usage-panel .agent-tools-section-heading')
+      const content = document.querySelector('.agent-tools-content')
+      const right = content.getBoundingClientRect().right - parseFloat(getComputedStyle(content).paddingRight)
+      const buttons = [...heading.querySelectorAll('button')].map(b => b.getBoundingClientRect())
+      const text = heading.querySelector(':scope > div:first-child').getBoundingClientRect()
+      return { fits: buttons.every(b => b.right <= right + 1), scroll: heading.scrollWidth <= heading.clientWidth,
+               beside: buttons.every(b => b.top < text.bottom) }
+    })()""")
+    assert result["fits"] and result["scroll"], result
+    if width >= 1280:
+        assert result["beside"], result
+
+
+def test_a_long_task_title_keeps_a_square_checkbox_beside_its_first_line(ui, page):
+    # V-T13. Mutation: restore align-items:center on .agent-tools-task (the box shrinks to 10 px and moves 14 px down).
+    title = "Inspect the source of the parser and its tests, then list every place that reads the configuration file directly"
+    open_tab(ui, page, "Tasks", f"window.task = {{ ...task, title: {json.dumps(title + ' before startup')} }}")
+    checkbox = page.get_by_role("checkbox", name=re.compile("^Complete task Inspect the source"))
+    expect(checkbox).to_be_visible()
+    box = checkbox.bounding_box()
+    text = page.locator(".agent-tools-task strong").first
+    assert text.evaluate("e => e.getClientRects().length > 1 || e.getBoundingClientRect().height > 30")  # it wraps
+    assert round(box["width"]) == 13 and round(box["height"]) == 13, box
+    assert abs(box["y"] - text.bounding_box()["y"]) <= 6, (box, text.bounding_box())

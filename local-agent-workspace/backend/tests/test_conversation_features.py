@@ -212,8 +212,9 @@ async def test_get_task_returns_details_for_this_conversation_only(runtime):
 
     other = manager.store.create(manager.settings.values)
     output = await manager.execute_tool(other, tools, "get_task", {"task_id": first["id"]}, "g3")
-    assert output == "Task not found in this conversation."
+    assert json.loads(output) == {"error_kind": "not_found", "message": "Task not found in this conversation."}
     assert other["events"][-1]["state"] == "error"
+    assert other["events"][-1]["output"] == "Task not found in this conversation."
 
 
 @pytest.mark.parametrize("mode", ["manual", "auto", "acceptEdits", "plan", "bypassPermissions"])
@@ -243,7 +244,7 @@ async def test_get_task_is_in_every_tool_profile(runtime, monkeypatch, profile):
     gateway(monkeypatch, handler)
     await manager.run_databricks(session, "Which task is next?")
     assert "get_task" in seen[0]
-    assert len([*TOOL_DEFINITIONS, *FEATURE_TOOLS]) == 17
+    assert len([*TOOL_DEFINITIONS, *FEATURE_TOOLS]) == 27
 
 
 # API: task routes push the list, the stream sends it on connect, and the transcript export.

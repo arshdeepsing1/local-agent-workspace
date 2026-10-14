@@ -15,6 +15,7 @@ def test_session_metrics_aggregates_purposes_models_and_documented_dbu_rates():
         "inference_calls": [
             {"id": "agent-1", "purpose": "agent", "model": "databricks-claude-opus-4-8",
              "created": "2026-09-22T10:00:00Z", "status": "completed", "http_status": 200,
+             "attempt": 2, "retry_reason": "network",
              "usage": {"input_tokens": 1_000_000, "output_tokens": 2_000_000,
                        "cache_read_input_tokens": 3_000_000,
                        "cache_creation_input_tokens": 4_000_000,
@@ -29,13 +30,16 @@ def test_session_metrics_aggregates_purposes_models_and_documented_dbu_rates():
     assert metrics["scope"] == "session" and metrics["session_id"] == session["id"]
     assert metrics["complete"] is True
     assert metrics["totals"] == {
-        "calls": 2, "successful": 1, "errors": 1, "rate_limited": 1,
+        "calls": 2, "successful": 1, "errors": 1, "rate_limited": 1, "retries": 1,
         "input_tokens": 1_000_000, "output_tokens": 2_000_000,
         "cache_read_input_tokens": 3_000_000,
         "cache_creation_input_tokens": 4_000_000,
         "reasoning_tokens": 5_000_000, "estimated_dbu": pytest.approx(1164.288),
     }
     assert [row["key"] for row in metrics["by_purpose"]] == ["agent", "compaction"]
+    # Automatic retries are counted and named; a first attempt has no retry_reason.
+    assert metrics["calls"][0]["retry_reason"] == "network" and "retry_reason" not in metrics["calls"][1]
+    assert [row["retries"] for row in metrics["by_purpose"]] == [1, 0]
     assert metrics["by_model"][0]["estimated_dbu"] == pytest.approx(1164.288)
     assert metrics["pricing"]["currency"] == "DBU" and metrics["pricing"]["estimated"] is True
 

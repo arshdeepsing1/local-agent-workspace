@@ -5,6 +5,7 @@ import pytest
 
 from local_agent.agents import AgentManager
 from local_agent.config import Settings
+from local_agent.context import INVALID_ARGUMENTS_CONTINUATION
 from local_agent.model_stream import MAX_ERROR_BODY_BYTES, MAX_SSE_EVENT_BYTES, MAX_TOOL_ARGUMENT_BYTES, MAX_TOOL_CALLS, ToolCallBuffer, sse_data
 from local_agent.store import Store
 from local_agent.telemetry import InferenceError
@@ -143,22 +144,31 @@ async def test_overflow_preserves_typed_failure_without_executing_valid_prefix_a
                 "name": "write_file" if number == 0 else "", "arguments": "x" * 65536}}]}) for number in range(9)]
         return httpx.Response(200, stream=Chunks([prefix, *tail]))
 
-    async def execute(*args):
+    async def execute(*args, **_):
         pytest.fail("No call from an oversized response may execute, including its complete prefix")
 
     manager.execute_tool = execute
     mock_gateway(monkeypatch, gateway)
     await manager.run(session, "Inspect the project.")
-    assert len(requests) == 1
     info = next(item["request_info"] for item in session["events"] if "request_info" in item)
     assert info["status"] == "error" and info["http_status"] == 200
     assert info["error_kind"] == ("invalid_response" if overflow == "frame" else "invalid_tool_arguments")
     assert info["usage"] == {"input_tokens": 25}
-    assert session["events"][-1]["type"] == "error"
     assert not any(message.get("tool_calls") for message in session["wire"])
+    if overflow == "frame":
+        # A stream cut mid-event is not repaired: the turn ends with the error.
+        assert len(requests) == 1
+        assert session["events"][-1]["type"] == "error"
+    else:
+        # Oversized arguments get one hidden retry request after a placeholder reply.
+        assert [request["stream"] for request in requests] == [True, True, False]  # The last one names the chat.
+        assert [message["role"] for message in requests[1]["messages"][-3:]] == ["user", "assistant", "user"]
+        assert requests[1]["messages"][-1]["content"] == INVALID_ARGUMENTS_CONTINUATION
+        assert "exceeded 512 KiB" in requests[1]["messages"][-2]["content"]
+        assert session["events"][-1]["text"] == "Ready to continue."
     saved = manager.store.get(session["id"])
     assert await manager.run_databricks(saved, "Continue in smaller steps.") is True
-    assert len(requests) == 2
+    assert len(requests) == (2 if overflow == "frame" else 4)
 
 
 async def test_maximum_existing_file_size_with_json_escaping_still_executes(runtime, monkeypatch):
@@ -177,7 +187,7 @@ async def test_maximum_existing_file_size_with_json_escaping_still_executes(runt
             return httpx.Response(200, stream=Chunks([*chunks, event({}, "tool_calls"), b"data: [DONE]\n\n"]))
         return httpx.Response(200, content=event({"content": "Done."}, "stop") + b"data: [DONE]\n\n")
 
-    async def execute(session, tools, name, values, call_id):
+    async def execute(session, tools, name, values, call_id, **_):
         calls.append((name, values, call_id))
         return "File written."
 

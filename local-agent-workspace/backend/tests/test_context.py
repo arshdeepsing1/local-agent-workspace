@@ -10,6 +10,10 @@ from local_agent.context import (
     SAFETY_MARGIN, SUMMARY_MAX_TOKENS, SUMMARY_PREFIX, build_summary_messages,
     context_boundary, context_breakdown, context_messages, estimate_tokens, prepare_context, retained_request,
 )
+from local_agent.context import (
+    INCOMPLETE_RESPONSE_CONTINUATION, INVALID_ARGUMENTS_CONTINUATION, VERIFY_CONTINUATION_PREFIX, is_continuation,
+    turn_start,
+)
 
 
 SYSTEM = {"role": "system", "content": "Follow the user's current request."}
@@ -97,7 +101,9 @@ async def test_small_context_requires_no_compaction_and_reports_estimated_budget
                     "input_budget": DEFAULT_CONTEXT_WINDOW - REPLY_RESERVE - SAFETY_MARGIN,
                     "context_window": DEFAULT_CONTEXT_WINDOW, "reply_reserve": REPLY_RESERVE,
                     "compactions": 0, "summarized_messages": 0, "estimate_method": "weighted_utf8",
-                    "breakdown": context_breakdown(messages, TOOLS)}
+                    "breakdown": context_breakdown(messages, TOOLS),
+                    "auto_compact_threshold": DEFAULT_CONTEXT_WINDOW - REPLY_RESERVE - SAFETY_MARGIN,
+                    "auto_compact_percent": 100}
 
 
 async def test_dynamic_reply_reserve_is_budgeted_without_mutating_wire():
@@ -311,9 +317,13 @@ async def test_final_serialized_request_is_checked_before_committing_summary():
     async def summarize(previous, chunk, limit_bytes):
         return "\\" * limit_bytes
 
-    with pytest.raises(ValueError, match="still exceed the context budget"):
-        await prepare_context(wire, state, SYSTEM, TOOLS, COMPACTION_CONTEXT_WINDOW, summarize)
-    assert (wire, state) == original
+    # The billed summary is shortened until the request fits, not discarded.
+    _, updated, info = await prepare_context(wire, state, SYSTEM, TOOLS, COMPACTION_CONTEXT_WINDOW, summarize)
+    assert info["estimated_tokens"] <= info["input_budget"] and info["summary_fitted_to_budget"] == "trimmed"
+    assert "summary_adjustment" not in info  # It was within its own byte limit.
+    assert updated["compactions"] == 1 and (wire, state) == original
+    # Turns that leave too little room even for a much shorter summary still fail without committing
+    # it: test_compaction_review_fixes.test_a_summary_that_cannot_fit_above_the_floor_still_fails_without_committing.
 
 
 @pytest.mark.parametrize("context_window", [MIN_CONTEXT_WINDOW - 1, MAX_CONTEXT_WINDOW + 1])
@@ -424,9 +434,73 @@ async def test_manual_compaction_still_keeps_the_latest_turn_intact():
                               forbidden_summary, force_compact=True)
 
 
+VERIFY_MESSAGE = user(VERIFY_CONTINUATION_PREFIX + " the project's verify command `pytest -q` failed (failed, exit 1).")
+
+
+async def test_manual_compaction_does_not_cut_one_turn_at_its_continuation():
+    # One turn with a Verify fix round: the hidden Verify message is not an earlier turn.
+    wire = [*reading_turn(files=1), assistant("Done."), VERIFY_MESSAGE, *read_exchange(1), assistant("Fixed.")]
+    with pytest.raises(ValueError, match="No earlier turns to compact"):
+        await prepare_context(wire, {}, SYSTEM, TOOLS, DEFAULT_CONTEXT_WINDOW, forbidden_summary, force_compact=True)
+
+
+async def test_automatic_compaction_keeps_the_latest_turn_whole_past_its_continuations():
+    wire = [user("Read the old log."), *read_exchange(0, size=75000), assistant("Read it."),
+            user("Latest request"), assistant("bad args"), user(INVALID_ARGUMENTS_CONTINUATION),
+            *read_exchange(1, size=100), assistant("Done."), VERIFY_MESSAGE, *read_exchange(2, size=100)]
+
+    async def summarize(previous, chunk, limit_bytes):
+        return "Old log read."
+
+    messages, state, info = await prepare_context(wire, {}, SYSTEM, TOOLS, COMPACTION_CONTEXT_WINDOW, summarize)
+    assert state["through"] == 4 and not info.get("compacted_in_turn")
+    assert messages[1] == user(SUMMARY_PREFIX + "Old log read.") and messages[2:] == wire[4:]
+
+
 def test_summary_boundaries_are_turn_starts_or_responses_inside_a_turn():
     wire = reading_turn(files=2)
     assert [index for index in range(len(wire) + 1) if context_boundary(wire, index)] == [0, 1, 3, 5]
     assert retained_request(wire, 3) == [wire[0]] and retained_request(wire, 0) == []
     assert context_boundary([assistant("orphan"), user("next")], 0) and not context_boundary(
         [assistant("orphan"), assistant("again")], 1)
+
+
+CONTINUATIONS = [OUTPUT_LIMIT_CONTINUATION, INVALID_ARGUMENTS_CONTINUATION, INCOMPLETE_RESPONSE_CONTINUATION,
+                 VERIFY_CONTINUATION_PREFIX + " the project's verify command `pytest -q` failed (failed, exit 1)."]
+
+
+@pytest.mark.parametrize("text", CONTINUATIONS)
+def test_app_continuations_never_start_a_turn(text):
+    assert is_continuation(user(text))
+    wire = [user("Fix the parser."), assistant("[Placeholder]"), user(text), assistant("Fixed.")]
+    # The real request starts the turn; a summary ending inside it keeps that request.
+    assert turn_start(wire, 3) == 0 and turn_start(wire, 2) == 0
+    assert retained_request(wire, 3) == [wire[0]]
+    assert [index for index in range(len(wire) + 1) if context_boundary(wire, index)] == [0, 1, 2, 3, 4]
+
+
+def test_only_the_apps_exact_messages_are_continuations():
+    assert not is_continuation(assistant(INVALID_ARGUMENTS_CONTINUATION))
+    assert not is_continuation(user(INVALID_ARGUMENTS_CONTINUATION + " And also this."))
+    assert not is_continuation(user("Please run " + VERIFY_CONTINUATION_PREFIX))
+    assert not is_continuation({"role": "user", "content": [{"type": "text", "text": OUTPUT_LIMIT_CONTINUATION}]})
+    assert not is_continuation(None)
+
+
+async def test_a_transcript_that_fits_one_summary_request_is_probed_once(monkeypatch):
+    """Integration review B, finding 16: each probe of the chunk search serializes about the whole
+    transcript on the event loop; one that fits whole needs no search."""
+    from local_agent import context
+    probes = []
+    encode = context.encode_payload
+    monkeypatch.setattr(context, "encode_payload", lambda payload: probes.append(1) or encode(payload))
+    wire = [message for number in range(40) for message in (
+        user(f"Question {number} " + "q" * 2_000), assistant(f"Answer {number} " + "a" * 2_000))] + [user("Latest")]
+    chunks = []
+
+    async def summarize(previous, chunk, limit_bytes):
+        chunks.append(chunk)
+        return "Summary."
+    probes.clear()
+    await prepare_context(wire, {}, SYSTEM, TOOLS, 262_144, summarize, force_compact=True)
+    assert len(chunks) == 1 and len(probes) <= 2  # One probe, plus the final request check.

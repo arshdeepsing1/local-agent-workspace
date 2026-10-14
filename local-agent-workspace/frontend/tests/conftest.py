@@ -59,7 +59,9 @@ class UI:
     def mount(self, module: str, props: str = "{}", name: str = "default", **start):
         """Render one module; `props` is a JavaScript expression evaluated in the page."""
         self.start(**start)
-        self.page.evaluate(f"() => mount({json.dumps(module)}, () => ({props}), {json.dumps(name)})")
+        self.page.evaluate(f"() => preload({json.dumps(module)}, {json.dumps(name)})")
+        # Synchronous: no promise is left for DevTools to await while the app starts.
+        self.page.evaluate(f"() => {{ mount({json.dumps(module)}, () => ({props}), {json.dumps(name)}) }}")
 
     def app(self, session: str | None = None, **start):
         """Render the whole app, optionally opened at ?session=<id>."""
@@ -68,7 +70,8 @@ class UI:
     def probe(self, module: str, name: str, session: str | None = None, **start):
         """Run a hook alone; its latest result is `hook` in the page."""
         self.start(query=f"?session={session}" if session else "", **start)
-        self.page.evaluate(f"() => probe({json.dumps(module)}, {json.dumps(name)})")
+        self.page.evaluate(f"() => preload({json.dumps(module)}, {json.dumps(name)})")
+        self.page.evaluate(f"() => {{ probe({json.dumps(module)}, {json.dumps(name)}) }}")
 
     def rerender(self, props: str):
         self.page.evaluate(f"() => rerender(() => ({props}))")
@@ -110,6 +113,13 @@ class UI:
         """Advance the faked clock (tests started with clock=True)."""
         self.page.clock.run_for(ms)
 
+    def row_action(self, title: str, item: str):
+        """Choose an item (Rename, Pin, Archive, Edit tags…, Delete…) in a sidebar row's More actions menu."""
+        button = self.page.get_by_role("button", name=f"More actions for {title}", exact=True)
+        button.hover()
+        button.click()
+        self.page.get_by_role("menu", name=f"Actions for {title}", exact=True).get_by_role("menuitem", name=item, exact=True).click()
+
 
 @pytest.fixture
 def page(browser):
@@ -126,3 +136,21 @@ def page(browser):
 @pytest.fixture
 def ui(page):
     return UI(page)
+
+
+@pytest.fixture
+def coarse_page(browser):
+    """A phone-sized touch page: (pointer: coarse) and (hover: none) match."""
+    context = browser.new_context(viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True)
+    page = context.new_page()
+    page.route(f"{ORIGIN}/**", serve)
+    errors = []
+    page.on("pageerror", lambda error: errors.append(error))
+    yield page
+    context.close()
+    assert not errors, f"Uncaught errors in the page: {errors}"
+
+
+@pytest.fixture
+def coarse_ui(coarse_page):
+    return UI(coarse_page)

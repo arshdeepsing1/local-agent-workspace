@@ -113,6 +113,8 @@ async def test_draft_checkpoints_are_throttled_by_size_and_flush_small_stalled_c
     manager, session = runtime
     monkeypatch.setattr("local_agent.drafts.DRAFT_BYTES", 100)
     monkeypatch.setattr("local_agent.drafts.DRAFT_INTERVAL_SECONDS", 0.02)
+    # Spacing by a save's cost would make the timing depend on the disk (see test_save_cost.py).
+    monkeypatch.setattr("local_agent.drafts.DRAFT_COST_FACTOR", 0)
     saved = []
     original = manager.store.save
 

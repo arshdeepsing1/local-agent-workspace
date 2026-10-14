@@ -5,7 +5,7 @@ import ConversationTransfer from './ConversationTransfer.js'
 import UsagePanel from './UsagePanel.js'
 import { blockerOf, OpenBlockingChat } from './BlockingChat.js'
 
-// Props: session, workspace?, onClose, onSelectSession, onError
+// Props: session, workspace?, onClose, onSelectSession, onError, onSaveTools?(tools) -> Session
 const profileLabels = { inherit: 'Inherit permitted tools', read_only: 'Read-only files', file_editor: 'Read and edit files' }
 const taskStatuses = ['pending', 'in_progress', 'completed', 'cancelled']
 const scopeQuery = session => session ? `?session_id=${encodeURIComponent(session.id)}` : ''
@@ -41,9 +41,9 @@ function AgentToolsScope(props) {
   return html`<dialog class="agent-tools-dialog" ref=${dialog} aria-label="Agent tools" onCancel=${props.onClose} onClick=${e => { if (e.target === dialog.current) props.onClose() }}>
     <div class="agent-tools-content">
       <header class="agent-tools-header"><div><h2>Agent tools</h2><p>${props.session?.title || 'Default workspace'}</p></div><button class="icon-button" aria-label="Close agent tools" onClick=${props.onClose}><${X} size=${18} /></button></header>
-      <nav class="agent-tools-tabs" aria-label="Agent tools sections">${['Recovery', 'Usage', 'Worktrees', 'Tasks', 'Extensions', 'Conversation'].map(name => html`<button key=${name} aria-pressed=${tab === name} onClick=${() => setTab(name)}>${name}</button>`)}</nav>
-      ${tab === 'Recovery' ? html`<${Recovery} ...${props} />` : tab === 'Usage' ? html`<${UsagePanel} session=${props.session} onError=${props.onError} />` : tab === 'Worktrees' ? html`<${Worktrees} ...${props} />` : tab === 'Tasks' ? html`<${Tasks} ...${props} />` : tab === 'Extensions' ? html`<${ExtensionsPanel} ...${props} />` :
-        html`<${ConversationTransfer} sessionId=${props.session?.id} workspace=${props.session?.workspace || props.workspace || ''} busy=${!!props.session && props.session.status !== 'idle'} onError=${props.onError} onSelectSession=${id => { props.onSelectSession(id); props.onClose() }} />`}
+      <nav class="agent-tools-tabs" aria-label="Agent tools sections">${['Recovery', 'Usage', 'Worktrees', 'Tasks', 'Verify', 'Extensions', 'Tools', 'Conversation'].map(name => html`<button key=${name} aria-pressed=${tab === name} onClick=${() => setTab(name)}>${name}</button>`)}</nav>
+      <div class="agent-tools-body">${tab === 'Recovery' ? html`<${Recovery} ...${props} />` : tab === 'Usage' ? html`<${UsagePanel} session=${props.session} onError=${props.onError} />` : tab === 'Worktrees' ? html`<${Worktrees} ...${props} />` : tab === 'Tasks' ? html`<${Tasks} ...${props} />` : tab === 'Verify' ? html`<${Verify} ...${props} />` : tab === 'Extensions' ? html`<${ExtensionsPanel} ...${props} />` : tab === 'Tools' ? html`<${ToolsPanel} ...${props} />` :
+        html`<${ConversationTransfer} sessionId=${props.session?.id} workspace=${props.session?.workspace || props.workspace || ''} busy=${!!props.session && props.session.status !== 'idle'} onError=${props.onError} onSelectSession=${id => { props.onSelectSession(id); props.onClose() }} />`}</div>
     </div>
   </dialog>`
 }
@@ -165,6 +165,42 @@ function SessionTasks({ session, onError, onSelectSession, onClose }) {
   </section>`
 }
 
+// The project's Verify command (app state, keyed by the resolved workspace, so a worktree is its own project).
+function Verify({ session, workspace, onError }) {
+  const query = scopeQuery(session)
+  const { busy, error, run } = useRequest(onError)
+  const [project, setProject] = useState(null)
+  const [command, setCommand] = useState('')
+  const [seconds, setSeconds] = useState('600')
+  const [rounds, setRounds] = useState('2')
+  const [notice, setNotice] = useState('')
+  const show = useCallback(values => {
+    setProject(values); setCommand(values.verify_command)
+    setSeconds(String(values.verify_timeout_seconds)); setRounds(String(values.verify_max_rounds))
+  }, [])
+  useEffect(() => { void run(() => api(`/project-settings${query}`), show) }, [query, run, show])
+  const save = e => {
+    e.preventDefault()
+    if (!project || busy) return  // A repeat Enter or click while saving.
+    setNotice('')
+    void run(() => api(`/project-settings${query}`, 'PUT', { verify_command: command.trim(), verify_timeout_seconds: Number(seconds), verify_max_rounds: Number(rounds) }),
+      values => { show(values); setNotice(values.verify_command ? 'Verify command saved for this project.' : 'Verify is off for this project.') })
+  }
+  const folder = project?.workspace || session?.workspace || workspace || 'this workspace'
+  return html`<section class="agent-tools-section" aria-label="Verify">
+    <h3>Verify command</h3>
+    <p>Runs after a reply in which the agent changed files in this project (${folder}). It runs like the agent's run_command, so the permission mode and rules apply: it asks for approval unless the mode or an allow rule (for this chat, this project or all projects) allows it, deny rules block it, Don't ask blocks it unless a rule allows it, and it never runs in Plan mode. If it fails, the agent sees the end of its output and gets another model request to fix it, up to the fix rounds below. Leave it empty to turn it off.</p>
+    <form class="agent-tools-form" onSubmit=${save}>
+      <label>Command<input disabled=${!project} readOnly=${busy} maxLength=${2000} spellcheck=${false} value=${command} placeholder="pytest -q" onInput=${e => setCommand(e.currentTarget.value)} /></label>
+      <label>Time limit (seconds)<input type="number" min="10" max="3600" step="1" required disabled=${!project} readOnly=${busy} value=${seconds} onInput=${e => setSeconds(e.currentTarget.value)} /></label>
+      <label>Fix rounds<input type="number" min="1" max="3" step="1" required disabled=${!project} readOnly=${busy} value=${rounds} onInput=${e => setRounds(e.currentTarget.value)} /></label>
+      <div class="agent-tools-actions"><button class="primary" disabled=${!project} aria-disabled=${busy ? 'true' : 'false'}>Save</button></div>
+    </form>
+    ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}${notice ? html`<p role="status">${notice}</p>` : null}
+    <p class="field-help">Saved in this app's state for this project folder, not in the repository, and not included in conversation exports. Each fix round uses agent steps; the command card shows the full output.</p>
+  </section>`
+}
+
 const extensionExample = JSON.stringify({ servers: [{ id: 'example', name: 'Example MCP', transport: 'stdio', command: 'your-mcp-server', args: [], enabled: false }], hooks: [{ id: 'example-hook', event: 'before_tool', tools: ['write_file', 'edit_file'], command: 'your-hook-command', timeout_seconds: 10, enabled: false }] }, null, 2)
 
 function ExtensionsPanel({ session, onError }) {
@@ -191,5 +227,56 @@ function ExtensionsPanel({ session, onError }) {
     <h3>Skills</h3>${!session ? html`<p class="field-help">Start a conversation to enable skills.</p>` : null}
     <div class="agent-tools-list">${skills.map(skill => html`<div class="agent-tools-row" key=${skill.id}><label><input type="checkbox" disabled=${busy || !session} checked=${activeSkills.includes(skill.id)} onChange=${e => { if (session) void run(() => api(`/sessions/${encodeURIComponent(session.id)}/skills`, 'POST', { skill_id: skill.id, enabled: e.currentTarget.checked }), result => setActiveSkills(result.active_skills)) }} />${skill.name}<small>${skill.description}</small><small>${skill.path}</small></label></div>`)}</div>
     ${!busy && !skills.length ? html`<p class="muted">No installed skills found.</p>` : null}
+  </section>`
+}
+
+// MCP tool names the server accepts in a chat's turned-off list.
+const MCP_TOOL = /^mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_.-]+$/
+
+// Turned-off tools of this chat: GET /tools?session_id= lists the built-in and feature tools.
+function ToolsPanel({ session, onError, onSaveTools }) {
+  const { busy, error, run } = useRequest(onError)
+  const [tools, setTools] = useState(null)
+  const [off, setOff] = useState([])
+  const [mcpName, setMcpName] = useState('')
+  const [mcpError, setMcpError] = useState('')
+  const [notice, setNotice] = useState('')
+  const id = session?.id
+  useEffect(() => {
+    if (id) void run(() => api(`/tools?session_id=${encodeURIComponent(id)}`), result => { setTools(result.tools || []); setOff(result.disabled || []) })
+  }, [id, run])
+  if (!session) return html`<section class="agent-tools-section" aria-label="Tools"><p>Start a conversation to choose its tools.</p></section>`
+  const names = new Set((tools || []).map(tool => tool.name))
+  const extra = off.filter(name => !names.has(name))
+  const toggle = (name, available) => { setNotice(''); setOff(current => available ? current.filter(item => item !== name) : [...current, name]) }
+  const addMcp = () => {
+    const name = mcpName.trim()
+    if (!MCP_TOOL.test(name)) { setMcpError('Enter an MCP tool name such as mcp__docs__search.'); return }
+    setMcpError(''); setNotice(''); setMcpName('')
+    setOff(current => current.includes(name) ? current : [...current, name])
+  }
+  const save = () => {
+    setNotice('')
+    const operation = onSaveTools ? () => onSaveTools(off) : () => api(`/sessions/${encodeURIComponent(id)}/disabled-tools`, 'PUT', { tools: off })
+    void run(operation, updated => { if (Array.isArray(updated?.disabled_tools)) setOff(updated.disabled_tools); setNotice('Tools saved for this chat.') })
+  }
+  return html`<section class="agent-tools-section tools-panel" aria-label="Tools">
+    <h3>Tools in this chat</h3>
+    <p>Turned-off tools are not offered to the agent in this chat, and calls to them are refused. Changes apply from the agent's next step. Subagents, forks and imports keep this setting.</p>
+    ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
+    <div class="agent-tools-list">${(tools || []).map(tool => html`<div class="agent-tools-row" key=${tool.name}><label class="tools-toggle">
+      <input type="checkbox" aria-label=${tool.name} aria-describedby=${tool.description ? `tool-description-${tool.name}` : null}
+        disabled=${busy} checked=${!off.includes(tool.name)} onChange=${e => toggle(tool.name, e.currentTarget.checked)} />
+      <span><strong>${tool.name}</strong>${tool.description ? html`<small id=${`tool-description-${tool.name}`}>${tool.description}</small>` : null}</span></label></div>`)}</div>
+    <form class="agent-tools-form" onSubmit=${e => { e.preventDefault(); addMcp() }}>
+      <label>Turn off an MCP tool by name<input spellcheck=${false} disabled=${busy} value=${mcpName} placeholder="mcp__docs__search"
+        onInput=${e => { setMcpName(e.currentTarget.value); setMcpError('') }} /></label>
+      <button class="outline" disabled=${busy || !mcpName.trim()}>Add</button>
+    </form>
+    ${mcpError ? html`<p class="form-error" role="alert">${mcpError}</p>` : null}
+    ${extra.length ? html`<ul class="tool-chips" aria-label="Turned-off MCP tools">${extra.map(name => html`<li key=${name}><span>${name}</span>
+      <button class="icon-button" disabled=${busy} aria-label=${`Turn on ${name}`} onClick=${() => toggle(name, true)}><${X} size=${13} /></button></li>`)}</ul>` : null}
+    <div class="agent-tools-actions"><button class="primary" disabled=${busy || tools === null} onClick=${save}>Save tools</button></div>
+    ${notice ? html`<p role="status">${notice}</p>` : null}
   </section>`
 }

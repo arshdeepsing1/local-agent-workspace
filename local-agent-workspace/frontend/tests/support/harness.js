@@ -1,7 +1,7 @@
 // Renders one UI module in isolation for a test:
-//   await mount('components/Conversation.js', () => ({ session, onError: fake.spy('onError') }))
+//   await preload('components/Conversation.js'); mount('components/Conversation.js', () => ({ session, onError: fake.spy('onError') }))
 //   rerender(() => ({ ...newProps }))   unmount()
-//   await probe('useWorkspace.js', 'useWorkspace')  then read window.hook
+//   await preload('useWorkspace.js', 'useWorkspace'); probe('useWorkspace.js', 'useWorkspace')  then read window.hook
 import { h, options, render } from 'preact'
 import { useState } from 'preact/hooks'
 
@@ -24,18 +24,28 @@ function Host({ component, initial }) {
   return h(component, props)
 }
 
-// Rendering is synchronous, so each helper returns once the component is on the page.
-window.mount = async (module, makeProps = () => ({}), name = 'default') => {
-  const component = await load(module, name)
-  render(h(Host, { component, initial: makeProps() }), root)
+// Modules are imported first (window.preload, the only asynchronous step); mount and
+// probe then render synchronously, so the test's evaluate call returns no promise.
+// A promise that resolves while the rendered app's effects and fetches still fill the
+// microtask queue can be garbage collected before DevTools reads it ("Resulting promise
+// was garbage collected"), which made tests that mount the whole app flaky.
+const loaded = new Map()
+window.preload = async (module, name = 'default') => { loaded.set(`${module}#${name}`, await load(module, name)) }
+// Runs `use` with the export now when it was preloaded, else after importing it (a promise).
+const withExport = (module, name, use) => {
+  const value = loaded.get(`${module}#${name}`)
+  return value ? use(value) : load(module, name).then(use)
 }
+
+// Rendering is synchronous, so each helper returns once the component is on the page.
+window.mount = (module, makeProps = () => ({}), name = 'default') =>
+  withExport(module, name, component => { render(h(Host, { component, initial: makeProps() }), root) })
 window.rerender = makeProps => setProps(makeProps())
 window.unmount = () => render(null, root)
 
 // Mounts a component that calls a hook and publishes its latest result.
-window.probe = async (module, name) => {
-  const hook = await load(module, name)
+window.probe = (module, name) => withExport(module, name, hook => {
   function Probe() { window.hook = hook(); return null }
   render(h(Probe), root)
-}
+})
 window.harnessReady = true

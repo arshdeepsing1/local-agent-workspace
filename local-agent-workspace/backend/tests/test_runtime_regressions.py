@@ -143,7 +143,9 @@ async def test_resume_recovers_completed_tool_result_after_cancelled_broadcast(r
     assert (tmp_path / "written.txt").read_text() == "Already written."
     saved = manager.store.get(session["id"])
     output = next(event["output"] for event in saved["events"] if event.get("call_id") == "write-call")
-    assert not any(message["role"] == "tool" for message in saved["wire"])
+    # Stop closes the turn at once with the recorded result, then the stop marker (history.close_stopped).
+    assert [message["role"] for message in saved["wire"]] == ["user", "assistant", "tool", "assistant"]
+    assert saved["wire"][2] == {"role": "tool", "tool_call_id": "write-call", "content": output}
 
     restarted = AgentManager(manager.store, manager.settings)
     restarted.start(session["id"], "Continue.")

@@ -285,6 +285,22 @@ def test_activity_summary_counts_one_action_in_the_singular(ui, page):
     expect(page.get_by_text("Activity · 1 action", exact=True)).to_be_visible()
 
 
+def test_find_files_and_wait_job_cards_name_their_pattern_and_job(ui, page):
+    show(ui, """[
+      { id: 'find', type: 'tool', name: 'find_files', state: 'completed', input: { pattern: 'src/**/*.test.ts', path: 'web' } },
+      { id: 'find-here', type: 'tool', name: 'find_files', state: 'completed', input: { pattern: '*.py', path: '.' } },
+      { id: 'wait', type: 'tool', name: 'wait_job', state: 'completed', input: { job_id: '0123456789abcdef', until_regex: 'ready on [0-9]+' } },
+      { id: 'wait-exit', type: 'tool', name: 'wait_job', state: 'running', input: { job_id: 'fedcba9876543210' } },
+    ]""")
+    expect(page.get_by_role("button", name="find files src/**/*.test.ts in web", exact=True)).to_be_visible()
+    expect(page.get_by_role("button", name="find files *.py", exact=True)).to_be_visible()
+    expect(page.get_by_role("button", name="wait job 01234567 until /ready on [0-9]+/", exact=True)).to_be_visible()
+    expect(page.get_by_role("button", name="wait job fedcba98", exact=True)).to_be_visible()
+    page.get_by_text("Activity · 4 actions").click()
+    expect(page.locator("details.activity-summary").get_by_text("· src/**/*.test.ts in web")).to_be_visible()
+    expect(page.locator("details.activity-summary").get_by_text("· 01234567 until /ready on [0-9]+/")).to_be_visible()
+
+
 def test_activity_summary_keeps_states_and_approval(ui, page):
     states = ["running", "pending", "completed", "rejected", "cancelled", "error"]
     events = "[" + ",".join(f"{{ id: 'tool-{i}', type: 'tool', name: 'action_{i}', state: '{state}', input: {{ path: 'file-{i}' }} }}"
@@ -348,7 +364,8 @@ def test_task_updates_do_not_claim_requested_status(ui, page):
     expect(page.get_by_role("button", name="update task Verify exported HTML", exact=True)).to_be_visible()
     expect(page.get_by_text("Task: completed")).to_have_count(0)
     ui.rerender(f"{{ onError: fake.spy('onError'), session: makeSession([{create}, {{ ...{update}, state: 'error', output: 'Complete dependencies first.' }}]) }}")
-    page.get_by_role("button", name="update task Verify exported HTML", exact=True).click()
+    # A failed tool names its status after the subject (no error category here: "failed").
+    page.get_by_role("button", name="update task Verify exported HTML failed", exact=True).click()
     expect(page.get_by_label("Output")).to_have_text("Complete dependencies first.")
     expect(page.get_by_text("Task: completed")).to_have_count(0)
 
@@ -454,8 +471,202 @@ def test_pages_of_one_file_show_the_lines_each_read_covered(ui, page):
     show(ui, "[" + ", ".join([read("p1", 1, 108), read("p2", 109, 243), read("p3", 244, state="running", output=""),
                                read("empty", 1, 0), read("failed", 500, state="error", output="Not a file.")]) + "]")
     for name in ("read file notes/v7.md · lines 1–108", "read file notes/v7.md · lines 109–243",
-                 "read file notes/v7.md · from line 244", "read file notes/v7.md · from line 500"):
+                 "read file notes/v7.md · from line 244", "read file notes/v7.md · from line 500 failed"):
         expect(page.get_by_role("button", name=name, exact=True)).to_be_visible()
     expect(page.get_by_role("button", name="read file notes/v7.md", exact=True)).to_be_visible()
     page.get_by_text("Activity · 5 actions").click()
     expect(page.locator(".activity-subject").nth(1)).to_have_text(" · notes/v7.md · lines 109–243")
+
+
+# File paths in replies and tool cards open the Workspace editor.
+
+PATH_REPLY = ("Edit `src/app.py:12` now, and see docs/guide.md for details. "
+              "The page https://example.com/docs/page.html, file:///srv/x/notes.md, e.g. this, and `npm test` stay text.")
+
+
+def test_paths_in_a_reply_become_links_and_urls_do_not(ui, page):
+    show(ui, "[{ id: 'reply', type: 'assistant', text: " + json.dumps(PATH_REPLY) + " }]",
+         ", onOpenPath: fake.spy('open')")
+    links = page.locator(".markdown a.path-link")
+    expect(links).to_have_count(2)
+    expect(links.nth(0)).to_have_text("src/app.py:12")
+    expect(links.nth(0)).to_have_attribute("data-path", "src/app.py")
+    expect(links.nth(0)).to_have_attribute("data-line", "12")
+    expect(links.nth(0).locator("code")).to_have_text("src/app.py:12")
+    expect(links.nth(1)).to_have_text("docs/guide.md")
+    expect(links.nth(1)).not_to_have_attribute("data-line", re.compile("."))
+    expect(page.get_by_role("link", name="https://example.com/docs/page.html")).to_have_attribute(
+        "href", "https://example.com/docs/page.html")
+    expect(page.get_by_text(re.compile(r"file:///srv/x/notes\.md, e\.g\. this"))).to_be_visible()
+    links.nth(1).click()
+    links.nth(0).click()
+    assert ui.spy("open") == [[{"path": "docs/guide.md"}], [{"path": "src/app.py", "line": 12}]]
+    assert ui.js("location.hash") == ""
+
+
+IDENTIFIER_REPLY = ("Call `os.path.join` and `json.dumps`, read `settings.values`, use `console.log`, set `self.timeout`. "
+                    "Connect to db.example.com:5432 and api.internal.io:8080 or `db.example.com:5432`. "
+                    "Edit `package.json`, `app.ts:3`, `Main.PY` and main.go:7.\n\n"
+                    "```\nsrc/app.py:12\nsee docs/guide.md and main.go:7\n```")
+
+
+def test_identifiers_hosts_and_code_blocks_are_not_linked(ui, page):
+    # Reported: dotted identifiers in inline code and host:port text became broken file links.
+    show(ui, "[{ id: 'reply', type: 'assistant', text: " + json.dumps(IDENTIFIER_REPLY) + " }]",
+         ", onOpenPath: fake.spy('open')")
+    expect(page.locator(".markdown pre")).to_contain_text("src/app.py:12")
+    expect(page.locator(".markdown a.path-link")).to_have_text(["package.json", "app.ts:3", "Main.PY", "main.go:7"])
+    expect(page.locator(".markdown pre a")).to_have_count(0)
+
+
+def test_reasoning_summaries_and_conversations_without_a_handler_have_no_path_links(ui, page):
+    show(ui, "[{ id: 'reply', type: 'assistant', text: 'See docs/guide.md.', reasoning_summary: 'Read src/app.py:3 first.' }]",
+         ", onOpenPath: fake.spy('open')")
+    page.get_by_text("Provider reasoning summary").click()
+    expect(page.locator(".reasoning-summary a.path-link")).to_have_count(0)
+    expect(page.locator(".markdown a.path-link")).to_have_count(1)
+    ui.rerender("{ session: makeSession([{ id: 'other', type: 'assistant', text: 'See docs/other.md.' }]), onError: fake.spy('onError') }")
+    expect(page.get_by_text("See docs/other.md.")).to_be_visible()
+    expect(page.locator(".markdown a.path-link")).to_have_count(0)
+
+
+def test_markup_next_to_a_path_stays_text(ui, page):
+    text = 'Open docs/guide.md <img src=x onerror="window.pwned=1"> <b>bold</b> and lib/x.py:3 <i>it</i>'
+    show(ui, "[{ id: 'reply', type: 'assistant', text: " + json.dumps(text) + " }]", ", onOpenPath: fake.spy('open')")
+    expect(page.locator(".markdown a.path-link")).to_have_count(2)
+    expect(page.locator(".markdown img, .markdown b, .markdown i")).to_have_count(0)
+    expect(page.locator(".markdown")).to_contain_text('<img src=x onerror="window.pwned=1"> <b>bold</b>')
+    page.wait_for_timeout(100)
+    assert ui.js("window.pwned === undefined")
+
+
+@pytest.mark.parametrize("name, field, start, expected", [
+    ("read_file", "path", 40, {"path": "src/app.py", "line": 40}),
+    ("edit_file", "path", None, {"path": "src/app.py"}),
+    ("move_path", "destination", None, {"path": "src/app.py"}),
+])
+def test_tool_card_open_file(ui, page, name, field, start, expected):
+    extra = f", start_line: {start}" if start else ""
+    show(ui, f"[{{ id: 'tool', type: 'tool', name: '{name}', state: 'completed', output: 'ok', "
+             f"input: {{ {field}: 'src/app.py', path_other: 'x'{extra} }} }}]", ", onOpenPath: fake.spy('open')")
+    page.get_by_role("button", name=re.compile(f"^{name.replace('_', ' ')}")).click()
+    page.get_by_role("button", name="Open file").click()
+    assert ui.spy("open") == [[expected]]
+
+
+def test_tool_cards_without_a_file_have_no_open_button(ui, page):
+    show(ui, "[{ id: 'tool', type: 'tool', name: 'run_command', state: 'completed', output: 'ok', input: { command: 'ls' } }]",
+         ", onOpenPath: fake.spy('open')")
+    page.get_by_role("button", name=re.compile("^run command")).click()
+    expect(page.get_by_role("button", name="Open file")).to_have_count(0)
+
+
+@pytest.mark.parametrize("newline", ["\\n", "\\r\\n"], ids=["lf", "crlf"])
+def test_a_path_link_opens_the_file_at_its_line_in_the_workspace_panel(ui, page, newline):
+    reply = json.dumps(PATH_REPLY)
+    ui.app(session="a", scenario="workspace", setup=f"""
+      fake.sessions.set('a', {{ ...makeSession('a', 'Other conversation'), events: [{{ id: 'r', type: 'assistant', text: {reply} }}] }})
+      window.fileText = Array.from({{ length: 40 }}, (_, index) => `line ${{index + 1}} of the file`).join('{newline}')
+      fake.override = path => path.startsWith('/api/file?') ? fake.json({{ path: 'src/app.py', content: fileText, absolute: '/abs/path/src/app.py' }}) : undefined""")
+    ui.show_session("a")
+    page.locator(".markdown a.path-link").first.click()
+    editor = page.get_by_role("textbox", name="Edit src/app.py")
+    expect(editor).to_be_visible()
+    assert ui.requests("/api/file?path=src%2Fapp.py&session_id=a")
+    # The textarea holds CRLF line breaks as LF; the selection indexes that text.
+    offset = ui.js("fileText.split(/\\r?\\n/).slice(0, 11).join('\\n').length + 1")
+    ui.wait(f"document.activeElement?.selectionStart === {offset}")
+    assert ui.js("document.activeElement.selectionEnd") == offset + len("line 12 of the file")
+    assert ui.js("document.activeElement.value.slice(document.activeElement.selectionStart, "
+                 "document.activeElement.selectionEnd)") == "line 12 of the file"
+    expect(editor).to_be_focused()
+    expect(page.locator(".editor-status")).to_contain_text("40 lines · Line 12")
+    editor.press("End")
+    expect(page.locator(".editor-status")).not_to_contain_text("Line 12")
+
+
+def test_outline_and_overview_cards_name_their_subject(ui, page):
+    show(ui, """[
+      { id: 'outline', type: 'tool', name: 'outline_file', state: 'completed', output: '{}',
+        input: { path: 'docs/handoff.md', max_level: 2 } },
+      { id: 'outline-next', type: 'tool', name: 'outline_file', state: 'completed', output: '{}',
+        input: { path: 'src/app.py', offset: 120, max_level: 6 } },
+      { id: 'here', type: 'tool', name: 'project_overview', state: 'completed', output: '{}', input: { path: '.' } },
+      { id: 'default', type: 'tool', name: 'project_overview', state: 'completed', output: '{}', input: {} },
+      { id: 'backend', type: 'tool', name: 'project_overview', state: 'completed', output: '{}', input: { path: 'backend' } },
+    ]""", ", onOpenPath: fake.spy('open')")
+    expect(page.get_by_role("button", name="outline file docs/handoff.md · to level 2", exact=True)).to_be_visible()
+    expect(page.get_by_role("button", name="outline file src/app.py · from entry 120", exact=True)).to_be_visible()
+    expect(page.get_by_role("button", name="project overview workspace", exact=True)).to_have_count(2)
+    expect(page.get_by_role("button", name="project overview backend", exact=True)).to_be_visible()
+    page.get_by_role("button", name="outline file docs/handoff.md · to level 2", exact=True).click()
+    page.get_by_role("button", name="Open file").click()
+    assert ui.spy("open") == [[{"path": "docs/handoff.md"}]]
+
+
+def test_collapsed_cards_say_when_the_agent_got_less_than_the_card(ui, page):
+    show(ui, """[
+      { id: 'withheld', type: 'tool', name: 'read_file', state: 'completed', output: '{"content": "1: a"}',
+        input: { path: 'a.txt' }, model_output: '{"error_kind": "result_deferred"}',
+        result_withheld: { estimated_tokens: 9000, allowance_tokens: 4000 } },
+      { id: 'deferred', type: 'tool', name: 'read_file', state: 'completed', output: '{"content": "1: c"}',
+        input: { path: 'c.txt' }, model_output: '{"error_kind": "result_deferred"}',
+        result_withheld: { estimated_tokens: 3000, allowance_tokens: 4000 } },
+      { id: 'shortened', type: 'tool', name: 'run_command', state: 'completed', output: '{"output": "long"}',
+        input: { command: 'make test' }, model_output: '{"result_shortened": true}', result_shortened: true },
+      { id: 'plain', type: 'tool', name: 'read_file', state: 'completed', output: '{}', input: { path: 'b.txt' } },
+    ]""")
+    expect(page.locator(".tool-outcome")).to_have_count(3)
+    # One read larger than the whole allowance: running it again would not help.
+    expect(page.get_by_text("Result not sent to the agent: it is larger than the step's context allowance (about "
+                            "9,000 of 4,000 tokens). The agent was asked to read a smaller part.",
+                            exact=True)).to_be_visible()
+    expect(page.get_by_text("Result not sent to the agent: earlier results in the same step filled its context "
+                            "allowance. The agent can run it again.", exact=True)).to_be_visible()
+    expect(page.get_by_text("Result shortened for the agent to fit its context allowance.", exact=True)).to_be_visible()
+
+
+# Markdown tables keep words whole and scroll sideways; the phone tool-card subject uses the free space (styles.css)
+
+TABLE_REPLY = ("| File | Test | Note |\n|---|---|---|\n"
+               "| `src/utils/helpers.py` | `tests/test_app.py` | The helper keeps the order of the sections and the test "
+               "compares the rendered output line by line, so a change in one section shows as one failing line. |")
+
+
+def test_markdown_table_cells_keep_code_whole_at_phone_width(ui, page):
+    # V-T11. Mutations: delete .markdown :is(th,td){overflow-wrap:break-word} (code cells break mid-token), or set
+    # .markdown{overflow-wrap:normal} (the long path overflows). With .markdown{overflow-wrap:break-word} the path still
+    # wraps here (the reply, reasoning and plan containers have min-width:0), but its min-content width grows, which
+    # is why only table cells use break-word.
+    page.set_viewport_size({"width": 390, "height": 844})
+    long_path = "/srv/x/" + "_".join(f"generated_module_{n:02d}" for n in range(10)) + ".py"
+    assert len(long_path) >= 200
+    sentence = f"The file is {long_path} today."
+    show(ui, json.dumps([{"id": "r", "type": "assistant", "text": TABLE_REPLY},
+                         {"id": "p", "type": "assistant", "text": sentence, "reasoning_summary": sentence},
+                         {"id": "plan", "type": "tool", "name": "submit_plan", "state": "pending", "input": {"plan": sentence}}]))
+    codes = page.locator(".markdown td code")
+    expect(codes).to_have_count(2)
+    assert codes.evaluate_all("els => els.map(el => el.getClientRects().length)") == [1, 1]
+    assert page.locator(".markdown table").evaluate("e => e.scrollWidth >= e.clientWidth")
+    assert ui.js("document.documentElement.scrollWidth") <= 390
+    page.get_by_text("Provider reasoning summary").click()
+    paragraphs = page.locator(".markdown p", has_text="The file is")
+    expect(paragraphs).to_have_count(3)  # the reply, its reasoning summary and the plan
+    for paragraph in paragraphs.all():
+        assert paragraph.evaluate("e => e.getBoundingClientRect().height > 40")  # it wraps
+        assert paragraph.evaluate("e => e.scrollWidth <= e.clientWidth && e.getBoundingClientRect().right <= innerWidth")
+    assert ui.js("document.documentElement.scrollWidth") <= 390
+
+
+def test_a_phone_tool_card_shows_its_whole_subject(ui, page):
+    # V-T12. Mutation: restore .tool-subject{max-width:110px} in the 600 px block.
+    page.set_viewport_size({"width": 390, "height": 844})
+    output = json.dumps({"path": "README.md", "start_line": 1, "end_line": 40, "content": "# Readme"})
+    show(ui, json.dumps([{"id": "t", "type": "tool", "name": "read_file", "state": "completed", "input": {"path": "README.md"},
+                          "output": output}]))
+    subject = page.locator(".tool-card .tool-subject")
+    expect(subject).to_have_text("README.md · lines 1–40")
+    assert subject.evaluate("e => e.scrollWidth <= e.clientWidth")
+    heading = page.locator(".tool-card .tool-heading")
+    assert heading.evaluate("e => e.lastElementChild.getBoundingClientRect().right <= e.getBoundingClientRect().right + 0.5")

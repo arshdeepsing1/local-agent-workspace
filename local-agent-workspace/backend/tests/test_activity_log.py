@@ -111,6 +111,22 @@ def test_insert_replaces_marker_appends_or_creates_and_rejects_duplicates():
 def test_file_too_close_to_the_limit_asks_for_a_separate_file(tmp_path):
     with pytest.raises(ValueError, match="separate, new file"):
         activity_content({"id": "s", "workspace": str(tmp_path), "events": []}, "x" * 79_500)
+    # The budget follows the limit it is given (the smaller of 80 KB and the write limit).
+    with pytest.raises(ValueError, match="too close to the 16 KB limit"):
+        activity_content({"id": "s", "workspace": str(tmp_path), "events": []}, "x" * 15_500, limit=16_000)
+    content, stats = activity_content({"id": "s", "workspace": str(tmp_path), "events": []}, "x" * 15_500)
+    assert stats["placement"] == "appended"
+
+
+def test_file_groups_name_moves_deletes_notebooks_and_file_searches(tmp_path):
+    events = [tool_event(name, name, 1790238000.0 + number, input={"path": f"{name}.txt", "destination": "d.txt"})
+              for number, name in enumerate(("move_path", "delete_path", "notebook_edit", "notebook_read", "find_files"))]
+    log, stats = activity_log({"id": "s", "workspace": str(tmp_path), "events": events})
+    for label, name in (("Moved", "move_path"), ("Deleted", "delete_path"), ("Edited notebook", "notebook_edit"),
+                        ("Read notebook", "notebook_read"), ("Searched for files in", "find_files")):
+        destination = f" → {tmp_path / 'd.txt'}" if name == "move_path" else ""
+        assert f"**{label}** (`{name}`):\n- `{tmp_path / (name + '.txt')}{destination}`" in log
+    assert stats["files"] == 5 and stats["other_tool_calls"] == 0
 
 
 def test_activity_tool_is_a_file_edit_for_profiles_and_permission_modes():
@@ -121,11 +137,37 @@ def test_activity_tool_is_a_file_edit_for_profiles_and_permission_modes():
     assert tool_decision("plan", "insert_activity_log", {}) == "deny"
 
 
-def test_current_time_text_states_local_date_time_and_offset():
-    moment = datetime(2026, 9, 24, 13, 55, tzinfo=timezone(timedelta(hours=5, minutes=30)))
-    text = current_time_text(moment)
-    assert text.startswith("Current local date and time: 2026-09-24 13:55 ")
-    assert "(UTC+05:30)" in text and "do not infer today's date from file names" in text
+def test_current_time_text_states_the_local_date_and_offset_without_the_time():
+    """Day precision: a minute in the system message would miss the provider's prompt cache once a minute."""
+    zone = timezone(timedelta(hours=5, minutes=30))
+    text = current_time_text(datetime(2026, 9, 24, 13, 55, tzinfo=zone))
+    assert text.startswith("Current local date: 2026-09-24 (")
+    assert "UTC+05:30)" in text and "do not infer today's date from file names" in text
+    assert "run `date` when the exact time matters" in text and "13:55" not in text
+    assert current_time_text(datetime(2026, 9, 24, 0, 1, tzinfo=zone)) == text
+    # Without run_command (a restricted subagent) the model is not told to run `date`.
+    restricted = current_time_text(datetime(2026, 9, 24, 13, 55, tzinfo=zone), commands=False)
+    assert restricted.endswith("file names.") and "`date`" not in restricted and "13:55" not in restricted
+
+
+@pytest.mark.parametrize("profile, date, writes", [("read_only", False, False), ("file_editor", False, True),
+                                                   ("inherit", True, True)])
+def test_the_system_message_names_only_tools_the_profile_offers(tmp_path, monkeypatch, profile, date, writes):
+    monkeypatch.setattr("local_agent.config.APP_ROOT", tmp_path)
+    settings = Settings(tmp_path / "state")
+    settings.values.update(workspace=str(tmp_path), env_file="")
+    store = Store(settings.state_dir / "profiles.sqlite3")
+    try:
+        manager = AgentManager(store, settings)
+        session = store.create(settings.values)
+        session["tool_profile"] = profile
+        available = {item["function"]["name"] for item in manager.step_definitions(session, [])}
+        assert ("run_command" in available) is date and ("write_file" in available) is writes
+        system, _ = manager.context_inputs(session, manager.session_tools(session), "manual", available=available)
+        assert ("run `date`" in system["content"]) is date
+        assert ("File write limit" in system["content"]) is writes
+    finally:
+        store.db.close()
 
 
 # --- Agent integration --------------------------------------------------------------
@@ -242,7 +284,7 @@ async def test_system_prompt_states_the_date_and_that_documents_need_not_be_shor
     mock_gateway(monkeypatch, gateway)
     await manager.run(session, "Hello")
     system = requests[0]["messages"][0]["content"]
-    assert re.search(r"Current local date and time: \d{4}-\d{2}-\d{2} \d{2}:\d{2} .*\(UTC[+-]\d{2}:\d{2}\)", system)
+    assert re.search(r"Current local date: \d{4}-\d{2}-\d{2} \(.*UTC[+-]\d{2}:\d{2}\)", system)
     assert "Keep chat replies concise" in system
     assert "conciseness\napplies to chat replies, not to those files" in system
     assert "instead of shortening their" in system

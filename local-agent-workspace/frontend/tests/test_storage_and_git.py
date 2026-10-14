@@ -1,4 +1,4 @@
-"""Unreadable conversation files are named in a dismissible notice; the Changes tab shows server Git output."""
+"""Unreadable conversation files are named in a dismissible notice; the Changes tab shows Git's view from the server."""
 import json
 import re
 
@@ -46,7 +46,7 @@ def test_no_notice_when_every_file_was_read(ui, page):
 
 
 # A conversation whose file is unreadable: the server lists it as a storage problem
-# and answers GET /api/sessions/<id> with 400.
+# and answers GET /api/sessions/<id> and its /info existence check with 400.
 UNREADABLE = """
 fake.unreadable = new Set(UNREADABLE_IDS)
 fake.sessions.set('b', makeSession('b', 'Second conversation'))
@@ -56,7 +56,7 @@ fake.override = (path, options) => {
     storage_problems: [...fake.unreadable].map(id => ({ file: `${id}.jsonl`, reason: 'line 1 is not valid JSON' })) })
   if (path === '/api/sessions' && method === 'GET')
     return fake.json([...fake.sessions.values()].filter(item => !fake.unreadable.has(item.id)))
-  const id = path.match(/^\\/api\\/sessions\\/([^/]+)$/)?.[1]
+  const id = path.match(/^\\/api\\/sessions\\/([^/]+?)(?:\\/info)?$/)?.[1]
   if (id && method === 'GET' && fake.unreadable.has(id))
     return fake.json({ detail: `Conversation file ${id}.jsonl could not be read: line 1 is not valid JSON.` }, 400)
 }
@@ -78,9 +78,9 @@ def test_going_back_to_an_unreadable_conversation_explains_it_and_stops(ui, page
     expect(page.get_by_text("Reconnecting to your local server")).to_have_count(0)
     expect(page.locator(".conversation-title")).to_have_text("New conversation")
     assert ui.js("location.search") == ""
-    calls = len(ui.requests("/api/sessions/a", "GET"))
+    calls = len(ui.requests("/api/sessions/a/info", "GET"))
     page.clock.run_for(10000)
-    assert len(ui.requests("/api/sessions/a", "GET")) == calls  # no retry loop
+    assert len(ui.requests("/api/sessions/a/info", "GET")) == calls  # no retry loop
     assert ui.js("fake.socketsFor('a').length") == 1
 
 
@@ -94,29 +94,38 @@ def test_a_link_to_an_unreadable_conversation_does_not_say_it_no_longer_exists(u
     assert ui.js("location.search") == ""
 
 
-# The Changes tab shows GET /api/git output (run by the server without a shell).
+# The Changes tab shows Git's view of the project from GET /api/git/status (run by the server without a shell).
 
-def open_changes(ui, page, body, status=200):
-    setup = f"fake.override = path => path.startsWith('/api/git') ? fake.json({json.dumps(body)}, {status}) : undefined"
+def open_changes(ui, page, body, status=200, diff=None):
+    setup = (f"fake.override = path => path.startsWith('/api/git/status') ? fake.json({json.dumps(body)}, {status}) "
+             f": path.startsWith('/api/git/diff') ? fake.json({json.dumps(diff)}) : undefined")
     ui.app(scenario="workspace", setup=setup)
     expect(page.get_by_role("combobox", name="Model")).to_have_value("test-model")
     page.get_by_role("button", name="Workspace", exact=True).click()
     page.get_by_role("button", name="Changes", exact=True).click()
-    return page.locator(".diff-output")
+    return page.get_by_role("complementary", name="Workspace panel")
 
 
 def test_changes_tab_shows_status_and_diff(ui, page):
-    output = " M app.py\ndiff --git a/app.py b/app.py\n-print('old')\n+print('new')\n"
-    diff = open_changes(ui, page, {"exit_code": 0, "output": output, "truncated": False})
-    expect(diff).to_contain_text(" M app.py")
-    expect(diff.locator(".added")).to_have_text("+print('new')\n")
-    expect(diff.locator(".removed")).to_have_text("-print('old')\n")
+    body = {"repository": True, "branch": "main", "truncated": False, "files": [
+        {"path": "app.py", "area": "unstaged", "status": "modified", "added": 1, "removed": 1, "hidden": None}]}
+    diff = {"path": "app.py", "area": "unstaged", "binary": False, "truncated": False, "added": 1, "removed": 1, "lines": [
+        {"kind": "hunk", "text": "@@ -1 +1 @@"}, {"kind": "removed", "text": "print('old')", "old": 1},
+        {"kind": "added", "text": "print('new')", "new": 1}]}
+    panel = open_changes(ui, page, body, diff=diff)
+    expect(panel.get_by_role("heading", name="Changes (1)")).to_be_visible()
+    panel.get_by_role("button", name=re.compile("app.py")).click()
+    lines = panel.locator(".diff-line")
+    expect(lines).to_have_count(3)
+    expect(lines.nth(0)).to_have_class(re.compile(r"\bhunk\b"))
+    expect(panel.locator(".diff-line.added .line-text")).to_have_text("Added: print('new')")
+    expect(panel.locator(".diff-line.removed .line-text")).to_have_text("Removed: print('old')")
+    assert ui.requests("/api/git/diff?path=app.py&area=unstaged")
 
 
 def test_changes_tab_explains_a_folder_without_a_repository(ui, page):
-    message = "fatal: not a git repository (or any of the parent directories): .git"
-    diff = open_changes(ui, page, {"exit_code": 128, "output": message + "\n", "truncated": False})
-    expect(diff).to_contain_text(message)
+    panel = open_changes(ui, page, {"repository": False, "branch": None, "files": [], "truncated": False})
+    expect(panel.get_by_text("Not a Git repository.")).to_be_visible()
 
 
 def test_changes_tab_reports_a_git_timeout(ui, page):
