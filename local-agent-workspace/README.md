@@ -2161,6 +2161,42 @@ Automatic compaction adds bounded summary requests beyond the configured agent s
 Databricks inference is billed to your workspace. Endpoints must support streaming,
 function calling, and non-streamed text responses for summarization.
 
+## Trying the app offline (simulator)
+
+`scripts/simulate_databricks.py` starts the app against a simulated Databricks workspace on
+your computer: no network, no token, no billed requests. Use it to try effort levels, the
+Thinking display, subagents, background jobs and change review before using a paid workspace.
+
+```
+.venv/bin/python scripts/simulate_databricks.py                 # http://127.0.0.1:8766
+.venv/bin/python scripts/simulate_databricks.py --speed 0.3     # less waiting
+.venv/bin/python scripts/simulate_databricks.py --workspace ~/code/demo
+```
+
+- A fake gateway on `127.0.0.1` answers the two routes the app uses
+  (`/api/2.0/serving-endpoints` and `/serving-endpoints/<name>/invocations`) with the same
+  chat-completion chunks as Databricks, and lists `databricks-claude-opus-5-5`,
+  `databricks-claude-opus-4-8` and `databricks-gpt-oss-120b`. Your credential file is never
+  read; the app's credentials point at the gateway.
+- It checks reasoning fields as the endpoints document them: Claude Opus 5.5 always thinks
+  (effort `low` to `max` in `output_config.effort`, default `medium`; `budget_tokens` or
+  disabled thinking is refused with HTTP 400), Opus 4.8 thinks only with
+  `thinking.type: "adaptive"`, GPT OSS takes `reasoning_effort` `low`/`medium`/`high`. Claude
+  endpoints stream a summary only when the request asks for `thinking.display: "summarized"`; longer
+  efforts think longer and report more reasoning tokens. Each request's reasoning fields are
+  printed in the terminal.
+- `--claude-fields anthropic|openai|none` makes the simulated route refuse one style of
+  reasoning field for Claude endpoints, to rehearse what happens if the real chat-completions
+  route does (the default `both` accepts either).
+- Words in your message choose a scripted turn: `edit` (writes a file, then edits it twice
+  with pauses, so you can press **Keep** in between), `job` (a background command and
+  `wait_job`), `delegate` or `parallel` (one or two read-only subagents), `ask` (a question
+  card), `task`, `read`, `rate limit` (one HTTP 429 with `Retry-After: 2`), `long`. Any other
+  message gets a reply that says which effort and fields the request carried.
+- Simulated chats and settings live in `.local/simulator/` (`--state-dir` to change), apart
+  from your real conversations. Without `--workspace` a small demo Git project is created
+  there. The app runs on port 8766, so the real app on 8765 can run at the same time.
+
 ## Development and checks
 
 The frontend has no build step. The browser loads the files in `frontend/static/`
