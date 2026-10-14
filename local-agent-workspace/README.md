@@ -651,7 +651,8 @@ when opening a conversation or performing restart recovery.
   A command that exits non-zero, times out or is interrupted shows a warning icon, a label
   (`exit 1`, `signal 9` for a process ended by a signal, `timed out` or `interrupted`) and its
   last output line under the collapsed card (`Exit 1 · …`; when output past `max_output_bytes`
-  was not kept, it says so instead). A command started with `background` is labelled
+  was not kept, it says so instead); its expanded card's **Action** line reads `ran · exit 1`,
+  not `completed`. A command started with `background` is labelled
   `started in background`. A failed tool shows its error category, and its expanded card shows
   **Error category** and the **Hint given to the agent**. Expanded command and job cards show the
   output as text, then a **State** line (state, exit code, size, and which part the result
@@ -660,7 +661,9 @@ when opening a conversation or performing restart recovery.
   with the full result (with the edited-command note for a command you edited; when a result
   was shortened for the agent or not sent to it, the card says so). On `wait_job`,
   `get_job_output` and `stop_job` cards a green tick means
-  the tool worked; a muted label such as `job exit 1` reports the job itself.
+  the tool worked; a muted label such as `job exit 1` reports the job itself. A `wait_job` card
+  first says how the wait ended: `matched` (the **State** line quotes the matching line),
+  `wait timed out` (no tick) or `job ended`.
   **Read before overwriting:** the conversation remembers the size and modification time
   of each file the agent read (`read_file` any page, or `notebook_read`) or wrote, up to 500 files.
   `write_file` on an existing file is refused, before any approval card, unless the

@@ -53,7 +53,9 @@ def test_a_failed_command_shows_its_exit_code_and_last_line(ui, page):
     expect(raw).not_to_be_visible()
     page.get_by_text("Raw result", exact=True).click()
     expect(raw).to_contain_text('"exit_code": 1')
-    expect(card.get_by_text("Action: completed · exit 1")).to_be_visible()
+    # The Action line does not contradict the failed state. Mutation: print event.state.
+    expect(card.get_by_text("Action: ran · exit 1")).to_be_visible()
+    expect(card.get_by_text("Action: completed", exact=False)).to_have_count(0)
     expect(card.locator(".tool-outcome")).to_have_count(0)
 
 
@@ -154,6 +156,26 @@ def test_a_wait_job_card_reports_a_failed_job_in_a_muted_label(ui, page):
     expect(card.locator(".tool-outcome")).to_have_count(0)
 
 
+@pytest.mark.parametrize("reason, match, state, tick, label, line", [
+    ("matched", {"line": "server ready on :8000", "offset": 0}, "running", True, "matched",
+     "State: running · wait matched: server ready on :8000"),
+    ("timeout", None, "running", False, "wait timed out", "State: running · wait timed out"),
+    ("exited", None, "completed", True, "job ended", "State: completed · job ended during the wait · exit 0"),
+])
+def test_a_wait_job_card_shows_how_the_wait_ended(ui, page, reason, match, state, tick, label, line):
+    # The heading and the expanded card name the wait's reason, not only the job's state ('job running').
+    # Mutation: build the label from job.state alone.
+    output = "server ready on :8000\n"
+    show(ui, tool(name="wait_job", output=job_page(state, 0 if state == "completed" else None, output, reason=reason,
+                                                    match=match, output_start=0, next_offset=len(output))))
+    card = page.locator(".tool-card")
+    expect(card.locator(".tool-status")).to_have_text(label)
+    expect(card.locator(".success-icon")).to_have_count(1 if tick else 0)
+    card.locator(".tool-heading").click()
+    expect(card.locator(".tool-job-state")).to_have_text(f"{line} · {len(output)} characters")
+    expect(card.get_by_text(f"Action: completed · {label}")).to_be_visible()
+
+
 def test_a_failed_shell_command_shows_its_exit_not_json(ui, page):
     # B-T4. Mutation: drop user_command from JOB_TOOLS.
     show(ui, tool(name="user_command", state="error", output=job_page("failed", 2, "ls: cannot access 'x'\n"), command="ls x"))
@@ -203,11 +225,11 @@ def test_an_mcp_error_shows_its_text(ui, page):
 
 
 def test_the_activity_summary_names_the_exit_code(ui, page):
-    # B-T8. Mutation: leave the summary on event.state.
+    # B-T8. Mutation: leave the summary on event.state. A command that failed 'ran' (not 'completed').
     show(ui, tool(output=job_page("failed", 1, FAILED_OUTPUT)), tool("ok", output=job_page("completed", 0, "fine"), command="true"))
     page.get_by_text("Activity · 2 actions").click()
     items = page.locator(".activity-summary li")
-    expect(items.nth(0)).to_contain_text("Action: completed · exit 1")
+    expect(items.nth(0)).to_contain_text("Action: ran · exit 1")
     expect(items.nth(1).locator("small")).to_have_text("Action: completed")
 
 
