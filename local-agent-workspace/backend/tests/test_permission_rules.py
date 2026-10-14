@@ -359,8 +359,8 @@ async def test_delegate_task_shows_a_card_in_manual_and_a_chat_rule_allows_it(ru
                                                     {"task": "Count files", "context": "Use ls", "max_steps": 3}, "d"))
     session_id, event_id = await card(manager)
     event = next(item for item in session["events"] if item["id"] == event_id)
-    assert event["preview"] == ("Start a subagent (separate paid model requests, at most 3 steps)\n\nTask: Count files"
-                                "\nContext: Use ls")
+    assert event["preview"] == ("Start a subagent (general; separate paid model requests, at most 3 steps)"
+                                "\n\nTask: Count files\nContext: Use ls")
     assert started == []
     manager.decide(session_id, event_id, True, scope="chat")
     result = json.loads(await asyncio.wait_for(task, 10))

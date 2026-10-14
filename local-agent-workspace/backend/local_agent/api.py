@@ -356,7 +356,10 @@ def create_app(settings=None):
     @app.get("/api/sessions")
     async def list_sessions():
         counts = manager.changes.counts()
-        return [{**s, "status": manager.statuses.get(s["id"], "idle"), "unreviewed_changes": counts.get(s["id"], 0)}
+        # A parent's subagents index (up to 200 entries) is left out: the list is fetched often while
+        # subagents work, and /sessions/<id>/children lists them.
+        return [{**{k: v for k, v in s.items() if k != "subagents"}, "status": manager.statuses.get(s["id"], "idle"),
+                 "unreviewed_changes": counts.get(s["id"], 0)}
                 for s in store.list()]
 
     @app.post("/api/sessions")
@@ -515,6 +518,7 @@ def create_app(settings=None):
                 deleting_sessions.update(family)
             for member in family:
                 await manager.stop(member)
+                manager.delegates.forget(member, keep=family)  # A deleted subagent stays in its parent's index, marked.
                 await manager.jobs.remove_session(member)
                 manager.task_board.delete_session(member)
                 manager.checkpoints.delete_session(member)

@@ -140,7 +140,7 @@ async def test_keeping_children_stops_the_active_subagent_first(runtime):
     parent, child, _, _ = family(manager)
     live_child = manager.store.get(child["id"])
     cancelled = running(manager, live_child)
-    manager.delegates.active[parent["id"]] = {"child_session_id": child["id"], "cancelled": False}
+    manager.delegates.active[parent["id"]] = [{"child_session_id": child["id"], "cancelled": False}]
     response = await client.delete(f"/api/sessions/{parent['id']}", params={"children": "keep"})
     assert response.status_code == 200
     assert cancelled.is_set()

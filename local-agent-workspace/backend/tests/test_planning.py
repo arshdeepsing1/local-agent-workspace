@@ -175,7 +175,7 @@ async def test_delegate_uses_authoritative_parent_permissions_and_rejects_recurs
         await helper.delegate(parent, "Gone parent")
 
 
-@pytest.mark.parametrize("steps", [0, 9, True, 1.5, "6"])
+@pytest.mark.parametrize("steps", [0, 25, True, 1.5, "6"])
 async def test_delegate_validates_step_limit_before_creating_child(delegation, steps):
     manager, helper, parent = delegation
     with pytest.raises(ValueError, match="max_steps"):
@@ -183,29 +183,82 @@ async def test_delegate_validates_step_limit_before_creating_child(delegation, s
     assert len(manager.store.list()) == 1
 
 
-async def test_delegate_enforces_global_and_per_parent_limits(delegation):
+async def test_delegations_beyond_three_wait_for_a_free_slot(delegation):
+    """A chat may run several subagents; over all chats at most three run, the others wait (queued)."""
     manager, helper, parent = delegation
-    parents = [parent] + [manager.store.create(manager.settings.values) for _ in range(3)]
-    release, started = asyncio.Event(), asyncio.Event()
-    count = 0
+    other = manager.store.create(manager.settings.values)
+    releases, started = {}, []
     async def worker(session, prompt):
-        nonlocal count
-        count += 1
-        if count == 3:
-            started.set()
+        started.append(session["id"])
+        releases[session["id"]] = release = asyncio.Event()
         await release.wait()
         await manager.event(session, "assistant", text="Finished")
     manager.run_databricks = worker
-    pending = [asyncio.create_task(helper.delegate(item, "Inspect")) for item in parents[:3]]
-    await asyncio.wait_for(started.wait(), 1)
-    with pytest.raises(ValueError, match="already running"):
-        await helper.delegate(parent, "Duplicate")
-    with pytest.raises(ValueError, match="three subagents"):
-        await helper.delegate(parents[3], "Fourth")
-    release.set()
-    assert all(result["status"] == "completed" for result in await asyncio.gather(*pending))
+    pending = [asyncio.create_task(helper.delegate(parent, f"Inspect {index}")) for index in range(2)]
+    pending.append(asyncio.create_task(helper.delegate(other, "Inspect other")))
+    for _ in range(100):
+        if len(started) == 3:
+            break
+        await asyncio.sleep(0.01)
+    assert len(started) == 3 and helper.running() == 3
+    assert len(helper.active[parent["id"]]) == 2 and len(helper.active[other["id"]]) == 1
+    manager.live[parent["id"]] = parent
+    spawning = await manager.event(parent, "tool", name="delegate_task", call_id="queued", input={"task": "Fourth"},
+                                   output="", state="running")
+    fourth = asyncio.create_task(helper.delegate(parent, "Fourth", parent_event=spawning))
+    for _ in range(100):
+        if spawning.get("delegation"):
+            break
+        await asyncio.sleep(0.01)
+    assert spawning["delegation"] == {"status": "queued", "completed_tools": 0, "agent_type": "general"}
+    assert len(started) == 3 and helper.running() == 3 and len(helper.active[parent["id"]]) == 3
+    releases[started[0]].set()
+    for _ in range(100):
+        if len(started) == 4:
+            break
+        await asyncio.sleep(0.01)
+    assert len(started) == 4 and spawning["child_session_id"] == started[3]
+    assert spawning["delegation"]["status"] == "running"
+    for release in list(releases.values()):
+        release.set()
+    for _ in range(100):
+        if len(releases) == 4:
+            break
+        await asyncio.sleep(0.01)
+    releases[started[3]].set()
+    results = await asyncio.gather(*pending, fourth)
+    assert [result["status"] for result in results] == ["completed"] * 4
+    assert helper.active == {} and helper.waiters == []
+
+
+async def test_stopping_a_parent_stops_all_its_subagents_and_a_queued_one_never_starts(delegation):
+    manager, helper, parent = delegation
+    busy = [manager.store.create(manager.settings.values) for _ in range(2)]
+    started = []
+    async def worker(session, prompt):
+        started.append(session["id"])
+        await asyncio.Event().wait()
+    manager.run_databricks = worker
+    others = [asyncio.create_task(helper.delegate(item, "Hold a slot")) for item in busy]
+    mine = asyncio.create_task(helper.delegate(parent, "Mine"))
+    for _ in range(100):
+        if len(started) == 3:
+            break
+        await asyncio.sleep(0.01)
+    queued = asyncio.create_task(helper.delegate(parent, "Waits"))
+    await asyncio.sleep(0.02)
+    assert len(started) == 3 and len(helper.active[parent["id"]]) == 2
+    await helper.cancel_parent(parent["id"])
+    first, second = await asyncio.gather(mine, queued)
+    assert first["status"] == "cancelled" and manager.tasks[first["child_session_id"]].done()
+    assert second == {"child_session_id": None, "agent_type": "general", "tool_profile": "inherit", "status": "cancelled",
+                      "terminal_reason": "stopped", "steps_used": 0, "tool_calls": 0, "changed_files": [],
+                      "transcript": None, "output": "The subagent was cancelled before it started."}
+    assert len(started) == 3 and parent["id"] not in helper.active
+    for item in busy:
+        await helper.cancel_parent(item["id"])
+    assert all(result["status"] == "cancelled" for result in await asyncio.gather(*others))
     assert helper.active == {}
-    assert (await helper.delegate(parents[3], "Now allowed"))["status"] == "completed"
 
 
 async def test_parent_cancellation_awaits_child_cleanup(delegation):
@@ -305,14 +358,20 @@ async def test_parent_progress_is_live_correlated_and_contains_no_child_payloads
     assert child["parent_event_id"] == spawning["id"] and child["parent_call_id"] == "call-review"
     assert child["events"][0]["origin"] == {"kind": "delegated", "parent_session_id": parent["id"],
                                             "parent_event_id": spawning["id"], "parent_call_id": "call-review"}
-    assert event["delegation"] == {"status": "awaiting_approval", "completed_tools": 0, "last_tool": "read_file"}
+    started = event["delegation"].pop("started")
+    assert event["delegation"] == {"status": "awaiting_approval", "completed_tools": 0, "last_tool": "read_file",
+                                   "agent_type": "general"}
+    event["delegation"]["started"] = started
     assert "private child contents" not in json.dumps(saved)
     assert saved["wire"] == []
     release.set()
     result = await pending
     assert result["status"] == result["terminal_reason"] == "completed"
     progress = manager.store.get(parent["id"])["events"][0]["delegation"]
-    assert progress == {"status": "completed", "completed_tools": 1, "last_tool": "read_file", "terminal_reason": "completed"}
+    assert progress["started"] <= progress["ended"]
+    assert {key: value for key, value in progress.items() if key not in ("started", "ended")} == {
+        "status": "completed", "completed_tools": 1, "last_tool": "read_file", "terminal_reason": "completed",
+        "agent_type": "general"}
     await helper.progress(manager.store.get(child["id"]), status="running", terminal_reason="stopped")
     assert manager.store.get(parent["id"])["events"][0]["delegation"] == progress
 
@@ -372,7 +431,8 @@ async def test_child_cancelled_before_first_schedule_has_terminal_progress(deleg
     assert manager.statuses[result["child_session_id"]] == "idle"
     assert helper.active == {}
     progress = manager.store.get(parent["id"])["events"][-1]["delegation"]
-    assert progress == {"status": "cancelled", "completed_tools": 0, "terminal_reason": "stopped"}
+    assert {key: value for key, value in progress.items() if key not in ("started", "ended")} == {
+        "status": "cancelled", "completed_tools": 0, "terminal_reason": "stopped", "agent_type": "general"}
     monkeypatch.setattr(manager, "start", original)
     manager.run_databricks = lambda session, prompt: asyncio.sleep(0)
     manager.start(result["child_session_id"], "Human follow-up after cancellation")
@@ -393,8 +453,7 @@ async def test_delegation_reserves_capacity_before_publishing_and_cleans_up_canc
     monkeypatch.setattr(manager, "broadcast", broadcast)
     pending = asyncio.create_task(helper.delegate(parent, "Slow notification"))
     await asyncio.wait_for(publishing.wait(), 1)
-    with pytest.raises(ValueError, match="already running"):
-        await helper.delegate(parent, "Duplicate")
+    assert helper.running() == 1 and helper.active[parent["id"]][0]["child_session_id"]
     assert len(helper.children(parent["id"])) == 1
     pending.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -422,7 +481,7 @@ async def test_parent_cancellation_during_unscheduled_child_cleanup_propagates(d
     monkeypatch.setattr(manager, "stop", stop)
     pending = asyncio.create_task(helper.delegate(parent, "Never started"))
     await asyncio.wait_for(cleanup_started.wait(), 1)
-    child_id = helper.active[parent["id"]]["child_session_id"]
+    child_id = helper.active[parent["id"]][0]["child_session_id"]
     pending.cancel()
     with pytest.raises(asyncio.CancelledError):
         await pending

@@ -43,7 +43,7 @@ from .worktrees import WorktreeManager
 from .extensions import ExtensionManager
 from .extensions import skill_index
 from .context import estimate_text_tokens
-from .planning import TaskManager, DelegateManager
+from .planning import DEFAULT_STEPS, PROFILE_TYPES, CallAllowance, DelegateManager, DelegationGate, TaskManager
 from .interactions import InteractionManager
 from .feature_tools import FEATURE_TOOLS
 from .tool_profiles import tool_allowed, filter_tools
@@ -286,9 +286,14 @@ asked about CSV files. When a listed skill fits the task, load it with use_skill
 A user message that contains /<skill-id> as a word (or starts with /skill <skill-id>) has
 selected that skill, and its instructions are included here: follow them, treating the rest
 of the message as the request.
-Record multi-step work with create_task/update_task; keep status truthful. Delegate only a
-concrete independent task, supplying its needed context. Subagents share files, so avoid
-concurrent conflicting edits. Open the child conversation to approve its pending actions.
+Record multi-step work with create_task/update_task; keep status truthful.
+Use delegate_task to keep this context small: give a subagent broad codebase exploration, reading
+many or large files, wide searches, running a long command and summarizing its output, or an
+independent investigation; only its short report comes back. Do a single small lookup, or work
+that needs this conversation's back-and-forth, yourself. A subagent sees nothing of this chat:
+state the full task, constraints, paths and the report you expect. agent_type explore is read-only
+(investigation), editor edits files, general has this chat's tools. Independent delegations can
+run in parallel as several delegate_task calls in one response; never split edits that could conflict.
 MCP tools and configured hooks require separate approval except in Bypass; Plan blocks them.
 Prefer surgical edits. Don't modify unrelated files.
 """
@@ -666,6 +671,14 @@ def card_answers(events, call_id, output):
             return (event.get("state") in ("completed", "error", "rejected")
                     and event.get("model_output", event.get("output")) == output)
     return False
+
+
+def parallel_run(calls, start):
+    """How many calls from start run together: a run of consecutive delegate_task calls, else 1."""
+    end = start
+    while end < len(calls) and calls[end]["function"]["name"] == "delegate_task":
+        end += 1
+    return max(1, end - start)
 
 
 def unanswered(event, declined):
@@ -1747,10 +1760,9 @@ class AgentManager:
             raise ValueError("This action cannot be edited.")
         await reviser(changes)
 
-    def active_child(self, session):
-        entry = self.delegates.active.get(session["id"])
-        child = self.get(entry["child_session_id"]) if entry else None
-        return child if child is not None and child is not session else None
+    def active_children(self, session):
+        """The chat's running subagents (several when it delegated in parallel)."""
+        return [child for child in self.delegates.active_children(session["id"]) if child is not session]
 
     async def change_mode(self, session, mode, *, notice=True):
         """Switch the permission mode at any time; waiting cards and a running subagent follow."""
@@ -1766,8 +1778,7 @@ class AgentManager:
         interactions = getattr(self, "interactions", None)
         if interactions is not None:
             await interactions.mode_changed(session, old, mode)
-        child = self.active_child(session)
-        if child is not None:
+        for child in self.active_children(session):
             await self.change_mode(child, mode, notice=notice)
 
     async def set_disabled_tools(self, session, names):
@@ -1776,16 +1787,14 @@ class AgentManager:
         self.store.save(session)
         await self.publish_permissions(session)
         await self.recheck_pending(session, "tools")
-        child = self.active_child(session)
-        if child is not None:
+        for child in self.active_children(session):
             await self.set_disabled_tools(child, names)
 
     async def rules_changed(self, scope, session=None):
         """Publish and re-check after a rule change: the chat, every live chat of the project, or every live chat."""
         if scope == "chat":
             affected = [session] if session is not None else []
-            child = self.active_child(session) if session is not None else None
-            if child is not None:
+            for child in self.active_children(session) if session is not None else ():
                 # A running subagent copied the chat's rules when it started; new deny and ask rules reach it too.
                 rules = child.setdefault("allow_rules", [])
                 added = [rule for rule in session.get("allow_rules") or [] if rule.get("behavior") in ("deny", "ask")
@@ -2280,7 +2289,8 @@ class AgentManager:
             await self.status(session, "running")
             await self.event(session, "user", text=prompt, **origin, **({"attachments": attachments} if attachments else {}))
             if session["title"] == "New conversation" and not session.get("title_generated"):
-                session["title"] = fallback_title(prompt, self.redact_title)
+                # A delegated prompt is named by its task (the first paragraph), not the instructions after it.
+                session["title"] = fallback_title(prompt.split("\n\n", 1)[0] if origin else prompt, self.redact_title)
                 self.store.save(session)
                 await self.broadcast(session["id"], {"type": "title", "title": session["title"]})
             # content (the message with its attachments) is passed only when it differs from the prompt.
@@ -2369,10 +2379,51 @@ class AgentManager:
             except STORAGE_ERRORS as exc:
                 await report_storage_failure(exc)
 
-    async def execute_tool(self, session, tools, name, arguments, call_id, origin=None, allowance=None):
+    async def run_delegations(self, session, tools, calls, values, allowance):
+        """Consecutive delegate_task calls of one response, run in parallel; their outputs in call
+        order. Each call is prepared in call order (checks, approval card, hooks), so cards come
+        one at a time; then every prepared delegation starts together (DelegateManager still runs
+        at most three subagents at once; the others wait for a slot). Results are finished one at
+        a time as the subagents end, each charged once to the response's allowance."""
+        lock = asyncio.Lock()
+        gates = [DelegationGate(lock) for _ in calls]
+        shares = [CallAllowance(allowance) for _ in calls]
+        tasks = []
+        try:
+            for call, arguments, gate, share in zip(calls, values, gates, shares):
+                task = asyncio.create_task(self.execute_tool(session, tools, call["function"]["name"], arguments,
+                                                             call["id"], allowance=share, gate=gate))
+                task.add_done_callback(gate.finished)
+                tasks.append(task)
+                # Prepared (waiting at the gate) or finished early (refused, declined, invalid).
+                await asyncio.wait((task, gate.ready), return_when=asyncio.FIRST_COMPLETED)
+                if task.done():
+                    task.result()  # An unexpected error ends the turn, as it does for one call.
+            delegating = any(gate.ready.done() for gate in gates)
+            if delegating:
+                await self.status(session, "delegating")
+            try:
+                for gate in gates:
+                    gate.go.set()
+                outputs = await asyncio.gather(*tasks)
+            finally:
+                if delegating:
+                    await self.status(session, "running")
+            for output, share in zip(outputs, shares):
+                if not share.settled:
+                    share.charge(output)  # A refusal or another early return is sent too.
+            return outputs
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+    async def execute_tool(self, session, tools, name, arguments, call_id, origin=None, allowance=None, gate=None):
         """Run one tool call and return what the model receives. allowance (a ResultAllowance) is
         the context the results of the current model response may still use: a read that does not
-        fit is withheld (the model may ask again), other results are shortened."""
+        fit is withheld (the model may ask again), other results are shortened. gate (a
+        planning.DelegationGate): a delegate_task call that runs in parallel with others (run_delegations)."""
         event = await self.event(session, "tool", name=name, input=arguments, call_id=call_id, state="running", output="",
                                  **({"verify": True} if origin == "verify" else {}))
         invoked = False
@@ -2414,7 +2465,9 @@ class AgentManager:
             carded = False  # An "ask" verdict must have shown a card before anything runs.
             if name in ("delegate_task", "stop_job") and verdict.decision == "ask":
                 if name == "delegate_task":
-                    preview = (f"Start a subagent (separate paid model requests, at most {arguments.get('max_steps', 6)} steps)"
+                    kind = arguments.get("agent_type") or PROFILE_TYPES.get(arguments.get("tool_profile"), "general")
+                    preview = (f"Start a subagent ({kind}; separate paid model requests, at most "
+                               f"{arguments.get('max_steps', DEFAULT_STEPS)} steps)"
                                f"\n\nTask: {arguments['task']}"
                                + (f"\nContext: {arguments['context']}" if arguments.get("context") else "")
                                + (f"\nTool profile: {arguments['tool_profile']}" if arguments.get("tool_profile") else ""))
@@ -2637,11 +2690,16 @@ class AgentManager:
             elif name in ("ask_user", "submit_plan"):
                 result = await self.interactions.handle(session, event, name, arguments)
             elif name == "delegate_task":
-                await self.status(session, "delegating")
-                try:
-                    result = await self.delegates.delegate(session, **arguments, parent_event=event)
-                finally:
-                    await self.status(session, "running")
+                def start():
+                    return self.delegates.delegate(session, **arguments, parent_event=event)
+                if gate is not None:
+                    result = await gate.run(start)  # run_delegations sets the chat's status.
+                else:
+                    await self.status(session, "delegating")
+                    try:
+                        result = await start()
+                    finally:
+                        await self.status(session, "running")
             elif name == "run_command":
                 if verdict.argv is not None and verdict.decision == "allow":
                     result = await self.command_tool(session, event, arguments, argv=list(verdict.argv),
@@ -4074,18 +4132,27 @@ class AgentManager:
                 allowance = ResultAllowance(
                     max(0, min(input_budget // 2, input_budget - fixed - ALLOWANCE_MARGIN_TOKENS)), scale,
                     calls=len(ordered_calls))
-                for call, values in zip(ordered_calls, arguments):
-                    settled = allowance.settled
-                    output = await self.execute_tool(session, tools, call["function"]["name"], values, call["id"],
-                                                     allowance=allowance)
-                    if allowance.settled == settled:
-                        allowance.charge(output)  # A refusal or another early return is sent too.
-                    wire.append({"role": "tool", "tool_call_id": call["id"], "content": output})
-                    if not card_answers(session["events"], call["id"], output):
-                        # A finished card already saved this result; repair_tool_history rebuilds this
-                        # message from it if the app stops before the next save. Each save rewrites
-                        # the whole conversation file.
-                        self.store.save(session)
+                start = 0
+                while start < len(ordered_calls):
+                    # Consecutive delegate_task calls run in parallel; every other call runs alone, in order.
+                    size = parallel_run(ordered_calls, start)
+                    group, values = ordered_calls[start:start + size], arguments[start:start + size]
+                    start += size
+                    if size > 1:
+                        outputs = await self.run_delegations(session, tools, group, values, allowance)
+                    else:
+                        settled = allowance.settled
+                        outputs = [await self.execute_tool(session, tools, group[0]["function"]["name"], values[0],
+                                                           group[0]["id"], allowance=allowance)]
+                        if allowance.settled == settled:
+                            allowance.charge(outputs[0])  # A refusal or another early return is sent too.
+                    for call, output in zip(group, outputs):  # One tool message per call, in call order.
+                        wire.append({"role": "tool", "tool_call_id": call["id"], "content": output})
+                        if not card_answers(session["events"], call["id"], output):
+                            # A finished card already saved this result; repair_tool_history rebuilds this
+                            # message from it if the app stops before the next save. Each save rewrites
+                            # the whole conversation file.
+                            self.store.save(session)
                 if step_index + 1 < steps:
                     await self.drain_queue(session, wire, tools, fits=lambda message: in_turn_tokens(
                         [*model_history(wire), message], context_state, system, definitions, input_budget,

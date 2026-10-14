@@ -229,7 +229,7 @@ async def test_stopping_parent_cancels_child_without_another_parent_model_reques
     monkeypatch.setattr(manager.delegates, "cancel_parent", cancel_with_yield)
     manager.start(session["id"], "Delegate an inspection")
     await asyncio.wait_for(child_started.wait(), 3)
-    child_id = manager.delegates.active[session["id"]]["child_session_id"]
+    child_id = manager.delegates.active[session["id"]][0]["child_session_id"]
     await asyncio.wait_for(manager.stop(session["id"]), 3)
     assert len(parent_requests) == 1
     assert len(child_requests) == 1

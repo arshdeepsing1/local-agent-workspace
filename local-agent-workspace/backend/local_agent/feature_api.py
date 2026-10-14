@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 from . import approvals
 from .agents import public_session
 from .approvals import busy_conflict, busy_status, ensure_idle
+from .planning import transcript_name
 from .portability_api import root_project
 from .tool_profiles import validate_profile
 
@@ -165,8 +166,11 @@ def register_features(app, manager, settings, store, session_or_404, workspace_t
 
     @app.get("/api/sessions/{session_id}/children")
     async def children(session_id: str):
-        session_or_404(session_id)
-        return [{**child, "status": manager.statuses.get(child["id"], "idle")}
+        """The chat's subagent chats (headers), with their status, transcript file and, for those
+        started since the parent keeps a subagents index, that entry (task, steps_used, tool_calls)."""
+        index = {item.get("id"): item for item in session_or_404(session_id).get("subagents") or [] if isinstance(item, dict)}
+        return [{**child, "status": manager.statuses.get(child["id"], "idle"), "transcript": transcript_name(child["id"]),
+                 **({"subagent": index[child["id"]]} if child["id"] in index else {})}
                 for child in manager.delegates.children(session_id)]
 
     @app.put("/api/sessions/{session_id}/subagent-profile")
