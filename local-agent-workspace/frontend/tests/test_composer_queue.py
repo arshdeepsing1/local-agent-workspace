@@ -207,9 +207,18 @@ def test_a_pending_side_question_leaves_the_box_free(ui, page):
     expect(box).to_have_value("")
     box.fill("Also fix the tests")
     expect(page.get_by_role("button", name="Queue message")).to_be_enabled()
+    # A slow answer to the queued message, as on a busy machine: Enter is ignored while a message is
+    # being sent, so the next step waits until Queue message is enabled again.
+    ui.run("""const send = window.fetch; window.fetch = async (url, options) => {
+      const response = await send(url, options)
+      if (String(url).endsWith('/messages')) await new Promise(done => setTimeout(done, 400))
+      return response
+    }""")
     box.press("Enter")
     ui.wait("fake.requests('/api/sessions/a/messages', 'POST').length === 1")
     assert ui.bodies("/api/sessions/a/messages", "POST") == [{"text": "Also fix the tests"}]
+    box.fill("x")
+    expect(page.get_by_role("button", name="Queue message")).to_be_enabled()
     box.fill("/btw and now?")  # One side question at a time: the text stays, with the reason.
     box.press("Enter")
     expect(page.get_by_role("alert")).to_contain_text("A side question is already being answered in this conversation.")
