@@ -48,7 +48,8 @@ frontend that runs without a build step.
 - Explicit MCP servers, workspace skills with a `/` command menu, and approval-controlled
   tool lifecycle hooks.
 - Persistent tasks with dependencies, shown as a live checklist above the message box,
-  and bounded subagents in separate conversations.
+  and subagents the model starts on its own (explore, general or editor; several in
+  parallel), each in its own conversation file linked from its parent's.
 - Markdown transcripts of a conversation: download or copy one from the app, or write
   them for many saved conversations with a script.
 - Collapsible activity and persisted provider reasoning summaries when returned by the endpoint.
@@ -184,7 +185,7 @@ MCP (`mcp==2.2.0`), and the MCP HTTP transport dependency HTTPX2. No Claude SDK,
 Claude CLI, or sibling SDK checkout is required. An optional MCP server may have
 its own runtime requirements, such as Node; install those only for the servers you choose.
 
-To move selected chat history between machines, use **Agent tools → Conversation →
+To move selected chat history between machines, use **Agent tools → Export →
 Export conversation**, then import the JSON on the other machine and explicitly
 choose its local project folder. Imports receive fresh IDs, Manual permissions,
 no folder grants, and no active skills; they never overwrite existing conversations.
@@ -209,7 +210,7 @@ recent history may not have been saved. Back up the whole `conversations/` folde
 (the JSONL files and their `.state.json` files) and the separate operational SQLite
 database.
 
-**Agent tools → Conversation** exports a versioned JSON bundle, optionally with
+**Agent tools → Export** exports a versioned JSON bundle, optionally with
 subagent conversations (32 total, 16 MiB maximum). Export requires idle chats.
 Imports preserve historical messages, tool results, summaries, and usage, remap
 conversation/event/call IDs and included child links, and cancel historical active
@@ -334,7 +335,7 @@ when opening a conversation or performing restart recovery.
   - **Long chats**: opening a chat loads its latest 200 messages and actions, extended to the
     whole latest turn (at most 1,000). **Load earlier messages (N more)** at the top loads the
     100 before them without moving what you are reading. Until then, the **Activity · N
-    actions** summary and the turn labels of **Agent tools → Recovery** cover only the loaded
+    actions** summary and the turn labels of **Agent tools → Checkpoints** cover only the loaded
     part. Reconnecting loads the latest part again.
 - **Notifications**: click **Notify me** at the bottom of the sidebar to turn on browser
   notifications; the browser asks for permission only then. The switch shows **On** or
@@ -459,7 +460,7 @@ when opening a conversation or performing restart recovery.
   folder removes it from Files and leaves the folder itself alone; a folder that no longer
   exists or cannot be reached shows "Not found". When the agent changed files under none of these folders,
   "N changed files outside these folders" offers **Add <folder>** for up to three of their
-  folders. **Agent tools → Recovery** can preview and restore saves and agent edits in an
+  folders. **Agent tools → Checkpoints** can preview and restore saves and agent edits in an
   added folder. You can review (**Keep** or **Undo**) the agent's changes there whatever the
   chat's folder access.
   The list is kept in `workspace_folders.json` in the state directory. The choice
@@ -494,7 +495,7 @@ when opening a conversation or performing restart recovery.
     file changed after the list or diff you looked at, its Keep or Undo is refused and the
     list refreshes, so you can look again. An Undo of several files checks all of them
     before it changes any.
-  - An undo is itself a file checkpoint: **Agent tools → Recovery → Other file edits** can
+  - An undo is itself a file checkpoint: **Agent tools → Checkpoints → Other file edits** can
     bring the agent's version back. Folders created for a new file are not removed.
   - The agent's `write_file`, `edit_file`, `move_path`, `delete_path`, `notebook_edit`
     and `insert_activity_log` changes are listed, and files changed by its foreground
@@ -562,7 +563,7 @@ when opening a conversation or performing restart recovery.
     that reaches the step limit keeps its list, so **Undo** stays available. A manual
     compaction does not count as a reply, and a subagent's reply clears only the subagent's
     list. Edits made with the
-    agent's file tools can still be undone from **Agent tools → Recovery**; edits made by
+    agent's file tools can still be undone from **Agent tools → Checkpoints**; edits made by
     commands can no longer be undone from the app.
 - **Workspace / Changes**: inspect Git status and tracked-file diffs. Untracked
   files are listed too. Files are grouped as **Staged changes**, **Changes** (not staged,
@@ -615,7 +616,7 @@ when opening a conversation or performing restart recovery.
   "“Fix the parser” is waiting for your approval. Answer or stop it before undoing agent
   changes."); when it is another chat, **Open “…”** next to the error switches to it. The
   button appears in the error banner, next to Undo errors in the Workspace file review, and
-  next to Restore errors in **Agent tools** → **Recovery**.
+  next to Restore errors in **Agent tools** → **Checkpoints**.
   A chat waiting for approval shows **Needs approval** in the sidebar and counts in the tab
   title; **Notify me** also tells you when this page is hidden or another chat is open.
 - **Allow for this chat**: next to Decline and Approve, a card offers **Always allow this
@@ -774,7 +775,7 @@ when opening a conversation or performing restart recovery.
   this computer; hover it for the explanation.
 - **Stop**: cancel the current agent turn and its foreground command. Background
   jobs continue; stop them individually in Terminal. Approved writes and completed
-  shell side effects are retained. Stop also cancels its active subagent. Deleting a
+  shell side effects are retained. Stop also cancels its subagents. Deleting a
   conversation removes its jobs, tasks, and file checkpoint copies; edited files stay
   on disk. Delete a chat with **More actions** → **Delete…**; one that has subagent chats asks first: **Delete with subagents**
   deletes them too (at every depth, each stopped first), and **Delete, keep subagents** keeps
@@ -813,7 +814,7 @@ when opening a conversation or performing restart recovery.
     agent edits). Any file in the last two states, or one the chat can no longer
     reach, refuses the whole file rewind and nothing is changed. A rewound file goes
     back, in one write, to its state before the agent's first edit in that range; each
-    write keeps a reverse checkpoint, so **Agent tools → Recovery → Other file edits**
+    write keeps a reverse checkpoint, so **Agent tools → Checkpoints → Other file edits**
     can undo it. Only edits made through the file tools (`write_file`, `edit_file`,
     `insert_activity_log`, `move_path`, `delete_path`, `notebook_edit`) are rewound,
     including those of turns an earlier conversation rewind removed; changes made by
@@ -900,7 +901,7 @@ when opening a conversation or performing restart recovery.
   are refused with the reason. **Open in VS Code** in the editor toolbar opens the file at
   that line through a `vscode://file/<absolute path>:<line>` link; nothing happens when VS
   Code is not installed.
-- **Copy and export a conversation**: **Agent tools → Conversation → Export Markdown**
+- **Copy and export a conversation**: **Agent tools → Export → Export Markdown**
   downloads the conversation as a Markdown transcript (`<date>-<title>-<id>.md`; a secret
   in the title becomes `redacted` in the file name), and
   **Copy conversation** copies the same text. It is the transcript the
@@ -927,7 +928,10 @@ workspace anyway, because commands run in the workspace can still reach it.
   history (`wire`). Commands associated with the chat are included as sanitized job
   records with their command, state, limits, exit status, and bounded retained output.
   Files are atomically replaced as current-state snapshots rather than appended
-  indefinitely while an answer streams.
+  indefinitely while an answer streams. A subagent has a file of its own; its header names
+  its parent (`parent_session_id`, `parent_event_id`), and the parent's header lists its
+  subagents with their task, type, status and file (see **Linked transcripts** under
+  **Agent tools: tasks, subagents, and activity**).
 - `conversations/<conversation-id>.state.json`: the chat's "Allow for this chat" rules and
   the size and modification time of the files the agent last read or wrote (paths only, no
   contents). It sits beside the JSONL file so earlier versions of the app can still open the
@@ -1443,7 +1447,16 @@ of the system-instruction estimate; do not add them again to the overall total.
 
 ### Agent tools: recovery and worktrees
 
-Open **Agent tools** in the header. **Recovery** lists checkpoints created before
+Open **Agent tools** in the header. Its sections are listed on the left (a scrolling row on a
+narrow window) in two groups: **This chat** (Overview, Tasks, Subagents, Tools, Usage, Export)
+and **Project** (Checkpoints, Verify, Worktrees, Extensions). The dialog opens on the section
+you used last in this browser, or **Overview**: the chat's model and permission mode, how many
+tools are on, its subagents running and finished, task progress, files with unreviewed changes,
+and for the project its file checkpoints, Verify command, managed worktrees and MCP servers and
+hooks, each with **Open** for its section. A value that cannot be loaded reads
+**Could not load**; its section shows the error.
+
+**Checkpoints** (called Recovery before) lists checkpoints created before
 successful `write_file`, `edit_file`, `move_path`, `delete_path`, `notebook_edit`, and
 editor saves. Preview the reverse diff,
 then click **Restore checkpoint**. Restoring verifies the current file's content,
@@ -1667,28 +1680,70 @@ the message box. A conversation holds up to 50 tasks; dependencies must belong t
 cannot form cycles, and must finish before dependent work starts or completes.
 These planning records are available in Plan mode.
 
-The model can use `delegate_task` for one concrete task with explicitly supplied
-context. The child has a separate transcript/context and inherits workspace,
-model, permission mode, folder grants, turned-off tools, and "Allow for this chat" rules (a copy: rules the
-child adds stay in the child); project and all-project rules apply to it as to the parent. Files remain shared: choose independent
-work to avoid conflicting edits. One child runs per parent, at most three globally;
-children have 1–8 model steps (default six), cannot delegate again, and cannot start
-managed background jobs. The parent waits for a bounded result and an honest
-completed/failed/cancelled status. **Open subagent** opens the child to review its
-work or approve actions; **Back to parent conversation** returns to the parent.
-Stop cancels both parent and active child. This is bounded delegation, not a
-multi-agent team scheduler or automatic task assignment.
-The parent card links to its child immediately and updates live with approval
-waits, the last tool, completed-action count, and a structured stopping reason
-(completion, user Stop, step limit, inference/tool error, or interruption).
-Progress metadata does not copy child tool payloads into the parent's context.
-The child's first prompt is labeled **Delegated by parent conversation** and
-retains the spawning action ID; later human messages are not labeled delegated.
-Unfinished delegated runs are marked interrupted on restart rather than left running.
+**Subagents.** The model delegates on its own with `delegate_task`, as its instructions
+describe: broad codebase exploration, reading many or large files, wide searches, running a
+long command and summarizing its output, or an independent investigation, so that only a
+short report enters the chat's context. It does a single small lookup, or work that needs
+the conversation's back-and-forth, itself. A subagent sees nothing of the chat: the model
+passes the full task, constraints, paths and the report it expects (`task` and `context`).
+`agent_type` picks the tools: **explore** is read-only (the `read_only` profile, for
+investigation), **editor** reads and edits files without commands (`file_editor`), and
+**general** (the default) has the chat's tools (`inherit`); all stay within the chat's
+subagent tool ceiling (below). The older `tool_profile` argument still works; given with
+`agent_type`, the narrower applies. `max_steps` is 1–24 model requests (default 10). The child
+uses the chat's model (and its reasoning setting when the chat has one) and inherits workspace,
+permission mode, folder grants, turned-off tools, and "Allow for this chat" rules (a copy:
+rules the child adds stay in the child); project and all-project rules apply to it as to the
+parent. Children cannot delegate again or start managed background jobs. The child's first
+prompt asks it to end with a concise report: a summary, key findings with `path:line`
+references, files changed, and open questions or risks.
 
-**Tasks → New subagent tool ceiling** selects `inherit`, `read_only`, or `file_editor`
+Several `delegate_task` calls next to each other in one model response run in parallel.
+Their approval cards (Manual and Plan ask) come one at a time, in call order, and none of
+them starts before every card is answered; then they all start. Other tool calls run one at
+a time in their order, so a call after the delegations waits for them. At most three
+subagents run at once over all chats (a chat and three subagents is the model endpoint's
+request budget, see **Rate limits**); a further one waits for a free slot and its card says
+**waiting for a free slot**. Every call gets exactly one result, in call order, also when a
+child fails or is stopped. Files are shared, so the model gives parallel subagents
+independent work, never edits that could conflict.
+
+The parent receives a bounded result (at most 6,000 bytes as JSON; the report is shortened
+first): `child_session_id`, `agent_type`, `tool_profile`, `status`
+(completed/failed/cancelled), `terminal_reason` (completion, user Stop, step limit,
+inference/tool error, or interruption), `steps_used`, `tool_calls`, `changed_files` (paths
+its file tools changed, at most 20; `changed_files_total` when there were more; files a
+command changed are in the changes bar), `transcript`, and `output` (the report).
+Each subagent has its own card: its type, live status (running, waiting for approval,
+waiting for a free slot, completed, failed, cancelled), completed actions, last tool, how
+long it has run, **Open subagent** and, once it ended, a collapsible **Report** with the
+files it changed. Progress metadata does not copy child tool payloads into the parent's
+context. **Open subagent** opens the child to review its work or approve actions;
+**Back to parent conversation** returns to the parent. Stop on the parent stops all its
+subagents, also those still waiting for a slot. The child's first prompt is labeled
+**Delegated by parent conversation** and retains the spawning action ID; later human
+messages are not labeled delegated. A subagent chat is named by its task until it gets a
+title. Unfinished delegated runs are marked interrupted on restart rather than left running.
+
+**Linked transcripts.** Every subagent is a conversation of its own:
+`conversations/<id>.jsonl` in the state folder, like any chat. Its header (the first line)
+keeps `parent_session_id`, `parent_event_id` (the parent's card) and `parent_call_id`, its
+`agent_type`, `tool_profile`, `max_steps`, and `delegation` (status, completed actions, last
+tool, start and end times). The parent's header keeps a `subagents` index, one entry per
+child: `{id, task (its first 200 characters), agent_type, status, created, ended,
+transcript}`, plus `steps_used` and `tool_calls` once it ended. An entry is added when the
+child starts and updated when it ends and by restart recovery; the newest 200 are kept.
+Deleting a subagent chat keeps its entry, marked `deleted` and without a transcript; deleting
+the parent with its subagents removes them all. An import rebuilds the index of each copied
+parent from the copied children; exports leave it out, and forks and rewind backups have
+none. The sessions list (`GET /api/sessions`) leaves the index out;
+`GET /api/sessions/<id>/children` lists the children with their `transcript` and index entry.
+
+**Agent tools → Subagents** lists the chat's subagents with their type, status, task, steps
+and tool calls, start and end, and transcript file name, with **Open** for each.
+**Subagents → New subagent tool ceiling** selects `inherit`, `read_only`, or `file_editor`
 for future children while the parent is idle. The model may request a narrower
-`tool_profile` in `delegate_task` but cannot widen the parent's ceiling. Read-only
+`agent_type` or `tool_profile` in `delegate_task` but cannot widen the parent's ceiling. Read-only
 permits file listing/reading/search, skill discovery/selection, task listing/reading, and
 `ask_user`; file-editor additionally permits file writes/edits under normal approval rules.
 Both file-only profiles exclude shell commands, jobs, MCP startup/calls, hooks,
@@ -1886,6 +1941,11 @@ from a new chat creates the chat first.
 
 **Turned-off tools.** **Agent tools → Tools** turns tools off for one chat. They are not
 offered to the agent and calls to them are refused. Subagents, forks and imports keep the setting.
+The tools are grouped (Files, Search, Commands and jobs, Git, Tasks and subagents, Skills,
+Other); **Filter tools** matches names, groups and descriptions, and each group has
+**All on** and **All off** for the tools it shows. Each tool shows the first sentence of its
+description; hover it for more. MCP tools are turned off by their full name, and nothing
+changes until **Save tools**.
 
 **Don't ask** never shows a card: actions that the mode or a rule does not allow are refused,
 and the agent is told to continue without them. Folder access outside the project is refused,
@@ -2337,12 +2397,12 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `backend/local_agent/changes.py`: the agent's file changes per conversation, their diffs, Keep and Undo.
 - `backend/local_agent/shell_changes.py`: the files a foreground `run_command` changed, from Git status before and after it.
 - `backend/local_agent/extensions.py` / `mcp_client.py`: skills, hooks, MCP lifecycle.
-- `backend/local_agent/planning.py` / `feature_tools.py`: tasks and delegated workers.
+- `backend/local_agent/planning.py` / `feature_tools.py`: tasks and subagents (agent types, the slot limit, parallel batches, the subagents index).
 - `backend/local_agent/feature_api.py`: scoped feature endpoints.
 - `backend/local_agent/reasoning.py`: provider reasoning-summary extraction.
 - `frontend/static/js/`: browser interface (Preact + htm, no build), conversation state, editor and settings;
   `attention.js` holds browser notifications, the tab-title count and unread tracking, `drafts.js` saves
-  message drafts, and `markdown.js` renders and highlights replies.
+  message drafts, `markdown.js` renders and highlights replies, and `components/AgentToolsDialog.js` is the Agent tools dialog.
 - `frontend/tests/`: browser tests (pytest + Playwright) with a fake backend.
 - `design/`: original visual concept and extracted design tokens.
 
