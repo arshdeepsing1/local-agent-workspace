@@ -2733,8 +2733,21 @@ class AgentManager:
             elif name in ("ask_user", "submit_plan"):
                 result = await self.interactions.handle(session, event, name, arguments)
             elif name == "delegate_task":
+                def still_allowed():
+                    """After a wait for a free slot: the chat may have turned the tool off, added a deny
+                    rule or switched to a mode that asks while this delegation waited."""
+                    if not tool_allowed(session, name):
+                        return "delegate_task was turned off in this chat while the subagent waited for a free slot. It did not start."
+                    now = self.permission(session, tools, name, arguments)
+                    if now.decision == "deny":
+                        return now.message
+                    if now.decision == "ask" and not carded:
+                        return ("The permission mode or rules changed while the subagent waited for a free slot, and "
+                                "starting it now needs approval. It did not start; delegate again to ask.")
+                    return None
+
                 def start():
-                    return self.delegates.delegate(session, **arguments, parent_event=event)
+                    return self.delegates.delegate(session, **arguments, parent_event=event, recheck=still_allowed)
                 if gate is not None:
                     result = await gate.run(start)  # run_delegations sets the chat's status.
                 else:

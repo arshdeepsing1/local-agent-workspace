@@ -490,3 +490,103 @@ async def test_the_result_lists_changed_files_and_stays_within_6000_bytes(runtim
 def test_bounded_result_keeps_small_results_unchanged():
     result = {"child_session_id": "c", "status": "completed", "changed_files": ["a"], "output": "Short."}
     assert bounded_result(result) is result
+
+
+# Review fixes: a queued delegation follows later permission changes; failures free the slot;
+# a deleted child stays deleted in the index; imports keep the index order.
+
+@pytest.mark.parametrize("change", ["manual", "deny_rule", "disabled"])
+async def test_a_queued_delegation_does_not_start_after_the_chat_stops_allowing_it(runtime, monkeypatch, change):
+    manager, parent, _ = runtime
+    parent["permission_mode"] = "auto"
+    manager.store.save(parent)
+    releases = {task: asyncio.Event() for task in ("A", "B", "C", "D")}
+
+    def held(task):
+        async def respond(count, body):
+            await releases[task].wait()
+            return reply(f"{task} done.")
+        return respond
+    gateway = Gateway(monkeypatch, [lambda: calls_reply(*(delegate(task, f"call-{task}") for task in releases)),
+                                    lambda: reply("All done.")], {task: held(task) for task in releases})
+    manager.start(parent["id"], "Delegate four")
+    for task in ("A", "B", "C"):
+        await asyncio.wait_for(gateway.child_started(task).wait(), 5)
+    live = manager.live[parent["id"]]
+    await eventually(lambda: (card(live, "call-D").get("delegation") or {}).get("status") == "queued")
+    if change == "manual":
+        await manager.change_mode(live, "manual")
+    elif change == "disabled":
+        await manager.set_disabled_tools(live, ["delegate_task"])
+    else:
+        live.setdefault("allow_rules", []).append({"behavior": "deny", "tool": "delegate_task"})
+        manager.store.save(live)
+        await manager.rules_changed("chat", live)
+    releases["A"].set()
+    await eventually(lambda: card(live, "call-D").get("state") in ("error", "rejected"))
+    assert not gateway.child_started("D").is_set()
+    assert "did not start" in card(live, "call-D")["output"] or change == "deny_rule"
+    assert card(live, "call-D")["delegation"]["status"] == "cancelled"
+    for release in releases.values():
+        release.set()
+    await asyncio.wait_for(manager.tasks[parent["id"]], 10)
+    assert manager.delegates.running() == 0
+
+
+async def test_a_failed_child_write_frees_the_slot(runtime, monkeypatch):
+    manager, parent, _ = runtime
+    original = manager.store.create
+
+    def failing(values):
+        if values.get("workspace") and "events" not in values and values is not manager.settings.values:
+            raise OSError(28, "No space left on device")
+        return original(values)
+    monkeypatch.setattr(manager.store, "create", failing)
+    with pytest.raises(OSError):
+        await manager.delegates.delegate(parent, "Inspect")
+    assert manager.delegates.running() == 0 and not manager.delegates.active.get(parent["id"])
+
+
+async def test_an_import_lists_subagents_in_the_order_they_started(runtime):
+    manager, parent, project = runtime
+
+    async def worker(child, prompt):
+        await manager.event(child, "assistant", text="Report.")
+    manager.run_databricks = worker
+    await manager.delegates.delegate(parent, "First")
+    await asyncio.sleep(0.01)
+    await manager.delegates.delegate(parent, "Second")
+    saved = manager.store.get(parent["id"])
+    assert [item["task"] for item in saved["subagents"]] == ["First", "Second"]
+    # The export endpoint lists children newest updated first.
+    children = [manager.store.get(item["id"]) for item in manager.store.list() if item.get("parent_session_id") == parent["id"]]
+    copies, root = fresh_copies(export_bundle([saved, *children], parent["id"]), str(project))
+    assert [item["task"] for item in next(item for item in copies if item["id"] == root)["subagents"]] == ["First", "Second"]
+
+
+async def test_a_subagent_chat_deleted_while_it_runs_stays_deleted_in_the_index(runtime, monkeypatch):
+    manager, parent, _ = runtime
+
+    class SlowSocket:  # The parent chat is open in a browser, so broadcasts yield.
+        async def send_json(self, data):
+            await asyncio.sleep(0.01)
+
+    async def forever(count, body):
+        await asyncio.Event().wait()
+    gateway = Gateway(monkeypatch, [lambda: calls_reply(delegate("One", "call-1"), delegate("Two", "call-2")),
+                                    lambda: reply("Parent done.")],
+                      {"One": forever, "Two": lambda count, body: asyncio.sleep(0, reply("Two done."))})
+    manager.listeners[parent["id"]] = {SlowSocket()}
+    manager.start(parent["id"], "Delegate")
+    await asyncio.wait_for(gateway.child_started("One").wait(), 5)
+    live = manager.live[parent["id"]]
+    await eventually(lambda: card(live, "call-1").get("child_session_id"))
+    child_id = card(live, "call-1")["child_session_id"]
+    # What DELETE /api/sessions/<child> does for a child deleted alone.
+    await manager.stop(child_id)
+    manager.delegates.forget(child_id, keep=[child_id])
+    manager.store.delete(child_id)
+    manager.live.pop(child_id, None)
+    await asyncio.wait_for(manager.tasks[parent["id"]], 10)
+    entry = next(item for item in manager.store.header(parent["id"])["subagents"] if item["id"] == child_id)
+    assert entry["deleted"] is True and entry["transcript"] is None

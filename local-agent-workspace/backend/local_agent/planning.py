@@ -164,7 +164,14 @@ def subagent_index(sessions):
     """{parent id: index} rebuilt from conversations copied together (an import), oldest child first."""
     by_id = {session["id"]: session for session in sessions}
     index = {}
-    for child in sorted(sessions, key=lambda item: item.get("created", 0)):
+    def started(child):
+        # Copies all get the import time as created: order by when the delegation started.
+        progress = child.get("delegation") if isinstance(child.get("delegation"), dict) else {}
+        source = (child.get("provenance") or {}).get("source_created") if isinstance(child.get("provenance"), dict) else None
+        value = progress.get("started", source if source is not None else child.get("created", 0))
+        return value if isinstance(value, (int, float)) else 0
+
+    for child in sorted(sessions, key=started):
         parent = by_id.get(child.get("parent_session_id"))
         if parent is None:
             continue
@@ -310,6 +317,8 @@ class DelegateManager:
         current = next((item for item in index if isinstance(item, dict) and item.get("id") == child["id"]), None)
         if current is None and task is None:
             return False
+        if current is not None and current.get("deleted"):
+            return False  # Deleted while it ran: the entry keeps no transcript.
         updated = {**(current or {}), **index_entry(child, current.get("task", "") if task is None else task), **extra}
         if updated == current:
             return False
@@ -414,6 +423,7 @@ class DelegateManager:
         """Wait until fewer than MAX_RUNNING subagents run (over all chats); the card says queued."""
         noticed = parent_event is None
         while not entry["cancelled"] and self.running() >= MAX_RUNNING:
+            entry["queued"] = True
             if not noticed:
                 noticed = True
                 await self.manager.update_event(parent, parent_event, delegation={
@@ -436,7 +446,9 @@ class DelegateManager:
                 **progress, "status": "cancelled", "terminal_reason": "stopped", "ended": time.time()})
 
     async def delegate(self, parent_session, task, context="", max_steps=None, parent_event=None, tool_profile=None,
-                       agent_type=None):
+                       agent_type=None, recheck=None):
+        """recheck() -> refusal text or None: after a wait for a free slot, whether the chat still allows
+        this delegation (its tools, rules or mode may have changed while it waited)."""
         parent = self.manager.get(parent_session["id"])
         if not parent:
             raise ValueError("Parent conversation not found.")
@@ -470,22 +482,33 @@ class DelegateManager:
                                    "status": "cancelled", "terminal_reason": "stopped", "steps_used": 0, "tool_calls": 0,
                                    "changed_files": [], "transcript": None,
                                    "output": "The subagent was cancelled before it started."})
-        child = self.manager.store.create({"workspace": parent["workspace"], "model": parent["model"]})
-        child.update(parent_session_id=parent["id"], is_subagent=True, max_steps=max_steps,
-                     tool_profile=profile, agent_type=kind,
-                     permission_mode=parent.get("permission_mode", "manual"),
-                     allowed_directories=list(parent.get("allowed_directories", [])),
-                     allow_rules=[dict(rule) for rule in parent.get("allow_rules", [])],
-                     disabled_tools=list(parent.get("disabled_tools", [])))
-        if parent.get("reasoning_effort") is not None:
-            child["reasoning_effort"] = parent["reasoning_effort"]  # The chat's model settings apply to its subagents.
-        if isinstance(parent.get("worktree"), dict):
-            # Display metadata only: the subagent of a worktree chat is listed under the same project.
-            child["worktree"] = dict(parent["worktree"])
-        event_id = parent_event["id"] if parent_event is not None else str(uuid.uuid4())
-        child.update(parent_event_id=event_id, parent_call_id=(parent_event or {}).get("call_id"),
-                     delegation={"status": "running", "completed_tools": 0, "agent_type": kind, "started": time.time()})
-        self.manager.store.save(child)
+        refusal = recheck() if recheck is not None and entry.get("queued") else None
+        if refusal:
+            self._release(parent["id"], entry)
+            await self._unqueue(parent, parent_event)
+            raise ValueError(refusal)
+        try:
+            child = self.manager.store.create({"workspace": parent["workspace"], "model": parent["model"]})
+            child.update(parent_session_id=parent["id"], is_subagent=True, max_steps=max_steps,
+                         tool_profile=profile, agent_type=kind,
+                         permission_mode=parent.get("permission_mode", "manual"),
+                         allowed_directories=list(parent.get("allowed_directories", [])),
+                         allow_rules=[dict(rule) for rule in parent.get("allow_rules", [])],
+                         disabled_tools=list(parent.get("disabled_tools", [])))
+            if parent.get("reasoning_effort") is not None:
+                child["reasoning_effort"] = parent["reasoning_effort"]  # The chat's model settings apply to its subagents.
+            if isinstance(parent.get("worktree"), dict):
+                # Display metadata only: the subagent of a worktree chat is listed under the same project.
+                child["worktree"] = dict(parent["worktree"])
+            event_id = parent_event["id"] if parent_event is not None else str(uuid.uuid4())
+            child.update(parent_event_id=event_id, parent_call_id=(parent_event or {}).get("call_id"),
+                         delegation={"status": "running", "completed_tools": 0, "agent_type": kind, "started": time.time()})
+            self.manager.store.save(child)
+        except BaseException:
+            # A failed write (a full disk) must not keep the slot: other delegations would wait forever.
+            self._release(parent["id"], entry)
+            await self._unqueue(parent, parent_event)
+            raise
         entry["child_session_id"] = child["id"]
         failure = ""
         worker = None
