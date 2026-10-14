@@ -212,6 +212,14 @@ def test_the_workspace_review_and_its_active_tab_are_readable(ui, page):
     expect(page.locator(".workspace-tabs .active")).to_have_css("background-color", "rgb(232, 229, 222)")
     assert ratio(page, ".workspace-tabs .active") >= 4.5
     page.get_by_role("button", name="Changes", exact=True).click()
+    # The Git file list (Mutations: .git-letter #8b6f2e, or .git-letter.deleted #a95640 on a hovered row).
+    expect(page.locator(".git-letter.deleted")).to_be_visible()
+    assert_readable(page, ".git-letter.modified", ".git-letter.deleted", ".git-letter.untracked")
+    assert failures(page, ".workspace-panel") == []
+    deleted_row = page.get_by_role("button", name=re.compile("old.py")).first
+    deleted_row.hover()
+    expect(deleted_row).to_have_css("background-color", "rgb(232, 229, 222)")
+    assert ratio(page, ".git-letter.deleted") >= 4.5
     page.get_by_role("button", name=re.compile("app.py")).first.click()
     expect(page.locator(".git-diff-lines .diff-line.hunk")).to_be_visible()
     assert failures(page, ".workspace-panel") == []
@@ -257,6 +265,46 @@ def test_the_row_menu_is_readable(ui, page):
     assert failures(page, ".sidebar") == []
 
 
+DECLINED = {"id": "t3", "type": "tool", "name": "run_command", "state": "rejected", "approval": "declined",
+            "input": {"command": "make clean"}}
+OTHER_PROJECT = ("fake.sessions.set('o', { ...makeSession('o', 'Other waiting'), workspace: '/srv/other', "
+                 "status: 'awaiting_approval' })\n")
+STATUSES = ("{ type: 'changes', changes: makeChanges(changedFile('note.txt', 2, 1), changedFile('new.py', 3, 0, 'created'), "
+            "changedFile('old.py', 0, 2, 'deleted'), changedFile('gone.bin', 0, 0, 'unavailable')) }")
+
+
+def test_status_labels_badges_and_outcome_lines_are_readable(ui, page):
+    # Mutations: .changes-status #777971, .changes-status.deleted #a95640, .project-badge #706e64, .tool-outcome #956545,
+    # .project-group-toggle #706e64 or .diff-stat .removed #a95640 (both 4.1:1 on the hover background).
+    start_chat(ui, page, events=CHAT[:1] + [DECLINED] + CHAT[3:4], setup=OTHER_PROJECT)
+    ui.emit("a", STATUSES)
+    expect(page.locator(".tool-outcome")).to_have_text("Action declined")
+    toggle = page.locator(".changes-toggle")
+    toggle.click()
+    expect(page.locator(".changes-status")).to_have_count(3)
+    other = page.locator(".project-group-toggle", has_text="other")
+    expect(other.locator(".project-badge")).to_have_text("1 needs approval")
+    assert_readable(page, ".tool-outcome", ".changes-status.created", ".changes-status.deleted", ".changes-status.unavailable",
+                    ".project-badge")
+    assert failures(page) == []
+    # Touch keeps :hover on a tapped button, so the hovered toggles stay readable too.
+    for hovered, text in ((toggle, ".changes-toggle .diff-stat .removed"), (other, ".project-group-toggle:has-text('other') .project-group-name")):
+        hovered.hover()
+        expect(hovered).to_have_css("background-color", "rgb(232, 229, 222)")
+        assert ratio(page, text) >= 4.5, text
+
+
+def test_the_permission_menu_is_readable(ui, page):
+    # Mutation: .permission-name small back to #777971 (3.87:1 on its #f0f0ed chip).
+    start_chat(ui, page)
+    page.locator(".permission-trigger").click()
+    expect(page.locator(".permissions-menu")).to_be_visible()
+    page.locator(".never-asks>summary").click()
+    expect(page.locator(".never-asks li").first).to_be_visible()
+    assert_readable(page, ".permission-name small", ".never-asks>summary")
+    assert failures(page, ".permissions-menu") == []
+
+
 def test_text_on_a_phone_is_readable(ui, page):
     start_chat(ui, page, 390, 844)
     page.get_by_text("Activity · 2 actions").click()
@@ -267,6 +315,18 @@ def test_text_on_a_phone_is_readable(ui, page):
     expect(page.locator(".sidebar")).to_be_visible()
     assert_readable(page, ".sidebar .connection-state", ".sidebar .section-label", ".conversation-row .session-id")
     assert failures(page, ".sidebar") == []
+
+
+def test_line_comment_buttons_have_three_to_one_on_touch_screens(coarse_ui, coarse_page):
+    # V10. Without hover the per-line Add comment buttons stay faded. Mutation: opacity .55 (2.1:1).
+    ui, page = coarse_ui, coarse_page
+    start_chat(ui, page, 390, 844)
+    page.get_by_role("button", name=re.compile("^Workspace")).click()
+    page.get_by_role("button", name="note.txt Changed by the agent").click()
+    icons = page.locator(".diff-review .line-comment svg")
+    expect(icons.first).to_be_visible()
+    values = icons.evaluate_all("els => els.map(el => visual.ratio(el))")
+    assert len(values) >= 3 and min(values) >= 3, values
 
 
 def test_message_action_icons_have_three_to_one(ui, page):
@@ -327,6 +387,48 @@ def test_one_focus_ring_for_summaries_links_scrollers_and_the_review(ui, page):
     page.get_by_role("button", name=re.compile("app.py")).first.click()
     for target in [page.get_by_role("link", name="Open in VS Code"), page.locator(".git-diff-lines")]:
         expect(target).to_be_visible()
+        keyboard_focus(page, target)
+        assert outline(target) == ["solid", "2px", ACCENT], target
+
+
+# The ring's rectangle (outline-offset plus outline-width around the border box) against the padding box of the
+# nearest ancestor that clips its overflow: a ring outside that box is cut off and shows nothing.
+RING_INSIDE_CLIP = """e => {
+  const style = getComputedStyle(e), grow = parseFloat(style.outlineOffset) + parseFloat(style.outlineWidth)
+  const box = e.getBoundingClientRect()
+  let clip = e.parentElement
+  while (clip && getComputedStyle(clip).overflow === 'visible') clip = clip.parentElement
+  const outer = clip.getBoundingClientRect(), cs = getComputedStyle(clip)
+  const inner = { left: outer.left + parseFloat(cs.borderLeftWidth), right: outer.right - parseFloat(cs.borderRightWidth),
+                  top: outer.top + parseFloat(cs.borderTopWidth), bottom: outer.bottom - parseFloat(cs.borderBottomWidth) }
+  return box.left - grow >= inner.left - 0.5 && box.right + grow <= inner.right + 0.5
+    && box.top - grow >= inner.top - 0.5 && box.bottom + grow <= inner.bottom + 0.5
+}"""
+
+
+def test_rings_inside_clipped_cards_and_the_permission_menu_show(ui, page):
+    # V-T5. Mutations: delete :is(.tool-heading,.task-checklist-toggle):focus-visible (offset 3px, clipped by the card's
+    # overflow), restore outline:none on .permissions-menu>button:focus-visible, or the never-asks summary ring #347aca.
+    start_chat(ui, page)
+    ui.emit("a", {"type": "tasks", "tasks": [{"id": "t1", "title": "Read the parser", "description": "", "status": "completed",
+                                              "depends_on": []}, {"id": "t2", "title": "Fix empty input", "description": "",
+                                                                  "status": "pending", "depends_on": []}]})
+    targets = [page.locator(".tool-card .tool-heading").first, page.get_by_role("button", name=re.compile(r"^Tasks 1\/2 done"))]
+    for target in targets:
+        expect(target).to_be_visible()
+        keyboard_focus(page, target)
+        assert outline(target) == ["solid", "2px", ACCENT], target
+        assert target.evaluate(RING_INSIDE_CLIP), target
+    page.locator(".permission-trigger").focus()
+    page.keyboard.press("Enter")
+    expect(page.locator(".permissions-menu")).to_be_visible()
+    page.keyboard.press("ArrowDown")
+    item = page.locator(".permissions-menu :focus")
+    expect(item).to_have_count(1)
+    assert item.evaluate("e => e.matches(':focus-visible')")
+    assert outline(item) == ["solid", "2px", ACCENT]
+    assert item.evaluate(RING_INSIDE_CLIP)
+    for target in (page.locator(".permissions-menu>.add-rule"), page.locator(".never-asks>summary")):
         keyboard_focus(page, target)
         assert outline(target) == ["solid", "2px", ACCENT], target
 
@@ -422,6 +524,29 @@ def test_a_long_error_stays_inside_the_viewport(ui, page, width, height):
     assert error.bounding_box()["height"] <= height * 0.3 + 40
     dismiss.click()
     expect(error).to_have_count(0)
+
+
+@pytest.mark.parametrize("width,height", [(820, 1180), (390, 844)])
+def test_a_long_error_in_the_workspace_drawer_stays_inside_the_viewport(ui, page, width, height):
+    # Below 1024 px the open drawer shows the error in .drawer-alert. Mutation: drop its max-height and the span's
+    # max-height/overflow (the alert grows to 4500 px and Dismiss sits above the screen).
+    detail = ("The server rejected the model change: " + "quoted input " * 1600)[:20000]
+    start_chat(ui, page, width, height, setup=("window.answer = (path, options) => path === '/api/sessions/a/model' && options.method === 'PUT' "
+                                               f"? fake.json({{ detail: {json.dumps(detail)} }}, 400) : undefined"))
+    page.get_by_role("combobox", name="Model").select_option("other-model")
+    expect(page.locator(".app-error")).to_contain_text("The server rejected the model change")
+    page.get_by_role("button", name=re.compile("^Workspace")).click()
+    alert = page.locator(".drawer-alert")
+    expect(alert).to_contain_text("The server rejected the model change")
+    box = alert.bounding_box()
+    assert box["y"] >= 0 and box["y"] + box["height"] <= height, box
+    assert box["height"] <= height * 0.3 + 40, box
+    dismiss = alert.get_by_role("button", name="Dismiss error")
+    box = dismiss.bounding_box()
+    assert box["y"] >= 0 and box["y"] + box["height"] <= height and box["x"] + box["width"] <= width, box
+    dismiss.click(timeout=3000)
+    expect(alert).to_have_count(0)
+    expect(page.locator(".app-error")).to_have_count(0)
 
 
 def test_a_two_digit_change_count_fits_its_badge(ui, page):

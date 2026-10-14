@@ -293,6 +293,6 @@ def test_line_buttons_are_visible_and_large_enough_on_touch_screens(touch_ui):
     ui, page = touch_ui
     mount_review(ui)
     assert page.evaluate("matchMedia('(hover: none)').matches")
-    page.wait_for_function("[...document.querySelectorAll('.line-comment')].every(b => getComputedStyle(b).opacity === '0.55')")
+    page.wait_for_function("[...document.querySelectorAll('.line-comment')].every(b => getComputedStyle(b).opacity === '0.8')")
     boxes = page.locator(".line-comment").evaluate_all("buttons => buttons.map(b => b.getBoundingClientRect().toJSON())")
     assert all(box["width"] >= 24 and box["height"] >= 24 for box in boxes)
