@@ -170,3 +170,22 @@ def test_descendants_survive_a_cycle(tmp_path, monkeypatch):
     manager.store.save(second)
     assert manager.descendants(first["id"]) == [second["id"]]
     manager.store.db.close()
+
+
+async def test_deleting_a_subagent_marks_it_in_its_parents_index_and_the_list_leaves_the_index_out(runtime):
+    client, manager = runtime
+    parent, child, grandchild, other = family(manager)
+    entry = {"id": child["id"], "task": "Review", "agent_type": "explore", "status": "completed", "created": 1.0, "ended": 2.0,
+             "transcript": f"conversations/{child['id']}.jsonl"}
+    parent["subagents"] = [entry]
+    manager.store.save(parent)
+    listed = (await client.get(f"/api/sessions/{parent['id']}/children")).json()
+    assert [(item["id"], item["transcript"], item["subagent"]) for item in listed] == [
+        (child["id"], f"conversations/{child['id']}.jsonl", entry)]
+    summary = next(item for item in (await client.get("/api/sessions")).json() if item["id"] == parent["id"])
+    assert "subagents" not in summary
+    assert (await client.get(f"/api/sessions/{parent['id']}/info")).json()["subagents"] == [entry]
+    response = await client.delete(f"/api/sessions/{child['id']}", params={"children": "delete"})
+    assert response.status_code == 200
+    assert manager.store.header(parent["id"])["subagents"] == [{**entry, "deleted": True, "transcript": None}]
+    assert manager.store.header(parent["id"])["updated"] == parent["updated"]  # Not reordered in the sidebar.
