@@ -3541,6 +3541,8 @@ class AgentManager:
             retry_reason=retry_reason)
         if effort is not None and not reasoning.plain_default(effort):
             call["effort"] = effort["effort"]
+            if effort["fields"]:
+                call["reasoning_fields"] = sorted(effort["fields"])  # The top-level fields sent, by name.
             for key, name in (("effort_field", "effort_field"), ("skipped", "reasoning_skipped")):
                 if effort.get(key):
                     call[name] = effort[key]

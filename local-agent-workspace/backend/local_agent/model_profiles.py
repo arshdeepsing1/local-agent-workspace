@@ -96,6 +96,12 @@ def reasoning_profile(model):
     return {"label": label or profile["label"], **{key: profile[key] for key in REASONING_KEYS}}
 
 
+def known_endpoints():
+    """[{model, label}] of the endpoints this table describes, for the Settings endpoint chooser."""
+    return ([{"model": model, "label": profile["label"]} for model, profile in MODEL_PROFILES.items()]
+            + [{"model": model, "label": label} for model, (_, label) in REASONING_ALIASES.items()])
+
+
 def default_limits(model):
     """(context window, max output tokens) for a new install or a model change."""
     profile = profile_for(model) or {}

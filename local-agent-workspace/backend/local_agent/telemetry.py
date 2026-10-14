@@ -230,6 +230,9 @@ def _public_call(call, *, fallback=False):
                 "reasoning_skipped"):
         if isinstance(call.get(key), str):
             result[key] = call[key]
+    fields = call.get("reasoning_fields")  # The top-level reasoning fields the request sent.
+    if isinstance(fields, list) and all(isinstance(name, str) for name in fields):
+        result["reasoning_fields"] = fields
     usage = reported_usage(call.get("usage"))
     if usage:
         result["usage"] = usage

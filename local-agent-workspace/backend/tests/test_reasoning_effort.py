@@ -132,6 +132,9 @@ async def test_settings_default_and_validate_the_reasoning_choices(api):
     client, manager, settings, _ = api
     public = (await client.get("/api/settings")).json()
     assert (public["reasoning_effort"], public["reasoning_format"], public["thinking_summaries"]) == ("default", "auto", True)
+    # The endpoint chooser lists the endpoints the app has facts about.
+    assert public["endpoint_profiles"] == [{"model": OPUS, "label": "Claude Opus 5.5"}, {"model": OPUS_48, "label": "Claude Opus 4.8"},
+                                           {"model": GPT, "label": "GPT OSS 120B"}, {"model": GPT_20B, "label": "GPT OSS 20B"}]
     saved = await client.put("/api/settings", json=settings_body(settings, reasoning_effort="xhigh",
                                                                  reasoning_format="openai", thinking_summaries=False))
     assert saved.status_code == 200, saved.text
@@ -394,6 +397,8 @@ async def test_a_rejected_reasoning_field_is_resent_once_without_it_and_remember
     assert [(call["attempt"], call["status"], call.get("http_status"), call.get("retry_reason"), call.get("effort"),
              call.get("reasoning_skipped")) for call in calls] == [
         (1, "error", 400, None, "high", None), (2, "completed", 200, "reasoning_rejected", "high", "rejected")]
+    assert [call.get("reasoning_fields") for call in calls] == [["output_config", "thinking"], None]
+    assert session_metrics(session)["calls"][0]["reasoning_fields"] == ["output_config", "thinking"]
     assert manager.reasoning_rejections == {(OPUS, "anthropic"): "output_config.effort"}
     assert session["terminal_reason"] == "completed"
     # Later requests to the endpoint skip the fields without another rejection or notice.

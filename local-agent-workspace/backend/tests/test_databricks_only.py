@@ -27,7 +27,7 @@ def test_legacy_settings_do_not_restore_removed_options(tmp_path, monkeypatch):
     with TestClient(create_app(settings)) as client:
         bootstrap = client.get("/api/bootstrap").json()
         assert set(bootstrap["settings"]) == {*expected, "host", "configured", "coding_dir_status",
-                                              "python_venv_status", "default_model", "default_limits"}
+                                              "python_venv_status", "default_model", "default_limits", "endpoint_profiles"}
         assert bootstrap["settings"]["default_limits"] == {"context_window": 131072, "max_output_tokens": 8192}
         headers = {"X-Local-Token": bootstrap["token"]}
         # Old clients may still send these keys, but they cannot enable a mode.
