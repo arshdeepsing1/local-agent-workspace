@@ -1,4 +1,4 @@
-import { html, useEffect, useRef, useState } from '../lib.js'
+import { html, useEffect, useLayoutEffect, useRef, useState } from '../lib.js'
 
 // @ file mentions in the message box. Typing "@" at the start of a word lists the
 // project's files (GET /mention-files?q=, 150 ms after the last key); choosing one
@@ -61,6 +61,7 @@ export function useMentionMenu({ value, setValue, caret, setCaret, input, loadFi
   const load = useRef(loadFiles)
   load.current = loadFiles
   const menu = useRef(null)
+  const caretAfterInsert = useRef(null)
   const at = loadFiles ? mentionAt(value, caret) : null
   const query = at?.query ?? null
   const open = at !== null && focused && value !== dismissed
@@ -83,8 +84,17 @@ export function useMentionMenu({ value, setValue, caret, setCaret, input, loadFi
     const inserted = `${value.slice(0, at.start)}@${file.path} `
     setValue(inserted + rest)
     setCaret(inserted.length)
-    requestAnimationFrame(() => { input.current?.focus(); input.current?.setSelectionRange(inserted.length, inserted.length) })
+    caretAfterInsert.current = inserted.length
   }
+  // Place the caret right after the box shows the inserted path, before the next key event is
+  // handled: a caret moved one animation frame later put keys typed in between out of order.
+  useLayoutEffect(() => {
+    const position = caretAfterInsert.current
+    if (position === null || !input.current) return
+    caretAfterInsert.current = null
+    input.current.focus()
+    input.current.setSelectionRange(position, position)
+  })
   const keyDown = event => {
     if (!open || event.isComposing) return false
     if (event.key === 'Escape') { event.preventDefault(); setDismissed(value); return true }

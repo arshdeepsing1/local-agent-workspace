@@ -57,6 +57,30 @@ def test_the_menu_filters_files_and_inserts_the_chosen_path(ui, page):
     assert not ui.requests("/api/sessions/a/stop")
 
 
+
+def test_keys_typed_right_after_choosing_a_file_keep_their_order(ui, page):
+    """The caret is placed as soon as the box shows the path, not on a later frame (a slow
+    machine ran the frame after the next keys, which then landed before them)."""
+    start_app(ui, page)
+    box = message(page)
+    ui.run("window.requestAnimationFrame = callback => setTimeout(callback, 300)")
+    box.press_sequentially("with @READ")
+    expect(files(page)).to_have_count(1)
+    box.press("Tab")
+    box.press_sequentially("and @x", delay=10)
+    expect(box).to_have_value("with @README.md and @x")
+    # Choosing in the middle of the text keeps the rest after the inserted path.
+    box.fill("")
+    box.press_sequentially("see  later")
+    box.press("Home")
+    for _ in range(4):
+        box.press("ArrowRight")
+    box.press_sequentially("@READ")
+    expect(files(page)).to_have_count(1)
+    box.press("Enter")
+    box.press_sequentially("now ", delay=10)  # the inserted path's space replaces the one that was there
+    expect(box).to_have_value("see @README.md now later")
+
 def test_chips_show_each_mention_and_remove_its_token(ui, page):
     start_app(ui, page)
     box = message(page)
