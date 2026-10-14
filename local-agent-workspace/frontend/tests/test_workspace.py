@@ -114,10 +114,12 @@ def test_settings_edit_and_save_only_databricks_fields(ui, page):
     expect(output).to_have_attribute("max", "131072")
     expect(dialog.get_by_text("Current estimated input budget: 120,832 tokens.", exact=False)).to_be_visible()
     endpoint = dialog.get_by_label("Databricks model endpoint")
+    expect(endpoint.locator("option:checked")).to_have_text("Test model · test-model")
     budget.fill("131000")
     output.fill("121000")
     expect(dialog.get_by_text(re.compile("leaves too little room for a working conversation"))).to_be_visible()
-    endpoint.fill("test-model")
+    endpoint.select_option("other-model")
+    endpoint.select_option("test-model")
     budget.fill("131072")
     output.fill("8192")
     steps = dialog.get_by_label("Agent steps per message")
@@ -128,14 +130,17 @@ def test_settings_edit_and_save_only_databricks_fields(ui, page):
     expect(dialog.get_by_label("Agent runtime")).to_have_count(0)
     # No agent runtime options: CLAUDE.md is named only as a project instruction file.
     # No Claude CLI runtime settings (a model name such as Claude Opus 5.5 in help text is fine).
-    expect(dialog.get_by_text(re.compile(r"Claude(?!\.md| Opus)|MCP|skills", re.I))).to_have_count(0)
+    expect(dialog.get_by_text(re.compile(r"Claude(?!\.md| Opus|-opus)|MCP|skills", re.I))).to_have_count(0)
     checkboxes = dialog.get_by_role("checkbox")
-    expect(checkboxes).to_have_count(4)
+    expect(checkboxes).to_have_count(5)
     expect(dialog.locator("label:has(input[type=checkbox])")).to_have_text([
-        "Save a detailed handoff at each compaction", "Keep agent changes automatically when a reply finishes",
-        "Continue automatically after rate limits", "Desktop notification when no browser tab is open"])
+        "Save a detailed handoff at each compaction", "Show thinking summaries",
+        "Keep agent changes automatically when a reply finishes", "Continue automatically after rate limits",
+        "Desktop notification when no browser tab is open"])
     dialog.get_by_label("Project folder").fill("/updated-project")
-    endpoint.fill("databricks-gpt-oss-120b")
+    endpoint.select_option(label="Other endpoint…")
+    expect(dialog.get_by_role("textbox", name="Endpoint name")).to_be_focused()
+    dialog.get_by_role("textbox", name="Endpoint name").fill("databricks-gpt-oss-120b")
     dialog.get_by_label("Credential file").fill("/credentials/env_vars.txt")
     budget.fill("65536")
     output.fill("32768")
@@ -432,7 +437,8 @@ def test_draft_model_changes_default_before_creating_conversation(ui, page):
     assert ui.bodies("/api/settings") == [{"workspace": "/project", "model": "other-model", "env_file": "", "context_window": 131072,
                                            "max_output_tokens": 8192, "max_agent_steps": 32, "user_instructions": "",
                                            "write_limit_kb": 80, "command_env": [], "rate_limit_auto_continue": True,
-                                           "coding_dir": "", "python_venv": ""}]
+                                           "coding_dir": "", "python_venv": "", "reasoning_effort": "default",
+                                           "reasoning_format": "auto", "thinking_summaries": True}]
     send(page).click()
     ui.show_session("created")
     assert ui.js("fake.sessions.get('created').model") == "other-model"

@@ -460,12 +460,43 @@ function ActionButton({ label, icon: Icon, onClick, disabled = false, target }) 
   return html`<button class="icon-button message-action" aria-label=${label} title=${label} disabled=${disabled} data-target=${target} onClick=${onClick}><${Icon} size=${14} /></button>`
 }
 
-function Reply({ text, reasoning, truncated, requestInfo, onOpenPath, actions = null }) {
+const wholeSeconds = value => Math.max(1, Math.round(value))
+
+// The reply's thinking, like Claude's: open with live text while the model thinks ("Thinking… 12 s"), collapsed to
+// "Thought for 12 s" once answer text or a tool call starts or the response ends, unless the user opened or closed
+// it. started: epoch seconds (AgentEvent.reasoning_started); seconds: AgentEvent.reasoning_seconds. Without
+// text, an endpoint that thought (a duration or reported reasoning tokens) gets one quiet line.
+function Thinking({ text, truncated, started, seconds, streaming, answering, reasoningTokens }) {
+  const thinking = streaming && !answering && typeof seconds !== 'number'
+  const [manual, setManual] = useState(null)
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (!thinking || typeof started !== 'number') return
+    setNow(Date.now())
+    const timer = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(timer)
+  }, [thinking, started])
+  const elapsed = typeof seconds === 'number' ? seconds : typeof started === 'number' ? Math.max(0, now / 1000 - started) : null
+  const label = thinking ? `Thinking…${elapsed >= 1 ? ` ${Math.floor(elapsed)} s` : ''}`
+    : elapsed !== null ? `Thought for ${wholeSeconds(elapsed)} s` : 'Thought'
+  if (!text) {
+    if (typeof started !== 'number' && typeof seconds !== 'number' && !(reasoningTokens > 0)) return null
+    if (thinking) return html`<p class="thinking-line">${label}</p>`
+    return html`<p class="thinking-line">${label} · the endpoint did not return a summary</p>`
+  }
+  const open = manual ?? thinking
+  return html`<details class="thinking" open=${open}>
+    <summary onClick=${event => { event.preventDefault(); setManual(!open) }}>${label}</summary>
+    <div class="thinking-body"><${Markdown} text=${text} streaming=${streaming} />
+      ${truncated ? html`<p class="thinking-note">Thinking display limit reached.</p>` : null}</div>
+  </details>`
+}
+
+function Reply({ text, reasoning, truncated, started, seconds, requestInfo, onOpenPath, actions = null }) {
   const streaming = requestInfo?.status === 'running'
   return html`<div class="assistant-reply"><${Brand} small=${true} />
-    <div class="reply-content">${reasoning ? html`<details class="reasoning-summary"><summary>Provider reasoning summary</summary>
-      <p class="muted">Supplied by the model endpoint.</p><${Markdown} text=${reasoning} streaming=${streaming} />
-      ${truncated ? html`<p class="muted">Summary display limit reached.</p>` : null}</details>` : null}<${Markdown} text=${text} streaming=${streaming} onOpenPath=${onOpenPath} />
+    <div class="reply-content"><${Thinking} text=${reasoning} truncated=${truncated} started=${started} seconds=${seconds}
+      streaming=${streaming} answering=${!!text} reasoningTokens=${requestInfo?.usage?.reasoning_tokens} /><${Markdown} text=${text} streaming=${streaming} onOpenPath=${onOpenPath} />
       ${text || actions ? html`<div class="message-actions">${text ? html`<${CopyAction} text=${text} label="Copy response" />` : null}${actions}</div>` : null}
       ${requestInfo ? html`<${RequestDetails} info=${requestInfo} />` : null}
     </div></div>`
@@ -597,7 +628,7 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
       if (event.type === 'tool' && event.name === 'ask_user') return html`<${QuestionCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
       if (event.type === 'tool' && event.name === 'submit_plan') return html`<${PlanCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
       if (event.type === 'tool') return html`<${ToolCard} key=${event.id} event=${event} summary=${toolSummaries.get(event.id)} result=${toolStates.get(event.id).result} status=${toolStates.get(event.id).status} failure=${toolStates.get(event.id).failure} sessionId=${session.id} onError=${onError} onSelectSession=${onSelectSession} onOpenPath=${onOpenPath} />`
-      if (event.type === 'assistant') return event.text || event.reasoning_summary || event.request_info ? html`<${Reply} key=${event.id} text=${event.text || ''} reasoning=${event.reasoning_summary} truncated=${event.reasoning_truncated} requestInfo=${event.request_info} onOpenPath=${onOpenPath} actions=${event.text ? replyActions(event) : null} />` : null
+      if (event.type === 'assistant') return event.text || event.reasoning_summary || event.request_info || event.reasoning_started ? html`<${Reply} key=${event.id} text=${event.text || ''} reasoning=${event.reasoning_summary} truncated=${event.reasoning_truncated} started=${event.reasoning_started} seconds=${event.reasoning_seconds} requestInfo=${event.request_info} onOpenPath=${onOpenPath} actions=${event.text ? replyActions(event) : null} />` : null
       const marker = event.type !== 'error' && (!!event.stop_phase || event.text === STOPPED_TEXT)
       const classes = ['conversation-notice', event.type === 'error' && 'error', marker && 'stop-marker', event.compaction && 'compaction'].filter(Boolean).join(' ')
       if (marker) return html`<div class=${classes} key=${event.id} title=${event.text}>${STOP_TEXT[event.stop_phase] || 'Stopped'}</div>`

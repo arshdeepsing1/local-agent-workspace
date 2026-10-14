@@ -366,3 +366,58 @@
 @container main (max-width:520px){.context-label{display:none}}
 /* UI visual: touch-size controls. */
 @media(pointer:coarse){button,summary,select,[role=menuitem],[role=option],[role=switch]{min-height:24px}button,a.icon-button{min-width:24px}.terminal-view input{min-height:28px}}
+/* reasoning and settings (2026-10-14) */
+.effort-control{display:flex;align-items:center;position:relative;gap:3px;font-size:12px;color:var(--muted);min-width:0}
+.effort-control>.lucide-brain{flex-shrink:0;color:var(--muted)}
+.effort-control select{appearance:none;border:0;padding:5px 17px 5px 2px;background:transparent;max-width:100%;cursor:pointer;text-overflow:ellipsis;font-size:12px;field-sizing:content;color:var(--ink)}
+.effort-control select:disabled{opacity:.8;cursor:default}
+.effort-control>.lucide-chevron-down{position:absolute;right:1px;pointer-events:none}
+.app-shell .composer-toolbar .effort-control{max-width:34%}
+@media(max-width:600px){.effort-control>.lucide-brain{display:none}.app-shell .composer-toolbar .effort-control select{font-size:11px}}
+.thinking{margin:0 0 12px;border-left:2px solid var(--border);padding:0 0 0 12px}
+.thinking>summary{cursor:pointer;width:fit-content;max-width:100%;font-size:13px;color:var(--muted);padding:2px 0}
+.thinking>summary:hover{color:var(--ink)}
+.thinking-body{margin-top:6px}
+.app-shell .thinking .markdown,.thinking .markdown{font-size:13px;line-height:1.6;color:var(--muted)}
+.app-shell .thinking .markdown p,.thinking .markdown p{line-height:1.6;margin:0 0 9px}
+.thinking .markdown :is(h1,h2,h3,h4){font-size:13px;font-weight:600}
+.thinking-note{font-size:12px;color:var(--muted);margin:4px 0 0}
+.thinking-line{font-size:13px;color:var(--muted);margin:0 0 10px;padding-left:12px;border-left:2px solid var(--border)}
+.request-fields{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}
+.usage-effort{font-size:11px;color:var(--muted)}
+.app-settings{width:min(860px,calc(100vw - 32px))}
+.app-settings .dialog-content>header{margin-bottom:18px}
+.app-settings .dialog-content h2{font:600 21px/1.3 'DM Sans',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;letter-spacing:-.2px;margin:0 0 4px}
+.app-settings .dialog-content header p{font-size:13px;line-height:1.45}
+.app-settings .settings-layout{display:grid;grid-template-columns:172px minmax(0,1fr);gap:0 30px;align-items:start}
+.app-settings .settings-nav{position:sticky;top:0;padding-top:4px}
+.app-settings .settings-nav ul{list-style:none;margin:0;padding:0;display:grid;gap:2px}
+.app-settings .settings-nav button{display:block;width:100%;text-align:left;font-size:13px;line-height:1.35;padding:7px 10px;border-radius:7px;color:var(--ink);cursor:pointer}
+.app-settings .settings-nav button:hover{background:#efeee9}
+.app-settings .settings-nav button[aria-current=true]{background:#ebe9e2;font-weight:600}
+.app-settings .settings-sections{min-width:0}
+.app-settings .settings-group{margin:30px 0 0;scroll-margin-top:12px}
+.app-settings .settings-group:first-of-type{margin-top:0}
+.app-settings .settings-group:focus{outline:none}
+.app-settings .settings-group:focus-visible>legend{outline:2px solid var(--accent);outline-offset:3px;border-radius:3px}
+.app-settings .settings-group>legend{font-size:15px;font-weight:600;line-height:1.4;padding:0 0 2px}
+.app-settings .dialog-content label{font-size:13px;font-weight:500;line-height:1.45;margin-top:16px}
+.app-settings .dialog-content input:not([type=checkbox]),.app-settings .dialog-content select,.app-settings .settings-instructions{font-size:13.5px;line-height:1.45}
+.app-settings .dialog-content select{display:block;width:100%;margin-top:7px;border:1px solid var(--border);background:var(--surface);color:var(--ink);border-radius:8px;padding:9px 10px}
+.app-settings .dialog-content .settings-checkbox{margin-top:18px}
+.app-settings .field-help{font-size:12px;line-height:1.45;margin:6px 0 0;color:var(--muted)}
+.app-settings .settings-note{font-size:12px;line-height:1.5}
+.app-settings .settings-limits .field-help,.app-settings .settings-limits .settings-note{margin-top:8px}
+.field-more{margin:3px 0 0;font-size:12px}
+.field-more>summary{cursor:pointer;width:fit-content;color:var(--muted);text-decoration:underline;text-decoration-style:dotted;text-underline-offset:3px;list-style:none}
+.field-more>summary::-webkit-details-marker{display:none}
+.field-more>summary:hover{color:var(--ink)}
+.field-more>.field-help{margin-top:4px}
+.app-settings .settings-recommended{display:inline-flex;gap:6px;margin:10px 0 0;font-size:12.5px}
+.app-settings .settings-recommended.applied{color:var(--muted);border-style:dashed;cursor:default}
+.app-settings .settings-recommended.applied svg{color:#3f7a4f}
+.settings-preview{margin-top:16px;padding:12px 14px;border:1px solid var(--border);border-radius:9px;background:var(--surface)}
+.settings-preview-title{font-size:12.5px;font-weight:600;margin:0;line-height:1.45}
+.settings-preview-json{font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;margin:8px 0 0;padding:10px 12px;border-radius:7px;background:#f0f0ec;white-space:pre-wrap;overflow-wrap:anywhere}
+.settings-preview-empty{font-size:12.5px;margin:8px 0 0}
+@media(max-width:720px){.app-settings .settings-layout{display:block}.app-settings .settings-nav{display:none}}

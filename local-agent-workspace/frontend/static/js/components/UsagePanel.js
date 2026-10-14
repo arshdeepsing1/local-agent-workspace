@@ -1,5 +1,6 @@
 import { html, useCallback, useEffect, useMemo, useRef, useState } from '../lib.js'
 import { api, apiText } from '../api.js'
+import { EFFORT_LABELS } from '../types.js'
 
 const integer = new Intl.NumberFormat()
 const dbu = new Intl.NumberFormat(undefined, { maximumFractionDigits: 4 })
@@ -132,7 +133,7 @@ export default function UsagePanel({ session, onError }) {
       <div class="usage-breakdown">
         <h3>Call breakdown</h3>
         <div class="usage-table-scroll"><table><caption class="sr-only">Model calls for this conversation</caption><thead><tr><th>Purpose</th><th>Model</th><th>Status</th><th>Total input</th><th>Uncached input</th><th>Cache read</th><th>Cache write</th><th>Output</th><th>Est. DBU</th></tr></thead><tbody>
-          ${metrics.calls.slice().reverse().map(call => html`<tr key=${call.id}><td>${call.purpose}</td><td>${call.model}</td><td>${call.status}${call.http_status ? ` · ${call.http_status}` : ''}</td><td>${formatCallTokens(totalInput(call))}</td><td>${formatCallTokens(tokenValue(call, 'input_tokens'))}</td><td>${formatCallTokens(tokenValue(call, 'cache_read_input_tokens'))}</td><td>${formatCallTokens(tokenValue(call, 'cache_creation_input_tokens'))}</td><td>${formatCallTokens(tokenValue(call, 'output_tokens'))}</td><td>${call.estimated_dbu == null ? '—' : formatDbu(call.estimated_dbu)}</td></tr>`)}
+          ${metrics.calls.slice().reverse().map(call => html`<tr key=${call.id}><td>${call.purpose}</td><td>${call.model}${call.effort ? html`<small class="usage-effort"> · ${EFFORT_LABELS[call.effort] || call.effort}</small>` : null}</td><td>${call.status}${call.http_status ? ` · ${call.http_status}` : ''}</td><td>${formatCallTokens(totalInput(call))}</td><td>${formatCallTokens(tokenValue(call, 'input_tokens'))}</td><td>${formatCallTokens(tokenValue(call, 'cache_read_input_tokens'))}</td><td>${formatCallTokens(tokenValue(call, 'cache_creation_input_tokens'))}</td><td>${formatCallTokens(tokenValue(call, 'output_tokens'))}</td><td>${call.estimated_dbu == null ? '—' : formatDbu(call.estimated_dbu)}</td></tr>`)}
         </tbody></table></div>
       </div>
       <p class="field-help usage-cost-note">Cost is a near-real-time estimate from provider-reported tokens and published pay-per-token DBU rates, not an invoice. Databricks billing records can lag and may apply contract pricing, credits, or regional uplifts. Unknown or provisioned endpoints show cost as unavailable. <a href=${metrics.pricing.source_url} target="_blank" rel="noreferrer">Pricing source</a>.</p>` : null}

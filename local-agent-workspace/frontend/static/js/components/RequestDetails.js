@@ -1,4 +1,5 @@
 import { html } from '../lib.js'
+import { EFFORT_LABELS } from '../types.js'
 
 const usageLabels = {
   input_tokens: 'Input tokens',
@@ -23,6 +24,17 @@ function rateLimitText(limit) {
     + (typeof limit.retry_after === 'number' ? `, retry after ${limit.retry_after.toLocaleString()} s` : '')
 }
 
+// The reasoning a request asked for (RequestInfo.reasoning): "High (output_config.effort)".
+export function effortText(reasoning) {
+  const label = EFFORT_LABELS[reasoning.effort] || reasoning.effort
+  if (reasoning.skipped === 'rejected') return `${label} (not sent: Databricks rejected ${reasoning.rejected_field}, so the request was sent again without reasoning fields)`
+  if (reasoning.skipped === 'rejected_earlier') return `${label} (not sent: this endpoint rejected ${reasoning.rejected_field} earlier)`
+  if (reasoning.effort === 'default') return Object.keys(reasoning.fields || {}).length ? `${label} (no effort field; thinking.display)` : `${label} (endpoint default)`
+  if (!reasoning.effort_field) return `${label} (not sent: no reasoning fields for this endpoint)`
+  const sent = reasoning.sent_effort && reasoning.sent_effort !== reasoning.effort ? ` as ${reasoning.sent_effort}` : ''
+  return `${label} (${reasoning.effort_field}${sent})`
+}
+
 export default function RequestDetails({ info }) {
   return html`<details class="request-details">
     <summary>Request details · ${info.status}</summary>
@@ -34,6 +46,8 @@ export default function RequestDetails({ info }) {
         <div><dt>HTTP status</dt><dd>${info.http_status ?? 'Unavailable'}</dd></div>
         ${info.error_kind || info.status === 'error' ? html`<div><dt>Error category</dt><dd>${info.error_kind?.replace(/_/g, ' ') ?? 'Unavailable'}</dd></div>` : null}
         ${info.rate_limit ? html`<div><dt>Rate limit</dt><dd>${rateLimitText(info.rate_limit)}</dd></div>` : null}
+        ${info.reasoning ? html`<div><dt>Effort</dt><dd>${effortText(info.reasoning)}</dd></div>` : null}
+        ${info.reasoning && Object.keys(info.reasoning.fields || {}).length ? html`<div><dt>Reasoning fields</dt><dd><code class="request-fields">${JSON.stringify(info.reasoning.fields)}</code></dd></div>` : null}
       </dl>
       <p class="request-details-heading">Token usage · provider-reported</p>
       <dl>${Object.entries(usageLabels).map(([key, label]) => {
