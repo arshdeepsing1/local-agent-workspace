@@ -328,6 +328,9 @@ async def test_agent_requests_carry_the_fields_and_record_them(runtime, monkeypa
         assert call["effort"] == effort
         assert session_metrics(session)["calls"][0]["effort"] == effort
         assert usage_rows(session)[0]["effort"] == effort
+        # The level that went out: GPT OSS gets High for Max; display-only fields send no level.
+        sent = (expected.get("output_config") or {}).get("effort") or expected.get("reasoning_effort")
+        assert call.get("sent_effort") == sent and usage_rows(session)[0]["effort_sent"] == (sent or "")
     if expected.get("output_config"):
         assert call["effort_field"] == recorded["effort_field"] == "output_config.effort"
 
@@ -398,6 +401,7 @@ async def test_a_rejected_reasoning_field_is_resent_once_without_it_and_remember
              call.get("reasoning_skipped")) for call in calls] == [
         (1, "error", 400, None, "high", None), (2, "completed", 200, "reasoning_rejected", "high", "rejected")]
     assert [call.get("reasoning_fields") for call in calls] == [["output_config", "thinking"], None]
+    assert [call.get("sent_effort") for call in calls] == ["high", "none"]  # The resend sent no level.
     assert session_metrics(session)["calls"][0]["reasoning_fields"] == ["output_config", "thinking"]
     assert manager.reasoning_rejections == {(OPUS, "anthropic"): "output_config.effort"}
     assert session["terminal_reason"] == "completed"

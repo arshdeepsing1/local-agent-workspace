@@ -1818,8 +1818,7 @@ class AgentManager:
         if busy_status(self, session["id"]) != "idle" and not session.get("is_subagent"):
             await self.event(session, "notice", text=f"Reasoning effort changed to {reasoning.EFFORT_LABELS[effort]}. "
                              "It applies from the agent's next model request.")
-        child = self.active_child(session)
-        if child is not None:
+        for child in self.active_children(session):
             await self.change_effort(child, effort)
 
     def reasoning_request(self, session):
@@ -3623,6 +3622,11 @@ class AgentManager:
             retry_reason=retry_reason)
         if effort is not None and not reasoning.plain_default(effort):
             call["effort"] = effort["effort"]
+            # What went out: the level sent (a mapped one on endpoints with fewer levels), or none
+            # when the fields were skipped after a rejection.
+            sent = effort["sent_effort"] or ("none" if effort.get("skipped") else None)
+            if sent is not None:
+                call["sent_effort"] = sent
             if effort["fields"]:
                 call["reasoning_fields"] = sorted(effort["fields"])  # The top-level fields sent, by name.
             for key, name in (("effort_field", "effort_field"), ("skipped", "reasoning_skipped")):

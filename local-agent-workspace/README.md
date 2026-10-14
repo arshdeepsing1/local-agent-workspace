@@ -1091,6 +1091,8 @@ without reasoning fields (see **Reasoning effort and thinking**). The Usage sect
 retries** tile counts these calls; **429 responses** counts rate-limited calls. The CSV's
 `effort` column (after `max_output_tokens`) and the call table name the reasoning effort a
 request asked for; it is empty for a request at Default that sent no reasoning fields.
+`effort_sent` is the level that went out: GPT OSS gets `high` for Extra high and Max, and
+`none` means the reasoning fields were left out after a rejection.
 
 ### Reasoning effort and thinking
 
