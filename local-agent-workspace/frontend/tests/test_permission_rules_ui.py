@@ -795,3 +795,33 @@ def test_a_busy_card_with_edit_and_always_allow_open_fits_a_phone(ui, page):
         box = button.bounding_box()
         if box:
             assert box["x"] + box["width"] <= 390, box
+
+
+@pytest.mark.parametrize("width,height", [(1440, 900), (360, 740)])
+def test_menu_shows_every_mode(ui, page, width, height):
+    page.set_viewport_size({"width": width, "height": height})
+    menu = open_menu(ui, page)
+    expect(menu).to_be_visible()
+    expect(mode_item(page, "Bypass permissions")).to_be_in_viewport(ratio=1)
+    expect(page.get_by_role("menuitem", name="Add a rule…")).to_be_in_viewport(ratio=1)
+    assert menu.bounding_box()["y"] >= ui.js("document.querySelector('.topbar').getBoundingClientRect().bottom")
+
+
+@pytest.mark.parametrize("width,height,lines", [(1366, 625, 1), (844, 390, 1), (1024, 768, 8), (1280, 720, 12), (360, 740, 6)],
+                         ids=["1366x625", "844x390", "1024x768-tall-draft", "1280x720-tall-draft", "360x740-tall-draft"])
+def test_menu_stays_below_the_top_bar(ui, page, width, height, lines):
+    """On a short window, or above a tall draft, the menu is shorter and scrolls; its heading stays on screen."""
+    page.set_viewport_size({"width": width, "height": height})
+    ui.app(session="a", scenario="workspace")
+    ui.show_session("a")
+    if lines > 1:
+        page.get_by_role("textbox", name="Message").fill("\n".join(f"Line {n}" for n in range(lines)))
+    page.get_by_role("button", name=MENU).click()
+    menu = page.get_by_role("menu")
+    expect(menu).to_be_visible()
+    assert menu.bounding_box()["y"] >= ui.js("document.querySelector('.topbar').getBoundingClientRect().bottom")
+    expect(page.get_by_role("button", name="Close permissions")).to_be_in_viewport(ratio=1)
+    expect(mode_item(page, "Manual")).to_be_focused()
+    bypass = mode_item(page, "Bypass permissions")
+    bypass.evaluate("e => e.scrollIntoView({ block: 'center' })")  # The menu scrolls when it is shorter than its items.
+    expect(bypass).to_be_in_viewport(ratio=1)

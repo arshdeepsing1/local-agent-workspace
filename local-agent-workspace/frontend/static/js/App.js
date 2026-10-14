@@ -1,5 +1,5 @@
-import { html, resolve, useEffect, useState } from './lib.js'
-import { Folder, Laptop, Menu, PanelRight, Pencil, Terminal, X } from './icons.js'
+import { html, resolve, useEffect, useRef, useState } from './lib.js'
+import { Folder, Laptop, Menu, PanelRight, Pencil, Terminal, Wrench, X } from './icons.js'
 import { api } from './api.js'
 import { useWorkspace } from './useWorkspace.js'
 import { useAttention } from './attention.js'
@@ -55,6 +55,52 @@ export default function App() {
   const setEditorFile = value => setEditorDrafts(current => ({ ...current, [editorKey]: resolve(value, current[editorKey] || null) }))
   const hasMessages = !!active?.events.length
   const busy = !!active && active.status !== 'idle'
+  // Below 1,024 px the Workspace panel is a drawer over the chat (and full width on phones): focus moves into it,
+  // Escape closes it, focus returns to the Workspace toggle, and the chat column is inert while it is open.
+  const [drawerTier, setDrawerTier] = useState(() => matchMedia('(width < 1024px)').matches)
+  useEffect(() => {
+    const query = matchMedia('(width < 1024px)')
+    const update = () => setDrawerTier(query.matches)
+    query.addEventListener('change', update)
+    return () => query.removeEventListener('change', update)
+  }, [])
+  const drawerOpen = drawerTier && workspaceOpen && !!app.settings && (!app.activeId || !!active)
+  // Focus moves in when the drawer is asked for (opened, or the window narrowed with it open), not when it only
+  // comes back after a chat chosen in the sidebar has loaded.
+  const drawerWanted = drawerTier && workspaceOpen
+  const workspaceToggle = useRef(null)
+  const drawerWasOpen = useRef(false)
+  const drawerWasWanted = useRef(false)
+  const drawerFocusPending = useRef(false)
+  useEffect(() => {
+    const was = drawerWasOpen.current
+    drawerWasOpen.current = drawerOpen
+    if (drawerWanted !== drawerWasWanted.current) drawerFocusPending.current = drawerWanted
+    drawerWasWanted.current = drawerWanted
+    if (drawerOpen && drawerFocusPending.current) {
+      drawerFocusPending.current = false
+      const panel = document.querySelector('.workspace-panel')
+      if (panel && !panel.contains(document.activeElement)) panel.querySelector('[aria-label="Close workspace"]')?.focus()
+    } else if (drawerOpen && !was) {
+      // Back after that chat loaded: its message box took focus and is inert now, so focus returns to its row.
+      const focused = document.activeElement
+      if (!focused || focused === document.body || document.querySelector('.main-area')?.contains(focused)) document.querySelector('.sidebar [aria-current="page"]')?.focus()
+    } else if (was && !workspaceOpen && (!document.activeElement || document.activeElement === document.body)) {
+      workspaceToggle.current?.focus()
+    }
+  }, [drawerOpen, drawerWanted, workspaceOpen])
+  useEffect(() => {
+    if (!drawerOpen) return
+    const onKeyDown = event => {
+      if (event.key !== 'Escape' || event.defaultPrevented || event.isComposing || document.querySelector('dialog[open]')) return
+      // From the drawer, the sidebar beside it or its error; the chat column is inert.
+      if (event.target !== document.body && !event.target.closest?.('.workspace-panel, .sidebar, .drawer-alert')) return
+      event.preventDefault()
+      setWorkspaceOpen(false)
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => document.removeEventListener('keydown', onKeyDown)
+  }, [drawerOpen])
   // An error can name another chat that blocks the action: { message, session_id, title }.
   const [blocker, setBlocker] = useState(null)
   const showError = error => {
@@ -102,13 +148,13 @@ export default function App() {
       }}
       onMeta=${app.setMeta} onSearch=${app.searchConversations} onError=${showError}
       onDelete=${(id, children) => app.deleteSession(id, children).then(deleted => deleted.forEach(removeDraft)).catch(e => showError(e.message))} />
-    <main class="main-area">
+    <main class="main-area" inert=${drawerOpen}>
       <header class="topbar"><button class="icon-button mobile-only" aria-label="Open sidebar" onClick=${() => setSidebarOpen(true)}><${Menu} size=${20} /></button>
         <${Laptop} size=${18} className="topbar-device" />
-        <span class="conversation-title">${active?.title || (app.activeId ? 'Loading conversation…' : 'New conversation')}
+        <span class="conversation-title" title=${active ? `${active.title}\nSession: ${active.id}` : undefined}>${active?.title || (app.activeId ? 'Loading conversation…' : 'New conversation')}
           ${app.activeId ? html`<small class="session-id" title=${`Session: ${app.activeId}`}> · ${app.activeId.slice(0, 8)}</small>` : null}</span>
-        <button class="outline agent-tools-toggle" onClick=${() => setAgentToolsOpen(true)}>Agent tools</button>
-        <button class=${`outline workspace-toggle ${workspaceOpen ? 'active' : ''}`} onClick=${() => setWorkspaceOpen(v => !v)}><${PanelRight} size=${18} /><span>Workspace</span>
+        <button class="outline agent-tools-toggle" title="Agent tools" onClick=${() => setAgentToolsOpen(true)}><${Wrench} size=${16} /><span class="toggle-label">Agent tools</span></button>
+        <button ref=${workspaceToggle} class=${`outline workspace-toggle ${workspaceOpen ? 'active' : ''}`} title="Workspace" onClick=${() => setWorkspaceOpen(v => !v)}><${PanelRight} size=${18} /><span class="toggle-label">Workspace</span>
           ${changedFiles ? html`<span class="change-count" title=${`${plural(changedFiles, 'file')} changed by the agent`}><span aria-hidden="true">${changedFiles}</span><span class="sr-only">(${plural(changedFiles, 'changed file')})</span></span>` : null}</button>
       </header>
       ${app.error ? html`<div class="app-error" role="alert"><span>${app.error}</span>
@@ -142,6 +188,9 @@ export default function App() {
           } : undefined} />
       </div>
     </main>
+    ${drawerOpen && app.error ? html`<div class="drawer-alert" role="alert"><span>${app.error}</span>
+      <${OpenBlockingChat} blocker=${blocker?.message === app.error ? blocker : null} currentId=${app.activeId} onSelect=${app.setActiveId} /><button class="icon-button" aria-label="Dismiss error" onClick=${() => { app.setError(''); document.querySelector('.workspace-panel [aria-label="Close workspace"]')?.focus() }}><${X} size=${16} /></button></div>` : null}
+    ${workspaceOpen && app.settings && (!app.activeId || active) ? html`<div class="workspace-scrim" aria-hidden="true" onClick=${() => setWorkspaceOpen(false)} />` : null}
     ${workspaceOpen && app.settings && (!app.activeId || active) ? html`<${WorkspacePanel} key=${editorKey} sessionId=${app.activeId}
       allowedDirectories=${active?.allowed_directories || []} codingDir=${app.settings.coding_dir_status} pythonVenv=${app.settings.python_venv_status}
       workspace=${workspace} file=${editorDrafts[editorKey] || null} setFile=${setEditorFile} onClose=${() => setWorkspaceOpen(false)}

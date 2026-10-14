@@ -170,7 +170,7 @@ def test_menu_closes_when_the_message_box_loses_focus(ui, page):
     box = message(page)
     box.press_sequentially("/")
     expect(options(page)).to_have_count(3)
-    page.get_by_role("heading", name="What’s up next?").click()
+    page.locator(".conversation-title").click()  # The welcome heading now sits under the open menu.
     expect(page.locator(".slash-menu")).to_have_count(0)
     box.click()
     expect(options(page)).to_have_count(3)

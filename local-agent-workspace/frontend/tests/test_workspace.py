@@ -132,8 +132,8 @@ def test_settings_edit_and_save_only_databricks_fields(ui, page):
     checkboxes = dialog.get_by_role("checkbox")
     expect(checkboxes).to_have_count(4)
     expect(dialog.locator("label:has(input[type=checkbox])")).to_have_text([
-        "Save a detailed handoff at each compaction", "Desktop notification when no browser tab is open",
-        "Keep agent changes automatically when a reply finishes", "Continue automatically after rate limits"])
+        "Save a detailed handoff at each compaction", "Keep agent changes automatically when a reply finishes",
+        "Continue automatically after rate limits", "Desktop notification when no browser tab is open"])
     dialog.get_by_label("Project folder").fill("/updated-project")
     endpoint.fill("databricks-gpt-oss-120b")
     dialog.get_by_label("Credential file").fill("/credentials/env_vars.txt")
@@ -182,7 +182,7 @@ def test_rename_running_chat_keeps_stream_and_blocks_duplicates(ui, page):
     start_app(ui, page, "a", setup=pending("title", "path === '/api/sessions/a/title'"))
     ui.show_session("a")
     ui.emit("a", {"type": "status", "status": "running"})
-    page.get_by_role("button", name="Rename Other conversation").click()
+    ui.row_action("Other conversation", "Rename")
     field = page.get_by_role("textbox", name="Conversation name")
     expect(field).to_have_attribute("maxlength", "160")
     expect(field).to_be_focused()
@@ -198,7 +198,7 @@ def test_rename_running_chat_keeps_stream_and_blocks_duplicates(ui, page):
     expect(main(page).get_by_text("Clear project name")).to_be_visible()
     expect(page.get_by_text("Still streaming")).to_be_visible()
     expect(page.get_by_role("button", name="Stop response")).to_be_visible()
-    expect(page.get_by_role("button", name="Rename Clear project name")).to_be_focused()
+    expect(page.get_by_role("button", name="More actions for Clear project name")).to_be_focused()
     requests = ui.requests("/api/sessions/a/title")
     assert [request["method"] for request in requests] == ["PUT"]
     assert json.loads(requests[0]["body"]) == {"title": "  Clear   project name  "}
@@ -208,10 +208,10 @@ def test_rename_inactive_chat_keeps_selection_and_draft(ui, page):
     start_app(ui, page, "a", setup="fake.sessions.set('b', makeSession('b', 'Second conversation'))")
     ui.show_session("a")
     message(page).fill("Unsent draft")
-    page.get_by_role("button", name="Rename Second conversation").click()
+    ui.row_action("Second conversation", "Rename")
     page.get_by_role("textbox", name="Conversation name").fill("Renamed second chat")
     page.get_by_role("button", name="Save name").click()
-    expect(page.get_by_role("button", name="Rename Renamed second chat")).to_be_visible()
+    expect(page.get_by_role("button", name="More actions for Renamed second chat")).to_be_visible()
     expect(main(page).get_by_text("Other conversation")).to_be_visible()
     expect(message(page)).to_have_value("Unsent draft")
     assert ui.js("new URL(location.href).searchParams.get('session')") == "a"
@@ -221,7 +221,7 @@ def test_rename_inactive_chat_keeps_selection_and_draft(ui, page):
 @pytest.mark.parametrize("action", ["Escape", "Cancel"])
 def test_cancel_rename_restores_focus_and_discards_name(ui, page, action):
     start_app(ui, page)
-    page.get_by_role("button", name="Rename Other conversation").click()
+    ui.row_action("Other conversation", "Rename")
     field = page.get_by_role("textbox", name="Conversation name")
     field.fill("   ")
     expect(page.get_by_role("button", name="Save name")).to_be_disabled()
@@ -231,16 +231,15 @@ def test_cancel_rename_restores_focus_and_discards_name(ui, page, action):
     else:
         page.get_by_role("button", name="Cancel rename").click()
     expect(page.get_by_role("textbox", name="Conversation name")).to_have_count(0)
-    button = page.get_by_role("button", name="Rename Other conversation")
-    expect(button).to_be_focused()
+    expect(page.get_by_role("button", name="More actions for Other conversation")).to_be_focused()
     assert not ui.js("fake.calls.some(call => call.path.endsWith('/title'))")
-    button.click()
+    ui.row_action("Other conversation", "Rename")
     expect(page.get_by_role("textbox", name="Conversation name")).to_have_value("Other conversation")
 
 
 def test_failed_rename_stays_editable_and_can_retry(ui, page):
     start_app(ui, page, setup="fake.override = path => path === '/api/sessions/a/title' ? fake.json({ detail: 'Could not save the conversation.' }, 503) : undefined")
-    page.get_by_role("button", name="Rename Other conversation").click()
+    ui.row_action("Other conversation", "Rename")
     page.get_by_role("textbox", name="Conversation name").fill("Try this name")
     page.get_by_role("button", name="Save name").click()
     expect(page.get_by_role("alert")).to_have_text("Could not save the conversation.")
@@ -248,7 +247,7 @@ def test_failed_rename_stays_editable_and_can_retry(ui, page):
     assert ui.js("fake.sessions.get('a').title") == "Other conversation"
     ui.run("fake.override = () => undefined")
     page.get_by_role("button", name="Save name").click()
-    expect(page.get_by_role("button", name="Rename Try this name")).to_be_visible()
+    expect(page.get_by_role("button", name="More actions for Try this name")).to_be_visible()
     expect(page.get_by_role("alert")).to_have_count(0)
 
 

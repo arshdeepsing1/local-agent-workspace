@@ -393,7 +393,7 @@ def test_renaming_a_read_chat_keeps_it_read(ui, page):
         return fake.json(updated)
       }
     }""", clock=True)
-    page.get_by_role("button", name="Rename Other conversation").click()
+    ui.row_action("Other conversation", "Rename")
     page.get_by_role("textbox", name="Conversation name").fill("Renamed chat")
     page.get_by_role("button", name="Save name").click()
     expect(row(page, "Renamed chat")).to_be_visible()

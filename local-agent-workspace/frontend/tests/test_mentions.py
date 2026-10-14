@@ -64,7 +64,7 @@ def test_chips_show_each_mention_and_remove_its_token(ui, page):
     chips = page.locator(".mention-chip")
     expect(chips).to_have_count(2)
     expect(chips.nth(0)).to_contain_text("@src/parser.py:3-40")
-    expect(chips.nth(0)).to_have_attribute("title", "A snapshot is attached when you send (files only)")
+    expect(chips.nth(0)).to_have_attribute("title", "@src/parser.py:3-40\nA snapshot is attached when you send (files only)")
     expect(chips.nth(1)).to_contain_text("@README.md")
     page.get_by_role("button", name="Remove @src/parser.py").click()
     expect(box).to_have_value("Read , then @README.md and `@not/this` or a@b.c")
@@ -98,3 +98,24 @@ def test_a_new_conversation_searches_the_default_project(ui, page):
     message(page).press_sequentially("@read")
     expect(files(page)).to_have_count(1)
     assert ui.requests("/api/mention-files?q=read")
+
+
+def test_long_mention_chip_is_one_line(ui, page):
+    """A long path shortens its folder with an ellipsis and keeps the file name whole (one line, not five)."""
+    page.set_viewport_size({"width": 390, "height": 844})
+    start_app(ui, page)
+    folder = "src/" + "/".join(f"very_long_directory_name_{n}" for n in range(4)) + "/"
+    name = "configuration_file_with_a_long_name.py"
+    path = folder + name
+    assert len(path) >= 140
+    message(page).fill(f"Read @{path} and @README.md")
+    chips = page.locator(".mention-chip")
+    expect(chips).to_have_count(2)
+    composer = page.locator(".composer").bounding_box()
+    for index in range(2):
+        box = chips.nth(index).bounding_box()
+        assert box["height"] <= 32 and box["x"] + box["width"] <= composer["x"] + composer["width"] + 0.5, box
+    expect(chips.nth(0)).to_have_attribute("title", re.compile(f"^@{re.escape(path)}\n"))
+    expect(chips.nth(0).locator(".mention-base")).to_have_text(name)
+    assert ui.js("(e => e.scrollWidth > e.clientWidth)(document.querySelector('.mention-dir'))")  # The folder is what shortens.
+    expect(chips.nth(1).locator(".mention-base")).to_have_text("@README.md")

@@ -42,8 +42,8 @@ function AgentToolsScope(props) {
     <div class="agent-tools-content">
       <header class="agent-tools-header"><div><h2>Agent tools</h2><p>${props.session?.title || 'Default workspace'}</p></div><button class="icon-button" aria-label="Close agent tools" onClick=${props.onClose}><${X} size=${18} /></button></header>
       <nav class="agent-tools-tabs" aria-label="Agent tools sections">${['Recovery', 'Usage', 'Worktrees', 'Tasks', 'Verify', 'Extensions', 'Tools', 'Conversation'].map(name => html`<button key=${name} aria-pressed=${tab === name} onClick=${() => setTab(name)}>${name}</button>`)}</nav>
-      ${tab === 'Recovery' ? html`<${Recovery} ...${props} />` : tab === 'Usage' ? html`<${UsagePanel} session=${props.session} onError=${props.onError} />` : tab === 'Worktrees' ? html`<${Worktrees} ...${props} />` : tab === 'Tasks' ? html`<${Tasks} ...${props} />` : tab === 'Verify' ? html`<${Verify} ...${props} />` : tab === 'Extensions' ? html`<${ExtensionsPanel} ...${props} />` : tab === 'Tools' ? html`<${ToolsPanel} ...${props} />` :
-        html`<${ConversationTransfer} sessionId=${props.session?.id} workspace=${props.session?.workspace || props.workspace || ''} busy=${!!props.session && props.session.status !== 'idle'} onError=${props.onError} onSelectSession=${id => { props.onSelectSession(id); props.onClose() }} />`}
+      <div class="agent-tools-body">${tab === 'Recovery' ? html`<${Recovery} ...${props} />` : tab === 'Usage' ? html`<${UsagePanel} session=${props.session} onError=${props.onError} />` : tab === 'Worktrees' ? html`<${Worktrees} ...${props} />` : tab === 'Tasks' ? html`<${Tasks} ...${props} />` : tab === 'Verify' ? html`<${Verify} ...${props} />` : tab === 'Extensions' ? html`<${ExtensionsPanel} ...${props} />` : tab === 'Tools' ? html`<${ToolsPanel} ...${props} />` :
+        html`<${ConversationTransfer} sessionId=${props.session?.id} workspace=${props.session?.workspace || props.workspace || ''} busy=${!!props.session && props.session.status !== 'idle'} onError=${props.onError} onSelectSession=${id => { props.onSelectSession(id); props.onClose() }} />`}</div>
     </div>
   </dialog>`
 }

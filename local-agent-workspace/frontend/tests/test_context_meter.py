@@ -27,6 +27,12 @@ def test_shows_breakdown_and_compaction_threshold(ui, page):
     expect(page.get_by_text("Approximately 6,000 of 120,832 input tokens used.")).to_be_visible()
     expect(page.get_by_text("Automatic compaction threshold: approximately 120,832 input tokens.")).to_be_visible()
     expect(page.get_by_text("Compactions: 1. Messages summarized: 6.")).to_be_visible()
+    # Escape inside the open details closes them and returns focus to the summary.
+    expect(details).to_have_attribute("open", "")
+    page.locator("details.context-meter > summary").focus()
+    page.keyboard.press("Escape")
+    expect(details).not_to_have_attribute("open", "")
+    expect(page.locator("details.context-meter > summary")).to_be_focused()
 
 
 def test_zero_summary_and_no_invented_breakdown(ui, page):
