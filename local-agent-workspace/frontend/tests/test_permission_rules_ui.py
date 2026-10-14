@@ -91,13 +91,32 @@ def test_a_command_without_an_exact_argv_can_only_be_remembered_as_text_in_this_
     show(ui, """[{ id: 'card', type: 'tool', name: 'run_command', state: 'pending', preview: 'npm test | tee out',
       input: { command: 'npm test | tee out' }, rememberable: ['chat'],
       rule_options: { argv: null, prefixes: [], reason: 'uses shell syntax (|).' } }]""")
-    form = remember_form(page)
-    expect(form).to_contain_text("uses shell syntax (|). Only this exact text can be allowed, in this chat.")
-    expect(form.get_by_role("radio")).to_have_count(1)
-    expect(form.get_by_role("radio", name="This chat")).to_be_checked()
-    form.get_by_role("button", name="Approve and remember").click()
+    # The form could only repeat the chat button, so the card offers that button alone and says why in its title.
+    # Mutation: keep the split arrow when the form has nothing more to offer.
+    expect(page.get_by_role("button", name="Always allow…")).to_have_count(0)
+    expect(page.get_by_role("group", name="Always allow")).to_have_count(0)
+    allow = page.get_by_role("button", name="Always allow this command in this chat", exact=True)
+    expect(allow).to_have_attribute("title", "Always allow this command in this chat. uses shell syntax (|). Only this "
+                                             "exact text can be allowed, in this chat.")
+    allow.click()
     ui.wait("fake.calls.length === 1")
     assert decisions(ui) == [{"allowed": True, "remember": True}]
+
+
+@pytest.mark.parametrize("name, extra", [
+    ("mcp__docs__search", "input: {}, rememberable: ['chat']"),
+    ("run_command", "input: { command: 'git status' }, rememberable: ['chat'], rule_options: { argv: ['git', 'status'], prefixes: [] }"),
+])
+def test_a_chat_only_card_keeps_the_arrow_only_when_the_form_offers_more(ui, page, name, extra):
+    # An MCP tool for this chat only: nothing more to choose. A command with an exact argv: its form can match it.
+    show(ui, f"[{{ id: 'card', type: 'tool', name: '{name}', state: 'pending', preview: 'p', {extra} }}]")
+    toggle = page.get_by_role("button", name="Always allow…")
+    if name == "run_command":
+        expect(toggle).to_have_attribute("title", "Always allow…")
+        expect(remember_form(page).get_by_role("radio", name="Exactly this command")).to_be_visible()
+    else:
+        expect(toggle).to_have_count(0)
+        expect(page.get_by_role("button", name="Allow this tool in this chat", exact=True)).to_be_visible()
 
 
 def test_edits_can_be_remembered_for_a_folder_or_for_all_files(ui, page):

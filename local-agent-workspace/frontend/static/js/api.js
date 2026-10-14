@@ -1,9 +1,19 @@
 let token = ''
 let reconnecting = null
+// A request that could not reach the local server at all (the server stopped or restarts).
+export const OFFLINE_MESSAGE = 'Cannot reach the local server. Check that it is still running.'
+// fetch() rejects with a TypeError on a network failure; that becomes an ApiError with status 0 (the
+// original error stays on error.cause). Any other rejection keeps its own message.
+function offline(error) {
+  if (!(error instanceof TypeError)) throw error
+  const wrapped = new ApiError(OFFLINE_MESSAGE, 0)
+  wrapped.cause = error
+  throw wrapped
+}
 export function setToken(value) { token = value }
 export function refreshToken() {
   if (!reconnecting) reconnecting = (async () => {
-    const response = await fetch('/api/bootstrap')
+    const response = await fetch('/api/bootstrap').catch(offline)
     if (!response.ok) throw new Error('Cannot reconnect to the local server.')
     const data = await response.json()
     setToken(data.token)
@@ -31,6 +41,11 @@ function errorFor(data, status, fallback) {
     }
     return new ApiError(detail.message, status, detail)
   }
+  // A FastAPI validation error (HTTP 422) lists the problems: show the first one, named by its field.
+  if (Array.isArray(detail) && typeof detail[0]?.msg === 'string') {
+    const field = Array.isArray(detail[0].loc) ? detail[0].loc[detail[0].loc.length - 1] : null
+    return new ApiError(`${typeof field === 'string' ? `${field}: ` : ''}${detail[0].msg}`, status)
+  }
   return new ApiError(typeof detail === 'string' ? detail : fallback, status)
 }
 export async function api(path, method = 'GET', body, retried = false) {
@@ -47,7 +62,7 @@ export async function apiText(path) {
 }
 // The same, with the file name from the response's Content-Disposition header (or null).
 export async function apiFile(path, retried = false) {
-  const response = await fetch(`/api${path}`, { headers: { 'X-Local-Token': token } })
+  const response = await fetch(`/api${path}`, { headers: { 'X-Local-Token': token } }).catch(offline)
   if (response.ok) {
     const name = /filename="([^"]+)"/.exec(response.headers.get('Content-Disposition') || '')?.[1] || null
     return { text: await response.text(), name }
@@ -59,18 +74,21 @@ export async function apiFile(path, retried = false) {
   }
   throw errorFor(data, response.status, `Request failed with HTTP ${response.status}.`)
 }
+const UNREADABLE = Symbol('unreadable')  // a body that is not JSON (an HTML error page, an empty body)
 async function request(path, method, body, retried = false) {
   const response = await fetch(`/api${path}`, {
     method, headers: { 'Content-Type': 'application/json', 'X-Local-Token': token },
     body,
-  })
-  const data = await response.json()
+  }).catch(offline)
+  // A request that was sent and then lost is not sent again: it may have run.
+  const data = await response.json().catch(() => UNREADABLE)
+  if (data === UNREADABLE) throw new ApiError(`The local server sent an unexpected response (HTTP ${response.status}).`, response.status)
   // This response is emitted before the server executes the request, so one
   // retry after replacing an expired local token cannot duplicate an action.
-  if (response.status === 403 && data.code === 'reconnect_required' && !retried) {
+  if (response.status === 403 && data?.code === 'reconnect_required' && !retried) {
     await refreshToken()
     return request(path, method, body, true)
   }
-  if (!response.ok) throw errorFor(data, response.status, JSON.stringify(data.detail || data))
+  if (!response.ok) throw errorFor(data, response.status, JSON.stringify(data?.detail || data))
   return data
 }

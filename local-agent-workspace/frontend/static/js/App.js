@@ -139,7 +139,7 @@ export default function App() {
     loadSkills=${() => api(`/skills${app.activeId ? `?session_id=${encodeURIComponent(app.activeId)}` : ''}`)}
     onStop=${() => { if (active) void api(`/sessions/${active.id}/stop`, 'POST').catch(e => showError(e.message)) }} />`
   return html`<div class=${`app-shell ${workspaceOpen ? 'workspace-visible' : ''}`}>
-    <${Sidebar} settings=${app.settings} connection=${app.connection} sessions=${app.sessions} activeId=${app.activeId}
+    <${Sidebar} settings=${app.settings} connection=${app.connection} online=${app.online} sessions=${app.sessions} activeId=${app.activeId}
       open=${sidebarOpen} close=${() => setSidebarOpen(false)} onNew=${app.newConversation}
       onSelect=${app.setActiveId} onSettings=${() => setSettingsOpen(true)}
       attention=${attention} onRename=${async (id, title) => {
@@ -157,11 +157,11 @@ export default function App() {
         <button ref=${workspaceToggle} class=${`outline workspace-toggle ${workspaceOpen ? 'active' : ''}`} title="Workspace" onClick=${() => setWorkspaceOpen(v => !v)}><${PanelRight} size=${18} /><span class="toggle-label">Workspace</span>
           ${changedFiles ? html`<span class="change-count" title=${`${plural(changedFiles, 'file')} changed by the agent`}><span aria-hidden="true">${changedFiles}</span><span class="sr-only">(${plural(changedFiles, 'changed file')})</span></span>` : null}</button>
       </header>
-      ${app.error ? html`<div class="app-error" role="alert"><span>${app.error}</span>
+      ${app.error && (app.online || !app.offlineError) ? html`<div class="app-error" role="alert"><span>${app.error}</span>
         <${OpenBlockingChat} blocker=${blocker?.message === app.error ? blocker : null} currentId=${app.activeId} onSelect=${app.setActiveId} /><button class="icon-button" aria-label="Dismiss error" onClick=${() => app.setError('')}><${X} size=${16} /></button></div>` : null}
       <${StorageNotice} problems=${app.storageProblems} />
-      ${!app.online && app.activeId ? html`<div class="connection-banner">Reconnecting to your local server… Refresh if the server was restarted.</div>` : null}
-      ${app.connection && !app.connection.connected ? html`<div class="connection-banner"><span>${app.connection.error || 'Configure Databricks to start a conversation.'}</span><button onClick=${() => setSettingsOpen(true)}>Open settings</button></div>` : null}
+      ${!app.online ? html`<div class="connection-banner" role="status">Reconnecting to your local server… Refresh if the server was restarted.</div>` : null}
+      ${app.online && app.connection && !app.connection.connected ? html`<${ConnectionBanner} app=${app} onSettings=${() => setSettingsOpen(true)} onError=${showError} />` : null}
       ${hasMessages && active ? html`<${Conversation} key=${active.id} session=${active} onError=${showError} onSelectSession=${app.setActiveId} onOpenPath=${openFileAt}
           busy=${busy} onLoadEarlier=${app.loadEarlier} onPrefill=${text => { if (draft.trim()) return false; setDraft(text); return true }} />` :
         html`<div class="welcome"><div class="welcome-content">
@@ -188,7 +188,7 @@ export default function App() {
           } : undefined} />
       </div>
     </main>
-    ${drawerOpen && app.error ? html`<div class="drawer-alert" role="alert"><span>${app.error}</span>
+    ${drawerOpen && app.error && (app.online || !app.offlineError) ? html`<div class="drawer-alert" role="alert"><span>${app.error}</span>
       <${OpenBlockingChat} blocker=${blocker?.message === app.error ? blocker : null} currentId=${app.activeId} onSelect=${app.setActiveId} /><button class="icon-button" aria-label="Dismiss error" onClick=${() => { app.setError(''); document.querySelector('.workspace-panel [aria-label="Close workspace"]')?.focus() }}><${X} size=${16} /></button></div>` : null}
     ${workspaceOpen && app.settings && (!app.activeId || active) ? html`<div class="workspace-scrim" aria-hidden="true" onClick=${() => setWorkspaceOpen(false)} />` : null}
     ${workspaceOpen && app.settings && (!app.activeId || active) ? html`<${WorkspacePanel} key=${editorKey} sessionId=${app.activeId}
@@ -205,4 +205,38 @@ export default function App() {
       busy=${busy || (!!app.activeId && !active)} bypass=${app.permissionMode === 'bypassPermissions'} onAllow=${app.allowFolder} onRemove=${app.removeFolder} onClose=${() => setFoldersOpen(false)} />` : null}
     ${rulesOpen && app.settings ? html`<${PermissionRulesDialog} key=${app.viewKey} onAdd=${app.addRule} onClose=${() => setRulesOpen(false)} returnFocus=${rulesOpen.done} />` : null}
   </div>`
+}
+
+// Why Databricks cannot be used, with Check again (keeps focus while it checks and says what it found) and Open settings.
+function ConnectionBanner({ app, onSettings, onError }) {
+  const connection = app.connection
+  const network = connection.error_kind === 'network'
+  // A network failure, a Databricks server problem or rate limit, or an unreadable answer may pass: offer to check again.
+  const passing = connection.error_kind === 'invalid_response'
+    || (connection.error_kind === 'http' && (connection.http_status >= 500 || connection.http_status === 429))
+  const recheckable = network || passing || (!connection.error && app.settings?.configured)
+  // { connection, time } of the last Check again that did not connect; shown while that result is current.
+  const [checked, setChecked] = useState(null)
+  const recheck = async event => {
+    if (app.connectionChecking) return
+    const banner = event.currentTarget.closest('.connection-banner')
+    try {
+      const result = await app.checkConnection({ keep: true })
+      if (!result.connected) setChecked({ connection: result, time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) })
+    } catch (e) { onError(e) }
+    // Check again goes away with the banner (connected) or when the new problem cannot be checked again: keep
+    // keyboard focus on the banner's remaining button, or continue in the message box.
+    if (document.activeElement && document.activeElement !== document.body) return
+    const next = banner?.isConnected ? banner.querySelector('button') : null
+    ;(next || document.querySelector('.chat-composer textarea'))?.focus()
+  }
+  const text = network ? html`Can't reach Databricks${app.settings?.host ? ` at ${app.settings.host}` : ''}. Check your network or VPN connection.
+      <details class="banner-details"><summary>Details</summary>${connection.error}</details>`
+    : connection.error || (!app.settings?.configured ? 'Configure Databricks to start a conversation.' : 'Could not check the Databricks connection.')
+  const outcome = app.connectionChecking ? 'Checking…'
+    : checked?.connection === connection ? `Still not connected (checked ${checked.time}).` : ''
+  return html`<div class="connection-banner"><span class="banner-text">${text}
+      ${recheckable ? html`<span class="banner-checked" role="status">${outcome}</span>` : null}</span>
+    <div class="banner-actions">${recheckable ? html`<button aria-busy=${app.connectionChecking ? 'true' : 'false'} aria-disabled=${app.connectionChecking ? 'true' : 'false'} onClick=${recheck}>Check again</button>` : null}
+      <button onClick=${onSettings}>Open settings</button></div></div>`
 }

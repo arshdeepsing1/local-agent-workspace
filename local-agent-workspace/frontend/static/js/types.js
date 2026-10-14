@@ -25,7 +25,9 @@
 // Bootstrap (GET /bootstrap): { token, settings: Settings, storage_problems: StorageProblem[] }
 // StorageProblem: { file, reason } a conversation file in the state folder that could not
 //   be read; it is hidden and left unchanged. reason never quotes the file's contents.
-// Connection: { connected, models: string[], error: string | null }
+// Connection: { connected, models: string[], error: string | null,
+//   error_kind?: 'credentials'|'http'|'network'|'invalid_response' (which step failed; absent on success),
+//   http_status?: number (with error_kind 'http') }
 // Session: { id, title, workspace, model, status, events: AgentEvent[], updated,
 //   permission_mode: 'manual'|'auto'|'acceptEdits'|'dontAsk'|'plan'|'bypassPermissions', allowed_directories,
 //   allow_rules: Rule[] (this chat's rules), disabled_tools?: string[] (turned-off tools), context_info?, active_skills?,

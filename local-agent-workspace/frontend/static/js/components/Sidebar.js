@@ -392,10 +392,12 @@ export default function Sidebar(props) {
       <footer class="sidebar-footer">
         <button class="settings-button" onClick=${props.onSettings}><${SettingsIcon} />Settings</button>
         <${NotifyToggle} notifications=${props.attention?.notifications} />
-        <div class="connection-state" title=${props.connection?.error || props.settings?.host || 'Checking connection'}>
+        ${props.online === false ? html`<div class="connection-state" title="Reconnecting to your local server…">
+          <span class="status-dot disconnected" />Local server offline</div>`
+        : html`<div class="connection-state" title=${props.connection?.error || props.settings?.host || 'Checking connection'}>
           <span class=${`status-dot ${props.connection?.connected ? 'connected' : props.connection ? 'disconnected' : ''}`} />
           ${props.connection === null ? 'Checking Databricks…' : props.connection.connected ? 'Databricks connected' : 'Connection needs attention'}
-        </div>
+        </div>`}
       </footer>
     </aside>
     ${deleting ? html`<${DeleteConversationDialog} session=${deleting.session} children=${deleting.children}

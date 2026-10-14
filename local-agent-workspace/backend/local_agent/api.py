@@ -281,18 +281,43 @@ def create_app(settings=None):
 
     @app.get("/api/connection")
     async def connection():
+        # error_kind says which step failed: 'credentials' (the credential file), 'http' (Databricks answered
+        # with an error status), 'network' (no answer) or 'invalid_response' (an answer the app cannot read).
+        # An unreadable credential file (OSError) still reaches the global handler (HTTP 400).
         try:
             host, token = settings.credentials()
+        except ValueError as exc:
+            return {"connected": False, "models": [], "error": settings.redact(str(exc)), "error_kind": "credentials"}
+        try:
             async with httpx.AsyncClient(timeout=20, follow_redirects=False) as client:
                 response = await client.get(host + "/api/2.0/serving-endpoints", headers={"Authorization": f"Bearer {token}"})
-            if response.status_code != 200:
-                return {"connected": False, "models": [], "error": f"Databricks returned HTTP {response.status_code}. Check your credentials and access."}
+        except httpx.HTTPError as exc:
+            return {"connected": False, "models": [], "error": settings.redact(str(exc) or type(exc).__name__),
+                    "error_kind": "network"}
+        except ValueError as exc:
+            # The request could not be built from the credentials, for example a token with a non-ASCII character
+            # (not allowed in an HTTP header). A UnicodeError's message quotes that character, so it is not shown.
+            error = ("The Databricks host or token in your credential file contains characters that cannot be sent in a request."
+                     if isinstance(exc, UnicodeError) else settings.redact(str(exc)))
+            return {"connected": False, "models": [], "error": error, "error_kind": "credentials"}
+        if response.status_code != 200:
+            status = response.status_code
+            # A server problem or a rate limit usually passes; other statuses point at the credentials or access.
+            error = (f"Databricks had a server problem (HTTP {status}). Try again in a moment." if status >= 500
+                     else f"Databricks rate limited the check (HTTP {status}). Try again in a moment." if status == 429
+                     else f"Databricks returned HTTP {status}. Check your credentials and access.")
+            return {"connected": False, "models": [], "error": error, "error_kind": "http", "http_status": status}
+        try:
             data = response.json()
-            models = [item.get("name", "") for item in data.get("endpoints", [])]
-            models = [name for name in models if name and not any(term in name for term in ("embedding", "gte-", "bge-"))]
-            return {"connected": True, "models": models, "error": None}
-        except (ValueError, httpx.HTTPError) as exc:
-            return {"connected": False, "models": [], "error": settings.redact(str(exc))}
+        except ValueError:
+            data = None
+        endpoints = data.get("endpoints", []) if isinstance(data, dict) else None
+        if not isinstance(endpoints, list):
+            return {"connected": False, "models": [], "error": "Databricks returned a response the app could not read.",
+                    "error_kind": "invalid_response"}
+        models = [item.get("name", "") if isinstance(item, dict) else "" for item in endpoints]
+        models = [name for name in models if isinstance(name, str) and name and not any(term in name for term in ("embedding", "gte-", "bge-"))]
+        return {"connected": True, "models": models, "error": None}
 
     @app.put("/api/settings")
     async def update_settings(body: SettingsEdit):
