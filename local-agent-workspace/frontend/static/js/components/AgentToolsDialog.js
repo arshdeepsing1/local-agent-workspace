@@ -6,6 +6,7 @@ import UsagePanel from './UsagePanel.js'
 import { blockerOf, OpenBlockingChat } from './BlockingChat.js'
 import { modeLabel } from './PermissionsMenu.js'
 import { AGENT_TYPE_LABELS, elapsedText } from '../subagents.js'
+import { EFFORT_LABELS, modelLabel } from '../types.js'
 
 // Props: session, workspace?, changedFiles? (files with unreviewed agent changes in this chat, from the
 // changes bar; null when unknown), onClose, onSelectSession, onError, onSaveTools?(tools) -> Session
@@ -140,7 +141,9 @@ function Overview({ session, workspace, changedFiles, onOpen }) {
   const data = useOverview(session)
   const value = (key, show) => data[key]?.failed ? 'Could not load' : data[key] ? show(data[key].value) : 'Loading…'
   const chat = session ? [
-    { label: 'Model', text: session.model },
+    { label: 'Model', text: modelLabel(session.model) === session.model ? session.model : `${modelLabel(session.model)} · ${session.model}` },
+    ...(typeof session.reasoning_effort === 'string' && EFFORT_LABELS[session.reasoning_effort]
+      ? [{ label: 'Reasoning effort', text: EFFORT_LABELS[session.reasoning_effort] }] : []),
     { label: 'Permission mode', text: modeLabel(session.permission_mode || 'manual') },
     { label: 'Tools', tab: 'Tools', text: value('tools', toolsText) },
     { label: 'Subagents', tab: 'Subagents', text: value('children', subagentsText) },

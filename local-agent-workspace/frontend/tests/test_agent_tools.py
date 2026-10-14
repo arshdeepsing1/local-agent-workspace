@@ -551,13 +551,18 @@ def overview_row(page, label):
 def test_overview_is_the_first_section_and_sums_up_the_chat_and_project(ui, page):
     open_dialog(ui, props=", changedFiles: 3")
     expect(page.get_by_role("button", name="Overview", exact=True)).to_have_attribute("aria-pressed", "true")
-    expected = {"Model": "test-model", "Permission mode": "Manual", "Tools": "6 of 7 on", "Subagents": "1 running · 0 finished",
+    expected = {"Model": "Test model · test-model", "Permission mode": "Manual", "Tools": "6 of 7 on", "Subagents": "1 running · 0 finished",
                 "Tasks": "0 of 1 done", "Unreviewed changes": "3 files", "Checkpoints": "1 file checkpoint", "Verify": "pytest -q",
                 "Worktrees": "1 managed worktree", "Extensions": "None configured"}
     for label, value in expected.items():
         expect(overview_row(page, label).locator(".overview-value")).to_have_text(value)
     expect(page.get_by_role("region", name="Overview")).to_contain_text("/project")
     assert ui.spy("onError") == []
+
+
+def test_overview_names_the_chats_reasoning_effort(ui, page):
+    open_dialog(ui, selected="{ ...session(), reasoning_effort: 'xhigh' }")
+    expect(overview_row(page, "Reasoning effort").locator(".overview-value")).to_have_text("Extra high")
 
 
 def test_overview_buttons_open_their_sections(ui, page):
