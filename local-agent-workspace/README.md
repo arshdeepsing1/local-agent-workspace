@@ -2237,12 +2237,14 @@ first page. `list_jobs`, `get_job_output`, `wait_job`, and
 the new output and `next_offset` to wait again. It returns as soon as the job ends, so a
 long wait costs time only for jobs that keep running, such as servers. The app learns how
 long commands take: a background `run_command` whose command already ran to the end in
-this folder (completed or failed, not stopped or timed out) says `expected_seconds` (the
-median of the last five runs) and `next_wait_seconds`, and `wait_job` without
+this folder (not stopped or timed out) says `expected_seconds` (the median of the last
+five runs) and `next_wait_seconds`, and `wait_job` without
 `timeout_seconds` waits about what is left (a quarter more, at least 5 seconds) instead of
-60. Each result gives `elapsed_seconds`, `waited_seconds` and, while the job runs,
-`next_wait_seconds` (from the expected duration, else twice the last wait), and the
-system prompt asks the agent to size waits to the job instead of waiting the maximum.
+60. Only completed runs count, or failed ones when none completed. Each result gives
+`elapsed_seconds`, `timeout_seconds`, `waited_seconds` (how long this wait took) and, after a
+timeout or an idle return while the job still runs, `next_wait_seconds` (from the expected
+duration, else twice this wait, at least 10 seconds), and the system prompt asks the agent to
+size waits to the job instead of waiting the maximum.
 Without `from_offset` it scans from the end of the last result the conversation got
 for that job, so a line printed in between still counts. Stop ends the wait, not the
 job. The job's

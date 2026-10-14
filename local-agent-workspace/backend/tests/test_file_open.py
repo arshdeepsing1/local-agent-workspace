@@ -48,3 +48,29 @@ def test_a_worktree_chat_maps_the_source_projects_paths_to_its_worktree(tmp_path
     assert locate_file(tools, str(project / "README.md"), record) is None  # Not in the worktree.
     assert locate_file(tools, str(project / "src" / "app.py"), None) is None
     assert locate_file(tools, "demo/../src/app.py", record) is None
+
+
+@pytest.mark.parametrize("mode", ["manual", "bypassPermissions"])
+def test_a_worktree_chat_opens_its_own_copy_of_a_source_project_path(tmp_path, project, mode):
+    # The source project's absolute path names the worktree's copy, in every mode: the editor must
+    # never read (and later save) the main checkout's file from a worktree chat.
+    (project / "src" / "app.py").write_text("print('source')\n")
+    worktree = tmp_path / "state" / "worktrees" / "1234"
+    (worktree / "src").mkdir(parents=True)
+    (worktree / "src" / "app.py").write_text("print('worktree')\n")
+    settings = Settings(tmp_path / "state")
+    settings.values.update(workspace=str(project), env_file="")
+    app = create_app(settings)
+    with TestClient(app) as client:
+        headers = {"X-Local-Token": client.get("/api/bootstrap").json()["token"]}
+        created = client.post("/api/sessions", json={}, headers=headers).json()
+        manager = app.state.manager
+        session = manager.get(created["id"])
+        session.update(workspace=str(worktree), permission_mode=mode,
+                       worktree={"id": "1234", "branch": "chat/x", "source_workspace": str(project)})
+        manager.store.save(session)
+        opened = client.get("/api/file", params={"path": str(project / "src" / "app.py"), "session_id": created["id"]},
+                            headers=headers)
+        assert opened.status_code == 200, opened.json()
+        assert opened.json()["path"] == "src/app.py" and opened.json()["content"] == "print('worktree')\n"
+        assert opened.json()["absolute"] == str(worktree / "src" / "app.py")

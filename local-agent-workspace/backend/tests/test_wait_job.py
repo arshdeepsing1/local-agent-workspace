@@ -226,8 +226,9 @@ async def test_a_wait_returns_when_the_output_goes_quiet(runtime):
     result = await wait(manager, session, tools, job_id=job["id"], idle_seconds=1, from_offset=0)
     assert result["reason"] == "idle" and 0.9 <= time.monotonic() - started < 3
     assert result["output"] == "listening on 8000\n" and result["state"] == "running"
-    # No earlier run says how long it takes: the next wait doubles the default one.
-    assert result["waited_seconds"] == 60 and result["next_wait_seconds"] == 120
+    # No earlier run says how long it takes: the next wait doubles the one that just ended (at least 10).
+    assert result["timeout_seconds"] == 60 and 0.9 <= result["waited_seconds"] < 3
+    assert result["next_wait_seconds"] == 10
     assert "expected_seconds" not in result and result["elapsed_seconds"] >= 0.9
     invalid = await wait(manager, session, tools, job_id=job["id"], idle_seconds=0)
     assert invalid["message"] == "Invalid tool arguments at idle_seconds: JSON Schema minimum constraint failed."
@@ -245,8 +246,13 @@ async def test_earlier_runs_of_the_same_command_size_the_default_wait(runtime):
     expected = manager.jobs.expected_seconds(job)
     assert 0.25 <= expected < 2
     result = await wait(manager, session, tools, job_id=job["id"])
-    assert result["reason"] == "exited" and result["waited_seconds"] == 5  # Not the 60-second default.
+    assert result["reason"] == "exited" and result["timeout_seconds"] == 5  # Not the 60-second default.
     assert result["expected_seconds"] == round(expected, 1) and "next_wait_seconds" not in result
+    # Completed runs win over failed ones, which may have failed at once.
+    failing = "sleep .2; exit 3"
+    quick = await background(manager, session, failing)
+    await manager.jobs.wait(quick["id"])
+    assert 0.15 <= manager.jobs.expected_seconds(await background(manager, session, failing)) < 2
     # A run that was stopped says nothing about how long the command takes.
     stopped = await background(manager, session, "sleep 30")
     await manager.jobs.stop(stopped["id"])

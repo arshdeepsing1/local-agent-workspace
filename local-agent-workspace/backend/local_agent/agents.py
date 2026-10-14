@@ -2780,13 +2780,17 @@ class AgentManager:
                 if start > total:
                     raise ValueError(f"from_offset is beyond the job output ({total:,} characters).")
                 pattern = until_pattern(arguments["until_regex"]) if "until_regex" in arguments else None
+                began = time.monotonic()
                 job, reason, match = await self.jobs.watch(job["id"], start, pattern, timeout, idle=idle)
+                waited = time.monotonic() - began
                 elapsed = job_runtime(job)
-                timing = {"elapsed_seconds": round(elapsed, 1), "waited_seconds": timeout}
+                timing = {"elapsed_seconds": round(elapsed, 1), "timeout_seconds": timeout,
+                          "waited_seconds": round(waited, 1)}
                 if expected is not None:
                     timing["expected_seconds"] = round(expected, 1)
                 if job["state"] == "running" and reason in ("timeout", "idle"):
-                    timing["next_wait_seconds"] = suggested_wait(expected, elapsed, timeout)
+                    # From what this wait took, so a wait that ended early does not suggest a long one.
+                    timing["next_wait_seconds"] = suggested_wait(expected, elapsed, max(1, round(waited)))
                 result = wait_page(job, reason, match, start, extra=timing)
                 self.job_seen(job)
             elif name in ("get_job_output", "stop_job"):

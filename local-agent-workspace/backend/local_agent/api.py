@@ -721,6 +721,13 @@ def create_app(settings=None):
     async def file(path: str, session_id: str | None = None):
         tools = ui_tools(session_id)
         session = session_or_404(session_id) if session_id else {}
+        worktree = session.get("worktree")
+        source = worktree.get("source_workspace") if isinstance(worktree, dict) else None
+        if isinstance(source, str) and source and PurePosixPath(path).is_absolute() \
+                and PurePosixPath(path).is_relative_to(PurePosixPath(source)):
+            # A worktree chat opens its own copy of a file named by the source project's path,
+            # so the editor never saves into the main checkout by mistake.
+            path = locate_file(tools, path, worktree) or path
         try:
             content = tools.read_file(path)
         except FileNotFoundError:

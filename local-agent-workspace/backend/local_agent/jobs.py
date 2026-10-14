@@ -622,14 +622,18 @@ class JobManager:
         return copy.deepcopy(job)
 
     def expected_seconds(self, job):
-        """How long this command usually runs: the median duration of the latest finished runs (at
-        most five, completed or failed, not stopped or timed out) of the same command text in the
-        same folder, or None when there is none."""
-        runs = sorted((other for other in self._jobs.values()
-                       if other["id"] != job["id"] and other["command"] == job["command"]
-                       and other["workspace"] == job["workspace"] and other["state"] in ("completed", "failed")),
-                      key=lambda other: other["updated"], reverse=True)[:5]
-        return statistics.median(job_runtime(other) for other in runs) if runs else None
+        """How long this command usually runs: the median duration of the latest runs (at most five)
+        of the same command text in the same folder that completed, or, when none did, that failed
+        (a run that fails at once says little about a full one). Stopped and timed-out runs never
+        count. None when there is no such run."""
+        same = [other for other in self._jobs.values() if other["id"] != job["id"]
+                and other["command"] == job["command"] and other["workspace"] == job["workspace"]]
+        for states in (("completed",), ("failed",)):
+            runs = sorted((other for other in same if other["state"] in states),
+                          key=lambda other: other["updated"], reverse=True)[:5]
+            if runs:
+                return statistics.median(job_runtime(other) for other in runs)
+        return None
 
     async def watch(self, job_id, offset, pattern, timeout, idle=None):
         """Wait until the job ends, a new complete output line after offset matches pattern,
