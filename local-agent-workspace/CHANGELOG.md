@@ -4,6 +4,29 @@ Notable changes to Local Agent Workspace, newest first. Dates are UTC.
 
 ## Unreleased
 
+UI layout and behaviour (from a survey of the app at six window sizes, desktop to phone):
+
+- Layout: below 1,024 px the Workspace panel opens over the chat instead of squeezing it (focus
+  moves into it; Escape, **Close workspace** or a click outside closes it), and the sidebar no
+  longer changes width. In a narrow chat column **Agent tools** and **Workspace** show only
+  their icons, so the title stays readable (hover it for the full title and session ID). Sidebar
+  rows have one **More actions** menu (**Rename**, **Pin**, **Archive**, **Edit tags…**,
+  **Delete…**), titles use the whole row, the session ID shows only for repeated titles, and the
+  menu opens upward near the bottom of the list. **Last model input** details open as a popover
+  above the meter, and the bars above the message box no longer squeeze the conversation. The
+  Agent tools dialog keeps its size and tabs in place; Settings is grouped, named and keeps
+  **Save** visible; the permission menu fits the window; long `@` chips stay on one line; the
+  welcome text sits above the message box.
+- Behaviour: a command that exits non-zero, times out or is interrupted shows a warning icon and
+  `exit N`, `timed out` or `interrupted` instead of a success tick, and expanded cards show the
+  output as text with a **State** line and the **Raw result**. Error notices give a short reason
+  with **Details**. A stop is marked by one divider that says what was interrupted. While the
+  local server is unreachable one banner says so on every screen and the sidebar shows **Local
+  server offline**; Databricks network errors read as plain sentences with **Check again**. On
+  approval cards the allow-in-this-chat button and **Always allow…** form one split button. Plan
+  cards scale their headings, drop the inner scroll and keep **Approve** reachable. **Local** is
+  a label, not a button.
+
 Default model, code folder, Python environment, large inputs and compaction:
 
 - The default model is Claude Opus 5.5 (`databricks-claude-opus-5-5`) with a 200,000-token
