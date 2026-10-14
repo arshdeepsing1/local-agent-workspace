@@ -500,3 +500,16 @@ def test_usage_heading_fits(ui, page, width, height):
     assert result["fits"] and result["scroll"], result
     if width >= 1280:
         assert result["beside"], result
+
+
+def test_a_long_task_title_keeps_a_square_checkbox_beside_its_first_line(ui, page):
+    # V-T13. Mutation: restore align-items:center on .agent-tools-task (the box shrinks to 10 px and moves 14 px down).
+    title = "Inspect the source of the parser and its tests, then list every place that reads the configuration file directly"
+    open_tab(ui, page, "Tasks", f"window.task = {{ ...task, title: {json.dumps(title + ' before startup')} }}")
+    checkbox = page.get_by_role("checkbox", name=re.compile("^Complete task Inspect the source"))
+    expect(checkbox).to_be_visible()
+    box = checkbox.bounding_box()
+    text = page.locator(".agent-tools-task strong").first
+    assert text.evaluate("e => e.getClientRects().length > 1 || e.getBoundingClientRect().height > 30")  # it wraps
+    assert round(box["width"]) == 13 and round(box["height"]) == 13, box
+    assert abs(box["y"] - text.bounding_box()["y"]) <= 6, (box, text.bounding_box())

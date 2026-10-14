@@ -624,3 +624,49 @@ def test_collapsed_cards_say_when_the_agent_got_less_than_the_card(ui, page):
     expect(page.get_by_text("Result not sent to the agent: earlier results in the same step filled its context "
                             "allowance. The agent can run it again.", exact=True)).to_be_visible()
     expect(page.get_by_text("Result shortened for the agent to fit its context allowance.", exact=True)).to_be_visible()
+
+
+# Markdown tables keep words whole and scroll sideways; the phone tool-card subject uses the free space (styles.css)
+
+TABLE_REPLY = ("| File | Test | Note |\n|---|---|---|\n"
+               "| `src/utils/helpers.py` | `tests/test_app.py` | The helper keeps the order of the sections and the test "
+               "compares the rendered output line by line, so a change in one section shows as one failing line. |")
+
+
+def test_markdown_table_cells_keep_code_whole_at_phone_width(ui, page):
+    # V-T11. Mutations: delete .markdown :is(th,td){overflow-wrap:break-word} (code cells break mid-token), or set
+    # .markdown{overflow-wrap:normal} (the long path overflows). With .markdown{overflow-wrap:break-word} the path still
+    # wraps here (the reply, reasoning and plan containers have min-width:0), but its min-content width grows, which
+    # is why only table cells use break-word.
+    page.set_viewport_size({"width": 390, "height": 844})
+    long_path = "/srv/x/" + "_".join(f"generated_module_{n:02d}" for n in range(10)) + ".py"
+    assert len(long_path) >= 200
+    sentence = f"The file is {long_path} today."
+    show(ui, json.dumps([{"id": "r", "type": "assistant", "text": TABLE_REPLY},
+                         {"id": "p", "type": "assistant", "text": sentence, "reasoning_summary": sentence},
+                         {"id": "plan", "type": "tool", "name": "submit_plan", "state": "pending", "input": {"plan": sentence}}]))
+    codes = page.locator(".markdown td code")
+    expect(codes).to_have_count(2)
+    assert codes.evaluate_all("els => els.map(el => el.getClientRects().length)") == [1, 1]
+    assert page.locator(".markdown table").evaluate("e => e.scrollWidth >= e.clientWidth")
+    assert ui.js("document.documentElement.scrollWidth") <= 390
+    page.get_by_text("Provider reasoning summary").click()
+    paragraphs = page.locator(".markdown p", has_text="The file is")
+    expect(paragraphs).to_have_count(3)  # the reply, its reasoning summary and the plan
+    for paragraph in paragraphs.all():
+        assert paragraph.evaluate("e => e.getBoundingClientRect().height > 40")  # it wraps
+        assert paragraph.evaluate("e => e.scrollWidth <= e.clientWidth && e.getBoundingClientRect().right <= innerWidth")
+    assert ui.js("document.documentElement.scrollWidth") <= 390
+
+
+def test_a_phone_tool_card_shows_its_whole_subject(ui, page):
+    # V-T12. Mutation: restore .tool-subject{max-width:110px} in the 600 px block.
+    page.set_viewport_size({"width": 390, "height": 844})
+    output = json.dumps({"path": "README.md", "start_line": 1, "end_line": 40, "content": "# Readme"})
+    show(ui, json.dumps([{"id": "t", "type": "tool", "name": "read_file", "state": "completed", "input": {"path": "README.md"},
+                          "output": output}]))
+    subject = page.locator(".tool-card .tool-subject")
+    expect(subject).to_have_text("README.md · lines 1–40")
+    assert subject.evaluate("e => e.scrollWidth <= e.clientWidth")
+    heading = page.locator(".tool-card .tool-heading")
+    assert heading.evaluate("e => e.lastElementChild.getBoundingClientRect().right <= e.getBoundingClientRect().right + 0.5")

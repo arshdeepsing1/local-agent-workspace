@@ -142,3 +142,17 @@ def test_polling_stops_on_error_until_refresh(ui, page):
     page.get_by_role("button", name="Refresh jobs").click()
     expect(page.get_by_role("alert")).to_have_count(0)
     assert ui.js("fake.calls.length") == calls + 1
+
+
+def test_the_shell_command_shows_keyboard_focus(ui, page):
+    # V-T14. The input itself has no outline; its .terminal-command box shows the ring. Mutation: delete
+    # .terminal-command:focus-within.
+    open_terminal(ui)
+    command = page.get_by_role("textbox", name="Shell command")
+    expect(command).to_be_visible()
+    page.keyboard.press("Shift")
+    command.focus()
+    box = page.locator(".terminal-command")
+    assert box.evaluate("e => [getComputedStyle(e).outlineStyle, getComputedStyle(e).outlineWidth]") == ["solid", "2px"]
+    command.evaluate("e => e.blur()")
+    assert box.evaluate("e => getComputedStyle(e).outlineStyle") == "none"
