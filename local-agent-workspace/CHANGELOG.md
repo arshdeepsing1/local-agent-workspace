@@ -26,6 +26,12 @@ UI layout and behaviour (from a survey of the app at six window sizes, desktop t
   approval cards the allow-in-this-chat button and **Always allow…** form one split button. Plan
   cards scale their headings, drop the inner scroll and keep **Approve** reachable. **Local** is
   a label, not a button.
+- Readability: muted text, links and the accent colour meet WCAG AA contrast (4.5:1 for text,
+  3:1 for icons and controls) on every surface, also when hovered; every focusable element shows
+  the same 2 px focus ring, including the message box and the Terminal fields; no text is
+  smaller than 11 px (12 px for phone banners); on touch screens controls are at least 24 px;
+  Markdown tables keep code cells whole and scroll sideways; the model picker's label sits next
+  to its arrow; a long error no longer pushes the message box off screen.
 
 Default model, code folder, Python environment, large inputs and compaction:
 
