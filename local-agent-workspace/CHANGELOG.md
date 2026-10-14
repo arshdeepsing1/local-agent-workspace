@@ -4,6 +4,56 @@ Notable changes to Local Agent Workspace, newest first. Dates are UTC.
 
 ## Unreleased
 
+Requests of 2026-10-14 (testing on a new machine):
+
+- Reasoning effort per conversation: **Default**, **Fast**, **Medium**, **High**, **Extra
+  high** or **Max**, chosen beside the model picker and applied from the agent's next request,
+  also while a response runs; subagents use their chat's effort. Each endpoint gets the fields
+  it takes: Claude Opus 5.5 and 4.8 `thinking` (adaptive) and `output_config.effort`, GPT OSS
+  `reasoning_effort` (Extra high and Max are sent as high). **Settings → Reasoning** sets the
+  default for new chats, the request format (Automatic, Anthropic fields, OpenAI field, none),
+  **Show thinking summaries**, and previews the exact JSON added to agent requests. If
+  Databricks rejects a reasoning field, the request is sent once more without it and a notice
+  says how to change the format. Titles, compaction and side questions send no reasoning
+  fields.
+- Replies show the model's thinking in a collapsible **Thinking** block ("Thinking… 12 s" while
+  it thinks, "Thought for 12 s" once the answer starts). Claude Opus 5.5 returns thinking text
+  only when asked, so with summaries on its requests ask for it. Request details and the usage
+  table name the effort.
+- Settings: the "Use … defaults" button stays as a confirmed state instead of disappearing,
+  the endpoint is chosen from a list that keeps every endpoint choosable (plus **Other
+  endpoint…**), and the dialog has a section list on wide screens, shorter help with **More**,
+  and one type scale.
+- Subagents: the agent hands broad exploration, wide searches, large reads and long command
+  output to subagents on its own, so only their short reports enter the chat. It chooses
+  **explore** (read-only), **editor** (file edits) or **general**, with up to 24 steps. Several
+  subagents run at once (three at a time; others wait for a free slot); their approval cards
+  come one by one and Stop stops them all. Each has its own card with type, live status,
+  elapsed time, **Open subagent** and a collapsible **Report**. Every subagent keeps its own
+  conversation file, and the parent's file lists its subagents (task, type, status, times,
+  file).
+- Agent tools: sections are grouped in a side navigation (**This chat**: Overview, Tasks,
+  Subagents, Tools, Usage, Export; **Project**: Checkpoints, Verify, Worktrees, Extensions)
+  with a new **Overview**; **Tools** has groups, a filter and per-group switches; the dialog
+  reopens on the last section. **Recovery** is now **Checkpoints** and **Conversation** is
+  now **Export**.
+- Workspace panel: drag its left edge (or use the arrow keys on it) to resize it; the width is
+  kept, Enter or a double-click restores it, and **Expand** makes it as wide as the chat allows.
+  A worktree chat's panel names its project and branch. A file the agent edits again after
+  **Keep** opens its review again, and an open file without unsaved edits follows the agent's
+  later edits. Files a reply, a tool card or Git names are opened by their project path; a file
+  named from the project's folder name, the repository root or a worktree's source project is
+  found, and a missing file is reported with the folder searched.
+- Sidebar: a **Tags** menu lists every tag with its number of chats and filters by any checked
+  tag; `#word` in the search box filters by tag.
+- Background jobs: `wait_job` can return when a job's output goes quiet (`idle_seconds`), and
+  without `timeout_seconds` waits about what earlier runs of the same command say is left
+  instead of 60 seconds; results suggest the next wait, and the agent is asked to size waits
+  to the job.
+- `scripts/simulate_databricks.py` runs the app against a simulated Databricks workspace (no
+  network, no billed requests) to try effort levels, the Thinking block, subagents, jobs and
+  change review; it checks reasoning fields the way the endpoints document them.
+
 UI layout and behaviour (from a survey of the app at six window sizes, desktop to phone):
 
 - Layout: below 1,024 px the Workspace panel opens over the chat instead of squeezing it (focus
