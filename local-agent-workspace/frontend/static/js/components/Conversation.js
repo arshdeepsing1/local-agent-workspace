@@ -103,7 +103,7 @@ export function resultOf(event) {
   return { note, text: page.output, raw: text, mcpError: page.is_error === true,
     job: 'state' in page ? { state: String(page.state), exitCode: page.exit_code, background: !!page.background,
       total: page.total_chars, truncated: page.truncated === true, shown: shownPart(page),
-      // wait_job: why the wait ended ('matched', 'timeout' or 'exited') and the line that matched.
+      // wait_job: why the wait ended ('matched', 'timeout', 'idle' or 'exited') and the line that matched.
       wait: typeof page.reason === 'string' ? page.reason : null, match: typeof page.match?.line === 'string' ? page.match.line : null } : null }
 }
 
@@ -155,6 +155,7 @@ export function toolStatus(event, result) {
     // A wait reports its outcome first: its line matched, or it timed out (no tick: what it waited for did not come).
     if (job.wait === 'matched') return { tone: 'ok', label: 'matched', labelTone: 'neutral' }
     if (job.wait === 'timeout') return { tone: 'neutral', label: 'wait timed out', labelTone: 'neutral' }
+    if (job.wait === 'idle' && job.state === 'running') return { tone: 'neutral', label: 'output quiet', labelTone: 'neutral' }
     const label = job.state === 'failed' ? `job ${exitLabel(job.exitCode)}` : OTHER_JOB[job.state] || (job.wait === 'exited' ? 'job ended' : '')
     return { tone: 'ok', label, labelTone: label ? 'neutral' : null }
   }
@@ -178,7 +179,7 @@ function toolState(event) {
 
 // The State line of an expanded command or job card.
 const KILLED = new Set(['timed_out', 'cancelled', 'interrupted'])  // the app ended the process: its code says nothing more
-const WAIT_LINE = { matched: 'wait matched', timeout: 'wait timed out', exited: 'job ended during the wait' }
+const WAIT_LINE = { matched: 'wait matched', timeout: 'wait timed out', idle: 'output went quiet', exited: 'job ended during the wait' }
 function jobStateLine(job) {
   const wait = WAIT_LINE[job.wait] ? WAIT_LINE[job.wait] + (job.wait === 'matched' && job.match ? `: ${clip(job.match, 80)}` : '') : ''
   return [`State: ${job.state.replace(/_/g, ' ')}`, wait, Number.isInteger(job.exitCode) && !KILLED.has(job.state) ? exitLabel(job.exitCode) : '',

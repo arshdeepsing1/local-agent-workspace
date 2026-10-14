@@ -160,6 +160,7 @@ def test_a_wait_job_card_reports_a_failed_job_in_a_muted_label(ui, page):
     ("matched", {"line": "server ready on :8000", "offset": 0}, "running", True, "matched",
      "State: running · wait matched: server ready on :8000"),
     ("timeout", None, "running", False, "wait timed out", "State: running · wait timed out"),
+    ("idle", None, "running", False, "output quiet", "State: running · output went quiet"),
     ("exited", None, "completed", True, "job ended", "State: completed · job ended during the wait · exit 0"),
 ])
 def test_a_wait_job_card_shows_how_the_wait_ended(ui, page, reason, match, state, tick, label, line):

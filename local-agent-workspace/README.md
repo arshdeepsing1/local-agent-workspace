@@ -665,7 +665,7 @@ when opening a conversation or performing restart recovery.
   `get_job_output` and `stop_job` cards a green tick means
   the tool worked; a muted label such as `job exit 1` reports the job itself. A `wait_job` card
   first says how the wait ended: `matched` (the **State** line quotes the matching line),
-  `wait timed out` (no tick) or `job ended`.
+  `wait timed out` (no tick), `output quiet` or `job ended`.
   **Read before overwriting:** the conversation remembers the size and modification time
   of each file the agent read (`read_file` any page, or `notebook_read`) or wrote, up to 500 files.
   `write_file` on an existing file is refused, before any approval card, unless the
@@ -2106,8 +2106,17 @@ where it begins; when the command printed more than `max_output_bytes`, the exce
 ends with a line saying that the rest was not kept. Successful commands keep their
 first page. `list_jobs`, `get_job_output`, `wait_job`, and
 `stop_job` inspect, paginate, wait for, and stop jobs in the same conversation.
-`wait_job` waits up to 300 seconds (default 60) until the job ends or a new output line
-matches `until_regex`, and returns the new output and `next_offset` to wait again.
+`wait_job` waits up to 300 seconds until the job ends, a new output line matches
+`until_regex`, or (with `idle_seconds`) the job prints nothing for that long, and returns
+the new output and `next_offset` to wait again. It returns as soon as the job ends, so a
+long wait costs time only for jobs that keep running, such as servers. The app learns how
+long commands take: a background `run_command` whose command already ran to the end in
+this folder (completed or failed, not stopped or timed out) says `expected_seconds` (the
+median of the last five runs) and `next_wait_seconds`, and `wait_job` without
+`timeout_seconds` waits about what is left (a quarter more, at least 5 seconds) instead of
+60. Each result gives `elapsed_seconds`, `waited_seconds` and, while the job runs,
+`next_wait_seconds` (from the expected duration, else twice the last wait), and the
+system prompt asks the agent to size waits to the job instead of waiting the maximum.
 Without `from_offset` it scans from the end of the last result the conversation got
 for that job, so a line printed in between still counts. Stop ends the wait, not the
 job. The job's

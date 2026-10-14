@@ -2,9 +2,11 @@ import asyncio
 import codecs
 import copy
 import json
+import math
 import os
 import re
 import signal
+import statistics
 import time
 import uuid
 from pathlib import Path
@@ -38,6 +40,9 @@ WAIT_SCAN_SECONDS = 1.0  # wait_job's regular-expression budget per batch of new
 WAIT_THREAD_CHARS = 65_536  # larger batches are scanned in a worker thread
 WAIT_OUTPUT_CHARS = 4_000
 PAGE_BYTES = 8_000
+MIN_WAIT_SECONDS = 5
+MAX_WAIT_SECONDS = 300  # wait_job's timeout_seconds limit
+DEFAULT_WAIT_SECONDS = 60  # wait_job without timeout_seconds when no earlier run says how long the job takes
 
 
 def shell_argv(command):
@@ -370,8 +375,25 @@ def scan_lines(text, start, pattern, timeout):
     return None
 
 
-def wait_page(job, reason, match, from_offset):
-    """wait_job's result: the new output since from_offset (its end when long), at most 8,000 bytes of JSON."""
+def job_runtime(job, now=None):
+    """Seconds a job has run: until now while it runs, else until its last update (its end)."""
+    end = (time.time() if now is None else now) if job["state"] == "running" else job["updated"]
+    return max(0.0, end - job["created"])
+
+
+def suggested_wait(expected, elapsed, previous=None):
+    """wait_job seconds for a job: what an earlier run's duration says is left (a quarter more, at
+    least 5), else twice the previous wait (from 10), at most 300; None without either."""
+    if expected is not None and expected > elapsed:
+        return int(min(MAX_WAIT_SECONDS, max(MIN_WAIT_SECONDS, math.ceil((expected - elapsed) * 1.25) + 2)))
+    if previous is not None:
+        return int(min(MAX_WAIT_SECONDS, max(10, previous * 2)))
+    return None
+
+
+def wait_page(job, reason, match, from_offset, extra=None):
+    """wait_job's result: the new output since from_offset (its end when long), at most 8,000 bytes of JSON.
+    extra (timing: elapsed, expected and the suggested next wait) is part of every page."""
     from .tools import _excerpt
     output = job["output"]
     total = len(output)
@@ -379,7 +401,8 @@ def wait_page(job, reason, match, from_offset):
     def page(begin):
         return {"job_id": job["id"], "state": job["state"], "exit_code": job["exit_code"], "reason": reason,
                 "match": match and {"line": _excerpt(match[0])[0], "offset": match[1]},
-                "output": output[begin:], "output_start": begin, "next_offset": total, "total_chars": total}
+                "output": output[begin:], "output_start": begin, "next_offset": total, "total_chars": total,
+                **(extra or {})}
 
     low = min(total, max(from_offset, total - WAIT_OUTPUT_CHARS))
     high = total
@@ -598,12 +621,24 @@ class JobManager:
                 await self._notify(job)
         return copy.deepcopy(job)
 
-    async def watch(self, job_id, offset, pattern, timeout):
-        """Wait until the job ends, a new complete output line after offset matches
-        pattern, or timeout seconds pass. Returns (job copy, reason, (line, offset) or None).
+    def expected_seconds(self, job):
+        """How long this command usually runs: the median duration of the latest finished runs (at
+        most five, completed or failed, not stopped or timed out) of the same command text in the
+        same folder, or None when there is none."""
+        runs = sorted((other for other in self._jobs.values()
+                       if other["id"] != job["id"] and other["command"] == job["command"]
+                       and other["workspace"] == job["workspace"] and other["state"] in ("completed", "failed")),
+                      key=lambda other: other["updated"], reverse=True)[:5]
+        return statistics.median(job_runtime(other) for other in runs) if runs else None
+
+    async def watch(self, job_id, offset, pattern, timeout, idle=None):
+        """Wait until the job ends, a new complete output line after offset matches pattern,
+        it prints nothing for idle seconds (when given), or timeout seconds pass. Returns
+        (job copy, reason, (line, offset) or None); reason is matched, exited, idle or timeout.
         Each wake-up scans only output not scanned before. Cancelling the wait leaves the job running."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
+        started = time.time()
         cursor = offset
         while True:
             seen = self._changes
@@ -629,6 +664,12 @@ class JobManager:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 return copy.deepcopy(job), "timeout", None
+            if idle is not None:
+                # Quiet since its last output, or since the wait began if that was later.
+                quiet = time.time() - max(job["updated"], started)
+                if quiet >= idle:
+                    return copy.deepcopy(job), "idle", None
+                remaining = min(remaining, idle - quiet)
             async with self._signal:
                 try:
                     await asyncio.wait_for(self._signal.wait_for(lambda: self._changes != seen), remaining)

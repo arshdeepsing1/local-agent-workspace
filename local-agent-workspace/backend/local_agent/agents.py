@@ -13,7 +13,8 @@ import httpx
 
 from .tools import TOOL_DEFINITIONS, WorkspaceTools, file_error
 from .jobs import (CREDENTIAL_ENV, DENIED_ENV, DENIED_ENV_PREFIXES, ENVIRONMENT_KEYS, ENVIRONMENT_NAME, HEAD_CHARS,
-                   JOB_NOTICE_STATES, MIN_HEAD_CHARS, TAIL_CHARS, job_command, job_ending, until_pattern, wait_page)
+                   DEFAULT_WAIT_SECONDS, JOB_NOTICE_STATES, MIN_HEAD_CHARS, TAIL_CHARS, job_command, job_ending,
+                   job_runtime, suggested_wait, until_pattern, wait_page)
 from .tools import read_page_bytes
 from .permissions import MODE_LABELS, SCOPE_NAMES, denied_tools, evaluate, log, mode_prompt
 from .rules import (APP_ROOT, RuleStore, card_rule_options, default_rule, normalize_rule, project_key, protected_reason,
@@ -267,7 +268,7 @@ selected permission mode and shows any needed approval controls. Do not ask for 
 chat before issuing a tool call. If an approval is denied, respect the decision.
 Commands default to a 60-second timeout; choose timeout_seconds up to 3600 if needed.
 Use background=true for a managed job that must outlive this turn, never shell '&' or daemon detachment.
-Use list_jobs/get_job_output to inspect jobs, wait_job to wait until a background job finishes or prints a line you expect, and stop_job to terminate them. A failed command's first result shows the start and the end of its retained output. Use find_files to locate files by name. Background jobs
+Use list_jobs/get_job_output to inspect jobs, wait_job to wait until a background job finishes or prints a line you expect, and stop_job to terminate them. Size each wait to the job: wait_job returns as soon as the job ends, so for a quick build or test wait about as long as it should take (a few seconds to a minute), use until_regex for a server's ready line, idle_seconds when output stops once it is ready, and follow next_wait_seconds or expected_seconds (earlier runs of the same command) instead of always waiting the maximum. A failed command's first result shows the start and the end of its retained output. Use find_files to locate files by name. Background jobs
 continue after this turn is stopped and end on explicit job Stop, timeout, or app shutdown.
 Read files in numbered line ranges and follow next_line; paginate searches and job output instead of
 requesting huge results. The results of one response share a context allowance: prefer a few large reads per
@@ -1280,6 +1281,13 @@ class AgentManager:
                 await self.track_shell_changes(session, tracker)
             else:
                 job = self.jobs.get(job["id"])
+                expected = self.jobs.expected_seconds(job)
+                if expected is not None and job["state"] == "running":
+                    # So the first wait_job can be about as long as the job needs, not a guess.
+                    page = self.first_page(job)
+                    page.update(expected_seconds=round(expected, 1),
+                                next_wait_seconds=suggested_wait(expected, job_runtime(job)))
+                    return page
             return self.first_page(job)
         except asyncio.CancelledError:
             if not job["background"]:
@@ -2663,9 +2671,14 @@ class AgentManager:
                     result["jobs"].append(item)
             elif name == "wait_job":
                 job = self.session_job(session, arguments["job_id"])
-                timeout = arguments.get("timeout_seconds", 60)
+                # Without timeout_seconds, an earlier run of the same command says how long to wait.
+                expected = self.jobs.expected_seconds(job)
+                timeout = arguments.get("timeout_seconds", suggested_wait(expected, job_runtime(job)) or DEFAULT_WAIT_SECONDS)
                 if type(timeout) is not int or not 1 <= timeout <= 300:
                     raise ValueError("timeout_seconds must be an integer from 1 to 300.")
+                idle = arguments.get("idle_seconds")
+                if idle is not None and (type(idle) is not int or not 1 <= idle <= 300):
+                    raise ValueError("idle_seconds must be an integer from 1 to 300.")
                 total = len(job["output"])
                 last = self.__dict__.get("_job_seen", {}).get(job["id"], (0, False))[0]
                 start = arguments.get("from_offset", min(last, total))
@@ -2674,8 +2687,14 @@ class AgentManager:
                 if start > total:
                     raise ValueError(f"from_offset is beyond the job output ({total:,} characters).")
                 pattern = until_pattern(arguments["until_regex"]) if "until_regex" in arguments else None
-                job, reason, match = await self.jobs.watch(job["id"], start, pattern, timeout)
-                result = wait_page(job, reason, match, start)
+                job, reason, match = await self.jobs.watch(job["id"], start, pattern, timeout, idle=idle)
+                elapsed = job_runtime(job)
+                timing = {"elapsed_seconds": round(elapsed, 1), "waited_seconds": timeout}
+                if expected is not None:
+                    timing["expected_seconds"] = round(expected, 1)
+                if job["state"] == "running" and reason in ("timeout", "idle"):
+                    timing["next_wait_seconds"] = suggested_wait(expected, elapsed, timeout)
+                result = wait_page(job, reason, match, start, extra=timing)
                 self.job_seen(job)
             elif name in ("get_job_output", "stop_job"):
                 job = self.session_job(session, arguments["job_id"])
