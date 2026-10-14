@@ -32,6 +32,12 @@ UI layout and behaviour (from a survey of the app at six window sizes, desktop t
   smaller than 11 px (12 px for phone banners); on touch screens controls are at least 24 px;
   Markdown tables keep code cells whole and scroll sideways; the model picker's label sits next
   to its arrow; a long error no longer pushes the message box off screen.
+- From a second survey: rate-limit wait notices come before the reply they delay and stop
+  asking for Stop once the wait is over; in the tablet drawer the sidebar stays usable with the
+  mouse as well as the keyboard; `wait_job` cards say whether the wait matched, timed out or the
+  job ended; a failed command's card says it ran rather than completed; long file names and
+  Terminal commands show in full on hover; in a narrower sidebar status badges become coloured
+  dots so titles stay readable.
 
 Default model, code folder, Python environment, large inputs and compaction:
 
