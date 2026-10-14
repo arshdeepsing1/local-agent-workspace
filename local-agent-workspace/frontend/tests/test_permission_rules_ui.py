@@ -501,7 +501,9 @@ fake.override = (path, options) => {
     return fake.json(ruleSets(session_id))
   }
 }"""
-POSTS = "fake.calls.filter(call => call.method !== 'GET').map(call => [call.method, call.path])"
+# Changes only: the reasoning preview (POST /api/settings/reasoning) reads.
+POSTS = ("fake.calls.filter(call => call.method !== 'GET' && call.path !== '/api/settings/reasoning')"
+         ".map(call => [call.method, call.path])")
 
 
 def test_a_new_chat_removes_a_project_rule_through_the_chat_it_creates(ui, page):
