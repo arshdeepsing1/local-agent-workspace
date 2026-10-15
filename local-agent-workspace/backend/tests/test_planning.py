@@ -210,8 +210,9 @@ async def test_delegations_beyond_three_wait_for_a_free_slot(delegation):
         if spawning.get("delegation"):
             break
         await asyncio.sleep(0.01)
+    # No effort while queued: a general subagent takes the chat's when it starts.
     assert spawning["delegation"] == {"status": "queued", "completed_tools": 0, "agent_type": "general",
-                                      "model": "synthetic-model", "effort": "default"}
+                                      "model": "synthetic-model"}
     assert len(started) == 3 and helper.running() == 3 and len(helper.active[parent["id"]]) == 3
     releases[started[0]].set()
     for _ in range(100):
@@ -219,7 +220,7 @@ async def test_delegations_beyond_three_wait_for_a_free_slot(delegation):
             break
         await asyncio.sleep(0.01)
     assert len(started) == 4 and spawning["child_session_id"] == started[3]
-    assert spawning["delegation"]["status"] == "running"
+    assert (spawning["delegation"]["status"], spawning["delegation"]["effort"]) == ("running", "default")
     for release in list(releases.values()):
         release.set()
     for _ in range(100):

@@ -97,6 +97,10 @@ def _scalar(value, number):
             raise ValueError(f"Line {number}: a double-quoted value must end with \" (JSON escapes).") from None
         if not isinstance(decoded, str):
             raise ValueError(f"Line {number}: a double-quoted value must be text.")
+        try:
+            decoded.encode("utf-8")  # A lone surrogate escape ("\ud800") breaks every later JSON or UTF-8 write.
+        except UnicodeEncodeError:
+            raise ValueError(f"Line {number}: a double-quoted value is not valid text (a lone \\u escape).") from None
         return decoded
     if value[:1] == "'":
         if len(value) < 2 or not value.endswith("'"):
@@ -328,6 +332,12 @@ def discover(workspace, redact=lambda text: text):
             continue
         for entry in sorted(entries, key=lambda item: item.name):
             if not entry.name.endswith(".md") or entry.name.startswith("."):
+                continue
+            try:
+                entry.name.encode("utf-8")
+            except UnicodeEncodeError:  # Bytes that are not UTF-8 (surrogate escapes): no path to show, send or save.
+                errors.append({"path": f"{folder}/{ascii(entry.name)[1:-1]}",
+                               "error": "The file name is not valid UTF-8 text; rename the file."})
                 continue
             path = f"{folder}/{entry.name}"
             try:

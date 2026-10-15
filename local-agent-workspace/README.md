@@ -1970,7 +1970,7 @@ Report each finding with path:line, its severity and a suggested fix.
 | `profile` | `read_only` (the default), `file_editor` or `inherit`, as for `tool_profile`. |
 | `model` | Optional Databricks serving endpoint name; left out (or `inherit`): the chat's model. |
 | `effort` | Optional `default`, `low` (Fast), `medium`, `high`, `xhigh` or `max`; left out: the chat's effort. |
-| `skills` | Optional: up to three skill IDs loaded into the subagent like selected skills; one that does not load is left out with a note in its first prompt. |
+| `skills` | Optional: up to three skill IDs loaded into the subagent like selected skills; one that does not load is left out with a note in its first prompt. A `/skill` word in the instructions or the task loads no other skill. |
 | `max_steps` | Optional 1–24: the subagent's steps when the call gives no `max_steps` (a call's own value wins). |
 
 The parser is small and strict: `key: value` lines, `[a, b]` or `- item` lists, `"..."` or
@@ -1982,7 +1982,8 @@ mean the chat's model. An agent file is at most 16 KB (16,384 bytes) with up to 
 of instructions; a folder with more than 100 entries is not read (Agent types says so) and at
 most 30 agents are used. A file
 that cannot be used (no description, a bad name or value, too large, a symbolic link, not UTF-8
-text, a name another file already uses, an agent folder outside the project) is listed under
+text, a quoted value with a lone `\u` escape, a file name that is not UTF-8, a name another file
+already uses, an agent folder outside the project) is listed under
 **Agent tools → Subagents → Agent types** with the reason, and delegating to it fails with that
 reason.
 
@@ -2007,22 +2008,27 @@ chat**, a listed endpoint, or **Other endpoint…**) and effort (**Same as the c
 | custom agent | its `profile` and `tools` | its `model`, else the chat's | its `effort`, else the chat's |
 
 A subagent whose type sets an effort keeps it when you change the chat's effort; the others
-follow the chat. A subagent on another endpoint than its chat follows that endpoint's default
-budgets where Settings is at the Settings model's defaults, and Settings budgets above that
-endpoint's defaults are lowered to them (and, as for every chat, to its maxima): with Claude
-Opus 5.5 at 1,000,000 context and 32,000 output tokens, an agent on GPT OSS 120B sends 131,072
-and 8,192. Lower Settings budgets stay as they are.
+follow the chat, and one still waiting for a free slot takes the chat's effort when it starts
+(until then its card shows only an effort its type sets). A subagent on an endpoint its type
+sets, other than its chat's and the Settings model, follows that endpoint's default budgets where
+Settings is at the Settings model's defaults, and Settings budgets above that endpoint's
+defaults are lowered to them (and, as for every chat, to its maxima): with Claude Opus 5.5 at
+1,000,000 context and 32,000 output tokens, an agent on GPT OSS 120B sends 131,072 and 8,192,
+while an agent on the Settings model keeps 1,000,000 and 32,000, also from a chat on GPT OSS 120B.
+Lower Settings budgets stay as they are.
 
 *Safety.* An agent file is project content, like `AGENTS.md`, and never widens what the chat
 allows: its profile is intersected with the chat's subagent tool ceiling and any requested
-`tool_profile` (the narrowest wins), its tools with that profile (a delegation whose tools all
-fall outside it is refused), the chat's turned-off tools, rules and permission mode apply as to
-any subagent, and subagents never delegate. A tool outside the agent's list is refused like a
-turned-off one. In Manual mode the approval card names the agent and everything it sets, for
-example **Start a subagent (security-auditor · read-only · model Claude Sonnet 4.5 · effort
-Fast; separate paid model requests, at most 8 steps)**, followed by the task, the agent file,
-its tools and skills, and the exact endpoint. Text the app shows or sends from agent files is
-redacted (the Databricks token and common secret shapes).
+`tool_profile` (the narrowest wins), its tools with that profile and without those the chat has
+turned off or an unconditional deny rule covers (a delegation with none of its tools left is
+refused, and the first prompt lists only the tools it has), the chat's turned-off tools, rules
+and permission mode apply as to any subagent, and subagents never delegate. A tool outside the
+agent's list is refused like a turned-off one. In Manual mode the approval card names the agent
+and everything it sets, for example **Start a subagent (security-auditor · read-only · model
+Claude Sonnet 4.5 · effort Fast; separate paid model requests, at most 8 steps)**, followed by
+the task, the agent file, its tools and skills, and the exact endpoint; the subagent that starts
+is the one the card showed, even if its file changes before you approve. Text the app shows or
+sends from agent files is redacted (the Databricks token and common secret shapes).
 
 **Questions and plan review.** With `ask_user` the model asks 1–4 short multiple-choice
 questions when it needs a decision. Each question has 2–4 options (single or multiple

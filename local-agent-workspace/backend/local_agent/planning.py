@@ -5,9 +5,10 @@ import time
 import uuid
 
 from . import custom_agents
+from .permissions import denied_tools
 from .reasoning import EFFORT_LABELS
 from .spending import own_spend
-from .tool_profiles import PROFILES, child_profile, validate_profile
+from .tool_profiles import PROFILES, child_profile, covering_tool, validate_profile
 
 
 class TaskManager:
@@ -470,20 +471,30 @@ class DelegateManager:
         defaults = self.manager.settings.values.get("subagent_defaults")
         return custom_agents.resolve(agent_type, tool_profile, catalog, defaults if isinstance(defaults, dict) else {})
 
-    @staticmethod
-    def agent_tools(spec, profile):
-        """A custom agent's tools list within the child's profile (None: no list); ValueError when
-        none of its tools is left."""
+    def agent_tools(self, parent, spec, profile):
+        """A custom agent's tools list within the child's profile, without the tools the chat has turned
+        off or an unconditional deny rule covers (None: no list); ValueError when none of its tools is left,
+        rather than a child that pays for requests without a tool."""
         tools = custom_agents.child_tools(spec["tools"], profile)
         if tools == []:
             raise ValueError(f"None of the {spec['name']} agent's tools ({', '.join(spec['tools'])}) is allowed under "
                              f"this chat's subagent tool ceiling ({profile}). Use another agent_type.")
-        return tools
+        if tools is None:
+            return None
+        disabled = parent.get("disabled_tools") or []
+        saved = self.manager.rules.rules(parent["workspace"])
+        denied = denied_tools(parent.get("allow_rules") or [], saved["project"], saved["user"], tools)
+        usable = [name for name in tools if name not in denied and name not in disabled and not covering_tool(name, disabled)]
+        if not usable:
+            raise ValueError(f"None of the {spec['name']} agent's tools ({', '.join(tools)}) is available in this chat: "
+                             "each is turned off or blocked by a deny rule. Use another agent_type.")
+        return usable
 
-    def card_preview(self, parent, arguments):
+    def card_preview(self, parent, arguments, spec=None):
         """The approval card text of a delegate_task call: the agent, its tools and any model or effort
-        it sets (Manual mode shows it before anything starts)."""
-        spec = self.agent_spec(parent, arguments.get("agent_type"), arguments.get("tool_profile"))
+        it sets (Manual mode shows it before anything starts). spec: the agent_spec the card shows, which
+        delegate() then starts."""
+        spec = spec or self.agent_spec(parent, arguments.get("agent_type"), arguments.get("tool_profile"))
         profile = child_profile(parent, spec["requested"])
         parts = [spec["name"]]
         if spec["custom"] or profile != "inherit":
@@ -499,7 +510,7 @@ class DelegateManager:
                 + (f"\nTool profile: {arguments['tool_profile']}" if arguments.get("tool_profile") else ""))
         if spec["custom"]:
             text += f"\nAgent file: {spec['path']}"
-            tools = self.agent_tools(spec, profile)
+            tools = self.agent_tools(parent, spec, profile)
             if tools is not None:
                 text += "\nTools: " + ", ".join(tools)
             if spec["skills"]:
@@ -523,9 +534,10 @@ class DelegateManager:
         return loaded, notes
 
     async def delegate(self, parent_session, task, context="", max_steps=None, parent_event=None, tool_profile=None,
-                       agent_type=None, recheck=None):
+                       agent_type=None, recheck=None, spec=None):
         """recheck() -> refusal text or None: after a wait for a free slot, whether the chat still allows
-        this delegation (its tools, rules or mode may have changed while it waited)."""
+        this delegation (its tools, rules or mode may have changed while it waited). spec: the agent an
+        approval card showed (card_preview); it starts as approved, even if its file changed since."""
         parent = self.manager.get(parent_session["id"])
         if not parent:
             raise ValueError("Parent conversation not found.")
@@ -535,19 +547,18 @@ class DelegateManager:
             raise ValueError("Delegation requires a Databricks conversation.")
         if not isinstance(task, str) or not task.strip() or not isinstance(context, str):
             raise ValueError("A nonempty task and string context are required.")
-        spec = self.agent_spec(parent, agent_type, tool_profile)
+        spec = spec or self.agent_spec(parent, agent_type, tool_profile)
         max_steps = (spec["max_steps"] or DEFAULT_STEPS) if max_steps is None else max_steps
         if type(max_steps) is not int or not 1 <= max_steps <= MAX_STEPS:
             raise ValueError(f"max_steps must be an integer from 1 to {MAX_STEPS}.")
         profile = child_profile(parent, spec["requested"])
         kind = spec["name"]
-        agent_tools = self.agent_tools(spec, profile)
+        agent_tools = self.agent_tools(parent, spec, profile)
         skills, notes = self.agent_skills(parent, spec)
-        # The agent's model and effort, else the chat's (a chat saved without an effort uses the Settings default).
+        # The agent's model, else the chat's. A queued card shows only the agent's own effort: the chat's is
+        # read when the child starts, since change_effort reaches running children only.
         model = spec["model"] or parent["model"]
-        effort = spec["effort"] or parent.get("reasoning_effort")
-        labels = {"agent_type": kind, "model": model,
-                  "effort": effort or self.manager.settings.values.get("reasoning_effort") or "default"}
+        labels = {"agent_type": kind, "model": model, **({"effort": spec["effort"]} if spec["effort"] else {})}
         if parent_event is not None:
             parent_event = next((event for event in parent["events"] if event["id"] == parent_event["id"]), None)
             if parent_event is None:
@@ -572,7 +583,13 @@ class DelegateManager:
             self._release(parent["id"], entry)
             await self._unqueue(parent, parent_event)
             raise ValueError(refusal)
+        child = None
         try:
+            if entry.get("queued"):  # The chat may have turned the agent's tools off while it waited.
+                agent_tools = self.agent_tools(parent, spec, profile)
+            # The agent's effort, else the chat's now (a chat saved without one uses the Settings default).
+            effort = spec["effort"] or (self.manager.get(parent["id"]) or parent).get("reasoning_effort")
+            labels["effort"] = effort or self.manager.settings.values.get("reasoning_effort") or "default"
             child = self.manager.store.create({"workspace": parent["workspace"], "model": model})
             child.update(parent_session_id=parent["id"], is_subagent=True, max_steps=max_steps,
                          tool_profile=profile, agent_type=kind,
@@ -601,6 +618,11 @@ class DelegateManager:
             self.manager.store.save(child)
         except BaseException:
             # A failed write (a full disk) must not keep the slot: other delegations would wait forever.
+            if child is not None:
+                try:
+                    self.manager.store.delete(child["id"])  # create saved it: no orphan "New conversation".
+                except OSError:
+                    pass
             self._release(parent["id"], entry)
             await self._unqueue(parent, parent_event)
             raise
