@@ -497,6 +497,8 @@ class DelegateManager:
         catalog = {"agents": [], "errors": []}
         if isinstance(agent_type, str) and agent_type not in AGENT_TYPES:
             catalog = custom_agents.discover(parent["workspace"], custom_agents.display_redactor(self.manager.settings))
+            used = custom_agents.used_endpoints(self.manager.settings, [parent, *self.manager.store.list()])
+            catalog = {**catalog, "agents": [custom_agents.limit_model(agent, used) for agent in catalog["agents"]]}
         defaults = self.manager.settings.values.get("subagent_defaults")
         return custom_agents.resolve(agent_type, tool_profile, catalog, defaults if isinstance(defaults, dict) else {})
 
@@ -546,6 +548,8 @@ class DelegateManager:
                 text += "\nSkills: " + ", ".join(spec["skills"])
         if spec["model"] and spec["model"] != parent["model"]:
             text += f"\nEndpoint: {spec['model']}"
+        if spec.get("unused_model"):
+            text += f"\nEndpoint: the agent file names {spec['unused_model']}, which you do not use; it runs on the chat's model."
         return self.manager.settings.redact(text)
 
     def agent_skills(self, parent, spec):

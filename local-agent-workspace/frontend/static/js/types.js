@@ -231,7 +231,8 @@
 // AgentTypes (GET /agents?session_id=, the session optional): { built_in: [{ name, built_in: true, profile,
 //   description, model, effort }] ('' model or effort: the chat's; Settings.subagent_defaults), custom: [{ name,
 //   built_in: false, description, path (workspace-relative), profile, tools (null: every tool of the profile),
-//   model, effort (null: the chat's), skills, max_steps, notes, instructions_chars }], errors: [{ path, error }],
+//   model, effort (null: the chat's), unused_model? (the file's endpoint, which the user does not use: model is
+//   then null and a note says so), skills, max_steps, notes, instructions_chars }], errors: [{ path, error }],
 //   folders, index_bytes }. Settings.subagent_defaults: { explore|general|editor: { model, effort } }.
 //   A delegation's progress (event.delegation) and a subagents index entry carry the model and effort it started with.
 // Changes (pushed as { type: 'changes', changes } and returned by Keep/Undo): {

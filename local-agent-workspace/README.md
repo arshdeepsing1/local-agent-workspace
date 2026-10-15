@@ -1987,7 +1987,7 @@ Report each finding with path:line, its severity and a suggested fix.
 | `description` | Required: one line of at most 300 characters, which the model reads to choose the agent. |
 | `tools` | Optional: the only tools the agent may use (`[a, b]`, `- item` lines, or `a, b`). Names this app does not have are ignored with a note, `delegate_task` never applies, and tools outside the profile are dropped. Left out: every tool of the profile. |
 | `profile` | `read_only` (the default), `file_editor` or `inherit`, as for `tool_profile`. |
-| `model` | Optional Databricks serving endpoint name; left out (or `inherit`): the chat's model. |
+| `model` | Optional Databricks serving endpoint name, only one you already use: the Settings model, a **Settings → Subagents** model or the model of one of your chats (not a subagent chat). Any other endpoint runs on the chat's model, with a note in Agent types and on the approval card. Left out (or `inherit`): the chat's model. |
 | `effort` | Optional `default`, `low` (Fast), `medium`, `high`, `xhigh` or `max`; left out: the chat's effort. |
 | `skills` | Optional: up to three skill IDs loaded into the subagent like selected skills; one that does not load is left out with a note in its first prompt. A `/skill` word in the instructions or the task loads no other skill. |
 | `max_steps` | Optional 1–24: the subagent's steps when the call gives no `max_steps` (a call's own value wins). |
@@ -2024,7 +2024,7 @@ chat**, a listed endpoint, or **Other endpoint…**) and effort (**Same as the c
 | explore | `read_only` | the chat's | Fast (`low`) |
 | general | the chat's (`inherit`) | the chat's | the chat's |
 | editor | `file_editor` | the chat's | the chat's |
-| custom agent | its `profile` and `tools` | its `model`, else the chat's | its `effort`, else the chat's |
+| custom agent | its `profile` and `tools` | its `model` (an endpoint you use), else the chat's | its `effort`, else the chat's |
 
 A subagent whose type sets an effort keeps it when you change the chat's effort; the others
 follow the chat, and one still waiting for a free slot takes the chat's effort when it starts
@@ -2037,8 +2037,9 @@ while an agent on the Settings model keeps 1,000,000 and 32,000, also from a cha
 Lower Settings budgets stay as they are.
 
 *Safety.* An agent file is project content, like `AGENTS.md`, and never widens what the chat
-allows: its profile is intersected with the chat's subagent tool ceiling and any requested
-`tool_profile` (the narrowest wins), its tools with that profile and without those the chat has
+allows. It cannot send the subagent's requests, and the project content they carry, to an
+endpoint you do not already use (see `model` above). Its profile is intersected with the chat's
+subagent tool ceiling and any requested `tool_profile` (the narrowest wins), its tools with that profile and without those the chat has
 turned off or an unconditional deny rule covers (a delegation with none of its tools left is
 refused, and the first prompt lists only the tools it has), the chat's turned-off tools, rules
 and permission mode apply as to any subagent, and subagents never delegate. A tool outside the

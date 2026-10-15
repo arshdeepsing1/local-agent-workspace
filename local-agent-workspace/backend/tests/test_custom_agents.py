@@ -4,6 +4,7 @@ model, effort, tools, skills, instructions and steps), Settings → Subagents de
 types, budgets on another endpoint, the approval card, and the subagents index."""
 import asyncio
 import json
+import types
 import os
 
 import httpx
@@ -256,6 +257,13 @@ def test_subagent_defaults_are_checked_and_a_hand_written_file_falls_back():
     assert subagent_defaults({"explore": {"effort": "turbo"}, "general": 3, "x": 1}, strict=False) == DEFAULT_SUBAGENT_DEFAULTS
 
 
+def use_endpoints(manager, *models):
+    """Chats of the user on these endpoints: an agent file may name only endpoints the user already uses."""
+    for model in models:
+        chat = manager.store.create({**manager.settings.values, "model": model})
+        manager.store.save(chat)
+
+
 @pytest.fixture
 async def api(tmp_path, monkeypatch):
     monkeypatch.setattr("local_agent.config.APP_ROOT", tmp_path)
@@ -290,7 +298,8 @@ async def test_settings_save_the_defaults_partially_and_read_them_back(api):
 
 
 async def test_the_agents_route_lists_built_in_and_custom_agents_and_bad_files(api):
-    client, _, settings, project = api
+    client, manager, settings, project = api
+    use_endpoints(manager, GPT)
     write_agent(project, "security-auditor", AUDITOR)
     write_agent(project, "bad", "---\nname: Bad\ndescription: x\n---\n", AGENT_ROOTS[1])
     listing = (await client.get("/api/agents")).json()
@@ -398,6 +407,7 @@ def offered(body):
 
 async def test_a_custom_agent_gets_its_model_effort_tools_skills_instructions_and_steps(runtime, monkeypatch):
     manager, parent, project = runtime
+    use_endpoints(manager, GPT)
     write_agent(project, "security-auditor", AUDITOR)
     skill = project / ".agents/skills/review/SKILL.md"
     skill.parent.mkdir(parents=True)
@@ -541,6 +551,7 @@ async def test_an_unknown_agent_name_is_a_tool_error_listing_the_agents(runtime,
 
 async def test_the_manual_mode_card_names_the_agent_its_tools_and_its_model(runtime):
     manager, parent, project = runtime
+    use_endpoints(manager, SONNET)
     write_agent(project, "security-auditor", AUDITOR.replace("model: databricks-gpt-oss-120b", f"model: {SONNET}")
                 .replace("effort: high", "effort: low"))
     parent["permission_mode"] = "manual"
@@ -571,6 +582,7 @@ async def test_the_manual_mode_card_names_the_agent_its_tools_and_its_model(runt
 
 async def test_an_approved_card_starts_the_agent_it_showed_after_its_file_changes(runtime):
     manager, parent, project = runtime
+    use_endpoints(manager, SONNET, GPT)
     write_agent(project, "mapper", f"---\ndescription: Maps.\nmodel: {SONNET}\neffort: low\ntools: [read_file]\n---\n"
                 "Map the old way.\n")
     parent["permission_mode"] = "manual"
@@ -633,6 +645,7 @@ async def test_settings_defaults_set_a_built_in_types_model_and_effort(runtime, 
 
 async def test_a_child_on_a_smaller_endpoint_gets_that_endpoints_budgets(runtime, monkeypatch):
     manager, parent, project = runtime
+    use_endpoints(manager, GPT)
     # Settings budgets customised for Claude Opus 5.5, beyond GPT OSS 120B's defaults and maxima.
     manager.settings.values.update(model=OPUS, context_window=1_000_000, max_output_tokens=32_000)
     parent["model"] = OPUS
@@ -771,6 +784,7 @@ async def test_an_agent_max_steps_is_the_default_and_the_call_can_set_its_own(ru
 
 async def test_copies_of_a_custom_agents_subagent_keep_its_tools(runtime):
     manager, parent, project = runtime
+    use_endpoints(manager, GPT)
     write_agent(project, "mapper", agent_text(tools="[read_file]", model=GPT, effort="high"))
 
     async def worker(child, prompt):
@@ -810,3 +824,61 @@ async def test_the_agent_index_is_left_out_without_agents_and_of_subagents(runti
     assert "Custom subagents" not in without["content"]
     child = {**parent, "id": "child", "is_subagent": True}
     assert "Custom subagents" not in manager.context_inputs(child, tools, "bypassPermissions")[0]["content"]
+
+
+# An agent file names only endpoints the user already uses.
+
+def test_the_endpoints_in_use_are_settings_subagent_defaults_and_the_users_chats():
+    from local_agent.custom_agents import limit_model, used_endpoints
+    settings = types.SimpleNamespace(values={"model": OPUS, "subagent_defaults": {
+        "explore": {"model": "", "effort": "low"}, "general": {"model": f" {SONNET} ", "effort": ""}}})
+    chats = [{"model": "databricks-gpt-oss-20b"}, {"model": "chosen-by-a-file", "is_subagent": True}, {"model": ""}]
+    assert used_endpoints(settings, chats) == {OPUS, SONNET, "databricks-gpt-oss-20b"}
+    agent = {"name": "mapper", "model": GPT, "notes": []}
+    limited = limit_model(agent, {OPUS})
+    assert limited["model"] is None and limited["unused_model"] == GPT
+    assert limited["notes"] == [f"Its model {GPT} is not an endpoint you use (the Settings model, Settings → Subagents "
+                                "or one of your chats), so it runs on the chat's model."]
+    assert limit_model(agent, {GPT}) is agent and limit_model({"model": None}, set()) == {"model": None}
+
+
+async def test_an_agent_file_on_an_endpoint_you_do_not_use_runs_on_the_chats_model(runtime):
+    manager, parent, project = runtime
+    write_agent(project, "mapper", agent_text("Maps.", model=GPT, effort="high", tools="[read_file]"))
+    parent["permission_mode"] = "manual"
+    tools = manager.session_tools(parent)
+    started = []
+
+    async def worker(child, prompt):
+        started.append(child)
+        await manager.event(child, "assistant", text="Done.")
+    manager.run_databricks = worker
+    task = asyncio.create_task(manager.execute_tool(parent, tools, "delegate_task", {"task": "Map", "agent_type": "mapper"}, "d"))
+    for _ in range(300):
+        if manager.pending:
+            break
+        await asyncio.sleep(0.01)
+    session_id, event_id = next(iter(manager.pending))
+    preview = next(item for item in parent["events"] if item["id"] == event_id)["preview"]
+    assert "· model " not in preview.split("\n")[0]  # The card's summary names no endpoint the agent will not use.
+    assert f"Endpoint: the agent file names {GPT}, which you do not use; it runs on the chat's model." in preview
+    manager.decide(session_id, event_id, True)
+    result = json.loads(await asyncio.wait_for(task, 10))
+    assert result["status"] == "completed" and started[0]["model"] == parent["model"] != GPT
+    assert "agent_model" not in started[0] and started[0]["reasoning_effort"] == "high"  # Its effort still applies.
+    # Once the user uses that endpoint (a chat of theirs runs on it), the agent may name it.
+    use_endpoints(manager, GPT)
+    parent["permission_mode"] = "bypassPermissions"
+    result = json.loads(await manager.execute_tool(parent, tools, "delegate_task", {"task": "Map", "agent_type": "mapper"}, "e"))
+    assert result["status"] == "completed" and started[1]["model"] == GPT
+
+
+async def test_the_agents_route_marks_an_endpoint_you_do_not_use(api):
+    client, manager, settings, project = api
+    write_agent(project, "mapper", agent_text("Maps.", model=GPT))
+    agent = (await client.get("/api/agents")).json()["custom"][0]
+    assert agent["model"] is None and agent["unused_model"] == GPT
+    assert any("is not an endpoint you use" in note for note in agent["notes"])
+    use_endpoints(manager, GPT)
+    agent = (await client.get("/api/agents")).json()["custom"][0]
+    assert agent["model"] == GPT and "unused_model" not in agent

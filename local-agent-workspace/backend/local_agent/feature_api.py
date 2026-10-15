@@ -180,8 +180,10 @@ def register_features(app, manager, settings, store, session_or_404, workspace_t
         and the files that could not be used, with the reason."""
         catalog = custom_agents.discover(workspace_tools(session_id).root, custom_agents.display_redactor(settings))
         defaults = settings.values.get("subagent_defaults")
+        # As delegate_task resolves them: an agent file's model must be an endpoint the user already uses.
+        used = custom_agents.used_endpoints(settings, manager.store.list())
         return {"built_in": custom_agents.built_in_agents(defaults if isinstance(defaults, dict) else {}),
-                "custom": [custom_agents.public_agent(agent) for agent in catalog["agents"]],
+                "custom": [custom_agents.public_agent(custom_agents.limit_model(agent, used)) for agent in catalog["agents"]],
                 "errors": catalog["errors"], "folders": list(custom_agents.AGENT_ROOTS),
                 "index_bytes": len(custom_agents.agent_index(catalog["agents"]).encode("utf-8"))}
 

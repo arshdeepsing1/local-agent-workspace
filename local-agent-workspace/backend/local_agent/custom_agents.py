@@ -392,6 +392,28 @@ def built_in_agents(defaults):
             for name, (profile, description) in BUILT_IN.items()]
 
 
+def used_endpoints(settings, sessions):
+    """The endpoints the user already uses: the Settings model, the Settings → Subagents models and the
+    models of their own chats (not subagent chats, whose model an agent file may have chosen)."""
+    names = {settings.values.get("model")}
+    defaults = settings.values.get("subagent_defaults")
+    if isinstance(defaults, dict):
+        names |= {entry.get("model") for entry in defaults.values() if isinstance(entry, dict)}
+    names |= {session.get("model") for session in sessions if isinstance(session, dict) and not session.get("is_subagent")}
+    return {name.strip() for name in names if isinstance(name, str) and name.strip()}
+
+
+def limit_model(agent, used):
+    """An agent file names its endpoint only from those the user already uses (used_endpoints): a
+    project's file must not send the subagent's requests, and the workspace content they carry, to
+    another endpoint the token can reach. Any other model runs on the chat's model, with a note."""
+    if not agent.get("model") or agent["model"] in used:
+        return agent
+    note = (f"Its model {agent['model']} is not an endpoint you use (the Settings model, Settings → Subagents or "
+            "one of your chats), so it runs on the chat's model.")
+    return {**agent, "model": None, "unused_model": agent["model"], "notes": [*agent.get("notes", []), note]}
+
+
 def public_agent(agent):
     """A custom agent for Agent tools: its definition without the instructions text."""
     return {**{key: value for key, value in agent.items() if key not in ("instructions", "root")},
@@ -425,7 +447,8 @@ def resolve(agent_type, tool_profile, catalog, defaults):
                          + ". Available agent types: " + ", ".join(names) + ".")
     return {"name": agent["name"], "custom": True, "requested": narrower(agent["profile"], tool_profile),
             "model": agent["model"], "effort": agent["effort"], "tools": agent["tools"], "skills": agent["skills"],
-            "instructions": agent["instructions"], "max_steps": agent["max_steps"], "path": agent["path"]}
+            "instructions": agent["instructions"], "max_steps": agent["max_steps"], "path": agent["path"],
+            "unused_model": agent.get("unused_model")}
 
 
 def child_tools(tools, profile):

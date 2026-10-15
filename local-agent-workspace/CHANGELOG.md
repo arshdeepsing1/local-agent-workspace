@@ -17,7 +17,9 @@ Follow-up of 2026-10-15:
   its requests within that endpoint's budgets.
 - A custom agent never widens what its chat allows: its tools stay within the subagent tool
   ceiling, turned-off tools, rules and mode, and Manual mode's approval card names the agent,
-  its tools, model and effort before it starts.
+  its tools, model and effort before it starts. Its `model` must be an endpoint you already use
+  (the Settings model, Settings → Subagents or one of your chats); any other runs on the
+  chat's model, with a note.
 - Spending limit per conversation: a soft cap on the estimated DBU of a chat and its
   subagents, checked before each agent model request. **Settings → Agent** sets the default
   (0 = none), **Agent tools → Usage** shows the spend against the limit and sets a chat's own.
