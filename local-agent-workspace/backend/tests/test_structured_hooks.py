@@ -1,6 +1,7 @@
 """Structured hook output (one JSON object on stdout) and the lifecycle hook events: user_prompt,
 session_start, agent_stop, subagent_start and subagent_stop (lifecycle_hooks.py, extensions.py)."""
 import asyncio
+import copy
 import json
 import shlex
 import sys
@@ -10,13 +11,16 @@ import httpx
 import pytest
 
 from local_agent.agents import AgentManager
+from local_agent.approvals import busy_status
 from local_agent.composer_api import STEER_PREFIX
 from local_agent.config import Settings
 from local_agent.context import HOOK_CONTINUATION_PREFIX, is_app_prompt
 from local_agent.extensions import (CONFIG_LIMIT, HOOK_CONTEXT_CHARS, HOOK_EVENTS, MAX_HOOKS, parse_hook_output,
-                                    validate_config)
+                                    shown_hook_output, validate_config)
 from local_agent.instructions import load_project_instructions
-from local_agent.portability import _validate_wire
+from local_agent.planning import CallAllowance
+from local_agent.portability import _validate_wire, export_bundle, fresh_copies, validate_bundle
+from local_agent.result_budget import ResultAllowance
 from local_agent.store import Store
 from local_agent.tools import WorkspaceTools
 
@@ -99,8 +103,14 @@ def reply(text):
 
 
 def call(name, arguments, call_id="call-1"):
-    part = {"index": 0, "id": call_id, "type": "function", "function": {"name": name, "arguments": json.dumps(arguments)}}
-    return httpx.Response(200, text=frame({"content": "", "tool_calls": [part]}, "tool_calls") + "data: [DONE]\n\n")
+    return calls((name, arguments, call_id))
+
+
+def calls(*items):
+    """One response with several tool calls: (name, arguments, call_id) each."""
+    parts = [{"index": index, "id": call_id, "type": "function", "function": {"name": name, "arguments": json.dumps(arguments)}}
+             for index, (name, arguments, call_id) in enumerate(items)]
+    return httpx.Response(200, text=frame({"content": "", "tool_calls": parts}, "tool_calls") + "data: [DONE]\n\n")
 
 
 class Gateway:
@@ -549,3 +559,287 @@ async def test_user_prompt_hooks_also_check_a_message_steered_into_the_turn(rt, 
         assert last["role"] == "tool" and steered["in_wire"] is False and steered["hook_blocked"]["reason"] == "Not now."
     assert live.get("queued_messages") == [] and live["terminal_reason"] == "completed"
     _validate_wire(live["wire"], complete=True)
+    if decision == "block":  # Shown where it was blocked, with the reason after it.
+        place = live["events"].index(steered)
+        assert live["events"][place + 1]["text"].startswith("A user-prompt hook (tidy) blocked this message: Not now.")
+
+
+# Review fixes: stdout only, malformed JSON, redaction after decoding -------------------------------
+
+async def test_stderr_never_spoils_a_json_decision_and_shows_after_stdout(rt):
+    configure(rt, hook("guard", "before_tool",
+                       emit({"decision": "deny", "reason": "Main is frozen."}) + "; echo 'warning: x' >&2"))
+    output = await rt.manager.execute_tool(rt.session, rt.tools, "write_file", {"path": "a.txt", "content": "x"}, "w")
+    assert output.startswith("Blocked by the before-tool hook guard: Main is frozen.")
+    assert not (rt.project / "a.txt").exists()
+    card = cards(rt.session, "hook_before_tool")[0]
+    assert card["hook_result"]["decision"] == "deny"
+    assert card["output"] == '{"decision": "deny", "reason": "Main is frozen."}\n[stderr]\nwarning: x\n'
+    # A failing hook's warning shows its stderr too.
+    configure(rt, hook("post", "after_tool", "echo partial; echo 'missing tool' >&2; exit 2"))
+    await rt.manager.execute_tool(rt.session, rt.tools, "list_files", {"path": "."}, "l")
+    warning = [event["text"] for event in rt.session["events"] if event["type"] == "notice"][-1]
+    assert warning.startswith("After-tool hook warning: Hook failed (exit 2): partial\n[stderr]\nmissing tool")
+    # Both long: stderr keeps about half of what a card shows.
+    text, shortened = shown_hook_output("o" * 10_000, "e" * 10_000, 3_800)
+    assert shortened and len(text.encode()) <= 3_800 and "\n[stderr]\n" in text and text.count("e") > 1_500
+
+
+async def test_output_that_looks_like_one_json_object_but_does_not_decode_fails_the_hook(rt):
+    with pytest.raises(ValueError, match=r"looks like a JSON object but is not valid JSON \(Expecting"):
+        parse_hook_output("before_tool", '{"decision": deny}')
+    assert parse_hook_output("before_tool", '{"decision": "deny"') is None  # Cut off: plain text, as before.
+    configure(rt, hook("guard", "before_tool", "printf '%s' '{decision: deny}'"))
+    output = await rt.manager.execute_tool(rt.session, rt.tools, "write_file", {"path": "a.txt", "content": "x"}, "w")
+    assert ("Before-tool hook blocked write_file: Hook output could not be used: Hook output looks like a JSON object "
+            "but is not valid JSON (Expecting property name") in output
+    assert not (rt.project / "a.txt").exists()
+    # Any other hook: a warning, and nothing changes.
+    configure(rt, hook("post", "after_tool", "printf '%s' '{context: 1}'"))
+    output = await rt.manager.execute_tool(rt.session, rt.tools, "list_files", {"path": "."}, "l")
+    assert "Hook context" not in output
+    assert rt.session["events"][-1]["text"].startswith("After-tool hook warning: Hook output could not be used")
+
+
+async def test_a_json_escaped_secret_is_redacted_after_decoding(rt, monkeypatch):
+    gateway = Gateway(monkeypatch, [lambda: reply("Done")])
+    escaped = "\\u" + format(ord(TOKEN[0]), "04x") + TOKEN[1:]  # Decodes to TOKEN; the raw text does not contain it.
+    configure(rt, hook("ctx", "user_prompt", "printf '%s' " + shlex.quote('{"context": "key ' + escaped + '"}')))
+    await rt.manager.run(rt.session, "hello")
+    sent = last_user(gateway.requests[0])
+    assert sent.endswith("- user_prompt hook ctx: key [REDACTED]")
+    card = cards(rt.session, "hook_user_prompt")[0]
+    user = next(event for event in rt.session["events"] if event["type"] == "user")
+    assert card["hook_result"]["context"] == "key [REDACTED]" and user["hook_notes"][0]["context"] == "key [REDACTED]"
+    # The card shows stdout re-encoded, without the escape (its preview shows the configured command).
+    assert card["output"] == '{"context": "key [REDACTED]"}'
+    # Replacement arguments are redacted the same way.
+    configure(rt, hook("swap", "before_tool",
+                       "printf '%s' " + shlex.quote('{"arguments": {"path": "a.txt", "content": "' + escaped + '"}}')))
+    await rt.manager.execute_tool(rt.session, rt.tools, "write_file", {"path": "a.txt", "content": "x"}, "w")
+    assert (rt.project / "a.txt").read_text() == "[REDACTED]"
+    assert TOKEN not in json.dumps(rt.session["events"])
+
+
+# Review fixes: a subagent chat the user continues --------------------------------------------------
+
+async def test_a_subagent_chat_the_user_continues_runs_its_own_hooks_not_subagent_stop(rt, monkeypatch):
+    # Manual, with no rule for the subagent_stop hook in the parent: a card there would leave the idle parent busy.
+    rt.session.update(permission_mode="manual", allow_rules=[{"tool": "delegate_task"}, {"tool": "hook", "hook": "tidy"},
+                                                             {"tool": "hook", "hook": "done"}])
+    review, tidy, done = (rt.tmp / f"{name}.json" for name in ("review", "tidy", "done"))
+    Gateway(monkeypatch, [lambda: call("delegate_task", {"task": "Survey", "agent_type": "general"}, "d1"),
+                          lambda: reply("Parent done")],
+            children={"Survey": [lambda: reply("Findings"), lambda: reply("Again")]})
+    configure(rt, hook("review", "subagent_stop", emit({}, review, append=True)),
+              hook("tidy", "user_prompt", emit({}, tidy, append=True)),
+              hook("done", "agent_stop", emit({}, done, append=True)))
+    sid = rt.session["id"]
+    rt.manager.start(sid, "Delegate")
+    key, _ = await pending_card(rt.manager, "hook_subagent_stop")  # The delegated turn: in the parent.
+    assert key[0] == sid
+    rt.manager.decide(*key, True)
+    await asyncio.wait_for(rt.manager.tasks[sid], 10)
+    parent = rt.manager.store.get(sid)
+    child_id = json.loads(next(event for event in parent["events"] if event.get("call_id") == "d1")["output"])["child_session_id"]
+    assert len(stdin_lines(review)) == 1 and stdin_lines(review)[0]["subagent_session_id"] == child_id
+    # The delegated prompt got no user_prompt hook; the parent's own message and turn end did.
+    assert [line["session_id"] for line in stdin_lines(tidy)] == [sid]
+    assert [line["session_id"] for line in stdin_lines(done)] == [sid]
+    before = rt.manager.store.get(sid)
+    await rt.manager.submit_message(child_id, "One more thing")
+    await asyncio.wait_for(rt.manager.tasks[child_id], 10)
+    assert not rt.manager.pending and len(stdin_lines(review)) == 1
+    assert stdin_lines(tidy)[-1]["session_id"] == child_id and stdin_lines(tidy)[-1]["prompt"] == "One more thing"
+    assert stdin_lines(done)[-1]["session_id"] == child_id and stdin_lines(done)[-1]["reply"] == "Again"
+    # The idle parent is left alone: not busy, and its stored state is as it was.
+    after = rt.manager.store.get(sid)
+    assert busy_status(rt.manager, sid) == "idle" and after["events"] == before["events"]
+    child = rt.manager.store.get(child_id)
+    assert child["turn_delegated"] is False and child["terminal_reason"] == "completed"
+    # A copy keeps the subagent named on its parent's hook card (the copy's ID).
+    bundle = export_bundle([after, child], sid)
+    copies, _ = fresh_copies(bundle, str(rt.project))
+    copied_parent, copied_child = copies
+    card = next(event for event in copied_parent["events"] if event.get("name") == "hook_subagent_stop")
+    assert card["input"]["subagent_session_id"] == copied_child["id"] != child_id
+
+
+async def test_a_subagent_stopped_while_its_hook_card_waits_leaves_the_parent_delegating(rt, monkeypatch):
+    rt.session.update(permission_mode="manual", allow_rules=[{"tool": "delegate_task"}])
+    Gateway(monkeypatch, [lambda: calls(("delegate_task", {"task": "A", "agent_type": "general"}, "d1"),
+                                        ("delegate_task", {"task": "B", "agent_type": "general"}, "d2")),
+                          lambda: reply("Parent done")],
+            children={"A": [lambda: reply("Findings A")],
+                      "B": [lambda: call("write_file", {"path": "b.txt", "content": "x"}, "w"), lambda: reply("B done")]})
+    configure(rt, hook("review", "subagent_stop", emit({})))
+    sid = rt.session["id"]
+    rt.manager.start(sid, "Delegate")
+    key, card = await pending_card(rt.manager, "hook_subagent_stop")
+    write, _ = await pending_card(rt.manager, "write_file")  # Subagent B waits on its own card.
+    child_a =next(event for event in rt.manager.get(sid)["events"] if event.get("call_id") == "d1")["child_session_id"]
+    await rt.manager.stop(child_a)
+    assert card["state"] == "cancelled" and key not in rt.manager.pending
+    assert rt.manager.statuses[sid] == "delegating"  # Not left waiting for a card that is gone.
+    rt.manager.decide(*write, False)
+    second = key
+    while second == key:  # Subagent B ends too: its own card in the parent.
+        await asyncio.sleep(0.01)
+        second, _ = await pending_card(rt.manager, "hook_subagent_stop")
+    rt.manager.decide(*second, True)
+    await asyncio.wait_for(rt.manager.tasks[sid], 10)
+    assert rt.manager.statuses[sid] == "idle" and rt.manager.store.get(sid)["terminal_reason"] == "completed"
+
+
+# Review fixes: a steered message's user_prompt hooks ------------------------------------------------
+
+async def test_a_steered_message_stays_queued_while_its_hook_card_waits_and_after_stop(rt, monkeypatch):
+    rt.session.update(permission_mode="manual")
+    gateway = Gateway(monkeypatch, [lambda: call("write_file", {"path": "a.txt", "content": "x"}, "w"),
+                                    lambda: reply("Done.")])
+    configure(rt, hook("tidy", "user_prompt", emit({})))
+    sid = rt.session["id"]
+    rt.manager.start(sid, "Write a.txt")
+    key, _ = await pending_card(rt.manager, "hook_user_prompt")
+    rt.manager.decide(*key, True)
+    key, _ = await pending_card(rt.manager, "write_file")
+    assert (await rt.manager.submit_message(sid, "also a date pls"))["queued"] is True
+    rt.manager.decide(*key, True)
+    await pending_card(rt.manager, "hook_user_prompt")  # The steered message's own hook card.
+    for session in (rt.manager.get(sid), rt.manager.store.get(sid)):  # Saved queued too: a restart keeps it.
+        assert [item["text"] for item in session["queued_messages"]] == ["also a date pls"]
+        assert [event["text"] for event in session["events"] if event["type"] == "user"] == ["Write a.txt"]
+    await rt.manager.stop(sid)
+    stored = rt.manager.store.get(sid)
+    assert [(item["text"], item["paused"]) for item in stored["queued_messages"]] == [("also a date pls", False)]
+    assert [event["text"] for event in stored["events"] if event["type"] == "user"] == ["Write a.txt"]
+    assert not any("also a date" in (message.get("content") or "") for message in stored["wire"])
+    assert cards(stored, "hook_user_prompt")[-1]["state"] == "cancelled"
+    # Send queued messages sends it, through its hook again.
+    await rt.manager.send_queued(sid)
+    key, _ = await pending_card(rt.manager, "hook_user_prompt")
+    rt.manager.decide(*key, True)
+    await asyncio.wait_for(rt.manager.tasks[sid], 10)
+    assert last_user(gateway.requests[-1]) == "also a date pls" and rt.manager.store.get(sid)["queued_messages"] == []
+
+
+async def test_a_steered_message_removed_while_its_hook_card_waits_is_not_sent(rt, monkeypatch):
+    rt.session.update(permission_mode="manual", allow_rules=[{"tool": "edits"}])
+    gateway = Gateway(monkeypatch, [lambda: call("write_file", {"path": "a.txt", "content": "x"}, "w"),
+                                    lambda: reply("Done.")])
+    configure(rt, hook("tidy", "user_prompt", "if grep -q '\"steered\": true'; then printf '%s' '{\"prompt\": \"edited\"}'; fi"))
+    sid = rt.session["id"]
+    rt.manager.start(sid, "Write a.txt")
+    first, _ = await pending_card(rt.manager, "hook_user_prompt")
+    queued = await rt.manager.enqueue(sid, "also a date pls")
+    rt.manager.decide(*first, True)
+    key = first
+    while key == first:  # The steered message's own hook card, after the write.
+        await asyncio.sleep(0.01)
+        key, _ = await pending_card(rt.manager, "hook_user_prompt")
+    await rt.manager.remove_queued(sid, queued["queued_messages"][0]["id"])
+    rt.manager.decide(*key, True)
+    await asyncio.wait_for(rt.manager.tasks[sid], 10)
+    live = rt.manager.store.get(sid)
+    assert [event["text"] for event in live["events"] if event["type"] == "user"] == ["Write a.txt"]
+    assert gateway.requests[1]["messages"][-1]["role"] == "tool" and live["terminal_reason"] == "completed"
+
+
+async def test_a_steered_message_that_hook_context_makes_too_large_stays_queued(rt):
+    configure(rt, hook("ctx", "user_prompt", emit({"context": "c" * 1500})))
+    sid = rt.session["id"]
+    await rt.manager.enqueue(sid, "also a date pls")
+    call_part = {"id": "w", "type": "function", "function": {"name": "write_file", "arguments": "{}"}}
+    wire = [{"role": "user", "content": "Write a.txt"}, {"role": "assistant", "content": None, "tool_calls": [call_part]},
+            {"role": "tool", "tool_call_id": "w", "content": "ok"}]
+    await rt.manager.drain_queue(rt.session, wire, rt.tools, fits=lambda message: len(message["content"]) < 1000)
+    assert len(wire) == 3 and [item["text"] for item in rt.session["queued_messages"]] == ["also a date pls"]
+    assert not [event for event in rt.session["events"] if event["type"] == "user"]
+    assert cards(rt.session, "hook_user_prompt") and "waits for a later step" in rt.session["events"][-1]["text"]
+    await rt.manager.drain_queue(rt.session, wire, rt.tools, fits=lambda message: True)
+    assert wire[-1]["content"].startswith(STEER_PREFIX + "also a date pls\n\n[App note") and rt.session["queued_messages"] == []
+    assert [event["text"] for event in rt.session["events"] if event["type"] == "user"] == ["also a date pls"]
+
+
+# Review fixes: budgets, card edits, compaction ----------------------------------------------------
+
+async def test_what_hooks_add_to_a_result_is_charged_to_the_allowance(rt):
+    configure(rt, hook("post", "after_tool", emit({"context": "z" * 1990})))
+    allowance = ResultAllowance(10_000, 1.0, calls=1)
+    output = await rt.manager.execute_tool(rt.session, rt.tools, "list_files", {"path": "."}, "l", allowance=allowance)
+    assert "z" * 100 in output and allowance.settled == 1
+    assert allowance.total - allowance.left == allowance.cost(output)
+    # A refusal is not settled by the call: the turn charges what is sent, hook context included, once.
+    configure(rt, hook("guard", "before_tool", emit({"decision": "deny", "reason": "No.", "context": "y" * 1990})))
+    allowance = ResultAllowance(10_000, 1.0, calls=1)
+    output = await rt.manager.execute_tool(rt.session, rt.tools, "list_files", {"path": "."}, "l2", allowance=allowance)
+    assert output.endswith("y" * 100) and allowance.settled == 0 and allowance.left == allowance.total - allowance.stub
+    # A parallel delegation's share charges the shared allowance.
+    shared = ResultAllowance(10_000, 1.0, calls=1)
+    share = CallAllowance(shared)
+    share.charge("short")
+    share.charge_more("short" + "x" * 4000, "short")
+    assert shared.total - shared.left == shared.cost("short" + "x" * 4000)
+
+
+async def test_a_card_edit_after_a_hook_change_tells_the_model_what_ran(rt):
+    rt.session.update(permission_mode="manual", allow_rules=[{"tool": "hook", "hook": "swap"}])
+    configure(rt, hook("swap", "before_tool", emit({"arguments": {"command": "echo from-hook"}}), tools=["run_command"]))
+    task = asyncio.create_task(rt.manager.execute_tool(rt.session, rt.tools, "run_command", {"command": "echo agent"}, "c"))
+    key, _ = await pending_card(rt.manager, "run_command")
+    await rt.manager.revise_card(*key, {"command": "echo from-user"})
+    rt.manager.decide(*key, True)
+    output = await asyncio.wait_for(task, 10)
+    assert output.startswith("[A before-tool hook (swap) changed this call's arguments, and the user then edited them on "
+                             'the approval card, before it ran. It ran with: {"command": "echo from-user"}. Your '
+                             "proposed arguments did not run.]")
+    assert "from-hook" not in output and '"output": "from-user\\n"' in output
+
+
+async def test_compaction_tracks_the_path_a_hook_had_read_not_the_proposed_one(rt):
+    (rt.project / "a.txt").write_text("a\n")
+    (rt.project / "b.txt").write_text("b\n")
+    await rt.manager.execute_tool(rt.session, rt.tools, "read_file", {"path": "a.txt"}, "r0")
+    configure(rt, hook("swap", "before_tool", emit({"arguments": {"path": "b.txt"}}), tools=["read_file"]))
+    await rt.manager.execute_tool(rt.session, rt.tools, "read_file", {"path": "a.txt"}, "r1")
+    assert next(event for event in rt.session["events"] if event.get("call_id") == "r1")["input"] == {"path": "b.txt"}
+
+    def read(call_id):
+        part = {"id": call_id, "type": "function", "function": {"name": "read_file", "arguments": '{"path": "a.txt"}'}}
+        return [{"role": "assistant", "content": None, "tool_calls": [part]},
+                {"role": "tool", "tool_call_id": call_id, "content": "read"}]
+    wire = [{"role": "user", "content": "Earlier"}, *read("r0"), {"role": "assistant", "content": "Read."},
+            {"role": "user", "content": "Now"}, *read("r1")]
+    record, holder = rt.manager.compaction_record(rt.session, rt.tools)
+    record(wire, 4)
+    # b.txt was read after the cut, so its contents stay in context; a.txt's only read is summarized.
+    assert holder["forgotten"] == [str((rt.project / "a.txt").resolve())]
+
+
+# Review fixes: imported hook fields ----------------------------------------------------------------
+
+async def test_hook_fields_are_exported_typed_and_a_bundle_with_bad_ones_is_refused(rt, monkeypatch):
+    Gateway(monkeypatch, [lambda: reply("Done")])
+    configure(rt, hook("tidy", "user_prompt", emit({"prompt": "Fix the bug", "context": "Ticket 7."})),
+              hook("swap", "before_tool", emit({"arguments": {"command": "echo hi"}, "context": "c"})))
+    await rt.manager.run(rt.session, "fix teh bug")
+    await rt.manager.execute_tool(rt.session, rt.tools, "run_command", {"command": "echo agent"}, "c")
+    bundle = export_bundle([rt.session], rt.session["id"])
+    events = bundle["sessions"][0]["events"]
+    user = next(event for event in events if event["type"] == "user")
+    assert user["hook_edit"] == {"hooks": ["tidy"], "original": "fix teh bug"}
+    assert user["hook_notes"] == [{"event": "user_prompt", "hook_id": "tidy", "context": "Ticket 7."}]
+    card = next(event for event in events if event.get("name") == "hook_before_tool")
+    assert card["hook_result"]["json"] is True and card["hook_result"]["arguments"]["after"] == {"command": "echo hi"}
+    assert next(event for event in events if event.get("call_id") == "c")["hook_change"]["original"] == {"command": "echo agent"}
+    for field, value in (("hook_edit", {"hooks": "x", "original": "y"}),
+                         ("hook_notes", [{"event": "on_stop", "hook_id": "a", "context": "c"}]),
+                         ("hook_blocked", {"hook_id": "a" * 65, "reason": "r"}),
+                         ("hook_ask", {"hook_id": "a", "reason": "r" * 2001}),
+                         ("hook_result", {"json": True, "decision": "allow"}),
+                         ("hook_change", {"hooks": ["a"], "original": "x" * 5000}),
+                         ("hook_change", {"hooks": ["a"], "original": {"content": "x" * 20_000}})):
+        broken = copy.deepcopy(bundle)
+        broken["sessions"][0]["events"][0][field] = value
+        with pytest.raises(ValueError, match="Invalid conversation bundle schema"):
+            validate_bundle(broken)

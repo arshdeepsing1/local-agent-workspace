@@ -46,7 +46,8 @@ HOOK_OUTPUT_FIELDS = {
 HOOK_CONTEXT_CHARS = 2_000  # context and reason are shortened to this many characters
 HOOK_REPORT_CHARS = 6_000
 HOOK_STDOUT_BYTES = 16_384  # stdout kept from a hook; more is shown as text, never read as JSON
-HOOK_SHOWN_BYTES = 3_800  # the part of it a hook card and a warning show
+HOOK_SHOWN_BYTES = 3_800  # the part of stdout and stderr a hook card and a warning show
+STDERR_LABEL = "[stderr]\n"  # stderr follows stdout under this line on a card; it is never read as JSON
 SHORTENED = " […shortened by the app]"
 
 
@@ -55,21 +56,54 @@ def _clip_hook_text(value, limit):
     return value if len(value) <= limit else value[:limit - len(SHORTENED)].rstrip() + SHORTENED
 
 
-def parse_hook_output(event, text, truncated=False):
+def _redact_tree(value, redact):
+    """value with redact applied to every string (keys too) inside objects and lists."""
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, dict):
+        return {redact(key): _redact_tree(item, redact) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_tree(item, redact) for item in value]
+    return value
+
+
+def _escaped_secrets(text, redact):
+    """text (stdout that may be one JSON object) re-encoded with its decoded strings redacted, when a
+    JSON escape spelled a secret that redacting the raw text missed; else None."""
+    stripped = text.strip()
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        return None
+    try:
+        value = json.loads(stripped)
+        cleaned = _redact_tree(value, redact)
+    except (ValueError, RecursionError):
+        return None
+    return json.dumps(cleaned, ensure_ascii=False) if cleaned != value else None
+
+
+def parse_hook_output(event, text, truncated=False, redact=None):
     """The structured part of a hook's stdout (exit code 0), or None for plain text.
 
     Only when the whole trimmed output is one JSON object is it read; anything else
-    (text, a list, malformed or cut-off JSON) is plain text, as before. Returns
-    {decision?, reason?, context?, arguments?, prompt?, report?, ignored: [names]}: fields
-    this event does not use are listed in ignored. A known field with a wrong type or value
-    raises ValueError: the hook then counts as failed (a before-tool hook blocks its tool)."""
+    (text, a list, cut-off JSON) is plain text, as before. Returns {decision?, reason?,
+    context?, arguments?, prompt?, report?, ignored: [names]}: fields this event does not
+    use are listed in ignored. Output that looks like one object ({...}) but is not valid
+    JSON, or a known field with a wrong type or value, raises ValueError: the hook then
+    counts as failed (a before-tool hook blocks its tool). redact applies to every decoded
+    string first: a JSON escape can spell a secret that the raw text does not contain."""
     stripped = text.strip() if isinstance(text, str) else ""
     if not (stripped.startswith("{") and stripped.endswith("}")) or truncated:
         return None
     try:
         value = json.loads(stripped)
-    except (ValueError, RecursionError):
-        return None
+        if redact is not None:
+            value = _redact_tree(value, redact)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Hook output looks like a JSON object but is not valid JSON ({exc.msg} at character "
+                         f"{exc.pos}).") from None
+    except (ValueError, RecursionError) as exc:
+        detail = "nested too deeply" if isinstance(exc, RecursionError) else "it could not be decoded"
+        raise ValueError(f"Hook output looks like a JSON object but is not valid JSON ({detail}).") from None
     if not isinstance(value, dict):
         return None
     fields = HOOK_OUTPUT_FIELDS.get(event, {})
@@ -103,6 +137,18 @@ def parse_hook_output(event, text, truncated=False):
     if parsed.get("decision") in ("deny", "block", "ask") and not parsed.get("reason"):
         parsed["reason"] = "The hook gave no reason."
     return parsed
+
+
+def shown_hook_output(stdout, stderr, limit):
+    """(text, shortened): stdout, then stderr under STDERR_LABEL, within limit bytes as bounded_result
+    counts them; when both are long, stderr keeps about half, so a failing hook's error still shows."""
+    if not stderr.strip():
+        result = bounded_result(stdout, limit=limit)
+        return result["output"], result["truncated"]
+    tail = ("\n" if stdout and not stdout.endswith("\n") else "") + STDERR_LABEL + stderr
+    first = bounded_result(stdout, limit=max(limit // 2, limit - len(json.dumps(tail).encode())))
+    second = bounded_result(tail, limit=limit - len(json.dumps(first["output"]).encode()))
+    return first["output"] + second["output"], first["truncated"] or second["truncated"]
 
 
 def _text(value, label, limit, optional=False):
@@ -362,10 +408,11 @@ class ExtensionManager:
     async def run_hook(self, hook, payload, workspace, env=None):
         """Run a hook with payload on stdin. env, when given, is the hook's whole environment.
 
-        Returns {exit_code, output (redacted, at most HOOK_SHOWN_BYTES as a card shows it),
-        truncated, timed_out?, structured?}: structured (parse_hook_output) is set when the
-        hook exited 0 and its whole stdout, redacted, is one JSON object; a ValueError for
-        an invalid one is returned as structured_error."""
+        Returns {exit_code, output (redacted stdout, then stderr under STDERR_LABEL, at most
+        HOOK_SHOWN_BYTES as a card shows it), truncated, timed_out?, structured?}: structured
+        (parse_hook_output) is set when the hook exited 0 and its whole stdout is one JSON
+        object, with every decoded text redacted; a ValueError for an invalid one is returned
+        as structured_error. stderr never takes part: a warning on it cannot spoil the JSON."""
         selected = next((entry for entry in self.config["hooks"] if entry["id"] == hook.get("id") and entry["enabled"]), None)
         if selected is None or selected != hook:
             raise ValueError("Hook is disabled or changed; refresh its configuration before running it.")
@@ -379,18 +426,26 @@ class ExtensionManager:
                 target.write(data)
             command = f"(\n{selected['command']}\n) < {shlex.quote(filename)}"
             try:
-                result = await run_process(command, workspace, selected["timeout_seconds"], HOOK_STDOUT_BYTES, env=env)
+                result = await run_process(command, workspace, selected["timeout_seconds"], HOOK_STDOUT_BYTES, env=env,
+                                           separate_stderr=True)
             except CommandTimeout as error:
                 result = {**error.result, "timed_out": True}
             # Room for the note that a command did not end, added after redaction.
             room = len(NOT_STOPPED) + 1 if result.get("stopped") is False else 0
-            redacted = self._redact(result["output"], tokens, partial=result["truncated"] or result.get("timed_out", False))
-            output = bounded_result(redacted, limit=HOOK_SHOWN_BYTES - room)
+            ended = result.get("timed_out", False)
+            redacted = self._redact(result["output"], tokens, partial=result["truncated"] or ended)
+            errors = self._redact(result.pop("stderr", ""), tokens, partial=result.pop("stderr_truncated", False) or ended)
+            redact = lambda text: self._redact(text, tokens)
+            # Shown re-encoded only when a JSON escape spelled a secret: the card never shows it either.
+            cleaned = None if result["truncated"] else _escaped_secrets(redacted, redact)
+            shown, shortened = shown_hook_output(cleaned or redacted, errors, HOOK_SHOWN_BYTES - room)
             extra = {}
             if result.get("exit_code") == 0 and not result.get("timed_out"):
-                # Read from the redacted output: a secret never reaches the card or the model.
+                # Read from the redacted stdout, each decoded text redacted again (an escaped secret):
+                # a secret never reaches the card or the model.
                 try:
-                    structured = parse_hook_output(selected["event"], redacted, truncated=result["truncated"])
+                    structured = parse_hook_output(selected["event"], redacted, truncated=result["truncated"],
+                                                   redact=redact)
                 except ValueError as exc:
                     extra["structured_error"] = str(exc)
                 else:
@@ -399,8 +454,7 @@ class ExtensionManager:
                 if result["truncated"] and redacted.lstrip().startswith("{"):
                     extra["structured_error"] = (f"Hook output is longer than {HOOK_STDOUT_BYTES // 1024} KB, so it "
                                                  "was not read as JSON.")
-            return {**result, "output": with_note(output["output"], result),
-                    "truncated": result["truncated"] or output["truncated"], **extra}
+            return {**result, "output": with_note(shown, result), "truncated": result["truncated"] or shortened, **extra}
         finally:
             Path(filename).unlink(missing_ok=True)
 
