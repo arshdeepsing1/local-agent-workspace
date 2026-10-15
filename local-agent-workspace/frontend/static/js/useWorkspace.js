@@ -31,9 +31,12 @@ export function useWorkspace() {
   const [ready, setReady] = useState(false)
   const [storageProblems, setStorageProblems] = useState([])
   const [draftMode, setDraftMode] = useState('manual')
+  // The reasoning effort chosen in a new conversation before it exists (null: the Settings default).
+  const [draftEffort, setDraftEffort] = useState(null)
   // Unreviewed agent file changes of one conversation: { id, value: Changes }.
   const [changes, setChanges] = useState({ id: null, value: null })
   const changesPushed = useRef(0)
+  const childStates = useRef(new Map())  // Card event id -> its subagent and status, as last seen.
   // The selected conversation's tasks, pushed as { type: 'tasks', tasks }: { id, value: Task[] }.
   const [tasks, setTasks] = useState({ id: null, value: [] })
   // The saved project and user permission rules of one selection: { key, project, user, project_path, problem }.
@@ -50,7 +53,7 @@ export function useWorkspace() {
     const next = { id, key: id ? draftKeys.current.get(id) || id : crypto.randomUUID() }
     selected.current = next
     setSelection({ ...next }); setSession(null); setError(''); setOnline(true)
-    if (!id) setDraftMode('manual')
+    if (!id) { setDraftMode('manual'); setDraftEffort(null) }
     if (!fromHistory) updateUrl(id)
   }, [updateUrl])
   // message: '' when another notice (the storage notice) already explains why.
@@ -219,7 +222,15 @@ export function useWorkspace() {
         }
         if (data.type === 'changes') { changesPushed.current++; setChanges({ id: activeId, value: data.changes }) }
         if (data.type === 'tasks') setTasks({ id: activeId, value: data.tasks })
-        if (data.type === 'event' && data.event.child_session_id) void refreshSessions().catch(e => setError(e.message))
+        if (data.type === 'event' && data.event.child_session_id) {
+          // Parallel subagents update their cards with every action: refresh the sidebar only when a
+          // subagent appears or its status changes, not for each completed action.
+          const state = `${data.event.child_session_id}:${data.event.delegation?.status ?? ''}`
+          if (childStates.current.get(data.event.id) !== state) {
+            childStates.current.set(data.event.id, state)
+            void refreshSessions().catch(e => setError(e.message))
+          }
+        }
         if (data.type === 'event') setSession(current => {
           if (!current || current.id !== activeId) return current
           const event = data.event
@@ -231,6 +242,7 @@ export function useWorkspace() {
           if (current.events_start > 0 && current.events.length && event.created < current.events[0].created) return current
           return { ...current, events: [...current.events, event], events_total: (current.events_total ?? current.events.length) + 1 }
         })
+        if (data.type === 'reasoning_effort') setSession(current => current?.id === activeId ? { ...current, reasoning_effort: data.reasoning_effort } : current)
         if (data.type === 'meta') {
           const meta = { pinned: data.pinned, archived: data.archived, tags: data.tags }
           setSession(current => current?.id === activeId ? { ...current, ...meta } : current)
@@ -285,7 +297,7 @@ export function useWorkspace() {
       // pending default-model choice before capturing the creation settings.
       if (defaultModelSave.current) await defaultModelSave.current
       // Concurrent first actions in one draft share its creation request.
-      target.creating ||= api('/sessions', 'POST', { permission_mode: draftMode })
+      target.creating ||= api('/sessions', 'POST', { permission_mode: draftMode, ...(draftEffort ? { reasoning_effort: draftEffort } : {}) })
       let created
       try { created = await target.creating }
       catch (error) { target.creating = undefined; throw error }
@@ -308,7 +320,7 @@ export function useWorkspace() {
   const saveSettings = async next => {
     const { workspace, model, env_file, context_window, max_output_tokens, max_agent_steps, compaction_handoffs, approval_timeout_minutes,
       system_notifications, user_instructions, write_limit_kb, command_env, rate_limit_auto_continue, auto_keep_changes,
-      coding_dir, python_venv, auto_compact_percent } = next
+      coding_dir, python_venv, auto_compact_percent, reasoning_effort, reasoning_format, thinking_summaries } = next
     const saved = await api('/settings', 'PUT', {
       workspace, model, env_file, context_window, max_output_tokens, max_agent_steps,
       ...(typeof compaction_handoffs === 'boolean' ? { compaction_handoffs } : {}),
@@ -322,6 +334,9 @@ export function useWorkspace() {
       ...(typeof auto_keep_changes === 'boolean' ? { auto_keep_changes } : {}),
       ...(typeof coding_dir === 'string' ? { coding_dir } : {}),
       ...(typeof python_venv === 'string' ? { python_venv } : {}),
+      ...(typeof reasoning_effort === 'string' ? { reasoning_effort } : {}),
+      ...(typeof reasoning_format === 'string' ? { reasoning_format } : {}),
+      ...(typeof thinking_summaries === 'boolean' ? { thinking_summaries } : {}),
     })
     setSettings(saved)
     void checkConnection().catch(e => setError(e.message))
@@ -409,6 +424,38 @@ export function useWorkspace() {
     // Renaming never replaces live events/status or changes the selected chat.
     setSession(current => current?.id === id ? { ...current, title: updated.title } : current)
     return updated
+  }
+  // A chat's reasoning effort, also while it is busy: its next model request uses it. In a new conversation it is
+  // held here and sent when the chat is created. The picker shows a choice at once; choices made while one is
+  // saved are sent in turn, the latest last, and a failed save shows the chat's saved level again.
+  const effortSaves = useRef(new Map())  // selection key -> the latest level waiting to be sent, or null
+  const changeEffort = async reasoning_effort => {
+    const target = selected.current
+    const scope = target.key
+    if (!target.id && !target.creating) { setDraftEffort(reasoning_effort); return }
+    const show = (id, value) => {
+      if (selected.current === target) setSession(current => current?.id === id ? { ...current, reasoning_effort: value } : current)
+      setSessions(current => current.map(item => item.id === id ? { ...item, reasoning_effort: value } : item))
+    }
+    const id = target.id || (await target.creating).id
+    // The level the server has: before the first save, then each saved one, so a failed later save never undoes an earlier one.
+    let saved = session?.id === id ? session.reasoning_effort : undefined
+    show(id, reasoning_effort)
+    if (effortSaves.current.has(scope)) { effortSaves.current.set(scope, reasoning_effort); return }
+    effortSaves.current.set(scope, null)
+    let next = reasoning_effort
+    try {
+      while (next) {
+        const updated = await api(`/sessions/${encodeURIComponent(id)}/reasoning-effort`, 'PUT', { reasoning_effort: next })
+        saved = updated.reasoning_effort
+        next = effortSaves.current.get(scope)
+        effortSaves.current.set(scope, null)
+        if (!next) show(id, updated.reasoning_effort)
+      }
+    } catch (error) {
+      show(id, saved)
+      throw error
+    } finally { effortSaves.current.delete(scope) }
   }
   // options.confirm: the user confirmed switching to Bypass permissions (the server requires it).
   const setPermissionMode = async (permission_mode, options = {}) => {
@@ -547,6 +594,9 @@ export function useWorkspace() {
     runShell, askSide, removeQueued, sendQueued, loadMentionFiles, sideAnswer: sideAnswer.key === selection.key ? sideAnswer.value : null, dismissSide,
     modelSaving: modelSaves.has(selection.key) || (!activeId && defaultModelSave.current !== null),
     checkConnection, refreshSessions, permissionMode: activeSession?.permission_mode || draftMode, setPermissionMode, allowFolder, removeFolder,
+    // A chat saved without an effort, and a new conversation, use the Settings default.
+    reasoningEffort: (activeId ? activeSession?.reasoning_effort : draftEffort) || settings?.reasoning_effort || 'default',
+    changeEffort,
     loadEarlier, setMeta, searchConversations,
     rules: { chat: activeSession?.allow_rules || [], project: rulesHere?.project || [], user: rulesHere?.user || [],
       project_path: rulesHere?.project_path || null, problem: rulesHere?.problem || null },

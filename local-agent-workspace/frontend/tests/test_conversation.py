@@ -76,13 +76,12 @@ def test_copies_raw_user_and_assistant_text(ui, page):
 
 def test_reasoning_is_collapsed_and_separate_from_the_answer(ui, page):
     show(ui, """[{ id: 'reply', type: 'assistant', text: 'The answer is ready.', reasoning_summary: 'Provider considered **two approaches**.' }]""")
-    summary = page.get_by_text("Provider reasoning summary")
-    details = page.locator("details.reasoning-summary")
+    summary = page.get_by_text("Thought", exact=True)
+    details = page.locator("details.thinking")
     expect(details).not_to_have_attribute("open", "")
     expect(details.get_by_text("The answer is ready.")).to_have_count(0)
     summary.click()
     expect(details).to_have_attribute("open", "")
-    expect(details.get_by_text("Supplied by the model endpoint.")).to_be_visible()
     expect(details.locator("strong", has_text="two approaches")).to_be_visible()
     expect(page.get_by_text("The answer is ready.")).to_have_count(1)
     summary.click()
@@ -94,9 +93,9 @@ def test_ordinary_messages_have_no_invented_reasoning_or_activity(ui, page):
     show(ui, """[{ id: 'user', type: 'user', text: 'Please explain the parser.' },
       { id: 'reply', type: 'assistant', text: 'I considered two approaches. Here is the answer.' }]""")
     expect(page.get_by_text("I considered two approaches. Here is the answer.")).to_be_visible()
-    expect(page.get_by_text("Provider reasoning summary")).to_have_count(0)
+    expect(page.locator(".thinking, .thinking-line")).to_have_count(0)
     expect(page.get_by_text(re.compile("Activity ·"))).to_have_count(0)
-    expect(page.get_by_text("Summary display limit reached.")).to_have_count(0)
+    expect(page.get_by_text("Thinking display limit reached.")).to_have_count(0)
     expect(page.get_by_text(re.compile("Request details"))).to_have_count(0)
 
 
@@ -273,11 +272,11 @@ def test_usage_before_failure_is_marked_partial(ui, page):
 def test_reasoning_display_limit_notice(ui, page, truncated):
     show(ui, f"""[{{ id: 'reply', type: 'assistant', reasoning_summary: 'A provider-supplied partial summary.',
       reasoning_truncated: {json.dumps(truncated)} }}]""")
-    summary = page.get_by_text("Provider reasoning summary")
-    expect(page.locator("details.reasoning-summary")).not_to_have_attribute("open", "")
+    summary = page.get_by_text("Thought", exact=True)
+    expect(page.locator("details.thinking")).not_to_have_attribute("open", "")
     summary.click()
     expect(page.get_by_text("A provider-supplied partial summary.")).to_be_visible()
-    expect(page.get_by_text("Summary display limit reached.")).to_have_count(1 if truncated else 0)
+    expect(page.get_by_text("Thinking display limit reached.")).to_have_count(1 if truncated else 0)
 
 
 def test_activity_summary_counts_one_action_in_the_singular(ui, page):
@@ -522,8 +521,8 @@ def test_identifiers_hosts_and_code_blocks_are_not_linked(ui, page):
 def test_reasoning_summaries_and_conversations_without_a_handler_have_no_path_links(ui, page):
     show(ui, "[{ id: 'reply', type: 'assistant', text: 'See docs/guide.md.', reasoning_summary: 'Read src/app.py:3 first.' }]",
          ", onOpenPath: fake.spy('open')")
-    page.get_by_text("Provider reasoning summary").click()
-    expect(page.locator(".reasoning-summary a.path-link")).to_have_count(0)
+    page.get_by_text("Thought", exact=True).click()
+    expect(page.locator(".thinking a.path-link")).to_have_count(0)
     expect(page.locator(".markdown a.path-link")).to_have_count(1)
     ui.rerender("{ session: makeSession([{ id: 'other', type: 'assistant', text: 'See docs/other.md.' }]), onError: fake.spy('onError') }")
     expect(page.get_by_text("See docs/other.md.")).to_be_visible()
@@ -650,7 +649,7 @@ def test_markdown_table_cells_keep_code_whole_at_phone_width(ui, page):
     assert codes.evaluate_all("els => els.map(el => el.getClientRects().length)") == [1, 1]
     assert page.locator(".markdown table").evaluate("e => e.scrollWidth >= e.clientWidth")
     assert ui.js("document.documentElement.scrollWidth") <= 390
-    page.get_by_text("Provider reasoning summary").click()
+    page.get_by_text("Thought", exact=True).click()
     paragraphs = page.locator(".markdown p", has_text="The file is")
     expect(paragraphs).to_have_count(3)  # the reply, its reasoning summary and the plan
     for paragraph in paragraphs.all():
@@ -670,3 +669,58 @@ def test_a_phone_tool_card_shows_its_whole_subject(ui, page):
     assert subject.evaluate("e => e.scrollWidth <= e.clientWidth")
     heading = page.locator(".tool-card .tool-heading")
     assert heading.evaluate("e => e.lastElementChild.getBoundingClientRect().right <= e.getBoundingClientRect().right + 0.5")
+
+
+PARALLEL = """now => [
+  { id: 'd1', type: 'tool', name: 'delegate_task', call_id: 'c1', input: { task: 'Map the parser', agent_type: 'explore' },
+    state: 'running', child_session_id: 'child-1',
+    delegation: { status: 'running', completed_tools: 2, last_tool: 'read_file', agent_type: 'explore', started: now - 65 } },
+  { id: 'd2', type: 'tool', name: 'delegate_task', call_id: 'c2', input: { task: 'Fix the docs', agent_type: 'editor' },
+    state: 'completed', child_session_id: 'child-2',
+    delegation: { status: 'completed', completed_tools: 3, agent_type: 'editor', started: now - 100, ended: now - 40,
+      terminal_reason: 'completed' },
+    output: JSON.stringify({ child_session_id: 'child-2', agent_type: 'editor', status: 'completed',
+      output: '## Summary\\n\\nUpdated the install steps.', changed_files: ['README.md', 'docs/setup.md'], changed_files_total: 5,
+      steps_used: 3, tool_calls: 4, transcript: 'conversations/child-2.jsonl' }) },
+  { id: 'd3', type: 'tool', name: 'delegate_task', call_id: 'c3', input: { task: 'Check the tests' }, state: 'running',
+    delegation: { status: 'queued', completed_tools: 0, agent_type: 'general' } },
+]"""
+
+
+def test_parallel_subagents_have_their_own_cards_with_type_time_and_report(ui, page):
+    ui.mount("components/Conversation.js", f"""{{ session: makeSession(({PARALLEL})(Date.now() / 1000)),
+      onError: fake.spy('onError'), onSelectSession: fake.spy('select') }}""", setup=SETUP)
+    cards = page.locator(".tool-card")
+    expect(cards).to_have_count(3)
+    running, finished, queued = (cards.nth(index).get_by_label("Subagent progress") for index in range(3))
+    expect(running.locator(".delegation-status")).to_have_text("Subagent: running")
+    expect(running.locator(".delegation-type")).to_have_text("Explore")
+    expect(running).to_contain_text("2 completed actions")
+    expect(running).to_contain_text("Last tool: read file")
+    expect(running.locator(".delegation-elapsed")).to_have_text(re.compile(r"^1 min 0[5-7] s$"))
+    expect(running.locator(".delegation-elapsed")).to_have_text(re.compile(r"^1 min (0[6-9]|1\d) s$"))  # It keeps counting.
+    expect(running.locator(".delegation-report")).to_have_count(0)
+    expect(finished.locator(".delegation-type")).to_have_text("Editor")
+    expect(finished.locator(".delegation-elapsed")).to_have_text("1 min 00 s")
+    expect(finished).to_contain_text("Reason: completed")
+    report = finished.locator("details.delegation-report")
+    expect(report).not_to_have_attribute("open", "")
+    expect(report.get_by_role("heading", name="Summary")).to_be_hidden()
+    report.locator("summary").click()
+    expect(report.get_by_role("heading", name="Summary")).to_be_visible()
+    expect(report).to_contain_text("Updated the install steps.")
+    expect(report.locator(".delegation-files")).to_have_text("Files changed: README.md, docs/setup.md and 3 more")
+    expect(report.locator("small")).to_have_text("3 steps · 4 tool calls · Transcript: conversations/child-2.jsonl")
+    expect(queued.locator(".delegation-status")).to_have_text("Subagent: waiting for a free slot")
+    expect(queued.locator(".delegation-type")).to_have_text("General")
+    expect(queued.get_by_role("button", name="Open subagent")).to_have_count(0)
+    finished.get_by_role("button", name="Open subagent").click()
+    assert ui.spy("select") == [["child-2"]]
+
+
+def test_a_report_that_is_not_json_shows_no_report(ui, page):
+    show(ui, """[{ id: 'd', type: 'tool', name: 'delegate_task', input: { task: 'x' }, state: 'completed', child_session_id: 'c',
+      output: 'Subagents cannot delegate further tasks.', delegation: { status: 'failed', completed_tools: 0, terminal_reason: 'error' } }]""")
+    expect(page.get_by_label("Subagent progress")).to_contain_text("Subagent: failed")
+    expect(page.locator(".delegation-report")).to_have_count(0)
+    expect(page.locator(".delegation-elapsed")).to_have_count(0)  # Older progress has no start time.

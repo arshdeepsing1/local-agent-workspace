@@ -27,8 +27,10 @@ def needs_title(session, redact=None):
     if session.get("title_generated"):
         return False
     first = next((event.get("text", "") for event in session["events"] if event["type"] == "user"), "")
+    task = first.split("\n\n", 1)[0]  # A subagent's fallback title is its delegated task (agents.run).
     return bool(first) and session["title"] in {
         "New conversation", fallback_title(first), fallback_title(first, redact), first.replace("\n", " ")[:64],
+        fallback_title(task), fallback_title(task, redact),
     }
 
 

@@ -63,7 +63,8 @@ def test_shell_tiers(ui, page, width, height, opened):
     assert ui.js("document.documentElement.scrollWidth <= innerWidth")
     main = box(ui, ".main-area")
     assert main["width"] >= 360, main
-    in_flow = opened and ui.js("getComputedStyle(document.querySelector('.workspace-panel')).position") == "static"
+    # Docked panels are positioned relative (in the flow) for their resize handle; drawers are fixed.
+    in_flow = opened and ui.js("getComputedStyle(document.querySelector('.workspace-panel')).position") in ("static", "relative")
     if in_flow:
         assert main["width"] >= min(width, 420), main
     assert box(ui, ".conversation-title")["width"] >= 120

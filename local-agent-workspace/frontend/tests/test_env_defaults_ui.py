@@ -17,6 +17,16 @@ def settings_setup(**values):
     return f"fake.settings = {{ ...fake.settings, {body} }}"
 
 
+def choose_endpoint(dialog, name):
+    """Choose an endpoint in Settings: from the list, or typed after Other endpoint…."""
+    chooser = dialog.get_by_label("Databricks model endpoint")
+    if chooser.locator(f'option[value="{name}"]').count():
+        chooser.select_option(name)
+    else:
+        chooser.select_option(label="Other endpoint…")
+        dialog.get_by_role("textbox", name="Endpoint name").fill(name)
+
+
 def open_settings(ui, page, setup="", clock=False):
     ui.app(scenario="workspace", setup=setup, clock=clock)
     expect(page.get_by_role("combobox", name="Model")).to_be_visible()
@@ -87,10 +97,9 @@ def test_live_limits_follow_the_latest_values(ui, page):
     ui.tick(300)
     ui.wait("fake.requests('/api/settings/limits').length === 1")
     expect(dialog.get_by_text("No built-in limits for this endpoint.", exact=False)).to_be_visible()
-    endpoint = dialog.get_by_label("Databricks model endpoint")
     budget = dialog.get_by_label("Context budget (tokens)")
     output = dialog.get_by_label("Max output tokens per request")
-    endpoint.fill(OPUS)
+    choose_endpoint(dialog, OPUS)
     ui.tick(300)
     ui.wait("fake.requests('/api/settings/limits').length === 2")  # Held: answered later.
     budget.fill("300000")
@@ -119,39 +128,50 @@ def test_live_limits_follow_the_latest_values(ui, page):
 
 
 def test_the_recommended_defaults_button(ui, page):
+    # Reported: the button went away as soon as it was clicked, with no feedback. It stays, confirmed, and comes
+    # back when the values differ again.
     dialog = open_settings(ui, page, settings_setup(model=f"'{OPUS}'"))
-    button = dialog.get_by_role("button", name="Use Claude Opus 5.5 defaults (200,000 context, 16,384 output)")
-    expect(button).to_be_visible()
+    button = dialog.locator(".settings-recommended")
+    expect(button).to_have_accessible_name("Use Claude Opus 5.5 defaults (200,000 context, 16,384 output)")
     expect(dialog.get_by_text(re.compile("^Limits for Claude Opus 5.5 are Databricks's documented"))).to_be_visible()
     button.focus()
     page.keyboard.press("Enter")
     expect(dialog.get_by_label("Context budget (tokens)")).to_have_value("200000")
     expect(dialog.get_by_label("Max output tokens per request")).to_have_value("16384")
-    expect(button).to_have_count(0)
-    expect(dialog.get_by_label("Context budget (tokens)")).to_be_focused()  # Not lost with the removed button.
+    expect(button).to_have_accessible_name("Using Claude Opus 5.5 defaults (200,000 context, 16,384 output)")
+    expect(button).to_have_attribute("aria-disabled", "true")
+    expect(button).to_be_visible()
+    expect(button).to_be_focused()  # Still where you pressed it.
+    page.keyboard.press("Enter")  # Pressed again: nothing changes.
+    expect(dialog.get_by_label("Context budget (tokens)")).to_have_value("200000")
+    page.wait_for_timeout(400)  # The limits check after the change keeps it.
+    expect(button).to_have_accessible_name("Using Claude Opus 5.5 defaults (200,000 context, 16,384 output)")
+    dialog.get_by_label("Context budget (tokens)").fill("250000")
+    expect(button).to_have_accessible_name("Use Claude Opus 5.5 defaults (200,000 context, 16,384 output)")
+    expect(button).not_to_have_attribute("aria-disabled", "true")
 
 
 def test_budgets_at_the_defaults_follow_the_endpoint_field_as_save_does(ui, page):
     dialog = open_settings(ui, page)  # test-model at its defaults, 131,072 / 8,192.
-    endpoint = dialog.get_by_label("Databricks model endpoint")
     budget = dialog.get_by_label("Context budget (tokens)")
     output = dialog.get_by_label("Max output tokens per request")
-    endpoint.fill(OPUS)
+    choose_endpoint(dialog, OPUS)
     expect(budget).to_have_value("200000")
     expect(output).to_have_value("16384")
     expect(dialog.get_by_role("button", name=re.compile("^Use Claude Opus 5.5 defaults"))).to_have_count(0)
+    expect(dialog.get_by_role("button", name=re.compile("^Using Claude Opus 5.5 defaults"))).to_be_visible()
     expect(dialog.get_by_text("Current estimated input budget: 181,568 tokens.", exact=False)).to_be_visible()
-    endpoint.fill("test-model")  # The saved endpoint again: the saved budgets.
+    choose_endpoint(dialog, "test-model")  # The saved endpoint again: the saved budgets.
     expect(budget).to_have_value("131072")
     expect(output).to_have_value("8192")
-    endpoint.fill(OPUS)
+    choose_endpoint(dialog, OPUS)
     expect(output).to_have_value("16384")
     output.fill("12000")  # Edited: it stays; the context budget still follows.
-    endpoint.fill("other-endpoint")
+    choose_endpoint(dialog, "other-endpoint")
     expect(budget).to_have_value("131072")
     page.wait_for_timeout(400)
     expect(output).to_have_value("12000")
-    endpoint.fill(OPUS)
+    choose_endpoint(dialog, OPUS)
     expect(budget).to_have_value("200000")
     dialog.get_by_role("button", name="Save settings").click()
     expect(page.get_by_role("dialog")).to_have_count(0)
@@ -161,7 +181,7 @@ def test_budgets_at_the_defaults_follow_the_endpoint_field_as_save_does(ui, page
 
 def test_custom_budgets_do_not_follow_the_endpoint_field(ui, page):
     dialog = open_settings(ui, page, settings_setup(context_window="65536"))
-    dialog.get_by_label("Databricks model endpoint").fill(OPUS)
+    choose_endpoint(dialog, OPUS)
     ui.wait("fake.requests('/api/settings/limits').some(request => JSON.parse(request.body).model === 'databricks-claude-opus-5-5')")
     expect(dialog.get_by_role("button", name=re.compile("^Use Claude Opus 5.5 defaults"))).to_be_visible()
     expect(dialog.get_by_label("Context budget (tokens)")).to_have_value("65536")
@@ -203,7 +223,9 @@ def test_the_migration_note(ui, page):
         "The default model changed from GPT OSS 120B to Claude Opus 5.5, the app's new default. Claude Opus 5.5 costs "
         "more per token. To switch back, choose databricks-gpt-oss-120b here and save, or in the model picker of a new "
         "conversation (in an open conversation the picker changes only that conversation).")
-    expect(dialog.get_by_label("Databricks model endpoint")).to_have_attribute("placeholder", OPUS)
+    chooser = dialog.get_by_label("Databricks model endpoint")
+    expect(chooser).to_have_value(OPUS)
+    expect(chooser.locator("option:checked")).to_have_text(f"Claude Opus 5.5 · {OPUS}")
 
 
 def test_no_migration_note_without_a_migration(ui, page):

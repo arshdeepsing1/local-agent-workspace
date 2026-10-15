@@ -1,5 +1,5 @@
 import { html, useCallback, useEffect, useRef, useState } from '../lib.js'
-import { ArrowLeft, ChevronRight, Code2, File, FileDiff, Folder, GitBranch, Pencil, Plus, RefreshCw, Save, Terminal, X } from '../icons.js'
+import { ArrowLeft, ChevronRight, Code2, File, FileDiff, Folder, GitBranch, Maximize2, Minimize2, Pencil, Plus, RefreshCw, Save, Terminal, X } from '../icons.js'
 import { api } from '../api.js'
 import FileRoots, { standingFolder, useWorkspaceFolders } from './FileRoots.js'
 import TerminalPanel from './TerminalPanel.js'
@@ -125,6 +125,78 @@ function GitChanges({ query, workspace, busy, onOpenFile }) {
   </div>`
 }
 
+// The panel's width, set by dragging or with the keyboard on its left edge, and kept for this browser.
+// Phone screens (the panel covers the window) keep the stylesheet's width.
+const PANEL_WIDTH_KEY = 'workspace-panel-width'
+const PANEL_MIN = 320
+const PANEL_STEP = 32
+function savedWidth() {
+  try {
+    const value = Number(localStorage.getItem(PANEL_WIDTH_KEY))
+    return Number.isFinite(value) && value >= PANEL_MIN ? value : null
+  } catch { return null }
+}
+function saveWidth(value) {
+  try { if (value === null) localStorage.removeItem(PANEL_WIDTH_KEY); else localStorage.setItem(PANEL_WIDTH_KEY, String(Math.round(value))) } catch {}
+}
+// The widest the panel may be: docked, it leaves the chat column at least 420 px; over the chat (601 to
+// 1,023 px), it stops at the sidebar like the stylesheet's drawer (8 px from it).
+function widest() {
+  const docked = window.innerWidth >= 1024
+  const sidebar = window.innerWidth > 600 ? (document.querySelector('.app-shell > .sidebar')?.getBoundingClientRect().width || 0) : 0
+  return Math.max(PANEL_MIN, Math.floor(window.innerWidth - sidebar - (docked ? 420 : 8)))
+}
+export function usePanelWidth() {
+  const [width, setWidth] = useState(savedWidth)
+  const [limit, setLimit] = useState(() => widest())
+  useEffect(() => {
+    const resize = () => setLimit(widest())
+    window.addEventListener('resize', resize)
+    return () => window.removeEventListener('resize', resize)
+  }, [])
+  // keep false while dragging: the width is saved once, when the drag ends.
+  const set = (value, keep = true) => {
+    const next = value === null ? null : Math.min(Math.max(Math.round(value), PANEL_MIN), widest())
+    setWidth(next)
+    if (keep) saveWidth(next)
+  }
+  return { width: width === null ? null : Math.min(width, limit), limit, set }
+}
+
+function PanelResizer({ panel, width, limit, onWidth }) {
+  const drag = useRef(null)
+  const current = () => width ?? panel.current?.getBoundingClientRect().width ?? PANEL_MIN
+  const onPointerDown = event => {
+    if (event.button !== 0) return
+    event.preventDefault()
+    event.currentTarget.setPointerCapture(event.pointerId)
+    drag.current = { x: event.clientX, width: current() }
+    document.body.classList.add('panel-resizing')
+  }
+  const onPointerMove = event => {
+    if (!drag.current) return
+    drag.current.moved = drag.current.width + drag.current.x - event.clientX  // Dragging left widens the panel.
+    onWidth(drag.current.moved, false)
+  }
+  const end = () => {
+    if (drag.current?.moved !== undefined) onWidth(drag.current.moved)
+    drag.current = null
+    document.body.classList.remove('panel-resizing')
+  }
+  const onKeyDown = event => {
+    const step = event.shiftKey ? PANEL_STEP * 4 : PANEL_STEP
+    const next = { ArrowLeft: current() + step, ArrowRight: current() - step, Home: PANEL_MIN, End: limit }[event.key]
+    if (next !== undefined) { event.preventDefault(); onWidth(next) }
+    else if (event.key === 'Enter') { event.preventDefault(); onWidth(null) }
+  }
+  useEffect(() => end, [])
+  return html`<div class="panel-resizer" role="separator" aria-orientation="vertical" tabindex="0"
+    aria-label="Resize workspace panel" aria-valuemin=${PANEL_MIN} aria-valuemax=${limit} aria-valuenow=${Math.round(current())}
+    title="Drag to resize. Arrow keys resize, Enter or a double-click restores the default width."
+    onPointerDown=${onPointerDown} onPointerMove=${onPointerMove} onPointerUp=${end} onPointerCancel=${end} onLostPointerCapture=${end}
+    onDblClick=${() => onWidth(null)} onKeyDown=${onKeyDown} />`
+}
+
 // file: { id, path, content, original, mode?: 'edit'|'review' } | null; setFile accepts a value or an updater.
 // changes: the conversation's unreviewed agent changes (see ChangesBar); review: { path } opens
 // that file's changes once, then onReviewOpened() clears it; onReview(action, files) keeps or undoes;
@@ -134,8 +206,19 @@ function GitChanges({ query, workspace, busy, onOpenFile }) {
 // codingDir: Settings coding_dir_status (the default code folder, a root of Files in every chat);
 // pythonVenv: Settings python_venv_status (named in the Terminal).
 // open: { path, line? } opens that file in the editor once, at that line, then onOpened() clears it.
-export default function WorkspacePanel({ sessionId, workspace, allowedDirectories = [], codingDir = null, pythonVenv = null, file, setFile, onClose, onAttach, changes: agentChanges, busy, review, onReviewOpened, onReview, onSelectSession, onSendComments, open, onOpened }) {
+// worktree: the chat's worktree ({ branch, source_workspace }) or null; the header then names the project and branch.
+export default function WorkspacePanel({ sessionId, workspace, worktree = null, allowedDirectories = [], codingDir = null, pythonVenv = null, file, setFile, onClose, onAttach, changes: agentChanges, busy, review, onReviewOpened, onReview, onSelectSession, onSendComments, open, onOpened }) {
   const [tab, setTab] = useState('files')
+  const panel = useRef(null)
+  const sizing = usePanelWidth()
+  // The drawer's error alert (outside the panel) is as wide as the panel.
+  useEffect(() => {
+    const shell = panel.current?.closest('.app-shell')
+    if (!shell) return undefined
+    if (sizing.width === null) shell.style.removeProperty('--panel-width')
+    else shell.style.setProperty('--panel-width', `${sizing.width}px`)
+    return () => shell.style.removeProperty('--panel-width')
+  }, [sizing.width])
   // root '.' is the project; a granted or added folder is browsed by absolute paths and never above itself.
   const [root, setRoot] = useState('.')
   const [directory, setDirectory] = useState('.')
@@ -169,7 +252,16 @@ export default function WorkspacePanel({ sessionId, workspace, allowedDirectorie
   const editor = useRef(null)
   const pendingLine = useRef(null)
   const [lineMark, setLineMark] = useState(null)
-  const openFile = async (path, mode = changed.has(path) ? 'review' : 'edit', line) => {
+  // A path as a reply, a tool card or Git named it: relative to the project when inside it, without './'.
+  const normalize = requested => {
+    let value = String(requested || '').replace(/^(?:\.\/)+/, '')
+    const base = workspace.replace(/\/+$/, '')
+    if (base && value.startsWith(`${base}/`)) value = value.slice(base.length + 1)
+    return value || requested
+  }
+  const openFile = async (requested, chosen, line) => {
+    const path = normalize(requested)
+    const mode = chosen || (changed.has(path) ? 'review' : 'edit')
     if (file?.path === path && mode === 'review') { setFile({ ...file, mode }); return }  // Keeps an unsaved draft.
     if (dirty && !confirm('Discard your unsaved edits?')) return
     const request = ++openRequest.current
@@ -177,17 +269,22 @@ export default function WorkspacePanel({ sessionId, workspace, allowedDirectorie
     try {
       const result = await api(`/file?path=${encodeURIComponent(path)}&${query}`)
       if (request !== openRequest.current) return
+      // The server can find a file named from another folder (the project's own folder name first,
+      // or a worktree's source project); the editor then works on the file it found.
+      const opened = typeof result.path === 'string' && result.path ? result.path : path
       const id = crypto.randomUUID()
       pendingLine.current = line ? { id, line } : null
       setLineMark(null)
-      setFile({ id, path, content: result.content, original: result.content, mode, absolute: result.absolute })
+      setFile({ id, path: opened, content: result.content, original: result.content, absolute: result.absolute,
+        mode: mode === 'review' && !changed.has(opened) ? 'edit' : mode, ...(opened !== path ? { requested: path } : {}) })
     } catch (e) {
       if (request !== openRequest.current) return
       // A file the agent deleted, or that a command made unreadable, still has a review.
-      if (mode === 'review') setFile({ id: crypto.randomUUID(), path, content: '', original: '', mode, missing: true })
+      if (mode === 'review' || changed.has(path)) setFile({ id: crypto.randomUUID(), path, content: '', original: '', mode: 'review', missing: true })
       else setError(e.message)
     }
   }
+
   // Show the text editor again with the file as it is on disk, keeping an unsaved draft.
   const editFile = async (quiet = false) => {
     if (!file) return
@@ -235,6 +332,25 @@ export default function WorkspacePanel({ sessionId, workspace, allowedDirectorie
   }, [file?.id, tab, file?.mode])
   const leaveLine = () => { if (lineMark?.selected) setLineMark({ ...lineMark, selected: false }) }
   const markedLine = lineMark && lineMark.id === file?.id ? lineMark : null
+  // The agent changed the open file again after Keep or Undo: its review opens again. An editor without
+  // unsaved edits follows the agent's later edits. Only for the same file, once the changes list is known.
+  const pendingHash = pending?.current_hash || null
+  const lastPending = useRef({ path: file?.path, hash: pendingHash, known: !!agentChanges })
+  useEffect(() => {
+    const before = lastPending.current
+    lastPending.current = { path: file?.path, hash: pendingHash, known: !!agentChanges }
+    if (!file || dirty || !before.known || before.path !== file.path || before.hash === pendingHash || !pendingHash) return
+    if (!before.hash && file.mode !== 'review') setFile({ ...file, mode: 'review' })
+    else if (file.mode === 'edit') void editFile(true)
+  }, [file?.path, pendingHash, !!agentChanges])
+  // New or removed changed files can add or remove folders and files: list the folder again.
+  const changedKey = [...changed.keys()].sort().join('\n')
+  const listedKey = useRef(changedKey)
+  useEffect(() => {
+    if (listedKey.current === changedKey) return
+    listedKey.current = changedKey
+    if (tab === 'files' && !file) void refresh()
+  }, [changedKey])
   // Once a reviewed file is kept or undone, return to its current text.
   const reviewed = file?.mode === 'review' && agentChanges && !pending
   useEffect(() => { if (reviewed) void editFile(true) }, [reviewed])
@@ -249,9 +365,19 @@ export default function WorkspacePanel({ sessionId, workspace, allowedDirectorie
     finally { setLoading(false) }
   }
   const tabButton = (name, Icon, label) => html`<button class=${tab === name ? 'active' : ''} onClick=${() => setTab(name)}><${Icon} size=${15} />${label}</button>`
-  return html`<aside class="workspace-panel" aria-label="Workspace panel">
-    <header><div><h2>Workspace</h2><p title=${workspace}>${workspace.split('/').filter(Boolean).pop()}</p></div>
-      <button class="icon-button" aria-label="Close workspace" onClick=${onClose}><${X} size=${19} /></button></header>
+  const branch = typeof worktree?.branch === 'string' ? worktree.branch : ''
+  const project = (branch && typeof worktree.source_workspace === 'string' ? worktree.source_workspace : workspace)
+    .split('/').filter(Boolean).pop() || workspace
+  const expanded = sizing.width !== null && sizing.width >= sizing.limit
+  return html`<aside class=${`workspace-panel ${sizing.width !== null ? 'sized' : ''}`} aria-label="Workspace panel" ref=${panel}
+    style=${sizing.width !== null ? { '--panel-width': `${sizing.width}px` } : null}>
+    <${PanelResizer} panel=${panel} width=${sizing.width} limit=${sizing.limit} onWidth=${sizing.set} />
+    <header><div><h2>Workspace</h2><p class="workspace-project" title=${workspace}><span>${project}</span>
+        ${branch ? html`<span class="branch-badge" title=${`Worktree branch ${branch}`}><${GitBranch} size=${11} /><span>${branch}</span></span>` : null}</p></div>
+      <div class="workspace-header-actions">
+        <button class="icon-button panel-expand" aria-label=${expanded ? 'Restore workspace width' : 'Expand workspace'} title=${expanded ? 'Restore the default width' : 'Make the panel as wide as possible'}
+          onClick=${() => sizing.set(expanded ? null : sizing.limit)}>${expanded ? html`<${Minimize2} size=${16} />` : html`<${Maximize2} size=${16} />`}</button>
+        <button class="icon-button" aria-label="Close workspace" onClick=${onClose}><${X} size=${19} /></button></div></header>
     <nav class="workspace-tabs" aria-label="Workspace views">
       ${tabButton('files', Folder, 'Files')}${tabButton('changes', GitBranch, 'Changes')}${tabButton('terminal', Terminal, 'Terminal')}
     </nav>
@@ -269,6 +395,7 @@ export default function WorkspacePanel({ sessionId, workspace, allowedDirectorie
           onSendComments=${onSendComments} />` : html`
         <textarea ref=${editor} class="code-editor" aria-label=${`Edit ${file.path}`} value=${file.content} spellcheck=${false}
           onMouseDown=${leaveLine} onKeyDown=${leaveLine} onInput=${e => { leaveLine(); setFile({ ...file, content: e.currentTarget.value }) }} />
+        ${file.requested ? html`<p class="editor-note" role="status">Opened ${file.path}: the reply named it ${file.requested}.</p>` : null}
         <div class="editor-status"><span>${file.content.split('\n').length} lines${markedLine?.selected ? ` · Line ${markedLine.line}` : ''}</span><span>${dirty ? 'Unsaved changes' : 'Saved on disk'}</span></div>`}
       </div>` : html`<div class="file-browser">
         <${FileRoots} workspace=${workspace} root=${root} onChoose=${chooseRoot} granted=${allowedDirectories} folders=${added.folders} codingDir=${codingDir}

@@ -501,7 +501,9 @@ fake.override = (path, options) => {
     return fake.json(ruleSets(session_id))
   }
 }"""
-POSTS = "fake.calls.filter(call => call.method !== 'GET').map(call => [call.method, call.path])"
+# Changes only: the reasoning preview (POST /api/settings/reasoning) reads.
+POSTS = ("fake.calls.filter(call => call.method !== 'GET' && call.path !== '/api/settings/reasoning')"
+         ".map(call => [call.method, call.path])")
 
 
 def test_a_new_chat_removes_a_project_rule_through_the_chat_it_creates(ui, page):
@@ -710,7 +712,7 @@ def open_tools(ui, page, selected="session()"):
 def test_the_tools_tab_loads_toggles_and_saves(ui, page):
     tools = open_tools(ui, page)
     tabs = page.get_by_role("navigation", name="Agent tools sections").get_by_role("button").all_inner_texts()
-    assert tabs.index("Tools") == tabs.index("Extensions") + 1
+    assert tabs == ["Overview", "Tasks", "Subagents", "Tools", "Usage", "Export", "Checkpoints", "Verify", "Worktrees", "Extensions"]
     expect(tools).to_contain_text("Turned-off tools are not offered to the agent in this chat, and calls to them are refused. "
                                   "Changes apply from the agent's next step. Subagents, forks and imports keep this setting.")
     # Each checkbox is named by its tool alone; the description describes it.

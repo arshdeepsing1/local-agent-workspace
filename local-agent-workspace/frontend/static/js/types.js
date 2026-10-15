@@ -13,7 +13,19 @@
 //   default_model (the app's default endpoint),
 //   default_limits: { context_window, max_output_tokens } (the saved model's defaults; budgets equal to them
 //     follow a model change), model_migrated_from? (set while a legacy settings file at the old default
-//   model is moved at load; cleared by the next save, which writes settings_version 2) }
+//   model is moved at load; cleared by the next save, which writes settings_version 2),
+//   reasoning_effort: Effort (new chats' level, default 'default'), reasoning_format: 'auto'|'anthropic'|'openai'|'none'
+//   (how agent requests ask for it; 'auto' = per endpoint), thinking_summaries: boolean (thinking.display 'summarized'
+//   for adaptive Claude endpoints; default true), endpoint_profiles: [{ model, label }] (endpoints with built-in facts) }
+// Effort: 'default' (no effort field: the endpoint's own) | 'low' (labelled Fast) | 'medium' | 'high' | 'xhigh' (Extra
+//   high) | 'max'. Labels: types.js EFFORT_LABELS.
+// POST /settings/reasoning { model, reasoning_effort?, reasoning_format?, thinking_summaries? } -> ReasoningPreview:
+//   { model, label (profile label or null), verified (false: no profile; every level offered, fields unverified),
+//     format (the one requests use: 'anthropic'|'openai'|'none'), format_setting, endpoint_format, default_effort,
+//     default_label ('Medium', 'no thinking' or null), levels: [{ value: Effort, label ('Default (Medium)'), sent (the level
+//     sent, or null), note? ('sent as High') }], effort, sent_effort?, effort_field? ('output_config.effort' |
+//     'reasoning_effort'), fields (the exact top-level JSON added to agent requests), skipped?: 'rejected_earlier',
+//     rejected_field?, notes: string[] }. Computed by the server's request builder (backend reasoning.py).
 // GET /settings -> Settings (the folder states checked again). PUT /settings { ...editable fields } -> Settings.
 // POST /settings/limits { model, context_window, max_output_tokens } -> LimitsCheck:
 //   { profile: { label, context_max, output_max, itpm, otpm, recommended_context_window,
@@ -32,10 +44,17 @@
 //   permission_mode: 'manual'|'auto'|'acceptEdits'|'dontAsk'|'plan'|'bypassPermissions', allowed_directories,
 //   allow_rules: Rule[] (this chat's rules), disabled_tools?: string[] (turned-off tools), context_info?, active_skills?,
 //   parent_session_id?, is_subagent?, delegation?, tool_profile?, subagent_tool_profile?,
+//   agent_type?: 'explore'|'general'|'editor' (a subagent), subagents?: SubagentEntry[] (a parent's index of its
+//   subagent chats; left out of GET /sessions list items),
 //   terminal_reason?: how the last turn ended: 'completed'|'stopped'|'error'|'inference_error'|
 //   'tool_error'|'step_limit'|'interrupted' (also in the /api/sessions summaries),
 //   turn_ended?: epoch seconds when the last turn ended; null while a turn runs (also in summaries),
-//   turn_delegated?: true while the last turn is one a parent's delegate_task started (also in summaries) }
+//   turn_delegated?: true while the last turn is one a parent's delegate_task started (also in summaries),
+//   reasoning_effort?: Effort (the chat's own level, saved in its header; absent on chats saved before it existed,
+//   which use Settings.reasoning_effort; kept by forks and imports; also in summaries) }
+// POST /sessions { permission_mode, reasoning_effort? } creates a chat (Settings' effort when absent).
+// PUT /sessions/<id>/reasoning-effort { reasoning_effort } -> Session, also while busy: the agent's next model request
+//   (and a running subagent's) uses it. Pushed as { type: 'reasoning_effort', reasoning_effort }.
 //   GET /sessions list items omit events and allow_rules, and add unreviewed_changes (files with agent
 //   changes not yet kept or undone, including rows rolled up from its subagents).
 //   pinned?, archived? (hidden in the sidebar; wins over pinned), tags?: string[] (at most 10, 1-32 characters),
@@ -83,8 +102,12 @@
 //   turn_ended, when a parent's delegate_task started that turn) }
 // /api/presence: a WebSocket (same protocols as the stream) each page holds open; no messages.
 // AgentEvent: { id, type: 'user'|'assistant'|'tool'|'notice'|'error', text?,
-//   reasoning_summary?, reasoning_truncated?, child_session_id?, request_info?,
+//   reasoning_summary? (the reply's thinking text the endpoint returned, redacted, at most 12,000 characters),
+//   reasoning_truncated?, reasoning_started? (epoch seconds when its thinking began), reasoning_seconds? (how long it
+//   thought: until answer text or a tool call began, or the response ended; also set when the endpoint reported
+//   reasoning tokens without text), child_session_id?, request_info?,
 //   name?, input?, output?, preview?, state?, delegation?, origin?,
+//   (delegation: Delegation, on a delegate_task card or a notice with child_session_id),
 //   approval?: 'approved'|'declined'|'expired'|'blocked', approval_expires? (epoch seconds, only with a limit),
 //   decline_note? (the user's note sent with Decline), allowed_by_rule? (true: ran by a Rule, no card),
 //   rule_scope?: 'chat'|'project'|'user' (with allowed_by_rule), read_only_command? (true: ran from the fixed
@@ -110,6 +133,13 @@
 //   when the turn failed before that; absent on older events), steered? (true: sent while the agent was
 //   working) and attachments?: Attachment[]. The 'Stopped.' notice carries stop_phase?: 'streaming'|'tools'|'waiting'.
 //   A compaction's notice carries compaction?: Compaction (one notice per compaction).
+// Delegation: { status: 'queued'|'running'|'awaiting_approval'|...|'completed'|'failed'|'cancelled'|'interrupted',
+//   completed_tools, last_tool?, terminal_reason?, agent_type?, started?, ended? (epoch seconds) }. A finished
+//   delegate_task card's output is the JSON result { child_session_id, agent_type, tool_profile, status,
+//   terminal_reason, steps_used, tool_calls, changed_files, changed_files_total?, transcript, output }.
+// SubagentEntry: { id, task (200 characters), agent_type, status, created, ended, transcript ('conversations/<id>.jsonl'
+//   in the state folder, null once deleted), steps_used?, tool_calls?, deleted? }.
+// GET /sessions/<id>/children -> list items of its subagent chats, each with status, transcript and subagent?: SubagentEntry.
 // Attachment (metadata only, never content): { kind: 'file', path, start_line, end_line, truncated? }
 //   | { kind: 'shell', command (at most 2,000 characters), exit_code }
 // RewindPreview (GET /sessions/<id>/rewind-preview?before_event_id=<user event id>; read-only, also while busy):
@@ -127,7 +157,9 @@
 // ApiError: { message, status, detail? }. A 409 that a busy chat causes has
 //   detail { message, session_id, title } naming that chat; other errors have no detail.
 // RequestInfo: { model, status, finish_reason?, http_status?, error_kind?, usage?,
-//   rate_limit?: { limit_type, limit?, current?, retry_after? } (only on a final, not retried, 429) }.
+//   rate_limit?: { limit_type, limit?, current?, retry_after? } (only on a final, not retried, 429),
+//   reasoning?: { effort, format, fields, sent_effort?, effort_field?, skipped?: 'rejected'|'rejected_earlier',
+//   rejected_field? } (absent when the request was at Default and sent nothing) }.
 //   error_kind includes 'rate_limit', 'payload_too_large' (over the 4 MB request limit; not sent) and
 //   'output_tokens_over_limit' (Max output tokens above the endpoint's reported OTPM limit).
 // ContextInfo: { estimated_tokens, input_budget, context_window, reply_reserve,
@@ -157,7 +189,8 @@
 //   treats it as current only while compactions and input_budget match the session's, and the model too once a
 //   request to another model has been prepared (estimated_tokens no longer the report's).
 // Metrics (GET /sessions/<id>/metrics): { scope, session_id, complete, totals, calls, by_purpose, by_model,
-//   pricing, last_input: LastRequest | null }
+//   pricing, last_input: LastRequest | null }. A call has effort?, effort_field? and reasoning_skipped? like
+//   RequestInfo.reasoning; retry_reason 'reasoning_rejected' marks the resend without reasoning fields.
 // Job: { id, session_id, workspace, command, state, created, updated, exit_code,
 //   output?, truncated, timeout_seconds, max_output_bytes, background,
 //   without_shell? (true: ran from an argument vector without a shell) }
@@ -197,6 +230,9 @@
 //   session optional): the project's folders added to Files, view only (the agent's access is
 //   unchanged). { workspace (absolute project path), folders: [{ path (absolute), missing: boolean }],
 //   added? (POST only: the resolved path of the folder just added, or already listed) }
+
+// Reasoning effort levels (backend reasoning.EFFORT_LEVELS) and their labels.
+export const EFFORT_LABELS = { default: 'Default', low: 'Fast', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Max' }
 
 export function modelLabel(model) {
   return model.replace(/^databricks-/, '').replace(/^system\.ai\./, '')

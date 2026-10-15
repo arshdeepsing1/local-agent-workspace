@@ -13,7 +13,8 @@ import httpx
 
 from .tools import TOOL_DEFINITIONS, WorkspaceTools, file_error
 from .jobs import (CREDENTIAL_ENV, DENIED_ENV, DENIED_ENV_PREFIXES, ENVIRONMENT_KEYS, ENVIRONMENT_NAME, HEAD_CHARS,
-                   JOB_NOTICE_STATES, MIN_HEAD_CHARS, TAIL_CHARS, job_command, job_ending, until_pattern, wait_page)
+                   DEFAULT_WAIT_SECONDS, JOB_NOTICE_STATES, MIN_HEAD_CHARS, TAIL_CHARS, job_command, job_ending,
+                   job_runtime, suggested_wait, until_pattern, wait_page)
 from .tools import read_page_bytes
 from .permissions import MODE_LABELS, SCOPE_NAMES, denied_tools, evaluate, log, mode_prompt
 from .rules import (APP_ROOT, RuleStore, card_rule_options, default_rule, normalize_rule, project_key, protected_reason,
@@ -43,11 +44,12 @@ from .worktrees import WorktreeManager
 from .extensions import ExtensionManager
 from .extensions import skill_index
 from .context import estimate_text_tokens
-from .planning import TaskManager, DelegateManager
+from .planning import DEFAULT_STEPS, PROFILE_TYPES, CallAllowance, DelegateManager, DelegationGate, TaskManager
 from .interactions import InteractionManager
 from .feature_tools import FEATURE_TOOLS
 from .tool_profiles import tool_allowed, filter_tools
-from .reasoning import reasoning_summary
+from . import reasoning
+from .reasoning import reasoning_delta
 from .titles import fallback_title, generate_title, needs_title
 from .telemetry import (
     InferenceError, begin_inference_call, finish_inference_call, http_error_kind,
@@ -108,6 +110,7 @@ MAX_RATE_LIMIT_WAITS = 2  # Extra waits per turn after the retries, when Setting
 # A request still running near Databricks' execution limit gets one notice per turn.
 EXECUTION_NOTICE_MARGIN = 10
 request_clock = time.monotonic  # Request durations (tests replace it, never time.monotonic itself).
+thinking_clock = time.monotonic  # How long a reply thought (the Thinking block); tests replace it.
 MAX_REPAIR_RETRIES = 2
 # Failures answered with a hidden continuation, and its text.
 UNANSWERED_CONTINUATION = "[No reply: the request after this message failed or was stopped.]"
@@ -267,7 +270,7 @@ selected permission mode and shows any needed approval controls. Do not ask for 
 chat before issuing a tool call. If an approval is denied, respect the decision.
 Commands default to a 60-second timeout; choose timeout_seconds up to 3600 if needed.
 Use background=true for a managed job that must outlive this turn, never shell '&' or daemon detachment.
-Use list_jobs/get_job_output to inspect jobs, wait_job to wait until a background job finishes or prints a line you expect, and stop_job to terminate them. A failed command's first result shows the start and the end of its retained output. Use find_files to locate files by name. Background jobs
+Use list_jobs/get_job_output to inspect jobs, wait_job to wait until a background job finishes or prints a line you expect, and stop_job to terminate them. Size each wait to the job: wait_job returns as soon as the job ends, so for a quick build or test wait about as long as it should take (a few seconds to a minute), use until_regex for a server's ready line, idle_seconds when output stops once it is ready, and follow next_wait_seconds or expected_seconds (earlier runs of the same command) instead of always waiting the maximum. A failed command's first result shows the start and the end of its retained output. Use find_files to locate files by name. Background jobs
 continue after this turn is stopped and end on explicit job Stop, timeout, or app shutdown.
 Read files in numbered line ranges and follow next_line; paginate searches and job output instead of
 requesting huge results. The results of one response share a context allowance: prefer a few large reads per
@@ -286,9 +289,14 @@ asked about CSV files. When a listed skill fits the task, load it with use_skill
 A user message that contains /<skill-id> as a word (or starts with /skill <skill-id>) has
 selected that skill, and its instructions are included here: follow them, treating the rest
 of the message as the request.
-Record multi-step work with create_task/update_task; keep status truthful. Delegate only a
-concrete independent task, supplying its needed context. Subagents share files, so avoid
-concurrent conflicting edits. Open the child conversation to approve its pending actions.
+Record multi-step work with create_task/update_task; keep status truthful.
+Use delegate_task to keep this context small: give a subagent broad codebase exploration, reading
+many or large files, wide searches, running a long command and summarizing its output, or an
+independent investigation; only its short report comes back. Do a single small lookup, or work
+that needs this conversation's back-and-forth, yourself. A subagent sees nothing of this chat:
+state the full task, constraints, paths and the report you expect. agent_type explore is read-only
+(investigation), editor edits files, general has this chat's tools. Independent delegations can
+run in parallel as several delegate_task calls in one response; never split edits that could conflict.
 MCP tools and configured hooks require separate approval except in Bypass; Plan blocks them.
 Prefer surgical edits. Don't modify unrelated files.
 """
@@ -668,6 +676,14 @@ def card_answers(events, call_id, output):
     return False
 
 
+def parallel_run(calls, start):
+    """How many calls from start run together: a run of consecutive delegate_task calls, else 1."""
+    end = start
+    while end < len(calls) and calls[end]["function"]["name"] == "delegate_task":
+        end += 1
+    return max(1, end - start)
+
+
 def unanswered(event, declined):
     """The model-facing result of an approval that was declined, blocked or never answered."""
     if event.get("approval") == "blocked":
@@ -731,6 +747,9 @@ class AgentManager:
         self.extension_connections = {}
         self.notifier = SystemNotifier()
         self.closing = False
+        # In memory only: {(endpoint, request format): field} for reasoning fields Databricks rejected
+        # with HTTP 400. Requests to that endpoint go without them until a restart or a Settings save.
+        self.reasoning_rejections = {}
         # The lifespan writes the marker after every task and job stopped. It is removed before
         # anything else, so a crash during this run gives a full scan next time. Without it (a
         # crash, a failed shutdown, a fresh or older state folder) every conversation is loaded.
@@ -793,6 +812,11 @@ class AgentManager:
             if event.get("request_info", {}).get("status") == "running":
                 event["request_info"].update(status="interrupted", error_kind="incomplete_response")
                 changed = cut_short = True
+            progress = event.get("delegation")
+            if isinstance(progress, dict) and not progress.get("terminal_reason") and not event.get("child_session_id"):
+                # Still waiting for a subagent slot: no child exists whose recovery would close it.
+                event["delegation"] = {**progress, "status": "interrupted", "terminal_reason": "interrupted"}
+                changed = True
         if cut_short:
             session["terminal_reason"] = "interrupted"  # Continue is offered; notifications report it.
             newest = next((event for event in reversed(session["events"]) if event.get("type") == "user"), None)
@@ -1280,6 +1304,13 @@ class AgentManager:
                 await self.track_shell_changes(session, tracker)
             else:
                 job = self.jobs.get(job["id"])
+                expected = self.jobs.expected_seconds(job)
+                if expected is not None and job["state"] == "running":
+                    # So the first wait_job can be about as long as the job needs, not a guess.
+                    page = self.first_page(job)
+                    page.update(expected_seconds=round(expected, 1),
+                                next_wait_seconds=suggested_wait(expected, job_runtime(job)))
+                    return page
             return self.first_page(job)
         except asyncio.CancelledError:
             if not job["background"]:
@@ -1747,10 +1778,9 @@ class AgentManager:
             raise ValueError("This action cannot be edited.")
         await reviser(changes)
 
-    def active_child(self, session):
-        entry = self.delegates.active.get(session["id"])
-        child = self.get(entry["child_session_id"]) if entry else None
-        return child if child is not None and child is not session else None
+    def active_children(self, session):
+        """The chat's running subagents (several when it delegated in parallel)."""
+        return [child for child in self.delegates.active_children(session["id"]) if child is not session]
 
     async def change_mode(self, session, mode, *, notice=True):
         """Switch the permission mode at any time; waiting cards and a running subagent follow."""
@@ -1766,8 +1796,7 @@ class AgentManager:
         interactions = getattr(self, "interactions", None)
         if interactions is not None:
             await interactions.mode_changed(session, old, mode)
-        child = self.active_child(session)
-        if child is not None:
+        for child in self.active_children(session):
             await self.change_mode(child, mode, notice=notice)
 
     async def set_disabled_tools(self, session, names):
@@ -1776,16 +1805,39 @@ class AgentManager:
         self.store.save(session)
         await self.publish_permissions(session)
         await self.recheck_pending(session, "tools")
-        child = self.active_child(session)
-        if child is not None:
+        for child in self.active_children(session):
             await self.set_disabled_tools(child, names)
+
+    async def change_effort(self, session, effort):
+        """Set the chat's reasoning effort; its next model request (and a running subagent's) uses it."""
+        if session.get("reasoning_effort") == effort:
+            return
+        session["reasoning_effort"] = effort
+        self.store.save(session)
+        await self.broadcast(session["id"], {"type": "reasoning_effort", "reasoning_effort": effort})
+        if busy_status(self, session["id"]) != "idle" and not session.get("is_subagent"):
+            await self.event(session, "notice", text=f"Reasoning effort changed to {reasoning.EFFORT_LABELS[effort]}. "
+                             "It applies from the agent's next model request.")
+        for child in self.active_children(session):
+            await self.change_effort(child, effort)
+
+    def reasoning_request(self, session):
+        """The reasoning fields the chat's next agent request carries (reasoning.effort_request): the
+        chat's own effort, or the Settings default for a chat saved without one (subagents too)."""
+        values = self.settings.values
+        effort = reasoning.valid_effort(session.get("reasoning_effort")) or reasoning.valid_effort(
+            values.get("reasoning_effort")) or reasoning.DEFAULT_EFFORT
+        setting = values.get("reasoning_format")
+        setting = setting if setting in reasoning.REQUEST_FORMATS else reasoning.DEFAULT_FORMAT
+        model = session["model"]
+        rejected = self.reasoning_rejections.get((model, reasoning.request_format(model, setting)))
+        return reasoning.effort_request(model, effort, setting, values.get("thinking_summaries") is not False, rejected)
 
     async def rules_changed(self, scope, session=None):
         """Publish and re-check after a rule change: the chat, every live chat of the project, or every live chat."""
         if scope == "chat":
             affected = [session] if session is not None else []
-            child = self.active_child(session) if session is not None else None
-            if child is not None:
+            for child in self.active_children(session) if session is not None else ():
                 # A running subagent copied the chat's rules when it started; new deny and ask rules reach it too.
                 rules = child.setdefault("allow_rules", [])
                 added = [rule for rule in session.get("allow_rules") or [] if rule.get("behavior") in ("deny", "ask")
@@ -2280,7 +2332,8 @@ class AgentManager:
             await self.status(session, "running")
             await self.event(session, "user", text=prompt, **origin, **({"attachments": attachments} if attachments else {}))
             if session["title"] == "New conversation" and not session.get("title_generated"):
-                session["title"] = fallback_title(prompt, self.redact_title)
+                # A delegated prompt is named by its task (the first paragraph), not the instructions after it.
+                session["title"] = fallback_title(prompt.split("\n\n", 1)[0] if origin else prompt, self.redact_title)
                 self.store.save(session)
                 await self.broadcast(session["id"], {"type": "title", "title": session["title"]})
             # content (the message with its attachments) is passed only when it differs from the prompt.
@@ -2369,10 +2422,51 @@ class AgentManager:
             except STORAGE_ERRORS as exc:
                 await report_storage_failure(exc)
 
-    async def execute_tool(self, session, tools, name, arguments, call_id, origin=None, allowance=None):
+    async def run_delegations(self, session, tools, calls, values, allowance):
+        """Consecutive delegate_task calls of one response, run in parallel; their outputs in call
+        order. Each call is prepared in call order (checks, approval card, hooks), so cards come
+        one at a time; then every prepared delegation starts together (DelegateManager still runs
+        at most three subagents at once; the others wait for a slot). Results are finished one at
+        a time as the subagents end, each charged once to the response's allowance."""
+        lock = asyncio.Lock()
+        gates = [DelegationGate(lock) for _ in calls]
+        shares = [CallAllowance(allowance) for _ in calls]
+        tasks = []
+        try:
+            for call, arguments, gate, share in zip(calls, values, gates, shares):
+                task = asyncio.create_task(self.execute_tool(session, tools, call["function"]["name"], arguments,
+                                                             call["id"], allowance=share, gate=gate))
+                task.add_done_callback(gate.finished)
+                tasks.append(task)
+                # Prepared (waiting at the gate) or finished early (refused, declined, invalid).
+                await asyncio.wait((task, gate.ready), return_when=asyncio.FIRST_COMPLETED)
+                if task.done():
+                    task.result()  # An unexpected error ends the turn, as it does for one call.
+            delegating = any(gate.ready.done() for gate in gates)
+            if delegating:
+                await self.status(session, "delegating")
+            try:
+                for gate in gates:
+                    gate.go.set()
+                outputs = await asyncio.gather(*tasks)
+            finally:
+                if delegating:
+                    await self.status(session, "running")
+            for output, share in zip(outputs, shares):
+                if not share.settled:
+                    share.charge(output)  # A refusal or another early return is sent too.
+            return outputs
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+    async def execute_tool(self, session, tools, name, arguments, call_id, origin=None, allowance=None, gate=None):
         """Run one tool call and return what the model receives. allowance (a ResultAllowance) is
         the context the results of the current model response may still use: a read that does not
-        fit is withheld (the model may ask again), other results are shortened."""
+        fit is withheld (the model may ask again), other results are shortened. gate (a
+        planning.DelegationGate): a delegate_task call that runs in parallel with others (run_delegations)."""
         event = await self.event(session, "tool", name=name, input=arguments, call_id=call_id, state="running", output="",
                                  **({"verify": True} if origin == "verify" else {}))
         invoked = False
@@ -2414,7 +2508,9 @@ class AgentManager:
             carded = False  # An "ask" verdict must have shown a card before anything runs.
             if name in ("delegate_task", "stop_job") and verdict.decision == "ask":
                 if name == "delegate_task":
-                    preview = (f"Start a subagent (separate paid model requests, at most {arguments.get('max_steps', 6)} steps)"
+                    kind = arguments.get("agent_type") or PROFILE_TYPES.get(arguments.get("tool_profile"), "general")
+                    preview = (f"Start a subagent ({kind}; separate paid model requests, at most "
+                               f"{arguments.get('max_steps', DEFAULT_STEPS)} steps)"
                                f"\n\nTask: {arguments['task']}"
                                + (f"\nContext: {arguments['context']}" if arguments.get("context") else "")
                                + (f"\nTool profile: {arguments['tool_profile']}" if arguments.get("tool_profile") else ""))
@@ -2637,11 +2733,29 @@ class AgentManager:
             elif name in ("ask_user", "submit_plan"):
                 result = await self.interactions.handle(session, event, name, arguments)
             elif name == "delegate_task":
-                await self.status(session, "delegating")
-                try:
-                    result = await self.delegates.delegate(session, **arguments, parent_event=event)
-                finally:
-                    await self.status(session, "running")
+                def still_allowed():
+                    """After a wait for a free slot: the chat may have turned the tool off, added a deny
+                    rule or switched to a mode that asks while this delegation waited."""
+                    if not tool_allowed(session, name):
+                        return "delegate_task was turned off in this chat while the subagent waited for a free slot. It did not start."
+                    now = self.permission(session, tools, name, arguments)
+                    if now.decision == "deny":
+                        return now.message
+                    if now.decision == "ask" and not carded:
+                        return ("The permission mode or rules changed while the subagent waited for a free slot, and "
+                                "starting it now needs approval. It did not start; delegate again to ask.")
+                    return None
+
+                def start():
+                    return self.delegates.delegate(session, **arguments, parent_event=event, recheck=still_allowed)
+                if gate is not None:
+                    result = await gate.run(start)  # run_delegations sets the chat's status.
+                else:
+                    await self.status(session, "delegating")
+                    try:
+                        result = await start()
+                    finally:
+                        await self.status(session, "running")
             elif name == "run_command":
                 if verdict.argv is not None and verdict.decision == "allow":
                     result = await self.command_tool(session, event, arguments, argv=list(verdict.argv),
@@ -2663,9 +2777,14 @@ class AgentManager:
                     result["jobs"].append(item)
             elif name == "wait_job":
                 job = self.session_job(session, arguments["job_id"])
-                timeout = arguments.get("timeout_seconds", 60)
+                # Without timeout_seconds, an earlier run of the same command says how long to wait.
+                expected = self.jobs.expected_seconds(job)
+                timeout = arguments.get("timeout_seconds", suggested_wait(expected, job_runtime(job)) or DEFAULT_WAIT_SECONDS)
                 if type(timeout) is not int or not 1 <= timeout <= 300:
                     raise ValueError("timeout_seconds must be an integer from 1 to 300.")
+                idle = arguments.get("idle_seconds")
+                if idle is not None and (type(idle) is not int or not 1 <= idle <= 300):
+                    raise ValueError("idle_seconds must be an integer from 1 to 300.")
                 total = len(job["output"])
                 last = self.__dict__.get("_job_seen", {}).get(job["id"], (0, False))[0]
                 start = arguments.get("from_offset", min(last, total))
@@ -2674,8 +2793,18 @@ class AgentManager:
                 if start > total:
                     raise ValueError(f"from_offset is beyond the job output ({total:,} characters).")
                 pattern = until_pattern(arguments["until_regex"]) if "until_regex" in arguments else None
-                job, reason, match = await self.jobs.watch(job["id"], start, pattern, timeout)
-                result = wait_page(job, reason, match, start)
+                began = time.monotonic()
+                job, reason, match = await self.jobs.watch(job["id"], start, pattern, timeout, idle=idle)
+                waited = time.monotonic() - began
+                elapsed = job_runtime(job)
+                timing = {"elapsed_seconds": round(elapsed, 1), "timeout_seconds": timeout,
+                          "waited_seconds": round(waited, 1)}
+                if expected is not None:
+                    timing["expected_seconds"] = round(expected, 1)
+                if job["state"] == "running" and reason in ("timeout", "idle"):
+                    # From what this wait took, so a wait that ended early does not suggest a long one.
+                    timing["next_wait_seconds"] = suggested_wait(expected, elapsed, max(1, round(waited)))
+                result = wait_page(job, reason, match, start, extra=timing)
                 self.job_seen(job)
             elif name in ("get_job_output", "stop_job"):
                 job = self.session_job(session, arguments["job_id"])
@@ -3485,12 +3614,18 @@ class AgentManager:
             self.store.forget_encodings(session["id"])
             await self.status(session, "idle")
 
-    async def model_response(self, session, event, client, url, headers, payload, retry_reason=None, body=None):
+    async def model_response(self, session, event, client, url, headers, payload, retry_reason=None, body=None,
+                             effort=None):
         """One streamed agent request. retry_reason (ledger only) names why the app sent it automatically.
-        body is payload already encoded (request_limits.encode_payload); those exact bytes are sent."""
+        body is payload already encoded (request_limits.encode_payload); those exact bytes are sent.
+        effort is the request's reasoning (AgentManager.reasoning_request), recorded in request_info and
+        the ledger; a 400 that names one of its fields marks the error with reasoning_rejected."""
         body = encode_payload(payload) if body is None else body
         started = request_clock()
         info = dict(event["request_info"])
+        # Recorded unless the request is the plain default (no effort chosen, nothing sent or skipped).
+        if effort is not None and not reasoning.plain_default(effort):
+            info["reasoning"] = reasoning.request_record(effort)
         event["request_info"] = info
         attempt = 1 + sum(
             isinstance(item, dict) and item.get("event_id") == event["id"]
@@ -3502,11 +3637,35 @@ class AgentManager:
             estimated_input_tokens=(estimate_tokens(messages, payload.get("tools", ()))
                                     if isinstance(messages, list) else None),
             retry_reason=retry_reason)
+        if effort is not None and not reasoning.plain_default(effort):
+            call["effort"] = effort["effort"]
+            # What went out: the level sent (a mapped one on endpoints with fewer levels), or none
+            # when the fields were skipped after a rejection.
+            sent = effort["sent_effort"] or ("none" if effort.get("skipped") else None)
+            if sent is not None:
+                call["sent_effort"] = sent
+            if effort["fields"]:
+                call["reasoning_fields"] = sorted(effort["fields"])  # The top-level fields sent, by name.
+            for key, name in (("effort_field", "effort_field"), ("skipped", "reasoning_skipped")):
+                if effort.get(key):
+                    call[name] = effort[key]
         # Record the attempt durably before sending it to the provider. Later
         # stream checkpoints replace this running state with the final outcome.
         self.store.save(session)
         draft = StreamDraft(self.store, session)
         tool_buffer, finish, appended = ToolCallBuffer(), None, False
+        # thinking_clock() when the request was sent, when reasoning began and when the answer (text or a tool call) began.
+        thinking = {"sent": thinking_clock(), "since": None, "output": None}
+
+        async def answer_begins():
+            if thinking["output"] is not None:
+                return
+            thinking["output"] = thinking_clock()
+            if thinking["since"] is not None and "reasoning_seconds" not in event:
+                # The Thinking block collapses to "Thought for N s" when the answer starts.
+                event["reasoning_seconds"] = round(max(0.0, thinking["output"] - thinking["since"]), 1)
+                draft.changed()
+                await self.broadcast(session["id"], {"type": "event", "event": event})
         try:
             async with client.stream("POST", url, headers={**headers, **request_tag_headers(session, call),
                                                            "Content-Type": "application/json"},
@@ -3535,6 +3694,8 @@ class AgentManager:
                             info["rate_limit"] = request_info_fields(rate)
                     elif response.status_code in SERVER_RETRY_STATUSES:
                         mark_retryable(error, "server_error", response.headers, error_text)
+                    elif response.status_code == 400 and effort is not None:
+                        error.reasoning_rejected = reasoning.rejected_field(error_text, effort)
                     raise error
                 async for data in sse_data(response):
                     if data == "[DONE]":
@@ -3555,18 +3716,28 @@ class AgentManager:
                         raise InferenceError("The model returned invalid streaming choices.", "invalid_response")
                     for choice in choices:
                         delta = choice.get("delta", {})
-                        summary = reasoning_summary(delta.get("content"))
+                        summary, thought = reasoning_delta(delta)
+                        if thought and thinking["since"] is None:
+                            # Even an item with no text (thinking the endpoint does not show) starts the clock.
+                            thinking["since"] = thinking_clock()
+                            event["reasoning_started"] = time.time()
+                            draft.changed()
+                            if not summary:
+                                await self.broadcast(session["id"], {"type": "event", "event": event})
                         if summary:
                             previous = event.get("reasoning_summary", "")
                             combined = previous + summary
-                            event.update(reasoning_summary=self.settings.redact(combined)[:12000],
-                                         reasoning_truncated=len(combined) > 12000 or event.get("reasoning_truncated", False))
+                            limit = reasoning.SUMMARY_LIMIT
+                            event.update(reasoning_summary=self.settings.redact(combined)[:limit],
+                                         reasoning_truncated=len(combined) > limit or event.get("reasoning_truncated", False))
                             draft.changed(len(summary.encode("utf-8")))
                             await self.broadcast(session["id"], {"type": "event", "event": event})
                         text = visible_text(delta.get("content"))
                         if text:
+                            await answer_begins()
                             await self.delta(session, event, text, draft)
                         for part in delta.get("tool_calls", []):
+                            await answer_begins()
                             tool_buffer.add(part)
                         reason = choice.get("finish_reason")
                         if reason is not None:
@@ -3662,6 +3833,13 @@ class AgentManager:
                 session["wire"].append({"role": "assistant", "content": (event["text"] + "\n\n[" + str(exc) + "]").strip()})
             raise exc
         finally:
+            if "reasoning_seconds" not in event:
+                end = thinking["output"] if thinking["output"] is not None else thinking_clock()
+                if thinking["since"] is not None:
+                    event["reasoning_seconds"] = round(max(0.0, end - thinking["since"]), 1)
+                elif (info.get("usage") or {}).get("reasoning_tokens"):
+                    # Reasoning the endpoint counted but did not show: about the time before the answer began.
+                    event["reasoning_seconds"] = round(max(0.0, end - thinking["sent"]), 1)
             finish_inference_call(call, info)
             await draft.close()
             if call.get("purpose") == "agent":
@@ -3937,9 +4115,11 @@ class AgentManager:
                     session["file_views"] = views
                 context_state = session["context_state"] = {**next_context, "tool_definitions": definitions}
                 input_budget = info["input_budget"]
+                # Read at each step, so an effort chosen while the turn runs applies from this request.
+                effort = self.reasoning_request(session)
                 # The exact bytes sent: the meter shows the size of this request in the same update.
-                payload = {"messages": messages,
-                           "tools": definitions, "stream": True, "max_tokens": max_output_tokens}
+                payload = {"messages": messages, "tools": definitions, "stream": True,
+                           "max_tokens": max_output_tokens, **effort["fields"]}
                 body = encode_payload(payload)
                 session["context_info"] = {**info, "instruction_files": guidance["files"], "instruction_sources": guidance["sources"],
                                            "warnings": guidance["warnings"], **last_request(session),
@@ -3957,16 +4137,34 @@ class AgentManager:
                     # Requests that got no usable status (429, 502/503/504, a failed connection)
                     # are repeated unchanged, sharing one budget; then, for a rate limit only,
                     # up to MAX_RATE_LIMIT_WAITS longer waits per turn when Settings allows them.
-                    transient_attempt = 0
+                    transient_attempt, reasoning_resent = 0, False
                     while True:
                         try:
                             # Another chat's 429 on this endpoint: wait with it instead of adding to the overload.
                             await self.wait_for_rate_limit(session, "the model request", max_output_tokens)
                             await self.reply_after_notices(session, event)
                             ordered_calls, arguments = await self.model_response(
-                                session, event, client, url, headers, payload, retry_reason=retry_reason, body=body)
+                                session, event, client, url, headers, payload, retry_reason=retry_reason, body=body,
+                                effort=effort)
                             break
                         except InferenceError as exc:
+                            field = getattr(exc, "reasoning_rejected", None)
+                            if field and not reasoning_resent:
+                                # A 400 before any stream that names a reasoning field this request added: the
+                                # guess about the endpoint's fields was wrong. Send it once more without them, and
+                                # skip them for this endpoint and format until a restart or a Settings save.
+                                reasoning_resent = True
+                                self.reasoning_rejections[(session["model"], effort["format"])] = field
+                                payload = {key: value for key, value in payload.items() if key not in effort["fields"]}
+                                body = encode_payload(payload)
+                                effort = reasoning.without_fields(effort, field)
+                                retry_reason = "reasoning_rejected"
+                                await self.event(session, "notice", text=(
+                                    f"Databricks rejected the reasoning field {field} for {session['model']} (HTTP 400), "
+                                    "so the app sent the request again without reasoning fields. Requests to this "
+                                    "endpoint skip them until the app restarts or Settings are saved. To send them "
+                                    "another way, change Settings → Reasoning → Request format."))
+                                continue
                             if not getattr(exc, "retryable", False):
                                 raise
                             waited = None
@@ -4074,18 +4272,27 @@ class AgentManager:
                 allowance = ResultAllowance(
                     max(0, min(input_budget // 2, input_budget - fixed - ALLOWANCE_MARGIN_TOKENS)), scale,
                     calls=len(ordered_calls))
-                for call, values in zip(ordered_calls, arguments):
-                    settled = allowance.settled
-                    output = await self.execute_tool(session, tools, call["function"]["name"], values, call["id"],
-                                                     allowance=allowance)
-                    if allowance.settled == settled:
-                        allowance.charge(output)  # A refusal or another early return is sent too.
-                    wire.append({"role": "tool", "tool_call_id": call["id"], "content": output})
-                    if not card_answers(session["events"], call["id"], output):
-                        # A finished card already saved this result; repair_tool_history rebuilds this
-                        # message from it if the app stops before the next save. Each save rewrites
-                        # the whole conversation file.
-                        self.store.save(session)
+                start = 0
+                while start < len(ordered_calls):
+                    # Consecutive delegate_task calls run in parallel; every other call runs alone, in order.
+                    size = parallel_run(ordered_calls, start)
+                    group, values = ordered_calls[start:start + size], arguments[start:start + size]
+                    start += size
+                    if size > 1:
+                        outputs = await self.run_delegations(session, tools, group, values, allowance)
+                    else:
+                        settled = allowance.settled
+                        outputs = [await self.execute_tool(session, tools, group[0]["function"]["name"], values[0],
+                                                           group[0]["id"], allowance=allowance)]
+                        if allowance.settled == settled:
+                            allowance.charge(outputs[0])  # A refusal or another early return is sent too.
+                    for call, output in zip(group, outputs):  # One tool message per call, in call order.
+                        wire.append({"role": "tool", "tool_call_id": call["id"], "content": output})
+                        if not card_answers(session["events"], call["id"], output):
+                            # A finished card already saved this result; repair_tool_history rebuilds this
+                            # message from it if the app stops before the next save. Each save rewrites
+                            # the whole conversation file.
+                            self.store.save(session)
                 if step_index + 1 < steps:
                     await self.drain_queue(session, wire, tools, fits=lambda message: in_turn_tokens(
                         [*model_history(wire), message], context_state, system, definitions, input_budget,

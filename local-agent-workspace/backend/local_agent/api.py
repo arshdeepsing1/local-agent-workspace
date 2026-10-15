@@ -24,6 +24,7 @@ from .context import (
 )
 from .context import MAX_AUTO_COMPACT_PERCENT, MIN_AUTO_COMPACT_PERCENT
 from .model_profiles import default_limits, effective_limits, limit_warnings, limits_note, public_profile
+from . import reasoning
 from .user_paths import standing_directories
 from .store import Store, UnreadableConversation
 from . import conversation_search
@@ -74,8 +75,27 @@ class Decision(BaseModel):
     rule: dict | None = None  # The rule to save (at most 8 KB of JSON); the card's default rule when absent.
 
 
+Effort = Literal["default", "low", "medium", "high", "xhigh", "max"]  # reasoning.EFFORT_LEVELS
+RequestFormat = Literal["auto", "anthropic", "openai", "none"]  # reasoning.REQUEST_FORMATS
+
+
 class SessionPermissions(BaseModel):
     permission_mode: PermissionMode = "manual"
+    reasoning_effort: Effort | None = None  # A new chat's effort; Settings' default when absent.
+
+
+class SessionEffort(BaseModel):
+    model_config = {"extra": "forbid"}
+    reasoning_effort: Effort
+
+
+class ReasoningQuery(BaseModel):
+    """What agent requests to an endpoint would carry (Settings → Reasoning and the effort picker)."""
+    model_config = {"extra": "forbid"}
+    model: str = Field(min_length=1, max_length=256, strict=True)
+    reasoning_effort: Effort = "default"
+    reasoning_format: RequestFormat = "auto"
+    thinking_summaries: bool = Field(default=True, strict=True)
 
 
 class PermissionChange(BaseModel):
@@ -141,6 +161,9 @@ class SettingsEdit(BaseModel):
     write_limit_kb: int | None = Field(default=None, ge=MIN_WRITE_LIMIT_KB, le=MAX_WRITE_LIMIT_KB, strict=True)
     command_env: list[str] | None = Field(default=None, max_length=MAX_COMMAND_ENV, strict=True)
     rate_limit_auto_continue: bool | None = Field(default=None, strict=True)
+    reasoning_effort: Effort | None = None
+    reasoning_format: RequestFormat | None = None
+    thinking_summaries: bool | None = Field(default=None, strict=True)
     coding_dir: str | None = Field(default=None, max_length=4096, strict=True)
     python_venv: str | None = Field(default=None, max_length=4096, strict=True)
 
@@ -164,6 +187,37 @@ class CommandRequest(BaseModel):
     timeout_seconds: int = Field(default=60, ge=1, le=3600, strict=True)
     max_output_bytes: int = Field(default=80000, ge=1024, le=1000000, strict=True)
     background: bool = Field(default=False, strict=True)
+
+
+def locate_file(tools, path, worktree=None):
+    """The project file a not-found path most likely names, as a workspace path, or None: a path that
+    starts with the project's own last folders (`<project>/src/app.py`, or `<sub>/src/app.py` from the
+    Git repository's root) without them, or in a worktree chat the same file under the worktree
+    instead of its source project (by absolute path or by the source folder's name)."""
+    value = PurePosixPath(path.replace("\\", "/"))
+    candidates = []
+    source = worktree.get("source_workspace") if isinstance(worktree, dict) else None
+    roots = [PurePosixPath(str(tools.root)).parts]
+    if isinstance(source, str) and source:
+        roots.append(PurePosixPath(source).parts)
+        if value.is_absolute():
+            try:
+                candidates.append(str(value.relative_to(PurePosixPath(source))))
+            except ValueError:
+                pass
+    if not value.is_absolute():
+        parts = tuple(part for part in value.parts if part != ".")
+        candidates += ["/".join(parts[count:]) for root in roots for count in range(1, min(4, len(parts)))
+                       if len(root) > count and parts[:count] == root[-count:]]
+    for candidate in candidates:
+        if not candidate or ".." in PurePosixPath(candidate).parts:
+            continue
+        try:
+            if tools.path(candidate).is_file():
+                return candidate
+        except (ValueError, OSError):
+            continue
+    return None
 
 
 def create_app(settings=None):
@@ -323,6 +377,8 @@ def create_app(settings=None):
     async def update_settings(body: SettingsEdit):
         manager.workspace_available(body.workspace)
         result = settings.update(body.model_dump(exclude_none=True))
+        # A request format Databricks rejected is tried again after any Settings save.
+        manager.reasoning_rejections.clear()
         # Open chats' meters follow the new budgets and threshold; others follow when opened (stream).
         for session_id in [key for key, sockets in manager.listeners.items() if sockets]:
             try:
@@ -353,10 +409,24 @@ def create_app(settings=None):
                 "warnings": limit_warnings(model, body.context_window, body.max_output_tokens),
                 "note": limits_note(model)}
 
+    @app.post("/api/settings/reasoning")
+    async def reasoning_preview(body: ReasoningQuery):
+        """The reasoning fields agent requests to this endpoint carry for these choices, computed by the
+        code that builds the requests, and each level's label for the effort picker."""
+        model = body.model.strip()
+        if not model:
+            raise ValueError("Enter a model endpoint name.")
+        fmt = reasoning.request_format(model, body.reasoning_format)
+        return reasoning.preview(model, body.reasoning_effort, body.reasoning_format, body.thinking_summaries,
+                                 manager.reasoning_rejections.get((model, fmt)))
+
     @app.get("/api/sessions")
     async def list_sessions():
         counts = manager.changes.counts()
-        return [{**s, "status": manager.statuses.get(s["id"], "idle"), "unreviewed_changes": counts.get(s["id"], 0)}
+        # A parent's subagents index (up to 200 entries) is left out: the list is fetched often while
+        # subagents work, and /sessions/<id>/children lists them.
+        return [{**{k: v for k, v in s.items() if k != "subagents"}, "status": manager.statuses.get(s["id"], "idle"),
+                 "unreviewed_changes": counts.get(s["id"], 0)}
                 for s in store.list()]
 
     @app.post("/api/sessions")
@@ -364,6 +434,8 @@ def create_app(settings=None):
         manager.workspace_available(settings.values["workspace"])
         session = store.create(settings.values)
         session["permission_mode"] = body.permission_mode if body else "manual"
+        if body and body.reasoning_effort:
+            session["reasoning_effort"] = body.reasoning_effort
         store.save(session)
         return public_session(session)
 
@@ -390,6 +462,14 @@ def create_app(settings=None):
         await manager.broadcast(session_id, {"type": "model", "model": model})
         await manager.refresh_meter_limits(session)  # The meter follows the new endpoint's budgets.
         return public_session(session)
+
+    @app.put("/api/sessions/{session_id}/reasoning-effort")
+    async def change_effort(session_id: str, body: SessionEffort):
+        # Allowed while a turn runs: the agent's next model request uses it (and a running subagent's).
+        from .approvals import busy_status
+        session = session_or_404(session_id)
+        await manager.change_effort(session, body.reasoning_effort)
+        return public_session(session, busy_status(manager, session_id))
 
     @app.put("/api/sessions/{session_id}/title")
     async def rename_session(session_id: str, body: SessionTitle):
@@ -515,6 +595,7 @@ def create_app(settings=None):
                 deleting_sessions.update(family)
             for member in family:
                 await manager.stop(member)
+                manager.delegates.forget(member, keep=family)  # A deleted subagent stays in its parent's index, marked.
                 await manager.jobs.remove_session(member)
                 manager.task_board.delete_session(member)
                 manager.checkpoints.delete_session(member)
@@ -639,8 +720,27 @@ def create_app(settings=None):
     @app.get("/api/file")
     async def file(path: str, session_id: str | None = None):
         tools = ui_tools(session_id)
+        session = session_or_404(session_id) if session_id else {}
+        worktree = session.get("worktree")
+        source = worktree.get("source_workspace") if isinstance(worktree, dict) else None
+        if isinstance(source, str) and source and PurePosixPath(path).is_absolute() \
+                and PurePosixPath(path).is_relative_to(PurePosixPath(source)):
+            # A worktree chat opens its own copy of a file named by the source project's path,
+            # so the editor never saves into the main checkout by mistake.
+            path = locate_file(tools, path, worktree) or path
+        try:
+            content = tools.read_file(path)
+        except FileNotFoundError:
+            # Replies and tool cards name files in other ways: from the project's own folder name
+            # (demo/src/app.py), from the Git repository's root, or in a worktree chat by the source
+            # project's absolute path. Open the one existing file such a name means, else say so.
+            found = locate_file(tools, path, session.get("worktree"))
+            if found is None:
+                raise ValueError(f"{path} does not exist in {tools.root}. It may have been moved or deleted, "
+                                 "or it was named relative to another folder.") from None
+            path, content = found, tools.read_file(found)
         # The absolute path lets the editor offer an "Open in VS Code" link.
-        return {"path": path, "content": tools.read_file(path), "absolute": str(tools.path(path))}
+        return {"path": path, "content": content, "absolute": str(tools.path(path))}
 
     @app.put("/api/file")
     async def save_file(body: FileEdit):

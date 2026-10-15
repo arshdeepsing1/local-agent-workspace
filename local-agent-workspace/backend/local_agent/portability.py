@@ -9,6 +9,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .context import LARGE_SUMMARY_MAX_BYTES, MAX_ESTIMATE_SCALE, context_boundary
+from .planning import MAX_STEPS, subagent_index
 
 
 MAX_BUNDLE_BYTES = 16 * 1024 * 1024
@@ -38,6 +39,20 @@ class RateLimitDetails(Record):
     retry_after: float | None = Field(default=None, ge=0)
 
 
+Effort = Literal["default", "low", "medium", "high", "xhigh", "max"]  # reasoning.EFFORT_LEVELS
+
+
+class ReasoningInfo(Record):
+    """The reasoning a request asked for (reasoning.request_record)."""
+    effort: Effort
+    format: Literal["anthropic", "openai", "none"]
+    fields: dict[str, Any] = Field(default_factory=dict)
+    sent_effort: str | None = Field(default=None, max_length=16)
+    effort_field: str | None = Field(default=None, max_length=64)
+    skipped: Literal["rejected", "rejected_earlier"] | None = None
+    rejected_field: str | None = Field(default=None, max_length=64)
+
+
 class RequestInfo(Record):
     model: str = Field(max_length=256)
     status: Literal["running", "completed", "error", "cancelled", "interrupted"]
@@ -46,6 +61,7 @@ class RequestInfo(Record):
     error_kind: str | None = None
     usage: Usage | None = None
     rate_limit: RateLimitDetails | None = None
+    reasoning: ReasoningInfo | None = None
 
 
 class Progress(Record):
@@ -53,6 +69,9 @@ class Progress(Record):
     completed_tools: int = Field(ge=0)
     last_tool: str | None = None
     terminal_reason: str | None = None
+    agent_type: Literal["explore", "general", "editor"] | None = None
+    started: float | None = None
+    ended: float | None = None
 
 
 class Origin(Record):
@@ -93,6 +112,9 @@ class Event(Record):
     text: str | None = None
     reasoning_summary: str | None = None
     reasoning_truncated: bool | None = None
+    # When the reply's thinking began (epoch seconds) and how long it took (the Thinking block's label).
+    reasoning_started: float | None = Field(default=None, ge=0)
+    reasoning_seconds: float | None = Field(default=None, ge=0)
     request_info: RequestInfo | None = None
     name: str | None = None
     input: dict[str, Any] | None = None
@@ -215,7 +237,9 @@ class Conversation(Record):
     title_generated: bool | None = None
     tool_profile: Profile = "inherit"
     subagent_tool_profile: Profile = "inherit"
-    max_steps: int | None = Field(default=None, ge=1, le=8)
+    reasoning_effort: Effort | None = None  # Kept by forks and imports, like the model.
+    max_steps: int | None = Field(default=None, ge=1, le=MAX_STEPS)
+    agent_type: Literal["explore", "general", "editor"] | None = None
     # Kept by forks and imports, like tool_profile: a copy never gets more tools than its source.
     disabled_tools: list[Annotated[str, Field(min_length=1, max_length=300)]] | None = Field(default=None, max_length=64)
     # The user's labels. Pinned and archived are view state of this app and are not exported.
@@ -505,4 +529,8 @@ def fresh_copies(bundle, workspace, *, kind="import"):
                 source["terminal_reason"] = "interrupted"
             if event.get("delegation") and not event["delegation"].get("terminal_reason"):
                 event["delegation"].update(status="interrupted", terminal_reason="interrupted")
+    # The subagents index of each copied parent lists its copied children (a bundle does not carry it).
+    by_id = {source["id"]: source for source in sessions}
+    for parent_id, index in subagent_index(sessions).items():
+        by_id[parent_id]["subagents"] = index
     return sessions, ids[bundle["root_session_id"]]

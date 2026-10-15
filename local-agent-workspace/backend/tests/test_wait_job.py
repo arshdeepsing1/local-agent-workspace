@@ -201,3 +201,71 @@ async def test_a_line_printed_after_the_last_result_still_counts_by_default(runt
     again = await wait(manager, session, tools, job_id=started["job_id"], until_regex="ready", timeout_seconds=1)
     assert again["reason"] == "timeout" and again["output_start"] == result["total_chars"]
     await manager.jobs.stop(started["job_id"])
+
+
+# Sizing waits to the job (expected durations, idle output, suggested next wait)
+
+def test_suggested_waits_follow_earlier_runs_or_back_off():
+    from local_agent.jobs import suggested_wait
+    assert suggested_wait(None, 0) is None
+    assert suggested_wait(40, 10) == 40  # 30 seconds left, a quarter more, plus 2.
+    assert suggested_wait(3, 1) == 5  # At least 5 seconds.
+    assert suggested_wait(1000, 0) == 300  # At most the wait_job limit.
+    assert suggested_wait(10, 20, previous=30) == 60  # Running longer than usual: twice the last wait.
+    assert suggested_wait(None, 5, previous=3) == 10
+    assert suggested_wait(None, 5, previous=200) == 300
+
+
+async def test_a_wait_returns_when_the_output_goes_quiet(runtime):
+    manager, session, tools = runtime
+    job = await background(manager, session, "printf 'listening on 8000\\n'; sleep 30")
+    async with asyncio.timeout(5):
+        while not manager.jobs.get(job["id"])["output"]:
+            await asyncio.sleep(.02)
+    started = time.monotonic()
+    result = await wait(manager, session, tools, job_id=job["id"], idle_seconds=1, from_offset=0)
+    assert result["reason"] == "idle" and 0.9 <= time.monotonic() - started < 3
+    assert result["output"] == "listening on 8000\n" and result["state"] == "running"
+    # No earlier run says how long it takes: the next wait doubles the one that just ended (at least 10).
+    assert result["timeout_seconds"] == 60 and 0.9 <= result["waited_seconds"] < 3
+    assert result["next_wait_seconds"] == 10
+    assert "expected_seconds" not in result and result["elapsed_seconds"] >= 0.9
+    invalid = await wait(manager, session, tools, job_id=job["id"], idle_seconds=0)
+    assert invalid["message"] == "Invalid tool arguments at idle_seconds: JSON Schema minimum constraint failed."
+
+
+async def test_earlier_runs_of_the_same_command_size_the_default_wait(runtime):
+    manager, session, tools = runtime
+    command = "sleep .3; printf done"
+    for _ in range(2):
+        finished = await background(manager, session, command)
+        await manager.jobs.wait(finished["id"])
+    other = await background(manager, session, "sleep .1")  # Another command does not count.
+    await manager.jobs.wait(other["id"])
+    job = await background(manager, session, command)
+    expected = manager.jobs.expected_seconds(job)
+    assert 0.25 <= expected < 2
+    result = await wait(manager, session, tools, job_id=job["id"])
+    assert result["reason"] == "exited" and result["timeout_seconds"] == 5  # Not the 60-second default.
+    assert result["expected_seconds"] == round(expected, 1) and "next_wait_seconds" not in result
+    # Completed runs win over failed ones, which may have failed at once.
+    failing = "sleep .2; exit 3"
+    quick = await background(manager, session, failing)
+    await manager.jobs.wait(quick["id"])
+    assert 0.15 <= manager.jobs.expected_seconds(await background(manager, session, failing)) < 2
+    # A run that was stopped says nothing about how long the command takes.
+    stopped = await background(manager, session, "sleep 30")
+    await manager.jobs.stop(stopped["id"])
+    assert manager.jobs.expected_seconds(await background(manager, session, "sleep 30")) is None
+
+
+async def test_a_background_command_says_how_long_earlier_runs_took(runtime):
+    manager, session, tools = runtime
+    session["permission_mode"] = "bypassPermissions"
+    command = "sleep .2; printf built"
+    first = json.loads(await manager.execute_tool(session, tools, "run_command", {"command": command, "background": True}, "c1"))
+    assert "expected_seconds" not in first
+    await manager.jobs.wait(first["job_id"])
+    second = json.loads(await manager.execute_tool(session, tools, "run_command", {"command": command, "background": True}, "c2"))
+    assert 0.15 <= second["expected_seconds"] < 2 and second["next_wait_seconds"] == 5
+    await manager.jobs.wait(second["job_id"])

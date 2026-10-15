@@ -36,11 +36,11 @@ class RewindRequest(BaseModel):
 
 
 # Never copied into a rewind backup: the usage ledger and jobs stay with the live chat, and authority,
-# links and local state are not carried. The worktree header stays: it is display metadata (grouping under
-# the project), not authority.
+# links and local state are not carried (its subagents stay linked to the live chat, so the backup has
+# no subagents index). The worktree header stays: it is display metadata (grouping under the project).
 BACKUP_DROPPED = ("pinned", "inference_calls", "command_jobs", "context_info", "file_views", "instruction_directories",
                   "turn_running", "queued_messages", "pending_context", "parent_session_id", "parent_event_id",
-                  "parent_call_id", "delegation")
+                  "parent_call_id", "delegation", "subagents")
 
 
 def backup_copy(session):
@@ -295,7 +295,7 @@ def register_portability(app, manager, settings, store, session_or_404):
                 if body.code:
                     raise HTTPException(500, detail={"message": settings.redact(
                         f"Files were rewound, but the conversation could not be saved: {error_clause(exc)}. "
-                        "Rewound files can be restored from Agent tools → Recovery.")}) from exc
+                        "Rewound files can be restored from Agent tools → Checkpoints.")}) from exc
                 drop_backup()
                 raise
         await manager.broadcast(session_id, {"type": "snapshot", "session": public_session(session, "idle")})

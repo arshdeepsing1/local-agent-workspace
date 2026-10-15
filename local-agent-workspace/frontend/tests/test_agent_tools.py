@@ -5,14 +5,15 @@ import pytest
 from playwright.sync_api import expect
 
 
-def open_dialog(ui, setup="", selected="session()"):
-    ui.mount("components/AgentToolsDialog.js", f"dialogProps({selected})", scenario="agent_tools", setup=setup)
+def open_dialog(ui, setup="", selected="session()", props=""):
+    ui.mount("components/AgentToolsDialog.js", f"{{ ...dialogProps({selected}){props} }}", scenario="agent_tools", setup=setup)
+    expect(ui.page.get_by_role("region", name="Overview")).to_be_visible()  # The first section.
 
 
 def open_tab(ui, page, tab, setup="", selected="session()"):
     open_dialog(ui, setup, selected)
-    expect(page.get_by_role("button", name="Preview checkpoint src/main.py")).to_be_visible()
     page.get_by_role("button", name=tab, exact=True).click()
+    expect(page.get_by_role("button", name=tab, exact=True)).to_have_attribute("aria-pressed", "true")
 
 
 def pending(name, condition):
@@ -21,7 +22,7 @@ def pending(name, condition):
 
 
 def test_restores_only_the_previewed_checkpoint(ui, page):
-    open_dialog(ui)
+    open_tab(ui, page, "Checkpoints")
     page.get_by_role("button", name="Preview checkpoint src/main.py").click()
     restore = page.get_by_role("button", name="Restore checkpoint")
     expect(restore).to_be_visible()
@@ -33,7 +34,7 @@ def test_restores_only_the_previewed_checkpoint(ui, page):
 
 
 def test_unrestorable_checkpoint_stays_disabled_with_explanation(ui, page):
-    open_dialog(ui, """fake.override = path => path.includes('/preview') ? fake.json({ ...checkpoint, diff: '', expected_current_hash: '',
+    open_tab(ui, page, "Checkpoints", """fake.override = path => path.includes('/preview') ? fake.json({ ...checkpoint, diff: '', expected_current_hash: '',
       can_restore: false, error: 'The file changed externally.' }) : undefined""")
     page.get_by_role("button", name="Preview checkpoint src/main.py").click()
     expect(page.get_by_role("button", name="Restore checkpoint")).to_be_disabled()
@@ -53,7 +54,7 @@ def test_turn_preview_restores_only_the_selected_file(ui, page):
           { ...second, diff: '', expected_current_hash: 'second-hash', can_restore: false, error: 'Changed externally.' },
         ] })
       }"""
-    open_dialog(ui, setup, "selected")
+    open_tab(ui, page, "Checkpoints", setup, "selected")
     page.get_by_role("button", name="Preview turn turn-1").click()
     expect(page.get_by_text("Update both parsers")).to_be_visible()
     first_preview = page.get_by_role("group", name="Recovery preview src/main.py")
@@ -78,13 +79,13 @@ def test_turn_preview_pages_and_clears_on_session_switch(ui, page):
         ] })
       }
     }"""
-    open_dialog(ui, setup)
+    open_tab(ui, page, "Checkpoints", setup)
     page.get_by_role("button", name="Preview turn turn-1").click()
     page.get_by_role("button", name="More checkpoints in this turn").click()
     expect(page.get_by_role("group", name="Recovery preview page-10.py")).to_be_visible()
     expect(page.get_by_role("group", name="Recovery preview page-0.py")).to_be_visible()
     expect(page.get_by_role("button", name="More checkpoints in this turn")).to_have_count(0)
-    ui.rerender("dialogProps(session('b'))")
+    ui.rerender("dialogProps(session('b'))")  # Another chat: the remembered section, without the old previews.
     expect(page.get_by_role("button", name="Preview checkpoint src/main.py")).to_be_visible()
     expect(page.get_by_role("group", name=re.compile("Recovery preview"))).to_have_count(0)
 
@@ -272,7 +273,7 @@ def test_refused_worktree_removal_is_inline(ui, page):
     assert ui.spy("onError") == [["Worktree has uncommitted changes."]]
 
 
-def test_tasks_dependencies_statuses_and_children(ui, page):
+def test_tasks_dependencies_and_statuses(ui, page):
     open_tab(ui, page, "Tasks")
     expect(page.get_by_role("checkbox", name="Complete task Inspect source")).to_be_visible()
     page.get_by_label("Task title").fill("Fix parser")
@@ -288,10 +289,8 @@ def test_tasks_dependencies_statuses_and_children(ui, page):
     page.get_by_role("checkbox", name="Complete task Inspect source").click()
     expect(page.get_by_role("checkbox", name="Complete task Inspect source")).to_be_checked()
     assert ui.bodies("/api/sessions/a/tasks/task") == [{"status": "in_progress"}, {"status": "completed"}]
-    expect(page.get_by_text("Waiting for approval")).to_be_visible()
-    page.get_by_role("button", name="Open subagent Child review").click()
-    assert ui.spy("select") == [["child"]]
-    assert ui.spy("close") == [[]]
+    expect(page.get_by_role("region", name="Tasks")).to_contain_text("1 of 2 done.")
+    expect(page.get_by_role("button", name="Open subagent Child review")).to_have_count(0)  # Subagents have their own section.
 
 
 def test_rejected_task_update_keeps_previous_status(ui, page):
@@ -332,7 +331,8 @@ def test_invalid_extension_json_is_not_sent(ui, page):
 
 def test_extension_editor_locked_while_loading_and_saving(ui, page):
     open_tab(ui, page, "Extensions", """const loading = fake.defer('loading'), saving = fake.defer('saving')
-      fake.override = (path, options) => path === '/api/extensions' ? (options.method === 'PUT' ? saving.promise : loading.promise) : undefined""")
+      fake.override = (path, options) => path === '/api/extensions' ? (options.method === 'PUT' ? saving.promise
+        : loading.promise.then(response => response.clone())) : undefined  // The Overview reads it too.""")
     editor = page.get_by_role("textbox", name="Extension configuration (JSON)")
     expect(editor).to_be_disabled()
     expect(page.get_by_role("button", name="Save configuration")).to_be_disabled()
@@ -380,7 +380,9 @@ def test_skills_come_from_the_selected_conversation_workspace(ui, page):
 
 def test_draft_scope_requires_conversation_for_tasks_and_skills(ui, page):
     open_tab(ui, page, "Tasks", selected="null")
-    expect(page.get_by_text("Start a conversation to manage tasks and subagents.")).to_be_visible()
+    expect(page.get_by_text("Start a conversation to manage its tasks.")).to_be_visible()
+    page.get_by_role("button", name="Subagents", exact=True).click()
+    expect(page.get_by_text("Start a conversation to see its subagents.")).to_be_visible()
     assert not ui.js("fake.calls.some(call => call.path.includes('/sessions/'))")
     assert ui.requests("/api/checkpoints")
     page.get_by_role("button", name="Extensions", exact=True).click()
@@ -388,7 +390,7 @@ def test_draft_scope_requires_conversation_for_tasks_and_skills(ui, page):
 
 
 def test_previous_scope_preview_and_error_are_ignored(ui, page):
-    open_dialog(ui, pending("preview", "path === '/api/checkpoints/checkpoint/preview?session_id=a'"))
+    open_tab(ui, page, "Checkpoints", pending("preview", "path === '/api/checkpoints/checkpoint/preview?session_id=a'"))
     page.get_by_role("button", name="Preview checkpoint src/main.py").click()
     ui.rerender("dialogProps(session('b'))")
     expect(page.get_by_role("button", name="Preview checkpoint src/main.py")).to_be_visible()
@@ -409,7 +411,7 @@ def test_late_open_worktree_after_close_does_not_navigate(ui, page):
 
 
 def test_subagent_ceiling_saved_only_after_server_accepts(ui, page):
-    open_tab(ui, page, "Tasks")
+    open_tab(ui, page, "Subagents")
     expect(page.get_by_role("button", name="Open subagent Child review")).to_be_visible()
     selector = page.get_by_role("combobox", name="New subagent tool ceiling")
     selector.select_option("read_only")
@@ -423,7 +425,7 @@ def test_subagent_ceiling_saved_only_after_server_accepts(ui, page):
 
 
 def test_child_conversation_cannot_widen_its_profile(ui, page):
-    open_tab(ui, page, "Tasks", selected="{ ...session(), is_subagent: true, tool_profile: 'read_only' }")
+    open_tab(ui, page, "Subagents", selected="{ ...session(), is_subagent: true, tool_profile: 'read_only' }")
     expect(page.get_by_text(re.compile("This child cannot widen"))).to_be_visible()
     expect(page.get_by_role("combobox", name="New subagent tool ceiling")).to_have_count(0)
 
@@ -446,7 +448,7 @@ def test_mcp_results_per_server_and_stale_results_cleared(ui, page):
 
 # The dialog keeps one size: the tabs stay put and only the tab content scrolls
 
-TABS = ["Recovery", "Usage", "Worktrees", "Tasks", "Verify", "Extensions", "Tools", "Conversation"]
+TABS = ["Overview", "Tasks", "Subagents", "Tools", "Usage", "Export", "Checkpoints", "Verify", "Worktrees", "Extensions"]
 
 
 def tabs_top(ui):
@@ -457,13 +459,15 @@ def tabs_top(ui):
 def test_tabs_stay_put(ui, page, width, height):
     page.set_viewport_size({"width": width, "height": height})
     open_dialog(ui)
-    expect(page.get_by_role("button", name="Preview checkpoint src/main.py")).to_be_visible()
     top = tabs_top(ui)
+    size = ui.js("document.querySelector('.agent-tools-dialog').getBoundingClientRect().toJSON()")
     for tab in TABS:
         page.get_by_role("button", name=tab, exact=True).click()
         expect(page.get_by_role("button", name=tab, exact=True)).to_have_attribute("aria-pressed", "true")
         assert abs(tabs_top(ui) - top) <= 1, tab
-        if tab in ("Usage", "Conversation"):
+        box = ui.js("document.querySelector('.agent-tools-dialog').getBoundingClientRect().toJSON()")
+        assert all(abs(box[key] - size[key]) <= 1 for key in ("width", "height", "top", "left")), tab
+        if tab in ("Usage", "Export", "Tools"):
             if tab == "Usage":
                 expect(page.get_by_role("button", name="Refresh usage")).to_be_visible()
             ui.run("const body = document.querySelector('.agent-tools-body'); body.scrollTop = body.scrollHeight")
@@ -472,15 +476,37 @@ def test_tabs_stay_put(ui, page, width, height):
             assert ui.js("(d => d.scrollHeight <= d.clientHeight + 1)(document.querySelector('.agent-tools-dialog'))"), tab
 
 
-def test_phone_tabs_wrap(ui, page):
-    page.set_viewport_size({"width": 360, "height": 740})
+@pytest.mark.parametrize("width", [360, 600, 639])
+def test_narrow_navigation_is_one_scrolling_row(ui, page, width):
+    page.set_viewport_size({"width": width, "height": 740})
     open_dialog(ui)
-    expect(page.get_by_role("button", name="Preview checkpoint src/main.py")).to_be_visible()
-    assert ui.js("(e => e.scrollWidth <= e.clientWidth)(document.querySelector('.agent-tools-tabs'))")
+    nav = ui.js("(n => ({ box: n.getBoundingClientRect().toJSON(), scroll: n.scrollWidth, client: n.clientWidth }))"
+                "(document.querySelector('.agent-tools-tabs'))")
     content = ui.js("document.querySelector('.agent-tools-content').getBoundingClientRect().toJSON()")
-    for tab in TABS:
-        b = page.get_by_role("button", name=tab, exact=True).bounding_box()
-        assert b["x"] >= content["left"] - 0.5 and b["x"] + b["width"] <= content["right"] + 0.5, tab
+    assert nav["box"]["left"] >= content["left"] - 0.5 and nav["box"]["right"] <= content["right"] + 0.5
+    assert nav["scroll"] > nav["client"]  # More sections than fit: the row scrolls instead of wrapping.
+    tops = {round(page.get_by_role("button", name=tab, exact=True).bounding_box()["y"]) for tab in TABS}
+    assert len(tops) == 1, tops
+    assert ui.js("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
+    page.get_by_role("button", name="Extensions", exact=True).click()  # The last one scrolls into view.
+    expect(page.get_by_role("region", name="Extensions")).to_be_visible()
+    ui.js("new Promise(done => setTimeout(done, 400))")  # A smooth scroll settles.
+    button = page.get_by_role("button", name="Extensions", exact=True).bounding_box()
+    nav_box = ui.js("document.querySelector('.agent-tools-tabs').getBoundingClientRect().toJSON()")
+    assert button["x"] >= nav_box["left"] - 1 and button["x"] + button["width"] <= nav_box["right"] + 1
+
+
+def test_wide_navigation_is_a_grouped_column(ui, page):
+    open_dialog(ui)
+    nav = page.get_by_role("navigation", name="Agent tools sections")
+    expect(nav.get_by_role("group")).to_have_count(2)
+    expect(nav.get_by_role("group", name="This chat").get_by_role("button")).to_have_text(TABS[:6])
+    expect(nav.get_by_role("group", name="Project").get_by_role("button")).to_have_text(TABS[6:])
+    expect(nav.locator(".agent-tools-group-label")).to_have_text(["This chat", "Project"])
+    boxes = [page.get_by_role("button", name=tab, exact=True).bounding_box() for tab in TABS]
+    assert len({round(box["x"]) for box in boxes}) == 1 and all(a["y"] < b["y"] for a, b in zip(boxes, boxes[1:]))
+    body = ui.js("document.querySelector('.agent-tools-body').getBoundingClientRect().toJSON()")
+    assert boxes[0]["x"] + boxes[0]["width"] <= body["left"] + 1  # The navigation is left of the content.
 
 
 @pytest.mark.parametrize("width,height", [(360, 740), (390, 844), (1280, 900)])
@@ -513,3 +539,180 @@ def test_a_long_task_title_keeps_a_square_checkbox_beside_its_first_line(ui, pag
     assert text.evaluate("e => e.getClientRects().length > 1 || e.getBoundingClientRect().height > 30")  # it wraps
     assert round(box["width"]) == 13 and round(box["height"]) == 13, box
     assert abs(box["y"] - text.bounding_box()["y"]) <= 6, (box, text.bounding_box())
+
+
+# Overview: this chat and its project at a glance, with a way into each section
+
+def overview_row(page, label):
+    return page.get_by_role("region", name="Overview").locator(".overview-row").filter(
+        has=page.locator("dt", has_text=re.compile(f"^{re.escape(label)}$")))
+
+
+def test_overview_is_the_first_section_and_sums_up_the_chat_and_project(ui, page):
+    open_dialog(ui, props=", changedFiles: 3")
+    expect(page.get_by_role("button", name="Overview", exact=True)).to_have_attribute("aria-pressed", "true")
+    expected = {"Model": "Test model · test-model", "Permission mode": "Manual", "Tools": "6 of 7 on", "Subagents": "1 running · 0 finished",
+                "Tasks": "0 of 1 done", "Unreviewed changes": "3 files", "Checkpoints": "1 file checkpoint", "Verify": "pytest -q",
+                "Worktrees": "1 managed worktree", "Extensions": "None configured"}
+    for label, value in expected.items():
+        expect(overview_row(page, label).locator(".overview-value")).to_have_text(value)
+    expect(page.get_by_role("region", name="Overview")).to_contain_text("/project")
+    assert ui.spy("onError") == []
+
+
+def test_overview_names_the_chats_reasoning_effort(ui, page):
+    open_dialog(ui, selected="{ ...session(), reasoning_effort: 'xhigh' }")
+    expect(overview_row(page, "Reasoning effort").locator(".overview-value")).to_have_text("Extra high")
+
+
+def test_overview_buttons_open_their_sections(ui, page):
+    open_dialog(ui)
+    regions = {"Tools": "Tools", "Subagents": "Subagents", "Tasks": "Tasks", "Usage": "Usage", "Export": "Conversation transfer",
+               "Checkpoints": "Checkpoints", "Verify": "Verify", "Worktrees": "Worktrees", "Extensions": "Extensions"}
+    for tab, region in regions.items():
+        page.get_by_role("button", name=f"Open {tab}", exact=True).click()
+        expect(page.get_by_role("button", name=tab, exact=True)).to_have_attribute("aria-pressed", "true")
+        expect(page.get_by_role("region", name=region, exact=True)).to_be_visible()
+        page.get_by_role("button", name="Overview", exact=True).click()
+        expect(page.get_by_role("region", name="Overview")).to_be_visible()
+    # Model and mode are shown, not sections of this dialog.
+    expect(overview_row(page, "Model").get_by_role("button")).to_have_count(0)
+
+
+def test_overview_reports_what_it_cannot_load_without_an_error_banner(ui, page):
+    open_dialog(ui, """fake.override = path => path === '/api/extensions' ? fake.json({ detail: 'Broken' }, 500)
+      : path === '/api/worktrees?session_id=a' ? fake.json([]) : path === '/api/project-settings?session_id=a'
+      ? fake.json({ ...projectSettings, verify_command: '' }) : undefined""")
+    expect(overview_row(page, "Extensions").locator(".overview-value")).to_have_text("Could not load")
+    expect(overview_row(page, "Worktrees").locator(".overview-value")).to_have_text("None")
+    expect(overview_row(page, "Verify").locator(".overview-value")).to_have_text("Off")
+    expect(overview_row(page, "Unreviewed changes")).to_have_count(0)  # Not known without the changes bar.
+    assert ui.spy("onError") == []
+
+
+def test_overview_without_a_conversation_shows_the_project(ui, page):
+    open_dialog(ui, selected="null")
+    overview = page.get_by_role("region", name="Overview")
+    expect(overview).to_contain_text("Start a conversation to see its tools, tasks, subagents and usage here.")
+    expect(overview_row(page, "Checkpoints").locator(".overview-value")).to_have_text("1 file checkpoint")
+    expect(overview_row(page, "Tools")).to_have_count(0)
+    assert not ui.js("fake.calls.some(call => call.path.includes('/sessions/') || call.path.startsWith('/api/tools'))")
+
+
+# Subagents: each child chat with its type, status, work and transcript
+
+def test_subagents_lists_each_child_and_opens_it(ui, page):
+    open_tab(ui, page, "Subagents")
+    section = page.get_by_role("region", name="Subagents")
+    row = section.locator(".subagent-row")
+    expect(row).to_have_count(1)
+    expect(row.locator("strong")).to_have_text("Review the parser module")
+    expect(row).to_contain_text("Explore · Waiting for approval · Read-only files")
+    expect(row).to_contain_text("up to 10 steps · 3 completed actions")
+    expect(row).to_contain_text("Started ")
+    expect(row.locator("code")).to_have_text("conversations/child.jsonl")
+    section.get_by_role("button", name="Open subagent Child review").click()
+    assert ui.spy("select") == [["child"]] and ui.spy("close") == [[]]
+
+
+def test_a_finished_subagent_shows_steps_tool_calls_and_how_long_it_ran(ui, page):
+    open_tab(ui, page, "Subagents", """window.child = { ...child, status: 'idle',
+      delegation: { ...child.delegation, status: 'completed', terminal_reason: 'completed', ended: 1125 },
+      subagent: { ...child.subagent, status: 'completed', ended: 1125, steps_used: 4, tool_calls: 6 } }""")
+    row = page.locator(".subagent-row")
+    expect(row).to_contain_text("Explore · completed · Read-only files")
+    expect(row).to_contain_text("4 of 10 steps · 6 tool calls")
+    expect(row).to_contain_text("(2 min 05 s)")
+
+
+def test_a_subagent_from_before_the_index_falls_back_to_its_header(ui, page):
+    open_tab(ui, page, "Subagents", """window.child = { ...session('old'), title: 'Old child', status: 'idle', tool_profile: 'inherit',
+      created: 1000, delegation: { status: 'completed', completed_tools: 2, terminal_reason: 'completed' } }""")
+    row = page.locator(".subagent-row")
+    expect(row.locator("strong")).to_have_text("Old child")
+    expect(row).to_contain_text("completed · Inherit permitted tools")
+    expect(row.locator("code")).to_have_text("conversations/old.jsonl")
+
+
+# Tools: grouped by category, with a filter and per-group switches
+
+def test_tools_are_grouped_and_each_group_can_be_turned_off(ui, page):
+    open_tab(ui, page, "Tools")
+    tools = page.get_by_role("region", name="Tools")
+    groups = tools.get_by_role("group")
+    expect(groups).to_have_count(6)
+    assert [groups.nth(index).get_attribute("aria-label") for index in range(6)] == [
+        "Files", "Search", "Commands and jobs", "Tasks and subagents", "Skills", "Other"]
+    files = tools.get_by_role("group", name="Files")
+    expect(files.get_by_role("checkbox")).to_have_count(2)
+    expect(files.locator("h4")).to_contain_text("2 of 2 on")
+    expect(tools.locator(".tools-count")).to_have_text("6 of 7 on")
+    read = files.get_by_role("checkbox", name="read_file", exact=True)
+    expect(read).to_have_accessible_description("Read numbered lines from a text file.")  # The first sentence.
+    expect(files.locator("label.tools-toggle").first).to_have_attribute(
+        "title", "Read numbered lines from a text file. Pages follow next_line.")
+    tools.get_by_role("button", name="Turn off all Files tools").click()
+    expect(files.get_by_role("checkbox", checked=True)).to_have_count(0)
+    expect(tools.get_by_role("button", name="Turn off all Files tools")).to_be_disabled()
+    tools.get_by_role("button", name="Turn on all Commands and jobs tools").click()
+    expect(tools.get_by_role("checkbox", name="run_command", exact=True)).to_be_checked()
+    tools.get_by_role("button", name="Save tools").click()
+    expect(tools.get_by_role("status")).to_have_text("Tools saved for this chat.")
+    assert ui.bodies("/api/sessions/a/disabled-tools", "PUT") == [{"tools": ["read_file", "write_file"]}]
+
+
+def test_the_tool_filter_matches_names_groups_and_descriptions(ui, page):
+    open_tab(ui, page, "Tools")
+    tools = page.get_by_role("region", name="Tools")
+    search = tools.get_by_role("searchbox", name="Filter tools")
+    search.fill("subagent")
+    expect(tools.get_by_role("checkbox")).to_have_count(1)
+    expect(tools.get_by_role("checkbox", name="delegate_task", exact=True)).to_be_visible()
+    search.fill("COMMANDS")
+    expect(tools.get_by_role("group")).to_have_count(1)
+    expect(tools.get_by_role("group", name="Commands and jobs")).to_be_visible()
+    # A group switch acts on the tools it shows.
+    search.fill("file")
+    expect(tools.get_by_role("group", name="Files").get_by_role("checkbox")).to_have_count(2)
+    expect(tools.get_by_role("group", name="Search").get_by_role("checkbox")).to_have_count(1)
+    tools.get_by_role("button", name="Turn off all Search tools").click()
+    search.fill("nothing like this")
+    expect(tools.get_by_text("No tools match “nothing like this”.")).to_be_visible()
+    search.fill("")
+    expect(tools.get_by_role("checkbox", name="find_files", exact=True)).not_to_be_checked()
+    expect(tools.get_by_role("checkbox")).to_have_count(7)
+
+
+# The last section is remembered in this browser
+
+def test_the_last_section_is_remembered(ui, page):
+    open_tab(ui, page, "Verify")
+    expect(page.get_by_role("region", name="Verify")).to_be_visible()
+    ui.run("unmount()")
+    ui.page.evaluate("() => mount('components/AgentToolsDialog.js', () => dialogProps(session('b')))")
+    expect(page.get_by_role("button", name="Verify", exact=True)).to_have_attribute("aria-pressed", "true")
+    expect(page.get_by_role("region", name="Verify")).to_be_visible()
+    ui.run("localStorage.setItem('agent-tools-tab', 'Recovery'); unmount()")  # An unknown name: Overview.
+    ui.page.evaluate("() => mount('components/AgentToolsDialog.js', () => dialogProps())")
+    expect(page.get_by_role("button", name="Overview", exact=True)).to_have_attribute("aria-pressed", "true")
+
+
+def test_blocked_storage_falls_back_to_the_overview(ui, page):
+    open_dialog(ui, "Object.defineProperty(window, 'localStorage', { configurable: true, get() { throw new Error('blocked') } })")
+    page.get_by_role("button", name="Subagents", exact=True).click()
+    expect(page.get_by_role("region", name="Subagents")).to_be_visible()
+
+
+def test_every_section_is_readable(ui, page):
+    from test_visual_tokens import CONTRAST_JS
+    page.add_init_script(script=CONTRAST_JS)
+    open_dialog(ui, props=", changedFiles: 1")
+    expect(overview_row(page, "Tools").locator(".overview-value")).to_have_text("6 of 7 on")
+    for tab in TABS:
+        page.get_by_role("button", name=tab, exact=True).click()
+        expect(page.get_by_role("button", name=tab, exact=True)).to_have_attribute("aria-pressed", "true")
+        ui.js("new Promise(done => setTimeout(done, 50))")
+        problems = page.evaluate("() => [...visual.failures(document.querySelector('.agent-tools-dialog')), "
+                                 "...visual.iconFailures(document.querySelector('.agent-tools-dialog'))]")
+        assert problems == [], (tab, problems)
+        assert page.evaluate("() => visual.smallText(document.querySelector('.agent-tools-dialog'))") == [], tab

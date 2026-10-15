@@ -374,6 +374,9 @@ class Store:
                    "model": settings["model"], "events": [], "wire": [],
                    "permission_mode": "manual", "allowed_directories": [],
                    "inference_ledger_version": LEDGER_VERSION, "inference_calls": []}
+        if settings.get("reasoning_effort"):
+            # Kept with the chat like its model; a chat saved without one uses the Settings default.
+            session["reasoning_effort"] = settings["reasoning_effort"]
         self.save(session)
         return session
 

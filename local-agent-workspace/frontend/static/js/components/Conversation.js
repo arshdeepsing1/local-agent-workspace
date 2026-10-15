@@ -11,6 +11,7 @@ import EditMessage from './EditMessage.js'
 import RewindDialog from './RewindDialog.js'
 import ForkDialog from './ForkDialog.js'
 import { backupTitle, setRewindNotice } from '../rewindNotice.js'
+import { AGENT_TYPE_LABELS, elapsedText } from '../subagents.js'
 
 // A long file is read in pages. Naming the lines each read covered keeps the
 // pages of one file from looking like the same read repeated.
@@ -103,7 +104,7 @@ export function resultOf(event) {
   return { note, text: page.output, raw: text, mcpError: page.is_error === true,
     job: 'state' in page ? { state: String(page.state), exitCode: page.exit_code, background: !!page.background,
       total: page.total_chars, truncated: page.truncated === true, shown: shownPart(page),
-      // wait_job: why the wait ended ('matched', 'timeout' or 'exited') and the line that matched.
+      // wait_job: why the wait ended ('matched', 'timeout', 'idle' or 'exited') and the line that matched.
       wait: typeof page.reason === 'string' ? page.reason : null, match: typeof page.match?.line === 'string' ? page.match.line : null } : null }
 }
 
@@ -155,6 +156,7 @@ export function toolStatus(event, result) {
     // A wait reports its outcome first: its line matched, or it timed out (no tick: what it waited for did not come).
     if (job.wait === 'matched') return { tone: 'ok', label: 'matched', labelTone: 'neutral' }
     if (job.wait === 'timeout') return { tone: 'neutral', label: 'wait timed out', labelTone: 'neutral' }
+    if (job.wait === 'idle' && job.state === 'running') return { tone: 'neutral', label: 'output quiet', labelTone: 'neutral' }
     const label = job.state === 'failed' ? `job ${exitLabel(job.exitCode)}` : OTHER_JOB[job.state] || (job.wait === 'exited' ? 'job ended' : '')
     return { tone: 'ok', label, labelTone: label ? 'neutral' : null }
   }
@@ -178,7 +180,7 @@ function toolState(event) {
 
 // The State line of an expanded command or job card.
 const KILLED = new Set(['timed_out', 'cancelled', 'interrupted'])  // the app ended the process: its code says nothing more
-const WAIT_LINE = { matched: 'wait matched', timeout: 'wait timed out', exited: 'job ended during the wait' }
+const WAIT_LINE = { matched: 'wait matched', timeout: 'wait timed out', idle: 'output went quiet', exited: 'job ended during the wait' }
 function jobStateLine(job) {
   const wait = WAIT_LINE[job.wait] ? WAIT_LINE[job.wait] + (job.wait === 'matched' && job.match ? `: ${clip(job.match, 80)}` : '') : ''
   return [`State: ${job.state.replace(/_/g, ' ')}`, wait, Number.isInteger(job.exitCode) && !KILLED.has(job.state) ? exitLabel(job.exitCode) : '',
@@ -329,15 +331,51 @@ export function expiryTime(seconds, now = new Date()) {
     : when.toLocaleString([], { weekday: 'short', ...options })
 }
 
-function DelegationStatus({ event, onSelectSession }) {
+// The finished delegate_task result ({ status, output, changed_files, ... }) the parent agent received, or null.
+function delegationResult(event) {
+  if (event.name !== 'delegate_task' || event.state !== 'completed' || typeof event.output !== 'string') return null
+  try {
+    const result = JSON.parse(event.output)
+    return result && typeof result === 'object' && typeof result.output === 'string' ? result : null
+  } catch { return null }
+}
+
+const DELEGATION_STATUS = { awaiting_approval: 'Waiting for approval', queued: 'waiting for a free slot' }
+
+function DelegationStatus({ event, onSelectSession, onOpenPath }) {
   const progress = event.delegation
+  const running = !!progress && !progress.terminal_reason && typeof progress.started === 'number'
+  const [now, setNow] = useState(() => Date.now() / 1000)
+  useEffect(() => {
+    if (!running) return undefined
+    setNow(Date.now() / 1000)
+    const timer = setInterval(() => setNow(Date.now() / 1000), 1000)
+    return () => clearInterval(timer)
+  }, [running])
   if (!progress) return null
-  const status = progress.status === 'awaiting_approval' ? 'Waiting for approval' : progress.status.replace(/_/g, ' ')
-  return html`<div class="delegation-progress" aria-label="Subagent progress">
-    <span>Subagent: ${status}</span><span>${progress.completed_tools} completed ${progress.completed_tools === 1 ? 'action' : 'actions'}</span>
+  const status = DELEGATION_STATUS[progress.status] || String(progress.status || '').replace(/_/g, ' ')
+  const kind = progress.agent_type || event.input?.agent_type
+  const started = typeof progress.started === 'number' ? progress.started : null
+  // Ended without an end time (a restart interrupted it): no duration, rather than one that grows with every reload.
+  const elapsed = started == null ? null : typeof progress.ended === 'number' ? progress.ended - started
+    : running ? Math.max(now, started) - started : null
+  const result = delegationResult(event)
+  const files = Array.isArray(result?.changed_files) ? result.changed_files : []
+  return html`<div class=${`delegation-progress ${progress.terminal_reason ? `delegation-${progress.status}` : 'delegation-live'}`} aria-label="Subagent progress">
+    <span class="delegation-status">Subagent: ${status}</span>
+    ${kind ? html`<span class="delegation-type">${AGENT_TYPE_LABELS[kind] || kind}</span>` : null}
+    <span>${progress.completed_tools} completed ${progress.completed_tools === 1 ? 'action' : 'actions'}</span>
     ${progress.last_tool ? html`<span>Last tool: ${progress.last_tool.replace(/_/g, ' ')}</span>` : null}
+    ${elapsed != null ? html`<span class="delegation-elapsed" title=${progress.terminal_reason ? 'Time it ran' : 'Time running'}>${elapsedText(elapsed)}</span>` : null}
     ${progress.terminal_reason ? html`<span>Reason: ${progress.terminal_reason.replace(/_/g, ' ')}</span>` : null}
     ${event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}
+    ${result ? html`<details class="delegation-report"><summary>Report</summary>
+      <${Markdown} text=${result.output} onOpenPath=${onOpenPath} />
+      ${files.length ? html`<p class="delegation-files"><strong>Files changed:</strong> ${files.join(', ')}${result.changed_files_total > files.length ? ` and ${result.changed_files_total - files.length} more` : ''}</p>` : null}
+      <small class="muted">${[Number.isInteger(result.steps_used) ? `${result.steps_used} ${result.steps_used === 1 ? 'step' : 'steps'}` : '',
+        Number.isInteger(result.tool_calls) ? `${result.tool_calls} tool ${result.tool_calls === 1 ? 'call' : 'calls'}` : '',
+        result.transcript ? `Transcript: ${result.transcript}` : ''].filter(Boolean).join(' · ')}</small>
+    </details>` : null}
   </div>`
 }
 
@@ -391,7 +429,7 @@ function ToolCard({ event, summary, result, status, failure = null, sessionId, o
       ${status.label ? html`<span class=${`tool-status ${status.labelTone === 'neutral' ? 'neutral' : ''}`} data-short=${SHORT_STATUS[status.label]}>${status.label}</span>` : null}
       ${expanded || pending ? html`<${ChevronDown} size=${14} />` : html`<${ChevronRight} size=${14} />`}
     </button>
-    <${DelegationStatus} event=${event} onSelectSession=${onSelectSession} />
+    <${DelegationStatus} event=${event} onSelectSession=${onSelectSession} onOpenPath=${onOpenPath} />
     ${rule ? html`<p class="tool-rule">${rule}</p>` : null}
     ${expanded || pending ? html`<div class="tool-body">
       ${pending ? html`<p>Local needs your approval to ${title.toLowerCase()}.${event.approval_expires
@@ -460,12 +498,45 @@ function ActionButton({ label, icon: Icon, onClick, disabled = false, target }) 
   return html`<button class="icon-button message-action" aria-label=${label} title=${label} disabled=${disabled} data-target=${target} onClick=${onClick}><${Icon} size=${14} /></button>`
 }
 
-function Reply({ text, reasoning, truncated, requestInfo, onOpenPath, actions = null }) {
+const wholeSeconds = value => Math.max(1, Math.round(value))
+
+// The reply's thinking, like Claude's: open with live text while the model thinks ("Thinking… 12 s"), collapsed to
+// "Thought for 12 s" once answer text or a tool call starts or the response ends, unless the user opened or closed
+// it. started: epoch seconds (AgentEvent.reasoning_started); seconds: AgentEvent.reasoning_seconds. Without
+// text, an endpoint that thought (a duration or reported reasoning tokens) gets one quiet line.
+function Thinking({ text, truncated, started, seconds, streaming, answering, reasoningTokens }) {
+  const thinking = streaming && !answering && typeof seconds !== 'number'
+  const [manual, setManual] = useState(null)
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (!thinking || typeof started !== 'number') return
+    setNow(Date.now())
+    const timer = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(timer)
+  }, [thinking, started])
+  // Timed from its start only while the response streams; a finished reply without a duration (cut short by a
+  // restart) shows none, rather than one that grows with every reload.
+  const elapsed = typeof seconds === 'number' ? seconds : streaming && typeof started === 'number' ? Math.max(0, now / 1000 - started) : null
+  const label = thinking ? `Thinking…${elapsed >= 1 ? ` ${Math.floor(elapsed)} s` : ''}`
+    : elapsed !== null ? `Thought for ${wholeSeconds(elapsed)} s` : 'Thought'
+  if (!text) {
+    if (typeof started !== 'number' && typeof seconds !== 'number' && !(reasoningTokens > 0)) return null
+    if (thinking) return html`<p class="thinking-line">${label}</p>`
+    return html`<p class="thinking-line">${label} · the endpoint did not return a summary</p>`
+  }
+  const open = manual ?? thinking
+  return html`<details class="thinking" open=${open}>
+    <summary onClick=${event => { event.preventDefault(); setManual(!open) }}>${label}</summary>
+    <div class="thinking-body"><${Markdown} text=${text} streaming=${streaming} />
+      ${truncated ? html`<p class="thinking-note">Thinking display limit reached.</p>` : null}</div>
+  </details>`
+}
+
+function Reply({ text, reasoning, truncated, started, seconds, requestInfo, onOpenPath, actions = null }) {
   const streaming = requestInfo?.status === 'running'
   return html`<div class="assistant-reply"><${Brand} small=${true} />
-    <div class="reply-content">${reasoning ? html`<details class="reasoning-summary"><summary>Provider reasoning summary</summary>
-      <p class="muted">Supplied by the model endpoint.</p><${Markdown} text=${reasoning} streaming=${streaming} />
-      ${truncated ? html`<p class="muted">Summary display limit reached.</p>` : null}</details>` : null}<${Markdown} text=${text} streaming=${streaming} onOpenPath=${onOpenPath} />
+    <div class="reply-content"><${Thinking} text=${reasoning} truncated=${truncated} started=${started} seconds=${seconds}
+      streaming=${streaming} answering=${!!text} reasoningTokens=${requestInfo?.usage?.reasoning_tokens} /><${Markdown} text=${text} streaming=${streaming} onOpenPath=${onOpenPath} />
       ${text || actions ? html`<div class="message-actions">${text ? html`<${CopyAction} text=${text} label="Copy response" />` : null}${actions}</div>` : null}
       ${requestInfo ? html`<${RequestDetails} info=${requestInfo} />` : null}
     </div></div>`
@@ -597,7 +668,7 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
       if (event.type === 'tool' && event.name === 'ask_user') return html`<${QuestionCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
       if (event.type === 'tool' && event.name === 'submit_plan') return html`<${PlanCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
       if (event.type === 'tool') return html`<${ToolCard} key=${event.id} event=${event} summary=${toolSummaries.get(event.id)} result=${toolStates.get(event.id).result} status=${toolStates.get(event.id).status} failure=${toolStates.get(event.id).failure} sessionId=${session.id} onError=${onError} onSelectSession=${onSelectSession} onOpenPath=${onOpenPath} />`
-      if (event.type === 'assistant') return event.text || event.reasoning_summary || event.request_info ? html`<${Reply} key=${event.id} text=${event.text || ''} reasoning=${event.reasoning_summary} truncated=${event.reasoning_truncated} requestInfo=${event.request_info} onOpenPath=${onOpenPath} actions=${event.text ? replyActions(event) : null} />` : null
+      if (event.type === 'assistant') return event.text || event.reasoning_summary || event.request_info || event.reasoning_started ? html`<${Reply} key=${event.id} text=${event.text || ''} reasoning=${event.reasoning_summary} truncated=${event.reasoning_truncated} started=${event.reasoning_started} seconds=${event.reasoning_seconds} requestInfo=${event.request_info} onOpenPath=${onOpenPath} actions=${event.text ? replyActions(event) : null} />` : null
       const marker = event.type !== 'error' && (!!event.stop_phase || event.text === STOPPED_TEXT)
       const classes = ['conversation-notice', event.type === 'error' && 'error', marker && 'stop-marker', event.compaction && 'compaction'].filter(Boolean).join(' ')
       if (marker) return html`<div class=${classes} key=${event.id} title=${event.text}>${STOP_TEXT[event.stop_phase] || 'Stopped'}</div>`

@@ -1,7 +1,7 @@
 import { html, useAutoFocus, useEffect, useLayoutEffect, useMemo, useRef, useState } from '../lib.js'
 import {
   ArrowLeftRight, Bell, BellOff, ChevronDown, ChevronRight, Code2, Ellipsis, Folder, GitBranch, Pin, Plus,
-  Search, Settings as SettingsIcon, X,
+  Search, Settings as SettingsIcon, Tag, X,
 } from '../icons.js'
 import DeleteConversationDialog from './DeleteConversationDialog.js'
 
@@ -20,6 +20,8 @@ const folderName = path => path.split('/').filter(Boolean).pop() || path || 'No 
 // Only a list of strings counts as tags, so a damaged header cannot break the list.
 const tagsOf = session => Array.isArray(session.tags) ? session.tags.filter(tag => typeof tag === 'string') : []
 const MAX_TAGS = 10
+// '#word' in the search box filters by tag (a tag starting with word); the other words search titles and messages.
+const hashTerm = word => word.length > 1 && word.startsWith('#')
 
 // Subagent chats nest under their parent when it is listed and still linked (one level, so a
 // damaged parent cycle cannot hide both chats). Archived and pinned chats are never nested.
@@ -42,13 +44,24 @@ function organize(sessions) {
 }
 
 // Pinned (across projects), one group per project with the current one first, and Archived.
-function arrange(sessions, tree, { runningOnly, terms, tag, current }) {
-  const filtering = runningOnly || terms.length > 0 || !!tag
-  const passes = session => (!runningOnly || session.status !== 'idle')
-    && (!tag || tagsOf(session).some(item => fold(item) === fold(tag)))
-    && terms.every(term => fold(session.title).includes(term))
+// tags: chosen in the Tags menu (a chat with any of them passes); hashes: '#word' search terms (every one must match a tag).
+function arrange(sessions, tree, { runningOnly, terms, tags, hashes, current }) {
+  const filtering = runningOnly || terms.length > 0 || tags.length > 0 || hashes.length > 0
+  const chosen = tags.map(fold)
+  const passes = session => {
+    const own = tagsOf(session).map(fold)
+    return (!runningOnly || session.status !== 'idle')
+      && (!chosen.length || chosen.some(item => own.includes(item)))
+      && hashes.every(hash => own.some(item => item.startsWith(hash)))
+      && terms.every(term => fold(session.title).includes(term))
+  }
   // While filtering, matching subagent chats are listed on their own.
   const pool = filtering ? sessions.filter(passes) : tree.topLevel
+  // The chats a tag filter allows, for the message search results (null: no tag filter).
+  const tagged = chosen.length || hashes.length ? new Set(sessions.filter(session => {
+    const own = tagsOf(session).map(fold)
+    return (!chosen.length || chosen.some(item => own.includes(item))) && hashes.every(hash => own.some(item => item.startsWith(hash)))
+  }).map(session => session.id)) : null
   const pinned = []
   const archived = []
   const groups = new Map()
@@ -63,7 +76,7 @@ function arrange(sessions, tree, { runningOnly, terms, tag, current }) {
   }
   // Groups keep the order of their newest chat, with the current project first.
   const ordered = [...groups.entries()].sort(([a], [b]) => (b === current) - (a === current))
-  return { filtering, pinned, archived, groups: ordered, listed: pool.length - archived.length }
+  return { filtering, pinned, archived, groups: ordered, listed: pool.length - archived.length, tagged }
 }
 
 function RenameForm({ session, title, setTitle, saving, error, onSave, onCancel }) {
@@ -225,6 +238,43 @@ function ConversationRow({ session, selected, unread, failed, showId, childCount
       title=${`Show conversations tagged ${tag}`} onClick=${() => onTag(tag)}>${tag}</button>`)}</div>` : null}`
 }
 
+// The Tags menu: every tag in use with its number of chats; chats with any checked tag are listed.
+function TagFilter({ sessions, selected, onChange }) {
+  const [open, setOpen] = useState(false)
+  const root = useRef(null)
+  const button = useRef(null)
+  const counts = useMemo(() => {
+    const found = new Map()
+    for (const session of sessions) for (const tag of tagsOf(session)) {
+      const entry = found.get(fold(tag)) || { tag, count: 0 }
+      entry.count++
+      found.set(fold(tag), entry)
+    }
+    return [...found.values()].sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag))
+  }, [sessions])
+  useEffect(() => {
+    if (!open) return
+    root.current?.querySelector('input')?.focus({ preventScroll: true })
+    const outside = event => { if (!root.current?.contains(event.target)) setOpen(false) }
+    document.addEventListener('pointerdown', outside)
+    return () => document.removeEventListener('pointerdown', outside)
+  }, [open])
+  if (!counts.length) return null
+  const checked = tag => selected.some(item => fold(item) === fold(tag))
+  return html`<div class="tag-menu-anchor" ref=${root} onKeyDown=${event => {
+    if (open && event.key === 'Escape') { event.preventDefault(); setOpen(false); button.current?.focus() }
+  }}>
+    <button ref=${button} class="running-filter tag-filter-toggle" aria-haspopup="true" aria-expanded=${open} aria-pressed=${selected.length > 0}
+      title="Filter conversations by tag" onClick=${() => setOpen(value => !value)}><${Tag} size=${11} />Tags${selected.length ? ` (${selected.length})` : ''}</button>
+    ${open ? html`<div class="tag-menu" role="group" aria-label="Filter by tag">
+      ${counts.map(({ tag, count }) => html`<label key=${fold(tag)}><input type="checkbox" checked=${checked(tag)}
+        onChange=${event => onChange(event.currentTarget.checked ? [...selected, tag] : selected.filter(item => fold(item) !== fold(tag)))} />
+        <span>${tag}</span><small aria-label=${`${plural(count, 'conversation')}`}>${count}</small></label>`)}
+      <p class="tag-menu-hint">Tip: type #tag in the search box.</p>
+    </div>` : null}
+  </div>`
+}
+
 // Turns browser notifications on or off; permission is asked for only by this click.
 function NotifyToggle({ notifications }) {
   if (!notifications) return null
@@ -247,10 +297,12 @@ function badges(sessions, children) {
 
 // Chats whose messages match, from the server, opened with a click. Title matches are
 // left out: the title filter above already lists them.
-const messageHits = found => (found?.results || []).filter(result => Array.isArray(result.matches) && result.matches.length > 0)
-function FoundInMessages({ found, onOpen }) {
+// tagged: the IDs a tag filter allows (null: no tag filter); other chats' hits are left out too.
+const messageHits = (found, tagged = null) => (found?.results || []).filter(result => Array.isArray(result.matches)
+  && result.matches.length > 0 && (!tagged || tagged.has(result.id)))
+function FoundInMessages({ found, tagged, onOpen }) {
   if (!found) return null
-  const hits = messageHits(found)
+  const hits = messageHits(found, tagged)
   return html`<section class="found-in-messages" aria-label="Found in messages"><p class="section-label">Found in messages</p>
     ${found.error ? html`<p class="empty-sessions" role="alert">${found.error}</p>`
       : hits.length === 0 ? html`<p class="empty-sessions">No messages match.</p>`
@@ -271,7 +323,7 @@ export default function Sidebar(props) {
   const current = props.settings?.workspace || ''
   const [runningOnly, setRunningOnly] = useState(false)
   const [query, setQuery] = useState('')
-  const [tag, setTag] = useState(null)
+  const [tags, setTags] = useState([])  // Chosen in the Tags menu or by clicking a row's tag.
   const [showArchived, setShowArchived] = useState(false)
   const [expanded, setExpanded] = useState({})  // project key -> open
   const [openChildren, setOpenChildren] = useState({})  // parent id -> open
@@ -281,12 +333,16 @@ export default function Sidebar(props) {
   const [moved, setMoved] = useState(null)  // id of a chat that Pin or Archive moved
   const aside = useRef(null)
   const searchRequest = useRef(0)
-  const terms = useMemo(() => fold(query).split(/\s+/).filter(Boolean), [query])
+  const words = useMemo(() => fold(query).split(/\s+/).filter(Boolean), [query])
+  const terms = useMemo(() => words.filter(word => !hashTerm(word)), [words])
+  const hashes = useMemo(() => words.filter(hashTerm).map(word => word.slice(1)), [words])
   const tree = useMemo(() => organize(props.sessions), [props.sessions])
-  const view = useMemo(() => arrange(props.sessions, tree, { runningOnly, terms, tag, current }),
-    [props.sessions, tree, runningOnly, terms, tag, current])
+  const view = useMemo(() => arrange(props.sessions, tree, { runningOnly, terms, tags, hashes, current }),
+    [props.sessions, tree, runningOnly, terms, tags, hashes, current])
+  const addTag = tag => setTags(current => current.some(item => fold(item) === fold(tag)) ? current : [...current, tag])
 
-  const text = query.trim()
+  // '#tag' words filter the list only; the rest is also searched in messages.
+  const text = query.split(/\s+/).filter(word => word && !hashTerm(word)).join(' ').trim()
   // The latest callback, so re-renders (streamed replies, list polls) do not restart a search.
   const onSearch = useRef(props.onSearch)
   onSearch.current = props.onSearch
@@ -323,7 +379,7 @@ export default function Sidebar(props) {
     unread=${!!props.attention?.unread(session)} failed=${!!props.attention?.failed(session)}
     childCount=${tree.childCount.get(session.id) || 0} onSelect=${() => select(session.id)}
     onDelete=${() => props.onDelete(session.id)} onAskDelete=${() => setDeleting({ session, children: tree.childCount.get(session.id) || 0 })}
-    onRename=${props.onRename} onMeta=${props.onMeta} onMoved=${setMoved} onTag=${setTag} onError=${props.onError} />`
+    onRename=${props.onRename} onMeta=${props.onMeta} onMoved=${setMoved} onTag=${addTag} onError=${props.onError} />`
   // A row, and while nothing is filtered, its subagent chats behind a toggle.
   const entry = session => {
     const kids = view.filtering ? [] : tree.children.get(session.id) || []
@@ -358,7 +414,7 @@ export default function Sidebar(props) {
   const searching = text.length >= SEARCH_MIN_CHARS
   const empty = props.sessions.length === 0 ? 'Your conversations will appear here.'
     : view.listed === 0 && runningOnly ? 'No conversation is running.'
-      : view.listed === 0 && view.filtering && !view.archived.length && !(searching && messageHits(found).length)
+      : view.listed === 0 && view.filtering && !view.archived.length && !(searching && messageHits(found, view.tagged).length)
         ? (terms.length ? 'No titles match.' : 'No conversation matches.') : ''
   return html`
     ${props.open ? html`<button class="sidebar-scrim" aria-label="Close sidebar" onClick=${props.close} />` : null}
@@ -372,19 +428,20 @@ export default function Sidebar(props) {
       </button>
       <div class="conversation-list">
         <div class="conversation-list-heading"><p class="section-label">Conversations</p>
+          <${TagFilter} sessions=${props.sessions} selected=${tags} onChange=${setTags} />
           ${props.sessions.length ? html`<button class="running-filter" aria-pressed=${runningOnly} title="Show only conversations that are working or waiting"
             onClick=${() => setRunningOnly(value => !value)}>Running</button>` : null}</div>
         ${props.sessions.length ? html`<div class="conversation-search"><${Search} size=${14} />
-          <input type="search" aria-label="Search conversations" placeholder="Search conversations" spellcheck=${false} maxLength=${200}
+          <input type="search" aria-label="Search conversations" placeholder="Search conversations or #tag" spellcheck=${false} maxLength=${200}
             value=${query} onInput=${event => setQuery(event.currentTarget.value)}
             onKeyDown=${event => { if (event.key === 'Escape' && query) { event.preventDefault(); setQuery('') } }} /></div>` : null}
-        ${tag ? html`<div class="tag-filter"><span>Tag: ${tag}</span><button class="icon-button" aria-label="Clear tag filter"
-          onClick=${() => { setTag(null); aside.current?.querySelector('.conversation-search input')?.focus() }}><${X} size=${12} /></button></div>` : null}
+        ${tags.length ? html`<div class="tag-filter"><span>${tags.length === 1 ? 'Tag' : 'Tags'}: ${tags.join(', ')}</span><button class="icon-button" aria-label="Clear tag filter"
+          onClick=${() => { setTags([]); aside.current?.querySelector('.conversation-search input')?.focus() }}><${X} size=${12} /></button></div>` : null}
         ${empty ? html`<p class="empty-sessions">${empty}</p>` : null}
         ${view.pinned.length ? html`<section class="pinned-group" aria-label="Pinned"><p class="section-label"><${Pin} size=${12} />Pinned</p>
           ${rows('pinned', view.pinned)}</section>` : null}
         ${view.groups.map(group)}
-        <${FoundInMessages} found=${searching ? found : null} onOpen=${select} />
+        <${FoundInMessages} found=${searching ? found : null} tagged=${view.tagged} onOpen=${select} />
         ${view.archived.length ? html`<button class="archived-toggle" aria-expanded=${showArchived}
           onClick=${() => setShowArchived(value => !value)}>${showArchived ? html`<${ChevronDown} size=${13} />` : html`<${ChevronRight} size=${13} />`}Archived (${view.archived.length})</button>
           ${showArchived ? html`<section class="archived-group" aria-label="Archived">${rows('archived', view.archived)}</section>` : null}` : null}
