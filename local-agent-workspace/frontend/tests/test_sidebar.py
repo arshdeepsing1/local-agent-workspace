@@ -330,7 +330,8 @@ def test_titles_filter_instantly_and_messages_are_searched_after_a_pause(ui, pag
     search.fill("parser NOTES")
     expect(page.locator(".conversation-row")).to_have_count(1)
     expect(row(page, "Parser notes")).to_be_visible()
-    page.wait_for_timeout(500)
+    # The pause's message search, before the next words (a fixed wait raced it on slow runners).
+    ui.wait("fake.requests(/session-search/).some(call => call.path.endsWith('q=parser+NOTES'))")
     ui.run("fake.calls.length = 0")
     search.fill("needle")
     found = page.get_by_role("region", name="Found in messages")
