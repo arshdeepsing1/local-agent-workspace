@@ -38,9 +38,13 @@ def test_connect_checks_the_header_not_the_full_conversation(ui, page):
     assert ui.requests("/api/sessions/a", "GET") == []
 
 
-# Records the scroll position as soon as the earlier messages are in the page, before any
+# Records the scroll position at the click (what the app anchors to; the page can change height
+# after an earlier measurement) and as soon as the earlier messages are in the page, before any
 # animation frame: a smooth scroll would still be near the top then.
 FIRST_POSITION = """const el = document.querySelector('.transcript')
+document.querySelector('.load-earlier').addEventListener('click', () => {
+  window.clickPosition = { top: el.scrollTop, height: el.scrollHeight }
+}, { capture: true, once: true })
 new MutationObserver((records, observer) => {
   if (!el.querySelector('.user-message')?.textContent.includes('Message 0')) return
   window.firstPosition = { top: el.scrollTop, height: el.scrollHeight }
@@ -61,10 +65,10 @@ def test_earlier_messages_are_prepended_without_moving_the_view(ui, page):
     expect(button).to_have_count(0)
     assert texts(page) == [f"Message {number}" for number in range(250)]
     assert [call["path"] for call in ui.js("fake.requests(/\\/events\\?/)")] == ["/api/sessions/a/events?before=e100&limit=100"]
-    first = ui.js("window.firstPosition")
+    first, clicked = ui.js("window.firstPosition"), ui.js("window.clickPosition")
     after = ui.js("(el => ({ top: el.scrollTop, height: el.scrollHeight }))(document.querySelector('.transcript'))")
     assert after["height"] > before["height"]
-    assert first["top"] > 0 and abs(first["top"] - (first["height"] - before["height"])) <= 1
+    assert first["top"] > 0 and abs(first["top"] - (clicked["top"] + first["height"] - clicked["height"])) <= 1
     assert abs(after["top"] - first["top"]) <= 1
 
 
