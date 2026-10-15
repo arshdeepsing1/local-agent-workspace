@@ -3,6 +3,7 @@ import json
 import time
 import uuid
 
+from .spending import own_spend
 from .tool_profiles import PROFILES, child_profile, validate_profile
 
 
@@ -564,6 +565,8 @@ class DelegateManager:
         if len(paths) > CHANGED_FILES:
             result["changed_files_total"] = len(paths)
         current = self.manager.get(parent["id"])
-        if current and self._record(current, saved, steps_used=steps, tool_calls=calls):
+        spent, unpriced = own_spend(saved)  # Counted for the parent's spending limit (spending.py).
+        if current and self._record(current, saved, steps_used=steps, tool_calls=calls, estimated_dbu=spent,
+                                    unpriced_calls=unpriced):
             self.manager.store.save(current)
         return bounded_result(result)

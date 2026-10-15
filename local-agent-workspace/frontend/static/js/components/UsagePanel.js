@@ -70,6 +70,61 @@ function LastInput({ report }) {
   </div>`
 }
 
+const MAX_LIMIT_DBU = 100000
+
+// The chat's spending limit (backend spending.py): a soft cap on the estimated DBU of the chat and its
+// subagents, checked before each agent model request. Its own value wins over the Settings default;
+// a subagent follows its parent's.
+function SpendingLimit({ session, spending, onSaved }) {
+  const limit = spending.limit_dbu
+  const [draft, setDraft] = useState(limit == null ? '0' : String(limit))
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+  useEffect(() => { setDraft(limit == null ? '0' : String(limit)) }, [limit, spending.source])
+  const own = spending.source === 'chat'
+  const save = async value => {
+    setSaving(true); setError('')
+    try {
+      await api(`/sessions/${encodeURIComponent(session.id)}/spending-limit`, 'PUT', { spending_limit_dbu: value })
+      await onSaved()
+    } catch (cause) { setError(cause.message) } finally { setSaving(false) }
+  }
+  const submit = event => {
+    event.preventDefault()
+    const value = draft.trim() === '' ? NaN : Number(draft)
+    if (!Number.isFinite(value) || value < 0 || value > MAX_LIMIT_DBU) {
+      setError(`Enter a number of DBU from 0 (no limit) to ${MAX_LIMIT_DBU.toLocaleString('en-US')}.`)
+      return
+    }
+    void save(value)
+  }
+  const spent = spending.spent_dbu || 0
+  const over = limit != null && spent >= limit
+  const summary = limit == null ? `${formatDbu(spent)} DBU · no limit` : `${formatDbu(spent)} of ${formatDbu(limit)} DBU`
+  const details = [
+    session.is_subagent ? 'Follows its parent conversation\'s limit; the total includes the parent and its other subagents.'
+      : limit == null ? (own ? 'No limit for this chat.' : 'No limit (Settings → Agent sets a default for every chat).')
+      : own ? 'This chat\'s own limit.' : 'The default from Settings → Agent.',
+    spending.subagents_dbu > 0 ? `Includes ${formatDbu(spending.subagents_dbu)} DBU from subagents.` : '',
+    spending.unpriced_calls ? `${spending.unpriced_calls === 1 ? '1 call' : `${spending.unpriced_calls} calls`} to endpoints without price data ${spending.unpriced_calls === 1 ? 'is' : 'are'} not counted.` : '',
+  ].filter(Boolean)
+  return html`<div class=${`usage-spending${over ? ' usage-spending-over' : ''}`} role="group" aria-label="Spending limit">
+    <div class="usage-spending-head"><small>Spending limit</small><strong>${summary}</strong>
+      ${limit != null ? html`<span class="usage-spending-percent">${spending.percent}%</span>` : null}</div>
+    ${limit != null ? html`<meter min="0" max=${limit} low=${limit * .8} high=${limit * .999} optimum="0" value=${Math.min(spent, limit)}
+      aria-label=${`Estimated spend: ${spending.percent}% of the limit`} />` : null}
+    ${details.map(text => html`<p class="field-help" key=${text}>${text}</p>`)}
+    ${over && !session.is_subagent ? html`<p class="usage-warning" role="status">The agent stops before its next model request until you raise the limit.</p>` : null}
+    ${session.is_subagent ? null : html`<form class="usage-spending-form" noValidate onSubmit=${submit}>
+      <label>Limit for this chat (DBU, 0 = none)<input type="number" min="0" max=${MAX_LIMIT_DBU} step="any" inputmode="decimal"
+        value=${draft} onInput=${event => setDraft(event.currentTarget.value)} /></label>
+      <button class="outline" disabled=${saving}>${saving ? 'Saving…' : 'Save limit'}</button>
+      <button type="button" class="outline" disabled=${saving || !own} onClick=${() => void save(null)}>Use Settings default</button>
+    </form>`}
+    ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
+  </div>`
+}
+
 export default function UsagePanel({ session, onError }) {
   const sessionId = session?.id
   const [metrics, setMetrics] = useState(null)
@@ -117,6 +172,7 @@ export default function UsagePanel({ session, onError }) {
     ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
     ${!metrics && loading ? html`<p role="status">Loading usage…</p>` : null}
     ${metrics ? html`
+      ${metrics.spending ? html`<${SpendingLimit} session=${session} spending=${metrics.spending} onSaved=${refresh} />` : null}
       <${LastInput} report=${metrics.last_input} />
       <div class="usage-cards">
         <div><small>Model calls</small><strong>${integer.format(metrics.totals.calls)}</strong></div>

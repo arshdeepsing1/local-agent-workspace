@@ -11,6 +11,7 @@ from .context import (
 from .context import DEFAULT_AUTO_COMPACT_PERCENT, MAX_AUTO_COMPACT_PERCENT, MIN_AUTO_COMPACT_PERCENT
 from .model_profiles import DEFAULT_MODEL, LEGACY_DEFAULT_LIMITS, LEGACY_DEFAULT_MODEL, default_limits, known_endpoints
 from .reasoning import DEFAULT_EFFORT, DEFAULT_FORMAT, EFFORT_LEVELS, REQUEST_FORMATS
+from .spending import validate_limit
 
 APP_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MAX_AGENT_STEPS = 32
@@ -109,6 +110,8 @@ class Settings:
             "reasoning_effort": DEFAULT_EFFORT,
             "reasoning_format": DEFAULT_FORMAT,
             "thinking_summaries": True,
+            # Settings → Agent (spending.py): the soft cap in estimated DBU of chats without their own; 0 = none.
+            "spending_limit_dbu": 0,
         }
         self.migrated_from = None
         if self.path.exists():
@@ -243,6 +246,7 @@ class Settings:
             raise ValueError("Reasoning request format must be one of: " + ", ".join(REQUEST_FORMATS) + ".")
         if type(candidate["thinking_summaries"]) is not bool:
             raise ValueError("Show thinking summaries must be on or off.")
+        candidate["spending_limit_dbu"] = validate_limit(candidate["spending_limit_dbu"], "Default spending limit")
         for key, label, check in (("coding_dir", "Default code folder", user_paths.check_coding_dir_setting),
                                   ("python_venv", "Python environment", user_paths.check_python_venv_setting)):
             value = candidate[key]

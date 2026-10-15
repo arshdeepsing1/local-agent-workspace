@@ -249,6 +249,16 @@ def _public_call(call, *, fallback=False):
     return result
 
 
+def call_estimated_dbu(call):
+    """(estimated DBU or None, priced) of one ledger record, as the usage panel counts it. priced is
+    False only for a call that reported its usage to an endpoint without price data."""
+    public = _public_call(call)
+    if public["estimated_dbu"] is not None:
+        return public["estimated_dbu"], True
+    usage = public.get("usage") or {}
+    return None, not ("input_tokens" in usage and "output_tokens" in usage)
+
+
 def _totals(calls):
     totals = {"calls": len(calls), "successful": 0, "errors": 0, "rate_limited": 0, "retries": 0,
               **{field: 0 for field in USAGE_FIELDS}}

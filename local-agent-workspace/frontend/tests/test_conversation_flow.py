@@ -80,6 +80,7 @@ def test_continue_follows_live_turn_endings(ui, page):
 
 @pytest.mark.parametrize("events,fields,shown", [
     ("[]", {"terminal_reason": "step_limit"}, "The agent reached its step limit."),
+    ("[]", {"terminal_reason": "spending_limit"}, "The conversation reached its spending limit."),
     ("[]", {"terminal_reason": "stopped"}, "The response was stopped."),
     ("[]", {"terminal_reason": "interrupted"}, "The response was interrupted."),
     ("[{ type: 'error', text: 'Output limit', error_kind: 'output_limit' }]", {"terminal_reason": "inference_error"},

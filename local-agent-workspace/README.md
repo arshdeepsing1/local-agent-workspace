@@ -1023,7 +1023,8 @@ It does not estimate missing token counts. This is not an account-wide report or
 invoice: regional uplifts, provisioned endpoints, negotiated pricing, credits, and
 delayed billing adjustments can differ. Older chats that predate the ledger show
 visible agent-call totals as incomplete because title, summary, and retry attempts
-cannot be reconstructed. A delegated child's requests stay in its own conversation.
+cannot be reconstructed. A delegated child's requests stay in its own conversation's
+usage (its parent's spending limit counts them).
 Databricks responses may omit usage.
 See the [Databricks API reference](https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/api-reference)
 for the provider's usage fields. The context meter below shows the input Databricks
@@ -1112,6 +1113,26 @@ retries** tile counts these calls; **429 responses** counts rate-limited calls. 
 request asked for; it is empty for a request at Default that sent no reasoning fields.
 `effort_sent` is the level that went out: GPT OSS gets `high` for Extra high and Max, and
 `none` means the reasoning fields were left out after a rejection.
+
+### Spending limit
+
+A conversation can have a **spending limit**: a soft cap on its estimated DBU (the estimate
+above, from list prices), counting its subagents too. **Settings → Agent → Spending limit per
+conversation** sets the default for every chat without its own (0, the default, means no
+limit); **Agent tools → Usage** shows what the chat has used against its limit, with the share
+from subagents, and sets the chat's own limit (0 = none for this chat) or returns it to the
+Settings default. It can be changed while a reply runs.
+
+The app checks the limit before each agent model request, before any compaction for it. At 80%
+it adds one notice; once the chat has used the limit, it does not send the next request and
+ends the turn with a notice (a subagent ends with an error its parent sees), the chat offers
+**Continue**, and desktop notifications say "Reached the spending limit". Raise the limit, then
+continue. It is a soft cap: one response can pass it before the next request is stopped.
+Calls to endpoints without price data count as nothing and are listed as not counted; title
+and compaction requests are counted but never stopped. A subagent follows its parent's limit,
+and an ended subagent keeps its estimate in the parent's subagents index (subagents that ended
+before this existed are not counted). The offline simulator reports usage, so
+`databricks-claude-opus-5-5` there can be used to try a small limit.
 
 ### Reasoning effort and thinking
 

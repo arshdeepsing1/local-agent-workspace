@@ -53,6 +53,8 @@ def attention_message(session, previous, status, turn_ended=False):
         return f"Stopped with an error: {title}"
     if reason == "step_limit":  # Not finished: the chat offers Continue.
         return f"Reached the step limit: {title}"
+    if reason == "spending_limit":
+        return f"Reached the spending limit: {title}"
     return f"Finished: {title}"
 
 

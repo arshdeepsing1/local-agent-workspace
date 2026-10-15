@@ -53,6 +53,7 @@ export function attentionFor(before, session) {
   if (ERROR_REASONS.has(session.terminal_reason)) return { state: 'error', body: `Stopped with an error: ${title}` }
   // Not finished: the chat offers Continue.
   if (session.terminal_reason === 'step_limit') return { state: 'step_limit', body: `Reached the step limit: ${title}` }
+  if (session.terminal_reason === 'spending_limit') return { state: 'spending_limit', body: `Reached the spending limit: ${title}` }
   return { state: 'finished', body: `Finished: ${title}` }
 }
 

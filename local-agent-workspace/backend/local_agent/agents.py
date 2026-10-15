@@ -50,6 +50,7 @@ from .feature_tools import FEATURE_TOOLS
 from .tool_profiles import tool_allowed, filter_tools
 from . import reasoning
 from .reasoning import reasoning_delta
+from . import spending
 from .titles import fallback_title, generate_title, needs_title
 from .telemetry import (
     InferenceError, begin_inference_call, finish_inference_call, http_error_kind,
@@ -1820,6 +1821,20 @@ class AgentManager:
                              "It applies from the agent's next model request.")
         for child in self.active_children(session):
             await self.change_effort(child, effort)
+
+    async def change_spending_limit(self, session, limit):
+        """Set the chat's spending limit in DBU (0 = none; None = follow the Settings default). Its next
+        model request, and its running subagents', check the new limit."""
+        if session.get("is_subagent"):
+            raise ValueError("A subagent follows its parent conversation's spending limit; change it there.")
+        if limit is None:
+            session.pop("spending_limit_dbu", None)
+        else:
+            session["spending_limit_dbu"] = spending.validate_limit(limit)
+        session.pop("spending_warned", None)  # A new limit warns again at its own 80%.
+        self.store.save(session, touch=False)
+        await self.broadcast(session["id"], {"type": "spending_limit", "spending_limit_dbu":
+                                             session.get("spending_limit_dbu"), "spending": spending.status(self, session)})
 
     def reasoning_request(self, session):
         """The reasoning fields the chat's next agent request carries (reasoning.effort_request): the
@@ -4084,8 +4099,16 @@ class AgentManager:
             consecutive_output_retries = 0
             execution_noticed = False
             for step_index in range(steps):
-                # Before any compaction is billed: a max_tokens above the output-tokens-per-minute
-                # limit Databricks reported for this endpoint can never be admitted.
+                # Before any compaction is billed: the chat's spending limit (its subagents count
+                # for it) and a max_tokens above the output-tokens-per-minute limit Databricks
+                # reported for this endpoint, which can never be admitted.
+                verdict, text = spending.check(self, session)
+                if verdict == "stop":
+                    await self.event(session, "error" if session.get("is_subagent") else "notice", text=text,
+                                     terminal_reason="spending_limit")
+                    return False
+                if verdict == "warn":
+                    await self.event(session, "notice", text=text)
                 if (refusal := self.otpm_preflight(session, max_output_tokens)) is not None:
                     raise refusal
                 # The mode, rules and turned-off tools can change while a turn runs; each step follows them.

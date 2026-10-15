@@ -5,6 +5,7 @@
 //   when the next request's estimate passes this share of the input budget), approval_timeout_minutes? (0 = no limit),
 //   system_notifications? (server notifications while no page is open),
 //   auto_keep_changes? (true: Keep every listed change when a chat's reply ends), host, configured,
+//   spending_limit_dbu? (0-100000, default 0 = none: the spending limit of chats without their own; spending.py),
 //   coding_dir (default folder for new standalone code: the saved or .env value, '' = off),
 //   python_venv (virtual environment the agent's commands, Verify, hooks and the Terminal use, '' = off),
 //   coding_dir_status: { path, state: 'off'|'ready'|'missing'|'invalid', message, source: 'settings'|'env'|'none' }
@@ -47,14 +48,19 @@
 //   agent_type?: 'explore'|'general'|'editor' (a subagent), subagents?: SubagentEntry[] (a parent's index of its
 //   subagent chats; left out of GET /sessions list items),
 //   terminal_reason?: how the last turn ended: 'completed'|'stopped'|'error'|'inference_error'|
-//   'tool_error'|'step_limit'|'interrupted' (also in the /api/sessions summaries),
+//   'tool_error'|'step_limit'|'spending_limit'|'interrupted' (also in the /api/sessions summaries),
 //   turn_ended?: epoch seconds when the last turn ended; null while a turn runs (also in summaries),
 //   turn_delegated?: true while the last turn is one a parent's delegate_task started (also in summaries),
 //   reasoning_effort?: Effort (the chat's own level, saved in its header; absent on chats saved before it existed,
-//   which use Settings.reasoning_effort; kept by forks and imports; also in summaries) }
+//   which use Settings.reasoning_effort; kept by forks and imports; also in summaries),
+//   spending_limit_dbu?: number (the chat's own spending limit; 0 = none; absent: Settings.spending_limit_dbu) }
 // POST /sessions { permission_mode, reasoning_effort? } creates a chat (Settings' effort when absent).
 // PUT /sessions/<id>/reasoning-effort { reasoning_effort } -> Session, also while busy: the agent's next model request
 //   (and a running subagent's) uses it. Pushed as { type: 'reasoning_effort', reasoning_effort }.
+// PUT /sessions/<id>/spending-limit { spending_limit_dbu: number 0..100000 | null (follow Settings) } -> Session, also
+//   while busy (400 for a subagent). Pushed as { type: 'spending_limit', spending_limit_dbu, spending: Spending }.
+// Spending (GET /sessions/<id>/metrics → spending): { limit_dbu: number | null (none), source: 'chat'|'settings',
+//   spent_dbu, own_dbu, subagents_dbu, unpriced_calls, percent: number | null } — a subagent reports its parent's.
 //   GET /sessions list items omit events and allow_rules, and add unreviewed_changes (files with agent
 //   changes not yet kept or undone, including rows rolled up from its subagents).
 //   pinned?, archived? (hidden in the sidebar; wins over pinned), tags?: string[] (at most 10, 1-32 characters),

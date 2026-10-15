@@ -154,7 +154,9 @@ function Overview({ session, workspace, changedFiles, onOpen }) {
     { label: 'Tasks', tab: 'Tasks', text: value('tasks', tasks => tasks.length
       ? `${tasks.filter(task => task.status === 'completed').length} of ${tasks.length} done` : 'None yet') },
     ...(typeof changedFiles === 'number' ? [{ label: 'Unreviewed changes', text: changedFiles ? plural(changedFiles, 'file') : 'None' }] : []),
-    { label: 'Usage', tab: 'Usage', text: 'Model calls, tokens and estimated cost' },
+    { label: 'Usage', tab: 'Usage', text: typeof session.spending_limit_dbu === 'number'
+      ? `Spending limit: ${session.spending_limit_dbu ? `${session.spending_limit_dbu} DBU` : 'none'} (this chat)`
+      : 'Model calls, tokens, estimated cost and spending limit' },
     { label: 'Export', tab: 'Export', text: 'Markdown transcript, conversation file, fork' },
   ] : []
   const project = [

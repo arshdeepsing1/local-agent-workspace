@@ -506,3 +506,18 @@ body.panel-resizing{cursor:col-resize;user-select:none}
 .conversation-list-heading .section-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .conversation-list-heading .running-filter{white-space:nowrap;flex-shrink:0}
 @media(601px <= width < 1024px){.drawer-alert{width:calc(var(--panel-width,min(520px,100vw - 238px)) - 24px)}}
+
+/* 2026-10-15 spending limit: Agent tools → Usage */
+.usage-spending{background:var(--surface);border:1px solid var(--border);border-radius:9px;padding:12px;margin:18px 0 0;min-width:0}
+.usage-spending-head{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px}
+.usage-spending-head small{flex-basis:100%;font-size:11px;color:var(--muted)}
+.usage-spending-head strong{font-size:15px;font-weight:500;overflow-wrap:anywhere}
+.usage-spending-percent{font-size:11px;color:var(--muted)}
+.usage-spending meter{display:block;width:100%;height:8px;margin:9px 0 2px}
+.usage-spending .field-help{margin:6px 0 0}
+.usage-spending-over .usage-spending-head strong{color:#8a3b2e}
+.usage-spending-form{display:flex;flex-wrap:wrap;align-items:flex-end;gap:8px;margin-top:10px}
+.usage-spending-form label{flex:1 1 12rem;min-width:0;font-size:12px}
+.usage-spending-form input{width:100%}
+.usage-spending-form button{white-space:nowrap}
+.usage-spending .usage-warning{margin:9px 0 0}

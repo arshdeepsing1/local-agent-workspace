@@ -4,6 +4,14 @@ Notable changes to Local Agent Workspace, newest first. Dates are UTC.
 
 ## Unreleased
 
+Follow-up of 2026-10-15:
+
+- Spending limit per conversation: a soft cap on the estimated DBU of a chat and its
+  subagents, checked before each agent model request. **Settings → Agent** sets the default
+  (0 = none), **Agent tools → Usage** shows the spend against the limit and sets a chat's own.
+  One notice at 80%; at the limit the turn ends before the next request, with **Continue**
+  and a "Reached the spending limit" notification.
+
 Requests of 2026-10-14 (testing on a new machine):
 
 - Reasoning effort per conversation: **Default**, **Fast**, **Medium**, **High**, **Extra

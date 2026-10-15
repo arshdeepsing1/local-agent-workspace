@@ -196,6 +196,16 @@ def test_a_turn_stopped_at_the_step_limit_is_not_announced_as_finished(ui, page)
     assert notes(ui) == [["Local", "Reached the step limit: Long job", "a:step_limit"]]
 
 
+def test_a_turn_stopped_at_the_spending_limit_says_so(ui, page):
+    start(ui, page, "b", setup=GRANTED + sessions(("a", "Costly job", {"status": "running", "turn_ended": None}),
+                                                   ("b", "Selected chat", {})), clock=True)
+    ui.show_session("b")
+    update(ui, "a", status="idle", terminal_reason="spending_limit", turn_ended=6, updated=6)
+    ui.tick(1500)
+    ui.wait("notifications.length === 1")
+    assert notes(ui) == [["Local", "Reached the spending limit: Costly job", "a:spending_limit"]]
+
+
 def test_turn_ends_notify_after_automatic_compaction_but_not_after_a_manual_one(ui, page):
     start(ui, page, "b", setup=GRANTED + sessions(("a", "Other conversation", {"turn_ended": 1}),
                                                    ("b", "Selected chat", {})), clock=True)

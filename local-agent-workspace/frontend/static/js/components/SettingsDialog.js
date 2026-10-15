@@ -243,6 +243,10 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         <label>Agent steps per message<input type="number" required min=${1} max=${64} step=${1}
           value=${form.max_agent_steps || ''} onInput=${number('max_agent_steps')} /></label>
         <p class="field-help">Limits model round trips for one message, not individual tool calls. One model response can request several tools. The default is 32.</p>
+        <label>Spending limit per conversation (DBU)<input type="number" required min=${0} max=${100000} step="any" inputmode="decimal"
+          value=${form.spending_limit_dbu ?? 0} onInput=${number('spending_limit_dbu')} /></label>
+        <p class="field-help">The agent stops before its next model request once a conversation and its subagents have used this much (estimated from list prices, as in Agent tools → Usage), and warns at 80%. 0 means no limit. A chat can set its own limit in Usage.</p>
+        <${More} topic="spending limit">It is a soft cap: one response can pass it before the next request is stopped. Calls to endpoints without price data are not counted, and title and compaction requests are not stopped.<//>
         <label>Approval wait (minutes)<input type="number" required min=${0} max=${1440} step=${1}
           value=${form.approval_timeout_minutes ?? 60} onInput=${number('approval_timeout_minutes')} /></label>
         <p class="field-help">How long an approval card waits for your answer (default 60); after that the action does not run and the agent is told nobody answered. 0 waits until you answer or press Stop.</p>
