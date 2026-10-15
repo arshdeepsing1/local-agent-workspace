@@ -11,7 +11,7 @@ import EditMessage from './EditMessage.js'
 import RewindDialog from './RewindDialog.js'
 import ForkDialog from './ForkDialog.js'
 import { backupTitle, setRewindNotice } from '../rewindNotice.js'
-import { AGENT_TYPE_LABELS, elapsedText } from '../subagents.js'
+import { agentLabel, agentSettingsText, elapsedText } from '../subagents.js'
 
 // A long file is read in pages. Naming the lines each read covered keeps the
 // pages of one file from looking like the same read repeated.
@@ -400,6 +400,7 @@ function DelegationStatus({ event, onSelectSession, onOpenPath }) {
   if (!progress) return null
   const status = DELEGATION_STATUS[progress.status] || String(progress.status || '').replace(/_/g, ' ')
   const kind = progress.agent_type || event.input?.agent_type
+  const settings = agentSettingsText(progress.effort, progress.model)
   const started = typeof progress.started === 'number' ? progress.started : null
   // Ended without an end time (a restart interrupted it): no duration, rather than one that grows with every reload.
   const elapsed = started == null ? null : typeof progress.ended === 'number' ? progress.ended - started
@@ -408,7 +409,8 @@ function DelegationStatus({ event, onSelectSession, onOpenPath }) {
   const files = Array.isArray(result?.changed_files) ? result.changed_files : []
   return html`<div class=${`delegation-progress ${progress.terminal_reason ? `delegation-${progress.status}` : 'delegation-live'}`} aria-label="Subagent progress">
     <span class="delegation-status">Subagent: ${status}</span>
-    ${kind ? html`<span class="delegation-type">${AGENT_TYPE_LABELS[kind] || kind}</span>` : null}
+    ${kind ? html`<span class="delegation-type">${agentLabel(kind)}</span>` : null}
+    ${settings ? html`<span class="delegation-agent" title=${progress.model ? `Effort and model (${progress.model})` : 'Effort'}>${settings}</span>` : null}
     <span>${progress.completed_tools} completed ${progress.completed_tools === 1 ? 'action' : 'actions'}</span>
     ${progress.last_tool ? html`<span>Last tool: ${progress.last_tool.replace(/_/g, ' ')}</span>` : null}
     ${elapsed != null ? html`<span class="delegation-elapsed" title=${progress.terminal_reason ? 'Time it ran' : 'Time running'}>${elapsedText(elapsed)}</span>` : null}

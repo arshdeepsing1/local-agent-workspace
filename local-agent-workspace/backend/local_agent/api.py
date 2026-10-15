@@ -175,6 +175,8 @@ class SettingsEdit(BaseModel):
     spending_limit_dbu: float | None = Field(default=None, ge=0, le=MAX_LIMIT_DBU, allow_inf_nan=False, strict=True)
     coding_dir: str | None = Field(default=None, max_length=4096, strict=True)
     python_venv: str | None = Field(default=None, max_length=4096, strict=True)
+    # Settings → Subagents: {explore|general|editor: {model, effort}}; config.subagent_defaults checks it.
+    subagent_defaults: dict[str, dict[str, str]] | None = None
 
 
 class LimitsQuery(BaseModel):

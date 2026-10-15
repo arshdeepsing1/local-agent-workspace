@@ -43,8 +43,9 @@ from .workspace_folders import WorkspaceFolders, _within
 from .worktrees import WorktreeManager
 from .extensions import ExtensionManager
 from .extensions import skill_index
+from . import custom_agents
 from .context import estimate_text_tokens
-from .planning import DEFAULT_STEPS, PROFILE_TYPES, CallAllowance, DelegateManager, DelegationGate, TaskManager
+from .planning import CallAllowance, DelegateManager, DelegationGate, TaskManager
 from .interactions import InteractionManager
 from .feature_tools import FEATURE_TOOLS
 from .tool_profiles import tool_allowed, filter_tools
@@ -1094,7 +1095,13 @@ class AgentManager(LifecycleHooks):
         defaults = default_limits(values["model"])
         current = (values["context_window"], values["max_output_tokens"])
         follow = [current[0] == defaults[0], current[1] == defaults[1]]
-        return follow_limits(follow, default_limits(session.get("model") or values["model"]), current)
+        limits = follow_limits(follow, default_limits(session.get("model") or values["model"]), current)
+        if session.get("agent_model") and session.get("agent_model") == session.get("model"):
+            # A subagent on its agent's own endpoint: budgets customised for the Settings endpoint stay
+            # within this endpoint's defaults, which always fit together (and its maxima, below).
+            own = default_limits(session["model"])
+            limits = (min(limits[0], own[0]), min(limits[1], own[1]))
+        return limits
 
     async def limits_notice(self, session):
         """One notice per chat when its endpoint supports less than Settings asks for. Never a wire message."""
@@ -1767,7 +1774,8 @@ class AgentManager(LifecycleHooks):
             await self.event(session, "notice", text=f"Reasoning effort changed to {reasoning.EFFORT_LABELS[effort]}. "
                              "It applies from the agent's next model request.")
         for child in self.active_children(session):
-            await self.change_effort(child, effort)
+            if not child.get("agent_effort"):  # A custom or built-in agent's own effort stays.
+                await self.change_effort(child, effort)
 
     async def change_spending_limit(self, session, limit):
         """Set the chat's spending limit in DBU (0 = none; None = follow the Settings default). Its next
@@ -2474,9 +2482,12 @@ class AgentManager(LifecycleHooks):
             if not tool_allowed(session, name):
                 disabled = session.get("disabled_tools") or []
                 cover = covering_tool(name, disabled)
+                listed = session.get("agent_tools")
                 output = (f"The user turned off {name} in this chat. Use other tools." if name in disabled else
                           f"The user turned off {cover} in this chat, which also covers {name}. Use other tools."
                           if cover else
+                          f"The {session.get('agent_type')} agent's tools list does not include {name}. Use only the "
+                          "available tools." if isinstance(listed, list) and name not in listed else
                           f"The {session['tool_profile']} tool profile does not permit {name}. Use only the available tools.")
                 await self.update_event(session, event, state="rejected", output=output)
                 return output
@@ -2530,12 +2541,8 @@ class AgentManager(LifecycleHooks):
             carded = False  # An "ask" verdict must have shown a card before anything runs.
             if name in ("delegate_task", "stop_job") and verdict.decision == "ask":
                 if name == "delegate_task":
-                    kind = arguments.get("agent_type") or PROFILE_TYPES.get(arguments.get("tool_profile"), "general")
-                    preview = (f"Start a subagent ({kind}; separate paid model requests, at most "
-                               f"{arguments.get('max_steps', DEFAULT_STEPS)} steps)"
-                               f"\n\nTask: {arguments['task']}"
-                               + (f"\nContext: {arguments['context']}" if arguments.get("context") else "")
-                               + (f"\nTool profile: {arguments['tool_profile']}" if arguments.get("tool_profile") else ""))
+                    # The agent, its tools and any model or effort it sets; an unknown agent_type fails here.
+                    preview = self.delegates.card_preview(session, arguments)
                 else:
                     job = self.session_job(session, arguments["job_id"])
                     preview = f"Stop job {job['id']}: {job['command']}"
@@ -3130,7 +3137,9 @@ class AgentManager(LifecycleHooks):
         return True
 
     async def run_databricks(self, session, prompt, content=None):
-        if session.get("tool_profile", "inherit") != "inherit":
+        listed = session.get("agent_tools")
+        if session.get("tool_profile", "inherit") != "inherit" or (
+                isinstance(listed, list) and not any(name.startswith("mcp__") for name in listed)):
             # Restricted children must not start external servers during discovery.
             return await self._run_databricks(session, prompt, [], **({"content": content} if content is not None else {}))
         async with self.extensions.turn() as connection:
@@ -3164,6 +3173,16 @@ class AgentManager(LifecycleHooks):
         if index:
             guidance["sources"].append({"path": "Skill index", "scope": "this workspace", "status": "loaded",
                                         "estimated_tokens": estimate_text_tokens(index)})
+        agents = ""
+        if not session.get("is_subagent") and (available is None or "delegate_task" in available):
+            try:
+                agents = custom_agents.agent_index(custom_agents.discover(
+                    tools.root, custom_agents.display_redactor(self.settings))["agents"])
+            except (OSError, ValueError, RuntimeError):
+                agents = ""  # Agent tools → Subagents reports unusable agent files.
+            if agents:
+                guidance["sources"].append({"path": "Agent index", "scope": "this workspace", "status": "loaded",
+                                            "estimated_tokens": estimate_text_tokens(agents)})
         # Stable text first and the parts that change between requests last, so a
         # provider's prompt prefix caching can reuse the longest possible prefix.
         system = {"role": "system", "content": SYSTEM_PROMPT + "\n" + user_block + mode_prompt(mode, bool(session.get("is_subagent")))
@@ -3176,6 +3195,7 @@ class AgentManager(LifecycleHooks):
                       available, input_budget=self.input_budget(session),
                       scale=estimate_scale([], session["model"]))) else "")
                   + ("\n" + index if index else "")
+                  + ("\n" + agents if agents else "")
                   + "\n" + guidance["text"] + "\n" + tools.skill_signature
                   + ("\nProject instruction warnings: " + json.dumps(guidance["warnings"]) if guidance["warnings"] else "")
                   + "\nAdditional allowed folders: " + json.dumps(session.get("allowed_directories", []))

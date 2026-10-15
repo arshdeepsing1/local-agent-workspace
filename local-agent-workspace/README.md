@@ -48,8 +48,9 @@ frontend that runs without a build step.
 - Explicit MCP servers, workspace skills with a `/` command menu, and approval-controlled
   hooks around tool calls, your messages and the end of a turn, which can answer in JSON.
 - Persistent tasks with dependencies, shown as a live checklist above the message box,
-  and subagents the model starts on its own (explore, general or editor; several in
-  parallel), each in its own conversation file linked from its parent's.
+  and subagents the model starts on its own (explore, general, editor, or a custom agent
+  defined in the project's `.agents/agents` files; several in parallel), each in its own
+  conversation file linked from its parent's, with a model and effort per agent type.
 - Markdown transcripts of a conversation: download or copy one from the app, or write
   them for many saved conversations with a script.
 - A reasoning effort per conversation (Default, Fast, Medium, High, Extra high, Max) sent in the
@@ -1143,7 +1144,8 @@ A new conversation starts at **Settings → Reasoning → Default effort for new
 (Default unless you change it), and keeps its own level in its file like its model; forks and
 imports keep it, and a conversation saved before this existed uses the Settings default. A
 change applies from the agent's next model request, also while a response runs (a notice
-says so) and for a running subagent. The picker names what Default means where it is known,
+says so) and for a running subagent whose type sets no effort of its own (see **Custom agents**
+under **Agent tools: tasks, subagents, and activity**). The picker names what Default means where it is known,
 for example **Default (Medium)**. Levels above Default make the model think longer, which
 uses more output tokens (thinking counts toward **Max output tokens**) and costs more.
 
@@ -1514,8 +1516,8 @@ tools, connect MCP servers, or rewrite the archived conversation. The resulting
 older sessions without that snapshot); definitions may change on the next turn.
 The details open above the meter; Escape, a click elsewhere or moving focus away closes them.
 
-**Settings** groups its fields under Project, Model and context, Reasoning, Agent, Commands and
-files, Notifications and Credentials; on a wide screen a list of these sections beside them
+**Settings** groups its fields under Project, Model and context, Reasoning, Agent, Subagents,
+Commands and files, Notifications and Credentials; on a wide screen a list of these sections beside them
 jumps to each one. Longer explanations wait behind **More**. **Settings → Databricks model
 endpoint** lists the endpoints with built-in facts (label and name) and those your workspace
 serves; **Other endpoint…** opens a field for any other name. **Save settings** stays at the
@@ -1866,10 +1868,12 @@ the conversation's back-and-forth, itself. A subagent sees nothing of the chat: 
 passes the full task, constraints, paths and the report it expects (`task` and `context`).
 `agent_type` picks the tools: **explore** is read-only (the `read_only` profile, for
 investigation), **editor** reads and edits files without commands (`file_editor`), and
-**general** (the default) has the chat's tools (`inherit`); all stay within the chat's
-subagent tool ceiling (below). The older `tool_profile` argument still works; given with
-`agent_type`, the narrower applies. `max_steps` is 1–24 model requests (default 10). The child
-uses the chat's model (and its reasoning setting when the chat has one) and inherits workspace,
+**general** (the default) has the chat's tools (`inherit`); a project's own agents are named
+by their files (see **Custom agents** below). All stay within the chat's subagent tool ceiling
+(below). The older `tool_profile` argument still works; given with `agent_type`, the narrower
+applies. `max_steps` is 1–24 model requests (default 10). The child uses its agent type's model
+and effort (**Settings → Subagents**: explore runs at Fast on the chat's model by default) and
+otherwise the chat's model (and its reasoning setting when the chat has one). It inherits workspace,
 permission mode, folder grants, turned-off tools, and "Allow for this chat" rules (a copy:
 rules the child adds stay in the child); project and all-project rules apply to it as to the
 parent. Children cannot delegate again or start managed background jobs. The child's first
@@ -1892,7 +1896,8 @@ first): `child_session_id`, `agent_type`, `tool_profile`, `status`
 inference/tool error, or interruption), `steps_used`, `tool_calls`, `changed_files` (paths
 its file tools changed, at most 20; `changed_files_total` when there were more; files a
 command changed are in the changes bar), `transcript`, and `output` (the report).
-Each subagent has its own card: its type, live status (running, waiting for approval,
+Each subagent has its own card: its type, the effort and model it started with (for example
+**Fast · Claude Opus 5.5**), live status (running, waiting for approval,
 waiting for a free slot, completed, failed, cancelled), completed actions, last tool, how
 long it has run, **Open subagent** and, once it ended, a collapsible **Report** with the
 files it changed. Progress metadata does not copy child tool payloads into the parent's
@@ -1907,9 +1912,12 @@ title. Unfinished delegated runs are marked interrupted on restart rather than l
 `conversations/<id>.jsonl` in the state folder, like any chat. Its header (the first line)
 keeps `parent_session_id`, `parent_event_id` (the parent's card) and `parent_call_id`, its
 `agent_type`, `tool_profile`, `max_steps`, and `delegation` (status, completed actions, last
-tool, start and end times). The parent's header keeps a `subagents` index, one entry per
-child: `{id, task (its first 200 characters), agent_type, status, created, ended,
-transcript}`, plus `steps_used` and `tool_calls` once it ended. An entry is added when the
+tool, the `model` and `effort` it started with, start and end times). A child whose agent set
+them also keeps `agent_model`, `agent_effort`, and for a custom agent `agent_file` and
+`agent_tools` (exports, imports and forks keep them, so a copy never gets more tools). The
+parent's header keeps a `subagents` index, one entry per child: `{id, task (its first 200
+characters), agent_type, status, created, ended, transcript, model, effort}`, plus
+`steps_used` and `tool_calls` once it ended. An entry is added when the
 child starts and updated when it ends and by restart recovery; the newest 200 are kept.
 Deleting a subagent chat keeps its entry, marked `deleted` and without a transcript; deleting
 the parent with its subagents removes them all. An import rebuilds the index of each copied
@@ -1917,8 +1925,12 @@ parent from the copied children; exports leave it out, and forks and rewind back
 none. The sessions list (`GET /api/sessions`) leaves the index out;
 `GET /api/sessions/<id>/children` lists the children with their `transcript` and index entry.
 
-**Agent tools → Subagents** lists the chat's subagents with their type, status, task, steps
-and tool calls, start and end, and transcript file name, with **Open** for each.
+**Agent tools → Subagents** lists the chat's subagents with their type, status, tool profile,
+effort and model, task, steps and tool calls, start and end, and transcript file name, with
+**Open** for each. Below them, **Agent types** lists what `delegate_task` can start in this
+project: the built-in types with their Settings defaults, each custom agent (description, file,
+profile, tools, model, effort, default steps, skills, and notes such as ignored tool names), and
+every agent file that cannot be used, with the reason (**Refresh agent types** reads the files again).
 **Subagents → New subagent tool ceiling** selects `inherit`, `read_only`, or `file_editor`
 for future children while the parent is idle. The model may request a narrower
 `agent_type` or `tool_profile` in `delegate_task` but cannot widen the parent's ceiling. Read-only
@@ -1929,6 +1941,87 @@ task mutations, and further delegation. Restrictions persist on child continuati
 imports, and forks. Existing children are unchanged by a new ceiling. These are
 server-enforced model-tool limits, not an OS sandbox or restrictions on the user's
 explicit editor/terminal actions.
+
+**Custom agents.** A project can define its own subagents in Markdown files, which the app
+only reads: `.agents/agents/<name>.md`, then `.claude/agents/<name>.md` (when both define a
+name, the `.agents` file is used and the other is noted). Frontmatter between two `---` lines
+names the agent and its limits; the rest of the file is its instructions:
+
+```markdown
+---
+name: security-auditor
+description: Reviews changed code for injection, secrets handling and unsafe file access.
+tools: [read_file, search_files, find_files, outline_file]
+profile: read_only
+model: databricks-claude-haiku-5-5
+effort: low
+skills: [review]
+max_steps: 8
+---
+Check every changed file for hard-coded secrets and unsafe path handling.
+Report each finding with path:line, its severity and a suggested fix.
+```
+
+| Field | Meaning |
+| --- | --- |
+| `name` | A lowercase letter, then up to 39 lowercase letters, digits or `-` (default: the file name); not `explore`, `general` or `editor`. |
+| `description` | Required: one line of at most 300 characters, which the model reads to choose the agent. |
+| `tools` | Optional: the only tools the agent may use (`[a, b]`, `- item` lines, or `a, b`). Names this app does not have are ignored with a note, `delegate_task` never applies, and tools outside the profile are dropped. Left out: every tool of the profile. |
+| `profile` | `read_only` (the default), `file_editor` or `inherit`, as for `tool_profile`. |
+| `model` | Optional Databricks serving endpoint name; left out (or `inherit`): the chat's model. |
+| `effort` | Optional `default`, `low` (Fast), `medium`, `high`, `xhigh` or `max`; left out: the chat's effort. |
+| `skills` | Optional: up to three skill IDs loaded into the subagent like selected skills; one that does not load is left out with a note in its first prompt. |
+| `max_steps` | Optional 1–24: the subagent's steps when the call gives no `max_steps` (a call's own value wins). |
+
+The parser is small and strict: `key: value` lines, `[a, b]` or `- item` lists, `"..."` or
+`'...'` quoting and `#` comment lines; nested or multi-line (`|`, `>`) values are refused.
+Claude Code agent files work too: its tool names `Read`, `Write`, `Edit`, `MultiEdit`, `Glob`,
+`Grep`, `LS`, `Bash`, `NotebookRead` and `NotebookEdit` stand for this app's, other fields such
+as `color` are ignored with a note, and its model values `sonnet`, `opus`, `haiku` and `inherit`
+mean the chat's model. An agent file is at most 16 KB (16,384 bytes) with up to 8,000 characters
+of instructions; each folder is read up to 100 entries and at most 30 agents are used. A file
+that cannot be used (no description, a bad name or value, too large, a symbolic link, not UTF-8
+text, a name another file already uses, an agent folder outside the project) is listed under
+**Agent tools → Subagents → Agent types** with the reason, and delegating to it fails with that
+reason.
+
+*How the model chooses.* A chat that can delegate gets an **agent index** in its system
+message, right after the skill index: each agent's name and description (shortened to 150
+characters), at most 30 lines and 2,000 bytes, with a count of any left out. It changes only
+when agent files change, so the endpoint's prompt prefix caching keeps working. `agent_type` in
+`delegate_task` is a plain string rather than an enum, because custom names differ per project
+while the tool definitions stay the same in every request; the server checks it, and an unknown
+name returns an error that lists every available type (and why a file of that name cannot be
+used). The subagent's first prompt carries the task and context, then `Custom agent: <name>
+(from <file>)` with its instructions, then what its tools allow and the report it ends with. An agent's instructions never enter the parent's system message.
+
+*Defaults per type.* **Settings → Subagents** sets each built-in type's model (**Same as the
+chat**, a listed endpoint, or **Other endpoint…**) and effort (**Same as the chat** or a level):
+
+| Type | Tools | Model | Effort |
+| --- | --- | --- | --- |
+| explore | `read_only` | the chat's | Fast (`low`) |
+| general | the chat's (`inherit`) | the chat's | the chat's |
+| editor | `file_editor` | the chat's | the chat's |
+| custom agent | its `profile` and `tools` | its `model`, else the chat's | its `effort`, else the chat's |
+
+A subagent whose type sets an effort keeps it when you change the chat's effort; the others
+follow the chat. A subagent on another endpoint than its chat follows that endpoint's default
+budgets where Settings is at the Settings model's defaults, and Settings budgets above that
+endpoint's defaults are lowered to them (and, as for every chat, to its maxima): with Claude
+Opus 5.5 at 1,000,000 context and 32,000 output tokens, an agent on GPT OSS 120B sends 131,072
+and 8,192. Lower Settings budgets stay as they are.
+
+*Safety.* An agent file is project content, like `AGENTS.md`, and never widens what the chat
+allows: its profile is intersected with the chat's subagent tool ceiling and any requested
+`tool_profile` (the narrowest wins), its tools with that profile (a delegation whose tools all
+fall outside it is refused), the chat's turned-off tools, rules and permission mode apply as to
+any subagent, and subagents never delegate. A tool outside the agent's list is refused like a
+turned-off one. In Manual mode the approval card names the agent and everything it sets, for
+example **Start a subagent (security-auditor · read-only · model Claude Haiku 5.5 · effort
+Fast; separate paid model requests, at most 8 steps)**, followed by the task, the agent file,
+its tools and skills, and the exact endpoint. Text the app shows or sends from agent files is
+redacted (the Databricks token and common secret shapes).
 
 **Questions and plan review.** With `ask_user` the model asks 1–4 short multiple-choice
 questions when it needs a decision. Each question has 2–4 options (single or multiple
@@ -2442,7 +2535,8 @@ Thinking display, subagents, background jobs and change review before using a pa
   route does (the default `both` accepts either).
 - Words in your message choose a scripted turn: `edit` (writes a file, then edits it twice
   with pauses, so you can press **Keep** in between), `job` (a background command and
-  `wait_job`), `delegate` or `parallel` (one or two read-only subagents), `ask` (a question
+  `wait_job`), `delegate` or `parallel` (one or two read-only subagents; `delegate custom` uses
+  the first agent of the project's agent index, see **Custom agents**), `ask` (a question
   card), `task`, `read`, `rate limit` (one HTTP 429 with `Retry-After: 2`), `long`. Any other
   message gets a reply that says which effort and fields the request carried.
 - Simulated chats and settings live in `.local/simulator/` (`--state-dir` to change), apart

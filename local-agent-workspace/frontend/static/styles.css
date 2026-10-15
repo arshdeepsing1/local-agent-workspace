@@ -538,3 +538,21 @@ body.panel-resizing{cursor:col-resize;user-select:none}
 .hook-events thead th{font-weight:500}
 .hook-events code{font-size:11px}
 @media(max-width:600px){.hook-events,.hook-events tbody,.hook-events tr,.hook-events th,.hook-events td{display:block}.hook-events thead{display:none}.hook-events td{border-bottom:0;padding:0 0 4px}.hook-events tr{border-bottom:1px solid var(--border);padding:4px 0}}
+
+/* custom agents (2026-10-15) */
+.agent-types{margin:22px 0 4px}
+.agent-types-list{list-style:none;margin:12px 0;padding:0}
+.agent-type-row{padding:11px 0;border-bottom:1px solid var(--border);min-width:0}
+.agent-type-row small{display:block;color:var(--muted);font-size:11px;overflow-wrap:anywhere}
+.agent-type-row .form-error{margin:3px 0 0}
+.agent-type-title{display:flex;align-items:center;flex-wrap:wrap;gap:8px;min-width:0}
+.agent-type-title strong{font-weight:500;overflow-wrap:anywhere;min-width:0}
+.agent-type-badge{border:1px solid var(--border);border-radius:10px;padding:0 7px;font-size:11px;color:var(--ink);background:var(--surface);white-space:nowrap}
+.agent-type-note{font-style:italic}
+.delegation-agent{font-size:11px;color:var(--muted)}
+.settings-subagent{margin:14px 0 0;padding:10px 0 0;border-top:1px solid var(--border);min-width:0;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);column-gap:14px}
+.settings-subagent-title{grid-column:1/-1;margin:0;overflow-wrap:anywhere}
+.settings-subagent-title strong{font-weight:500}
+.settings-subagent label{min-width:0;margin-top:10px}
+.settings-subagent .settings-subagent-endpoint{grid-column:1/-1}
+@media(max-width:600px){.settings-subagent{grid-template-columns:minmax(0,1fr)}}

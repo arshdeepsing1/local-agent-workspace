@@ -114,7 +114,9 @@ def card(session, call_id):
 def test_the_tool_definition_offers_agent_types_and_up_to_24_steps():
     definition = next(item["function"] for item in FEATURE_TOOLS if item["function"]["name"] == "delegate_task")
     properties = definition["parameters"]["properties"]
-    assert properties["agent_type"]["enum"] == ["explore", "general", "editor"]
+    # A string, not an enum: custom agent names differ per project and the definitions stay the same.
+    assert properties["agent_type"]["type"] == "string" and "enum" not in properties["agent_type"]
+    assert "or a custom agent the system message lists" in definition["description"]
     assert properties["max_steps"]["maximum"] == MAX_STEPS == 24 and DEFAULT_STEPS == 10
     for phrase in ("broad exploration", "sees nothing of this chat", "run in parallel", "not for a single small lookup"):
         assert phrase in definition["description"]
@@ -168,7 +170,7 @@ async def test_an_unknown_agent_type_or_too_many_steps_is_refused_before_a_child
     assert len(manager.store.list()) == 1
 
 
-async def test_an_explore_subagent_is_offered_only_read_tools_and_uses_the_chats_model_settings(runtime, monkeypatch):
+async def test_an_explore_subagent_is_offered_only_read_tools_and_runs_at_fast_on_the_chats_model(runtime, monkeypatch):
     manager, parent, _ = runtime
     parent["reasoning_effort"] = "high"
     manager.store.save(parent)
@@ -180,7 +182,9 @@ async def test_an_explore_subagent_is_offered_only_read_tools_and_uses_the_chats
     offered = {tool["function"]["name"] for tool in body["tools"]}
     assert "read_file" in offered and not offered & {"run_command", "write_file", "edit_file", "delegate_task"}
     child = manager.store.get(card(saved, "a")["child_session_id"])
-    assert child["reasoning_effort"] == "high" and child["model"] == parent["model"]
+    # Settings → Subagents: explore defaults to Fast (low); the model is the chat's.
+    assert child["reasoning_effort"] == "low" and child["agent_effort"] == "low" and child["model"] == parent["model"]
+    assert "agent_model" not in child
     assert child["max_steps"] == DEFAULT_STEPS
     # Named by its task until a title is generated (needs_title accepts that fallback).
     assert child["title"] == "A title" and child["title_generated"] is True
@@ -456,8 +460,9 @@ async def test_import_rebuilds_the_index_and_rewind_backups_and_forks_have_none(
     assert by_id[root]["subagents"] == [{
         "id": copied_child["id"], "task": "Inspect", "agent_type": "explore", "status": "completed",
         "created": child["delegation"]["started"], "ended": child["delegation"]["ended"],
-        "transcript": f"conversations/{copied_child['id']}.jsonl"}]
+        "transcript": f"conversations/{copied_child['id']}.jsonl", "model": "test-model", "effort": "low"}]
     assert copied_child["agent_type"] == "explore" and copied_child["max_steps"] == DEFAULT_STEPS
+    assert copied_child["agent_effort"] == copied_child["reasoning_effort"] == "low"
     fork, fork_root = fresh_copies(export_bundle([saved], parent["id"]), str(project), kind="fork")
     assert "subagents" not in fork[0]
     assert "subagents" not in backup_copy(saved)

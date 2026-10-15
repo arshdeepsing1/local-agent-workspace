@@ -41,6 +41,8 @@ class RateLimitDetails(Record):
 
 
 Effort = Literal["default", "low", "medium", "high", "xhigh", "max"]  # reasoning.EFFORT_LEVELS
+# A built-in subagent type or a custom agent's name (custom_agents.NAME).
+AgentName = Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{0,39}$")]
 
 
 class ReasoningInfo(Record):
@@ -70,7 +72,9 @@ class Progress(Record):
     completed_tools: int = Field(ge=0)
     last_tool: str | None = None
     terminal_reason: str | None = None
-    agent_type: Literal["explore", "general", "editor"] | None = None
+    agent_type: AgentName | None = None
+    model: str | None = Field(default=None, max_length=256)  # The model and effort the subagent started with.
+    effort: Effort | None = None
     started: float | None = None
     ended: float | None = None
 
@@ -250,9 +254,14 @@ class Conversation(Record):
     reasoning_effort: Effort | None = None  # Kept by forks and imports, like the model.
     spending_limit_dbu: float | None = Field(default=None, ge=0, le=MAX_LIMIT_DBU)  # Kept too (not the spend).
     max_steps: int | None = Field(default=None, ge=1, le=MAX_STEPS)
-    agent_type: Literal["explore", "general", "editor"] | None = None
+    agent_type: AgentName | None = None
     # Kept by forks and imports, like tool_profile: a copy never gets more tools than its source.
     disabled_tools: list[Annotated[str, Field(min_length=1, max_length=300)]] | None = Field(default=None, max_length=64)
+    # A custom agent's subagent: only these tools (custom_agents.py); its file, and the model and effort its agent set.
+    agent_tools: list[Annotated[str, Field(min_length=1, max_length=300)]] | None = Field(default=None, max_length=64)
+    agent_file: str | None = Field(default=None, max_length=300)
+    agent_model: str | None = Field(default=None, max_length=256)
+    agent_effort: Effort | None = None
     # The user's labels. Pinned and archived are view state of this app and are not exported.
     tags: list[Annotated[str, Field(min_length=1, max_length=32)]] | None = Field(default=None, max_length=10)
 

@@ -6,6 +6,18 @@ Notable changes to Local Agent Workspace, newest first. Dates are UTC.
 
 Follow-up of 2026-10-15:
 
+- Custom agents: Markdown files in a project's `.agents/agents` (or `.claude/agents`) define
+  subagents with a description, tools, profile, model, effort, skills and default steps. The
+  model chooses them from a short agent index in the system message, and `delegate_task`
+  checks the name. Agent tools → Subagents lists every agent type and any agent file that
+  cannot be used, with the reason.
+- Each subagent type can have its own endpoint and reasoning effort (**Settings →
+  Subagents**); explore now runs at Fast by default. Cards, Agent tools and the subagents index
+  show the effort and model a subagent started with, and a subagent on a smaller endpoint keeps
+  its requests within that endpoint's budgets.
+- A custom agent never widens what its chat allows: its tools stay within the subagent tool
+  ceiling, turned-off tools, rules and mode, and Manual mode's approval card names the agent,
+  its tools, model and effort before it starts.
 - Spending limit per conversation: a soft cap on the estimated DBU of a chat and its
   subagents, checked before each agent model request. **Settings → Agent** sets the default
   (0 = none), **Agent tools → Usage** shows the spend against the limit and sets a chat's own.

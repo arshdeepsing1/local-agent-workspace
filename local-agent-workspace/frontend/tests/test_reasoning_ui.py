@@ -204,8 +204,8 @@ def test_a_saved_endpoint_without_a_profile_or_listing_shows_in_the_list(ui, pag
 def test_the_section_list_jumps_to_a_section(ui, page):
     dialog = open_settings(ui, page)
     nav = dialog.get_by_role("navigation", name="Settings sections")
-    expect(nav.get_by_role("button")).to_have_text(["Project", "Model and context", "Reasoning", "Agent", "Commands and files",
-                                                    "Notifications", "Credentials"])
+    expect(nav.get_by_role("button")).to_have_text(["Project", "Model and context", "Reasoning", "Agent", "Subagents",
+                                                    "Commands and files", "Notifications", "Credentials"])
     expect(nav.get_by_role("button", name="Project")).to_have_attribute("aria-current", "true")
     nav.get_by_role("button", name="Reasoning").click()
     expect(nav.get_by_role("button", name="Reasoning")).to_have_attribute("aria-current", "true")
