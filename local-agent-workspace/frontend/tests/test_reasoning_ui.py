@@ -45,12 +45,15 @@ def test_the_picker_works_from_the_keyboard_and_while_the_agent_works(ui, page):
     expect(picker).to_be_enabled()
     expect(picker).to_have_attribute("title", re.compile("applies from the agent's next model request"))
     picker.focus()
-    page.keyboard.press("ArrowDown")
+    # Typing a level's first letter chooses it on every platform (on macOS the arrow keys open the
+    # menu of a closed select instead of stepping through it).
+    page.keyboard.press("f")
     ui.wait("fake.requests('/api/sessions/a/reasoning-effort', 'PUT').length === 1")
     assert ui.bodies("/api/sessions/a/reasoning-effort", "PUT") == [{"reasoning_effort": "low"}]
     expect(picker).to_have_value("low")
-    expect(picker).to_be_focused()  # Still on the picker: the next arrow press steps on.
-    page.keyboard.press("ArrowDown")
+    expect(picker).to_be_focused()  # Still on the picker: the next key press chooses again.
+    page.wait_for_timeout(1100)  # Past the browser's type-ahead window, so "m" starts a new search.
+    page.keyboard.press("m")
     ui.wait("fake.requests('/api/sessions/a/reasoning-effort', 'PUT').length === 2")
     expect(picker).to_have_value("medium")
 
