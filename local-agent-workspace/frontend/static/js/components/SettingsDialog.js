@@ -166,6 +166,17 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
   const effective = limits?.effective
   const capped = effective?.clamped ? effective.context_window - effective.max_output_tokens - 2048 : null
   const number = key => event => field(key, Number(event.currentTarget.value))
+  // A focused field must not end under the sticky footer. For a text box the browser scrolls only its
+  // caret into view, so on a phone the lower part of Custom instructions could stay hidden.
+  const keepAboveFooter = event => {
+    const target = event.target
+    const footer = event.currentTarget.querySelector(':scope > footer')
+    if (!footer || footer.contains(target) || !target.getBoundingClientRect) return
+    const box = target.getBoundingClientRect()
+    const top = footer.getBoundingClientRect().top
+    // Before the browser's own focus scroll, which then finds the caret already in view.
+    if (box.bottom > top + .5) target.scrollIntoView({ block: box.height < top - 60 ? 'nearest' : 'start' })
+  }
   const jump = id => {
     const section = sections.current[id]
     if (!section) return
@@ -198,7 +209,7 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
   })
   return html`<dialog ref=${dialog} class="settings-dialog app-settings" aria-label="Settings" aria-describedby="settings-description" onCancel=${onClose} onScroll=${scrolled} onClick=${e => { if (e.target === dialog.current) onClose() }}>
     <div class="dialog-content"><header><div><h2>Settings</h2><p id="settings-description">Configure your local workspace.</p></div><button class="icon-button" onClick=${onClose} aria-label="Close settings"><${X} /></button></header>
-      <form onSubmit=${e => {
+      <form onfocusin=${keepAboveFooter} onSubmit=${e => {
         e.preventDefault()
         // The server checks this too; saying it here avoids its raw validation error.
         if ((form.command_env || []).length > 32) { setError('List at most 32 environment variable names.'); return }
