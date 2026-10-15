@@ -301,7 +301,7 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         ${SUBAGENT_TYPES.map(([kind, label, help]) => html`<${SubagentDefaults} key=${kind} label=${label} help=${help}
           value=${subagents[kind] || {}} choices=${choices} onChange=${(key, value) => subagentField(kind, key, value)} />`)}
         <p class="field-help">Explore starts at Fast: reading and searching rarely needs long thinking. Default sends no effort field, so the subagent's endpoint uses its own.</p>
-        <${More} topic="subagent defaults">A subagent on another endpoint than its chat keeps its requests within that endpoint's default budgets when the Model and context budgets are larger. Custom agents (Markdown files in a project's .agents/agents or .claude/agents folder) set their own model and effort; Agent tools → Subagents lists them. A running subagent keeps the model it started with, and one whose type sets an effort keeps it when you change the chat's effort.<//>`)}
+        <${More} topic="subagent defaults">A subagent on another endpoint than its chat keeps its requests within that endpoint's default budgets when the Model and context budgets are larger. Custom agents (a project's Markdown agent files) set their own model and effort; Agent tools → Subagents lists them and where their files go. A running subagent keeps the model it started with, and one whose type sets an effort keeps it when you change the chat's effort.<//>`)}
         ${group('commands', html`
         <label>File write limit (KB)<input type="number" required min=${16} max=${1000} step=${1}
           value=${form.write_limit_kb === undefined ? 80 : form.write_limit_kb || ''} onInput=${number('write_limit_kb')} /></label>
