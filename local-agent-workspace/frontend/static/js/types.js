@@ -48,7 +48,8 @@
 //   agent_type?: 'explore'|'general'|'editor' or a custom agent's name (a subagent), subagents?: SubagentEntry[] (a parent's index of its
 //   subagent chats; left out of GET /sessions list items),
 //   terminal_reason?: how the last turn ended: 'completed'|'stopped'|'error'|'inference_error'|
-//   'tool_error'|'step_limit'|'spending_limit'|'interrupted' (also in the /api/sessions summaries),
+//   'tool_error'|'step_limit'|'spending_limit'|'interrupted'|'hook_blocked' (a user_prompt hook blocked the
+//   message; also in the /api/sessions summaries),
 //   turn_ended?: epoch seconds when the last turn ended; null while a turn runs (also in summaries),
 //   turn_delegated?: true while the last turn is one a parent's delegate_task started (also in summaries),
 //   reasoning_effort?: Effort (the chat's own level, saved in its header; absent on chats saved before it existed,

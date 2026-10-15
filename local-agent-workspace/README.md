@@ -1129,11 +1129,14 @@ The app checks the limit before each agent model request, before any compaction 
 it adds one notice; once the chat has used the limit, it does not send the next request and
 ends the turn with a notice (a subagent ends with an error its parent sees), the chat offers
 **Continue**, and desktop notifications say "Reached the spending limit". Raise the limit, then
-continue. It is a soft cap: one response can pass it before the next request is stopped.
+continue. A reply that arrives over the limit ends the turn the same way, without Verify or stop
+hooks (they could only continue with a refused request; a subagent's final reply still reaches
+its parent), and messages queued while it ran stay queued. It is a soft cap: one response can pass it before the next request is stopped.
 Calls to endpoints without price data count as nothing and are listed as not counted; title
-and compaction requests are counted but never stopped. A subagent follows its parent's limit,
-and an ended subagent keeps its estimate in the parent's subagents index (subagents that ended
-before this existed are not counted). The offline simulator reports usage, so
+and compaction requests are counted but never stopped. A subagent follows its parent's limit
+(a subagent chat without its parent, such as a copy of one, has its own), and its spend is kept
+in the parent's subagents index after each of its turns, also when it is stopped, deleted or
+continued by you (subagents that ended before this existed are not counted). The offline simulator reports usage, so
 `databricks-claude-opus-5-5` there can be used to try a small limit.
 
 ### Reasoning effort and thinking

@@ -171,6 +171,9 @@ def index_entry(child, task):
              "transcript": transcript_name(child["id"])}
     # The model and effort it started with (children from before custom agents have none recorded).
     entry.update({key: progress[key] for key in ("model", "effort") if isinstance(progress.get(key), str)})
+    if isinstance(child.get("inference_calls"), list):
+        # What it spent so far, for its parent's spending limit (spending.py); a header has no ledger.
+        entry["estimated_dbu"], entry["unpriced_calls"] = own_spend(child)
     return entry
 
 
@@ -336,9 +339,29 @@ class DelegateManager:
         updated = {**(current or {}), **index_entry(child, current.get("task", "") if task is None else task), **extra}
         if updated == current:
             return False
-        parent["subagents"] = ([*index, updated][-INDEX_ENTRIES:] if current is None
-                               else [updated if item is current else item for item in index])
+        if current is None:
+            entries = [*index, updated]
+            # Entries past the cap leave the index, not the chat's spend (spending.chat_spend).
+            for item in entries[:-INDEX_ENTRIES]:
+                if isinstance(item, dict) and isinstance(item.get("estimated_dbu"), (int, float)):
+                    parent["subagents_dropped_dbu"] = round(parent.get("subagents_dropped_dbu", 0) + item["estimated_dbu"], 6)
+            parent["subagents"] = entries[-INDEX_ENTRIES:]
+        else:
+            parent["subagents"] = [updated if item is current else item for item in index]
         return True
+
+    def record_spend(self, child):
+        """After each turn of a subagent chat (also one the user continued): its spend so far in its
+        parent's index entry, saved before the child leaves the live chats so no check misses it."""
+        parent_id = child.get("parent_session_id")
+        if not isinstance(parent_id, str) or not child.get("is_subagent"):
+            return
+        try:
+            parent = self.manager.live.get(parent_id) or self._readable(parent_id)
+            if parent and self._record(parent, child):
+                self.manager.store.save(parent, touch=False)
+        except (ValueError, OSError):
+            pass  # An unreadable parent keeps its index; the child's own ledger is unchanged.
 
     def forget(self, child_id, keep=()):
         """A subagent chat is being deleted: its parent's index entry stays, marked deleted and
@@ -352,8 +375,11 @@ class DelegateManager:
         index = (parent or {}).get("subagents")
         if not isinstance(index, list):
             return
-        marked = [{**item, "deleted": True, "transcript": None} if isinstance(item, dict) and item.get("id") == child_id
-                  else item for item in index]
+        # Its spend stays counted for the parent's limit.
+        full = self.manager.live.get(child_id) or (self._readable(child_id) if child else None)
+        spend = dict(zip(("estimated_dbu", "unpriced_calls"), own_spend(full))) if full and full.get("inference_calls") else {}
+        marked = [{**item, **spend, "deleted": True, "transcript": None}
+                  if isinstance(item, dict) and item.get("id") == child_id else item for item in index]
         if marked != index:
             parent["subagents"] = marked
             self.manager.store.save(parent, touch=False)
@@ -670,8 +696,6 @@ class DelegateManager:
         if len(paths) > CHANGED_FILES:
             result["changed_files_total"] = len(paths)
         current = self.manager.get(parent["id"])
-        spent, unpriced = own_spend(saved)  # Counted for the parent's spending limit (spending.py).
-        if current and self._record(current, saved, steps_used=steps, tool_calls=calls, estimated_dbu=spent,
-                                    unpriced_calls=unpriced):
+        if current and self._record(current, saved, steps_used=steps, tool_calls=calls):
             self.manager.store.save(current)
         return bounded_result(result)

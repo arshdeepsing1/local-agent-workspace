@@ -47,7 +47,7 @@ def attention_message(session, previous, status, turn_ended=False):
     if status != "idle" or not turn_ended or session.get("turn_delegated"):
         return None
     reason = session.get("terminal_reason")
-    if reason == "stopped":
+    if reason in ("stopped", "hook_blocked"):  # A stop was asked for, or a hook refused the message.
         return None
     if reason in ERROR_REASONS:
         return f"Stopped with an error: {title}"

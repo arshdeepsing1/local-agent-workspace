@@ -123,3 +123,10 @@ def test_a_limit_changed_elsewhere_refreshes_the_open_panel(ui, page):
     ui.rerender("{ ...dialogProps({ ...session(), spending_limit_dbu: 3 }) }")
     expect(group).to_contain_text("1.7 of 3 DBU")
     expect(group).to_contain_text("This chat's own limit.")
+
+
+def test_a_subagent_chat_without_a_parent_sets_its_own_limit(ui, page):
+    group = open_usage(ui, page, spending(source="settings", follows_parent=False),
+                       selected="{ ...session(), is_subagent: true }")
+    expect(group).not_to_contain_text("Follows its parent")
+    expect(group.get_by_role("spinbutton", name="Limit for this chat (DBU, 0 = none)")).to_be_visible()

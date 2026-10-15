@@ -173,6 +173,13 @@ class Settings:
                 self.migrated_from = LEGACY_DEFAULT_MODEL
             self.values.update({key: value for key, value in saved.items() if key in keys})
             self.values["subagent_defaults"] = subagent_defaults(self.values["subagent_defaults"], strict=False)
+            # A hand-edited limit: a number written as text still counts; anything else is shown and used
+            # as no limit (0) instead of a value Settings would display but the agent would ignore.
+            limit = self.values["spending_limit_dbu"]
+            try:
+                self.values["spending_limit_dbu"] = validate_limit(float(limit) if isinstance(limit, str) else limit)
+            except ValueError:
+                self.values["spending_limit_dbu"] = 0
         # Budgets not saved follow the model's defaults; saved ones win.
         limits = dict(zip(LIMIT_KEYS, default_limits(self.values["model"])))
         ordered = {}

@@ -49,7 +49,7 @@ export function attentionFor(before, session) {
   // A turn that delegate_task started is reported by its parent's turn (a subagent chat
   // you continued yourself is not); a stop was asked for.
   if (session.status !== 'idle' || !session.turn_ended || session.turn_ended === before.turn_ended
-    || session.turn_delegated || session.terminal_reason === 'stopped') return null
+    || session.turn_delegated || ['stopped', 'hook_blocked'].includes(session.terminal_reason)) return null
   if (ERROR_REASONS.has(session.terminal_reason)) return { state: 'error', body: `Stopped with an error: ${title}` }
   // Not finished: the chat offers Continue.
   if (session.terminal_reason === 'step_limit') return { state: 'step_limit', body: `Reached the step limit: ${title}` }

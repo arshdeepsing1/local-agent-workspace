@@ -76,15 +76,16 @@ async def test_the_chat_warns_once_at_80_percent_and_stops_before_the_request_ov
     # 0.857 after one response, 1.714 (over 80 % of 2) after two, 2.571 after three: no fourth request.
     assert len(requests) == 3
     texts = [event["text"] for event in notices(session)]
-    warned = [text for text in texts if "spending limit" in text and "did not send" not in text]
+    warned = [text for text in texts if "spending limit" in text and "stops before" not in text]
     assert warned == ["This conversation has used about 1.714 of its 2.000 DBU spending limit (an estimate from list prices)."]
     stop = notices(session)[-1]
     assert stop["terminal_reason"] == "spending_limit" and "about 2.571 of its 2.000 DBU" in stop["text"]
-    assert "did not send the next model request" in stop["text"] and "Agent tools → Usage" in stop["text"]
+    assert "stops before its next model request" in stop["text"] and "Agent tools → Usage" in stop["text"]
     assert session["terminal_reason"] == "spending_limit" and session["spending_warned"] == 2.0
     status = spending.status(manager, session)
     assert status == {"limit_dbu": 2.0, "source": "chat", "spent_dbu": round(3 * PER_CALL, 6),
-                      "own_dbu": round(3 * PER_CALL, 6), "subagents_dbu": 0.0, "unpriced_calls": 0, "percent": 128.6}
+                      "own_dbu": round(3 * PER_CALL, 6), "subagents_dbu": 0.0, "unpriced_calls": 0, "follows_parent": False,
+                      "percent": 128.6}
     # Continuing at the same limit stops again before any request; nothing is billed.
     await manager.run(session, "Continue")
     assert len(requests) == 3 and session["terminal_reason"] == "spending_limit"
@@ -125,9 +126,19 @@ class Delegates:
         self.active = active
 
 
+class FakeStore:
+    def __init__(self, sessions):
+        self.sessions = sessions
+
+    def header(self, session_id):
+        session = self.sessions.get(session_id)
+        return None if session is None else {key: value for key, value in session.items() if key != "inference_calls"}
+
+
 class FakeManager:
     def __init__(self, sessions, live=(), active=None, default=0):
         self.sessions = sessions
+        self.store = FakeStore(sessions)
         self.live = {item["id"]: item for item in live}
         self.delegates = Delegates(active or {})
         self.settings = type("S", (), {"values": {"spending_limit_dbu": default}})()
@@ -214,7 +225,7 @@ async def test_the_route_sets_clears_and_reports_the_chat_limit(api):
     url = f"/api/sessions/{session['id']}/spending-limit"
     metrics = (await client.get(f"/api/sessions/{session['id']}/metrics")).json()
     assert metrics["spending"] == {"limit_dbu": 4.0, "source": "settings", "spent_dbu": 0.0, "own_dbu": 0.0,
-                                   "subagents_dbu": 0.0, "unpriced_calls": 0, "percent": 0.0}
+                                   "subagents_dbu": 0.0, "unpriced_calls": 0, "follows_parent": False, "percent": 0.0}
     live = manager.get(session["id"])
     live["spending_warned"] = 4.0
     changed = await client.put(url, json={"spending_limit_dbu": 1.5})

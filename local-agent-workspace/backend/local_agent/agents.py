@@ -710,6 +710,10 @@ def delegated_prompt(session):
                 and not (session.get("delegation") or {}).get("terminal_reason"))
 
 
+# The wire's answer to a prompt the spending limit stopped before any model request (spending_stop).
+SPENDING_STOP_REPLY = "[No reply: the spending limit stopped this turn before a model request.]"
+
+
 def public_session(session, status="idle"):
     pending = pending_summary(session)
     return {"permission_mode": "manual", "allowed_directories": [], "allow_rules": [], "disabled_tools": [],
@@ -1777,10 +1781,19 @@ class AgentManager(LifecycleHooks):
             if not child.get("agent_effort"):  # A custom or built-in agent's own effort stays.
                 await self.change_effort(child, effort)
 
+    async def spending_stop(self, session, wire, text):
+        """End the turn at the spending limit. A prompt the turn never answered gets a placeholder reply
+        in the wire, so a Continue (or any next message) never follows it directly."""
+        if wire and wire[-1].get("role") == "user":
+            wire.append({"role": "assistant", "content": SPENDING_STOP_REPLY})
+            self.store.save(session)
+        await self.event(session, "error" if session.get("is_subagent") else "notice", text=text,
+                         terminal_reason="spending_limit")
+
     async def change_spending_limit(self, session, limit):
         """Set the chat's spending limit in DBU (0 = none; None = follow the Settings default). Its next
         model request, and its running subagents', check the new limit."""
-        if session.get("is_subagent"):
+        if spending.root_of(self, session) is not session:
             raise ValueError("A subagent follows its parent conversation's spending limit; change it there.")
         if limit is None:
             session.pop("spending_limit_dbu", None)
@@ -2326,6 +2339,7 @@ class AgentManager(LifecycleHooks):
                 # user_prompt and session_start hooks: a block ends the turn before any model request.
                 prepared = await self.prompt_hooks(session, user_event, prompt, content)
                 if prepared is None:
+                    terminal_reason = "hook_blocked"  # Not "completed": no Finished notice, Keep or queue.
                     return
                 prompt, content = prepared
             if session["title"] == "New conversation" and not session.get("title_generated"):
@@ -2412,6 +2426,8 @@ class AgentManager(LifecycleHooks):
             except STORAGE_ERRORS as exc:
                 session["terminal_reason"] = "error"
                 await report_storage_failure(exc)
+            # Before it leaves the live chats, so no spending check of its parent misses this turn.
+            self.delegates.record_spend(session)
             self.live.pop(session["id"], None)
             self.store.forget_encodings(session["id"])
             try:
@@ -4137,14 +4153,16 @@ class AgentManager(LifecycleHooks):
             stop_state = {"blocks": 0}  # Continuations agent_stop or subagent_stop hooks asked for in this turn.
             consecutive_output_retries = 0
             execution_noticed = False
+            system = None  # The latest request's system message (a spending stop after a step refreshes the meter with it).
             for step_index in range(steps):
                 # Before any compaction is billed: the chat's spending limit (its subagents count
                 # for it) and a max_tokens above the output-tokens-per-minute limit Databricks
                 # reported for this endpoint, which can never be admitted.
                 verdict, text = spending.check(self, session)
                 if verdict == "stop":
-                    await self.event(session, "error" if session.get("is_subagent") else "notice", text=text,
-                                     terminal_reason="spending_limit")
+                    if step_index:
+                        await self.refresh_next_estimate(session, system, definitions, wire, context_state)
+                    await self.spending_stop(session, wire, text)
                     return False
                 if verdict == "warn":
                     await self.event(session, "notice", text=text)
@@ -4318,6 +4336,14 @@ class AgentManager(LifecycleHooks):
                         "in Settings if your endpoint supports it, or send a message to continue.",
                         "output_limit", exc.http_status) from exc
                 if not ordered_calls:
+                    if spending.reached(self, session):
+                        # Verify and stop hooks could only continue with a request the limit refuses. A
+                        # subagent's final reply is still its report; a chat says why the turn ends here.
+                        await self.refresh_next_estimate(session, system, definitions, wire, context_state)
+                        if session.get("is_subagent"):
+                            return True
+                        await self.spending_stop(session, wire, spending.check(self, session)[1])
+                        return False
                     if await self.verify_step(session, tools, wire, verify_state, step_index + 1 < steps) == "continue":
                         retry_reason = "verify"
                         continue
@@ -4358,7 +4384,7 @@ class AgentManager(LifecycleHooks):
                             # message from it if the app stops before the next save. Each save rewrites
                             # the whole conversation file.
                             self.store.save(session)
-                if step_index + 1 < steps:
+                if step_index + 1 < steps and not spending.reached(self, session):
                     await self.drain_queue(session, wire, tools, fits=lambda message: in_turn_tokens(
                         [*model_history(wire), message], context_state, system, definitions, input_budget,
                         scale) <= input_budget)

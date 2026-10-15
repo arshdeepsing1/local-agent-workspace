@@ -82,6 +82,7 @@ function SpendingLimit({ session, spending, onSaved }) {
   const [error, setError] = useState('')
   useEffect(() => { setDraft(limit == null ? '0' : String(limit)) }, [limit, spending.source])
   const own = spending.source === 'chat'
+  const follows = spending.follows_parent ?? !!session.is_subagent
   const save = async value => {
     setSaving(true); setError('')
     try {
@@ -102,7 +103,7 @@ function SpendingLimit({ session, spending, onSaved }) {
   const over = limit != null && spent >= limit
   const summary = limit == null ? `${formatDbu(spent)} DBU · no limit` : `${formatDbu(spent)} of ${formatDbu(limit)} DBU`
   const details = [
-    session.is_subagent ? 'Follows its parent conversation\'s limit; the total includes the parent and its other subagents.'
+    follows ? 'Follows its parent conversation\'s limit; the total includes the parent and its other subagents.'
       : limit == null ? (own ? 'No limit for this chat.' : 'No limit (Settings → Agent sets a default for every chat).')
       : own ? 'This chat\'s own limit.' : 'The default from Settings → Agent.',
     spending.subagents_dbu > 0 ? `Includes ${formatDbu(spending.subagents_dbu)} DBU from subagents.` : '',
@@ -114,8 +115,8 @@ function SpendingLimit({ session, spending, onSaved }) {
     ${limit != null ? html`<meter min="0" max=${limit} low=${limit * .8} high=${limit * .999} optimum="0" value=${Math.min(spent, limit)}
       aria-label=${`Estimated spend: ${spending.percent}% of the limit`} />` : null}
     ${details.map(text => html`<p class="field-help" key=${text}>${text}</p>`)}
-    ${over && !session.is_subagent ? html`<p class="usage-warning" role="status">The agent stops before its next model request until you raise the limit.</p>` : null}
-    ${session.is_subagent ? null : html`<form class="usage-spending-form" noValidate onSubmit=${submit}>
+    ${over && !follows ? html`<p class="usage-warning" role="status">The agent stops before its next model request until you raise the limit.</p>` : null}
+    ${follows ? null : html`<form class="usage-spending-form" noValidate onSubmit=${submit}>
       <label>Limit for this chat (DBU, 0 = none)<input type="number" min="0" max=${MAX_LIMIT_DBU} step="any" inputmode="decimal"
         value=${draft} onInput=${event => setDraft(event.currentTarget.value)} /></label>
       <button class="outline" disabled=${saving}>${saving ? 'Saving…' : 'Save limit'}</button>

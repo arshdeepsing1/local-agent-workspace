@@ -420,7 +420,7 @@ def export_bundle(sessions, root_id):
 def completed_for_fork(session):
     wire = session["wire"]
     reason = session.get("terminal_reason")
-    if reason not in (None, "completed") or not wire or wire[-1]["role"] != "assistant" or wire[-1].get("tool_calls"):
+    if reason not in (None, "completed", "hook_blocked") or not wire or wire[-1]["role"] != "assistant" or wire[-1].get("tool_calls"):
         raise ValueError("Only a completed conversation can be forked. Finish a response first.")
     if any(event.get("state") in ("pending", "running") or (event.get("request_info") or {}).get("status") == "running"
            for event in session["events"]):
