@@ -506,3 +506,19 @@ body.panel-resizing{cursor:col-resize;user-select:none}
 .conversation-list-heading .section-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .conversation-list-heading .running-filter{white-space:nowrap;flex-shrink:0}
 @media(601px <= width < 1024px){.drawer-alert{width:calc(var(--panel-width,min(520px,100vw - 238px)) - 24px)}}
+/* structured hooks (2026-10-15) */
+.hook-outcome{margin:0 13px 10px;font-size:11px;color:#87593b;overflow-wrap:anywhere}
+.hook-label{display:block;font-size:11px;color:#87593b;margin-bottom:4px;white-space:normal}
+.user-message.hook-blocked{border:1px dashed #c9b79c}
+.hook-original,.hook-notes{margin-top:8px;font-size:12px;white-space:normal}
+.hook-original summary,.hook-notes summary{cursor:pointer;color:var(--muted)}
+.hook-original p{margin:6px 0 0;white-space:pre-wrap}
+.hook-notes ul{margin:6px 0 0;padding-left:18px}
+.tool-hook-ask{padding:8px 10px;border-radius:6px;background:#f4ecdf;color:#796143;overflow-wrap:anywhere}
+.hook-result .hook-reason{margin:2px 0 8px;overflow-wrap:anywhere}
+.hook-ignored{font-size:11px}
+.hook-events{width:100%;border-collapse:collapse;font-size:12px;margin:8px 0}
+.hook-events th,.hook-events td{text-align:left;vertical-align:top;padding:5px 8px 5px 0;border-bottom:1px solid var(--border);font-weight:400}
+.hook-events thead th{font-weight:500}
+.hook-events code{font-size:11px}
+@media(max-width:600px){.hook-events,.hook-events tbody,.hook-events tr,.hook-events th,.hook-events td{display:block}.hook-events thead{display:none}.hook-events td{border-bottom:0;padding:0 0 4px}.hook-events tr{border-bottom:1px solid var(--border);padding:4px 0}}

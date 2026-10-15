@@ -46,7 +46,7 @@ frontend that runs without a build step.
 - An unreadable conversation file does not stop the app: it is skipped, left unchanged,
   and named in a notice.
 - Explicit MCP servers, workspace skills with a `/` command menu, and approval-controlled
-  tool lifecycle hooks.
+  hooks around tool calls, your messages and the end of a turn, which can answer in JSON.
 - Persistent tasks with dependencies, shown as a live checklist above the message box,
   and subagents the model starts on its own (explore, general or editor; several in
   parallel), each in its own conversation file linked from its parent's.
@@ -1734,26 +1734,97 @@ references and patternProperties are rejected. Explicit dialects must be JSON Sc
 2020-12. Unsupported schemas produce a diagnostic instead of executing unvalidated
 input. Existing MCP schema/argument caps remain in force.
 
-Hooks support `before_tool`, `after_tool`, and `tool_failure`. Each enabled hook receives JSON on
-stdin with the event, conversation ID, tool, arguments, stable `call_id`, and (after execution) result.
-The optional `tools` array selects exact names (including MCP names); omit it for
-all tools, or use an empty array to match none. A hook for `read_file` also runs for
-`outline_file`, and one for `list_files` or `find_files` also runs for `project_overview`;
-its input then has `covered_by` naming the selected tool. Failure hooks receive the original
-error/outcome for invoked tools that fail, including MCP `is_error` results. Schema,
-policy, and approval rejections and cancelled actions do not launch failure hooks.
-Foreground commands with failed/timed-out results also trigger failure hooks;
-background-job completion does not launch a deferred hook.
-Each hook separately asks for approval except in Bypass; Plan skips hooks, and Don't ask runs
-only hooks a rule allows (a before-hook without one blocks its tool). **Allow this hook in this
-chat** stops asking for that hook ID in that chat; a saved hook rule does the same for the
-project or all projects. Deny and ask rules for hooks apply in Bypass too. A declined
-or failing before-hook blocks the tool. An after-hook failure displays a warning
-while retaining the completed action/result. Failure-hook errors also preserve the
-original error. Hooks have a 1–30 second timeout and
-bounded output. They do not recursively invoke hooks. Enable only commands you
-intend to run for every applicable tool; configuration can change only while agent
-turns are idle.
+**Hooks** are local commands from this configuration (at most 16; the whole configuration stays
+within 32 KB). Each one has an `event`:
+
+| Event | Runs | JSON output it reads |
+| --- | --- | --- |
+| `before_tool` | Before a tool call: after its schema check and deny rules, before its approval card | `decision` (`"deny"` with `reason`, or `"ask"`), `arguments`, `context` |
+| `after_tool` | After a tool call completed | `context` |
+| `tool_failure` | After an invoked tool call failed | `context` |
+| `user_prompt` | Before your message (also one sent while the agent works) goes to the model | `decision` (`"block"` with `reason`), `prompt`, `context` |
+| `session_start` | Once, before a chat's first model request (a subagent gets `subagent_start` instead) | `context` |
+| `agent_stop` | When a turn would end with a final reply (after Verify) | `decision` (`"block"` with `reason`) |
+| `subagent_start` | Before a subagent's first model request | `context` |
+| `subagent_stop` | When a subagent would end with its final reply | `decision` (`"block"` with `reason`), `report` |
+
+**Input.** Each hook gets one JSON object on stdin with `event` and the conversation's
+`session_id`. Tool events add `tool`, `arguments`, a stable `call_id`, `result` (after
+execution) and, for `tool_failure`, the original `error`; a hook for `read_file` also runs
+for `outline_file`, and one for `list_files` or `find_files` also runs for
+`project_overview`, its input then has `covered_by` naming the selected tool. `user_prompt`
+adds `prompt` (your text, without attached file contents), `attachments` (their names),
+`steered`, `workspace`, `model`, `permission_mode` and `title`; `session_start` adds
+`workspace`, `model`, `permission_mode` and `title`; `agent_stop` adds `reply` (the final
+reply), `continuations` (how often hooks continued this turn), `workspace`, `model` and
+`permission_mode`. The subagent events give the parent's `session_id` and add
+`subagent_session_id`, `agent_type`, `task`, plus `tool_profile`, `context` and `max_steps`
+(`subagent_start`) or `reply` and `continuations` (`subagent_stop`). Long text is shortened
+(the `*_shortened` field then says so); hook input is at most 128 KB.
+
+The optional `tools` array of a tool event selects exact names (including MCP names); omit it
+for all tools, or use an empty array to match none. Other events ignore it. Failure hooks run
+for invoked tools that fail, including MCP `is_error` results and foreground commands that
+failed or timed out; schema, policy and approval rejections, cancelled actions and
+background-job completion do not launch them.
+
+**Output.** A hook may print **one JSON object** on stdout, for example
+`{"decision": "deny", "reason": "Generated files are rebuilt by make; edit the template."}`.
+Only when the whole trimmed output is one object is it read; any other output (text, a list,
+malformed or cut-off JSON) is plain text, shown on the hook card as before. Fields an event
+does not use are ignored and listed on the card. A known field with a wrong type or value (for
+example `"decision": "block"` on `before_tool`), or JSON output over 16 KB, counts as a failed
+hook. Exit code 0 means no objection plus the optional JSON; any other exit code (or a timeout)
+keeps its old meaning: a failing before-tool hook blocks its tool, and other failing hooks
+leave a warning notice and change nothing. Hooks run in configuration order; a later hook of
+the same event sees an earlier hook's replacement `arguments` or `prompt`, and a `deny` or
+`block` ends that event's hooks.
+
+- `decision`: `"deny"` (`before_tool`) refuses the call; the agent gets the `reason`
+  ("Blocked by the before-tool hook …"). `"ask"` shows an approval card even where the mode or a
+  rule would run the call without one, also in **Bypass permissions** (a hook's request for a
+  person is never answered silently) and also for tools that never show a card, such as reads.
+  Such a card cannot be remembered as a rule, and switching modes does not approve it; Don't ask
+  refuses the call instead. `"allow"`, or no decision, is no objection: it never skips a card
+  the mode or rules require. `"block"` on `user_prompt` keeps your message from the model (the
+  chat says why; nothing is sent or billed), on `agent_stop` asks the agent to keep working (a
+  hidden message with the reason; the chat shows "A hook asked the agent to continue: … (1 of
+  3)"), at most three times in a row per turn and only while agent steps are left, and on
+  `subagent_stop` gives the subagent one more round, at most twice. Stopped turns, errors, the
+  step limit and **Stop** never run `agent_stop` or `subagent_stop`.
+- `arguments` (`before_tool`): replacement arguments for the call. They must pass the tool's
+  JSON schema, or the hook fails and the call is blocked. Because before-tool hooks run before
+  the call's own approval card, everything after them uses the final arguments: deny, ask and
+  allow rules, protected files, folder access, the approval card (which shows what will run,
+  with a **Before the hook** view of the agent's proposal), the read-before-overwrite and
+  changed-file guards, and the shell-free run of a command an argv rule allows. A hook cannot
+  turn an approved or allowed command into another one without the new one's own check. The
+  agent is told its arguments were replaced and what ran. The project's Verify command and the
+  activity log keep the app's arguments (the field is listed as ignored).
+- `prompt` (`user_prompt`): replacement text for your message. The message then shows
+  "Edited by hook …" with your original under **Your original message**; @ files and ! output
+  you attached stay attached (a replacement's own @ tokens attach nothing).
+- `context`: text for the agent, at most 2,000 characters per hook (4,000 per result or message),
+  always labelled as coming from your local hook commands. Tool-event context is added after
+  that call's result; `user_prompt` and `session_start` context after your message (never into
+  the system prompt), shown under **Hook context sent with this message**; `subagent_start`
+  context after the subagent's first message.
+- `report` (`subagent_stop`): replacement text for the report the parent chat receives,
+  labelled as replaced by the hook; the subagent's own final reply stays in its transcript.
+
+**Permissions.** Every event goes through the same approvals as before: its permission is
+`hook_<event>` (for example `hook_user_prompt`), each hook asks for approval except in Bypass,
+Plan skips hooks, and Don't ask runs only hooks a rule allows (a before-hook without one blocks
+its tool). **Allow this hook in this chat** stops asking for that hook ID in that chat; a saved
+hook rule does the same for the project or all projects. Deny and ask rules for hooks apply in
+Bypass too. A hook card shows in the chat it affects (the subagent events: in the parent chat,
+where the delegation is) and says what the hook decided: "Hook blocked: …", "Hook asked for
+approval: …", "Hook added context", "Hook changed the arguments" (with a before/after view) or
+"Hook edited the message". A declined hook does not run: a declined before-hook blocks its tool,
+and a declined lifecycle hook changes nothing. Hooks have a 1–30 second timeout; a card and a
+warning show at most 3.8 KB of output, and secrets are redacted from everything shown or sent.
+Hooks do not recursively invoke hooks. Enable only commands you intend to run for every
+applicable event; configuration can change only while agent turns are idle.
 
 ### Agent tools: tasks, subagents, and activity
 
@@ -1993,9 +2064,10 @@ is checked again at once: switching to Accept edits approves a waiting edit, swi
 blocks waiting edits and commands ("Not run: the user switched this chat to Plan mode while this
 card was waiting.") but approves a waiting command from the read-only list and leaves a subagent
 card waiting, switching to Don't ask blocks waiting cards, and switching to Bypass approves
-waiting cards, including folder access (without adding a folder grant). An action that was
-allowed when it started but waited on a before-tool hook's card is checked again after the hook:
-it gets its own card (and a folder-access card outside the project) when the new mode needs one. Switching to Bypass asks for confirmation for that reason.
+waiting cards, including folder access (without adding a folder grant), except a card a
+before-tool hook asked for (`"ask"`), which waits for your answer. Before-tool hooks run before an
+action's own card, so an action whose hook card waited is checked again after the hook: it gets
+its own card (and a folder-access card outside the project) when the new mode needs one. Switching to Bypass asks for confirmation for that reason.
 Each new model request uses the current mode, and a running subagent follows the parent's
 change, including its waiting cards. Adding or removing a rule, and turning a tool off, re-check
 waiting cards the same way (a new allow rule approves a matching card; a deny rule blocks it).
@@ -2035,8 +2107,9 @@ changes until **Save tools**.
 **Don't ask** never shows a card: actions that the mode or a rule does not allow are refused,
 and the agent is told to continue without them. Folder access outside the project is refused,
 and enabled before-tool hooks block the tools they cover unless a hook
-rule allows the hook. After-tool and failure hooks do not run unless a hook rule allows them;
-their hook card says so, without a notice after every tool. When Verify is blocked this way (or
+rule allows the hook. Other hooks (after-tool, failure and the lifecycle events) do not run unless
+a hook rule allows them; their hook card says so, without a notice every time. A before-tool hook's
+`"ask"` is refused there. When Verify is blocked this way (or
 by a deny rule or a turned-off `run_command`), one notice says why and Verify does not run again
 in that turn.
 
@@ -2181,7 +2254,8 @@ parts listed at the top of the first.
 first page of `run_command` (start and end), `list_jobs` (7.5 KB), `list_skills`,
 `list_tasks`, MCP results and the diffs of edits and moves. `read_file` pages are 8–32 KB,
 up to 128 KB on large budgets; `delegate_task` returns at most 6 KB; hook output on cards
-and notices 3.8 KB; task descriptions 4,000 characters; skills 8 KB combined; the model's
+and notices 3.8 KB (JSON output is read from up to 16 KB; hook context adds at most 4,000
+characters to a result); task descriptions 4,000 characters; skills 8 KB combined; the model's
 own tool arguments 512 KiB and 64 calls per response. Every tool result, for the card and
 the model alike, is also capped at 128 KiB: the longest text values keep their start and
 end around a marker, and the result says `truncated` with `omitted_bytes`.

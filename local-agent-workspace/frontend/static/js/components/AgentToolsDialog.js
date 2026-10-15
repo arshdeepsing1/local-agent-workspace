@@ -377,7 +377,22 @@ function Verify({ session, workspace, onError }) {
   </section>`
 }
 
-const extensionExample = JSON.stringify({ servers: [{ id: 'example', name: 'Example MCP', transport: 'stdio', command: 'your-mcp-server', args: [], enabled: false }], hooks: [{ id: 'example-hook', event: 'before_tool', tools: ['write_file', 'edit_file'], command: 'your-hook-command', timeout_seconds: 10, enabled: false }] }, null, 2)
+const extensionExample = JSON.stringify({ servers: [{ id: 'example', name: 'Example MCP', transport: 'stdio', command: 'your-mcp-server', args: [], enabled: false }], hooks: [
+  { id: 'example-hook', event: 'before_tool', tools: ['write_file', 'edit_file'], command: 'your-hook-command', timeout_seconds: 10, enabled: false },
+  { id: 'prompt-check', event: 'user_prompt', command: 'your-prompt-check', timeout_seconds: 10, enabled: false },
+  { id: 'stop-check', event: 'agent_stop', command: 'your-stop-check', timeout_seconds: 30, enabled: false }] }, null, 2)
+// Hook events (extensions.HOOK_EVENTS): when each runs and the JSON output fields it reads.
+const HOOK_EVENT_HELP = [
+  ['before_tool', 'Before a tool call, before its approval card', 'decision "deny" (with reason) or "ask"; arguments (a replacement, checked again); context'],
+  ['after_tool', 'After a tool call completed', 'context'],
+  ['tool_failure', 'After a tool call failed', 'context'],
+  ['user_prompt', 'Before your message goes to the agent', 'decision "block" (with reason); prompt (a replacement); context'],
+  ['session_start', "Before a chat's first model request", 'context'],
+  ['agent_stop', 'When the agent would end its turn', 'decision "block" (with reason): it keeps working, at most 3 times'],
+  ['subagent_start', "Before a subagent's first request", 'context'],
+  ['subagent_stop', 'When a subagent would finish', 'decision "block" (with reason): one more round, at most 2; report (a replacement)'],
+]
+const hookOutputExample = JSON.stringify({ decision: 'deny', reason: 'Generated files are rebuilt by make; edit the template.' })
 
 function ExtensionsPanel({ session, onError }) {
   const query = scopeQuery(session)
@@ -392,9 +407,14 @@ function ExtensionsPanel({ session, onError }) {
   useEffect(() => { void run(() => Promise.all([api('/extensions'), api(`/skills${query}`)]), ([config, skills]) => { setConfiguration(JSON.stringify(config, null, 2)); setSkills(skills); setLoaded(true) }) }, [query, run])
   return html`<section class="agent-tools-section" aria-label="Extensions">
     <h3>MCP servers and hooks</h3>
-    <p>Configure stdio commands or HTTP server URLs and before_tool / after_tool / tool_failure hooks. Saving authorizes enabled servers to start.</p>
+    <p>Configure stdio commands or HTTP server URLs, and up to 16 hooks: local commands that run around tool calls and at the start and end of a turn. Saving authorizes enabled servers to start.</p>
     <label class="agent-tools-config">Extension configuration (JSON)<textarea aria-label="Extension configuration (JSON)" disabled=${!loaded || busy} spellcheck=${false} value=${configuration} onInput=${e => setConfiguration(e.currentTarget.value)} /></label>
-    <details class="agent-tools-example"><summary>Configuration example</summary><pre>${extensionExample}</pre><p>The optional tools list matches exact tool names. Omit it to match all tools; an empty list matches none. Hook input includes call_id; failure hooks also receive the original error.</p></details>
+    <details class="agent-tools-example"><summary>Configuration example</summary><pre>${extensionExample}</pre><p>The optional tools list matches exact tool names for before_tool, after_tool and tool_failure hooks (other events ignore it). Omit it to match all tools; an empty list matches none. Hook input includes call_id; failure hooks also receive the original error.</p></details>
+    <details class="agent-tools-example hook-events-help"><summary>Hook events and JSON output</summary>
+      <table class="hook-events" aria-label="Hook events"><thead><tr><th scope="col">Event</th><th scope="col">Runs</th><th scope="col">JSON output it reads</th></tr></thead>
+        <tbody>${HOOK_EVENT_HELP.map(([event, when, fields]) => html`<tr key=${event}><th scope="row"><code>${event}</code></th><td>${when}</td><td>${fields}</td></tr>`)}</tbody></table>
+      <p>A hook gets a JSON object on stdin (the event, the chat and, per event, the tool call, your message, the reply or the subagent's task). It may print one JSON object on stdout, for example <code>${hookOutputExample}</code>; any other output is plain text, as before. Exit code 0 means no objection; another exit code blocks a before_tool call and only warns for other events.</p>
+      <p>Context (up to 2,000 characters per hook) reaches the agent labelled as hook output. Replaced arguments are checked again against the tool's schema, your rules and its approval card. "allow" never skips a card the mode or rules need; "ask" always shows one, also in Bypass permissions. Each hook still asks for approval except in Bypass, rules can allow or block it, and Plan mode skips hooks.</p></details>
     <div class="agent-tools-actions"><button class="primary" disabled=${!loaded || busy || !configuration.trim()} onClick=${() => { setNotice(''); setTools(null); setServers(null); void run(() => api('/extensions', 'PUT', JSON.parse(configuration)), config => { setConfiguration(JSON.stringify(config, null, 2)); setNotice('Configuration saved.') }) }}>Save configuration</button>
       <button class="outline" disabled=${busy} onClick=${() => { setNotice(''); setTools(null); setServers(null); void run(() => api('/extensions/test', 'POST'), result => { setTools(result.tools); setServers(result.servers || null) }) }}>Test saved configuration</button></div>
     ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}${notice ? html`<p role="status">${notice}</p>` : null}

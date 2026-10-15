@@ -156,6 +156,8 @@ export default function ApprovalOptions({ event, sessionId, onError, deciding, o
     ${event.protected ? html`<p class="tool-protected">Protected file: ${event.protected}. Edits to it always need your approval.</p>` : null}
     ${event.uncertain ? html`<p class="tool-uncertain">This command could not be checked exactly against your deny and ask rules, so it needs your approval.</p>` : null}
     ${event.edited ? html`<p class="tool-edited">Edited by you</p>` : null}
+    ${event.hook_ask ? html`<p class="tool-hook-ask">The hook ${event.hook_ask.hook_id} asked for your approval${event.hook_ask.reason ? `: ${event.hook_ask.reason}` : '.'} A hook's request cannot be remembered as a rule.</p>` : null}
+    ${event.hook_change ? html`<p class="tool-hook-ask">The hook ${(event.hook_change.hooks || []).join(', ')} changed what the agent proposed; this card shows what would run.</p>` : null}
     ${editing ? html`<${EditAction} event=${event} sessionId=${sessionId} onError=${onError} onClose=${closeEditor} />` : details}
     ${declineNote}
     <div class="approval-buttons"><button class="outline" disabled=${locked} onClick=${() => void onDecide(false)}><${X} size=${15} />Decline</button>
