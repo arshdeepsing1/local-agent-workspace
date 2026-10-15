@@ -4,6 +4,39 @@ Notable changes to Local Agent Workspace, newest first. Dates are UTC.
 
 ## Unreleased
 
+Follow-up of 2026-10-15:
+
+- Custom agents: Markdown files in a project's `.agents/agents` (or `.claude/agents`) define
+  subagents with a description, tools, profile, model, effort, skills and default steps. The
+  model chooses them from a short agent index in the system message, and `delegate_task`
+  checks the name. Agent tools → Subagents lists every agent type and any agent file that
+  cannot be used, with the reason.
+- Each subagent type can have its own endpoint and reasoning effort (**Settings →
+  Subagents**); explore now runs at Fast by default. Cards, Agent tools and the subagents index
+  show the effort and model a subagent started with, and a subagent on a smaller endpoint keeps
+  its requests within that endpoint's budgets.
+- A custom agent never widens what its chat allows: its tools stay within the subagent tool
+  ceiling, turned-off tools, rules and mode, and Manual mode's approval card names the agent,
+  its tools, model and effort before it starts. Its `model` must be an endpoint you already use
+  (the Settings model, Settings → Subagents or one of your chats); any other runs on the
+  chat's model, with a note.
+- Spending limit per conversation: a soft cap on the estimated DBU of a chat and its
+  subagents, checked before each agent model request. **Settings → Agent** sets the default
+  (0 = none), **Agent tools → Usage** shows the spend against the limit and sets a chat's own.
+  One notice at 80%; at the limit the turn ends before the next request, with **Continue**
+  and a "Reached the spending limit" notification. A subagent's spend stays counted when it is
+  stopped, deleted or continued by you.
+- Hooks can answer with one JSON object on stdout (stderr is shown on the card, never read as
+  JSON; output that looks like JSON but does not decode fails the hook): a before-tool hook can
+  deny a call, ask for an approval card (also in Bypass), replace its arguments (checked again
+  against the schema, rules and card) or add context for the agent; after-tool and failure
+  hooks can add context. Decoded text is redacted like plain output.
+- New hook events: `user_prompt` (block, edit or extend your message), `session_start`,
+  `agent_stop` (keep the agent working, at most 3 times), `subagent_start` and `subagent_stop`
+  (one more round, or a replacement report). Up to 16 hooks.
+- Hook cards say what a hook decided, with a before/after view of changed arguments; messages
+  show a hook's edit or block; Agent tools → Extensions lists the events and their JSON output.
+
 Requests of 2026-10-14 (testing on a new machine):
 
 - Reasoning effort per conversation: **Default**, **Fast**, **Medium**, **High**, **Extra

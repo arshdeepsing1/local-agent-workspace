@@ -9,6 +9,8 @@ export const CONTINUE_MESSAGE = 'Continue from where you stopped.'
 //   { type: 'status', status: 'idle', terminal_reason } message after each turn.
 //   'step_limit': the agent step limit was reached (that notice, or a subagent's
 //     error, also carries terminal_reason: 'step_limit').
+//   'spending_limit': the chat's spending limit was reached before a model request
+//     (backend spending.py); Continue stops again until the limit is raised.
 //   'stopped': Stop ("Stopped. You can continue this conversation.").
 //   'interrupted': a server restart (or an import) found the turn still running
 //     and marked its events cancelled / its request_info interrupted.
@@ -36,6 +38,7 @@ export function stopReason(session) {
   const turn = events.slice(start + 1)
   const reason = session.terminal_reason
   if (reason === 'step_limit') return 'The agent reached its step limit.'
+  if (reason === 'spending_limit') return 'The conversation reached its spending limit. Raise it in Agent tools → Usage, then continue.'
   if (reason === 'stopped') return 'The response was stopped.'
   if (reason === 'interrupted') return 'The response was interrupted.'
   if (reason === 'inference_error') {

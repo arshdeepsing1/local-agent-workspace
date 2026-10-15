@@ -46,10 +46,11 @@ frontend that runs without a build step.
 - An unreadable conversation file does not stop the app: it is skipped, left unchanged,
   and named in a notice.
 - Explicit MCP servers, workspace skills with a `/` command menu, and approval-controlled
-  tool lifecycle hooks.
+  hooks around tool calls, your messages and the end of a turn, which can answer in JSON.
 - Persistent tasks with dependencies, shown as a live checklist above the message box,
-  and subagents the model starts on its own (explore, general or editor; several in
-  parallel), each in its own conversation file linked from its parent's.
+  and subagents the model starts on its own (explore, general, editor, or a custom agent
+  defined in the project's `.agents/agents` files; several in parallel), each in its own
+  conversation file linked from its parent's, with a model and effort per agent type.
 - Markdown transcripts of a conversation: download or copy one from the app, or write
   them for many saved conversations with a script.
 - A reasoning effort per conversation (Default, Fast, Medium, High, Extra high, Max) sent in the
@@ -1023,7 +1024,8 @@ It does not estimate missing token counts. This is not an account-wide report or
 invoice: regional uplifts, provisioned endpoints, negotiated pricing, credits, and
 delayed billing adjustments can differ. Older chats that predate the ledger show
 visible agent-call totals as incomplete because title, summary, and retry attempts
-cannot be reconstructed. A delegated child's requests stay in its own conversation.
+cannot be reconstructed. A delegated child's requests stay in its own conversation's
+usage (its parent's spending limit counts them).
 Databricks responses may omit usage.
 See the [Databricks API reference](https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/api-reference)
 for the provider's usage fields. The context meter below shows the input Databricks
@@ -1113,6 +1115,30 @@ request asked for; it is empty for a request at Default that sent no reasoning f
 `effort_sent` is the level that went out: GPT OSS gets `high` for Extra high and Max, and
 `none` means the reasoning fields were left out after a rejection.
 
+### Spending limit
+
+A conversation can have a **spending limit**: a soft cap on its estimated DBU (the estimate
+above, from list prices), counting its subagents too. **Settings → Agent → Spending limit per
+conversation** sets the default for every chat without its own (0, the default, means no
+limit); **Agent tools → Usage** shows what the chat has used against its limit, with the share
+from subagents, and sets the chat's own limit (0 = none for this chat) or returns it to the
+Settings default. It can be changed while a reply runs. Forks and imports keep a chat's own limit
+(their spend starts again from their own calls).
+
+The app checks the limit before each agent model request, before any compaction for it. At 80%
+it adds one notice; once the chat has used the limit, it does not send the next request and
+ends the turn with a notice (a subagent ends with an error its parent sees), the chat offers
+**Continue**, and desktop notifications say "Reached the spending limit". Raise the limit, then
+continue. A reply that arrives over the limit ends the turn the same way, without Verify or stop
+hooks (they could only continue with a refused request; a subagent's final reply still reaches
+its parent), and messages queued while it ran stay queued. It is a soft cap: one response can pass it before the next request is stopped.
+Calls to endpoints without price data count as nothing and are listed as not counted; title
+and compaction requests are counted but never stopped. A subagent follows its parent's limit
+(a subagent chat without its parent, such as a copy of one, has its own), and its spend is kept
+in the parent's subagents index after each of its turns, also when it is stopped, deleted or
+continued by you (subagents that ended before this existed are not counted). The offline simulator reports usage, so
+`databricks-claude-opus-5-5` there can be used to try a small limit.
+
 ### Reasoning effort and thinking
 
 Each conversation has a **reasoning effort**, chosen in the picker beside the model picker
@@ -1121,7 +1147,8 @@ A new conversation starts at **Settings → Reasoning → Default effort for new
 (Default unless you change it), and keeps its own level in its file like its model; forks and
 imports keep it, and a conversation saved before this existed uses the Settings default. A
 change applies from the agent's next model request, also while a response runs (a notice
-says so) and for a running subagent. The picker names what Default means where it is known,
+says so) and for a running subagent whose type sets no effort of its own (see **Custom agents**
+under **Agent tools: tasks, subagents, and activity**). The picker names what Default means where it is known,
 for example **Default (Medium)**. Levels above Default make the model think longer, which
 uses more output tokens (thinking counts toward **Max output tokens**) and costs more.
 
@@ -1492,8 +1519,8 @@ tools, connect MCP servers, or rewrite the archived conversation. The resulting
 older sessions without that snapshot); definitions may change on the next turn.
 The details open above the meter; Escape, a click elsewhere or moving focus away closes them.
 
-**Settings** groups its fields under Project, Model and context, Reasoning, Agent, Commands and
-files, Notifications and Credentials; on a wide screen a list of these sections beside them
+**Settings** groups its fields under Project, Model and context, Reasoning, Agent, Subagents,
+Commands and files, Notifications and Credentials; on a wide screen a list of these sections beside them
 jumps to each one. Longer explanations wait behind **More**. **Settings → Databricks model
 endpoint** lists the endpoints with built-in facts (label and name) and those your workspace
 serves; **Other endpoint…** opens a field for any other name. **Save settings** stays at the
@@ -1734,26 +1761,113 @@ references and patternProperties are rejected. Explicit dialects must be JSON Sc
 2020-12. Unsupported schemas produce a diagnostic instead of executing unvalidated
 input. Existing MCP schema/argument caps remain in force.
 
-Hooks support `before_tool`, `after_tool`, and `tool_failure`. Each enabled hook receives JSON on
-stdin with the event, conversation ID, tool, arguments, stable `call_id`, and (after execution) result.
-The optional `tools` array selects exact names (including MCP names); omit it for
-all tools, or use an empty array to match none. A hook for `read_file` also runs for
-`outline_file`, and one for `list_files` or `find_files` also runs for `project_overview`;
-its input then has `covered_by` naming the selected tool. Failure hooks receive the original
-error/outcome for invoked tools that fail, including MCP `is_error` results. Schema,
-policy, and approval rejections and cancelled actions do not launch failure hooks.
-Foreground commands with failed/timed-out results also trigger failure hooks;
-background-job completion does not launch a deferred hook.
-Each hook separately asks for approval except in Bypass; Plan skips hooks, and Don't ask runs
-only hooks a rule allows (a before-hook without one blocks its tool). **Allow this hook in this
-chat** stops asking for that hook ID in that chat; a saved hook rule does the same for the
-project or all projects. Deny and ask rules for hooks apply in Bypass too. A declined
-or failing before-hook blocks the tool. An after-hook failure displays a warning
-while retaining the completed action/result. Failure-hook errors also preserve the
-original error. Hooks have a 1–30 second timeout and
-bounded output. They do not recursively invoke hooks. Enable only commands you
-intend to run for every applicable tool; configuration can change only while agent
-turns are idle.
+**Hooks** are local commands from this configuration (at most 16; the whole configuration stays
+within 32 KB). Each one has an `event`:
+
+| Event | Runs | JSON output it reads |
+| --- | --- | --- |
+| `before_tool` | Before a tool call: after its schema check and deny rules, before its approval card | `decision` (`"deny"` with `reason`, or `"ask"`), `arguments`, `context` |
+| `after_tool` | After a tool call completed | `context` |
+| `tool_failure` | After an invoked tool call failed | `context` |
+| `user_prompt` | Before your message (also one sent while the agent works) goes to the model | `decision` (`"block"` with `reason`), `prompt`, `context` |
+| `session_start` | Once, before a chat's first model request (a subagent gets `subagent_start` instead) | `context` |
+| `agent_stop` | When a turn would end with a final reply (after Verify) | `decision` (`"block"` with `reason`) |
+| `subagent_start` | Before a subagent's first model request | `context` |
+| `subagent_stop` | When a subagent would end with its final reply | `decision` (`"block"` with `reason`), `report` |
+
+**Input.** Each hook gets one JSON object on stdin with `event` and the conversation's
+`session_id`. Tool events add `tool`, `arguments`, a stable `call_id`, `result` (after
+execution) and, for `tool_failure`, the original `error`; a hook for `read_file` also runs
+for `outline_file`, and one for `list_files` or `find_files` also runs for
+`project_overview`, its input then has `covered_by` naming the selected tool. `user_prompt`
+adds `prompt` (your text, without attached file contents), `attachments` (their names),
+`steered`, `workspace`, `model`, `permission_mode` and `title`; `session_start` adds
+`workspace`, `model`, `permission_mode` and `title`; `agent_stop` adds `reply` (the final
+reply), `continuations` (how often hooks continued this turn), `workspace`, `model` and
+`permission_mode`. The subagent events give the parent's `session_id` and add
+`subagent_session_id`, `agent_type`, `task`, plus `tool_profile`, `context` and `max_steps`
+(`subagent_start`) or `reply` and `continuations` (`subagent_stop`). Long text is shortened
+(the `*_shortened` field then says so); hook input is at most 128 KB.
+
+The optional `tools` array of a tool event selects exact names (including MCP names); omit it
+for all tools, or use an empty array to match none. Other events ignore it. Failure hooks run
+for invoked tools that fail, including MCP `is_error` results and foreground commands that
+failed or timed out; schema, policy and approval rejections, cancelled actions and
+background-job completion do not launch them.
+
+**Output.** A hook may print **one JSON object** on stdout, for example
+`{"decision": "deny", "reason": "Generated files are rebuilt by make; edit the template."}`.
+Only stdout is read, and only when its whole trimmed text is one object; any other output (text,
+a list, cut-off JSON) is plain text, shown on the hook card as before. stderr is never read as
+JSON: the card shows it after stdout, under `[stderr]`, so a warning a command prints there
+cannot turn a decision into plain text. Fields an event does not use are ignored and listed on
+the card. Output that starts with `{` and ends with `}` but is not valid JSON, a known field with
+a wrong type or value (for example `"decision": "block"` on `before_tool`), or JSON output over
+16 KB counts as a failed hook. Exit code 0 means no objection plus the optional JSON; any other exit code (or a timeout)
+keeps its old meaning: a failing before-tool hook blocks its tool, and other failing hooks
+leave a warning notice and change nothing. Hooks run in configuration order; a later hook of
+the same event sees an earlier hook's replacement `arguments` or `prompt`, and a `deny` or
+`block` ends that event's hooks.
+
+- `decision`: `"deny"` (`before_tool`) refuses the call; the agent gets the `reason`
+  ("Blocked by the before-tool hook …"). `"ask"` shows an approval card even where the mode or a
+  rule would run the call without one, also in **Bypass permissions** (a hook's request for a
+  person is never answered silently) and also for tools that never show a card, such as reads.
+  Such a card cannot be remembered as a rule, and switching modes does not approve it; Don't ask
+  refuses the call instead. `"allow"`, or no decision, is no objection: it never skips a card
+  the mode or rules require. `"block"` on `user_prompt` keeps your message from the model (the
+  chat says why; nothing is sent or billed), on `agent_stop` asks the agent to keep working (a
+  hidden message with the reason; the chat shows "A hook asked the agent to continue: … (1 of
+  3)"), at most three times in a row per turn and only while agent steps are left, and on
+  `subagent_stop` gives the subagent one more round, at most twice. Stopped turns, errors, the
+  step limit and **Stop** never run `agent_stop` or `subagent_stop`.
+- `arguments` (`before_tool`): replacement arguments for the call. They must pass the tool's
+  JSON schema, or the hook fails and the call is blocked. Because before-tool hooks run before
+  the call's own approval card, everything after them uses the final arguments: deny, ask and
+  allow rules, protected files, folder access, the approval card (which shows what will run,
+  with a **Before the hook** view of the agent's proposal), the read-before-overwrite and
+  changed-file guards, and the shell-free run of a command an argv rule allows. A hook cannot
+  turn an approved or allowed command into another one without the new one's own check. The
+  agent is told its arguments were replaced and what ran. If you edit the call on its card
+  (**Edit** before approving), your edit runs without before-tool hooks checking it again (the
+  rules still do), and the agent is told the edited arguments ran. The project's Verify command
+  and the activity log keep the app's arguments (the field is listed as ignored).
+- `prompt` (`user_prompt`): replacement text for your message. The message then shows
+  "Edited by hook …" with your original under **Your original message**; @ files and ! output
+  you attached stay attached (a replacement's own @ tokens attach nothing).
+- `context`: text for the agent, at most 2,000 characters per hook (4,000 per result or message),
+  always labelled as coming from your local hook commands. Tool-event context is added after
+  that call's result; `user_prompt` and `session_start` context after your message (never into
+  the system prompt), shown under **Hook context sent with this message**; `subagent_start`
+  context after the subagent's first message.
+- `report` (`subagent_stop`): replacement text for the report the parent chat receives,
+  labelled as replaced by the hook; the subagent's own final reply stays in its transcript.
+
+**Queued messages and subagent chats.** A message you queue while the agent works stays
+queued while its `user_prompt` hooks run or their card waits, so after **Stop**, an error or a
+restart it is still queued (see **Messages while the agent works**); it leaves the queue once it
+is sent or a hook blocks it, and one you remove meanwhile is not sent. If hook context makes it
+too large for the context budget at that step, it waits for a later one, and its hooks run again
+then. The subagent events belong to a subagent's delegated turn. A subagent chat you continue
+yourself (a message, **Edit** or **Retry** after its delegation ended) is an ordinary chat for
+hooks: your messages there get `user_prompt` hooks and its turns end with `agent_stop`, under
+that chat's mode and rules (a subagent with a restricted tool profile, such as `explore`, runs
+no hooks); nothing runs or shows in the parent chat.
+
+**Permissions.** Every event goes through the same approvals as before: its permission is
+`hook_<event>` (for example `hook_user_prompt`), each hook asks for approval except in Bypass,
+Plan skips hooks, and Don't ask runs only hooks a rule allows (a before-hook without one blocks
+its tool). **Allow this hook in this chat** stops asking for that hook ID in that chat; a saved
+hook rule does the same for the project or all projects. Deny and ask rules for hooks apply in
+Bypass too. A hook card shows in the chat it affects (the subagent events: in the parent chat,
+where the delegation is) and says what the hook decided: "Hook blocked: …", "Hook asked for
+approval: …", "Hook added context", "Hook changed the arguments" (with a before/after view) or
+"Hook edited the message". A declined hook does not run: a declined before-hook blocks its tool,
+and a declined lifecycle hook changes nothing. Hooks have a 1–30 second timeout; a card and a
+warning show at most 3.8 KB of output, and secrets are redacted from everything shown or sent
+(in JSON output also after decoding, so an escaped spelling of a secret is caught too).
+Hooks do not recursively invoke hooks. Enable only commands you intend to run for every
+applicable event; configuration can change only while agent turns are idle.
 
 ### Agent tools: tasks, subagents, and activity
 
@@ -1773,10 +1887,12 @@ the conversation's back-and-forth, itself. A subagent sees nothing of the chat: 
 passes the full task, constraints, paths and the report it expects (`task` and `context`).
 `agent_type` picks the tools: **explore** is read-only (the `read_only` profile, for
 investigation), **editor** reads and edits files without commands (`file_editor`), and
-**general** (the default) has the chat's tools (`inherit`); all stay within the chat's
-subagent tool ceiling (below). The older `tool_profile` argument still works; given with
-`agent_type`, the narrower applies. `max_steps` is 1–24 model requests (default 10). The child
-uses the chat's model (and its reasoning setting when the chat has one) and inherits workspace,
+**general** (the default) has the chat's tools (`inherit`); a project's own agents are named
+by their files (see **Custom agents** below). All stay within the chat's subagent tool ceiling
+(below). The older `tool_profile` argument still works; given with `agent_type`, the narrower
+applies. `max_steps` is 1–24 model requests (default 10). The child uses its agent type's model
+and effort (**Settings → Subagents**: explore runs at Fast on the chat's model by default) and
+otherwise the chat's model (and its reasoning setting when the chat has one). It inherits workspace,
 permission mode, folder grants, turned-off tools, and "Allow for this chat" rules (a copy:
 rules the child adds stay in the child); project and all-project rules apply to it as to the
 parent. Children cannot delegate again or start managed background jobs. The child's first
@@ -1799,7 +1915,8 @@ first): `child_session_id`, `agent_type`, `tool_profile`, `status`
 inference/tool error, or interruption), `steps_used`, `tool_calls`, `changed_files` (paths
 its file tools changed, at most 20; `changed_files_total` when there were more; files a
 command changed are in the changes bar), `transcript`, and `output` (the report).
-Each subagent has its own card: its type, live status (running, waiting for approval,
+Each subagent has its own card: its type, the effort and model it started with (for example
+**Fast · Claude Opus 5.5**), live status (running, waiting for approval,
 waiting for a free slot, completed, failed, cancelled), completed actions, last tool, how
 long it has run, **Open subagent** and, once it ended, a collapsible **Report** with the
 files it changed. Progress metadata does not copy child tool payloads into the parent's
@@ -1814,9 +1931,12 @@ title. Unfinished delegated runs are marked interrupted on restart rather than l
 `conversations/<id>.jsonl` in the state folder, like any chat. Its header (the first line)
 keeps `parent_session_id`, `parent_event_id` (the parent's card) and `parent_call_id`, its
 `agent_type`, `tool_profile`, `max_steps`, and `delegation` (status, completed actions, last
-tool, start and end times). The parent's header keeps a `subagents` index, one entry per
-child: `{id, task (its first 200 characters), agent_type, status, created, ended,
-transcript}`, plus `steps_used` and `tool_calls` once it ended. An entry is added when the
+tool, the `model` and `effort` it started with, start and end times). A child whose agent set
+them also keeps `agent_model`, `agent_effort`, and for a custom agent `agent_file` and
+`agent_tools` (exports, imports and forks keep them, so a copy never gets more tools). The
+parent's header keeps a `subagents` index, one entry per child: `{id, task (its first 200
+characters), agent_type, status, created, ended, transcript, model, effort}`, plus
+`steps_used` and `tool_calls` once it ended. An entry is added when the
 child starts and updated when it ends and by restart recovery; the newest 200 are kept.
 Deleting a subagent chat keeps its entry, marked `deleted` and without a transcript; deleting
 the parent with its subagents removes them all. An import rebuilds the index of each copied
@@ -1824,8 +1944,12 @@ parent from the copied children; exports leave it out, and forks and rewind back
 none. The sessions list (`GET /api/sessions`) leaves the index out;
 `GET /api/sessions/<id>/children` lists the children with their `transcript` and index entry.
 
-**Agent tools → Subagents** lists the chat's subagents with their type, status, task, steps
-and tool calls, start and end, and transcript file name, with **Open** for each.
+**Agent tools → Subagents** lists the chat's subagents with their type, status, tool profile,
+effort and model, task, steps and tool calls, start and end, and transcript file name, with
+**Open** for each. Below them, **Agent types** lists what `delegate_task` can start in this
+project: the built-in types with their Settings defaults, each custom agent (description, file,
+profile, tools, model, effort, default steps, skills, and notes such as ignored tool names), and
+every agent file that cannot be used, with the reason (**Refresh agent types** reads the files again).
 **Subagents → New subagent tool ceiling** selects `inherit`, `read_only`, or `file_editor`
 for future children while the parent is idle. The model may request a narrower
 `agent_type` or `tool_profile` in `delegate_task` but cannot widen the parent's ceiling. Read-only
@@ -1836,6 +1960,95 @@ task mutations, and further delegation. Restrictions persist on child continuati
 imports, and forks. Existing children are unchanged by a new ceiling. These are
 server-enforced model-tool limits, not an OS sandbox or restrictions on the user's
 explicit editor/terminal actions.
+
+**Custom agents.** A project can define its own subagents in Markdown files, which the app
+only reads: `.agents/agents/<name>.md`, then `.claude/agents/<name>.md` (when both define a
+name, the `.agents` file is used and the other is noted). Frontmatter between two `---` lines
+names the agent and its limits; the rest of the file is its instructions:
+
+```markdown
+---
+name: security-auditor
+description: Reviews changed code for injection, secrets handling and unsafe file access.
+tools: [read_file, search_files, find_files, outline_file]
+profile: read_only
+model: databricks-claude-sonnet-4-5
+effort: low
+skills: [review]
+max_steps: 8
+---
+Check every changed file for hard-coded secrets and unsafe path handling.
+Report each finding with path:line, its severity and a suggested fix.
+```
+
+| Field | Meaning |
+| --- | --- |
+| `name` | A lowercase letter, then up to 39 lowercase letters, digits or `-` (default: the file name); not `explore`, `general` or `editor`. |
+| `description` | Required: one line of at most 300 characters, which the model reads to choose the agent. |
+| `tools` | Optional: the only tools the agent may use (`[a, b]`, `- item` lines, or `a, b`). Names this app does not have are ignored with a note, `delegate_task` never applies, and tools outside the profile are dropped. Left out: every tool of the profile. |
+| `profile` | `read_only` (the default), `file_editor` or `inherit`, as for `tool_profile`. |
+| `model` | Optional Databricks serving endpoint name, only one you already use: the Settings model, a **Settings → Subagents** model or the model of one of your chats (not a subagent chat). Any other endpoint runs on the chat's model, with a note in Agent types and on the approval card. Left out (or `inherit`): the chat's model. |
+| `effort` | Optional `default`, `low` (Fast), `medium`, `high`, `xhigh` or `max`; left out: the chat's effort. |
+| `skills` | Optional: up to three skill IDs loaded into the subagent like selected skills; one that does not load is left out with a note in its first prompt. A `/skill` word in the instructions or the task loads no other skill. |
+| `max_steps` | Optional 1–24: the subagent's steps when the call gives no `max_steps` (a call's own value wins). |
+
+The parser is small and strict: `key: value` lines, `[a, b]` or `- item` lists, `"..."` or
+`'...'` quoting and `#` comment lines; nested or multi-line (`|`, `>`) values are refused.
+Claude Code agent files work too: its tool names `Read`, `Write`, `Edit`, `MultiEdit`, `Glob`,
+`Grep`, `LS`, `Bash`, `NotebookRead` and `NotebookEdit` stand for this app's, other fields such
+as `color` are ignored with a note, and its model values `sonnet`, `opus`, `haiku` and `inherit`
+mean the chat's model. An agent file is at most 16 KB (16,384 bytes) with up to 8,000 characters
+of instructions; a folder with more than 100 entries is not read (Agent types says so) and at
+most 30 agents are used. A file
+that cannot be used (no description, a bad name or value, too large, a symbolic link, not UTF-8
+text, a quoted value with a lone `\u` escape, a file name that is not UTF-8, a name another file
+already uses, an agent folder outside the project) is listed under
+**Agent tools → Subagents → Agent types** with the reason, and delegating to it fails with that
+reason.
+
+*How the model chooses.* A chat that can delegate gets an **agent index** in its system
+message, right after the skill index: each agent's name and description (shortened to 150
+characters), at most 30 lines and 2,000 bytes, with a count of any left out. It changes only
+when agent files change, so the endpoint's prompt prefix caching keeps working. `agent_type` in
+`delegate_task` is a plain string rather than an enum, because custom names differ per project
+while the tool definitions stay the same in every request; the server checks it, and an unknown
+name returns an error that lists every available type (and why a file of that name cannot be
+used). The subagent's first prompt carries the task and context, then `Custom agent: <name>
+(from <file>)` with its instructions, then what its tools allow and the report it ends with. An agent's instructions never enter the parent's system message.
+
+*Defaults per type.* **Settings → Subagents** sets each built-in type's model (**Same as the
+chat**, a listed endpoint, or **Other endpoint…**) and effort (**Same as the chat** or a level):
+
+| Type | Tools | Model | Effort |
+| --- | --- | --- | --- |
+| explore | `read_only` | the chat's | Fast (`low`) |
+| general | the chat's (`inherit`) | the chat's | the chat's |
+| editor | `file_editor` | the chat's | the chat's |
+| custom agent | its `profile` and `tools` | its `model` (an endpoint you use), else the chat's | its `effort`, else the chat's |
+
+A subagent whose type sets an effort keeps it when you change the chat's effort; the others
+follow the chat, and one still waiting for a free slot takes the chat's effort when it starts
+(until then its card shows only an effort its type sets). A subagent on an endpoint its type
+sets, other than its chat's and the Settings model, follows that endpoint's default budgets where
+Settings is at the Settings model's defaults, and Settings budgets above that endpoint's
+defaults are lowered to them (and, as for every chat, to its maxima): with Claude Opus 5.5 at
+1,000,000 context and 32,000 output tokens, an agent on GPT OSS 120B sends 131,072 and 8,192,
+while an agent on the Settings model keeps 1,000,000 and 32,000, also from a chat on GPT OSS 120B.
+Lower Settings budgets stay as they are.
+
+*Safety.* An agent file is project content, like `AGENTS.md`, and never widens what the chat
+allows. It cannot send the subagent's requests, and the project content they carry, to an
+endpoint you do not already use (see `model` above). Its profile is intersected with the chat's
+subagent tool ceiling and any requested `tool_profile` (the narrowest wins), its tools with that profile and without those the chat has
+turned off or an unconditional deny rule covers (a delegation with none of its tools left is
+refused, and the first prompt lists only the tools it has), the chat's turned-off tools, rules
+and permission mode apply as to any subagent, and subagents never delegate. A tool outside the
+agent's list is refused like a turned-off one. In Manual mode the approval card names the agent
+and everything it sets, for example **Start a subagent (security-auditor · read-only · model
+Claude Sonnet 4.5 · effort Fast; separate paid model requests, at most 8 steps)**, followed by
+the task, the agent file, its tools and skills, and the exact endpoint; the subagent that starts
+is the one the card showed, even if its file changes before you approve. Text the app shows or
+sends from agent files is redacted (the Databricks token and common secret shapes).
 
 **Questions and plan review.** With `ask_user` the model asks 1–4 short multiple-choice
 questions when it needs a decision. Each question has 2–4 options (single or multiple
@@ -1993,9 +2206,10 @@ is checked again at once: switching to Accept edits approves a waiting edit, swi
 blocks waiting edits and commands ("Not run: the user switched this chat to Plan mode while this
 card was waiting.") but approves a waiting command from the read-only list and leaves a subagent
 card waiting, switching to Don't ask blocks waiting cards, and switching to Bypass approves
-waiting cards, including folder access (without adding a folder grant). An action that was
-allowed when it started but waited on a before-tool hook's card is checked again after the hook:
-it gets its own card (and a folder-access card outside the project) when the new mode needs one. Switching to Bypass asks for confirmation for that reason.
+waiting cards, including folder access (without adding a folder grant), except a card a
+before-tool hook asked for (`"ask"`), which waits for your answer. Before-tool hooks run before an
+action's own card, so an action whose hook card waited is checked again after the hook: it gets
+its own card (and a folder-access card outside the project) when the new mode needs one. Switching to Bypass asks for confirmation for that reason.
 Each new model request uses the current mode, and a running subagent follows the parent's
 change, including its waiting cards. Adding or removing a rule, and turning a tool off, re-check
 waiting cards the same way (a new allow rule approves a matching card; a deny rule blocks it).
@@ -2035,8 +2249,9 @@ changes until **Save tools**.
 **Don't ask** never shows a card: actions that the mode or a rule does not allow are refused,
 and the agent is told to continue without them. Folder access outside the project is refused,
 and enabled before-tool hooks block the tools they cover unless a hook
-rule allows the hook. After-tool and failure hooks do not run unless a hook rule allows them;
-their hook card says so, without a notice after every tool. When Verify is blocked this way (or
+rule allows the hook. Other hooks (after-tool, failure and the lifecycle events) do not run unless
+a hook rule allows them; their hook card says so, without a notice every time. A before-tool hook's
+`"ask"` is refused there. When Verify is blocked this way (or
 by a deny rule or a turned-off `run_command`), one notice says why and Verify does not run again
 in that turn.
 
@@ -2181,7 +2396,8 @@ parts listed at the top of the first.
 first page of `run_command` (start and end), `list_jobs` (7.5 KB), `list_skills`,
 `list_tasks`, MCP results and the diffs of edits and moves. `read_file` pages are 8–32 KB,
 up to 128 KB on large budgets; `delegate_task` returns at most 6 KB; hook output on cards
-and notices 3.8 KB; task descriptions 4,000 characters; skills 8 KB combined; the model's
+and notices 3.8 KB (JSON output is read from up to 16 KB; hook context adds at most 4,000
+characters to a result); task descriptions 4,000 characters; skills 8 KB combined; the model's
 own tool arguments 512 KiB and 64 calls per response. Every tool result, for the card and
 the model alike, is also capped at 128 KiB: the longest text values keep their start and
 end around a marker, and the result says `truncated` with `omitted_bytes`.
@@ -2190,7 +2406,8 @@ The results of one model response also share a **context allowance**: what the i
 budget leaves after the latest exchange, with room for the largest summary, the app
 record, a handoff line, the tool definitions and 1,024 tokens for the next step's notices,
 and at most half the input budget. Room for a short notice per tool call of the response is
-kept aside, and every text sent is counted, including notices and refusals. A compaction
+kept aside, and every text sent is counted, including notices, refusals and what hooks add to
+a result (their context and a changed-arguments note). A compaction
 inside that turn can therefore keep every result it was given, as long as the response's
 own tool calls and their notices fit the budget. The allowance uses the estimate scale
 after the response's reported input tokens, as the next request does. A read (`read_file`,
@@ -2346,7 +2563,8 @@ Thinking display, subagents, background jobs and change review before using a pa
   route does (the default `both` accepts either).
 - Words in your message choose a scripted turn: `edit` (writes a file, then edits it twice
   with pauses, so you can press **Keep** in between), `job` (a background command and
-  `wait_job`), `delegate` or `parallel` (one or two read-only subagents), `ask` (a question
+  `wait_job`), `delegate` or `parallel` (one or two read-only subagents; `delegate custom` uses
+  the first agent of the project's agent index, see **Custom agents**), `ask` (a question
   card), `task`, `read`, `rate limit` (one HTTP 429 with `Retry-After: 2`), `long`. Any other
   message gets a reply that says which effort and fields the request carried.
 - Simulated chats and settings live in `.local/simulator/` (`--state-dir` to change), apart

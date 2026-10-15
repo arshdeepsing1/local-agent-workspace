@@ -43,13 +43,15 @@ from .workspace_folders import WorkspaceFolders, _within
 from .worktrees import WorktreeManager
 from .extensions import ExtensionManager
 from .extensions import skill_index
+from . import custom_agents
 from .context import estimate_text_tokens
-from .planning import DEFAULT_STEPS, PROFILE_TYPES, CallAllowance, DelegateManager, DelegationGate, TaskManager
+from .planning import CallAllowance, DelegateManager, DelegationGate, TaskManager
 from .interactions import InteractionManager
 from .feature_tools import FEATURE_TOOLS
 from .tool_profiles import tool_allowed, filter_tools
 from . import reasoning
 from .reasoning import reasoning_delta
+from . import spending
 from .titles import fallback_title, generate_title, needs_title
 from .telemetry import (
     InferenceError, begin_inference_call, finish_inference_call, http_error_kind,
@@ -62,7 +64,8 @@ from .store import UnreadableConversation
 from .approvals import MAX_ALLOW_RULES, busy_status, declined, rule_for
 from .notify import SystemNotifier, attention_message
 from .context import INCOMPLETE_RESPONSE_CONTINUATION, INVALID_ARGUMENTS_CONTINUATION, VERIFY_CONTINUATION_PREFIX
-from .context import is_app_prompt, is_continuation
+from .context import HOOK_CONTINUATION_PREFIX, is_app_prompt, is_continuation
+from .lifecycle_hooks import LifecycleHooks, ToolHookNotes, blocked_prompt_notice, hook_contexts, shown_arguments
 from .context import retained_request as context_retained
 from . import history
 from .tool_errors import tool_error_text
@@ -707,6 +710,10 @@ def delegated_prompt(session):
                 and not (session.get("delegation") or {}).get("terminal_reason"))
 
 
+# The wire's answer to a prompt the spending limit stopped before any model request (spending_stop).
+SPENDING_STOP_REPLY = "[No reply: the spending limit stopped this turn before a model request.]"
+
+
 def public_session(session, status="idle"):
     pending = pending_summary(session)
     return {"permission_mode": "manual", "allowed_directories": [], "allow_rules": [], "disabled_tools": [],
@@ -717,7 +724,7 @@ def public_session(session, status="idle"):
             "status": status}
 
 
-class AgentManager:
+class AgentManager(LifecycleHooks):
     def __init__(self, store, settings):
         self.store, self.settings = store, settings
         self.live = {}
@@ -878,10 +885,14 @@ class AgentManager:
         self.store.save(session)
         return {"active_skills": ids}
 
-    def requested_skills(self, tools, prompt):
+    def requested_skills(self, tools, prompt, session=None):
         """The skills a message names: `/skill <id> …` at its start, or a listed
         skill's `/<id>` as a word anywhere ("/handoff …", "… use /handoff to …").
-        Other slashes, such as paths, leave the message ordinary text."""
+        Other slashes, such as paths, leave the message ordinary text. A custom agent's
+        delegated first prompt names none: the skills its file lists are loaded already, and
+        its instructions (in that prompt) must not load others or go over the limit of three."""
+        if session is not None and session.get("agent_file") and session.get("turn_delegated"):
+            return []
         words = prompt.split(maxsplit=2)
         if words and words[0] == "/skill" and len(words) > 1:
             return [words[1]]
@@ -920,67 +931,7 @@ class AgentManager:
         return ((guidance["text"], guidance["warnings"]) == getattr(tools, "instruction_signature", ("", []))
                 and self.skill_text(session, tools) == getattr(tools, "skill_signature", ""))
 
-    async def run_hooks(self, session, phase, name, arguments, result=None, *, call_id=None, error=None):
-        if session.get("permission_mode") == "plan" or session.get("tool_profile", "inherit") != "inherit":
-            return
-        for hook in self.extensions.public_config()["hooks"]:
-            if asyncio.current_task().cancelling():
-                return
-            # A hook for read_file also runs for outline_file, and one for list_files or find_files for
-            # project_overview (COVERED_BY), as their rules and turned-off tools do.
-            selected = hook.get("tools")
-            cover = None if selected is None or name in selected else covering_tool(name, selected)
-            if not hook["enabled"] or hook["event"] != phase or (selected is not None and name not in selected
-                                                                 and cover is None):
-                continue
-            hook_tools = self.session_tools(session)
-            verdict = self.permission(session, hook_tools, f"hook_{phase}", {"hook_id": hook["id"]})
-            event = await self.event(session, "tool", name=f"hook_{phase}", state="running", input={"hook_id": hook["id"], "tool": name, "call_id": call_id},
-                                     preview=f"Hook: {hook['id']}\nFor tool: {name}\nCommand: {hook['command']}\nTimeout: {hook['timeout_seconds']} seconds", output="",
-                                     **(self.verdict_fields(verdict) if verdict.decision == "allow" else {}))
-            try:
-                if verdict.decision == "deny":
-                    # A deny rule, or Don't ask with no allow rule: the hook does not run.
-                    await self.update_event(session, event, state="rejected", approval="blocked",
-                                            blocked_reason=verdict.message)
-                    raise ValueError(verdict.message)
-                if verdict.decision == "ask":
-                    allowed, _ = await self.request_approval(session, hook_tools, event, f"hook_{phase}",
-                                                             {"hook_id": hook["id"]})
-                    if not allowed:
-                        approval = event.get("approval")
-                        if approval is None:  # Denied by a fresh check just before the card.
-                            await self.update_event(session, event, approval="blocked", blocked_reason=event["output"])
-                        raise ValueError(
-                            "Hook approval was not answered in time." if approval == "expired"
-                            else declined(event, "this hook", f"Do not retry {name} without a new instruction.")
-                            if approval == "declined" else event["blocked_reason"])
-                if asyncio.current_task().cancelling():
-                    return
-                payload = {"event": phase, "session_id": session["id"], "tool": name, "arguments": arguments, "call_id": call_id,
-                           **({"covered_by": cover} if cover else {})}
-                if result is not None:
-                    payload["result"] = result
-                if phase == "tool_failure":
-                    payload.update(error=error, outcome="error")
-                # The Python environment applies; variables named in Settings are not passed to hooks.
-                outcome = await self.extensions.run_hook(hook, payload, session["workspace"],
-                                                         env=self.jobs.command_environment(named=False))
-                output = outcome["output"]
-                if outcome["exit_code"] != 0 or outcome.get("timed_out"):
-                    raise ValueError(f"Hook failed (exit {outcome['exit_code']}): {output}")
-                await self.update_event(session, event, state="completed", output=output)
-            except (ValueError, OSError, TimeoutError) as exc:
-                warning = self.settings.redact(str(exc))
-                await self.update_event(session, event, state="rejected" if event["state"] == "rejected" else "error", output=warning)
-                if phase == "before_tool":
-                    raise ValueError(f"Before-tool hook blocked {name}: {warning}") from exc
-                if verdict.decision == "deny":
-                    continue  # Blocked by a rule or Don't ask: the hook card says so; no notice after every tool.
-                warning = warning.rstrip().removesuffix(".")
-                text = (f"Failure-hook warning: {warning}. The original tool error is unchanged." if phase == "tool_failure"
-                        else f"After-tool hook warning: {warning}. The tool action already completed.")
-                await self.event(session, "notice", text=text)
+    # run_hooks and the other hook events: lifecycle_hooks.LifecycleHooks.
 
     def get(self, session_id):
         return self.live.get(session_id) or self.store.get(session_id)
@@ -1152,7 +1103,14 @@ class AgentManager:
         defaults = default_limits(values["model"])
         current = (values["context_window"], values["max_output_tokens"])
         follow = [current[0] == defaults[0], current[1] == defaults[1]]
-        return follow_limits(follow, default_limits(session.get("model") or values["model"]), current)
+        limits = follow_limits(follow, default_limits(session.get("model") or values["model"]), current)
+        if session.get("agent_model") and session.get("agent_model") == session.get("model") != values["model"]:
+            # A subagent on its agent's own endpoint: budgets customised for the Settings endpoint stay
+            # within this endpoint's defaults, which always fit together (and its maxima, below). On the
+            # Settings endpoint itself they are the budgets customised for it, as for any chat there.
+            own = default_limits(session["model"])
+            limits = (min(limits[0], own[0]), min(limits[1], own[1]))
+        return limits
 
     async def limits_notice(self, session):
         """One notice per chat when its endpoint supports less than Settings asks for. Never a wire message."""
@@ -1688,6 +1646,8 @@ class AgentManager:
         """The message for remembering a card that offers no rule."""
         if event.get("protected"):
             return "Protected files are always confirmed; this approval cannot be remembered."
+        if event.get("hook_ask"):
+            return "A before-tool hook asked for this approval; it cannot be remembered."
         tools = self.session_tools(session)
         verdict = self.permission(session, tools, event.get("name"), event.get("input"))
         if event.get("uncertain") or (verdict.decision == "ask" and verdict.source == "rule"):
@@ -1705,16 +1665,18 @@ class AgentManager:
         return (f"Not run: the user switched this chat to {label} mode while this card was waiting. "
                 + message.removeprefix("Not run: "))
 
-    async def request_approval(self, session, tools, event, name, arguments, *, reviser=None, card=None):
+    async def request_approval(self, session, tools, event, name, arguments, *, reviser=None, card=None, forced=None):
         """Show an approval card for a tool call and wait; returns (allowed, verdict).
 
         The decision is evaluated again immediately before the card, and a waiting card is
         re-checked after every mode, rule or turned-off-tool change. The returned verdict is
         the one execution must use: a card resolved by a switch to Auto or by a new allow rule
         runs like an action that mode or rule allows (without a shell where it applies).
+        forced: a before-tool hook asked for this card ({hook_id, reason}); no mode or rule
+        approves it then (Don't ask refuses it), and it cannot be remembered.
         """
         card = card if card is not None else {"arguments": arguments}
-        verdict = self.permission(session, tools, name, card["arguments"])
+        verdict = self.hooked_permission(session, tools, name, card["arguments"], forced)
         if verdict.decision == "allow":
             await self.update_event(session, event, **self.verdict_fields(verdict))
             return True, verdict
@@ -1724,7 +1686,7 @@ class AgentManager:
         holder = {}
 
         def recheck(change=None):
-            current = self.permission(session, tools, name, card["arguments"])
+            current = self.hooked_permission(session, tools, name, card["arguments"], forced)
             if current.decision == "allow":
                 holder["verdict"] = current
                 if current.source == "rule":
@@ -1736,6 +1698,8 @@ class AgentManager:
         key = (session["id"], event["id"])
         editable = EDITABLE.get(name, ()) if reviser is not None else ()
         event.update(self.card_fields(tools, name, card["arguments"], verdict, editable))
+        if forced:
+            event.update(rememberable=[], hook_ask=forced)  # The hook asks again next time: no rule would apply.
         self.pending_checks[key] = recheck
         if reviser is not None:
             self.card_revisers[key] = reviser
@@ -1819,7 +1783,31 @@ class AgentManager:
             await self.event(session, "notice", text=f"Reasoning effort changed to {reasoning.EFFORT_LABELS[effort]}. "
                              "It applies from the agent's next model request.")
         for child in self.active_children(session):
-            await self.change_effort(child, effort)
+            if not child.get("agent_effort"):  # A custom or built-in agent's own effort stays.
+                await self.change_effort(child, effort)
+
+    async def spending_stop(self, session, wire, text):
+        """End the turn at the spending limit. A prompt the turn never answered gets a placeholder reply
+        in the wire, so a Continue (or any next message) never follows it directly."""
+        if wire and wire[-1].get("role") == "user":
+            wire.append({"role": "assistant", "content": SPENDING_STOP_REPLY})
+            self.store.save(session)
+        await self.event(session, "error" if session.get("is_subagent") else "notice", text=text,
+                         terminal_reason="spending_limit")
+
+    async def change_spending_limit(self, session, limit):
+        """Set the chat's spending limit in DBU (0 = none; None = follow the Settings default). Its next
+        model request, and its running subagents', check the new limit."""
+        if spending.root_of(self, session) is not session:
+            raise ValueError("A subagent follows its parent conversation's spending limit; change it there.")
+        if limit is None:
+            session.pop("spending_limit_dbu", None)
+        else:
+            session["spending_limit_dbu"] = spending.validate_limit(limit)
+        session.pop("spending_warned", None)  # A new limit warns again at its own 80%.
+        self.store.save(session, touch=False)
+        await self.broadcast(session["id"], {"type": "spending_limit", "spending_limit_dbu":
+                                             session.get("spending_limit_dbu"), "spending": spending.status(self, session)})
 
     def reasoning_request(self, session):
         """The reasoning fields the chat's next agent request carries (reasoning.effort_request): the
@@ -1993,7 +1981,9 @@ class AgentManager:
         """Steering: at a step boundary, after every tool result, the unpaused queued messages
         become one user message of this turn. fits(message) says whether that message still fits
         the context budget with the latest tool results; when it does not, the messages stay
-        queued (not paused) until a later step boundary, or the end of the turn."""
+        queued (not paused) until a later step boundary, or the end of the turn. user_prompt hooks
+        check the message first and it stays queued while they run, so a Stop, restart or error
+        then leaves it queued; it leaves the queue once it is sent or a hook blocked it."""
         entries = [item for item in self.queue_of(session) if not item.get("paused")]
         # Never directly after an app-generated prompt.
         if not entries or not wire or wire[-1].get("role") == "user" or is_app_prompt(wire[-1]):
@@ -2008,7 +1998,11 @@ class AgentManager:
             self.store.save(session)
             await self.publish_queue(session, self.settings.redact(str(exc)))
             return
-        if fits is not None and not fits({"role": "user", "content": STEER_PREFIX + content}):
+
+        async def waits(message):
+            """Whether message does not fit the budget now; it then waits, with one notice per turn."""
+            if fits is None or fits({"role": "user", "content": message}):
+                return False
             notified = self.__dict__.setdefault("_steer_wait_notices", set())
             turn = next((event["id"] for event in reversed(session["events"]) if event.get("type") == "user"
                          and not event.get("steered")), None)
@@ -2021,17 +2015,35 @@ class AgentManager:
                     "fit in the context budget. If the reply completes first, it is sent as the next message; after "
                     "Stop, an error or the step limit it stays queued until you click Send queued messages."))
             await self.publish_queue(session)
+            return True
+        message = STEER_PREFIX + content
+        if await waits(message):
             return
         sent = {item["id"] for item in entries}
+        fields = {"text": text, "steered": True, **({"attachments": attachments} if attachments else {})}
+        if self.has_hooks(session, "user_prompt"):
+            # The hooks edit, extend or block the message (block: it never reaches the model). Their cards
+            # come first; fields collects what they did for the message's event, added below.
+            prepared = await self.prompt_hooks(session, fields, text, content, steered=True)
+            if not sent <= {item.get("id") for item in self.queue_of(session)}:
+                return  # Removed or edited while its hooks ran: not sent.
+            if prepared is None:
+                session["queued_messages"] = [item for item in self.queue_of(session) if item.get("id") not in sent]
+                await self.event(session, "user", **fields)  # Saved with the queue: shown as not sent.
+                await self.event(session, "notice", text=blocked_prompt_notice(fields["hook_blocked"]))
+                await self.publish_queue(session)
+                return
+            message = STEER_PREFIX + (prepared[1] if prepared[1] is not None else prepared[0])
+            if await waits(message):
+                return  # Hook context made it too large: it stays queued, and its hooks run again later.
         session["queued_messages"] = [item for item in self.queue_of(session) if item.get("id") not in sent]
         for target, seen in views:
             self.remember_file(session, target, seen)
-        wire.append({"role": "user", "content": STEER_PREFIX + content})
+        wire.append({"role": "user", "content": message})
         self._drop_pending(session)
         # No await between the wire append and the event: event() appends the user event before
         # its first await, so the wire and the events never disagree (m4-history-branching).
-        await self.event(session, "user", text=text, steered=True, in_wire=True,
-                         **({"attachments": attachments} if attachments else {}))
+        await self.event(session, "user", **fields, in_wire=True)
         await self.publish_queue(session)
 
     def _pause_queue(self, session):
@@ -2330,7 +2342,19 @@ class AgentManager:
             # turn_delegated: the parent's delegate_task started this turn and reports its end.
             session.update(turn_running=True, turn_ended=None, turn_delegated=bool(origin))
             await self.status(session, "running")
-            await self.event(session, "user", text=prompt, **origin, **({"attachments": attachments} if attachments else {}))
+            # A subagent's first message carries the context of its parent's subagent_start hooks.
+            noted, note = self.first_message_notes(session) if origin else ({}, "")
+            user_event = await self.event(session, "user", text=prompt, **origin, **noted,
+                                          **({"attachments": attachments} if attachments else {}))
+            if note:
+                content = (content if content is not None else prompt) + note
+            elif not origin:
+                # user_prompt and session_start hooks: a block ends the turn before any model request.
+                prepared = await self.prompt_hooks(session, user_event, prompt, content)
+                if prepared is None:
+                    terminal_reason = "hook_blocked"  # Not "completed": no Finished notice, Keep or queue.
+                    return
+                prompt, content = prepared
             if session["title"] == "New conversation" and not session.get("title_generated"):
                 # A delegated prompt is named by its task (the first paragraph), not the instructions after it.
                 session["title"] = fallback_title(prompt.split("\n\n", 1)[0] if origin else prompt, self.redact_title)
@@ -2415,6 +2439,8 @@ class AgentManager:
             except STORAGE_ERRORS as exc:
                 session["terminal_reason"] = "error"
                 await report_storage_failure(exc)
+            # Before it leaves the live chats, so no spending check of its parent misses this turn.
+            self.delegates.record_spend(session)
             self.live.pop(session["id"], None)
             self.store.forget_encodings(session["id"])
             try:
@@ -2466,9 +2492,22 @@ class AgentManager:
         """Run one tool call and return what the model receives. allowance (a ResultAllowance) is
         the context the results of the current model response may still use: a read that does not
         fit is withheld (the model may ask again), other results are shortened. gate (a
-        planning.DelegationGate): a delegate_task call that runs in parallel with others (run_delegations)."""
-        event = await self.event(session, "tool", name=name, input=arguments, call_id=call_id, state="running", output="",
-                                 **({"verify": True} if origin == "verify" else {}))
+        planning.DelegationGate): a delegate_task call that runs in parallel with others (run_delegations).
+        Hooks may add to the result: a note when a before-tool hook changed the arguments, and
+        context from before-tool, after-tool and failure hooks (lifecycle_hooks.add_hook_notes).
+        What they add is charged to allowance too; an unsettled result is charged whole by the caller."""
+        notes = ToolHookNotes()
+        settled = getattr(allowance, "settled", None)
+        output = await self._execute_tool(session, tools, name, arguments, call_id, origin, allowance, gate, notes)
+        sent = await self.add_hook_notes(session, notes, output, origin)
+        if allowance is not None and sent != output and allowance.settled != settled:
+            allowance.charge_more(sent, output)  # _execute_tool charged output, before the hook notes.
+        return sent
+
+    async def _execute_tool(self, session, tools, name, arguments, call_id, origin, allowance, gate, notes):
+        event = notes.event = await self.event(session, "tool", name=name, input=arguments, call_id=call_id,
+                                               state="running", output="",
+                                               **({"verify": True} if origin == "verify" else {}))
         invoked = False
         views_key = views_prev = None
         try:
@@ -2477,9 +2516,12 @@ class AgentManager:
             if not tool_allowed(session, name):
                 disabled = session.get("disabled_tools") or []
                 cover = covering_tool(name, disabled)
+                listed = session.get("agent_tools")
                 output = (f"The user turned off {name} in this chat. Use other tools." if name in disabled else
                           f"The user turned off {cover} in this chat, which also covers {name}. Use other tools."
                           if cover else
+                          f"The {session.get('agent_type')} agent's tools list does not include {name}. Use only the "
+                          "available tools." if isinstance(listed, list) and name not in listed else
                           f"The {session['tool_profile']} tool profile does not permit {name}. Use only the available tools.")
                 await self.update_event(session, event, state="rejected", output=output)
                 return output
@@ -2503,22 +2545,45 @@ class AgentManager:
             if verdict.decision == "deny":
                 await self.update_event(session, event, state="rejected", output=verdict.message)
                 return verdict.message
+            # Before-tool hooks run before the call's own card, so the card shows the arguments that will
+            # run and every check below (permission, folder access, file guards) sees them. A hook may
+            # deny the call, ask for a card the mode or rules would skip, or replace the arguments
+            # (validated against the schema; Verify's command and the activity log keep theirs).
+            hooked = await self.before_tool_hooks(session, name, arguments, definition, call_id,
+                                                  fixed=origin == "verify" or activity is not None)
+            notes.contexts.extend(hooked["contexts"])
+            if hooked["refusal"]:
+                await self.update_event(session, event, state="rejected", output=hooked["refusal"],
+                                        hook_blocked=hooked["blocked"])
+                return hooked["refusal"]
+            if hooked["changed_by"]:
+                await self.update_event(session, event, input=hooked["arguments"], hook_change={
+                    "hooks": hooked["changed_by"], "original": shown_arguments(arguments)})
+                arguments = hooked["arguments"]
+                notes.changed = (hooked["changed_by"], arguments)
+            forced = hooked["forced"]
+            if forced:
+                await self.update_event(session, event, hook_ask=forced)
+            # A hook card may have waited while the mode, rules or turned-off tools changed.
+            tools.unrestricted = session.get("permission_mode", "manual") == "bypassPermissions"
+            verdict = self.hooked_permission(session, tools, name, arguments, forced)
+            if verdict.decision == "deny":
+                await self.update_event(session, event, state="rejected", output=verdict.message)
+                return verdict.message
             if session.get("is_subagent") and (name == "delegate_task" or (name == "run_command" and arguments.get("background"))):
                 raise ValueError("Subagents cannot delegate or leave background jobs.")
             carded = False  # An "ask" verdict must have shown a card before anything runs.
+            approved = None  # delegate_task: the agent its card showed, which starts (its file is not read again).
             if name in ("delegate_task", "stop_job") and verdict.decision == "ask":
                 if name == "delegate_task":
-                    kind = arguments.get("agent_type") or PROFILE_TYPES.get(arguments.get("tool_profile"), "general")
-                    preview = (f"Start a subagent ({kind}; separate paid model requests, at most "
-                               f"{arguments.get('max_steps', DEFAULT_STEPS)} steps)"
-                               f"\n\nTask: {arguments['task']}"
-                               + (f"\nContext: {arguments['context']}" if arguments.get("context") else "")
-                               + (f"\nTool profile: {arguments['tool_profile']}" if arguments.get("tool_profile") else ""))
+                    # The agent, its tools and any model or effort it sets; an unknown agent_type fails here.
+                    approved = self.delegates.agent_spec(session, arguments.get("agent_type"), arguments.get("tool_profile"))
+                    preview = self.delegates.card_preview(session, arguments, approved)
                 else:
                     job = self.session_job(session, arguments["job_id"])
                     preview = f"Stop job {job['id']}: {job['command']}"
                 await self.update_event(session, event, preview=preview)
-                allowed, verdict = await self.request_approval(session, tools, event, name, arguments)
+                allowed, verdict = await self.request_approval(session, tools, event, name, arguments, forced=forced)
                 if not allowed:
                     return await self.refused(session, event, verdict, declined(event))
                 carded = True
@@ -2530,7 +2595,7 @@ class AgentManager:
                     raise ValueError("MCP tool is not available in this turn.")
                 await self.update_event(session, event, preview=json.dumps(arguments, indent=2))
                 if verdict.decision == "ask":
-                    allowed, verdict = await self.request_approval(session, tools, event, name, arguments)
+                    allowed, verdict = await self.request_approval(session, tools, event, name, arguments, forced=forced)
                     if not allowed:
                         return await self.refused(session, event, verdict, declined(event, "this MCP action"))
                     carded = True
@@ -2611,13 +2676,16 @@ class AgentManager:
                     if activity is None and name in EDITABLE and (name != "edit_file" or "new_text" in arguments):
                         reviser = self.card_reviser(session, tools, event, name, definition, card, original)
                     allowed, verdict = await self.request_approval(session, tools, event, name, arguments,
-                                                                   reviser=reviser, card=card)
+                                                                   reviser=reviser, card=card, forced=forced)
                     arguments = card["arguments"]
                     if not allowed:
                         return await self.refused(session, event, verdict, declined(event))
                     carded = True
                     if event.get("edited"):
                         edited_note = EDITED_NOTES[name].format(command=arguments.get("command", ""))
+                        if notes.changed:
+                            # The user edited what the hook proposed; the edit is not hooked again.
+                            notes.changed, notes.edited = (notes.changed[0], arguments), True
                 if not self.guidance_matches(session, tools):
                     raise ValueError("Project instructions changed while preparing this action. Review the refreshed guidance before retrying. No file was changed and no command ran.")
                 if name != "run_command":
@@ -2626,22 +2694,28 @@ class AgentManager:
                     for guard in guarded:
                         if refusal := self.overwrite_refusal(session, tools, *guard):
                             raise ValueError(refusal)
+            if verdict.decision == "ask" and not carded and forced:
+                # A hook asked for a card on a tool that never shows one (a read, a task): a plain card.
+                await self.update_event(session, event, preview=clip(json.dumps(arguments, indent=2), 20_000))
+                allowed, verdict = await self.request_approval(session, tools, event, name, arguments, forced=forced)
+                if not allowed:
+                    return await self.refused(session, event, verdict, declined(event))
+                carded = True
             if verdict.decision == "ask" and not carded:
                 raise ValueError("This action needs an approval card, which this tool cannot show.")
             if verdict.decision == "allow" and not carded and (fields := self.verdict_fields(verdict)):
                 await self.update_event(session, event, **fields)
-            await self.run_hooks(session, "before_tool", name, arguments, call_id=call_id)
-            # The mode, rules or turned-off tools can change while a card or hook card waits (for example
-            # a switch to Plan, or from Bypass to Manual): follow the current ones before anything runs.
+            # The mode, rules or turned-off tools can change while a card waits (for example a switch
+            # to Plan, or from Bypass to Manual): follow the current ones before anything runs.
             tools.unrestricted = session.get("permission_mode", "manual") == "bypassPermissions"
             if name in PATH_TOOLS and (output := await access_refusal()) is not None:
                 return output
-            if (current := self.permission(session, tools, name, arguments)).decision == "deny":
+            if (current := self.hooked_permission(session, tools, name, arguments, forced)).decision == "deny":
                 await self.update_event(session, event, state="rejected", output=current.message)
                 return current.message
             if not carded and current.decision == "ask":
                 # Allowed when it started, but it needs a card now.
-                allowed, verdict = await self.request_approval(session, tools, event, name, arguments)
+                allowed, verdict = await self.request_approval(session, tools, event, name, arguments, forced=forced)
                 if not allowed:
                     return await self.refused(session, event, verdict, declined(event))
                 carded = True
@@ -2663,7 +2737,7 @@ class AgentManager:
                 # A withheld read must not count as seen by the write_file overwrite guard.
                 views_key = str(tools.path(arguments["path"]))
                 views_prev = (session.get("file_views") or {}).get(views_key)
-            invoked = True
+            invoked = notes.ran = True
             if name.startswith("mcp__"):
                 result = await connection.call(name, arguments)
             elif name in ("write_file", "edit_file"):
@@ -2747,7 +2821,8 @@ class AgentManager:
                     return None
 
                 def start():
-                    return self.delegates.delegate(session, **arguments, parent_event=event, recheck=still_allowed)
+                    return self.delegates.delegate(session, **arguments, parent_event=event, recheck=still_allowed,
+                                                   spec=approved)
                 if gate is not None:
                     result = await gate.run(start)  # run_delegations sets the chat's status.
                 else:
@@ -2868,11 +2943,13 @@ class AgentManager:
             if name in FILE_CHANGE_TOOLS:
                 await self.publish_changes(session)
                 await self.publish_parent_changes(session)
-            await self.run_hooks(session, "after_tool", name, arguments, result, call_id=call_id)
+            notes.contexts.extend(hook_contexts(await self.run_hooks(session, "after_tool", name, arguments, result,
+                                                                     call_id=call_id), "after_tool"))
             command_failed = (name == "run_command" and isinstance(result, dict) and not result.get("background")
                               and result.get("state") in {"failed", "timed_out"})
             if failed or command_failed:
-                await self.run_hooks(session, "tool_failure", name, arguments, result, call_id=call_id, error=output)
+                notes.contexts.extend(hook_contexts(await self.run_hooks(
+                    session, "tool_failure", name, arguments, result, call_id=call_id, error=output), "tool_failure"))
             output = model_output
         except (ValueError, OSError, UnicodeError, KeyError, TypeError, TimeoutError) as exc:
             output = cap_text(self.settings.redact(file_error(exc)) or "The command timed out after 60 seconds.")
@@ -2882,7 +2959,8 @@ class AgentManager:
                 allowance.charge(model_output)
             await self.update_event(session, event, state="error", output=output, model_output=model_output)
             if invoked:
-                await self.run_hooks(session, "tool_failure", name, arguments, call_id=call_id, error=output)
+                notes.contexts.extend(hook_contexts(await self.run_hooks(
+                    session, "tool_failure", name, arguments, call_id=call_id, error=output), "tool_failure"))
             output = model_output
         return output
 
@@ -2929,6 +3007,8 @@ class AgentManager:
                 raise ValueError("This approval is no longer pending.")
             card["arguments"] = new
             fields = self.card_fields(tools, name, new, verdict, EDITABLE[name])
+            if event.get("hook_ask"):
+                fields["rememberable"] = []  # A card a hook asked for stays one that cannot be remembered.
             event.pop("uncertain", None)
             # Changed back to the agent's own proposal: not an edit, so the agent is not told it was.
             await self.update_event(session, event, input=new, preview=preview, edited=new != proposed,
@@ -3097,7 +3177,9 @@ class AgentManager:
         return True
 
     async def run_databricks(self, session, prompt, content=None):
-        if session.get("tool_profile", "inherit") != "inherit":
+        listed = session.get("agent_tools")
+        if session.get("tool_profile", "inherit") != "inherit" or (
+                isinstance(listed, list) and not any(name.startswith("mcp__") for name in listed)):
             # Restricted children must not start external servers during discovery.
             return await self._run_databricks(session, prompt, [], **({"content": content} if content is not None else {}))
         async with self.extensions.turn() as connection:
@@ -3131,6 +3213,16 @@ class AgentManager:
         if index:
             guidance["sources"].append({"path": "Skill index", "scope": "this workspace", "status": "loaded",
                                         "estimated_tokens": estimate_text_tokens(index)})
+        agents = ""
+        if not session.get("is_subagent") and (available is None or "delegate_task" in available):
+            try:
+                agents = custom_agents.agent_index(custom_agents.discover(
+                    tools.root, custom_agents.display_redactor(self.settings))["agents"])
+            except (OSError, ValueError, RuntimeError):
+                agents = ""  # Agent tools → Subagents reports unusable agent files.
+            if agents:
+                guidance["sources"].append({"path": "Agent index", "scope": "this workspace", "status": "loaded",
+                                            "estimated_tokens": estimate_text_tokens(agents)})
         # Stable text first and the parts that change between requests last, so a
         # provider's prompt prefix caching can reuse the longest possible prefix.
         system = {"role": "system", "content": SYSTEM_PROMPT + "\n" + user_block + mode_prompt(mode, bool(session.get("is_subagent")))
@@ -3143,6 +3235,7 @@ class AgentManager:
                       available, input_budget=self.input_budget(session),
                       scale=estimate_scale([], session["model"]))) else "")
                   + ("\n" + index if index else "")
+                  + ("\n" + agents if agents else "")
                   + "\n" + guidance["text"] + "\n" + tools.skill_signature
                   + ("\nProject instruction warnings: " + json.dumps(guidance["warnings"]) if guidance["warnings"] else "")
                   + "\nAdditional allowed folders: " + json.dumps(session.get("allowed_directories", []))
@@ -3403,19 +3496,25 @@ class AgentManager:
                               [f"- {name}" for name in changed[:RECORD_FILES]], max(0, len(changed) - RECORD_FILES),
                               lambda n: f"- … {n:,} more", None))
             completed = completed_call_ids(session)
+            # Those calls' tool events: their input is what ran (a before-tool hook may have replaced the path).
+            ran = {event["call_id"]: event for event in session.get("events", []) if isinstance(event, dict)
+                   and event.get("type") == "tool" and event.get("call_id") in completed
+                   and event.get("state") == "completed" and not event.get("result_withheld")}
             seen = set()
             for message in wire[cut:]:
                 for call in message.get("tool_calls") or [] if message.get("role") == "assistant" else []:
                     function = call.get("function") if isinstance(call, dict) else None
-                    if not isinstance(function, dict) or call.get("id") not in completed:
+                    if not isinstance(function, dict) or call.get("id") not in ran:
                         continue
                     if function.get("name") not in SEEN_PATH_TOOLS:
                         continue
-                    try:
-                        arguments = json.loads(function.get("arguments") or "{}")
-                    except (TypeError, ValueError):
-                        continue
-                    seen.update(call_paths(function["name"], arguments))
+                    paths = call_paths(function["name"], event_input(ran[call["id"]]))
+                    if not paths:  # An older record without the event's input: the call's own arguments.
+                        try:
+                            paths = call_paths(function["name"], json.loads(function.get("arguments") or "{}"))
+                        except (TypeError, ValueError):
+                            continue
+                    seen.update(paths)
             for message in [*context_retained(wire, cut), *wire[cut:]]:
                 if message.get("role") == "user":
                     seen.update(mentions.attached_paths(message.get("content")))
@@ -4043,7 +4142,7 @@ class AgentManager:
         tools = self.session_tools(session)
         definitions = filter_tools(session, [*TOOL_DEFINITIONS, *[tool for tool in FEATURE_TOOLS
                        if not session.get("is_subagent") or tool["function"]["name"] != "delegate_task"], *external_tools])
-        for skill_id in self.requested_skills(tools, prompt):
+        for skill_id in self.requested_skills(tools, prompt, session):
             self.select_skill(session, tools, skill_id)
         # Complete interrupted tool exchanges before sending the next user turn.
         wire, context_state = repair_tool_history(session["wire"], session["events"], session.get("context_state", {}))
@@ -4056,7 +4155,7 @@ class AgentManager:
         # output or the user's note), so it stays, answered by a placeholder: the next real
         # user prompt never directly follows a continuation.
         if wire and is_continuation(wire[-1]):
-            if wire[-1]["content"].startswith(VERIFY_CONTINUATION_PREFIX):
+            if wire[-1]["content"].startswith((VERIFY_CONTINUATION_PREFIX, HOOK_CONTINUATION_PREFIX)):
                 wire.append({"role": "assistant", "content": UNANSWERED_CONTINUATION})
             else:
                 wire.pop()
@@ -4081,11 +4180,22 @@ class AgentManager:
             turn_events = session["events"]
             verify_state = {"rounds": 0, "since": next(
                 (index for index in range(len(turn_events) - 1, -1, -1) if turn_events[index].get("type") == "user"), 0)}
+            stop_state = {"blocks": 0}  # Continuations agent_stop or subagent_stop hooks asked for in this turn.
             consecutive_output_retries = 0
             execution_noticed = False
+            system = None  # The latest request's system message (a spending stop after a step refreshes the meter with it).
             for step_index in range(steps):
-                # Before any compaction is billed: a max_tokens above the output-tokens-per-minute
-                # limit Databricks reported for this endpoint can never be admitted.
+                # Before any compaction is billed: the chat's spending limit (its subagents count
+                # for it) and a max_tokens above the output-tokens-per-minute limit Databricks
+                # reported for this endpoint, which can never be admitted.
+                verdict, text = spending.check(self, session)
+                if verdict == "stop":
+                    if step_index:
+                        await self.refresh_next_estimate(session, system, definitions, wire, context_state)
+                    await self.spending_stop(session, wire, text)
+                    return False
+                if verdict == "warn":
+                    await self.event(session, "notice", text=text)
                 if (refusal := self.otpm_preflight(session, max_output_tokens)) is not None:
                     raise refusal
                 # The mode, rules and turned-off tools can change while a turn runs; each step follows them.
@@ -4256,8 +4366,19 @@ class AgentManager:
                         "in Settings if your endpoint supports it, or send a message to continue.",
                         "output_limit", exc.http_status) from exc
                 if not ordered_calls:
+                    if spending.reached(self, session):
+                        # Verify and stop hooks could only continue with a request the limit refuses. A
+                        # subagent's final reply is still its report; a chat says why the turn ends here.
+                        await self.refresh_next_estimate(session, system, definitions, wire, context_state)
+                        if session.get("is_subagent"):
+                            return True
+                        await self.spending_stop(session, wire, spending.check(self, session)[1])
+                        return False
                     if await self.verify_step(session, tools, wire, verify_state, step_index + 1 < steps) == "continue":
                         retry_reason = "verify"
+                        continue
+                    if await self.stop_hooks(session, wire, stop_state, step_index + 1 < steps) == "continue":
+                        retry_reason = "stop_hook"
                         continue
                     # Only at the end of the turn: mid-turn the next request also carries
                     # tool results that are not in the history yet.
@@ -4293,7 +4414,7 @@ class AgentManager:
                             # message from it if the app stops before the next save. Each save rewrites
                             # the whole conversation file.
                             self.store.save(session)
-                if step_index + 1 < steps:
+                if step_index + 1 < steps and not spending.reached(self, session):
                     await self.drain_queue(session, wire, tools, fits=lambda message: in_turn_tokens(
                         [*model_history(wire), message], context_state, system, definitions, input_budget,
                         scale) <= input_budget)

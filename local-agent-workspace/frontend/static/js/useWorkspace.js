@@ -243,6 +243,11 @@ export function useWorkspace() {
           return { ...current, events: [...current.events, event], events_total: (current.events_total ?? current.events.length) + 1 }
         })
         if (data.type === 'reasoning_effort') setSession(current => current?.id === activeId ? { ...current, reasoning_effort: data.reasoning_effort } : current)
+        if (data.type === 'spending_limit') setSession(current => {
+          if (current?.id !== activeId) return current
+          const { spending_limit_dbu: _, ...rest } = current
+          return typeof data.spending_limit_dbu === 'number' ? { ...rest, spending_limit_dbu: data.spending_limit_dbu } : rest
+        })
         if (data.type === 'meta') {
           const meta = { pinned: data.pinned, archived: data.archived, tags: data.tags }
           setSession(current => current?.id === activeId ? { ...current, ...meta } : current)
@@ -320,7 +325,7 @@ export function useWorkspace() {
   const saveSettings = async next => {
     const { workspace, model, env_file, context_window, max_output_tokens, max_agent_steps, compaction_handoffs, approval_timeout_minutes,
       system_notifications, user_instructions, write_limit_kb, command_env, rate_limit_auto_continue, auto_keep_changes,
-      coding_dir, python_venv, auto_compact_percent, reasoning_effort, reasoning_format, thinking_summaries } = next
+      coding_dir, python_venv, auto_compact_percent, reasoning_effort, reasoning_format, thinking_summaries, subagent_defaults, spending_limit_dbu } = next
     const saved = await api('/settings', 'PUT', {
       workspace, model, env_file, context_window, max_output_tokens, max_agent_steps,
       ...(typeof compaction_handoffs === 'boolean' ? { compaction_handoffs } : {}),
@@ -335,8 +340,10 @@ export function useWorkspace() {
       ...(typeof coding_dir === 'string' ? { coding_dir } : {}),
       ...(typeof python_venv === 'string' ? { python_venv } : {}),
       ...(typeof reasoning_effort === 'string' ? { reasoning_effort } : {}),
+      ...(Number.isFinite(spending_limit_dbu) ? { spending_limit_dbu } : {}),
       ...(typeof reasoning_format === 'string' ? { reasoning_format } : {}),
       ...(typeof thinking_summaries === 'boolean' ? { thinking_summaries } : {}),
+      ...(subagent_defaults && typeof subagent_defaults === 'object' ? { subagent_defaults } : {}),
     })
     setSettings(saved)
     void checkConnection().catch(e => setError(e.message))

@@ -210,7 +210,9 @@ async def test_delegations_beyond_three_wait_for_a_free_slot(delegation):
         if spawning.get("delegation"):
             break
         await asyncio.sleep(0.01)
-    assert spawning["delegation"] == {"status": "queued", "completed_tools": 0, "agent_type": "general"}
+    # No effort while queued: a general subagent takes the chat's when it starts.
+    assert spawning["delegation"] == {"status": "queued", "completed_tools": 0, "agent_type": "general",
+                                      "model": "synthetic-model"}
     assert len(started) == 3 and helper.running() == 3 and len(helper.active[parent["id"]]) == 3
     releases[started[0]].set()
     for _ in range(100):
@@ -218,7 +220,7 @@ async def test_delegations_beyond_three_wait_for_a_free_slot(delegation):
             break
         await asyncio.sleep(0.01)
     assert len(started) == 4 and spawning["child_session_id"] == started[3]
-    assert spawning["delegation"]["status"] == "running"
+    assert (spawning["delegation"]["status"], spawning["delegation"]["effort"]) == ("running", "default")
     for release in list(releases.values()):
         release.set()
     for _ in range(100):
@@ -360,7 +362,7 @@ async def test_parent_progress_is_live_correlated_and_contains_no_child_payloads
                                             "parent_event_id": spawning["id"], "parent_call_id": "call-review"}
     started = event["delegation"].pop("started")
     assert event["delegation"] == {"status": "awaiting_approval", "completed_tools": 0, "last_tool": "read_file",
-                                   "agent_type": "general"}
+                                   "agent_type": "general", "model": "synthetic-model", "effort": "default"}
     event["delegation"]["started"] = started
     assert "private child contents" not in json.dumps(saved)
     assert saved["wire"] == []
@@ -371,7 +373,7 @@ async def test_parent_progress_is_live_correlated_and_contains_no_child_payloads
     assert progress["started"] <= progress["ended"]
     assert {key: value for key, value in progress.items() if key not in ("started", "ended")} == {
         "status": "completed", "completed_tools": 1, "last_tool": "read_file", "terminal_reason": "completed",
-        "agent_type": "general"}
+        "agent_type": "general", "model": "synthetic-model", "effort": "default"}
     await helper.progress(manager.store.get(child["id"]), status="running", terminal_reason="stopped")
     assert manager.store.get(parent["id"])["events"][0]["delegation"] == progress
 
@@ -432,7 +434,8 @@ async def test_child_cancelled_before_first_schedule_has_terminal_progress(deleg
     assert helper.active == {}
     progress = manager.store.get(parent["id"])["events"][-1]["delegation"]
     assert {key: value for key, value in progress.items() if key not in ("started", "ended")} == {
-        "status": "cancelled", "completed_tools": 0, "terminal_reason": "stopped", "agent_type": "general"}
+        "status": "cancelled", "completed_tools": 0, "terminal_reason": "stopped", "agent_type": "general",
+        "model": "synthetic-model", "effort": "default"}
     monkeypatch.setattr(manager, "start", original)
     manager.run_databricks = lambda session, prompt: asyncio.sleep(0)
     manager.start(result["child_session_id"], "Human follow-up after cancellation")

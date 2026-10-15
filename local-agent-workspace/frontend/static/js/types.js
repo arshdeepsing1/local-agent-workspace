@@ -5,6 +5,7 @@
 //   when the next request's estimate passes this share of the input budget), approval_timeout_minutes? (0 = no limit),
 //   system_notifications? (server notifications while no page is open),
 //   auto_keep_changes? (true: Keep every listed change when a chat's reply ends), host, configured,
+//   spending_limit_dbu? (0-100000, default 0 = none: the spending limit of chats without their own; spending.py),
 //   coding_dir (default folder for new standalone code: the saved or .env value, '' = off),
 //   python_venv (virtual environment the agent's commands, Verify, hooks and the Terminal use, '' = off),
 //   coding_dir_status: { path, state: 'off'|'ready'|'missing'|'invalid', message, source: 'settings'|'env'|'none' }
@@ -44,17 +45,24 @@
 //   permission_mode: 'manual'|'auto'|'acceptEdits'|'dontAsk'|'plan'|'bypassPermissions', allowed_directories,
 //   allow_rules: Rule[] (this chat's rules), disabled_tools?: string[] (turned-off tools), context_info?, active_skills?,
 //   parent_session_id?, is_subagent?, delegation?, tool_profile?, subagent_tool_profile?,
-//   agent_type?: 'explore'|'general'|'editor' (a subagent), subagents?: SubagentEntry[] (a parent's index of its
+//   agent_type?: 'explore'|'general'|'editor' or a custom agent's name (a subagent), subagents?: SubagentEntry[] (a parent's index of its
 //   subagent chats; left out of GET /sessions list items),
 //   terminal_reason?: how the last turn ended: 'completed'|'stopped'|'error'|'inference_error'|
-//   'tool_error'|'step_limit'|'interrupted' (also in the /api/sessions summaries),
+//   'tool_error'|'step_limit'|'spending_limit'|'interrupted'|'hook_blocked' (a user_prompt hook blocked the
+//   message; also in the /api/sessions summaries),
 //   turn_ended?: epoch seconds when the last turn ended; null while a turn runs (also in summaries),
 //   turn_delegated?: true while the last turn is one a parent's delegate_task started (also in summaries),
 //   reasoning_effort?: Effort (the chat's own level, saved in its header; absent on chats saved before it existed,
-//   which use Settings.reasoning_effort; kept by forks and imports; also in summaries) }
+//   which use Settings.reasoning_effort; kept by forks and imports; also in summaries),
+//   spending_limit_dbu?: number (the chat's own spending limit; 0 = none; absent: Settings.spending_limit_dbu;
+//   kept by forks and imports) }
 // POST /sessions { permission_mode, reasoning_effort? } creates a chat (Settings' effort when absent).
 // PUT /sessions/<id>/reasoning-effort { reasoning_effort } -> Session, also while busy: the agent's next model request
 //   (and a running subagent's) uses it. Pushed as { type: 'reasoning_effort', reasoning_effort }.
+// PUT /sessions/<id>/spending-limit { spending_limit_dbu: number 0..100000 | null (follow Settings) } -> Session, also
+//   while busy (400 for a subagent). Pushed as { type: 'spending_limit', spending_limit_dbu, spending: Spending }.
+// Spending (GET /sessions/<id>/metrics → spending): { limit_dbu: number | null (none), source: 'chat'|'settings',
+//   spent_dbu, own_dbu, subagents_dbu, unpriced_calls, percent: number | null } — a subagent reports its parent's.
 //   GET /sessions list items omit events and allow_rules, and add unreviewed_changes (files with agent
 //   changes not yet kept or undone, including rows rolled up from its subagents).
 //   pinned?, archived? (hidden in the sidebar; wins over pinned), tags?: string[] (at most 10, 1-32 characters),
@@ -133,6 +141,13 @@
 //   when the turn failed before that; absent on older events), steered? (true: sent while the agent was
 //   working) and attachments?: Attachment[]. The 'Stopped.' notice carries stop_phase?: 'streaming'|'tools'|'waiting'.
 //   A compaction's notice carries compaction?: Compaction (one notice per compaction).
+//   Hooks (lifecycle_hooks.py): a hook card (name 'hook_<event>', input { hook_id, tool?, call_id?, event?,
+//   subagent_session_id? }) carries hook_result?: { json: true, decision?, reason?, context?, arguments?: { before,
+//   after }, prompt?: { before, after }, report?, ignored?: string[] } when the hook printed one JSON object. A tool
+//   card can carry hook_change?: { hooks: string[], original } (a before-tool hook replaced the arguments; input is
+//   what ran), hook_ask?: { hook_id, reason } (a hook asked for its card) and hook_blocked?: { hook_id, reason }.
+//   A user event can carry hook_blocked? (never sent), hook_edit?: { hooks, original } (text is the hook's
+//   replacement) and hook_notes?: [{ event, hook_id, context }] (context sent to the model after the message).
 // Delegation: { status: 'queued'|'running'|'awaiting_approval'|...|'completed'|'failed'|'cancelled'|'interrupted',
 //   completed_tools, last_tool?, terminal_reason?, agent_type?, started?, ended? (epoch seconds) }. A finished
 //   delegate_task card's output is the JSON result { child_session_id, agent_type, tool_profile, status,
@@ -213,6 +228,13 @@
 //   only paths an @ token can spell). Queued messages must also fit one message's @ limits together.
 // Skill: { id, name, description, path } (path is workspace-relative, or absolute
 //   for a skill shipped with the app)
+// AgentTypes (GET /agents?session_id=, the session optional): { built_in: [{ name, built_in: true, profile,
+//   description, model, effort }] ('' model or effort: the chat's; Settings.subagent_defaults), custom: [{ name,
+//   built_in: false, description, path (workspace-relative), profile, tools (null: every tool of the profile),
+//   model, effort (null: the chat's), unused_model? (the file's endpoint, which the user does not use: model is
+//   then null and a note says so), skills, max_steps, notes, instructions_chars }], errors: [{ path, error }],
+//   folders, index_bytes }. Settings.subagent_defaults: { explore|general|editor: { model, effort } }.
+//   A delegation's progress (event.delegation) and a subagents index entry carry the model and effort it started with.
 // Changes (pushed as { type: 'changes', changes } and returned by Keep/Undo): {
 //   files: [{ path, status: 'created'|'modified'|'deleted'|'unavailable', added, removed,
 //   current_hash: string | null, error?, via_session_id? (a subagent of this chat made the edit),

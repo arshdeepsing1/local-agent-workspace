@@ -11,6 +11,7 @@ from .context import (
 from .context import DEFAULT_AUTO_COMPACT_PERCENT, MAX_AUTO_COMPACT_PERCENT, MIN_AUTO_COMPACT_PERCENT
 from .model_profiles import DEFAULT_MODEL, LEGACY_DEFAULT_LIMITS, LEGACY_DEFAULT_MODEL, default_limits, known_endpoints
 from .reasoning import DEFAULT_EFFORT, DEFAULT_FORMAT, EFFORT_LEVELS, REQUEST_FORMATS
+from .spending import validate_limit
 
 APP_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MAX_AGENT_STEPS = 32
@@ -36,6 +37,48 @@ ENV_KEYS = {"coding_dir": "LOCAL_AGENT_CODING_DIR", "python_venv": "LOCAL_AGENT_
 LIMIT_KEYS = ("context_window", "max_output_tokens")
 # settings.json files without this version were written before the default model changed (see Settings.__init__).
 SETTINGS_VERSION = 2
+# Settings → Subagents: each built-in subagent type's endpoint and reasoning effort; "" is the chat's own.
+# Explore starts at Fast (low effort): its work is reading and searching. Custom agents set theirs in
+# their files (custom_agents.py).
+SUBAGENT_TYPES = ("explore", "general", "editor")
+DEFAULT_SUBAGENT_DEFAULTS = {"explore": {"model": "", "effort": "low"}, "general": {"model": "", "effort": ""},
+                             "editor": {"model": "", "effort": ""}}
+# A Databricks serving endpoint name (letters, digits, '.', '_' and '-'), as subagent model overrides take it.
+ENDPOINT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+
+
+def subagent_defaults(value, strict=True):
+    """Settings → Subagents as {type: {model, effort}} for every built-in type. strict: a bad value is a
+    ValueError (a save); otherwise it is the type's default (a settings.json written by hand)."""
+    if value is None:
+        value = {}
+    if not isinstance(value, dict) or (strict and set(value) - set(SUBAGENT_TYPES)):
+        if strict:
+            raise ValueError("Subagent defaults name only explore, general and editor.")
+        value = {}
+    result = {}
+    for kind in SUBAGENT_TYPES:
+        entry = value.get(kind, DEFAULT_SUBAGENT_DEFAULTS[kind])
+        default = DEFAULT_SUBAGENT_DEFAULTS[kind]
+        if not isinstance(entry, dict) or set(entry) - {"model", "effort"}:
+            if strict:
+                raise ValueError(f"The {kind} subagent default takes only model and effort.")
+            entry = default
+        model = entry.get("model", default["model"])
+        effort = entry.get("effort", default["effort"])
+        model = model.strip() if isinstance(model, str) else model
+        if not isinstance(model, str) or (model and not ENDPOINT_NAME.match(model)):
+            if strict:
+                raise ValueError(f"The {kind} subagent model must be empty (the chat's model) or an endpoint name of "
+                                 "letters, digits, '.', '_' and '-' (at most 128 characters).")
+            model = default["model"]
+        if effort != "" and effort not in EFFORT_LEVELS:
+            if strict:
+                raise ValueError(f"The {kind} subagent effort must be empty (the chat's effort) or one of: "
+                                 + ", ".join(EFFORT_LEVELS) + ".")
+            effort = default["effort"]
+        result[kind] = {"model": model, "effort": effort}
+    return result
 
 
 def read_env(path: Path) -> dict[str, str]:
@@ -109,6 +152,9 @@ class Settings:
             "reasoning_effort": DEFAULT_EFFORT,
             "reasoning_format": DEFAULT_FORMAT,
             "thinking_summaries": True,
+            # Settings → Agent (spending.py): the soft cap in estimated DBU of chats without their own; 0 = none.
+            "spending_limit_dbu": 0,
+            "subagent_defaults": subagent_defaults(None),
         }
         self.migrated_from = None
         if self.path.exists():
@@ -126,6 +172,14 @@ class Settings:
                 saved["model"] = DEFAULT_MODEL
                 self.migrated_from = LEGACY_DEFAULT_MODEL
             self.values.update({key: value for key, value in saved.items() if key in keys})
+            self.values["subagent_defaults"] = subagent_defaults(self.values["subagent_defaults"], strict=False)
+            # A hand-edited limit: a number written as text still counts; anything else is shown and used
+            # as no limit (0) instead of a value Settings would display but the agent would ignore.
+            limit = self.values["spending_limit_dbu"]
+            try:
+                self.values["spending_limit_dbu"] = validate_limit(float(limit) if isinstance(limit, str) else limit)
+            except ValueError:
+                self.values["spending_limit_dbu"] = 0
         # Budgets not saved follow the model's defaults; saved ones win.
         limits = dict(zip(LIMIT_KEYS, default_limits(self.values["model"])))
         ordered = {}
@@ -243,6 +297,15 @@ class Settings:
             raise ValueError("Reasoning request format must be one of: " + ", ".join(REQUEST_FORMATS) + ".")
         if type(candidate["thinking_summaries"]) is not bool:
             raise ValueError("Show thinking summaries must be on or off.")
+        candidate["spending_limit_dbu"] = validate_limit(candidate["spending_limit_dbu"], "Default spending limit")
+        sent = values.get("subagent_defaults")
+        if isinstance(sent, dict):
+            # Types and fields left out keep their current values.
+            current = self.values["subagent_defaults"]
+            sent = {kind: {**current.get(kind, {}), **entry} if isinstance(entry, dict) and kind in current else entry
+                    for kind, entry in sent.items()}
+            candidate["subagent_defaults"] = {**current, **sent}
+        candidate["subagent_defaults"] = subagent_defaults(candidate["subagent_defaults"])
         for key, label, check in (("coding_dir", "Default code folder", user_paths.check_coding_dir_setting),
                                   ("python_venv", "Python environment", user_paths.check_python_venv_setting)):
             value = candidate[key]

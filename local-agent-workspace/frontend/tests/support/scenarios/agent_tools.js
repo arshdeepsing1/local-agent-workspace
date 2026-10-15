@@ -22,6 +22,19 @@ window.child = { ...session('child'), title: 'Child review', status: 'awaiting_a
   transcript: 'conversations/child.jsonl',
   subagent: { id: 'child', task: 'Review the parser module', agent_type: 'explore', status: 'running', created: 1000, ended: null,
     transcript: 'conversations/child.jsonl' } }
+// GET /api/agents?session_id=: the built-in types with their Settings defaults, one custom agent and a file that cannot be used.
+window.agentTypes = {
+  built_in: [
+    { name: 'explore', built_in: true, profile: 'read_only', description: 'Investigation with read-only tools: find, search, outline and read files.', model: '', effort: 'low' },
+    { name: 'general', built_in: true, profile: 'inherit', description: "The chat's tools (within the subagent tool ceiling).", model: '', effort: '' },
+    { name: 'editor', built_in: true, profile: 'file_editor', description: 'Reads and edits files, without commands.', model: 'databricks-gpt-oss-120b', effort: 'high' },
+  ],
+  custom: [{ name: 'security-auditor', built_in: false, description: 'Reviews code for injection and secrets handling.',
+    path: '.agents/agents/security-auditor.md', profile: 'read_only', tools: ['read_file', 'search_files'], model: 'databricks-claude-sonnet-4-5',
+    effort: 'low', skills: ['review'], max_steps: 8, notes: ['Ignored unknown tools: web_fetch.'], instructions_chars: 120 }],
+  errors: [{ path: '.claude/agents/broken.md', error: 'description is required: one line (at most 300 characters) that tells the model when to use this agent.' }],
+  folders: ['.agents/agents', '.claude/agents'], index_bytes: 210,
+}
 window.metrics = {
   scope: 'session', complete: true,
   totals: { calls: 2, successful: 1, errors: 1, rate_limited: 1, retries: 3, input_tokens: 1200, output_tokens: 300, cache_read_input_tokens: 300, cache_creation_input_tokens: 100, reasoning_tokens: 20, estimated_dbu: 0.2039292 },
@@ -46,6 +59,7 @@ fake.handle = (path, options) => {
   if (path.endsWith('/tasks')) return fake.json(options.method === 'POST' ? { ...task, id: 'new-task', ...body() } : [task])
   if (path.includes('/tasks/')) return fake.json({ ...task, ...body() })
   if (path.endsWith('/children')) return fake.json([child])
+  if (path === '/api/agents' || path.startsWith('/api/agents?')) return fake.json(agentTypes)
   if (path.startsWith('/api/tools')) return fake.json(toolList)
   if (path.endsWith('/disabled-tools')) return fake.json({ ...session(), disabled_tools: body().tools })
   if (path.endsWith('/subagent-profile')) return fake.json({ ...session(), subagent_tool_profile: body().tool_profile })

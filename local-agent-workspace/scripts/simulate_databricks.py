@@ -27,7 +27,8 @@ for Claude endpoints (the real route is not verified yet): both (default), anthr
 Scripted turns, chosen by words in your message (the agent only calls tools the chat offers):
   edit / keep      writes a file, then edits it twice with pauses (try Keep in between)
   job / background starts a background command and waits for it with wait_job
-  delegate         delegates a read-only survey to a subagent; "parallel" delegates two
+  delegate         delegates a read-only survey to a subagent; "parallel" delegates two;
+                   "custom" uses the first custom agent of the system message's agent index
   ask              asks you a question with ask_user
   task             creates and completes tasks
   read             project_overview and read_file
@@ -191,6 +192,7 @@ class Brain:
         made = tool_calls_before(messages)
         results = tool_results(messages)
         words = prompt.lower()
+        system = text_of(messages[0].get("content")) if messages and messages[0].get("role") == "system" else ""
         if first.startswith("Delegated task:") and len(users) == 1:
             return self.subagent(prompt, made, results, tools)
         if "rate limit" in words or "429" in words:
@@ -206,7 +208,7 @@ class Brain:
                                ("parallel", self.delegate), ("delegate", self.delegate), ("subagent", self.delegate),
                                ("ask", self.ask), ("task", self.tasks), ("read", self.read)):
             if re.search(rf"\b{name}\b", words):
-                return scenario(words, made, results, tools)
+                return scenario(words, made, results, tools, **({"system": system} if scenario == self.delegate else {}))
         if "long" in words:
             return self.long(), []
         return None, []
@@ -247,7 +249,7 @@ class Brain:
         state = re.search(r'"(?:state|reason)"\s*:\s*"([^"]+)"', output)
         return f"The background job finished ({state.group(1) if state else 'see the card'}).", []
 
-    def delegate(self, words, made, results, tools):
+    def delegate(self, words, made, results, tools, system=""):
         if "delegate_task" not in tools:
             return "delegate_task is not available in this chat (subagents cannot delegate further).", []
         if made:
@@ -256,6 +258,14 @@ class Brain:
         properties = tools["delegate_task"].get("properties", {})
         extra = {"agent_type": "explore"} if "agent_type" in properties else (
             {"tool_profile": "read_only"} if "tool_profile" in properties else {})
+        # "custom": the first agent the app's agent index lists ("- <name>: <description>" lines).
+        index = system.split("Custom subagents:", 1)[1] if "Custom subagents:" in system else ""
+        custom = re.findall(r"^- ([a-z][a-z0-9-]{0,39}): ", index, re.MULTILINE)
+        if re.search(r"\bcustom\b", words) and "agent_type" in properties:
+            if not custom:
+                return ("This project has no custom agents: add one in .agents/agents/<name>.md "
+                        "(see Custom agents in the README).", [])
+            extra = {"agent_type": custom[0]}
         tasks = ["Survey the project: list its top-level folders and name the three most important files.",
                  "Find the README and summarize what the project does in three bullet points."]
         if "parallel" not in words:

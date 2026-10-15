@@ -11,7 +11,7 @@ export const modes = [
 ]
 export const modeLabel = value => modes.find(m => m.value === value)?.label || value
 
-export const BYPASS_CONFIRM = 'Switch this chat to Bypass permissions?\n\nEvery action will run without asking, including commands and edits outside the project, and any approval cards waiting now will be approved. Deny rules, ask rules and credential exclusions still apply.'
+export const BYPASS_CONFIRM = 'Switch this chat to Bypass permissions?\n\nEvery action will run without asking, including commands and edits outside the project, and any approval cards waiting now will be approved. Deny rules, ask rules, credential exclusions and approvals a hook asks for still apply.'
 
 // The commands Auto and Plan run without asking: the server's fixed list of exact forms (README: Read-only commands).
 const READ_ONLY_NOTE = 'A fixed list of read-only command forms, such as pwd, ls -la, git status, git diff --stat, git log --oneline and git show; other arguments still ask'

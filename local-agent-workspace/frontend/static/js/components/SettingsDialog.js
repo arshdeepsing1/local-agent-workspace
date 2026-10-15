@@ -9,11 +9,16 @@ const inRange = (value, low, high) => Number.isInteger(value) && value >= low &&
 const LIMIT_KEYS = ['context_window', 'max_output_tokens']
 // The dialog's sections, in order: [id, title]. On wide screens a list beside them jumps to each.
 const SECTIONS = [['project', 'Project'], ['model', 'Model and context'], ['reasoning', 'Reasoning'], ['agent', 'Agent'],
-  ['commands', 'Commands and files'], ['notifications', 'Notifications'], ['credentials', 'Credentials']]
+  ['subagents', 'Subagents'], ['commands', 'Commands and files'], ['notifications', 'Notifications'], ['credentials', 'Credentials']]
 const FORMATS = [['auto', 'Automatic (per endpoint)'], ['anthropic', 'Anthropic fields (thinking + output_config.effort)'],
   ['openai', 'OpenAI field (reasoning_effort)'], ['none', 'Don\'t send reasoning fields']]
 const OTHER_ENDPOINT = '\u0000other'
 const FALLBACK_LEVELS = Object.entries(EFFORT_LABELS).map(([value, label]) => ({ value, label }))
+// Settings → Subagents: each built-in type's endpoint and effort ('' is the chat's own; backend
+// config.DEFAULT_SUBAGENT_DEFAULTS).
+const SUBAGENT_TYPES = [['explore', 'Explore', 'Read-only investigation: finding, searching and reading files.'],
+  ['general', 'General', 'The chat\'s tools, within the subagent tool ceiling.'], ['editor', 'Editor', 'Reads and edits files, without commands.']]
+const SUBAGENT_DEFAULTS = { explore: { model: '', effort: 'low' }, general: { model: '', effort: '' }, editor: { model: '', effort: '' } }
 
 // The budgets after those in following take target's values, as the server does on a model change
 // (config.follow_limits): a value that would not fit with the other budget is not followed.
@@ -39,6 +44,35 @@ function More({ topic, children }) {
   return html`<details class="field-more"><summary aria-label=${`More about ${topic}`}>More</summary><p class="field-help">${children}</p></details>`
 }
 
+// One built-in subagent type's defaults: its endpoint (Same as the chat, a listed endpoint, or a typed
+// name with Other endpoint…) and its effort.
+function SubagentDefaults({ label, help, value, choices, onChange }) {
+  const model = value.model || ''
+  const [other, setOther] = useState(() => !!model && !choices.some(choice => choice.value === model))
+  const input = useRef(null)
+  const focus = useRef(false)
+  useEffect(() => { if (other && focus.current) { focus.current = false; input.current?.focus() } }, [other])
+  return html`<div class="settings-subagent">
+    <p class="settings-subagent-title"><strong>${label}</strong> <span class="field-help">${help}</span></p>
+    <label>${label} model<select value=${other ? OTHER_ENDPOINT : model} onChange=${e => {
+      const next = e.currentTarget.value
+      if (next === OTHER_ENDPOINT) { focus.current = true; setOther(true); return }
+      setOther(false)
+      onChange('model', next)
+    }}>
+      <option value="">Same as the chat</option>
+      ${choices.map(choice => html`<option key=${choice.value} value=${choice.value}>${choice.label}</option>`)}
+      <option value=${OTHER_ENDPOINT}>Other endpoint…</option>
+    </select></label>
+    <label>${label} effort<select value=${value.effort || ''} onChange=${e => onChange('effort', e.currentTarget.value)}>
+      <option value="">Same as the chat</option>
+      ${FALLBACK_LEVELS.map(level => html`<option key=${level.value} value=${level.value}>${level.label}</option>`)}
+    </select></label>
+    ${other ? html`<label class="settings-subagent-endpoint">${label} endpoint name<input ref=${input} spellcheck=${false} value=${model}
+      onInput=${e => onChange('model', e.currentTarget.value.trim())} placeholder="Empty: the chat's model" /></label>` : null}
+  </div>`
+}
+
 // The endpoints the chooser lists: the app's profiles (label and name), the workspace's endpoints and the saved one.
 function endpointChoices(settings, connection) {
   const profiles = Array.isArray(settings.endpoint_profiles) ? settings.endpoint_profiles : []
@@ -61,6 +95,8 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
   const [error, setError] = useState('')
   // The variable names as typed; the form holds them as a list.
   const [envText, setEnvText] = useState((settings.command_env || []).join(' '))
+  // The limit as typed: a number input reports "2." as "" or "2", so the form keeps the text and its number.
+  const [spendingText, setSpendingText] = useState(String(settings.spending_limit_dbu ?? 0))
   const choices = endpointChoices(settings, connection)
   // Other endpoint…: a typed name. It stays open while chosen, so typing never switches the list back.
   const [otherEndpoint, setOtherEndpoint] = useState(() => !choices.some(choice => choice.value === settings.model))
@@ -132,6 +168,17 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
   const effective = limits?.effective
   const capped = effective?.clamped ? effective.context_window - effective.max_output_tokens - 2048 : null
   const number = key => event => field(key, Number(event.currentTarget.value))
+  // A focused field must not end under the sticky footer. For a text box the browser scrolls only its
+  // caret into view, so on a phone the lower part of Custom instructions could stay hidden.
+  const keepAboveFooter = event => {
+    const target = event.target
+    const footer = event.currentTarget.querySelector(':scope > footer')
+    if (!footer || footer.contains(target) || !target.getBoundingClientRect) return
+    const box = target.getBoundingClientRect()
+    const top = footer.getBoundingClientRect().top
+    // Before the browser's own focus scroll, which then finds the caret already in view.
+    if (box.bottom > top + .5) target.scrollIntoView({ block: box.height < top - 60 ? 'nearest' : 'start' })
+  }
   const jump = id => {
     const section = sections.current[id]
     if (!section) return
@@ -157,9 +204,14 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
     ref=${element => { sections.current[id] = element }}><legend>${SECTIONS.find(item => item[0] === id)[1]}</legend>${children}</fieldset>`
   const fields = preview?.fields || {}
   const currentLevel = levels.find(level => level.value === effort) || levels[0]
+  const subagents = { ...SUBAGENT_DEFAULTS, ...(form.subagent_defaults || {}) }
+  const subagentField = (kind, key, value) => setForm(current => {
+    const all = { ...SUBAGENT_DEFAULTS, ...(current.subagent_defaults || {}) }
+    return { ...current, subagent_defaults: { ...all, [kind]: { ...all[kind], [key]: value } } }
+  })
   return html`<dialog ref=${dialog} class="settings-dialog app-settings" aria-label="Settings" aria-describedby="settings-description" onCancel=${onClose} onScroll=${scrolled} onClick=${e => { if (e.target === dialog.current) onClose() }}>
     <div class="dialog-content"><header><div><h2>Settings</h2><p id="settings-description">Configure your local workspace.</p></div><button class="icon-button" onClick=${onClose} aria-label="Close settings"><${X} /></button></header>
-      <form onSubmit=${e => {
+      <form onfocusin=${keepAboveFooter} onSubmit=${e => {
         e.preventDefault()
         // The server checks this too; saying it here avoids its raw validation error.
         if ((form.command_env || []).length > 32) { setError('List at most 32 environment variable names.'); return }
@@ -243,6 +295,10 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         <label>Agent steps per message<input type="number" required min=${1} max=${64} step=${1}
           value=${form.max_agent_steps || ''} onInput=${number('max_agent_steps')} /></label>
         <p class="field-help">Limits model round trips for one message, not individual tool calls. One model response can request several tools. The default is 32.</p>
+        <label>Spending limit per conversation (DBU)<input type="number" required min=${0} max=${100000} step="any" inputmode="decimal"
+          value=${spendingText} onInput=${e => { const text = e.currentTarget.value; setSpendingText(text); field('spending_limit_dbu', text.trim() === '' ? NaN : Number(text)) }} /></label>
+        <p class="field-help">The agent stops before its next model request once a conversation and its subagents have used this much (estimated from list prices, as in Agent tools → Usage), and warns at 80%. 0 means no limit. A chat can set its own limit in Usage.</p>
+        <${More} topic="spending limit">It is a soft cap: one response can pass it before the next request is stopped. Calls to endpoints without price data are not counted, and title and compaction requests are not stopped.<//>
         <label>Approval wait (minutes)<input type="number" required min=${0} max=${1440} step=${1}
           value=${form.approval_timeout_minutes ?? 60} onInput=${number('approval_timeout_minutes')} /></label>
         <p class="field-help">How long an approval card waits for your answer (default 60); after that the action does not run and the agent is told nobody answered. 0 waits until you answer or press Stop.</p>
@@ -257,6 +313,12 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         <label>Custom instructions<textarea class="settings-instructions" rows=${5} maxLength=${8000} spellcheck=${false} value=${instructions} aria-describedby="settings-instructions-count"
           onInput=${e => field('user_instructions', e.currentTarget.value)} placeholder="How you want the agent to work in every project" /></label>
         <p class="field-help"><span class="field-counter" id="settings-instructions-count">${instructions.length.toLocaleString('en-US')} / 8,000</span> Added to every conversation in every project, before project instructions (AGENTS.md, CLAUDE.md), which cannot override them. Their size is counted in the context meter.</p>`)}
+        ${group('subagents', html`
+        <p class="field-help">The agent hands self-contained work to subagents of three built-in types. Each type can use its own endpoint and reasoning effort; Same as the chat follows the chat that starts it.</p>
+        ${SUBAGENT_TYPES.map(([kind, label, help]) => html`<${SubagentDefaults} key=${kind} label=${label} help=${help}
+          value=${subagents[kind] || {}} choices=${choices} onChange=${(key, value) => subagentField(kind, key, value)} />`)}
+        <p class="field-help">Explore starts at Fast: reading and searching rarely needs long thinking. Default sends no effort field, so the subagent's endpoint uses its own.</p>
+        <${More} topic="subagent defaults">A subagent on another endpoint than its chat keeps its requests within that endpoint's default budgets when the Model and context budgets are larger. Custom agents (a project's Markdown agent files) set their own model and effort; Agent tools → Subagents lists them and where their files go. A running subagent keeps the model it started with, and one whose type sets an effort keeps it when you change the chat's effort.<//>`)}
         ${group('commands', html`
         <label>File write limit (KB)<input type="number" required min=${16} max=${1000} step=${1}
           value=${form.write_limit_kb === undefined ? 80 : form.write_limit_kb || ''} onInput=${number('write_limit_kb')} /></label>

@@ -3,7 +3,7 @@ from pathlib import Path
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
-from . import approvals
+from . import approvals, custom_agents
 from .agents import public_session
 from .approvals import busy_conflict, busy_status, ensure_idle
 from .planning import transcript_name
@@ -172,6 +172,20 @@ def register_features(app, manager, settings, store, session_or_404, workspace_t
         return [{**child, "status": manager.statuses.get(child["id"], "idle"), "transcript": transcript_name(child["id"]),
                  **({"subagent": index[child["id"]]} if child["id"] in index else {})}
                 for child in manager.delegates.children(session_id)]
+
+    @app.get("/api/agents")
+    async def agents(session_id: str | None = None):
+        """The subagent types delegate_task offers in the chat's workspace: the built-in ones with their
+        Settings → Subagents defaults, the custom agents of its agent files (without their instructions)
+        and the files that could not be used, with the reason."""
+        catalog = custom_agents.discover(workspace_tools(session_id).root, custom_agents.display_redactor(settings))
+        defaults = settings.values.get("subagent_defaults")
+        # As delegate_task resolves them: an agent file's model must be an endpoint the user already uses.
+        used = custom_agents.used_endpoints(settings, manager.store.list())
+        return {"built_in": custom_agents.built_in_agents(defaults if isinstance(defaults, dict) else {}),
+                "custom": [custom_agents.public_agent(custom_agents.limit_model(agent, used)) for agent in catalog["agents"]],
+                "errors": catalog["errors"], "folders": list(custom_agents.AGENT_ROOTS),
+                "index_bytes": len(custom_agents.agent_index(catalog["agents"]).encode("utf-8"))}
 
     @app.put("/api/sessions/{session_id}/subagent-profile")
     async def subagent_profile(session_id: str, body: SubagentProfileRequest):

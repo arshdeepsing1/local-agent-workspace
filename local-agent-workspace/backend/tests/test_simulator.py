@@ -118,3 +118,24 @@ def test_rejections_and_endpoint_listing(gateway, simulator):
     assert first.status_code == 429 and first.headers["Retry-After"] == "2"
     second = httpx.post(f"{gateway}/serving-endpoints/databricks-claude-opus-5-5/invocations", json=limited)
     assert second.status_code == 200
+
+
+def test_a_custom_delegation_uses_the_first_agent_of_the_agent_index(gateway):
+    url = f"{gateway}/serving-endpoints/databricks-claude-opus-5-5/invocations"
+    tools = [{"type": "function", "function": {"name": "delegate_task", "parameters": {
+        "type": "object", "properties": {"task": {"type": "string"}, "agent_type": {"type": "string"}}}}}]
+    system = ("You are Local.\nCustom subagents: set delegate_task agent_type to one of these names when its description "
+              "fits (each brings its own instructions and tools, within this chat's limits):\n"
+              "- security-auditor: Reviews code.\n- mapper: Maps modules.")
+
+    def answer(system_text, prompt="delegate custom"):
+        messages = [{"role": "system", "content": system_text}, {"role": "user", "content": prompt}]
+        parts = chunks(httpx.post(url, json={"messages": messages, "tools": tools, "stream": True}))
+        arguments = "".join(call.get("function", {}).get("arguments", "") for part in parts
+                            for call in part["choices"][0]["delta"].get("tool_calls") or [])
+        pieces = [part["choices"][0]["delta"].get("content") for part in parts]
+        return (json.loads(arguments) if arguments else None), "".join(piece for piece in pieces if isinstance(piece, str))
+    assert answer(system)[0]["agent_type"] == "security-auditor"
+    assert answer(system, "delegate a survey")[0]["agent_type"] == "explore"
+    called, content = answer("You are Local.")
+    assert called is None and "no custom agents" in content

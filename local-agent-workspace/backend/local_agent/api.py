@@ -34,6 +34,8 @@ from .tools import WorkspaceTools, file_error
 from .workspace_folders import register_workspace_folders
 from .permissions import PermissionMode
 from .telemetry import session_metrics
+from . import spending
+from .spending import MAX_LIMIT_DBU
 from .activity import redact_secrets
 from .usage_export import usage_csv, usage_rows
 from .transcript import transcript, transcript_file_name
@@ -87,6 +89,12 @@ class SessionPermissions(BaseModel):
 class SessionEffort(BaseModel):
     model_config = {"extra": "forbid"}
     reasoning_effort: Effort
+
+
+class SessionSpendingLimit(BaseModel):
+    """The chat's own limit in DBU (0 = none), or null to follow the Settings default."""
+    model_config = {"extra": "forbid"}
+    spending_limit_dbu: float | None = Field(ge=0, le=MAX_LIMIT_DBU, allow_inf_nan=False, strict=True)
 
 
 class ReasoningQuery(BaseModel):
@@ -164,8 +172,11 @@ class SettingsEdit(BaseModel):
     reasoning_effort: Effort | None = None
     reasoning_format: RequestFormat | None = None
     thinking_summaries: bool | None = Field(default=None, strict=True)
+    spending_limit_dbu: float | None = Field(default=None, ge=0, le=MAX_LIMIT_DBU, allow_inf_nan=False, strict=True)
     coding_dir: str | None = Field(default=None, max_length=4096, strict=True)
     python_venv: str | None = Field(default=None, max_length=4096, strict=True)
+    # Settings → Subagents: {explore|general|editor: {model, effort}}; config.subagent_defaults checks it.
+    subagent_defaults: dict[str, dict[str, str]] | None = None
 
 
 class LimitsQuery(BaseModel):
@@ -471,6 +482,14 @@ def create_app(settings=None):
         await manager.change_effort(session, body.reasoning_effort)
         return public_session(session, busy_status(manager, session_id))
 
+    @app.put("/api/sessions/{session_id}/spending-limit")
+    async def change_spending_limit(session_id: str, body: SessionSpendingLimit):
+        # Allowed while a turn runs: the agent's next model request checks it (and a running subagent's).
+        from .approvals import busy_status
+        session = session_or_404(session_id)
+        await manager.change_spending_limit(session, body.spending_limit_dbu)
+        return public_session(session, busy_status(manager, session_id))
+
     @app.put("/api/sessions/{session_id}/title")
     async def rename_session(session_id: str, body: SessionTitle):
         session = session_or_404(session_id)
@@ -563,7 +582,8 @@ def create_app(settings=None):
 
     @app.get("/api/sessions/{session_id}/metrics")
     async def get_session_metrics(session_id: str):
-        return session_metrics(session_or_404(session_id))
+        session = session_or_404(session_id)
+        return {**session_metrics(session), "spending": spending.status(manager, session)}
 
     @app.get("/api/sessions/{session_id}/usage.csv")
     async def export_session_usage(session_id: str):

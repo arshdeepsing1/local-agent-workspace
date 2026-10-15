@@ -6,10 +6,13 @@ import time
 import uuid
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError
 
 from .context import LARGE_SUMMARY_MAX_BYTES, MAX_ESTIMATE_SCALE, context_boundary
+from .extensions import HOOK_CONTEXT_CHARS, HOOK_EVENTS, HOOK_REPORT_CHARS, MAX_HOOKS
+from .lifecycle_hooks import SHOWN_ARGUMENTS_BYTES
 from .planning import MAX_STEPS, subagent_index
+from .spending import MAX_LIMIT_DBU
 
 
 MAX_BUNDLE_BYTES = 16 * 1024 * 1024
@@ -40,6 +43,8 @@ class RateLimitDetails(Record):
 
 
 Effort = Literal["default", "low", "medium", "high", "xhigh", "max"]  # reasoning.EFFORT_LEVELS
+# A built-in subagent type or a custom agent's name (custom_agents.NAME).
+AgentName = Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{0,39}$")]
 
 
 class ReasoningInfo(Record):
@@ -69,7 +74,9 @@ class Progress(Record):
     completed_tools: int = Field(ge=0)
     last_tool: str | None = None
     terminal_reason: str | None = None
-    agent_type: Literal["explore", "general", "editor"] | None = None
+    agent_type: AgentName | None = None
+    model: str | None = Field(default=None, max_length=256)  # The model and effort the subagent started with.
+    effort: Effort | None = None
     started: float | None = None
     ended: float | None = None
 
@@ -103,6 +110,69 @@ class Withheld(Record):
     """A read result the model did not get (result_budget): its estimate and the allowance."""
     estimated_tokens: int = Field(ge=0)
     allowance_tokens: int = Field(ge=0)
+
+
+def _shown_arguments(value):
+    if isinstance(value, dict) and len(json.dumps(value, ensure_ascii=False).encode("utf-8")) > SHOWN_ARGUMENTS_BYTES:
+        raise ValueError("Hook arguments are too large.")
+    return value
+
+
+# What lifecycle_hooks records about hooks; the chat view reads these shapes, so an import must match them.
+HookId = Annotated[str, Field(min_length=1, max_length=64)]
+HookIds = Annotated[list[HookId], Field(min_length=1, max_length=MAX_HOOKS)]
+HookText = Annotated[str, Field(max_length=HOOK_CONTEXT_CHARS)]  # a reason or context, as parse_hook_output clips it
+# lifecycle_hooks.shown_arguments: the arguments object, or its JSON text shortened when it is large.
+ShownArguments = Annotated[dict[str, Any] | Annotated[str, Field(max_length=SHOWN_ARGUMENTS_BYTES // 4)],
+                           AfterValidator(_shown_arguments)]
+
+
+class HookVerdict(Record):
+    """hook_ask or hook_blocked: the hook that asked for a card or blocked a call or message."""
+    hook_id: HookId
+    reason: HookText | None = None
+
+
+class HookChange(Record):
+    """hook_change: the before-tool hooks that replaced a call's arguments and the agent's proposal."""
+    hooks: HookIds
+    original: ShownArguments
+
+
+class HookEdit(Record):
+    """hook_edit: the user_prompt hooks that replaced a message and the user's own text."""
+    hooks: HookIds
+    original: str = Field(max_length=100_000)  # A message, or queued messages sent as one.
+
+
+class HookNote(Record):
+    """One entry of hook_notes: context a hook added for the model after a message."""
+    event: Literal[HOOK_EVENTS]
+    hook_id: HookId
+    context: HookText
+
+
+class ArgumentsChange(Record):
+    before: ShownArguments
+    after: ShownArguments
+
+
+class PromptChange(Record):
+    before: str = Field(max_length=4000)
+    after: str = Field(max_length=4000)
+
+
+class HookResult(Record):
+    """hook_result: what a hook card shows of a structured result (LifecycleHooks.hook_summary)."""
+    model_config = ConfigDict(serialize_by_alias=True)
+    structured: bool | None = Field(default=None, alias="json")  # "json" would shadow BaseModel.json.
+    decision: Literal["deny", "ask", "block"] | None = None
+    reason: HookText | None = None
+    context: HookText | None = None
+    report: str | None = Field(default=None, max_length=HOOK_REPORT_CHARS)
+    arguments: ArgumentsChange | None = None
+    prompt: PromptChange | None = None
+    ignored: list[Annotated[str, Field(max_length=40)]] | None = Field(default=None, max_length=16)
 
 
 class Event(Record):
@@ -157,6 +227,15 @@ class Event(Record):
     steered: bool | None = None
     attachments: list[Attachment] | None = Field(default=None, max_length=10)
     stop_phase: Literal["streaming", "tools", "waiting"] | None = None
+    # Hooks (lifecycle_hooks): a hook card's structured result; on a tool card, the arguments a
+    # before-tool hook replaced, the card it asked for, or its deny; on a user message, a hook's
+    # edit or block and the context hooks added for the model.
+    hook_result: HookResult | None = None
+    hook_change: HookChange | None = None
+    hook_ask: HookVerdict | None = None
+    hook_blocked: HookVerdict | None = None
+    hook_edit: HookEdit | None = None
+    hook_notes: list[HookNote] | None = Field(default=None, max_length=2 * MAX_HOOKS)
 
 
 class Function(Record):
@@ -238,10 +317,16 @@ class Conversation(Record):
     tool_profile: Profile = "inherit"
     subagent_tool_profile: Profile = "inherit"
     reasoning_effort: Effort | None = None  # Kept by forks and imports, like the model.
+    spending_limit_dbu: float | None = Field(default=None, ge=0, le=MAX_LIMIT_DBU)  # Kept too (not the spend).
     max_steps: int | None = Field(default=None, ge=1, le=MAX_STEPS)
-    agent_type: Literal["explore", "general", "editor"] | None = None
+    agent_type: AgentName | None = None
     # Kept by forks and imports, like tool_profile: a copy never gets more tools than its source.
     disabled_tools: list[Annotated[str, Field(min_length=1, max_length=300)]] | None = Field(default=None, max_length=64)
+    # A custom agent's subagent: only these tools (custom_agents.py); its file, and the model and effort its agent set.
+    agent_tools: list[Annotated[str, Field(min_length=1, max_length=300)]] | None = Field(default=None, max_length=64)
+    agent_file: str | None = Field(default=None, max_length=300)
+    agent_model: str | None = Field(default=None, max_length=256)
+    agent_effort: Effort | None = None
     # The user's labels. Pinned and archived are view state of this app and are not exported.
     tags: list[Annotated[str, Field(min_length=1, max_length=32)]] | None = Field(default=None, max_length=10)
 
@@ -400,7 +485,7 @@ def export_bundle(sessions, root_id):
 def completed_for_fork(session):
     wire = session["wire"]
     reason = session.get("terminal_reason")
-    if reason not in (None, "completed") or not wire or wire[-1]["role"] != "assistant" or wire[-1].get("tool_calls"):
+    if reason not in (None, "completed", "hook_blocked") or not wire or wire[-1]["role"] != "assistant" or wire[-1].get("tool_calls"):
         raise ValueError("Only a completed conversation can be forked. Finish a response first.")
     if any(event.get("state") in ("pending", "running") or (event.get("request_info") or {}).get("status") == "running"
            for event in session["events"]):
@@ -514,6 +599,11 @@ def fresh_copies(bundle, workspace, *, kind="import"):
             child = event.pop("child_session_id", None)
             if child in ids:
                 event["child_session_id"] = ids[child]
+            if str(event.get("name")).startswith("hook_subagent_") and isinstance(event.get("input"), dict):
+                # A subagent event's hook card names its subagent: the copy, or none outside the bundle.
+                subagent = event["input"].pop("subagent_session_id", None)
+                if subagent in ids:
+                    event["input"]["subagent_session_id"] = ids[subagent]
             origin = event.pop("origin", None)
             if origin and origin["parent_session_id"] in ids:
                 parent = origin["parent_session_id"]
