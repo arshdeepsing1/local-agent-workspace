@@ -5,7 +5,7 @@ import ConversationTransfer from './ConversationTransfer.js'
 import UsagePanel from './UsagePanel.js'
 import { blockerOf, OpenBlockingChat } from './BlockingChat.js'
 import { modeLabel } from './PermissionsMenu.js'
-import { AGENT_TYPE_LABELS, elapsedText } from '../subagents.js'
+import { agentLabel, agentSettingsText, elapsedText } from '../subagents.js'
 import { EFFORT_LABELS, modelLabel } from '../types.js'
 
 // Props: session, workspace?, changedFiles? (files with unreviewed agent changes in this chat, from the
@@ -300,6 +300,8 @@ function SubagentRow({ child, onOpen }) {
   const entry = child.subagent || {}
   const progress = child.delegation || {}
   const kind = child.agent_type || entry.agent_type || progress.agent_type
+  // The effort and model it started with; an older child shows its own header's.
+  const settings = agentSettingsText(progress.effort || entry.effort || child.reasoning_effort, progress.model || entry.model || child.model)
   const started = typeof progress.started === 'number' ? progress.started : typeof entry.created === 'number' ? entry.created : child.created
   const ended = typeof progress.ended === 'number' ? progress.ended : typeof entry.ended === 'number' ? entry.ended : null
   const work = [Number.isInteger(entry.steps_used) ? `${entry.steps_used} of ${child.max_steps ?? '?'} steps`
@@ -308,7 +310,7 @@ function SubagentRow({ child, onOpen }) {
     : Number.isInteger(progress.completed_tools) ? plural(progress.completed_tools, 'completed action') : '']
   return html`<div class="agent-tools-row subagent-row"><div>
     <strong>${entry.task || child.title}</strong>
-    <small>${[AGENT_TYPE_LABELS[kind] || kind, childStatus(child), profileLabels[child.tool_profile || 'inherit']].filter(Boolean).join(' · ')}</small>
+    <small>${[agentLabel(kind), childStatus(child), profileLabels[child.tool_profile || 'inherit'], settings].filter(Boolean).join(' · ')}</small>
     <small>${work.filter(Boolean).join(' · ')}</small>
     ${typeof started === 'number' ? html`<small>Started ${moment(started)}${ended != null ? ` · ended ${moment(ended)} (${elapsedText(ended - started)})` : ''}</small>` : null}
     <small class="subagent-transcript" title="In the app's state folder">Transcript: <code>${child.transcript || `conversations/${child.id}.jsonl`}</code></small>
@@ -329,6 +331,7 @@ function SessionSubagents({ session, onError, onSelectSession, onClose }) {
     ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
     <div class="agent-tools-list">${children.map(child => html`<${SubagentRow} key=${child.id} child=${child} onOpen=${() => { onSelectSession(child.id); onClose() }} />`)}</div>
     ${!busy && !children.length ? html`<p class="muted">No subagents in this conversation.</p>` : null}
+    ${session.is_subagent ? null : html`<${AgentTypes} session=${session} onError=${onError} />`}
     <h3>Tool ceiling</h3>
     ${session.is_subagent ? html`<p>Tool profile: ${profileLabels[session.tool_profile || 'inherit']}. This child cannot widen its inherited tool access.</p>` : html`
       <label class="agent-tools-profile">New subagent tool ceiling<select aria-label="New subagent tool ceiling" disabled=${busy || session.status !== 'idle'} value=${profile} onChange=${e => {
@@ -339,6 +342,47 @@ function SessionSubagents({ session, onError, onSelectSession, onClose }) {
       <p class="field-help">The widest tools a new subagent of this chat gets: explore subagents are read-only and editor subagents edit files without commands, but neither gets more than this. File-only profiles disable commands, MCP and hooks; normal approvals still apply. Applies to new subagents only, and limits agent tools, not your editor or terminal.</p>
       ${profileNotice ? html`<p role="status">${profileNotice}</p>` : null}`}
   </section>`
+}
+
+// The agent types delegate_task offers in this chat's project (GET /agents): the built-in ones with their
+// Settings → Subagents defaults, the project's custom agent files, and the files that cannot be used.
+function AgentTypes({ session, onError }) {
+  const { busy, error, run } = useRequest(onError)
+  const [agents, setAgents] = useState(null)
+  const query = scopeQuery(session)
+  const refresh = useCallback(() => run(() => api(`/agents${query}`), setAgents), [query, run])
+  useEffect(() => { void refresh() }, [refresh])
+  const effort = value => value ? `${EFFORT_LABELS[value] || value} effort` : 'Same effort as the chat'
+  const model = value => value ? modelLabel(value) : 'Same model as the chat'
+  const builtIn = agents?.built_in || []
+  const custom = agents?.custom || []
+  const errors = agents?.errors || []
+  return html`<div class="agent-types">
+    <div class="agent-tools-section-heading"><h3>Agent types</h3><button class="outline" disabled=${busy} onClick=${() => void refresh()}>Refresh agent types</button></div>
+    <p>The agent chooses a type for each subagent. Set the built-in types' model and effort in Settings → Subagents. Custom agents are Markdown files in this project's <code>.agents/agents</code> or <code>.claude/agents</code> folder; their tools never go beyond this chat's tool ceiling.</p>
+    ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
+    ${agents ? html`<ul class="agent-types-list" aria-label="Agent types">
+      ${builtIn.map(agent => html`<li key=${agent.name} class="agent-type-row">
+        <div class="agent-type-title"><strong>${agentLabel(agent.name)}</strong><span class="agent-type-badge">Built-in</span></div>
+        <small>${agent.description}</small>
+        <small>${[profileLabels[agent.profile], effort(agent.effort), model(agent.model)].join(' · ')}</small>
+      </li>`)}
+      ${custom.map(agent => html`<li key=${agent.path} class="agent-type-row">
+        <div class="agent-type-title"><strong>${agent.name}</strong><span class="agent-type-badge">Custom</span></div>
+        <small>${agent.description}</small>
+        <small>${[profileLabels[agent.profile], Array.isArray(agent.tools) ? `Tools: ${agent.tools.join(', ')}` : 'Every tool of its profile',
+          effort(agent.effort), model(agent.model), Number.isInteger(agent.max_steps) ? `${agent.max_steps} steps by default` : '',
+          agent.skills?.length ? `Skills: ${agent.skills.join(', ')}` : ''].filter(Boolean).join(' · ')}</small>
+        <small class="agent-type-file">File: <code>${agent.path}</code></small>
+        ${(agent.notes || []).map((note, index) => html`<small key=${index} class="agent-type-note">${note}</small>`)}
+      </li>`)}
+      ${errors.map(item => html`<li key=${item.path} class="agent-type-row agent-type-error">
+        <div class="agent-type-title"><strong><code>${item.path}</code></strong><span class="agent-type-badge">Not used</span></div>
+        <p class="form-error">${item.error}</p>
+      </li>`)}
+    </ul>` : null}
+    ${agents && !custom.length && !errors.length ? html`<p class="muted">No custom agents in this project.</p>` : null}
+  </div>`
 }
 
 // The project's Verify command (app state, keyed by the resolved workspace, so a worktree is its own project).

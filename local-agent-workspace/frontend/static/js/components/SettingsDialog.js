@@ -9,11 +9,16 @@ const inRange = (value, low, high) => Number.isInteger(value) && value >= low &&
 const LIMIT_KEYS = ['context_window', 'max_output_tokens']
 // The dialog's sections, in order: [id, title]. On wide screens a list beside them jumps to each.
 const SECTIONS = [['project', 'Project'], ['model', 'Model and context'], ['reasoning', 'Reasoning'], ['agent', 'Agent'],
-  ['commands', 'Commands and files'], ['notifications', 'Notifications'], ['credentials', 'Credentials']]
+  ['subagents', 'Subagents'], ['commands', 'Commands and files'], ['notifications', 'Notifications'], ['credentials', 'Credentials']]
 const FORMATS = [['auto', 'Automatic (per endpoint)'], ['anthropic', 'Anthropic fields (thinking + output_config.effort)'],
   ['openai', 'OpenAI field (reasoning_effort)'], ['none', 'Don\'t send reasoning fields']]
 const OTHER_ENDPOINT = '\u0000other'
 const FALLBACK_LEVELS = Object.entries(EFFORT_LABELS).map(([value, label]) => ({ value, label }))
+// Settings → Subagents: each built-in type's endpoint and effort ('' is the chat's own; backend
+// config.DEFAULT_SUBAGENT_DEFAULTS).
+const SUBAGENT_TYPES = [['explore', 'Explore', 'Read-only investigation: finding, searching and reading files.'],
+  ['general', 'General', 'The chat\'s tools, within the subagent tool ceiling.'], ['editor', 'Editor', 'Reads and edits files, without commands.']]
+const SUBAGENT_DEFAULTS = { explore: { model: '', effort: 'low' }, general: { model: '', effort: '' }, editor: { model: '', effort: '' } }
 
 // The budgets after those in following take target's values, as the server does on a model change
 // (config.follow_limits): a value that would not fit with the other budget is not followed.
@@ -37,6 +42,35 @@ function pathStatus(status, saved, current) {
 // Details that most people do not need on every visit.
 function More({ topic, children }) {
   return html`<details class="field-more"><summary aria-label=${`More about ${topic}`}>More</summary><p class="field-help">${children}</p></details>`
+}
+
+// One built-in subagent type's defaults: its endpoint (Same as the chat, a listed endpoint, or a typed
+// name with Other endpoint…) and its effort.
+function SubagentDefaults({ label, help, value, choices, onChange }) {
+  const model = value.model || ''
+  const [other, setOther] = useState(() => !!model && !choices.some(choice => choice.value === model))
+  const input = useRef(null)
+  const focus = useRef(false)
+  useEffect(() => { if (other && focus.current) { focus.current = false; input.current?.focus() } }, [other])
+  return html`<div class="settings-subagent">
+    <p class="settings-subagent-title"><strong>${label}</strong> <span class="field-help">${help}</span></p>
+    <label>${label} model<select value=${other ? OTHER_ENDPOINT : model} onChange=${e => {
+      const next = e.currentTarget.value
+      if (next === OTHER_ENDPOINT) { focus.current = true; setOther(true); return }
+      setOther(false)
+      onChange('model', next)
+    }}>
+      <option value="">Same as the chat</option>
+      ${choices.map(choice => html`<option key=${choice.value} value=${choice.value}>${choice.label}</option>`)}
+      <option value=${OTHER_ENDPOINT}>Other endpoint…</option>
+    </select></label>
+    <label>${label} effort<select value=${value.effort || ''} onChange=${e => onChange('effort', e.currentTarget.value)}>
+      <option value="">Same as the chat</option>
+      ${FALLBACK_LEVELS.map(level => html`<option key=${level.value} value=${level.value}>${level.label}</option>`)}
+    </select></label>
+    ${other ? html`<label class="settings-subagent-endpoint">${label} endpoint name<input ref=${input} spellcheck=${false} value=${model}
+      onInput=${e => onChange('model', e.currentTarget.value.trim())} placeholder="Empty: the chat's model" /></label>` : null}
+  </div>`
 }
 
 // The endpoints the chooser lists: the app's profiles (label and name), the workspace's endpoints and the saved one.
@@ -157,6 +191,11 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
     ref=${element => { sections.current[id] = element }}><legend>${SECTIONS.find(item => item[0] === id)[1]}</legend>${children}</fieldset>`
   const fields = preview?.fields || {}
   const currentLevel = levels.find(level => level.value === effort) || levels[0]
+  const subagents = { ...SUBAGENT_DEFAULTS, ...(form.subagent_defaults || {}) }
+  const subagentField = (kind, key, value) => setForm(current => {
+    const all = { ...SUBAGENT_DEFAULTS, ...(current.subagent_defaults || {}) }
+    return { ...current, subagent_defaults: { ...all, [kind]: { ...all[kind], [key]: value } } }
+  })
   return html`<dialog ref=${dialog} class="settings-dialog app-settings" aria-label="Settings" aria-describedby="settings-description" onCancel=${onClose} onScroll=${scrolled} onClick=${e => { if (e.target === dialog.current) onClose() }}>
     <div class="dialog-content"><header><div><h2>Settings</h2><p id="settings-description">Configure your local workspace.</p></div><button class="icon-button" onClick=${onClose} aria-label="Close settings"><${X} /></button></header>
       <form onSubmit=${e => {
@@ -257,6 +296,12 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         <label>Custom instructions<textarea class="settings-instructions" rows=${5} maxLength=${8000} spellcheck=${false} value=${instructions} aria-describedby="settings-instructions-count"
           onInput=${e => field('user_instructions', e.currentTarget.value)} placeholder="How you want the agent to work in every project" /></label>
         <p class="field-help"><span class="field-counter" id="settings-instructions-count">${instructions.length.toLocaleString('en-US')} / 8,000</span> Added to every conversation in every project, before project instructions (AGENTS.md, CLAUDE.md), which cannot override them. Their size is counted in the context meter.</p>`)}
+        ${group('subagents', html`
+        <p class="field-help">The agent hands self-contained work to subagents of three built-in types. Each type can use its own endpoint and reasoning effort; Same as the chat follows the chat that starts it.</p>
+        ${SUBAGENT_TYPES.map(([kind, label, help]) => html`<${SubagentDefaults} key=${kind} label=${label} help=${help}
+          value=${subagents[kind] || {}} choices=${choices} onChange=${(key, value) => subagentField(kind, key, value)} />`)}
+        <p class="field-help">Explore starts at Fast: reading and searching rarely needs long thinking. Default sends no effort field, so the subagent's endpoint uses its own.</p>
+        <${More} topic="subagent defaults">A subagent on another endpoint than its chat keeps its requests within that endpoint's default budgets when the Model and context budgets are larger. Custom agents (Markdown files in a project's .agents/agents or .claude/agents folder) set their own model and effort; Agent tools → Subagents lists them. A running subagent keeps the model it started with, and one whose type sets an effort keeps it when you change the chat's effort.<//>`)}
         ${group('commands', html`
         <label>File write limit (KB)<input type="number" required min=${16} max=${1000} step=${1}
           value=${form.write_limit_kb === undefined ? 80 : form.write_limit_kb || ''} onInput=${number('write_limit_kb')} /></label>
