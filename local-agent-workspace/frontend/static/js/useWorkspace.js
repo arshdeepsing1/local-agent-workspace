@@ -561,8 +561,10 @@ export function useWorkspace() {
   const sendQueued = async () => {
     const id = selected.current.id
     if (!id) return
-    await api(`/sessions/${encodeURIComponent(id)}/queue/send`, 'POST')
+    // The old error goes before the request: an error the server pushes while it is answered (the
+    // queue could not start) must stay, and a refused request shows its own error.
     setSession(current => current?.id === id ? { ...current, queue_error: null } : current)
+    await api(`/sessions/${encodeURIComponent(id)}/queue/send`, 'POST')
   }
   const loadMentionFiles = q => {
     const id = selected.current.id

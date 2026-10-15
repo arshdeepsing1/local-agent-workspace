@@ -78,6 +78,22 @@ def test_an_idle_chat_offers_to_send_waiting_messages_and_shows_queue_errors(ui,
     expect(bar.get_by_role("alert")).to_have_text("This managed worktree is being removed. Choose another workspace.")
 
 
+def test_a_queue_error_pushed_before_send_is_answered_stays(ui, page):
+    # The order slow runners hit: the server's queue error arrives before its answer to Send.
+    start_app(ui, page, queued_messages=[{**QUEUED[0], "paused": True}], setup="""const answer = fake.defer('send')
+fake.override = (path, options) => path === '/api/sessions/a/queue/send' && options.method === 'POST'
+  ? answer.promise.then(() => fake.json({ ok: true })) : undefined""")
+    bar = queue_bar(page)
+    bar.get_by_role("button", name="Send queued messages").click()
+    ui.wait("fake.requests('/api/sessions/a/queue/send', 'POST').length === 1")
+    ui.emit("a", {"type": "queue", "queued_messages": [{**QUEUED[0], "paused": True}],
+                  "error": "This managed worktree is being removed. Choose another workspace."})
+    expect(bar.get_by_role("alert")).to_have_text("This managed worktree is being removed. Choose another workspace.")
+    ui.run("fake.deferreds.send.resolve()")
+    page.wait_for_timeout(100)  # Let the answered request finish its update.
+    expect(bar.get_by_role("alert")).to_have_text("This managed worktree is being removed. Choose another workspace.")
+
+
 def test_queued_message_buttons_name_their_message_and_keep_focus_in_the_page(ui, page):
     three = [{"id": f"q{number}", "text": text, "created": number, "paused": True}
              for number, text in ((1, "First note"), (2, "Second note " + "y" * 60), (3, "Third note"))]
