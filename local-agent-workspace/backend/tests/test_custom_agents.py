@@ -22,7 +22,7 @@ from local_agent.tool_profiles import tool_allowed
 REAL_CLIENT = httpx.AsyncClient
 OPUS = "databricks-claude-opus-5-5"
 GPT = "databricks-gpt-oss-120b"
-HAIKU = "databricks-claude-haiku-5-5"
+SONNET = "databricks-claude-sonnet-4-5"
 AUDITOR = """---
 name: security-auditor
 description: Reviews code for injection, secrets handling and unsafe file access.
@@ -208,7 +208,7 @@ def test_resolve_names_every_available_agent_for_an_unknown_one(tmp_path):
 
 def test_model_labels_follow_the_endpoint_profiles_or_the_name():
     assert model_label(OPUS) == "Claude Opus 5.5" and model_label(GPT) == "GPT OSS 120B"
-    assert model_label(HAIKU) == "Claude Haiku 5.5"
+    assert model_label(SONNET) == "Claude Sonnet 4.5"
     assert custom_agents.MAX_STEPS == planning.MAX_STEPS
 
 
@@ -217,8 +217,8 @@ def test_model_labels_follow_the_endpoint_profiles_or_the_name():
 def test_subagent_defaults_are_checked_and_a_hand_written_file_falls_back():
     assert subagent_defaults(None) == DEFAULT_SUBAGENT_DEFAULTS
     assert DEFAULT_SUBAGENT_DEFAULTS["explore"] == {"model": "", "effort": "low"}
-    assert subagent_defaults({"general": {"model": f" {HAIKU} ", "effort": "max"}})["general"] == {
-        "model": HAIKU, "effort": "max"}
+    assert subagent_defaults({"general": {"model": f" {SONNET} ", "effort": "max"}})["general"] == {
+        "model": SONNET, "effort": "max"}
     for bad, reason in (({"planner": {}}, "only explore, general and editor"),
                         ({"explore": {"model": "a b"}}, "endpoint name"), ({"explore": {"effort": "turbo"}}, "effort"),
                         ({"explore": {"color": "x"}}, "only model and effort"), ({"explore": []}, "only model")):
@@ -247,13 +247,13 @@ async def test_settings_save_the_defaults_partially_and_read_them_back(api):
     client, _, settings, _ = api
     body = {key: settings.values[key] for key in ("workspace", "model", "env_file")}
     assert (await client.get("/api/settings")).json()["subagent_defaults"] == DEFAULT_SUBAGENT_DEFAULTS
-    saved = await client.put("/api/settings", json={**body, "subagent_defaults": {"explore": {"model": HAIKU}}})
+    saved = await client.put("/api/settings", json={**body, "subagent_defaults": {"explore": {"model": SONNET}}})
     assert saved.status_code == 200, saved.text
     # Types and fields left out keep their values.
-    assert saved.json()["subagent_defaults"]["explore"] == {"model": HAIKU, "effort": "low"}
+    assert saved.json()["subagent_defaults"]["explore"] == {"model": SONNET, "effort": "low"}
     assert saved.json()["subagent_defaults"]["general"] == {"model": "", "effort": ""}
-    assert json.loads(settings.path.read_text())["subagent_defaults"]["explore"]["model"] == HAIKU
-    assert Settings(settings.state_dir).values["subagent_defaults"]["explore"]["model"] == HAIKU
+    assert json.loads(settings.path.read_text())["subagent_defaults"]["explore"]["model"] == SONNET
+    assert Settings(settings.state_dir).values["subagent_defaults"]["explore"]["model"] == SONNET
     refused = await client.put("/api/settings", json={**body, "subagent_defaults": {"editor": {"effort": "turbo"}}})
     assert refused.status_code == 400 and "editor subagent effort" in refused.json()["detail"]
     assert (await client.put("/api/settings", json={**body, "subagent_defaults": {"editor": {"effort": 3}}})).status_code == 422
@@ -436,7 +436,7 @@ async def test_an_unknown_agent_name_is_a_tool_error_listing_the_agents(runtime,
 
 async def test_the_manual_mode_card_names_the_agent_its_tools_and_its_model(runtime):
     manager, parent, project = runtime
-    write_agent(project, "security-auditor", AUDITOR.replace("model: databricks-gpt-oss-120b", f"model: {HAIKU}")
+    write_agent(project, "security-auditor", AUDITOR.replace("model: databricks-gpt-oss-120b", f"model: {SONNET}")
                 .replace("effort: high", "effort: low"))
     parent["permission_mode"] = "manual"
     tools = manager.session_tools(parent)
@@ -455,13 +455,13 @@ async def test_the_manual_mode_card_names_the_agent_its_tools_and_its_model(runt
     session_id, event_id = next(iter(manager.pending))
     event = next(item for item in parent["events"] if item["id"] == event_id)
     assert event["preview"] == (
-        "Start a subagent (security-auditor · chat's tools · model Claude Haiku 5.5 · effort Fast; separate paid model "
+        "Start a subagent (security-auditor · chat's tools · model Claude Sonnet 4.5 · effort Fast; separate paid model "
         "requests, at most 7 steps)\n\nTask: Audit\nAgent file: .agents/agents/security-auditor.md\n"
-        "Tools: read_file, search_files, run_command\nSkills: review, missing\nEndpoint: databricks-claude-haiku-5-5")
+        "Tools: read_file, search_files, run_command\nSkills: review, missing\nEndpoint: databricks-claude-sonnet-4-5")
     assert started == []
     manager.decide(session_id, event_id, True)
     result = json.loads(await asyncio.wait_for(task, 10))
-    assert result["status"] == "completed" and started[0]["model"] == HAIKU and started[0]["reasoning_effort"] == "low"
+    assert result["status"] == "completed" and started[0]["model"] == SONNET and started[0]["reasoning_effort"] == "low"
 
 
 async def test_built_in_cards_name_their_profile_and_settings_effort(runtime):

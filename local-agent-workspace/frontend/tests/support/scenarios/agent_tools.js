@@ -30,7 +30,7 @@ window.agentTypes = {
     { name: 'editor', built_in: true, profile: 'file_editor', description: 'Reads and edits files, without commands.', model: 'databricks-gpt-oss-120b', effort: 'high' },
   ],
   custom: [{ name: 'security-auditor', built_in: false, description: 'Reviews code for injection and secrets handling.',
-    path: '.agents/agents/security-auditor.md', profile: 'read_only', tools: ['read_file', 'search_files'], model: 'databricks-claude-haiku-5-5',
+    path: '.agents/agents/security-auditor.md', profile: 'read_only', tools: ['read_file', 'search_files'], model: 'databricks-claude-sonnet-4-5',
     effort: 'low', skills: ['review'], max_steps: 8, notes: ['Ignored unknown tools: web_fetch.'], instructions_chars: 120 }],
   errors: [{ path: '.claude/agents/broken.md', error: 'description is required: one line (at most 300 characters) that tells the model when to use this agent.' }],
   folders: ['.agents/agents', '.claude/agents'], index_bytes: 210,

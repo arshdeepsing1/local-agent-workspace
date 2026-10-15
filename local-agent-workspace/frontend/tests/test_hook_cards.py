@@ -106,3 +106,23 @@ def test_the_extensions_help_lists_every_hook_event(ui, page):
     page.get_by_text("Configuration example").click()
     example = json.loads(page.locator(".agent-tools-example pre").first.text_content())
     assert [hook["event"] for hook in example["hooks"]] == ["before_tool", "user_prompt", "agent_stop"]
+
+
+def test_a_call_a_hook_blocked_names_the_hook_not_the_text_for_the_model(ui, page):
+    show(ui, {"id": "w", "type": "tool", "name": "write_file", "call_id": "w", "state": "rejected",
+              "input": {"path": "main.py", "content": "x"},
+              "output": "Not run: Blocked by the before-tool hook guard: Main is frozen. Do not retry it unchanged or work around it.",
+              "hook_blocked": {"hook_id": "guard", "reason": "Main is frozen."}})
+    card = page.locator(".tool-card")
+    expect(card).to_contain_text("Not run: hook guard blocked it: Main is frozen.")
+    expect(card).not_to_contain_text("Do not retry")
+
+
+def test_the_hook_events_table_keeps_its_headers_on_a_phone(ui, page):
+    page.set_viewport_size({"width": 360, "height": 800})
+    ui.mount("components/AgentToolsDialog.js", "{ ...dialogProps(session()) }", scenario="agent_tools")
+    page.get_by_role("button", name="Extensions", exact=True).click()
+    page.get_by_text("Hook events and JSON output").click()
+    table = page.get_by_role("table", name="Hook events")
+    expect(table.get_by_role("columnheader", name="JSON output it reads")).to_be_visible()
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")

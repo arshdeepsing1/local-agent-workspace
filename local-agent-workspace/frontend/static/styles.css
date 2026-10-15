@@ -537,7 +537,9 @@ body.panel-resizing{cursor:col-resize;user-select:none}
 .hook-events th,.hook-events td{text-align:left;vertical-align:top;padding:5px 8px 5px 0;border-bottom:1px solid var(--border);font-weight:400}
 .hook-events thead th{font-weight:500}
 .hook-events code{font-size:11px}
-@media(max-width:600px){.hook-events,.hook-events tbody,.hook-events tr,.hook-events th,.hook-events td{display:block}.hook-events thead{display:none}.hook-events td{border-bottom:0;padding:0 0 4px}.hook-events tr{border-bottom:1px solid var(--border);padding:4px 0}}
+/* A real table on phones too (its headers stay for screen readers); it scrolls sideways when narrow. */
+.hook-events-scroll{overflow-x:auto;max-width:100%}
+.hook-events-scroll .hook-events{min-width:30rem}
 
 /* custom agents (2026-10-15) */
 .agent-types{margin:22px 0 4px}

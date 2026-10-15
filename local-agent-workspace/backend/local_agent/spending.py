@@ -19,6 +19,8 @@ def validate_limit(value, label="Spending limit"):
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) \
             or not 0 <= value <= MAX_LIMIT_DBU:
         raise ValueError(f"{label} must be a number of DBU from 0 (off) to {MAX_LIMIT_DBU:,}.")
+    if 0 < value < 0.001:  # Rounded to 0 it would mean no limit.
+        raise ValueError(f"{label} must be 0 (off) or at least 0.001 DBU.")
     return round(float(value), 3)
 
 

@@ -45,7 +45,7 @@
 //   permission_mode: 'manual'|'auto'|'acceptEdits'|'dontAsk'|'plan'|'bypassPermissions', allowed_directories,
 //   allow_rules: Rule[] (this chat's rules), disabled_tools?: string[] (turned-off tools), context_info?, active_skills?,
 //   parent_session_id?, is_subagent?, delegation?, tool_profile?, subagent_tool_profile?,
-//   agent_type?: 'explore'|'general'|'editor' (a subagent), subagents?: SubagentEntry[] (a parent's index of its
+//   agent_type?: 'explore'|'general'|'editor' or a custom agent's name (a subagent), subagents?: SubagentEntry[] (a parent's index of its
 //   subagent chats; left out of GET /sessions list items),
 //   terminal_reason?: how the last turn ended: 'completed'|'stopped'|'error'|'inference_error'|
 //   'tool_error'|'step_limit'|'spending_limit'|'interrupted' (also in the /api/sessions summaries),

@@ -147,6 +147,10 @@ export default function UsagePanel({ session, onError }) {
     } finally { if (alive.current && request === latestRequest.current) setLoading(false) }
   }, [sessionId])
   useEffect(() => { setMetrics(null); void refresh() }, [refresh])
+  // A pushed spending_limit change (another tab, the API) updates the chat's own limit: show it.
+  const pushedLimit = session?.spending_limit_dbu
+  const firstLimit = useRef(true)
+  useEffect(() => { if (firstLimit.current) { firstLimit.current = false; return } void refresh() }, [pushedLimit])
   const [exporting, setExporting] = useState(false)
   const exportCsv = async () => {
     if (!sessionId) return

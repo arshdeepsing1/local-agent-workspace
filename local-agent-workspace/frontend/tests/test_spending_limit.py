@@ -100,3 +100,26 @@ def test_settings_save_a_default_limit(ui, page):
     dialog.get_by_role("button", name="Save settings").click()
     expect(page.get_by_role("dialog")).to_have_count(0)
     assert ui.bodies("/api/settings", "PUT")[0]["spending_limit_dbu"] == 12.5
+
+
+def test_settings_take_a_typed_decimal_limit(ui, page):
+    ui.app(scenario="workspace")
+    expect(page.get_by_role("combobox", name="Model")).to_have_value("test-model")
+    page.get_by_role("button", name="Settings", exact=True).click()
+    dialog = page.get_by_role("dialog")
+    field = dialog.get_by_role("spinbutton", name="Spending limit per conversation (DBU)")
+    field.select_text()
+    field.press_sequentially("2.5")  # Key by key: "2." must not be rewritten to "2".
+    expect(field).to_have_value("2.5")
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    assert ui.bodies("/api/settings", "PUT")[0]["spending_limit_dbu"] == 2.5
+
+
+def test_a_limit_changed_elsewhere_refreshes_the_open_panel(ui, page):
+    group = open_usage(ui, page, spending())
+    expect(group).to_contain_text("1.7 of 2 DBU")
+    ui.run("spendingState = { ...spendingState, source: 'chat', limit_dbu: 3, percent: 56.7 }")
+    ui.rerender("{ ...dialogProps({ ...session(), spending_limit_dbu: 3 }) }")
+    expect(group).to_contain_text("1.7 of 3 DBU")
+    expect(group).to_contain_text("This chat's own limit.")

@@ -6,7 +6,7 @@ export const AGENT_TYPE_LABELS = { explore: 'Explore', general: 'General', edito
 
 export const agentLabel = kind => AGENT_TYPE_LABELS[kind] || kind
 
-// "Fast · Claude Haiku 5.5": the effort and model a subagent started with (its delegation progress or
+// "Fast · Claude Sonnet 4.5": the effort and model a subagent started with (its delegation progress or
 // index entry; subagents from before custom agents recorded neither).
 export function agentSettingsText(effort, model) {
   return [EFFORT_LABELS[effort] || '', typeof model === 'string' && model ? modelLabel(model) : ''].filter(Boolean).join(' · ')

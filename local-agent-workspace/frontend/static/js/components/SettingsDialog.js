@@ -95,6 +95,8 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
   const [error, setError] = useState('')
   // The variable names as typed; the form holds them as a list.
   const [envText, setEnvText] = useState((settings.command_env || []).join(' '))
+  // The limit as typed: a number input reports "2." as "" or "2", so the form keeps the text and its number.
+  const [spendingText, setSpendingText] = useState(String(settings.spending_limit_dbu ?? 0))
   const choices = endpointChoices(settings, connection)
   // Other endpoint…: a typed name. It stays open while chosen, so typing never switches the list back.
   const [otherEndpoint, setOtherEndpoint] = useState(() => !choices.some(choice => choice.value === settings.model))
@@ -294,7 +296,7 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
           value=${form.max_agent_steps || ''} onInput=${number('max_agent_steps')} /></label>
         <p class="field-help">Limits model round trips for one message, not individual tool calls. One model response can request several tools. The default is 32.</p>
         <label>Spending limit per conversation (DBU)<input type="number" required min=${0} max=${100000} step="any" inputmode="decimal"
-          value=${form.spending_limit_dbu ?? 0} onInput=${number('spending_limit_dbu')} /></label>
+          value=${spendingText} onInput=${e => { const text = e.currentTarget.value; setSpendingText(text); field('spending_limit_dbu', text.trim() === '' ? NaN : Number(text)) }} /></label>
         <p class="field-help">The agent stops before its next model request once a conversation and its subagents have used this much (estimated from list prices, as in Agent tools → Usage), and warns at 80%. 0 means no limit. A chat can set its own limit in Usage.</p>
         <${More} topic="spending limit">It is a soft cap: one response can pass it before the next request is stopped. Calls to endpoints without price data are not counted, and title and compaction requests are not stopped.<//>
         <label>Approval wait (minutes)<input type="number" required min=${0} max=${1440} step=${1}

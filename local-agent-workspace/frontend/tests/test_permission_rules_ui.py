@@ -318,8 +318,8 @@ def mode_item(page, label):
 
 
 BYPASS_TEXT = ("Switch this chat to Bypass permissions?\n\nEvery action will run without asking, including commands and edits "
-               "outside the project, and any approval cards waiting now will be approved. Deny rules, ask rules and "
-               "credential exclusions still apply.")
+               "outside the project, and any approval cards waiting now will be approved. Deny rules, ask rules, "
+               "credential exclusions and approvals a hook asks for still apply.")
 
 
 def test_bypass_needs_confirmation_and_sends_confirm(ui, page):

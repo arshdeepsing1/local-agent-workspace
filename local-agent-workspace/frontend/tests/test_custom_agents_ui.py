@@ -26,7 +26,7 @@ def test_the_subagents_section_lists_the_agent_types_and_unusable_files(ui, page
     expect(custom.locator("strong")).to_have_text("security-auditor")
     expect(custom).to_contain_text("Custom")
     expect(custom).to_contain_text("Reviews code for injection and secrets handling.")
-    expect(custom).to_contain_text("Read-only files · Tools: read_file, search_files · Fast effort · Claude Haiku 5.5 · "
+    expect(custom).to_contain_text("Read-only files · Tools: read_file, search_files · Fast effort · Claude Sonnet 4.5 · "
                                    "8 steps by default · Skills: review")
     expect(custom.locator("code")).to_have_text(".agents/agents/security-auditor.md")
     expect(custom.locator(".agent-type-note")).to_have_text("Ignored unknown tools: web_fetch.")
@@ -58,11 +58,11 @@ def test_a_failed_agent_list_shows_the_error_in_the_section(ui, page):
 
 
 def test_a_subagent_row_names_its_agent_effort_and_model(ui, page):
-    section = open_subagents(ui, page, """window.child = { ...child, agent_type: 'security-auditor', model: 'databricks-claude-haiku-5-5',
-      delegation: { ...child.delegation, agent_type: 'security-auditor', model: 'databricks-claude-haiku-5-5', effort: 'low' },
-      subagent: { ...child.subagent, agent_type: 'security-auditor', model: 'databricks-claude-haiku-5-5', effort: 'low' } }""")
+    section = open_subagents(ui, page, """window.child = { ...child, agent_type: 'security-auditor', model: 'databricks-claude-sonnet-4-5',
+      delegation: { ...child.delegation, agent_type: 'security-auditor', model: 'databricks-claude-sonnet-4-5', effort: 'low' },
+      subagent: { ...child.subagent, agent_type: 'security-auditor', model: 'databricks-claude-sonnet-4-5', effort: 'low' } }""")
     row = section.locator(".subagent-row")
-    expect(row).to_contain_text("security-auditor · Waiting for approval · Read-only files · Fast · Claude Haiku 5.5")
+    expect(row).to_contain_text("security-auditor · Waiting for approval · Read-only files · Fast · Claude Sonnet 4.5")
     expect(row.locator("code")).to_have_text("conversations/child.jsonl")
 
 
@@ -77,7 +77,7 @@ window.makeSession = (events, overrides = {}) => ({
 def test_a_subagent_card_shows_the_agent_with_its_effort_and_model(ui, page):
     events = """[{ id: 'd1', type: 'tool', name: 'delegate_task', call_id: 'c1', state: 'running', child_session_id: 'child-1',
       input: { task: 'Audit the parser', agent_type: 'security-auditor' },
-      delegation: { status: 'running', completed_tools: 1, agent_type: 'security-auditor', model: 'databricks-claude-haiku-5-5',
+      delegation: { status: 'running', completed_tools: 1, agent_type: 'security-auditor', model: 'databricks-claude-sonnet-4-5',
         effort: 'low', started: Date.now() / 1000 - 5 } },
       { id: 'd2', type: 'tool', name: 'delegate_task', call_id: 'c2', state: 'running', input: { task: 'Old' },
         delegation: { status: 'running', completed_tools: 0, agent_type: 'explore' } }]"""
@@ -86,8 +86,8 @@ def test_a_subagent_card_shows_the_agent_with_its_effort_and_model(ui, page):
     expect(cards).to_have_count(2)
     expect(cards.nth(0).locator(".delegation-type")).to_have_text("security-auditor")
     agent = cards.nth(0).locator(".delegation-agent")
-    expect(agent).to_have_text("Fast · Claude Haiku 5.5")
-    expect(agent).to_have_attribute("title", "Effort and model (databricks-claude-haiku-5-5)")
+    expect(agent).to_have_text("Fast · Claude Sonnet 4.5")
+    expect(agent).to_have_attribute("title", "Effort and model (databricks-claude-sonnet-4-5)")
     # A card from before agents recorded their model and effort shows only the type.
     expect(cards.nth(1).locator(".delegation-type")).to_have_text("Explore")
     expect(cards.nth(1).locator(".delegation-agent")).to_have_count(0)
@@ -119,14 +119,14 @@ def test_settings_subagents_show_the_defaults_and_save_changes(ui, page):
     group.get_by_role("combobox", name="General model").select_option(label="Other endpoint…")
     name = group.get_by_role("textbox", name="General endpoint name")
     expect(name).to_be_focused()
-    name.fill("databricks-claude-haiku-5-5")
+    name.fill("databricks-claude-sonnet-4-5")
     group.get_by_role("combobox", name="Editor model").select_option("")
     expect(group.get_by_role("textbox", name="Editor endpoint name")).to_have_count(0)
     dialog.get_by_role("button", name="Save settings").click()
     expect(page.get_by_role("dialog")).to_have_count(0)
     assert ui.bodies("/api/settings", "PUT")[0]["subagent_defaults"] == {
         "explore": {"model": "databricks-gpt-oss-120b", "effort": "low"},
-        "general": {"model": "databricks-claude-haiku-5-5", "effort": "high"},
+        "general": {"model": "databricks-claude-sonnet-4-5", "effort": "high"},
         "editor": {"model": "", "effort": "max"}}
 
 

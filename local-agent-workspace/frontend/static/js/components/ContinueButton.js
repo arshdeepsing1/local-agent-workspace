@@ -38,7 +38,7 @@ export function stopReason(session) {
   const turn = events.slice(start + 1)
   const reason = session.terminal_reason
   if (reason === 'step_limit') return 'The agent reached its step limit.'
-  if (reason === 'spending_limit') return 'The conversation reached its spending limit.'
+  if (reason === 'spending_limit') return 'The conversation reached its spending limit. Raise it in Agent tools → Usage, then continue.'
   if (reason === 'stopped') return 'The response was stopped.'
   if (reason === 'interrupted') return 'The response was interrupted.'
   if (reason === 'inference_error') {

@@ -74,7 +74,7 @@ def display_redactor(settings):
 
 
 def model_label(model):
-    """A short name for an endpoint ("Claude Haiku 5.5"): its profile's label, else from its name
+    """A short name for an endpoint ("Claude Sonnet 4.5"): its profile's label, else from its name
     (the frontend's modelLabel)."""
     profile = profile_for(model)
     if profile is not None:

@@ -1953,7 +1953,7 @@ name: security-auditor
 description: Reviews changed code for injection, secrets handling and unsafe file access.
 tools: [read_file, search_files, find_files, outline_file]
 profile: read_only
-model: databricks-claude-haiku-5-5
+model: databricks-claude-sonnet-4-5
 effort: low
 skills: [review]
 max_steps: 8
@@ -1979,7 +1979,8 @@ Claude Code agent files work too: its tool names `Read`, `Write`, `Edit`, `Multi
 `Grep`, `LS`, `Bash`, `NotebookRead` and `NotebookEdit` stand for this app's, other fields such
 as `color` are ignored with a note, and its model values `sonnet`, `opus`, `haiku` and `inherit`
 mean the chat's model. An agent file is at most 16 KB (16,384 bytes) with up to 8,000 characters
-of instructions; each folder is read up to 100 entries and at most 30 agents are used. A file
+of instructions; a folder with more than 100 entries is not read (Agent types says so) and at
+most 30 agents are used. A file
 that cannot be used (no description, a bad name or value, too large, a symbolic link, not UTF-8
 text, a name another file already uses, an agent folder outside the project) is listed under
 **Agent tools → Subagents → Agent types** with the reason, and delegating to it fails with that
@@ -2018,7 +2019,7 @@ allows: its profile is intersected with the chat's subagent tool ceiling and any
 fall outside it is refused), the chat's turned-off tools, rules and permission mode apply as to
 any subagent, and subagents never delegate. A tool outside the agent's list is refused like a
 turned-off one. In Manual mode the approval card names the agent and everything it sets, for
-example **Start a subagent (security-auditor · read-only · model Claude Haiku 5.5 · effort
+example **Start a subagent (security-auditor · read-only · model Claude Sonnet 4.5 · effort
 Fast; separate paid model requests, at most 8 steps)**, followed by the task, the agent file,
 its tools and skills, and the exact endpoint. Text the app shows or sends from agent files is
 redacted (the Databricks token and common secret shapes).

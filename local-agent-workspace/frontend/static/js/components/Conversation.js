@@ -336,6 +336,8 @@ const STOP_TEXT = { streaming: 'Stopped while replying', tools: 'Stopped during 
 function toolOutcome(event) {
   const clipped = clip(event.output)
   if (event.state === 'rejected') {
+    // A before-tool hook's deny: its hook and reason, not the text the model got.
+    if (event.hook_blocked?.hook_id) return `Not run: hook ${event.hook_blocked.hook_id} blocked it${event.hook_blocked.reason ? `: ${clip(event.hook_blocked.reason)}` : ''}`
     if (event.approval === 'expired') return 'Not answered in time; the action did not run'
     if (event.approval === 'declined') return event.decline_note ? `Action declined: ${clip(event.decline_note)}` : 'Action declined'
     // Blocked by a rule, Don't ask or a mode change; the reason may already start with "Not run:".

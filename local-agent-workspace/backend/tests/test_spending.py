@@ -27,6 +27,9 @@ def test_limits_are_numbers_of_dbu_from_zero_to_the_maximum():
     for value in (-0.1, spending.MAX_LIMIT_DBU + 1, True, "3", None, float("nan"), float("inf")):
         with pytest.raises(ValueError, match="from 0 \\(off\\)"):
             spending.validate_limit(value)
+    with pytest.raises(ValueError, match="at least 0.001"):
+        spending.validate_limit(0.0004)  # Rounded to 0 it would mean no limit.
+    assert spending.validate_limit(0.001) == 0.001
 
 
 @pytest.fixture
