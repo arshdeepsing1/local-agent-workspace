@@ -11,6 +11,14 @@ Follow-up of 2026-10-15:
   (0 = none), **Agent tools → Usage** shows the spend against the limit and sets a chat's own.
   One notice at 80%; at the limit the turn ends before the next request, with **Continue**
   and a "Reached the spending limit" notification.
+- Hooks can answer in JSON: a before-tool hook can deny a call, ask for an approval card (also
+  in Bypass), replace its arguments (checked again against the schema, rules and card) or add
+  context for the agent; after-tool and failure hooks can add context.
+- New hook events: `user_prompt` (block, edit or extend your message), `session_start`,
+  `agent_stop` (keep the agent working, at most 3 times), `subagent_start` and `subagent_stop`
+  (one more round, or a replacement report). Up to 16 hooks.
+- Hook cards say what a hook decided, with a before/after view of changed arguments; messages
+  show a hook's edit or block; Agent tools → Extensions lists the events and their JSON output.
 
 Requests of 2026-10-14 (testing on a new machine):
 

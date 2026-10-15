@@ -42,6 +42,8 @@ function summarizeTools(events) {
         + (Number.isInteger(input.offset) && input.offset > 0 ? ` · from entry ${input.offset}` : '')
     }
     if (event.name === 'project_overview') subject = input.path && input.path !== '.' ? String(input.path) : 'workspace'
+    // A hook card names its hook and the tool it ran for (lifecycle events have no tool).
+    if (String(event.name || '').startsWith('hook_') && input.hook_id) subject = `${input.hook_id}${input.tool ? ` · ${input.tool}` : ''}`
     let taskStatus
     if (event.name === 'create_task' || event.name === 'update_task') {
       let task = {}
@@ -189,13 +191,55 @@ function jobStateLine(job) {
     job.shown || ''].filter(Boolean).join(' · ')
 }
 
+// Hooks (lifecycle_hooks.py). A hook card's structured result is hook_result ({ decision?, reason?, context?,
+// arguments?: { before, after }, prompt?: { before, after }, report?, ignored? }); a tool card can carry hook_change
+// ({ hooks, original }: a before-tool hook replaced the arguments), hook_ask ({ hook_id, reason }: a hook asked for
+// its card) and hook_blocked ({ hook_id, reason }: a hook's deny).
+const STOP_HOOKS = new Set(['hook_agent_stop', 'hook_subagent_stop'])
+export function hookSummary(event) {
+  const result = event.hook_result
+  const parts = []
+  if (result && typeof result === 'object') {
+    const reason = clip(result.reason, 160)
+    if (result.decision === 'deny') parts.push(`Hook blocked: ${reason}`)
+    else if (result.decision === 'block') parts.push(STOP_HOOKS.has(event.name) ? `Hook asked the agent to continue: ${reason}` : `Hook blocked the message: ${reason}`)
+    else if (result.decision === 'ask') parts.push(`Hook asked for approval: ${reason}`)
+    if (result.arguments) parts.push('Hook changed the arguments')
+    if (result.prompt) parts.push('Hook edited the message')
+    if (result.report) parts.push('Hook replaced the report')
+    if (result.context) parts.push('Hook added context')
+  }
+  const hooks = Array.isArray(event.hook_change?.hooks) ? event.hook_change.hooks.join(', ') : ''
+  if (event.hook_change) parts.push(hooks ? `Hook ${hooks} changed the arguments` : 'A hook changed the arguments')
+  if (event.hook_ask && event.state !== 'pending') parts.push(`Hook ${event.hook_ask.hook_id} asked for approval`)
+  return parts.join(' · ')
+}
+
+const pretty = value => typeof value === 'string' ? value : JSON.stringify(value ?? {}, null, 2)
+
+function HookResult({ result }) {
+  if (!result || typeof result !== 'object') return null
+  return html`<div class="hook-result">
+    ${result.reason ? html`<p class="tool-detail-label">Reason</p><p class="hook-reason">${result.reason}</p>` : null}
+    ${result.context ? html`<p class="tool-detail-label">Context added for the agent</p><pre aria-label="Hook context">${result.context}</pre>` : null}
+    ${result.arguments ? html`<p class="tool-detail-label">Arguments before the hook</p><pre aria-label="Arguments before">${pretty(result.arguments.before)}</pre>
+      <p class="tool-detail-label">Arguments after the hook</p><pre aria-label="Arguments after">${pretty(result.arguments.after)}</pre>` : null}
+    ${result.prompt ? html`<p class="tool-detail-label">Message before the hook</p><pre aria-label="Message before">${result.prompt.before}</pre>
+      <p class="tool-detail-label">Message after the hook</p><pre aria-label="Message after">${result.prompt.after}</pre>` : null}
+    ${result.report ? html`<p class="tool-detail-label">Report the parent chat receives</p><pre aria-label="Replacement report">${result.report}</pre>` : null}
+    ${Array.isArray(result.ignored) && result.ignored.length ? html`<p class="muted hook-ignored">Ignored fields: ${result.ignored.join(', ')}</p>` : null}
+  </div>`
+}
+
 // failure: what a failed tool told the agent (toolError), or null.
 function ToolDetails({ event, pending, result = null, failure = null }) {
   const { command, ...options } = event.input || {}
   const hasCommand = typeof command === 'string'
   const job = result?.job
   return html`
-    <p class="tool-detail-label">${hasCommand ? 'Command' : 'Input'}</p>
+    ${event.hook_change ? html`<p class="tool-detail-label">Before the hook (the agent's proposal)</p>
+      <pre aria-label="Arguments before the hook">${pretty(event.hook_change.original)}</pre>` : null}
+    <p class="tool-detail-label">${hasCommand ? 'Command' : 'Input'}${event.hook_change ? ' after the hook' : ''}</p>
     <pre aria-label=${hasCommand ? 'Command' : 'Input'}>${hasCommand ? (pending && event.preview ? event.preview : command) : JSON.stringify(event.input || {}, null, 2)}</pre>
     ${hasCommand && Object.keys(options).length && !(pending && event.preview) ? html`<p class="tool-detail-label">Options</p><pre aria-label="Options">${JSON.stringify(options, null, 2)}</pre>` : null}
     ${pending && !hasCommand && event.preview ? html`<p class="tool-detail-label">Approval preview</p><pre aria-label="Approval preview">${event.preview}</pre>` : null}
@@ -205,7 +249,8 @@ function ToolDetails({ event, pending, result = null, failure = null }) {
         <details class="tool-raw"><summary>Raw result</summary><pre aria-label="Raw result">${result.raw}</pre></details>`
       : !pending || event.output ? html`<p class="tool-detail-label">Output</p><pre aria-label="Output">${event.output || (event.state === 'running' ? 'Waiting for output…' : 'No output.')}</pre>` : null}
     ${failure ? html`<p class="tool-detail-label">Error category</p><p>${failure.label}</p>
-      ${failure.hint ? html`<p>Hint given to the agent: ${failure.hint}</p>` : null}` : null}`
+      ${failure.hint ? html`<p>Hint given to the agent: ${failure.hint}</p>` : null}` : null}
+    <${HookResult} result=${event.hook_result} />`
 }
 
 const clip = (text, limit = 240) => {
@@ -410,6 +455,7 @@ function ToolCard({ event, summary, result, status, failure = null, sessionId, o
   const isTask = event.name === 'create_task' || event.name === 'update_task'
   const allowInChat = pending ? allowLabel(event) : null
   const rule = ruleLine(event)
+  const hooked = hookSummary(event)
   const decide = async (allowed, extra = {}) => {
     setDeciding(true)
     // The note goes to the model with a Decline; extra is { remember: true } (an exact rule for this chat) or { scope, rule? }.
@@ -431,6 +477,7 @@ function ToolCard({ event, summary, result, status, failure = null, sessionId, o
     </button>
     <${DelegationStatus} event=${event} onSelectSession=${onSelectSession} onOpenPath=${onOpenPath} />
     ${rule ? html`<p class="tool-rule">${rule}</p>` : null}
+    ${hooked ? html`<p class="hook-outcome">${hooked}</p>` : null}
     ${expanded || pending ? html`<div class="tool-body">
       ${pending ? html`<p>Local needs your approval to ${title.toLowerCase()}.${event.approval_expires
           ? ` If you do not answer by ${expiryTime(event.approval_expires)}, it will not run.` : ''}</p>
@@ -492,6 +539,22 @@ export function attachmentLabel(item) {
 function Attachments({ items }) {
   if (!Array.isArray(items) || !items.length) return null
   return html`<ul class="attachment-chips" aria-label="Attachments">${items.map((item, index) => html`<li key=${index} class="attachment-chip">${attachmentLabel(item)}</li>`)}</ul>`
+}
+
+// What user_prompt hooks did to a message (lifecycle_hooks.prompt_hooks): hook_blocked ({ hook_id, reason }: never
+// sent), hook_edit ({ hooks, original }: the text shown is the hook's replacement) and hook_notes ([{ event, hook_id,
+// context }]: context the model received after the message).
+function HookMessageLabel({ event }) {
+  if (event.hook_blocked) return html`<small class="hook-label">Not sent: blocked by hook ${event.hook_blocked.hook_id}${event.hook_blocked.reason ? ` (${clip(event.hook_blocked.reason, 160)})` : ''}</small>`
+  if (event.hook_edit) return html`<small class="hook-label">Edited by hook ${(event.hook_edit.hooks || []).join(', ')}</small>`
+  return null
+}
+
+function HookMessageDetails({ event }) {
+  const notes = Array.isArray(event.hook_notes) ? event.hook_notes : []
+  return html`${event.hook_edit ? html`<details class="hook-original"><summary>Your original message</summary><p>${event.hook_edit.original}</p></details>` : null}
+    ${notes.length ? html`<details class="hook-notes"><summary>Hook context sent with this message</summary>
+      <ul>${notes.map((note, index) => html`<li key=${index}><strong>${String(note.event || '').replace(/_/g, ' ')} hook ${note.hook_id}:</strong> ${note.context}</li>`)}</ul></details>` : null}`
 }
 
 function ActionButton({ label, icon: Icon, onClick, disabled = false, target }) {
@@ -664,7 +727,7 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
           setEditing(null)
           resent(result, text)
         }} />`
-      if (event.type === 'user') return html`<div class=${`user-message${event.steered ? ' steered' : ''}`} key=${event.id}>${event.steered ? html`<small class="steered-label">Sent while the agent was working</small>` : null}${event.origin?.kind === 'delegated' ? html`<small class="delegation-origin">Delegated by parent conversation</small>` : null}${event.text}<${Attachments} items=${event.attachments} />${event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}${event.text || idle ? html`<div class="message-actions">${event.text ? html`<${CopyAction} text=${event.text} label="Copy message" />` : null}${idle ? html`<${ActionButton} label="Edit message" icon=${Pencil} target=${`edit:${event.id}`} onClick=${() => setEditing(event.id)} /><${ActionButton} label="Rewind to here" icon=${Undo2} onClick=${() => setRewinding(event)} />` : null}</div>` : null}</div>`
+      if (event.type === 'user') return html`<div class=${`user-message${event.steered ? ' steered' : ''}${event.hook_blocked ? ' hook-blocked' : ''}`} key=${event.id}>${event.steered ? html`<small class="steered-label">Sent while the agent was working</small>` : null}${event.origin?.kind === 'delegated' ? html`<small class="delegation-origin">Delegated by parent conversation</small>` : null}<${HookMessageLabel} event=${event} />${event.text}<${Attachments} items=${event.attachments} /><${HookMessageDetails} event=${event} />${event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}${event.text || idle ? html`<div class="message-actions">${event.text ? html`<${CopyAction} text=${event.text} label="Copy message" />` : null}${idle ? html`<${ActionButton} label="Edit message" icon=${Pencil} target=${`edit:${event.id}`} onClick=${() => setEditing(event.id)} /><${ActionButton} label="Rewind to here" icon=${Undo2} onClick=${() => setRewinding(event)} />` : null}</div>` : null}</div>`
       if (event.type === 'tool' && event.name === 'ask_user') return html`<${QuestionCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
       if (event.type === 'tool' && event.name === 'submit_plan') return html`<${PlanCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
       if (event.type === 'tool') return html`<${ToolCard} key=${event.id} event=${event} summary=${toolSummaries.get(event.id)} result=${toolStates.get(event.id).result} status=${toolStates.get(event.id).status} failure=${toolStates.get(event.id).failure} sessionId=${session.id} onError=${onError} onSelectSession=${onSelectSession} onOpenPath=${onOpenPath} />`

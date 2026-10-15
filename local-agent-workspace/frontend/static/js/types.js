@@ -140,6 +140,13 @@
 //   when the turn failed before that; absent on older events), steered? (true: sent while the agent was
 //   working) and attachments?: Attachment[]. The 'Stopped.' notice carries stop_phase?: 'streaming'|'tools'|'waiting'.
 //   A compaction's notice carries compaction?: Compaction (one notice per compaction).
+//   Hooks (lifecycle_hooks.py): a hook card (name 'hook_<event>', input { hook_id, tool?, call_id?, event?,
+//   subagent_session_id? }) carries hook_result?: { json: true, decision?, reason?, context?, arguments?: { before,
+//   after }, prompt?: { before, after }, report?, ignored?: string[] } when the hook printed one JSON object. A tool
+//   card can carry hook_change?: { hooks: string[], original } (a before-tool hook replaced the arguments; input is
+//   what ran), hook_ask?: { hook_id, reason } (a hook asked for its card) and hook_blocked?: { hook_id, reason }.
+//   A user event can carry hook_blocked? (never sent), hook_edit?: { hooks, original } (text is the hook's
+//   replacement) and hook_notes?: [{ event, hook_id, context }] (context sent to the model after the message).
 // Delegation: { status: 'queued'|'running'|'awaiting_approval'|...|'completed'|'failed'|'cancelled'|'interrupted',
 //   completed_tools, last_tool?, terminal_reason?, agent_type?, started?, ended? (epoch seconds) }. A finished
 //   delegate_task card's output is the JSON result { child_session_id, agent_type, tool_profile, status,

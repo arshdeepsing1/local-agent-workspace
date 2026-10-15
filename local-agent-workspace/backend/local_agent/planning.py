@@ -524,6 +524,8 @@ class DelegateManager:
             if context:
                 prompt += f"\n\nParent-provided context:\n{context}"
             prompt += f"\n\n{BRIEFS[profile]} {REPORT}"
+            # subagent_start hooks (in this parent chat): their context reaches the child's first request.
+            await self.manager.subagent_start_hooks(parent, child, task=task, context=context, max_steps=max_steps)
             self.manager.start(child["id"], prompt)
             worker = self.manager.tasks[child["id"]]
             try:
@@ -555,7 +557,9 @@ class DelegateManager:
         status = "cancelled" if cancelled or reason == "stopped" else "failed" if errors or reason != "completed" else "completed"
         await self.progress(saved, terminal_reason=reason)
         reply = next((event.get("text", "") for event in reversed(events) if event.get("type") == "assistant" and event.get("text")), "")
-        output = ("Errors:\n" + "\n".join(errors) + "\n\n" if errors else "") + (reply or "No final assistant reply was produced.")
+        if reply and not cancelled and status == "completed":
+            reply = self.manager.hook_report(saved, reply)  # A subagent_stop hook's replacement report, labelled.
+        output =("Errors:\n" + "\n".join(errors) + "\n\n" if errors else "") + (reply or "No final assistant reply was produced.")
         paths = [self.manager.settings.redact(path)[:PATH_CHARS] for path in changed_paths(events)]
         steps = sum(event.get("type") == "assistant" for event in events)
         calls = sum(event.get("type") == "tool" for event in events)
