@@ -280,6 +280,9 @@ class CallAllowance:
         self.allowance.charge(text)
         self.settled = True
 
+    def charge_more(self, sent, charged):
+        self.allowance.charge_more(sent, charged)
+
 
 class DelegateManager:
     def __init__(self, agent_manager):

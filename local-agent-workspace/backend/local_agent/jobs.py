@@ -119,9 +119,11 @@ def drained(reader):
 
 
 async def discard_output(process):
-    """Read a command's output to the end without keeping it, then reap it."""
-    while await process.stdout.read(65536):
-        pass
+    """Read a command's output (and stderr, when it has its own pipe) to the end without keeping it, then reap it."""
+    async def empty(stream):
+        while await stream.read(65536):
+            pass
+    await asyncio.gather(*(empty(stream) for stream in (process.stdout, process.stderr) if stream is not None))
     await process.wait()
 
 
@@ -162,15 +164,16 @@ def validate_argv(argv, limit=ARGV_LIMIT):
                          "1,000 characters without NUL.")
 
 
-async def spawn(argv, workspace, env):
-    """Start argv in its own session with no stdin and stdout and stderr on one pipe.
+async def spawn(argv, workspace, env, separate_stderr=False):
+    """Start argv in its own session with no stdin and stdout and stderr on one pipe
+    (separate_stderr: stderr on a pipe of its own).
 
     Process creation can finish after its caller is cancelled. That process is then
     acquired and reaped before the cancellation propagates."""
     spawning = asyncio.create_task(asyncio.create_subprocess_exec(
         *argv, cwd=workspace, env=env,
         stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT, start_new_session=True))
+        stderr=asyncio.subprocess.PIPE if separate_stderr else asyncio.subprocess.STDOUT, start_new_session=True))
     try:
         return await asyncio.shield(spawning)
     except asyncio.CancelledError as error:
@@ -184,18 +187,20 @@ async def spawn(argv, workspace, env):
 
 
 async def run_process(command, workspace, timeout_seconds=60, max_output_bytes=80_000, on_output=None,
-                      extra_env=None, *, argv=None, env=None):
+                      extra_env=None, *, argv=None, env=None, separate_stderr=False):
     """Run a noninteractive command, retaining bounded output while draining its pipe.
 
     command is the text run by the shell, or with argv the display text of argv,
     which then runs without a shell. extra_env holds variables passed through by
     name; the caller has filtered them. env, when given, replaces the whole
-    environment (command_environment(extra_env) otherwise)."""
+    environment (command_environment(extra_env) otherwise). separate_stderr keeps
+    stderr out of output: the result then also has stderr and stderr_truncated
+    (at most max_output_bytes too), and on_output sees stdout only."""
     validate_command_options(command, timeout_seconds, max_output_bytes)
     if argv is not None:
         validate_argv(argv, PREPARED_ARGV_LIMIT)
     env = env if env is not None else command_environment(extra_env)
-    process = await spawn(list(argv) if argv is not None else shell_argv(command), workspace, env)
+    process = await spawn(list(argv) if argv is not None else shell_argv(command), workspace, env, separate_stderr)
 
     output = ""
     retained = 0
@@ -203,20 +208,39 @@ async def run_process(command, workspace, timeout_seconds=60, max_output_bytes=8
     finished = False
     changed = asyncio.Event()
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    errors = {"text": "", "kept": 0, "truncated": False}
 
     def result(stopped=True):
         values = {"exit_code": process.returncode, "output": output, "truncated": truncated}
+        if separate_stderr:
+            values.update(stderr=errors["text"], stderr_truncated=errors["truncated"])
         return values if stopped else {**values, "stopped": False}
+
+    async def drain_stderr():
+        reader = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        while chunk := await process.stderr.read(4096):
+            kept = chunk[:max(0, max_output_bytes - errors["kept"])]
+            errors["kept"] += len(kept)
+            errors["text"] += reader.decode(kept)
+            errors["truncated"] = errors["truncated"] or len(kept) < len(chunk)
+        errors["text"] += reader.decode(b"", final=not errors["truncated"])
 
     async def drain():
         nonlocal output, retained, truncated, finished
-        while chunk := await process.stdout.read(4096):
-            available = max_output_bytes - retained
-            kept = chunk[:available]
-            retained += len(kept)
-            output += decoder.decode(kept)
-            truncated = truncated or len(chunk) > available
-            changed.set()
+        side = asyncio.ensure_future(drain_stderr()) if separate_stderr else None
+        try:
+            while chunk := await process.stdout.read(4096):
+                available = max_output_bytes - retained
+                kept = chunk[:available]
+                retained += len(kept)
+                output += decoder.decode(kept)
+                truncated = truncated or len(chunk) > available
+                changed.set()
+            if side is not None:
+                await side
+        finally:
+            if side is not None and not side.done():
+                side.cancel()
         # A byte limit may cut a UTF-8 character in half. Do not add a replacement
         # character for that deliberately omitted suffix.
         output += decoder.decode(b"", final=not truncated)

@@ -1794,11 +1794,13 @@ background-job completion do not launch them.
 
 **Output.** A hook may print **one JSON object** on stdout, for example
 `{"decision": "deny", "reason": "Generated files are rebuilt by make; edit the template."}`.
-Only when the whole trimmed output is one object is it read; any other output (text, a list,
-malformed or cut-off JSON) is plain text, shown on the hook card as before. Fields an event
-does not use are ignored and listed on the card. A known field with a wrong type or value (for
-example `"decision": "block"` on `before_tool`), or JSON output over 16 KB, counts as a failed
-hook. Exit code 0 means no objection plus the optional JSON; any other exit code (or a timeout)
+Only stdout is read, and only when its whole trimmed text is one object; any other output (text,
+a list, cut-off JSON) is plain text, shown on the hook card as before. stderr is never read as
+JSON: the card shows it after stdout, under `[stderr]`, so a warning a command prints there
+cannot turn a decision into plain text. Fields an event does not use are ignored and listed on
+the card. Output that starts with `{` and ends with `}` but is not valid JSON, a known field with
+a wrong type or value (for example `"decision": "block"` on `before_tool`), or JSON output over
+16 KB counts as a failed hook. Exit code 0 means no objection plus the optional JSON; any other exit code (or a timeout)
 keeps its old meaning: a failing before-tool hook blocks its tool, and other failing hooks
 leave a warning notice and change nothing. Hooks run in configuration order; a later hook of
 the same event sees an earlier hook's replacement `arguments` or `prompt`, and a `deny` or
@@ -1823,8 +1825,10 @@ the same event sees an earlier hook's replacement `arguments` or `prompt`, and a
   with a **Before the hook** view of the agent's proposal), the read-before-overwrite and
   changed-file guards, and the shell-free run of a command an argv rule allows. A hook cannot
   turn an approved or allowed command into another one without the new one's own check. The
-  agent is told its arguments were replaced and what ran. The project's Verify command and the
-  activity log keep the app's arguments (the field is listed as ignored).
+  agent is told its arguments were replaced and what ran. If you edit the call on its card
+  (**Edit** before approving), your edit runs without before-tool hooks checking it again (the
+  rules still do), and the agent is told the edited arguments ran. The project's Verify command
+  and the activity log keep the app's arguments (the field is listed as ignored).
 - `prompt` (`user_prompt`): replacement text for your message. The message then shows
   "Edited by hook …" with your original under **Your original message**; @ files and ! output
   you attached stay attached (a replacement's own @ tokens attach nothing).
@@ -1836,6 +1840,17 @@ the same event sees an earlier hook's replacement `arguments` or `prompt`, and a
 - `report` (`subagent_stop`): replacement text for the report the parent chat receives,
   labelled as replaced by the hook; the subagent's own final reply stays in its transcript.
 
+**Queued messages and subagent chats.** A message you queue while the agent works stays
+queued while its `user_prompt` hooks run or their card waits, so after **Stop**, an error or a
+restart it is still queued (see **Messages while the agent works**); it leaves the queue once it
+is sent or a hook blocks it, and one you remove meanwhile is not sent. If hook context makes it
+too large for the context budget at that step, it waits for a later one, and its hooks run again
+then. The subagent events belong to a subagent's delegated turn. A subagent chat you continue
+yourself (a message, **Edit** or **Retry** after its delegation ended) is an ordinary chat for
+hooks: your messages there get `user_prompt` hooks and its turns end with `agent_stop`, under
+that chat's mode and rules (a subagent with a restricted tool profile, such as `explore`, runs
+no hooks); nothing runs or shows in the parent chat.
+
 **Permissions.** Every event goes through the same approvals as before: its permission is
 `hook_<event>` (for example `hook_user_prompt`), each hook asks for approval except in Bypass,
 Plan skips hooks, and Don't ask runs only hooks a rule allows (a before-hook without one blocks
@@ -1846,7 +1861,8 @@ where the delegation is) and says what the hook decided: "Hook blocked: …", "H
 approval: …", "Hook added context", "Hook changed the arguments" (with a before/after view) or
 "Hook edited the message". A declined hook does not run: a declined before-hook blocks its tool,
 and a declined lifecycle hook changes nothing. Hooks have a 1–30 second timeout; a card and a
-warning show at most 3.8 KB of output, and secrets are redacted from everything shown or sent.
+warning show at most 3.8 KB of output, and secrets are redacted from everything shown or sent
+(in JSON output also after decoding, so an escaped spelling of a secret is caught too).
 Hooks do not recursively invoke hooks. Enable only commands you intend to run for every
 applicable event; configuration can change only while agent turns are idle.
 
@@ -2380,7 +2396,8 @@ The results of one model response also share a **context allowance**: what the i
 budget leaves after the latest exchange, with room for the largest summary, the app
 record, a handoff line, the tool definitions and 1,024 tokens for the next step's notices,
 and at most half the input budget. Room for a short notice per tool call of the response is
-kept aside, and every text sent is counted, including notices and refusals. A compaction
+kept aside, and every text sent is counted, including notices, refusals and what hooks add to
+a result (their context and a changed-arguments note). A compaction
 inside that turn can therefore keep every result it was given, as long as the response's
 own tool calls and their notices fit the budget. The allowance uses the estimate scale
 after the response's reported input tokens, as the next request does. A read (`read_file`,

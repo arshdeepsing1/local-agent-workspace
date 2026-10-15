@@ -208,6 +208,10 @@ class ResultAllowance:
         self._settle()
         self.left -= self.cost(text)
 
+    def charge_more(self, sent, charged):
+        """A settled result grew before it was sent (hook notes): charge what sent adds to charged."""
+        self.left -= max(0, self.cost(sent) - self.cost(charged))
+
 
 def deferred_text(name, cost, total):
     """The model's result for a read that did not fit this response's allowance."""

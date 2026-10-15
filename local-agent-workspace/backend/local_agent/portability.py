@@ -6,9 +6,11 @@ import time
 import uuid
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError
 
 from .context import LARGE_SUMMARY_MAX_BYTES, MAX_ESTIMATE_SCALE, context_boundary
+from .extensions import HOOK_CONTEXT_CHARS, HOOK_EVENTS, HOOK_REPORT_CHARS, MAX_HOOKS
+from .lifecycle_hooks import SHOWN_ARGUMENTS_BYTES
 from .planning import MAX_STEPS, subagent_index
 from .spending import MAX_LIMIT_DBU
 
@@ -110,6 +112,69 @@ class Withheld(Record):
     allowance_tokens: int = Field(ge=0)
 
 
+def _shown_arguments(value):
+    if isinstance(value, dict) and len(json.dumps(value, ensure_ascii=False).encode("utf-8")) > SHOWN_ARGUMENTS_BYTES:
+        raise ValueError("Hook arguments are too large.")
+    return value
+
+
+# What lifecycle_hooks records about hooks; the chat view reads these shapes, so an import must match them.
+HookId = Annotated[str, Field(min_length=1, max_length=64)]
+HookIds = Annotated[list[HookId], Field(min_length=1, max_length=MAX_HOOKS)]
+HookText = Annotated[str, Field(max_length=HOOK_CONTEXT_CHARS)]  # a reason or context, as parse_hook_output clips it
+# lifecycle_hooks.shown_arguments: the arguments object, or its JSON text shortened when it is large.
+ShownArguments = Annotated[dict[str, Any] | Annotated[str, Field(max_length=SHOWN_ARGUMENTS_BYTES // 4)],
+                           AfterValidator(_shown_arguments)]
+
+
+class HookVerdict(Record):
+    """hook_ask or hook_blocked: the hook that asked for a card or blocked a call or message."""
+    hook_id: HookId
+    reason: HookText | None = None
+
+
+class HookChange(Record):
+    """hook_change: the before-tool hooks that replaced a call's arguments and the agent's proposal."""
+    hooks: HookIds
+    original: ShownArguments
+
+
+class HookEdit(Record):
+    """hook_edit: the user_prompt hooks that replaced a message and the user's own text."""
+    hooks: HookIds
+    original: str = Field(max_length=100_000)  # A message, or queued messages sent as one.
+
+
+class HookNote(Record):
+    """One entry of hook_notes: context a hook added for the model after a message."""
+    event: Literal[HOOK_EVENTS]
+    hook_id: HookId
+    context: HookText
+
+
+class ArgumentsChange(Record):
+    before: ShownArguments
+    after: ShownArguments
+
+
+class PromptChange(Record):
+    before: str = Field(max_length=4000)
+    after: str = Field(max_length=4000)
+
+
+class HookResult(Record):
+    """hook_result: what a hook card shows of a structured result (LifecycleHooks.hook_summary)."""
+    model_config = ConfigDict(serialize_by_alias=True)
+    structured: bool | None = Field(default=None, alias="json")  # "json" would shadow BaseModel.json.
+    decision: Literal["deny", "ask", "block"] | None = None
+    reason: HookText | None = None
+    context: HookText | None = None
+    report: str | None = Field(default=None, max_length=HOOK_REPORT_CHARS)
+    arguments: ArgumentsChange | None = None
+    prompt: PromptChange | None = None
+    ignored: list[Annotated[str, Field(max_length=40)]] | None = Field(default=None, max_length=16)
+
+
 class Event(Record):
     id: str = Field(min_length=1, max_length=512)
     type: Literal["user", "assistant", "tool", "notice", "error"]
@@ -165,12 +230,12 @@ class Event(Record):
     # Hooks (lifecycle_hooks): a hook card's structured result; on a tool card, the arguments a
     # before-tool hook replaced, the card it asked for, or its deny; on a user message, a hook's
     # edit or block and the context hooks added for the model.
-    hook_result: dict[str, Any] | None = None
-    hook_change: dict[str, Any] | None = None
-    hook_ask: dict[str, Any] | None = None
-    hook_blocked: dict[str, Any] | None = None
-    hook_edit: dict[str, Any] | None = None
-    hook_notes: list[dict[str, Any]] | None = Field(default=None, max_length=32)
+    hook_result: HookResult | None = None
+    hook_change: HookChange | None = None
+    hook_ask: HookVerdict | None = None
+    hook_blocked: HookVerdict | None = None
+    hook_edit: HookEdit | None = None
+    hook_notes: list[HookNote] | None = Field(default=None, max_length=2 * MAX_HOOKS)
 
 
 class Function(Record):
@@ -534,6 +599,11 @@ def fresh_copies(bundle, workspace, *, kind="import"):
             child = event.pop("child_session_id", None)
             if child in ids:
                 event["child_session_id"] = ids[child]
+            if str(event.get("name")).startswith("hook_subagent_") and isinstance(event.get("input"), dict):
+                # A subagent event's hook card names its subagent: the copy, or none outside the bundle.
+                subagent = event["input"].pop("subagent_session_id", None)
+                if subagent in ids:
+                    event["input"]["subagent_session_id"] = ids[subagent]
             origin = event.pop("origin", None)
             if origin and origin["parent_session_id"] in ids:
                 parent = origin["parent_session_id"]

@@ -65,7 +65,7 @@ from .approvals import MAX_ALLOW_RULES, busy_status, declined, rule_for
 from .notify import SystemNotifier, attention_message
 from .context import INCOMPLETE_RESPONSE_CONTINUATION, INVALID_ARGUMENTS_CONTINUATION, VERIFY_CONTINUATION_PREFIX
 from .context import HOOK_CONTINUATION_PREFIX, is_app_prompt, is_continuation
-from .lifecycle_hooks import LifecycleHooks, ToolHookNotes, hook_contexts, shown_arguments
+from .lifecycle_hooks import LifecycleHooks, ToolHookNotes, blocked_prompt_notice, hook_contexts, shown_arguments
 from .context import retained_request as context_retained
 from . import history
 from .tool_errors import tool_error_text
@@ -1963,7 +1963,9 @@ class AgentManager(LifecycleHooks):
         """Steering: at a step boundary, after every tool result, the unpaused queued messages
         become one user message of this turn. fits(message) says whether that message still fits
         the context budget with the latest tool results; when it does not, the messages stay
-        queued (not paused) until a later step boundary, or the end of the turn."""
+        queued (not paused) until a later step boundary, or the end of the turn. user_prompt hooks
+        check the message first and it stays queued while they run, so a Stop, restart or error
+        then leaves it queued; it leaves the queue once it is sent or a hook blocked it."""
         entries = [item for item in self.queue_of(session) if not item.get("paused")]
         # Never directly after an app-generated prompt.
         if not entries or not wire or wire[-1].get("role") == "user" or is_app_prompt(wire[-1]):
@@ -1978,7 +1980,11 @@ class AgentManager(LifecycleHooks):
             self.store.save(session)
             await self.publish_queue(session, self.settings.redact(str(exc)))
             return
-        if fits is not None and not fits({"role": "user", "content": STEER_PREFIX + content}):
+
+        async def waits(message):
+            """Whether message does not fit the budget now; it then waits, with one notice per turn."""
+            if fits is None or fits({"role": "user", "content": message}):
+                return False
             notified = self.__dict__.setdefault("_steer_wait_notices", set())
             turn = next((event["id"] for event in reversed(session["events"]) if event.get("type") == "user"
                          and not event.get("steered")), None)
@@ -1991,33 +1997,35 @@ class AgentManager(LifecycleHooks):
                     "fit in the context budget. If the reply completes first, it is sent as the next message; after "
                     "Stop, an error or the step limit it stays queued until you click Send queued messages."))
             await self.publish_queue(session)
+            return True
+        message = STEER_PREFIX + content
+        if await waits(message):
             return
         sent = {item["id"] for item in entries}
-        session["queued_messages"] = [item for item in self.queue_of(session) if item.get("id") not in sent]
+        fields = {"text": text, "steered": True, **({"attachments": attachments} if attachments else {})}
         if self.has_hooks(session, "user_prompt"):
-            # The message is shown first; user_prompt hooks then edit, extend or block it (block: it never
-            # reaches the model). It enters the wire with no await before the flag, as below.
-            event = await self.event(session, "user", text=text, steered=True,
-                                     **({"attachments": attachments} if attachments else {}))
-            prepared = await self.prompt_hooks(session, event, text, content, steered=True)
-            if prepared is not None:
-                for target, seen in views:
-                    self.remember_file(session, target, seen)
-                wire.append({"role": "user", "content": STEER_PREFIX + (prepared[1] if prepared[1] is not None
-                                                                         else prepared[0])})
-                event["in_wire"] = True
-                self._drop_pending(session)
-                self.store.save(session)
-            await self.publish_queue(session)
-            return
+            # The hooks edit, extend or block the message (block: it never reaches the model). Their cards
+            # come first; fields collects what they did for the message's event, added below.
+            prepared = await self.prompt_hooks(session, fields, text, content, steered=True)
+            if not sent <= {item.get("id") for item in self.queue_of(session)}:
+                return  # Removed or edited while its hooks ran: not sent.
+            if prepared is None:
+                session["queued_messages"] = [item for item in self.queue_of(session) if item.get("id") not in sent]
+                await self.event(session, "user", **fields)  # Saved with the queue: shown as not sent.
+                await self.event(session, "notice", text=blocked_prompt_notice(fields["hook_blocked"]))
+                await self.publish_queue(session)
+                return
+            message = STEER_PREFIX + (prepared[1] if prepared[1] is not None else prepared[0])
+            if await waits(message):
+                return  # Hook context made it too large: it stays queued, and its hooks run again later.
+        session["queued_messages"] = [item for item in self.queue_of(session) if item.get("id") not in sent]
         for target, seen in views:
             self.remember_file(session, target, seen)
-        wire.append({"role": "user", "content": STEER_PREFIX + content})
+        wire.append({"role": "user", "content": message})
         self._drop_pending(session)
         # No await between the wire append and the event: event() appends the user event before
         # its first await, so the wire and the events never disagree (m4-history-branching).
-        await self.event(session, "user", text=text, steered=True, in_wire=True,
-                         **({"attachments": attachments} if attachments else {}))
+        await self.event(session, "user", **fields, in_wire=True)
         await self.publish_queue(session)
 
     def _pause_queue(self, session):
@@ -2465,10 +2473,15 @@ class AgentManager(LifecycleHooks):
         fit is withheld (the model may ask again), other results are shortened. gate (a
         planning.DelegationGate): a delegate_task call that runs in parallel with others (run_delegations).
         Hooks may add to the result: a note when a before-tool hook changed the arguments, and
-        context from before-tool, after-tool and failure hooks (lifecycle_hooks.add_hook_notes)."""
+        context from before-tool, after-tool and failure hooks (lifecycle_hooks.add_hook_notes).
+        What they add is charged to allowance too; an unsettled result is charged whole by the caller."""
         notes = ToolHookNotes()
+        settled = getattr(allowance, "settled", None)
         output = await self._execute_tool(session, tools, name, arguments, call_id, origin, allowance, gate, notes)
-        return await self.add_hook_notes(session, notes, output, origin)
+        sent = await self.add_hook_notes(session, notes, output, origin)
+        if allowance is not None and sent != output and allowance.settled != settled:
+            allowance.charge_more(sent, output)  # _execute_tool charged output, before the hook notes.
+        return sent
 
     async def _execute_tool(self, session, tools, name, arguments, call_id, origin, allowance, gate, notes):
         event = notes.event = await self.event(session, "tool", name=name, input=arguments, call_id=call_id,
@@ -2647,6 +2660,9 @@ class AgentManager(LifecycleHooks):
                     carded = True
                     if event.get("edited"):
                         edited_note = EDITED_NOTES[name].format(command=arguments.get("command", ""))
+                        if notes.changed:
+                            # The user edited what the hook proposed; the edit is not hooked again.
+                            notes.changed, notes.edited = (notes.changed[0], arguments), True
                 if not self.guidance_matches(session, tools):
                     raise ValueError("Project instructions changed while preparing this action. Review the refreshed guidance before retrying. No file was changed and no command ran.")
                 if name != "run_command":
@@ -3456,19 +3472,25 @@ class AgentManager(LifecycleHooks):
                               [f"- {name}" for name in changed[:RECORD_FILES]], max(0, len(changed) - RECORD_FILES),
                               lambda n: f"- … {n:,} more", None))
             completed = completed_call_ids(session)
+            # Those calls' tool events: their input is what ran (a before-tool hook may have replaced the path).
+            ran = {event["call_id"]: event for event in session.get("events", []) if isinstance(event, dict)
+                   and event.get("type") == "tool" and event.get("call_id") in completed
+                   and event.get("state") == "completed" and not event.get("result_withheld")}
             seen = set()
             for message in wire[cut:]:
                 for call in message.get("tool_calls") or [] if message.get("role") == "assistant" else []:
                     function = call.get("function") if isinstance(call, dict) else None
-                    if not isinstance(function, dict) or call.get("id") not in completed:
+                    if not isinstance(function, dict) or call.get("id") not in ran:
                         continue
                     if function.get("name") not in SEEN_PATH_TOOLS:
                         continue
-                    try:
-                        arguments = json.loads(function.get("arguments") or "{}")
-                    except (TypeError, ValueError):
-                        continue
-                    seen.update(call_paths(function["name"], arguments))
+                    paths = call_paths(function["name"], event_input(ran[call["id"]]))
+                    if not paths:  # An older record without the event's input: the call's own arguments.
+                        try:
+                            paths = call_paths(function["name"], json.loads(function.get("arguments") or "{}"))
+                        except (TypeError, ValueError):
+                            continue
+                    seen.update(paths)
             for message in [*context_retained(wire, cut), *wire[cut:]]:
                 if message.get("role") == "user":
                     seen.update(mentions.attached_paths(message.get("content")))

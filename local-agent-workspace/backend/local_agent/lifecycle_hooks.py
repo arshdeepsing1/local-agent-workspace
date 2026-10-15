@@ -13,7 +13,8 @@ Events (extensions.HOOK_EVENTS):
 - user_prompt (prompt_hooks): before a user's message goes to the model; never for the app's
   hidden continuations or a subagent's delegated prompt.
 - session_start (prompt_hooks): before a chat's first model request only.
-- agent_stop / subagent_stop (stop_hooks): when a turn would end with a final reply.
+- agent_stop / subagent_stop (stop_hooks): when a turn would end with a final reply; subagent_stop
+  only for a subagent's delegated turn (a subagent chat the user continues is an ordinary chat).
 - subagent_start (subagent_start_hooks): before a subagent's first request.
 Subagent events run in the parent chat: its mode, rules and cards.
 """
@@ -113,13 +114,22 @@ def message_context_text(notes):
     return note_lines(notes, "App note: context from the user's local hook commands (not the user's words):")
 
 
-def changed_arguments_note(hook_ids, arguments, ran=True):
+def changed_arguments_note(hook_ids, arguments, ran=True, edited=False):
+    """edited: the user then edited the hook's arguments on the approval card; arguments are the edited ones."""
     shown = clip(json.dumps(arguments, ensure_ascii=False), 1500)
+    changed = f"A before-tool hook ({', '.join(hook_ids)}) changed this call's arguments"
+    if edited:
+        changed += ", and the user then edited them on the approval card,"
     if not ran:
-        return (f"[A before-tool hook ({', '.join(hook_ids)}) changed this call's arguments to: {shown}. The changed "
-                "call did not run; the result below is about it. Your proposed arguments did not run either.]")
-    return (f"[A before-tool hook ({', '.join(hook_ids)}) changed this call's arguments before it ran. It ran with: "
-            f"{shown}. Your proposed arguments did not run.]")
+        return (f"[{changed} to: {shown}. The changed call did not run; the result below is about it. Your proposed "
+                "arguments did not run either.]")
+    return f"[{changed} before it ran. It ran with: {shown}. Your proposed arguments did not run.]"
+
+
+def blocked_prompt_notice(blocked):
+    """The notice under a message a user_prompt hook blocked: blocked is its hook_blocked."""
+    return (f"A user-prompt hook ({blocked['hook_id']}) blocked this message: {clip(blocked['reason'], 600)} "
+            "It was not sent to the agent.")
 
 
 def stop_continuation(phase, outcome, count, cap):
@@ -139,6 +149,7 @@ class ToolHookNotes:
     def __init__(self):
         self.event = None  # the call's tool card
         self.changed = None  # (hook IDs, arguments) when before-tool hooks replaced the arguments
+        self.edited = False  # the user then edited them on the card: changed holds the edited arguments
         self.ran = False  # whether the tool itself ran (the changed-arguments note says so)
         self.contexts = []  # (event, hook ID, context)
 
@@ -211,10 +222,12 @@ class LifecycleHooks:
                     raise ValueError(verdict.message)
                 if verdict.decision == "ask":
                     status = self.statuses.get(owner["id"])
-                    allowed, _ = await self.request_approval(owner, hook_tools, event, f"hook_{phase}",
-                                                             {"hook_id": hook["id"]})
-                    if status == "delegating" and self.statuses.get(owner["id"]) == "running":
-                        await self.status(owner, "delegating")  # A subagent's hook card in its parent.
+                    try:
+                        allowed, _ = await self.request_approval(owner, hook_tools, event, f"hook_{phase}",
+                                                                 {"hook_id": hook["id"]})
+                    finally:
+                        if status != "running" and (owner is not session or not asyncio.current_task().cancelling()):
+                            await self.after_hook_card(owner, event, status)
                     if not allowed:
                         approval = event.get("approval")
                         if approval is None:  # Denied by a fresh check just before the card.
@@ -267,6 +280,21 @@ class LifecycleHooks:
                 warning = warning.rstrip().removesuffix(".")
                 await self.event(owner, "notice", text=f"{WARNING_LABELS[phase]} warning: {warning}. {WARNING_TAILS[phase]}")
         return outcomes
+
+    async def after_hook_card(self, owner, event, previous):
+        """After a hook card in a chat that was not just running (a subagent's card in its delegating
+        parent): approve() left it running, so put back its previous status, or awaiting_approval
+        while another of its cards waits. A card a stopped subagent left waiting shows cancelled."""
+        if event.get("state") == "pending":
+            await self.update_event(owner, event, state="cancelled")
+        task = self.tasks.get(owner["id"])
+        if previous is None or task is None or task.done() or task.cancelling():
+            return  # The owner's turn is over or stopping: its own end sets its status.
+        waiting = any(key[0] == owner["id"] and not future.done() for key, future in self.pending.items())
+        # Another card's own wait ended meanwhile: the chat was delegating under it.
+        status = "awaiting_approval" if waiting else "delegating" if previous == "awaiting_approval" else previous
+        if self.statuses.get(owner["id"]) != status:
+            await self.status(owner, status)
 
     @staticmethod
     def hook_summary(parsed, arguments=None, prompt=None):
@@ -340,7 +368,8 @@ class LifecycleHooks:
         hook context last. Verify reads its own result, so nothing is added there."""
         if origin == "verify" or notes.event is None or not (notes.changed or notes.contexts):
             return output
-        text = (changed_arguments_note(*notes.changed, ran=notes.ran) + "\n" if notes.changed else "") + output
+        text = (changed_arguments_note(*notes.changed, ran=notes.ran, edited=notes.edited) + "\n"
+                if notes.changed else "") + output
         if notes.contexts:
             text += tool_context_text(notes.contexts)
         text = cap_text(self.settings.redact(text))
@@ -356,9 +385,18 @@ class LifecycleHooks:
         """Before a user's message goes to the model: user_prompt hooks, then session_start hooks when
         the chat has made no model request yet. Returns (prompt, content) to send, or None when a hook
         blocked the message (the chat says why; nothing is sent, so nothing is billed). A replacement
-        prompt is shown on the message as edited by a hook; context is appended for the model only."""
-        if session.get("is_subagent"):
+        prompt is shown on the message as edited by a hook; context is appended for the model only.
+        A steered message stays queued while its hooks run (drain_queue): event is then the fields of
+        the user event drain_queue adds afterwards, with the notice of a block. Only a subagent's
+        delegated prompt skips these hooks, not the user's own messages in a subagent chat."""
+        if (event.get("origin") or {}).get("kind") == "delegated":
             return prompt, content
+
+        async def mark(**values):
+            if steered:
+                event.update(values)  # Not in the chat yet.
+            else:
+                await self.update_event(session, event, **values)
         notes = []
         if self.has_hooks(session, "user_prompt"):
             shown, shortened = fit_text(prompt)
@@ -376,13 +414,13 @@ class LifecycleHooks:
                     notes.append(("user_prompt", outcome["hook_id"], outcome["context"]))
                 if outcome.get("decision") == "block":
                     reason = outcome["reason"]
-                    await self.update_event(session, event, hook_blocked={"hook_id": outcome["hook_id"], "reason": reason})
-                    await self.event(session, "notice", text=(
-                        f"A user-prompt hook ({outcome['hook_id']}) blocked this message: {clip(reason, 600)} "
-                        "It was not sent to the agent."))
+                    await mark(hook_blocked={"hook_id": outcome["hook_id"], "reason": reason})
+                    if steered:
+                        return None
+                    await self.event(session, "notice", text=blocked_prompt_notice(event["hook_blocked"]))
                     return None
             if final != prompt:
-                await self.update_event(session, event, text=final, hook_edit={"hooks": editors, "original": prompt})
+                await mark(text=final, hook_edit={"hooks": editors, "original": prompt})
                 # The @ files and ! output stay attached; a replacement's own @ tokens attach nothing.
                 content = final + content[len(prompt):] if isinstance(content, str) and content.startswith(prompt) else None
                 prompt = final
@@ -394,8 +432,7 @@ class LifecycleHooks:
                     notes.append(("session_start", outcome["hook_id"], outcome["context"]))
         if notes:
             notes.sort(key=lambda note: note[0] != "session_start")
-            await self.update_event(session, event, hook_notes=[
-                {"event": kind, "hook_id": hook_id, "context": text} for kind, hook_id, text in notes])
+            await mark(hook_notes=[{"event": kind, "hook_id": hook_id, "context": text} for kind, hook_id, text in notes])
             content = (content if content is not None else prompt) + message_context_text(notes)
         return prompt, content
 
@@ -433,12 +470,16 @@ class LifecycleHooks:
 
     async def stop_hooks(self, session, wire, state, has_another_step):
         """When a turn would end with a final reply (after Verify): agent_stop hooks, or subagent_stop
-        hooks (in the parent chat) for a subagent. Returns 'continue' when a hook's block decision was
-        handed to the model as a hidden continuation, else 'done'. state['blocks'] counts this turn's
-        continuations: at most STOP_CAPS of them, and only while an agent step is left."""
-        subagent = bool(session.get("is_subagent"))
+        hooks (in the parent chat) for a subagent's delegated turn. Returns 'continue' when a hook's
+        block decision was handed to the model as a hidden continuation, else 'done'. state['blocks']
+        counts this turn's continuations: at most STOP_CAPS of them, and only while an agent step is left.
+        A subagent chat the user continues (a message, Edit or Retry after its delegation ended) has
+        no delegation to report to: its turns are the user's own and run agent_stop in that chat."""
+        subagent = bool(session.get("is_subagent") and session.get("turn_delegated"))
         phase = "subagent_stop" if subagent else "agent_stop"
-        owner = (self.get(session["parent_session_id"]) if session.get("parent_session_id") else None) if subagent else session
+        # The parent waits on this delegation, so it is live: never a stored copy that a card's answer
+        # would save over the parent's newer state.
+        owner = self.live.get(session.get("parent_session_id")) if subagent else session
         if owner is None or not self.has_hooks(owner, phase):
             session.pop("hook_report", None)
             return "done"
