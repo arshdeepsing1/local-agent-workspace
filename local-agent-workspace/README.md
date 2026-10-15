@@ -1121,7 +1121,8 @@ above, from list prices), counting its subagents too. **Settings → Agent → S
 conversation** sets the default for every chat without its own (0, the default, means no
 limit); **Agent tools → Usage** shows what the chat has used against its limit, with the share
 from subagents, and sets the chat's own limit (0 = none for this chat) or returns it to the
-Settings default. It can be changed while a reply runs.
+Settings default. It can be changed while a reply runs. Forks and imports keep a chat's own limit
+(their spend starts again from their own calls).
 
 The app checks the limit before each agent model request, before any compaction for it. At 80%
 it adds one notice; once the chat has used the limit, it does not send the next request and

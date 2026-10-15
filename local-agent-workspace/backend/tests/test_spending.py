@@ -282,3 +282,27 @@ async def test_an_ended_subagent_keeps_its_estimate_in_the_parent_index(runtime,
     assert (entry["estimated_dbu"], entry["unpriced_calls"]) == (PER_CALL, 0)
     assert spending.chat_spend(manager, saved) == {"spent_dbu": round(3 * PER_CALL, 6), "own_dbu": round(2 * PER_CALL, 6),
                                                    "subagents_dbu": PER_CALL, "unpriced_calls": 0}
+
+
+async def test_forks_exports_and_imports_keep_the_limit_but_not_the_spend(api, tmp_path):
+    client, manager, settings = api
+    source = manager.store.create(settings.values)
+    source.update(title="Capped", title_generated=True, terminal_reason="completed", spending_limit_dbu=3.25,
+                  spending_warned=3.25, events=[{"id": "u", "type": "user", "text": "Hi", "in_wire": True},
+                                                {"id": "a", "type": "assistant", "text": "Hello",
+                                                 "request_info": {"model": OPUS, "status": "completed"}}],
+                  wire=[{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello"}])
+    manager.store.save(source)
+    fork = await client.post(f"/api/sessions/{source['id']}/fork")
+    assert fork.status_code == 201, fork.text
+    copied = manager.store.get(fork.json()["id"])
+    assert copied["spending_limit_dbu"] == 3.25 and "spending_warned" not in copied
+    assert spending.chat_spend(manager, copied)["spent_dbu"] == 0
+    bundle = (await client.get(f"/api/sessions/{source['id']}/export")).json()
+    assert bundle["sessions"][0]["spending_limit_dbu"] == 3.25
+    imported = await client.post("/api/sessions/import", params={"workspace": settings.values["workspace"]}, json=bundle)
+    assert imported.status_code == 201, imported.text
+    assert manager.store.get(imported.json()["session"]["id"])["spending_limit_dbu"] == 3.25
+    bundle["sessions"][0]["spending_limit_dbu"] = -1
+    refused = await client.post("/api/sessions/import", params={"workspace": settings.values["workspace"]}, json=bundle)
+    assert refused.status_code == 400

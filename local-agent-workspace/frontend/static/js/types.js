@@ -53,7 +53,8 @@
 //   turn_delegated?: true while the last turn is one a parent's delegate_task started (also in summaries),
 //   reasoning_effort?: Effort (the chat's own level, saved in its header; absent on chats saved before it existed,
 //   which use Settings.reasoning_effort; kept by forks and imports; also in summaries),
-//   spending_limit_dbu?: number (the chat's own spending limit; 0 = none; absent: Settings.spending_limit_dbu) }
+//   spending_limit_dbu?: number (the chat's own spending limit; 0 = none; absent: Settings.spending_limit_dbu;
+//   kept by forks and imports) }
 // POST /sessions { permission_mode, reasoning_effort? } creates a chat (Settings' effort when absent).
 // PUT /sessions/<id>/reasoning-effort { reasoning_effort } -> Session, also while busy: the agent's next model request
 //   (and a running subagent's) uses it. Pushed as { type: 'reasoning_effort', reasoning_effort }.

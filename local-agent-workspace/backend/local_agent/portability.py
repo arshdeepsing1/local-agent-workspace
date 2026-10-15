@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .context import LARGE_SUMMARY_MAX_BYTES, MAX_ESTIMATE_SCALE, context_boundary
 from .planning import MAX_STEPS, subagent_index
+from .spending import MAX_LIMIT_DBU
 
 
 MAX_BUNDLE_BYTES = 16 * 1024 * 1024
@@ -238,6 +239,7 @@ class Conversation(Record):
     tool_profile: Profile = "inherit"
     subagent_tool_profile: Profile = "inherit"
     reasoning_effort: Effort | None = None  # Kept by forks and imports, like the model.
+    spending_limit_dbu: float | None = Field(default=None, ge=0, le=MAX_LIMIT_DBU)  # Kept too (not the spend).
     max_steps: int | None = Field(default=None, ge=1, le=MAX_STEPS)
     agent_type: Literal["explore", "general", "editor"] | None = None
     # Kept by forks and imports, like tool_profile: a copy never gets more tools than its source.
