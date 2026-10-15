@@ -166,6 +166,8 @@ class SettingsEdit(BaseModel):
     thinking_summaries: bool | None = Field(default=None, strict=True)
     coding_dir: str | None = Field(default=None, max_length=4096, strict=True)
     python_venv: str | None = Field(default=None, max_length=4096, strict=True)
+    # Settings → Subagents: {explore|general|editor: {model, effort}}; config.subagent_defaults checks it.
+    subagent_defaults: dict[str, dict[str, str]] | None = None
 
 
 class LimitsQuery(BaseModel):

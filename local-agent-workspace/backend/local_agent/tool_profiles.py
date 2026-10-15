@@ -35,6 +35,9 @@ def tool_allowed(session, name):
     disabled = session.get("disabled_tools") or []
     if name in disabled or covering_tool(name, disabled):
         return False  # Turned off by the user in this chat, directly or through a tool that covers it.
+    agent_tools = session.get("agent_tools")
+    if isinstance(agent_tools, list) and name not in agent_tools:
+        return False  # A custom agent's subagent (custom_agents.py) uses only the tools its file lists.
     profile = validate_profile(session.get("tool_profile", "inherit"))
     return profile == "inherit" or name in (READ_TOOLS if profile == "read_only" else FILE_TOOLS)
 
