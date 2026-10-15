@@ -157,6 +157,15 @@ class Event(Record):
     steered: bool | None = None
     attachments: list[Attachment] | None = Field(default=None, max_length=10)
     stop_phase: Literal["streaming", "tools", "waiting"] | None = None
+    # Hooks (lifecycle_hooks): a hook card's structured result; on a tool card, the arguments a
+    # before-tool hook replaced, the card it asked for, or its deny; on a user message, a hook's
+    # edit or block and the context hooks added for the model.
+    hook_result: dict[str, Any] | None = None
+    hook_change: dict[str, Any] | None = None
+    hook_ask: dict[str, Any] | None = None
+    hook_blocked: dict[str, Any] | None = None
+    hook_edit: dict[str, Any] | None = None
+    hook_notes: list[dict[str, Any]] | None = Field(default=None, max_length=32)
 
 
 class Function(Record):

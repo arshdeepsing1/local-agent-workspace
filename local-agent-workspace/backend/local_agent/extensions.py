@@ -25,6 +25,84 @@ WORKSPACE_SKILL_ROOTS = (".agents/skills", ".claude/skills")
 SKILL_INDEX_ENTRIES = 30
 SKILL_INDEX_BYTES = 2_000
 SKILL_INDEX_DESCRIPTION = 150
+MAX_SERVERS = 4
+MAX_HOOKS = 16
+# Hook events: the three tool events (their tools field selects tools) and the lifecycle events.
+TOOL_HOOK_EVENTS = ("before_tool", "after_tool", "tool_failure")
+HOOK_EVENTS = (*TOOL_HOOK_EVENTS, "user_prompt", "session_start", "agent_stop", "subagent_start", "subagent_stop")
+HOOK_EVENT_LIST = ", ".join(HOOK_EVENTS[:-1]) + " or " + HOOK_EVENTS[-1]
+# Structured hook output: what one JSON object on stdout may set, per event. decision values are
+# listed; other fields are text, except before_tool arguments (an object). Unknown fields are ignored.
+HOOK_OUTPUT_FIELDS = {
+    "before_tool": {"decision": ("allow", "deny", "ask"), "reason": str, "arguments": dict, "context": str},
+    "after_tool": {"context": str},
+    "tool_failure": {"context": str},
+    "user_prompt": {"decision": ("allow", "block"), "reason": str, "prompt": str, "context": str},
+    "session_start": {"context": str},
+    "agent_stop": {"decision": ("allow", "block"), "reason": str},
+    "subagent_start": {"context": str},
+    "subagent_stop": {"decision": ("allow", "block"), "reason": str, "report": str},
+}
+HOOK_CONTEXT_CHARS = 2_000  # context and reason are shortened to this many characters
+HOOK_REPORT_CHARS = 6_000
+HOOK_STDOUT_BYTES = 16_384  # stdout kept from a hook; more is shown as text, never read as JSON
+HOOK_SHOWN_BYTES = 3_800  # the part of it a hook card and a warning show
+SHORTENED = " […shortened by the app]"
+
+
+def _clip_hook_text(value, limit):
+    value = value.strip()
+    return value if len(value) <= limit else value[:limit - len(SHORTENED)].rstrip() + SHORTENED
+
+
+def parse_hook_output(event, text, truncated=False):
+    """The structured part of a hook's stdout (exit code 0), or None for plain text.
+
+    Only when the whole trimmed output is one JSON object is it read; anything else
+    (text, a list, malformed or cut-off JSON) is plain text, as before. Returns
+    {decision?, reason?, context?, arguments?, prompt?, report?, ignored: [names]}: fields
+    this event does not use are listed in ignored. A known field with a wrong type or value
+    raises ValueError: the hook then counts as failed (a before-tool hook blocks its tool)."""
+    stripped = text.strip() if isinstance(text, str) else ""
+    if not (stripped.startswith("{") and stripped.endswith("}")) or truncated:
+        return None
+    try:
+        value = json.loads(stripped)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    fields = HOOK_OUTPUT_FIELDS.get(event, {})
+    parsed = {"ignored": sorted(str(key)[:40] for key in value if key not in fields)[:10]}
+    for key, kind in fields.items():
+        if key not in value or value[key] is None:
+            continue
+        item = value[key]
+        if isinstance(kind, tuple):
+            if item not in kind:
+                raise ValueError(f"Hook output has an unsupported decision {json.dumps(item)[:40]} for {event}; "
+                                 f"use {', '.join(kind)}.")
+            parsed["decision"] = item
+        elif kind is dict:
+            if not isinstance(item, dict):
+                raise ValueError("Hook output arguments must be a JSON object.")
+            parsed["arguments"] = item
+        else:
+            if not isinstance(item, str):
+                raise ValueError(f"Hook output {key} must be text.")
+            if key in ("reason", "context"):
+                item = _clip_hook_text(item, HOOK_CONTEXT_CHARS)
+            elif key == "report":
+                item = _clip_hook_text(item, HOOK_REPORT_CHARS)
+            if key == "prompt" and not item.strip():
+                raise ValueError("Hook output prompt must not be empty.")
+            if item.strip():
+                parsed[key] = item
+    if parsed.get("decision") == "allow":
+        parsed.pop("decision")  # No objection: never skips a card the mode or rules require.
+    if parsed.get("decision") in ("deny", "block", "ask") and not parsed.get("reason"):
+        parsed["reason"] = "The hook gave no reason."
+    return parsed
 
 
 def _text(value, label, limit, optional=False):
@@ -37,7 +115,7 @@ def validate_config(config):
     if not isinstance(config, dict) or set(config) - {"servers", "hooks"}:
         raise ValueError("Extension configuration contains unsupported fields.")
     result = {"servers": [], "hooks": []}
-    for key, maximum in (("servers", 4), ("hooks", 8)):
+    for key, maximum in (("servers", MAX_SERVERS), ("hooks", MAX_HOOKS)):
         entries = config.get(key, [])
         if not isinstance(entries, list) or len(entries) > maximum:
             raise ValueError(f"Configure at most {maximum} {key}.")
@@ -77,8 +155,8 @@ def validate_config(config):
             else:
                 if set(entry) - {"id", "event", "command", "timeout_seconds", "enabled", "tools"}:
                     raise ValueError("Hook configuration contains unsupported fields.")
-                if entry.get("event") not in {"before_tool", "after_tool", "tool_failure"}:
-                    raise ValueError("Hook event must be before_tool, after_tool or tool_failure.")
+                if entry.get("event") not in HOOK_EVENTS:
+                    raise ValueError(f"Hook event must be {HOOK_EVENT_LIST}.")
                 timeout = entry.get("timeout_seconds", 10)
                 if type(timeout) is not int or not 1 <= timeout <= 30:
                     raise ValueError("Hook timeout must be an integer from 1 to 30 seconds.")
@@ -282,7 +360,12 @@ class ExtensionManager:
         return self._skill(tools, skill_id, roots=roots)
 
     async def run_hook(self, hook, payload, workspace, env=None):
-        """Run a hook with payload on stdin. env, when given, is the hook's whole environment."""
+        """Run a hook with payload on stdin. env, when given, is the hook's whole environment.
+
+        Returns {exit_code, output (redacted, at most HOOK_SHOWN_BYTES as a card shows it),
+        truncated, timed_out?, structured?}: structured (parse_hook_output) is set when the
+        hook exited 0 and its whole stdout, redacted, is one JSON object; a ValueError for
+        an invalid one is returned as structured_error."""
         selected = next((entry for entry in self.config["hooks"] if entry["id"] == hook.get("id") and entry["enabled"]), None)
         if selected is None or selected != hook:
             raise ValueError("Hook is disabled or changed; refresh its configuration before running it.")
@@ -296,13 +379,28 @@ class ExtensionManager:
                 target.write(data)
             command = f"(\n{selected['command']}\n) < {shlex.quote(filename)}"
             try:
-                result = await run_process(command, workspace, selected["timeout_seconds"], 4096, env=env)
+                result = await run_process(command, workspace, selected["timeout_seconds"], HOOK_STDOUT_BYTES, env=env)
             except CommandTimeout as error:
                 result = {**error.result, "timed_out": True}
             # Room for the note that a command did not end, added after redaction.
             room = len(NOT_STOPPED) + 1 if result.get("stopped") is False else 0
-            output = bounded_result(self._redact(result["output"], tokens, partial=result["truncated"] or result.get("timed_out", False)), limit=3800 - room)
-            return {**result, "output": with_note(output["output"], result), "truncated": result["truncated"] or output["truncated"]}
+            redacted = self._redact(result["output"], tokens, partial=result["truncated"] or result.get("timed_out", False))
+            output = bounded_result(redacted, limit=HOOK_SHOWN_BYTES - room)
+            extra = {}
+            if result.get("exit_code") == 0 and not result.get("timed_out"):
+                # Read from the redacted output: a secret never reaches the card or the model.
+                try:
+                    structured = parse_hook_output(selected["event"], redacted, truncated=result["truncated"])
+                except ValueError as exc:
+                    extra["structured_error"] = str(exc)
+                else:
+                    if structured is not None:
+                        extra["structured"] = structured
+                if result["truncated"] and redacted.lstrip().startswith("{"):
+                    extra["structured_error"] = (f"Hook output is longer than {HOOK_STDOUT_BYTES // 1024} KB, so it "
+                                                 "was not read as JSON.")
+            return {**result, "output": with_note(output["output"], result),
+                    "truncated": result["truncated"] or output["truncated"], **extra}
         finally:
             Path(filename).unlink(missing_ok=True)
 

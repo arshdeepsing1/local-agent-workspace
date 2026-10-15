@@ -77,6 +77,9 @@ VERIFY_CONTINUATION_PREFIX = "Automatic verification after your edits:"
 VERIFY_DECLINED_START = VERIFY_CONTINUATION_PREFIX + " the user declined the project's verify command `"
 VERIFY_DECLINED_NOTE = "`, so it did not run. Their note: "
 VERIFY_DECLINED_END = "\nAnswer the note. Do not run the verify command yourself unless the user asks."
+# The prefix of the app's message when an agent_stop or subagent_stop hook asked the agent to keep
+# working (lifecycle_hooks.stop_continuation): like a Verify message, it carries data.
+HOOK_CONTINUATION_PREFIX = "Automatic stop-hook result from the app:"
 
 # Automatic compaction runs when the next request's estimate passes this share
 # of the input budget (Settings -> Auto-compact at).
@@ -134,6 +137,7 @@ APP_PROMPT_LABELS = {
 }
 VERIFY_LABEL = "[Automatic Verify result from the app; not the user's words.]\n"
 VERIFY_NOTE_LABEL = "[The user declined the app's Verify command and wrote this note (the user's words):]\n"
+HOOK_CONTINUATION_LABEL = "[Automatic stop-hook result from the app; not the user's words.]\n"
 # The start of the attachment part mentions.expand_context appends to a user message.
 ATTACHMENT_SEPARATOR = "\n\n---\n"
 
@@ -145,7 +149,7 @@ def is_continuation(message):
     content = message.get("content")
     return isinstance(content, str) and (
         content in (OUTPUT_LIMIT_CONTINUATION, INVALID_ARGUMENTS_CONTINUATION, INCOMPLETE_RESPONSE_CONTINUATION)
-        or content.startswith(VERIFY_CONTINUATION_PREFIX))
+        or content.startswith(VERIFY_CONTINUATION_PREFIX) or content.startswith(HOOK_CONTINUATION_PREFIX))
 
 
 # Ratio of provider-counted to estimated input tokens assumed before a model has
@@ -277,7 +281,9 @@ def is_app_prompt(message):
     - INVALID_ARGUMENTS_CONTINUATION and INCOMPLETE_RESPONSE_CONTINUATION after a
       response whose tool calls could not run;
     - a message starting with VERIFY_CONTINUATION_PREFIX after a failed Verify run
-      or a declined one with the user's note.
+      or a declined one with the user's note;
+    - a message starting with HOOK_CONTINUATION_PREFIX when a stop hook asked the
+      agent to keep working.
     All of them are is_continuation messages. The compaction summary
     (SUMMARY_PREFIX) is only built into requests, never stored in the history.
     """
@@ -587,6 +593,8 @@ def summary_transcript(archived, later, result_limit, completed_calls=None):
                 message = {"role": "user", "content": VERIFY_NOTE_LABEL + note}
             elif content in APP_PROMPT_LABELS:
                 message = {"role": "app", "content": APP_PROMPT_LABELS[content]}
+            elif content.startswith(HOOK_CONTINUATION_PREFIX):
+                message = {"role": "app", "content": HOOK_CONTINUATION_LABEL + clip_result(content, result_limit, stats)}
             else:
                 message = {"role": "app", "content": VERIFY_LABEL + clip_result(content, result_limit, stats)}
         elif role == "user" and isinstance(content, str):
