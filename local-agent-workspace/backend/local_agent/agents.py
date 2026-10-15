@@ -885,10 +885,14 @@ class AgentManager(LifecycleHooks):
         self.store.save(session)
         return {"active_skills": ids}
 
-    def requested_skills(self, tools, prompt):
+    def requested_skills(self, tools, prompt, session=None):
         """The skills a message names: `/skill <id> …` at its start, or a listed
         skill's `/<id>` as a word anywhere ("/handoff …", "… use /handoff to …").
-        Other slashes, such as paths, leave the message ordinary text."""
+        Other slashes, such as paths, leave the message ordinary text. A custom agent's
+        delegated first prompt names none: the skills its file lists are loaded already, and
+        its instructions (in that prompt) must not load others or go over the limit of three."""
+        if session is not None and session.get("agent_file") and session.get("turn_delegated"):
+            return []
         words = prompt.split(maxsplit=2)
         if words and words[0] == "/skill" and len(words) > 1:
             return [words[1]]
@@ -1100,9 +1104,10 @@ class AgentManager(LifecycleHooks):
         current = (values["context_window"], values["max_output_tokens"])
         follow = [current[0] == defaults[0], current[1] == defaults[1]]
         limits = follow_limits(follow, default_limits(session.get("model") or values["model"]), current)
-        if session.get("agent_model") and session.get("agent_model") == session.get("model"):
+        if session.get("agent_model") and session.get("agent_model") == session.get("model") != values["model"]:
             # A subagent on its agent's own endpoint: budgets customised for the Settings endpoint stay
-            # within this endpoint's defaults, which always fit together (and its maxima, below).
+            # within this endpoint's defaults, which always fit together (and its maxima, below). On the
+            # Settings endpoint itself they are the budgets customised for it, as for any chat there.
             own = default_limits(session["model"])
             limits = (min(limits[0], own[0]), min(limits[1], own[1]))
         return limits
@@ -2555,10 +2560,12 @@ class AgentManager(LifecycleHooks):
             if session.get("is_subagent") and (name == "delegate_task" or (name == "run_command" and arguments.get("background"))):
                 raise ValueError("Subagents cannot delegate or leave background jobs.")
             carded = False  # An "ask" verdict must have shown a card before anything runs.
+            approved = None  # delegate_task: the agent its card showed, which starts (its file is not read again).
             if name in ("delegate_task", "stop_job") and verdict.decision == "ask":
                 if name == "delegate_task":
                     # The agent, its tools and any model or effort it sets; an unknown agent_type fails here.
-                    preview = self.delegates.card_preview(session, arguments)
+                    approved = self.delegates.agent_spec(session, arguments.get("agent_type"), arguments.get("tool_profile"))
+                    preview = self.delegates.card_preview(session, arguments, approved)
                 else:
                     job = self.session_job(session, arguments["job_id"])
                     preview = f"Stop job {job['id']}: {job['command']}"
@@ -2798,7 +2805,8 @@ class AgentManager(LifecycleHooks):
                     return None
 
                 def start():
-                    return self.delegates.delegate(session, **arguments, parent_event=event, recheck=still_allowed)
+                    return self.delegates.delegate(session, **arguments, parent_event=event, recheck=still_allowed,
+                                                   spec=approved)
                 if gate is not None:
                     result = await gate.run(start)  # run_delegations sets the chat's status.
                 else:
@@ -4112,7 +4120,7 @@ class AgentManager(LifecycleHooks):
         tools = self.session_tools(session)
         definitions = filter_tools(session, [*TOOL_DEFINITIONS, *[tool for tool in FEATURE_TOOLS
                        if not session.get("is_subagent") or tool["function"]["name"] != "delegate_task"], *external_tools])
-        for skill_id in self.requested_skills(tools, prompt):
+        for skill_id in self.requested_skills(tools, prompt, session):
             self.select_skill(session, tools, skill_id)
         # Complete interrupted tool exchanges before sending the next user turn.
         wire, context_state = repair_tool_history(session["wire"], session["events"], session.get("context_state", {}))

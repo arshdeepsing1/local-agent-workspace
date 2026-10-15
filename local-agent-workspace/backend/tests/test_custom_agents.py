@@ -108,6 +108,9 @@ def test_defaults_are_the_file_name_read_only_and_the_chats_model_and_effort():
     (agent_text(max_steps=0), "1 to 24"),
     (agent_text(max_steps="'ten'"), "1 to 24"),
     ("---\ndescription: x\n---\n" + "y" * 8001, "at most 8,000"),
+    # A lone surrogate escape decodes but cannot be written as UTF-8 (the agents route, the system message).
+    ('---\ndescription: "Maps \\ud800 modules"\n---\n', "Line 2: a double-quoted value is not valid text"),
+    ('---\ndescription: x\ntools: ["read_file", "\\udfff"]\n---\n', "Line 3: a double-quoted value is not valid text"),
 ])
 def test_bad_files_are_refused_with_a_clear_reason(text, reason):
     with pytest.raises(ValueError, match=reason.replace("(", r"\(").replace("[", r"\[")):
@@ -165,6 +168,32 @@ def test_an_agent_folder_outside_the_workspace_is_not_read(tmp_path):
     assert discover(project) == {"agents": [], "errors": [
         {"path": ".agents/agents", "error": "Agent files must be in a folder inside this workspace."}]}
     assert discover(tmp_path / "missing") == {"agents": [], "errors": []}
+
+
+NON_UTF8_ERROR = {".agents/agents/caf\\udce9.md": "The file name is not valid UTF-8 text; rename the file."}
+
+
+def non_utf8_agent(project):
+    """Write the agent file cafe as caf\\xe9.md, a name with a byte that is not UTF-8; False where the
+    file system refuses such names (macOS)."""
+    folder = project / AGENT_ROOTS[0]
+    folder.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(os.fsencode(folder) + b"/caf\xe9.md", "wb") as handle:
+            handle.write(agent_text("A cafe agent.", name="cafe").encode())
+    except OSError:
+        return False
+    return True
+
+
+def test_a_file_name_that_is_not_utf8_is_reported_without_parsing(tmp_path):
+    if not non_utf8_agent(tmp_path):
+        pytest.skip("this file system refuses file names that are not UTF-8")
+    write_agent(tmp_path, "mapper", agent_text("Maps."))
+    found = discover(tmp_path)
+    assert [agent["name"] for agent in found["agents"]] == ["mapper"]
+    assert {item["path"]: item["error"] for item in found["errors"]} == NON_UTF8_ERROR
+    json.dumps(found, ensure_ascii=False).encode("utf-8")  # Safe to send and save.
 
 
 def test_secrets_in_agent_files_are_redacted(tmp_path):
@@ -277,6 +306,20 @@ async def test_the_agents_route_lists_built_in_and_custom_agents_and_bad_files(a
     assert listing["errors"] == [{"path": ".claude/agents/bad.md", "error": listing["errors"][0]["error"]}]
     assert listing["errors"][0]["error"].startswith("name must start with a lowercase letter")
     assert listing["folders"] == [".agents/agents", ".claude/agents"] and 0 < listing["index_bytes"] <= INDEX_BYTES
+
+
+async def test_the_agents_route_lists_files_with_bad_text_or_names_as_errors(api):
+    client, _, _, project = api
+    write_agent(project, "mapper", '---\ndescription: "Maps \\ud800 modules"\n---\nBody\n')
+    write_agent(project, "tester", agent_text("Runs tests."))
+    named = non_utf8_agent(project)
+    response = await client.get("/api/agents")
+    assert response.status_code == 200, response.text
+    listing = response.json()
+    assert [item["name"] for item in listing["custom"]] == ["tester"]
+    assert {item["path"]: item["error"] for item in listing["errors"]} == {
+        **(NON_UTF8_ERROR if named else {}),
+        ".agents/agents/mapper.md": "Line 2: a double-quoted value is not valid text (a lone \\u escape)."}
 
 
 # Delegation
@@ -397,6 +440,31 @@ async def test_a_custom_agent_gets_its_model_effort_tools_skills_instructions_an
     assert "- security-auditor: Reviews code for injection, secrets handling and unsafe file access." in parent_system
 
 
+def write_skill(project, skill_id):
+    path = project / ".agents/skills" / skill_id / "SKILL.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"---\nname: {skill_id}\ndescription: Skill {skill_id}\n---\nDo {skill_id}.\n")
+
+
+async def test_skill_words_in_an_agents_instructions_load_no_skills(runtime, monkeypatch):
+    manager, parent, project = runtime
+    for skill_id in ("a1", "b1", "c1", "d1"):
+        write_skill(project, skill_id)
+    # A fourth skill would fail the child (at most three); a skill the file does not list must not load.
+    write_agent(project, "mapper", "---\ndescription: Maps.\nskills: [a1, b1, c1]\n---\nWhen done, follow /d1.\n")
+    write_agent(project, "lister", "---\ndescription: Lists.\n---\nUse /d1 here.\n")
+    gateway = Gateway(monkeypatch, [lambda: calls_reply(
+        ("delegate_task", {"task": "Map", "agent_type": "mapper"}, "a"),
+        ("delegate_task", {"task": "List with /a1", "agent_type": "lister"}, "b"),
+        ("delegate_task", {"task": "Look, then use /a1", "agent_type": "explore"}, "c")), lambda: reply("Parent done.")])
+    saved = await run_turn(manager, parent)
+    assert [json.loads(card(saved, call)["output"])["status"] for call in "abc"] == ["completed"] * 3
+    assert len(gateway.requests["child"]) == 3
+    skills = {call: manager.store.get(card(saved, call)["child_session_id"]).get("active_skills") for call in "abc"}
+    # A custom agent gets its file's skills only; a built-in type's task can still name one.
+    assert skills == {"a": ["a1", "b1", "c1"], "b": None, "c": ["a1"]}
+
+
 async def test_a_custom_agent_tool_outside_its_list_is_refused(runtime):
     manager, parent, project = runtime
     child = manager.store.create({"workspace": str(project), "model": "test-model"})
@@ -421,6 +489,43 @@ async def test_no_tool_of_the_agent_fits_the_ceiling_and_unknown_names_are_refus
     with pytest.raises(ValueError, match="Available agent types: explore, general, editor, runner"):
         await manager.delegates.delegate(parent, "Run it", agent_type="tester")
     assert len(manager.store.list()) == 1
+
+
+async def test_agent_tools_the_chat_turned_off_or_denies_are_left_out(runtime, monkeypatch):
+    manager, parent, project = runtime
+    write_agent(project, "runner", agent_text("Runs things.", profile="inherit", tools="[run_command, outline_file]"))
+    write_agent(project, "reader", agent_text("Reads.", tools="[read_file, search_files, outline_file]"))
+    # outline_file is covered by read_file: turning read_file off turns it off too.
+    parent.update(disabled_tools=["read_file"], allow_rules=[{"behavior": "deny", "tool": "run_command"}])
+    manager.store.save(parent)
+    with pytest.raises(ValueError, match=r"None of the runner agent's tools \(run_command, outline_file\) is available "
+                                         r"in this chat: each is turned off or blocked by a deny rule"):
+        await manager.delegates.delegate(parent, "Run it", agent_type="runner")
+    assert "Tools: search_files" in manager.delegates.card_preview(parent, {"task": "Read", "agent_type": "reader"}).splitlines()
+    gateway = Gateway(monkeypatch, [lambda: calls_reply(("delegate_task", {"task": "Run", "agent_type": "runner"}, "a"),
+                                                        ("delegate_task", {"task": "Read", "agent_type": "reader"}, "b")),
+                                    lambda: reply("Parent done.")])
+    saved = await run_turn(manager, parent)
+    assert card(saved, "a")["state"] == "error" and "child_session_id" not in card(saved, "a")
+    (_, body), = gateway.requests["child"]  # No paid requests without a tool.
+    assert offered(body) == ["search_files"]
+    assert "Your tools: search_files." in body["messages"][1]["content"]
+    assert manager.store.get(card(saved, "b")["child_session_id"])["agent_tools"] == ["search_files"]
+
+
+async def test_a_child_that_cannot_be_saved_leaves_no_conversation_and_frees_its_slot(runtime, monkeypatch):
+    manager, parent, project = runtime
+    save = manager.store.save
+
+    def failing(session, **options):
+        if session.get("is_subagent"):
+            raise OSError(28, "No space left on device")
+        return save(session, **options)
+    monkeypatch.setattr(manager.store, "save", failing)
+    with pytest.raises(OSError, match="No space left"):
+        await manager.delegates.delegate(parent, "Look", agent_type="explore")
+    assert [session["id"] for session in manager.store.list()] == [parent["id"]]
+    assert manager.delegates.running() == 0 and manager.delegates.active == {}
 
 
 async def test_an_unknown_agent_name_is_a_tool_error_listing_the_agents(runtime, monkeypatch):
@@ -462,6 +567,37 @@ async def test_the_manual_mode_card_names_the_agent_its_tools_and_its_model(runt
     manager.decide(session_id, event_id, True)
     result = json.loads(await asyncio.wait_for(task, 10))
     assert result["status"] == "completed" and started[0]["model"] == SONNET and started[0]["reasoning_effort"] == "low"
+
+
+async def test_an_approved_card_starts_the_agent_it_showed_after_its_file_changes(runtime):
+    manager, parent, project = runtime
+    write_agent(project, "mapper", f"---\ndescription: Maps.\nmodel: {SONNET}\neffort: low\ntools: [read_file]\n---\n"
+                "Map the old way.\n")
+    parent["permission_mode"] = "manual"
+    tools = manager.session_tools(parent)
+    started = []
+
+    async def worker(child, prompt):
+        started.append((child, prompt))
+        await manager.event(child, "assistant", text="Done.")
+    manager.run_databricks = worker
+    task = asyncio.create_task(manager.execute_tool(parent, tools, "delegate_task", {"task": "Map", "agent_type": "mapper"},
+                                                    "d"))
+    for _ in range(300):
+        if manager.pending:
+            break
+        await asyncio.sleep(0.01)
+    session_id, event_id = next(iter(manager.pending))
+    preview = next(item for item in parent["events"] if item["id"] == event_id)["preview"]
+    assert preview.startswith("Start a subagent (mapper · read-only · model Claude Sonnet 4.5 · effort Fast;")
+    # The file changes while the card waits (an editor, a git pull): what was approved starts.
+    write_agent(project, "mapper", agent_text("Maps.", model=GPT, effort="max", profile="inherit") + "Map the new way.\n")
+    manager.decide(session_id, event_id, True)
+    assert json.loads(await asyncio.wait_for(task, 10))["status"] == "completed"
+    (child, prompt), = started
+    assert (child["model"], child["reasoning_effort"], child["tool_profile"], child["agent_tools"]) == (
+        SONNET, "low", "read_only", ["read_file"])
+    assert "Map the old way." in prompt and "new way" not in prompt
 
 
 async def test_built_in_cards_name_their_profile_and_settings_effort(runtime):
@@ -521,6 +657,22 @@ async def test_a_child_on_a_smaller_endpoint_gets_that_endpoints_budgets(runtime
     assert manager.request_limits(child) == (1_000_000, 32_000)
 
 
+async def test_a_child_on_the_settings_endpoint_keeps_the_budgets_set_for_it(runtime, monkeypatch):
+    manager, parent, project = runtime
+    manager.settings.values.update(model=OPUS, context_window=1_000_000, max_output_tokens=32_000)
+    parent["model"] = GPT  # This chat runs on a smaller endpoint; the agent names the Settings one.
+    manager.store.save(parent)
+    write_agent(project, "mapper", agent_text("Maps.", model=OPUS))
+    gateway = Gateway(monkeypatch, [lambda: calls_reply(("delegate_task", {"task": "Map", "agent_type": "mapper"}, "a")),
+                                    lambda: reply("Parent done.")])
+    saved = await run_turn(manager, parent)
+    (endpoint, body), = gateway.requests["child"]
+    assert endpoint == OPUS and body["max_tokens"] == 32_000
+    child = manager.store.get(card(saved, "a")["child_session_id"])
+    assert child["agent_model"] == OPUS
+    assert manager.request_limits(child) == manager.request_limits({**parent, "model": OPUS}) == (1_000_000, 32_000)
+
+
 async def test_a_chat_effort_change_does_not_reach_a_child_with_its_agents_effort(runtime):
     manager, parent, _ = runtime
     release = asyncio.Event()
@@ -541,6 +693,66 @@ async def test_a_chat_effort_change_does_not_reach_a_child_with_its_agents_effor
     assert efforts == {"explore": "low", "general": "xhigh"}
     release.set()
     await asyncio.gather(explore, general)
+
+
+async def test_a_queued_subagent_starts_with_the_chats_effort_of_that_time(runtime):
+    manager, parent, _ = runtime
+    parent["reasoning_effort"] = "medium"
+    manager.store.save(parent)
+    manager.live[parent["id"]] = parent
+    release, efforts = asyncio.Event(), {}
+
+    async def worker(child, prompt):
+        efforts[prompt.split("\n")[1]] = child.get("reasoning_effort")
+        await release.wait()
+        await manager.event(child, "assistant", text="Done.")
+    manager.run_databricks = worker
+    kinds = [None, None, None, None, "explore"]  # Three run; the last two wait for a slot.
+    cards = [await manager.event(parent, "tool", name="delegate_task", call_id=f"c{index}", input={"task": f"Task {index}"},
+                                 output="", state="running") for index in range(len(kinds))]
+    tasks = [asyncio.create_task(manager.delegates.delegate(parent, f"Task {index}", parent_event=cards[index],
+                                                            agent_type=kind)) for index, kind in enumerate(kinds)]
+    for _ in range(300):
+        if len(manager.active_children(parent)) == 3 and all(item.get("delegation") for item in cards):
+            break
+        await asyncio.sleep(0.01)
+    # A queued card shows the agent's own effort (explore: Settings → Subagents), not the chat's of now.
+    assert [(item["delegation"]["status"], item["delegation"].get("effort")) for item in cards[3:]] == [
+        ("queued", None), ("queued", "low")]
+    await manager.change_effort(parent, "xhigh")
+    release.set()
+    await asyncio.gather(*tasks)
+    assert efforts == {"Task 0": "medium", "Task 1": "medium", "Task 2": "medium", "Task 3": "xhigh", "Task 4": "low"}
+    assert [item["delegation"]["effort"] for item in cards] == ["medium", "medium", "medium", "xhigh", "low"]
+
+
+async def test_tools_turned_off_while_an_agent_waits_for_a_slot_are_left_out(runtime):
+    manager, parent, project = runtime
+    write_agent(project, "runner", agent_text("Runs.", profile="inherit", tools="[run_command, read_file]"))
+    write_agent(project, "lister", agent_text("Lists.", tools="[list_files]"))
+    manager.live[parent["id"]] = parent
+    release, prompts = asyncio.Event(), {}
+
+    async def worker(child, prompt):
+        prompts[child.get("agent_type")] = (child.get("agent_tools"), prompt)
+        await release.wait()
+        await manager.event(child, "assistant", text="Done.")
+    manager.run_databricks = worker
+    running = [asyncio.create_task(manager.delegates.delegate(parent, f"Task {index}")) for index in range(3)]
+    for _ in range(300):
+        if len(manager.active_children(parent)) == 3:
+            break
+        await asyncio.sleep(0.01)
+    queued = [asyncio.create_task(manager.delegates.delegate(parent, "Wait", agent_type=kind)) for kind in ("runner", "lister")]
+    await asyncio.sleep(0.05)
+    await manager.set_disabled_tools(parent, ["run_command", "list_files"])
+    release.set()
+    await asyncio.gather(*running)
+    runner, lister = await asyncio.gather(*queued, return_exceptions=True)
+    assert runner["status"] == "completed" and prompts["runner"][0] == ["read_file"]
+    assert "Your tools: read_file." in prompts["runner"][1]
+    assert isinstance(lister, ValueError) and "None of the lister agent's tools (list_files) is available" in str(lister)
+    assert "lister" not in prompts
 
 
 async def test_an_agent_max_steps_is_the_default_and_the_call_can_set_its_own(runtime):
