@@ -118,8 +118,16 @@
       ...(Object.keys(fields).length && sent ? { sent_effort: sent, effort_field: format === 'openai' ? 'reasoning_effort' : 'output_config.effort' } : {}),
       fields, notes }
   }
+  // Answers every scenario shares unless a test overrides them: the reasoning preview, the built-in output styles
+  // (Settings → Output style) and an empty project memory (Agent tools → Memory and its Overview row).
+  const STYLES = [{ id: 'default', name: 'Default', description: "The app's usual replies.", source: 'built-in' },
+    { id: 'concise', name: 'Concise', description: 'Short, direct replies that lead with the result.', source: 'built-in' },
+    { id: 'explanatory', name: 'Explanatory', description: 'Explains the reasoning and concepts behind the work.', source: 'built-in' }]
+  fake.memory = { project: '/project', notes: [], bytes: 0, max_bytes: 4000, max_notes: 50, max_note_chars: 500, enabled: true, problem: null }
   const defaults = (path, options) => path === '/api/settings/reasoning' && options.method === 'POST'
-    ? json(fake.reasoningPreview(JSON.parse(options.body))) : undefined
+    ? json(fake.reasoningPreview(JSON.parse(options.body)))
+    : /^\/api\/output-styles(?:\?|$)/.test(path) ? json({ styles: STYLES, errors: [] })
+    : /^\/api\/memory(?:\?|$)/.test(path) && (options.method || 'GET') === 'GET' ? json(fake.memory) : undefined
 
   window.fetch = async (input, options = {}) => {
     const path = String(input)

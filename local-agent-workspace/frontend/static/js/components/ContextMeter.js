@@ -1,7 +1,13 @@
 import { html, useEffect, useLayoutEffect, useRef, useState } from '../lib.js'
 
 // Custom instructions (Settings) and the skill index are not files with a folder scope.
-const WIDE_SCOPES = ['all projects', 'this workspace']
+const WIDE_SCOPES = ['all projects', 'this workspace', 'this project']
+// What one loaded instruction source costs: its estimate, marked when the budget cut it (instructions.py).
+const sourceCost = source => source.status === 'loaded' ? `~${source.estimated_tokens.toLocaleString()} tokens`
+  : source.status === 'trimmed' ? `Trimmed · ~${source.estimated_tokens.toLocaleString()} tokens loaded` : 'Omitted · 0 tokens loaded'
+const sourceScope = source => WIDE_SCOPES.includes(source.scope) ? html`${source.path} · applies to ${source.scope}`
+  : source.scope.startsWith('files matching ') ? html`<code>${source.path}</code> · applies to ${source.scope}`
+  : html`<code>${source.path}</code> · scope: <code>${source.scope}</code> and descendants`
 const count = value => typeof value === 'number' ? value.toLocaleString() : 'Not reported'
 
 // The input Databricks reported for one request: total = uncached + cache read + cache write.
@@ -159,8 +165,7 @@ export default function ContextMeter({ info, model, busy = false, status, onComp
       <p class="context-heading">Loaded instructions</p>
       ${info.instruction_sources?.length ? html`
         <ul>${info.instruction_sources.map(source => html`<li key=${source.path}>
-          ${WIDE_SCOPES.includes(source.scope) ? html`${source.path} · applies to ${source.scope}`
-            : html`<code>${source.path}</code> · scope: <code>${source.scope}</code> and descendants`} · ${source.status === 'loaded' ? `~${source.estimated_tokens.toLocaleString()} tokens` : 'Omitted · 0 tokens loaded'}
+          ${sourceScope(source)} · ${sourceCost(source)}
           ${source.reason ? html`<p>${source.reason}</p>` : null}
         </li>`)}</ul>
         <p>File costs are estimates included in system instructions above; shared guidance and framing are counted separately.</p>`

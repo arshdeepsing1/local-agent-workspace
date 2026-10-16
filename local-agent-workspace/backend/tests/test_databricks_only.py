@@ -20,7 +20,8 @@ def test_legacy_settings_do_not_restore_removed_options(tmp_path, monkeypatch):
     settings.credentials = lambda: ("https://gateway.example", "fake-token")
     expected = {**editable, "context_window": 131072, "max_output_tokens": 8192, "max_agent_steps": 32,
                 "compaction_handoffs": True, "auto_compact_percent": 90, "approval_timeout_minutes": 60, "system_notifications": False,
-                "user_instructions": "", "write_limit_kb": 80, "command_env": [], "rate_limit_auto_continue": True,
+                "user_instructions": "", "user_agents_file": True, "user_claude_file": False, "project_memory": True,
+                "output_style": "default", "write_limit_kb": 80, "command_env": [], "rate_limit_auto_continue": True,
                 "auto_keep_changes": False, "reasoning_effort": "default", "reasoning_format": "auto",
                 "thinking_summaries": True, "prompt_caching": "auto", "spending_limit_dbu": 0, "subagent_defaults": DEFAULT_SUBAGENT_DEFAULTS, "coding_dir": "", "python_venv": ""}
     assert settings.values == expected

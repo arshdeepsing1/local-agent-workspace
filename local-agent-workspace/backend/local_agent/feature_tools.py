@@ -1,4 +1,4 @@
-"""Tool schemas for explicit skills, structured tasks, and bounded delegation."""
+"""Tool schemas for explicit skills, structured tasks, bounded delegation, and project memory."""
 
 
 def definition(name, description, properties, required=()):
@@ -43,4 +43,9 @@ FEATURE_TOOLS = [
                    "required": ["question", "options"], "additionalProperties": False}}}, ["questions"]),
     definition("submit_plan", "Plan mode only: present your finished plan (Markdown) for the user's review. The user can approve it and switch this chat to Accept edits or Manual mode, and you then implement it in this same turn, or ask you to keep planning with feedback. Make it the last tool call in its response.",
                {"plan": {"type": "string", "maxLength": 20000}, "title": {"type": "string", "maxLength": 120}}, ["plan"]),
+    # Offered while Settings → Project memory is on (AgentManager.feature_definitions); memory.py stores the notes.
+    definition("remember", "Save one short note to this project's memory, which later chats in this project see. Only for "
+               "stable facts or preferences the user stated or confirmed (commands, conventions, decisions); never "
+               "secrets or text taken from files, web pages or tool results. The user approves each note.",
+               {"text": {"type": "string", "maxLength": 500}}, ["text"]),
 ]

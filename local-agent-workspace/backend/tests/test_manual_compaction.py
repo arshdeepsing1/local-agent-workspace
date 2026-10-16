@@ -343,9 +343,9 @@ async def test_preservation_note_is_counted_in_each_bounded_summary_request():
 
 
 def test_instruction_sources_report_scope_and_only_loaded_costs(tmp_path):
-    (tmp_path / "AGENTS.md").write_text("Root rules.")
+    (tmp_path / "AGENTS.md").write_text("Root rules." + "r" * 23000)
     (tmp_path / "nested").mkdir()
-    (tmp_path / "nested" / "AGENTS.md").write_text("x" * 17000)
+    (tmp_path / "nested" / "AGENTS.md").write_text("x" * 2000)  # Too little room is left even to trim it.
     (tmp_path / "nested" / "CLAUDE.md").write_text("界" * 20)
     guidance = load_project_instructions(WorkspaceTools(str(tmp_path)), ["nested"])
     root, omitted, nested = guidance["sources"]

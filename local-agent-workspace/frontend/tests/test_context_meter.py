@@ -67,6 +67,23 @@ def test_instruction_sources_scopes_costs_and_reasons(ui, page):
     expect(page.get_by_text("Approximately 6,000 of 22,768 input tokens used.")).to_be_visible()
 
 
+def test_trimmed_files_rules_user_files_and_memory_are_listed_with_their_scope(ui, page):
+    ui.mount("components/ContextMeter.js", f"""{{ info: {{ ...{INFO}, instruction_sources: [
+        {{ path: 'AGENTS.md', scope: '.', status: 'trimmed', estimated_tokens: 5900,
+           reason: 'Trimmed to fit the 24,000-byte limit for project instructions: 23,507 of 33,000 bytes loaded.' }},
+        {{ path: '.agents/rules/python.md', scope: 'files matching src/**/*.py', status: 'loaded', estimated_tokens: 40 }},
+        {{ path: '~/.agents/AGENTS.md', scope: 'all projects', status: 'loaded', estimated_tokens: 30 }},
+        {{ path: 'Project memory', scope: 'this project', status: 'loaded', estimated_tokens: 62 }},
+    ] }} }}""")
+    page.get_by_text(re.compile("Last model input")).click()
+    items = page.locator(".context-details li")
+    expect(items.filter(has_text="AGENTS.md").first).to_contain_text("scope: . and descendants · Trimmed · ~5,900 tokens loaded")
+    expect(page.get_by_text(re.compile("^Trimmed to fit the 24,000-byte limit"))).to_be_visible()
+    expect(items.filter(has_text="python.md")).to_contain_text(".agents/rules/python.md · applies to files matching src/**/*.py · ~40 tokens")
+    expect(items.filter(has_text="~/.agents/AGENTS.md")).to_contain_text("~/.agents/AGENTS.md · applies to all projects · ~30 tokens")
+    expect(items.filter(has_text="Project memory")).to_contain_text("Project memory · applies to this project · ~62 tokens")
+
+
 def test_submits_note_once_and_prevents_duplicates(ui, page):
     ui.mount("components/ContextMeter.js", f"""{{ info: {INFO},
         onCompact: fake.spy('compact', () => fake.defer('compact').promise) }}""")

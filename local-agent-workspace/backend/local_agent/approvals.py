@@ -38,7 +38,7 @@ def rule_for(name, arguments):
     if name.startswith("hook_"):
         hook = arguments.get("hook_id")
         return {"tool": "hook", "hook": hook} if isinstance(hook, str) and hook else None
-    if name in ("delegate_task", "stop_job"):
+    if name in ("delegate_task", "stop_job", "remember"):
         return {"tool": name}
     return None
 

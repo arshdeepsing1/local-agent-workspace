@@ -326,7 +326,7 @@ export function useWorkspace() {
     const { workspace, model, env_file, context_window, max_output_tokens, max_agent_steps, compaction_handoffs, approval_timeout_minutes,
       system_notifications, user_instructions, write_limit_kb, command_env, rate_limit_auto_continue, auto_keep_changes,
       coding_dir, python_venv, auto_compact_percent, reasoning_effort, reasoning_format, thinking_summaries, prompt_caching, subagent_defaults,
-      spending_limit_dbu } = next
+      spending_limit_dbu, user_agents_file, user_claude_file, project_memory, output_style } = next
     const saved = await api('/settings', 'PUT', {
       workspace, model, env_file, context_window, max_output_tokens, max_agent_steps,
       ...(typeof compaction_handoffs === 'boolean' ? { compaction_handoffs } : {}),
@@ -346,6 +346,10 @@ export function useWorkspace() {
       ...(typeof thinking_summaries === 'boolean' ? { thinking_summaries } : {}),
       ...(typeof prompt_caching === 'string' ? { prompt_caching } : {}),
       ...(subagent_defaults && typeof subagent_defaults === 'object' ? { subagent_defaults } : {}),
+      ...(typeof user_agents_file === 'boolean' ? { user_agents_file } : {}),
+      ...(typeof user_claude_file === 'boolean' ? { user_claude_file } : {}),
+      ...(typeof project_memory === 'boolean' ? { project_memory } : {}),
+      ...(typeof output_style === 'string' && output_style ? { output_style } : {}),
     })
     setSettings(saved)
     void checkConnection().catch(e => setError(e.message))

@@ -563,3 +563,12 @@ body.panel-resizing{cursor:col-resize;user-select:none}
 .composer-hint-show{font-size:11px;padding:1px 6px;margin-left:4px;border-radius:5px;color:var(--ink);text-decoration:underline;text-underline-offset:2px}
 .tool-clock,.compacting-elapsed{font-variant-numeric:tabular-nums}
 .tool-live{margin:0 13px 10px;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* 2026-10-16 instructions: Agent tools → Memory, its notes and their edit form. */
+.memory-notes{list-style:none;margin:12px 0;padding:0}
+.memory-note{display:flex;align-items:flex-start;justify-content:space-between;gap:15px;padding:12px 0;border-bottom:1px solid var(--border);min-width:0}
+.memory-note>form{flex:1;margin:0;min-width:0}
+.memory-note-text{flex:1;min-width:0;overflow-wrap:anywhere}
+.memory-note-text small{display:block;color:var(--muted);font-size:11px}
+.memory-project code{overflow-wrap:anywhere}
+@media(max-width:639px){.memory-note{flex-direction:column;gap:8px}}

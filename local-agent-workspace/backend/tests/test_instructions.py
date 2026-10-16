@@ -106,28 +106,53 @@ def test_unreadable_file_warns_and_remaining_guidance_loads(tmp_path, monkeypatc
     assert "unreadable" not in result["text"]
 
 
-@pytest.mark.parametrize("size", [MAX_INSTRUCTION_BYTES + 1, LIMIT + 1])
-def test_oversize_file_is_omitted_whole_with_warning(tmp_path, size):
-    write(tmp_path, "AGENTS.md", "x" * size)
+def test_an_oversize_file_is_trimmed_after_the_files_that_fit_whole(tmp_path):
+    write(tmp_path, "AGENTS.md", "".join(f"rule {n:05d}\n" for n in range(3000)))  # 33,000 bytes
+    write(tmp_path, "CLAUDE.md", "small guidance")
+    result = load_project_instructions(WorkspaceTools(str(tmp_path)))
+    assert result["files"] == ["AGENTS.md", "CLAUDE.md"]
+    assert "small guidance" in result["text"] and "rule 00000\n" in result["text"] and "rule 02999" not in result["text"]
+    assert len(result["text"].encode("utf-8")) <= MAX_INSTRUCTION_BYTES
+    head = result["text"][:result["text"].index("[Trimmed: the rest of this file")]
+    assert head.endswith("\n")  # Cut at a line break.
+    first = result["sources"][0]
+    assert first["status"] == "trimmed" and first["estimated_tokens"] > 0
+    assert first["reason"].startswith("Trimmed to fit the 24,000-byte limit for project instructions:")
+    assert result["warnings"] == ["AGENTS.md: " + first["reason"]]
+    assert result["sources"][1]["status"] == "loaded"
+
+
+def test_a_file_over_the_read_limit_is_omitted_whole_with_warning(tmp_path):
+    write(tmp_path, "AGENTS.md", "x" * (LIMIT + 1))
     write(tmp_path, "CLAUDE.md", "small guidance")
     result = load_project_instructions(WorkspaceTools(str(tmp_path)))
     assert result["files"] == ["CLAUDE.md"]
-    assert len(result["text"].encode("utf-8")) <= MAX_INSTRUCTION_BYTES
     assert "x" * 20 not in result["text"]
-    assert len(result["warnings"]) == 1
-    assert result["warnings"][0].startswith("AGENTS.md:")
+    assert len(result["warnings"]) == 1 and result["warnings"][0].startswith("AGENTS.md:")
     assert "limit" in result["warnings"][0]
+    assert result["sources"][0]["status"] == "omitted"
 
 
-def test_combined_limit_counts_utf8_bytes_and_keeps_whole_files(tmp_path):
-    write(tmp_path, "AGENTS.md", "é" * 4000)
-    write(tmp_path, "CLAUDE.md", "界" * 3000)
+def test_combined_limit_counts_utf8_bytes_and_trims_on_a_character_boundary(tmp_path):
+    write(tmp_path, "AGENTS.md", "é" * 8000)  # 16,000 bytes
+    write(tmp_path, "CLAUDE.md", "界" * 3000)  # 9,000 bytes: only part of it fits
+    result = load_project_instructions(WorkspaceTools(str(tmp_path)))
+    assert result["files"] == ["AGENTS.md", "CLAUDE.md"]
+    assert "é" * 8000 in result["text"]
+    assert "界" * 2000 in result["text"] and "界" * 3000 not in result["text"]
+    assert "\ufffd" not in result["text"]
+    assert len(result["text"].encode("utf-8")) <= MAX_INSTRUCTION_BYTES
+    assert [source["status"] for source in result["sources"]] == ["loaded", "trimmed"]
+    assert result["warnings"][0].startswith("CLAUDE.md: Trimmed")
+
+
+def test_files_that_no_longer_fit_after_a_trim_are_omitted_with_the_limit(tmp_path):
+    write(tmp_path, "AGENTS.md", "a" * 23_000)
+    write(tmp_path, "CLAUDE.md", "b" * 2_000)
     result = load_project_instructions(WorkspaceTools(str(tmp_path)))
     assert result["files"] == ["AGENTS.md"]
-    assert "é" * 4000 in result["text"]
-    assert "界" not in result["text"]
-    assert len(result["text"].encode("utf-8")) <= MAX_INSTRUCTION_BYTES
-    assert result["warnings"][0].startswith("CLAUDE.md:")
+    assert result["sources"][1] == {"path": "CLAUDE.md", "scope": ".", "status": "omitted", "estimated_tokens": 0,
+                                    "reason": "Omitted whole file: over the 24,000-byte total limit for project instructions."}
 
 
 def test_missing_files_are_ignored_and_directives_are_plain_data(tmp_path):

@@ -6,7 +6,7 @@ import { modeLabel, quoteArgv } from './PermissionsMenu.js'
 // Pending-card fields (see types.js): rememberable, rule_options, editable, protected, uncertain, edited.
 const SCOPE_LABELS = { chat: 'This chat', project: 'This project', user: 'All projects' }
 const RULE_SCOPES = { chat: 'this chat', project: 'this project', user: 'all projects' }
-const FIELD_LABELS = { command: 'Command', content: 'File content', new_text: 'Replacement text' }
+const FIELD_LABELS = { command: 'Command', content: 'File content', new_text: 'Replacement text', text: 'Note' }
 // A shorter visible label for narrow cards. It must be the start of the accessible name (WCAG 2.5.3 Label in Name),
 // so a speech-input user who says what they see still matches. Only the command label is long; the others
 // ("Allow edits in this chat", "Allow subagents in this chat", …) keep their full text at every width.
@@ -110,7 +110,7 @@ function EditAction({ event, sessionId, onError, onClose }) {
   }
   return html`<div class="approval-edit">
     ${fields.map((field, index) => html`<label key=${field}>${FIELD_LABELS[field]}<textarea ref=${index === 0 ? first : null} spellcheck=${false} disabled=${saving}
-      rows=${field === 'command' ? 3 : 8} value=${values[field]} onInput=${e => { const value = e.currentTarget.value; setValues(current => ({ ...current, [field]: value })) }} /></label>`)}
+      rows=${field === 'command' || field === 'text' ? 3 : 8} value=${values[field]} onInput=${e => { const value = e.currentTarget.value; setValues(current => ({ ...current, [field]: value })) }} /></label>`)}
     <div class="approval-buttons"><button class="outline" disabled=${saving} onClick=${onClose}>Cancel edit</button>
       <button class="primary" disabled=${saving || !changed} onClick=${() => void save()}>Save edit</button></div>
   </div>`

@@ -457,7 +457,8 @@ def test_mcp_results_per_server_and_stale_results_cleared(ui, page):
 
 # The dialog keeps one size: the tabs stay put and only the tab content scrolls
 
-TABS = ["Overview", "Tasks", "Subagents", "Tools", "Usage", "Export", "Checkpoints", "Verify", "Worktrees", "Extensions"]
+TABS = ["Overview", "Tasks", "Subagents", "Tools", "Usage", "Export", "Checkpoints", "Verify", "Memory", "Worktrees",
+        "Extensions"]
 
 
 def tabs_top(ui):
@@ -562,7 +563,7 @@ def test_overview_is_the_first_section_and_sums_up_the_chat_and_project(ui, page
     expect(page.get_by_role("button", name="Overview", exact=True)).to_have_attribute("aria-pressed", "true")
     expected = {"Model": "Test model · test-model", "Permission mode": "Manual", "Tools": "6 of 7 on", "Subagents": "1 running · 0 finished",
                 "Tasks": "0 of 1 done", "Unreviewed changes": "3 files", "Checkpoints": "1 file checkpoint", "Verify": "pytest -q",
-                "Worktrees": "1 managed worktree", "Extensions": "None configured"}
+                "Memory": "None yet", "Worktrees": "1 managed worktree", "Extensions": "None configured"}
     for label, value in expected.items():
         expect(overview_row(page, label).locator(".overview-value")).to_have_text(value)
     expect(page.get_by_role("region", name="Overview")).to_contain_text("/project")
@@ -577,7 +578,8 @@ def test_overview_names_the_chats_reasoning_effort(ui, page):
 def test_overview_buttons_open_their_sections(ui, page):
     open_dialog(ui)
     regions = {"Tools": "Tools", "Subagents": "Subagents", "Tasks": "Tasks", "Usage": "Usage", "Export": "Conversation transfer",
-               "Checkpoints": "Checkpoints", "Verify": "Verify", "Worktrees": "Worktrees", "Extensions": "Extensions"}
+               "Checkpoints": "Checkpoints", "Verify": "Verify", "Memory": "Memory", "Worktrees": "Worktrees",
+               "Extensions": "Extensions"}
     for tab, region in regions.items():
         page.get_by_role("button", name=f"Open {tab}", exact=True).click()
         expect(page.get_by_role("button", name=tab, exact=True)).to_have_attribute("aria-pressed", "true")

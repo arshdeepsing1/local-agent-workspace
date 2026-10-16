@@ -70,8 +70,9 @@ READ_ONLY_COMMANDS = frozenset(tuple(text.split()) for text in (
 READ_ONLY_SPELLINGS = {"/bin/pwd": "pwd", "/bin/ls": "ls"}
 
 PROTECTED_DIRS = frozenset({".vscode", ".idea", ".husky", ".githooks", ".agents", ".claude", ".devcontainer"})
-PROTECTED_FILES = frozenset(name.casefold() for name in ("AGENTS.md", "CLAUDE.md", "CLAUDE.local.md", ".gitattributes",
-                                                         ".gitmodules", ".pre-commit-config.yaml", ".envrc"))
+PROTECTED_FILES = frozenset(name.casefold() for name in ("AGENTS.md", "AGENTS.local.md", "CLAUDE.md", "CLAUDE.local.md",
+                                                         ".gitattributes", ".gitmodules", ".pre-commit-config.yaml",
+                                                         ".envrc"))
 HOME_FILES = frozenset({".bashrc", ".bash_profile", ".bash_login", ".profile", ".zshrc", ".zshenv", ".zprofile",
                         ".zlogin", ".gitconfig", ".ssh"})
 EDIT_KINDS_RULE = "edits"
@@ -229,6 +230,8 @@ def rule_label(rule):
         return "subagents"
     if tool == "stop_job":
         return "stopping jobs"
+    if tool == "remember":
+        return "saving project memory"
     if tool.startswith("mcp__") and tool.endswith("__*"):
         return f"all tools of MCP server {tool[5:-3]}"
     return f"the tool {tool}"
@@ -383,7 +386,7 @@ def normalize_rule(draft, *, resolve_path, credential_file=None, credential_toke
         if MCP_WILDCARD.match(tool):
             if behavior == "allow":
                 raise ValueError("A rule for every tool of an MCP server can only deny or ask.")
-        elif tool in ("delegate_task", "stop_job") or MCP_NAME.match(tool):
+        elif tool in ("delegate_task", "stop_job", "remember") or MCP_NAME.match(tool):
             pass
         elif tool in TOOL_KINDS:
             if behavior != "deny":
@@ -503,7 +506,7 @@ def default_rule(name, arguments):
         return {"argv": argv, "behavior": "allow", "tool": "run_command"}
     if kind == "edit":
         return {"behavior": "allow", "tool": EDIT_KINDS_RULE}
-    if kind in ("mcp", "delegate", "job_stop"):
+    if kind in ("mcp", "delegate", "job_stop", "memory"):
         return {"behavior": "allow", "tool": name}
     if kind == "hook":
         hook = arguments.get("hook_id")
