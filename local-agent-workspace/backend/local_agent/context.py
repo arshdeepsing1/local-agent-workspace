@@ -1101,7 +1101,7 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
                           preservation_note="", condense=None, scale=1.0, handoff_path=None, save_handoff=None,
                           default_reply_reserve=DEFAULT_MAX_OUTPUT_TOKENS,
                           auto_compact_percent=MAX_AUTO_COMPACT_PERCENT, record_requests=False, app_record=None,
-                          output_allowance=0, completed_calls=None, model_window=None):
+                          output_allowance=0, completed_calls=None, model_window=None, before_compaction=None):
     """(messages, state, info) for the next request, compacting earlier turns when needed.
 
     Compaction runs when force_compact is set or the estimate passes auto_compact_percent
@@ -1112,7 +1112,10 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
     that later calls superseded. model_window (model_context_window) is the provider's
     real window: the input budget and the summary requests then keep a margin for estimate
     error against it (effective_input_budget, COMPACTION_ESTIMATE_FACTOR). The defaults
-    keep the behaviour before these options.
+    keep the behaviour before these options. before_compaction(info), when given, is awaited once
+    when a compaction will run, before its first summary request, with {estimated_input_tokens,
+    threshold, input_budget}; it returns the preservation note to use (the user's before_compaction
+    hooks add to it) or raises to stop a manual compaction.
     """
     if not MIN_CONTEXT_WINDOW <= context_window <= MAX_CONTEXT_WINDOW:
         raise ValueError(f"Choose a context window between {MIN_CONTEXT_WINDOW} and {MAX_CONTEXT_WINDOW}.")
@@ -1258,6 +1261,9 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
                 raise budget_error(problem, context_window, reply_reserve, input_budget, default_reply_reserve)
 
     if cut is not None:
+        if before_compaction is not None:
+            preservation_note = await before_compaction({"estimated_input_tokens": estimate, "threshold": threshold,
+                                                         "input_budget": input_budget})
         archived = wire[state["through"]:cut]
         if in_turn and request_index < state["through"]:
             # The request (and the user's steered messages) were kept out of the last

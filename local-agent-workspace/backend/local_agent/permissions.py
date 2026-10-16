@@ -4,7 +4,8 @@ tool_decision is each mode's baseline without rules. evaluate is the one decisio
 every tool call and every waiting approval card goes through; its order is fixed:
 turned-off tools, deny rules, Plan's denial, ask rules and uncertain commands,
 protected paths, the mode baseline, allow rules (never in Plan), Don't ask (and Bypass
-for a memory note), ask.
+for a memory note), ask. Web tools (kind "web") ask in every mode but Bypass: a domain
+rule allows web_fetch for one host, and Plan always shows the card.
 """
 import logging
 from dataclasses import dataclass
@@ -32,6 +33,8 @@ TOOL_KINDS = {
     "stop_job": "job_stop",
     "delegate_task": "delegate",
     "remember": "memory",
+    # web_fetch.py: a card per new domain (domain rules), one for a chat's first search.
+    **dict.fromkeys(("web_fetch", "web_search"), "web"),
 }
 # Every path-valued argument of each edit tool: protected-path checks and path rules cover all of them.
 EDIT_TOOL_PATHS = {"write_file": ("path",), "edit_file": ("path",), "insert_activity_log": ("path",),
@@ -85,7 +88,7 @@ def tool_decision(mode: str, name: str, arguments: dict) -> str:
     if mode == "plan":
         if read_only:
             return "allow"
-        return "ask" if kind == "delegate" else "deny"
+        return "ask" if kind in ("delegate", "web") else "deny"  # A web read always shows its card in Plan.
     if kind == "memory":
         return "ask"  # Every mode asks; Bypass and Don't ask save a note only when a rule allows it (evaluate).
     if mode == "bypassPermissions":

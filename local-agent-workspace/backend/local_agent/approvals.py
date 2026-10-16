@@ -23,8 +23,8 @@ def rule_for(name, arguments):
     """The rule that "Allow for this chat" stores for an action, or None when it cannot be remembered.
 
     Commands match by their exact text (only surrounding whitespace is removed),
-    MCP tools by their exact name, and hooks by their exact ID. Folder access and
-    every other card has no rule.
+    MCP tools by their exact name, hooks by their exact ID, and web fetches by their
+    host (web_fetch.domain_of). Folder access and every other card has no rule.
     """
     name = name if isinstance(name, str) else ""
     arguments = arguments if isinstance(arguments, dict) else {}
@@ -38,8 +38,12 @@ def rule_for(name, arguments):
     if name.startswith("hook_"):
         hook = arguments.get("hook_id")
         return {"tool": "hook", "hook": hook} if isinstance(hook, str) and hook else None
-    if name in ("delegate_task", "stop_job", "remember"):
+    if name in ("delegate_task", "stop_job", "remember", "web_search"):
         return {"tool": name}
+    if name == "web_fetch":
+        from .web_fetch import domain_of
+        domain = domain_of(arguments.get("url"))
+        return {"tool": "web_fetch", "domain": domain} if domain else None
     return None
 
 
@@ -67,6 +71,7 @@ class AllowRule(BaseModel):
     prefix: list[str] | None = Field(default=None, max_length=16)
     flags: list[str] | None = Field(default=None, max_length=64)
     path: str | None = Field(default=None, max_length=4096, strict=True)
+    domain: str | None = Field(default=None, max_length=253, strict=True)
 
 
 class RuleChange(BaseModel):

@@ -528,3 +528,38 @@ def test_a_memory_card_names_the_note_and_edits_it_as_a_note(ui, page):
     page.get_by_role("button", name="Save edit").click()
     ui.wait("fake.calls.length === 1")
     assert ui.bodies("/api/sessions/parent/approvals/note/edit", "POST") == [{"input": {"text": "Tests run with pytest -q from backend/."}}]
+
+
+# Web cards (web_fetch.py): one domain per card
+
+WEB_FETCH = ", input: { url: 'https://docs.example.com/guide' }, web_domain: 'docs.example.com', rememberable: ['chat', 'project', 'user'], rule_options: { domain: 'docs.example.com' }"
+
+
+def test_a_web_fetch_card_offers_allow_once_the_domain_in_this_chat_or_always(ui, page):
+    show(ui, f"[{pending('fetch', 'web_fetch', WEB_FETCH)}]")
+    card = page.locator(".tool-card.needs-approval")
+    expect(card).to_contain_text("Local needs your approval to fetch from docs.example.com.")
+    expect(card.get_by_role("button", name=re.compile(r"^web fetch https:\/\/docs\.example\.com\/guide"))).to_be_visible()
+    card.get_by_role("button", name="Always allow…", exact=True).click()
+    form = card.get_by_role("group", name="Remember this approval")
+    expect(form).to_contain_text("Allows fetches from docs.example.com only (not its subdomains).")
+    form.get_by_role("radio", name="All projects").check()
+    form.get_by_role("button", name="Approve and remember").click()
+    ui.wait("fake.calls.length === 1")
+    card.get_by_role("button", name="Allow docs.example.com in this chat", exact=True).click()
+    ui.wait("fake.calls.length === 2")
+    card.get_by_role("button", name="Allow once", exact=True).click()
+    ui.wait("fake.calls.length === 3")
+    assert decisions(ui, "fetch") == [{"allowed": True, "scope": "user"}, {"allowed": True, "remember": True},
+                                      {"allowed": True}]
+
+
+def test_a_web_search_card_shows_the_query_and_needs_no_chat_button(ui, page):
+    show(ui, f"[{pending('search', 'web_search', ", input: { query: 'python asyncio' }, web_provider: 'Brave Search', rememberable: ['chat', 'project', 'user']")}]")
+    card = page.locator(".tool-card.needs-approval")
+    expect(card).to_contain_text("Local needs your approval to search the web with Brave Search.")
+    expect(card.get_by_role("button", name=re.compile("^web search python asyncio"))).to_be_visible()
+    expect(card.get_by_role("button", name=re.compile("in this chat$"))).to_have_count(0)
+    card.get_by_role("button", name="Approve", exact=True).click()
+    ui.wait("fake.calls.length === 1")
+    assert decisions(ui, "search") == [{"allowed": True}]

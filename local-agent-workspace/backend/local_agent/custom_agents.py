@@ -56,7 +56,8 @@ INDEX_DESCRIPTION = 150
 # Claude Code's agent files (.claude/agents) name its own tools; these are this app's equivalents.
 TOOL_ALIASES = {"Read": "read_file", "Write": "write_file", "Edit": "edit_file", "MultiEdit": "edit_file",
                 "Glob": "find_files", "Grep": "search_files", "LS": "list_files", "Bash": "run_command",
-                "NotebookRead": "notebook_read", "NotebookEdit": "notebook_edit"}
+                "NotebookRead": "notebook_read", "NotebookEdit": "notebook_edit", "WebFetch": "web_fetch",
+                "WebSearch": "web_search"}
 # Claude Code's model values: not Databricks endpoints, so the chat's model is used.
 MODEL_ALIASES = ("sonnet", "opus", "haiku")
 INHERIT_VALUES = ("", "inherit", "default-model")

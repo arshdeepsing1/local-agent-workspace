@@ -656,6 +656,37 @@ def test_edit_and_tool_rules(ui, page):
     ]
 
 
+def test_web_fetch_rules_name_a_domain(ui, page):
+    dialog = open_dialog(ui, page)
+    dialog.get_by_role("combobox", name="Applies to").select_option(label="Web fetches")
+    domain = dialog.get_by_role("textbox", name="Domain")
+    expect(dialog.get_by_text("Allow names one host exactly; other hosts, also its subdomains, still ask.")).to_be_visible()
+    expect(dialog.get_by_role("button", name="Add rule")).to_be_disabled()
+    domain.fill(" docs.python.org ")
+    dialog.get_by_role("button", name="Add rule").click()
+    expect(dialog).to_have_count(0)
+    page.get_by_role("button", name=MENU).click()
+    page.get_by_role("menuitem", name="Add a rule…").click()
+    dialog.get_by_role("combobox", name="Behavior").select_option(label="Deny")
+    dialog.get_by_role("combobox", name="Applies to").select_option(label="Web fetches")
+    expect(dialog.get_by_text("Deny and Always ask cover the domain and its subdomains; leave it empty for every web fetch.")).to_be_visible()
+    dialog.get_by_role("button", name="Add rule").click()
+    expect(dialog).to_have_count(0)
+    assert ui.bodies("/api/permission-rules", "POST") == [
+        {"scope": "project", "session_id": "a", "rule": {"tool": "web_fetch", "behavior": "allow", "domain": "docs.python.org"}},
+        {"scope": "project", "session_id": "a", "rule": {"tool": "web_fetch", "behavior": "deny"}},
+    ]
+
+
+def test_web_rules_have_plain_labels_in_the_menu(ui, page):
+    menu = open_menu(ui, page, setup="""fake.userRules = [{ behavior: 'allow', tool: 'web_fetch', domain: 'docs.python.org' },
+      { behavior: 'deny', tool: 'web_fetch', domain: 'example.com' }, { behavior: 'allow', tool: 'web_search' }]""")
+    user = menu.get_by_role("group", name="All projects", exact=True)
+    expect(user.get_by_role("menuitem", name="Remove rule: Fetches from docs.python.org", exact=True)).to_be_visible()
+    expect(user.get_by_role("menuitem", name="Remove rule: Fetches from example.com and its subdomains")).to_be_visible()
+    expect(user.get_by_role("menuitem", name="Remove rule: Web searches")).to_be_visible()
+
+
 def test_cancel_and_escape_close_the_dialog(ui, page):
     dialog = open_dialog(ui, page)
     dialog.get_by_role("button", name="Cancel").click()

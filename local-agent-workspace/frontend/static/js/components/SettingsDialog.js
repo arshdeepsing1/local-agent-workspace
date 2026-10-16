@@ -9,7 +9,12 @@ const inRange = (value, low, high) => Number.isInteger(value) && value >= low &&
 const LIMIT_KEYS = ['context_window', 'max_output_tokens']
 // The dialog's sections, in order: [id, title]. On wide screens a list beside them jumps to each.
 const SECTIONS = [['project', 'Project'], ['model', 'Model and context'], ['reasoning', 'Reasoning'], ['agent', 'Agent'],
-  ['subagents', 'Subagents'], ['commands', 'Commands and files'], ['notifications', 'Notifications'], ['credentials', 'Credentials']]
+  ['subagents', 'Subagents'], ['commands', 'Commands and files'], ['web', 'Web access'], ['notifications', 'Notifications'],
+  ['credentials', 'Credentials']]
+// Settings → Web access: web_search providers (backend web_fetch.PROVIDERS) and the credential-file entry each reads
+// its API key from when Settings names none (web_fetch.DEFAULT_KEYS); SearXNG takes an address instead.
+const SEARCH_PROVIDERS = [['', 'None (no web search)'], ['brave', 'Brave Search'], ['tavily', 'Tavily'], ['searxng', 'SearXNG (your own server)']]
+const SEARCH_KEYS = { brave: 'BRAVE_API_KEY', tavily: 'TAVILY_API_KEY' }
 const FORMATS = [['auto', 'Automatic (per endpoint)'], ['anthropic', 'Anthropic fields (thinking + output_config.effort)'],
   ['openai', 'OpenAI field (reasoning_effort)'], ['none', 'Don\'t send reasoning fields']]
 // Settings → Prompt caching (backend config.PROMPT_CACHING): cache markers on agent requests to Claude endpoints;
@@ -197,6 +202,10 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
     && recommended.max_output_tokens === form.max_output_tokens
   const recommendedText = recommended ? `${limits.profile.label} defaults (${recommended.context_window.toLocaleString('en-US')} context, ${recommended.max_output_tokens.toLocaleString('en-US')} output)` : ''
   const field = (key, value) => setForm(current => ({ ...current, [key]: value }))
+  const searchProvider = form.web_search_provider || ''
+  // The saved provider's state (configured, or which key is missing); an edited choice is checked on save.
+  const searchStatus = searchProvider && searchProvider === (settings.web_search_provider || '') && (form.web_search_key || '') === (settings.web_search_key || '')
+    ? settings.web_search_status : null
   // The check's answer for the endpoint and budgets now in the form only: after an edit an older answer
   // would name another budget (and reason) until the next check answers.
   const query = limits?.query
@@ -404,6 +413,20 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         <label>Environment variables for commands<input value=${envText} spellcheck=${false} placeholder="JAVA_HOME NVM_DIR CONDA_PREFIX"
           onInput=${e => { const text = e.currentTarget.value; setEnvText(text); field('command_env', [...new Set(text.split(/[\s,]+/).filter(Boolean))]) }} /></label>
         <p class="field-help">Commands get a minimal environment; names listed here are passed from the environment the server was started with. Never list secrets you do not want commands to see; the Databricks token and variables that change how programs start (LD_*, BASH_ENV, NODE_OPTIONS and similar) are never passed.</p>`)}
+        ${group('web', html`
+        <label class="settings-checkbox"><input type="checkbox" checked=${form.web_fetch !== false}
+          onChange=${e => field('web_fetch', e.currentTarget.checked)} />Let the agent fetch web pages (web_fetch)</label>
+        <p class="field-help">The agent reads one public page at a time, as text. Each new domain asks first: Allow once, allow the domain in this chat, or always with a rule. This computer, private networks and cloud metadata addresses are never fetched, and page text reaches the agent as untrusted data.</p>
+        <label>Web search provider<select value=${searchProvider} onChange=${e => field('web_search_provider', e.currentTarget.value)}>
+          ${SEARCH_PROVIDERS.map(([value, label]) => html`<option key=${value} value=${value}>${label}</option>`)}
+        </select></label>
+        ${searchProvider === 'searxng' ? html`<label>SearXNG address<input value=${form.web_search_url || ''} spellcheck=${false} required
+          placeholder="http://127.0.0.1:8888" onInput=${e => field('web_search_url', e.currentTarget.value)} /></label>` : null}
+        ${SEARCH_KEYS[searchProvider] ? html`<label>API key entry in your credential file<input value=${form.web_search_key || ''} spellcheck=${false}
+          placeholder=${SEARCH_KEYS[searchProvider]} onInput=${e => field('web_search_key', e.currentTarget.value.trim())} /></label>
+          <p class="field-help">The name of the entry, for example ${form.web_search_key || SEARCH_KEYS[searchProvider]}=… in your credential file. The key itself stays there: it is read for each search and never saved in settings.</p>` : null}
+        ${searchStatus ? html`<p class=${searchStatus.ready ? 'field-help' : 'settings-note'} role="status">${searchStatus.ready ? `${searchStatus.provider} is ready.` : searchStatus.problem}</p>` : null}
+        <p class="field-help">With a provider, the agent gets a web_search tool. Each query goes to that provider, which may charge for it and sees what is searched; check your organization's rules first. The first search in each chat shows its query for your approval.</p>`)}
         ${group('notifications', html`
         <label class="settings-checkbox"><input type="checkbox" checked=${form.system_notifications === true}
           onChange=${e => field('system_notifications', e.currentTarget.checked)} />Desktop notification when no browser tab is open</label>

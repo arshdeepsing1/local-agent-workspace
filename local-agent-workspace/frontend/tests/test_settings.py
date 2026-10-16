@@ -261,10 +261,11 @@ def test_save_is_always_visible(ui, page, width, height):
     expect(dialog.get_by_role("group", name="Model and context").get_by_role("spinbutton", name="Context budget (tokens)")).to_be_visible()
     expect(dialog.get_by_role("group", name="Project").get_by_role("textbox", name="Project folder")).to_be_visible()
     groups = dialog.locator("fieldset.settings-group")
-    expect(groups).to_have_count(8)
-    assert [groups.nth(n).locator("legend").inner_text() for n in range(8)] == [
-        "Project", "Model and context", "Reasoning", "Agent", "Subagents", "Commands and files", "Notifications", "Credentials"]
-    for n in range(8):
+    expect(groups).to_have_count(9)
+    assert [groups.nth(n).locator("legend").inner_text() for n in range(9)] == [
+        "Project", "Model and context", "Reasoning", "Agent", "Subagents", "Commands and files", "Web access", "Notifications",
+        "Credentials"]
+    for n in range(9):
         expect(dialog.get_by_role("group", name=groups.nth(n).locator("legend").inner_text(), exact=True)).to_have_count(1)
     # The footer spans the dialog's padding without making it scroll sideways (phones have less padding).
     fits = ui.js("""(d => { const box = d.getBoundingClientRect(), footer = d.querySelector('form > footer').getBoundingClientRect()
@@ -368,3 +369,38 @@ def test_the_built_in_styles_are_offered_when_the_style_list_fails(ui, page):
       ? fake.json({ detail: 'Broken' }, 500) : undefined""")
     style = dialog.get_by_role("combobox", name="Output style")
     expect(style.locator("option")).to_have_text(["Default", "Concise", "Explanatory"])
+
+
+# Settings → Web access
+
+def test_web_access_turns_fetch_off_and_names_a_search_provider_without_its_key(ui, page):
+    dialog = open_settings(ui, page)
+    group = dialog.get_by_role("group", name="Web access")
+    fetch = group.get_by_role("checkbox", name="Let the agent fetch web pages (web_fetch)")
+    provider = group.get_by_role("combobox", name="Web search provider")
+    expect(fetch).to_be_checked()
+    expect(provider).to_have_value("")
+    expect(group.get_by_role("textbox", name="SearXNG address")).to_have_count(0)
+    provider.select_option("brave")
+    key = group.get_by_role("textbox", name="API key entry in your credential file")
+    expect(key).to_have_attribute("placeholder", "BRAVE_API_KEY")
+    expect(group.get_by_text("The name of the entry, for example BRAVE_API_KEY=… in your credential file.", exact=False)).to_be_visible()
+    provider.select_option("searxng")
+    expect(key).to_have_count(0)
+    group.get_by_role("textbox", name="SearXNG address").fill("http://127.0.0.1:8888")
+    fetch.uncheck()
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    body = ui.bodies("/api/settings", "PUT")[0]
+    assert (body["web_fetch"], body["web_search_provider"], body["web_search_url"]) == (False, "searxng", "http://127.0.0.1:8888")
+
+
+def test_web_access_shows_what_the_saved_provider_still_needs(ui, page):
+    dialog = open_settings(ui, page, setup="""fake.settings = { ...fake.settings, web_search_provider: 'tavily', web_search_key: '',
+      web_search_status: { provider: 'Tavily', ready: false, key_name: 'TAVILY_API_KEY',
+        problem: 'Add TAVILY_API_KEY=… to your credential file: web search with Tavily reads its API key there.' } }""")
+    group = dialog.get_by_role("group", name="Web access")
+    expect(group.get_by_role("status")).to_have_text(
+        "Add TAVILY_API_KEY=… to your credential file: web search with Tavily reads its API key there.")
+    group.get_by_role("textbox", name="API key entry in your credential file").fill("MY_TAVILY")
+    expect(group.get_by_role("status")).to_have_count(0)  # Checked again when saved.

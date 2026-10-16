@@ -28,7 +28,7 @@ SONNET = "databricks-claude-sonnet-4-5"
 AUDITOR = """---
 name: security-auditor
 description: Reviews code for injection, secrets handling and unsafe file access.
-tools: [read_file, search_files, run_command, Grep, web_fetch]
+tools: [read_file, search_files, run_command, Grep, browser_open]
 profile: inherit
 model: databricks-gpt-oss-120b
 effort: high
@@ -66,16 +66,18 @@ def test_a_full_agent_file_parses_with_its_notes():
     assert agent["tools"] == ["read_file", "search_files", "run_command"]
     assert agent["instructions"] == "Check every changed file for hard-coded secrets.\nReport each finding with path:line."
     assert "Claude Code tool names used as this app's: Grep → search_files." in agent["notes"]
-    assert "Ignored unknown tools: web_fetch." in agent["notes"]
+    assert "Ignored unknown tools: browser_open." in agent["notes"]
 
 
 def test_defaults_are_the_file_name_read_only_and_the_chats_model_and_effort():
     agent = parse_agent("---\ndescription: 'Maps a module, it''s quick'\n# A comment\n\n---\n", "mapper")
     assert agent == {"name": "mapper", "description": "Maps a module, it's quick", "profile": "read_only", "tools": None,
                      "model": None, "effort": None, "skills": [], "max_steps": None, "instructions": "", "notes": []}
-    claude = parse_agent('---\nname: reviewer\ndescription: "Reviews \\"diffs\\""\ntools: Read, Grep, Glob\n'
+    claude = parse_agent('---\nname: reviewer\ndescription: "Reviews \\"diffs\\""\ntools: Read, Grep, Glob, WebFetch\n'
                          "model: sonnet\ncolor: blue\n---\nBody", "other")
     assert claude["tools"] == ["read_file", "search_files", "find_files"] and claude["model"] is None
+    # WebFetch is this app's web_fetch, which a read-only agent does not get.
+    assert "Not in the read_only profile, so unavailable: web_fetch." in claude["notes"]
     assert claude["description"] == 'Reviews "diffs"'
     assert any("sonnet is not a Databricks endpoint" in note for note in claude["notes"])
     assert "Ignored unknown fields: color." in claude["notes"]
@@ -98,7 +100,7 @@ def test_defaults_are_the_file_name_read_only_and_the_chats_model_and_effort():
     ("---\n- item\ndescription: x\n---\n", "must follow a 'key:' line"),
     (agent_text(tools="[read_file"), "must close on the same line"),
     (agent_text(tools="[]"), "tools is empty"),
-    (agent_text(tools="[web_fetch, Task]"), "names no tool"),
+    (agent_text(tools="[browser_open, Task]"), "names no tool"),
     (agent_text(tools="[run_command]"), "set profile: file_editor or inherit"),
     (agent_text(profile="admin"), "profile must be read_only"),
     (agent_text(model="bad model!"), "model must be a Databricks serving endpoint name"),

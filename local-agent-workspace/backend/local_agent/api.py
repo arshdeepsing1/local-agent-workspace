@@ -189,6 +189,11 @@ class SettingsEdit(BaseModel):
     subagent_defaults: dict[str, dict[str, str]] | None = None
     # Settings → Model and context: "" = none; config.Settings.update and AgentManager.fallback_allowed check it.
     fallback_model: str | None = Field(default=None, max_length=128, strict=True)
+    # Settings → Web access: config.Settings.check_web_settings checks them; the key is a credential-file entry name.
+    web_fetch: bool | None = Field(default=None, strict=True)
+    web_search_provider: Literal["", "brave", "tavily", "searxng"] | None = None
+    web_search_url: str | None = Field(default=None, max_length=2048, strict=True)
+    web_search_key: str | None = Field(default=None, max_length=64, strict=True)
 
 
 class LimitsQuery(BaseModel):

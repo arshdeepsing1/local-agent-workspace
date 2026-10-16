@@ -631,3 +631,9 @@ body.panel-resizing{cursor:col-resize;user-select:none}
 .sent-with .attachment-chip{font-family:inherit}
 .queue-tag{font-size:11px;color:var(--muted);border:1px solid #dededb;border-radius:5px;padding:0 5px;white-space:nowrap}
 .skill-notes{color:#87593b}
+/* 2026-10-16 webhooks: a web_fetch card's domain rule, and the hook form's Run without asking shortcut. */
+.remember-domain{margin:6px 0 0;font-size:12px;overflow-wrap:anywhere}
+.hook-trust{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:10px}
+.hook-trust>span{flex:1 1 220px;min-width:0;font-size:12px;line-height:1.5;overflow-wrap:anywhere}
+.hook-trust .hook-trusted{color:#4f6b3f}
+.hook-trust .outline{font-size:12px;padding:6px 11px}

@@ -29,7 +29,7 @@ def test_the_subagents_section_lists_the_agent_types_and_unusable_files(ui, page
     expect(custom).to_contain_text("Read-only files · Tools: read_file, search_files · Fast effort · Claude Sonnet 4.5 · "
                                    "8 steps by default · Skills: review")
     expect(custom.locator("code")).to_have_text(".agents/agents/security-auditor.md")
-    expect(custom.locator(".agent-type-note")).to_have_text("Ignored unknown tools: web_fetch.")
+    expect(custom.locator(".agent-type-note")).to_have_text("Ignored unknown tools: browser_open.")
     broken = rows.nth(4)
     expect(broken.locator("code")).to_have_text(".claude/agents/broken.md")
     expect(broken).to_contain_text("Not used")

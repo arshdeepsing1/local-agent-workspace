@@ -74,10 +74,16 @@ def test_hook_selectors_and_failure_phase_roundtrip(manager):
     assert validate_config({"hooks": [hook("true", tools=[])]})["hooks"][0]["tools"] == []
 
 
-@pytest.mark.parametrize("selectors", ["read_file", ["*"], ["read_.*"], ["read_file", "read_file"], [None], ["x" * 65], [f"tool{n}" for n in range(65)]])
-def test_hook_selectors_require_unique_exact_tool_names(selectors):
-    with pytest.raises(ValueError, match="exact tool names"):
+@pytest.mark.parametrize("selectors", ["read_file", ["read_(file|path)"], ["read_[ab]"], ["read file"], ["read_file", "read_file"],
+                                       [None], ["x" * 65], [f"tool{n}" for n in range(65)], [""]])
+def test_hook_selectors_are_unique_names_or_glob_patterns(selectors):
+    with pytest.raises(ValueError, match="unique tool names or patterns with \\* and \\?"):
         validate_config({"hooks": [hook("true", tools=selectors)]})
+
+
+def test_hook_selectors_accept_glob_patterns():
+    selectors = ["*", "mcp__github__*", "*_file", "read_?ile", "mcp__docs__search.v2"]
+    assert validate_config({"hooks": [hook("true", tools=selectors)]})["hooks"][0]["tools"] == selectors
 
 
 def test_skills_discover_workspace_agents_and_load_bounded_text(manager, tmp_path):

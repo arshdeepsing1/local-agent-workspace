@@ -1,7 +1,8 @@
 """Long tool results and images, kept in memory for this app run (never saved to disk).
 
-An MCP result longer than its first page is kept here, already redacted, so the agent can
-read the rest with get_tool_output; an image an MCP tool returned is kept for its card,
+An MCP or web_fetch result longer than its first page is kept here, already redacted, so the
+agent can read the rest with get_tool_output (a web page's pages repeat its untrusted-content
+note); an image an MCP tool returned is kept for its card,
 never sent to the model. Per chat at most MAX_ENTRIES entries; in all at most MAX_TOTAL
 characters; the least recently used entry goes first. A restart or deleting the chat
 empties it: the agent is told to call the tool again.
@@ -42,9 +43,9 @@ class ResultStore:
         if entry is not None:
             self.total -= entry["size"]
 
-    def add(self, session_id, text):
-        """Keep text (already redacted; at most MAX_TEXT characters); returns its ID."""
-        return self._add(session_id, {"kind": "text", "text": text[:MAX_TEXT]}, "out")
+    def add(self, session_id, text, note=None):
+        """Keep text (already redacted; at most MAX_TEXT characters); returns its ID. note: shown with every page."""
+        return self._add(session_id, {"kind": "text", "text": text[:MAX_TEXT], **({"note": note} if note else {})}, "out")
 
     def add_image(self, session_id, mime_type, data):
         """Keep one image (base64 data) for its card; returns its ID."""
@@ -79,7 +80,8 @@ class ResultStore:
 
         def page(length):
             end = offset + length
-            return {"result_id": result_id, "output": content[:length], "offset": offset,
+            return {"result_id": result_id, **({"note": entry["note"]} if entry.get("note") else {}),
+                    "output": content[:length], "offset": offset,
                     "next_offset": end if end < len(text) else None, "total_chars": len(text)}
         low, high = 0, len(content)
         while low < high:

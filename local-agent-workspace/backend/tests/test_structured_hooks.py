@@ -201,7 +201,7 @@ def test_new_events_validate_and_the_limit_is_sixteen_hooks():
     assert MAX_HOOKS == 16 and len(validate_config({"hooks": hooks})["hooks"]) == 16
     with pytest.raises(ValueError, match="at most 16 hooks"):
         validate_config({"hooks": [*hooks, hook("extra", "agent_stop", "true")]})
-    with pytest.raises(ValueError, match="user_prompt, session_start, agent_stop, subagent_start or subagent_stop"):
+    with pytest.raises(ValueError, match="agent_stop, subagent_start, subagent_stop, before_compaction or notification"):
         validate_config({"hooks": [hook("a", "on_stop", "true")]})
     with pytest.raises(ValueError, match="32 KB"):
         validate_config({"hooks": [hook(f"h{index}", "agent_stop", "x" * 4000) for index in range(MAX_HOOKS)]})
@@ -843,3 +843,122 @@ async def test_hook_fields_are_exported_typed_and_a_bundle_with_bad_ones_is_refu
         broken["sessions"][0]["events"][0][field] = value
         with pytest.raises(ValueError, match="Invalid conversation bundle schema"):
             validate_bundle(broken)
+
+
+# Glob selectors, subagent attribution, before_compaction and notification ------------------------------------
+
+async def test_glob_selectors_pick_tools_and_the_tools_they_cover(rt):
+    record = rt.tmp / "glob.jsonl"
+    configure(rt, hook("reads", "before_tool", emit({}, record, append=True), tools=["read_*", "mcp__docs__*"]))
+    (rt.project / "a.md").write_text("# A\n")
+    for name, arguments in (("read_file", {"path": "a.md"}), ("outline_file", {"path": "a.md"}),
+                            ("list_files", {"path": "."})):
+        await rt.manager.execute_tool(rt.session, rt.tools, name, arguments, name)
+    seen = stdin_lines(record)
+    assert [(item["tool"], item.get("covered_by")) for item in seen] == [("read_file", None), ("outline_file", "read_file")]
+
+
+async def test_tool_hooks_name_the_agent_and_a_subagent_its_parent(rt):
+    record = rt.tmp / "agent.jsonl"
+    configure(rt, hook("who", "before_tool", emit({}, record, append=True), tools=["list_files"]))
+    await rt.manager.execute_tool(rt.session, rt.tools, "list_files", {"path": "."}, "parent")
+    child = rt.manager.store.create({"workspace": str(rt.project), "model": "test-model"})
+    child.update(parent_session_id=rt.session["id"], is_subagent=True, agent_type="reviewer", tool_profile="inherit",
+                 permission_mode="bypassPermissions", agent_file=".agents/agents/reviewer.md")
+    rt.manager.store.save(child)
+    await rt.manager.execute_tool(child, rt.tools, "list_files", {"path": "."}, "child")
+    parent, sub = stdin_lines(record)
+    assert parent["agent"] == {"session_id": rt.session["id"], "is_subagent": False, "agent_type": None,
+                               "parent_session_id": None, "agent_file": None}
+    assert sub["agent"] == {"session_id": child["id"], "is_subagent": True, "agent_type": "reviewer",
+                            "parent_session_id": rt.session["id"], "agent_file": ".agents/agents/reviewer.md"}
+    assert sub["session_id"] == child["id"]
+
+
+def compactable(rt):
+    rt.manager.settings.values["compaction_handoffs"] = False
+    rt.session["wire"] = [
+        {"role": "user", "content": "Earlier decision: keep the migration."}, {"role": "assistant", "content": "Done."},
+        {"role": "user", "content": "What is next?"}, {"role": "assistant", "content": "Run tests."}]
+    rt.session["context_state"] = {"summary": "", "through": 0, "compactions": 0}
+    rt.manager.store.save(rt.session)
+
+
+def summary_gateway(monkeypatch):
+    requests = []
+
+    async def gateway(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "## Summary\nKept."}, "finish_reason": "stop"}],
+                                         "usage": {"prompt_tokens": 10, "completion_tokens": 5}})
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: REAL_CLIENT(**kwargs, transport=httpx.MockTransport(gateway)))
+    return requests
+
+
+async def test_a_before_compaction_hook_adds_context_to_the_summary_request(rt, monkeypatch):
+    compactable(rt)
+    record = rt.tmp / "compact.jsonl"
+    configure(rt, hook("keep", "before_compaction", emit({"context": "Keep the ticket number PRJ-9."}, record)))
+    requests = summary_gateway(monkeypatch)
+    await rt.manager.manual_compact(rt.session, "Keep the migration decision.")
+    payload = stdin_lines(record)[0]
+    assert payload["trigger"] == "manual" and payload["preservation_note"] == "Keep the migration decision."
+    assert payload["estimated_input_tokens"] > 0 and payload["threshold"] > 0 and "agent" not in payload
+    prompt = requests[0]["messages"][1]["content"]
+    assert "Keep the migration decision." in prompt and "before_compaction hook keep: Keep the ticket number PRJ-9." in prompt
+    assert prompt.index("Keep the migration decision.") < prompt.index("PRJ-9")
+    assert rt.session["context_state"]["compactions"] == 1
+    assert cards(rt.session, "hook_before_compaction")[0]["hook_result"]["context"] == "Keep the ticket number PRJ-9."
+
+
+async def test_a_before_compaction_block_stops_only_a_manual_compaction(rt, monkeypatch):
+    compactable(rt)
+    configure(rt, hook("hold", "before_compaction", emit({"decision": "block", "reason": "Release in progress."})))
+    requests = summary_gateway(monkeypatch)
+    await rt.manager.manual_compact(rt.session)
+    assert requests == [] and rt.session["context_state"]["compactions"] == 0
+    error = next(event for event in rt.session["events"] if event["type"] == "error")
+    assert error["text"].startswith("A before-compaction hook (hold) blocked this compaction: Release in progress.")
+    note = {"text": ""}
+    before = rt.manager.compaction_hook(rt.session, "auto", "", note)
+    assert await before({"estimated_input_tokens": 1, "threshold": 2, "input_budget": 3}) == ""
+    assert "Automatic compaction runs whenever the context is full, so it ran." in rt.session["events"][-1]["text"]
+
+
+async def test_prepare_context_runs_the_before_compaction_callback_once_when_it_compacts():
+    from local_agent.context import prepare_context
+    calls = []
+
+    async def before(info):
+        calls.append(info)
+        return "From a hook: keep PRJ-9."
+
+    async def summarize(previous, chunk, limit_bytes):
+        return "## Summary\nKept."
+    wire = [{"role": "user", "content": "old " * 4000}, {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "new"}]
+    system = {"role": "system", "content": "s"}
+    await prepare_context(wire, {}, system, [], 16_384, summarize, reply_reserve=2_048, before_compaction=before)
+    assert calls == []  # Nothing to compact: the callback never runs.
+    await prepare_context(wire, {}, system, [], 16_384, summarize, reply_reserve=2_048, force_compact=True,
+                          before_compaction=before)
+    assert len(calls) == 1 and set(calls[0]) == {"estimated_input_tokens", "threshold", "input_budget"}
+
+
+async def test_notification_hooks_never_show_a_card_and_need_a_rule_outside_bypass(rt):
+    record = rt.tmp / "notify.jsonl"
+    configure(rt, hook("ping", "notification", emit("ignored output", record)))
+    rt.session.update(permission_mode="manual", title=f"Deploy {TOKEN}")
+    events = len(rt.session["events"])
+    rt.manager.notify_status(rt.session, "running", "awaiting_approval")
+    await asyncio.sleep(0.05)
+    assert not record.exists() and len(rt.session["events"]) == events and not rt.manager.pending
+    rt.manager.rules.add("user", rt.session["workspace"], {"behavior": "allow", "tool": "hook", "hook": "ping"})
+    rt.manager.notify_status(rt.session, "running", "awaiting_approval")
+    rt.manager.notify_status(rt.session, "running", "running")  # No notification: nothing runs.
+    await asyncio.gather(*rt.manager._notification_runs.values())
+    payload, = stdin_lines(record)
+    assert payload == {"event": "notification", "session_id": rt.session["id"], "status": "awaiting_approval",
+                       "message": "Needs your approval: Deploy [REDACTED]", "title": "Deploy [REDACTED]",
+                       "page_open": False}
+    assert len(rt.session["events"]) == events  # Never a card, never a notice.
