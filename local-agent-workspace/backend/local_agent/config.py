@@ -35,7 +35,8 @@ DENIED_ENV_PREFIXES = ("LD_", "DYLD_")
 # Settings that .env or the process environment can set; settings.json holds only values chosen in Settings.
 ENV_KEYS = {"coding_dir": "LOCAL_AGENT_CODING_DIR", "python_venv": "LOCAL_AGENT_PYTHON_VENV"}
 LIMIT_KEYS = ("context_window", "max_output_tokens")
-PROMPT_CACHING = ("auto", "off")  # Settings → Prompt caching: Automatic (Claude endpoints) or Off.
+# Settings → Prompt caching: Automatic (Claude endpoints), Documented forms only (prompt_cache level "messages") or Off.
+PROMPT_CACHING = ("auto", "messages", "off")
 # settings.json files without this version were written before the default model changed (see Settings.__init__).
 SETTINGS_VERSION = 2
 # Settings → Subagents: each built-in subagent type's endpoint and reasoning effort; "" is the chat's own.
@@ -154,7 +155,8 @@ class Settings:
             "reasoning_format": DEFAULT_FORMAT,
             "thinking_summaries": True,
             # Settings → Model and context (prompt_cache.py): "auto" marks the stable start of agent requests to
-            # Databricks-hosted Claude endpoints for prompt caching; "off" sends no cache markers.
+            # Databricks-hosted Claude endpoints for prompt caching; "messages" sends only the documented marker
+            # forms (no system message or tool result marker); "off" sends no cache markers.
             "prompt_caching": "auto",
             # Settings → Agent (spending.py): the soft cap in estimated DBU of chats without their own; 0 = none.
             "spending_limit_dbu": 0,

@@ -17,8 +17,9 @@
 //   model is moved at load; cleared by the next save, which writes settings_version 2),
 //   reasoning_effort: Effort (new chats' level, default 'default'), reasoning_format: 'auto'|'anthropic'|'openai'|'none'
 //   (how agent requests ask for it; 'auto' = per endpoint), thinking_summaries: boolean (thinking.display 'summarized'
-//   for adaptive Claude endpoints; default true), prompt_caching: 'auto'|'off' (cache markers on agent requests to
-//   Databricks-hosted Claude endpoints; default 'auto'), endpoint_profiles: [{ model, label }] (endpoints with built-in facts) }
+//   for adaptive Claude endpoints; default true), prompt_caching: 'auto'|'messages'|'off' (cache markers on agent
+//   requests to Databricks-hosted Claude endpoints; 'messages' = only the documented forms; default 'auto'),
+//   endpoint_profiles: [{ model, label }] (endpoints with built-in facts) }
 // Effort: 'default' (no effort field: the endpoint's own) | 'low' (labelled Fast) | 'medium' | 'high' | 'xhigh' (Extra
 //   high) | 'max'. Labels: types.js EFFORT_LABELS.
 // POST /settings/reasoning { model, reasoning_effort?, reasoning_format?, thinking_summaries? } -> ReasoningPreview:

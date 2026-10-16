@@ -371,6 +371,67 @@ async def test_a_reasoning_field_rejection_is_handled_first(runtime, monkeypatch
     assert texts[1].startswith(f"Databricks rejected prompt caching (cache_control) for {OPUS} (HTTP 400)")
 
 
+async def test_a_rejection_that_names_caching_goes_down_the_cache_levels_before_the_reasoning_fields(runtime, monkeypatch):
+    manager, session, _ = runtime
+    session["reasoning_effort"] = "high"
+    # The 400 names cache_control and also a reasoning field: the markers are dropped, the reasoning fields kept.
+    bodies = mock_gateway(monkeypatch, rejects(lambda body: markers(body) > 0,
+                                               "cache_control is not supported together with thinking"))
+    await manager.run(session, "Hello")
+    sent = agent_bodies(bodies)
+    assert [(markers(body), "thinking" in body, "output_config" in body) for body in sent] == [
+        (2, True, True), (1, True, True), (0, True, True)]
+    assert [call.get("retry_reason") for call in agent_calls(session)] == [None, "cache_rejected", "cache_rejected"]
+    assert manager.reasoning_rejections == {} and manager.cache_levels == {OPUS: "off"}
+    texts = notices(session)
+    assert len(texts) == 1 and texts[0].startswith(f"Databricks rejected prompt caching (cache_control) for {OPUS}")
+    # Once no markers go out, a 400 that names a reasoning field takes the reasoning branch as before.
+    bodies = mock_gateway(monkeypatch, rejects(lambda body: "thinking" in body, "thinking: cache_control unsupported"))
+    await manager.run(session, "Again")
+    assert [("thinking" in body, markers(body)) for body in agent_bodies(bodies)] == [(True, 0), (False, 0)]
+    assert manager.reasoning_rejections == {(OPUS, "anthropic"): "thinking"}
+
+
+async def test_documented_forms_only_sends_no_system_or_tool_result_marker(runtime, monkeypatch):
+    manager, session, project = runtime
+    manager.settings.values["prompt_caching"] = "messages"
+    (project / "note.txt").write_text("first\n")
+    script = [lambda: call_reply("read_file", {"path": "note.txt"}), reply]
+    bodies = mock_gateway(monkeypatch, lambda body: script.pop(0)())
+    await manager.run(session, "Read the note")
+    first, second = agent_bodies(bodies)
+    for body in (first, second):
+        assert markers(body) == 1 and isinstance(body["messages"][0]["content"], str)
+        assert all(isinstance(message["content"], str) for message in body["messages"] if message["role"] == "tool")
+    assert first["messages"][-1]["content"] == [{"type": "text", "text": "Read the note", **MARK}]
+    assert second["messages"][-1]["role"] == "tool"
+    calls = next(message for message in reversed(second["messages"]) if message.get("tool_calls"))["tool_calls"]
+    assert calls[-1]["cache_control"] == CACHE_CONTROL
+    assert [call["prompt_cache"] for call in agent_calls(session)] == ["messages", "messages"]
+    # A rejection from there goes to no markers, as from Automatic.
+    bodies = mock_gateway(monkeypatch, rejects(lambda body: markers(body) > 0))
+    await manager.run(session, "Again")
+    assert [markers(body) for body in agent_bodies(bodies)] == [1, 0]
+    assert manager.cache_levels == {OPUS: "off"} and manager.cache_level(session) == "off"
+
+
+async def test_the_tail_change_is_flagged_on_the_attempt_that_is_answered(runtime, monkeypatch):
+    manager, session, _ = runtime
+    monkeypatch.setattr("local_agent.agents.transient_retry_delay", lambda error, attempt: 0)
+    answers = [reply(), httpx.Response(429, json={"error_code": "REQUEST_LIMIT_EXCEEDED", "message": "Slow down."}),
+               reply(), reply()]
+    mock_gateway(monkeypatch, lambda body: answers.pop(0))
+    await manager.run(session, "Hello")
+    session["allowed_directories"] = ["/srv/other"]  # The system message's changing part differs from here on.
+    await manager.run(session, "Again")
+    await manager.run(session, "Once more")
+    calls = agent_calls(session)
+    # Every attempt of the step after the change carries the flag (the 429 wrote nothing to the cache); the
+    # step after the answered one compares with it.
+    assert [(call.get("http_status"), call.get("retry_reason"), call.get("system_tail_changed")) for call in calls] == [
+        (200, None, None), (429, None, True), (200, "rate_limit", True), (200, None, None)]
+
+
 # Settings → Prompt caching
 
 @pytest.fixture
@@ -402,8 +463,16 @@ async def test_the_setting_defaults_to_automatic_is_validated_and_a_save_restore
     assert manager.cache_level({"model": OPUS}) == "off" and manager.cache_level({"model": GPT}) is None
     for bad in ("on", "full", True, 1):
         assert (await client.put("/api/settings", json={**base, "prompt_caching": bad})).status_code == 422, bad
-    with pytest.raises(ValueError, match="Prompt caching must be one of: auto, off"):
-        settings.update({"prompt_caching": "messages"})
+    with pytest.raises(ValueError, match="Prompt caching must be one of: auto, messages, off"):
+        settings.update({"prompt_caching": "full"})
+    # Documented forms only: the "messages" level, or none once a rejection lowered the endpoint to none.
+    saved = await client.put("/api/settings", json={**base, "prompt_caching": "messages"})
+    assert saved.status_code == 200 and saved.json()["prompt_caching"] == "messages"
+    assert manager.cache_level({"model": OPUS}) == "messages" and manager.cache_level({"model": GPT}) is None
+    manager.cache_levels[OPUS] = "messages"
+    assert manager.cache_level({"model": OPUS}) == "messages"
+    manager.cache_levels[OPUS] = "off"
+    assert manager.cache_level({"model": OPUS}) == "off"
     assert (await client.put("/api/settings", json={**base, "prompt_caching": "auto"})).status_code == 200
     manager.cache_levels[OPUS] = "messages"
     assert manager.cache_level({"model": OPUS}) == "messages"

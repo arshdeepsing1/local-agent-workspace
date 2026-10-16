@@ -12,8 +12,9 @@ const SECTIONS = [['project', 'Project'], ['model', 'Model and context'], ['reas
   ['subagents', 'Subagents'], ['commands', 'Commands and files'], ['notifications', 'Notifications'], ['credentials', 'Credentials']]
 const FORMATS = [['auto', 'Automatic (per endpoint)'], ['anthropic', 'Anthropic fields (thinking + output_config.effort)'],
   ['openai', 'OpenAI field (reasoning_effort)'], ['none', 'Don\'t send reasoning fields']]
-// Settings → Prompt caching (backend config.PROMPT_CACHING): cache markers on agent requests to Claude endpoints.
-const CACHING = [['auto', 'Automatic (Claude endpoints)'], ['off', 'Off']]
+// Settings → Prompt caching (backend config.PROMPT_CACHING): cache markers on agent requests to Claude endpoints;
+// 'messages' sends only the forms Databricks documents (prompt_cache.py level "messages").
+const CACHING = [['auto', 'Automatic (Claude endpoints)'], ['messages', 'Documented forms only'], ['off', 'Off']]
 const OTHER_ENDPOINT = '\u0000other'
 const FALLBACK_LEVELS = Object.entries(EFFORT_LABELS).map(([value, label]) => ({ value, label }))
 // Settings → Subagents: each built-in type's endpoint and effort ('' is the chat's own; backend
@@ -277,7 +278,7 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         <label>Prompt caching<select value=${form.prompt_caching || 'auto'} onChange=${e => field('prompt_caching', e.currentTarget.value)}>
           ${CACHING.map(([value, label]) => html`<option key=${value} value=${value}>${label}</option>`)}
         </select></label>
-        <p class="field-help">Marks the stable start of each agent request so Databricks can bill repeated input at the cache-read rate (about 5% of the input price). Writes cost 25% more; entries expire after 5 minutes.</p>`)}
+        <p class="field-help">Marks the stable start of each agent request so Databricks can bill repeated input at the cache-read rate (about 5% of the input price). Writes cost 25% more; entries expire after 5 minutes. Documented forms only marks just your last message or the last tool call.</p>`)}
         ${group('reasoning', html`
         <label>Default effort for new chats<select value=${effort} onChange=${e => field('reasoning_effort', e.currentTarget.value)}>
           ${levels.map(level => html`<option key=${level.value} value=${level.value}>${levelLabel(level)}</option>`)}

@@ -172,7 +172,7 @@ class SettingsEdit(BaseModel):
     reasoning_effort: Effort | None = None
     reasoning_format: RequestFormat | None = None
     thinking_summaries: bool | None = Field(default=None, strict=True)
-    prompt_caching: Literal["auto", "off"] | None = None  # config.PROMPT_CACHING
+    prompt_caching: Literal["auto", "messages", "off"] | None = None  # config.PROMPT_CACHING
     spending_limit_dbu: float | None = Field(default=None, ge=0, le=MAX_LIMIT_DBU, allow_inf_nan=False, strict=True)
     coding_dir: str | None = Field(default=None, max_length=4096, strict=True)
     python_venv: str | None = Field(default=None, max_length=4096, strict=True)

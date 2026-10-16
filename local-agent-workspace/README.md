@@ -1188,7 +1188,8 @@ field and **Settings → Reasoning → Request format**, and sends no reasoning 
 endpoint in that format until the app restarts or you save Settings. Both attempts are in the
 usage ledger; the second has `retry_reason` `reasoning_rejected`. A 400 that names none of
 them is not sent again without reasoning fields; on Claude endpoints the cache-marker fallback
-(see **Prompt caching**) may still send it again with fewer cache markers before the error is shown.
+(see **Prompt caching**) may still send it again with fewer cache markers before the error is shown,
+and a 400 that names caching too (`cache_control`) goes to that fallback first.
 
 **Show thinking summaries** (on by default) adds `"display": "summarized"` to `thinking`.
 Claude Opus 5.5 omits its thinking text unless asked, so without it no thinking is shown; the
@@ -1236,23 +1237,36 @@ the error says, the app sends it again with fewer: first only the documented for
 message, or the last tool call before its results), then none. Once Databricks accepts one, a
 notice says so above the reply, and requests to that endpoint use that level until the app
 restarts or you save Settings; if even the request without markers fails, its error is shown and
-nothing is remembered. These resends do not use up the retries after rate limits and server errors,
-and a rejected reasoning field (see **Reasoning effort and thinking**) is handled first. Each resend
-has `retry_reason` `cache_rejected` in the usage ledger, and each agent call to a Claude endpoint
+nothing is remembered. These resends do not use up the retries after rate limits and server errors.
+A 400 that names a reasoning field the request added (see **Reasoning effort and thinking**) is
+handled by that fallback first, unless it also names caching (`cache_control`, `prompt caching`,
+`ephemeral`): then the markers go first and the reasoning fields stay. Each resend has
+`retry_reason` `cache_rejected` in the usage ledger, and each agent call to a Claude endpoint
 records the markers it was sent with as `prompt_cache` (`full`, `messages` or `off`).
 
 **Settings → Model and context → Prompt caching** is **Automatic (Claude endpoints)** (the
-default) or **Off**, which sends no markers at all.
+default), **Documented forms only** or **Off**, which sends no markers at all. **Documented forms
+only** sends only the forms Databricks documents, the first step of the fallback above: one marker
+on your last message, or on the last tool call before its results, and none on the system message
+or a tool result. The fallback steps down only when Databricks rejects the markers; if it accepts
+them but silently ignores the undocumented ones, nothing steps down and most of each step's input
+is billed as uncached input. In the **Cache read** column of **Agent tools → Usage** that shows as
+cache reads that stay at about the size of the system message and the tool definitions on every
+step, instead of covering the conversation before it: choose **Documented forms only** then. A rejection that lowered an endpoint
+to no markers still applies until a restart or a Settings save.
 
 How Databricks counts `prompt_tokens` while the cache is in use is still to be confirmed by one
 cached request: the context meter, the estimate scale and the DBU estimate assume it excludes the
 cache reads and writes, which Databricks reports as `cache_read_input_tokens` and
-`cache_creation_input_tokens`. To help check it, the ledger in the conversation file keeps, per
-call, the key names of the usage object Databricks sent (`usage_keys`, never values), the shape
-that carried the model's reasoning (`reasoning_shape`) and whether a reasoning signature came
+`cache_creation_input_tokens`. To help check it, the ledger in the conversation file keeps, for
+each agent and subagent request (not titles, `/btw` side questions or compaction), the key names
+of the usage object Databricks sent (`usage_keys`, never values), the shape that carried the
+model's reasoning (`reasoning_shape`) and whether a reasoning signature came
 (`reasoning_signature`, never the signature), and for an agent request whose system message's
-changing part differed from the chat's previous one, `system_tail_changed` (the conversation after
-it was written to the cache again). They are not CSV columns.
+changing part differed from the chat's last request that Databricks answered,
+`system_tail_changed` (the conversation after it was written to the cache again; a retry after a
+429 or a server error keeps the flag, because the failed attempt wrote nothing). They are not CSV
+columns.
 
 ### Context and project instructions
 

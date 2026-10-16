@@ -760,7 +760,8 @@ class AgentManager(LifecycleHooks):
         self.reasoning_rejections = {}
         # In memory only: {endpoint: prompt_cache level} after Databricks rejected cache markers with HTTP 400
         # and a lower level went through; until a restart or a Settings save. And {chat id: hash of the
-        # system message's changing part} of each chat's latest agent request (the ledger's system_tail_changed).
+        # system message's changing part} of each chat's latest agent request that Databricks answered with HTTP
+        # 200 (the ledger's system_tail_changed).
         self.cache_levels = {}
         self.system_tails = {}
         # The lifespan writes the marker after every task and job stopped. It is removed before
@@ -1829,13 +1830,14 @@ class AgentManager(LifecycleHooks):
 
     def cache_level(self, session):
         """The prompt_cache level the chat's next agent request starts at, or None for an endpoint that never
-        gets cache markers (no Databricks-hosted Claude profile). "off" while Settings → Prompt caching is Off;
-        otherwise "full", or the level a rejection lowered this endpoint to (cache_levels)."""
+        gets cache markers (no Databricks-hosted Claude profile): the lower of Settings → Prompt caching
+        ("full" for Automatic, "messages" for Documented forms only, "off") and the level a rejection lowered
+        this endpoint to (cache_levels)."""
         if not prompt_caching(session["model"]):
             return None
-        if self.settings.values.get("prompt_caching", "auto") != "auto":
-            return "off"
-        return self.cache_levels.get(session["model"], "full")
+        chosen = {"auto": "full", "messages": "messages"}.get(self.settings.values.get("prompt_caching", "auto"), "off")
+        remembered = self.cache_levels.get(session["model"], "full")
+        return max(chosen, remembered, key=prompt_cache.LEVELS.index)
 
     async def rules_changed(self, scope, session=None):
         """Publish and re-check after a rule change: the chat, every live chat of the project, or every live chat."""
@@ -4001,6 +4003,13 @@ class AgentManager(LifecycleHooks):
         sent = prompt_cache.marked(payload, prefix, level)
         return encode_payload(sent), level if prompt_cache.markers(sent) else "off"
 
+    async def request_accepted(self, session, event, tail, lowered):
+        """Databricks answered an agent request with HTTP 200: its system tail hash is what the chat's next request
+        compares with (system_tail_changed), and a lower cache level it was sent at after a rejection is kept."""
+        self.system_tails[session["id"]] = tail
+        if lowered:
+            await self.cache_lowered(session, event, lowered)
+
     async def cache_lowered(self, session, event, lowered):
         """Databricks accepted a request sent again with fewer cache markers after an HTTP 400: requests to
         the endpoint use that level until a restart or a Settings save, and a notice above the reply says so."""
@@ -4322,16 +4331,21 @@ class AgentManager(LifecycleHooks):
                             # Another chat's 429 on this endpoint: wait with it instead of adding to the overload.
                             await self.wait_for_rate_limit(session, "the model request", max_output_tokens)
                             await self.reply_after_notices(session, event)
-                            previous_tail, self.system_tails[session["id"]] = self.system_tails.get(session["id"]), tail
+                            # Compared with the tail of the chat's last request Databricks answered (HTTP 200), so
+                            # a failed attempt moves nothing and the attempt that is served keeps the flag.
+                            previous_tail = self.system_tails.get(session["id"])
                             ordered_calls, arguments = await self.model_response(
                                 session, event, client, url, headers, payload, retry_reason=retry_reason, body=body,
                                 effort=effort, cache={"prompt_cache": cache_sent,
                                                       "system_tail_changed": previous_tail not in (None, tail)},
-                                accepted=(lambda: self.cache_lowered(session, event, lowered)) if lowered else None)
+                                accepted=lambda: self.request_accepted(session, event, tail, lowered))
                             break
                         except InferenceError as exc:
                             field = getattr(exc, "reasoning_rejected", None)
-                            if field and not reasoning_resent:
+                            # A 400 that names caching to a request with markers goes down the cache levels first,
+                            # even when it also mentions a reasoning term; other reasoning-field 400s come first.
+                            cache_named = cache_sent not in (None, "off") and getattr(exc, "cache_named", False)
+                            if field and not reasoning_resent and not cache_named:
                                 # A 400 before any stream that names a reasoning field this request added: the
                                 # guess about the endpoint's fields was wrong. Send it once more without them, and
                                 # skip them for this endpoint and format until a restart or a Settings save.
