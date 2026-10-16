@@ -161,6 +161,9 @@ class Settings:
             "reasoning_effort": DEFAULT_EFFORT,
             "reasoning_format": DEFAULT_FORMAT,
             "thinking_summaries": True,
+            # Settings → Reasoning (reasoning_replay.py): send a turn's signed thinking back with its tool results
+            # (experimental; off until an endpoint check shows the route accepts it).
+            "thinking_replay": False,
             # Settings → Model and context (prompt_cache.py): "auto" marks the stable start of agent requests to
             # Databricks-hosted Claude endpoints for prompt caching; "messages" sends only the documented marker
             # forms (no system message or tool result marker); "off" sends no cache markers.
@@ -323,6 +326,8 @@ class Settings:
             raise ValueError("Reasoning request format must be one of: " + ", ".join(REQUEST_FORMATS) + ".")
         if type(candidate["thinking_summaries"]) is not bool:
             raise ValueError("Show thinking summaries must be on or off.")
+        if type(candidate["thinking_replay"]) is not bool:
+            raise ValueError("Send earlier thinking back must be on or off.")
         if candidate["prompt_caching"] not in PROMPT_CACHING:
             raise ValueError("Prompt caching must be one of: " + ", ".join(PROMPT_CACHING) + ".")
         candidate["spending_limit_dbu"] = validate_limit(candidate["spending_limit_dbu"], "Default spending limit")

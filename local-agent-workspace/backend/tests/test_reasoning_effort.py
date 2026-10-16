@@ -12,6 +12,7 @@ from local_agent import reasoning
 from local_agent.agents import AgentManager
 from local_agent.api import create_app
 from local_agent.config import Settings
+from local_agent.model_profiles import effective_limits
 from local_agent.reasoning import EFFORT_LEVELS, effort_request, reasoning_delta, reasoning_summary
 from local_agent.store import Store
 from local_agent.telemetry import session_metrics
@@ -157,8 +158,10 @@ async def test_settings_default_and_validate_the_reasoning_choices(api):
 
 
 async def test_the_preview_is_what_the_request_builder_sends(api):
-    client, manager, _, _ = api
+    client, manager, settings, _ = api
     for model in (OPUS, OPUS_48, GPT, "test-endpoint"):
+        # The thinking budget format caps budget_tokens at the endpoint's Max output tokens, as requests do.
+        limit = effective_limits(model, settings.values["context_window"], settings.values["max_output_tokens"])
         for effort in EFFORT_LEVELS:
             for fmt in reasoning.REQUEST_FORMATS:
                 for summaries in (True, False):
@@ -166,7 +169,8 @@ async def test_the_preview_is_what_the_request_builder_sends(api):
                         "model": model, "reasoning_effort": effort, "reasoning_format": fmt,
                         "thinking_summaries": summaries})
                     assert response.status_code == 200
-                    assert response.json()["fields"] == effort_request(model, effort, fmt, summaries)["fields"]
+                    assert response.json()["fields"] == effort_request(
+                        model, effort, fmt, summaries, max_tokens=limit["max_output_tokens"])["fields"]
     gpt = (await client.post("/api/settings/reasoning", json={"model": GPT, "reasoning_effort": "max"})).json()
     assert gpt["levels"][0] == {"value": "default", "label": "Default (Medium)", "sent": None}
     assert gpt["levels"][4] == {"value": "xhigh", "label": "Extra high", "sent": "high", "note": "sent as High"}
@@ -449,6 +453,83 @@ async def test_a_settings_save_forgets_rejections(api):
     manager.reasoning_rejections[(OPUS, "anthropic")] = "thinking"
     assert (await client.put("/api/settings", json=settings_body(settings))).status_code == 200
     assert manager.reasoning_rejections == {}
+
+
+# Older Claude endpoints: thinking with a token budget (the anthropic_budget format and the 400 ladder)
+
+SONNET = "databricks-claude-sonnet-4-5"  # No profile: Automatic guesses the Anthropic fields from its name.
+
+
+def test_the_budget_format_sends_a_thinking_budget_below_max_output_tokens():
+    assert effort_request(SONNET, "low", "anthropic_budget")["fields"] == {"thinking": {"type": "enabled", "budget_tokens": 1024}}
+    high = effort_request(SONNET, "high", "anthropic_budget", max_tokens=32_000)
+    assert high["fields"] == {"thinking": {"type": "enabled", "budget_tokens": 8192}}
+    assert (high["effort_field"], high["sent_effort"], high["format"]) == ("thinking.budget_tokens", "high", "anthropic_budget")
+    assert effort_request(SONNET, "max", "anthropic_budget", max_tokens=8192)["fields"]["thinking"]["budget_tokens"] == 7168
+    assert effort_request(SONNET, "high", "anthropic_budget", max_tokens=1500)["fields"] == {}  # No room for 1,024.
+    assert effort_request(SONNET, "default", "anthropic_budget")["fields"] == {}  # Default: the endpoint's own.
+    assert reasoning.rejected_field('{"message": "budget_tokens must be less than max_tokens"}', high) == "thinking"
+    preview = reasoning.preview(SONNET, "high", "anthropic_budget", True, max_tokens=8192)
+    assert any("thinking with a token budget" in note for note in preview["notes"])
+    tight = reasoning.preview(SONNET, "high", "anthropic_budget", True, max_tokens=1500)
+    assert any("leave no room for a thinking budget" in note for note in tight["notes"])
+
+
+def test_a_profile_that_takes_only_the_budget_form_uses_it_under_automatic(monkeypatch):
+    from local_agent import model_profiles
+    profile = {**model_profiles.MODEL_PROFILES[OPUS_48], "label": "Older Claude", "thinking": "budget"}
+    monkeypatch.setitem(model_profiles.MODEL_PROFILES, "databricks-claude-older", profile)
+    assert reasoning.request_format("databricks-claude-older", "auto") == "anthropic_budget"
+    assert effort_request("databricks-claude-older", "medium", max_tokens=16_384)["fields"] == {
+        "thinking": {"type": "enabled", "budget_tokens": 4096}}
+
+
+async def test_a_rejected_adaptive_form_steps_down_to_a_budget_and_then_to_none(runtime, monkeypatch):
+    manager, session = runtime
+    session.update(model=SONNET, reasoning_effort="high")
+    manager.settings.values["prompt_caching"] = "off"
+    requests, budget_ok = [], [True]
+
+    async def gateway(request):
+        requests.append(json.loads(request.content))
+        thinking = requests[-1].get("thinking") or {}
+        if thinking.get("type") == "adaptive":
+            return httpx.Response(400, json={"message": "thinking.type: Input tag 'adaptive' found using 'type' does not "
+                                                        "match any of the expected tags: 'enabled', 'disabled'"})
+        if thinking.get("type") == "enabled" and not budget_ok[0]:
+            return httpx.Response(400, json={"message": "thinking.budget_tokens: not supported"})
+        return httpx.Response(200, text=sse({"content": "Done."}))
+    mock_gateway(monkeypatch, gateway)
+    await manager.run(session, "Hello")
+    assert [sent_fields(request) for request in requests] == [
+        {"thinking": ADAPTIVE, "output_config": {"effort": "high"}},
+        {"thinking": {"type": "enabled", "budget_tokens": 7168}}]  # Max output tokens 8,192 less 1,024.
+    reply = next(event for event in session["events"] if event["type"] == "assistant")
+    assert reply["request_info"]["status"] == "completed"
+    assert reply["request_info"]["reasoning"]["format"] == "anthropic_budget"
+    assert reply["request_info"]["reasoning"]["effort_field"] == "thinking.budget_tokens"
+    assert "asking for thinking with a token budget (thinking.budget_tokens)" in notices(session)[0]
+    assert manager.reasoning_rejections == {(SONNET, "anthropic"): "thinking"}
+    assert [call.get("retry_reason") for call in agent_calls(session)] == [None, "reasoning_rejected"]
+    # The next request asks for the budget at once; one that is rejected too goes without reasoning fields.
+    budget_ok[0] = False
+    await manager.run(session, "Again")
+    assert [sent_fields(request) for request in requests[2:]] == [{"thinking": {"type": "enabled", "budget_tokens": 7168}}, {}]
+    assert manager.reasoning_rejections[(SONNET, "anthropic_budget")] == "thinking"
+    await manager.run(session, "Once more")
+    assert sent_fields(requests[-1]) == {} and len(requests) == 5
+
+
+async def test_the_preview_shows_the_budget_after_the_adaptive_form_was_rejected(api):
+    client, manager, _, _ = api
+    manager.reasoning_rejections[(SONNET, "anthropic")] = "thinking"
+    preview = (await client.post("/api/settings/reasoning", json={"model": SONNET, "reasoning_effort": "medium"})).json()
+    assert preview["fields"] == {"thinking": {"type": "enabled", "budget_tokens": 4096}}
+    assert preview["format"] == "anthropic_budget"
+    assert any("ask for thinking with a token budget instead" in note for note in preview["notes"])
+    # An endpoint that always thinks rejects budget_tokens too: it goes straight to no reasoning fields.
+    manager.reasoning_rejections[(OPUS, "anthropic")] = "thinking"
+    assert (await client.post("/api/settings/reasoning", json={"model": OPUS, "reasoning_effort": "high"})).json()["fields"] == {}
 
 
 # Reasoning text in the stream

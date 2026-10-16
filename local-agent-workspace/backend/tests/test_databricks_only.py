@@ -23,7 +23,7 @@ def test_legacy_settings_do_not_restore_removed_options(tmp_path, monkeypatch):
                 "user_instructions": "", "user_agents_file": True, "user_claude_file": False, "project_memory": True,
                 "output_style": "default", "write_limit_kb": 80, "command_env": [], "rate_limit_auto_continue": True,
                 "auto_keep_changes": False, "reasoning_effort": "default", "reasoning_format": "auto",
-                "thinking_summaries": True, "prompt_caching": "auto", "spending_limit_dbu": 0, "subagent_defaults": DEFAULT_SUBAGENT_DEFAULTS, "fallback_model": "", "coding_dir": "", "python_venv": ""}
+                "thinking_summaries": True, "thinking_replay": False, "prompt_caching": "auto", "spending_limit_dbu": 0, "subagent_defaults": DEFAULT_SUBAGENT_DEFAULTS, "fallback_model": "", "coding_dir": "", "python_venv": ""}
     assert settings.values == expected
     with TestClient(create_app(settings)) as client:
         bootstrap = client.get("/api/bootstrap").json()

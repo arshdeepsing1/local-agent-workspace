@@ -441,7 +441,8 @@ def test_draft_model_changes_default_before_creating_conversation(ui, page):
                                            "max_output_tokens": 8192, "max_agent_steps": 32, "user_instructions": "",
                                            "write_limit_kb": 80, "command_env": [], "rate_limit_auto_continue": True,
                                            "coding_dir": "", "python_venv": "", "reasoning_effort": "default",
-                                           "reasoning_format": "auto", "thinking_summaries": True, "fallback_model": ""}]
+                                           "reasoning_format": "auto", "thinking_summaries": True, "thinking_replay": False,
+                                           "fallback_model": ""}]
     send(page).click()
     ui.show_session("created")
     assert ui.js("fake.sessions.get('created').model") == "other-model"

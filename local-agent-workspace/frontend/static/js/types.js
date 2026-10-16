@@ -15,9 +15,11 @@
 //   default_limits: { context_window, max_output_tokens } (the saved model's defaults; budgets equal to them
 //     follow a model change), model_migrated_from? (set while a legacy settings file at the old default
 //   model is moved at load; cleared by the next save, which writes settings_version 2),
-//   reasoning_effort: Effort (new chats' level, default 'default'), reasoning_format: 'auto'|'anthropic'|'openai'|'none'
-//   (how agent requests ask for it; 'auto' = per endpoint), thinking_summaries: boolean (thinking.display 'summarized'
-//   for adaptive Claude endpoints; default true), prompt_caching: 'auto'|'messages'|'off' (cache markers on agent
+//   reasoning_effort: Effort (new chats' level, default 'default'), reasoning_format: 'auto'|'anthropic'|'anthropic_budget'|
+//   'openai'|'none' (how agent requests ask for it; 'auto' = per endpoint; 'anthropic_budget' = thinking.budget_tokens for
+//   older Claude endpoints), thinking_summaries: boolean (thinking.display 'summarized' for adaptive Claude endpoints;
+//   default true), thinking_replay: boolean (Send earlier thinking back: a turn's signed thinking goes back to its own
+//   endpoint during tool use; experimental, default false), prompt_caching: 'auto'|'messages'|'off' (cache markers on agent
 //   requests to Databricks-hosted Claude endpoints; 'messages' = only the documented forms; default 'auto'),
 //   fallback_model: string ('' = none: the endpoint an agent or subagent request goes to once when the model
 //   endpoint failed before the reply started; one with built-in facts or one the user uses; chats on it have none),
@@ -41,6 +43,18 @@
 //     'reasoning_effort'), fields (the exact top-level JSON added to agent requests), skipped?: 'rejected_earlier',
 //     rejected_field?, notes: string[] }. Computed by the server's request builder (backend reasoning.py).
 // GET /settings -> Settings (the folder states checked again). PUT /settings { ...editable fields } -> Settings.
+// Endpoint checks (backend endpoint_probes.py, endpoint_checks_api.py): POST /endpoints/plan { model, probes? } ->
+//   EndpointPlan { model, probes: [{ id, title, question, requests: [{ id, label, estimated_input_tokens, max_tokens,
+//   estimated_dbu (null without price data), alternative_to? }] }], total_dbu (at most; null: unpriced), priced,
+//   max_output_tokens, pricing_effective_at, plan_id } (no request is sent). POST /endpoints/run { model, probes?, plan_id,
+//   approved_dbu } and POST /endpoints/test { model, plan_id, approved_dbu } (the smoke check alone) -> 202 EndpointRun
+//   { id, model, kind: 'check'|'test', status: 'running'|'completed'|'stopped'|'failed', requests: [{ id, probe, label,
+//   state: 'pending'|'running'|'done'|'skipped'|'not_sent'|'stopped', http_status, summary }], error, waiting,
+//   reported_dbu, approved_dbu }; 400 without approved_dbu, 409 for another plan or while a run goes on (nothing sent).
+//   POST /endpoints/run/stop -> { run }. GET /endpoints/<model>/checks -> { model, saved: { checked, plan_id, results:
+//   { <probe>: { status: 'accepted'|'rejected'|'not_seen'|'error', summary, checked, ... } }, calls } | null, run, capabilities:
+//   [{ id, capability, result, source ('probed <date>'|'documented'|'unknown'), status }] }. GET /endpoints/<model>/state
+//   -> { model, ready, config_update, task, error } (Databricks' serving state; no model request).
 // POST /settings/limits { model, context_window, max_output_tokens } -> LimitsCheck:
 //   { profile: { label, context_max, output_max, itpm, otpm, recommended_context_window,
 //       recommended_max_output_tokens, thinking_reserve, reasoning fields, prompt_caching, vision (image_url content

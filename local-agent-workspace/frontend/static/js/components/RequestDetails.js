@@ -36,7 +36,7 @@ function rateLimitMessage(limit) {
 function usageValue(info, key) {
   const value = info.usage?.[key]
   if (value != null) return value.toLocaleString()
-  if (key === 'reasoning_tokens' && info.usage && info.reasoning?.format === 'anthropic') return 'In output tokens (not reported separately)'
+  if (key === 'reasoning_tokens' && info.usage && ['anthropic', 'anthropic_budget'].includes(info.reasoning?.format)) return 'In output tokens (not reported separately)'
   return 'Unavailable'
 }
 
@@ -71,6 +71,7 @@ export default function RequestDetails({ info, reasoningWait, reasoningText = fa
         ${info.reasoning ? html`<div><dt>Effort</dt><dd>${effortText(info.reasoning)}</dd></div>` : null}
         ${info.reasoning && Object.keys(info.reasoning.fields || {}).length ? html`<div><dt>Reasoning fields</dt><dd><code class="request-fields">${JSON.stringify(info.reasoning.fields)}</code></dd></div>` : null}
         ${typeof reasoningWait === 'number' ? html`<div><dt>${reasoningText ? 'Thinking text began' : 'Thinking began'}</dt><dd>after ${reasoningWait.toFixed(1)} s</dd></div>` : null}
+        ${info.reasoning_replayed ? html`<div><dt>Earlier thinking sent</dt><dd>${info.reasoning_replayed === 1 ? '1 earlier reply' : `${info.reasoning_replayed} earlier replies`} of this turn</dd></div>` : null}
       </dl>
       <p class="request-details-heading">Token usage · provider-reported</p>
       <dl>${Object.entries(usageLabels).map(([key, label]) => html`<div key=${key}><dt>${label}</dt><dd>${usageValue(info, key)}</dd></div>`)}<div><dt>Input incl. cache</dt><dd>${inputWithCache(info.usage)?.toLocaleString() ?? 'Unavailable'}</dd></div></dl>

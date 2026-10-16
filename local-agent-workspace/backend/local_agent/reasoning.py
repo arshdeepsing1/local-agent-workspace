@@ -8,8 +8,9 @@ compaction requests send none: they use the endpoint's default, which their outp
 (model_profiles.thinking_reserve, context.compaction_output_allowance) was sized for, and a chat
 set to Max must not make every summary cost Max.
 
-Responses: only reasoning text the provider supplies for display is shown, never replayed to the
-model (the wire history keeps answers and tool calls only), redacted and capped at SUMMARY_LIMIT.
+Responses: only reasoning text the provider supplies for display is shown, redacted and capped at
+SUMMARY_LIMIT. Signed reasoning items are kept with the reply in the history and sent back only during
+tool use and only when Settings → Reasoning asks for it (reasoning_replay.py).
 """
 import re
 
@@ -18,9 +19,9 @@ from .model_profiles import reasoning_profile
 EFFORT_LEVELS = ("default", "low", "medium", "high", "xhigh", "max")
 EFFORT_LABELS = {"default": "Default", "low": "Fast", "medium": "Medium", "high": "High", "xhigh": "Extra high",
                  "max": "Max"}
-REQUEST_FORMATS = ("auto", "anthropic", "openai", "none")
-FORMAT_LABELS = {"auto": "Automatic", "anthropic": "Anthropic fields", "openai": "OpenAI field",
-                 "none": "Don't send reasoning fields"}
+REQUEST_FORMATS = ("auto", "anthropic", "anthropic_budget", "openai", "none")
+FORMAT_LABELS = {"auto": "Automatic", "anthropic": "Anthropic fields", "anthropic_budget": "Anthropic thinking budget",
+                 "openai": "OpenAI field", "none": "Don't send reasoning fields"}
 DEFAULT_EFFORT = "default"
 DEFAULT_FORMAT = "auto"
 # The top-level request fields this module adds; a resend without reasoning drops exactly these.
@@ -30,6 +31,12 @@ REJECTION_TERMS = (("output_config", "output_config.effort"), ("reasoning_effort
                    ("budget_tokens", "thinking"), ("display", "thinking.display"), ("adaptive", "thinking"),
                    ("thinking", "thinking"), ("effort", None))
 SUMMARY_LIMIT = 12_000  # Characters of reasoning text kept per response.
+# The budget format (older Claude endpoints, which take thinking {"type": "enabled", "budget_tokens": N} and reject
+# adaptive thinking and output_config): N per effort. Anthropic requires at least 1,024 and less than max_tokens,
+# so N is capped at max_tokens minus BUDGET_HEADROOM (room for the answer); below 1,024 nothing is sent.
+BUDGET_TOKENS = {"low": 1_024, "medium": 4_096, "high": 8_192, "xhigh": 16_384, "max": 32_768}
+MIN_BUDGET_TOKENS = 1_024
+BUDGET_HEADROOM = 1_024
 
 
 def valid_effort(value):
@@ -61,9 +68,20 @@ def endpoint_reasoning(model):
 
 def request_format(model, setting=DEFAULT_FORMAT):
     """The format requests to this endpoint use: the Settings choice, or the endpoint's own for Automatic."""
-    if setting in ("anthropic", "openai", "none"):
+    if setting in ("anthropic", "anthropic_budget", "openai", "none"):
         return setting
-    return endpoint_reasoning(model)["reasoning_format"] or "none"
+    endpoint = endpoint_reasoning(model)
+    if endpoint["reasoning_format"] == "anthropic" and endpoint["thinking"] == "budget":
+        return "anthropic_budget"  # A profile whose endpoint takes only the older budget form.
+    return endpoint["reasoning_format"] or "none"
+
+
+def budget_tokens(level, max_tokens=None):
+    """thinking.budget_tokens for an effort level in the budget format, or None when max_tokens leaves no room."""
+    tokens = BUDGET_TOKENS[level]
+    if type(max_tokens) is int:
+        tokens = min(tokens, max_tokens - BUDGET_HEADROOM)
+    return tokens if tokens >= MIN_BUDGET_TOKENS else None
 
 
 def sent_level(endpoint, effort):
@@ -88,12 +106,14 @@ def default_label(endpoint):
     return None
 
 
-def effort_request(model, effort=DEFAULT_EFFORT, setting=DEFAULT_FORMAT, summaries=True, rejected=None):
+def effort_request(model, effort=DEFAULT_EFFORT, setting=DEFAULT_FORMAT, summaries=True, rejected=None,
+                   max_tokens=None):
     """The reasoning fields an agent request to this endpoint carries, and what to record about them.
 
     rejected: the field Databricks rejected earlier for this endpoint and format (AgentManager keeps
-    it until a restart or a Settings save); then nothing is sent. Returns {effort, format, fields
-    (the exact top-level JSON added), sent_effort, effort_field, skipped?, rejected_field?}."""
+    it until a restart or a Settings save); then nothing is sent. max_tokens (the request's) caps the
+    budget format's thinking.budget_tokens. Returns {effort, format, fields (the exact top-level JSON
+    added), sent_effort, effort_field, skipped?, rejected_field?}."""
     effort = valid_effort(effort) or DEFAULT_EFFORT
     endpoint = endpoint_reasoning(model)
     fmt = request_format(model, setting)
@@ -108,6 +128,11 @@ def effort_request(model, effort=DEFAULT_EFFORT, setting=DEFAULT_FORMAT, summari
             # Default sends no effort. An endpoint that always thinks still gets the display
             # choice: it changes what is shown, not how much it thinks or costs.
             fields = {"thinking": {"type": "adaptive", **display}}
+    elif fmt == "anthropic_budget" and level is not None:
+        # The older Claude form: no display field (those endpoints return their thinking text as they are).
+        tokens = budget_tokens(level, max_tokens)
+        if tokens is not None:
+            fields, field = {"thinking": {"type": "enabled", "budget_tokens": tokens}}, "thinking.budget_tokens"
     elif fmt == "openai" and level is not None:
         fields, field = {"reasoning_effort": level}, "reasoning_effort"
     result = {"effort": effort, "format": fmt, "fields": fields, "sent_effort": level if fields else None,
@@ -152,10 +177,12 @@ def rejected_field(error_text, request):
     return None
 
 
-def preview(model, effort, setting, summaries, rejected=None):
-    """Settings → Reasoning and the composer's effort picker: what this endpoint gets for each level."""
+def preview(model, effort, setting, summaries, rejected=None, max_tokens=None, stepped=None):
+    """Settings → Reasoning and the composer's effort picker: what this endpoint gets for each level.
+    stepped: the field Databricks rejected in the adaptive form when requests use the budget form instead
+    (setting is then "anthropic_budget"; AgentManager.reasoning_ladder)."""
     endpoint = endpoint_reasoning(model)
-    request = effort_request(model, effort, setting, summaries, rejected)
+    request = effort_request(model, effort, setting, summaries, rejected, max_tokens)
     fmt = request["format"]
     meaning = default_label(endpoint)
     levels = []
@@ -191,6 +218,15 @@ def preview(model, effort, setting, summaries, rejected=None):
             accepted = ", ".join(EFFORT_LABELS[item] for item in endpoint["effort_levels"])
             notes.append(f"{name} accepts {accepted}: {EFFORT_LABELS[request['effort']]} is sent as "
                          f"{EFFORT_LABELS[request['sent_effort']]}.")
+    if fmt == "anthropic_budget" and request["fields"]:
+        notes.append(f"{name} gets thinking with a token budget (thinking.budget_tokens), the form older Claude "
+                     "endpoints take; the budget grows with the level and stays below Max output tokens.")
+    elif fmt == "anthropic_budget" and request["effort"] != "default" and not request.get("skipped"):
+        notes.append(f"Max output tokens leave no room for a thinking budget of at least {MIN_BUDGET_TOKENS:,} "
+                     "tokens, so no thinking is asked for.")
+    if stepped:
+        notes.append(f"Databricks rejected {stepped} for this endpoint, so requests ask for thinking with a token "
+                     "budget instead until the app restarts or Settings are saved.")
     if request.get("skipped"):
         notes.append(f"Databricks rejected {rejected} for this endpoint, so requests go without reasoning fields "
                      "until the app restarts or Settings are saved.")
@@ -243,8 +279,9 @@ REASONING_ITEMS = ("reasoning", "thinking", "redacted_thinking")
 def without_reasoning(messages):
     """messages with no reasoning in assistant messages (reasoning, thinking and redacted thinking content items,
     and reasoning_content or reasoning fields), for a request to an endpoint other than the one that wrote them:
-    a reasoning signature is valid only for its own model. The app's history keeps none today; this keeps a
-    fallback request (AgentManager.fallback_attempt) free of them if history ever does."""
+    a reasoning signature is valid only for its own model. Requests carry them only when a chat's own endpoint
+    gets its signed reasoning back (reasoning_replay.apply); this keeps a fallback request
+    (AgentManager.fallback_attempt) free of them."""
     result = []
     for message in messages:
         if isinstance(message, dict) and message.get("role") == "assistant":

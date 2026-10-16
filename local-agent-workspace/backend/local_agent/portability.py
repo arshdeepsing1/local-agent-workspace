@@ -12,6 +12,7 @@ from .context import LARGE_SUMMARY_MAX_BYTES, MAX_ESTIMATE_SCALE, context_bounda
 from .extensions import HOOK_CONTEXT_CHARS, HOOK_EVENTS, HOOK_REPORT_CHARS, MAX_HOOKS
 from .lifecycle_hooks import SHOWN_ARGUMENTS_BYTES
 from .planning import MAX_STEPS, subagent_index
+from .reasoning_replay import MAX_SIDECAR_BYTES, MAX_SIDECAR_ITEMS, REASONING_ITEMS
 from .spending import MAX_LIMIT_DBU
 
 
@@ -53,7 +54,7 @@ AgentName = Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{0,39}$")]
 class ReasoningInfo(Record):
     """The reasoning a request asked for (reasoning.request_record)."""
     effort: Effort
-    format: Literal["anthropic", "openai", "none"]
+    format: Literal["anthropic", "anthropic_budget", "openai", "none"]
     fields: dict[str, Any] = Field(default_factory=dict)
     sent_effort: str | None = Field(default=None, max_length=16)
     effort_field: str | None = Field(default=None, max_length=64)
@@ -73,6 +74,8 @@ class RequestInfo(Record):
     # A reply from Settings → Fallback endpoint (model above): the chat's endpoint and why it failed.
     fallback_from: str | None = Field(default=None, max_length=256)
     fallback_reason: str | None = Field(default=None, max_length=64)
+    # Earlier replies of the turn this request sent with their signed thinking (reasoning_replay.py).
+    reasoning_replayed: int | None = Field(default=None, ge=0)
 
 
 class Progress(Record):
@@ -258,11 +261,29 @@ class ToolCall(Record):
     function: Function
 
 
+def _reasoning_items(items):
+    if any(item.get("type") not in REASONING_ITEMS for item in items):
+        raise ValueError("Reasoning items must be reasoning, thinking or redacted thinking.")
+    if len(json.dumps(items, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > MAX_SIDECAR_BYTES:
+        raise ValueError("A reply's reasoning items are too large.")
+    return items
+
+
+class ReasoningSidecar(Record):
+    """A reply's signed reasoning (reasoning_replay.py): the endpoint that wrote it and its items as streamed.
+    In a conversation file only when it was exported with reasoning."""
+    model: str = Field(min_length=1, max_length=256)
+    items: Annotated[list[dict[str, Any]], Field(min_length=1, max_length=MAX_SIDECAR_ITEMS),
+                     AfterValidator(_reasoning_items)]
+    bytes: int = Field(ge=0, le=MAX_SIDECAR_BYTES)
+
+
 class Message(Record):
     role: Literal["user", "assistant", "tool"]
     content: str | None = None
     tool_calls: list[ToolCall] | None = Field(default=None, max_length=256)
     tool_call_id: str | None = None
+    reasoning: ReasoningSidecar | None = None  # Assistant replies only.
 
 
 class ContextState(Record):
@@ -461,14 +482,22 @@ def _validate_wire(wire, *, complete=False):
                 pending.add(call["id"])
         if role in ("user", "tool") and not isinstance(message.get("content"), str):
             raise ValueError("User messages and tool results require text content.")
+        if role != "assistant" and message.get("reasoning") is not None:
+            raise ValueError("Only assistant replies can carry reasoning.")
     if complete and pending:
         raise ValueError("Only a completed conversation can be forked.")
 
 
-def export_bundle(sessions, root_id):
+def export_bundle(sessions, root_id, with_reasoning=False):
+    """A validated bundle of these conversations. Replies' signed reasoning (reasoning_replay's sidecars) is
+    left out unless with_reasoning (an export "with reasoning", and forks, which keep the chat's endpoint)."""
     records = []
     for source in sessions:
         record = {key: value for key, value in source.items() if key in Conversation.model_fields}
+        if not with_reasoning:
+            record["wire"] = [{key: value for key, value in message.items() if key != "reasoning"}
+                              if isinstance(message, dict) and "reasoning" in message else message
+                              for message in record.get("wire", [])]
         record["events"] = [{key: value for key, value in event.items() if key in Event.model_fields}
                             for event in record["events"]]
         # Keep only the fields a bundle defines; newer display details such as

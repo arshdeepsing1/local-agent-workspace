@@ -22,6 +22,7 @@ def simulator():
 @pytest.fixture
 def gateway(simulator):
     simulator.Gateway.speed, simulator.Gateway.claude_fields, simulator.Gateway.cache_mode = 0.0, "both", "accept"
+    simulator.Gateway.replay_mode = simulator.Gateway.vision_mode = simulator.Gateway.response_format_mode = "accept"
     simulator.Gateway.prompt_cache = simulator.PromptCache()
     server = ThreadingHTTPServer(("127.0.0.1", 0), simulator.Gateway)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -252,3 +253,79 @@ def test_cache_markers_are_checked_and_the_modes_rehearse_a_route_that_refuses_t
     for _ in range(2):
         usage = usage_of(gateway, cached_request())
         assert usage["cache_read_input_tokens"] == usage["cache_creation_input_tokens"] == 0
+
+
+def test_an_older_claude_name_takes_only_a_thinking_budget(simulator):
+    read, sonnet = simulator.reasoning_request, "databricks-claude-sonnet-4-5"
+    assert read(sonnet, {"max_tokens": 8192, "thinking": {"type": "enabled", "budget_tokens": 4096}}, "both") == ("medium", True)
+    assert read(sonnet, {"max_tokens": 8192}, "both") == (None, False)
+    for body, words in (({"thinking": {"type": "adaptive"}}, "Input tag 'adaptive'"),
+                        ({"output_config": {"effort": "low"}}, "output_config"),
+                        ({"max_tokens": 2048, "thinking": {"type": "enabled", "budget_tokens": 4096}}, "less than max_tokens")):
+        with pytest.raises(simulator.Rejected, match=words):
+            read(sonnet, body, "both")
+
+
+def signed_turn(simulator, signature=None, text="Plan."):
+    call = {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+    item = {"type": "reasoning", "summary": [{"type": "summary_text", "text": text,
+                                              "signature": signature or simulator.sign(text)}]}
+    return {"stream": True, "max_tokens": 1024, "messages": [
+        {"role": "user", "content": "hello"}, {"role": "assistant", "content": [item], "tool_calls": [call]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "x"}]}
+
+
+def test_reasoning_sent_back_is_checked_and_the_replay_modes_rehearse_other_routes(simulator):
+    opus, replay = "databricks-claude-opus-5-5", simulator.replay_request
+    replay(opus, signed_turn(simulator), "accept", True)
+    replay(opus, signed_turn(simulator), "require", True)
+    with pytest.raises(simulator.Rejected, match="invalid signature"):
+        replay(opus, signed_turn(simulator, "sim-forged"), "accept", True)
+    with pytest.raises(simulator.Rejected, match="not supported in assistant messages"):
+        replay(opus, signed_turn(simulator), "reject", True)
+    plain = signed_turn(simulator)
+    plain["messages"][1]["content"] = None
+    replay(opus, plain, "accept", True)
+    with pytest.raises(simulator.Rejected, match="must start with its signed thinking"):
+        replay(opus, plain, "require", True)
+    replay(opus, plain, "require", False)  # Without thinking nothing is required.
+    with pytest.raises(simulator.Rejected, match="only accepted by Claude"):
+        replay("databricks-gpt-oss-120b", signed_turn(simulator), "accept", True)
+
+
+def test_streamed_claude_reasoning_ends_with_the_gateways_signature(gateway, simulator):
+    body = {"messages": [{"role": "user", "content": "hello"}], "stream": True, "max_tokens": 1024,
+            "thinking": {"type": "adaptive", "display": "summarized"}}
+    parts = chunks(httpx.post(f"{gateway}/serving-endpoints/databricks-claude-opus-5-5/invocations", json=body))
+    items = [item for part in parts for block in part["choices"][0]["delta"].get("content") or []
+             if isinstance(block, dict) for item in block.get("summary", [])]
+    text = "".join(item["text"] for item in items)
+    assert [item["signature"] for item in items if item["signature"]] == [simulator.sign(text)]
+    gpt = chunks(httpx.post(f"{gateway}/serving-endpoints/databricks-gpt-oss-120b/invocations",
+                            json={"messages": body["messages"], "stream": True, "max_tokens": 1024}))
+    assert not any(item.get("signature") for part in gpt for block in part["choices"][0]["delta"].get("content") or []
+                   if isinstance(block, dict) for item in block.get("summary", []))
+
+
+def test_images_response_format_and_the_endpoint_state(gateway, simulator):
+    url = f"{gateway}/serving-endpoints/databricks-claude-opus-5-5/invocations"
+    image = {"stream": True, "max_tokens": 64, "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "Endpoint check: what colour is this square? Answer in one word."},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}]}
+    text = "".join(part["choices"][0]["delta"]["content"] for part in chunks(httpx.post(url, json=image))
+                   if isinstance(part["choices"][0]["delta"].get("content"), str))
+    assert text == "Red."
+    assert httpx.post(f"{gateway}/serving-endpoints/databricks-gpt-oss-120b/invocations", json=image).status_code == 400
+    simulator.Gateway.vision_mode = "reject"
+    assert "image_url" in httpx.post(url, json=image).json()["message"]
+    structured = {"stream": True, "max_tokens": 64, "response_format": {"type": "json_schema", "json_schema": {}},
+                  "messages": [{"role": "user", "content": "hello"}]}
+    reply = "".join(part["choices"][0]["delta"]["content"] for part in chunks(httpx.post(url, json=structured))
+                    if isinstance(part["choices"][0]["delta"].get("content"), str))
+    assert "answer" in json.loads(reply)
+    simulator.Gateway.response_format_mode = "reject"
+    assert httpx.post(url, json=structured).status_code == 400
+    state = httpx.get(f"{gateway}/api/2.0/serving-endpoints/databricks-claude-opus-5-5").json()
+    assert state["state"]["ready"] == "READY" and state["task"] == "llm/v1/chat"
+    assert httpx.get(f"{gateway}/api/2.0/serving-endpoints/unknown-endpoint").status_code == 404
+

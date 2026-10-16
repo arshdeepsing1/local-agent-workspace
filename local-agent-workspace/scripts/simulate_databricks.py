@@ -18,7 +18,9 @@ can be rehearsed before using a paid workspace:
 - databricks-gpt-oss-120b and -20b: reasoning_effort low|medium|high (xhigh and max count as high).
 - Any other endpoint name (Settings → Other endpoint…) follows the family the app guesses from
   the name (claude: thinking only when adaptive; gpt-oss, gpt-5, o1/o3/o4: reasoning_effort);
-  other names are plain models that refuse reasoning fields.
+  other names are plain models that refuse reasoning fields. A Claude name with sonnet, haiku or
+  claude-3 in it is an older Claude endpoint: it refuses adaptive thinking and output_config and
+  takes thinking {"type": "enabled", "budget_tokens": N} (N from 1,024 and below max_tokens).
 
 --claude-fields chooses which reasoning fields the simulated chat-completions route accepts
 for Claude endpoints (the real route is not verified yet): both (default), anthropic
@@ -33,6 +35,15 @@ read) answers a request that repeats an earlier one's marked prefix.
 --cache chooses how the route treats the markers: accept (default), documented (refuses list content
 for role system or tool, the forms Databricks does not document), reject (refuses any cache_control)
 or ignore (accepts them and reports no cache use).
+
+Thinking sent back: each streamed reasoning item ends with a signature the gateway makes from its text
+(an HMAC with a fixed key). --replay chooses how the route takes reasoning items in assistant messages:
+accept (default: checks their signatures), require (also refuses a tool loop whose last tool request
+comes back without its signed thinking, as Anthropic's API does with thinking on) or reject (refuses
+any). --vision accept|reject: whether Claude endpoints take image_url content parts (other endpoints
+never do). --response-format accept|reject: whether response_format is taken together with tools (an
+accepted JSON schema gets a JSON reply). The app's endpoint checks (Settings → Model and context →
+Check endpoint…) get short scripted answers, so the whole check can be rehearsed offline.
 
 Scripted turns, chosen by words in your message (the agent only calls tools the chat offers):
   edit / keep      writes a file, then edits it twice with pauses (try Keep in between)
@@ -52,6 +63,7 @@ simulated chats never mix with real ones. Your credential file is never read.
 import argparse
 import copy
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -69,6 +81,10 @@ THINKING = {"low": (0.6, 120), "medium": (1.5, 400), "high": (3.0, 1_200), "xhig
 CACHE_TTL_SECONDS = 300  # An ephemeral cache entry lives 5 minutes from its last write or read.
 CACHE_LOOKBACK = 20  # Block boundaries before a marker checked for an earlier entry (as Anthropic documents).
 CACHE_MODES = ("accept", "documented", "reject", "ignore")
+REPLAY_MODES = ("accept", "require", "reject")
+SIGNING_KEY = b"simulated-gateway"  # Fixed, so signatures stay valid across restarts (synthetic, not a secret).
+REASONING_ITEMS = ("reasoning", "thinking", "redacted_thinking")
+BUDGET_LEVELS = ((1_024, "low"), (4_096, "medium"), (8_192, "high"), (16_384, "xhigh"))
 # Bytes of a request's JSON per simulated Claude input token. The real route counts about 1.03-1.4 times the app's
 # estimate (about 3 bytes a token; measured on Claude Opus 5.5, see context.estimate_scale), so simulated counts
 # come to about 1.1 times it and a rehearsed cache accounting check reads near 1.
@@ -88,6 +104,8 @@ def endpoint_profile(endpoint):
     if endpoint in ENDPOINTS:
         return ENDPOINTS[endpoint]
     name = endpoint.lower()
+    if "claude" in name and re.search(r"sonnet|haiku|claude-3", name):
+        return {"family": "claude", "always_thinks": False, "default": "high", "budget": True}
     if "claude" in name:
         return {"family": "claude", "always_thinks": False, "default": "high"}
     if "gpt-oss" in name or re.search(r"(?:^|[-_.])(?:gpt-5|o[134])(?:[-_.]|$)", name):
@@ -130,6 +148,8 @@ def reasoning_request(endpoint, body, claude_fields):
     if (thinking is not None or output_config is not None) and claude_fields in ("openai", "none"):
         field = "thinking" if thinking is not None else "output_config"
         raise Rejected(400, f"Unrecognized request argument supplied: {field}")
+    if profile.get("budget"):
+        return budget_request(body, thinking, output_config)
     if thinking is not None:
         if not isinstance(thinking, dict):
             raise Rejected(400, "thinking must be an object.")
@@ -157,6 +177,90 @@ def reasoning_request(endpoint, body, claude_fields):
     if not thinking_on:
         return None, False
     return level or profile["default"], isinstance(thinking, dict) and thinking.get("display") == "summarized"
+
+
+def budget_request(body, thinking, output_config):
+    """An older Claude endpoint: thinking {"type": "enabled", "budget_tokens": N} only."""
+    if output_config is not None:
+        raise Rejected(400, "Unrecognized request argument supplied: output_config")
+    if thinking is None:
+        return None, False
+    if not isinstance(thinking, dict) or thinking.get("type") not in ("enabled", "disabled"):
+        raise Rejected(400, f"thinking.type: Input tag {thinking.get('type') if isinstance(thinking, dict) else None!r} "
+                            "does not match any of the expected tags: 'enabled', 'disabled'")
+    if thinking["type"] == "disabled":
+        return None, False
+    budget = thinking.get("budget_tokens")
+    if type(budget) is not int or budget < 1_024 or budget >= (body.get("max_tokens") or 0):
+        raise Rejected(400, "thinking.budget_tokens must be at least 1024 and less than max_tokens.")
+    return next((level for limit, level in BUDGET_LEVELS if budget <= limit), "max"), True
+
+
+def sign(text):
+    """The signature the gateway puts on a reasoning item with this text."""
+    return "sim-" + hmac.new(SIGNING_KEY, text.encode("utf-8"), hashlib.sha256).hexdigest()[:40]
+
+
+def sent_reasoning(body):
+    """[(message index, item)] of the reasoning items in assistant messages."""
+    return [(index, part) for index, message in enumerate(body.get("messages") or [])
+            if isinstance(message, dict) and message.get("role") == "assistant" and isinstance(message.get("content"), list)
+            for part in message["content"] if isinstance(part, dict) and part.get("type") in REASONING_ITEMS]
+
+
+def item_signature(item):
+    """(text, signature) of a reasoning item sent back, as the gateway signed it."""
+    if item.get("type") == "thinking":
+        return item.get("thinking") or "", item.get("signature")
+    if item.get("type") == "reasoning":
+        summary = [part for part in item.get("summary") or [] if isinstance(part, dict)]
+        return "".join(part.get("text", "") for part in summary), next(
+            (part.get("signature") for part in reversed(summary) if part.get("signature")), None)
+    return "", None
+
+
+def replay_request(endpoint, body, mode, thinking):
+    """How the simulated route takes reasoning items sent back in assistant messages; Rejected as it refuses them."""
+    sent = sent_reasoning(body)
+    if sent and endpoint_profile(endpoint)["family"] != "claude":
+        raise Rejected(400, f"messages[{sent[0][0]}].content: reasoning items are only accepted by Claude models.")
+    if sent and mode == "reject":
+        raise Rejected(400, f"messages[{sent[0][0]}].content[0].type: reasoning items are not supported in assistant "
+                            "messages on this route.")
+    for index, item in sent:
+        if item.get("type") != "redacted_thinking":
+            text, signature = item_signature(item)
+            if signature != sign(text):
+                raise Rejected(400, f"messages[{index}].content: invalid signature in a thinking block.")
+    if mode == "require" and thinking and endpoint_profile(endpoint)["family"] == "claude":
+        messages = body.get("messages") or []
+        start = next((index + 1 for index in range(len(messages) - 1, -1, -1) if messages[index].get("role") == "user"), 0)
+        tool_requests = [index for index in range(start, len(messages))
+                         if messages[index].get("role") == "assistant" and messages[index].get("tool_calls")]
+        if tool_requests and not any(index == tool_requests[-1] for index, _ in sent):
+            raise Rejected(400, f"messages[{tool_requests[-1]}]: with thinking enabled, an assistant message with tool "
+                                "calls must start with its signed thinking block.")
+
+
+def image_request(endpoint, body, mode):
+    """Rejected for image_url content parts the simulated route does not take."""
+    for index, message in enumerate(body.get("messages") or []):
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list) and any(isinstance(part, dict) and part.get("type") == "image_url" for part in content):
+            if endpoint_profile(endpoint)["family"] != "claude" or mode == "reject":
+                raise Rejected(400, f"messages[{index}].content: image_url content parts are not supported for {endpoint}.")
+
+
+def format_request(body, mode):
+    """True when the reply must be the JSON a response_format schema asks for; Rejected when it is refused."""
+    if "response_format" not in body:
+        return False
+    if mode == "reject":
+        raise Rejected(400, "response_format is not supported together with tools on this route.")
+    value = body["response_format"]
+    if not isinstance(value, dict) or value.get("type") not in ("json_schema", "json_object", "text"):
+        raise Rejected(400, "response_format.type must be json_schema, json_object or text.")
+    return value["type"] != "text"
 
 
 def cache_markers(body):
@@ -311,6 +415,8 @@ class Brain:
         results = tool_results(messages)
         words = prompt.lower()
         system = text_of(messages[0].get("content")) if messages and messages[0].get("role") == "system" else ""
+        if prompt.startswith("Endpoint check:"):
+            return self.probe(words, made, tools)
         if first.startswith("Delegated task:") and len(users) == 1:
             return self.subagent(prompt, made, results, tools)
         if "rate limit" in words or "429" in words:
@@ -330,6 +436,20 @@ class Brain:
         if "long" in words:
             return self.long(), []
         return None, []
+
+    def probe(self, words, made, tools):
+        """Short answers to the app's endpoint checks (endpoint_probes.py)."""
+        if "get_weekday" in words and "get_weekday" in tools and not made:
+            return "", [call("get_weekday", date="2026-01-05")]
+        if "get_weekday" in words:
+            return "Monday.", []
+        if "json object" in words:
+            return json.dumps({"answer": "5"}), []
+        for clue, answer in (("17 times 23", "391"), ("colour is this square", "Red."), ("word cached", "cached"),
+                             ("word ready", "ready")):
+            if clue in words:
+                return answer, []
+        return "ok", []
 
     def edit(self, words, made, results, tools):
         if not {"write_file", "edit_file"} <= tools.keys():
@@ -469,6 +589,9 @@ class Gateway(BaseHTTPRequestHandler):
     brain = Brain()
     claude_fields = "both"
     cache_mode = "accept"
+    replay_mode = "accept"
+    vision_mode = "accept"
+    response_format_mode = "accept"
     prompt_cache = PromptCache()
     speed = 1.0
     protocol_version = "HTTP/1.1"
@@ -487,8 +610,12 @@ class Gateway(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_GET(self):
+        single = re.fullmatch(r"/api/2\.0/serving-endpoints/([^/]+)", self.path.rstrip("/"))
         if self.path.rstrip("/") == "/api/2.0/serving-endpoints":
             self.send_json(200, {"endpoints": [{"name": name, "state": {"ready": "READY"}} for name in ENDPOINTS]})
+        elif single and single.group(1) in ENDPOINTS:
+            self.send_json(200, {"name": single.group(1), "task": "llm/v1/chat",
+                                 "state": {"ready": "READY", "config_update": "NOT_UPDATING"}})
         else:
             self.send_json(404, {"error_code": "NOT_FOUND", "message": "Not found in the simulator."})
 
@@ -507,6 +634,9 @@ class Gateway(BaseHTTPRequestHandler):
         try:
             effort, summarized = reasoning_request(endpoint, body, self.claude_fields)
             caching = cache_request(endpoint, body, self.cache_mode)
+            replay_request(endpoint, body, self.replay_mode, effort is not None)
+            image_request(endpoint, body, self.vision_mode)
+            structured = format_request(body, self.response_format_mode)
             fields = {key: body[key] for key in ("thinking", "output_config", "reasoning_effort") if key in body}
             kind = "agent" if body.get("stream") else "auxiliary"
             log(f"{endpoint} {kind} request: fields {json.dumps(fields) if fields else 'none'} -> "
@@ -516,7 +646,7 @@ class Gateway(BaseHTTPRequestHandler):
                 cache = self.prompt_cache.use(endpoint, body, caching)
                 log(f"{endpoint} cache: read {cache[0]:,}, wrote {cache[1]:,} of {cache[2]:,} input tokens")
             if body.get("stream"):
-                self.stream(endpoint, body, effort, summarized, cache)
+                self.stream(endpoint, body, effort, summarized, cache, structured)
             else:
                 self.complete(endpoint, body, cache)
         except Rejected as rejected:
@@ -554,7 +684,7 @@ class Gateway(BaseHTTPRequestHandler):
         self.wfile.write(f"{len(line):x}\r\n".encode() + line + b"\r\n")
         self.wfile.flush()
 
-    def stream(self, endpoint, body, effort, summarized, cache=None):
+    def stream(self, endpoint, body, effort, summarized, cache=None, structured=False):
         prompt = next((text_of(message.get("content")) for message in reversed(body.get("messages") or [])
                        if message.get("role") == "user"), "")
         text, calls = self.brain.respond(body)
@@ -564,6 +694,8 @@ class Gateway(BaseHTTPRequestHandler):
                     f"`{json.dumps(fields) if fields else 'none'}`\n- Thinking: "
                     + (f"effort **{effort}**" + (", summary returned" if summarized else ", summary omitted (empty text)")
                        if effort else "off") + f"\n\n{SCENARIO_HINT}")
+        if structured and not calls and not text.lstrip().startswith("{"):
+            text = json.dumps({"answer": text})  # An accepted JSON schema: the reply is JSON.
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Transfer-Encoding", "chunked")
@@ -583,8 +715,9 @@ class Gateway(BaseHTTPRequestHandler):
                 self.chunk(response_id, endpoint, {"content": [{"type": "reasoning", "summary": [
                     {"type": "summary_text", "text": piece, "signature": ""}]}]})
                 time.sleep(seconds * self.speed / len(pieces))
-            self.chunk(response_id, endpoint, {"content": [{"type": "reasoning", "summary": [
-                {"type": "summary_text", "text": "", "signature": "simulated-signature"}]}]})
+            if cache is not None:  # Claude: the last piece carries the item's signature.
+                self.chunk(response_id, endpoint, {"content": [{"type": "reasoning", "summary": [
+                    {"type": "summary_text", "text": "", "signature": sign("".join(pieces))}]}]})
         for piece in words_of(text):
             self.chunk(response_id, endpoint, {"content": piece})
             time.sleep(0.015 * self.speed)
@@ -652,17 +785,25 @@ def main():
                         help="reasoning fields the simulated route accepts for Claude endpoints")
     parser.add_argument("--cache", choices=CACHE_MODES, default="accept",
                         help="how the simulated route treats cache_control on Claude endpoints")
+    parser.add_argument("--replay", choices=REPLAY_MODES, default="accept",
+                        help="how the simulated route takes reasoning items sent back in assistant messages")
+    parser.add_argument("--vision", choices=("accept", "reject"), default="accept",
+                        help="whether Claude endpoints take image_url content parts")
+    parser.add_argument("--response-format", choices=("accept", "reject"), default="accept",
+                        help="whether response_format is taken together with tools")
     parser.add_argument("--speed", type=float, default=1.0, help="multiplies simulated thinking and typing time")
     parser.add_argument("--gateway-only", action="store_true", help="run only the fake gateway (for your own launcher)")
     args = parser.parse_args()
 
     Gateway.claude_fields, Gateway.cache_mode, Gateway.speed = args.claude_fields, args.cache, max(0.0, args.speed)
+    Gateway.replay_mode, Gateway.vision_mode, Gateway.response_format_mode = args.replay, args.vision, args.response_format
     server = ThreadingHTTPServer(("127.0.0.1", args.gateway_port), Gateway)
     server.daemon_threads = True
     gateway = f"http://127.0.0.1:{server.server_address[1]}"
     threading.Thread(target=server.serve_forever, daemon=True).start()
     log(f"fake Databricks gateway on {gateway} (Claude reasoning fields accepted: {args.claude_fields}; "
-        f"cache markers: {args.cache})")
+        f"cache markers: {args.cache}; thinking sent back: {args.replay}; images: {args.vision}; "
+        f"response_format: {args.response_format})")
     if args.gateway_only:
         try:
             threading.Event().wait()

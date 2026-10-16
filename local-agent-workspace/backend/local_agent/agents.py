@@ -24,7 +24,7 @@ from .context import (
     DEFAULT_AUTO_COMPACT_PERCENT, MAX_AUTO_COMPACT_PERCENT,
     MIN_AUTO_COMPACT_PERCENT, OUTPUT_LIMIT_CONTINUATION, SUMMARY_MAX_TOKENS,
     build_condense_messages, build_handoff_messages, build_summary_messages, compaction_output_allowance,
-    condense_output_tokens, effective_input_budget, estimate_prior, estimate_scale,
+    condense_output_tokens, context_breakdown, effective_input_budget, estimate_prior, estimate_scale,
     estimate_tokens, handoff_output_tokens, handoff_with_contents, has_earlier_turn, last_request_report,
     model_context_window, next_request_estimate, prepare_context, scaled_estimate, summary_byte_limit,
     summary_output_tokens, verify_declined_message,
@@ -54,8 +54,9 @@ from .feature_tools import FEATURE_TOOLS
 from .tool_profiles import tool_allowed, filter_tools, off_servers, server_off
 from .mcp_client import FULL_RESULT_CHARS, RETRY_SECONDS
 from .result_store import ResultStore
-from . import prompt_cache, reasoning
+from . import prompt_cache, reasoning, reasoning_replay
 from .reasoning import reasoning_delta, reasoning_shape
+from .endpoint_probes import CheckStore
 from . import spending
 from .titles import fallback_title, generate_title, needs_title
 from .telemetry import (
@@ -78,6 +79,7 @@ from . import history
 from .tool_errors import tool_error_text
 from .projects import ProjectSettings
 from .model_profiles import default_limits, effective_limits, known_endpoints, prompt_caching, thinking_reserve
+from .model_profiles import supports as model_profiles_supports
 from . import user_paths
 from . import mentions
 from .composer_api import (MAX_QUEUED, MAX_QUEUED_CHARS, SHELL_ONE_LINE, SIDE_QUESTION_PREFIX, SIDE_TOO_LONG,
@@ -612,9 +614,11 @@ def output_limit_text(max_output_tokens, thinking=False):
 
 
 def model_history(wire):
-    """Keep the archive and context offsets intact while excluding broken calls."""
+    """Keep the archive and context offsets intact while excluding broken calls. A reply's kept reasoning
+    (reasoning_replay's sidecar) is never part of it: requests get it only through reasoning_replay.apply."""
     messages, omitted = [], {}
     for message in wire:
+        message = reasoning_replay.strip(message)
         calls = message.get("tool_calls", [])
         if calls:
             try:
@@ -826,6 +830,12 @@ class AgentManager(LifecycleHooks):
         # 200 (the ledger's system_tail_changed).
         self.cache_levels = {}
         self.system_tails = {}
+        # In memory only: endpoints that rejected signed reasoning sent back (Settings → Reasoning → Send earlier
+        # thinking back) with HTTP 400; until a restart or a Settings save.
+        self.replay_rejections = set()
+        # Endpoint check results (Settings → Model and context → Check endpoint…), read by cache_level and
+        # replay_model; endpoint_checks_api registers the runner.
+        self.endpoint_checks = CheckStore(settings.state_dir)
         # The lifespan writes the marker after every task and job stopped. It is removed before
         # anything else, so a crash during this run gives a full scan next time. Without it (a
         # crash, a failed shutdown, a fresh or older state folder) every conversation is loaded.
@@ -1887,28 +1897,61 @@ class AgentManager(LifecycleHooks):
         await self.broadcast(session["id"], {"type": "spending_limit", "spending_limit_dbu":
                                              session.get("spending_limit_dbu"), "spending": spending.status(self, session)})
 
-    def reasoning_request(self, session):
+    def reasoning_request(self, session, max_tokens=None):
         """The reasoning fields the chat's next agent request carries (reasoning.effort_request): the
-        chat's own effort, or the Settings default for a chat saved without one (subagents too)."""
+        chat's own effort, or the Settings default for a chat saved without one (subagents too). max_tokens
+        (the request's; default the chat's limit) caps a thinking budget."""
         values = self.settings.values
         effort = reasoning.valid_effort(session.get("reasoning_effort")) or reasoning.valid_effort(
             values.get("reasoning_effort")) or reasoning.DEFAULT_EFFORT
         setting = values.get("reasoning_format")
         setting = setting if setting in reasoning.REQUEST_FORMATS else reasoning.DEFAULT_FORMAT
+        setting, rejected, _ = self.reasoning_ladder(session["model"], setting)
+        if max_tokens is None:
+            max_tokens = self.request_limits(session)[1]
+        return reasoning.effort_request(session["model"], effort, setting, values.get("thinking_summaries") is not False,
+                                        rejected, max_tokens)
+
+    def reasoning_ladder(self, model, setting):
+        """(setting requests use, the field rejected for it, the adaptive field rejected before): after Databricks
+        rejected the adaptive Anthropic fields (thinking, output_config) for an endpoint that does not always think,
+        requests ask for thinking with a token budget instead (reasoning format anthropic_budget); after that
+        is rejected too, they send none. Remembered until a restart or a Settings save (reasoning_rejections)."""
+        fmt = reasoning.request_format(model, setting)
+        rejected = self.reasoning_rejections.get((model, fmt))
+        if fmt == "anthropic" and rejected and reasoning.endpoint_reasoning(model)["thinking"] != "always":
+            return "anthropic_budget", self.reasoning_rejections.get((model, "anthropic_budget")), rejected
+        return setting, rejected, None
+
+    def supports(self, model, flag):
+        """model_profiles.supports for this endpoint, unless an endpoint check showed it rejects the capability
+        (an image part refused: vision is off). A check never turns a capability on."""
+        if not model_profiles_supports(model, flag):
+            return False
+        return flag not in ("vision", "structured_output") or not self.endpoint_checks.refused(model, flag)
+
+    def replay_model(self, session):
+        """The endpoint whose signed reasoning the chat's next agent request sends back during tool use, or None:
+        Settings → Reasoning → Send earlier thinking back is on, and the endpoint has not rejected it (an HTTP 400
+        since the last restart or Settings save, or an endpoint check)."""
         model = session["model"]
-        rejected = self.reasoning_rejections.get((model, reasoning.request_format(model, setting)))
-        return reasoning.effort_request(model, effort, setting, values.get("thinking_summaries") is not False, rejected)
+        if (self.settings.values.get("thinking_replay") is not True or model in self.replay_rejections
+                or self.endpoint_checks.refused(model, "replay")):
+            return None
+        return model
 
     def cache_level(self, session):
         """The prompt_cache level the chat's next agent request starts at, or None for an endpoint that never
         gets cache markers (no Databricks-hosted Claude profile): the lower of Settings → Prompt caching
-        ("full" for Automatic, "messages" for Documented forms only, "off") and the level a rejection lowered
-        this endpoint to (cache_levels)."""
+        ("full" for Automatic, "messages" for Documented forms only, "off"), the level a rejection lowered
+        this endpoint to (cache_levels) and the level an endpoint check found accepted."""
         if not prompt_caching(session["model"]):
             return None
         chosen = {"auto": "full", "messages": "messages"}.get(self.settings.values.get("prompt_caching", "auto"), "off")
         remembered = self.cache_levels.get(session["model"], "full")
-        return max(chosen, remembered, key=prompt_cache.LEVELS.index)
+        # An endpoint check that found the markers rejected starts the ladder at the level it found accepted.
+        probed = self.endpoint_checks.cache_level(session["model"]) or "full"
+        return max(chosen, remembered, probed, key=prompt_cache.LEVELS.index)
 
     async def rules_changed(self, scope, session=None):
         """Publish and re-check after a rule change: the chat, every live chat of the project, or every live chat."""
@@ -4011,7 +4054,7 @@ class AgentManager(LifecycleHooks):
             await self.status(session, "idle")
 
     async def model_response(self, session, event, client, url, headers, payload, retry_reason=None, body=None,
-                             effort=None, cache=None, accepted=None, fallback=None):
+                             effort=None, cache=None, accepted=None, fallback=None, replayed=0):
         """One streamed agent request. retry_reason (ledger only) names why the app sent it automatically.
         body is payload already encoded (request_limits.encode_payload); those exact bytes are sent (with
         any prompt-cache markers; payload has none). effort is the request's reasoning
@@ -4019,7 +4062,11 @@ class AgentManager(LifecycleHooks):
         its fields marks the error with reasoning_rejected. cache ({prompt_cache, system_tail_changed}) is
         copied into the ledger. accepted, when given, is awaited once Databricks answers HTTP 200, before
         the stream is read. fallback ({model, from, reason}: AgentManager.fallback_attempt) is a request to
-        Settings → Fallback endpoint (url) instead of the chat's: request_info and the ledger name both."""
+        Settings → Fallback endpoint (url) instead of the chat's: request_info and the ledger name both.
+        replayed: how many earlier replies of this turn carry their signed reasoning in payload
+        (reasoning_replay.apply); a 400 then marks the error with replay_named. While Settings → Reasoning → Send
+        earlier thinking back applies to the endpoint, a completed reply keeps its own signed reasoning in its
+        wire message (reasoning_replay's sidecar), with the endpoint that wrote it."""
         body = encode_payload(payload) if body is None else body
         started = request_clock()
         model = fallback["model"] if fallback else session["model"]
@@ -4029,6 +4076,8 @@ class AgentManager(LifecycleHooks):
                 "status": "running"}
         if fallback:
             info.update(fallback_from=fallback["from"], fallback_reason=fallback["reason"])
+        if replayed:
+            info["reasoning_replayed"] = replayed  # Earlier replies sent with their signed thinking.
         # Recorded unless the request is the plain default (no effort chosen, nothing sent or skipped).
         if effort is not None and not reasoning.plain_default(effort):
             info["reasoning"] = reasoning.request_record(effort)
@@ -4045,6 +4094,8 @@ class AgentManager(LifecycleHooks):
             retry_reason=retry_reason)
         if fallback:
             call["fallback_from"] = fallback["from"]  # The chat's endpoint, which failed before this attempt.
+        if replayed:
+            call["reasoning_replayed"] = replayed
         if effort is not None and not reasoning.plain_default(effort):
             call["effort"] = effort["effort"]
             # What went out: the level sent (a mapped one on endpoints with fewer levels), or none
@@ -4069,6 +4120,7 @@ class AgentManager(LifecycleHooks):
         self.store.save(session)
         draft = StreamDraft(self.store, session)
         tool_buffer, finish, appended = ToolCallBuffer(), None, False
+        collector = reasoning_replay.Collector()  # The reply's signed reasoning, for its wire message.
         # thinking_clock() when the request was sent, when reasoning began and when the answer (text or a tool call) began.
         thinking = {"sent": thinking_clock(), "since": None, "output": None}
 
@@ -4116,6 +4168,7 @@ class AgentManager(LifecycleHooks):
                         if effort is not None:
                             error.reasoning_rejected = reasoning.rejected_field(error_text, effort)
                         error.cache_named = prompt_cache.rejected(error_text)  # The notice's wording only.
+                        error.replay_named = bool(replayed) and reasoning_replay.rejected(error_text)
                     raise error
                 async for data in sse_data(response):
                     if data == "[DONE]":
@@ -4145,6 +4198,7 @@ class AgentManager(LifecycleHooks):
                                 shape.setdefault("reasoning_shape", kind)  # The first delta's shape.
                             if signed:
                                 shape["reasoning_signature"] = True
+                            collector.add(delta)
                         if thought and thinking["since"] is None:
                             # Even an item with no text (thinking the endpoint does not show) starts the clock.
                             thinking["since"] = thinking_clock()
@@ -4209,8 +4263,15 @@ class AgentManager(LifecycleHooks):
             if error:
                 if error.kind != "output_limit":
                     message["content"] = ((message["content"] or "") + "\n\n[" + str(error) + "]").strip()
-            elif calls:
-                message["tool_calls"] = ordered_calls
+            else:
+                if calls:
+                    message["tool_calls"] = ordered_calls
+                # Only a complete reply keeps its signed reasoning, named by the endpoint that wrote it, and only
+                # while that endpoint gets it back (replay_model): otherwise no signature is written to disk.
+                kept = (reasoning_replay.sidecar(model, collector.result(), self.settings.redact)
+                        if self.replay_model({**session, "model": model}) is not None else None)
+                if kept:
+                    message["reasoning"] = kept
             session["wire"].append(message)
             appended = True
             if error:
@@ -4292,12 +4353,21 @@ class AgentManager(LifecycleHooks):
         sent = prompt_cache.marked(payload, prefix, level)
         return encode_payload(sent), level if prompt_cache.markers(sent) else "off"
 
-    async def request_accepted(self, session, event, tail, lowered):
+    async def request_accepted(self, session, event, tail, lowered, replay_dropped=None):
         """Databricks answered an agent request with HTTP 200: its system tail hash is what the chat's next request
-        compares with (system_tail_changed), and a lower cache level it was sent at after a rejection is kept."""
+        compares with (system_tail_changed), a lower cache level it was sent at after a rejection is kept, and so
+        is a rejection of the signed reasoning it was first sent with (replay_dropped)."""
         self.system_tails[session["id"]] = tail
         if lowered:
             await self.cache_lowered(session, event, lowered)
+        if replay_dropped:
+            replay_dropped.clear()
+            self.replay_rejections.add(session["model"])
+            await self.event(session, "notice", text=(
+                f"Databricks rejected this turn's earlier thinking sent back to {session['model']} (HTTP 400), so the "
+                "app sent the request again without it. Requests to this endpoint send no earlier thinking until the "
+                "app restarts or Settings are saved (Settings → Reasoning → Send earlier thinking back)."))
+            await self.reply_after_notices(session, event)
 
     async def cache_lowered(self, session, event, lowered):
         """Databricks accepted a request sent again with fewer cache markers after an HTTP 400: requests to
@@ -4350,7 +4420,7 @@ class AgentManager(LifecycleHooks):
             # count only up to this one's defaults, as for a subagent on its own endpoint (base_limits).
             own = default_limits(fallback)
             context_window, max_tokens = min(context_window, own[0]), min(max_tokens, own[1])
-        effort = self.reasoning_request(target)
+        effort = self.reasoning_request(target, max_tokens)
         messages = reasoning.without_reasoning(messages)
         # The system message names the response limit (output_limit_text): the fallback's own, not the chat's.
         system = messages[0] if messages and messages[0].get("role") == "system" else {}
@@ -4601,6 +4671,8 @@ class AgentManager(LifecycleHooks):
             else:
                 wire.pop()
             self.store.save(session)
+        # A new turn: no earlier reply's signed reasoning is sent back again, so the history keeps none of it.
+        reasoning_replay.prune(wire)
         wire.append({"role": "user", "content": prompt if content is None else content})
         compactable = False
         if isinstance(meter := session.get("context_info"), dict) and meter.get("compactable") is False:
@@ -4662,8 +4734,9 @@ class AgentManager(LifecycleHooks):
                                                                allowance=allowance)
                 record, holder = self.compaction_record(session, tools)
                 scale = estimate_scale(session.get("inference_calls"), session["model"])
+                history = model_history(wire)  # reasoning_replay.apply matches the prepared tail against it.
                 messages, next_context, info = await prepare_context(
-                    model_history(wire), context_state, system, definitions, context_window, summarize,
+                    history, context_state, system, definitions, context_window, summarize,
                     reply_reserve=max_output_tokens, condense=condense, default_reply_reserve=default_reply_reserve,
                     scale=scale,
                     handoff_path=plan and plan["path"], save_handoff=plan and self.handoff_saver(session, plan),
@@ -4678,9 +4751,20 @@ class AgentManager(LifecycleHooks):
                 context_state = session["context_state"] = {**next_context, "tool_definitions": definitions}
                 input_budget = info["input_budget"]
                 # Read at each step, so an effort chosen while the turn runs applies from this request.
-                effort = self.reasoning_request(session)
+                effort = self.reasoning_request(session, max_output_tokens)
+                # Settings → Reasoning → Send earlier thinking back: this turn's replies carry their signed reasoning,
+                # counted in the estimate and the meter; a request it would push over the input budget goes without.
+                sent, replayed = messages, 0
+                if (replay := self.replay_model(session)) is not None:
+                    sent, replayed = reasoning_replay.apply(messages, history, wire, replay)
+                    tokens = scaled_estimate(sent, definitions, scale) if replayed else 0
+                    if tokens > input_budget:
+                        sent, replayed = messages, 0
+                    elif replayed:
+                        info = {**info, "estimated_tokens": tokens, "replayed_reasoning_tokens": tokens - info["estimated_tokens"],
+                                "breakdown": context_breakdown(sent, definitions, bool(next_context.get("summary")), scale)}
                 # The exact bytes sent: the meter shows the size of this request in the same update.
-                payload = {"messages": messages, "tools": definitions, "stream": True,
+                payload = {"messages": sent, "tools": definitions, "stream": True,
                            "max_tokens": max_output_tokens, **effort["fields"]}
                 # Prompt-cache markers go into the body only; payload stays what estimates, the ledger and the meter read.
                 prefix = guidance["cache_prefix_chars"]
@@ -4706,7 +4790,8 @@ class AgentManager(LifecycleHooks):
                     # level until Databricks accepts it (its own budget: the transient one is not used).
                     # After those, one request to Settings → Fallback endpoint (fallback, fallback_attempt) when the
                     # failure came before the reply started; the next step tries the chat's endpoint again.
-                    transient_attempt, reasoning_resent, lowered, fallback = 0, False, {}, None
+                    # replay_dropped: the request went again without this turn's signed reasoning after a 400 ({named}).
+                    transient_attempt, reasoning_resends, lowered, fallback, replay_dropped = 0, 0, {}, None, {}
                     while True:
                         try:
                             # Another chat's 429 on this endpoint: wait with it instead of adding to the overload.
@@ -4722,31 +4807,57 @@ class AgentManager(LifecycleHooks):
                                 retry_reason=retry_reason, body=body,
                                 effort=effort, cache={"prompt_cache": cache_sent,
                                                       "system_tail_changed": previous_tail not in (None, tail)},
-                                accepted=lambda: self.request_accepted(session, event, tail, lowered),
-                                fallback=fallback)
+                                accepted=lambda: self.request_accepted(session, event, tail, lowered, replay_dropped),
+                                fallback=fallback, replayed=replayed)
                             break
                         except InferenceError as exc:
                             if fallback is not None:
                                 raise  # One fallback attempt: its own failure ends the request.
+                            if replayed and exc.http_status == 400:
+                                # Signed reasoning sent back may be what Databricks rejected: send the request once
+                                # more without it, before the other fallbacks. A 400 that names it is remembered
+                                # for the endpoint at once; otherwise once the request without it is accepted.
+                                replay_dropped["named"] = getattr(exc, "replay_named", False)
+                                if replay_dropped["named"]:
+                                    self.replay_rejections.add(session["model"])
+                                payload = {**payload, "messages": messages}
+                                body, cache_sent = self.cache_body(payload, prefix, cache_sent)
+                                replayed, retry_reason = 0, "replay_rejected"
+                                await self.update_event(session, event,
+                                                        request_info={"model": session["model"], "status": "running"})
+                                continue
+                            if replay_dropped.get("named") is False:
+                                replay_dropped.clear()  # The request without it failed too: the 400 was not about it.
                             field = getattr(exc, "reasoning_rejected", None)
                             # A 400 that names caching to a request with markers goes down the cache levels first,
                             # even when it also mentions a reasoning term; other reasoning-field 400s come first.
                             cache_named = cache_sent not in (None, "off") and getattr(exc, "cache_named", False)
-                            if field and not reasoning_resent and not cache_named:
+                            if field and reasoning_resends < 2 and not cache_named:
                                 # A 400 before any stream that names a reasoning field this request added: the
-                                # guess about the endpoint's fields was wrong. Send it once more without them, and
-                                # skip them for this endpoint and format until a restart or a Settings save.
-                                reasoning_resent = True
+                                # guess about the endpoint's fields was wrong. Send it once more with the next form
+                                # of the ladder (reasoning_ladder: the adaptive Anthropic fields, then a thinking
+                                # budget, then none), and remember the rejection for this endpoint and format until
+                                # a restart or a Settings save.
+                                reasoning_resends += 1
                                 self.reasoning_rejections[(session["model"], effort["format"])] = field
                                 payload = {key: value for key, value in payload.items() if key not in effort["fields"]}
+                                stepped = self.reasoning_request(session, max_output_tokens)
+                                if stepped["fields"] and stepped["format"] == "anthropic_budget" != effort["format"]:
+                                    payload.update(stepped["fields"])
+                                    effort = stepped
+                                    text = (f"Databricks rejected the reasoning field {field} for {session['model']} "
+                                            "(HTTP 400), so the app sent the request again asking for thinking with a "
+                                            "token budget (thinking.budget_tokens), the form older Claude endpoints take. "
+                                            "Requests to this endpoint use it until the app restarts or Settings are saved.")
+                                else:
+                                    effort = reasoning.without_fields(effort, field)
+                                    text = (f"Databricks rejected the reasoning field {field} for {session['model']} "
+                                            "(HTTP 400), so the app sent the request again without reasoning fields. "
+                                            "Requests to this endpoint skip them until the app restarts or Settings are "
+                                            "saved. To send them another way, change Settings → Reasoning → Request format.")
                                 body, cache_sent = self.cache_body(payload, prefix, cache_sent)
-                                effort = reasoning.without_fields(effort, field)
                                 retry_reason = "reasoning_rejected"
-                                await self.event(session, "notice", text=(
-                                    f"Databricks rejected the reasoning field {field} for {session['model']} (HTTP 400), "
-                                    "so the app sent the request again without reasoning fields. Requests to this "
-                                    "endpoint skip them until the app restarts or Settings are saved. To send them "
-                                    "another way, change Settings → Reasoning → Request format."))
+                                await self.event(session, "notice", text=text)
                                 continue
                             if exc.http_status == 400 and cache_sent not in (None, "off"):
                                 # A 400 before any stream to a request with cache markers: Databricks may word a
@@ -4792,7 +4903,7 @@ class AgentManager(LifecycleHooks):
                                 if fallback is None:
                                     raise exc
                                 payload, body, effort = fallback["payload"], fallback["body"], fallback["effort"]
-                                cache_sent, lowered, retry_reason = fallback["cache"], {}, "fallback"
+                                cache_sent, lowered, retry_reason, replayed = fallback["cache"], {}, "fallback", 0
                                 continue
                             details = rate_limit_details(exc) if exc.retry_reason == "rate_limit" else None
                             if exc.retry_reason == "rate_limit":
@@ -4886,6 +4997,9 @@ class AgentManager(LifecycleHooks):
                 # The results of this response share what the input budget leaves after the
                 # latest exchange, so in-turn compaction can always keep them (result_budget).
                 fixed = in_turn_tokens(model_history(wire), context_state, system, definitions, input_budget, scale)
+                if self.replay_model(session) is not None:
+                    # The next request also sends this turn's signed reasoning back (reasoning_replay.apply).
+                    fixed += math.ceil(reasoning_replay.pending_bytes(wire, session["model"]) / 3 * scale)
                 allowance = ResultAllowance(
                     max(0, min(input_budget // 2, input_budget - fixed - ALLOWANCE_MARGIN_TOKENS)), scale,
                     calls=len(ordered_calls))

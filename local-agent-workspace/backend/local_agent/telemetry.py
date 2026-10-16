@@ -38,7 +38,9 @@ USAGE_KEY_LIMIT = 16
 USAGE_KEY_PATTERN = re.compile(r"[a-z0-9_.]{1,64}\Z")
 REASONING_SHAPES = ("content.reasoning", "content.thinking", "reasoning_content", "reasoning")
 PROMPT_CACHE_LEVELS = ("full", "messages", "off")  # prompt_cache.LEVELS
-PURPOSE_LABELS = {"agent": "Agent", "compaction": "Compaction", "title": "Title", "side_question": "Side question"}
+# "probe": an endpoint check's request (endpoint_checks_api); it is in no chat's ledger, only in its request tags.
+PURPOSE_LABELS = {"agent": "Agent", "compaction": "Compaction", "title": "Title", "side_question": "Side question",
+                  "probe": "Endpoint check"}
 # Databricks AI Gateway stores these tags in system.ai_gateway.usage.request_tags,
 # so each ledger record can be joined to the provider's usage rows exactly.
 REQUEST_TAGS_HEADER = "Databricks-Ai-Gateway-Request-Tags"
@@ -268,7 +270,8 @@ def _public_call(call, *, fallback=False):
         "created": _iso_time(call.get("created")),
         "status": call.get("status") if isinstance(call.get("status"), str) else "unknown",
     }
-    for key in ("http_status", "attempt", "max_output_tokens"):
+    # reasoning_replayed: earlier replies of the turn sent with their signed thinking (reasoning_replay.py).
+    for key in ("http_status", "attempt", "max_output_tokens", "reasoning_replayed"):
         if type(call.get(key)) is int:
             result[key] = call[key]
     # effort: the reasoning effort the request asked for (reasoning.EFFORT_LEVELS); sent_effort: the
