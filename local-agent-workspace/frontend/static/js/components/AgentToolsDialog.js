@@ -463,7 +463,7 @@ const HOOK_EVENT_HELP = [
   ['agent_stop', 'When the agent would end its turn', 'decision "block" (with reason): it keeps working, at most 3 times'],
   ['subagent_start', "Before a subagent's first request", 'context'],
   ['subagent_stop', 'When a subagent would finish', 'decision "block" (with reason): one more round, at most 2; report (a replacement)'],
-  ['before_compaction', 'Before context is compacted (automatic or Compact now)', 'context (added to the preservation note); decision "block" (with reason) stops Compact now only'],
+  ['before_compaction', 'Before context is compacted (automatic or Compact now)', 'context (added to the preservation note); it cannot stop a compaction'],
   ['notification', 'When the app notifies (approval needed, finished, stopped with an error); only without asking', 'none: output is ignored'],
 ]
 const hookOutputExample = JSON.stringify({ decision: 'deny', reason: 'Generated files are rebuilt by make; edit the template.' })

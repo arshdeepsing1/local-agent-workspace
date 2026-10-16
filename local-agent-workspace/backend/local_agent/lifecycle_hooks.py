@@ -17,7 +17,7 @@ Events (extensions.HOOK_EVENTS):
   only for a subagent's delegated turn (a subagent chat the user continues is an ordinary chat).
 - subagent_start (subagent_start_hooks): before a subagent's first request.
 - before_compaction (compaction_hook): once per compaction, before its first summary request; its
-  context joins the preservation note, and "block" stops only a manual compaction.
+  context joins the preservation note. It cannot block: a decision is ignored (listed on its card).
 - notification (notification_hooks): for each of the app's own notifications (notify.attention_message),
   in the background, only when the hook may run without a card (Bypass or an allow rule), output ignored.
 Subagent events run in the parent chat: its mode, rules and cards. A tool event's stdin, and any event's
@@ -350,8 +350,8 @@ class LifecycleHooks:
         hooks. prepare_context calls it once, when it compacts, before the first summary request (so before the
         status turns compacting); it returns the preservation note those requests use: the user's note, then
         each hook's context, labelled as the user's local hook. note is the dict whose "text" the summary
-        callbacks read (compaction_requests). A "block" stops a manual compaction before anything is
-        summarized or billed; an automatic compaction must run, so there a block is only named in a notice."""
+        callbacks read (compaction_requests). A hook cannot stop a compaction (its output fields have no
+        decision, so a "block" is ignored and listed on its card)."""
         if not self.has_hooks(session, "before_compaction"):
             return None
 
@@ -361,15 +361,6 @@ class LifecycleHooks:
                        "input_budget": info.get("input_budget"), "workspace": session["workspace"],
                        "model": session["model"], "permission_mode": session.get("permission_mode", "manual")}
             outcomes = await self.run_hooks(session, "before_compaction", payload=payload)
-            block = next((outcome for outcome in outcomes if outcome.get("decision") == "block"), None)
-            if block is not None:
-                reason = clip(" ".join(str(block.get("reason") or "").split()), 600)
-                if trigger == "manual":
-                    raise ValueError(f"A before-compaction hook ({block['hook_id']}) blocked this compaction: {reason} "
-                                     "The previous context and full history are preserved.")
-                await self.event(session, "notice", text=(
-                    f"A before-compaction hook ({block['hook_id']}) asked to block an automatic compaction: {reason} "
-                    "Automatic compaction runs whenever the context is full, so it ran."))
             notes = hook_contexts(outcomes, "before_compaction")
             if notes:
                 added = note_lines(notes, "Context from the user's local before_compaction hooks (not the user's "

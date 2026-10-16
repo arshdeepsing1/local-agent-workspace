@@ -78,7 +78,7 @@ HOOK_OUTPUT_FIELDS = {
     "agent_stop": {"decision": ("allow", "block"), "reason": str},
     "subagent_start": {"context": str},
     "subagent_stop": {"decision": ("allow", "block"), "reason": str, "report": str},
-    "before_compaction": {"decision": ("allow", "block"), "reason": str, "context": str},
+    "before_compaction": {"context": str},  # it adds a note; it cannot stop a compaction
     "notification": {},
 }
 HOOK_CONTEXT_CHARS = 2_000  # context and reason are shortened to this many characters

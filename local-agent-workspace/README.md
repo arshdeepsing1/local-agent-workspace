@@ -2282,7 +2282,7 @@ within 32 KB). Each one has an `event`:
 | `agent_stop` | When a turn would end with a final reply (after Verify) | `decision` (`"block"` with `reason`) |
 | `subagent_start` | Before a subagent's first model request | `context` |
 | `subagent_stop` | When a subagent would end with its final reply | `decision` (`"block"` with `reason`), `report` |
-| `before_compaction` | Once per compaction (automatic, or **Compact now**), before its first summary request | `context`, `decision` (`"block"` with `reason`: stops **Compact now** only) |
+| `before_compaction` | Once per compaction (automatic, or **Compact now**), before its first summary request | `context` (it cannot stop a compaction) |
 | `notification` | When the app notifies: a chat needs your approval, finished, stopped with an error, or reached the step or spending limit; only without asking | none: output is ignored |
 
 **Input.** Each hook gets one JSON object on stdin with `event` and the conversation's
@@ -2340,10 +2340,9 @@ the same event sees an earlier hook's replacement `arguments` or `prompt`, and a
   hidden message with the reason; the chat shows "A hook asked the agent to continue: … (1 of
   3)"), at most three times in a row per turn and only while agent steps are left, and on
   `subagent_stop` gives the subagent one more round, at most twice. Stopped turns, errors, the
-  step limit and **Stop** never run `agent_stop` or `subagent_stop`. `"block"` on
-  `before_compaction` stops **Compact now** before anything is summarized or billed ("A
-  before-compaction hook (*id*) blocked this compaction: …"); an automatic compaction runs anyway,
-  because the context is full, and a notice names the hook.
+  step limit and **Stop** never run `agent_stop` or `subagent_stop`. A `before_compaction` hook
+  cannot stop a compaction: it only adds `context`, and a `decision` there is ignored (listed on
+  its card).
 - `arguments` (`before_tool`): replacement arguments for the call. They must pass the tool's
   JSON schema, or the hook fails and the call is blocked. Because before-tool hooks run before
   the call's own approval card, everything after them uses the final arguments: deny, ask and
@@ -2626,9 +2625,10 @@ agent as untrusted web content: information to check, never instructions to foll
 `http` or `https` page and returns its text. HTML becomes plain text, with headings as `#`, links
 as `[text](url)`, list items, table rows and code blocks kept, and scripts, styles and SVG
 dropped; JSON is indented; other text stays as it is; images, PDFs and other types are refused.
-The body is read up to 2 MB. The first 8 KB come back with the call; a longer page (up to
-1,000,000 characters) is kept in memory for this app run and read on with `get_tool_output`,
-whose pages repeat the untrusted-content note.
+The body is read up to 2 MB, counted after decompression: a compressed page may use one gzip
+or deflate layer, never more (other encodings are refused). The first 8 KB come back with the
+call; a longer page (up to 1,000,000 characters) is kept in memory for this app run and read on
+with `get_tool_output`, whose pages repeat the untrusted-content note.
 
 Before anything is sent, the URL is checked: `http` or `https`, port 80 or 443, no user name or
 password, and no name of this computer or a private network (`localhost`, `*.localhost`,

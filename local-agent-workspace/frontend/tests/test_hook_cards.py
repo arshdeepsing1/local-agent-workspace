@@ -103,7 +103,7 @@ def test_the_extensions_help_lists_every_hook_event(ui, page):
                                                     "session_start", "agent_stop", "subagent_start", "subagent_stop",
                                                     "before_compaction", "notification"])
     expect(table.get_by_role("row", name=re.compile("^agent_stop"))).to_contain_text("at most 3 times")
-    expect(table.get_by_role("row", name=re.compile("^before_compaction"))).to_contain_text("stops Compact now only")
+    expect(table.get_by_role("row", name=re.compile("^before_compaction"))).to_contain_text("cannot stop a compaction")
     expect(table.get_by_role("row", name=re.compile("^notification"))).to_contain_text("output is ignored")
     expect(page.get_by_text('"decision":"deny"', exact=False)).to_be_visible()
     page.get_by_text("Configuration example").click()

@@ -2,8 +2,11 @@
 
 Offline only: live fetches go to a local http.server that the tests reach through an injected resolver,
 classifier and port list; searches use httpx.MockTransport."""
+import gzip
 import json
 import threading
+import time
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpcore
@@ -25,7 +28,7 @@ REFUSED = [
     "http://255.255.255.255/", "http://localhost/", "http://LOCALHOST./", "http://a.localhost/", "http://printer.local/",
     "http://db.corp/", "http://intranet/", "http://[2002:7f00:1::]/", "http://[2002:a00:1::]/", "http://[64:ff9b::7f00:1]/",
     "http://[64:ff9b::a00:1]/", "http://[2001:0:4136:e378:8000:63bf:3fff:fdd2]/", "file:///etc/passwd", "ftp://example.com/",
-    "gopher://example.com/", "javascript:alert(1)", "http://user:secret@example.com/", "http://user@example.com/",
+    "gopher://example.com/", "javascript:alert(1)", "http://user:secret@example.test/", "http://user@example.test/",
     "http://example.com:8080/", "https://example.com:22/", "http://example.com:notaport/", "http://999.1.1.1/",
     "http://example.123/", "https://example.com/?api_key=abcdefgh12345678", "https://example.com/?token=abcdef1234567890",
     "https://example.com/ghp_abcdefghijklmnopqrstuvwxyz0123", "http://exa mple.com/", "", "http://",
@@ -231,6 +234,72 @@ async def test_the_body_is_read_up_to_the_cap(site):
     assert page["cut"] is True and len(page["text"]) == web_fetch.MAX_BYTES
 
 
+@pytest.mark.parametrize("encoding, encode", [
+    ("gzip", gzip.compress), ("x-gzip", gzip.compress), ("deflate", zlib.compress),
+    ("deflate", lambda data: zlib.compress(data)[2:-4]),  # raw deflate, without the zlib header
+    ("identity", lambda data: data)])
+async def test_one_gzip_or_deflate_layer_is_decoded(site, encoding, encode):
+    site.routes["/z"] = (200, {"Content-Type": "text/plain", "Content-Encoding": encoding}, encode(b"compressed text"))
+    assert (await get(site, "/z"))["text"] == "compressed text"
+    assert site.requests[0]["headers"]["Accept-Encoding"] == "gzip, deflate"
+
+
+@pytest.mark.parametrize("encoding", ["gzip, gzip", "deflate, gzip", "br", "zstd"])
+async def test_stacked_or_other_encodings_are_refused_before_the_body_is_read(site, encoding):
+    site.routes["/z"] = (200, {"Content-Type": "text/plain", "Content-Encoding": encoding},
+                         gzip.compress(gzip.compress(b"\0" * 1_000_000)))
+    with pytest.raises(ValueError, match="Content-Encoding .*, which is not read"):
+        await get(site, "/z")
+
+
+async def test_a_damaged_compressed_body_is_an_error(site):
+    site.routes["/z"] = (200, {"Content-Type": "text/plain", "Content-Encoding": "gzip"}, b"not gzip at all")
+    with pytest.raises(ValueError, match="gzip body is damaged"):
+        await get(site, "/z")
+
+
+class RawResponse:
+    """What read_capped reads of a response: its headers and its raw (still encoded) chunks."""
+
+    is_stream_consumed = False
+
+    def __init__(self, chunks, encoding):
+        self.headers, self.chunks = httpx.Headers({"Content-Encoding": encoding}), chunks
+
+    async def aiter_raw(self):
+        for chunk in self.chunks:
+            yield chunk
+
+
+async def test_a_compression_bomb_never_expands_past_the_cap(monkeypatch):
+    decoded = []
+    decode = web_fetch.BodyDecoder.decode
+
+    def spy(self, data, limit):
+        out = decode(self, data, limit)
+        decoded.append(len(out))
+        return out
+    monkeypatch.setattr(web_fetch.BodyDecoder, "decode", spy)
+    bomb = gzip.compress(b"\0" * 50_000_000)  # 50 MB from about 50 KB on the wire
+    chunks = [bomb[start:start + 65_536] for start in range(0, len(bomb), 65_536)]
+    body, cut = await web_fetch.read_capped(RawResponse(chunks, "gzip"), 1_000_000)
+    assert cut is True and len(body) == 1_000_000
+    assert sum(decoded) <= 1_000_001 and max(decoded) <= 1_000_001  # httpx's decoder gave 50 MB in one chunk
+
+
+async def test_the_page_is_converted_off_the_event_loop(site, monkeypatch):
+    threads = []
+    convert = web_fetch.convert
+
+    def recording(*args):
+        threads.append(threading.get_ident())
+        return convert(*args)
+    monkeypatch.setattr(web_fetch, "convert", recording)
+    site.routes["/x"] = (200, {"Content-Type": "text/html"}, b"<p>Hello</p>")
+    assert (await get(site, "/x"))["text"] == "Hello"
+    assert threads and threads[0] != threading.get_ident()
+
+
 @pytest.mark.parametrize("content_type, body, expected", [
     ("application/json", b'{"a": [1, 2]}', '{\n  "a": [\n    1,\n    2\n  ]\n}'),
     ("text/plain; charset=latin-1", "café".encode("latin-1"), "café"),
@@ -290,6 +359,17 @@ def test_html_conversion_keeps_structure_and_drops_scripts():
                     "```\n\nA | B\n1 | 2\n\nRun")
 
 
+def test_links_do_not_nest_so_unclosed_links_convert_in_linear_time():
+    assert html_to_text("<p><a href='/a'>one <a href='/b'>two</a> three</a></p>", "https://example.com/")[1] == (
+        "[one](https://example.com/a) [two](https://example.com/b) three")
+    start = time.perf_counter()
+    title, text = html_to_text("<a href='/x'>y " * 40_000, "https://example.com/")  # 600 KB, never closed
+    assert time.perf_counter() - start < 15  # about 1 s; nesting each link in the last took minutes
+    assert text.count("[y](https://example.com/x)") == 40_000
+    title, text = html_to_text("<title>" + "x<b>" * 200_000, "https://example.com/")  # a title left open
+    assert len(title) == web_fetch.TITLE_CHARS
+
+
 def test_a_page_without_a_closed_head_still_has_its_body():
     title, text = html_to_text("<html><head><title>T</title><body><p>Body text</p>", "https://example.com/")
     assert (title, text) == ("T", "Body text")
@@ -347,6 +427,36 @@ async def test_brave_sends_the_key_in_its_header_and_returns_plain_snippets():
     assert request.url.host == "api.search.brave.com" and request.url.params["q"] == "python docs"
     assert request.headers["X-Subscription-Token"] == "brave-synthetic-key"
     assert request.url.params["count"] == "1"
+
+
+class Streamed(httpx.AsyncByteStream):
+    """A response body that arrives as raw chunks, as from the network (not read in advance)."""
+
+    def __init__(self, data):
+        self.data = data
+
+    async def __aiter__(self):
+        for start in range(0, len(self.data), 65_536):
+            yield self.data[start:start + 65_536]
+
+
+async def test_a_search_answer_is_decoded_with_the_same_bound():
+    answer = gzip.compress(json.dumps({"results": [{"title": "T", "url": "https://example.com/", "content": "c"}]}).encode())
+    transport, seen = provider(lambda request: httpx.Response(200, headers={"Content-Encoding": "gzip"},
+                                                              stream=Streamed(answer)))
+    setup = web_fetch.search_setup({"web_search_provider": "searxng", "web_search_url": "http://127.0.0.1:8888"})
+    result = await web_fetch.search(setup, "a", transport=transport)
+    assert result["results"] == [{"title": "T", "url": "https://example.com/", "snippet": "c"}]
+    assert seen[0].headers["Accept-Encoding"] == "gzip, deflate"
+    bomb = gzip.compress(b" " * 30_000_000)
+    transport, _ = provider(lambda request: httpx.Response(200, headers={"Content-Encoding": "gzip"},
+                                                           stream=Streamed(bomb)))
+    with pytest.raises(ValueError, match="larger than 1 MB"):
+        await web_fetch.search(setup, "a", transport=transport)
+    transport, _ = provider(lambda request: httpx.Response(200, headers={"Content-Encoding": "gzip, gzip"},
+                                                           stream=Streamed(gzip.compress(bomb))))
+    with pytest.raises(ValueError, match="Content-Encoding gzip, gzip, which is not read"):
+        await web_fetch.search(setup, "a", transport=transport)
 
 
 async def test_tavily_posts_the_query_with_a_bearer_key():

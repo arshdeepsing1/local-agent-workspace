@@ -911,18 +911,22 @@ async def test_a_before_compaction_hook_adds_context_to_the_summary_request(rt, 
     assert cards(rt.session, "hook_before_compaction")[0]["hook_result"]["context"] == "Keep the ticket number PRJ-9."
 
 
-async def test_a_before_compaction_block_stops_only_a_manual_compaction(rt, monkeypatch):
+async def test_a_before_compaction_hook_cannot_block_a_compaction(rt, monkeypatch):
     compactable(rt)
-    configure(rt, hook("hold", "before_compaction", emit({"decision": "block", "reason": "Release in progress."})))
+    configure(rt, hook("hold", "before_compaction", emit({"decision": "block", "reason": "Release in progress.",
+                                                         "context": "Keep the release plan."})))
     requests = summary_gateway(monkeypatch)
     await rt.manager.manual_compact(rt.session)
-    assert requests == [] and rt.session["context_state"]["compactions"] == 0
-    error = next(event for event in rt.session["events"] if event["type"] == "error")
-    assert error["text"].startswith("A before-compaction hook (hold) blocked this compaction: Release in progress.")
+    assert len(requests) >= 1 and rt.session["context_state"]["compactions"] == 1
+    assert "before_compaction hook hold: Keep the release plan." in requests[0]["messages"][1]["content"]
+    assert not [event for event in rt.session["events"] if event["type"] == "error"]
+    result = cards(rt.session, "hook_before_compaction")[0]["hook_result"]
+    assert result["ignored"] == ["decision", "reason"] and "decision" not in result
     note = {"text": ""}
     before = rt.manager.compaction_hook(rt.session, "auto", "", note)
-    assert await before({"estimated_input_tokens": 1, "threshold": 2, "input_budget": 3}) == ""
-    assert "Automatic compaction runs whenever the context is full, so it ran." in rt.session["events"][-1]["text"]
+    shown = len(rt.session["events"])
+    assert "Keep the release plan." in await before({"estimated_input_tokens": 1, "threshold": 2, "input_budget": 3})
+    assert not [event for event in rt.session["events"][shown:] if event["type"] in ("notice", "error")]
 
 
 async def test_prepare_context_runs_the_before_compaction_callback_once_when_it_compacts():
