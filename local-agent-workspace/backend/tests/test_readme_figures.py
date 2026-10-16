@@ -61,3 +61,15 @@ def test_the_readme_handoff_read_size_matches_the_code():
     window, output = default_limits(DEFAULT_MODEL)
     size = handoff_read_bytes(window - output - SAFETY_MARGIN, estimate_scale([], DEFAULT_MODEL))
     assert f"about {size:,} bytes at the Claude Opus 5.5 default" in readme()
+
+
+def test_the_readme_window_margin_figures_match_the_code():
+    # The input budget near an endpoint's known window (effective_input_budget), and its auto-compact threshold.
+    from local_agent.context import effective_input_budget, model_context_window
+    opus = effective_input_budget(1_000_000, 16_384, model_context_window(DEFAULT_MODEL))
+    gpt = effective_input_budget(131_072, 8_192, model_context_window("databricks-gpt-oss-120b"))
+    text = readme()
+    assert f"which is {opus:,} on Opus 5.5 at 1,000,000 and 16,384, and {gpt:,} at GPT OSS 120B's defaults" in text
+    assert f"about 108,748 ({compaction_threshold(gpt, 90):,} on GPT OSS 120B, whose window those budgets fill)" in text
+    window, output = default_limits(DEFAULT_MODEL)
+    assert effective_input_budget(window, output, model_context_window(DEFAULT_MODEL)) == figures(window, output)["budget"]

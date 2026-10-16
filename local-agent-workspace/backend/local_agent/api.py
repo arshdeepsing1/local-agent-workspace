@@ -21,6 +21,7 @@ from .config import APP_ROOT, MAX_APPROVAL_MINUTES, MAX_MAX_AGENT_STEPS, MIN_MAX
 from .config import MAX_COMMAND_ENV, MAX_USER_INSTRUCTIONS, MAX_WRITE_LIMIT_KB, MIN_WRITE_LIMIT_KB
 from .context import (
     MAX_CONTEXT_WINDOW, MAX_MAX_OUTPUT_TOKENS, MIN_CONTEXT_WINDOW, MIN_MAX_OUTPUT_TOKENS, SAFETY_MARGIN,
+    effective_input_budget, model_context_window,
 )
 from .context import MAX_AUTO_COMPACT_PERCENT, MIN_AUTO_COMPACT_PERCENT
 from .model_profiles import default_limits, effective_limits, limit_warnings, limits_note, public_profile
@@ -416,9 +417,14 @@ def create_app(settings=None):
             recommended = {"context_window": profile["recommended_context_window"],
                            "max_output_tokens": profile["recommended_max_output_tokens"]}
         defaults = default_limits(model)
+        effective = effective_limits(model, body.context_window, body.max_output_tokens)
+        # The input budget requests use (AgentManager.input_budget): the capped budgets, with the
+        # estimate margin near the endpoint's window.
+        effective["input_budget"] = effective_input_budget(effective["context_window"], effective["max_output_tokens"],
+                                                           model_context_window(model))
         return {"profile": profile, "recommended": recommended,
                 "defaults": {"context_window": defaults[0], "max_output_tokens": defaults[1]},
-                "effective": effective_limits(model, body.context_window, body.max_output_tokens),
+                "effective": effective,
                 "warnings": limit_warnings(model, body.context_window, body.max_output_tokens),
                 "note": limits_note(model)}
 

@@ -292,7 +292,7 @@ class ContextInfo(Record):
     prepared_for_next_turn: bool | None = None
     breakdown: Breakdown | None = None
     estimate_scale: float | None = Field(default=None, ge=1, le=MAX_ESTIMATE_SCALE)
-    summary_adjustment: Literal["condensed", "trimmed"] | None = None
+    summary_adjustment: Literal["condensed", "condensed_trimmed", "trimmed"] | None = None
 
 
 class Conversation(Record):

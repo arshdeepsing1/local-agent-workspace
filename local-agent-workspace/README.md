@@ -1290,13 +1290,21 @@ turn, including existing conversations. The configured total includes space for 
 reply. **Max output tokens** accepts 1,024–131,072, but must be below the context budget minus
 the 2,048-token safety margin. The output setting is also the reply reserve, so the Opus 5.5
 defaults leave an estimated input budget of 181,568 tokens (120,832 at 131,072 and 8,192).
+Near the window of an endpoint in the profile table (Opus 5.5: 1,000,000 tokens; GPT OSS 120B:
+131,072) the input budget also keeps 5% of the window for estimate error, because the endpoint
+rejects a request over its window and the app's estimate can be a few percent low: it is at most
+(window − Max output tokens − 2,048) ÷ 1.05, which is 934,826 on Opus 5.5 at 1,000,000 and
+16,384, and 115,078 at GPT OSS 120B's defaults of 131,072 and 8,192, which fill its window. Opus
+5.5 budgets up to about 950,000, including its defaults, are unchanged. Settings names the
+budget requests use next to the estimated input budget when they differ, and the context meter
+shows it.
 
 While you edit these fields, Settings shows warnings from the profile (they never block saving)
 and, for an endpoint with recommended values, a **Use … defaults** button, which reads **Using …
 defaults** while the form holds them. When the endpoint
 field changes, budgets still at the saved model's defaults change to the new endpoint's defaults
 in the form, as Save would store them, and the estimated input budget also names what requests
-to an endpoint with lower maxima get. The numbers are
+to an endpoint with lower maxima, or with the margin above, get. The numbers are
 Databricks's documented pay-per-token defaults for the Enterprise tier, also partner models'
 quota Tier 1 ([limits page](https://docs.databricks.com/gcp/en/machine-learning/foundation-model-apis/limits),
 checked 2026-10-13): Opus 5.5, Opus 4.8 and GPT OSS 120B each allow 1,000,000 input tokens
@@ -1324,16 +1332,22 @@ meters refresh on the next request.
 Each agent and summary request records this unscaled estimate in the usage ledger.
 When Databricks reports input tokens, later estimates for the same conversation and
 model are multiplied by the ratio of reported to estimated input tokens across up to
-the five most recent completed requests of at least 1,000 estimated tokens (cache
-read/write tokens are added to input tokens). The scale only raises the heuristic,
-never lowers it, and is capped at 2×. In one observed code-heavy chat, Claude
-reported about 26% more input tokens than the heuristic; a scale of about 1.26 makes
-automatic compaction start before the real request outgrows the context budget.
-Context details show the applied scale. Before a model has reported any counts in a
-conversation, the estimate uses a starting scale: 1.3 for `databricks-claude-opus-5-5`
-(newer Claude tokenizers count up to about 1.35 times as many tokens as older ones),
-and the unscaled heuristic for every other endpoint, including
-`databricks-claude-opus-4-8`. The first reports replace it.
+the five most recent completed agent requests of at least 1,000 estimated tokens (cache
+read/write tokens are added to input tokens). Compaction requests are left out, because
+their escaped transcript without tool definitions counts differently, and so is a report
+that looks like it counted cached tokens twice (uncached input alone at least 0.7 of the
+estimate and the total at least 1.7 of it). The scale only raises the heuristic, never
+lowers it, and is capped at 2×. Context details show the applied scale. Before a model
+has reported any counts in a conversation, the estimate uses a starting scale: 1.3 for
+`databricks-claude-opus-5-5`, and the unscaled heuristic for every other endpoint,
+including `databricks-claude-opus-4-8`. Measured on Opus 5.5, the system message and tool
+definitions count about 1.03 times the heuristic, a long coding chat 1.16–1.25, compaction
+requests 1.17–1.38, and the files and handoffs a chat reads about 1.2–1.4, so the start stays
+1.3. Some text, such as plain prose, counts fewer tokens than the heuristic; the scale still
+never goes below 1, because an overestimate only makes compaction start a little early.
+Once reports arrive, the starting ratio keeps the weight of 20,000 estimated tokens among
+them, so a first request that is mostly system message and tool definitions does not replace
+it at once (after a typical first request the scale is about 1.22); later reports outweigh it.
 Expanded context details attribute that same estimate to system/project
 instructions (including selected skills), tool definitions, conversation messages
 and tool results, the retained summary, and request framing/rounding overhead.
@@ -1344,7 +1358,7 @@ measurements.
 automatic compaction runs: when the next request's estimate passes that share of the
 input budget (the budget left after the reply and safety reserves). With the default
 settings (Claude Opus 5.5 at 200,000 and 16,384) that is about 163,411 tokens; at 131,072 and 8,192 it is
-about 108,748. Lower values compact sooner and keep requests
+about 108,748 (103,570 on GPT OSS 120B, whose window those budgets fill). Lower values compact sooner and keep requests
 smaller; 100 waits until the input budget is full. Compaction looks for a cut that
 brings the request under the threshold. When no cut does (for example a large first
 request, or a large request after a few short turns) and the request still fits the
@@ -1428,13 +1442,21 @@ Goal and current status; Open tasks and next steps; User requirements, preferenc
 constraints (with your exact words); Decisions and reasons; Errors, causes and fixes;
 Files read and changed; Commands and results. A conversation long enough to need
 several summary requests passes each request's summary on whole to the next one and
-condenses only once, at the end. The retained summary may use about an eighth of the
+condenses only once, at the end. Near the window of an endpoint in the profile table (Opus 5.5:
+1,000,000 tokens; GPT OSS 120B: 131,072), each summary request also leaves room for counting
+1.2 times its estimate (compaction requests count more densely than agent requests), so a
+near-full compaction may take two summary requests instead of one the endpoint could reject;
+budgets well below the window, such as the Opus 5.5 default, are unchanged.
+The retained summary may use about an eighth of the
 input budget, between 3,500 and 12,000 UTF-8 bytes, and up to 32,000 bytes on large
 budgets (a twelfth of the input budget): 15,130 bytes with the default settings, 12,000 at
 131,072 and 8,192. That byte cap is not a token count. A summary that comes back longer is not discarded, because
 producing it may have required a large billed request: a small extra request,
-containing only that summary, asks the model to condense it, and a second one
-condenses that result if it is shorter but still too long. A condensing request may
+containing only that summary, asks the model to condense it to about four fifths of the
+limit (models tend to overshoot a size they are asked for), and the result is accepted up to
+the limit. There is one such request: a condensed summary that is shorter but still too long
+is shortened by the app as described below, at no cost (a second request rarely fit and took
+about as long as the first). A condensing request may
 use about one output token per two bytes of the limit (6,000 tokens for 12,000 bytes,
 7,565 for the default 15,130; at least 4,096), so a slightly long reply is not cut off. A condensed summary that
 lost the goal, open tasks or requirements section counts as failed. If condensing
@@ -1443,7 +1465,9 @@ reduces them to their headings; only then does it remove whole lines from the mi
 the first three sections, in proportion to their size, keeping each one's first and last
 lines; a share that a short section cannot give goes to the others. Only if whole lines
 are not enough (for example a summary without those sections) does it keep the start
-and end of the summary. The summary's room is reserved in bytes,
+and end of the summary. The compaction notice says which happened, and that a saved handoff
+has the shortened sections in full; it counts the summary and condensing requests apart
+("summarized in 1 request, plus 1 condensing request", also when that request failed). The summary's room is reserved in bytes,
 but escapes and non-ASCII text count more toward the estimate: when the request after a
 compaction is still over the input budget, the summary, already paid for, is shortened
 (or condensed once) to fit rather than discarded, and the compaction notice and the meter
@@ -1552,7 +1576,11 @@ the app starts. The app does not pace requests by tokens per minute itself: limi
 tier and workspace, a rejected 429 is not billed, Databricks returns `retry_after`, and the
 app's token counts are estimates.
 The newest turn and its complete tool exchanges are retained verbatim;
-the preceding turn is also retained when space allows. The app's hidden messages
+automatic compaction also retains the preceding turn when the request then needs at most 60%
+of the auto-compact threshold (or of the input budget, when only a cut within the budget is
+possible), so the next steps have room before another compaction. A preceding turn kept with
+less room was summarized a few steps later anyway, after each of those steps had sent it
+again. The app's hidden messages
 inside a turn (automatic retries, Verify results) belong to that turn and never count
 as a turn of their own. One request can outgrow the
 budget by itself, for example when it reads many large files. The app then summarizes
@@ -1561,8 +1589,8 @@ itself stays verbatim after the summary, followed by its latest exchanges up to 
 the input budget, so later results have room before another compaction. The summary
 (and handoff) request is asked to keep the facts the unfinished work needs from the
 files and output read so far, and a notice reports the compaction. Manual **Compact
-now** still keeps the latest turn intact. Summaries persist across
-restarts, while the full display transcript and original model/tool history remain
+now** summarizes every turn before the latest one and keeps the latest turn intact.
+Summaries persist across restarts, while the full display transcript and original model/tool history remain
 in that conversation's JSONL file. Summary requests are additional billed inference. A failed or stopped
 summary leaves the previous summary state intact and performs no tools. Summaries
 can lose details; they are not an exact substitute for the original transcript.
@@ -1591,7 +1619,11 @@ additional model inference and can be cancelled with **Stop**. It does not run
 tools, connect MCP servers, or rewrite the archived conversation. The resulting
 **Context preview** uses the last saved tool definitions (built-ins only for
 older sessions without that snapshot); definitions may change on the next turn.
-The details open above the meter; Escape, a click elsewhere or moving focus away closes them.
+When every turn before the latest one is already summarized (or the conversation has one
+turn), there is nothing to compact: the note field and **Compact now** are disabled with that
+explanation until your next message, and a compaction request is refused before it starts.
+The details open above the meter; Escape, a click elsewhere or moving focus away closes them, and
+they close when the chat starts waiting for your approval or answer, so they never cover its card.
 
 **Settings** groups its fields under Project, Model and context, Reasoning, Agent, Subagents,
 Commands and files, Notifications and Credentials; on a wide screen a list of these sections beside them

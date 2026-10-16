@@ -538,7 +538,7 @@ async def test_a_handoff_of_the_stated_size_costs_about_a_third_of_the_budget_on
         # The text uses the model's starting scale, so calibration does not change the system message.
         session["inference_calls"] = [{"purpose": "agent", "model": session["model"], "status": "completed",
                                        "estimated_input_tokens": 100_000, "usage": {"input_tokens": 117_000}}]
-        assert estimate_scale(session["inference_calls"], session["model"]) == 1.17
+        assert estimate_scale(session["inference_calls"], session["model"]) == 1.192  # With the prior's weight.
         again, _ = manager.context_inputs(session, tools, "manual", available=available)
         assert again["content"] == system["content"]
     finally:

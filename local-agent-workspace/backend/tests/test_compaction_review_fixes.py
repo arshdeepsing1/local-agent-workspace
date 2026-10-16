@@ -222,6 +222,46 @@ async def test_a_large_overshoot_is_condensed_once_before_trimming():
     assert info["estimated_tokens"] <= OPUS_BUDGET and info["compaction"]["requests"] == 2
 
 
+async def test_the_notice_says_a_condensed_summary_was_shortened_and_counts_the_requests_apart():
+    compaction = {"number": 3, "trigger": "auto", "before_tokens": 170_000, "after_tokens": 60_000,
+                  "threshold_tokens": 163_411, "summarized_messages": 12, "requests": 2, "summarize_requests": 1,
+                  "condense_requests": 1, "elided_bytes": 0, "superseded_results": 0}
+    info = {"input_budget": OPUS_BUDGET, "auto_compact_percent": 90, "compaction": compaction,
+            "summary_adjustment": "condensed_trimmed", "handoff_path": "handoffs/auto/chat-compaction-3.md"}
+    text = await notice_for(info)
+    assert "12 earlier messages were summarized in 1 request, plus 1 condensing request; the request now needs" in text
+    assert ("The condensed summary was still longer than 15,130 bytes, so the app shortened its least important "
+            "sections; the saved handoff has them in full.") in text
+    assert "could not be condensed" not in text and "in 2 requests" not in text
+    text = await notice_for({**info, "handoff_path": None})
+    assert text.endswith("so the app shortened its least important sections.") and "handoff" not in text
+    # A compaction recorded before the requests were counted apart.
+    old = {key: value for key, value in compaction.items() if key not in ("summarize_requests", "condense_requests")}
+    assert "were summarized in 2 requests;" in await notice_for({**info, "compaction": old})
+    two = {**compaction, "requests": 4, "summarize_requests": 2, "condense_requests": 2}
+    assert "were summarized in 2 requests, plus 2 condensing requests;" in await notice_for({**info, "compaction": two})
+
+
+async def test_a_failed_condense_is_counted_without_claiming_it_condensed():
+    # The condensing request is sent and fails: it is still a request, and the notice says the summary
+    # could not be condensed rather than that it was condensed.
+    wire = [{"role": "user", "content": "Old: " + "o" * 60_000}, {"role": "assistant", "content": "Done."},
+            {"role": "user", "content": "Latest request"}]
+
+    async def summarize(previous, chunk, limit_bytes):
+        return "## Goal and current status\n" + "s" * (limit_bytes * 2)
+
+    async def condense(text, limit_bytes):
+        raise RuntimeError("HTTP 503")
+
+    _, _, info = await prepare_context(wire, {}, SYSTEM, [], 32_768, summarize, reply_reserve=4096,
+                                       condense=condense, auto_compact_percent=50)
+    assert info["summary_adjustment"] == "trimmed" and info["compaction"]["condense_requests"] == 1
+    text = await notice_for(info)
+    assert "summarized in 1 request, plus 1 condensing request;" in text and "could not be condensed" in text
+    assert "condensed in" not in text
+
+
 async def test_a_summary_that_cannot_fit_above_the_floor_still_fails_without_committing():
     window, reserve = 16_384, 8_192
     wire = history_at(window, reserve, window - reserve - SAFETY_MARGIN)

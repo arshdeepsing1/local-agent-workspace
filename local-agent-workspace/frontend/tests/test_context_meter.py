@@ -90,6 +90,46 @@ def test_rejected_compaction_keeps_the_note(ui, page):
     expect(page.get_by_role("textbox")).to_have_value("Keep decisions")
 
 
+def test_compact_now_is_unavailable_when_there_is_nothing_to_compact(ui, page):
+    ui.mount("components/ContextMeter.js", f"""{{ info: {{ ...{INFO}, compactable: false }},
+        onCompact: fake.spy('compact') }}""")
+    page.get_by_text(re.compile("Last model input")).click()
+    button = page.get_by_role("button", name="Compact now")
+    expect(button).to_be_disabled()
+    expect(page.get_by_role("textbox", name="Preservation note (optional)")).to_be_disabled()
+    note = ("Nothing to compact yet: earlier turns are already summarized and the latest turn is kept whole. "
+            "Compact now is available again after your next message.")
+    expect(page.get_by_text(note)).to_be_visible()
+    expect(button).to_have_accessible_description(note)
+    expect(page.get_by_text(re.compile("Summarizes earlier turns"))).to_have_count(0)
+    button.click(force=True)
+    assert ui.spy("compact") == []
+    # Before any compaction: a conversation with one turn.
+    ui.rerender(f"{{ info: {{ ...{INFO}, compactions: 0, compactable: false }}, onCompact: fake.spy('compact') }}")
+    expect(page.get_by_text(re.compile(r"^Nothing to compact yet: this conversation has one turn"))).to_be_visible()
+    # A new turn makes it available again, as does an older saved meter without the flag.
+    for flag in ("compactable: true, ", ""):
+        ui.rerender(f"{{ info: {{ ...{INFO}, {flag}}}, onCompact: fake.spy('compact') }}")
+        expect(button).to_be_enabled()
+        expect(page.get_by_text(re.compile("Summarizes earlier turns"))).to_be_visible()
+        expect(page.get_by_text(re.compile("Nothing to compact yet"))).to_have_count(0)
+
+
+def test_open_details_close_when_the_chat_waits_for_approval(ui, page):
+    # The details float over the transcript; a new approval card must not sit under them.
+    ui.mount("components/ContextMeter.js", f"{{ info: {INFO}, busy: true, status: 'running' }}")
+    details = page.locator("details.context-meter")
+    page.get_by_text(re.compile("Last model input")).click()
+    expect(details).to_have_attribute("open", "")
+    ui.rerender(f"{{ info: {INFO}, busy: true, status: 'awaiting_approval' }}")
+    expect(details).not_to_have_attribute("open", "")
+    # They can be opened again while the approval waits, and other statuses leave them open.
+    page.get_by_text(re.compile("Last model input")).click()
+    expect(details).to_have_attribute("open", "")
+    ui.rerender(f"{{ info: {INFO}, busy: true, status: 'running' }}")
+    expect(details).to_have_attribute("open", "")
+
+
 def test_busy_disables_compaction_and_preview_is_labelled(ui, page):
     ui.mount("components/ContextMeter.js", f"""{{ info: {{ ...{INFO}, prepared_for_next_turn: true }}, busy: true,
         onCompact: fake.spy('compact') }}""")
@@ -115,6 +155,18 @@ def test_calibrated_estimate_and_summary_adjustments(ui, page):
     ui.rerender(f"{{ info: {{ ...{CONTEXT}, summary_adjustment: 'trimmed' }} }}")
     expect(page.get_by_text(re.compile("Heuristic text-size estimate"))).to_be_visible()
     expect(page.get_by_text(re.compile(r"part of it was omitted\. Full history is preserved\."))).to_be_visible()
+    # Condensed, but still too long: the app shortened its least important sections (kept in the handoff).
+    handoff = "handoff_path: 'handoffs/auto/h.md'"
+    ui.rerender(f"{{ info: {{ ...{CONTEXT}, summary_adjustment: 'condensed_trimmed', {handoff} }} }}")
+    expect(page.get_by_text("The condensed conversation summary was still over its size limit, so the app shortened "
+                            "its least important sections; the saved handoff has them in full. Full history is "
+                            "preserved.")).to_be_visible()
+    expect(page.get_by_text(re.compile("part of it was omitted"))).to_have_count(0)
+    ui.rerender(f"{{ info: {{ ...{CONTEXT}, summary_adjustment: 'condensed_trimmed' }} }}")
+    expect(page.get_by_text(re.compile(r"least important sections\. Full history is preserved\.$"))).to_be_visible()
+    ui.rerender(f"{{ info: {{ ...{CONTEXT}, summary_fitted_to_budget: 'condensed_trimmed' }} }}")
+    expect(page.get_by_text(re.compile("condensed the summary and the app shortened its least important sections to "
+                                       "fit"))).to_be_visible()
     # Within its own limit, but the request after compaction was over the input budget.
     ui.rerender(f"{{ info: {{ ...{CONTEXT}, summary_fitted_to_budget: 'trimmed' }} }}")
     expect(page.get_by_text(re.compile(r"^The request after the latest compaction was over the input budget .*so part "

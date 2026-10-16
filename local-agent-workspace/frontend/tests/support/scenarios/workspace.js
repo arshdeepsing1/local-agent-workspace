@@ -43,7 +43,7 @@ window.opusProfile = { label: 'Claude Opus 5.5', context_max: 1000000, output_ma
   recommended_context_window: 200000, recommended_max_output_tokens: 16384, thinking_reserve: 4096, prompt_caching: true,
   model: 'databricks-claude-opus-5-5', output_concurrency_limit: 20000, context_rate_limit: 250000 }
 window.limitsCheck = ({ model, context_window, max_output_tokens }) => {
-  const effective = { context_window, max_output_tokens, clamped: false }
+  const effective = { context_window, max_output_tokens, clamped: false, input_budget: context_window - max_output_tokens - 2048 }
   if (model.trim().toLowerCase() !== 'databricks-claude-opus-5-5') {
     return { profile: null, recommended: null, defaults: { context_window: 131072, max_output_tokens: 8192 }, effective, warnings: [],
       note: 'No built-in limits for this endpoint. Set the context budget at or below its context window.' }
@@ -52,6 +52,9 @@ window.limitsCheck = ({ model, context_window, max_output_tokens }) => {
   effective.context_window = Math.min(context_window, 1000000)
   effective.max_output_tokens = Math.min(max_output_tokens, 128000, effective.context_window - 2049)
   effective.clamped = effective.context_window !== context_window || effective.max_output_tokens !== max_output_tokens
+  // Near the 1,000,000-token window the input budget keeps 5% of it for estimate error.
+  effective.input_budget = Math.min(effective.context_window - effective.max_output_tokens - 2048,
+    Math.floor((1000000 - effective.max_output_tokens - 2048) / 1.05))
   if (max_output_tokens > 20000) warnings.push({ code: 'output_concurrency', level: 'warning', text: 'Above 20,000, four requests at once can be rejected with HTTP 429 before they start.' })
   if (context_window > 250000) warnings.push({ code: 'context_itpm', level: 'note', text: 'Above 250,000 tokens, four full steps in one minute reach the input limit.' })
   return { profile: opusProfile, recommended: { context_window: 200000, max_output_tokens: 16384 },

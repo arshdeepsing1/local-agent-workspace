@@ -516,6 +516,24 @@ def test_manual_compaction_keeps_stop_available(ui, page):
     expect(page.get_by_role("button", name="Compact now")).to_be_enabled()
 
 
+def test_the_meter_closes_for_an_approval_and_offers_no_compaction_after_one(ui, page):
+    start_app(ui, page, "a", setup="fake.sessions.set('a', { ...makeSession('a'), context_info: contextInfo })")
+    ui.show_session("a")
+    details = page.locator("details.context-meter")
+    page.get_by_text("Last model input · ~50%").click()
+    expect(details).to_have_attribute("open", "")
+    ui.emit("a", {"type": "status", "status": "running"})
+    expect(details).to_have_attribute("open", "")
+    ui.emit("a", {"type": "status", "status": "awaiting_approval"})
+    expect(details).not_to_have_attribute("open", "")
+    # After a compaction that kept only the latest turn there is nothing more to compact until the next message.
+    ui.emit("a", "{ type: 'context', context_info: { ...contextInfo, compactions: 2, compactable: false } }")
+    ui.emit("a", {"type": "status", "status": "idle"})
+    page.get_by_text(re.compile("Last model input")).click()
+    expect(page.get_by_text(re.compile("^Nothing to compact yet: earlier turns are already summa"))).to_be_visible()
+    expect(page.get_by_role("button", name="Compact now")).to_be_disabled()
+
+
 def test_one_composer_after_creating_and_switching(ui, page):
     start_app(ui, page)
     message(page).fill("Start a conversation")
