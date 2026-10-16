@@ -10,6 +10,7 @@ from .context import (
 )
 from .context import DEFAULT_AUTO_COMPACT_PERCENT, MAX_AUTO_COMPACT_PERCENT, MIN_AUTO_COMPACT_PERCENT
 from .model_profiles import DEFAULT_MODEL, LEGACY_DEFAULT_LIMITS, LEGACY_DEFAULT_MODEL, default_limits, known_endpoints
+from .output_styles import STYLE_ID
 from .reasoning import DEFAULT_EFFORT, DEFAULT_FORMAT, EFFORT_LEVELS, REQUEST_FORMATS
 from .spending import validate_limit
 
@@ -145,6 +146,12 @@ class Settings:
             "approval_timeout_minutes": DEFAULT_APPROVAL_MINUTES,
             "system_notifications": False,
             "user_instructions": "",
+            # Settings → Agent (instructions.py, memory.py, output_styles.py): the user's own instruction files
+            # (~/.agents/AGENTS.md on, the read-only ~/.claude/CLAUDE.md off), project memory and the reply style.
+            "user_agents_file": True,
+            "user_claude_file": False,
+            "project_memory": True,
+            "output_style": "default",
             "write_limit_kb": 80,
             "command_env": [],
             "rate_limit_auto_continue": True,
@@ -287,6 +294,13 @@ class Settings:
         instructions = candidate["user_instructions"]
         if not isinstance(instructions, str) or len(instructions) > MAX_USER_INSTRUCTIONS or "\x00" in instructions:
             raise ValueError(f"Custom instructions must be text of at most {MAX_USER_INSTRUCTIONS:,} characters.")
+        for key, label in (("user_agents_file", "Load ~/.agents/AGENTS.md"), ("user_claude_file", "Load ~/.claude/CLAUDE.md"),
+                           ("project_memory", "Project memory")):
+            if type(candidate[key]) is not bool:
+                raise ValueError(f"{label} must be on or off.")
+        if not isinstance(candidate["output_style"], str) or not STYLE_ID.match(candidate["output_style"]):
+            raise ValueError("Output style must be default, concise, explanatory or the name of a style file "
+                             "(1-40 lowercase letters, digits, - or _).")
         write_limit = candidate["write_limit_kb"]
         if type(write_limit) is not int or not MIN_WRITE_LIMIT_KB <= write_limit <= MAX_WRITE_LIMIT_KB:
             raise ValueError(f"File write limit must be an integer from {MIN_WRITE_LIMIT_KB} to {MAX_WRITE_LIMIT_KB:,} KB.")

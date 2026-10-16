@@ -39,8 +39,8 @@ class RewindRequest(BaseModel):
 # links and local state are not carried (its subagents stay linked to the live chat, so the backup has
 # no subagents index). The worktree header stays: it is display metadata (grouping under the project).
 BACKUP_DROPPED = ("pinned", "inference_calls", "command_jobs", "context_info", "file_views", "instruction_directories",
-                  "turn_running", "queued_messages", "pending_context", "parent_session_id", "parent_event_id",
-                  "parent_call_id", "delegation", "subagents")
+                  "instruction_paths", "turn_running", "queued_messages", "pending_context", "parent_session_id",
+                  "parent_event_id", "parent_call_id", "delegation", "subagents")
 
 
 def backup_copy(session):

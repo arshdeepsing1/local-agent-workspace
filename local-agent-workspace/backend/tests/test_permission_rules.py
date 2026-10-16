@@ -252,7 +252,9 @@ def test_rule_store_limits(tmp_path, monkeypatch):
 # Protected paths
 
 @pytest.mark.parametrize("relative", [".vscode/settings.json", ".github/workflows/ci.yml", ".github/actions/a/action.yml",
-                                      "AGENTS.md", "docs/CLAUDE.md", "CLAUDE.local.md", ".gitattributes", ".envrc",
+                                      "AGENTS.md", "docs/CLAUDE.md", "CLAUDE.local.md", "src/AGENTS.local.md",
+                                      ".gitattributes", ".envrc", ".agents/rules/python.md",
+                                      ".agents/output-styles/terse.md",
                                       ".claude/settings.json", ".agents/permissions.json", ".husky/pre-commit",
                                       ".pre-commit-config.yaml", ".devcontainer/devcontainer.json", ".IDEA/x.xml"])
 def test_protected_reason_covers_configuration_that_runs_code(relative):

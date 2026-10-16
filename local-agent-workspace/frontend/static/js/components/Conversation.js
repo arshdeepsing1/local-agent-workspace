@@ -68,6 +68,7 @@ function summarizeTools(events, shorten = path => path, projectName = '') {
       subject = `${input.pattern ?? ''}` + (where ? ` in ${where}` : '')
       shown = `${input.pattern ?? ''}` + (where ? ` in ${shorten(where)}` : '')
     }
+    if (event.name === 'remember') subject = shown = String(input.text ?? '')
     if (event.name === 'wait_job') subject = shown = String(input.job_id ?? '').slice(0, 8) + (input.until_regex ? ` until /${input.until_regex}/` : '')
     if (event.name === 'outline_file') {
       suffix = (Number.isInteger(input.max_level) && input.max_level < 6 ? ` · to level ${input.max_level}` : '')
@@ -405,6 +406,7 @@ export function allowLabel(event) {
   if (name.startsWith('hook_')) return 'Allow this hook in this chat'
   if (name === 'delegate_task') return 'Allow subagents in this chat'
   if (name === 'stop_job') return 'Allow stopping jobs in this chat'
+  if (name === 'remember') return 'Allow saving memory in this chat'
   return null
 }
 

@@ -16,6 +16,8 @@ const FORMATS = [['auto', 'Automatic (per endpoint)'], ['anthropic', 'Anthropic 
 // 'messages' sends only the forms Databricks documents (prompt_cache.py level "messages").
 const CACHING = [['auto', 'Automatic (Claude endpoints)'], ['messages', 'Documented forms only'], ['off', 'Off']]
 const OTHER_ENDPOINT = '\u0000other'
+// Settings → Output style (backend output_styles.PRESETS): listed until GET /output-styles adds the style files.
+const BUILT_IN_STYLES = [{ id: 'default', name: 'Default' }, { id: 'concise', name: 'Concise' }, { id: 'explanatory', name: 'Explanatory' }]
 const FALLBACK_LEVELS = Object.entries(EFFORT_LABELS).map(([value, label]) => ({ value, label }))
 // Settings → Subagents: each built-in type's endpoint and effort ('' is the chat's own; backend
 // config.DEFAULT_SUBAGENT_DEFAULTS).
@@ -113,6 +115,7 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
   const [envText, setEnvText] = useState((settings.command_env || []).join(' '))
   // The limit as typed: a number input reports "2." as "" or "2", so the form keeps the text and its number.
   const [spendingText, setSpendingText] = useState(String(settings.spending_limit_dbu ?? 0))
+  const [styles, setStyles] = useState(BUILT_IN_STYLES)
   const choices = endpointChoices(settings, connection)
   // Other endpoint…: a typed name. It stays open while chosen, so typing never switches the list back.
   const [otherEndpoint, setOtherEndpoint] = useState(() => !choices.some(choice => choice.value === settings.model))
@@ -126,6 +129,8 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
   const [activeSection, setActiveSection] = useState(SECTIONS[0][0])
   const jumping = useRef(0)
   const instructions = form.user_instructions || ''
+  const style = form.output_style || 'default'
+  const styleChoices = styles.some(item => item.id === style) ? styles : [...styles, { id: style, name: `${style} (no such style file here)` }]
   const inputBudget = form.context_window - form.max_output_tokens - 2048
   const model = (form.model || '').trim()
   const effort = form.reasoning_effort || 'default'
@@ -150,6 +155,10 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
     let current = true
     api('/settings').then(fresh => {
       if (current) setStatuses({ coding_dir: fresh.coding_dir_status, python_venv: fresh.python_venv_status })
+    }, () => {})
+    // The project's and your own style files; the built-in styles stay listed if this fails.
+    api('/output-styles').then(result => {
+      if (current && Array.isArray(result?.styles) && result.styles.length) setStyles(result.styles)
     }, () => {})
     return () => { current = false }
   }, [])
@@ -364,7 +373,20 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         <p class="field-help">After three quick retries, wait for Databricks's rate limit to reset (up to two minutes, at most twice per message) instead of stopping. Stop cancels the wait.</p>
         <label>Custom instructions<textarea class="settings-instructions" rows=${5} maxLength=${8000} spellcheck=${false} value=${instructions} aria-describedby="settings-instructions-count"
           onInput=${e => field('user_instructions', e.currentTarget.value)} placeholder="How you want the agent to work in every project" /></label>
-        <p class="field-help"><span class="field-counter" id="settings-instructions-count">${instructions.length.toLocaleString('en-US')} / 8,000</span> Added to every conversation in every project, before project instructions (AGENTS.md, CLAUDE.md), which cannot override them. Their size is counted in the context meter.</p>`)}
+        <p class="field-help"><span class="field-counter" id="settings-instructions-count">${instructions.length.toLocaleString('en-US')} / 8,000</span> Added to every conversation in every project, before project instructions (AGENTS.md, CLAUDE.md), which cannot override them. Their size is counted in the context meter.</p>
+        <label class="settings-checkbox"><input type="checkbox" checked=${form.user_agents_file !== false}
+          onChange=${e => field('user_agents_file', e.currentTarget.checked)} />Load my instructions file ~/.agents/AGENTS.md</label>
+        <label class="settings-checkbox"><input type="checkbox" checked=${form.user_claude_file === true}
+          onChange=${e => field('user_claude_file', e.currentTarget.checked)} />Also load ~/.claude/CLAUDE.md</label>
+        <p class="field-help">Your own instruction files for every project, added after Custom instructions with the same precedence, up to 8,000 bytes each. The app only reads them.</p>
+        <${More} topic="instruction files">A file can import another file in your home folder by naming it as @path, for example @~/notes/style.md; credential files are never read. Changing a file does not hold back a running reply. For one project, AGENTS.local.md or CLAUDE.local.md in the project hold personal notes; list them in .gitignore.<//>
+        <label>Output style<select value=${style} onChange=${e => field('output_style', e.currentTarget.value)}>
+          ${styleChoices.map(item => html`<option key=${item.id} value=${item.id}>${item.name}</option>`)}
+        </select></label>
+        <p class="field-help">How the agent writes its replies: Concise keeps them short, Explanatory explains the reasons behind its work. A project can add styles in .agents/output-styles/, and you in ~/.agents/output-styles/ (yours win for the same name).</p>
+        <label class="settings-checkbox"><input type="checkbox" checked=${form.project_memory !== false}
+          onChange=${e => field('project_memory', e.currentTarget.checked)} />Project memory</label>
+        <p class="field-help">The agent can save short notes about a project, each with your approval, and later chats in that project see them. Review, edit and delete them in Agent tools → Memory.</p>`)}
         ${group('subagents', html`
         <p class="field-help">The agent hands self-contained work to subagents of three built-in types. Each type can use its own endpoint and reasoning effort; Same as the chat follows the chat that starts it.</p>
         ${SUBAGENT_TYPES.map(([kind, label, help]) => html`<${SubagentDefaults} key=${kind} label=${label} help=${help}

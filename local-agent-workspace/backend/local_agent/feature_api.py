@@ -1,9 +1,9 @@
 from pathlib import Path
 
 from fastapi import HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
-from . import approvals, custom_agents
+from . import approvals, custom_agents, memory, output_styles
 from .agents import public_session
 from .approvals import busy_conflict, busy_status, ensure_idle
 from .planning import transcript_name
@@ -43,6 +43,11 @@ class SkillRequest(BaseModel):
 
 class SubagentProfileRequest(BaseModel):
     tool_profile: str = Field(strict=True, max_length=32)
+
+
+class MemoryNote(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    text: str = Field(min_length=1, max_length=2000, strict=True)  # memory.check_note keeps 500 characters.
 
 
 def register_features(app, manager, settings, store, session_or_404, workspace_tools, ui_tools=None):
@@ -220,6 +225,58 @@ def register_features(app, manager, settings, store, session_or_404, workspace_t
     async def test_extensions():
         extensions_idle()
         return await manager.extensions.test()
+
+    # Agent tools → Memory: the notes of the chat's project (the default project without a chat).
+    def memory_listing(workspace):
+        current = manager.memory.read(workspace)
+        return {**current, "enabled": settings.values.get("project_memory", True) is True,
+                "max_bytes": memory.MAX_MEMORY_BYTES, "max_notes": memory.MAX_NOTES, "max_note_chars": memory.MAX_NOTE_CHARS}
+
+    def note_id(value):
+        if not memory.NOTE_ID.match(value):
+            raise HTTPException(404, "This memory note no longer exists.")
+        return value
+
+    def memory_change(change):
+        try:
+            change()
+        except KeyError as exc:
+            raise HTTPException(404, exc.args[0]) from None
+
+    @app.get("/api/memory")
+    async def memory_notes(session_id: str | None = None):
+        return memory_listing(workspace_tools(session_id).root)
+
+    @app.post("/api/memory")
+    async def add_memory_note(body: MemoryNote, session_id: str | None = None):
+        workspace = workspace_tools(session_id).root
+        manager.memory.add(workspace, body.text, settings.redact)
+        return memory_listing(workspace)
+
+    @app.patch("/api/memory/{entry}")
+    async def edit_memory_note(entry: str, body: MemoryNote, session_id: str | None = None):
+        workspace = workspace_tools(session_id).root
+        memory_change(lambda: manager.memory.edit(workspace, note_id(entry), body.text, settings.redact))
+        return memory_listing(workspace)
+
+    @app.delete("/api/memory/{entry}")
+    async def delete_memory_note(entry: str, session_id: str | None = None):
+        workspace = workspace_tools(session_id).root
+        memory_change(lambda: manager.memory.delete(workspace, note_id(entry)))
+        return memory_listing(workspace)
+
+    @app.delete("/api/memory")
+    async def clear_memory(session_id: str | None = None):
+        workspace = workspace_tools(session_id).root
+        manager.memory.clear(workspace)
+        return memory_listing(workspace)
+
+    # Settings → Output style: the built-in styles and those of the chat's (or the default) project and home folder.
+    @app.get("/api/output-styles")
+    async def list_output_styles(session_id: str | None = None):
+        found = output_styles.discover(workspace_tools(session_id), manager.home_tools())
+        return {"styles": [{key: value for key, value in style.items() if key != "text"} for style in found["styles"]],
+                "errors": found["errors"]}
 
     @app.get("/api/skills")
     async def skills(session_id: str | None = None):

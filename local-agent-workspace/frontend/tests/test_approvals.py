@@ -40,6 +40,7 @@ def decisions(ui, event_id):
     ("hook_before_tool", ", input: { hook_id: 'check', tool: 'write_file' }", "Allow this hook in this chat"),
     ("delegate_task", ", input: { task: 'Review the parser' }", "Allow subagents in this chat"),
     ("stop_job", ", input: { job_id: 'job-1' }", "Allow stopping jobs in this chat"),
+    ("remember", ", input: { text: 'Tests run with pytest -q.' }", "Allow saving memory in this chat"),
 ])
 def test_each_kind_of_card_offers_its_own_allow_for_this_chat(ui, page, name, extra, label):
     show(ui, f"[{pending('card', name, extra)}]")
@@ -515,3 +516,15 @@ def test_show_in_the_hint_scrolls_to_the_waiting_card_and_focuses_it(ui, page):
     heading = card.get_by_role("button", name="write file a.txt", exact=True)
     expect(heading).to_be_focused()
     expect(heading).to_be_in_viewport(ratio=1)
+
+
+def test_a_memory_card_names_the_note_and_edits_it_as_a_note(ui, page):
+    show(ui, f"[{pending('note', 'remember', ", input: { text: 'Tests run with pytest -q.' }, editable: ['text'], rememberable: ['chat', 'project', 'user']")}]")
+    expect(page.get_by_role("button", name=re.compile("^remember Tests run with pytest -q\\.")).first).to_be_visible()
+    page.get_by_role("button", name="Edit", exact=True).click()
+    editor = page.get_by_role("textbox", name="Note")
+    expect(editor).to_have_value("Tests run with pytest -q.")
+    editor.fill("Tests run with pytest -q from backend/.")
+    page.get_by_role("button", name="Save edit").click()
+    ui.wait("fake.calls.length === 1")
+    assert ui.bodies("/api/sessions/parent/approvals/note/edit", "POST") == [{"input": {"text": "Tests run with pytest -q from backend/."}}]

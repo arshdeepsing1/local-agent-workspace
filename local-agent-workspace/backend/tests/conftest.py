@@ -18,6 +18,15 @@ def isolated_defaults(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def empty_user_home(tmp_path_factory, monkeypatch):
+    """The user's instruction files (~/.agents/AGENTS.md, ~/.claude/CLAUDE.md) and output styles come from an
+    empty folder, not the developer's home. Tests of those files write into instructions.user_home()."""
+    from local_agent import instructions
+    home = tmp_path_factory.mktemp("home")
+    monkeypatch.setattr(instructions, "user_home", lambda: home)
+
+
+@pytest.fixture(autouse=True)
 def no_ripgrep(monkeypatch):
     """Search without ripgrep by default, so results do not depend on whether it is
     installed. Tests that need it use real_ripgrep."""

@@ -41,6 +41,7 @@ function ruleParts(rule) {
   if (tool === 'hook') return rule.hook ? [`Hook: ${rule.hook}`, null, ''] : ['Hooks', null, '']
   if (tool === 'delegate_task') return ['Subagents', null, '']
   if (tool === 'stop_job') return ['Stopping jobs', null, '']
+  if (tool === 'remember') return ['Saving project memory', null, '']
   const server = /^mcp__(.+)__\*$/.exec(tool)?.[1]
   if (server) return ['All tools of MCP server ', server, '']
   return [`Tool: ${tool}`, null, '']

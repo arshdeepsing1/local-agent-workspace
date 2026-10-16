@@ -3,6 +3,7 @@ import { X } from '../icons.js'
 import { api } from '../api.js'
 import ConversationTransfer from './ConversationTransfer.js'
 import UsagePanel from './UsagePanel.js'
+import MemoryPanel from './MemoryPanel.js'
 import { blockerOf, OpenBlockingChat } from './BlockingChat.js'
 import { modeLabel } from './PermissionsMenu.js'
 import { agentLabel, agentSettingsText, elapsedText } from '../subagents.js'
@@ -18,7 +19,7 @@ const plural = (count, one, many = `${one}s`) => `${count.toLocaleString('en-US'
 // The sections, grouped in the navigation on the left (one scrolling row below 640 px).
 export const SECTIONS = [
   { group: 'This chat', tabs: ['Overview', 'Tasks', 'Subagents', 'Tools', 'Usage', 'Export'] },
-  { group: 'Project', tabs: ['Checkpoints', 'Verify', 'Worktrees', 'Extensions'] },
+  { group: 'Project', tabs: ['Checkpoints', 'Verify', 'Memory', 'Worktrees', 'Extensions'] },
 ]
 const TABS = SECTIONS.flatMap(section => section.tabs)
 const TAB_KEY = 'agent-tools-tab'
@@ -81,6 +82,7 @@ function AgentToolsScope(props) {
       busy=${!!props.session && props.session.status !== 'idle'} onError=${props.onError} onSelectSession=${id => { props.onSelectSession(id); props.onClose() }} />`,
     Checkpoints: () => html`<${Checkpoints} ...${props} />`,
     Verify: () => html`<${Verify} ...${props} />`,
+    Memory: () => html`<${MemoryPanel} session=${props.session} onError=${props.onError} />`,
     Worktrees: () => html`<${Worktrees} ...${props} />`,
     Extensions: () => html`<${ExtensionsPanel} ...${props} />`,
   }
@@ -108,7 +110,7 @@ function useOverview(session) {
     const query = id ? `?session_id=${encodeURIComponent(id)}` : ''
     const path = id ? `/sessions/${encodeURIComponent(id)}` : null
     const requests = {
-      checkpoints: () => api(`/checkpoints${query}`), project: () => api(`/project-settings${query}`),
+      checkpoints: () => api(`/checkpoints${query}`), project: () => api(`/project-settings${query}`), memory: () => api(`/memory${query}`),
       extensions: () => api('/extensions'), worktrees: () => api(`/worktrees${query}`),
       ...(path ? { tools: () => api(`/tools${query}`), children: () => api(`${path}/children`), tasks: () => api(`${path}/tasks`) } : {}),
     }
@@ -162,6 +164,8 @@ function Overview({ session, workspace, changedFiles, onOpen }) {
   const project = [
     { label: 'Checkpoints', tab: 'Checkpoints', text: value('checkpoints', items => items.length ? plural(items.length, 'file checkpoint') : 'None yet') },
     { label: 'Verify', tab: 'Verify', text: value('project', settings => settings.verify_command ? html`<code>${settings.verify_command}</code>` : 'Off') },
+    { label: 'Memory', tab: 'Memory', text: value('memory', memory => !memory.enabled ? 'Off in Settings'
+      : memory.notes.length ? plural(memory.notes.length, 'note') : 'None yet') },
     { label: 'Worktrees', tab: 'Worktrees', text: value('worktrees', items => items.length ? plural(items.length, 'managed worktree') : 'None') },
     { label: 'Extensions', tab: 'Extensions', text: value('extensions', extensionsText) },
   ]
@@ -485,6 +489,7 @@ const TOOL_GROUPS = [
   { name: 'Git', match: name => /^git_/.test(name) },
   { name: 'Tasks and subagents', tools: ['list_tasks', 'get_task', 'create_task', 'update_task', 'delegate_task'] },
   { name: 'Skills', tools: ['list_skills', 'use_skill'] },
+  { name: 'Memory', tools: ['remember'] },
 ]
 
 export function toolGroup(name) {

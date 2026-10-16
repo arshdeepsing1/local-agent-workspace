@@ -274,7 +274,7 @@ class ContextState(Record):
 class InstructionSource(Record):
     path: str
     scope: str
-    status: Literal["loaded", "omitted"]
+    status: Literal["loaded", "trimmed", "omitted"]
     estimated_tokens: int = Field(ge=0)
     reason: str | None = None
 

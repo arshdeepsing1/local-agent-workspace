@@ -321,3 +321,50 @@ def test_an_invalid_field_is_shown_above_the_footer(ui, page, width, height):
     expect(limit).to_be_focused()
     assert limit.bounding_box()["y"] + limit.bounding_box()["height"] <= footer_top(ui) + 0.5
     assert ui.bodies("/api/settings", "PUT") == []
+
+
+# The user's instruction files, the output style and project memory (Settings → Agent)
+
+def test_instruction_files_output_style_and_memory_show_their_defaults_and_save(ui, page):
+    dialog = open_settings(ui, page, setup="""fake.override = path => path === '/api/output-styles' ? fake.json({ styles: [
+      { id: 'default', name: 'Default', source: 'built-in' }, { id: 'concise', name: 'Concise', source: 'built-in' },
+      { id: 'explanatory', name: 'Explanatory', source: 'built-in' },
+      { id: 'teacher', name: 'Teacher', source: 'project', path: '.agents/output-styles/teacher.md' }], errors: [] }) : undefined""")
+    group = dialog.get_by_role("group", name="Agent")
+    agents = group.get_by_role("checkbox", name="Load my instructions file ~/.agents/AGENTS.md")
+    claude = group.get_by_role("checkbox", name="Also load ~/.claude/CLAUDE.md")
+    memory = group.get_by_role("checkbox", name="Project memory")
+    style = group.get_by_role("combobox", name="Output style")
+    expect(agents).to_be_checked()
+    expect(claude).not_to_be_checked()
+    expect(memory).to_be_checked()
+    expect(style).to_have_value("default")
+    expect(style.locator("option")).to_have_text(["Default", "Concise", "Explanatory", "Teacher"])
+    expect(group.get_by_text(re.compile(r"^Your own instruction files for every project, added after Custom instructions"))).to_be_visible()
+    expect(group.get_by_text(re.compile(r"Review, edit and delete them in Agent tools → Memory\.$"))).to_be_visible()
+    claude.check()
+    agents.uncheck()
+    memory.uncheck()
+    style.select_option("teacher")
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    body = ui.bodies("/api/settings", "PUT")[0]
+    assert (body["user_agents_file"], body["user_claude_file"], body["project_memory"], body["output_style"]) == (
+        False, True, False, "teacher")
+
+
+def test_a_saved_style_without_its_file_stays_selected_and_says_so(ui, page):
+    dialog = open_settings(ui, page, setup="fake.settings = { ...fake.settings, output_style: 'gone' }")
+    style = dialog.get_by_role("combobox", name="Output style")
+    expect(style).to_have_value("gone")
+    expect(style.locator("option:checked")).to_have_text("gone (no such style file here)")
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    assert ui.bodies("/api/settings", "PUT")[0]["output_style"] == "gone"
+
+
+def test_the_built_in_styles_are_offered_when_the_style_list_fails(ui, page):
+    dialog = open_settings(ui, page, setup="""fake.override = path => path === '/api/output-styles'
+      ? fake.json({ detail: 'Broken' }, 500) : undefined""")
+    style = dialog.get_by_role("combobox", name="Output style")
+    expect(style.locator("option")).to_have_text(["Default", "Concise", "Explanatory"])

@@ -21,7 +21,16 @@
 //   requests to Databricks-hosted Claude endpoints; 'messages' = only the documented forms; default 'auto'),
 //   fallback_model: string ('' = none: the endpoint an agent or subagent request goes to once when the model
 //   endpoint failed before the reply started; one with built-in facts or one the user uses; chats on it have none),
-//   endpoint_profiles: [{ model, label }] (endpoints with built-in facts) }
+//   endpoint_profiles: [{ model, label }] (endpoints with built-in facts),
+//   user_agents_file: boolean (load ~/.agents/AGENTS.md; default true), user_claude_file: boolean (also load the
+//   read-only ~/.claude/CLAUDE.md; default false), project_memory: boolean (offer remember and load the project's notes;
+//   default true), output_style: string ('default' | 'concise' | 'explanatory' | a style file's id; default 'default') }
+// GET /output-styles?session_id= -> { styles: [{ id, name, description, source: 'built-in'|'project'|'user', path? }],
+//   errors: [{ path, error }] } (backend output_styles.py; the chat's project, or the default one without a chat).
+// Memory (GET /memory?session_id=; POST { text } adds, PATCH /memory/<id> { text } edits, DELETE /memory/<id> deletes
+//   one, DELETE /memory clears; each returns the listing): { project (the repository folder whose notes these are),
+//   notes: [{ id, date: 'YYYY-MM-DD', text }], bytes, max_bytes, max_notes, max_note_chars, enabled (Settings →
+//   Project memory), problem (why the file could not be read, or null) }. Kept in the app's state folder.
 // Effort: 'default' (no effort field: the endpoint's own) | 'low' (labelled Fast) | 'medium' | 'high' | 'xhigh' (Extra
 //   high) | 'max'. Labels: types.js EFFORT_LABELS.
 // POST /settings/reasoning { model, reasoning_effort?, reasoning_format?, thinking_summaries? } -> ReasoningPreview:
@@ -198,7 +207,9 @@
 //   'output_tokens_over_limit' (Max output tokens above the endpoint's reported OTPM limit).
 // ContextInfo: { estimated_tokens, input_budget, context_window, reply_reserve,
 //   compactions, summarized_messages, estimate_method, instruction_files, warnings,
-//   instruction_sources?, prepared_for_next_turn?, breakdown?, estimate_scale?, summary_adjustment?: 'condensed'|
+//   instruction_sources?: [{ path, scope ('.', a folder, 'files matching <globs>' for a project rule, 'all projects',
+//   'this workspace' or 'this project'), status: 'loaded'|'trimmed'|'omitted', estimated_tokens, reason? }],
+//   prepared_for_next_turn?, breakdown?, estimate_scale?, summary_adjustment?: 'condensed'|
 //   'condensed_trimmed'|'trimmed' (the summary was over its byte limit: condensed by a request; condensed but still
 //   over, so the app shortened its least important sections; or shortened without a successful condense),
 //   summary_fitted_to_budget?: 'condensed'|'condensed_trimmed'|'trimmed' (shortened because the request after

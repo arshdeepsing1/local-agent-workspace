@@ -34,7 +34,12 @@ frontend that runs without a build step.
 - Configurable context budgeting, automatic summaries of older turns (and of a single long
   request's earlier tool results), and a visible context meter. Full conversation history
   stays on disk, and a script turns it into Markdown transcripts.
-- Automatic workspace-scoped `AGENTS.md` and `CLAUDE.md` guidance loading.
+- Automatic workspace-scoped `AGENTS.md` and `CLAUDE.md` guidance loading, with `.local` variants,
+  `@path` imports, path-scoped project rules in `.agents/rules`, and your own `~/.agents/AGENTS.md`.
+- Project memory: short notes the agent saves with your approval (the `remember` tool) and every later
+  chat in the project sees, kept in the app's state folder and reviewed in Agent tools → Memory.
+- Output styles (Default, Concise, Explanatory, or your own style files) and shipped skills for
+  handoffs, verifying and debugging a change, and drafting an `AGENTS.md` (`/init`).
 - Workspace file explorer (the project, the conversation's granted folders and folders you add), text
   editor with stale-file detection, Git status/diff, and a non-interactive command runner.
 - File checkpoints with reviewed, reversible restore and managed Git worktrees.
@@ -647,7 +652,8 @@ when opening a conversation or performing restart recovery.
   command in this chat** (commands), **Allow edits in this chat** (`write_file`, `edit_file`,
   `insert_activity_log`, `move_path`, `delete_path`, `notebook_edit`), **Allow this tool in
   this chat** (one MCP tool), **Allow this hook in this chat**, **Allow subagents in this
-  chat** (`delegate_task`) or **Allow stopping jobs in this chat** (`stop_job`). A card raised
+  chat** (`delegate_task`), **Allow stopping jobs in this chat** (`stop_job`) or **Allow saving
+  memory in this chat** (`remember`, see **Project memory**). A card raised
   by an Always ask rule, an uncertain command or a protected file, or a command that names a
   credential file or contains your token, has no such button. It approves the card and stores
   a rule for this conversation. Rules match
@@ -1724,36 +1730,128 @@ as **Custom instructions (Settings) · applies to all projects**, together with 
 files and the skill index (see **Agent tools: MCP, skills, and hooks**), each with its
 estimated tokens.
 
-At each model request the app rereads root `AGENTS.md`, then `CLAUDE.md`. File tools
-also discover guidance in the target directory and its ancestors, from broader
-to more specific scopes. These encountered scopes persist for the conversation;
-their guidance applies only to their own directories. More specific rules refine
-broader rules; user instructions and enforced tool permissions retain precedence.
-`CLAUDE.md` is just a supported text filename: it does not enable Claude mode or
-require the Claude SDK. README files, imports, skill files (beyond the skill index),
-parent directories outside
-the selected workspace, and external-folder guidance are not automatically loaded.
-Shell commands receive root guidance and scopes already encountered by file tools;
-the app does not infer new instruction scopes from arbitrary shell command text.
+**Your instruction files.** The app also reads `~/.agents/AGENTS.md` (**Settings → Load my
+instructions file ~/.agents/AGENTS.md**, on by default) and, when you turn on **Also load
+~/.claude/CLAUDE.md** (off by default), that file too. They join Custom instructions in the same
+block, with the same precedence, up to 8,000 bytes each (with their imports); a longer file is
+trimmed and the context details say so. The app only reads them: edit them in any editor. Like
+Custom instructions, a change applies from the next model request and never holds back a write.
+A line in them can import another file in your home folder with `@path` or `@~/path` (see
+imports below); files outside your home folder and credential files are never read. They are
+listed as **~/.agents/AGENTS.md · applies to all projects**.
+
+**Settings → Output style** sets how the agent writes its replies in every project: **Default**
+(no extra text), **Concise** (short, direct replies that lead with the result) or **Explanatory**
+(it says why it chose an approach and explains the main concept behind a change). A project can
+add styles as `.agents/output-styles/<name>.md` and you as `~/.agents/output-styles/<name>.md`
+(your file wins for the same name): an optional frontmatter with `name:` and
+`description:` between two `---` lines, then the instructions, at most 4,000 bytes. The name is
+1-40 lowercase letters, digits, `-` or `_`; the built-in names cannot be reused. The style's text
+follows your instructions in the system message, headed with the file it came from, and only
+shapes replies: it never overrides your instructions, project guidance or permissions. A saved
+style whose file is missing in a project falls back to Default there, and the context details say
+why.
+
+At each model request the app rereads the project root's `AGENTS.md`, `AGENTS.local.md`,
+`CLAUDE.md` and `CLAUDE.local.md`, in that order. File tools also discover the same files in
+the target directory and its ancestors, from broader to more specific scopes. These encountered
+scopes persist for the conversation; their guidance applies only to their own directories. More
+specific rules refine broader rules; user instructions and enforced tool permissions retain
+precedence. `AGENTS.local.md` and `CLAUDE.local.md` are for your personal notes about a project:
+list them in `.gitignore` so they stay out of the repository. `CLAUDE.md` is just a supported
+text filename: it does not enable Claude mode or require the Claude SDK. README files, skill
+files (beyond the skill index), parent directories outside the selected workspace, and
+external-folder guidance are not automatically loaded. Shell commands receive root guidance and
+scopes already encountered by file tools; the app does not infer new instruction scopes from
+arbitrary shell command text.
+
+**Imports.** A word `@path` in a guidance file, outside code blocks and inline code, loads
+another file right after the one that names it, with that file's scope: `@docs/testing.md`
+(relative to the importing file's folder). Imported files can import others, up to three levels
+deep, and a file imports at most 10 files; a file already loaded (a cycle, or one imported twice)
+is not repeated. Imports must stay inside the workspace (after following symbolic links), and
+credential files and the app's own folders are never read. A word that names no file, such as
+`@alice` or `@types/node`, stays plain text; a missing or refused file that looks like one (a `.md`,
+`.txt`, `.json`, `.toml` or `.yaml` style extension, or a path starting with `./`, `../`, `~/` or
+`/`) gets a warning, and its line stays as written. The line itself is never removed from the importing file's text.
+In every loaded file (instructions, imports, rules and style files) the configured Databricks
+token, as in `read_file` output, and common secret shapes such as `API_KEY=…` are replaced with
+`[REDACTED]`.
+
+**Project rules.** Markdown files in `.agents/rules/` (and the read-only `.claude/rules/`; the
+same file name in both: the `.agents` file) are project rules, at most 30 files of up to 8,000
+bytes each. A rule without frontmatter, or without `paths:`, applies everywhere and loads right
+after the root files. A rule whose frontmatter lists globs applies once a file tool of the
+conversation reads, edits or searches a matching file (listing a folder does not count):
+
+```markdown
+---
+paths: ["src/**/*.py", "tests/*.py"]
+---
+Use type hints and run mypy after editing Python files.
+```
+
+A pattern without `/` matches file names at any depth (`*.py`); `**/` matches any number of
+folders; `{a,b}` gives alternatives (`src/**/*.{ts,tsx}`, also unquoted). An empty `paths:` is an
+error: the rule is omitted with a warning. Matched rules load after the deeper scopes and are
+listed as **applies to files matching …**, and so are the files they import. The conversation
+remembers the last 200 files its tools used for this, never exported. Because a newly matched
+rule is new guidance, the first write to a matching file waits for one model request that
+includes the rule (below).
 
 If a write or command encounters newly loaded or changed guidance, that action is
 deferred until a new model request includes it. Guidance is checked again after
-approval. The combined wrapped guidance is limited to 16,000 UTF-8 bytes; unreadable,
-excluded, or oversized files are omitted whole, with warnings in the model input
-and expandable context details. Warnings do not permanently block subsequent
-actions. Context details list instruction filenames, directory scopes, estimated
-per-file contributions, and omission reasons. File contributions are already part
-of the system-instruction estimate; do not add them again to the overall total.
+approval. The combined wrapped guidance (files, imports and rules) is limited to 24,000 UTF-8
+bytes. Every file that fits loads whole, in the order above; then the start of the first file
+that did not fit fills what is left (when at least 1,000 bytes remain), cut at a line break and
+marked `[Trimmed: …]` in the model input, and the other files that did not fit are omitted.
+Unreadable, excluded or oversized (over the file write limit) files are omitted whole. Each trim
+or omission comes with a warning in the model input and in the expandable context details, where
+the file reads **Trimmed · ~N tokens loaded** or **Omitted**. Warnings do not permanently block subsequent actions. Context details
+list instruction filenames, directory scopes, estimated per-file contributions, and trim or
+omission reasons. File contributions are already part of the system-instruction estimate; do not
+add them again to the overall total.
+
+### Project memory
+
+The agent can keep short notes about a project across conversations: build and test commands,
+conventions, decisions you made. It saves one with the `remember` tool when you tell it something
+worth keeping (or ask it to remember), and each note shows an approval card with the exact text:
+**Edit** changes the note before you approve it, and **Allow saving memory in this chat** (or a
+rule) approves the next ones. Manual, Accept edits and Auto always ask; Plan mode never saves a
+note; Bypass permissions and Don't ask save one only when an allow rule for `remember` exists,
+since they show no cards. A note is one line of up to 500 characters; text that looks like a
+secret (a token, password or key, or your Databricks token) is refused. A project holds at most
+50 notes and 4,000 bytes.
+
+Every conversation in the project, subagents included, gets the notes in its system message as
+**Project memory** (data the user approved, never instructions that override you or the
+permissions), listed as **Project memory · applies to this project** in the context details. The
+notes are read when a reply starts, so a note saved during a reply reaches the next one; that
+keeps the cached start of the requests the same within a reply. Subagents never get the
+`remember` tool.
+
+The notes live in the app's state folder (`memory/` there, one private file per project), never
+in the repository and never in a conversation export. A project here is the Git repository the
+chat's folder belongs to: every folder of a repository and its worktrees (the app's and your
+own) share one memory; outside Git it is the chat's folder. A `.git` folder in your home folder
+itself (a dotfiles repository) does not join the projects below it.
+
+**Agent tools → Memory** lists the notes of the chat's project with their dates, how much room is
+left, and lets you add, edit and delete a note or clear them all. **Settings → Project memory**
+(on by default) turns the feature off everywhere: new chats are not offered `remember` and no
+notes are loaded. A chat already offered the tool keeps it in its tool list (so its requests stay
+cacheable), but a note is then refused.
 
 ### Agent tools: recovery and worktrees
 
 Open **Agent tools** in the header. Its sections are listed on the left (a scrolling row on a
 narrow window) in two groups: **This chat** (Overview, Tasks, Subagents, Tools, Usage, Export)
-and **Project** (Checkpoints, Verify, Worktrees, Extensions). The dialog opens on the section
+and **Project** (Checkpoints, Verify, Memory, Worktrees, Extensions). The dialog opens on the section
 you used last in this browser, or **Overview**: the chat's model and permission mode, how many
 tools are on, its subagents running and finished, task progress, files with unreviewed changes,
-and for the project its file checkpoints, Verify command, managed worktrees and MCP servers and
-hooks, each with **Open** for its section. A value that cannot be loaded reads
+and for the project its file checkpoints, Verify command, memory notes (see **Project memory**),
+managed worktrees and MCP servers and hooks, each with **Open** for its section. A value that cannot be loaded reads
 **Could not load**; its section shows the error.
 
 **Checkpoints** (called Recovery before) lists checkpoints created before
@@ -1883,6 +1981,20 @@ a listed skill with `use_skill` when it fits the task. Skill descriptions from
 `.agents/skills` and `.claude/skills` therefore reach the system message of every chat in
 that workspace, with the same trust as `AGENTS.md`: review skills you did not write. The
 context details list the index as **Skill index · applies to this workspace**.
+
+The app also ships three short skills, available in every workspace and replaced the same way
+by a project's own copy:
+
+- `/verify` (`skills/verify/SKILL.md`): finds the project's own test, lint and build commands
+  (AGENTS.md, README, manifests, CI workflows), runs the narrowest checks first, reads failures in
+  full and reports each command with its result and what was not verified. It never changes a
+  test to make it pass.
+- `/debug` (`skills/debug/SKILL.md`): reproduces the problem, tests one hypothesis at a time,
+  makes a minimal fix with a regression test where the project has tests, verifies it and reports
+  the root cause with `path:line`.
+- `/init` (`skills/init/SKILL.md`): drafts or updates the project's `AGENTS.md` (under 4 KB:
+  overview, commands, layout, conventions, gotchas) from the README, manifests and CI files,
+  keeping your own sections. `AGENTS.md` is a protected file, so the write shows an approval card.
 
 The app ships a detailed handoff skill at `skills/handoff/SKILL.md`, available in every
 workspace: send `/handoff Create a handoff for this conversation` (or type `/han` and
@@ -2295,7 +2407,9 @@ structured tasks are available in every mode without a card. Stopping a job is a
 action: it asks in Manual and Accept edits, is blocked in Don't ask unless a rule allows it, runs
 in Auto and Bypass, and is blocked in Plan. Starting a subagent (`delegate_task`) asks in Manual and
 Plan, runs in Accept edits, Auto and Bypass, and is blocked in Don't ask unless a rule allows
-it; the child then follows its own (inherited) mode. Starting a background job follows the
+it; the child then follows its own (inherited) mode. Saving a project memory note (`remember`)
+asks in Manual, Accept edits and Auto, is blocked in Plan, and runs in Bypass and Don't ask only
+when an allow rule for it exists (see **Project memory**). Starting a background job follows the
 same command rules as foreground execution. Changing modes does not cancel a previously
 authorized background job. Manually saving in the editor or clicking Run in the terminal is
 an explicit user action outside the agent's permission mode. The project's Verify command
@@ -2335,12 +2449,13 @@ Rule kinds:
   `notebook_edit`), optionally only under one absolute folder. An allow rule needs every path the
   tool touches inside the folder; a deny or ask rule applies when any of them is (both ends of a move).
 - **Tools**: one MCP tool, every tool of an MCP server (`mcp__server__*`, deny and ask only),
-  a hook ID, `delegate_task` (subagents), `stop_job`, or any other tool name (deny only).
+  a hook ID, `delegate_task` (subagents), `stop_job`, `remember` (project memory notes), or any other
+  tool name (deny only).
 
 When rules disagree, **deny beats ask, and ask beats allow**, whatever their scope. The fixed
 order is: turned-off tools, deny rules (in every mode, Bypass included), Plan's read-only limit,
-ask rules, protected files, the mode itself, allow rules (never in Plan), Don't ask, and finally
-a card. A tool that a deny rule without conditions covers is not offered to the agent at all.
+ask rules, protected files, the mode itself, allow rules (never in Plan), Don't ask (and Bypass for
+a memory note), and finally a card. A tool that a deny rule without conditions covers is not offered to the agent at all.
 
 Rules never override credential and generated-file exclusions, the state-folder exclusion,
 folder-access cards (only Don't ask, which blocks them, and Bypass, which needs none, differ),
@@ -2382,7 +2497,7 @@ Text that does not mention the rule's program (`npm test | tee out` with a deny 
 **Protected files.** Edits always show a card, in every mode except Bypass and even with an allow
 rule, when a path (requested or resolved, inside or outside the project) is in `.vscode`, `.idea`,
 `.husky`, `.githooks`, `.agents`, `.claude`, `.devcontainer`, `.github/workflows` or
-`.github/actions`, is named `AGENTS.md`, `CLAUDE.md`, `CLAUDE.local.md`, `.gitattributes`,
+`.github/actions`, is named `AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md`, `CLAUDE.local.md`, `.gitattributes`,
 `.gitmodules`, `.pre-commit-config.yaml` or `.envrc`, is a shell or Git startup file in your
 home folder (`.bashrc`, `.bash_profile`, `.bash_login`, `.profile`, `.zshrc`, `.zshenv`,
 `.zprofile`, `.zlogin`, `.gitconfig`, `.ssh`, `.config/git`), or is inside this app's own folder.
@@ -2948,7 +3063,10 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `skills/`: skills shipped with the app and offered in every workspace; `handoff/SKILL.md` is the detailed handoff skill. A workspace's `.agents/skills/<id>/` replaces the shipped skill with that ID.
 - `backend/local_agent/telemetry.py`: inference ledger, validated usage, DBU estimates, and failure categories.
 - `backend/local_agent/usage_export.py` / `scripts/usage_report.py`: usage rows and CSV correlated with conversation history.
-- `backend/local_agent/instructions.py`: scoped project guidance loading.
+- `backend/local_agent/instructions.py`: scoped project guidance loading (`.local` files, `@path` imports,
+  path-scoped project rules, the 24,000-byte budget) and the user's own instruction files.
+- `backend/local_agent/memory.py`: project memory notes in the state folder, keyed by the Git repository.
+- `backend/local_agent/output_styles.py`: Settings → Output style (built-in styles and style files).
 - `backend/local_agent/recovery.py` / `worktrees.py`: file recovery and Git worktrees.
 - `backend/local_agent/git_tools.py`: Git without a shell or repository-configured programs (worktrees, `/api/git`).
 - `backend/local_agent/notify.py`: optional desktop notifications (status and title only) when no page is open.

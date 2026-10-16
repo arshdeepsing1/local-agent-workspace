@@ -186,14 +186,15 @@ async def test_nested_write_defers_until_guidance_is_sent(runtime, monkeypatch):
 
 async def test_instruction_warnings_are_visible(runtime, monkeypatch):
     manager, session, project = runtime
-    (project / "AGENTS.md").write_text("x" * 17000)
+    (project / "AGENTS.md").write_text("x" * 23500)
+    (project / "CLAUDE.md").write_text("y" * 2000)  # No room left for it within the 24,000-byte limit.
     async def gateway(request):
         assert "Omitted whole file" in json.loads(request.content)["messages"][0]["content"]
         return response()
     mock_gateway(monkeypatch, gateway)
     await manager.run_databricks(session, "Hello")
-    assert session["context_info"]["instruction_files"] == []
-    assert "AGENTS.md" in session["context_info"]["warnings"][0]
+    assert session["context_info"]["instruction_files"] == ["AGENTS.md"]
+    assert session["context_info"]["warnings"][0].startswith("CLAUDE.md: Omitted whole file")
 
 
 @pytest.mark.parametrize("budget", [32768, 65536, DEFAULT_CONTEXT_WINDOW])

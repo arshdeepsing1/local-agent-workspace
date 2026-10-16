@@ -62,7 +62,7 @@ export default function PermissionRulesDialog({ onAdd, onClose, returnFocus }) {
         <p class="field-help">Optional. An absolute path; leave it empty for every file edit.</p>` : null}
       ${form.target === 'tool' ? html`<label>Tool name<input required spellcheck=${false} disabled=${saving} value=${form.tool}
         placeholder="mcp__docs__search" onInput=${e => set('tool', e.currentTarget.value)} /></label>
-        <p class="field-help">For example mcp__docs__search, mcp__docs__* or delegate_task.</p>` : null}
+        <p class="field-help">For example mcp__docs__search, mcp__docs__*, delegate_task or remember (project memory).</p>` : null}
       ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
       <footer><button type="button" class="outline" onClick=${onClose}>Cancel</button>
         <button type="submit" class="primary" disabled=${saving || !ready}>Add rule</button></footer>

@@ -167,6 +167,10 @@ class SettingsEdit(BaseModel):
     system_notifications: bool | None = Field(default=None, strict=True)
     auto_keep_changes: bool | None = Field(default=None, strict=True)
     user_instructions: str | None = Field(default=None, max_length=MAX_USER_INSTRUCTIONS, strict=True)
+    user_agents_file: bool | None = Field(default=None, strict=True)
+    user_claude_file: bool | None = Field(default=None, strict=True)
+    project_memory: bool | None = Field(default=None, strict=True)
+    output_style: str | None = Field(default=None, min_length=1, max_length=40, strict=True)  # output_styles.STYLE_ID
     write_limit_kb: int | None = Field(default=None, ge=MIN_WRITE_LIMIT_KB, le=MAX_WRITE_LIMIT_KB, strict=True)
     command_env: list[str] | None = Field(default=None, max_length=MAX_COMMAND_ENV, strict=True)
     rate_limit_auto_continue: bool | None = Field(default=None, strict=True)

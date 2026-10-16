@@ -3,7 +3,8 @@
 tool_decision is each mode's baseline without rules. evaluate is the one decision
 every tool call and every waiting approval card goes through; its order is fixed:
 turned-off tools, deny rules, Plan's denial, ask rules and uncertain commands,
-protected paths, the mode baseline, allow rules (never in Plan), Don't ask, ask.
+protected paths, the mode baseline, allow rules (never in Plan), Don't ask (and Bypass
+for a memory note), ask.
 """
 import logging
 from dataclasses import dataclass
@@ -30,6 +31,7 @@ TOOL_KINDS = {
     "run_command": "command",
     "stop_job": "job_stop",
     "delegate_task": "delegate",
+    "remember": "memory",
 }
 # Every path-valued argument of each edit tool: protected-path checks and path rules cover all of them.
 EDIT_TOOL_PATHS = {"write_file": ("path",), "edit_file": ("path",), "insert_activity_log": ("path",),
@@ -47,6 +49,8 @@ PLAN_DENIED_SUBAGENT = ("Plan mode is read-only. Only read-only commands from a 
                         "git status/diff/log/show/branch). Return the plan as your final reply.")
 DONT_ASK_DENIED = ("Not run: Don't ask mode blocks actions that no rule allows, without showing an approval card. "
                    "Continue without it and tell the user which action needs a rule or another mode.")
+BYPASS_MEMORY_DENIED = ("Not saved: Bypass permissions mode shows no approval cards, and project memory is saved without "
+                        "one only when a rule allows it. Continue without it and tell the user what you would remember.")
 SCOPE_NAMES = {"chat": "this chat", "project": "this project", "user": "all projects"}
 
 
@@ -82,6 +86,8 @@ def tool_decision(mode: str, name: str, arguments: dict) -> str:
         if read_only:
             return "allow"
         return "ask" if kind == "delegate" else "deny"
+    if kind == "memory":
+        return "ask"  # Every mode asks; Bypass and Don't ask save a note only when a rule allows it (evaluate).
     if mode == "bypassPermissions":
         return "allow"
     if kind == "edit" and mode in ("acceptEdits", "auto"):
@@ -203,9 +209,11 @@ def evaluate(mode, name, arguments, *, chat_rules=(), project_rules=(), user_rul
                     shell_free = name == "run_command" and argv is not None and "command" not in rule
                     return Verdict("allow", "rule", rule=rule, scope=scope,
                                    argv=tuple(argv) if shell_free else None, read_only=shell_free and read_only)
-    # (7) Don't ask: never a card.
+    # (7) Don't ask: never a card. Bypass shows none either, so a memory note no rule allows is not saved.
     if mode == "dontAsk":
         return Verdict("deny", "dont_ask", DONT_ASK_DENIED)
+    if mode == "bypassPermissions" and kind == "memory":
+        return Verdict("deny", "bypass_memory", BYPASS_MEMORY_DENIED)
     # (8) Everything else asks.
     return Verdict("ask", "mode")
 

@@ -34,7 +34,9 @@ from .tools import write_limit_setting
 from . import diagnostics, notebooks
 from .edits import clip_result, preview_diff, split_lines
 from .config import DEFAULT_APPROVAL_MINUTES, DEFAULT_MAX_AGENT_STEPS, follow_limits
-from .instructions import load_project_instructions
+from .instructions import load_project_instructions, load_user_instructions, note_instruction_path, user_tools
+from . import memory as project_memory
+from .output_styles import style_block
 from .jobs import JobManager, shell_note, validate_command_options
 from .command_exec import prepare_command
 from .recovery import CheckpointManager
@@ -471,13 +473,14 @@ PATH_TOOLS = ("list_files", "find_files", "read_file", "search_files", "notebook
 DIRECTORY_TOOLS = ("list_files", "find_files", "search_files", "project_overview")
 DELETE_PREVIEW_LINES = 200
 # Edit before approving: the one argument the user may change on each kind of card.
-EDITABLE = {"run_command": ("command",), "write_file": ("content",), "edit_file": ("new_text",)}
+EDITABLE = {"run_command": ("command",), "write_file": ("content",), "edit_file": ("new_text",), "remember": ("text",)}
 EDIT_ONLY = {"run_command": "Only the command can be edited.", "write_file": "Only the file content can be edited.",
-             "edit_file": "Only the replacement text can be edited."}
+             "edit_file": "Only the replacement text can be edited.", "remember": "Only the note can be edited."}
 EDITED_NOTES = {
     "run_command": "[The user edited this command before approving it. It ran as: {command}. Your proposed command did not run.]",
     "write_file": "[The user edited the file content before approving it. Read the file before editing it again.]",
-    "edit_file": "[The user edited the replacement text before approving it. Read the file before editing it again.]"}
+    "edit_file": "[The user edited the replacement text before approving it. Read the file before editing it again.]",
+    "remember": "[The user edited this note before approving it. It was saved as: {text}]"}
 # Card fields that only matter while a card waits; they are removed once it is answered.
 PENDING_FIELDS = ("rememberable", "rule_options", "editable", "uncertain")
 DONT_ASK_ACCESS = ("Not run: this path is outside the project and folder access needs your approval, which Don't ask "
@@ -765,8 +768,8 @@ def public_session(session, status="idle"):
     pending = pending_summary(session)
     return {"permission_mode": "manual", "allowed_directories": [], "allow_rules": [], "disabled_tools": [],
             **{k: v for k, v in session.items()
-               if k not in ("wire", "context_state", "instruction_directories", "inference_calls", "command_jobs",
-                            "file_views", "turn_running", "jobs_reported_through", "pending_context")},
+               if k not in ("wire", "context_state", "instruction_directories", "instruction_paths", "inference_calls",
+                            "command_jobs", "file_views", "turn_running", "jobs_reported_through", "pending_context")},
             **({"pending_context": pending} if pending else {}),
             "status": status}
 
@@ -798,6 +801,10 @@ class AgentManager(LifecycleHooks):
         self.extensions = ExtensionManager(settings)
         self.task_board = TaskManager(store)
         self.projects = ProjectSettings(settings.state_dir)
+        self.memory = project_memory.MemoryStore(settings.state_dir)
+        # In memory only: {chat id: its project memory block}, read when a turn starts (run_databricks), so a
+        # note saved mid-turn changes the cached system prefix from the next turn on.
+        self.memory_snapshots = {}
         self.delegates = DelegateManager(self)
         self.interactions = InteractionManager(self)
         self.extension_connections = {}
@@ -982,7 +989,8 @@ class AgentManager(LifecycleHooks):
         return result
 
     def guidance_matches(self, session, tools):
-        guidance = load_project_instructions(tools, session.get("instruction_directories", []))
+        guidance = load_project_instructions(tools, session.get("instruction_directories", []),
+                                             session.get("instruction_paths", []))
         return ((guidance["text"], guidance["warnings"]) == getattr(tools, "instruction_signature", ("", []))
                 and self.skill_text(session, tools) == getattr(tools, "skill_signature", ""))
 
@@ -1915,18 +1923,28 @@ class AgentManager(LifecycleHooks):
             await self.publish_permissions(item)
             await self.recheck_pending(item, "rules")
 
+    def feature_definitions(self, session):
+        """The feature tools a chat can be offered: no delegate_task or remember in a subagent, and remember while
+        Settings → Project memory is on, or in a chat it was offered to before (its tool list stays the same)."""
+        subagent = bool(session.get("is_subagent"))
+        memory = not subagent and (self.settings.values.get("project_memory", True) is True
+                                   or session.get("memory_tool") is True)
+        return [tool for tool in FEATURE_TOOLS if not (subagent and tool["function"]["name"] == "delegate_task")
+                and (memory or tool["function"]["name"] != "remember")]
+
     def step_definitions(self, session, external_tools):
         """The tool definitions offered in the next model request: the profile's tools, without
         turned-off tools, tools an unconditional deny rule covers, and submit_plan outside Plan."""
-        definitions = filter_tools(session, [*TOOL_DEFINITIONS, *[tool for tool in FEATURE_TOOLS
-                                   if not session.get("is_subagent") or tool["function"]["name"] != "delegate_task"],
-                                   *external_tools])
+        definitions = filter_tools(session, [*TOOL_DEFINITIONS, *self.feature_definitions(session), *external_tools])
         saved = self.rules.rules(session["workspace"])
         names = [item["function"]["name"] for item in definitions]
         denied = denied_tools(session.get("allow_rules") or [], saved["project"], saved["user"], names)
         offer_plan = session.get("permission_mode", "manual") == "plan" and not session.get("is_subagent")
-        return [item for item in definitions if item["function"]["name"] not in denied
-                and (offer_plan or item["function"]["name"] != "submit_plan")]
+        offered = [item for item in definitions if item["function"]["name"] not in denied
+                   and (offer_plan or item["function"]["name"] != "submit_plan")]
+        if any(item["function"]["name"] == "remember" for item in offered):
+            session["memory_tool"] = True  # Offered from now on, even if Settings turns memory off.
+        return offered
 
     def start(self, session_id, prompt, *, from_queue=False):
         """Start a turn. @ files and pending ! output are attached now, so a refused file is an
@@ -2286,8 +2304,8 @@ class AgentManager(LifecycleHooks):
         mode = session.get("permission_mode", "manual")
         tools = self.session_tools(session)
         system, _ = self.context_inputs(session, tools, mode)
-        definitions = state.get("tool_definitions") or filter_tools(session, [*TOOL_DEFINITIONS, *[
-            tool for tool in FEATURE_TOOLS if not session.get("is_subagent") or tool["function"]["name"] != "delegate_task"]])
+        definitions = state.get("tool_definitions") or filter_tools(session, [*TOOL_DEFINITIONS,
+                                                                             *self.feature_definitions(session)])
         context_window, max_output_tokens = self.request_limits(session)
         # A model that always thinks spends part of the reserve on thinking.
         reserve = min(max_output_tokens, max(1024, min(max_output_tokens, 4096)) + thinking_reserve(session["model"]))
@@ -2697,12 +2715,39 @@ class AgentManager(LifecycleHooks):
                 for value in paths:
                     target = tools.path(value)
                     if target.is_relative_to(tools.root):
-                        directory = target if name in DIRECTORY_TOOLS and target.is_dir() else target.parent
+                        folder = name in DIRECTORY_TOOLS and target.is_dir()
+                        directory = target if folder else target.parent
                         relative = directory.relative_to(tools.root).as_posix()
                         directories = session.setdefault("instruction_directories", [])
                         if relative not in directories:
                             directories.append(relative)
+                        if not target.is_dir():
+                            # A project rule whose paths glob matches this file applies from now on.
+                            note_instruction_path(session, target.relative_to(tools.root).as_posix())
             edited_note = None
+            if name == "remember":
+                if session.get("is_subagent"):
+                    raise ValueError("Subagents cannot save project memory; put what is worth remembering in your final report.")
+                if self.settings.values.get("project_memory", True) is not True:
+                    output = ("Not saved: project memory is turned off in Settings. Continue without it and tell the "
+                              "user what you would remember.")
+                    await self.update_event(session, event, state="rejected", output=output)
+                    return output
+                # The card shows the note as it would be saved; a secret or a full memory fails before any card.
+                arguments = {**arguments, "text": project_memory.check_note(arguments["text"], self.settings.redact)}
+                self.memory.room_for(session["workspace"], arguments["text"])
+                await self.update_event(session, event, input=arguments, preview=self.memory_preview(session, arguments))
+                if verdict.decision == "ask":
+                    card = {"arguments": arguments}
+                    reviser = self.card_reviser(session, tools, event, name, definition, card, None)
+                    allowed, verdict = await self.request_approval(session, tools, event, name, arguments,
+                                                                   reviser=reviser, card=card, forced=forced)
+                    arguments = card["arguments"]
+                    if not allowed:
+                        return await self.refused(session, event, verdict, declined(event, "saving this note"))
+                    carded = True
+                    if event.get("edited"):
+                        edited_note = EDITED_NOTES[name].format(text=arguments["text"])
             if name in FILE_CHANGE_TOOLS + ("run_command",):
                 if not self.guidance_matches(session, tools):
                     output = "Project instructions were discovered or changed. Review the refreshed project guidance in the next model request before retrying this action. No file was changed and no command ran."
@@ -2875,6 +2920,12 @@ class AgentManager(LifecycleHooks):
                 await self.publish_tasks(session["id"])
             elif name in ("ask_user", "submit_plan"):
                 result = await self.interactions.handle(session, event, name, arguments)
+            elif name == "remember":
+                if self.settings.values.get("project_memory", True) is not True:
+                    raise ValueError("Project memory was turned off in Settings before the note was saved; nothing was saved.")
+                note = self.memory.add(session["workspace"], arguments["text"], self.settings.redact)
+                result = {"saved": note["text"], "message": "Saved to project memory. Later chats in this project see "
+                          "it in their system message; the user can edit or delete it in Agent tools → Memory."}
             elif name == "delegate_task":
                 def still_allowed():
                     """After a wait for a free slot: the chat may have turned the tool off, added a deny
@@ -3048,6 +3099,13 @@ class AgentManager(LifecycleHooks):
                 + ("\nBackground job: continues after this chat turn; stop it in Terminal or with stop_job."
                    if arguments.get("background") else "\nForeground command: Stop response also stops this job."))
 
+    def memory_preview(self, session, arguments):
+        """A remember card's text: the note as it would be saved, and where."""
+        project = project_memory.project_key(session["workspace"])
+        return (f"Save this note to the memory of {project}:\n\n{arguments['text']}\n\nLater chats in this project "
+                "see it in their system message. Notes are kept in the app's state folder, never in the repository; "
+                "edit or delete them in Agent tools → Memory.")
+
     def card_reviser(self, session, tools, event, name, definition, card, original):
         """Edit before approving: the closure that checks and applies a change to a waiting card."""
         proposed = card["arguments"]
@@ -3062,11 +3120,16 @@ class AgentManager(LifecycleHooks):
             validate_arguments(definition["parameters"], new, limit=512 * 1024)
             if name == "run_command":
                 validate_command_options(new["command"], new.get("timeout_seconds", 60), new.get("max_output_bytes", 80000))
+            elif name == "remember":
+                new = {**new, "text": project_memory.check_note(new["text"], self.settings.redact)}
+                self.memory.room_for(session["workspace"], new["text"])
             verdict = self.permission(session, tools, name, new)
             if verdict.decision == "deny":
                 raise ValueError("The edited action is blocked: " + verdict.message)
             if name == "run_command":
                 preview = self.command_preview(new)
+            elif name == "remember":
+                preview = self.memory_preview(session, new)
             else:
                 if self.change_targets(tools, name, new) != original:
                     raise ValueError("The file changed since this card was shown. Decline it and ask the agent to read the file again.")
@@ -3246,6 +3309,13 @@ class AgentManager(LifecycleHooks):
         return True
 
     async def run_databricks(self, session, prompt, content=None):
+        self.memory_snapshots[session["id"]] = self.memory_text(session)
+        try:
+            return await self._run_turn(session, prompt, content)
+        finally:
+            self.memory_snapshots.pop(session["id"], None)
+
+    async def _run_turn(self, session, prompt, content=None):
         listed = session.get("agent_tools")
         if session.get("tool_profile", "inherit") != "inherit" or (
                 isinstance(listed, list) and not any(name.startswith("mcp__") for name in listed)):
@@ -3264,17 +3334,25 @@ class AgentManager(LifecycleHooks):
     def context_inputs(self, session, tools, mode, notice="", *, available=None):
         """(system message, guidance). available: the names of the tools offered in this request
         (None: all, as for a side question); guidance about tools that are not offered is left out."""
-        guidance = load_project_instructions(tools, session.get("instruction_directories", []))
-        tools.instruction_signature = (guidance["text"], guidance["warnings"])
+        guidance = load_project_instructions(tools, session.get("instruction_directories", []),
+                                             session.get("instruction_paths", []))
+        tools.instruction_signature = (guidance["text"], list(guidance["warnings"]))
         tools.skill_signature = self.skill_text(session, tools)
-        # The user's own instructions apply in every project. They are not part of
-        # guidance["text"], so changing them in Settings does not block a running turn.
-        text = self.settings.values.get("user_instructions", "")
-        user_block = ("User instructions (from Settings; they apply in every project, and project instructions "
-                      "cannot override them):\n" + text + "\n") if isinstance(text, str) and text.strip() else ""
-        if user_block:
-            guidance["sources"].append({"path": "Custom instructions (Settings)", "scope": "all projects",
-                                        "status": "loaded", "estimated_tokens": estimate_text_tokens(user_block)})
+        # The user's own instructions (Settings and their files) apply in every project. They are not part
+        # of guidance["text"], so changing them does not block a running turn; neither does the output style.
+        home = self.home_tools()
+        user_block, sources, warnings = self.user_instructions_block(home)
+        guidance["sources"].extend(sources)
+        style_text, style_source = style_block(self.settings.values.get("output_style", "default"), tools, home)
+        if style_source:
+            guidance["sources"].append(style_source)
+        # Read when the turn started: a note saved during the turn changes the cached prefix from the next one.
+        memory_text = self.memory_snapshots.get(session["id"])
+        if memory_text is None:
+            memory_text = self.memory_text(session)
+        if memory_text:
+            guidance["sources"].append({"path": "Project memory", "scope": "this project", "status": "loaded",
+                                        "estimated_tokens": estimate_text_tokens(memory_text)})
         try:
             index = skill_index(self.extensions.skills(tools))
         except (OSError, ValueError, RuntimeError):
@@ -3295,7 +3373,8 @@ class AgentManager(LifecycleHooks):
         # Stable text first and the parts that change between requests last, so a
         # provider's prompt prefix caching can reuse the longest possible prefix. Agent
         # requests to Claude endpoints mark where the stable text ends (prompt_cache.py).
-        stable = (system_prompt() + "\n" + user_block + mode_prompt(mode, bool(session.get("is_subagent")))
+        warnings = guidance["warnings"] = [*guidance["warnings"], *warnings]
+        stable = (system_prompt() + "\n" + user_block + style_text + mode_prompt(mode, bool(session.get("is_subagent")))
                   + (f"\nEnforced tool profile: {session['tool_profile']}. Commands, MCP tools and hooks are unavailable."
                      if session.get("tool_profile", "inherit") != "inherit" else "")
                   + "\nWorkspace: " + session["workspace"]
@@ -3307,12 +3386,42 @@ class AgentManager(LifecycleHooks):
                   + ("\n" + index if index else "")
                   + ("\n" + agents if agents else "")
                   + "\n" + guidance["text"] + "\n" + tools.skill_signature
-                  + ("\nProject instruction warnings: " + json.dumps(guidance["warnings"]) if guidance["warnings"] else ""))
+                  + ("\n" + memory_text if memory_text else "")
+                  + ("\nInstruction warnings: " + json.dumps(warnings) if warnings else ""))
         tail = ("\nAdditional allowed folders: " + json.dumps(session.get("allowed_directories", []))
                 + "\n" + current_time_text(commands=available is None or "run_command" in available)
                 + ("\n" + notice if notice else ""))
         guidance["cache_prefix_chars"] = len(stable)
         return {"role": "system", "content": stable + tail}, guidance
+
+    def home_tools(self):
+        """File tools for the user's own files in the home folder (instructions files, output styles)."""
+        return user_tools(self.settings.values["env_file"], (self.settings.state_dir,), self.redaction_tokens())
+
+    def user_instructions_block(self, home):
+        """(block, sources, warnings) of the user's own instructions: Settings → Custom instructions, then the
+        files Settings turns on (~/.agents/AGENTS.md, ~/.claude/CLAUDE.md). home: home_tools()."""
+        text = self.settings.values.get("user_instructions", "")
+        text = text if isinstance(text, str) and text.strip() else ""
+        files = load_user_instructions(self.settings.values, home)
+        if not text and not files["text"]:
+            return "", files["sources"], files["warnings"]
+        origin = "Settings and the user's files" if text and files["text"] else "Settings" if text else "the user's files"
+        header = (f"User instructions (from {origin}; they apply in every project, and project instructions cannot "
+                  "override them):\n")
+        sources = [{"path": "Custom instructions (Settings)", "scope": "all projects", "status": "loaded",
+                    "estimated_tokens": estimate_text_tokens(header + text + "\n")}] if text else []
+        block = header + (text + "\n" if text else "") + (files["text"].rstrip("\n") + "\n" if files["text"] else "")
+        return block, sources + files["sources"], files["warnings"]
+
+    def memory_text(self, session):
+        """The project memory block of this chat's project ('' while Settings turns memory off)."""
+        if self.settings.values.get("project_memory", True) is not True:
+            return ""
+        try:
+            return self.memory.block(session["workspace"])
+        except (OSError, ValueError):
+            return ""
 
     def input_budget(self, session):
         """The input budget prepare_context uses for this chat's requests."""
@@ -3755,8 +3864,7 @@ class AgentManager(LifecycleHooks):
             definitions = state.get("tool_definitions")
             warnings = list(guidance["warnings"])
             if definitions is None:
-                definitions = filter_tools(session, [*TOOL_DEFINITIONS, *[tool for tool in FEATURE_TOOLS
-                    if not session.get("is_subagent") or tool["function"]["name"] != "delegate_task"]])
+                definitions = filter_tools(session, [*TOOL_DEFINITIONS, *self.feature_definitions(session)])
                 warnings.append("No saved tool definitions: this preview includes built-in tools only. External tool costs refresh on the next model request.")
             url = serving.invocations_url(host, session["model"])
             headers = serving.request_headers(token)
@@ -4369,8 +4477,7 @@ class AgentManager(LifecycleHooks):
         host, token = self.serving.credentials()
         mode = session.get("permission_mode", "manual")
         tools = self.session_tools(session)
-        definitions = filter_tools(session, [*TOOL_DEFINITIONS, *[tool for tool in FEATURE_TOOLS
-                       if not session.get("is_subagent") or tool["function"]["name"] != "delegate_task"], *external_tools])
+        definitions = filter_tools(session, [*TOOL_DEFINITIONS, *self.feature_definitions(session), *external_tools])
         for skill_id in self.requested_skills(tools, prompt, session):
             self.select_skill(session, tools, skill_id)
         # Complete interrupted tool exchanges before sending the next user turn.
