@@ -289,11 +289,13 @@ def test_plain_text_sends_exactly_what_was_typed(ui, page):
     ui.wait("fake.requests('/api/sessions/a/messages', 'POST').length === 1")
     assert ui.bodies("/api/sessions/a/messages", "POST") == [{"text": "/clear @note.txt", "verbatim": True}]
     expect(toggle).to_have_attribute("aria-pressed", "false")
-    # Shift+Alt+Enter sends one message as plain text, also a ! line or a /btw question.
-    for text in ("/help", "!ls", "/btw what changed?"):
+    # Shift+Alt+Enter sends one message as plain text, also a ! line or a /btw question. Each send must finish
+    # first: the composer ignores Enter while one is in flight.
+    for count, text in enumerate(("/help", "!ls", "/btw what changed?"), start=2):
+        expect(box).to_have_value("")
         box.fill(text)
         box.press("Shift+Alt+Enter")
-    ui.wait("fake.requests('/api/sessions/a/messages', 'POST').length === 4")
+        ui.wait(f"fake.requests('/api/sessions/a/messages', 'POST').length === {count}")
     assert ui.bodies("/api/sessions/a/messages", "POST")[1:] == [
         {"text": "/help", "verbatim": True}, {"text": "!ls", "verbatim": True}, {"text": "/btw what changed?", "verbatim": True}]
     assert not ui.requests("/api/sessions/a/shell", "POST") and not ui.requests("/api/sessions/a/side-question", "POST")
