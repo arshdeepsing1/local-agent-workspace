@@ -89,6 +89,20 @@ def test_unchecking_a_check_asks_for_a_new_plan_and_run_posts_its_plan_id(ui, pa
     assert ui.bodies("/api/endpoints/run") == [{"model": OPUS, "plan_id": "plan-basic", "approved_dbu": 0.607, "probes": ["basic"]}]
 
 
+def test_run_waits_for_the_estimate_of_a_changed_choice(ui, page):
+    dialog = open_dialog(ui)
+    expect(dialog.get_by_role("button", name="Run (about 3.0 DBU)")).to_be_enabled()
+    ui.run("fake.override = (path, options) => path === '/api/endpoints/plan' && JSON.parse(options.body).probes"
+           " ? fake.defer('plan').promise : undefined")
+    dialog.get_by_role("checkbox", name="Prompt-cache markers and a cache read").uncheck()
+    # The shown estimate is for the earlier choice: Run is not offered until the new one comes.
+    expect(dialog.get_by_role("button", name="Run (updating the estimate…)")).to_be_disabled()
+    ui.run("fake.deferreds.plan.resolve(fake.json(planFor({ model: 'databricks-claude-opus-5-5', probes: ['basic'] })))")
+    dialog.get_by_role("button", name="Run (about 0.61 DBU)").click()
+    expect(dialog.get_by_role("button", name="Stop")).to_be_visible()
+    assert ui.bodies("/api/endpoints/run") == [{"model": OPUS, "plan_id": "plan-basic", "approved_dbu": 0.607, "probes": ["basic"]}]
+
+
 def test_progress_polls_until_the_run_ends_and_the_table_renders(ui, page):
     dialog = open_dialog(ui)
     dialog.get_by_role("button", name="Run (about 3.0 DBU)").click()

@@ -180,13 +180,6 @@ def strip(message):
     return {key: value for key, value in message.items() if key != "reasoning"} if "reasoning" in message else message
 
 
-def sent_back(payload):
-    """True when a request body carries reasoning items in an assistant message."""
-    return any(isinstance(message, dict) and message.get("role") == "assistant" and isinstance(message.get("content"), list)
-               and any(isinstance(part, dict) and part.get("type") in REASONING_ITEMS for part in message["content"])
-               for message in payload.get("messages") or [])
-
-
 def rejected(error_text):
     """True when an HTTP 400 body names reasoning sent back in the history."""
     text = error_text.lower() if isinstance(error_text, str) else ""

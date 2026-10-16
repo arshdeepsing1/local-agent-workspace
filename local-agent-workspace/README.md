@@ -1394,23 +1394,25 @@ that show what the endpoint accepts on this route:
 
 The dialog lists every request, what it checks, its max tokens and its worst-case cost at list
 prices (input at the app's estimate, at the cache-write rate for the cache requests, plus every max
-token), and the total, for example at most about 6.7 DBU for all checks on Claude Opus 5.5 and 0.6
-DBU for Test model (a run usually costs a fraction of that). An endpoint without price data, such as
-GPT OSS, shows its token caps instead. You can untick checks. Nothing is sent until you press **Run
-(about N DBU)**, and every run asks again: the server sends the requests only with the plan you saw
-(`plan_id`, computed again from the endpoint, the chosen checks and the price list) and its
-estimate, and refuses anything else without sending a request. One run at a time; its requests go
-out one after another and are never retried: a 401, 403, 429, a server error or a failed
-connection stops the run (what came back so far is kept), and **Stop** cancels it. The requests use
-synthetic text only, carry no sampling fields (`temperature`, `top_p`, `top_k`, `tool_choice`), are
-tagged `local_agent_purpose: probe` and are not in any chat's usage.
+token; the two requests that send the tool result back include room for the reply they repeat, and a
+run does not send one that would come out larger), and the total, for example at most about 7.1 DBU
+for all checks on Claude Opus 5.5 and 0.6 DBU for Test model (a run usually costs a fraction of
+that). An endpoint without price data, such as GPT OSS, shows its token caps instead. You can untick
+checks. Nothing is sent until you press **Run (about N DBU)**, and every run asks again: the server
+sends the requests only with the plan you saw (`plan_id`, computed again from the endpoint, the
+chosen checks and the price list) and its estimate, and refuses anything else without sending a
+request. One run at a time; its requests go out one after another and are never retried: a 401, 403,
+429, a server error or a failed connection (also one that breaks off a reply) stops the run (what
+came back so far is kept), and **Stop** cancels it. The requests use synthetic text only, carry no
+sampling fields (`temperature`, `top_p`, `top_k`, `tool_choice`), are tagged
+`local_agent_purpose: probe` and are not in any chat's usage.
 
 The results are kept per endpoint in the state folder (`endpoint_checks.json`, mode 0600), never in
 a project or the repository, with a sanitized copy of each request and reply in
-`endpoint_fixtures/<endpoint>/` (signatures and redacted thinking replaced by their length,
-response and tool-call ids cut to their prefix, text redacted; no host, URL or headers but the
-content type and `Retry-After`), in the format the tests' replay client reads. A table of
-capability, result and source (**probed** with its date, **documented** for what Databricks
+`endpoint_fixtures/<endpoint>/` (signatures and redacted thinking replaced by their length, response
+and tool-call ids cut to their prefix, text redacted, URLs in error text replaced; no host, URL or
+headers but the content type and `Retry-After`), in the format the tests' replay client reads. A
+table of capability, result and source (**probed** with its date, **documented** for what Databricks
 documents, or **unknown**) is shown in the dialog and, for a chat's endpoint, in **Agent tools →
 Overview**. The results change agent requests only here: cache markers found rejected start the
 prompt-caching fallback at the level found accepted; an image part found rejected turns the

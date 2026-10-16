@@ -23,6 +23,7 @@ import uuid
 import zlib
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from . import prompt_cache, reasoning_replay
 from .context import estimate_scale, estimate_text_tokens, estimate_tokens
@@ -89,6 +90,11 @@ RESPONSE_FORMAT = {"type": "json_schema", "json_schema": {
 # Never sent by a probe (the endpoints' documented rules; tests/test_model_profiles.FORBIDDEN_KEYS).
 FORBIDDEN_KEYS = ("temperature", "top_p", "top_k", "tool_choice")
 STOPPING_STATUSES = (401, 403, 429)  # Besides 5xx and a failed connection: the run stops, nothing is retried.
+# The follow-ups send the tool_call reply back: its text, call and thinking come to at most its max_tokens of
+# output, and signatures to about as much again. Their planned input adds that many tool_call max_tokens, and
+# a run does not send a request whose input comes out above its planned estimate (exceeds_plan).
+FOLLOW_UP_ROOM = {"replay_plain": 1, "replay_signed": 2}
+URL = re.compile(r"https?://[^\s\"'<>]+")
 
 
 def now():
@@ -216,6 +222,22 @@ def body(request_id, model, outcomes=None):
     raise ValueError(f"Unknown endpoint check request: {request_id}.")
 
 
+def input_tokens(model, sent, request_id=None, prior=None):
+    """A request's estimated input: the app's estimate times the endpoint's starting estimate ratio, plus the
+    room a follow-up's request_id plans for the reply it sends back (FOLLOW_UP_ROOM)."""
+    prior = estimate_scale([], model) if prior is None else prior
+    room = FOLLOW_UP_ROOM.get(request_id, 0) * max_tokens_for(model, applies("reasoning", model))
+    return math.ceil((estimate_tokens(sent["messages"], sent.get("tools", ())) + room) * prior)
+
+
+def exceeds_plan(plan_value, request_id, sent):
+    """True when a request a run built from earlier replies would send more input than its planned estimate:
+    the run does not send it, so the approved figures stay upper bounds."""
+    planned = next((request for probe in plan_value["probes"] for request in probe["requests"]
+                    if request["id"] == request_id), None)
+    return planned is not None and input_tokens(plan_value["model"], sent) > planned["estimated_input_tokens"]
+
+
 def chosen_probes(model, probes=None):
     """The probes a plan covers: those asked for that apply to the endpoint (all that apply by default)."""
     wanted = list(PROBE_IDS) if probes is None else list(dict.fromkeys(probes))
@@ -232,10 +254,11 @@ def plan(model, probes=None):
     """What a run sends, with its estimated cost, before anything is sent: {model, probes: [{id, title, question,
     requests: [{id, label, estimated_input_tokens, max_tokens, estimated_dbu, alternative_to?}]}], total_dbu (at
     most, at list prices; None without price data), priced, max_output_tokens, pricing_effective_at, plan_id}.
-    Input is the app's estimate times the endpoint's starting estimate ratio; the worst case bills all of it (at
-    the cache-write rate for the cache requests) plus every max_tokens. A request sent only after another was
-    rejected replaces it (Databricks does not bill a rejected request). plan_id names the bodies and the prices,
-    so an approval covers exactly this plan."""
+    Input is the app's estimate times the endpoint's starting estimate ratio (with room for the reply a
+    follow-up sends back); the worst case bills all of it (at the cache-write rate for the cache requests)
+    plus every max_tokens. A request sent only after another was rejected replaces it (Databricks does not
+    bill a rejected request). plan_id names the bodies and the prices, so an approval covers exactly this
+    plan."""
     model = model.strip()
     rates = MODEL_DBU_PER_MILLION.get(model.lower())
     prior = estimate_scale([], model)
@@ -245,7 +268,7 @@ def plan(model, probes=None):
         for request_id, label in probe["requests"]:
             sent = body(request_id, model)
             canonical.append([request_id, sent])
-            tokens = math.ceil(estimate_tokens(sent["messages"], sent.get("tools", ())) * prior)
+            tokens = input_tokens(model, sent, request_id, prior)
             cost = None
             if rates is not None:
                 input_rate = rates["cache_creation_input_tokens"] if request_id in CACHE_REQUESTS else rates["input_tokens"]
@@ -288,10 +311,12 @@ def _visible(content):
 
 
 def read_stream(chunks):
-    """What a probe reply's chunks show: {text, finish_reason, usage, usage_keys, reasoning_seen, reasoning_shape,
-    signature, items (its signed reasoning, assembled as the history keeps it), tool_calls, error}."""
+    """What a probe reply's chunks show: {text, finish_reason, usage, raw_input_tokens (prompt_tokens or
+    input_tokens as sent, before reported_usage), usage_keys, reasoning_seen, reasoning_shape, signature, items
+    (its signed reasoning, assembled as the history keeps it), tool_calls, error}."""
     buffer, collector = ToolCallBuffer(), reasoning_replay.Collector()
     text, finish, usage, keys, shape, signed, seen, error = [], None, {}, [], None, False, False, None
+    raw_input = None
     try:
         for chunk in chunks:
             if not isinstance(chunk, dict):
@@ -299,6 +324,9 @@ def read_stream(chunks):
             if isinstance(chunk.get("usage"), dict):
                 keys = usage_keys(chunk["usage"], keys)
                 usage = reported_usage(chunk["usage"]) or usage
+                raw = next((chunk["usage"][key] for key in ("prompt_tokens", "input_tokens")
+                            if type(chunk["usage"].get(key)) is int and chunk["usage"][key] >= 0), None)
+                raw_input = raw if raw is not None else raw_input
             if "error" in chunk:
                 raise InferenceError(str(chunk["error"]), "stream_error")
             for choice in chunk.get("choices") or []:
@@ -319,9 +347,9 @@ def read_stream(chunks):
     except InferenceError as problem:
         error = str(problem)[:300]
     calls = buffer.finish()
-    return {"text": "".join(text), "finish_reason": finish, "usage": usage, "usage_keys": keys, "reasoning_seen": seen,
-            "reasoning_shape": shape, "signature": signed, "items": collector.result(),
-            "tool_calls": [calls[index] for index in sorted(calls)], "error": error}
+    return {"text": "".join(text), "finish_reason": finish, "usage": usage, "raw_input_tokens": raw_input,
+            "usage_keys": keys, "reasoning_seen": seen, "reasoning_shape": shape, "signature": signed,
+            "items": collector.result(), "tool_calls": [calls[index] for index in sorted(calls)], "error": error}
 
 
 def outcome_status(outcome):
@@ -354,14 +382,16 @@ def _tokens(value):
     return f"{value:,}" if type(value) is int else "0"
 
 
-def prompt_counting(first, second):
-    """How prompt_tokens counts cached tokens, from a request and its repeat: 'separate' (uncached input only;
-    the buckets add up to the same input both times), 'included' (prompt_tokens still counts the cache read) or
-    'unclear'; None when the repeat read nothing from the cache."""
+def prompt_counting(first, second, prompt=None):
+    """How prompt_tokens counts cached tokens, from a request and its repeat (reported_usage buckets): 'separate'
+    (uncached input only; the buckets add up to the same input both times), 'included' (prompt_tokens still
+    counts the cache read) or 'unclear'; None when the repeat read nothing from the cache. prompt is the repeat's
+    prompt_tokens as sent (read_stream's raw_input_tokens): reported_usage takes OpenAI-style cached_tokens out
+    of input_tokens, so input_tokens alone would always look separate there."""
     read = second.get("cache_read_input_tokens") or 0
     if not read:
         return None
-    prompt = second.get("input_tokens") or 0
+    prompt = (second.get("input_tokens") if prompt is None else prompt) or 0
 
     def total(usage):
         return sum(usage.get(key) or 0 for key in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
@@ -441,7 +471,7 @@ def _cache_result(outcomes):
                 "summary": named + (f"; the repeat failed: {outcome_text(read)}." if read else "; the repeat was not sent.")}
     second = (read.get("parsed") or {}).get("usage") or {}
     reads = second.get("cache_read_input_tokens") or 0
-    counting = prompt_counting(first_usage, second)
+    counting = prompt_counting(first_usage, second, (read.get("parsed") or {}).get("raw_input_tokens"))
     result.update(cache_read_tokens=reads, prompt_counting=counting)
     if not reads:
         return {**result, "status": "not_seen", "summary": named + ", but the repeat read nothing from the cache."}
@@ -452,20 +482,25 @@ def _cache_result(outcomes):
         f"{_tokens(result['cache_write_tokens'])}), and {words[counting]}.")}
 
 
+def _follow_up(outcome):
+    """A follow-up's status, or too_large when the run did not send it because it outgrew its estimate."""
+    return "too_large" if (outcome or {}).get("skipped") == "over_estimate" else outcome_status(outcome)
+
+
 def _tools_result(outcomes):
     call, plain, signed = (outcomes.get(name) for name in ("tool_call", "replay_plain", "replay_signed"))
     status = outcome_status(call)
     parsed = (call or {}).get("parsed") or {}
     calls, finish = parsed.get("tool_calls") or [], parsed.get("finish_reason")
     result = {"http_status": call.get("http_status"), "finish_reason": finish, "tool_calls": len(calls),
-              "signature": bool(parsed.get("items")), "replay_plain": outcome_status(plain),
-              "replay_signed": outcome_status(signed) or ("skipped" if calls else None)}
+              "signature": bool(parsed.get("items")), "replay_plain": _follow_up(plain),
+              "replay_signed": _follow_up(signed) or ("skipped" if calls else None)}
     if status != "accepted":
         return {**result, "status": status, "summary": outcome_text(call)}
     if not calls:
         return {**result, "status": "not_seen", "summary": f"No tool call came (finish reason {finish}); nothing was sent back."}
     words = {"accepted": "accepted", "rejected": "rejected", "error": "failed", "skipped": "not sent (no signature came)",
-             None: "not sent"}
+             "too_large": "not sent (larger than its estimate)", None: "not sent"}
     stop = " (finish reason stop although a complete tool call came)" if finish == "stop" else ""
     return {**result, "status": "accepted", "finish_stop_with_calls": finish == "stop", "summary": (
         f"A tool call came with finish reason {finish}{stop}. The tool result was {words[result['replay_plain']]} "
@@ -493,7 +528,7 @@ def capabilities(model, saved):
         return (yes, "documented", "documented") if profile.get(flag) is True else (no, "unknown", "unknown")
 
     words = {"accepted": "Accepted", "rejected": "Rejected", "not_seen": "Accepted, not shown", "error": "Failed",
-             "skipped": "Not sent"}
+             "skipped": "Not sent", "too_large": "Not sent (larger than its estimate)"}
     basic, source = probed("basic")
     rows.append(_row("streaming", "Streamed chat request", basic["summary"] if basic else "Not checked yet", source,
                      basic["status"] if basic else "unknown"))
@@ -585,18 +620,28 @@ def sanitize(value, redact=None, parent_type=None):
     return value
 
 
+def without_host(text, host):
+    """Error text without the workspace host (its URL or its name): the results file and the dialog show it."""
+    name = urlsplit(host).hostname if isinstance(host, str) else None
+    for value in (host, name):
+        if isinstance(value, str) and value:
+            text = text.replace(value, "<host>")
+    return text
+
+
 def fixture(model, request_id, sent, outcome, redact=None):
     """One request's fixture: the body sent and the answer (status, the content-type and Retry-After headers, and
-    the chunks or the error text), sanitized; never a host, a URL or other headers."""
+    the chunks or the error text, its URLs replaced), sanitized; never a host, a URL or other headers."""
     headers = {key: value for key, value in (outcome.get("headers") or {}).items() if key in ("content-type", "retry-after")}
     record = {"model": model, "probe": request_id, "recorded": now(), "request": sanitize(sent, redact)}
+    error = URL.sub("<url>", outcome.get("error") or "")
     if outcome.get("http_status") is None:
-        return {**record, "error": "connect", "note": sanitize(outcome.get("error") or "", redact)}
+        return {**record, "error": "connect", "note": sanitize(error, redact)}
     record.update(status=outcome["http_status"], headers=headers)
     if outcome["http_status"] == 200:
         record["chunks"] = sanitize(outcome.get("chunks") or [], redact)
     else:
-        record["text"] = sanitize(outcome.get("error") or "", redact)
+        record["text"] = sanitize(error, redact)
     return record
 
 

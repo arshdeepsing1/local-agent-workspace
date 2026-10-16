@@ -41,7 +41,7 @@ def test_the_plan_prices_each_request_at_list_prices_and_names_the_worst_case():
     assert requests["cache_write_documented"]["alternative_to"] == "cache_write"
     worst = sum(request["estimated_dbu"] for request_id, request in requests.items() if request_id != "cache_write_documented")
     assert value["total_dbu"] == pytest.approx(round(worst, 3)) and value["priced"] is True
-    assert value["total_dbu"] < 7  # The whole suite, at most; Test model alone:
+    assert value["total_dbu"] < 7.5  # The whole suite, at most; Test model alone:
     test = plan(OPUS, ["basic"])
     assert test["total_dbu"] <= 0.65 and [request["id"] for request in test["probes"][0]["requests"]] == ["basic"]
     assert value["pricing_effective_at"] == "2026-10-13"
@@ -64,6 +64,26 @@ def test_the_plan_id_names_the_endpoint_the_checks_and_the_bodies():
     assert plan(OPUS)["plan_id"] == plan(OPUS)["plan_id"]  # Deterministic synthetic bodies.
     ids = {plan(OPUS)["plan_id"], plan(OPUS, ["basic"])["plan_id"], plan(OPUS_48)["plan_id"], plan(" " + OPUS)["plan_id"]}
     assert len(ids) == 3  # Surrounding spaces name the same endpoint.
+
+
+def test_the_follow_ups_plan_room_for_the_reply_they_send_back_and_a_larger_one_is_not_sent():
+    value = plan(OPUS, ["tools"])
+    planned = {request["id"]: request["estimated_input_tokens"] for request in value["probes"][0]["requests"]}
+    assert planned["replay_signed"] > planned["replay_plain"] > planned["tool_call"]
+    # A tool_call reply that used its whole max_tokens: visible text, a thinking summary with a signature, one call.
+    call = {"id": "toolu_bdrk_01ABCDEF", "type": "function",
+            "function": {"name": "get_weekday", "arguments": '{"date": "2026-01-05"}'}}
+    items = [{"type": "reasoning", "summary": [{"type": "summary_text", "signature": "S" * 1_200,
+                                                "text": "I should call get_weekday for 2026-01-05 and then answer. " * 40}]}]
+    reply = {"http_status": 200, "parsed": {"tool_calls": [call], "items": items,
+                                            "text": "Let me check that date carefully. " * 170}}
+    for request_id in ("replay_plain", "replay_signed"):
+        sent = endpoint_probes.body(request_id, OPUS, {"tool_call": reply})
+        assert endpoint_probes.input_tokens(OPUS, sent) <= planned[request_id]
+        assert not endpoint_probes.exceeds_plan(value, request_id, sent)
+    # Signatures far above the room the plan made: the run does not send that request.
+    huge = {**reply, "parsed": {**reply["parsed"], "items": [{"type": "thinking", "thinking": "Plan.", "signature": "S" * 40_000}]}}
+    assert endpoint_probes.exceeds_plan(value, "replay_signed", endpoint_probes.body("replay_signed", OPUS, {"tool_call": huge}))
 
 
 @pytest.mark.parametrize("model", [OPUS, OPUS_48, GPT, "plain-endpoint"])
@@ -129,6 +149,14 @@ def test_the_cache_check_finds_the_level_the_read_and_how_prompt_tokens_count():
     assert interpret("cache", {"cache_write": write, "cache_read": doubled})["prompt_counting"] == "included"
     assert prompt_counting({"input_tokens": 6_408}, {"input_tokens": 6_408, "cache_read_input_tokens": 6_400}) == "included"
     assert prompt_counting({"input_tokens": 8}, {"input_tokens": 8}) is None
+    # OpenAI-style usage: prompt_tokens counts the cached tokens (prompt_tokens_details.cached_tokens), although
+    # reported_usage keeps input_tokens as the uncached part.
+    nested = outcome(sse_chunks("cached", usage={"prompt_tokens": 6_408, "completion_tokens": 2,
+                                                 "prompt_tokens_details": {"cached_tokens": 6_400}}))
+    plain = outcome(sse_chunks("cached", usage={"prompt_tokens": 6_408, "completion_tokens": 2}))
+    assert nested["parsed"]["usage"]["input_tokens"] == 8 and nested["parsed"]["raw_input_tokens"] == 6_408
+    result = interpret("cache", {"cache_write": plain, "cache_read": nested})
+    assert result["prompt_counting"] == "included" and "prompt_tokens also counts the cached tokens" in result["summary"]
     # The system-message marker rejected, the documented form accepted, nothing read back.
     rejected = outcome(status=400, error="cache_control is not supported for role system")
     nothing = outcome(sse_chunks("cached", usage=cache_usage(6_408, 0, 0)))
@@ -186,6 +214,12 @@ def test_fixtures_keep_no_signature_id_host_or_token():
     assert record["headers"] == {"content-type": "text/event-stream"} and "serving" not in text
     assert sanitize({"type": "summary_encrypted_text", "text": "abc"}) == {"type": "summary_encrypted_text", "text": "<text: 3 chars>"}
     assert endpoint_probes.id_prefix("chatcmpl-9xY") == "chatcmpl-…" and endpoint_probes.id_prefix("42") == "…"
+    # A URL a Databricks error names (its workspace host) is not kept either.
+    missing = endpoint_probes.fixture(OPUS, "basic", sent, outcome(status=404, error=(
+        "Endpoint x not found at https://workspace.example.com/serving-endpoints/x.")))
+    assert missing["text"] == "Endpoint x not found at <url>" and "workspace.example" not in json.dumps(missing)
+    assert endpoint_probes.without_host("No route to workspace.example.com (https://workspace.example.com/api)",
+                                        "https://workspace.example.com") == "No route to <host> (<host>/api)"
 
 
 def test_the_results_file_is_private_merges_probes_and_survives_damage(tmp_path):
@@ -299,6 +333,46 @@ async def test_a_rate_limit_stops_the_run_and_nothing_is_retried(api):
     assert len(transport.requests) == 2
     saved = manager.endpoint_checks.get(OPUS)
     assert saved["results"]["reasoning"]["status"] == "error" and "image" not in saved["results"]
+
+
+async def test_a_reply_that_breaks_off_stops_the_run_and_error_text_leaves_out_the_host(api):
+    client, manager, _ = api
+    transport = replay(manager, {"model": OPUS, "chunks": sse_chunks("re")[:1], "break": "read"},
+                       {"model": OPUS, "chunks": sse_chunks("391")})
+    approval = plan(OPUS, ["basic", "reasoning", "image"])
+    await client.post("/api/endpoints/run", json={"model": OPUS, "probes": ["basic", "reasoning", "image"],
+                                                  "plan_id": approval["plan_id"], "approved_dbu": approval["total_dbu"]})
+    run = await finished(manager)
+    assert run["status"] == "failed" and "The connection failed" in run["error"] and "Nothing is retried" in run["error"]
+    assert [entry["state"] for entry in run["requests"]] == ["done", "not_sent", "not_sent"]
+    assert len(transport.requests) == 1  # Nothing more is sent after a connection failure.
+    # An error that names the workspace host keeps it out of the summary and the results file.
+    replay(manager, {"model": OPUS, "status": 404, "text": f"Endpoint not found at {ReplayClient.HOST}/serving-endpoints/x"})
+    approval = plan(OPUS, ["basic"])
+    await client.post("/api/endpoints/test", json={"model": OPUS, "plan_id": approval["plan_id"],
+                                                   "approved_dbu": approval["total_dbu"]})
+    run = await finished(manager)
+    assert run["requests"][0]["summary"] == "HTTP 404: Endpoint not found at <host>/serving-endpoints/x"
+    assert "serving.example" not in json.dumps(manager.endpoint_checks.get(OPUS))
+
+
+async def test_a_follow_up_larger_than_its_estimate_is_not_sent(api):
+    client, manager, _ = api
+    signed = [{"choices": [{"delta": {"content": [{"type": "reasoning", "summary": [
+        {"type": "summary_text", "text": "Plan.", "signature": "S" * 40_000}]}]}, "finish_reason": None}]}]
+    transport = replay(manager, {"model": OPUS, "chunks": [*signed, *sse_chunks("", finish="tool_calls", tool_calls=[
+        {"id": "toolu_bdrk_01ABC", "name": "get_weekday", "arguments": {"date": "2026-01-05"}}])]},
+        {"model": OPUS, "chunks": sse_chunks("Monday.")})
+    approval = plan(OPUS, ["tools"])
+    await client.post("/api/endpoints/run", json={"model": OPUS, "probes": ["tools"], "plan_id": approval["plan_id"],
+                                                  "approved_dbu": approval["total_dbu"]})
+    run = await finished(manager)
+    assert run["status"] == "completed" and [entry["state"] for entry in run["requests"]] == ["done", "done", "skipped"]
+    assert "larger than the estimate you approved" in run["requests"][2]["summary"] and len(transport.requests) == 2
+    saved = manager.endpoint_checks.get(OPUS)
+    assert saved["results"]["tools"]["replay_signed"] == "too_large" and "not sent (larger than its estimate)" in (
+        saved["results"]["tools"]["summary"])
+    assert [call["request"] for call in saved["calls"]] == ["tool_call", "replay_plain"]
 
 
 async def test_stop_cancels_the_request_in_flight_and_keeps_what_came_back(api, monkeypatch):

@@ -37,6 +37,7 @@ export function testResultText(saved) {
 export default function EndpointChecksDialog({ model, mode = 'check', onClose }) {
   const dialog = useRef(null)
   const [plan, setPlan] = useState(null)
+  const [planFor, setPlanFor] = useState(null)  // The choice of checks the shown plan was computed for.
   const [available, setAvailable] = useState(null)  // The checks that apply to this endpoint (the first plan's).
   const [chosen, setChosen] = useState(null)
   const [checks, setChecks] = useState(null)
@@ -47,6 +48,9 @@ export default function EndpointChecksDialog({ model, mode = 'check', onClose })
   const run = checks?.run
   const running = run?.status === 'running'
   const query = `/endpoints/${encodeURIComponent(model)}`
+  const choice = `${model}|${test ? 'basic' : (chosen || []).join()}`
+  // While the plan for a changed choice is computed, the shown one is stale: Run waits for the new estimate.
+  const planReady = !!plan && planFor === choice
   useEffect(() => {
     const node = dialog.current
     node?.showModal()
@@ -59,10 +63,11 @@ export default function EndpointChecksDialog({ model, mode = 'check', onClose })
     api('/endpoints/plan', 'POST', { model, ...(probes ? { probes } : {}) }).then(value => {
       if (!current) return
       setPlan(value)
+      setPlanFor(choice)
       setAvailable(previous => previous || value.probes)
     }, e => { if (current) { setPlan(null); setError(e.message) } })
     return () => { current = false }
-  }, [model, test, (chosen || []).join()])
+  }, [model, test, choice])
   // Saved results and the live progress of a run (read again every second while one runs).
   const load = () => api(`${query}/checks`).then(value => setChecks(value), e => setError(e.message))
   useEffect(() => { void load() }, [model])
@@ -80,7 +85,7 @@ export default function EndpointChecksDialog({ model, mode = 'check', onClose })
     setChosen(next.length ? next : [...current])  // The last check stays chosen (and its box checked).
   }
   const start = async () => {
-    if (!plan || starting) return
+    if (!planReady || starting) return
     setStarting(true); setError('')
     try {
       const body = { model, plan_id: plan.plan_id, approved_dbu: plan.priced ? plan.total_dbu : 0,
@@ -97,7 +102,7 @@ export default function EndpointChecksDialog({ model, mode = 'check', onClose })
       void load()
     } catch (e) { setError(e.message) }
   }
-  const cost = plan ? (plan.priced ? `about ${dbuText(plan.total_dbu)} DBU` : 'no price data') : ''
+  const cost = !planReady ? 'updating the estimate…' : plan.priced ? `about ${dbuText(plan.total_dbu)} DBU` : 'no price data'
   const title = test ? 'Test model' : 'Check endpoint capabilities'
   const finishedRun = run && !running ? run : null
   const close = () => { if (!starting) onClose() }
@@ -141,7 +146,7 @@ export default function EndpointChecksDialog({ model, mode = 'check', onClose })
       <footer>
         <button type="button" class="outline" disabled=${starting} onClick=${close}>${finishedRun ? 'Close' : 'Cancel'}</button>
         ${running ? html`<button type="button" class="primary" onClick=${() => void stop()}>Stop</button>`
-          : html`<button type="button" class="primary" disabled=${!plan || starting} onClick=${() => void start()}>
+          : html`<button type="button" class="primary" disabled=${!planReady || starting} onClick=${() => void start()}>
             ${starting ? 'Starting…' : `Run (${cost})`}</button>`}
       </footer>
     </div>

@@ -5,7 +5,8 @@ of the estimate the user saw: the plan_id of a plan computed again for that requ
 request without approved_dbu is refused (HTTP 400) and one whose plan_id differs (another endpoint, choice of
 checks or price list) gets HTTP 409, and nothing is sent in either case. No approval is remembered: each run
 needs its own. One run at a time; its requests go out one after another, never retried: a 401, 403, 429, a
-5xx or a failed connection stops the run, and an HTTP 4xx answer to a probe is a result.
+5xx or a failed connection (also one that breaks off a reply) stops the run, and an HTTP 4xx answer to a probe
+is a result. A follow-up whose input would come out above its planned estimate is not sent.
 """
 import asyncio
 import json
@@ -126,6 +127,11 @@ class EndpointCheckRunner:
                         entry.update(state="skipped", summary="Not needed" if entry["id"] in endpoint_probes.ALTERNATIVES
                                      else "Not sent: the reply it builds on did not come")
                         continue
+                    if endpoint_probes.exceeds_plan(plan, entry["id"], body):
+                        outcomes[entry["id"]] = {"skipped": "over_estimate"}  # Its probe's result says so.
+                        entry.update(state="skipped", summary="Not sent: the reply it sends back is larger than "
+                                                              "the estimate you approved allows")
+                        continue
                     wait = self.manager.rate_gate.remaining(model, RATE_OWNER, body["max_tokens"])
                     if wait >= 0.5:
                         # Another chat's 429 on this endpoint: wait with it rather than add to the overload.
@@ -140,7 +146,8 @@ class EndpointCheckRunner:
                     record = endpoint_probes.call_record(entry["id"], model, outcome)
                     state["reported_dbu"] = round(state["reported_dbu"] + (record.get("estimated_dbu") or 0), 6)
                     status = outcome.get("http_status")
-                    if status is None or status in endpoint_probes.STOPPING_STATUSES or status >= 500:
+                    if (status is None or outcome.get("connection_failed") or status in endpoint_probes.STOPPING_STATUSES
+                            or status >= 500):
                         state["error"] = (f"Stopped after {entry['id']}: {endpoint_probes.outcome_text(outcome)}. "
                                           "Nothing is retried automatically.")
                         break
@@ -170,20 +177,26 @@ class EndpointCheckRunner:
             result = endpoint_probes.interpret(probe["id"], outcomes)
             if result is not None:
                 results[probe["id"]] = result
-        calls = [endpoint_probes.call_record(request_id, model, outcome) for request_id, outcome in outcomes.items()]
+        calls = [endpoint_probes.call_record(request_id, model, outcome) for request_id, outcome in outcomes.items()
+                 if request_id in sent]
         try:
             store.save(model, plan["plan_id"], results, calls)
             for request_id, outcome in outcomes.items():
+                if request_id not in sent:
+                    continue
                 store.write_fixture(model, request_id, endpoint_probes.fixture(model, request_id, sent[request_id],
                                                                                outcome, redact))
         except (OSError, ValueError) as exc:
             state["error"] = (state.get("error") or "") + f" The results could not be saved: {redact(str(exc))[:200]}"
 
     async def send(self, client, host, token, model, body):
-        """One probe request, read to its end: {http_status, headers, chunks, parsed, error, ttfb, elapsed}."""
+        """One probe request, read to its end: {http_status, headers, chunks, parsed, error, connection_failed,
+        ttfb, elapsed}. Error text leaves out the token and the workspace host."""
         call = {"id": str(uuid.uuid4()), "purpose": "probe"}
         headers = serving.call_headers(serving.request_headers(token), {"id": RATE_OWNER}, call)
-        redact = self.manager.settings.redact
+
+        def redact(text):
+            return endpoint_probes.without_host(self.manager.settings.redact(text), host)
         started = clock()
         outcome = {"http_status": None, "error": None, "ttfb": None, "elapsed": None}
         try:
@@ -210,8 +223,9 @@ class EndpointCheckRunner:
                 outcome.update(chunks=chunks, parsed=endpoint_probes.read_stream(chunks))
         except InferenceError as exc:  # An oversized or malformed stream (model_stream bounds).
             outcome["parsed"] = {"error": redact(str(exc))[:300], "finish_reason": None}
-        except httpx.HTTPError as exc:
+        except httpx.HTTPError as exc:  # Before the answer or during its stream: the run stops either way.
             outcome["error"] = ("The connection failed: " + redact(str(exc) or type(exc).__name__))[:300]
+            outcome["connection_failed"] = True
             if outcome["http_status"] == 200:
                 outcome["parsed"] = {"error": outcome["error"], "finish_reason": None}
         finally:
