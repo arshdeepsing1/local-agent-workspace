@@ -135,11 +135,11 @@ def test_settings_edit_and_save_only_databricks_fields(ui, page):
     expect(dialog.get_by_role("combobox", name="Prompt caching").locator("option").first).to_have_text(
         "Automatic (Claude endpoints)")
     checkboxes = dialog.get_by_role("checkbox")
-    expect(checkboxes).to_have_count(5)
+    expect(checkboxes).to_have_count(6)
     expect(dialog.locator("label:has(input[type=checkbox])")).to_have_text([
         "Save a detailed handoff at each compaction", "Show thinking summaries",
         "Keep agent changes automatically when a reply finishes", "Continue automatically after rate limits",
-        "Desktop notification when no browser tab is open"])
+        "Run commands typed with /", "Desktop notification when no browser tab is open"])
     dialog.get_by_label("Project folder").fill("/updated-project")
     endpoint.select_option(label="Other endpoint…")
     expect(dialog.get_by_role("textbox", name="Endpoint name")).to_be_focused()

@@ -473,8 +473,12 @@ async def test_skill_words_in_an_agents_instructions_load_no_skills(runtime, mon
     assert [json.loads(card(saved, call)["output"])["status"] for call in "abc"] == ["completed"] * 3
     assert len(gateway.requests["child"]) == 3
     skills = {call: manager.store.get(card(saved, call)["child_session_id"]).get("active_skills") for call in "abc"}
-    # A custom agent gets its file's skills only; a built-in type's task can still name one.
-    assert skills == {"a": ["a1", "b1", "c1"], "b": None, "c": ["a1"]}
+    # A custom agent gets its file's skills only; a built-in type's task can still name one, for its first message.
+    assert skills == {"a": ["a1", "b1", "c1"], "b": None, "c": None}
+    first = {request[1]["messages"][1]["content"].split("\n")[1]: request[1]["messages"][1]["content"]
+             for request in gateway.requests["child"]}
+    assert "Do a1." in first["Look, then use /a1"] and "[Skill /a1 selected by the user" in first["Look, then use /a1"]
+    assert not any("Do d1." in text or "[Skill /" in text for key, text in first.items() if key != "Look, then use /a1")
 
 
 async def test_a_custom_agent_tool_outside_its_list_is_refused(runtime):

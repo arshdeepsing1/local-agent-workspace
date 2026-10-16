@@ -1,5 +1,6 @@
 import { html, useEffect, useRef, useState } from '../lib.js'
 import { api, apiFile, apiJsonText } from '../api.js'
+import { copyLoaded } from '../commands.js'
 
 const MAX_BYTES = 16 * 1024 * 1024
 
@@ -9,15 +10,6 @@ function saveFile(text, name, type) {
   link.href = url; link.download = name
   document.body.appendChild(link)
   try { link.click() } finally { link.remove(); URL.revokeObjectURL(url) }
-}
-
-// Copy text that is still loading. Safari allows a clipboard write only during
-// the click, so the write starts at once and receives the text when it arrives.
-async function copyLoaded(load) {
-  if (window.ClipboardItem && navigator.clipboard?.write) {
-    const blob = load().then(text => new Blob([text], { type: 'text/plain' }))
-    await navigator.clipboard.write([new ClipboardItem({ 'text/plain': blob })])
-  } else await navigator.clipboard.writeText(await load())
 }
 
 export default function ConversationTransfer({ sessionId, workspace, busy = false, onSelectSession, onError }) {

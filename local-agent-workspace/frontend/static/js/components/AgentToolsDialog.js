@@ -9,7 +9,8 @@ import { agentLabel, agentSettingsText, elapsedText } from '../subagents.js'
 import { EFFORT_LABELS, modelLabel } from '../types.js'
 
 // Props: session, workspace?, changedFiles? (files with unreviewed agent changes in this chat, from the
-// changes bar; null when unknown), onClose, onSelectSession, onError, onSaveTools?(tools) -> Session
+// changes bar; null when unknown), onClose, onSelectSession, onError, onSaveTools?(tools) -> Session,
+// initialTab? (a section to open, as /usage and /export do; remembered like a chosen one)
 const profileLabels = { inherit: 'Inherit permitted tools', read_only: 'Read-only files', file_editor: 'Read and edit files' }
 const taskStatuses = ['pending', 'in_progress', 'completed', 'cancelled']
 const scopeQuery = session => session ? `?session_id=${encodeURIComponent(session.id)}` : ''
@@ -62,7 +63,11 @@ export default function AgentToolsDialog(props) {
 function AgentToolsScope(props) {
   const dialog = useRef(null)
   const nav = useRef(null)
-  const [tab, setTab] = useState(rememberedTab)
+  const [tab, setTab] = useState(() => {
+    if (!TABS.includes(props.initialTab)) return rememberedTab()
+    rememberTab(props.initialTab)
+    return props.initialTab
+  })
   useEffect(() => { dialog.current?.showModal() }, [])
   // In the narrow layout the navigation is one scrolling row: keep the open section's button in view.
   useEffect(() => { nav.current?.querySelector('[aria-pressed="true"]')?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' }) }, [tab])
@@ -450,7 +455,10 @@ function ExtensionsPanel({ session, onError }) {
   const [notice, setNotice] = useState('')
   const [tools, setTools] = useState(null)
   const [servers, setServers] = useState(null)
-  useEffect(() => { void run(() => Promise.all([api('/extensions'), api(`/skills${query}`)]), ([config, skills]) => { setConfiguration(JSON.stringify(config, null, 2)); setSkills(skills); setLoaded(true) }) }, [query, run])
+  // Command templates (GET /commands): { commands, errors, folders }; null until loaded or when it failed.
+  const [templates, setTemplates] = useState(null)
+  useEffect(() => { void run(() => Promise.all([api('/extensions'), api(`/skills${query}`), api(`/commands${query}`).catch(() => null)]),
+    ([config, skills, commands]) => { setConfiguration(JSON.stringify(config, null, 2)); setSkills(skills); setTemplates(commands); setLoaded(true) }) }, [query, run])
   return html`<section class="agent-tools-section" aria-label="Extensions">
     <h3>MCP servers and hooks</h3>
     <p>Configure stdio commands or HTTP server URLs, and up to 16 hooks: local commands that run around tool calls and at the start and end of a turn. Saving authorizes enabled servers to start.</p>
@@ -467,11 +475,29 @@ function ExtensionsPanel({ session, onError }) {
     ${tools ? html`<div class="agent-tools-test" role="status">${tools.length ? html`<strong>Available tools</strong><ul>${tools.map(tool => html`<li key=${tool}>${tool}</li>`)}</ul>` : 'No tools reported by the saved configuration.'}</div>` : null}
     ${servers ? html`<div class="agent-tools-list" aria-label="MCP server test results"><p class="field-help">Results from the last test, not a live connection monitor.</p>${servers.map(server => html`<div class="agent-tools-row" key=${server.id}><div><strong>${server.name}</strong><small>${server.status === 'connected' ? `Connected during test · ${server.tools.length} tools` : server.status === 'disabled' ? 'Disabled · not started' : 'Failed'}</small>${server.error ? html`<p class="form-error">${server.error}</p>` : null}</div></div>`)}</div>` : null}
     <h3>Skills</h3>${!session ? html`<p class="field-help">Start a conversation to enable skills.</p>` : null}
-    <div class="agent-tools-list">${skills.map(skill => html`<div class="agent-tools-row" key=${skill.id}><label><input type="checkbox" disabled=${busy || !session} checked=${activeSkills.includes(skill.id)} onChange=${e => { if (session) void run(() => api(`/sessions/${encodeURIComponent(session.id)}/skills`, 'POST', { skill_id: skill.id, enabled: e.currentTarget.checked }), result => setActiveSkills(result.active_skills)) }} />${skill.name}<small>${skill.description}</small><small>${skill.path}</small></label></div>`)}</div>
+    <p class="field-help">Checked skills are part of every request in this chat. /skill-id in a message sends a skill with that message only.</p>
+    <div class="agent-tools-list">${skills.map(skill => html`<div class="agent-tools-row" key=${skill.id}><label><input type="checkbox" disabled=${busy || !session} checked=${activeSkills.includes(skill.id)} onChange=${e => { if (session) void run(() => api(`/sessions/${encodeURIComponent(session.id)}/skills`, 'POST', { skill_id: skill.id, enabled: e.currentTarget.checked }), result => setActiveSkills(result.active_skills)) }} />${skill.name}<small>${skill.description}</small><small>${skill.path}</small>
+      ${skillNotes(skill) ? html`<small class="skill-notes">${skillNotes(skill)}</small>` : null}</label></div>`)}</div>
     ${!busy && !skills.length ? html`<p class="muted">No installed skills found.</p>` : null}
+    <h3>Custom commands</h3>
+    <p class="field-help">Type /name at the start of a message to send a command file's text with it: $ARGUMENTS becomes what you type after the name, $1 to $9 its words. Files are read from ${(templates?.folders || ['.agents/commands', '.claude/commands', '~/.agents/commands', '~/.claude/commands']).join(', ')} (in that order); the app never writes there.</p>
+    ${templates ? html`<div class="agent-tools-list" role="group" aria-label="Custom commands">${templates.commands.map(item => html`<div class="agent-tools-row" key=${item.name}><div>
+      <strong>/${item.name}${item.argument_hint ? ` ${item.argument_hint}` : ''}</strong>${item.description ? html`<small>${item.description}</small>` : null}<small>${item.path}</small>
+      ${item.notes.map((note, index) => html`<small key=${index} class="skill-notes">${note}</small>`)}</div></div>`)}
+      ${templates.errors.map(item => html`<div class="agent-tools-row" key=${`error-${item.path}`}><div><strong>${item.path}</strong><p class="form-error">${item.error}</p></div></div>`)}</div>
+      ${!busy && !templates.commands.length && !templates.errors.length ? html`<p class="muted">No command files found.</p>` : null}`
+      : loaded ? html`<p class="muted">Custom commands could not be listed.</p>` : null}
   </section>`
 }
 
+
+// What a skill's frontmatter and name change (GET /skills): the argument hint, who may load it, a reserved name.
+function skillNotes(skill) {
+  return [skill.argument_hint ? `Arguments: ${skill.argument_hint}` : '',
+    skill.disable_model_invocation ? 'Only you select it (disable-model-invocation)' : '',
+    skill.user_invocable === false ? 'Only the agent loads it (user-invocable: false)' : '',
+    skill.reserved ? `A command has its name: use /skill ${skill.id} in a message` : ''].filter(Boolean).join(' · ')
+}
 
 // MCP tool names the server accepts in a chat's turned-off list.
 const MCP_TOOL = /^mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_.-]+$/

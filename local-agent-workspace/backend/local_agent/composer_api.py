@@ -70,12 +70,13 @@ def register_composer(app, manager, settings, store, session_or_404):
 
     @app.delete("/api/sessions/{session_id}/queue/{item_id}")
     async def remove_queued(session_id: str, item_id: str):
+        from .agents import public_queue  # agents.py imports this module.
         session_or_404(session_id)
         try:
             queue = await manager.remove_queued(session_id, item_id)
         except KeyError:
             raise HTTPException(404, "This queued message was already sent.") from None
-        return {"queued_messages": queue}
+        return {"queued_messages": public_queue(queue)}
 
     @app.post("/api/sessions/{session_id}/queue/send")
     async def send_queued(session_id: str):

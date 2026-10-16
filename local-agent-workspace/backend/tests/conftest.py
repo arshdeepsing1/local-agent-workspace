@@ -17,6 +17,19 @@ def isolated_defaults(monkeypatch):
     monkeypatch.setenv("LOCAL_AGENT_MODEL", "test-endpoint")
 
 
+@pytest.fixture(scope="session")
+def empty_home(tmp_path_factory):
+    return tmp_path_factory.mktemp("home")
+
+
+@pytest.fixture(autouse=True)
+def isolated_user_folders(monkeypatch, empty_home):
+    """The user's own skill and command folders (~/.agents, ~/.claude) are read from an empty folder, never
+    the developer's home. Tests of those folders set extensions.USER_HOME to their own."""
+    from local_agent import extensions
+    monkeypatch.setattr(extensions, "USER_HOME", empty_home)
+
+
 @pytest.fixture(autouse=True)
 def no_ripgrep(monkeypatch):
     """Search without ripgrep by default, so results do not depend on whether it is

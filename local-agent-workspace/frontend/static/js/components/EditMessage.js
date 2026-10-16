@@ -22,7 +22,7 @@ export default function EditMessage({ sessionId, event, onSent, onCancel, onSele
     setSending(true); setError(null)
     try {
       const result = await api(`/sessions/${encodeURIComponent(sessionId)}/rewind`, 'POST',
-        { before_event_id: event.id, conversation: true, code, resend_text: text })
+        { before_event_id: event.id, conversation: true, code, resend_text: text, ...(event.verbatim ? { resend_verbatim: true } : {}) })
       onSent(result, text)
     } catch (e) { setError(e); setSending(false) }
   }

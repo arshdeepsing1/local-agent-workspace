@@ -157,6 +157,10 @@ VERIFY_NOTE_LABEL = "[The user declined the app's Verify command and wrote this 
 HOOK_CONTINUATION_LABEL = "[Automatic stop-hook result from the app; not the user's words.]\n"
 # The start of the attachment part mentions.expand_context appends to a user message.
 ATTACHMENT_SEPARATOR = "\n\n---\n"
+# The parts the app adds after a user's typed message (and its attachments): an expanded command template
+# (commands.py) and the skills the message selected (AgentManager.message_skills). Never the user's words.
+COMMAND_MARKER = ATTACHMENT_SEPARATOR + "[Command /"
+SKILL_MARKER = ATTACHMENT_SEPARATOR + "[Skill /"
 
 
 def is_continuation(message):
@@ -476,9 +480,17 @@ def verify_note(message):
 
 
 def _attachment_start(content):
-    """Where the @ file and ! output part (mentions.expand_context) of a user message starts, or -1."""
+    """Where the part of a user message the app added starts, or -1: the @ file and ! output part
+    (mentions.expand_context), an expanded command (COMMAND_MARKER) or the skills it selected (SKILL_MARKER)."""
     from .mentions import HEADER  # Not at module level: mentions imports tools, which imports much more.
-    return content.find(ATTACHMENT_SEPARATOR + HEADER.split("{nonce}", 1)[0])
+    found = [at for at in (content.find(ATTACHMENT_SEPARATOR + HEADER.split("{nonce}", 1)[0]),
+                           content.find(COMMAND_MARKER), content.find(SKILL_MARKER)) if at >= 0]
+    return min(found, default=-1)
+
+
+def _has_attachments(content):
+    from .mentions import HEADER
+    return ATTACHMENT_SEPARATOR + HEADER.split("{nonce}", 1)[0] in content
 
 
 def _outline(content, head_text, tail_text, limit):
@@ -697,8 +709,9 @@ def request_text(message, limit_bytes=REQUEST_CLIP_BYTES):
     """A user request as the app record keeps it, or None for other messages.
 
     App prompts are not requests, except the note a user wrote when declining
-    Verify. The steering prefix and @ attachments are left out; long requests keep
-    their start and end within limit_bytes UTF-8 bytes."""
+    Verify. The steering prefix, @ attachments, an expanded command and selected skills
+    are left out (only the typed words stay); long requests keep their start and end
+    within limit_bytes UTF-8 bytes."""
     if not isinstance(message, dict) or message.get("role") != "user" or not isinstance(message.get("content"), str):
         return None
     if is_app_prompt(message):
@@ -709,7 +722,7 @@ def request_text(message, limit_bytes=REQUEST_CLIP_BYTES):
         text = text[len(STEER_PREFIX):]
     start = _attachment_start(text)
     if start >= 0:
-        text = text[:start] + " [attachments omitted]"
+        text = text[:start] + (" [attachments omitted]" if _has_attachments(text[start:]) else "")
     return _clip_request(text, limit_bytes)
 
 

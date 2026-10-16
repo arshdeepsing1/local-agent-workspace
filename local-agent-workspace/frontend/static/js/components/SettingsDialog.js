@@ -335,6 +335,9 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         <p class="field-help">Explore starts at Fast: reading and searching rarely needs long thinking. Default sends no effort field, so the subagent's endpoint uses its own.</p>
         <${More} topic="subagent defaults">A subagent on another endpoint than its chat keeps its requests within that endpoint's default budgets when the Model and context budgets are larger. Custom agents (a project's Markdown agent files) set their own model and effort; Agent tools → Subagents lists them and where their files go. A running subagent keeps the model it started with, and one whose type sets an effort keeps it when you change the chat's effort.<//>`)}
         ${group('commands', html`
+        <label class="settings-checkbox"><input type="checkbox" checked=${form.slash_commands !== false}
+          onChange=${e => field('slash_commands', e.currentTarget.checked)} />Run commands typed with /</label>
+        <p class="field-help">/name at the start of a message runs a built-in or custom command, and /skill-id sends that skill with the message. Off: such text is sent to the agent as typed; built-in commands still run when you choose them in the / menu.</p>
         <label>File write limit (KB)<input type="number" required min=${16} max=${1000} step=${1}
           value=${form.write_limit_kb === undefined ? 80 : form.write_limit_kb || ''} onInput=${number('write_limit_kb')} /></label>
         <p class="field-help">Largest file the agent can edit or create and the editor can open (default 80). One write_file call carries at most about 500 KB, so larger files are built with edits.</p>

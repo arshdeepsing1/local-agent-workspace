@@ -33,6 +33,7 @@ class RewindRequest(BaseModel):
     conversation: bool = Field(default=False, strict=True)
     code: bool = Field(default=False, strict=True)
     resend_text: str | None = Field(default=None, min_length=1, max_length=50000, strict=True)
+    resend_verbatim: bool = Field(default=False, strict=True)  # Resent as plain text, as the message was sent.
 
 
 # Never copied into a rewind backup: the usage ledger and jobs stay with the live chat, and authority,
@@ -253,7 +254,8 @@ def register_portability(app, manager, settings, store, session_or_404):
                 manager.workspace_available(session["workspace"])
                 if not delegated_prompt(remaining):
                     mentions.expand_context(manager, remaining, manager.session_tools(session),
-                                            body.resend_text.strip(), include_pending=False)
+                                            body.resend_text.strip(), include_pending=False,
+                                            scan="" if body.resend_verbatim else None)
             except ValueError as exc:
                 raise HTTPException(400, settings.redact(str(exc))) from exc
         files = []
@@ -303,7 +305,7 @@ def register_portability(app, manager, settings, store, session_or_404):
         result = {"backup_session_id": backup_id, "files": files, "resent": False}
         if body.resend_text is not None:
             try:
-                manager.start(session_id, body.resend_text.strip())
+                manager.start(session_id, body.resend_text.strip(), verbatim=body.resend_verbatim)
                 result["resent"] = True
             except ValueError as exc:
                 result["resend_error"] = settings.redact(str(exc))

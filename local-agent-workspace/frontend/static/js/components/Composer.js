@@ -1,16 +1,22 @@
 import { html, useEffect, useRef, useState } from '../lib.js'
-import { ArrowUp, ChevronDown, Folder, FolderPlus, Laptop, ListPlus, MessageCircleQuestion, Plus, Square, Terminal, X } from '../icons.js'
+import { ArrowUp, ChevronDown, Folder, FolderPlus, Laptop, ListPlus, MessageCircleQuestion, Plus, Square, Terminal, Type, X } from '../icons.js'
 import { modelLabel } from '../types.js'
 import PermissionsMenu from './PermissionsMenu.js'
 import EffortPicker from './EffortPicker.js'
 import { useSlashMenu } from './SlashMenu.js'
 import { mentionLabel, parseMentions, removeMention, useMentionMenu } from './MentionMenu.js'
 import { MAX_MESSAGE_LENGTH } from '../reviewComments.js'
+import { parseCommand } from '../commands.js'
 
-// What the text in the message box does when sent: a message, a ! command or a /btw question.
-export function messageKind(text) {
+// What the text in the message box does when sent: a message, a ! command, a /btw question or a built-in
+// command (commands.js), which runs in the page. Options: slashCommands (Settings: false sends typed / text
+// as it is), picked (the built-in chosen in the / menu, which runs even then), plain (sent as plain text).
+export function messageKind(text, { slashCommands = true, picked = null, plain = false } = {}) {
+  if (plain) return 'message'
   if (text.startsWith('!')) return 'shell'
-  if (/^\/btw\s/.test(text)) return 'side'
+  if (/^\/btw\s/.test(text) && (slashCommands || picked === 'btw')) return 'side'
+  const parsed = parseCommand(text)
+  if (parsed && (slashCommands || picked === parsed.command.id)) return 'command'
   return 'message'
 }
 const clip = (text, limit) => text.length > limit ? `${text.slice(0, limit - 1)}…` : text
@@ -28,16 +34,36 @@ function chipLabel(item) {
 // onShell(command), onSideQuestion(question), loadFiles(query), pendingContext (Session.pending_context),
 // rules (this chat), projectRules, userRules, rulesProblem, onLoadRules, onAddRule(returnFocus), onRemoveRule(scope, rule), onResetRules,
 // effort (this chat's reasoning effort), onEffort(level) (allowed while busy), reasoningFormat and
-// thinkingSummaries (Settings → Reasoning, for the picker's labels)
+// thinkingSummaries (Settings → Reasoning, for the picker's labels), onCommand(id, args) (a built-in
+// command; rejects with the error to show), loadCommands (command templates for the / menu),
+// slashCommands (Settings → slash commands)
 export default function Composer(p) {
   const [sending, setSending] = useState(false)
   const [caret, setCaret] = useState(0)
+  // Send as plain text: the next message goes as typed, without a command, skills, @ files or ! shell.
+  const [plain, setPlain] = useState(false)
+  // A built-in command chosen in the / menu: it runs while the box still starts with it (slash commands off).
+  const [picked, setPicked] = useState(null)
   const input = useRef(null)
-  const slash = useSlashMenu({ value: p.value, setValue: p.setValue, loadSkills: p.loadSkills })
-  const mention = useMentionMenu({ value: p.value, setValue: p.setValue, caret, setCaret, input, loadFiles: p.loadFiles })
+  const slashCommands = p.slashCommands !== false
+  const run = async (id, args = '') => {
+    if (sending || p.modelSaving || p.disabled || !p.onCommand) return
+    const draft = p.value
+    setSending(true)
+    try {
+      await p.onCommand(id, args)
+      p.setValue(current => current === draft ? '' : current)
+      setPicked(null)
+    } catch (e) { p.onError(e.message) } finally { setSending(false) }
+  }
+  const slash = useSlashMenu({ value: p.value, setValue: p.setValue, loadSkills: p.loadSkills, loadCommands: p.loadCommands,
+    slashCommands, onRun: id => void run(id), onPick: setPicked, disabled: plain })
+  const mention = useMentionMenu({ value: p.value, setValue: p.setValue, caret, setCaret, input, loadFiles: plain ? null : p.loadFiles })
   useEffect(() => { input.current?.focus() }, [])
+  useEffect(() => { if (picked && !new RegExp(`^/${picked}(\\s|$)`).test(p.value)) setPicked(null) }, [p.value, picked])
   const text = p.value.trim()
-  const kind = messageKind(text)
+  const kind = messageKind(text, { slashCommands, picked, plain })
+  const parsed = kind === 'command' ? parseCommand(text) : null
   const multiline = kind === 'shell' && /[\r\n]/.test(text)
   // A ! command needs an idle chat and one line; a message or side question can be sent while busy.
   const blocked = kind === 'shell' && (p.busy || multiline || !text.slice(1).trim())
@@ -52,12 +78,15 @@ export default function Composer(p) {
       p.onError(e.message)
     })
   }
-  const submit = async () => {
-    if (!text || sending || p.modelSaving || p.disabled || blocked) return
-    if (kind === 'side') { askSide(); return }
+  // asPlain: Shift+Alt+Enter sends this message as plain text without the toggle.
+  const submit = async (asPlain = plain) => {
+    const sentKind = asPlain ? 'message' : kind
+    if (!text || sending || p.modelSaving || p.disabled || (blocked && sentKind === 'shell')) return
+    if (sentKind === 'command') { await run(parsed.command.id, parsed.args); return }
+    if (sentKind === 'side') { askSide(); return }
     // The server's limit counts code points; checked before sending, so no draft chat is created and
     // the text stays in the box.
-    const chars = kind === 'message' ? [...text].length : 0
+    const chars = sentKind === 'message' ? [...text].length : 0
     if (chars > MAX_MESSAGE_LENGTH) {
       p.onError(`Messages are limited to ${MAX_MESSAGE_LENGTH.toLocaleString('en-US')} characters (this one has ` +
         `${chars.toLocaleString('en-US')}). Save long text such as a handoff as a file in the project and attach it ` +
@@ -66,16 +95,18 @@ export default function Composer(p) {
     }
     setSending(true)
     try {
-      if (kind === 'shell') await p.onShell(text.slice(1).trim())
-      else await p.onSend(text)
+      if (sentKind === 'shell') await p.onShell(text.slice(1).trim())
+      else await p.onSend(text, asPlain ? { verbatim: true } : undefined)
       p.setValue(current => current === p.value ? '' : current)
+      if (asPlain) setPlain(false)
       input.current?.focus()
     }
     catch (e) { p.onError(e.message) }
     finally { setSending(false) }
   }
   const keyDown = e => {
-    if (slash.keyDown(e) || mention.keyDown(e)) return
+    if (e.key === 'Enter' && e.shiftKey && e.altKey && !e.isComposing) { e.preventDefault(); void submit(true); return }
+    if (!plain && (slash.keyDown(e) || mention.keyDown(e))) return
     if (e.key === 'Escape' && p.busy && !e.isComposing) { e.preventDefault(); p.onStop(); return }
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); void submit() }
   }
@@ -85,9 +116,12 @@ export default function Composer(p) {
     catch (e) { p.onError(e.message) }
   }
   const models = Array.from(new Set([p.model, ...p.models]))
-  const mentions = kind === 'message' ? parseMentions(p.value) : []
+  const mentions = kind === 'message' && !plain ? parseMentions(p.value) : []
   const pending = p.pendingContext || []
-  const hint = kind !== 'shell' ? null : multiline ? 'Shell mode runs one line.'
+  const hint = plain ? 'Plain text: sent exactly as typed, without commands, skills, @ files or ! shell.'
+    : parsed ? (p.busy && !parsed.command.whileBusy ? `Stop the response first: /${parsed.command.id} runs when the conversation is idle.`
+      : `/${parsed.command.id}: ${parsed.command.description} Enter runs it here; nothing is sent to the agent.`)
+    : kind !== 'shell' ? null : multiline ? 'Shell mode runs one line.'
     : p.busy ? 'Wait for the reply to finish before running a command.'
     : 'Shell command: Enter runs it in the project folder, even in Plan mode. Its output is sent to the agent with your next message.'
   const folderName = path => (path || '').split('/').filter(Boolean).pop()
@@ -95,8 +129,8 @@ export default function Composer(p) {
   const project = p.worktree?.branch ? `${folderName(p.worktree.source_workspace) || 'Project'} · ${p.worktree.branch}`
     : folderName(p.workspace) || 'Project'
   const caretFrom = e => setCaret(e.currentTarget.selectionStart ?? 0)
-  // Two menus share the message box; the open one names its list.
-  const menuProps = mention.listed ? { ...slash.inputProps, ...mention.inputProps } : slash.inputProps
+  // Two menus share the message box; the open one names its list. As plain text, neither opens.
+  const menuProps = plain ? {} : mention.listed ? { ...slash.inputProps, ...mention.inputProps } : slash.inputProps
   return html`<div class="composer-block">
     <div class="project-context">
       <span class="context-chip context-label" title="This conversation runs on this computer: commands and file edits use your local files."><${Laptop} size=${15} />Local</span>
@@ -114,15 +148,20 @@ export default function Composer(p) {
         ...${menuProps}
         onFocus=${() => { slash.inputProps.onFocus(); mention.inputProps.onFocus() }} onBlur=${() => { slash.inputProps.onBlur(); mention.inputProps.onBlur() }}
         onKeyDown=${keyDown} />
-      ${slash.menu}${mention.menu}
+      ${plain ? null : html`${slash.menu}${mention.menu}`}
+      ${p.busy && parsed ? html`<button class="send-button queue-button" aria-label="Run command" title="Runs here at once; nothing is sent to the agent"
+        disabled=${sending || p.modelSaving || p.disabled || !parsed.command.whileBusy} onClick=${() => void submit()}><${ArrowUp} size=${17} /></button>` : null}
       ${p.busy && text && kind === 'message' ? html`<button class="send-button queue-button" aria-label="Queue message" title="Sent to the agent after its current step" disabled=${sending || p.modelSaving || p.disabled} onClick=${() => void submit()}><${ListPlus} size=${17} /></button>` : null}
       ${p.busy && kind === 'side' ? html`<button class="send-button queue-button" aria-label="Ask side question" title="Answered beside the conversation, without adding to it" disabled=${!text.replace(/^\/btw\s+/, '').trim() || p.modelSaving || p.disabled} onClick=${() => void submit()}><${MessageCircleQuestion} size=${17} /></button>` : null}
       ${p.busy ? html`<button class="send-button stop-button" aria-label="Stop response" onClick=${p.onStop}><${Square} size=${15} fill="currentColor" /></button>` :
-        html`<button class="send-button" aria-label="Send message" disabled=${!text || sending || p.modelSaving || p.disabled || blocked} onClick=${() => void submit()}><${ArrowUp} size=${19} /></button>`}
+        html`<button class="send-button" aria-label=${parsed ? 'Run command' : 'Send message'} disabled=${!text || sending || p.modelSaving || p.disabled || blocked} onClick=${() => void submit()}><${ArrowUp} size=${19} /></button>`}
     </div>
-    ${hint ? html`<p class="composer-hint shell-hint" role="status">${hint}</p>` : null}
+    ${hint ? html`<p class=${`composer-hint ${parsed || plain ? 'command-hint' : 'shell-hint'}`} role="status">${hint}</p>` : null}
     <div class="composer-toolbar">
       <button class="attach-button icon-button" aria-label="Add project file" onClick=${p.onAttach}><${Plus} size=${19} /></button>
+      <button class=${`icon-button plain-toggle${plain ? ' active' : ''}`} aria-label="Send as plain text" aria-pressed=${plain}
+        title="Send as plain text: exactly as typed, without commands, skills, @ files or ! shell (or press Shift+Alt+Enter)"
+        onClick=${() => { setPlain(value => !value); input.current?.focus() }}><${Type} size=${17} /></button>
       <${PermissionsMenu} mode=${p.mode} busy=${p.busy} locked=${p.disabled || p.modelSaving || sending} onChange=${p.onMode} onError=${p.onError} onDone=${() => input.current?.focus()}
         rules=${p.rules} projectRules=${p.projectRules} userRules=${p.userRules} problem=${p.rulesProblem} onOpen=${p.onLoadRules}
         onRemoveRule=${p.onRemoveRule} onAddRule=${p.onAddRule && (() => p.onAddRule(() => input.current?.focus()))} onReset=${p.onResetRules} />

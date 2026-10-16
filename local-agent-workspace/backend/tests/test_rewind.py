@@ -334,6 +334,27 @@ async def idle(manager, session_id):
     raise AssertionError("The chat did not become idle.")
 
 
+async def test_a_message_sent_as_plain_text_is_resent_as_plain_text(runtime, monkeypatch):
+    """Retry and Edit of a message sent as plain text send it again without a command, skill or @ file."""
+    app, manager, session, project = runtime
+    standard(runtime)
+    skill = project / ".agents/skills/handoff/SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("Handoff rules.")
+    (project / "notes.txt").write_text("Notes.")
+    requests = []
+    async with await client_for(app) as client:
+        gateway_for(monkeypatch, requests)
+        response = await client.post(f"/api/sessions/{session['id']}/rewind", json={
+            "before_event_id": "u3", "conversation": True, "resend_text": "/handoff of @notes.txt", "resend_verbatim": True})
+        assert response.status_code == 200 and response.json()["resent"] is True, response.text
+        await idle(manager, session["id"])
+        monkeypatch.undo()
+    assert requests[-1]["messages"][-1] == {"role": "user", "content": "/handoff of @notes.txt"}
+    user = [event for event in manager.store.get(session["id"])["events"] if event["type"] == "user"][-1]
+    assert user["verbatim"] is True and "skills" not in user and "attachments" not in user
+
+
 async def test_a_resend_with_a_refused_file_changes_nothing(runtime):
     """The resend's own checks run before the backup and the cut: a 400 leaves the chat as it was."""
     app, manager, session, project = runtime

@@ -33,6 +33,8 @@ export function useWorkspace() {
   const [draftMode, setDraftMode] = useState('manual')
   // The reasoning effort chosen in a new conversation before it exists (null: the Settings default).
   const [draftEffort, setDraftEffort] = useState(null)
+  // The model of a new conversation that /clear started from another chat (null: the Settings default).
+  const [draftModel, setDraftModel] = useState(null)
   // Unreviewed agent file changes of one conversation: { id, value: Changes }.
   const [changes, setChanges] = useState({ id: null, value: null })
   const changesPushed = useRef(0)
@@ -53,7 +55,7 @@ export function useWorkspace() {
     const next = { id, key: id ? draftKeys.current.get(id) || id : crypto.randomUUID() }
     selected.current = next
     setSelection({ ...next }); setSession(null); setError(''); setOnline(true)
-    if (!id) { setDraftMode('manual'); setDraftEffort(null) }
+    if (!id) { setDraftMode('manual'); setDraftEffort(null); setDraftModel(null) }
     if (!fromHistory) updateUrl(id)
   }, [updateUrl])
   // message: '' when another notice (the storage notice) already explains why.
@@ -295,14 +297,22 @@ export function useWorkspace() {
     return () => { closed = true; clearTimeout(timer); socket?.close() }
   }, [activeId, selection.key, ready, refreshSessions, clearMissingSession, checkConnection])
 
-  const newConversation = () => selectSession(null)
+  // options (/clear): { model, mode, effort } the new conversation starts with, from the chat it replaces.
+  const newConversation = options => {
+    selectSession(null)
+    if (!options) return
+    setDraftMode(options.mode || 'manual')
+    setDraftEffort(options.effort || null)
+    setDraftModel(options.model || null)
+  }
   const ensureSession = async target => {
     if (!target.id) {
       // Folder access can create a chat before its first message. Wait for a
       // pending default-model choice before capturing the creation settings.
       if (defaultModelSave.current) await defaultModelSave.current
       // Concurrent first actions in one draft share its creation request.
-      target.creating ||= api('/sessions', 'POST', { permission_mode: draftMode, ...(draftEffort ? { reasoning_effort: draftEffort } : {}) })
+      target.creating ||= api('/sessions', 'POST', { permission_mode: draftMode, ...(draftEffort ? { reasoning_effort: draftEffort } : {}),
+        ...(draftModel ? { model: draftModel } : {}) })
       let created
       try { created = await target.creating }
       catch (error) { target.creating = undefined; throw error }
@@ -317,16 +327,17 @@ export function useWorkspace() {
     }
     return target.id
   }
-  const send = async text => {
+  // options.verbatim: sent as plain text (no command, skill or @ file on the server).
+  const send = async (text, options) => {
     const id = await ensureSession(selected.current)
-    await api(`/sessions/${id}/messages`, 'POST', { text })
+    await api(`/sessions/${id}/messages`, 'POST', { text, ...(options?.verbatim ? { verbatim: true } : {}) })
     return id
   }
   const saveSettings = async next => {
     const { workspace, model, env_file, context_window, max_output_tokens, max_agent_steps, compaction_handoffs, approval_timeout_minutes,
       system_notifications, user_instructions, write_limit_kb, command_env, rate_limit_auto_continue, auto_keep_changes,
       coding_dir, python_venv, auto_compact_percent, reasoning_effort, reasoning_format, thinking_summaries, prompt_caching, subagent_defaults,
-      spending_limit_dbu } = next
+      spending_limit_dbu, slash_commands } = next
     const saved = await api('/settings', 'PUT', {
       workspace, model, env_file, context_window, max_output_tokens, max_agent_steps,
       ...(typeof compaction_handoffs === 'boolean' ? { compaction_handoffs } : {}),
@@ -345,6 +356,7 @@ export function useWorkspace() {
       ...(typeof reasoning_format === 'string' ? { reasoning_format } : {}),
       ...(typeof thinking_summaries === 'boolean' ? { thinking_summaries } : {}),
       ...(typeof prompt_caching === 'string' ? { prompt_caching } : {}),
+      ...(typeof slash_commands === 'boolean' ? { slash_commands } : {}),
       ...(subagent_defaults && typeof subagent_defaults === 'object' ? { subagent_defaults } : {}),
     })
     setSettings(saved)
@@ -364,6 +376,8 @@ export function useWorkspace() {
     if (modelSaves.has(scope) || (!target.id && defaultModelSave.current) || !settings) return
     setModelSaves(current => new Set(current).add(scope))
     try {
+      // A new conversation /clear started keeps its own model; choosing another changes only that one.
+      if (!target.id && !creating && draftModel) { setDraftModel(model); return }
       if (!target.id && !creating) {
         const saving = saveSettings({ ...settings, model })
         defaultModelSave.current = saving
@@ -602,6 +616,7 @@ export function useWorkspace() {
   return { settings, connection, connectionChecking, sessions, session: activeSession, activeId, viewKey: selection.key, error,
     online: online && reachable, offlineError: error === OFFLINE_MESSAGE, ready,
     setError: reportError, setActiveId: selectSession, newConversation, send, saveSettings, refreshSettings, deleteSession, renameSession, changeModel,
+    draftModel: activeId ? null : draftModel,
     runShell, askSide, removeQueued, sendQueued, loadMentionFiles, sideAnswer: sideAnswer.key === selection.key ? sideAnswer.value : null, dismissSide,
     modelSaving: modelSaves.has(selection.key) || (!activeId && defaultModelSave.current !== null),
     checkConnection, refreshSessions, permissionMode: activeSession?.permission_mode || draftMode, setPermissionMode, allowFolder, removeFolder,
