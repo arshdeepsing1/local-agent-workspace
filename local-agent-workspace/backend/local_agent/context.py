@@ -6,6 +6,7 @@ is neither a provider token count nor a guaranteed upper bound for every model.
 When the provider reports input tokens, callers may pass an estimate scale
 derived from them (see estimate_scale) so the budget tracks real counts.
 """
+import hashlib
 import json
 import math
 import posixpath
@@ -120,6 +121,13 @@ ARGUMENT_KEEP_BYTES = 1_200
 ARGUMENT_HEAD_BYTES = 600
 UNPARSED_ARGUMENT_BYTES = 2_000
 SUPERSEDED_MIN_BYTES = 1_000
+# A summary request also leaves out the tool results of the older summarized turns: all but the latest
+# CLEAR_KEEP_TURNS turns of the summarized part, results of at least CLEAR_MIN_BYTES (CLEARED_RESULT). The
+# assistant's replies, which used them, stay; the stored history and the agent's context never change.
+CLEAR_KEEP_TURNS = 3
+CLEAR_MIN_BYTES = 2_048
+# A failed command keeps the end of its output, where the error usually is (the summary quotes errors exactly).
+CLEARED_ERROR_TAIL_BYTES = 600
 OUTLINE_MAX_LINES = 80
 # A chunk's summary is passed on unchanged to the next chunk while it is at most
 # this fraction of the summary request's input budget; it is condensed once, at the end.
@@ -143,6 +151,11 @@ SUPERSEDED_READ = ("[The app omitted this {tool} result for {path} before summar
                    "was read again with the same arguments or changed later in the conversation.]")
 ELIDED_ARGUMENT = ("[The app omitted {total:,} bytes of {field} before summarizing; the file on disk has the "
                    "current content.]")
+CLEARED_RESULT = ("[Output cleared by the app before summarizing: {size} from {tool}{target}, in an older turn. "
+                  "{log}Record only what the conversation did with it; do not guess what it said.]")
+CLEARED_LOG = "The handoff's activity log lists the call. "
+CLEARED_ERROR_TAIL = "\nThe failed command's output ended with:\n"
+FAILED_STATES = ("failed", "timed_out")
 UNPARSED_ARGUMENT_MARKER = " [truncated by the app]"
 OUTLINE_HEADING = "Definition lines kept by the app (line: text):"
 OUTLINE_LINE = re.compile(r"^\d+: \s*(async\s+def|def|class|function|export\s|interface\s|type\s+\w+\s*=|struct\s|"
@@ -282,16 +295,71 @@ def _calibration(calls, model):
         estimate, usage = call.get("estimated_input_tokens"), call.get("usage")
         if type(estimate) is not int or estimate < CALIBRATION_MIN_ESTIMATE or not isinstance(usage, dict):
             continue
-        counts = [usage.get(key, 0) for key in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")]
-        if type(usage.get("input_tokens")) is not int or any(type(count) is not int or count < 0 for count in counts):
-            continue
-        uncached, cached = counts[0], counts[1] + counts[2]
-        if cached and uncached * 10 >= estimate * 7 and (uncached + cached) * 10 >= estimate * 17:
+        total = reported_input(usage)
+        if total is None or double_counted(usage, estimate):
             continue
         estimated += estimate
-        reported += sum(counts)
+        reported += total
         samples += 1
     return estimated, reported, samples
+
+
+def reported_input(usage):
+    """The whole input Databricks reported (uncached + cache read + cache write), or None unless every count
+    present is a whole number of tokens and input_tokens is one."""
+    if not isinstance(usage, dict):
+        return None
+    counts = [usage.get(key, 0) for key in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")]
+    if type(usage.get("input_tokens")) is not int or any(type(count) is not int or count < 0 for count in counts):
+        return None
+    return sum(counts)
+
+
+def double_counted(usage, estimate):
+    """True for a report that looks counted twice with prompt caching on: cache tokens reported, and uncached
+    input alone at least 0.7 of the raw estimate while the sum is at least 1.7 of it (Databricks may include
+    cached tokens in its prompt count). Such a report neither calibrates nor anchors an estimate."""
+    uncached = usage.get("input_tokens", 0)
+    cached = usage.get("cache_read_input_tokens", 0) + usage.get("cache_creation_input_tokens", 0)
+    return bool(cached) and uncached * 10 >= estimate * 7 and (uncached + cached) * 10 >= estimate * 17
+
+
+# --- The anchored estimate: the last reported count plus the new content ------
+# A request that extends the chat's previous agent request (the same messages after the system message,
+# in the same order, with more after them) is estimated as what Databricks reported for that request plus
+# the scaled estimate of what changed since. The prefix is then counted exactly; only the new content uses
+# the learned scale. Kept in memory per chat (AgentManager.estimate_anchors), never saved: after a restart,
+# a compaction, a rewind or an edit, or a change to another model, the scaled estimate applies until the
+# next report; a report that cannot anchor (AgentManager.keep_anchor) leaves the previous anchor.
+
+def anchor_digest(messages):
+    """sha256 of messages (a request's messages after its system message) as canonical JSON."""
+    text = json.dumps(messages, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def anchor_candidate(messages):
+    """{count, digest} of a prepared request's messages (system message first, before any step note):
+    what a later request must start with to anchor on this one."""
+    return {"count": len(messages) - 1, "digest": anchor_digest(messages[1:])}
+
+
+def anchored_estimate(messages, raw, scale, anchor):
+    """(estimate, added) for messages, whose raw estimate_tokens is raw, anchored on an earlier request
+    ({count, digest, raw, reported}: anchor_candidate plus that request's raw estimate and reported input),
+    or None when messages do not extend it. added is the raw estimate of what is new; it is scaled when
+    positive, and taken unscaled when the request shrank (a shorter system message, fewer tools), which
+    keeps the estimate on the high side."""
+    if not isinstance(anchor, dict):
+        return None
+    count, reported, before = anchor.get("count"), anchor.get("reported"), anchor.get("raw")
+    if (type(count) is not int or type(reported) is not int or type(before) is not int or count < 1
+            or reported < 1 or len(messages) - 1 <= count or not isinstance(anchor.get("digest"), str)):
+        return None
+    if anchor_digest(messages[1:count + 1]) != anchor["digest"]:
+        return None
+    added = raw - before
+    return max(1, reported + (math.ceil(added * scale) if added > 0 else added)), added
 
 
 def estimate_text_tokens(text):
@@ -299,17 +367,53 @@ def estimate_text_tokens(text):
     return (_weighted_size(text) - 2) // 3
 
 
-def context_breakdown(messages, tools, has_summary=False, scale=1.0):
-    """Attribute the same estimate; framing and rounding stay in overhead."""
+def context_breakdown(messages, tools, has_summary=False, scale=1.0, total=None):
+    """Attribute the same estimate (total, an anchored estimate, or the scaled one); framing and rounding stay
+    in overhead."""
     sizes = {"system_instructions": 0, "tool_definitions": _weighted_size(tools) if tools else 0,
              "messages_and_results": 0, "summary": 0}
     for index, message in enumerate(messages):
         category = ("system_instructions" if index == 0 else "summary"
                     if has_summary and index == 1 else "messages_and_results")
         sizes[category] += _weighted_size(message)
+    if total is not None:
+        scale = total / max(1, estimate_tokens(messages, tools))
     breakdown = {category: int(size // 3 * scale) for category, size in sizes.items()}
-    breakdown["request_overhead"] = scaled_estimate(messages, tools, scale) - sum(breakdown.values())
+    whole = scaled_estimate(messages, tools, scale) if total is None else total
+    breakdown["request_overhead"] = max(0, whole - sum(breakdown.values()))
     return breakdown
+
+
+BUILT_IN_GROUP = "Built-in tools"
+
+
+def tool_group(name, servers=()):
+    """The meter's group of a tool definition: "MCP <server>" for an MCP server's tool (mcp__<server>__<tool>),
+    else BUILT_IN_GROUP (the app's tools). servers: the configured server IDs; the longest that names the tool
+    wins, so a saved ID containing "__" keeps its own row. Otherwise the server ends at the first "__"."""
+    if isinstance(name, str) and name.startswith("mcp__") and "__" in name[5:]:
+        named = [server for server in servers or () if isinstance(server, str) and name.startswith(f"mcp__{server}__")]
+        return "MCP " + (max(named, key=len) if named else name[5:].split("__", 1)[0])
+    return BUILT_IN_GROUP
+
+
+def tool_groups(tools, tokens, servers=()):
+    """{group: tokens}: tokens (the breakdown's tool_definitions) split over tool_group(name, servers) in
+    proportion to each group's definitions, built-in tools first, then the servers in the order they are
+    offered. The parts add up to tokens exactly; {} without tools."""
+    sizes = {}
+    for tool in tools or ():
+        function = tool.get("function") if isinstance(tool, dict) else None
+        group = tool_group(function.get("name") if isinstance(function, dict) else None, servers)
+        sizes[group] = sizes.get(group, 0) + _weighted_size(tool)
+    if not sizes:
+        return {}
+    ordered = {key: sizes[key] for key in sorted(sizes, key=lambda key: key != BUILT_IN_GROUP)}
+    whole = sum(ordered.values())
+    groups = {key: tokens * size // whole for key, size in ordered.items()}
+    first = next(iter(groups))
+    groups[first] += tokens - sum(groups.values())
+    return groups
 
 
 def handoff_output_tokens(context_window):
@@ -627,7 +731,37 @@ def _read_key(name, arguments):
     return name, _frozen(_normal_arguments(arguments))
 
 
-def summary_transcript(archived, later, result_limit, completed_calls=None):
+def _kb(size):
+    return f"{size / 1024:,.1f} KB" if size < 10 * 1024 else f"{round(size / 1024):,} KB"
+
+
+def _cleared_result(content, name, arguments, handoff):
+    """CLEARED_RESULT for a tool result; a failed command's keeps the last lines of its output."""
+    target = arguments.get("path") if isinstance(arguments, dict) else None
+    text = CLEARED_RESULT.format(size=_kb(_size(content)), tool=name if isinstance(name, str) else "a tool",
+                                 target=f" {target}" if isinstance(target, str) and target else "",
+                                 log=CLEARED_LOG if handoff else "")
+    try:
+        result = json.loads(content)
+    except ValueError:
+        result = None
+    output = result.get("output") if isinstance(result, dict) and result.get("state") in FAILED_STATES else None
+    if isinstance(output, str) and output.strip():
+        tail = _tail_bytes(output.rstrip(), CLEARED_ERROR_TAIL_BYTES)
+        if (line := tail.find("\n")) >= 0 and _size(output.rstrip()) > CLEARED_ERROR_TAIL_BYTES:
+            tail = tail[line + 1:]  # Whole lines only.
+        text += CLEARED_ERROR_TAIL + tail
+    return text
+
+
+def _cleared_from(archived, keep_turns):
+    """The position in archived where its latest keep_turns turns start (0: keep them all)."""
+    starts = [index for index, message in enumerate(archived) if isinstance(message, dict)
+              and message.get("role") == "user" and not is_continuation(message) and not is_steer(message)]
+    return starts[-keep_turns] if len(starts) >= keep_turns else 0
+
+
+def summary_transcript(archived, later, result_limit, completed_calls=None, keep_turns=None, handoff=False):
     """(text, stats): the JSON transcript of archived messages the summarizer reads.
 
     The stored history is never changed. App prompts are labelled role "app" (a
@@ -635,9 +769,16 @@ def summary_transcript(archived, later, result_limit, completed_calls=None):
     contents in tool arguments are shortened with a marker, and a read whose file was
     read again with the same arguments or changed by a later completed call (in
     archived after it, or in later) is replaced by a marker. completed_calls holds the
-    ids of tool calls that completed; None turns that replacement off. A message that
-    needs no change serializes exactly as json.dumps(archived)."""
+    ids of tool calls that completed; None turns that replacement off. With keep_turns,
+    tool results of CLEAR_MIN_BYTES or more before the latest keep_turns turns are
+    replaced by CLEARED_RESULT (handoff: the compaction saves a handoff, whose activity
+    log lists the calls), counted in stats["cleared"] and stats["cleared_bytes"]. A
+    message that needs no change serializes exactly as json.dumps(archived)."""
     stats = {"elided_bytes": 0, "superseded": 0, "shortened": 0}
+    clear_before = 0
+    if keep_turns is not None:
+        stats.update(cleared=0, cleared_bytes=0)
+        clear_before = _cleared_from(archived, keep_turns)
     combined = [*archived, *later]
     # The last position of a completed change to each normalised path, and of each completed
     # read by its arguments: a read is superseded when either is later (linear, not a scan of
@@ -689,6 +830,10 @@ def summary_transcript(archived, later, result_limit, completed_calls=None):
                     tool=name, path=arguments.get("path"), total=_size(content))}
                 stats["superseded"] += 1
                 stats["elided_bytes"] += _size(content)
+            elif position < clear_before and _size(content) >= CLEAR_MIN_BYTES:
+                message = {**message, "content": _cleared_result(content, name, arguments, handoff)}
+                stats["cleared"] += 1
+                stats["cleared_bytes"] += _size(content) - _size(message["content"])
             elif _size(content) > result_limit:
                 message = {**message, "content": clip_result(content, result_limit, stats)}
         transformed.append(message)
@@ -836,6 +981,10 @@ TRANSCRIPT_NOTES = (
     "Messages with role \"app\" were sent automatically by the app, not by the user; never record them as the "
     "user's requests. Text marked \"[The app ...]\" was shortened or omitted by the app before summarizing; do "
     "not guess what it left out. ")
+# The app record lists the files changed and the files read whose contents leave the context (compaction_record),
+# so the summary need not repeat every path. In the summary, handoff and condense prompts.
+FILES_NOTE = ("The app records which files were read and changed and keeps that list next to the summary, so under "
+              "\"Files read and changed\" name only the files that matter for the work ahead, and why. ")
 
 
 def build_summary_messages(previous, chunk, preservation_note="", limit_bytes=SUMMARY_MAX_BYTES):
@@ -851,7 +1000,7 @@ def build_summary_messages(previous, chunk, preservation_note="", limit_bytes=SU
             + "\nQuote the user's exact words for rules and preferences, including notes marked as the user's "
             "words. Give exact error text and full file paths; for commands give the command, its outcome and the "
             "key output. Write \"None.\" under a section with nothing to report. Distinguish completed work from "
-            "proposals and unknown outcomes. " + IN_PROGRESS_NOTE
+            "proposals and unknown outcomes. " + FILES_NOTE + IN_PROGRESS_NOTE
             + f"Return only the summary, at most {limit_bytes:,} UTF-8 bytes "
             f"(about {limit_bytes // 8:,} words).")},
         {"role": "user", "content": (_preservation_priorities(preservation_note) + "Previous summary:\n"
@@ -872,7 +1021,7 @@ def build_handoff_messages(previous, chunk, preservation_note="", max_tokens=HAN
             + _headings(SUMMARY_SECTIONS + HANDOFF_EXTRA_SECTIONS)
             + "\nQuote the user's exact words for rules and preferences. Include dead ends and the reasoning behind "
             "decisions. The app appends an exact log of every command, so describe only the commands that mattered. "
-            "Distinguish completed work from proposals and unknown outcomes. " + IN_PROGRESS_NOTE
+            + FILES_NOTE + "Distinguish completed work from proposals and unknown outcomes. " + IN_PROGRESS_NOTE
             + f"Never include secrets. Be complete, but stay under about {max_tokens // 4:,} words.")},
         {"role": "user", "content": (_preservation_priorities(preservation_note) + "Previous summary:\n"
                                      + previous + "\n\nTranscript fragment:\n" + chunk)},
@@ -890,7 +1039,7 @@ def build_condense_messages(summary, limit_bytes, preservation_note=""):
             + "\nDrop any other sections (such as " + " and ".join(f'\"{name}\"' for name in HANDOFF_EXTRA_SECTIONS)
             + "), folding the facts still needed into the sections above. Shorten later sections first. Never drop "
             "a user requirement, preference or constraint, or an open task; keep the user's quoted words. Remove "
-            "repetition and low-value detail. Return "
+            "repetition and low-value detail. " + FILES_NOTE + "Return "
             f"only the shortened summary, at most {target:,} UTF-8 bytes (about {target // 10:,} words).")},
         {"role": "user", "content": _preservation_priorities(preservation_note) + "Summary to shorten:\n" + summary},
     ]
@@ -1101,7 +1250,8 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
                           preservation_note="", condense=None, scale=1.0, handoff_path=None, save_handoff=None,
                           default_reply_reserve=DEFAULT_MAX_OUTPUT_TOKENS,
                           auto_compact_percent=MAX_AUTO_COMPACT_PERCENT, record_requests=False, app_record=None,
-                          output_allowance=0, completed_calls=None, model_window=None):
+                          output_allowance=0, completed_calls=None, model_window=None, anchor=None,
+                          on_compaction=None, tool_servers=()):
     """(messages, state, info) for the next request, compacting earlier turns when needed.
 
     Compaction runs when force_compact is set or the estimate passes auto_compact_percent
@@ -1111,8 +1261,13 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
     completed_calls (ids of completed tool calls) lets the summarizer's view drop reads
     that later calls superseded. model_window (model_context_window) is the provider's
     real window: the input budget and the summary requests then keep a margin for estimate
-    error against it (effective_input_budget, COMPACTION_ESTIMATE_FACTOR). The defaults
-    keep the behaviour before these options.
+    error against it (effective_input_budget, COMPACTION_ESTIMATE_FACTOR). anchor (the chat's
+    last reported request: anchored_estimate) estimates a request that extends it as that report
+    plus the scaled new content, for the threshold, the budget checks and the meter; cut candidates,
+    the summary requests and the byte guard keep the scaled or raw estimate. on_compaction(trigger)
+    is called once a compaction's cut is chosen, before its first summary request ("manual",
+    "in_turn" or "auto"). tool_servers (the MCP server IDs) names the meter's tool groups (tool_group).
+    The defaults keep the behaviour before these options.
     """
     if not MIN_CONTEXT_WINDOW <= context_window <= MAX_CONTEXT_WINDOW:
         raise ValueError(f"Choose a context window between {MIN_CONTEXT_WINDOW} and {MAX_CONTEXT_WINDOW}.")
@@ -1151,14 +1306,16 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
         handoff_files = [*handoff_files, {"path": handoff_path, "compaction": state["compactions"] + 1}]
     pointer = handoff_pointer(handoff_files)
     messages = [system_message, *context_messages(wire, state)]
-    estimate = before = scaled_estimate(messages, tools, scale)
+    raw = estimate_tokens(messages, tools)
+    anchored = anchored_estimate(messages, raw, scale, anchor) if anchor else None
+    estimate = before = anchored[0] if anchored else raw if scale == 1 else math.ceil(raw * scale)
     adjustment = fitted_to_budget = saved_handoff = compaction = cut = None
     in_turn = deferred = byte_fallback = False
     # The 4 MB Databricks request limit: compaction also runs when the request body would
     # pass the app's byte target (request_limits). Within the token budget this only
     # happens when the estimator undercounts bytes, so the check usually costs nothing.
-    # The scaled estimate is at least the unscaled one (scale >= 1), so it serves as the bound.
-    over_bytes = request_bytes_over(messages, tools, estimate, request_limits.PAYLOAD_TARGET_BYTES)
+    # It takes the unscaled estimate: an anchored one can be lower and is no bound on the bytes.
+    over_bytes = request_bytes_over(messages, tools, raw, request_limits.PAYLOAD_TARGET_BYTES)
 
     if force_compact or estimate > threshold or over_bytes:
         if force_compact and not has_earlier_turn(wire, state):
@@ -1258,6 +1415,8 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
                 raise budget_error(problem, context_window, reply_reserve, input_budget, default_reply_reserve)
 
     if cut is not None:
+        if on_compaction is not None:
+            on_compaction("manual" if force_compact else "in_turn" if in_turn else "auto")
         archived = wire[state["through"]:cut]
         if in_turn and request_index < state["through"]:
             # The request (and the user's steered messages) were kept out of the last
@@ -1266,7 +1425,8 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
             archived = [wire[request_index], *(message for message in wire[request_index + 1:state["through"]]
                                                 if is_steer(message)), *archived]
         transcript, stats = summary_transcript(
-            archived, wire[cut:], elision_limit(summary_input_budget) * (2 if in_turn else 1), completed_calls)
+            archived, wire[cut:], elision_limit(summary_input_budget) * (2 if in_turn else 1), completed_calls,
+            keep_turns=CLEAR_KEEP_TURNS, handoff=bool(handoff_path))
         summary = state["summary"]
         offset, documents, requests = 0, [], {"summarize": 0, "condense": 0}
 
@@ -1340,7 +1500,7 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
             else:
                 updated.pop("app_notes", None)
         messages = [system_message, *context_messages(wire, updated)]
-        estimate = scaled_estimate(messages, tools, scale)
+        estimate, anchored = scaled_estimate(messages, tools, scale), None  # The summary is new: nothing to anchor on.
         # needed_at reserves summary_limit and record_limit ASCII bytes, but JSON escapes, non-ASCII
         # text and the record's headings weigh more. Shorten the summary, already paid for, until the
         # request fits instead of discarding it and failing the turn.
@@ -1390,19 +1550,26 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
             "summarized_messages": cut - state["through"],
             "requests": requests["summarize"] + requests["condense"],
             "summarize_requests": requests["summarize"], "condense_requests": requests["condense"],
-            "elided_bytes": stats["elided_bytes"], "superseded_results": stats["superseded"]}
+            "elided_bytes": stats["elided_bytes"], "superseded_results": stats["superseded"],
+            # Tool results of older turns the summary requests left out (CLEARED_RESULT), when there were any.
+            **({"cleared_results": stats["cleared"], "cleared_bytes": stats["cleared_bytes"]}
+               if stats["cleared"] else {})}
         state = updated
 
+    breakdown = context_breakdown(messages, tools, bool(state["summary"]), scale, estimate if anchored else None)
     info = {"estimated_tokens": estimate, "input_budget": input_budget, "context_window": context_window,
             "reply_reserve": reply_reserve, "compactions": state["compactions"],
             "summarized_messages": state["through"], "estimate_method": "weighted_utf8",
-            "breakdown": context_breakdown(messages, tools, bool(state["summary"]), scale),
+            "breakdown": breakdown, "tool_groups": tool_groups(tools, breakdown["tool_definitions"], tool_servers),
             "auto_compact_threshold": threshold, "auto_compact_percent": auto_compact_percent,
             # Whether Compact now has earlier turns to summarize. It describes the chat until its next
             # user message, which prepares a request again; steps within a turn add no turn start.
             "compactable": has_earlier_turn(wire, state)}
     if scale != 1:
         info["estimate_scale"] = float(scale)
+    if anchored:
+        # The previous request's reported input and the raw estimate of what was added since (the meter).
+        info["estimate_anchor"] = {"reported": anchor["reported"], "added": anchored[1]}
     if adjustment:
         info["summary_adjustment"] = adjustment
     if fitted_to_budget:
@@ -1516,9 +1683,14 @@ def in_turn_tokens(wire, state, system_message, tools, input_budget, scale=1.0, 
     return scaled_estimate([system_message, placeholder, *retained_request(wire, index), *wire[index:]], tools, scale)
 
 
-def next_request_estimate(wire, state, system, tools, scale):
-    """The estimated input of the next request before the user's next message."""
-    return scaled_estimate([system, *context_messages(wire, state)], tools, scale)
+def next_request_estimate(wire, state, system, tools, scale, anchor=None):
+    """(tokens, anchored, raw): the estimated input of the next request before the user's next message,
+    anchored on anchor when that request extends it (anchored_estimate's (estimate, added), else None), and
+    its raw estimate_tokens."""
+    messages = [system, *context_messages(wire, state)]
+    raw = estimate_tokens(messages, tools)
+    anchored = anchored_estimate(messages, raw, scale, anchor) if anchor else None
+    return anchored[0] if anchored else raw if scale == 1 else math.ceil(raw * scale), anchored, raw
 
 
 def handoff_with_contents(text, limit=40):

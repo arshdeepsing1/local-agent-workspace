@@ -173,6 +173,15 @@ def agent_bodies(bodies):
     return [body for body in bodies if body.get("stream") is True]
 
 
+def without_note(body):
+    """A request's messages without markers and without the step note ending its last message."""
+    messages = unmarked(body)["messages"]
+    content = body["messages"][-1].get("content")
+    if isinstance(content, list) and len(content) == 2:
+        messages[-1] = {**messages[-1], "content": content[0]["text"]}
+    return messages
+
+
 def agent_calls(session):
     return [call for call in session["inference_calls"] if call["purpose"] == "agent"]
 
@@ -192,7 +201,7 @@ async def test_agent_requests_carry_markers_and_keep_a_stable_prefix_across_step
               reply, reply, lambda: call_reply("list_tasks", {}, "c3"), reply]
     bodies = mock_gateway(monkeypatch, lambda body: script.pop(0)())
     await manager.run(session, "Read the note")
-    (project / "note.txt").write_text("changed by the user\n")  # A changed-files notice joins the system tail.
+    (project / "note.txt").write_text("changed by the user\n")  # A changed-files notice until it is read again.
     await manager.run(session, "Continue")
     await manager.run(session, "Once more")
     sent = agent_bodies(bodies)
@@ -201,13 +210,19 @@ async def test_agent_requests_carry_markers_and_keep_a_stable_prefix_across_step
         system = body["messages"][0]["content"]
         assert system[0]["cache_control"] == CACHE_CONTROL and "cache_control" not in system[1]
         assert system[1]["text"].startswith("\nAdditional allowed folders: ")
+        assert "Files changed since" not in system[1]["text"]  # Never in the system tail at this level.
         assert body["messages"][-1]["role"] in ("user", "tool")
         assert body["messages"][-1]["content"][0]["cache_control"] == CACHE_CONTROL and markers(body) == 2
-    assert "Files changed since" in sent[3]["messages"][0]["content"][1]["text"]
-    # The stable part never changed, and each request's messages (markers off) start with the previous one's.
+    # The notice ends the last message, after its marker, of each request from the change on.
+    notes = [body["messages"][-1]["content"][1:] for body in sent]
+    assert notes[:3] == [[]] * 3 and all(len(note) == 1 and "cache_control" not in note[0] for note in notes[3:])
+    assert notes[3][0]["text"] == ("\n\n[Note from the app, not the user's words or tool output: Files changed since "
+                                   "you last read or wrote them (by the user, an undo, or a command): note.txt. Read a "
+                                   "file again before editing it.]")
+    # The stable part never changed, and each request's messages (markers and note off) start with the previous one's.
     assert all(body["messages"][0]["content"][0] == sent[0]["messages"][0]["content"][0] for body in sent)
     for before, after in zip(sent, sent[1:]):
-        previous, current = unmarked(before)["messages"][1:], unmarked(after)["messages"][1:]
+        previous, current = without_note(before)[1:], without_note(after)[1:]
         assert current[:len(previous)] == previous
     # Estimates and the ledger read the request without markers; the meter's size is the bytes sent.
     calls = agent_calls(session)
@@ -217,10 +232,10 @@ async def test_agent_requests_carry_markers_and_keep_a_stable_prefix_across_step
     assert session["context_info"]["payload_bytes"] == len(json.dumps(sent[-1], ensure_ascii=False,
                                                                        separators=(",", ":")).encode())
     assert session_metrics(session)["calls"][-1]["prompt_cache"] == "full"
-    # The system tail changed once (the notice); it stays until the file is read again.
-    assert [call.get("system_tail_changed") for call in calls] == [None, None, None, True, None, None]
-    assert session_metrics(session)["calls"][3]["system_tail_changed"] is True
+    # The notice never changed the system tail.
+    assert [call.get("system_tail_changed") for call in calls] == [None] * 6
     assert "system_tail" not in json.dumps(session["context_info"]) and "Files changed" not in json.dumps(calls)
+    assert "Files changed" not in json.dumps(manager.store.get(session["id"])["wire"])  # Sent, never stored.
 
 
 @pytest.mark.parametrize("model,setting", [(OPUS, "off"), ("test-endpoint", "auto"), (GPT, "auto")])

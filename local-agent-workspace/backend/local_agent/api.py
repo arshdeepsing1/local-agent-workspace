@@ -620,7 +620,18 @@ def create_app(settings=None):
 
     @app.get("/api/sessions/{session_id}")
     async def get_session(session_id: str):
-        return public_session(session_or_404(session_id), manager.statuses.get(session_id, "idle"))
+        return public_session(session_or_404(session_id), manager.statuses.get(session_id, "idle"),
+                              manager.compaction_view(session_id))
+
+    @app.get("/api/sessions/{session_id}/context")
+    async def get_context(session_id: str):
+        """The chat's context meter as last prepared (estimate, breakdown with tool groups, instruction
+        sources, the last report and the next-request estimate), without building a request."""
+        info = session_or_404(session_id).get("context_info")
+        progress = manager.compaction_view(session_id)
+        return {"status": manager.statuses.get(session_id, "idle"),
+                "context_info": info if isinstance(info, dict) else None,
+                **({"compaction_progress": progress} if progress else {})}
 
     @app.get("/api/sessions/{session_id}/metrics")
     async def get_session_metrics(session_id: str):
@@ -666,6 +677,8 @@ def create_app(settings=None):
                 store.delete(member)
                 manager.live.pop(member, None)
                 manager.statuses.pop(member, None)
+                for remembered in (manager.estimate_anchors, manager.anchor_candidates, manager.compactions):
+                    remembered.pop(member, None)
         finally:
             deleting_sessions.difference_update(family)
         if children == "keep":
@@ -737,7 +750,7 @@ def create_app(settings=None):
         try:
             # The first snapshot carries the latest 200 events, extended to the whole latest turn
             # (at most 1,000); the page loads earlier ones from /events. Later snapshots are complete.
-            snapshot = public_session(session, manager.statuses.get(session_id, "idle"))
+            snapshot = public_session(session, manager.statuses.get(session_id, "idle"), manager.compaction_view(session_id))
             events, total = snapshot["events"], len(snapshot["events"])
             start = max(0, total - 200)
             latest_user = next((index for index in range(total - 1, -1, -1) if events[index].get("type") == "user"), None)

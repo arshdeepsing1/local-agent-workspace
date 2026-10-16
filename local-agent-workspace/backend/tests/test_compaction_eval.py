@@ -170,14 +170,19 @@ async def test_compaction_keeps_what_the_work_needs(workspace, monkeypatch):
                        if DECISION in str(message.get("content")))
     assert first_compaction["summarized_messages"] > decision_at  # Every planted item was summarized.
 
-    # (a) The summarizer saw every fact, the failure line and the outline of db.py's middle.
+    # (a) The summarizer saw every fact and the failure line. Turn 0's large results are older than the latest
+    # three summarized turns: they were cleared from the summary requests, a failed command keeping its last lines.
     shown = "\n".join(payload["messages"][1]["content"] for payload in model.summaries)
     for fact in FACTS:
         assert fact in shown
-    assert FAILED in shown and "200: class BillingRepository:" in shown
+    assert FAILED in shown and "200: class BillingRepository:" not in shown
+    assert "[Output cleared by the app before summarizing: 16 KB from read_file src/billing/db.py, in an older turn." in shown
+    assert ("KB from run_command, in an older turn. The handoff's activity log lists the call. Record only what the "
+            "conversation did with it; do not guess what it said.]\\nThe failed command's output ended with:\\n") in shown
+    assert first_compaction["cleared_results"] == 3 and first_compaction["cleared_bytes"] > 20_000
     # (b) Large contents were shortened: the transcript is much smaller than the history.
     assert middle not in shown
-    assert "The app shortened this tool result" in shown and "The app omitted this read_file result" in shown
+    assert "The app omitted this read_file result" in shown
     assert "bytes of content before summarizing; the file on disk has the current content." in shown
     first_requests = model.summaries[:first_compaction["requests"]]
     archived = json.dumps(model_history(session["wire"])[:first_compaction["summarized_messages"]], ensure_ascii=False)

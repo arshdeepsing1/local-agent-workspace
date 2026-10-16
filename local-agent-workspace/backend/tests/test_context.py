@@ -103,6 +103,7 @@ async def test_small_context_requires_no_compaction_and_reports_estimated_budget
                     "context_window": DEFAULT_CONTEXT_WINDOW, "reply_reserve": REPLY_RESERVE,
                     "compactions": 0, "summarized_messages": 0, "estimate_method": "weighted_utf8",
                     "breakdown": context_breakdown(messages, TOOLS),
+                    "tool_groups": {"Built-in tools": context_breakdown(messages, TOOLS)["tool_definitions"]},
                     "auto_compact_threshold": DEFAULT_CONTEXT_WINDOW - REPLY_RESERVE - SAFETY_MARGIN,
                     "auto_compact_percent": 100, "compactable": False}  # One turn: Compact now has nothing to do.
 

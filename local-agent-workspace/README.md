@@ -803,15 +803,22 @@ when opening a conversation or performing restart recovery.
   checkpoint. Diagnostics also report merge-conflict markers inside notebook cells.
   **Changed files:** the conversation keeps remembering the files it read or wrote.
   Before each model request the app checks the 200 most recent of these files and, if
-  any changed or were deleted (your editor saves, an Undo, a command), adds one line at
-  the end of the system message naming up to 10 of them. A deleted file is named once.
-  The system message keeps its stable parts first and puts the folder grants, the current
-  date and this line last. On Claude endpoints the stable part is cached on its own (see
-  **Prompt caching**), so when one of these last lines changes, the next request still reads
-  the stable part from the cache but writes the conversation after it again. It
-  gives the local date and time zone but not the time of day, so it changes once a day
-  rather than once a minute; the model runs `date` when it needs the exact time (a chat
-  without `run_command`, such as a `read_only` subagent, is not told to).
+  any changed or were deleted (your editor saves, an Undo, a command), adds one line
+  naming up to 10 of them; it repeats on each request until the file is read again. A
+  deleted file is named once. The line naming finished background jobs (see **Local access
+  and limits**) goes the same way. With **Prompt caching** at **Automatic** on a Claude
+  endpoint, these lines end the request's last message (your message or the last tool
+  result), after its cache marker, as `[Note from the app, not the user's words or tool
+  output: …]`: that request only, never the saved history, an export or a summary. So a line that appears or goes
+  never rewrites the cached conversation. Otherwise (Documented forms only, Off, other
+  endpoints) they end the system message, as before. The system message keeps its stable
+  parts first and puts the folder grants and the current date last. On Claude endpoints the
+  stable part is cached on its own (see **Prompt caching**), so when one of these last lines
+  changes, the next request still reads the stable part from the cache but writes the
+  conversation after it again. The date line gives the local date and time zone but not the
+  time of day, so it changes once a day rather than once a minute; the model runs `date`
+  when it needs the exact time (a chat without `run_command`, such as a `read_only`
+  subagent, is not told to).
 - **Request details**: expand the details below an assistant response or tool-only
   model request to inspect its endpoint, completion status, stop reason, and
   provider-reported token usage when available. Failed requests distinguish invalid
@@ -1337,9 +1344,10 @@ no markers (they share no start with the next request, so a marker would only ad
 cost), and other endpoints (GPT OSS, endpoints without a profile) get none.
 
 Each agent request gets two markers: one where the system message's stable part ends (before the
-folder grants, the date and the step notices; see **Changed files** above) and one on its last
-message (your message or the last tool result). Each request then writes the conversation up to
-its end, and the next step reads it back. The markers are added to the request body only: the
+folder grants and the date; see **Changed files** above) and one on its last message (your message
+or the last tool result). Each request then writes the conversation up to its end, and the next
+step reads it back. The changed-files and background-jobs lines follow the last message's marker,
+so the next step, which sends that message without them, still reads it from the cache. The markers are added to the request body only: the
 context meter's estimate, the estimate scale and compaction see the request without them; the
 request size and the 4 MB check count the bytes sent. A change in the stable part (another
 permission mode, a selected skill, edited project or custom instructions) makes the next request
@@ -1386,8 +1394,9 @@ model's reasoning (`reasoning_shape`) and whether a reasoning signature came
 (`reasoning_signature`, never the signature), and for an agent request whose system message's
 changing part differed from the chat's last request that Databricks answered,
 `system_tail_changed` (the conversation after it was written to the cache again; a retry after a
-429 or a server error keeps the flag, because the failed attempt wrote nothing). They are not CSV
-columns. **Check endpoint capabilities…** (see **Endpoint checks**) settles it with two identical
+429 or a server error keeps the flag, because the failed attempt wrote nothing). At **Automatic**
+that part holds only the folder grants and the date, so the flag marks a folder grant or a new day.
+They are not CSV columns. **Check endpoint capabilities…** (see **Endpoint checks**) settles it with two identical
 requests and reports whether `prompt_tokens` leaves the cached tokens out; when it finds markers
 rejected, agent requests to that endpoint start the fallback above at the level it found accepted.
 
@@ -1550,11 +1559,31 @@ never goes below 1, because an overestimate only makes compaction start a little
 Once reports arrive, the starting ratio keeps the weight of 20,000 estimated tokens among
 them, so a first request that is mostly system message and tool definitions does not replace
 it at once (after a typical first request the scale is about 1.22); later reports outweigh it.
+
+**Anchored estimate:** when Databricks has reported the whole input of the chat's previous agent
+request and the next request starts with the same messages (only the system message's changing
+part, the tools and the messages added after them may differ), the estimate is that reported
+count plus the scaled estimate of what changed since. The part Databricks already counted is
+then exact, which matters most for text the heuristic overestimates, such as plain prose: such
+a chat compacts later, closer to its real size. The context details say "Anchored on the last
+reported count: N tokens Databricks reported for the previous request + ~M tokens added since",
+and the next-request estimate says it is anchored. The anchor is kept in memory only: after a
+restart, a compaction, a rewind or an edited message, or a change to another model (changing
+back before any request anchors again), the scaled estimate applies until the next report. A fallback request, or a report
+that is partial, misses input tokens or looks counted twice, leaves the previous anchor (with
+none, the scaled estimate). The automatic compaction threshold, the budget checks, side questions
+(`/btw`) and the meter use the anchored estimate; the usage ledger, the estimate scale, the cuts
+compaction considers and the 4 MB check keep the heuristic estimate.
 Expanded context details attribute that same estimate to system/project
-instructions (including selected skills), tool definitions, conversation messages
-and tool results, the retained summary, and request framing/rounding overhead.
-The categories add up to the displayed estimate; they are not tokenizer-derived
-measurements.
+instructions (including skills selected for the chat), tool definitions (split per MCP server,
+for example "Built-in tools · ~5,900 tokens" and "MCP docs · ~640 tokens", when an MCP server's
+tools are offered), conversation messages and tool results, the retained summary, and request
+framing/rounding overhead. The categories add up to the displayed estimate; they are not
+tokenizer-derived measurements. **Loaded instructions** lists each selected skill with its cost:
+`Skill /<id>` applies to this chat (selected in **Agent tools → Skills**, in the system message)
+or to this message (selected with `/<id>`, sent with that message, so it counts in messages).
+`GET /api/sessions/<id>/context` returns the same meter as JSON (`{status, context_info}`, plus
+`compaction_progress` while the chat compacts) without building a request.
 
 **Settings → Auto-compact at (% of input budget)** (default 90, 50–100) sets when
 automatic compaction runs: when the next request's estimate passes that share of the
@@ -1589,8 +1618,9 @@ chat's next request right away (a running chat follows when its turn ends; budge
 from its next turn). When that changed the input budget, the collapsed meter reads
 **Next request · ~N%**: the next request's estimate, rescaled to the chat's model, as a
 share of the new input budget. When a turn ends, the details also show the
-estimate for the next request before your next message. Title, compaction and side
-question requests never change this report.
+estimate for the next request before your next message (anchored on the last report when it
+can be; after a model change it is the scaled estimate for the new model). Title, compaction
+and side question requests never change this report.
 
 The output-token limit is separate from the configurable total context capacity
 and the resulting input budget. Raising it reduces the available input budget and
@@ -1628,7 +1658,19 @@ lines (`class`, `def`, `function` and similar) of its omitted middle with their 
 numbers. File contents in `write_file`, `edit_file` and `notebook_edit` arguments keep
 their first 600 bytes and a marker (the file on disk has the current content), and a
 read whose file was later read again with the same arguments, or changed, moved or
-deleted by a completed call, is replaced by a marker. The app's own hidden messages
+deleted by a completed call, is replaced by a marker. Tool results of 2 KB or more from
+the older summarized turns (all but the latest three turns being summarized) are left out
+of the summary requests, each replaced by a short marker naming its size, tool and file, for
+example `[Output cleared by the app before summarizing: 16 KB from read_file src/db.py, in an
+older turn. …]`; a failed or timed-out command keeps the last 600 bytes of its output, where
+the error usually is. The assistant's replies, which used those results, stay. A long chat
+then needs fewer and smaller paid summary requests; the agent's own context and the saved
+history keep every result, and a compaction inside one long request keeps that request's results
+(only turns older than the latest three are cleared, as above).
+The compaction record in the notice's data counts them (`cleared_results`, `cleared_bytes`).
+The summary, handoff and condense prompts say that the app records the files read and changed
+itself (the app record below), so the summary's **Files read and changed** names only the files
+that matter for the work ahead. The app's own hidden messages
 (automatic retries, Verify results) are labelled as the app's, not the user's; the
 note you write when declining Verify stays your words. Your messages are never
 shortened, except for the @ file and ! output attachments in them.
@@ -1800,9 +1842,14 @@ the input budget, so later results have room before another compaction. The summ
 (and handoff) request is asked to keep the facts the unfinished work needs from the
 files and output read so far, and a notice reports the compaction. Manual **Compact
 now** summarizes every turn before the latest one and keeps the latest turn intact. While a
-compaction runs, the hint under the message box counts the time (`Compacting context… 1 min 50 s`)
-and, for an automatic compaction, says that the next request passed the auto-compact threshold;
-summary requests are not streamed, so a large one can take a few minutes. Summaries persist across
+compaction runs, the hint under the message box names the request it is on and counts the time
+since the compaction started, for example `Compacting context: condensing (request 2) · 1 min 05 s`
+(writing the handoff, summarizing or condensing; a retry keeps the number), and says why it runs:
+the next request passed the auto-compact threshold, or this request's tool results did (a
+compaction inside one long request); **Compact now** gives no reason. The server sends these
+before each summary request and with the chat when it is opened, so a page opened or reloaded
+mid-compaction shows them too. Summary requests are not streamed, so a large one can take a few
+minutes. Summaries persist across
 restarts, while the full display transcript and original model/tool history remain
 in that conversation's JSONL file. Summary requests are additional billed inference. A failed or stopped
 summary leaves the previous summary state intact and performs no tools. Summaries

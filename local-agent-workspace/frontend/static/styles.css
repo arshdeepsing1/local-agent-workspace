@@ -648,3 +648,6 @@ body.panel-resizing{cursor:col-resize;user-select:none}
 .capability-table tr[data-status=rejected] td:nth-child(2),.capability-table tr[data-status=error] td:nth-child(2){color:#98492f}
 .overview-capabilities{margin:-8px 0 20px;font-size:12px}.overview-capabilities>summary{cursor:pointer;color:var(--muted);padding:4px 0}
 @media(max-width:600px){.capability-table td:last-child{white-space:normal}.endpoint-requests li,.endpoint-progress li{flex-direction:column}}
+/* 2026-10-16 context: the context meter's tool definitions per MCP server. */
+.context-tool-groups{list-style:none;margin:3px 0 0;padding:0;font-size:11px;color:var(--muted)}
+.context-tool-groups li{margin:1px 0;overflow-wrap:anywhere}

@@ -185,6 +185,19 @@ async def test_a_tool_loop_sends_its_signed_reasoning_back_and_the_next_turn_dro
     assert items_in(manager.serving.transport.bodies(OPUS)[2]) == []
 
 
+async def test_a_step_note_does_not_stop_the_reasoning_going_back(runtime, monkeypatch):
+    # The changed-files or jobs note joins the last message after the reasoning is matched to the history.
+    manager, session = runtime
+    notes = iter(["", "Background jobs finished since your last step: 1234abcd `make` completed (exit 0)."])
+    monkeypatch.setattr(manager, "step_notices", lambda session, tools: next(notes, ""))
+    manager.serving = ReplayClient(manager.settings, [agent(tool_step()), agent(sse_chunks("It is a demo."))])
+    await manager.run(session, "What is this project?")
+    second = manager.serving.transport.bodies(OPUS)[1]
+    assert items_in(second) == [signed_item()]
+    assert "Background jobs finished since your last step" in json.dumps(second["messages"][-1])
+    assert "Background jobs finished" not in json.dumps(second["messages"][0])
+
+
 async def test_with_the_setting_off_nothing_is_kept_or_sent(runtime):
     manager, session = runtime
     manager.settings.values["thinking_replay"] = False

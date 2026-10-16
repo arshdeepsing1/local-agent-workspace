@@ -362,6 +362,9 @@ class PromptCache:
         return read, written, total
 
 
+STEP_NOTE = re.compile(r"\n\n\[Note from the app, not the user's words or tool output: .*\]\Z", re.DOTALL)
+
+
 def text_of(content):
     if isinstance(content, str):
         return content
@@ -410,7 +413,8 @@ class Brain:
                  for item in body.get("tools") or [] if isinstance(item, dict)}
         users = [message for message in messages if message.get("role") == "user"]
         first = text_of(users[0].get("content")) if users else ""
-        prompt = text_of(users[-1].get("content")) if users else ""
+        # The app's step note (changed files, finished jobs) can end the last message: not the user's words.
+        prompt = STEP_NOTE.sub("", text_of(users[-1].get("content"))) if users else ""
         made = tool_calls_before(messages)
         results = tool_results(messages)
         words = prompt.lower()

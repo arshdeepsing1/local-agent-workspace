@@ -258,14 +258,19 @@ export function useWorkspace() {
         if (data.type === 'delta') setSession(current => current?.id === activeId ? {
           ...current, events: current.events.map(e => e.id === data.id ? { ...e, text: (e.text || '') + data.text } : e),
         } : current)
+        // A compaction's progress (phase, request number, start, trigger) lasts until the status leaves 'compacting'.
+        if (data.type === 'compaction') setSession(current => current?.id === activeId ? { ...current, compaction_progress: data.progress } : current)
         if (data.type === 'status') {
           // Keep the sidebar current and prevent an older list response from
           // replacing this newer streamed status.
           sessionsRequest.current++
-          setSession(current => current?.id === activeId ? {
-            ...current, status: data.status, ...('terminal_reason' in data ? { terminal_reason: data.terminal_reason } : {}),
-            ...(data.turn_ended ? { turn_ended: data.turn_ended } : {}),
-          } : current)
+          setSession(current => {
+            if (current?.id !== activeId) return current
+            const { compaction_progress: progress, ...rest } = current
+            return { ...rest, status: data.status, ...('terminal_reason' in data ? { terminal_reason: data.terminal_reason } : {}),
+              ...(data.turn_ended ? { turn_ended: data.turn_ended } : {}),
+              ...(data.status === 'compacting' && progress ? { compaction_progress: progress } : {}) }
+          })
           setSessions(current => current.map(item => item.id === activeId ? {
             ...item, status: data.status, ...(data.terminal_reason ? { terminal_reason: data.terminal_reason } : {}),
             ...(data.turn_ended ? { turn_ended: data.turn_ended, turn_delegated: !!data.turn_delegated } : {}),

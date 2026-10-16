@@ -146,6 +146,13 @@
 // Status message: { type: 'status', status, terminal_reason?, turn_ended? (sent with 'idle'
 //   when a turn ended; a manual compaction leaves turn_ended unchanged), turn_delegated? (true, with
 //   turn_ended, when a parent's delegate_task started that turn) }
+// Compaction message: { type: 'compaction', progress: CompactionProgress }, sent before each summary or condensing
+//   request of a compaction. CompactionProgress: { phase: 'handoff'|'summary'|'condense', request (from 1; a retry
+//   keeps the number), started and request_started (server time, epoch seconds), trigger: 'manual'|'in_turn'|'auto'
+//   |null }. The session (snapshot, GET /sessions/<id>) carries it as compaction_progress? while its status is
+//   'compacting'; a status other than 'compacting' ends it.
+// GET /sessions/<id>/context -> { status, context_info: ContextInfo | null, compaction_progress? }: the meter as
+//   last prepared, without building a request.
 // /api/presence: a WebSocket (same protocols as the stream) each page holds open; no messages.
 // AgentEvent: { id, type: 'user'|'assistant'|'tool'|'notice'|'error', text?,
 //   reasoning_summary? (the reply's thinking text the endpoint returned, redacted, at most 12,000 characters),
@@ -246,8 +253,14 @@
 // ContextInfo: { estimated_tokens, input_budget, context_window, reply_reserve,
 //   compactions, summarized_messages, estimate_method, instruction_files, warnings,
 //   instruction_sources?: [{ path, scope ('.', a folder, 'files matching <globs>' for a project rule, 'all projects',
-//   'this workspace' or 'this project'), status: 'loaded'|'trimmed'|'omitted', estimated_tokens, reason? }],
-//   prepared_for_next_turn?, breakdown?, estimate_scale?, summary_adjustment?: 'condensed'|
+//   'this workspace', 'this project', 'this chat' (a skill selected for the chat: path 'Skill /<id>') or 'this
+//   message' (a skill the latest message selected; it counts in messages, not system instructions)),
+//   status: 'loaded'|'trimmed'|'omitted', estimated_tokens, reason? }],
+//   prepared_for_next_turn?, breakdown?, tool_groups? ({ 'Built-in tools': tokens, 'MCP <server>': tokens, … }:
+//   breakdown.tool_definitions split per MCP server; the parts add up to it), estimate_scale?,
+//   estimate_anchor? ({ reported, added }: the estimate is the input Databricks reported for the chat's previous
+//   request plus the scaled estimate of what was added since; added is that raw estimate, negative when the
+//   request shrank), summary_adjustment?: 'condensed'|
 //   'condensed_trimmed'|'trimmed' (the summary was over its byte limit: condensed by a request; condensed but still
 //   over, so the app shortened its least important sections; or shortened without a successful condense),
 //   summary_fitted_to_budget?: 'condensed'|'condensed_trimmed'|'trimmed' (shortened because the request after
@@ -257,14 +270,17 @@
 //   estimate_prior? (true: estimate_scale is the model's starting ratio, not yet from reported counts),
 //   auto_compact_threshold?, auto_compact_percent?, compaction_deferred? (over the threshold but within the input
 //   budget, and no cut brings it under the threshold: sent as it was), compaction?: Compaction (when this request compacted), last_request?: LastRequest,
-//   next_estimate?: { tokens, scale?, percent_of_input_budget, percent_of_threshold } (the app's estimate of the
+//   next_estimate?: { tokens, scale?, anchor? ({ model, reported, added, raw }: anchored like estimate_anchor),
+//   held_anchor? (the same, kept after a change to another model so a change back anchors again),
+//   percent_of_input_budget, percent_of_threshold } (the app's estimate of the
 //   next request before the user's next message; set when a turn ends), payload_bytes? (the size of the request
 //   body sent), payload_limit_bytes? (the Databricks per-request limit, 4,000,000) }. After a model change or a
 //   Settings save the budget fields, the threshold and next_estimate of an idle chat follow the new setup;
 //   estimated_tokens, estimate_scale and last_request still describe the last request.
 // Compaction: { number, trigger: 'manual'|'in_turn'|'auto', before_tokens, after_tokens, threshold_tokens,
 //   summarized_messages, requests (summary and condense requests), summarize_requests?, condense_requests? (the
-//   two apart; absent on older compactions), elided_bytes, superseded_results }
+//   two apart; absent on older compactions), elided_bytes, superseded_results, cleared_results?, cleared_bytes? (tool
+//   results of older turns the summary requests left out, and the bytes saved; only when there were any) }
 // LastRequest (what Databricks reported for the latest agent request): { call_id, model, status, finish_reason?,
 //   partial (ended without a finish reason: counts may be incomplete), input_tokens (= uncached + cache read +
 //   cache write), uncached_input_tokens, cache_read_input_tokens, cache_creation_input_tokens, output_tokens?,

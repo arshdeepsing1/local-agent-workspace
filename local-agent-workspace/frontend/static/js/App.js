@@ -231,7 +231,8 @@ export default function App() {
         ${active?.status === 'awaiting_approval' ? html`<p class="composer-hint"><span role="status">${(name => name === 'ask_user' ? 'The agent is waiting for your answer above.' : name === 'submit_plan' ? 'A plan is waiting for your review above.' : 'An action is waiting for your approval above.')(active.events?.findLast(event => event.state === 'pending')?.name)}</span>
           <button class="composer-hint-show" onClick=${showWaiting}>Show</button></p>` : null}
         ${active?.status === 'compacting' ? html`<${CompactingHint} key=${active.id} since=${statusSeen.current.since}
-          automatic=${statusSeen.current.before == null ? null : statusSeen.current.before !== 'idle'} percent=${active.context_info?.auto_compact_percent} />` : null}
+          automatic=${statusSeen.current.before == null ? null : statusSeen.current.before !== 'idle'} percent=${active.context_info?.auto_compact_percent}
+          progress=${active.compaction_progress} />` : null}
         ${active?.status === 'naming' ? html`<p class="composer-hint" role="status">Creating conversation title…</p>` : null}
         <${ContextMeter} key=${`context-${app.viewKey}`} info=${active?.context_info} model=${active?.model} busy=${busy} status=${active?.status} openSignal=${contextSignal}
           onCompact=${active && app.ready && app.online && app.settings?.configured ? async preservationNote => {
@@ -259,19 +260,32 @@ export default function App() {
   </div>`
 }
 
+// What a compaction request does (CompactionProgress.phase).
+const COMPACTION_PHASES = { handoff: 'writing the handoff', summary: 'summarizing', condense: 'condensing' }
+
 // "Compacting context… 1 min 50 s · why": the time since this page saw the chat start compacting (none after opening
 // it mid-compaction; it is not announced every second), and the reason: automatic is true for a compaction a turn
 // started, false for Compact now, null when unknown. percent: the chat's auto-compact share of the input budget.
-function CompactingHint({ since, automatic, percent }) {
+// progress (the server's CompactionProgress) names the request ("Compacting context: condensing (request 2) ·
+// 1 min 05 s") and gives the start and the trigger, so a page opened or reloaded mid-compaction shows them too.
+function CompactingHint({ since, automatic, percent, progress }) {
   const [now, setNow] = useState(() => Date.now())
+  const started = typeof progress?.started === 'number' ? progress.started * 1000 : since
   useEffect(() => {
-    if (since == null) return undefined
+    if (started == null) return undefined
     const timer = setInterval(() => setNow(Date.now()), 1000)
     return () => clearInterval(timer)
-  }, [since])
-  const reason = automatic ? `The next request passed the auto-compact threshold${typeof percent === 'number' ? ` (${percent}%)` : ''}. ` : ''
-  return html`<p class="composer-hint compacting-hint" role="status">Compacting context…${since != null
-    ? html` <span class="compacting-elapsed" aria-hidden="true">${elapsedText(Math.max(0, now - since) / 1000)}</span>` : null} · ${reason}Summary requests are not streamed and can take a few minutes.</p>`
+  }, [started])
+  const trigger = progress?.trigger ?? (automatic == null ? null : automatic ? 'auto' : 'manual')
+  const share = typeof percent === 'number' ? ` (${percent}%)` : ''
+  const reason = trigger === 'auto' ? `The next request passed the auto-compact threshold${share}. `
+    : trigger === 'in_turn' ? `This request's tool results passed the auto-compact threshold${share}. ` : ''
+  const phase = COMPACTION_PHASES[progress?.phase]
+  const elapsed = started != null
+    ? html`<span class="compacting-elapsed" aria-hidden="true">${elapsedText(Math.max(0, now - started) / 1000)}</span>` : null
+  return html`<p class="composer-hint compacting-hint" role="status">${phase && Number.isInteger(progress.request)
+    ? html`Compacting context: ${phase} (request ${progress.request})${elapsed ? html` · ${elapsed}` : null}`
+    : html`Compacting context…${elapsed ? html` ${elapsed}` : null}`} · ${reason}Summary requests are not streamed and can take a few minutes.</p>`
 }
 
 // Why Databricks cannot be used, with Check again (keeps focus while it checks and says what it found) and Open settings.
