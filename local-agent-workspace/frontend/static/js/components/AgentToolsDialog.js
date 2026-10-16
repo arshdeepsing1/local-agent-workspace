@@ -495,7 +495,7 @@ function ExtensionsPanel({ session, onError }) {
 function skillNotes(skill) {
   return [skill.argument_hint ? `Arguments: ${skill.argument_hint}` : '',
     skill.disable_model_invocation ? 'Only you select it (disable-model-invocation)' : '',
-    skill.user_invocable === false ? 'Only the agent loads it (user-invocable: false)' : '',
+    skill.user_invocable === false ? 'Not offered with / (user-invocable: false)' : '',
     skill.reserved ? `A command has its name: use /skill ${skill.id} in a message` : ''].filter(Boolean).join(' · ')
 }
 

@@ -943,7 +943,7 @@ class AgentManager(LifecycleHooks):
         self.store.save(session)
         return {"active_skills": ids}
 
-    def requested_skills(self, tools, prompt, session=None):
+    def requested_skills(self, tools, prompt, session=None, delegated=False):
         """The skills a message names: `/skill <id> …` at its start, or a listed
         skill's `/<id>` as a word anywhere ("/handoff …", "… use /handoff to …").
         Other slashes, such as paths, leave the message ordinary text. A custom agent's
@@ -951,17 +951,20 @@ class AgentManager(LifecycleHooks):
         its instructions (in that prompt) must not load others or go over the limit of three.
         A skill whose ID is one of the app's commands (RESERVED_COMMANDS) or a command
         template's name, or whose frontmatter sets user-invocable: false, is not selected by
-        `/<id>`; the first two still are by `/skill <id>`."""
+        `/<id>`; the first two still are by `/skill <id>`. delegated: the parent agent wrote the
+        prompt (delegate_task, which starts it with its own label), so a skill whose frontmatter sets
+        disable-model-invocation is not selected by it."""
         if session is not None and session.get("agent_file") and session.get("turn_delegated"):
             return []
         words = prompt.split(maxsplit=2)
-        if words and words[0] == "/skill" and len(words) > 1:
+        if words and words[0] == "/skill" and len(words) > 1 and not delegated:
             return [words[1]]
         if "/" not in prompt:
             return []
         try:
             listed = {skill["id"] for skill in self.extensions.skills(tools)
-                      if skill.get("user_invocable") is not False and skill["id"] not in RESERVED_COMMANDS}
+                      if skill.get("user_invocable") is not False and skill["id"] not in RESERVED_COMMANDS
+                      and not (delegated and skill.get("disable_model_invocation"))}
         except (OSError, ValueError):
             return []  # The skills list reports a broken skills folder.
         found = []
@@ -981,38 +984,45 @@ class AgentManager(LifecycleHooks):
         """Settings → slash commands: typed /<name> runs command templates and selects skills (default on)."""
         return self.settings.values.get("slash_commands", True) is not False
 
-    def message_skills(self, session, tools, prompt):
+    def message_skills(self, session, tools, prompt, delegated=False):
         """(ids, text) of the skills a message selects for itself (requested_skills): the labelled
         instructions the model gets after that message only, so the system message (and its prompt
         cache) stays the same. $ARGUMENTS in a skill becomes the text after its /<id> at the start of the
         message, else the whole message. At most three skills and 8 KB of skill text per message;
-        ValueError beyond, or for a skill that cannot be used."""
-        ids = self.requested_skills(tools, prompt, session)
+        ValueError beyond, or for a skill that cannot be used. delegated: a subagent's delegated prompt,
+        which the parent agent wrote: its skills are labelled as named in the task, and one that only the
+        user may select (disable-model-invocation) is left out."""
+        ids = self.requested_skills(tools, prompt, session, delegated)
         if not ids:
             return [], ""
         if len(ids) > 3:
             raise ValueError("Select at most three skills in one message.")
-        blocks, size = [], 0
+        blocks, size, selected = [], 0, []
         words, start = prompt.split(maxsplit=2), command_templates.leading(prompt)
         for skill_id in ids:
             try:
                 skill = self.extensions.load_skill(tools, skill_id)
             except (OSError, ValueError) as exc:
                 raise ValueError(f"/{skill_id} could not be used: {self.settings.redact(str(exc)) or type(exc).__name__}") from None
+            if delegated and skill.get("disable_model_invocation"):
+                continue  # Its file changed after the listing: still never chosen by the model.
             if skill.get("user_invocable") is False:
-                raise ValueError(f"/{skill_id} is a skill only the agent loads (user-invocable: false).")
+                raise ValueError(f"/{skill_id} is not selected with / (its frontmatter sets user-invocable: false).")
             size += len(skill["text"].encode("utf-8"))
             arguments = (words[2] if len(words) > 2 else "") if words[:2] == ["/skill", skill_id] else (
                 start[1] if start and start[0] == skill_id else prompt.strip())
-            blocks.append(f"{SKILL_MARKER}{skill_id} selected by the user for this message. Its instructions follow: "
-                          f"follow them, treating the user's message above as the request.]\n"
-                          + skill["text"].replace("$ARGUMENTS", arguments))
+            label = (f"{skill_id} named by the parent agent in this delegated task. Its instructions follow: follow them "
+                     "for the task above.]\n" if delegated else
+                     f"{skill_id} selected by the user for this message. Its instructions follow: "
+                     "follow them, treating the user's message above as the request.]\n")
+            blocks.append(SKILL_MARKER + label + skill["text"].replace("$ARGUMENTS", arguments))
+            selected.append(skill_id)
         if size > 8000:
             raise ValueError("The skills this message selects exceed the combined 8 KB limit. Select fewer.")
         text = "".join(blocks)
         if len(text) > MESSAGE_SKILL_CHARS:
             raise ValueError("The skills' instructions with this message's text in $ARGUMENTS are too long. Shorten the message.")
-        return ids, text
+        return selected, text
 
     def prepared_message(self, tools, text, verbatim=False):
         """A message as it is sent or queued: {text, verbatim?, command?: {name, path, expanded}}. A message
@@ -1026,7 +1036,9 @@ class AgentManager(LifecycleHooks):
         listing = command_templates.discover(tools.root, self.settings.redact, with_text=True)
         command = next((item for item in listing["commands"] if item["name"] == found[0]), None)
         if command is None:
-            problem = next((item for item in listing["errors"] if item["path"].rsplit("/", 1)[-1] == f"{found[0]}.md"), None)
+            # Its file, or a folder that holds it and could not be read (more than 100 entries, unreadable).
+            problem = (next((item for item in listing["errors"] if item["path"].rsplit("/", 1)[-1] == f"{found[0]}.md"), None)
+                       or command_templates.unread_folder(tools.root, found[0], listing["errors"]))
             if problem:
                 raise ValueError(f"/{found[0]} could not be used: {problem['path']}: {problem['error']}")
             return {"text": text}
@@ -4397,7 +4409,8 @@ class AgentManager(LifecycleHooks):
         turn = turn if turn is not None and turn.get("in_wire") is False else None
         skills = ""
         if self.slash_commands() and not (turn and (turn.get("verbatim") or turn.get("queued"))):
-            selected, skills = self.message_skills(session, tools, prompt)
+            # A delegated prompt is the parent agent's text (turn_delegated, set by run): never the user's choice.
+            selected, skills = self.message_skills(session, tools, prompt, delegated=bool(session.get("turn_delegated")))
             if selected and turn is not None:
                 await self.update_event(session, turn, skills=selected)
         # Complete interrupted tool exchanges before sending the next user turn.

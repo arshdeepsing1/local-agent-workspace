@@ -220,7 +220,7 @@ async def test_skill_frontmatter_hint_model_and_user_invocation(runtime, monkeyp
     assert last_user(requests[-1]).endswith("Deploy rules.")
     await send(manager, session, "Follow /style here")
     assert last_user(requests[-1]) == "Follow /style here"
-    with pytest.raises(ValueError, match="only the agent loads"):
+    with pytest.raises(ValueError, match=r"is not selected with / \(its frontmatter sets user-invocable: false\)"):
         await manager.submit_message(session["id"], "/skill style now")
 
 

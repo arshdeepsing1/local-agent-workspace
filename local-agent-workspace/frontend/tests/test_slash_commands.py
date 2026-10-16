@@ -162,6 +162,29 @@ def test_fork_new_and_clear(ui, page):
     expect(page.get_by_role("button", name="Permissions: Manual")).to_be_visible()
 
 
+DRAFT = "localStorage.getItem('local-workspace:draft:a')"
+
+
+def test_a_command_that_opens_another_view_leaves_no_draft_behind(ui, page):
+    """/clear, /new and /fork switch the view after the old chat's draft was saved (by the debounce, or
+    when the view switched): that saved command is removed, so the chat does not reopen with it in its box."""
+    start_app(ui, page)
+    for command, url in (("/clear", "=== null"), ("/new", "=== null"), ("/fork", "=== 'forked'")):
+        box = message(page)
+        box.fill(command)
+        if command == "/clear":
+            ui.wait(f"{DRAFT} === '/clear'")  # The paused-before-Enter case: the debounced save ran.
+        box.press("Escape")  # Close the / menu: Enter runs the typed command.
+        box.press("Enter")
+        ui.wait(f"new URL(location.href).searchParams.get('session') {url}")
+        ui.wait(f"{DRAFT} === null")
+        page.get_by_role("button", name="Work").first.click()
+        ui.show_session("a")
+        expect(message(page)).to_have_value("")
+        assert ui.js(DRAFT) is None
+    no_messages(ui)
+
+
 def test_clear_starts_a_new_chat_with_the_same_model_mode_and_effort(ui, page):
     start_app(ui, page)
     run(page, "/clear")

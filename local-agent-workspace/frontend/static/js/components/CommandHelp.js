@@ -20,6 +20,7 @@ export default function CommandHelp({ notice, onDismiss }) {
     <p>These run here and are never sent to the agent. Type <code>/</code> at the start of the message box to list them with
       your custom commands (<code>.agents/commands/&lt;name&gt;.md</code>) and skills; <code>/&lt;skill-id&gt;</code> in a message
       sends that skill with it. To send text such as <code>/clear</code> to the agent as it is, turn on
-      <strong>Send as plain text</strong> (the T button below the box) or press Shift+Alt+Enter.</p>
+      <strong>Send as plain text</strong> (the T button below the box) or press Shift+Alt+Enter: either applies to the next
+      message only.</p>
   </section>`
 }

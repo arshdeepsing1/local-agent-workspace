@@ -554,12 +554,17 @@ class DelegateManager:
 
     def agent_skills(self, parent, spec):
         """(skill IDs, notes): the agent's skills that load in the parent's workspace, within the
-        conversation limits of AgentManager.skill_text; the others are left out with a note."""
+        conversation limits of AgentManager.skill_text; the others are left out with a note. The
+        model chooses when an agent runs, so a skill only the user selects (disable-model-invocation)
+        is left out too."""
         if not spec["skills"]:
             return [], []
         tools, loaded, notes = self.manager.session_tools(parent), [], []
         for skill_id in spec["skills"]:
             try:
+                if self.manager.extensions.load_skill(tools, skill_id).get("disable_model_invocation"):
+                    notes.append(f"Skill {skill_id} was not loaded: only the user selects it (disable-model-invocation).")
+                    continue
                 self.manager.skill_text({}, tools, [*loaded, skill_id])
                 loaded.append(skill_id)
             except (OSError, ValueError, UnicodeError) as exc:

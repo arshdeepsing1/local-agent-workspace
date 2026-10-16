@@ -184,6 +184,15 @@ def discover(workspace, redact=lambda text: text, with_text=False):
     return {"commands": commands, "errors": errors}
 
 
+def unread_folder(workspace, name, errors):
+    """The error (from discover's errors) of a command folder that could not be read as a whole but holds
+    <name>.md, so /<name> is reported instead of sent as plain text; else None."""
+    failed = {item["path"]: item for item in errors}
+    _, folders = _folders(workspace)
+    return next((failed[shown] for base, shown, _ in folders
+                 if shown in failed and os.path.lexists(base / f"{name}.md")), None)
+
+
 def find(workspace, name, redact=lambda text: text):
     """The command with this name and its template text, or None."""
     return next((command for command in discover(workspace, redact, with_text=True)["commands"]

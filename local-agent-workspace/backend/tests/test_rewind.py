@@ -376,6 +376,34 @@ async def test_a_resend_with_a_refused_file_changes_nothing(runtime):
     assert session["id"] not in manager.tasks
 
 
+async def test_a_resend_with_a_command_or_skill_that_cannot_be_used_changes_nothing(runtime):
+    """A command template that cannot be used (a broken file, a refused @ file in its text) or skills over
+    the per-message limits are refused before the backup and the cut, as for a typed @ file."""
+    app, manager, session, project = runtime
+    chat = standard(runtime)
+    (project / ".env").write_text("TOKEN=abc\n")
+    folder = project / ".agents/commands"
+    folder.mkdir(parents=True)
+    (folder / "broken.md").write_text("---\ndescription: never closed\n")
+    (folder / "env.md").write_text("Look at @.env")
+    for skill_id in ("s1", "s2", "s3", "s4"):
+        skill = project / ".agents/skills" / skill_id / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text(f"Rules {skill_id}.")
+    before = jsonl(manager, session["id"])
+    async with await client_for(app) as client:
+        for text, message in (("/broken", "/broken could not be used: .agents/commands/broken.md: The frontmatter has no closing"),
+                              ("/env", "@.env: Credential files are excluded from file tools."),
+                              ("Use /s1 /s2 /s3 /s4", "Select at most three skills in one message.")):
+            response = await client.post(f"/api/sessions/{session['id']}/rewind", json={
+                "before_event_id": "u2", "conversation": True, "resend_text": text})
+            assert response.status_code == 400 and response.json()["detail"].startswith(message), response.text
+    assert jsonl(manager, session["id"]) == before
+    assert len(manager.store.list()) == 1  # No archived backup.
+    assert chat.files() == {"a.txt": "a3", "b.txt": "b3"}
+    assert session["id"] not in manager.tasks
+
+
 async def test_a_resend_attaches_again_the_command_output_the_removed_message_carried(runtime, monkeypatch):
     """Retry (and Edit, and a conversation rewind) of a message sent with ! output: the output waits
     again, so the resend carries it as the first send did."""

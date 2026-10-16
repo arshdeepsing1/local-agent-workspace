@@ -250,6 +250,21 @@ async def test_a_broken_or_too_long_command_is_an_error_at_once(runtime, monkeyp
     assert requests == [] and users(manager.store.get(session["id"])) == []
 
 
+async def test_a_command_in_a_folder_that_could_not_be_read_is_an_error(runtime, monkeypatch, home):
+    """A folder over the entry limit is skipped as a whole: /<name> of a file in it is reported, not sent as text."""
+    manager, session, project = runtime
+    requests = gateway(monkeypatch)
+    for index in range(101):
+        write(home / ".agents/commands", f"c{index:03d}", "Deploy $ARGUMENTS")
+    with pytest.raises(ValueError, match=r"/c000 could not be used: ~/\.agents/commands: The folder has more than 100 entries"):
+        await manager.submit_message(session["id"], "/c000 prod")
+    assert requests == [] and users(manager.store.get(session["id"])) == []
+    # A name the folder does not hold is still an ordinary message.
+    await manager.submit_message(session["id"], "/elsewhere prod")
+    await settle(manager, session["id"])
+    assert requests[-1]["messages"][-1]["content"] == "/elsewhere prod"
+
+
 async def test_plain_text_and_slash_commands_off_send_the_text_as_typed(runtime, monkeypatch):
     manager, session, project = runtime
     (project / "notes.txt").write_text("Notes.\n")

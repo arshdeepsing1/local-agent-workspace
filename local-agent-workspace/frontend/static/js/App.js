@@ -167,6 +167,10 @@ export default function App() {
       openAgentTools: tab => setAgentToolsOpen(tab),
       rename, notify: text => setCommandNotice({ key: app.viewKey, text }),
       help: () => setCommandNotice({ key: app.viewKey, help: true }),
+    }).then(() => {
+      // /new, /clear and /fork open another view: the command, saved as this view's draft when the view
+      // switched, is removed, so this chat does not reopen (after a reload) with the command in its box.
+      if (id === 'new' || id === 'clear' || id === 'fork') forgetDraft(`/${id}`, draftKey)
     })
   }
   const composer = html`<${Composer} key=${app.viewKey} value=${draft} setValue=${setDraft} model=${model}

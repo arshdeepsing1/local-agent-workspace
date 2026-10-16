@@ -418,10 +418,10 @@ when opening a conversation or performing restart recovery.
     (`/tmp/x.log`, `~/handoff/`), is sent unchanged.
   - **Custom commands** (`/<name>` from a command file) send the file's text with your message; see
     **Custom commands** under **Agent tools: MCP, skills, and hooks**.
-  - **Send as plain text**: the **T** button below the box (or Shift+Alt+Enter, for one message)
-    sends the text exactly as typed: no built-in or custom command, no skill, no `@` file snapshot
-    and no `!` shell command (the `/` and `@` lists do not open). Output of an earlier `!` command
-    that waits for your next message still goes with it. The message shows **Sent as plain text**,
+  - **Send as plain text**: the **T** button below the box, or Shift+Alt+Enter, sends the next
+    message exactly as typed (the button turns off again after that message): no built-in or custom
+    command, no skill, no `@` file snapshot and no `!` shell command (the `/` and `@` lists do not
+    open). Output of an earlier `!` command that waits for your next message still goes with it. The message shows **Sent as plain text**,
     and **Retry** and **Edit** send it the same way again. With **Settings → Commands and files →
     Run commands typed with /** turned off (it is on by default), typed `/` text is sent as it is in
     every message; built-in commands then run only when chosen in the `/` menu.
@@ -1877,9 +1877,10 @@ project (for example a link to a shared folder), or one of your folders, that ca
 has more than 100 entries or 30 skills, is skipped without an error, and the shipped skills stay
 available; each of your two folders has its own limit of 30. Optional simple frontmatter supplies
 `name`, `description`, `argument-hint` (shown in the `/` menu), `disable-model-invocation: true`
-(left out of the skill index and `list_skills`, and `use_skill` refuses it: only you select it) and
+(left out of the skill index and `list_skills`, `use_skill` refuses it, a `delegate_task` task that
+names it does not select it, and a custom agent's `skills` list leaves it out: only you select it) and
 `user-invocable: false` (not in the `/` menu, and neither `/<skill-id>` nor `/skill <skill-id>`
-selects it: only the model loads it). In a skill's text, `$ARGUMENTS` becomes the text after
+selects it; the model loads it, and you can still check it in **Agent tools → Extensions**). In a skill's text, `$ARGUMENTS` becomes the text after
 `/<skill-id>` (or `/skill <skill-id>`) when the message starts with it, otherwise the whole message.
 Enable a discovered skill in the panel, or ask the model to use its `list_skills` / `use_skill`
 tools: that selection persists per chat, its instructions are part of every request's system
@@ -1919,9 +1920,10 @@ with the same permission checks and limits. The conversation shows what you type
 command, and the record of your earlier requests that compaction keeps holds only what you typed. A
 command in a message you queue while the agent works is expanded when you queue it, so a broken file
 or a refused `@` file is reported at once. A command file that cannot be used makes `/<name>` an error
-that names the file. **Agent tools → Extensions** lists the commands, their notes and the files that
-could not be read. Command files are project content, like `AGENTS.md`: review files you did not
-write before you run them. For example, `.agents/commands/check.md`:
+that names the file, and so does a command folder that holds `<name>.md` but could not be read as a
+whole (for example one with more than 100 entries). **Agent tools → Extensions** lists the commands,
+their notes and the files that could not be read. Command files are project content, like
+`AGENTS.md`: review files you did not write before you run them. For example, `.agents/commands/check.md`:
 
 ```markdown
 ---
@@ -1931,8 +1933,8 @@ argument-hint: <path> [focus]
 Review @$1 for correctness bugs, with a focus on $2. Report each one with path:line.
 ```
 
-`/check src/parser.py error handling` then sends the review request with a snapshot of
-`src/parser.py`.
+`/check src/parser.py "error handling"` then sends the review request with a snapshot of
+`src/parser.py` (the quotes keep the two words together as `$2`; without them `$2` is `error`).
 
 The app ships a detailed handoff skill at `skills/handoff/SKILL.md`, available in every
 workspace: send `/handoff Create a handoff for this conversation` (or type `/han` and
@@ -2227,7 +2229,7 @@ Report each finding with path:line, its severity and a suggested fix.
 | `profile` | `read_only` (the default), `file_editor` or `inherit`, as for `tool_profile`. |
 | `model` | Optional Databricks serving endpoint name, only one you already use: the Settings model, a **Settings → Subagents** model or the model of one of your chats (not a subagent chat). Any other endpoint runs on the chat's model, with a note in Agent types and on the approval card. Left out (or `inherit`): the chat's model. |
 | `effort` | Optional `default`, `low` (Fast), `medium`, `high`, `xhigh` or `max`; left out: the chat's effort. |
-| `skills` | Optional: up to three skill IDs loaded into the subagent like selected skills; one that does not load is left out with a note in its first prompt. A `/skill` word in the instructions or the task loads no other skill. |
+| `skills` | Optional: up to three skill IDs loaded into the subagent like selected skills; one that does not load, or whose frontmatter sets `disable-model-invocation: true` (the model chooses when an agent runs), is left out with a note in its first prompt. A `/skill` word in the instructions or the task loads no other skill. |
 | `max_steps` | Optional 1–24: the subagent's steps when the call gives no `max_steps` (a call's own value wins). |
 
 The parser is small and strict: `key: value` lines, `[a, b]` or `- item` lists, `"..."` or
