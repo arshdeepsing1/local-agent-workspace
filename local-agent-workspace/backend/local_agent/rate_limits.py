@@ -1,7 +1,9 @@
 """Databricks rate limits: the fields of a 429 body, and a wait shared by every chat.
 
-A Databricks 429 body names the limit that was hit (limit_type, limit, current and
-retry_after; see the limits page). parse_rate_limit reads them defensively.
+A Databricks 429 body may name the limit that was hit (limit_type, limit, current and
+retry_after; see the limits page). parse_rate_limit reads them defensively; a body that gives
+only {error_code, message} names the limit type in its words, which limit_type_from_words reads
+(never a number: no limit is learned from words).
 RateLimitGate remembers, per model endpoint, until when Databricks asked for a pause,
 so other chats on the same endpoint wait too instead of adding to the overload, and the
 output-tokens-per-minute (OTPM) limit Databricks reported, so a request whose
@@ -22,7 +24,23 @@ KNOWN_LIMITS = (
     (OTPM, "output tokens per minute (OTPM)"),
     ("queries_per_hour", "queries per hour (QPH)"),
     ("queries_per_second", "queries per second (QPS)"),
+    ("queries_per_minute", "queries per minute (QPM)"),  # AI Gateway's own rate limits are per minute.
 )
+LABELS = dict(KNOWN_LIMITS)
+# The limit type a 429's words name, for a body without limit_type. Specific phrases first,
+# abbreviations only as whole words; a generic "tokens per minute" only when nothing more
+# specific matched. The text is lowercased, with "_" and "-" read as spaces.
+WORD_LIMITS = (
+    (ITPM, re.compile(r"\binput tokens? per minute\b|\bitpm\b")),
+    (OTPM, re.compile(r"\boutput tokens? per minute\b|\botpm\b")),
+    ("queries_per_hour", re.compile(r"\bquer(?:y|ies) per hour\b|\bqph\b")),
+    ("queries_per_minute", re.compile(r"\bquer(?:y|ies) per minute\b|\bqpm\b")),
+    ("queries_per_second", re.compile(r"\bquer(?:y|ies) per second\b|\bqps\b")),
+)
+GENERIC_TOKENS_PER_MINUTE = re.compile(r"\btokens? per minute\b|\btpm\b")
+WORDS_CHARS = 2000  # The most of a 429's message, error_code and detail text the classifier reads.
+MESSAGE_CHARS = 200  # A 429 message kept for notices, request details and the ledger.
+CODE = re.compile(r"[A-Za-z0-9_]{1,64}")
 OTPM_TOO_LOW = (
     "Max output tokens ({max_tokens:,}) is above the output-tokens-per-minute limit Databricks reported for {model} "
     "({limit:,}), so Databricks rejects every request before it starts. Lower Settings → Max output tokens to at "
@@ -61,6 +79,8 @@ class RateLimitInfo:
     limit: int | None = None
     current: int | None = None
     retry_after: float | None = None
+    code: str | None = None  # error_code, or the nested error's code or type (REQUEST_LIMIT_EXCEEDED)
+    message: str | None = None  # The body's message, redacted, whitespace collapsed, at most MESSAGE_CHARS
 
 
 def _count(value):
@@ -93,20 +113,52 @@ def _limit_type(value):
         return KNOWN_LIMITS[2]
     if "second" in normalized or normalized == "qps":
         return KNOWN_LIMITS[3]
+    if ("minute" in normalized and "quer" in normalized) or normalized == "qpm":
+        return KNOWN_LIMITS[4]
     cleaned = re.sub(r"[^a-z0-9_]", "", normalized)[:64]
     return (cleaned, cleaned.replace("_", " ")) if cleaned else (None, None)
 
 
-def parse_rate_limit(payload):
-    """The RateLimitInfo of a 429 body; values nested under "error" override the root's."""
-    fields = {}
-    for source in (payload, payload.get("error") if isinstance(payload, dict) else None):
-        if isinstance(source, dict):
-            fields.update({key: source[key] for key in ("limit_type", "limit", "current", "retry_after")
-                           if key in source})
+def limit_type_from_words(*texts):
+    """The one limit type the texts name, or None (none, or more than one: ambiguous)."""
+    text = re.sub(r"[\s_-]+", " ", " ".join(item for item in texts if isinstance(item, str))[:WORDS_CHARS].lower())
+    found = [name for name, pattern in WORD_LIMITS if pattern.search(text)]
+    if not found and GENERIC_TOKENS_PER_MINUTE.search(text):
+        return "tokens_per_minute"
+    return found[0] if len(found) == 1 else None
+
+
+def _clip(text, limit):
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def parse_rate_limit(payload, text=None, redact=None):
+    """The RateLimitInfo of a 429 body; values nested under "error" override the root's. text is the
+    body as text, the message of a body that is not a JSON object; redact (settings.redact) is applied
+    to the kept message. Without a limit_type field, the limit type is read from the words of the
+    message, error_code and detail (limit_type_from_words)."""
+    fields, words = {}, []
+    root = payload if isinstance(payload, dict) else {}
+    plain = None if isinstance(payload, dict) else text
+    nested = root.get("error") if isinstance(root.get("error"), dict) else {}
+    for source in (root, nested):
+        fields.update({key: source[key] for key in ("limit_type", "limit", "current", "retry_after")
+                       if key in source})
+        words += [source.get(key) for key in ("message", "error_code", "detail")]
     limit_type, label = _limit_type(fields.get("limit_type"))
+    if limit_type is None:
+        named = limit_type_from_words(*words, root.get("error"), plain)
+        limit_type, label = (named, LABELS.get(named) or named.replace("_", " ")) if named else (None, None)
+    code = next((value for value in (nested.get("error_code"), root.get("error_code"), nested.get("code"),
+                                     nested.get("type")) if isinstance(value, str) and CODE.fullmatch(value)
+                 and (redact is None or redact(value) == value)), None)
+    message = next((value for value in (nested.get("message"), root.get("message"), root.get("error"),
+                                        nested.get("detail"), root.get("detail"), plain)
+                    if isinstance(value, str) and value.strip()), None)
+    if message is not None:
+        message = _clip(" ".join((redact(message) if redact else message).split()), MESSAGE_CHARS) or None
     return RateLimitInfo(limit_type, label, _count(fields.get("limit")), _count(fields.get("current")),
-                         _seconds(fields.get("retry_after")))
+                         _seconds(fields.get("retry_after")), code, message)
 
 
 def describe(info):
@@ -119,7 +171,7 @@ def describe(info):
 
 def request_info_fields(info):
     """The rate limit fields a request's details show (only those Databricks sent)."""
-    return {key: value for key in ("limit_type", "limit", "current", "retry_after")
+    return {key: value for key in ("limit_type", "limit", "current", "retry_after", "code", "message")
             if (value := getattr(info, key)) is not None}
 
 
@@ -144,16 +196,18 @@ class RateLimitGate:
 
     def __init__(self, clock=time.monotonic):
         self.clock = clock
-        self.blocked = {}  # model -> {until, owner, limit_type, max_tokens}
+        self.blocked = {}  # model -> {until, owner, limit_type, max_tokens, details}
         self.learned = {}  # (model, limit_type) -> (limit, noted at)
 
-    def note(self, model, owner, delay, info=None, max_tokens=None):
+    def note(self, model, owner, delay, info=None, max_tokens=None, details=None):
+        """A 429 of owner's request to model: block it for delay seconds. details (agents.rate_limit_details)
+        are shown on the notices of the chats that wait. Only a limit Databricks sent as a number is learned."""
         now = self.clock()
         delay = max(0.0, min(float(delay or 0), RATE_LIMIT_WAIT_CAP))
         previous = self.blocked.pop(model, None)
         until = max(previous["until"] if previous else now, now + delay)
-        self.blocked[model] = {"until": until, "owner": owner,
-                               "limit_type": getattr(info, "limit_type", None), "max_tokens": max_tokens}
+        self.blocked[model] = {"until": until, "owner": owner, "limit_type": getattr(info, "limit_type", None),
+                               "max_tokens": max_tokens, "details": details}
         while len(self.blocked) > GATE_MODELS:
             self.blocked.pop(next(iter(self.blocked)))
         if info is not None and info.limit_type is not None and info.limit is not None:
@@ -175,6 +229,11 @@ class RateLimitGate:
                 and max_tokens < block["max_tokens"]):
             return 0.0  # A smaller output reservation may be admitted.
         return left
+
+    def details(self, model):
+        """The Details of the 429 behind model's current block, or None."""
+        block = self.blocked.get(model)
+        return block.get("details") if block is not None else None
 
     def learned_limit(self, model, limit_type):
         entry = self.learned.get((model, limit_type))

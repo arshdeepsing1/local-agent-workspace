@@ -35,11 +35,14 @@ class Usage(Record):
 
 
 class RateLimitDetails(Record):
-    """The fields of a final 429 Databricks named (rate_limits.request_info_fields)."""
-    limit_type: str = Field(min_length=1, max_length=64)
+    """What a final 429 said (agents.rate_limit_fields): the limit it named, its code and message, and the wait."""
+    limit_type: str | None = Field(default=None, min_length=1, max_length=64)
     limit: int | None = Field(default=None, ge=0)
     current: int | None = Field(default=None, ge=0)
     retry_after: float | None = Field(default=None, ge=0)
+    code: str | None = Field(default=None, max_length=64)
+    message: str | None = Field(default=None, max_length=200)
+    retry_after_header: str | None = Field(default=None, max_length=64)
 
 
 Effort = Literal["default", "low", "medium", "high", "xhigh", "max"]  # reasoning.EFFORT_LEVELS
@@ -182,9 +185,11 @@ class Event(Record):
     text: str | None = None
     reasoning_summary: str | None = None
     reasoning_truncated: bool | None = None
-    # When the reply's thinking began (epoch seconds) and how long it took (the Thinking block's label).
+    # When the reply's thinking began (epoch seconds), how long it took (the Thinking block's label) and
+    # how long after the request was sent its first thinking arrived.
     reasoning_started: float | None = Field(default=None, ge=0)
     reasoning_seconds: float | None = Field(default=None, ge=0)
+    reasoning_wait_seconds: float | None = Field(default=None, ge=0)
     request_info: RequestInfo | None = None
     name: str | None = None
     input: dict[str, Any] | None = None
@@ -227,6 +232,7 @@ class Event(Record):
     steered: bool | None = None
     attachments: list[Attachment] | None = Field(default=None, max_length=10)
     stop_phase: Literal["streaming", "tools", "waiting"] | None = None
+    details: str | None = Field(default=None, max_length=1000)  # A rate-limit notice's Details (the 429).
     # Hooks (lifecycle_hooks): a hook card's structured result; on a tool card, the arguments a
     # before-tool hook replaced, the card it asked for, or its deny; on a user message, a hook's
     # edit or block and the context hooks added for the model.

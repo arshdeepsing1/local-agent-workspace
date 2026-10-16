@@ -154,6 +154,24 @@ def test_csv_has_all_columns_and_neutralizes_spreadsheet_formulas():
     assert rows[1]["tools_called"] == "run_command, read_file"
 
 
+def test_a_429s_message_and_retry_after_add_no_columns():
+    session = recorded_session()
+    call = session["inference_calls"][0]
+    finish_inference_call(call, {"status": "error", "http_status": 429, "rate_limit": {
+        "limit_type": "input_tokens_per_minute", "message": "Exceeded workspace input tokens per minute rate limit",
+        "retry_after": 5.0, "retry_after_header": "5"}})
+    assert call["rate_limit_message"].startswith("Exceeded") and call["retry_after"] == 5.0
+    assert call["retry_after_header"] is True and call["limit_type"] == "input_tokens_per_minute"
+    rows = list(csv.DictReader(io.StringIO(usage_csv(usage_rows(session)))))
+    assert tuple(rows[0]) == COLUMNS and "Exceeded" not in usage_csv(usage_rows(session))
+    # Bounded: a long message is clipped, an impossible wait is dropped.
+    for wait in (float("inf"), -1, True, "5"):
+        fresh = begin_inference_call(session, "agent", MODEL)
+        finish_inference_call(fresh, {"status": "error", "rate_limit": {"message": "m" * 300, "retry_after": wait}})
+        assert len(fresh["rate_limit_message"]) == 200 and "retry_after" not in fresh
+        assert fresh["retry_after_header"] is False
+
+
 def test_jsonl_written_by_the_store_round_trips(tmp_path):
     store = Store(tmp_path / "state" / "tests.sqlite3")
     try:

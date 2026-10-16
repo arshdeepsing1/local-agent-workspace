@@ -336,12 +336,16 @@ def test_the_users_choice_is_kept(ui, page):
 def test_a_saved_reply_shows_how_long_it_thought(ui, page):
     events = [{"id": "u", "type": "user", "text": "Go"},
               {"id": "r", "type": "assistant", "text": "Answer.", "reasoning_summary": "Checked the **tests**.",
-               "reasoning_started": 1_700_000_000.0, "reasoning_seconds": 12.4,
+               "reasoning_started": 1_700_000_000.0, "reasoning_seconds": 12.4, "reasoning_wait_seconds": 9,
                "request_info": {"model": OPUS, "status": "completed", "finish_reason": "stop"}}]
     start_chat(ui, page, events=events)
     block = thinking(page)
     expect(block).not_to_have_attribute("open", "")
-    expect(block.locator("summary")).to_have_text("Thought for 12 s")
+    expect(block.locator("summary")).to_have_text("Thought for 12 s")  # From the first thinking text, as before.
+    # Request details say when that text arrived, after the request was sent.
+    page.get_by_text("Request details · completed").click()
+    expect(page.locator('xpath=//dt[normalize-space()="Thinking text began"]/following-sibling::dd[1]')).to_have_text(
+        "after 9.0 s")
     expect(block.locator(".markdown")).to_be_hidden()
     block.locator("summary").click()
     expect(block.locator(".markdown strong")).to_have_text("tests")
@@ -385,3 +389,5 @@ def test_request_details_name_the_effort_and_the_fields(ui, page):
     fields = page.locator('xpath=//dt[normalize-space()="Reasoning fields"]/following-sibling::dd[1]')
     expect(fields).to_have_text([json.dumps(reasoning["fields"], separators=(",", ":")),
                                  json.dumps(mapped["fields"], separators=(",", ":"))])
+    # No thinking was timed on these replies: no row about when it began.
+    expect(page.locator("dt", has_text=re.compile("^Thinking"))).to_have_count(0)

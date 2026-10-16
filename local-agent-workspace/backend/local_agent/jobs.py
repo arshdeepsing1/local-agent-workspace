@@ -45,11 +45,29 @@ MAX_WAIT_SECONDS = 300  # wait_job's timeout_seconds limit
 DEFAULT_WAIT_SECONDS = 60  # wait_job without timeout_seconds when no earlier run says how long the job takes
 
 
+SHELLS = (("/bin/zsh", ["-f"]), ("/bin/bash", ["--noprofile", "--norc"]), ("/bin/sh", []))
+# What the system prompt says about the shell shell_argv picks: zsh does not split an unquoted
+# $VAR into words, so a variable holding a command with options fails there.
+SHELL_NOTES = {
+    "/bin/zsh": ("Commands run with zsh -f: an unquoted $VAR is not split into words, so use a shell function "
+                 "or an array for a command with options."),
+    "/bin/bash": "Commands run with bash --noprofile --norc.",
+    "/bin/sh": "Commands run with /bin/sh (POSIX sh).",
+}
+POLLING_NOTE = "A loop that polls CI or a deploy should print one line per check."
+
+
 def shell_argv(command):
-    for executable, options in (("/bin/zsh", ["-f"]), ("/bin/bash", ["--noprofile", "--norc"]), ("/bin/sh", [])):
+    for executable, options in SHELLS:
         if Path(executable).is_file():
             return [executable, *options, "-c", command]
     raise ValueError("No supported POSIX shell was found (zsh, bash, or sh).")
+
+
+def shell_note():
+    """The system prompt's sentences about the shell commands run with (shell_argv's choice)."""
+    executable = next((path for path, _ in SHELLS if Path(path).is_file()), None)
+    return " ".join(filter(None, (SHELL_NOTES.get(executable), POLLING_NOTE)))
 
 
 def validate_command_options(command, timeout_seconds=60, max_output_bytes=80_000):

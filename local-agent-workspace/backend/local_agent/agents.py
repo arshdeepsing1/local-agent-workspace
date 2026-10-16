@@ -36,7 +36,7 @@ from . import diagnostics, notebooks
 from .edits import clip_result, preview_diff, split_lines
 from .config import DEFAULT_APPROVAL_MINUTES, DEFAULT_MAX_AGENT_STEPS, follow_limits
 from .instructions import load_project_instructions
-from .jobs import JobManager, validate_command_options
+from .jobs import JobManager, shell_note, validate_command_options
 from .command_exec import prepare_command
 from .recovery import CheckpointManager
 from .changes import ChangeReview
@@ -56,7 +56,7 @@ from .reasoning import reasoning_delta, reasoning_shape
 from . import spending
 from .titles import fallback_title, generate_title, needs_title
 from .telemetry import (
-    InferenceError, begin_inference_call, finish_inference_call, http_error_kind,
+    InferenceError, begin_inference_call, call_estimated_dbu, finish_inference_call, http_error_kind,
     record_response_id, reported_usage, request_tag_headers, stream_error_kind, usage_keys,
 )
 from .model_stream import ToolCallBuffer, error_body_prefix, sse_data
@@ -157,11 +157,6 @@ def retry_after_seconds(headers, attempt, payload=None):
     return RATE_LIMIT_RETRY_DELAYS[attempt]
 
 
-def retryable_rate_limit(text):
-    normalized = text.lower().replace("_", " ")
-    return "request limit exceeded" in normalized or "rate limit" in normalized
-
-
 def requested_delay(headers, payload=None):
     """The provider's Retry-After (header, or root or nested JSON retry_after) in seconds, or None."""
     nested = payload.get("error") if isinstance(payload, dict) else None
@@ -194,6 +189,44 @@ def transient_retry_delay(error, attempt):
         return retry_after_seconds(headers, attempt, payload)
     requested = requested_delay(headers, payload)
     return min(requested, 60.0) if requested is not None else TRANSIENT_RETRY_DELAYS[attempt]
+
+
+def rate_limit_fields(info, headers, payload):
+    """request_info["rate_limit"] of a 429: what its body named (rate_limits.request_info_fields), with
+    retry_after the wait Databricks asked for (the Retry-After header, else the body's retry_after) and
+    retry_after_header the header as sent when the wait came from it (not a header the app could not
+    read, such as a date in the past)."""
+    fields = request_info_fields(info)
+    fields.pop("retry_after", None)
+    header = (headers or {}).get("retry-after")
+    from_header = requested_delay({"retry-after": header})
+    requested = from_header if from_header is not None else requested_delay({}, payload)
+    if requested is not None:
+        fields["retry_after"] = round(requested, 3)
+    if from_header is not None and isinstance(header, str):
+        fields["retry_after_header"] = clip(header.strip(), 64)
+    return fields
+
+
+def rate_limit_details(error):
+    """A rate-limit notice's Details: 'HTTP 429 <code>: <message> · Retry-After: <n s | none>'."""
+    info = getattr(error, "rate_limit", None)
+    code, message = getattr(info, "code", None), getattr(info, "message", None)
+    status = error.http_status if type(getattr(error, "http_status", None)) is int else 429
+    head = f"HTTP {status}" + (f" {code}" if code and not (message or "").startswith(code) else "")
+    head += f": {message}" if message else ""
+    headers, payload = getattr(error, "retry_headers", None) or {}, getattr(error, "retry_payload", None)
+    header = headers.get("retry-after")
+    # The wait the retry used: the header when it reads as seconds or a future date, else the body's.
+    if (seconds := requested_delay({"retry-after": header})) is not None:
+        wait = f"Retry-After: {round(seconds, 1):g} s"
+    elif (seconds := requested_delay({}, payload)) is not None:
+        wait = f"retry_after: {round(seconds, 1):g} s"  # In the body, not a header.
+    elif header is not None and str(header).strip():
+        wait = "Retry-After: " + clip(str(header).strip(), 40)  # Unreadable: the app chose the wait.
+    else:
+        wait = "Retry-After: none"
+    return f"{head} · {wait}"
 
 
 def rate_limit_wait_seconds(headers, payload=None, now=None):
@@ -274,6 +307,7 @@ Call tools directly to fulfill the user's request: this application applies the
 selected permission mode and shows any needed approval controls. Do not ask for permission in
 chat before issuing a tool call. If an approval is denied, respect the decision.
 Commands default to a 60-second timeout; choose timeout_seconds up to 3600 if needed.
+{shell_note}
 Use background=true for a managed job that must outlive this turn, never shell '&' or daemon detachment.
 Use list_jobs/get_job_output to inspect jobs, wait_job to wait until a background job finishes or prints a line you expect, and stop_job to terminate them. Size each wait to the job: wait_job returns as soon as the job ends, so for a quick build or test wait about as long as it should take (a few seconds to a minute), use until_regex for a server's ready line, idle_seconds when output stops once it is ready, and follow next_wait_seconds or expected_seconds (earlier runs of the same command) instead of always waiting the maximum. A failed command's first result shows the start and the end of its retained output. Use find_files to locate files by name. Background jobs
 continue after this turn is stopped and end on explicit job Stop, timeout, or app shutdown.
@@ -305,6 +339,12 @@ run in parallel as several delegate_task calls in one response; never split edit
 MCP tools and configured hooks require separate approval except in Bypass; Plan blocks them.
 Prefer surgical edits. Don't modify unrelated files.
 """
+
+
+def system_prompt():
+    """SYSTEM_PROMPT with the sentences about the shell commands run with (jobs.shell_note), read for each
+    request so that they follow shell_argv's choice (zsh on a Mac, bash on most Linux machines)."""
+    return SYSTEM_PROMPT.replace("{shell_note}", shell_note(), 1)
 
 
 def visible_text(content):
@@ -1179,15 +1219,17 @@ class AgentManager(LifecycleHooks):
                 seen.pop(job_id, None)
 
     async def wait_for_rate_limit(self, session, purpose, max_tokens):
-        """Wait while Databricks asked another chat to pause requests to this endpoint, plus a
-        little jitter so waiting chats do not all retry at once. Stop cancels the wait."""
+        """Wait while Databricks asked another chat to pause requests to this endpoint, plus 1 to 3
+        seconds of jitter, so a waiting chat retries after that chat's own retry rather than with it.
+        The notice's Details are that chat's 429. Stop cancels the wait."""
         seconds = self.rate_gate.remaining(session["model"], session["id"], max_tokens)
         if seconds < 0.5:
             return
-        jitter = self.rate_rng.uniform(0, min(3.0, seconds * 0.25))
+        jitter = self.rate_rng.uniform(1.0, 3.0)
+        details = self.rate_gate.details(session["model"])
         await self.event(session, "notice", text=(
             f"Waiting {seconds_text(math.ceil(seconds))} before {purpose}: Databricks rate-limited another chat's request "
-            f"to {session['model']}."))
+            f"to {session['model']}."), **({"details": details} if details else {}))
         await asyncio.sleep(seconds + jitter)
 
     def otpm_preflight(self, session, max_tokens):
@@ -1201,8 +1243,9 @@ class AgentManager(LifecycleHooks):
 
     def rate_limit_error(self, session, error, headers, payload, max_tokens, diagnostic):
         """Classify a 429 (error, an InferenceError): mark it retryable, with its RateLimitInfo as
-        error.rate_limit, or return the impossible-OTPM error to raise instead. Returns (error, info)."""
-        info = parse_rate_limit(payload)
+        error.rate_limit, or return the impossible-OTPM error to raise instead. Returns (error, info).
+        diagnostic is the redacted body text, the message of a body that is not JSON."""
+        info = parse_rate_limit(payload, diagnostic, self.settings.redact)
         error.rate_limit = info
         if (info.limit_type == OTPM and info.limit is not None and type(max_tokens) is int
                 and max_tokens > info.limit):
@@ -1212,9 +1255,9 @@ class AgentManager(LifecycleHooks):
                                      "output_tokens_over_limit", error.http_status)
             refused.rate_limit = info
             return refused, info
-        if retryable_rate_limit(diagnostic) or info.limit_type is not None:
-            mark_retryable(error, "rate_limit", headers)
-            error.retry_payload = payload
+        # The status alone means rate limited: an empty, plain-text or proxy 429 body is retried too.
+        mark_retryable(error, "rate_limit", headers)
+        error.retry_payload = payload
         return error, info
 
     @staticmethod
@@ -2292,13 +2335,13 @@ class AgentManager(LifecycleHooks):
                 if response.status_code == 429:
                     limited, rate = self.rate_limit_error(
                         session, InferenceError("", "rate_limit", 429), response.headers, payload, reserve, detail)
+                    info["rate_limit"] = rate_limit_fields(rate, response.headers, payload)
                     if limited.kind == "output_tokens_over_limit":
                         info["error_kind"] = limited.kind
                         raise ValueError(str(limited))
                     delay = requested_delay(response.headers, payload)
-                    self.rate_gate.note(session["model"], session["id"], delay if delay is not None else 0, rate, reserve)
-                    if rate.limit_type is not None:
-                        info["rate_limit"] = request_info_fields(rate)
+                    self.rate_gate.note(session["model"], session["id"], delay if delay is not None else 0, rate, reserve,
+                                        details=rate_limit_details(limited))
                     described = describe(rate)
                 raise ValueError(f"Databricks returned HTTP {response.status_code}" + (f": {detail}" if detail else "")
                                  + (f" ({described})" if described else "") + ("" if detail or described else "."))
@@ -3245,7 +3288,7 @@ class AgentManager(LifecycleHooks):
         # Stable text first and the parts that change between requests last, so a
         # provider's prompt prefix caching can reuse the longest possible prefix. Agent
         # requests to Claude endpoints mark where the stable text ends (prompt_cache.py).
-        stable = (SYSTEM_PROMPT + "\n" + user_block + mode_prompt(mode, bool(session.get("is_subagent")))
+        stable = (system_prompt() + "\n" + user_block + mode_prompt(mode, bool(session.get("is_subagent")))
                   + (f"\nEnforced tool profile: {session['tool_profile']}. Commands, MCP tools and hooks are unavailable."
                      if session.get("tool_profile", "inherit") != "inherit" else "")
                   + "\nWorkspace: " + session["workspace"]
@@ -3357,8 +3400,7 @@ class AgentManager(LifecycleHooks):
                         error, rate = self.rate_limit_error(session, error, response.headers, payload, max_tokens,
                                                             diagnostic)
                         info["error_kind"] = error.kind
-                        if rate.limit_type is not None:
-                            info["rate_limit"] = request_info_fields(rate)
+                        info["rate_limit"] = rate_limit_fields(rate, response.headers, payload)
                     elif response.status_code in SERVER_RETRY_STATUSES:
                         mark_retryable(error, "server_error", response.headers)
                         error.retry_payload = payload
@@ -3369,10 +3411,13 @@ class AgentManager(LifecycleHooks):
                     reason = getattr(error, "retry_reason", None)
                     if reason and attempt < MAX_TRANSIENT_RETRIES:
                         delay = transient_retry_delay(error, attempt)
+                        details = rate_limit_details(error) if reason == "rate_limit" else None
                         if reason == "rate_limit":
-                            self.rate_gate.note(session["model"], session["id"], delay, error.rate_limit, max_tokens)
+                            self.rate_gate.note(session["model"], session["id"], delay, error.rate_limit, max_tokens,
+                                                details=details)
                         await self.event(session, "notice", text=retry_notice(
-                            error, delay, attempt + 1, MAX_TRANSIENT_RETRIES, "context compaction"))
+                            error, delay, attempt + 1, MAX_TRANSIENT_RETRIES, "context compaction"),
+                            **({"details": details} if details else {}))
                         await asyncio.sleep(delay)
                         retry_reason = reason
                         continue
@@ -3835,8 +3880,7 @@ class AgentManager(LifecycleHooks):
                             parsed = None
                         error, rate = self.rate_limit_error(session, error, response.headers, parsed,
                                                             payload.get("max_tokens"), diagnostic)
-                        if rate.limit_type is not None:
-                            info["rate_limit"] = request_info_fields(rate)
+                        info["rate_limit"] = rate_limit_fields(rate, response.headers, parsed)
                     elif response.status_code in SERVER_RETRY_STATUSES:
                         mark_retryable(error, "server_error", response.headers, error_text)
                     elif response.status_code == 400:
@@ -3876,6 +3920,9 @@ class AgentManager(LifecycleHooks):
                             # Even an item with no text (thinking the endpoint does not show) starts the clock.
                             thinking["since"] = thinking_clock()
                             event["reasoning_started"] = time.time()
+                            # Databricks sends the first thinking text a few seconds after thinking starts,
+                            # so "Thought for N s" leaves out this wait (Request details show it).
+                            event["reasoning_wait_seconds"] = round(max(0.0, thinking["since"] - thinking["sent"]), 1)
                             draft.changed()
                             if not summary:
                                 await self.broadcast(session["id"], {"type": "event", "event": event})
@@ -4268,6 +4315,8 @@ class AgentManager(LifecycleHooks):
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
             steps = (session.get("max_steps", 6) if session.get("is_subagent")
                      else self.settings.values.get("max_agent_steps", DEFAULT_MAX_AGENT_STEPS))
+            # What the chat had spent and how many calls it had before this turn (the step-limit notice).
+            turn_start = (self.spent_so_far(session), len(session.get("inference_calls") or []))
             # Hidden repairs, auto-continue waits after rate limits, the reason the next
             # request is sent automatically (ledger), and the Verify loop's progress.
             consecutive_repairs, rate_limit_waits, retry_reason = 0, 0, None
@@ -4420,10 +4469,12 @@ class AgentManager(LifecycleHooks):
                                         advice := self.itpm_advice(session, getattr(exc, "rate_limit", None))):
                                     exc.args = (str(exc) + advice,)
                                 raise
+                            details = rate_limit_details(exc) if exc.retry_reason == "rate_limit" else None
                             if exc.retry_reason == "rate_limit":
                                 self.rate_gate.note(session["model"], session["id"], delay,
-                                                    getattr(exc, "rate_limit", None), max_output_tokens)
-                            notice_event = await self.event(session, "notice", text=notice)
+                                                    getattr(exc, "rate_limit", None), max_output_tokens, details=details)
+                            notice_event = await self.event(session, "notice", text=notice,
+                                                            **({"details": details} if details else {}))
                             await self.reply_after_notices(session, event)
                             finished = False
                             try:
@@ -4541,4 +4592,24 @@ class AgentManager(LifecycleHooks):
         await self.event(session, "error" if session.get("is_subagent") else "notice",
                          text=(f"Reached the {steps}-request agent limit. This counts model requests, not tool "
                                "calls. Completed actions were kept. Increase Agent steps in Settings or send a "
-                               "message to continue."), terminal_reason="step_limit")
+                               "message to continue." + self.turn_cost(session, *turn_start)),
+                         terminal_reason="step_limit")
+
+    def spent_so_far(self, session):
+        """(estimated DBU, unpriced calls) of a chat and its subagents (spending.chat_spend); a subagent's own."""
+        if session.get("is_subagent"):
+            return spending.own_spend(session)
+        spend = spending.chat_spend(self, session)
+        return spend["spent_dbu"], spend["unpriced_calls"]
+
+    def turn_cost(self, session, before, first_call):
+        """' This turn used about N DBU (estimate).' since before (spent_so_far when the turn began), or ''
+        when a call of the turn has no price data or none of its own calls (from first_call on) was priced."""
+        spent, unpriced = self.spent_so_far(session)
+        calls = (session.get("inference_calls") or [])[first_call:]
+        if unpriced != before[1] or not any((call_estimated_dbu(call)[0] or 0) > 0 for call in calls
+                                            if isinstance(call, dict)):
+            return ""
+        used = max(0.0, spent - before[0])
+        return f" This turn used about {used:,.1f} DBU (estimate)." if used >= 1 else \
+            f" This turn used about {used:.3f} DBU (estimate)."

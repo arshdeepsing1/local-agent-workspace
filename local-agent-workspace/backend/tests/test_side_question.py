@@ -137,8 +137,10 @@ async def test_a_failed_request_is_an_error_and_is_recorded(runtime, monkeypatch
 
 async def test_a_conversation_too_long_for_a_side_question(runtime, monkeypatch):
     manager, session = runtime
-    manager.settings.values["context_window"] = 16384
-    session["wire"] = [{"role": "user", "content": "x " * 20000}, {"role": "assistant", "content": "ok"},
+    # The system message and tools alone take about 10,000 tokens: this budget leaves the latest turn
+    # room, so only the earlier turn is too long.
+    manager.settings.values["context_window"] = 24576
+    session["wire"] = [{"role": "user", "content": "x " * 40000}, {"role": "assistant", "content": "ok"},
                        {"role": "user", "content": "next"}, {"role": "assistant", "content": "done"}]
     manager.store.save(session)
     requests = gateway(monkeypatch, answer)

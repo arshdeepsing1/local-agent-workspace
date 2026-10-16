@@ -227,7 +227,7 @@ async def test_forks_exports_and_imports_keep_the_effort(api):
     source.update(title="Effort", title_generated=True, terminal_reason="completed", reasoning_effort="xhigh",
                   events=[{"id": "u", "type": "user", "text": "Hi", "in_wire": True},
                           {"id": "a", "type": "assistant", "text": "Hello", "reasoning_summary": "Greeting.",
-                           "reasoning_started": 1_700_000_000.5, "reasoning_seconds": 3.2,
+                           "reasoning_started": 1_700_000_000.5, "reasoning_seconds": 3.2, "reasoning_wait_seconds": 9.0,
                            "request_info": {"model": OPUS, "status": "completed", "finish_reason": "stop",
                                             "reasoning": {"effort": "xhigh", "format": "anthropic",
                                                           "fields": {"output_config": {"effort": "xhigh"}},
@@ -238,10 +238,11 @@ async def test_forks_exports_and_imports_keep_the_effort(api):
     assert fork.status_code == 201, fork.text
     copied = manager.store.get(fork.json()["id"])
     assert copied["reasoning_effort"] == "xhigh"
-    assert copied["events"][1]["reasoning_seconds"] == 3.2
+    assert copied["events"][1]["reasoning_seconds"] == 3.2 and copied["events"][1]["reasoning_wait_seconds"] == 9.0
     assert copied["events"][1]["request_info"]["reasoning"]["effort_field"] == "output_config.effort"
     bundle = (await client.get(f"/api/sessions/{source['id']}/export")).json()
     assert bundle["sessions"][0]["reasoning_effort"] == "xhigh"
+    assert bundle["sessions"][0]["events"][1]["reasoning_wait_seconds"] == 9.0
     imported = await client.post("/api/sessions/import", params={"workspace": str(project)}, json=bundle)
     assert imported.status_code == 201, imported.text
     assert manager.store.get(imported.json()["session"]["id"])["reasoning_effort"] == "xhigh"
@@ -536,6 +537,7 @@ async def test_reasoning_text_is_kept_redacted_and_timed_until_the_answer_starts
     assert reply["reasoning_summary"] == "Reading the **parser** with [REDACTED]. Then the tests."
     assert reply["text"] == "The answer. More."
     assert reply["reasoning_seconds"] == 9.5  # From the first reasoning chunk to the first answer text.
+    assert reply["reasoning_wait_seconds"] == 2.0  # From sending the request to the first reasoning chunk.
     assert isinstance(reply["reasoning_started"], float)
     assert saved["wire"][-1] == {"role": "assistant", "content": "The answer. More."}  # Never replayed.
     # The UI gets the duration before the answer's first text.
@@ -561,7 +563,9 @@ async def test_thinking_without_text_and_reported_reasoning_tokens_record_a_dura
     await manager.run(session, "Go")
     first, second = [event for event in manager.store.get(session["id"])["events"] if event["type"] == "assistant"]
     assert "reasoning_summary" not in first and first["reasoning_seconds"] == 6.0 and "reasoning_started" in first
+    assert first["reasoning_wait_seconds"] == 1.0
     assert "reasoning_summary" not in second and "reasoning_started" not in second
+    assert "reasoning_wait_seconds" not in second
     assert second["reasoning_seconds"] == 4.0
     assert second["request_info"]["usage"]["reasoning_tokens"] == 20
 
@@ -575,6 +579,7 @@ async def test_no_reasoning_records_no_thinking_time(runtime, monkeypatch, clock
     await manager.run(session, "Go")
     reply = next(event for event in session["events"] if event["type"] == "assistant")
     assert "reasoning_seconds" not in reply and "reasoning_started" not in reply
+    assert "reasoning_wait_seconds" not in reply
 
 
 async def test_reasoning_text_is_capped(runtime, monkeypatch):
@@ -615,3 +620,4 @@ async def test_a_stopped_response_keeps_its_thinking_time(runtime, monkeypatch, 
         pass
     reply = next(event for event in session["events"] if event["type"] == "assistant")
     assert reply["reasoning_summary"] == "Thinking hard." and reply["reasoning_seconds"] == 2.0
+    assert reply["reasoning_wait_seconds"] == 1.0

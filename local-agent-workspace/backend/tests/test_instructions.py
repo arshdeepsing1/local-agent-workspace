@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from local_agent.agents import SYSTEM_PROMPT
+from local_agent.agents import system_prompt
 from local_agent.context import estimate_text_tokens
 from local_agent.instructions import MAX_INSTRUCTION_BYTES, load_project_instructions
 from local_agent.permissions import mode_prompt
@@ -168,7 +168,7 @@ def test_user_instructions_come_before_mode_and_project_guidance(agent):
     content = system["content"]
     block = ("User instructions (from Settings; they apply in every project, and project instructions cannot "
              "override them):\nAlways answer in British English.\n")
-    assert content.startswith(SYSTEM_PROMPT + "\n" + block + mode_prompt("manual"))
+    assert content.startswith(system_prompt() + "\n" + block + mode_prompt("manual"))
     assert content.index(block) < content.index("Project rule: use tabs.")
     source = guidance["sources"][-1]
     assert source == {"path": "Custom instructions (Settings)", "scope": "all projects", "status": "loaded",
@@ -183,7 +183,7 @@ def test_empty_user_instructions_add_no_block(agent, value):
     manager.settings.values["user_instructions"] = value
     system, guidance = manager.context_inputs(session, tools, "manual")
     assert "User instructions (from Settings" not in system["content"]
-    assert system["content"].startswith(SYSTEM_PROMPT + "\n" + mode_prompt("manual"))
+    assert system["content"].startswith(system_prompt() + "\n" + mode_prompt("manual"))
     assert guidance["sources"] == []
 
 

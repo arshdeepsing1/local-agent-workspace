@@ -20,8 +20,10 @@ LIMITS_CHECKED = "2026-10-13"
 # Sources, checked 2026-10-13: the Databricks Foundation Model APIs limits page (LIMITS_SOURCE)
 # and the proprietary foundation model serving pricing page. Limits are the Enterprise workspace
 # tier / quota Tier 1 defaults (ITPM input tokens and OTPM output tokens per minute); a
-# workspace's limits may differ. Databricks reserves a request's max_tokens against OTPM when it
-# starts, so a request whose max_tokens is above OTPM is rejected with HTTP 429 before it runs.
+# workspace's limits may differ. Databricks documents that it reserves a request's max_tokens
+# against OTPM when it starts, so a request whose max_tokens is above OTPM is rejected with HTTP
+# 429 before it runs; some workspaces accept more (a Settings warning, not an error). Databricks
+# enforces ITPM and OTPM with a token bucket that admits short bursts above the per-minute figure.
 # Claude Opus 5.5 always runs adaptive thinking, and its thinking tokens count toward max_tokens.
 #
 # Why the recommended Opus 5.5 budgets:
@@ -44,9 +46,12 @@ LIMITS_CHECKED = "2026-10-13"
 # thinking: "always" (adaptive thinking runs on every request; "disabled" and budget_tokens are
 # rejected with HTTP 400) or "adaptive" (thinks only when the request sends thinking: adaptive).
 # Claude Opus 5.5 omits its thinking text unless thinking.display is "summarized" (visibility only,
-# not billing). Databricks documents the Anthropic fields on its Anthropic Messages route; that its
-# chat-completions route (the one this app uses) passes them on is unverified, so a 400 naming one
-# of them makes the app resend without them (AgentManager.model_response, reasoning.rejected_field).
+# not billing). Databricks documents the Anthropic fields on its Anthropic Messages route. Checked
+# 2026-10-16 on a live workspace: the chat-completions route (the one this app uses) accepts
+# thinking {adaptive, display summarized} alone (Default) and with output_config.effort low..max,
+# streams the summary text, and counts thinking inside output_tokens (no reasoning_tokens). The 400
+# fallback stays for other endpoints and workspaces: a 400 naming one of the fields makes the app
+# resend without them (AgentManager.model_response, reasoning.rejected_field).
 #
 # Prompt caching (checked 2026-10-16: the Databricks Foundation Model APIs reference): "cache_control":
 # {"type": "ephemeral"} on content parts and assistant tool_calls is accepted only by Databricks-hosted
@@ -176,10 +181,11 @@ def limit_warnings(model, context_window, max_output_tokens):
             f"{label} writes at most {output_max:,} output tokens per response, so requests to it use "
             f"{output_max:,} instead of {max_output_tokens:,}.")
     if output > otpm:
-        add("output_over_otpm", "error",
-            "Databricks rejects a request with HTTP 429 before it starts when Max output tokens is above the "
-            f"endpoint's output-tokens-per-minute limit ({otpm:,} by default for {label}). Lower it to at most "
-            f"{concurrency:,} unless your workspace has a higher limit.")
+        add("output_over_otpm", "warning",
+            "Databricks documents that a request whose Max output tokens is above the endpoint's "
+            f"output-tokens-per-minute limit ({otpm:,} by default for {label}) is rejected with HTTP 429 before it "
+            f"starts; some workspaces accept more. Lower it to at most {concurrency:,} unless your workspace has a "
+            "higher limit.")
     elif output > concurrency:
         add("output_concurrency", "warning",
             f"Databricks reserves Max output tokens against {label}'s limit of {otpm:,} output tokens per minute "
@@ -189,8 +195,8 @@ def limit_warnings(model, context_window, max_output_tokens):
     if context > rate:
         add("context_itpm", "note",
             f"Each agent step sends up to the whole context budget. Above {rate:,} tokens, four full steps in one "
-            f"minute reach {label}'s limit of {itpm:,} input tokens per minute, so long turns and subagents wait on "
-            "rate limits, and every step costs more.")
+            f"minute can reach, after a short burst allowance, {label}'s limit of {itpm:,} input tokens per minute, "
+            "so long turns and subagents wait on rate limits, and every step costs more.")
     recommended = profile.get("recommended_max_output_tokens")
     if profile.get("thinking_reserve") and recommended and output < recommended:
         add("output_below_recommended", "note",

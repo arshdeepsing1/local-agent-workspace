@@ -44,6 +44,34 @@ def test_session_metrics_aggregates_purposes_models_and_documented_dbu_rates():
     assert metrics["pricing"]["currency"] == "DBU" and metrics["pricing"]["estimated"] is True
 
 
+def test_a_token_field_no_call_reported_is_unavailable_not_zero():
+    # Claude Opus 5.5 reports cache fields (0 when nothing is cached) but never reasoning_tokens.
+    usage = {"input_tokens": 1000, "output_tokens": 200, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+    metrics = session_metrics({
+        "id": "opus", "events": [], "inference_ledger_version": LEDGER_VERSION,
+        "inference_calls": [
+            {"id": "a", "purpose": "agent", "model": "databricks-claude-opus-5-5", "created": 1, "status": "completed",
+             "http_status": 200, "usage": usage},
+            {"id": "b", "purpose": "agent", "model": "databricks-claude-opus-5-5", "created": 2, "status": "error",
+             "http_status": 429, "error_kind": "rate_limit"},
+            {"id": "c", "purpose": "title", "model": "databricks-claude-opus-5-5", "created": 3, "status": "completed",
+             "http_status": 200, "usage": {**usage, "reasoning_tokens": 7}}],
+    })
+    agent, title = metrics["by_purpose"]
+    assert agent["reasoning_tokens"] is None and agent["input_tokens"] == 1000
+    assert agent["cache_read_input_tokens"] == 0 and agent["cache_creation_input_tokens"] == 0
+    assert title["reasoning_tokens"] == 7 and metrics["totals"]["reasoning_tokens"] == 7
+    assert metrics["totals"]["output_tokens"] == 400 and metrics["totals"]["estimated_dbu"] is not None
+    # A group of rejections reports 0 input and output tokens, and nothing else.
+    rejected = session_metrics({"id": "r", "events": [], "inference_ledger_version": LEDGER_VERSION,
+                                "inference_calls": [{"id": "b", "purpose": "agent", "model": "m", "created": 1,
+                                                     "status": "error", "http_status": 429}]})["totals"]
+    assert (rejected["input_tokens"], rejected["output_tokens"], rejected["reasoning_tokens"]) == (0, 0, None)
+    # A conversation without calls has used nothing.
+    empty = session_metrics({"id": "e", "events": [], "inference_ledger_version": LEDGER_VERSION})["totals"]
+    assert empty["input_tokens"] == 0 and empty["reasoning_tokens"] == 0
+
+
 def test_legacy_fallback_is_explicit_and_unknown_model_cost_is_unavailable():
     metrics = session_metrics({
         "id": "legacy", "created": 1, "events": [{

@@ -134,6 +134,39 @@ def test_error_details_wrap_on_a_phone(ui, page):
     assert ui.js("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
 
 
+RATE_DETAILS = ("HTTP 429 REQUEST_LIMIT_EXCEEDED: Exceeded workspace input tokens per minute rate limit for "
+                "test-endpoint. · Retry-After: none")
+RATE_NOTICE = {"id": "n", "type": "notice", "details": RATE_DETAILS,
+               "text": "Databricks rate limited the model request (input tokens per minute (ITPM)). Retrying in 5 "
+                       "seconds (1 of 3)."}
+
+
+def test_a_rate_limit_notice_keeps_the_429_under_a_collapsed_details(ui, page):
+    plain = {"id": "p", "type": "notice", "text": "Context compaction completed."}
+    start_app(ui, [ERROR_TURN[0], RATE_NOTICE, plain], terminal_reason="completed")
+    notice = page.locator(".conversation-notice").filter(has_text="rate limited")
+    expect(notice).to_contain_text(RATE_NOTICE["text"])
+    expect(notice).not_to_have_attribute("role", "note")  # Not an error.
+    details = notice.locator(".notice-details pre")
+    expect(details).not_to_be_visible()
+    notice.get_by_text("Details", exact=True).click()
+    expect(details).to_have_text(RATE_DETAILS)
+    # Only a notice with details has the element.
+    expect(page.locator(".conversation-notice").filter(has_text="compaction completed").locator(".notice-details")).to_have_count(0)
+
+
+def test_rate_limit_details_wrap_on_a_phone(ui, page):
+    page.set_viewport_size({"width": 360, "height": 740})
+    long = {**RATE_NOTICE, "details": "HTTP 429 " + "A" * 64 + ": " + "unbroken" * 24 + " · Retry-After: none"}
+    start_app(ui, [ERROR_TURN[0], long], terminal_reason="completed")
+    notice = page.locator(".conversation-notice").filter(has_text="rate limited")
+    notice.get_by_text("Details", exact=True).click()
+    pre = notice.locator(".notice-details pre")
+    expect(pre).to_be_visible()
+    assert pre.evaluate("e => e.scrollWidth <= e.clientWidth")
+    assert ui.js("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
+
+
 def test_a_stop_is_a_divider_and_continue_is_the_only_message(ui, page):
     # B-T19. Mutation: render event.text for stop markers.
     events = [{"id": "u", "type": "user", "text": "Write the exporter"},
