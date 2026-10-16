@@ -338,7 +338,7 @@ export function useWorkspace() {
     const { workspace, model, env_file, context_window, max_output_tokens, max_agent_steps, compaction_handoffs, approval_timeout_minutes,
       system_notifications, user_instructions, write_limit_kb, command_env, secret_file_patterns, rate_limit_auto_continue, auto_keep_changes,
       coding_dir, python_venv, auto_compact_percent, reasoning_effort, reasoning_format, thinking_summaries, prompt_caching, subagent_defaults,
-      spending_limit_dbu, fallback_model, user_agents_file, user_claude_file, project_memory, output_style, slash_commands } = next
+      spending_limit_dbu, fallback_model, user_agents_file, user_claude_file, project_memory, output_style, slash_commands, thinking_replay } = next
     const saved = await api('/settings', 'PUT', {
       workspace, model, env_file, context_window, max_output_tokens, max_agent_steps,
       ...(typeof compaction_handoffs === 'boolean' ? { compaction_handoffs } : {}),
@@ -357,6 +357,7 @@ export function useWorkspace() {
       ...(Number.isFinite(spending_limit_dbu) ? { spending_limit_dbu } : {}),
       ...(typeof reasoning_format === 'string' ? { reasoning_format } : {}),
       ...(typeof thinking_summaries === 'boolean' ? { thinking_summaries } : {}),
+      ...(typeof thinking_replay === 'boolean' ? { thinking_replay } : {}),
       ...(typeof prompt_caching === 'string' ? { prompt_caching } : {}),
       ...(typeof fallback_model === 'string' ? { fallback_model: fallback_model.trim() } : {}),
       ...(typeof slash_commands === 'boolean' ? { slash_commands } : {}),

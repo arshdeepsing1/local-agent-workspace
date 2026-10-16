@@ -65,6 +65,8 @@ frontend that runs without a build step.
   summary and how long it thought.
 - Prompt caching on Claude endpoints: agent requests mark their stable start, so input that repeats
   an earlier step is billed at the cache-read rate.
+- Endpoint checks: **Test model** and **Check endpoint capabilities…** send a few small requests,
+  after you approve their estimated cost, and show what the endpoint accepts.
 - Collapsible activity.
 - Responsive desktop/mobile UI, bundled fonts, and no credential storage in the browser.
 
@@ -225,7 +227,10 @@ recent history may not have been saved. Back up the whole `conversations/` folde
 database.
 
 **Agent tools → Export** exports a versioned JSON bundle, optionally with
-subagent conversations (32 total, 16 MiB maximum). Export requires idle chats.
+subagent conversations (32 total, 16 MiB maximum). Export requires idle chats. A reply's
+signed thinking (kept only while **Settings → Reasoning → Send earlier thinking back** is on,
+see **Reasoning effort and thinking**) is left out unless you tick **Export with reasoning**;
+forks keep it.
 Imports preserve historical messages, tool results, summaries, and usage, remap
 conversation/event/call IDs and included child links, and cancel historical active
 states. Credential settings, hooks/MCP configuration, task-board records, jobs, file checkpoint ownership,
@@ -830,6 +835,8 @@ when opening a conversation or performing restart recovery.
   automatically after rate limits**. Once the retries (and, after rate limits, the waits) are used up, a request
   goes once to **Settings → Model and context → Fallback endpoint** when one is set (see **Fallback endpoint**);
   its Request details then show **Answered by** with that endpoint and **Fallback from** with the chat's.
+  A request that sent this turn's earlier thinking back (see **Reasoning effort and thinking**) shows
+  **Earlier thinking sent** with the number of replies.
   When a reply's tool calls had invalid or
   incomplete arguments, or the reply ended without a finish reason, none of its tools
   run, and the app asks the model in a hidden message to issue them again or to
@@ -1187,7 +1194,8 @@ sent a request automatically: `rate_limit`, `server_error` or `network` for a re
 of the same request, `rate_limit_wait` after an automatic wait, `output_limit`,
 `invalid_tool_arguments` or `incomplete_response` for the request after a hidden
 continuation, `verify` for a Verify fix round, `reasoning_rejected` for the resend
-without reasoning fields (see **Reasoning effort and thinking**), `cache_rejected` for the resend
+without reasoning fields or with a thinking budget instead (see **Reasoning effort and thinking**),
+`replay_rejected` for the resend without the turn's earlier thinking, `cache_rejected` for the resend
 with fewer cache markers (see **Prompt caching**), and `fallback` for the request sent to the fallback
 endpoint (see **Fallback endpoint**; the ledger and the metrics also keep `fallback_from`, the chat's endpoint,
 and the call's model is the endpoint that answered). The Usage section's **Automatic
@@ -1250,12 +1258,15 @@ What agent requests to each endpoint carry (top-level fields of the chat-complet
 | Claude Opus 4.8 (`databricks-claude-opus-4-8`) | nothing (no thinking) | the same as Opus 5.5 (it thinks only when `thinking` is sent) |
 | GPT OSS 120B and 20B | nothing (its default is medium) | `reasoning_effort: "low"`, `"medium"` or `"high"`; Extra high and Max are sent as `"high"` (the picker says so) |
 | Other endpoints | nothing | by the request format below; offered unverified |
+| Older Claude endpoints (Sonnet 4.5 and similar, with **Anthropic thinking budget**) | nothing | `thinking: {"type": "enabled", "budget_tokens": N}`: N is 1,024 at Fast, 4,096 at Medium, 8,192 at High, 16,384 at Extra high and 32,768 at Max, at most Max output tokens less 1,024 (below 1,024 nothing is sent) |
 
 **Settings → Reasoning → Request format** chooses how requests ask for an effort:
 **Automatic (per endpoint)** (the table above; for an endpoint without a profile the format is
 guessed from its name: `claude` → Anthropic fields, `gpt-oss`, `gpt-5`, `o1`, `o3`, `o4` →
 OpenAI field, anything else → none), **Anthropic fields** (`thinking` and `output_config.effort`),
-**OpenAI field** (`reasoning_effort`) or **Don't send reasoning fields**. Settings shows the
+**Anthropic thinking budget** (`thinking.budget_tokens`, the form older Claude endpoints take, which
+reject adaptive thinking and `output_config`), **OpenAI field** (`reasoning_effort`) or **Don't send
+reasoning fields**. Settings shows the
 exact JSON the endpoint and level in the form add to agent requests, computed by the same code
 that builds them. Titles, `/btw` side questions and compaction requests never carry reasoning
 fields: they use the endpoint's default, which their output allowance is sized for.
@@ -1269,7 +1280,12 @@ names a reasoning field the request added (`thinking`, `output_config`, `effort`
 without reasoning fields (a rejected request is not billed), posts one notice naming the
 field and **Settings → Reasoning → Request format**, and sends no reasoning fields to that
 endpoint in that format until the app restarts or you save Settings. Both attempts are in the
-usage ledger; the second has `retry_reason` `reasoning_rejected`. A 400 that names none of
+usage ledger; the second has `retry_reason` `reasoning_rejected`. On an endpoint that does not
+always think (not Claude Opus 5.5), a rejection of the adaptive Anthropic fields first steps to a
+thinking budget instead: the request is sent again with `thinking.budget_tokens` (the notice says
+so) and the endpoint keeps that form until a restart or a Settings save; only if the budget is
+rejected too are the fields left out. So an older Claude endpoint under Automatic still thinks
+after one rejected request, instead of getting no reasoning at all. A 400 that names none of
 them is not sent again without reasoning fields; on Claude endpoints the cache-marker fallback
 (see **Prompt caching**) may still send it again with fewer cache markers before the error is shown,
 and a 400 that names caching too (`cache_control`) goes to that fallback first.
@@ -1285,12 +1301,29 @@ a few seconds after thinking starts, so **Request details** also show when it ar
 example "Thinking text began after 9.0 s" (seconds after the request was sent). An endpoint that reported reasoning tokens or thinking
 without text gets one line instead, "Thought for N s · the endpoint did not return a summary".
 The app shows thinking text only as the endpoint returns it (redacted, up to 12,000
-characters) and never sends earlier thinking back to the model. **Request details** under a
+characters). **Request details** under a
 reply show **Effort**, for example "High (output_config.effort)", and the reasoning fields
 sent. Claude Opus 5.5 reports no reasoning tokens (its thinking is counted in output tokens), so
 **Reasoning tokens** there reads "In output tokens (not reported separately)" for a request that
 asked for Claude reasoning. A request at Default with **Show thinking summaries** off sends no
 reasoning fields, so it reads "Unavailable".
+
+**Send earlier thinking back (experimental)** (off by default) keeps each reply's signed
+thinking items (the reasoning items Claude endpoints stream, whose last piece carries a
+signature) with that reply in the conversation file, and during tool use sends them back: each
+request after a tool result carries the thinking of this turn's earlier replies, before their text
+and tool calls, as Anthropic's API expects with thinking on. Only replies the request's own
+endpoint wrote are sent back (a fallback endpoint or a model change never gets another endpoint's
+thinking), only within the current turn (a new message removes the earlier turn's thinking from the
+file, so it keeps at most one turn's), at most 64 KB per reply and 256 KB per request, newest
+first. The thinking counts in the context meter and the estimate (and costs input tokens), and a
+request it would push over the input budget goes without it. Compaction summaries, `/btw` side
+questions and titles never see it. Databricks does not document this on the chat-completions route,
+so when a request with it gets HTTP 400 the app sends it again once without it; a 400 that names
+the thinking or a signature, or a resend that is then accepted, makes requests to that endpoint
+skip it until a restart or a Settings save (a notice says so, and the resend has `retry_reason`
+`replay_rejected`). An endpoint check that found it rejected (see **Endpoint checks**) skips that
+endpoint too. With the setting off no signature is written to disk.
 
 ### Prompt caching
 
@@ -1354,7 +1387,9 @@ model's reasoning (`reasoning_shape`) and whether a reasoning signature came
 changing part differed from the chat's last request that Databricks answered,
 `system_tail_changed` (the conversation after it was written to the cache again; a retry after a
 429 or a server error keeps the flag, because the failed attempt wrote nothing). They are not CSV
-columns.
+columns. **Check endpoint capabilities…** (see **Endpoint checks**) settles it with two identical
+requests and reports whether `prompt_tokens` leaves the cached tokens out; when it finds markers
+rejected, agent requests to that endpoint start the fallback above at the level it found accepted.
 
 ### Fallback endpoint
 
@@ -1377,8 +1412,8 @@ model), its own reasoning fields (see **Reasoning effort and thinking**: GPT OSS
 `reasoning_effort`, Claude the `thinking` fields) and its own prompt-cache markers (none for GPT
 OSS). A conversation that does not fit the fallback's input budget, for example a long Claude chat
 on GPT OSS 120B with its 131,072-token window, is not sent there: a notice says so and the original
-error stands. Requests never carry the model's reasoning (thinking text or signatures) back in the
-history, and a fallback request drops any, so no endpoint receives another's.
+error stands. A fallback request carries no reasoning items (thinking text or signatures), also when
+**Send earlier thinking back** is on, so no endpoint receives another's.
 
 Because each request carries the conversation, Settings accepts only an endpoint the app knows (the
 ones the endpoint chooser labels) or one you already use: the Settings model, a Settings → Subagents
@@ -1388,6 +1423,50 @@ endpoint…** takes a typed name; chats on the fallback endpoint itself have no 
 **Fallback from** with the chat's endpoint and why it failed; **Agent tools → Usage** lists the call
 under the fallback endpoint, priced at that endpoint's rates (an endpoint without price data, such
 as GPT OSS, is not counted by the spending limit, as for any other call).
+
+### Endpoint checks
+
+**Settings → Model and context** has two buttons beside the endpoint chooser, for the endpoint in
+the form. **Test model** sends one short streamed request ("reply with the single word ready") and
+shows whether and how fast it answered. **Check endpoint capabilities…** sends a few small requests
+that show what the endpoint accepts on this route:
+
+| Check | Requests | What it shows |
+| --- | --- | --- |
+| Smoke test and usage fields | 1 | that a streamed request works, its time to the first byte and the usage keys Databricks sends |
+| Reasoning fields and the thinking stream | 1 | whether the endpoint's reasoning fields are accepted at Medium, the delta shape that carries the thinking and whether a signature comes |
+| Prompt-cache markers and a cache read (Claude endpoints) | 2 (+1) | whether `cache_control` is accepted (else the documented form is tried, a rejected request is not billed), whether the repeat reads the cache, and whether `prompt_tokens` counts the cached tokens |
+| Tool calls and thinking sent back | 3 | the finish reason that comes with a tool call (GPT OSS may say `stop`), and whether the tool result is accepted without and with the reply's signed thinking |
+| Structured output with tools | 1 | whether `response_format` with a JSON schema is accepted together with tools |
+| Image input | 1 | whether an `image_url` content part (a 16 × 16 PNG the app makes) is accepted |
+
+The dialog lists every request, what it checks, its max tokens and its worst-case cost at list
+prices (input at the app's estimate, at the cache-write rate for the cache requests, plus every max
+token; the two requests that send the tool result back include room for the reply they repeat, and a
+run does not send one that would come out larger), and the total, for example at most about 7.1 DBU
+for all checks on Claude Opus 5.5 and 0.6 DBU for Test model (a run usually costs a fraction of
+that). An endpoint without price data, such as GPT OSS, shows its token caps instead. You can untick
+checks. Nothing is sent until you press **Run (about N DBU)**, and every run asks again: the server
+sends the requests only with the plan you saw (`plan_id`, computed again from the endpoint, the
+chosen checks and the price list) and its estimate, and refuses anything else without sending a
+request. One run at a time; its requests go out one after another and are never retried: a 401, 403,
+429, a server error or a failed connection (also one that breaks off a reply) stops the run (what
+came back so far is kept), and **Stop** cancels it. The requests use synthetic text only, carry no
+sampling fields (`temperature`, `top_p`, `top_k`, `tool_choice`), are tagged
+`local_agent_purpose: probe` and are not in any chat's usage.
+
+The results are kept per endpoint in the state folder (`endpoint_checks.json`, mode 0600), never in
+a project or the repository, with a sanitized copy of each request and reply in
+`endpoint_fixtures/<endpoint>/` (signatures and redacted thinking replaced by their length, response
+and tool-call ids cut to their prefix, text redacted, URLs in error text replaced; no host, URL or
+headers but the content type and `Retry-After`), in the format the tests' replay client reads. A
+table of capability, result and source (**probed** with its date, **documented** for what Databricks
+documents, or **unknown**) is shown in the dialog and, for a chat's endpoint, in **Agent tools →
+Overview**. The results change agent requests only here: cache markers found rejected start the
+prompt-caching fallback at the level found accepted; an image part found rejected turns the
+endpoint's image support off; signed thinking found rejected makes **Send earlier thinking back**
+skip the endpoint. The thinking stream's shape is recorded for reference only. Databricks' serving
+state of the endpoint (ready, task) is read without a model request.
 
 ### Context and project instructions
 
@@ -3150,7 +3229,16 @@ Thinking display, subagents, background jobs and change review before using a pa
   markers and reports no cache use (the default is `accept`).
 - `--claude-fields anthropic|openai|none` makes the simulated route refuse one style of
   reasoning field for Claude endpoints, to rehearse what happens if the real chat-completions
-  route does (the default `both` accepts either).
+  route does (the default `both` accepts either). A Claude endpoint name with `sonnet`, `haiku`
+  or `claude-3` in it (Settings → Other endpoint…) behaves like an older Claude endpoint: it
+  refuses adaptive thinking and `output_config` and takes `thinking.budget_tokens`.
+- Each Claude reasoning item ends with a signature the gateway makes from its text.
+  `--replay accept|require|reject` chooses how the route takes thinking sent back in assistant
+  messages: `accept` (the default) checks the signatures, `require` also refuses a tool loop
+  whose last tool request comes back without its signed thinking, `reject` refuses any.
+  `--vision accept|reject` and `--response-format accept|reject` choose whether Claude
+  endpoints take `image_url` parts and `response_format` with tools. The endpoint checks get
+  short scripted answers, so **Check endpoint capabilities…** can be rehearsed offline.
 - Words in your message choose a scripted turn: `edit` (writes a file, then edits it twice
   with pauses, so you can press **Keep** in between), `job` (a background command and
   `wait_job`), `delegate` or `parallel` (one or two read-only subagents; `delegate custom` uses
@@ -3350,6 +3438,11 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `backend/local_agent/feature_api.py`: scoped feature endpoints.
 - `backend/local_agent/reasoning.py`: reasoning effort request fields per endpoint and format, the rejection
   check, and the thinking text of streamed deltas.
+- `backend/local_agent/reasoning_replay.py`: a reply's signed thinking kept with it in the history and sent back
+  during tool use (Send earlier thinking back).
+- `backend/local_agent/endpoint_probes.py` / `endpoint_checks_api.py`: endpoint checks (Test model, Check endpoint
+  capabilities…): the request bodies, the approved cost plan, reading the replies, the capability table, the results
+  file and fixtures, and the routes and runner.
 - `frontend/static/js/`: browser interface (Preact + htm, no build), conversation state, editor and settings;
   `attention.js` holds browser notifications, the tab-title count and unread tracking, `drafts.js` saves
   message drafts, `markdown.js` renders and highlights replies, and `components/AgentToolsDialog.js` is the Agent tools dialog.

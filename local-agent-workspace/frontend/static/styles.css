@@ -634,3 +634,17 @@ body.panel-resizing{cursor:col-resize;user-select:none}
 /* 2026-10-16 cmdsafety: the secret-file warning on command cards. */
 .tool-secret{padding:8px 10px;border-radius:6px;background:#f6e4e1;color:#7a3b31;overflow-wrap:anywhere}
 .tool-secret code{font-size:12px;overflow-wrap:anywhere}
+/* 2026-10-16 probes: endpoint checks (Test model, Check endpoint capabilities…), the capability table and its Overview entry. */
+.settings-endpoint-checks{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}.settings-endpoint-checks .outline{font-size:12.5px;padding:7px 12px}
+.endpoint-checks-dialog{width:min(640px,calc(100vw - 32px))}.endpoint-checks-dialog .dialog-content{overflow-wrap:anywhere}
+.endpoint-plan{list-style:none;margin:14px 0 0;padding:0}.endpoint-probe{padding:10px 0;border-bottom:1px solid var(--border)}.endpoint-probe:first-child{border-top:1px solid var(--border)}
+.endpoint-probe .settings-checkbox{margin-top:0;font-weight:600}.endpoint-probe-title{margin:0;font-size:13px;font-weight:600}
+.endpoint-requests,.endpoint-progress ul{list-style:none;margin:6px 0 0;padding:0;font-size:12px}.endpoint-requests li,.endpoint-progress li{display:flex;flex-wrap:wrap;justify-content:space-between;gap:4px 12px;padding:3px 0}
+.endpoint-cost,.endpoint-state{color:var(--muted);font-variant-numeric:tabular-nums}.endpoint-total{font-size:13px;font-weight:600;margin:14px 0 0}
+.endpoint-progress{margin-top:16px;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--surface)}.endpoint-progress-title{margin:0;font-size:12.5px;font-weight:600}
+.endpoint-progress li[data-state=running] .endpoint-state{color:var(--ink)}.endpoint-test-result{font-size:13px;margin:14px 0 0}.endpoint-results-title{font-size:13px;margin:18px 0 6px}
+.capability-table{width:100%;border-collapse:collapse;font-size:12px}.capability-table th,.capability-table td{text-align:left;vertical-align:top;padding:6px 8px 6px 0;border-bottom:1px solid var(--border)}
+.capability-table thead th{color:var(--muted);font-weight:500}.capability-table tbody th{font-weight:500}.capability-table td:last-child{color:var(--muted);white-space:nowrap}
+.capability-table tr[data-status=rejected] td:nth-child(2),.capability-table tr[data-status=error] td:nth-child(2){color:#98492f}
+.overview-capabilities{margin:-8px 0 20px;font-size:12px}.overview-capabilities>summary{cursor:pointer;color:var(--muted);padding:4px 0}
+@media(max-width:600px){.capability-table td:last-child{white-space:normal}.endpoint-requests li,.endpoint-progress li{flex-direction:column}}

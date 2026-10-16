@@ -142,8 +142,8 @@ def test_the_reasoning_group_previews_the_fields_and_saves(ui, page):
         {"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}, indent=2))
     request_format = group.get_by_role("combobox", name="Request format")
     expect(request_format.locator("option")).to_have_text([
-        "Automatic (per endpoint)", "Anthropic fields (thinking + output_config.effort)", "OpenAI field (reasoning_effort)",
-        "Don't send reasoning fields"])
+        "Automatic (per endpoint)", "Anthropic fields (thinking + output_config.effort)",
+        "Anthropic thinking budget (thinking.budget_tokens)", "OpenAI field (reasoning_effort)", "Don't send reasoning fields"])
     request_format.select_option("openai")
     expect(preview(dialog).locator("pre")).to_have_text(json.dumps({"reasoning_effort": "high"}, indent=2))
     request_format.select_option("none")

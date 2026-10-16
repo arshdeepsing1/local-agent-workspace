@@ -3,6 +3,7 @@ import { Check, X } from '../icons.js'
 import { api } from '../api.js'
 import { EFFORT_LABELS, modelLabel } from '../types.js'
 import { levelLabel, useReasoningPreview } from './EffortPicker.js'
+import EndpointChecksDialog, { testResultText } from './EndpointChecksDialog.js'
 
 const LIMIT_LEVELS = { error: 'form-error', warning: 'settings-note', note: 'field-help' }
 const inRange = (value, low, high) => Number.isInteger(value) && value >= low && value <= high
@@ -11,6 +12,7 @@ const LIMIT_KEYS = ['context_window', 'max_output_tokens']
 const SECTIONS = [['project', 'Project'], ['model', 'Model and context'], ['reasoning', 'Reasoning'], ['agent', 'Agent'],
   ['subagents', 'Subagents'], ['commands', 'Commands and files'], ['notifications', 'Notifications'], ['credentials', 'Credentials']]
 const FORMATS = [['auto', 'Automatic (per endpoint)'], ['anthropic', 'Anthropic fields (thinking + output_config.effort)'],
+  ['anthropic_budget', 'Anthropic thinking budget (thinking.budget_tokens)'],
   ['openai', 'OpenAI field (reasoning_effort)'], ['none', 'Don\'t send reasoning fields']]
 // Settings → Prompt caching (backend config.PROMPT_CACHING): cache markers on agent requests to Claude endpoints;
 // 'messages' sends only the forms Databricks documents (prompt_cache.py level "messages").
@@ -126,6 +128,9 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
   const [otherFallback, setOtherFallback] = useState(false)
   const fallbackInput = useRef(null)
   const fallbackFocus = useRef(false)
+  // Test model or Check endpoint… (EndpointChecksDialog) for the endpoint in the form, and that endpoint's saved checks.
+  const [checking, setChecking] = useState(null)
+  const [endpointChecks, setEndpointChecks] = useState(null)
   const sections = useRef({})
   const [activeSection, setActiveSection] = useState(SECTIONS[0][0])
   const jumping = useRef(0)
@@ -166,6 +171,17 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
   useEffect(() => {
     if (otherEndpoint && otherFocus.current) { otherFocus.current = false; otherInput.current?.focus() }
   }, [otherEndpoint])
+  // The saved endpoint checks of the endpoint in the form (no model request): the Test model line and what the
+  // check found about sending earlier thinking back. Read again when a check dialog closes.
+  useEffect(() => {
+    let current = true
+    setEndpointChecks(null)
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(model) || checking) return
+    const timer = setTimeout(() => {
+      api(`/endpoints/${encodeURIComponent(model)}/checks`).then(value => { if (current) setEndpointChecks(value) }, () => {})
+    }, 250)
+    return () => { current = false; clearTimeout(timer) }
+  }, [model, checking])
   useEffect(() => {
     if (otherFallback && fallbackFocus.current) { fallbackFocus.current = false; fallbackInput.current?.focus() }
   }, [otherFallback])
@@ -293,6 +309,12 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         ${otherEndpoint ? html`<label>Endpoint name<input ref=${otherInput} required spellcheck=${false} value=${form.model}
           onInput=${e => field('model', e.currentTarget.value)} placeholder=${settings.default_model || 'databricks-claude-opus-5-5'} /></label>` : null}
         <p class="field-help">Endpoints with built-in limits and the ones your Databricks workspace lists. Choose Other endpoint… to type a serving endpoint name.</p>
+        <div class="settings-endpoint-checks">
+          <button type="button" class="outline" disabled=${!model} onClick=${() => setChecking('test')}>Test model</button>
+          <button type="button" class="outline" disabled=${!model} onClick=${() => setChecking('check')}>Check endpoint capabilities…</button>
+        </div>
+        ${testResultText(endpointChecks?.saved) ? html`<p class="field-help endpoint-test-line">Test model: ${testResultText(endpointChecks.saved)}</p>` : null}
+        <p class="field-help">Test model sends one short request; Check endpoint capabilities… sends about ten small ones and shows what the endpoint accepts. Each shows its estimated cost first and sends nothing until you press Run.</p>
         ${settings.model_migrated_from ? html`<p class="settings-note" role="status">The default model changed from ${modelLabel(settings.model_migrated_from)} to ${modelLabel(settings.model)}, the app's new default. ${modelLabel(settings.model)} costs more per token. To switch back, choose ${settings.model_migrated_from} here and save, or in the model picker of a new conversation (in an open conversation the picker changes only that conversation).</p>` : null}
         <label>Context budget (tokens)<input ref=${contextInput} type="number" required min=${16384} max=${1048576} step=${1}
           value=${form.context_window || ''} onInput=${number('context_window')} /></label>
@@ -347,6 +369,14 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         <label class="settings-checkbox"><input type="checkbox" checked=${form.thinking_summaries !== false}
           onChange=${e => field('thinking_summaries', e.currentTarget.checked)} />Show thinking summaries</label>
         <p class="field-help">Asks endpoints with adaptive thinking (Claude Opus 5.5 and 4.8) for a summary of their thinking (thinking.display: summarized), shown in a Thinking block above each reply. It changes what is shown, not how much the model thinks or costs.</p>
+        <label class="settings-checkbox"><input type="checkbox" checked=${form.thinking_replay === true}
+          onChange=${e => field('thinking_replay', e.currentTarget.checked)} />Send earlier thinking back (experimental)</label>
+        <p class="field-help">During tool use, each request also carries the signed thinking of this turn's earlier replies, back to the endpoint that wrote it. It adds input tokens; another endpoint (a fallback or a model change) never gets it, and an endpoint that rejects it is skipped.</p>
+        ${(() => {
+          const row = (endpointChecks?.capabilities || []).find(item => item.id === 'replay')
+          return row && row.status !== 'unknown' ? html`<p class="field-help endpoint-replay-line">Endpoint check for ${model}: ${row.result} (${row.source}).</p>`
+            : html`<p class="field-help endpoint-replay-line">Databricks does not document it for this route: run Check endpoint capabilities… first to see whether ${model || 'the endpoint'} accepts it.</p>`
+        })()}
         <div class="settings-preview">
           <p class="settings-preview-title">Added to agent requests to ${preview?.label || model || 'this endpoint'} at ${levelLabel(currentLevel)}</p>
           ${!preview ? html`<p class="field-help">${model ? 'Checking…' : 'Choose an endpoint.'}</p>`
@@ -423,5 +453,6 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         <footer>${error ? html`<p class="form-error" role="alert">${error}</p>` : null}<button type="button" class="outline" onClick=${onClose}>Cancel</button><button class="primary" disabled=${saving}>${saving ? 'Saving…' : 'Save settings'}</button></footer>
       </form>
     </div>
+    ${checking ? html`<${EndpointChecksDialog} model=${model} mode=${checking} onClose=${() => setChecking(null)} />` : null}
   </dialog>`
 }

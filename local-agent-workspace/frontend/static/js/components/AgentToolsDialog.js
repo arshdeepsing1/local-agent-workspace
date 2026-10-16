@@ -10,6 +10,7 @@ import { modeLabel } from './PermissionsMenu.js'
 import { agentLabel, agentSettingsText, elapsedText } from '../subagents.js'
 import { EFFORT_LABELS, modelLabel } from '../types.js'
 import { hintText } from '../mcp.js'
+import { CapabilityTable } from './EndpointChecksDialog.js'
 
 // Props: session, workspace?, changedFiles? (files with unreviewed agent changes in this chat, from the
 // changes bar; null when unknown), onClose, onSelectSession, onError, onSaveTools?(tools) -> Session,
@@ -119,7 +120,9 @@ function useOverview(session) {
     const requests = {
       checkpoints: () => api(`/checkpoints${query}`), project: () => api(`/project-settings${query}`), memory: () => api(`/memory${query}`),
       extensions: () => api('/extensions'), worktrees: () => api(`/worktrees${query}`),
-      ...(path ? { tools: () => api(`/tools${query}`), children: () => api(`${path}/children`), tasks: () => api(`${path}/tasks`) } : {}),
+      ...(path ? { tools: () => api(`/tools${query}`), children: () => api(`${path}/children`), tasks: () => api(`${path}/tasks`),
+        // The chat endpoint's saved checks (Settings → Model and context → Check endpoint capabilities…); no model request.
+        endpoint: () => api(`/endpoints/${encodeURIComponent(session.model)}/checks`) } : {}),
     }
     for (const [key, request] of Object.entries(requests)) {
       Promise.resolve().then(request).then(value => { if (alive) setData(current => ({ ...current, [key]: { value } })) },
@@ -153,6 +156,13 @@ function subagentsText(children) {
   return `${running.toLocaleString('en-US')} running · ${(children.length - running).toLocaleString('en-US')} finished`
 }
 
+function endpointText({ saved }) {
+  const results = Object.values(saved?.results || {})
+  if (!results.length) return 'Not checked yet (Settings → Model and context → Check endpoint capabilities…)'
+  const accepted = results.filter(result => result.status === 'accepted').length
+  return `Checked ${String(saved.checked || '').slice(0, 10)}: ${accepted} of ${plural(results.length, 'check')} accepted`
+}
+
 function extensionsText({ servers = [], hooks = [] }) {
   if (!servers.length && !hooks.length) return 'None configured'
   const on = items => items.filter(item => item.enabled !== false).length
@@ -179,6 +189,7 @@ function Overview({ session, workspace, changedFiles, onOpen }) {
       ? `Spending limit: ${session.spending_limit_dbu ? `${session.spending_limit_dbu} DBU` : 'none'} (this chat)`
       : 'Model calls, tokens, estimated cost and spending limit' },
     { label: 'Export', tab: 'Export', text: 'Markdown transcript, conversation file, fork' },
+    { label: 'Endpoint checks', text: value('endpoint', endpointText) },
   ] : []
   const project = [
     { label: 'Checkpoints', tab: 'Checkpoints', text: value('checkpoints', items => items.length ? plural(items.length, 'file checkpoint') : 'None yet') },
@@ -195,6 +206,8 @@ function Overview({ session, workspace, changedFiles, onOpen }) {
     <h3>This chat</h3>
     ${session ? html`<dl class="overview-list" aria-label="This chat">${chat.map(row)}</dl>`
       : html`<p>Start a conversation to see its tools, tasks, subagents and usage here.</p>`}
+    ${data.endpoint?.value?.saved ? html`<details class="overview-capabilities"><summary>Endpoint capabilities · ${session.model}</summary>
+      <${CapabilityTable} rows=${data.endpoint.value.capabilities} label=${`Endpoint capabilities of ${session.model}`} /></details>` : null}
     <h3>Project</h3>
     ${folder ? html`<p class="field-help overview-folder">${folder}</p>` : null}
     <dl class="overview-list" aria-label="Project">${project.map(row)}</dl>

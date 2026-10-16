@@ -35,7 +35,7 @@ fake.settings = { ...baseSettings, user_instructions: '', write_limit_kb: 80, co
   coding_dir_status: { path: null, state: 'off', message: 'Not set. New code goes where you ask, or into the project folder.', source: 'none' },
   python_venv_status: { path: null, state: 'off', message: 'Not set. Commands use the Python on the server\'s PATH.', python: null, version: null, source: 'none' },
   default_model: 'databricks-claude-opus-5-5', default_limits: { context_window: 131072, max_output_tokens: 8192 },
-  reasoning_effort: 'default', reasoning_format: 'auto', thinking_summaries: true, fallback_model: '',
+  reasoning_effort: 'default', reasoning_format: 'auto', thinking_summaries: true, thinking_replay: false, fallback_model: '',
   endpoint_profiles: [{ model: 'databricks-claude-opus-5-5', label: 'Claude Opus 5.5' }, { model: 'databricks-claude-opus-4-8', label: 'Claude Opus 4.8' },
     { model: 'databricks-gpt-oss-120b', label: 'GPT OSS 120B' }, { model: 'databricks-gpt-oss-20b', label: 'GPT OSS 20B' }] }
 // POST /api/settings/limits: canned answers like the server's for Claude Opus 5.5; other endpoints have no profile.

@@ -106,7 +106,8 @@ def register_portability(app, manager, settings, store, session_or_404):
                 "imported_count": len(copies)}
 
     @app.get("/api/sessions/{session_id}/export")
-    async def export(session_id: str, include_children: bool = False):
+    async def export(session_id: str, include_children: bool = False, with_reasoning: bool = False):
+        """with_reasoning keeps the replies' signed reasoning (reasoning_replay.py); without it none is exported."""
         sessions = [idle(session_id)]
         if include_children:
             included = {session_id}
@@ -118,7 +119,7 @@ def register_portability(app, manager, settings, store, session_or_404):
                             raise ValueError("Export at most 32 conversations at once. Exclude subagents or export a child separately.")
                         sessions.append(idle(child["id"]))
                         included.add(child["id"])
-        return export_bundle(sessions, session_id)
+        return export_bundle(sessions, session_id, with_reasoning)
 
     @app.post("/api/sessions/import", status_code=201)
     async def import_conversations(request: Request, workspace: str):
@@ -138,7 +139,7 @@ def register_portability(app, manager, settings, store, session_or_404):
         if body is None:
             source = idle(session_id)
             completed_for_fork(source)
-            result = insert(export_bundle([source], session_id), destination(source["workspace"]), "fork")
+            result = insert(export_bundle([source], session_id, True), destination(source["workspace"]), "fork")
             return result["session"]
         live = session_or_404(session_id)
         # Like the other history actions: no running turn and no waiting approval, question or plan card.
@@ -148,7 +149,7 @@ def register_portability(app, manager, settings, store, session_or_404):
         source = copy.deepcopy(live)
         try:
             cut, _ = cut_session(source, body.before_event_id)
-            bundle = export_bundle([cut], session_id)
+            bundle = export_bundle([cut], session_id, True)
         except HistoryError as exc:
             raise HTTPException(400, str(exc)) from exc
         project = root_project(manager, source["workspace"], source.get("worktree"))

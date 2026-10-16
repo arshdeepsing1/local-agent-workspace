@@ -46,6 +46,7 @@ from .approvals import MAX_DECLINE_NOTE, ensure_idle, register_approvals
 from .composer_api import register_composer
 from .interactions import register_interactions
 from .projects import register_projects
+from .endpoint_checks_api import register_endpoint_checks
 
 
 # Browsers refuse ES modules served with a non-JavaScript type, and some systems
@@ -81,7 +82,7 @@ class Decision(BaseModel):
 
 
 Effort = Literal["default", "low", "medium", "high", "xhigh", "max"]  # reasoning.EFFORT_LEVELS
-RequestFormat = Literal["auto", "anthropic", "openai", "none"]  # reasoning.REQUEST_FORMATS
+RequestFormat = Literal["auto", "anthropic", "anthropic_budget", "openai", "none"]  # reasoning.REQUEST_FORMATS
 
 
 class SessionPermissions(BaseModel):
@@ -181,6 +182,7 @@ class SettingsEdit(BaseModel):
     reasoning_effort: Effort | None = None
     reasoning_format: RequestFormat | None = None
     thinking_summaries: bool | None = Field(default=None, strict=True)
+    thinking_replay: bool | None = Field(default=None, strict=True)  # Send earlier thinking back (reasoning_replay.py).
     prompt_caching: Literal["auto", "messages", "off"] | None = None  # config.PROMPT_CACHING
     slash_commands: bool | None = Field(default=None, strict=True)
     spending_limit_dbu: float | None = Field(default=None, ge=0, le=MAX_LIMIT_DBU, allow_inf_nan=False, strict=True)
@@ -256,6 +258,7 @@ def create_app(settings=None):
         yield
         manager.closing = True  # A Stop during shutdown records the reply as interrupted.
         await asyncio.gather(*(manager.stop(sid) for sid in list(manager.tasks)))
+        await manager.endpoint_runner.stop()  # An endpoint check keeps what came back so far.
         await manager.jobs.shutdown()
         # Everything stopped: the next start reads only conversation headers. If a stop raised,
         # no marker is written and the next start loads every conversation (the safe direction).
@@ -412,6 +415,7 @@ def create_app(settings=None):
         # A request format Databricks rejected, and cache markers it rejected, are tried again after any Settings save.
         manager.reasoning_rejections.clear()
         manager.cache_levels.clear()
+        manager.replay_rejections.clear()
         # Open chats' meters follow the new budgets and threshold; others follow when opened (stream).
         for session_id in [key for key, sockets in manager.listeners.items() if sockets]:
             try:
@@ -435,6 +439,8 @@ def create_app(settings=None):
         if profile and profile["recommended_context_window"] and profile["recommended_max_output_tokens"]:
             recommended = {"context_window": profile["recommended_context_window"],
                            "max_output_tokens": profile["recommended_max_output_tokens"]}
+        if profile is not None and profile.get("vision") and not manager.supports(model, "vision"):
+            profile["vision"] = False  # An endpoint check found image parts rejected.
         defaults = default_limits(model)
         effective = effective_limits(model, body.context_window, body.max_output_tokens)
         # The input budget requests use (AgentManager.input_budget): the capped budgets, with the
@@ -454,9 +460,11 @@ def create_app(settings=None):
         model = body.model.strip()
         if not model:
             raise ValueError("Enter a model endpoint name.")
-        fmt = reasoning.request_format(model, body.reasoning_format)
-        return reasoning.preview(model, body.reasoning_effort, body.reasoning_format, body.thinking_summaries,
-                                 manager.reasoning_rejections.get((model, fmt)))
+        # What requests use after a rejection: a thinking budget instead of the adaptive fields, or none.
+        setting, rejected, stepped = manager.reasoning_ladder(model, body.reasoning_format)
+        limits = effective_limits(model, settings.values["context_window"], settings.values["max_output_tokens"])
+        return reasoning.preview(model, body.reasoning_effort, setting, body.thinking_summaries, rejected,
+                                 limits["max_output_tokens"], stepped)
 
     @app.get("/api/sessions")
     async def list_sessions():
@@ -911,6 +919,7 @@ def create_app(settings=None):
     register_composer(app, manager, settings, store, session_or_404)
     register_interactions(app, manager, session_or_404)
     register_projects(app, manager, settings, workspace_tools)
+    register_endpoint_checks(app, manager, settings)
     workspace_folders = register_workspace_folders(app, settings, session_or_404)
 
     # The browser loads the frontend source files directly; there is no build step.
