@@ -1,6 +1,7 @@
 """Provider-reported inference telemetry and documented DBU estimates."""
 
 import json
+import math
 import uuid
 from datetime import datetime, timezone
 
@@ -69,7 +70,8 @@ def stream_error_kind(error):
         "authentication_error": "authentication", "unauthenticated": "authentication",
         "permission_error": "permission", "permission_denied": "permission",
         "rate_limit_error": "rate_limit", "resource_exhausted": "rate_limit",
-        "too_many_requests": "rate_limit", "invalid_request_error": "invalid_request",
+        "too_many_requests": "rate_limit", "request_limit_exceeded": "rate_limit",
+        "invalid_request_error": "invalid_request",
         "invalid_parameter_value": "invalid_request", "bad_request": "invalid_request",
         "api_error": "server", "server_error": "server", "internal_error": "server",
         "overloaded_error": "server",
@@ -109,9 +111,11 @@ def reported_usage(value):
     # cached_tokens), while Claude-style usage reports uncached input, cache reads and
     # cache writes as separate buckets. input_tokens is kept as the uncached part, so
     # the cache is not counted twice by totals, DBU estimates and the estimate scale.
-    # Top-level cache fields stay separate buckets. How Claude endpoints on Databricks
-    # fill these fields still needs one live check. Ledger records saved before this
-    # change keep their counts (they hold input_tokens only and cannot be re-split).
+    # Top-level cache fields stay separate buckets. Checked 2026-10-16 on a live workspace:
+    # the Claude route returns top-level cache_read_input_tokens and
+    # cache_creation_input_tokens, 0 when nothing is cached; a request that hits the cache
+    # is still unchecked. Ledger records saved before this change keep their counts (they
+    # hold input_tokens only and cannot be re-split).
     if (sources.get("input_tokens") == "prompt_tokens" and sources.get("cache_read_input_tokens") == "prompt_tokens_details"
             and usage["cache_read_input_tokens"] <= usage["input_tokens"]):
         usage["input_tokens"] -= usage["cache_read_input_tokens"]
@@ -173,11 +177,25 @@ def finish_inference_call(call, info):
     if usage:
         call["usage"] = usage
     rate_limit = info.get("rate_limit")
-    limit_type = rate_limit.get("limit_type") if isinstance(rate_limit, dict) else None
-    if isinstance(limit_type, str) and 0 < len(limit_type) <= 64:
-        call["limit_type"] = limit_type  # Which Databricks rate limit a 429 named (rate_limits.parse_rate_limit).
+    if isinstance(rate_limit, dict):  # A 429 (agents.rate_limit_fields).
+        limit_type = rate_limit.get("limit_type")
+        if isinstance(limit_type, str) and 0 < len(limit_type) <= 64:
+            call["limit_type"] = limit_type  # Which Databricks rate limit a 429 named (rate_limits.parse_rate_limit).
+        message = rate_limit.get("message")
+        if isinstance(message, str) and message:
+            call["rate_limit_message"] = message[:200]  # Already redacted, whitespace collapsed.
+        if (seconds := _seconds(rate_limit.get("retry_after"))) is not None:
+            call["retry_after"] = seconds  # The wait Databricks asked for: Retry-After, else the body's retry_after.
+        call["retry_after_header"] = isinstance(rate_limit.get("retry_after_header"), str)
     call["finished"] = _now()
     return call
+
+
+def _seconds(value):
+    """A finite number of seconds >= 0 as a float, or None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        return None
+    return float(value)
 
 
 def _iso_time(value):
@@ -234,6 +252,13 @@ def _public_call(call, *, fallback=False):
     fields = call.get("reasoning_fields")  # The top-level reasoning fields the request sent.
     if isinstance(fields, list) and all(isinstance(name, str) for name in fields):
         result["reasoning_fields"] = fields
+    # A 429's message, the wait Databricks asked for and whether it came in a Retry-After header.
+    if isinstance(call.get("rate_limit_message"), str):
+        result["rate_limit_message"] = call["rate_limit_message"][:200]
+    if (seconds := _seconds(call.get("retry_after"))) is not None:
+        result["retry_after"] = seconds
+    if isinstance(call.get("retry_after_header"), bool):
+        result["retry_after_header"] = call["retry_after_header"]
     usage = reported_usage(call.get("usage"))
     if usage:
         result["usage"] = usage
@@ -260,9 +285,13 @@ def call_estimated_dbu(call):
 
 
 def _totals(calls):
+    """A group's counts and token sums. A token field no call of the group reported is None, not 0
+    (Claude Opus 5.5 does not report reasoning_tokens: its thinking is counted in output_tokens); an
+    explicit rejection counts as 0 input and output tokens. Every token field is None when a call that
+    may have been billed has no usage."""
     totals = {"calls": len(calls), "successful": 0, "errors": 0, "rate_limited": 0, "retries": 0,
               **{field: 0 for field in USAGE_FIELDS}}
-    estimates = []
+    estimates, reported = [], set()
     usage_complete = True
     for call in calls:
         totals["successful"] += call["status"] == "completed"
@@ -273,11 +302,11 @@ def _totals(calls):
         usage = {} if rejected else call.get("usage", {})
         if not rejected and not ("input_tokens" in usage and "output_tokens" in usage):
             usage_complete = False
+        reported.update(("input_tokens", "output_tokens") if rejected else usage)
         for field in USAGE_FIELDS:
             totals[field] += usage.get(field, 0)
         estimates.append(call.get("estimated_dbu"))
-    if not usage_complete:
-        totals.update({field: None for field in USAGE_FIELDS})
+    totals.update({field: None for field in USAGE_FIELDS if not usage_complete or (calls and field not in reported)})
     totals["estimated_dbu"] = (round(sum(estimates), 9)
                                 if all(value is not None for value in estimates) else None)
     return totals

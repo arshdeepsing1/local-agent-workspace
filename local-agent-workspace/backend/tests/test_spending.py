@@ -121,6 +121,36 @@ async def test_no_limit_by_default_and_unpriced_endpoints_count_as_unpriced(runt
                                                      "unpriced_calls": 2}
 
 
+STEP_LIMIT = ("Reached the 3-request agent limit. This counts model requests, not tool calls. Completed actions were "
+              "kept. Increase Agent steps in Settings or send a message to continue.")
+
+
+async def test_the_step_limit_notice_names_the_turns_estimated_dbu(runtime, monkeypatch):
+    manager, session = runtime
+    manager.settings.values["max_agent_steps"] = 3
+    requests = []
+    endless_tools(monkeypatch, requests)
+    await manager.run(session, "Go")
+    assert len(requests) == 3 and session["terminal_reason"] == "step_limit"
+    # 3 x 0.857144 DBU: the first sentence is unchanged (Continue and the history cut match it).
+    assert notices(session)[-1]["text"] == STEP_LIMIT + " This turn used about 2.6 DBU (estimate)."
+    await manager.run(session, "Go on")  # Only this turn's requests, not the chat's total.
+    assert notices(session)[-1]["text"] == STEP_LIMIT + " This turn used about 2.6 DBU (estimate)."
+    manager.settings.values["max_agent_steps"] = 1
+    await manager.run(session, "Once more")
+    assert notices(session)[-1]["text"] == STEP_LIMIT.replace("3-request", "1-request") + (
+        " This turn used about 0.857 DBU (estimate).")
+
+
+async def test_the_step_limit_notice_names_no_dbu_without_price_data(runtime, monkeypatch):
+    manager, session = runtime
+    session["model"] = "test-endpoint"
+    manager.settings.values["max_agent_steps"] = 3
+    endless_tools(monkeypatch, [])
+    await manager.run(session, "Go")
+    assert notices(session)[-1]["text"] == STEP_LIMIT
+
+
 class Delegates:
     def __init__(self, active):
         self.active = active

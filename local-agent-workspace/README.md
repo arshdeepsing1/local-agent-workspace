@@ -79,7 +79,8 @@ Stop the local server with Ctrl+C. It must remain running for the UI and agents 
 ## Install / move to another computer
 
 Tested on macOS with Python 3.12. Install Python 3.12+ and Git for the Changes
-panel and worktrees. Shell tools select zsh, bash, or sh, in that order. The
+panel and worktrees. Shell tools select zsh (`zsh -f`), bash, or sh, in that order, and the
+system message names the one in use (in zsh an unquoted `$VAR` is not split into words). The
 frontend is plain JavaScript loaded directly by the browser, so a fresh checkout
 needs no Node.js, pnpm, or frontend build to run or change. Native Windows is not
 supported by the POSIX filesystem/process handling; use a Linux environment such as WSL for that
@@ -1009,9 +1010,12 @@ state so JSONL replacements and SQLite WAL files are settled.
 
 Request details retain the latest valid usage snapshot returned for each streamed
 chat-model request: input, output, total, cache read/write, and reasoning tokens
-when supplied. **Agent tools → Usage** adds a per-conversation graph and durable
+when supplied (Claude Opus 5.5 does not report them; its thinking is counted in output
+tokens, so Request details show "In output tokens (not reported separately)" for a
+request that asked for Claude reasoning). **Agent tools → Usage** adds a per-conversation graph and durable
 attempt ledger for agent, title, compaction, and retry calls. Repeated stream
-snapshots are not added together. Missing provider fields remain unavailable; usage
+snapshots are not added together. Missing provider fields remain unavailable, also in
+the totals: a token field that no call reported is unavailable, not 0; usage
 received before an interruption may be partial, not a final count.
 
 For recognized standard pay-per-token endpoints, the Usage section calculates an
@@ -1092,9 +1096,10 @@ requests, so the app does not send them). Match there on endpoint, `request_time
 within a few seconds of `started_utc`, and the exact token counts. The ledger also
 keeps each response's `id` as `response_id` (Databricks encrypts it) for support
 requests.
-For chat calls, an HTTP 429 `REQUEST_LIMIT_EXCEEDED` response, HTTP 502, 503 or 504,
+For chat calls, an HTTP 429 response (whatever its body says), HTTP 502, 503 or 504,
 and a connection failure, received before streaming begins, share at most three
-retries per request (see **Request details**). The app honors numeric or HTTP-date
+retries per request (see **Request details**). A rate limit reported inside the stream
+is labelled a rate limit but not retried. The app honors numeric or HTTP-date
 `Retry-After` headers and root/nested JSON `retry_after` values, capped at 60 seconds;
 otherwise it waits 5, 15, then 40 seconds after a rate limit and 2, 5, then 15 seconds
 after the others. Context-summary calls are not streamed and can run for minutes: they
@@ -1114,6 +1119,12 @@ retries** tile counts these calls; **429 responses** counts rate-limited calls. 
 request asked for; it is empty for a request at Default that sent no reasoning fields.
 `effort_sent` is the level that went out: GPT OSS gets `high` for Extra high and Max, and
 `none` means the reasoning fields were left out after a rejection.
+
+For a 429 the ledger also keeps `limit_type` (the limit the body named, by field or in
+its words), `rate_limit_message` (the body's message, redacted, at most 200
+characters), `retry_after` (the wait Databricks asked for, in seconds, when it asked)
+and `retry_after_header` (whether that came in a `Retry-After` header). They are in the
+conversation file and the metrics, not in the CSV.
 
 ### Spending limit
 
@@ -1150,7 +1161,8 @@ change applies from the agent's next model request, also while a response runs (
 says so) and for a running subagent whose type sets no effort of its own (see **Custom agents**
 under **Agent tools: tasks, subagents, and activity**). The picker names what Default means where it is known,
 for example **Default (Medium)**. Levels above Default make the model think longer, which
-uses more output tokens (thinking counts toward **Max output tokens**) and costs more.
+uses more output tokens (thinking counts toward **Max output tokens**) and costs more. Claude's
+thinking is adaptive: at any level below Max it may skip thinking on a simple request.
 
 What agent requests to each endpoint carry (top-level fields of the chat-completions body):
 
@@ -1170,9 +1182,10 @@ exact JSON the endpoint and level in the form add to agent requests, computed by
 that builds them. Titles, `/btw` side questions and compaction requests never carry reasoning
 fields: they use the endpoint's default, which their output allowance is sized for.
 
-Databricks documents the Anthropic fields for its Anthropic Messages route; whether its
-chat-completions route, which this app uses, passes them on has not been checked against a
-live endpoint. So when Databricks answers HTTP 400 before any reply streams and the error
+Checked on 2026-10-16 against a live Claude Opus 5.5 endpoint: the chat-completions route, which
+this app uses, accepts these fields at every level and streams the thinking summary (Databricks
+documents them for its Anthropic Messages route). Another endpoint or workspace may differ, so
+when Databricks answers HTTP 400 before any reply streams and the error
 names a reasoning field the request added (`thinking`, `output_config`, `effort`,
 `reasoning_effort`, `display` or `budget_tokens`), the app sends that request once more
 without reasoning fields (a rejected request is not billed), posts one notice naming the
@@ -1187,12 +1200,15 @@ setting changes what is shown, not how much the model thinks or what it costs. A
 thinking appears in a **Thinking** block at its top: open with the live text and "Thinking… 12 s"
 while the model thinks, then collapsed to "Thought for 12 s" when the answer or a tool call
 starts or the response ends (a block you opened or closed yourself stays as you left it). The
-duration is saved with the reply. An endpoint that reported reasoning tokens or thinking
+duration is saved with the reply. It counts from the first thinking text: Databricks sends that
+a few seconds after thinking starts, so **Request details** also show when it arrived, for
+example "Thinking text began after 9.0 s" (seconds after the request was sent). An endpoint that reported reasoning tokens or thinking
 without text gets one line instead, "Thought for N s · the endpoint did not return a summary".
 The app shows thinking text only as the endpoint returns it (redacted, up to 12,000
 characters) and never sends earlier thinking back to the model. **Request details** under a
 reply show **Effort**, for example "High (output_config.effort)", and the reasoning fields
-sent.
+sent. Claude Opus 5.5 reports no reasoning tokens (its thinking is counted in output tokens), so
+**Reasoning tokens** there reads "In output tokens (not reported separately)".
 
 ### Context and project instructions
 
@@ -1229,13 +1245,15 @@ checked 2026-10-13): Opus 5.5, Opus 4.8 and GPT OSS 120B each allow 1,000,000 in
 (ITPM) and 100,000 output tokens (OTPM) per minute. Your workspace's limits may differ.
 
 - Databricks reserves Max output tokens against OTPM when each request starts. Above 100,000 a
-  request is rejected with HTTP 429 before it starts (an error in Settings). Above 20,000 four
+  request is documented to be rejected with HTTP 429 before it starts (a warning in Settings;
+  some workspaces accept more). Above 20,000 four
   requests at once (a chat and up to three subagents, or several chats) can be rejected; the
   app then waits and retries. 20,000 keeps one fifth of OTPM free; at 16,384, four requests
   reserve 65,536.
 - Each agent step sends up to the whole context budget. Above 250,000 tokens, four full steps
-  in one minute reach ITPM, so long turns and subagents wait on rate limits, and every step
-  costs more (a note in Settings). You can raise Opus 5.5 to 1,000,000.
+  in one minute can reach ITPM after a short burst allowance (Databricks enforces ITPM and OTPM
+  with a token bucket that admits short bursts above the per-minute figure), so long turns and
+  subagents wait on rate limits, and every step costs more (a note in Settings). You can raise Opus 5.5 to 1,000,000.
 - Opus 5.5 always thinks before it answers, and its thinking counts toward Max output tokens.
   Below 16,384, complex steps and large file writes can stop at the limit (a note in Settings).
   The system message tells the model so. Title and `/btw` requests add 4,096 tokens for
@@ -1425,9 +1443,10 @@ notice explains it and compaction continues with the summary only. Subagent
 conversations do not write compaction handoffs. Turn the setting off for the previous
 summary-only compaction.
 
-Input tokens per minute matter on large budgets: with a 1,000,000-token budget, one
-near-full request uses all of Claude Opus 5.5's default 1,000,000 input tokens per
-minute, so the next step can be rate limited. Lower **Auto-compact at** or the
+Input tokens per minute matter on large budgets: with a 1,000,000-token budget, a few
+near-full requests within a minute or two can use up Claude Opus 5.5's default 1,000,000
+input tokens per minute (Databricks admits short bursts above the per-minute figure), so
+later steps can be rate limited. Lower **Auto-compact at** or the
 context budget for multi-step work.
 
 **Request size.** Databricks accepts at most 4 MB per request. The app encodes each
@@ -1448,13 +1467,20 @@ stops a request after 597 seconds; when a stream ends early after about that lon
 notice (once per turn) says so and suggests lowering Max output tokens or the context
 budget.
 
-**Rate limits.** A Databricks 429 body names the limit it hit: `limit_type` (input or output
-tokens per minute, queries per hour or second), `limit`, `current` and `retry_after`. Retry
-notices name it, for example "Databricks rate limited the model request (output tokens per
-minute (OTPM): limit 100,000, current 100,500). Retrying in 3 seconds (1 of 3).", and a
-429 that names a limit is retried even when its message does not say "rate limit". Request
-details show a **Rate limit** row for a final 429 (one that was not retried); the ledger
-records its `limit_type`. When a final 429 names the input-tokens-per-minute limit, the
+**Rate limits.** A Databricks 429 body may name the limit it hit: `limit_type` (input or output
+tokens per minute, queries per hour, minute or second), `limit`, `current` and `retry_after`;
+when it gives only a message, such as `{"error_code": "REQUEST_LIMIT_EXCEEDED", "message":
+"Exceeded workspace input tokens per minute rate limit ..."}`, the app reads the limit type from
+its words (one type only; a message that names two names none, and numbers in words are never
+read, so no limit is learned from them). Retry notices name it, for example "Databricks rate
+limited the model request (output tokens per minute (OTPM): limit 100,000, current 100,500).
+Retrying in 3 seconds (1 of 3).", and every 429 before streaming is retried, whatever its body
+says. Each rate-limit notice (a retry, an automatic continue, a wait for another chat) has
+**Details** with the 429 behind it: its code and message (redacted, at most 200 characters) and
+the wait Databricks asked for, for example "HTTP 429 REQUEST_LIMIT_EXCEEDED: Exceeded workspace
+input tokens per minute rate limit · Retry-After: none". Request details show a **Rate limit**
+row and the Databricks message for a final 429 (one that was not retried); the ledger records
+its `limit_type`, message and `retry_after`. When a final 429 names the input-tokens-per-minute limit, the
 error adds the arithmetic: each agent step resends the whole conversation, so the context
 budget times the steps per minute must stay under ITPM (at about 400,000 tokens per request,
 1,000,000 ITPM allows about 2 requests per minute; keep the budget near 200,000 tokens for
@@ -1470,13 +1496,13 @@ smallest summary plus thinking room cannot fit does compaction stop. The thinkin
 eighth of the context budget, up to 8,192 tokens, so the error names the context budget at which
 compaction fits (at most 47,239 tokens under a 10,000 OTPM limit) or, when no budget is small
 enough, asks for a higher limit from the workspace admin. When Databricks asks one chat to pause, other chats and compaction
-requests to the same endpoint wait for that pause too, plus up to 3 seconds of random
-jitter so they do not all retry at once, with a notice; a request with a smaller Max output
+requests to the same endpoint wait for that pause too, plus 1 to 3 seconds of random
+jitter so they retry after that chat's own retry rather than with it, with a notice; a request with a smaller Max output
 tokens may pass an output-tokens pause, and Stop cancels the wait. `/btw` does not wait: it
 says when to ask again. These pauses and learned limits live in memory and start empty when
 the app starts. The app does not pace requests by tokens per minute itself: limits vary by
-tier and workspace, a rejected 429 is not billed, Databricks returns `retry_after`, and the
-app's token counts are estimates.
+tier and workspace, a rejected 429 is not billed, Databricks may return `retry_after` (when it
+does not, the app waits 5, 15, then 40 seconds), and the app's token counts are estimates.
 The newest turn and its complete tool exchanges are retained verbatim;
 the preceding turn is also retained when space allows. The app's hidden messages
 inside a turn (automatic retries, Verify results) belong to that turn and never count
@@ -2306,7 +2332,12 @@ and never blocks saving other settings. Files shows the folder as soon as the ag
 **Settings → Agent steps** defaults to 32 model requests per user message and accepts
 1–64. This is a model-request ceiling, not a tool-call count: one model response can
 request several tools. Reaching the ceiling preserves completed actions and stops
-until the user continues or raises the setting. **Max output tokens** defaults to
+until the user continues or raises the setting; the notice adds what the turn cost, for
+example "This turn used about 42.5 DBU (estimate)." (the chat and its subagents, from list
+prices; left out for an endpoint without price data). Each step resends the whole
+conversation, so a long turn on a large context costs far more than a short one, and with no
+spending limit set (the default) the step limit is the only brake: if you raise Agent steps,
+also set a per-chat **spending limit** (see **Spending limit**). **Max output tokens** defaults to
 the endpoint's profile (16,384 for Opus 5.5, 8,192 otherwise) with the bounds described above. The editor and file edits are
 limited by Settings → File write limit (80 KB by default).
 

@@ -239,9 +239,15 @@ def test_opus_warning_boundaries(context, output, expected):
 
 def test_warning_levels_and_texts():
     warnings = {item["code"]: item for item in limit_warnings(OPUS, 300_000, 100_001)}
-    assert warnings["output_over_otpm"]["level"] == "error"
+    # Documented, but some workspaces accept more: a warning (role status), not an error.
+    assert warnings["output_over_otpm"]["level"] == "warning"
+    assert warnings["output_over_otpm"]["text"].startswith(
+        "Databricks documents that a request whose Max output tokens is above the endpoint's "
+        "output-tokens-per-minute limit (100,000 by default for Claude Opus 5.5) is rejected with HTTP 429 before it "
+        "starts; some workspaces accept more.")
     assert "Lower it to at most 20,000" in warnings["output_over_otpm"]["text"]
     assert warnings["context_itpm"]["level"] == "note"
+    assert "can reach, after a short burst allowance," in warnings["context_itpm"]["text"]
     assert "Above 250,000 tokens" in warnings["context_itpm"]["text"]
     concurrency = limit_warnings(OPUS, 200_000, 30_000)[0]
     assert concurrency["level"] == "warning" and "Above 20,000, four requests at once" in concurrency["text"]

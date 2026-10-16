@@ -8,7 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from local_agent.jobs import NOT_STOPPED, CommandTimeout, JobManager, run_process, shell_argv, validate_command_options
+from local_agent.jobs import (NOT_STOPPED, CommandTimeout, JobManager, run_process, shell_argv, shell_note,
+                              validate_command_options)
 from local_agent.store import Store
 
 
@@ -40,6 +41,21 @@ def test_command_validation(options):
 def test_shell_selection_disables_startup_files(monkeypatch, available, expected):
     monkeypatch.setattr("local_agent.jobs.Path.is_file", lambda path: str(path) in available)
     assert shell_argv("printf ok") == expected
+
+
+@pytest.mark.parametrize("available, expected", [
+    ({"/bin/zsh", "/bin/bash"}, "Commands run with zsh -f: an unquoted $VAR is not split into words, so use a shell "
+                                "function or an array for a command with options."),
+    ({"/bin/bash"}, "Commands run with bash --noprofile --norc."),
+    ({"/bin/sh"}, "Commands run with /bin/sh (POSIX sh)."),
+    (set(), ""),
+])
+def test_the_system_prompt_names_the_shell_commands_run_with(monkeypatch, available, expected):
+    from local_agent.agents import SYSTEM_PROMPT
+    assert shell_note() in SYSTEM_PROMPT  # Built from this machine's choice.
+    monkeypatch.setattr("local_agent.jobs.Path.is_file", lambda path: str(path) in available)
+    polling = "A loop that polls CI or a deploy should print one line per check."
+    assert shell_note() == (f"{expected} {polling}" if expected else polling)
 
 
 async def test_output_arrives_before_exit(tmp_path):

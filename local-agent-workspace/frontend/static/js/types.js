@@ -113,7 +113,8 @@
 //   reasoning_summary? (the reply's thinking text the endpoint returned, redacted, at most 12,000 characters),
 //   reasoning_truncated?, reasoning_started? (epoch seconds when its thinking began), reasoning_seconds? (how long it
 //   thought: until answer text or a tool call began, or the response ended; also set when the endpoint reported
-//   reasoning tokens without text), child_session_id?, request_info?,
+//   reasoning tokens without text), reasoning_wait_seconds? (seconds from sending the request to its first thinking
+//   item; Request details show it), child_session_id?, request_info?,
 //   name?, input?, output?, preview?, state?, delegation?, origin?,
 //   (delegation: Delegation, on a delegate_task card or a notice with child_session_id),
 //   approval?: 'approved'|'declined'|'expired'|'blocked', approval_expires? (epoch seconds, only with a limit),
@@ -140,6 +141,8 @@
 //   User events also carry in_wire? (true once the text reached the model history as its own message; false
 //   when the turn failed before that; absent on older events), steered? (true: sent while the agent was
 //   working) and attachments?: Attachment[]. The 'Stopped.' notice carries stop_phase?: 'streaming'|'tools'|'waiting'.
+//   A rate-limit retry, automatic-continue or shared-wait notice carries details?: string ('HTTP 429 <code>: <message>
+//   · Retry-After: <n s | none>', the 429 behind it; a shared wait shows the other chat's), shown under Details.
 //   A compaction's notice carries compaction?: Compaction (one notice per compaction).
 //   Hooks (lifecycle_hooks.py): a hook card (name 'hook_<event>', input { hook_id, tool?, call_id?, event?,
 //   subagent_session_id? }) carries hook_result?: { json: true, decision?, reason?, context?, arguments?: { before,
@@ -172,7 +175,10 @@
 // ApiError: { message, status, detail? }. A 409 that a busy chat causes has
 //   detail { message, session_id, title } naming that chat; other errors have no detail.
 // RequestInfo: { model, status, finish_reason?, http_status?, error_kind?, usage?,
-//   rate_limit?: { limit_type, limit?, current?, retry_after? } (only on a final, not retried, 429),
+//   rate_limit?: { limit_type?, limit?, current?, retry_after?, code?, message?, retry_after_header? } (on a 429 that
+//   ended the request: limit_type from the body's field or its words, absent when it names none; code: error_code or
+//   the error's code or type; message: the body's message, redacted, at most 200 characters; retry_after: the wait
+//   Databricks asked for, from the Retry-After header or the body; retry_after_header: that header as sent),
 //   reasoning?: { effort, format, fields, sent_effort?, effort_field?, skipped?: 'rejected'|'rejected_earlier',
 //   rejected_field? } (absent when the request was at Default and sent nothing) }.
 //   error_kind includes 'rate_limit', 'payload_too_large' (over the 4 MB request limit; not sent) and

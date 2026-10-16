@@ -8,9 +8,11 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from local_agent.agents import AgentManager, retry_notice
+from local_agent.agents import AgentManager, rate_limit_details, retry_notice
 from local_agent.config import Settings
-from local_agent.rate_limits import (LEARNED_TTL, OTPM, RateLimitGate, RateLimitInfo, describe, parse_rate_limit)
+from local_agent.portability import export_bundle
+from local_agent.rate_limits import (ITPM, LEARNED_TTL, OTPM, RateLimitGate, RateLimitInfo, describe,
+                                     limit_type_from_words, parse_rate_limit)
 from local_agent.store import Store
 from local_agent.telemetry import InferenceError, session_metrics
 
@@ -72,7 +74,8 @@ def test_the_documented_nested_body_is_parsed():
                                        "type": "rate_limit_exceeded", "code": 429,
                                        "limit_type": "input_tokens_per_minute", "limit": 1000000,
                                        "current": 1003000, "retry_after": 12}})
-    assert info == RateLimitInfo("input_tokens_per_minute", "input tokens per minute (ITPM)", 1000000, 1003000, 12.0)
+    assert info == RateLimitInfo("input_tokens_per_minute", "input tokens per minute (ITPM)", 1000000, 1003000, 12.0,
+                                 "rate_limit_exceeded", "Rate limit exceeded: ITPM limit of 1,000,000 tokens reached")
     assert describe(info) == "input tokens per minute (ITPM): limit 1,000,000, current 1,003,000"
 
 
@@ -86,6 +89,8 @@ def test_root_fields_are_read_and_nested_values_win():
     ("output-tokens-per-minute", ("output_tokens_per_minute", "output tokens per minute (OTPM)")),
     ("QPH", ("queries_per_hour", "queries per hour (QPH)")),
     ("queries_per_second", ("queries_per_second", "queries per second (QPS)")),
+    ("queries-per-minute", ("queries_per_minute", "queries per minute (QPM)")),
+    ("QPM", ("queries_per_minute", "queries per minute (QPM)")),
     ("Concurrent Requests!", ("concurrentrequests", "concurrentrequests")),
     ("tokens per day", ("tokensperday", "tokensperday")),
     ("x" * 65, (None, None)),
@@ -114,6 +119,59 @@ def test_the_existing_rate_limit_notice_is_unchanged_without_details():
     assert retry_notice(error, 5.0, 1, 3) == "Databricks rate limited the model request. Retrying in 5 seconds (1 of 3)."
     error.rate_limit = parse_rate_limit({"error_code": "REQUEST_LIMIT_EXCEEDED"})
     assert retry_notice(error, 5.0, 1, 3) == "Databricks rate limited the model request. Retrying in 5 seconds (1 of 3)."
+
+
+# --- The limit type in a 429's words (a body with only error_code and message) -------------------
+
+ITPM_WORDS = {"error_code": "REQUEST_LIMIT_EXCEEDED",
+              "message": "Exceeded workspace input tokens per minute rate limit for test-endpoint."}
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("Exceeded workspace input tokens per minute rate limit for test-endpoint.", ITPM),
+    ("Exceeded workspace output tokens per minute rate limit.", OTPM),
+    ("Rate limit exceeded: ITPM limit of 1,000,000 tokens reached.", ITPM),
+    ("OUTPUT_TOKENS_PER_MINUTE limit reached", OTPM),
+    ("The endpoint is limited to 0 queries per minute.", "queries_per_minute"),
+    ("QPH limit reached", "queries_per_hour"),
+    ("Too many queries per second", "queries_per_second"),
+    ("Exceeded tokens per minute limit", "tokens_per_minute"),
+    ("Exceeded the tokens per minute and the input tokens per minute limits", ITPM),  # The specific one wins.
+    ("input tokens per minute and output tokens per minute both exceeded", None),  # Ambiguous.
+    ("Exceeded workspace rate limit", None),
+    ("REQUEST_LIMIT_EXCEEDED", None),
+    ("Too Many Requests", None),
+    ("an itpmx value", None),
+    ("", None),
+])
+def test_the_limit_type_is_read_from_the_words(text, expected):
+    assert limit_type_from_words(text) == expected
+
+
+def test_a_body_with_only_a_code_and_a_message_names_its_limit_but_no_number():
+    info = parse_rate_limit(ITPM_WORDS)
+    assert (info.limit_type, info.label, info.code) == (ITPM, "input tokens per minute (ITPM)", "REQUEST_LIMIT_EXCEEDED")
+    assert describe(info) == "input tokens per minute (ITPM)"
+    # Numbers in words are never read: no limit is learned from them.
+    info = parse_rate_limit({"message": "ITPM limit of 1,000,000 tokens reached; current 1,200,000"})
+    assert info.limit_type == ITPM and info.limit is None and info.current is None
+    # A field wins over the words; nested values win over the root's.
+    assert parse_rate_limit({"limit_type": "qph", "message": "output tokens per minute"}).limit_type == "queries_per_hour"
+    nested = parse_rate_limit({"message": "root", "error": {"message": "QPM reached", "error_code": "LIMITED"}})
+    assert (nested.limit_type, nested.label, nested.code, nested.message) == (
+        "queries_per_minute", "queries per minute (QPM)", "LIMITED", "QPM reached")
+
+
+def test_the_kept_message_is_redacted_collapsed_and_clipped():
+    redact = lambda text: text.replace("private-token", "[REDACTED]")  # noqa: E731
+    info = parse_rate_limit({"error_code": "bad code!", "message": "Rate\n  limited  private-token " + "y" * 400},
+                            redact=redact)
+    assert info.message.startswith("Rate limited [REDACTED] yyy") and len(info.message) == 200
+    assert info.message.endswith("…") and info.code is None
+    # A body that is not JSON: its text is the message (and its words name the limit).
+    plain = parse_rate_limit(None, "Too many output tokens per minute", redact)
+    assert (plain.message, plain.limit_type) == ("Too many output tokens per minute", OTPM)
+    assert parse_rate_limit(None, "").message is None and parse_rate_limit({}, "{}").message is None
 
 
 def test_a_smaller_output_reservation_passes_an_otpm_block():
@@ -159,7 +217,8 @@ async def test_a_final_429_keeps_its_details_in_the_request_and_the_ledger(runti
     await manager.run(session, "Hello")
     reply = next(event for event in session["events"] if event["type"] == "assistant")
     assert reply["request_info"]["rate_limit"] == {"limit_type": "input_tokens_per_minute", "limit": 1000000,
-                                                   "current": 1200000, "retry_after": 2.0}
+                                                   "current": 1200000, "retry_after": 2.0,
+                                                   "message": "Rate limit exceeded"}
     calls = [call for call in session["inference_calls"] if call["purpose"] == "agent"]
     assert len(calls) == 4 and all(call["limit_type"] == "input_tokens_per_minute" for call in calls)
     assert all(call["limit_type"] == "input_tokens_per_minute" for call in session_metrics(session)["calls"])
@@ -179,6 +238,107 @@ def test_the_itpm_advice_names_the_requests_per_minute():
     assert AgentManager.itpm_advice({}, info) == (" For about five steps a minute, keep Settings → Context budget "
                                                   "near 200,000 tokens.")
     assert AgentManager.itpm_advice({}, parse_rate_limit(OTPM_BODY)) == ""
+
+
+async def test_a_429_whose_message_names_the_limit_is_labelled_kept_and_detailed(runtime, monkeypatch, delays):
+    manager, new_session, _ = runtime
+    session = new_session()
+    body = {**ITPM_WORDS, "message": ITPM_WORDS["message"] + " Token private-token. " + "z" * 300}
+    requests = []
+
+    async def gateway(request):
+        requests.append(request)
+        return httpx.Response(429, json=body) if len(requests) == 1 else httpx.Response(200, text=sse())
+    mock_gateway(monkeypatch, gateway)
+    await manager.run(session, "Hello")
+    assert len(requests) == 2 and delays == [5.0]
+    notice = next(event for event in session["events"] if event["type"] == "notice")
+    assert notice["text"] == ("Databricks rate limited the model request (input tokens per minute (ITPM)). "
+                              "Retrying in 5 seconds (1 of 3).")
+    assert notice["details"].startswith("HTTP 429 REQUEST_LIMIT_EXCEEDED: Exceeded workspace input tokens per minute "
+                                        "rate limit for test-endpoint. Token [REDACTED]. zzz")
+    assert notice["details"].endswith("… · Retry-After: none")
+    first = [call for call in session["inference_calls"] if call["purpose"] == "agent"][0]
+    assert first["limit_type"] == ITPM and first["retry_after_header"] is False and "retry_after" not in first
+    assert len(first["rate_limit_message"]) == 200 and "[REDACTED]" in first["rate_limit_message"]
+    public = session_metrics(session)["calls"][0]
+    assert public["rate_limit_message"] == first["rate_limit_message"] and public["retry_after_header"] is False
+    assert "private-token" not in json.dumps(manager.store.get(session["id"]))
+
+
+async def test_a_final_429_records_the_message_and_the_retry_after_header(runtime, monkeypatch, delays):
+    manager, new_session, _ = runtime
+    manager.settings.values["rate_limit_auto_continue"] = False
+    session = new_session()
+
+    async def gateway(request):
+        return httpx.Response(429, headers={"Retry-After": "7"}, json={"error_code": "REQUEST_LIMIT_EXCEEDED",
+                                                                       "message": "Exceeded workspace rate limit"})
+    mock_gateway(monkeypatch, gateway)
+    await manager.run(session, "Hello")
+    assert delays == [7.0, 7.0, 7.0]
+    reply = next(event for event in session["events"] if event["type"] == "assistant")
+    assert reply["request_info"]["rate_limit"] == {"code": "REQUEST_LIMIT_EXCEEDED",
+                                                   "message": "Exceeded workspace rate limit", "retry_after": 7.0,
+                                                   "retry_after_header": "7"}
+    assert all(text.startswith("Databricks rate limited the model request. Retrying in 7 seconds")
+               for text in notices(session))
+    assert {event["details"] for event in session["events"] if event["type"] == "notice"} == {
+        "HTTP 429 REQUEST_LIMIT_EXCEEDED: Exceeded workspace rate limit · Retry-After: 7 s"}
+    calls = [call for call in session["inference_calls"] if call["purpose"] == "agent"]
+    assert all(call["retry_after"] == 7.0 and call["retry_after_header"] is True and "limit_type" not in call
+               for call in calls)
+
+
+async def test_an_export_keeps_a_429_without_a_limit_type_and_its_details(runtime, monkeypatch, delays):
+    manager, new_session, _ = runtime
+    manager.settings.values["rate_limit_auto_continue"] = False
+    session = new_session()
+
+    async def gateway(request):
+        return httpx.Response(429, text="Too Many Requests")
+    mock_gateway(monkeypatch, gateway)
+    await manager.run(session, "Hello")
+    bundle = export_bundle([session], session["id"])
+    events = bundle["sessions"][0]["events"]
+    reply = next(event for event in events if event["type"] == "assistant")
+    assert reply["request_info"]["rate_limit"] == {"message": "Too Many Requests"}
+    assert [event["details"] for event in events if event["type"] == "notice"] == [
+        "HTTP 429: Too Many Requests · Retry-After: none"] * 3
+
+
+def test_the_details_name_a_retry_after_in_the_body_or_none():
+    error = InferenceError("", "rate_limit", 429)
+    error.rate_limit = parse_rate_limit({"error": {"message": "Slow down", "type": "rate_limit_exceeded"}})
+    error.retry_headers, error.retry_payload = {"retry-after": None}, {"error": {"retry_after": 2.5}}
+    assert rate_limit_details(error) == "HTTP 429 rate_limit_exceeded: Slow down · retry_after: 2.5 s"
+    error.rate_limit, error.retry_payload = parse_rate_limit(None, ""), None
+    assert rate_limit_details(error) == "HTTP 429 · Retry-After: none"
+    error.rate_limit = parse_rate_limit({"error_code": "LIMITED", "message": "LIMITED: try later"})
+    error.retry_headers = {"retry-after": "soon"}
+    assert rate_limit_details(error) == "HTTP 429: LIMITED: try later · Retry-After: soon"
+
+
+async def test_an_otpm_type_from_words_without_a_number_refuses_nothing(runtime, monkeypatch, delays):
+    manager, new_session, _ = runtime
+    manager.settings.values.update(context_window=262144, max_output_tokens=120000)
+    session = new_session()
+    requests = []
+
+    async def gateway(request):
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(429, json={"error_code": "REQUEST_LIMIT_EXCEEDED",
+                                             "message": "Exceeded workspace output tokens per minute rate limit."})
+        return httpx.Response(200, text=sse())
+    mock_gateway(monkeypatch, gateway)
+    await manager.run(session, "Hello")
+    assert len(requests) == 2 and session["terminal_reason"] == "completed"
+    assert notices(session)[0].startswith("Databricks rate limited the model request (output tokens per minute (OTPM)).")
+    assert manager.rate_gate.learned_limit(session["model"], OTPM) is None
+    assert manager.otpm_preflight(session, 120000) is None
+    await manager.run(session, "Again")
+    assert len(requests) == 3 and session["terminal_reason"] == "completed"
 
 
 # --- The learned OTPM limit ----------------------------------------------------------------------
@@ -270,6 +430,34 @@ async def test_another_chat_on_the_same_endpoint_waits_with_jitter(runtime, monk
     assert delays == [20.0, 20.5]
 
 
+async def test_a_waiting_chat_retries_one_to_three_seconds_after_the_owner(runtime, monkeypatch, delays):
+    manager, new_session, _ = runtime
+    drawn = []
+
+    def uniform(low, high):
+        drawn.append((low, high))
+        return 2.0
+    manager.rate_rng = SimpleNamespace(uniform=uniform)
+    first, second = new_session(), new_session()
+    requests = []
+
+    async def gateway(request):
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(429, json=ITPM_WORDS)
+        return httpx.Response(200, text=sse())
+    mock_gateway(monkeypatch, gateway)
+    await manager.run(first, "Hello")
+    await manager.run(second, "Hello")
+    # A floor, not a fraction of the remaining wait: even a short remainder is followed by at least 1 s.
+    assert drawn == [(1.0, 3.0)] and delays == [5.0, 7.0]
+    waiting = next(event for event in second["events"] if event["type"] == "notice")
+    assert waiting["text"].startswith("Waiting 5 seconds before the model request")
+    # The other chat's 429, under Details.
+    assert waiting["details"] == ("HTTP 429 REQUEST_LIMIT_EXCEEDED: Exceeded workspace input tokens per minute rate "
+                                  "limit for test-endpoint. · Retry-After: none")
+
+
 async def test_a_compaction_429_blocks_the_endpoint_for_other_chats(runtime, delays):
     manager, new_session, _ = runtime
     session = new_session()
@@ -288,6 +476,7 @@ async def test_a_compaction_429_blocks_the_endpoint_for_other_chats(runtime, del
     assert manager.rate_gate.remaining(session["model"], "another chat") == 5
     assert notices(session) == ["Databricks rate limited context compaction (queries per hour (QPH): limit 10). "
                                 "Retrying in 5 seconds (1 of 3)."]
+    assert session["events"][-1]["details"] == "HTTP 429: Rate limit exceeded · retry_after: 5 s"
     compaction = [call for call in session["inference_calls"] if call["purpose"] == "compaction"]
     assert compaction[0]["limit_type"] == "queries_per_hour" and "limit_type" not in compaction[1]
 
@@ -347,6 +536,8 @@ async def test_the_automatic_continue_notice_names_the_limit(runtime, monkeypatc
         "Databricks is still rate limiting this chat (input tokens per minute (ITPM): limit 1,000,000, current "
         "1,003,000). Continued automatically at ")
     assert waiting[0].endswith("(1 of 2).") and "Continued automatically at " in waiting[0]
+    wait = next(event for event in session["events"] if event.get("text") == waiting[0])
+    assert wait["details"] == "HTTP 429: Rate limit exceeded · retry_after: 2 s"
 
 
 def test_the_gate_keeps_at_most_64_endpoints():

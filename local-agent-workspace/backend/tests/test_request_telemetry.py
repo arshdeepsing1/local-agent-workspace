@@ -7,7 +7,7 @@ import pytest
 from local_agent.agents import AgentManager, retry_after_seconds
 from local_agent.config import Settings
 from local_agent.store import Store
-from local_agent.telemetry import reported_usage
+from local_agent.telemetry import reported_usage, stream_error_kind
 
 
 @pytest.fixture
@@ -132,7 +132,7 @@ async def test_request_attempt_is_durable_before_provider_admission(runtime, mon
 
 
 @pytest.mark.parametrize("status, kind", [(400, "invalid_request"), (401, "authentication"),
-    (403, "permission"), (429, "rate_limit"), (500, "server")])
+    (403, "permission"), (500, "server")])
 async def test_http_failures_are_typed_redacted_and_not_retried(runtime, monkeypatch, status, kind):
     manager, session = runtime
     requests = []
@@ -150,6 +150,41 @@ async def test_http_failures_are_typed_redacted_and_not_retried(runtime, monkeyp
     assert error["type"] == "error" and error["error_kind"] == kind and error["http_status"] == status
     assert "[REDACTED]" in error["text"]
     assert "private-token" not in json.dumps(manager.store.get(session["id"]))
+
+
+async def test_a_plain_text_429_is_retried_typed_and_redacted(runtime, monkeypatch):
+    # The status alone means rate limited (RL3); its text is the message kept, redacted.
+    manager, session = runtime
+    manager.settings.values["rate_limit_auto_continue"] = False
+    requests, delays = [], []
+
+    async def gateway(request):
+        requests.append(request)
+        return httpx.Response(429, text="Provider error private-token")
+
+    async def sleep(delay):
+        delays.append(delay)
+    mock_gateway(monkeypatch, gateway)
+    monkeypatch.setattr("local_agent.agents.asyncio.sleep", sleep)
+    await manager.run(session, "Hello")
+    assert len(requests) == 4 and delays == [5.0, 15.0, 40.0]
+    info = request_event(session)["request_info"]
+    assert info == {"model": session["model"], "status": "error", "http_status": 429, "error_kind": "rate_limit",
+                    "rate_limit": {"message": "Provider error [REDACTED]"}}
+    error = session["events"][-1]
+    assert error["type"] == "error" and error["error_kind"] == "rate_limit" and error["http_status"] == 429
+    assert "[REDACTED]" in error["text"]
+    calls = session["inference_calls"]
+    assert all(call["rate_limit_message"] == "Provider error [REDACTED]" and call["retry_after_header"] is False
+               and "retry_after" not in call and "limit_type" not in call for call in calls)
+    assert "private-token" not in json.dumps(manager.store.get(session["id"]))
+
+
+def test_an_in_stream_request_limit_error_is_labelled_a_rate_limit():
+    # Labelled, but never retried: part of the reply may already have streamed.
+    assert stream_error_kind({"error_code": "REQUEST_LIMIT_EXCEEDED", "message": "slow down"}) == "rate_limit"
+    assert stream_error_kind({"code": "request_limit_exceeded"}) == "rate_limit"
+    assert stream_error_kind({"error_code": "SOMETHING_ELSE"}) == "unknown"
 
 
 async def test_pre_admission_rate_limit_retries_same_request_without_duplicate_reply(runtime, monkeypatch):

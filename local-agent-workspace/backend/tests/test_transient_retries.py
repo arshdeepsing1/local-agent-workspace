@@ -200,6 +200,38 @@ async def test_four_503s_make_four_attempts_then_fail(runtime, monkeypatch, dela
     assert [call.get("retry_reason") for call in agent_calls(session)] == [None, "server_error", "server_error", "server_error"]
 
 
+@pytest.mark.parametrize("body", ["Too Many Requests", "", "<html><body>429 Too Many Requests</body></html>"])
+async def test_every_429_before_streaming_is_retried_whatever_its_body(runtime, monkeypatch, delays, body):
+    # The status alone means rate limited: a plain-text, empty or proxy 429 is repeated like a JSON one.
+    manager, session = runtime
+    requests = []
+
+    async def gateway(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(429, text=body) if len(requests) == 1 else httpx.Response(200, text=sse())
+
+    mock_gateway(monkeypatch, gateway)
+    await manager.run(session, "Hello")
+    assert len(requests) == 2 and requests[0] == requests[1] and delays == [5.0]
+    assert notices(session) == ["Databricks rate limited the model request. Retrying in 5 seconds (1 of 3)."]
+    assert session["terminal_reason"] == "completed"
+    assert [call.get("retry_reason") for call in agent_calls(session)] == [None, "rate_limit"]
+
+
+async def test_a_rate_limit_inside_the_stream_is_labelled_but_not_retried(runtime, monkeypatch, delays):
+    manager, session = runtime
+    requests = []
+
+    async def gateway(request):
+        requests.append(request)
+        return httpx.Response(200, text="data: " + json.dumps({"error": RATE_LIMITED}) + "\n\n")
+
+    mock_gateway(monkeypatch, gateway)
+    await manager.run(session, "Hello")
+    assert len(requests) == 1 and delays == [] and not notices(session)
+    assert session["events"][-1]["type"] == "error" and session["events"][-1]["error_kind"] == "rate_limit"
+
+
 async def test_rate_limits_and_gateway_errors_share_one_budget(runtime, monkeypatch, delays):
     manager, session = runtime
     requests = []

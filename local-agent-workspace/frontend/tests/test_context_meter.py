@@ -377,5 +377,19 @@ def test_request_details_show_the_rate_limit_of_a_final_429(ui, page):
     page.get_by_text("Request details · error").click()
     expect(definition(page, "Rate limit")).to_have_text(
         "input tokens per minute: limit 1,000,000, current 1,200,000, retry after 12 s")
+    expect(page.locator("dt", has_text="Databricks message")).to_have_count(0)
     ui.rerender("{ info: { model: 'm', status: 'error', http_status: 429, error_kind: 'rate_limit' } }")
     expect(page.locator("dt", has_text="Rate limit")).to_have_count(0)
+
+
+def test_request_details_show_what_a_429_without_a_limit_type_said(ui, page):
+    ui.mount("components/RequestDetails.js", """{ info: { model: 'm', status: 'error', http_status: 429,
+        error_kind: 'rate_limit', rate_limit: { code: 'REQUEST_LIMIT_EXCEEDED', message: 'Exceeded workspace rate limit',
+        retry_after: 7, retry_after_header: '7' } } }""")
+    page.get_by_text("Request details · error").click()
+    expect(definition(page, "Rate limit")).to_have_text("type not named, retry after 7 s (Retry-After header)")
+    expect(definition(page, "Databricks message")).to_have_text("REQUEST_LIMIT_EXCEEDED: Exceeded workspace rate limit")
+    ui.rerender("""{ info: { model: 'm', status: 'error', http_status: 429, error_kind: 'rate_limit',
+        rate_limit: { message: 'Too Many Requests' } } }""")
+    expect(definition(page, "Rate limit")).to_have_text("type not named")
+    expect(definition(page, "Databricks message")).to_have_text("Too Many Requests")

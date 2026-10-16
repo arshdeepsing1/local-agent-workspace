@@ -212,6 +212,22 @@ def test_usage_snapshot_for_event_without_text(ui, page):
     expect(details).not_to_have_attribute("open", "")
 
 
+def test_claude_reasoning_tokens_read_as_part_of_the_output(ui, page):
+    usage = "{ input_tokens: 1000, output_tokens: 200, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }"
+    anthropic = "{ effort: 'high', format: 'anthropic', fields: { thinking: { type: 'adaptive' } }, effort_field: 'output_config.effort' }"
+    show(ui, f"""[
+      {{ id: 'claude', type: 'assistant', text: 'A', request_info: {{ model: 'databricks-claude-opus-5-5', status: 'completed', usage: {usage}, reasoning: {anthropic} }} }},
+      {{ id: 'other', type: 'assistant', text: 'B', request_info: {{ model: 'm', status: 'completed', usage: {usage} }} }},
+      {{ id: 'none', type: 'assistant', text: 'C', request_info: {{ model: 'databricks-claude-opus-5-5', status: 'error', reasoning: {anthropic} }} }}]""")
+    for summary in page.get_by_text(re.compile("^Request details · ")).all():
+        summary.click()
+    rows = page.locator('xpath=//dt[normalize-space()="Reasoning tokens"]/following-sibling::dd[1]')
+    # Claude counts its thinking in output tokens; without usage, or for other endpoints, nothing was reported.
+    expect(rows).to_have_text(["In output tokens (not reported separately)", "Unavailable", "Unavailable"])
+    output = page.locator('xpath=//dt[normalize-space()="Output tokens"]/following-sibling::dd[1]')
+    expect(output).to_have_text(["200", "200", "Unavailable"])
+
+
 def test_request_metadata_updates_in_place(ui, page):
     running = "{ id: 'request', type: 'assistant', request_info: { model: 'model-a', status: 'running' } }"
     show(ui, f"[{running}]")

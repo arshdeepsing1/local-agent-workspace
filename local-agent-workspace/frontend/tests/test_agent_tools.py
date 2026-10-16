@@ -254,6 +254,15 @@ def test_missing_usage_is_unavailable_not_zero(ui, page):
     assert table.get_by_text("—", exact=True).count() >= 3
 
 
+def test_unreported_reasoning_tokens_leave_the_other_totals_shown(ui, page):
+    # Claude reports no reasoning_tokens: the metrics total is null, not 0, and the cards show the rest.
+    open_tab(ui, page, "Usage", """fake.override = path => path === '/api/sessions/a/metrics' ? fake.json({
+      ...metrics, totals: { ...metrics.totals, reasoning_tokens: null } }) : undefined""")
+    cards = page.locator(".usage-cards")
+    expect(cards).to_contain_text("1,200")
+    expect(cards.get_by_text("Unavailable", exact=True)).to_have_count(0)
+
+
 def test_legacy_usage_is_explained_and_draft_requests_no_metrics(ui, page):
     open_tab(ui, page, "Usage", "fake.override = path => path === '/api/sessions/a/metrics' ? fake.json({ ...metrics, complete: false }) : undefined")
     expect(page.get_by_text(re.compile("older conversation has no complete inference ledger"))).to_be_visible()
