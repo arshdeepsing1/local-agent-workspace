@@ -255,3 +255,41 @@ def reasoning_delta(delta):
             seen = seen or found
             text += part
     return text, seen
+
+
+def _block_shape(content):
+    """(kind, signature) of a content list's reasoning items: 'reasoning' or 'thinking' (the first seen,
+    redacted thinking counting as thinking) or None, and whether a signature, an encrypted summary
+    (summary_encrypted_text) or a redacted thinking item is among them."""
+    kind, signature = None, False
+    for block in content if isinstance(content, list) else []:
+        if not isinstance(block, dict) or block.get("type") not in ("reasoning", "thinking", "redacted_thinking"):
+            continue
+        kind = kind or ("reasoning" if block["type"] == "reasoning" else "thinking")
+        items = block.get("summary") if block["type"] == "reasoning" else [block]
+        signature = signature or block["type"] == "redacted_thinking" or any(
+            isinstance(item, dict) and (item.get("type") == "summary_encrypted_text"
+                                        or (isinstance(item.get("signature"), str) and item["signature"] != ""))
+            for item in (items if isinstance(items, list) else []))
+    return kind, signature
+
+
+def reasoning_shape(delta):
+    """(shape, signature) of one streamed delta, for the usage ledger: the shape that carried reasoning, as
+    reasoning_delta reads it ('content.reasoning', 'content.thinking', 'reasoning_content', 'reasoning'; None
+    without reasoning), and True when a signature, an encrypted summary or a redacted thinking item came
+    with it. The values themselves are never kept."""
+    if not isinstance(delta, dict):
+        return None, False
+    kind, signature = _block_shape(delta.get("content"))
+    shape = "content." + kind if kind else None
+    for key in ("reasoning_content", "reasoning"):
+        value = delta.get(key)
+        if isinstance(value, dict):
+            signature = signature or (isinstance(value.get("signature"), str) and value["signature"] != "")
+            value = value.get("text", value.get("summary", value.get("content")))
+        found, signed = _block_shape(value) if isinstance(value, list) else (None, False)
+        signature = signature or signed
+        if shape is None and (isinstance(value, str) or found):
+            shape = key
+    return shape, signature

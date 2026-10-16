@@ -172,6 +172,7 @@ class SettingsEdit(BaseModel):
     reasoning_effort: Effort | None = None
     reasoning_format: RequestFormat | None = None
     thinking_summaries: bool | None = Field(default=None, strict=True)
+    prompt_caching: Literal["auto", "off"] | None = None  # config.PROMPT_CACHING
     spending_limit_dbu: float | None = Field(default=None, ge=0, le=MAX_LIMIT_DBU, allow_inf_nan=False, strict=True)
     coding_dir: str | None = Field(default=None, max_length=4096, strict=True)
     python_venv: str | None = Field(default=None, max_length=4096, strict=True)
@@ -388,8 +389,9 @@ def create_app(settings=None):
     async def update_settings(body: SettingsEdit):
         manager.workspace_available(body.workspace)
         result = settings.update(body.model_dump(exclude_none=True))
-        # A request format Databricks rejected is tried again after any Settings save.
+        # A request format Databricks rejected, and cache markers it rejected, are tried again after any Settings save.
         manager.reasoning_rejections.clear()
+        manager.cache_levels.clear()
         # Open chats' meters follow the new budgets and threshold; others follow when opened (stream).
         for session_id in [key for key, sockets in manager.listeners.items() if sockets]:
             try:

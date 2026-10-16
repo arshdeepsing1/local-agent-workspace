@@ -415,6 +415,7 @@ async def test_a_rejected_reasoning_field_is_resent_once_without_it_and_remember
 async def test_a_400_that_names_no_reasoning_field_is_not_resent(runtime, monkeypatch):
     manager, session = runtime
     session["reasoning_effort"] = "high"
+    manager.settings.values["prompt_caching"] = "off"  # A 400 with cache markers is resent with fewer (test_prompt_caching).
     requests = []
 
     async def gateway(request):
@@ -430,6 +431,7 @@ async def test_a_400_that_names_no_reasoning_field_is_not_resent(runtime, monkey
 async def test_a_resend_that_is_rejected_again_is_not_repeated(runtime, monkeypatch):
     manager, session = runtime
     session["reasoning_effort"] = "high"
+    manager.settings.values["prompt_caching"] = "off"  # As above.
     requests = []
 
     async def gateway(request):
@@ -450,18 +452,24 @@ async def test_a_settings_save_forgets_rejections(api):
 
 # Reasoning text in the stream
 
-@pytest.mark.parametrize("delta,text", [
-    ({"content": [{"type": "reasoning", "summary": [{"type": "summary_text", "text": "Plan.", "signature": "s"}]}]}, "Plan."),
-    ({"content": [{"type": "thinking", "thinking": "Plan.", "signature": "s"}]}, "Plan."),
-    ({"reasoning_content": "Plan."}, "Plan."),
-    ({"reasoning": "Plan."}, "Plan."),
-    ({"reasoning": {"text": "Plan."}}, "Plan."),
-    ({"content": [{"type": "reasoning", "summary": [{"type": "summary_text", "text": ""}]}]}, ""),
-    ({"content": [{"type": "thinking", "thinking": ""}]}, ""),
-    ({"content": [{"type": "redacted_thinking", "data": "opaque"}]}, ""),
+@pytest.mark.parametrize("delta,text,shape", [
+    ({"content": [{"type": "reasoning", "summary": [{"type": "summary_text", "text": "Plan.", "signature": "s"}]}]}, "Plan.",
+     ("content.reasoning", True)),
+    ({"content": [{"type": "thinking", "thinking": "Plan.", "signature": "s"}]}, "Plan.", ("content.thinking", True)),
+    ({"reasoning_content": "Plan."}, "Plan.", ("reasoning_content", False)),
+    ({"reasoning": "Plan."}, "Plan.", ("reasoning", False)),
+    ({"reasoning": {"text": "Plan."}}, "Plan.", ("reasoning", False)),
+    ({"reasoning": {"text": "Plan.", "signature": "s"}}, "Plan.", ("reasoning", True)),
+    ({"content": [{"type": "reasoning", "summary": [{"type": "summary_text", "text": ""}]}]}, "", ("content.reasoning", False)),
+    ({"content": [{"type": "reasoning", "summary": [{"type": "summary_encrypted_text", "data": "opaque"}]}]}, "",
+     ("content.reasoning", True)),
+    ({"content": [{"type": "thinking", "thinking": ""}]}, "", ("content.thinking", False)),
+    ({"content": [{"type": "redacted_thinking", "data": "opaque"}]}, "", ("content.thinking", True)),
 ])
-def test_each_reasoning_delta_shape(delta, text):
+def test_each_reasoning_delta_shape(delta, text, shape):
     assert reasoning_delta(delta) == (text, True)
+    # The ledger keeps the shape's name and whether a signature (or encrypted or redacted reasoning) came.
+    assert reasoning.reasoning_shape(delta) == shape
 
 
 def test_answers_and_unknown_shapes_carry_no_reasoning():
@@ -469,6 +477,8 @@ def test_answers_and_unknown_shapes_carry_no_reasoning():
                   {"content": [{"type": "thinking", "text": "internal"}]} | {"x": 1}):
         text, _ = reasoning_delta(delta)
         assert text == ""
+    for delta in ({"content": "Answer"}, {"content": [{"type": "text", "text": "Answer"}]}, {}, {"reasoning": 3}, None):
+        assert reasoning.reasoning_shape(delta) == (None, False)
     assert reasoning_delta({"content": "Answer"}) == ("", False)
     assert reasoning_summary([{"type": "thinking", "text": "internal"}]) == ""
 

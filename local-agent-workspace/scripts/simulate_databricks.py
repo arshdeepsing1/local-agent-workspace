@@ -24,6 +24,15 @@ can be rehearsed before using a paid workspace:
 for Claude endpoints (the real route is not verified yet): both (default), anthropic
 (refuses reasoning_effort), openai (refuses thinking and output_config) or none.
 
+Prompt caching: Claude endpoints take "cache_control": {"type": "ephemeral"} on content parts and
+assistant tool_calls (at most 4; other endpoints refuse it with HTTP 400) and report usage as the real
+route does: prompt_tokens (the uncached remainder), completion_tokens, total_tokens and top-level
+cache_read_input_tokens and cache_creation_input_tokens. A prefix cache in memory (per endpoint, 5
+minutes, refreshed on each read) answers a request that repeats an earlier one's marked prefix.
+--cache chooses how the route treats the markers: accept (default), documented (refuses list content
+for role system or tool, the forms Databricks does not document), reject (refuses any cache_control)
+or ignore (accepts them and reports no cache use).
+
 Scripted turns, chosen by words in your message (the agent only calls tools the chat offers):
   edit / keep      writes a file, then edits it twice with pauses (try Keep in between)
   job / background starts a background command and waits for it with wait_job
@@ -40,6 +49,7 @@ Conversations and settings live in a separate state folder (default .local/simul
 simulated chats never mix with real ones. Your credential file is never read.
 """
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -55,6 +65,10 @@ APP = Path(__file__).resolve().parent.parent
 LEVELS = ("low", "medium", "high", "xhigh", "max")
 # Simulated thinking per effort: seconds of streamed reasoning (before --speed) and reported tokens.
 THINKING = {"low": (0.6, 120), "medium": (1.5, 400), "high": (3.0, 1_200), "xhigh": (5.0, 2_500), "max": (8.0, 5_000)}
+CACHE_TTL_SECONDS = 300  # An ephemeral cache entry lives 5 minutes from its last write or read.
+CACHE_LOOKBACK = 20  # Block boundaries before a marker checked for an earlier entry (as Anthropic documents).
+CACHE_MODES = ("accept", "documented", "reject", "ignore")
+FIRST_REASONING_DELAY = 2.0  # Seconds (before --speed) a Claude endpoint takes before its first reasoning chunk.
 ENDPOINTS = {
     "databricks-claude-opus-5-5": {"family": "claude", "always_thinks": True, "default": "medium"},
     "databricks-claude-opus-4-8": {"family": "claude", "always_thinks": False, "default": "high"},
@@ -138,6 +152,105 @@ def reasoning_request(endpoint, body, claude_fields):
     if not thinking_on:
         return None, False
     return level or profile["default"], isinstance(thinking, dict) and thinking.get("display") == "summarized"
+
+
+def cache_markers(body):
+    """The cache_control values of a request: on content parts and assistant tool_calls (where Databricks
+    documents them); Rejected for one anywhere else in a message."""
+    found = []
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        if "cache_control" in message:
+            raise Rejected(400, "Unrecognized request argument supplied: messages[].cache_control")
+        content = message.get("content")
+        for item in (content if isinstance(content, list) else []) + list(message.get("tool_calls") or []):
+            if isinstance(item, dict) and "cache_control" in item:
+                found.append(item["cache_control"])
+    return found
+
+
+def cache_request(endpoint, body, mode):
+    """How the simulated route takes a request's cache markers: True when the prefix cache applies;
+    Rejected as the route refuses them."""
+    found = cache_markers(body)
+    family = endpoint_profile(endpoint)["family"]
+    if found and family != "claude":
+        raise Rejected(400, "cache_control is only accepted by Databricks-hosted Claude models.")
+    if family != "claude":
+        return False
+    if found and mode == "reject":
+        raise Rejected(400, "Unrecognized request argument supplied: cache_control")
+    if mode == "documented":
+        for index, message in enumerate(body.get("messages") or []):
+            if isinstance(message, dict) and message.get("role") in ("system", "tool") and isinstance(message.get("content"), list):
+                raise Rejected(400, f"messages[{index}].content: Input should be a valid string for role "
+                                    f"{message['role']}.")
+    if len(found) > 4:
+        raise Rejected(400, f"A maximum of 4 blocks with cache_control may be provided. Found {len(found)}.")
+    for value in found:
+        if value != {"type": "ephemeral"}:
+            raise Rejected(400, f"cache_control: only {{\"type\": \"ephemeral\"}} is accepted here, not {json.dumps(value)}.")
+    return mode != "ignore"
+
+
+def cache_blocks(body):
+    """[(block, marked)]: the request in the order a prompt cache reads it (the tools, then each message's
+    parts and tool calls), markers stripped, a string content counted as one text part."""
+    blocks = [({"tools": body.get("tools") or []}, False)]
+    for index, message in enumerate(body.get("messages") or []):
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        parts = content if isinstance(content, list) else [{"type": "text", "text": content}] if content else []
+        base = {"message": index, "role": message.get("role"),
+                **({"tool_call_id": message.get("tool_call_id")} if message.get("role") == "tool" else {})}
+        for item in [*parts, *[{"tool_call": call} for call in message.get("tool_calls") or []]]:
+            if not isinstance(item, dict):
+                continue
+            marked = "cache_control" in item or "cache_control" in (item.get("tool_call") or {})
+            item = copy.deepcopy(item)
+            item.pop("cache_control", None)
+            if isinstance(item.get("tool_call"), dict):
+                item["tool_call"].pop("cache_control", None)
+            blocks.append(({**base, **item}, marked))
+    return blocks
+
+
+class PromptCache:
+    """An in-memory prefix cache: {(endpoint, sha256 of the prefix): expiry}."""
+
+    def __init__(self):
+        self.entries = {}
+        self.lock = threading.Lock()
+
+    def use(self, endpoint, body, active=True, now=None):
+        """(read, written, total) input tokens of a request: the longest live marked prefix is read, the
+        prefix up to the last marker is written, and the remainder is uncached input."""
+        now = time.time() if now is None else now
+        digest, sizes, keys, marks, total = hashlib.sha256(), [], [], [], 0
+        for index, (block, marked) in enumerate(cache_blocks(body)):
+            text = json.dumps(block, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            digest.update(text.encode() + b"\n")
+            total += max(1, len(text) // 4)
+            sizes.append(total)
+            keys.append((endpoint, digest.hexdigest()))
+            if marked:
+                marks.append(index)
+        if not active or not marks:
+            return 0, 0, total
+        with self.lock:
+            self.entries = {key: expiry for key, expiry in self.entries.items() if expiry > now}
+            hits = [position for mark in marks for position in range(mark, max(-1, mark - CACHE_LOOKBACK), -1)
+                    if keys[position] in self.entries]
+            best = max(hits, default=None)
+            read = sizes[best] if best is not None else 0
+            if best is not None:
+                self.entries[keys[best]] = now + CACHE_TTL_SECONDS
+            for mark in marks:
+                self.entries[keys[mark]] = now + CACHE_TTL_SECONDS
+        written = max(0, sizes[marks[-1]] - read)
+        return read, written, total
 
 
 def text_of(content):
@@ -350,6 +463,8 @@ def words_of(text):
 class Gateway(BaseHTTPRequestHandler):
     brain = Brain()
     claude_fields = "both"
+    cache_mode = "accept"
+    prompt_cache = PromptCache()
     speed = 1.0
     protocol_version = "HTTP/1.1"
 
@@ -386,14 +501,19 @@ class Gateway(BaseHTTPRequestHandler):
         endpoint = match.group(1)
         try:
             effort, summarized = reasoning_request(endpoint, body, self.claude_fields)
+            caching = cache_request(endpoint, body, self.cache_mode)
             fields = {key: body[key] for key in ("thinking", "output_config", "reasoning_effort") if key in body}
             kind = "agent" if body.get("stream") else "auxiliary"
             log(f"{endpoint} {kind} request: fields {json.dumps(fields) if fields else 'none'} -> "
                 f"{'effort ' + effort if effort else 'no thinking'}{', summary shown' if summarized else ''}")
+            cache = None
+            if endpoint_profile(endpoint)["family"] == "claude":
+                cache = self.prompt_cache.use(endpoint, body, caching)
+                log(f"{endpoint} cache: read {cache[0]:,}, wrote {cache[1]:,} of {cache[2]:,} input tokens")
             if body.get("stream"):
-                self.stream(endpoint, body, effort, summarized)
+                self.stream(endpoint, body, effort, summarized, cache)
             else:
-                self.complete(endpoint, body)
+                self.complete(endpoint, body, cache)
         except Rejected as rejected:
             log(f"{endpoint}: HTTP {rejected.status} {rejected}")
             headers = {"Retry-After": str(rejected.retry_after)} if rejected.retry_after else None
@@ -405,7 +525,7 @@ class Gateway(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def complete(self, endpoint, body):
+    def complete(self, endpoint, body, cache=None):
         """A title, compaction summary or side question: one JSON response."""
         messages = body.get("messages") or []
         request = "\n".join(text_of(message.get("content")) for message in messages)
@@ -418,8 +538,7 @@ class Gateway(BaseHTTPRequestHandler):
         self.send_json(200, {"id": f"sim-{uuid.uuid4().hex[:12]}", "object": "chat.completion", "model": endpoint,
                              "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
                                           "finish_reason": "stop"}],
-                             "usage": {"prompt_tokens": len(request) // 4 + 20, "completion_tokens": len(text) // 4 + 5,
-                                       "total_tokens": (len(request) + len(text)) // 4 + 25}})
+                             "usage": usage(len(request) // 4 + 20, len(text) // 4 + 5, cache)})
 
     def chunk(self, response_id, endpoint, delta, finish=None, usage=None):
         data = {"id": response_id, "object": "chat.completion.chunk", "model": endpoint,
@@ -430,7 +549,7 @@ class Gateway(BaseHTTPRequestHandler):
         self.wfile.write(f"{len(line):x}\r\n".encode() + line + b"\r\n")
         self.wfile.flush()
 
-    def stream(self, endpoint, body, effort, summarized):
+    def stream(self, endpoint, body, effort, summarized, cache=None):
         prompt = next((text_of(message.get("content")) for message in reversed(body.get("messages") or [])
                        if message.get("role") == "user"), "")
         text, calls = self.brain.respond(body)
@@ -450,6 +569,10 @@ class Gateway(BaseHTTPRequestHandler):
         if effort:
             seconds, reasoning_tokens = THINKING[effort]
             thought = reasoning_text(endpoint, effort, body, prompt) if summarized else ""
+            if cache is not None:
+                # Claude: the first summary text comes seconds after the request, and each summary ends with a blank line.
+                time.sleep(FIRST_REASONING_DELAY * self.speed)
+                thought += "\n\n" if thought else ""
             pieces = words_of(thought) or [""] * 4
             for piece in pieces:
                 self.chunk(response_id, endpoint, {"content": [{"type": "reasoning", "summary": [
@@ -470,13 +593,25 @@ class Gateway(BaseHTTPRequestHandler):
                                                                    "function": {"arguments": arguments[start:start + 40]}}]})
         prompt_tokens = len(json.dumps(body.get("messages"))) // 4 + len(json.dumps(body.get("tools") or [])) // 4
         completion = len(text) // 4 + 10 * len(calls) + reasoning_tokens
-        usage = {"prompt_tokens": prompt_tokens, "completion_tokens": completion, "total_tokens": prompt_tokens + completion,
-                 "prompt_tokens_details": {"cached_tokens": prompt_tokens // 2},
-                 "completion_tokens_details": {"reasoning_tokens": reasoning_tokens}}
-        self.chunk(response_id, endpoint, {}, finish="tool_calls" if calls else "stop", usage=usage)
+        self.chunk(response_id, endpoint, {}, finish="tool_calls" if calls else "stop",
+                   usage=usage(prompt_tokens, completion, cache, reasoning_tokens))
         done = b"data: [DONE]\n\n"
         self.wfile.write(f"{len(done):x}\r\n".encode() + done + b"\r\n0\r\n\r\n")
         self.wfile.flush()
+
+
+def usage(prompt_tokens, completion, cache=None, reasoning_tokens=0):
+    """The usage object. Claude endpoints (cache: (read, written, total) input tokens): prompt_tokens is the
+    uncached remainder, with the cache counts as top-level fields and no details objects or reasoning
+    tokens, as the real route reports them. Other endpoints: OpenAI-style, cached tokens inside prompt_tokens."""
+    if cache is not None:
+        read, written, total = cache
+        return {"prompt_tokens": total - read - written, "completion_tokens": completion,
+                "total_tokens": total + completion, "cache_read_input_tokens": read,
+                "cache_creation_input_tokens": written}
+    return {"prompt_tokens": prompt_tokens, "completion_tokens": completion, "total_tokens": prompt_tokens + completion,
+            "prompt_tokens_details": {"cached_tokens": prompt_tokens // 2},
+            "completion_tokens_details": {"reasoning_tokens": reasoning_tokens}}
 
 
 def demo_workspace(state):
@@ -510,16 +645,19 @@ def main():
     parser.add_argument("--workspace", help="project folder (default: a demo Git project in the state folder)")
     parser.add_argument("--claude-fields", choices=("both", "anthropic", "openai", "none"), default="both",
                         help="reasoning fields the simulated route accepts for Claude endpoints")
+    parser.add_argument("--cache", choices=CACHE_MODES, default="accept",
+                        help="how the simulated route treats cache_control on Claude endpoints")
     parser.add_argument("--speed", type=float, default=1.0, help="multiplies simulated thinking and typing time")
     parser.add_argument("--gateway-only", action="store_true", help="run only the fake gateway (for your own launcher)")
     args = parser.parse_args()
 
-    Gateway.claude_fields, Gateway.speed = args.claude_fields, max(0.0, args.speed)
+    Gateway.claude_fields, Gateway.cache_mode, Gateway.speed = args.claude_fields, args.cache, max(0.0, args.speed)
     server = ThreadingHTTPServer(("127.0.0.1", args.gateway_port), Gateway)
     server.daemon_threads = True
     gateway = f"http://127.0.0.1:{server.server_address[1]}"
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    log(f"fake Databricks gateway on {gateway} (Claude reasoning fields accepted: {args.claude_fields})")
+    log(f"fake Databricks gateway on {gateway} (Claude reasoning fields accepted: {args.claude_fields}; "
+        f"cache markers: {args.cache})")
     if args.gateway_only:
         try:
             threading.Event().wait()

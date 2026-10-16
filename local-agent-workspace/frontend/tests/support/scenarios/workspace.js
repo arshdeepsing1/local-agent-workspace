@@ -40,7 +40,7 @@ fake.settings = { ...baseSettings, user_instructions: '', write_limit_kb: 80, co
     { model: 'databricks-gpt-oss-120b', label: 'GPT OSS 120B' }, { model: 'databricks-gpt-oss-20b', label: 'GPT OSS 20B' }] }
 // POST /api/settings/limits: canned answers like the server's for Claude Opus 5.5; other endpoints have no profile.
 window.opusProfile = { label: 'Claude Opus 5.5', context_max: 1000000, output_max: 128000, itpm: 1000000, otpm: 100000,
-  recommended_context_window: 200000, recommended_max_output_tokens: 16384, thinking_reserve: 4096,
+  recommended_context_window: 200000, recommended_max_output_tokens: 16384, thinking_reserve: 4096, prompt_caching: true,
   model: 'databricks-claude-opus-5-5', output_concurrency_limit: 20000, context_rate_limit: 250000 }
 window.limitsCheck = ({ model, context_window, max_output_tokens }) => {
   const effective = { context_window, max_output_tokens, clamped: false }

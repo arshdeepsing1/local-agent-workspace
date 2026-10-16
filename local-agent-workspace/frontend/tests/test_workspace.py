@@ -129,8 +129,11 @@ def test_settings_edit_and_save_only_databricks_fields(ui, page):
     expect(dialog.get_by_text(re.compile("not individual tool calls"))).to_be_visible()
     expect(dialog.get_by_label("Agent runtime")).to_have_count(0)
     # No agent runtime options: CLAUDE.md is named only as a project instruction file.
-    # No Claude CLI runtime settings (a model name such as Claude Opus 5.5 in help text is fine).
-    expect(dialog.get_by_text(re.compile(r"Claude(?!\.md| Opus|-opus)|MCP|skills", re.I))).to_have_count(0)
+    # No Claude CLI runtime settings (a model name such as Claude Opus 5.5 in help text, or the Claude endpoints that
+    # Prompt caching applies to, is fine).
+    expect(dialog.get_by_text(re.compile(r"Claude(?!\.md| Opus|-opus| endpoints\))|MCP|skills", re.I))).to_have_count(0)
+    expect(dialog.get_by_role("combobox", name="Prompt caching").locator("option").first).to_have_text(
+        "Automatic (Claude endpoints)")
     checkboxes = dialog.get_by_role("checkbox")
     expect(checkboxes).to_have_count(5)
     expect(dialog.locator("label:has(input[type=checkbox])")).to_have_text([

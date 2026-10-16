@@ -1,6 +1,7 @@
 """Provider-reported inference telemetry and documented DBU estimates."""
 
 import json
+import re
 import uuid
 from datetime import datetime, timezone
 
@@ -31,6 +32,11 @@ MODEL_DBU_PER_MILLION = {
         "cache_creation_input_tokens": 89.286,
     },
 }
+# The raw usage object's key names kept per call (usage_keys): bounded, so a provider cannot write text into the ledger.
+USAGE_KEY_LIMIT = 16
+USAGE_KEY_PATTERN = re.compile(r"[a-z0-9_.]{1,64}\Z")
+REASONING_SHAPES = ("content.reasoning", "content.thinking", "reasoning_content", "reasoning")
+PROMPT_CACHE_LEVELS = ("full", "messages", "off")  # prompt_cache.LEVELS
 PURPOSE_LABELS = {"agent": "Agent", "compaction": "Compaction", "title": "Title", "side_question": "Side question"}
 # Databricks AI Gateway stores these tags in system.ai_gateway.usage.request_tags,
 # so each ledger record can be joined to the provider's usage rows exactly.
@@ -118,6 +124,19 @@ def reported_usage(value):
     return usage
 
 
+def usage_keys(value, seen=()):
+    """The sorted key names of a raw usage object, with parent.child names for nested objects, joined with
+    names seen before (earlier stream snapshots): at most USAGE_KEY_LIMIT names matching USAGE_KEY_PATTERN.
+    Only names are kept, never values, so the ledger shows which usage shape an endpoint sends."""
+    names = {name for name in seen if isinstance(name, str) and USAGE_KEY_PATTERN.match(name)}
+    if isinstance(value, dict):
+        for key, item in value.items():
+            names.add(key)
+            if isinstance(item, dict):
+                names.update(f"{key}.{child}" for child in item if isinstance(child, str))
+    return sorted(name for name in names if isinstance(name, str) and USAGE_KEY_PATTERN.match(name))[:USAGE_KEY_LIMIT]
+
+
 def _now():
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -176,6 +195,15 @@ def finish_inference_call(call, info):
     limit_type = rate_limit.get("limit_type") if isinstance(rate_limit, dict) else None
     if isinstance(limit_type, str) and 0 < len(limit_type) <= 64:
         call["limit_type"] = limit_type  # Which Databricks rate limit a 429 named (rate_limits.parse_rate_limit).
+    # The response's shape, by name only: the raw usage keys, the delta shape that carried reasoning, and
+    # whether a reasoning signature (or encrypted or redacted reasoning) came.
+    keys = usage_keys(None, info["usage_keys"]) if isinstance(info.get("usage_keys"), list) else []
+    if keys:
+        call["usage_keys"] = keys
+    if info.get("reasoning_shape") in REASONING_SHAPES:
+        call["reasoning_shape"] = info["reasoning_shape"]
+    if info.get("reasoning_signature") is True:
+        call["reasoning_signature"] = True
     call["finished"] = _now()
     return call
 
@@ -234,6 +262,20 @@ def _public_call(call, *, fallback=False):
     fields = call.get("reasoning_fields")  # The top-level reasoning fields the request sent.
     if isinstance(fields, list) and all(isinstance(name, str) for name in fields):
         result["reasoning_fields"] = fields
+    # prompt_cache: the cache-marker level an agent request went out with (prompt_cache.LEVELS);
+    # system_tail_changed: its system message's changing part differed from the chat's previous agent
+    # request (a cache miss for everything after it); usage_keys, reasoning_shape, reasoning_signature: the
+    # response's shape (finish_inference_call).
+    if call.get("prompt_cache") in PROMPT_CACHE_LEVELS:
+        result["prompt_cache"] = call["prompt_cache"]
+    keys = call.get("usage_keys")
+    if isinstance(keys, list) and keys == usage_keys(None, keys):
+        result["usage_keys"] = keys
+    if call.get("reasoning_shape") in REASONING_SHAPES:
+        result["reasoning_shape"] = call["reasoning_shape"]
+    for key in ("system_tail_changed", "reasoning_signature"):
+        if call.get(key) is True:
+            result[key] = True
     usage = reported_usage(call.get("usage"))
     if usage:
         result["usage"] = usage

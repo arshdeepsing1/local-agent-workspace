@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 
 from local_agent import agents as agents_module
 from local_agent import model_profiles
+from local_agent.prompt_cache import unmarked
 from local_agent.agents import AgentManager, output_limit_text
 from local_agent.api import create_app
 from local_agent.config import Settings, read_env
@@ -566,7 +567,7 @@ async def test_no_request_kind_sends_options_or_a_prefill_opus_5_5_rejects(runti
     await manager.manual_compact(session)  # A handoff.
     assert {"agent", "title", "side_question", "compaction"} <= set(kinds)
     assert kinds.count("compaction") >= 3
-    assert any(body["messages"][-1]["content"] == OUTPUT_LIMIT_CONTINUATION for body in requests)
+    assert any(unmarked(body)["messages"][-1]["content"] == OUTPUT_LIMIT_CONTINUATION for body in requests)
     for body in requests:
         assert not FORBIDDEN_KEYS & set(body), body.keys()
         last = body["messages"][-1]

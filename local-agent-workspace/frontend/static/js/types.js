@@ -17,7 +17,8 @@
 //   model is moved at load; cleared by the next save, which writes settings_version 2),
 //   reasoning_effort: Effort (new chats' level, default 'default'), reasoning_format: 'auto'|'anthropic'|'openai'|'none'
 //   (how agent requests ask for it; 'auto' = per endpoint), thinking_summaries: boolean (thinking.display 'summarized'
-//   for adaptive Claude endpoints; default true), endpoint_profiles: [{ model, label }] (endpoints with built-in facts) }
+//   for adaptive Claude endpoints; default true), prompt_caching: 'auto'|'off' (cache markers on agent requests to
+//   Databricks-hosted Claude endpoints; default 'auto'), endpoint_profiles: [{ model, label }] (endpoints with built-in facts) }
 // Effort: 'default' (no effort field: the endpoint's own) | 'low' (labelled Fast) | 'medium' | 'high' | 'xhigh' (Extra
 //   high) | 'max'. Labels: types.js EFFORT_LABELS.
 // POST /settings/reasoning { model, reasoning_effort?, reasoning_format?, thinking_summaries? } -> ReasoningPreview:
@@ -205,7 +206,10 @@
 //   request to another model has been prepared (estimated_tokens no longer the report's).
 // Metrics (GET /sessions/<id>/metrics): { scope, session_id, complete, totals, calls, by_purpose, by_model,
 //   pricing, last_input: LastRequest | null }. A call has effort?, effort_field? and reasoning_skipped? like
-//   RequestInfo.reasoning; retry_reason 'reasoning_rejected' marks the resend without reasoning fields.
+//   RequestInfo.reasoning; retry_reason 'reasoning_rejected' marks the resend without reasoning fields, and
+//   'cache_rejected' the resend with fewer cache markers. Agent calls also have prompt_cache? ('full'|'messages'|'off':
+//   the cache markers sent, on Claude endpoints), system_tail_changed? (true), usage_keys? (the raw usage key names),
+//   reasoning_shape? and reasoning_signature? (true).
 // Job: { id, session_id, workspace, command, state, created, updated, exit_code,
 //   output?, truncated, timeout_seconds, max_output_bytes, background,
 //   without_shell? (true: ran from an argument vector without a shell) }
