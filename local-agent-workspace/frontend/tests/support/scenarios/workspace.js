@@ -35,13 +35,13 @@ fake.settings = { ...baseSettings, user_instructions: '', write_limit_kb: 80, co
   coding_dir_status: { path: null, state: 'off', message: 'Not set. New code goes where you ask, or into the project folder.', source: 'none' },
   python_venv_status: { path: null, state: 'off', message: 'Not set. Commands use the Python on the server\'s PATH.', python: null, version: null, source: 'none' },
   default_model: 'databricks-claude-opus-5-5', default_limits: { context_window: 131072, max_output_tokens: 8192 },
-  reasoning_effort: 'default', reasoning_format: 'auto', thinking_summaries: true,
+  reasoning_effort: 'default', reasoning_format: 'auto', thinking_summaries: true, fallback_model: '',
   endpoint_profiles: [{ model: 'databricks-claude-opus-5-5', label: 'Claude Opus 5.5' }, { model: 'databricks-claude-opus-4-8', label: 'Claude Opus 4.8' },
     { model: 'databricks-gpt-oss-120b', label: 'GPT OSS 120B' }, { model: 'databricks-gpt-oss-20b', label: 'GPT OSS 20B' }] }
 // POST /api/settings/limits: canned answers like the server's for Claude Opus 5.5; other endpoints have no profile.
 window.opusProfile = { label: 'Claude Opus 5.5', context_max: 1000000, output_max: 128000, itpm: 1000000, otpm: 100000,
   recommended_context_window: 200000, recommended_max_output_tokens: 16384, thinking_reserve: 4096, prompt_caching: true,
-  model: 'databricks-claude-opus-5-5', output_concurrency_limit: 20000, context_rate_limit: 250000 }
+  vision: true, structured_output: false, model: 'databricks-claude-opus-5-5', output_concurrency_limit: 20000, context_rate_limit: 250000 }
 window.limitsCheck = ({ model, context_window, max_output_tokens }) => {
   const effective = { context_window, max_output_tokens, clamped: false, input_budget: context_window - max_output_tokens - 2048 }
   if (model.trim().toLowerCase() !== 'databricks-claude-opus-5-5') {

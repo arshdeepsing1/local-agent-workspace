@@ -95,6 +95,47 @@ def test_a_saved_prompt_caching_choice_is_shown_and_kept(ui, page):
     assert ui.bodies("/api/settings", "PUT")[0]["prompt_caching"] == "off"
 
 
+def test_the_fallback_endpoint_is_chosen_in_the_model_group_and_saved(ui, page):
+    dialog = open_settings(ui, page)
+    group = dialog.get_by_role("group", name="Model and context")
+    fallback = group.get_by_role("combobox", name="Fallback endpoint")
+    expect(fallback).to_have_value("")
+    # The endpoints the app knows, never the model endpoint itself, and a typed name for one a chat uses.
+    expect(fallback.locator("option")).to_have_text([
+        "None", "Claude Opus 5.5 · databricks-claude-opus-5-5", "Claude Opus 4.8 · databricks-claude-opus-4-8",
+        "GPT OSS 120B · databricks-gpt-oss-120b", "GPT OSS 20B · databricks-gpt-oss-20b", "Other endpoint…"])
+    expect(group.get_by_text(re.compile(r"^When the model endpoint fails before a reply starts .* The next request tries "
+                                        r"the model endpoint again\.$"))).to_be_visible()
+    fallback.select_option("databricks-gpt-oss-120b")
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    assert ui.bodies("/api/settings", "PUT")[0]["fallback_model"] == "databricks-gpt-oss-120b"
+    page.get_by_role("button", name="Settings", exact=True).click()
+    dialog = page.get_by_role("dialog")
+    fallback = dialog.get_by_role("combobox", name="Fallback endpoint")
+    expect(fallback).to_have_value("databricks-gpt-oss-120b")
+    fallback.select_option("Other endpoint…")
+    name = dialog.get_by_role("textbox", name="Fallback endpoint name")
+    expect(name).to_be_focused()
+    name.fill(" team-endpoint ")
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    assert ui.bodies("/api/settings", "PUT")[1]["fallback_model"] == "team-endpoint"
+
+
+def test_a_fallback_equal_to_the_model_endpoint_is_explained(ui, page):
+    dialog = open_settings(ui, page, setup="fake.settings = { ...fake.settings, fallback_model: 'other-model' }")
+    fallback = dialog.get_by_role("combobox", name="Fallback endpoint")
+    expect(fallback).to_have_value("other-model")
+    note = dialog.get_by_text("This is the model endpoint: chats on it have no fallback.")
+    expect(note).to_have_count(0)
+    dialog.get_by_role("combobox", name="Databricks model endpoint").select_option("other-model")
+    expect(note).to_be_visible()
+    expect(fallback).to_have_value("other-model")  # Still listed while the form has it.
+    fallback.select_option("")
+    expect(note).to_have_count(0)
+
+
 def test_a_rejected_name_shows_the_server_message(ui, page):
     dialog = open_settings(ui, page, setup="""fake.override = (path, options) => path === '/api/settings' && options.method === 'PUT'
       ? fake.json({ detail: 'LD_PRELOAD changes how programs start and cannot be passed to commands.' }, 400) : undefined""")

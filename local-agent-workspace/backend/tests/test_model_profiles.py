@@ -613,6 +613,8 @@ def test_the_limits_route(tmp_path, monkeypatch):
         assert result["effective"]["input_budget"] == 115_078 and result["effective"]["clamped"] is False
         result = check({"model": f" {OPUS} ", "context_window": 300_000, "max_output_tokens": 30_000})
         assert [item["code"] for item in result["warnings"]] == ["output_concurrency", "context_itpm"]
+        # The capability flags later features read (model_profiles.supports) come with the profile.
+        assert (result["profile"]["vision"], result["profile"]["structured_output"]) == (True, False)
         result = check({"model": "unknown-endpoint", "context_window": 65_536, "max_output_tokens": 8_192})
         assert result["profile"] is None and result["recommended"] is None
         assert result["defaults"] == {"context_window": 131_072, "max_output_tokens": 8_192}
@@ -668,3 +670,19 @@ def test_the_profile_module_has_the_documented_constants():
     assert model_profiles.MAX_REQUEST_BYTES == 4_000_000 and model_profiles.MAX_EXECUTION_SECONDS == 597
     assert model_profiles.CONCURRENT_REQUESTS == 4
     assert model_profiles.LEGACY_DEFAULT_LIMITS == (131_072, 8_192)
+
+
+def test_capability_flags_say_only_what_is_documented():
+    from local_agent.model_profiles import CAPABILITY_FLAGS, MODEL_PROFILES, public_profile, supports
+    for profile in MODEL_PROFILES.values():
+        assert all(type(profile[flag]) is bool for flag in CAPABILITY_FLAGS)
+    # Image content parts are documented for the Databricks-hosted Claude models; GPT OSS is text only.
+    models = (OPUS, "databricks-claude-opus-4-8", GPT, "databricks-gpt-oss-20b", "unknown-endpoint", None)
+    assert [supports(model, "vision") for model in models] == [True, True, False, False, False, False]
+    assert supports(" Databricks-Claude-Opus-5-5 ", "vision") is True
+    # Not confirmed for any endpoint yet: unknown is never supported.
+    assert not any(supports(model, "structured_output") for model in models)
+    assert [supports(model, "prompt_caching") for model in models[:3]] == [True, True, False]
+    assert public_profile(GPT)["vision"] is False and public_profile(OPUS)["structured_output"] is False
+    with pytest.raises(ValueError):
+        supports(OPUS, "telepathy")

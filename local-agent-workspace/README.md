@@ -773,7 +773,10 @@ when opening a conversation or performing restart recovery.
   notices of these waits come before the reply they held up, live and in the saved
   and exported conversation (see **Rate limits** under **Context and project
   instructions** for the limit a 429 names and the wait shared by chats). Turn the waits off with **Settings → Continue
-  automatically after rate limits**. When a reply's tool calls had invalid or
+  automatically after rate limits**. Once the retries (and, after rate limits, the waits) are used up, a request
+  goes once to **Settings → Model and context → Fallback endpoint** when one is set (see **Fallback endpoint**);
+  its Request details then show **Answered by** with that endpoint and **Fallback from** with the chat's.
+  When a reply's tool calls had invalid or
   incomplete arguments, or the reply ended without a finish reason, none of its tools
   run, and the app asks the model in a hidden message to issue them again or to
   continue: up to twice in a row, with a notice each time. A reply stopped by the
@@ -1130,8 +1133,10 @@ sent a request automatically: `rate_limit`, `server_error` or `network` for a re
 of the same request, `rate_limit_wait` after an automatic wait, `output_limit`,
 `invalid_tool_arguments` or `incomplete_response` for the request after a hidden
 continuation, `verify` for a Verify fix round, `reasoning_rejected` for the resend
-without reasoning fields (see **Reasoning effort and thinking**), and `cache_rejected` for the resend
-with fewer cache markers (see **Prompt caching**). The Usage section's **Automatic
+without reasoning fields (see **Reasoning effort and thinking**), `cache_rejected` for the resend
+with fewer cache markers (see **Prompt caching**), and `fallback` for the request sent to the fallback
+endpoint (see **Fallback endpoint**; the ledger and the metrics also keep `fallback_from`, the chat's endpoint,
+and the call's model is the endpoint that answered). The Usage section's **Automatic
 retries** tile counts these calls; **429 responses** counts rate-limited calls. The CSV's
 `effort` column (after `max_output_tokens`) and the call table name the reasoning effort a
 request asked for; it is empty for a request at Default that sent no reasoning fields.
@@ -1296,6 +1301,39 @@ changing part differed from the chat's last request that Databricks answered,
 `system_tail_changed` (the conversation after it was written to the cache again; a retry after a
 429 or a server error keeps the flag, because the failed attempt wrote nothing). They are not CSV
 columns.
+
+### Fallback endpoint
+
+**Settings → Model and context → Fallback endpoint** (default **None**) names a second endpoint for
+agent and subagent requests. When the chat's endpoint fails before a reply starts (no connection,
+HTTP 502, 503 or 504, or HTTP 429) and the automatic retries are used up (and, for a rate limit, the
+automatic waits too; see **Request details**), the app sends that one request to the fallback
+endpoint, with a notice naming both. With **Settings → Continue automatically after rate limits**
+off there are no waits, so a rate-limited request goes to the fallback right after the retries. It
+is never used after the reply started, for HTTP 400, 401, 403 or 500, for a content-filter stop, or
+for titles, `/btw` side questions and compaction. Only one request goes there: the next request,
+also the next step of the same turn, tries the chat's endpoint again, and the chat keeps its own
+endpoint. When the fallback request fails too, its error ends the request.
+
+The fallback request carries the same prepared conversation with the fallback endpoint's own limits
+(its context window and Max output tokens, as for a chat on that endpoint; for an endpoint whose
+context window the app does not know, such as GPT OSS 20B, Claude Opus 4.8 or a typed name, budgets
+you customised count only up to its defaults of 131,072 and 8,192 tokens unless it is the Settings
+model), its own reasoning fields (see **Reasoning effort and thinking**: GPT OSS gets
+`reasoning_effort`, Claude the `thinking` fields) and its own prompt-cache markers (none for GPT
+OSS). A conversation that does not fit the fallback's input budget, for example a long Claude chat
+on GPT OSS 120B with its 131,072-token window, is not sent there: a notice says so and the original
+error stands. Requests never carry the model's reasoning (thinking text or signatures) back in the
+history, and a fallback request drops any, so no endpoint receives another's.
+
+Because each request carries the conversation, Settings accepts only an endpoint the app knows (the
+ones the endpoint chooser labels) or one you already use: the Settings model, a Settings → Subagents
+model or the model of one of your chats (the same rule as a custom agent's model). **Other
+endpoint…** takes a typed name; chats on the fallback endpoint itself have no fallback. The reply's
+**Request details** show **Answered by** with the fallback (**Sent to** when it failed too) and
+**Fallback from** with the chat's endpoint and why it failed; **Agent tools → Usage** lists the call
+under the fallback endpoint, priced at that endpoint's rates (an endpoint without price data, such
+as GPT OSS, is not counted by the spending limit, as for any other call).
 
 ### Context and project instructions
 
@@ -1671,7 +1709,9 @@ they close when the chat starts waiting for your approval or answer, so they nev
 Commands and files, Notifications and Credentials; on a wide screen a list of these sections beside them
 jumps to each one. Longer explanations wait behind **More**. **Settings → Databricks model
 endpoint** lists the endpoints with built-in facts (label and name) and those your workspace
-serves; **Other endpoint…** opens a field for any other name. **Save settings** stays at the
+serves; **Other endpoint…** opens a field for any other name. **Fallback endpoint**, in the same
+group, takes a request the model endpoint failed before its reply started (see **Fallback endpoint**).
+**Save settings** stays at the
 bottom while you scroll, and a failed save shows its reason just above it.
 
 **Settings → Custom instructions** (up to 8,000 characters) are your own instructions for
@@ -2891,7 +2931,10 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `backend/local_agent/portability.py` / `portability_api.py`: validated conversation copies.
 - `backend/local_agent/tool_profiles.py` / `tool_schema.py`: tool ceilings and offline input validation.
 - `backend/local_agent/config.py`: external credentials and portable configuration.
-- `backend/local_agent/model_profiles.py`: per-endpoint limits, default budgets and Settings limit warnings.
+- `backend/local_agent/model_profiles.py`: per-endpoint limits, default budgets, Settings limit warnings and capability
+  flags (`prompt_caching`, `vision`, `structured_output`; `supports(model, flag)`, False when unknown).
+- `backend/local_agent/serving.py`: every model request's URL, headers, timeouts and HTTP client (`ServingClient`), and
+  `ReplayClient`/`ReplayTransport`, which answer them from scripted or recorded responses in tests, offline.
 - `backend/local_agent/user_paths.py`: checks for the default code folder and the Python environment, and the environment commands run with.
 - `backend/local_agent/context.py`: request estimates and bounded history compaction.
 - `backend/local_agent/request_limits.py`: the request body as sent, the 4 MB request limit and request timeouts.

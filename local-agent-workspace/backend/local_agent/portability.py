@@ -70,6 +70,9 @@ class RequestInfo(Record):
     usage: Usage | None = None
     rate_limit: RateLimitDetails | None = None
     reasoning: ReasoningInfo | None = None
+    # A reply from Settings → Fallback endpoint (model above): the chat's endpoint and why it failed.
+    fallback_from: str | None = Field(default=None, max_length=256)
+    fallback_reason: str | None = Field(default=None, max_length=64)
 
 
 class Progress(Record):
