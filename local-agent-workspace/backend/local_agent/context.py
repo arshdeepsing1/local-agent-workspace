@@ -1251,7 +1251,7 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
                           default_reply_reserve=DEFAULT_MAX_OUTPUT_TOKENS,
                           auto_compact_percent=MAX_AUTO_COMPACT_PERCENT, record_requests=False, app_record=None,
                           output_allowance=0, completed_calls=None, model_window=None, anchor=None,
-                          on_compaction=None, tool_servers=()):
+                          on_compaction=None, tool_servers=(), before_compaction=None):
     """(messages, state, info) for the next request, compacting earlier turns when needed.
 
     Compaction runs when force_compact is set or the estimate passes auto_compact_percent
@@ -1267,7 +1267,10 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
     the summary requests and the byte guard keep the scaled or raw estimate. on_compaction(trigger)
     is called once a compaction's cut is chosen, before its first summary request ("manual",
     "in_turn" or "auto"). tool_servers (the MCP server IDs) names the meter's tool groups (tool_group).
-    The defaults keep the behaviour before these options.
+    before_compaction(info), when given, is awaited once when a compaction will run, before its
+    first summary request, with {estimated_input_tokens, threshold, input_budget}; it returns the
+    preservation note to use (the user's before_compaction hooks add to it) or raises to stop a
+    manual compaction. The defaults keep the behaviour before these options.
     """
     if not MIN_CONTEXT_WINDOW <= context_window <= MAX_CONTEXT_WINDOW:
         raise ValueError(f"Choose a context window between {MIN_CONTEXT_WINDOW} and {MAX_CONTEXT_WINDOW}.")
@@ -1415,6 +1418,9 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
                 raise budget_error(problem, context_window, reply_reserve, input_budget, default_reply_reserve)
 
     if cut is not None:
+        if before_compaction is not None:
+            preservation_note = await before_compaction({"estimated_input_tokens": estimate, "threshold": threshold,
+                                                         "input_budget": input_budget})
         if on_compaction is not None:
             on_compaction("manual" if force_compact else "in_turn" if in_turn else "auto")
         archived = wire[state["through"]:cut]

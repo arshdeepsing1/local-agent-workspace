@@ -174,8 +174,10 @@ def test_the_largest_built_in_tool_set_fits_the_request_limit(runtime):
     from local_agent.agents import TOOL_DEFINITIONS
     from local_agent.feature_tools import FEATURE_TOOLS
     manager, session, _, _ = runtime
-    # Every built-in tool at once (Plan mode, get_tool_output offered, nothing turned off) leaves room for MCP tools.
+    # Every built-in tool at once (Plan mode, get_tool_output offered, a search provider set, nothing turned off)
+    # leaves room for MCP tools.
     assert len(TOOL_DEFINITIONS) + len(FEATURE_TOOLS) <= MAX_REQUEST_TOOLS
+    manager.settings.values.update(web_search_provider="searxng", web_search_url="http://127.0.0.1:8888")
     session.update(permission_mode="plan", tool_output_offered=True, disabled_tools=[])
     definitions, capped = manager.offered_tools(session, [])
     assert len(definitions) == len(TOOL_DEFINITIONS) + len(FEATURE_TOOLS) and capped == []

@@ -651,3 +651,9 @@ body.panel-resizing{cursor:col-resize;user-select:none}
 /* 2026-10-16 context: the context meter's tool definitions per MCP server. */
 .context-tool-groups{list-style:none;margin:3px 0 0;padding:0;font-size:11px;color:var(--muted)}
 .context-tool-groups li{margin:1px 0;overflow-wrap:anywhere}
+/* 2026-10-16 webhooks: a web_fetch card's domain rule, and the hook form's Run without asking shortcut. */
+.remember-domain{margin:6px 0 0;font-size:12px;overflow-wrap:anywhere}
+.hook-trust{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:10px}
+.hook-trust>span{flex:1 1 220px;min-width:0;font-size:12px;line-height:1.5;overflow-wrap:anywhere}
+.hook-trust .hook-trusted{color:#4f6b3f}
+.hook-trust .outline{font-size:12px;padding:6px 11px}

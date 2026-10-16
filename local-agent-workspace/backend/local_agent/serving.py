@@ -1,4 +1,5 @@
-"""Model serving requests: the one place their URLs, headers, timeouts and HTTP client are built.
+"""Model serving requests: the one place their URLs, headers, timeouts and HTTP client are built
+(and the HTTP client of the app's other outside requests, open_external_client).
 
 Every model call (agent and subagent requests, compaction, titles, /btw side questions) and the
 endpoint listing go through a ServingClient. The client is httpx.AsyncClient, looked up when a
@@ -66,6 +67,14 @@ def open_client(timeout, transport=None):
     helpers that replace it pass their own transport."""
     extra = {"transport": transport} if transport is not None else {}
     return httpx.AsyncClient(timeout=timeout, follow_redirects=False, **extra)
+
+
+def open_external_client(timeout, transport=None, headers=None):
+    """An httpx.AsyncClient for the app's requests to other services (web_fetch.py: a web page, a search
+    provider): no redirects followed (web_fetch follows them itself, after its checks), and no proxy,
+    certificate or other setting from the environment (trust_env off)."""
+    extra = {"transport": transport} if transport is not None else {}
+    return httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=False, headers=headers, **extra)
 
 
 class ServingClient:

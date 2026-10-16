@@ -213,7 +213,7 @@ def same_rule(first, second):
 
 
 def has_matcher(rule):
-    return any(key in rule for key in ("command", "argv", "prefix", "flags", "path", "hook"))
+    return any(key in rule for key in ("command", "argv", "prefix", "flags", "path", "hook", "domain"))
 
 
 def rule_label(rule):
@@ -241,6 +241,12 @@ def rule_label(rule):
         return "stopping jobs"
     if tool == "remember":
         return "saving project memory"
+    if tool == "web_fetch":
+        if not rule.get("domain"):
+            return "web fetches"
+        return f"fetches from {rule['domain']}" + ("" if behavior_of(rule) == "allow" else " and its subdomains")
+    if tool == "web_search":
+        return "web searches"
     if tool.startswith("mcp__") and tool.endswith("__*"):
         return f"all tools of MCP server {tool[5:-3]}"
     return f"the tool {tool}"
@@ -248,7 +254,7 @@ def rule_label(rule):
 
 MCP_NAME = re.compile(r"^mcp__[A-Za-z0-9_-]{1,64}__[A-Za-z0-9_.-]{1,128}$")
 MCP_WILDCARD = re.compile(r"^mcp__([A-Za-z0-9_-]{1,64})__\*$")
-RULE_KEYS = frozenset({"behavior", "tool", "command", "argv", "prefix", "flags", "path", "hook"})
+RULE_KEYS = frozenset({"behavior", "tool", "command", "argv", "prefix", "flags", "path", "hook", "domain"})
 DRAFT_KEYS = frozenset({"behavior", "tool", "text", "match", "options"})
 
 
@@ -348,8 +354,8 @@ def normalize_rule(draft, *, resolve_path, credential_file=None, credential_toke
                 if behavior != "allow" or "prefix" not in draft:
                     raise ValueError("Allowed options apply only to allow rules with a prefix.")
                 rule["flags"] = _tokens(draft["flags"], "The options", MAX_TOKENS)
-            if "path" in draft or "hook" in draft:
-                raise ValueError("A command rule has no path or hook.")
+            if "path" in draft or "hook" in draft or "domain" in draft:
+                raise ValueError("A command rule has no path, hook or domain.")
         if "prefix" in rule:
             if not rule["prefix"]:
                 raise ValueError("Enter a command.")
@@ -379,6 +385,15 @@ def normalize_rule(draft, *, resolve_path, credential_file=None, credential_toke
             rule["path"] = str(resolve_path(path))
             if not Path(rule["path"]).is_absolute():
                 raise ValueError("Enter an absolute folder path.")
+    elif tool == "web_fetch":
+        # Allow names one host exactly; deny and ask cover a domain and its subdomains, or every fetch.
+        from .web_fetch import normalize_domain
+        if is_draft or set(draft) - {"behavior", "tool", "domain"}:
+            raise ValueError("A web fetch rule can only name a domain.")
+        if "domain" in draft:
+            rule["domain"] = normalize_domain(draft["domain"])
+        elif behavior == "allow":
+            raise ValueError("An allow rule for web fetches must name one domain, such as docs.python.org.")
     elif tool == "hook":
         if set(draft) - {"behavior", "tool", "hook"}:
             raise ValueError("A hook rule can only name a hook.")
@@ -395,7 +410,7 @@ def normalize_rule(draft, *, resolve_path, credential_file=None, credential_toke
         if MCP_WILDCARD.match(tool):
             if behavior == "allow":
                 raise ValueError("A rule for every tool of an MCP server can only deny or ask.")
-        elif tool in ("delegate_task", "stop_job", "remember") or MCP_NAME.match(tool):
+        elif tool in ("delegate_task", "stop_job", "remember", "web_search") or MCP_NAME.match(tool):
             pass
         elif tool in TOOL_KINDS:
             if behavior != "deny":
@@ -521,6 +536,16 @@ def rule_matches(rule, name, arguments, *, resolve_path, credential_file=None):
     if tool == "hook":
         return (isinstance(name, str) and name.startswith("hook_")
                 and (rule.get("hook") is None or arguments.get("hook_id") == rule["hook"]))
+    if tool == "web_fetch":
+        if name != "web_fetch":
+            return False
+        from .web_fetch import domain_of
+        domain, host = rule.get("domain"), domain_of(arguments.get("url"))
+        if not domain:
+            return behavior != "allow"
+        if host is None:
+            return behavior != "allow"  # A URL that cannot be checked never matches an allow rule.
+        return host == domain if behavior == "allow" else host == domain or host.endswith("." + domain)
     if isinstance(tool, str):
         wildcard = MCP_WILDCARD.match(tool)
         if wildcard:
@@ -563,8 +588,12 @@ def default_rule(name, arguments):
         return {"argv": argv, "behavior": "allow", "tool": "run_command"}
     if kind == "edit":
         return {"behavior": "allow", "tool": EDIT_KINDS_RULE}
-    if kind in ("mcp", "delegate", "job_stop", "memory"):
+    if kind in ("mcp", "delegate", "job_stop", "memory") or name == "web_search":
         return {"behavior": "allow", "tool": name}
+    if name == "web_fetch":
+        from .web_fetch import domain_of
+        domain = domain_of(arguments.get("url"))
+        return {"behavior": "allow", "domain": domain, "tool": "web_fetch"} if domain else None
     if kind == "hook":
         hook = arguments.get("hook_id")
         return {"behavior": "allow", "hook": hook, "tool": "hook"} if isinstance(hook, str) and hook else None
@@ -624,6 +653,9 @@ def card_rule_options(name, arguments, *, resolve_path=None, credential_file=Non
             except (ValueError, OSError):
                 folder = None
         return {"folder": folder}
+    if name == "web_fetch":
+        from .web_fetch import domain_of
+        return {"domain": domain_of(arguments.get("url"))}
     return None
 
 

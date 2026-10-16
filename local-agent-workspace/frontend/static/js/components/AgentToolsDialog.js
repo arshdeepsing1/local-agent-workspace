@@ -476,6 +476,8 @@ const HOOK_EVENT_HELP = [
   ['agent_stop', 'When the agent would end its turn', 'decision "block" (with reason): it keeps working, at most 3 times'],
   ['subagent_start', "Before a subagent's first request", 'context'],
   ['subagent_stop', 'When a subagent would finish', 'decision "block" (with reason): one more round, at most 2; report (a replacement)'],
+  ['before_compaction', 'Before context is compacted (automatic or Compact now)', 'context (added to the preservation note); it cannot stop a compaction'],
+  ['notification', 'When the app notifies (approval needed, finished, stopped with an error); only without asking', 'none: output is ignored'],
 ]
 const hookOutputExample = JSON.stringify({ decision: 'deny', reason: 'Generated files are rebuilt by make; edit the template.' })
 
@@ -511,21 +513,35 @@ function ExtensionsPanel({ session, onError }) {
   const [servers, setServers] = useState(null)
   // Command templates (GET /commands): { commands, errors, folders }; null until loaded or when it failed.
   const [templates, setTemplates] = useState(null)
-  useEffect(() => { void run(() => Promise.all([api('/extensions'), api(`/skills${query}`), api(`/commands${query}`).catch(() => null)]),
-    ([config, skills, commands]) => { setConfig(config); setSkills(skills); setTemplates(commands) }) }, [query, run])
+  // Hook IDs an all-projects allow rule runs without asking (GET /permission-rules); null until loaded.
+  const [userRules, setUserRules] = useState(null)
+  useEffect(() => { void run(() => Promise.all([api('/extensions'), api(`/skills${query}`), api(`/commands${query}`).catch(() => null),
+    api('/permission-rules').catch(() => null)]),
+  ([config, skills, commands, rules]) => { setConfig(config); setSkills(skills); setTemplates(commands); setUserRules(rules?.user || null) }) }, [query, run])
+  const trust = userRules ? {
+    trusted: new Set(userRules.filter(rule => rule.tool === 'hook' && (rule.behavior || 'allow') === 'allow' && rule.hook).map(rule => rule.hook)),
+    onTrust: (id, on) => {
+      setNotice('')
+      const rule = { tool: 'hook', behavior: 'allow', hook: id }
+      void run(() => api('/permission-rules', on ? 'POST' : 'DELETE', { scope: 'user', rule }), result => {
+        setUserRules(result.user || [])
+        setNotice(on ? `Hook ${id} now runs without asking in all projects.` : `Hook ${id} asks for approval again.`)
+      })
+    },
+  } : null
   const status = Array.isArray(session?.mcp_status) ? session.mcp_status : []
   const save = draft => { setNotice(''); setTools(null); setServers(null); void run(() => api('/extensions', 'PUT', draft), saved => { setConfig(saved); setNotice('Configuration saved.') }) }
   const test = html`<button type="button" class="outline" disabled=${busy} onClick=${() => { setNotice(''); setTools(null); setServers(null); void run(() => api('/extensions/test', 'POST'), result => { setTools(result.tools); setServers(result.servers || null) }) }}>Test saved configuration</button>`
   return html`<section class="agent-tools-section" aria-label="Extensions">
     <h3>MCP servers and hooks</h3>
     <p>Configure stdio commands or HTTP server URLs, and up to 16 hooks: local commands that run around tool calls and at the start and end of a turn. Saving authorizes enabled servers to start. A server that fails is skipped (its tools are unavailable, the others work) and named once in the chat.</p>
-    <${ExtensionsEditor} config=${config} busy=${busy} session=${session} onSave=${save} onError=${onError} actions=${test} />
-    <details class="agent-tools-example"><summary>Configuration example</summary><pre>${extensionExample}</pre><p>The optional tools list matches exact tool names for before_tool, after_tool and tool_failure hooks (other events ignore it). Omit it to match all tools; an empty list matches none. Tool hooks' input includes call_id; failure hooks also receive the original error.</p><p>{"secret": "NAME"} reads NAME from your credential file each time the server starts; the value is never saved in this configuration. workspace_credentials sends your Databricks token only to an https URL on your workspace host.</p></details>
+    <${ExtensionsEditor} config=${config} busy=${busy} session=${session} onSave=${save} onError=${onError} actions=${test} trust=${trust} />
+    <details class="agent-tools-example"><summary>Configuration example</summary><pre>${extensionExample}</pre><p>The optional tools list selects tools for before_tool, after_tool and tool_failure hooks (other events ignore it): exact names or patterns with * and ?, such as mcp__github__* or *_file. Omit it to match all tools; an empty list matches none. Tool hooks' input includes call_id and agent (the chat or the subagent that made the call); failure hooks also receive the original error.</p><p>{"secret": "NAME"} reads NAME from your credential file each time the server starts; the value is never saved in this configuration. workspace_credentials sends your Databricks token only to an https URL on your workspace host.</p></details>
     <details class="agent-tools-example hook-events-help"><summary>Hook events and JSON output</summary>
       <div class="hook-events-scroll"><table class="hook-events" aria-label="Hook events"><thead><tr><th scope="col">Event</th><th scope="col">Runs</th><th scope="col">JSON output it reads</th></tr></thead>
         <tbody>${HOOK_EVENT_HELP.map(([event, when, fields]) => html`<tr key=${event}><th scope="row"><code>${event}</code></th><td>${when}</td><td>${fields}</td></tr>`)}</tbody></table></div>
       <p>A hook gets a JSON object on stdin (the event, the chat and, per event, the tool call, your message, the reply or the subagent's task). It may print one JSON object on stdout, for example <code>${hookOutputExample}</code>; other output is plain text, as before, but output in braces that is not valid JSON fails the hook. stderr is shown on the hook card, never read as JSON. Exit code 0 means no objection; another exit code blocks a before_tool call and only warns for other events.</p>
-      <p>Context (up to 2,000 characters per hook) reaches the agent labelled as hook output. Replaced arguments are checked again against the tool's schema, your rules and its approval card. "allow" never skips a card the mode or rules need; "ask" always shows one, also in Bypass permissions (Don't ask refuses the call instead). Each hook still asks for approval except in Bypass, rules can allow or block it, and Plan mode skips hooks.</p></details>
+      <p>Context (up to 2,000 characters per hook) reaches the agent labelled as hook output. Replaced arguments are checked again against the tool's schema, your rules and its approval card. "allow" never skips a card the mode or rules need; "ask" always shows one, also in Bypass permissions (Don't ask refuses the call instead). Each hook still asks for approval except in Bypass, rules can allow or block it (Run without asking saves an allow rule for all projects), and Plan mode skips hooks. Notification hooks never show a card: they run only without asking.</p></details>
     ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}${notice ? html`<p role="status">${notice}</p>` : null}
     ${tools ? html`<div class="agent-tools-test" role="status">${tools.length ? html`<strong>Available tools</strong><ul>${tools.map(tool => html`<li key=${tool}>${tool}</li>`)}</ul>` : 'No tools reported by the saved configuration.'}</div>` : null}
     ${servers ? html`<div class="agent-tools-list" aria-label="MCP server test results"><p class="field-help">Results from the last test, not a live connection monitor.</p>${servers.map(server => html`<${ServerRow} key=${server.id} server=${server} test=${true} />`)}</div>` : null}
@@ -570,6 +586,7 @@ const TOOL_GROUPS = [
   { name: 'Skills', tools: ['list_skills', 'use_skill'] },
   { name: 'Memory', tools: ['remember'] },
   { name: 'MCP', tools: ['get_tool_output'] },
+  { name: 'Web', tools: ['web_fetch', 'web_search'] },
 ]
 
 export function toolGroup(name) {

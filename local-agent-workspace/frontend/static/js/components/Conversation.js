@@ -75,6 +75,7 @@ function summarizeTools(events, shorten = path => path, projectName = '') {
       shown = `${input.pattern ?? ''}` + (where ? ` in ${shorten(where)}` : '')
     }
     if (event.name === 'remember') subject = shown = String(input.text ?? '')
+    if (event.name === 'web_fetch') subject = shown = String(input.url ?? '')
     if (event.name === 'wait_job') subject = shown = String(input.job_id ?? '').slice(0, 8) + (input.until_regex ? ` until /${input.until_regex}/` : '')
     if (event.name === 'outline_file') {
       suffix = (Number.isInteger(input.max_level) && input.max_level < 6 ? ` · to level ${input.max_level}` : '')
@@ -442,7 +443,22 @@ export function allowLabel(event) {
   if (name === 'delegate_task') return 'Allow subagents in this chat'
   if (name === 'stop_job') return 'Allow stopping jobs in this chat'
   if (name === 'remember') return 'Allow saving memory in this chat'
+  // web_search: approving the card allows searches for the rest of the chat, so it needs no second button.
+  if (name === 'web_fetch') return webDomain(event) ? `Allow ${webDomain(event)} in this chat` : null
   return null
+}
+
+// The host a web_fetch card asks about (the server's checked IDNA form, web_domain), or the URL's host.
+export function webDomain(event) {
+  if (typeof event.web_domain === 'string' && event.web_domain) return event.web_domain
+  try { return new URL(String(event.input?.url || '')).hostname || '' } catch { return '' }
+}
+
+// The first sentence of a pending card.
+function approvalAsk(event, title) {
+  if (event.name === 'web_fetch' && webDomain(event)) return `Local needs your approval to fetch from ${webDomain(event)}.`
+  if (event.name === 'web_search') return `Local needs your approval to search the web${event.web_provider ? ` with ${event.web_provider}` : ''}.`
+  return `Local needs your approval to ${title.toLowerCase()}.`
 }
 
 // The time an approval card expires, with the weekday when that is not today (limits reach 24 hours).
@@ -595,9 +611,10 @@ function ToolCard({ event, summary, result, status, failure = null, sessionId, o
     ${hooked ? html`<p class="hook-outcome">${hooked}</p>` : null}
     ${hints ? html`<p class="tool-hints" title="Hints from the MCP server. They never change approvals.">Server says: ${hints}</p>` : null}
     ${expanded || pending ? html`<div class="tool-body">
-      ${pending ? html`<p>Local needs your approval to ${title.toLowerCase()}.${event.approval_expires
+      ${pending ? html`<p>${approvalAsk(event, title)}${event.approval_expires
           ? ` If you do not answer by ${expiryTime(event.approval_expires)}, it will not run.` : ''}</p>
         <${ApprovalOptions} event=${event} sessionId=${sessionId} onError=${onError} deciding=${deciding} onDecide=${decide} allowInChat=${allowInChat}
+          approveLabel=${event.name === 'web_fetch' ? 'Allow once' : 'Approve'}
           details=${html`<${ToolDetails} event=${event} pending=${true} />`}
           declineNote=${html`<label class="decline-note"><span>Tell the agent why (optional)</span>
             <textarea rows=${2} maxLength=${2000} spellcheck=${false} value=${note} disabled=${deciding}

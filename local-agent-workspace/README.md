@@ -53,7 +53,11 @@ frontend that runs without a build step.
 - Built-in `/` commands (`/clear`, `/compact`, `/model`, `/mode`, `/rename`, `/copy` and more),
   custom command files with `$ARGUMENTS`, and skills sent with one message, all in one `/` menu.
 - Explicit MCP servers, workspace and personal skills, and approval-controlled
-  hooks around tool calls, your messages and the end of a turn, which can answer in JSON.
+  hooks around tool calls, your messages, compaction, the app's notifications and the end of a
+  turn, which can answer in JSON.
+- Web access: the agent reads public web pages as text with `web_fetch`, asking for each new domain
+  (this computer, private networks and cloud metadata addresses are never fetched), and searches
+  the web with `web_search` once you choose a provider (Brave, Tavily or your own SearXNG).
 - Persistent tasks with dependencies, shown as a live checklist above the message box,
   and subagents the model starts on its own (explore, general, editor, or a custom agent
   defined in the project's `.agents/agents` files; several in parallel), each in its own
@@ -383,6 +387,9 @@ when opening a conversation or performing restart recovery.
   holds a connection to the server (`/api/presence`). It starts the notifier directly, with
   the title and message as arguments (no shell) and a 5-second limit; for `notify-send`,
   `<`, `>` and `&` in a title are escaped so that notification servers show them as text.
+  A `notification` hook (see **Agent tools: MCP, skills, and hooks**) gets each of the server's
+  notifications, also while a page is open or desktop notifications are off, for example to
+  forward them to a chat tool.
 - **Commands and skills (`/`)**: type `/` at the start of the message box to list, in three
   groups, the app's commands, your custom commands and the skills this conversation can use, with
   their descriptions and arguments; keep typing to filter (a name typed in full comes first). Use
@@ -1886,7 +1893,7 @@ The details open above the meter; Escape, a click elsewhere or moving focus away
 they close when the chat starts waiting for your approval or answer, so they never cover its card.
 
 **Settings** groups its fields under Project, Model and context, Reasoning, Agent, Subagents,
-Commands and files, Notifications and Credentials; on a wide screen a list of these sections beside them
+Commands and files, Web access, Notifications and Credentials; on a wide screen a list of these sections beside them
 jumps to each one. Longer explanations wait behind **More**. **Settings → Databricks model
 endpoint** lists the endpoints with built-in facts (label and name) and those your workspace
 serves; **Other endpoint…** opens a field for any other name. **Fallback endpoint**, in the same
@@ -2186,7 +2193,8 @@ turned off in this chat, or disabled. The test results also show a server's own 
 never starts in that chat.
 
 Databricks accepts at most 32 tools per request, built-in and MCP tools together. Built-in
-tools come first, then MCP tools in server order; the MCP tools that do not fit are named once
+tools come first (28 in a new chat with the default Settings; up to 31 once `get_tool_output`, `web_search` and Plan's
+`submit_plan` are offered too), then MCP tools in server order; the MCP tools that do not fit are named once
 in a notice and in **Extensions**, and a call to one is refused. Turn off tools or servers a
 chat does not need to make room.
 
@@ -2401,6 +2409,8 @@ within 32 KB). Each one has an `event`:
 | `agent_stop` | When a turn would end with a final reply (after Verify) | `decision` (`"block"` with `reason`) |
 | `subagent_start` | Before a subagent's first model request | `context` |
 | `subagent_stop` | When a subagent would end with its final reply | `decision` (`"block"` with `reason`), `report` |
+| `before_compaction` | Once per compaction (automatic, or **Compact now**), before its first summary request | `context` (it cannot stop a compaction) |
+| `notification` | When the app notifies: a chat needs your approval, finished, stopped with an error, or reached the step or spending limit; only without asking | none: output is ignored |
 
 **Input.** Each hook gets one JSON object on stdin with `event` and the conversation's
 `session_id`. Tool events add `tool`, `arguments`, a stable `call_id`, `result` (after
@@ -2413,11 +2423,21 @@ adds `prompt` (your text, without attached file contents), `attachments` (their 
 reply), `continuations` (how often hooks continued this turn), `workspace`, `model` and
 `permission_mode`. The subagent events give the parent's `session_id` and add
 `subagent_session_id`, `agent_type`, `task`, plus `tool_profile`, `context` and `max_steps`
-(`subagent_start`) or `reply` and `continuations` (`subagent_stop`). Long text is shortened
-(the `*_shortened` field then says so); hook input is at most 128 KB.
+(`subagent_start`) or `reply` and `continuations` (`subagent_stop`). `before_compaction` adds
+`trigger` (`auto` or `manual`), `preservation_note` (your note for **Compact now**),
+`estimated_input_tokens`, `threshold`, `input_budget`, `workspace`, `model` and
+`permission_mode`; `notification` adds `status`, `message` (the notification's text), `title`
+(the chat's title, redacted and shortened) and `page_open`, never transcript text. Tool events
+also add `agent`, the chat or subagent that made the call: `{"session_id", "is_subagent",
+"agent_type", "parent_session_id", "agent_file"}` (the subagent's type, such as `explore` or a
+custom agent's name, its parent chat and its custom agent file; `null` for a chat's own call).
+Every other event of a subagent chat adds it too. Long text is shortened (the `*_shortened` field
+then says so); hook input is at most 128 KB.
 
-The optional `tools` array of a tool event selects exact names (including MCP names); omit it
-for all tools, or use an empty array to match none. Other events ignore it. Failure hooks run
+The optional `tools` array of a tool event selects tools by exact name (including MCP names) or
+by a pattern with `*` and `?` (`mcp__github__*`, `*_file`; case-sensitive, no regular
+expressions); a pattern that matches a covering tool (`read_*` for `read_file`) also selects the
+tools it covers. Omit it for all tools, or use an empty array to match none. Other events ignore it. Failure hooks run
 for invoked tools that fail, including MCP `is_error` results and foreground commands that
 failed or timed out; schema, policy and approval rejections, cancelled actions and
 background-job completion do not launch them.
@@ -2447,7 +2467,9 @@ the same event sees an earlier hook's replacement `arguments` or `prompt`, and a
   hidden message with the reason; the chat shows "A hook asked the agent to continue: … (1 of
   3)"), at most three times in a row per turn and only while agent steps are left, and on
   `subagent_stop` gives the subagent one more round, at most twice. Stopped turns, errors, the
-  step limit and **Stop** never run `agent_stop` or `subagent_stop`.
+  step limit and **Stop** never run `agent_stop` or `subagent_stop`. A `before_compaction` hook
+  cannot stop a compaction: it only adds `context`, and a `decision` there is ignored (listed on
+  its card).
 - `arguments` (`before_tool`): replacement arguments for the call. They must pass the tool's
   JSON schema, or the hook fails and the call is blocked. Because before-tool hooks run before
   the call's own approval card, everything after them uses the final arguments: deny, ask and
@@ -2466,7 +2488,8 @@ the same event sees an earlier hook's replacement `arguments` or `prompt`, and a
   always labelled as coming from your local hook commands. Tool-event context is added after
   that call's result; `user_prompt` and `session_start` context after your message (never into
   the system prompt), shown under **Hook context sent with this message**; `subagent_start`
-  context after the subagent's first message.
+  context after the subagent's first message; `before_compaction` context in the compaction's
+  preservation note, after yours, labelled as coming from your local hooks.
 - `report` (`subagent_stop`): replacement text for the report the parent chat receives,
   labelled as replaced by the hook; the subagent's own final reply stays in its transcript.
 
@@ -2485,8 +2508,13 @@ no hooks); nothing runs or shows in the parent chat.
 `hook_<event>` (for example `hook_user_prompt`), each hook asks for approval except in Bypass,
 Plan skips hooks, and Don't ask runs only hooks a rule allows (a before-hook without one blocks
 its tool). **Allow this hook in this chat** stops asking for that hook ID in that chat; a saved
-hook rule does the same for the project or all projects. Deny and ask rules for hooks apply in
-Bypass too. A hook card shows in the chat it affects (the subagent events: in the parent chat,
+hook rule does the same for the project or all projects. **Run without asking (all projects)**
+under a saved hook in **Agent tools → Extensions** saves that rule for all projects in one click
+(**Ask again** removes it); the rule follows the hook ID, so check the command first. Deny and ask
+rules for hooks apply in Bypass too. Notification hooks never show a card (a card would itself
+notify): they run only with such a rule or in Bypass and are skipped otherwise, which Extensions
+says. One run per hook at a time (a notification while it runs is skipped), and a failure is only
+logged. A hook card before an automatic compaction makes that step wait for your answer. A hook card shows in the chat it affects (the subagent events: in the parent chat,
 where the delegation is) and says what the hook decided: "Hook blocked: …", "Hook asked for
 approval: …", "Hook added context", "Hook changed the arguments" (with a before/after view) or
 "Hook edited the message". A declined hook does not run: a declined before-hook blocks its tool,
@@ -2622,7 +2650,7 @@ Report each finding with path:line, its severity and a suggested fix.
 The parser is small and strict: `key: value` lines, `[a, b]` or `- item` lists, `"..."` or
 `'...'` quoting and `#` comment lines; nested or multi-line (`|`, `>`) values are refused.
 Claude Code agent files work too: its tool names `Read`, `Write`, `Edit`, `MultiEdit`, `Glob`,
-`Grep`, `LS`, `Bash`, `NotebookRead` and `NotebookEdit` stand for this app's, other fields such
+`Grep`, `LS`, `Bash`, `NotebookRead`, `NotebookEdit`, `WebFetch` and `WebSearch` stand for this app's, other fields such
 as `color` are ignored with a note, and its model values `sonnet`, `opus`, `haiku` and `inherit`
 mean the chat's model. An agent file is at most 16 KB (16,384 bytes) with up to 8,000 characters
 of instructions; a folder with more than 100 entries is not read (Agent types says so) and at
@@ -2714,6 +2742,68 @@ is ignored. Thinking is not replayed as model history, and the app never fabrica
 hidden reasoning. Endpoint support varies; ordinary responses legitimately have no
 Thinking block.
 
+### Web fetch and search
+
+**Settings → Web access** controls the agent's two web tools. Both are tools of this app
+(Databricks does not offer Anthropic's server-side web tools), and what they return reaches the
+agent as untrusted web content: information to check, never instructions to follow.
+
+**`web_fetch`** (on by default; **Let the agent fetch web pages** turns it off) reads one public
+`http` or `https` page and returns its text. HTML becomes plain text, with headings as `#`, links
+as `[text](url)`, list items, table rows and code blocks kept, and scripts, styles and SVG
+dropped; JSON is indented; other text stays as it is; images, PDFs and other types are refused.
+The body is read up to 2 MB, counted after decompression: a compressed page may use one gzip
+or deflate layer, never more (other encodings are refused). The first 8 KB come back with the
+call; a longer page (up to 1,000,000 characters) is kept in memory for this app run and read on
+with `get_tool_output`, whose pages repeat the untrusted-content note.
+
+Before anything is sent, the URL is checked: `http` or `https`, port 80 or 443, no user name or
+password, and no name of this computer or a private network (`localhost`, `*.localhost`,
+`*.local`, `*.internal`, `*.localdomain`, `*.home.arpa`, `*.lan`, `*.corp`, `*.intranet`, or a
+name without a dot). An IP address must be on the public internet: loopback, private (10/8,
+172.16/12, 192.168/16, fc00::/7), link-local (169.254/16, where cloud metadata services answer,
+and fe80::/10), carrier-grade NAT (100.64/10), benchmarking, documentation, multicast, reserved
+and unspecified addresses are refused, also when an IPv6 address embeds one (IPv4-mapped,
+6to4, Teredo, NAT64) or an IPv4 address is written another way (`2130706433`, `0x7f000001`,
+`127.1`). A URL that contains your Databricks token, a configured secret, or a value shaped like
+a token, key or password is refused too. Nothing is looked up before you approve: the name is
+resolved when the connection opens, every address it resolves to must be public, and the
+connection goes to that checked address (TLS still checks the site's name), for every connection
+and every redirect, so a name cannot switch to a private address after the check. Redirects are
+followed on the same host, at most 5; a redirect to another host comes back to the agent, which
+must fetch that URL in a new call, with its own approval. No proxy, cookies or credentials are
+used, the User-Agent is fixed, and a fetch stops after 30 seconds (10 to connect). A refused URL
+tells the agent not to reach the address another way, for example with `curl`.
+
+**Approval.** A fetch card says "Local needs your approval to fetch from *domain*" and shows the
+whole URL with its host as rules name it (an international name in its `xn--` form). **Allow
+once** fetches this URL; **Allow *domain* in this chat** allows that host for the rest of the chat;
+**Always allow…** saves the same domain rule for the project or all projects. A domain rule
+allows one host exactly (`docs.python.org`, not `www.docs.python.org`); a deny or Always ask rule
+for a domain also covers its subdomains, and one without a domain covers every fetch (see
+**Permission rules**). Manual, Auto and Accept edits ask for every host no rule allows, Plan
+always asks (rules do not apply in Plan), Don't ask fetches only what a rule allows, and Bypass
+fetches without a card unless a deny or ask rule applies.
+
+**`web_search`** is off until you choose a **Web search provider**: Brave Search or Tavily (each
+with an API key), or SearXNG at your own server's address (for example `http://127.0.0.1:8888`,
+with its JSON format turned on; it may run on this computer, since you chose the address, not the
+agent). The API key stays in your credential file: Settings stores only the name of its entry
+(`BRAVE_API_KEY` or `TAVILY_API_KEY` unless you name another), and the key is read for each
+search, never saved in settings, sent only to the provider and hidden (`[REDACTED]`) in everything
+the app shows. Settings says when the entry is missing, and an entry holding your Databricks
+token is never sent. A search returns up to 10 results (5 by default), each a title, a URL and a
+snippet of up to 300 characters. The provider receives every query and may charge for it: check
+your organization's rules before you choose one. The first search in a chat shows its query on a
+card; approving it allows web searches for the rest of that chat (a **Web searches** rule in the
+Permissions menu, which you can remove). A query that contains a secret is not sent.
+
+Once a chat was offered a web tool, it keeps it, so its tool list (and the prompt cache) stays the
+same; a call after you turned the tool off in Settings is refused, and the agent is told why.
+Subagents with the chat's tools (general, or a custom agent that lists them) can use them, with
+their own cards; explore and editor subagents cannot. **Agent tools → Tools** lists both under
+**Web**.
+
 ### Permission modes
 
 Choose a mode beneath the chat input. Existing conversations default to Manual.
@@ -2736,7 +2826,9 @@ in Auto and Bypass, and is blocked in Plan. Starting a subagent (`delegate_task`
 Plan, runs in Accept edits, Auto and Bypass, and is blocked in Don't ask unless a rule allows
 it; the child then follows its own (inherited) mode. Saving a project memory note (`remember`)
 asks in Manual, Accept edits and Auto, is blocked in Plan, and runs in Bypass and Don't ask only
-when an allow rule for it exists (see **Project memory**). Starting a background job follows the
+when an allow rule for it exists (see **Project memory**). Web fetches and searches ask in Manual,
+Auto, Accept edits and Plan unless a rule allows them (rules do not apply in Plan), are blocked in
+Don't ask unless a rule allows them, and run in Bypass (see **Web fetch and search**). Starting a background job follows the
 same command rules as foreground execution. Changing modes does not cancel a previously
 authorized background job. Manually saving in the editor or clicking Run in the terminal is
 an explicit user action outside the agent's permission mode. The project's Verify command
@@ -2779,9 +2871,11 @@ Rule kinds:
 - **File edits** (`write_file`, `edit_file`, `insert_activity_log`, `move_path`, `delete_path`,
   `notebook_edit`), optionally only under one absolute folder. An allow rule needs every path the
   tool touches inside the folder; a deny or ask rule applies when any of them is (both ends of a move).
+- **Web fetches** (`web_fetch`): an allow rule names one host exactly (`docs.python.org`); a deny or
+  ask rule covers a domain and its subdomains, or every web fetch when it names none.
 - **Tools**: one MCP tool, every tool of an MCP server (`mcp__server__*`, deny and ask only),
-  a hook ID, `delegate_task` (subagents), `stop_job`, `remember` (project memory notes), or any other
-  tool name (deny only).
+  a hook ID, `delegate_task` (subagents), `stop_job`, `remember` (project memory notes), `web_search`,
+  or any other tool name (deny only).
 
 When rules disagree, **deny beats ask, and ask beats allow**, whatever their scope. The fixed
 order is: turned-off tools, deny rules (in every mode, Bypass included), Plan's read-only limit,
@@ -2922,18 +3016,18 @@ failure starts a fix round as usual.
 sets where the rule is saved (**This chat**, **This project** or **All projects**; only the
 scopes the server offers) and what it matches: for a command, its exact text or **Commands
 starting with** one of the prefixes the server offers, plus the options allowed after it; for
-edits, all file edits or only files under a folder. **Approve and remember** approves the card
+edits, all file edits or only files under a folder; for a web fetch, the card's host. **Approve and remember** approves the card
 and saves the rule. A command that cannot be split exactly can be remembered only by its exact
 text, in this chat. An edited card is marked "Edited by you". The **Permissions** menu lists the
 rules by scope, with **Deny** and **Always ask** badges and a remove button each, has **Add a
-rule…** (behavior, scope, a command, file edits or a tool, with options for allow prefixes) and a
+rule…** (behavior, scope, a command, file edits, web fetches or a tool, with options for allow prefixes) and a
 **Never asks** list naming what never needs approval. Adding or removing a chat or project rule
 from a new chat creates the chat first.
 
 **Turned-off tools.** **Agent tools → Tools** turns tools off for one chat. They are not
 offered to the agent and calls to them are refused. Subagents, forks and imports keep the setting.
 The tools are grouped (Files, Search, Commands and jobs, Git, Tasks and subagents, Skills,
-MCP, Other); **Filter tools** matches names, groups and descriptions, and each group has
+Memory, MCP, Web, Other); **Filter tools** matches names, groups and descriptions, and each group has
 **All on** and **All off** for the tools it shows. Each tool shows the first sentence of its
 description; hover it for more. Each configured MCP server has a switch: off, its process
 never starts in that chat (stored as `mcp__<server>__*`; subagents inherit it). One MCP tool
@@ -3481,7 +3575,8 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `backend/local_agent/changes.py`: the agent's file changes per conversation, their diffs, Keep and Undo.
 - `backend/local_agent/shell_changes.py`: the files a foreground `run_command` changed, from Git status before and after it.
 - `backend/local_agent/extensions.py` / `mcp_client.py`: skills, hooks, MCP configuration (secret references, workspace credentials) and lifecycle (each server isolated, its status, content flattening).
-- `backend/local_agent/mcp_import.py` / `result_store.py`: the `.mcp.json` import preview, and long MCP results and images kept in memory (`get_tool_output`).
+- `backend/local_agent/mcp_import.py` / `result_store.py`: the `.mcp.json` import preview, and long MCP and `web_fetch` results and MCP images kept in memory (`get_tool_output`).
+- `backend/local_agent/web_fetch.py`: `web_fetch` (the address guard checked before and at every connection, redirects, HTML to text) and `web_search` (Brave, Tavily or SearXNG).
 - `backend/local_agent/planning.py` / `feature_tools.py`: tasks and subagents (agent types, the slot limit, parallel batches, the subagents index).
 - `backend/local_agent/feature_api.py`: scoped feature endpoints.
 - `backend/local_agent/reasoning.py`: reasoning effort request fields per endpoint and format, the rejection

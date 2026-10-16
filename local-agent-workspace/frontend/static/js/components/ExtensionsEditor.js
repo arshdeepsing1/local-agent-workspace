@@ -5,9 +5,10 @@ import { api } from '../api.js'
 // Agent tools → Extensions: MCP servers and hooks as a form, or as the JSON it saves ("Edit as JSON"),
 // and an import of another tool's MCP servers (a preview first; imported servers are added disabled).
 // Props: config (the saved configuration, null while loading), busy (a save or test runs), session,
-// onSave(config) (the panel PUTs it), onError(message), actions (more buttons beside Save).
+// onSave(config) (the panel PUTs it), onError(message), actions (more buttons beside Save), trust ({ trusted: Set
+// of hook IDs an all-projects allow rule runs without asking, onTrust(id, on) }, or null while rules load).
 export const HOOK_EVENTS = ['before_tool', 'after_tool', 'tool_failure', 'user_prompt', 'session_start', 'agent_stop',
-  'subagent_start', 'subagent_stop']
+  'subagent_start', 'subagent_stop', 'before_compaction', 'notification']
 const TOOL_EVENTS = new Set(['before_tool', 'after_tool', 'tool_failure'])
 let rows = 0
 const rowKey = () => `row-${++rows}`
@@ -139,7 +140,24 @@ function ServerFields({ server, index, busy, onChange, onRemove }) {
   </fieldset>`
 }
 
-function HookFields({ hook, index, busy, onChange, onRemove }) {
+// Run without asking: an all-projects allow rule for one saved hook ID (POST /permission-rules), the same rule an
+// approval card's Always allow saves. Shown for hooks saved under that ID; the rule follows the ID, not the command.
+function HookTrust({ hook, n, saved, trust, busy }) {
+  const id = hook.id.trim()
+  if (!trust || !id || !saved) {
+    return hook.event === 'notification' ? html`<p class="field-help">Save the hook, then choose Run without asking: notification hooks never show a card.</p>` : null
+  }
+  const trusted = trust.trusted.has(id)
+  return html`<div class="hook-trust" role="group" aria-label=${`Hook ${n} approval`}>
+    <span class=${trusted ? 'hook-trusted' : 'field-help'}>${trusted ? 'Runs without asking in all projects (a rule for this hook ID).'
+      : hook.event === 'notification' ? 'Needs Run without asking (or Bypass permissions) to run: notification hooks never show a card.'
+        : 'Asks for approval each time, except in Bypass permissions.'}</span>
+    <button type="button" class="outline" disabled=${busy} onClick=${() => trust.onTrust(id, !trusted)}>
+      ${trusted ? 'Ask again' : 'Run without asking (all projects)'}</button>
+  </div>`
+}
+
+function HookFields({ hook, index, busy, saved, trust, onChange, onRemove }) {
   const n = index + 1
   return html`<fieldset class="extension-entry" disabled=${busy}>
     <legend>Hook ${n}${hook.id ? `: ${hook.id}` : ''}</legend>
@@ -156,13 +174,14 @@ function HookFields({ hook, index, busy, onChange, onRemove }) {
     ${TOOL_EVENTS.has(hook.event) || hook.match === 'listed' ? html`<label>Tools<select aria-label=${`Hook ${n} tools`} value=${hook.match}
         onChange=${e => onChange({ match: e.currentTarget.value })}>
         <option value="all">All tools</option><option value="listed">Only the tools listed</option></select></label>
-      ${hook.match === 'listed' ? html`<label>Exact tool names, one per line (none listed: no tool)<textarea aria-label=${`Hook ${n} tool names`}
+      ${hook.match === 'listed' ? html`<label>Tool names or patterns with * and ?, one per line (none listed: no tool)<textarea aria-label=${`Hook ${n} tool names`}
         rows=${2} spellcheck=${false} value=${hook.tools} onInput=${e => onChange({ tools: e.currentTarget.value })} /></label>` : null}` : null}
     <div class="extension-entry-actions">
       <label class="extension-check"><input type="checkbox" aria-label=${`Hook ${n} enabled`} checked=${hook.enabled}
         onChange=${e => onChange({ enabled: e.currentTarget.checked })} />Enabled</label>
       <button type="button" class="outline" aria-label=${`Remove hook ${n}`} onClick=${onRemove}>Remove</button>
     </div>
+    <${HookTrust} hook=${hook} n=${n} saved=${saved} trust=${trust} busy=${busy} />
   </fieldset>`
 }
 
@@ -192,7 +211,7 @@ function ImportPreview({ preview, onAdd, onCancel }) {
   </div>`
 }
 
-export default function ExtensionsEditor({ config, busy, session, onSave, onError, actions = null }) {
+export default function ExtensionsEditor({ config, busy, session, onSave, onError, actions = null, trust = null }) {
   const [mode, setMode] = useState('form')
   const [form, setForm] = useState(() => toForm(config || {}))
   const [text, setText] = useState(config ? JSON.stringify(config, null, 2) : '')
@@ -207,6 +226,7 @@ export default function ExtensionsEditor({ config, busy, session, onSave, onErro
   }, [config])
   const loaded = !!config
   const locked = !loaded || busy
+  const savedHooks = new Set((Array.isArray(config?.hooks) ? config.hooks : []).map(hook => hook?.id).filter(Boolean))
   // The JSON as an object, or null (the problem is shown).
   const parsed = () => {
     try { return JSON.parse(text) } catch (e) { setProblem(`The JSON is not valid: ${e.message}`); return null }
@@ -258,8 +278,8 @@ export default function ExtensionsEditor({ config, busy, session, onSave, onErro
           onChange=${changes => patch('servers', index, changes)} onRemove=${() => remove('servers', index)} />`)}
         <button type="button" class="outline" disabled=${locked} onClick=${() => setForm(current => ({ ...current, servers: [...current.servers, emptyServer()] }))}>Add server</button>
         <h4>Hooks</h4>
-        ${form.hooks.map((hook, index) => html`<${HookFields} key=${hook.key} hook=${hook} index=${index} busy=${locked}
-          onChange=${changes => patch('hooks', index, changes)} onRemove=${() => remove('hooks', index)} />`)}
+        ${form.hooks.map((hook, index) => html`<${HookFields} key=${hook.key} hook=${hook} index=${index} busy=${locked} trust=${trust}
+          saved=${savedHooks.has(hook.id.trim())} onChange=${changes => patch('hooks', index, changes)} onRemove=${() => remove('hooks', index)} />`)}
         <button type="button" class="outline" disabled=${locked} onClick=${() => setForm(current => ({ ...current, hooks: [...current.hooks, emptyHook()] }))}>Add hook</button>
       </div>`}
     <details class="agent-tools-example extensions-import"><summary>Import MCP servers</summary>

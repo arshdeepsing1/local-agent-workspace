@@ -14,13 +14,15 @@ from . import config
 from .jobs import CREDENTIAL_ENV, DENIED_ENV, DENIED_ENV_PREFIXES, NOT_STOPPED, CommandTimeout, run_process, with_note
 from .mcp_client import MCPConnection, bounded_error, bounded_result
 from .redaction import redact_secrets
+from .web_fetch import DEFAULT_KEYS, key_name as web_key_name
 
 CONFIG_LIMIT = 32_000
 SKILL_LIMIT = 8_000
 MAX_SKILLS = 30
 IDENTIFIER = re.compile(r"[a-z][a-z0-9_-]{0,19}\Z")
 SKILL_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
-TOOL_SELECTOR = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
+# A hook's tools entry: a tool name or a glob pattern (* and ?, fnmatch), such as mcp__github__* or *_file.
+TOOL_SELECTOR = re.compile(r"[A-Za-z0-9_*?.-]{1,64}\Z")
 # Workspace skill folders in order of precedence; the app only reads .claude/skills.
 WORKSPACE_SKILL_ROOTS = (".agents/skills", ".claude/skills")
 # The user's own skill folders in their home folder, after the workspace's and before the shipped skills
@@ -59,9 +61,11 @@ SECRET_WORDS = ("TOKEN", "SECRET", "PASSWORD", "PASSWD", "APIKEY", "API_KEY", "C
 SECRET_PARTS = {"KEY", "PAT", "PASS", "AUTH", "BEARER"}
 LOOPBACK = ("localhost", "127.0.0.1", "::1")
 SECRET_HINT = 'use {{"secret": "{name}"}} and add {name}=… to your credential file'
-# Hook events: the three tool events (their tools field selects tools) and the lifecycle events.
+# Hook events: the three tool events (their tools field selects tools) and the lifecycle events. notification
+# hooks run only without a card (Bypass or an allow rule), their output is ignored (lifecycle_hooks).
 TOOL_HOOK_EVENTS = ("before_tool", "after_tool", "tool_failure")
-HOOK_EVENTS = (*TOOL_HOOK_EVENTS, "user_prompt", "session_start", "agent_stop", "subagent_start", "subagent_stop")
+HOOK_EVENTS = (*TOOL_HOOK_EVENTS, "user_prompt", "session_start", "agent_stop", "subagent_start", "subagent_stop",
+               "before_compaction", "notification")
 HOOK_EVENT_LIST = ", ".join(HOOK_EVENTS[:-1]) + " or " + HOOK_EVENTS[-1]
 # Structured hook output: what one JSON object on stdout may set, per event. decision values are
 # listed; other fields are text, except before_tool arguments (an object). Unknown fields are ignored.
@@ -74,6 +78,8 @@ HOOK_OUTPUT_FIELDS = {
     "agent_stop": {"decision": ("allow", "block"), "reason": str},
     "subagent_start": {"context": str},
     "subagent_stop": {"decision": ("allow", "block"), "reason": str, "report": str},
+    "before_compaction": {"context": str},  # it adds a note; it cannot stop a compaction
+    "notification": {},
 }
 HOOK_CONTEXT_CHARS = 2_000  # context and reason are shortened to this many characters
 HOOK_REPORT_CHARS = 6_000
@@ -369,7 +375,8 @@ def validate_config(config, tokens=(), saved_ids=None):
                     if (not isinstance(selectors, list) or len(selectors) > 64
                             or any(not isinstance(name, str) or not TOOL_SELECTOR.fullmatch(name) for name in selectors)
                             or len(set(selectors)) != len(selectors)):
-                        raise ValueError("Hook tools must be at most 64 unique exact tool names (no wildcards or regular expressions).")
+                        raise ValueError("Hook tools must be at most 64 unique tool names or patterns with * and ? "
+                                         "(letters, digits, _, -, and .; no regular expressions).")
                     item["tools"] = list(selectors)
             result[key].append(item)
     if sum(server["enabled"] for server in result["servers"]) > MAX_ENABLED_SERVERS:
@@ -415,8 +422,12 @@ class ExtensionManager:
         return set(self._credential_values())
 
     def secret_values(self):
-        """The resolved values of the enabled servers' secret references (8 characters or more), to redact."""
+        """The resolved values of the enabled servers' secret references and of the web search API key
+        (Settings → Web access), 8 characters or more, to redact."""
         keys = [key for server in self.config["servers"] if server["enabled"] for key in references(server)]
+        values = getattr(self.settings, "values", None) or {}
+        if isinstance(values, dict) and values.get("web_search_provider") in DEFAULT_KEYS:
+            keys.append(web_key_name(values))
         if not keys:
             return []
         found = self._credential_values()

@@ -37,7 +37,7 @@ window.agentTypes = {
   ],
   custom: [{ name: 'security-auditor', built_in: false, description: 'Reviews code for injection and secrets handling.',
     path: '.agents/agents/security-auditor.md', profile: 'read_only', tools: ['read_file', 'search_files'], model: 'databricks-claude-sonnet-4-5',
-    effort: 'low', skills: ['review'], max_steps: 8, notes: ['Ignored unknown tools: web_fetch.'], instructions_chars: 120 }],
+    effort: 'low', skills: ['review'], max_steps: 8, notes: ['Ignored unknown tools: browser_open.'], instructions_chars: 120 }],
   errors: [{ path: '.claude/agents/broken.md', error: 'description is required: one line (at most 300 characters) that tells the model when to use this agent.' }],
   folders: ['.agents/agents', '.claude/agents'], index_bytes: 210,
 }
@@ -78,4 +78,11 @@ fake.handle = (path, options) => {
   if (path === '/api/commands' || path.startsWith('/api/commands?')) return fake.json({ commands: fake.commands || [], errors: [],
     folders: ['.agents/commands', '.claude/commands', '~/.agents/commands', '~/.claude/commands'] })
   if (path.endsWith('/skills')) return fake.json({ active_skills: body().enabled ? ['skill'] : [] })
+  // Saved rules for all projects (the Extensions hook shortcut adds and removes an allow rule for one hook ID).
+  if (path.startsWith('/api/permission-rules')) {
+    const rules = fake.userRules || (fake.userRules = [])
+    if (options.method === 'POST') rules.push(body().rule)
+    if (options.method === 'DELETE') fake.userRules = rules.filter(rule => rule.hook !== body().rule.hook)
+    return fake.json({ chat: [], project: [], user: fake.userRules, project_path: '/project', problem: null })
+  }
 }

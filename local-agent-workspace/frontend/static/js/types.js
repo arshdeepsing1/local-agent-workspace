@@ -30,7 +30,11 @@
 //   endpoint_profiles: [{ model, label }] (endpoints with built-in facts),
 //   user_agents_file: boolean (load ~/.agents/AGENTS.md; default true), user_claude_file: boolean (also load the
 //   read-only ~/.claude/CLAUDE.md; default false), project_memory: boolean (offer remember and load the project's notes;
-//   default true), output_style: string ('default' | 'concise' | 'explanatory' | a style file's id; default 'default') }
+//   default true), output_style: string ('default' | 'concise' | 'explanatory' | a style file's id; default 'default'),
+//   web_fetch: boolean (offer web_fetch; default true), web_search_provider: '' | 'brave' | 'tavily' | 'searxng' (default ''
+//   = no web_search), web_search_url: string (the SearXNG address), web_search_key: string (the credential-file entry
+//   that holds the API key; '' = BRAVE_API_KEY or TAVILY_API_KEY), web_search_status: { provider, ready, problem?,
+//   key_name? } | null (never the key) }
 // GET /output-styles?session_id= -> { styles: [{ id, name, description, source: 'built-in'|'project'|'user', path? }],
 //   errors: [{ path, error }] } (backend output_styles.py; the chat's project, or the default one without a chat).
 // Memory (GET /memory?session_id=; POST { text } adds, PATCH /memory/<id> { text } edits, DELETE /memory/<id> deletes
@@ -115,12 +119,13 @@
 // GET /session-search?q=2..200 chars&workspace?&include_subagents?&limit=1..50 (20) -> { results: [{ id, title, updated,
 //   workspace, archived, matches: [{ event_id, role: 'user'|'assistant', snippet }] }], truncated }.
 // Rule: { behavior: 'allow'|'ask'|'deny', tool, command?, argv?: string[], prefix?: string[], flags?: string[],
-//   path?: string, hook?: string }. A rule without behavior (an M1 "Allow for this chat" rule) means allow.
+//   path?: string, hook?: string, domain?: string }. A rule without behavior (an M1 "Allow for this chat" rule) means allow.
 //   tool: 'run_command' (command = M1 exact text, chat and allow only; argv = exact argv; prefix with flags =
 //   the prefix followed only by those options, '--name=' allowing any value; no matcher = every command,
 //   deny and ask only) | 'edits' (every edit tool; path = an absolute folder or file) | 'hook' (hook = id)
 //   | 'delegate_task' | 'stop_job' | 'mcp__<server>__<tool>' | 'mcp__<server>__*' (deny and ask only)
-//   | another tool name (deny only). Deny wins over ask, ask over allow. A deny rule for read_file also covers
+//   | 'web_fetch' (domain = one host for allow, which needs it; deny and ask cover its subdomains too, or every fetch)
+//   | 'web_search' | another tool name (deny only). Deny wins over ask, ask over allow. A deny rule for read_file also covers
 //   outline_file, and one for list_files or find_files also covers project_overview.
 // Rule draft (POST only): { tool: 'run_command', behavior, text, match: 'exact'|'prefix', options?: string }.
 // RuleSets (GET /permission-rules?session_id=; POST /permission-rules { scope: 'chat'|'project'|'user',
@@ -177,7 +182,8 @@
 //   response's context allowance: the agent got a result_deferred message), result_shortened?: true (an action's
 //   result was shortened for the agent),
 //   and on pending cards only: rememberable?: ('chat'|'project'|'user')[], rule_options?: { argv: string[] | null,
-//   prefixes: [{ prefix: string[], flags: string[] }], reason: string | null } (commands) | { folder } (edits),
+//   prefixes: [{ prefix: string[], flags: string[] }], reason: string | null } (commands) | { folder } (edits) |
+//   { domain } (web_fetch),
 //   editable?: ('command'|'content'|'new_text')[], uncertain?: true (a command that could not be checked
 //   exactly against deny and ask rules) }
 //   ask_user events: { name: 'ask_user', input: { questions }, answers?: [{ question, selected, other }],
@@ -204,6 +210,8 @@
 //   open_world? } (the server's hints, shown, never used for permissions) and mcp_images?: [{ id, mime_type, bytes }]
 //   (GET /sessions/<id>/tool-images/<id> -> { mime_type, data } while the app runs; never sent to the model). A long
 //   result's output JSON has result_id, next_offset, total_chars (and rest_not_kept) for get_tool_output.
+//   Web cards (web_fetch.py): web_fetch carries web_domain? (the checked IDNA host the card and its rules name) and
+//   web_search web_provider? (the provider's label); their output JSON has a note that the content is untrusted.
 // McpServerStatus: { id, name, status: 'connected'|'failed'|'skipped'|'off'|'disabled', tool_count, error?,
 //   stderr_tail? (redacted end of a stdio server's stderr), server_info?: { name, title?, version? },
 //   retry_seconds? (a failed server is tried again after 60 s), capped?: string[] (tools left out by the

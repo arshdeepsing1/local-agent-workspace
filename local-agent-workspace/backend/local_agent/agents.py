@@ -61,6 +61,7 @@ from .feature_tools import FEATURE_TOOLS
 from .tool_profiles import tool_allowed, filter_tools, off_servers, server_off
 from .mcp_client import FULL_RESULT_CHARS, RETRY_SECONDS
 from .result_store import ResultStore
+from . import web_fetch
 from . import prompt_cache, reasoning, reasoning_replay
 from .reasoning import reasoning_delta, reasoning_shape
 from .endpoint_probes import CheckStore
@@ -858,7 +859,10 @@ class AgentManager(LifecycleHooks):
         self.delegates = DelegateManager(self)
         self.interactions = InteractionManager(self)
         self.extension_connections = {}
-        self.results = ResultStore()  # In memory: long MCP results (get_tool_output) and their images.
+        self.results = ResultStore()  # In memory: long MCP and web_fetch results (get_tool_output), MCP images.
+        # web_fetch and web_search (web_fetch.py): tests replace the connection backend (a factory), the ports a
+        # fetch may use, and the search provider's transport.
+        self.web_options = {"backend": None, "ports": web_fetch.PORTS, "search_transport": None}
         self.notifier = SystemNotifier()
         self.closing = False
         # In memory only: {(endpoint, request format): field} for reasoning fields Databricks rejected
@@ -1598,13 +1602,22 @@ class AgentManager(LifecycleHooks):
             await self.refresh_meter_limits(session)
 
     def notify_status(self, session, previous, status, turn_ended=False):
-        """A desktop notification of the change, only if enabled and no page is open."""
-        if self.settings.values.get("system_notifications") is not True or self.pages or any(self.listeners.values()):
+        """A desktop notification of the change, only if enabled and no page is open. Notification hooks
+        (lifecycle_hooks.notification_hooks) get every such notification, also with a page open or desktop
+        notifications off."""
+        if attention_message(session, previous, status, turn_ended) is None:
+            return  # Most status changes notify nothing (the title only changes the text).
+        page_open = bool(self.pages or any(self.listeners.values()))
+        desktop = self.settings.values.get("system_notifications") is True and not page_open
+        hooked = self.has_hooks(session, "notification")
+        if not desktop and not hooked:
             return
         # Titles stored before redaction, too; redacted before attention_message cuts them.
         title = self.redact_title(str(session.get("title") or ""))
         message = attention_message({**session, "title": title}, previous, status, turn_ended)
-        if message:
+        if hooked:
+            self.notification_hooks(session, status, message, page_open)
+        if desktop:
             self.notifier.send(message)
 
     def redact_title(self, text):
@@ -2307,13 +2320,18 @@ class AgentManager(LifecycleHooks):
     def feature_definitions(self, session):
         """The feature tools a chat can be offered: no delegate_task or remember in a subagent; remember while
         Settings → Project memory is on, or in a chat it was offered to before; get_tool_output once a long result
-        of this chat was kept. Once offered, a tool stays offered, so the chat's tool list stays stable."""
+        of this chat was kept; web_fetch while Settings → Web access allows it and web_search while it names a
+        search provider, or in a chat they were offered to before. Once offered, a tool stays offered, so the
+        chat's tool list stays stable (a call to a tool Settings turned off is refused)."""
         subagent = bool(session.get("is_subagent"))
         memory = not subagent and (self.settings.values.get("project_memory", True) is True
                                    or session.get("memory_tool") is True)
+        offered = {"remember": memory, "get_tool_output": bool(session.get("tool_output_offered")),
+                   "web_fetch": self.settings.values.get("web_fetch", True) is True or session.get("web_fetch_tool") is True,
+                   "web_search": (web_fetch.search_setup(self.settings.values) is not None
+                                  or session.get("web_search_tool") is True)}
         return [tool for tool in FEATURE_TOOLS if not (subagent and tool["function"]["name"] == "delegate_task")
-                and (memory or tool["function"]["name"] != "remember")
-                and (tool["function"]["name"] != "get_tool_output" or session.get("tool_output_offered"))]
+                and offered.get(tool["function"]["name"], True)]
 
     def offered_tools(self, session, external_tools):
         """(definitions, capped): the tool definitions offered in the next model request (the profile's
@@ -2327,8 +2345,11 @@ class AgentManager(LifecycleHooks):
         offer_plan = session.get("permission_mode", "manual") == "plan" and not session.get("is_subagent")
         definitions = [item for item in definitions if item["function"]["name"] not in denied
                        and (offer_plan or item["function"]["name"] != "submit_plan")]
-        if any(item["function"]["name"] == "remember" for item in definitions):
-            session["memory_tool"] = True  # Offered from now on, even if Settings turns memory off.
+        names = {item["function"]["name"] for item in definitions}
+        # Offered from now on, even if Settings turns project memory or web access off.
+        for name, flag in (("remember", "memory_tool"), ("web_fetch", "web_fetch_tool"), ("web_search", "web_search_tool")):
+            if name in names:
+                session[flag] = True
         builtin = [item for item in definitions if not item["function"]["name"].startswith("mcp__")]
         external = [item for item in definitions if item["function"]["name"].startswith("mcp__")]
         room = max(0, MAX_REQUEST_TOOLS - len(builtin))
@@ -3109,6 +3130,32 @@ class AgentManager(LifecycleHooks):
                     if not allowed:
                         return await self.refused(session, event, verdict, declined(event, "this MCP action"))
                     carded = True
+            if name in ("web_fetch", "web_search"):
+                if (refusal := self.web_refusal(name)) is not None:
+                    await self.update_event(session, event, state="rejected", output=refusal)
+                    return refusal
+                # Checked before any card and any network access (no DNS lookup either): a refused URL never asks.
+                if name == "web_fetch":
+                    target = web_fetch.check_url(arguments["url"], self.redaction_tokens(), self.web_options["ports"])
+                    await self.update_event(session, event, web_domain=target.host, preview=(
+                        f"Fetch from {target.host}:\n{target.url}\n\nThe page's text goes to the agent as untrusted "
+                        "web content. Only GET; no cookies or credentials are sent."))
+                else:
+                    setup = self.web_search_setup()
+                    if setup.get("problem"):
+                        raise ValueError(setup["problem"])
+                    query = web_fetch.check_query(arguments["query"], self.redaction_tokens())
+                    await self.update_event(session, event, web_provider=setup["label"], preview=(
+                        f"Search the web with {setup['label']}:\n{query}\n\nThe query is sent to {setup['label']}; "
+                        "approving allows web searches for the rest of this chat."))
+                if verdict.decision == "ask":
+                    allowed, verdict = await self.request_approval(session, tools, event, name, arguments, forced=forced)
+                    if not allowed:
+                        return await self.refused(session, event, verdict, declined(
+                            event, "this web fetch" if name == "web_fetch" else "this web search"))
+                    carded = True
+                    if name == "web_search" and not forced and event.get("approval") == "approved":
+                        await self.allow_searches(session, tools, arguments)
             async def access_refusal():
                 """The refusal when a path needs folder access the user did not give, else None."""
                 for value in paths:
@@ -3300,6 +3347,12 @@ class AgentManager(LifecycleHooks):
             elif name == "get_tool_output":
                 result = self.results.page(session["id"], arguments["result_id"], arguments.get("offset", 0),
                                            arguments.get("max_chars", 4000))
+            elif name == "web_fetch":
+                result = await self.fetch_page(session, arguments)
+            elif name == "web_search":
+                result = await web_fetch.search(
+                    self.web_search_setup(), web_fetch.check_query(arguments["query"], self.redaction_tokens()),
+                    arguments.get("max_results", 5), transport=self.web_options["search_transport"])
             elif name in ("write_file", "edit_file"):
                 turn_id = next((item["id"] for item in reversed(session["events"]) if item["type"] == "user"), None)
                 result = self.checkpoints.apply_edit(tools, name, arguments, session_id=session["id"], turn_id=turn_id,
@@ -3507,8 +3560,8 @@ class AgentManager(LifecycleHooks):
                     # The action ran; its result is shortened, never withheld. A result with
                     # nothing long enough to shorten is sent as it is.
                     short = shorten_result(result, hint=shortened_hint(name))
-                    if (short["omitted_bytes"] and name.startswith("mcp__") and isinstance(result, dict)
-                            and isinstance(result.get("output"), str)):
+                    if (short["omitted_bytes"] and (name.startswith("mcp__") or name == "web_fetch")
+                            and isinstance(result, dict) and isinstance(result.get("output"), str)):
                         short = shorten_result(self.readable_result(session, result), hint=MCP_SHORTENED_HINT)
                     if short["omitted_bytes"]:
                         text = json.dumps(short, indent=2)
@@ -3825,14 +3878,60 @@ class AgentManager(LifecycleHooks):
                 self.extension_connections.pop(session["id"], None)
 
     def readable_result(self, session, result):
-        """An MCP result the response's allowance shortens, pointing at its whole text from offset 0, so the
+        """An MCP or web_fetch result the response's allowance shortens, pointing at its whole text from offset 0, so the
         omitted part can be read with get_tool_output (offered from the next request on). A result whose
         first page was all of it is kept now."""
         if not result.get("result_id"):
             kept = result["output"][:FULL_RESULT_CHARS]
-            result = {**result, "result_id": self.results.add(session["id"], kept), "total_chars": len(kept)}
+            result = {**result, "result_id": self.results.add(session["id"], kept, result.get("note")),
+                      "total_chars": len(kept)}
         session["tool_output_offered"] = True
         return {**result, "next_offset": 0}
+
+    def web_refusal(self, name):
+        """The result of a web tool call that Settings → Web access turned off (the tool stays offered), or None."""
+        if name == "web_fetch" and self.settings.values.get("web_fetch", True) is not True:
+            return ("Not fetched: web fetch is turned off in Settings → Web access. Continue without it and tell the "
+                    "user which page you would read.")
+        if name == "web_search" and web_fetch.search_setup(self.settings.values) is None:
+            return ("Not searched: web search is off (Settings → Web access names no provider). Continue without it "
+                    "and tell the user what you would search for.")
+        return None
+
+    def web_search_setup(self):
+        """What web_search uses now (web_fetch.search_setup), its key read from the credential file now."""
+        setup = web_fetch.search_setup(self.settings.values, self.extensions._credential_values) or {}
+        try:
+            token = self.settings.credentials()[1]
+        except (ValueError, OSError):
+            token = ""
+        if token and setup.get("key") == token:
+            setup = {**setup, "key": None, "problem": f"{setup['key_name']} holds your Databricks token, which is never "
+                     "sent to a search provider; name the entry with the provider's own key in Settings → Web access."}
+        return setup
+
+    async def fetch_page(self, session, arguments):
+        """One web_fetch call: the page (web_fetch.fetch), redacted before it is cut, and its first page; a longer
+        text is kept for get_tool_output, which is then offered from the next request on."""
+        tokens = self.redaction_tokens()
+        backend = self.web_options["backend"]() if self.web_options.get("backend") else None
+        fetched = await web_fetch.fetch(arguments["url"], secrets=tokens, backend=backend, ports=self.web_options["ports"],
+                                        redact=lambda text: self.settings.redact(redact_value(redact_secrets(text), tokens)))
+        result = web_fetch.page_result(fetched, lambda text, note: self.results.add(session["id"], text, note))
+        if result.get("result_id"):
+            session["tool_output_offered"] = True
+        return result
+
+    async def allow_searches(self, session, tools, arguments):
+        """After the user approved a chat's first web search on its card: later searches in this chat run without
+        one (a chat rule the Permissions menu lists and can remove), unless a rule or the mode asks."""
+        if self.permission(session, tools, "web_search", arguments).decision == "allow":
+            return  # A rule saved from this card already allows it.
+        rules = session.setdefault("allow_rules", [])
+        if len(rules) < MAX_ALLOW_RULES and not any(same_rule({"tool": "web_search"}, rule) for rule in rules):
+            rules.append({"tool": "web_search"})
+            self.store.save(session)
+            await self.publish_permissions(session)
 
     async def mcp_status_changed(self, session, status):
         """Keep this turn's MCP server status for Agent tools (session mcp_status: MCP_STATUS_FIELDS and a
@@ -4142,13 +4241,17 @@ class AgentManager(LifecycleHooks):
                 raise
 
     def compaction_requests(self, session, client, url, headers, preservation_note="", handoff_tokens=None,
-                            allowance=0):
-        """Summary and condense callbacks for prepare_context, sharing one client.
+                            allowance=0, trigger=None):
+        """(summarize, condense, before): the summary and condense callbacks for prepare_context, sharing one
+        client, and its before_compaction callback (lifecycle_hooks.compaction_hook) for a compaction with
+        trigger 'auto' or 'manual' when such hooks are enabled, else None.
 
         With handoff_tokens, the summary request writes a detailed handoff instead.
         allowance (compaction_output_allowance) is added to every request's max_tokens,
         because a model that always thinks spends part of max_tokens on thinking.
+        The requests read the preservation note when they are sent: hook context joins it.
         """
+        note = {"text": preservation_note}
         def fitted(tokens):
             """tokens (the output reserve before the allowance), lowered to fit the output-tokens-per-minute
             limit Databricks reported for this endpoint, which it reserves max_tokens against; never below
@@ -4173,20 +4276,21 @@ class AgentManager(LifecycleHooks):
             if handoff_tokens:
                 # The handoff's word target follows its reserve, so a smaller one is asked for a shorter handoff.
                 return await fitting(lambda tokens: self.summarize_context(
-                    session, client, url, headers, build_handoff_messages(previous, chunk, preservation_note, tokens),
+                    session, client, url, headers, build_handoff_messages(previous, chunk, note["text"], tokens),
                     max_tokens=tokens + allowance, keep_truncated=True), handoff_tokens)
             return await fitting(lambda tokens: self.summarize_context(
-                session, client, url, headers, build_summary_messages(previous, chunk, preservation_note, limit_bytes),
+                session, client, url, headers, build_summary_messages(previous, chunk, note["text"], limit_bytes),
                 max_tokens=tokens + allowance, keep_truncated=True, document="summary"),
                 summary_output_tokens(limit_bytes))
 
         async def condense(summary, limit_bytes):
             await self.compaction_progress(session, "condense")
             return await fitting(lambda tokens: self.summarize_context(
-                session, client, url, headers, build_condense_messages(summary, limit_bytes, preservation_note),
+                session, client, url, headers, build_condense_messages(summary, limit_bytes, note["text"]),
                 max_tokens=tokens + allowance), condense_output_tokens(limit_bytes))
 
-        return summarize, condense
+        before = self.compaction_hook(session, trigger, preservation_note, note) if trigger else None
+        return summarize, condense, before
 
     def compaction_trigger(self, session, trigger=None):
         """prepare_context's on_compaction: a compaction of this chat chose its cut ("manual", "in_turn" or
@@ -4462,8 +4566,8 @@ class AgentManager(LifecycleHooks):
             allowance = compaction_output_allowance(session["model"], context_window)
             record, holder = self.compaction_record(session, tools)
             async with self.serving.client(serving.COMPACTION_CLIENT_TIMEOUT) as client:
-                summarize, condense = self.compaction_requests(
-                    session, client, url, headers, preservation_note, plan and plan["tokens"], allowance)
+                summarize, condense, before = self.compaction_requests(
+                    session, client, url, headers, preservation_note, plan and plan["tokens"], allowance, trigger="manual")
                 _, updated, info = await prepare_context(
                     model_history(session["wire"]), state, system, definitions, context_window, summarize,
                     reply_reserve=max_output_tokens, default_reply_reserve=default_limits(session["model"])[1],
@@ -4473,7 +4577,8 @@ class AgentManager(LifecycleHooks):
                     auto_compact_percent=auto_compact_percent(self.settings.values), record_requests=True,
                     app_record=record, output_allowance=allowance, completed_calls=completed_call_ids(session),
                     model_window=model_context_window(session["model"]), anchor=self.estimate_anchor(session),
-                    on_compaction=self.compaction_trigger(session), tool_servers=self.mcp_server_ids())
+                    on_compaction=self.compaction_trigger(session), tool_servers=self.mcp_server_ids(),
+                    **({"before_compaction": before} if before else {}))
             views, updated = forget_summarized_reads(session.get("file_views") or {}, updated, holder["forgotten"])
             info = {**info, "instruction_files": guidance["files"], "instruction_sources": guidance["sources"],
                     "warnings": warnings, "prepared_for_next_turn": True, **last_request(session),
@@ -5245,9 +5350,9 @@ class AgentManager(LifecycleHooks):
                                                        available={item["function"]["name"] for item in definitions})
                 plan = self.handoff_plan(session, context_window)
                 allowance = compaction_output_allowance(session["model"], context_window)
-                summarize, condense = self.compaction_requests(session, client, url, headers,
-                                                               handoff_tokens=plan and plan["tokens"],
-                                                               allowance=allowance)
+                summarize, condense, before = self.compaction_requests(session, client, url, headers,
+                                                                       handoff_tokens=plan and plan["tokens"],
+                                                                       allowance=allowance, trigger="auto")
                 record, holder = self.compaction_record(session, tools)
                 scale = estimate_scale(session.get("inference_calls"), session["model"])
                 history = model_history(wire)  # reasoning_replay.apply matches the prepared tail against it.
@@ -5259,7 +5364,8 @@ class AgentManager(LifecycleHooks):
                     auto_compact_percent=auto_compact_percent(self.settings.values), record_requests=True,
                     app_record=record, output_allowance=allowance, completed_calls=completed_call_ids(session),
                     model_window=model_context_window(session["model"]), anchor=self.estimate_anchor(session),
-                    on_compaction=self.compaction_trigger(session), tool_servers=self.mcp_server_ids())
+                    on_compaction=self.compaction_trigger(session), tool_servers=self.mcp_server_ids(),
+                    **({"before_compaction": before} if before else {}))
                 # What the next request must start with to anchor its estimate on this one (without the note).
                 self.anchor_candidates[session["id"]] = anchor_candidate(messages)
                 # The step note joins the last message after the signed reasoning is matched against the history

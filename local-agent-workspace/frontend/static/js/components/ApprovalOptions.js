@@ -43,12 +43,14 @@ function rememberChoices(event) {
   const offered = (event.rememberable || []).filter(scope => SCOPE_LABELS[scope] && (!legacyOnly || scope === 'chat'))
   const folderOption = typeof options.folder === 'string' && options.folder ? options.folder : null
   const more = offered.some(scope => scope !== 'chat') || (isCommand && !legacyOnly) || !!folderOption
-  return { options, isCommand, legacyOnly, offered, folderOption, more }
+  // web_fetch: the rule allows fetches from this one host (the server's domain rule).
+  const domain = event.name === 'web_fetch' && typeof options.domain === 'string' && options.domain ? options.domain : null
+  return { options, isCommand, legacyOnly, offered, folderOption, more, domain }
 }
 
 // The "Always allow…" form: where the rule is saved and what it matches. The client never widens a rule on its own.
 function RememberOptions({ event, disabled, onApprove }) {
-  const { options, isCommand, legacyOnly, offered, folderOption } = rememberChoices(event)
+  const { options, isCommand, legacyOnly, offered, folderOption, domain } = rememberChoices(event)
   const [scope, setScope] = useState(offered.includes('project') ? 'project' : offered[0])
   const prefixes = isCommand && !legacyOnly && Array.isArray(options.prefixes) ? options.prefixes : []
   const [match, setMatch] = useState('exact')
@@ -75,6 +77,7 @@ function RememberOptions({ event, disabled, onApprove }) {
     <fieldset><legend>Where</legend>
       ${offered.map(value => html`<${Radio} key=${value} name=${`${id}-scope`} value=${value} checked=${scope === value} disabled=${disabled} onChange=${setScope}>${SCOPE_LABELS[value]}</${Radio}>`)}
     </fieldset>
+    ${domain ? html`<p class="remember-domain">Allows fetches from <code>${domain}</code> only (not its subdomains). Each other domain asks.</p>` : null}
     ${isCommand && !legacyOnly ? html`<fieldset><legend>Match</legend>
       <${Radio} name=${`${id}-match`} value="exact" checked=${match === 'exact'} disabled=${disabled} onChange=${setMatch}>Exactly this command <code>${quoteArgv(options.argv)}</code></${Radio}>
       ${prefixes.length ? html`<${Radio} name=${`${id}-match`} value="prefix" checked=${match === 'prefix'} disabled=${disabled} onChange=${setMatch}>Commands starting with</${Radio}>
@@ -124,7 +127,7 @@ function EditAction({ event, sessionId, onError, onClose }) {
 // The pending body of an approval card below its first sentence: notes, the preview (or the editor),
 // the decline note, the buttons and the "Always allow…" form.
 // onDecide(allowed, extra?): extra is merged into the answer ({ remember } or { scope, rule? }).
-export default function ApprovalOptions({ event, sessionId, onError, deciding, onDecide, allowInChat, details, declineNote }) {
+export default function ApprovalOptions({ event, sessionId, onError, deciding, onDecide, allowInChat, details, declineNote, approveLabel = 'Approve' }) {
   const [editing, setEditing] = useState(false)
   const [remembering, setRemembering] = useState(false)
   const canRemember = !event.protected && (event.rememberable || []).length > 0
@@ -177,6 +180,6 @@ export default function ApprovalOptions({ event, sessionId, onError, deciding, o
         onClick=${() => void onDecide(true, { remember: true })}>${chatLabel}</button>` : html`
       ${canRemember ? html`<button class="outline" disabled=${locked} aria-expanded=${remembering} onClick=${() => setRemembering(v => !v)}>Always allow…</button>` : null}
       ${allowInChat ? html`<button class="outline" disabled=${locked} onClick=${() => void onDecide(true, { remember: true })}>${allowInChat}</button>` : null}`}
-      <button class="primary" disabled=${locked} onClick=${() => void onDecide(true)}><${Check} size=${15} />Approve</button></div>
+      <button class="primary" disabled=${locked} onClick=${() => void onDecide(true)}><${Check} size=${15} />${approveLabel}</button></div>
     ${canRemember && !chatOnly && remembering && !editing ? html`<div ref=${rememberForm}><${RememberOptions} event=${event} disabled=${locked} onApprove=${extra => onDecide(true, extra)} /></div>` : null}`
 }

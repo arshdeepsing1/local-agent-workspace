@@ -179,6 +179,13 @@ class Settings:
             # Settings → Commands and files (commands.py): /<name> at the start of a message runs a command template
             # and /<skill-id> selects a skill for that message; off sends such text as typed.
             "slash_commands": True,
+            # Settings → Web access (web_fetch.py): the agent's web_fetch tool (a card for each new domain), and
+            # web_search through a provider: "" (none), "brave", "tavily" or "searxng" (at web_search_url). The API
+            # key stays in the credential file, in the entry web_search_key names ("" = the provider's usual name).
+            "web_fetch": True,
+            "web_search_provider": "",
+            "web_search_url": "",
+            "web_search_key": "",
         }
         self.migrated_from = None
         if self.path.exists():
@@ -236,12 +243,32 @@ class Settings:
             configured = True
         except (ValueError, OSError):
             host, configured = "", False
-        return {**self.values, "host": host, "configured": configured,
+        return {**self.values, "host": host, "configured": configured, "web_search_status": self.web_search_status(),
                 "coding_dir_status": user_paths.coding_dir_status(self),
                 "python_venv_status": user_paths.python_venv_status(self), "default_model": DEFAULT_MODEL,
                 "default_limits": dict(zip(LIMIT_KEYS, default_limits(self.values["model"]))),
                 "endpoint_profiles": known_endpoints(),
                 **({"model_migrated_from": self.migrated_from} if self.migrated_from is not None else {})}
+
+    def credential_values(self, path=None):
+        """The credential file's assignments (read as data), or {} without one. path: another file (a save's)."""
+        path = self.values.get("env_file") if path is None else path
+        if not path or not isinstance(path, str):
+            return {}
+        try:
+            return read_env(Path(path).expanduser())
+        except (OSError, UnicodeError, ValueError):
+            return {}
+
+    def web_search_status(self):
+        """Settings → Web access: {provider, ready, problem?, key_name?} for the chosen search provider (never the
+        key), or None when web search is off."""
+        from .web_fetch import search_setup
+        setup = search_setup(self.values, self.credential_values)
+        if setup is None:
+            return None
+        return {"provider": setup["label"], "ready": not setup.get("problem"),
+                **{key: setup[key] for key in ("problem", "key_name") if setup.get(key)}}
 
     def env_equivalent(self, key, value, candidate=None):
         """True when value is what .env or the process environment sets for key (coding_dir or
@@ -339,6 +366,7 @@ class Settings:
             raise ValueError("Prompt caching must be one of: " + ", ".join(PROMPT_CACHING) + ".")
         if type(candidate["slash_commands"]) is not bool:
             raise ValueError("Slash commands must be on or off.")
+        self.check_web_settings(candidate)
         candidate["spending_limit_dbu"] = validate_limit(candidate["spending_limit_dbu"], "Default spending limit")
         sent = values.get("subagent_defaults")
         if isinstance(sent, dict):
@@ -380,6 +408,37 @@ class Settings:
         temp.replace(self.path)
         self.migrated_from = None
         return self.public()
+
+    def check_web_settings(self, candidate):
+        """Settings → Web access, checked (and the address and key name tidied) in candidate."""
+        from .web_fetch import KEY_NAME, PROVIDERS, check_search_url
+        if type(candidate["web_fetch"]) is not bool:
+            raise ValueError("Web fetch must be on or off.")
+        provider = candidate["web_search_provider"]
+        if provider != "" and provider not in PROVIDERS:
+            raise ValueError("Web search provider must be none, brave, tavily or searxng.")
+        address, name = candidate["web_search_url"], candidate["web_search_key"]
+        if not isinstance(address, str) or not isinstance(name, str):
+            raise ValueError("The web search address and key name must be text.")
+        address, name = address.strip(), name.strip()
+        if address:
+            try:
+                address = check_search_url(address)
+            except ValueError:
+                if provider == "searxng":
+                    raise
+                address = ""  # A hidden field another provider does not use.
+        candidate["web_search_url"] = address
+        if provider == "searxng" and not address:
+            raise ValueError("Enter your SearXNG address for web search, such as http://127.0.0.1:8888.")
+        if name and not KEY_NAME.match(name):
+            raise ValueError("The web search key setting is the name of an entry in your credential file (capital "
+                             "letters, digits and _), such as BRAVE_API_KEY; the key itself stays in that file.")
+        if name in CREDENTIAL_ENV:
+            raise ValueError("Web search cannot use your Databricks credentials.")
+        if name and name in self.credential_values(candidate.get("env_file")).values():
+            raise ValueError("Enter the name of the credential-file entry that holds the key, not the key itself.")
+        candidate["web_search_key"] = name
 
     def redact(self, text: str) -> str:
         try:
