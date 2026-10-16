@@ -174,7 +174,10 @@ def test_a_command_that_opens_another_view_leaves_no_draft_behind(ui, page):
         box.fill(command)
         if command == "/clear":
             ui.wait(f"{DRAFT} === '/clear'")  # The paused-before-Enter case: the debounced save ran.
-        box.press("Escape")  # Close the / menu: Enter runs the typed command.
+        # Close the / menu once it is open (it opens after the skills load): Enter then runs the typed command.
+        expect(page.locator(".slash-menu")).to_be_visible()
+        box.press("Escape")
+        expect(page.locator(".slash-menu")).to_have_count(0)
         box.press("Enter")
         ui.wait(f"new URL(location.href).searchParams.get('session') {url}")
         ui.wait(f"{DRAFT} === null")
@@ -219,9 +222,11 @@ def test_paths_and_unknown_words_are_messages_and_commands_are_never_queued(ui, 
     run(page, "/rename Busy work")
     ui.wait("fake.requests('/api/sessions/a/title', 'PUT').length === 1")
     no_messages(ui)
-    for text in ("/tmp/output.log is empty", "/unknown do it", "/help me with the parser"):
+    # Each send must finish first: the composer ignores Enter while one is in flight.
+    for count, text in enumerate(("/tmp/output.log is empty", "/unknown do it", "/help me with the parser"), start=1):
         run(page, text)
-    ui.wait("fake.requests('/api/sessions/a/messages', 'POST').length === 3")
+        ui.wait(f"fake.requests('/api/sessions/a/messages', 'POST').length === {count}")
+        expect(message(page)).to_have_value("")
     assert [body["text"] for body in ui.bodies("/api/sessions/a/messages", "POST")] == [
         "/tmp/output.log is empty", "/unknown do it", "/help me with the parser"]
 
