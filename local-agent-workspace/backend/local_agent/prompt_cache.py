@@ -9,13 +9,19 @@ compaction read stays unmarked.
 
 Levels, best first:
 - "full": two breakpoints. The system message is split where its stable text ends (the folder
-  grants, date and step notices follow), and the last message, a user message or a tool result,
-  becomes one marked text part. Each request then writes the conversation up to its end, and the
-  next request reads it back.
+  grants and date follow), and the last message, a user message or a tool result, becomes one
+  marked text part. Each request then writes the conversation up to its end, and the next request
+  reads it back.
 - "messages": only the documented forms. A last user message becomes a marked text part; after
   tool results, the last tool call of the assistant message that made them is marked.
 - "off": no markers.
 A request that Databricks rejects with HTTP 400 is sent again one level lower (AgentManager).
+
+The app's step notes (changed files, finished background jobs: AgentManager.step_notices) end the
+last message of a request that starts at "full" (note_chars), after its marker: the next request,
+where that message comes without the note, still reads the cached prefix. A marked last message is
+then [marked text, unmarked note]; a tool result at "messages" keeps one string (its marker is on
+the tool call before it).
 """
 CACHE_CONTROL = {"type": "ephemeral"}
 LEVELS = ("full", "messages", "off")
@@ -26,20 +32,25 @@ def _part(text, mark=False):
     return {"type": "text", "text": text, **({"cache_control": dict(CACHE_CONTROL)} if mark else {})}
 
 
-def _marked_last_text(messages, roles):
+def _marked_last_text(messages, roles, note_chars=0):
     """True after the last message, when its role is in roles and its content is non-empty text, became one
-    marked text part (in place on the copied list)."""
+    marked text part (in place on the copied list), followed by an unmarked part with its last note_chars
+    characters (the app's step note) when it is longer than that."""
     last = messages[-1]
     if len(messages) > 1 and last.get("role") in roles and isinstance(last.get("content"), str) and last["content"]:
-        messages[-1] = {**last, "content": [_part(last["content"], True)]}
+        content = last["content"]
+        split = len(content) - note_chars if type(note_chars) is int and 0 < note_chars < len(content) else len(content)
+        messages[-1] = {**last, "content": [_part(content[:split], True), *([_part(content[split:])]
+                                                                             if split < len(content) else [])]}
         return True
     return False
 
 
-def marked(payload, stable_chars, level):
+def marked(payload, stable_chars, level, note_chars=0):
     """A new payload with the cache markers of this level (at most 2). payload is never changed: only the
     messages that get a marker are copied. stable_chars is where the system message's stable text ends
-    (AgentManager.context_inputs's guidance["cache_prefix_chars"])."""
+    (AgentManager.context_inputs's guidance["cache_prefix_chars"]). note_chars: the last message ends with
+    the app's step note of that many characters, which stays after the marker."""
     result = dict(payload)
     messages = payload.get("messages")
     if level not in ("full", "messages") or not isinstance(messages, list) or not messages:
@@ -52,8 +63,8 @@ def marked(payload, stable_chars, level):
                 and stable_chars > 0 and content):
             stable, tail = content[:stable_chars], content[stable_chars:]
             messages[0] = {**first, "content": [_part(stable, True), *([_part(tail)] if tail else [])]}
-        _marked_last_text(messages, ("user", "tool"))
-    elif not _marked_last_text(messages, ("user",)) and messages[-1].get("role") == "tool":
+        _marked_last_text(messages, ("user", "tool"), note_chars)
+    elif not _marked_last_text(messages, ("user",), note_chars) and messages[-1].get("role") == "tool":
         index = next((index for index in range(len(messages) - 1, -1, -1) if messages[index].get("role") == "assistant"
                       and isinstance(messages[index].get("tool_calls"), list) and messages[index]["tool_calls"]), None)
         if index is not None and isinstance(messages[index]["tool_calls"][-1], dict):

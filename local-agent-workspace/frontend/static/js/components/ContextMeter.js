@@ -1,7 +1,7 @@
 import { html, useEffect, useLayoutEffect, useRef, useState } from '../lib.js'
 
-// Custom instructions (Settings) and the skill index are not files with a folder scope.
-const WIDE_SCOPES = ['all projects', 'this workspace', 'this project']
+// Custom instructions (Settings), the skill index and selected skills are not files with a folder scope.
+const WIDE_SCOPES = ['all projects', 'this workspace', 'this project', 'this chat', 'this message']
 // What one loaded instruction source costs: its estimate, marked when the budget cut it (instructions.py).
 const sourceCost = source => source.status === 'loaded' ? `~${source.estimated_tokens.toLocaleString()} tokens`
   : source.status === 'trimmed' ? `Trimmed · ~${source.estimated_tokens.toLocaleString()} tokens loaded` : 'Omitted · 0 tokens loaded'
@@ -51,6 +51,22 @@ function ReportedInput({ report, current, heading }) {
         ? `Databricks counted ${Math.abs(gap)}% fewer input tokens than the app's estimate for this request (${estimate}). ${next === 1
           ? `${report.estimate_scale > 1 ? `That estimate was scaled ×${report.estimate_scale.toFixed(2)}; later estimates use the unscaled text-size heuristic (×1.00). ` : ''}The app never scales its estimate below the text-size heuristic, so compaction may start slightly early.` : later}`
         : "The app's estimate matched the reported count within 2%."}${cached ? ' Cached tokens still occupy the context window; they are cheaper, not smaller.' : ''}</p>` : null}`
+}
+
+// "Anchored on the last reported count: 52,310 tokens … + ~1,204 tokens added since": the estimate is the input
+// Databricks reported for the previous request plus the scaled estimate of what changed since (estimate_anchor).
+function anchoredText(info) {
+  const anchor = info.estimate_anchor
+  if (!anchor || typeof anchor.reported !== 'number') return null
+  const change = info.estimated_tokens - anchor.reported
+  return `Anchored on the last reported count: ${anchor.reported.toLocaleString()} tokens Databricks reported for the previous request ${change >= 0 ? '+' : '−'} ~${Math.abs(change).toLocaleString()} tokens ${change >= 0 ? 'added' : 'removed'} since. Only what changed is estimated from text size.`
+}
+
+// The tool definitions split per MCP server (tool_groups), shown when an MCP server's tools are offered.
+function ToolGroups({ groups }) {
+  const entries = Object.entries(groups || {})
+  if (entries.length < 2) return null
+  return html`<ul class="context-tool-groups">${entries.map(([name, tokens]) => html`<li key=${name}>${name} · ~${tokens.toLocaleString()} tokens</li>`)}</ul>`
 }
 
 // How the latest compaction fitted its summary within the size limit (summary_adjustment).
@@ -146,8 +162,9 @@ export default function ContextMeter({ info, model, busy = false, status, onComp
         <p class="context-heading">App estimate</p>` : null}
       ${legacyEstimate ? html`<p>The saved meter counted bytes as tokens and can overstate context use. It will refresh on the next model request.</p>` : html`
         <p>Approximately ${info.estimated_tokens.toLocaleString()} of ${info.input_budget.toLocaleString()} input tokens used.</p>
+        ${anchoredText(info) ? html`<p class="context-anchor">${anchoredText(info)}</p>` : null}
         <p>${info.estimate_scale && info.estimate_prior ? `Text-size estimate scaled ×${info.estimate_scale.toFixed(2)}, this model's starting ratio ${priorReplaced ? `before Databricks reported input tokens for it; later estimates use ×${report.next_estimate_scale.toFixed(2)}` : 'until Databricks reports input tokens for it'}. Not billing usage.` : info.estimate_scale ? `Text-size estimate scaled ×${info.estimate_scale.toFixed(2)} to match the input tokens Databricks reported for recent requests to this model. Not billing usage.` : 'Heuristic text-size estimate, not a provider token count or billing usage. Actual token counts vary by model.'} ${info.prepared_for_next_turn ? 'Preview after compaction using saved tool definitions, or built-in tools when unavailable. Definitions and instructions may change on the next model request.' : 'Estimate for the last request; updates each model call.'}</p>
-        ${next && typeof next.tokens === 'number' ? html`<p>Next request: ~${next.tokens.toLocaleString()} tokens (${next.percent_of_input_budget}% of the input budget) before your next message. Automatic compaction runs when it passes ~${threshold.toLocaleString()} tokens.</p>` : null}
+        ${next && typeof next.tokens === 'number' ? html`<p>Next request: ~${next.tokens.toLocaleString()} tokens (${next.percent_of_input_budget}% of the input budget${next.anchor ? ', anchored on the last reported count' : ''}) before your next message. Automatic compaction runs when it passes ~${threshold.toLocaleString()} tokens.</p>` : null}
         ${info.compaction_deferred ? html`<p>The estimate passed the auto-compact threshold, but summarizing earlier turns would not bring it under the threshold, so the request was sent as it is. Compaction runs when it would, or when the request no longer fits the input budget.</p>` : null}
         ${info.summary_adjustment ? html`<p>${info.summary_adjustment === 'condensed_trimmed'
           ? `${ADJUSTMENTS.condensed_trimmed}${info.handoff_path ? '; the saved handoff has them in full.' : '.'}`
@@ -160,7 +177,7 @@ export default function ContextMeter({ info, model, busy = false, status, onComp
         <p class="context-heading">Approximate input breakdown (app estimate)</p>
         <dl class="context-breakdown">
           <div><dt>System instructions</dt><dd>~${info.breakdown.system_instructions.toLocaleString()} tokens</dd></div>
-          <div><dt>Tool definitions</dt><dd>~${info.breakdown.tool_definitions.toLocaleString()} tokens</dd></div>
+          <div><dt>Tool definitions</dt><dd>~${info.breakdown.tool_definitions.toLocaleString()} tokens<${ToolGroups} groups=${info.tool_groups} /></dd></div>
           <div><dt>Messages and tool results</dt><dd>~${info.breakdown.messages_and_results.toLocaleString()} tokens</dd></div>
           <div><dt>Conversation summary</dt><dd>~${info.breakdown.summary.toLocaleString()} tokens</dd></div>
           <div><dt>Request overhead</dt><dd>~${info.breakdown.request_overhead.toLocaleString()} tokens</dd></div>
@@ -178,7 +195,7 @@ export default function ContextMeter({ info, model, busy = false, status, onComp
           ${sourceScope(source)} · ${sourceCost(source)}
           ${source.reason ? html`<p>${source.reason}</p>` : null}
         </li>`)}</ul>
-        <p>File costs are estimates included in system instructions above; shared guidance and framing are counted separately.</p>`
+        <p>File costs are estimates included in system instructions above; shared guidance and framing are counted separately.${info.instruction_sources.some(source => source.scope === 'this message') ? ' A skill your message selected counts in messages and tool results instead.' : ''}</p>`
         : info.instruction_files.length ? html`<ul>${info.instruction_files.map(file => html`<li key=${file}><code>${file}</code></li>`)}</ul>` : html`<p>No project instruction files loaded.</p>`}
       ${info.warnings.length ? html`<p class="context-heading">Warnings</p><ul class="context-warnings">${info.warnings.map((warning, index) => html`<li key=${index}>${warning}</li>`)}</ul>` : null}
       ${onCompact ? html`<form class="context-compact" onSubmit=${event => {

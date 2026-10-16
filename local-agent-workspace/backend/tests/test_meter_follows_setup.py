@@ -82,9 +82,11 @@ async def test_a_model_change_moves_the_meter_to_the_new_models_budgets(app_clie
     assert limits_of(before) == {"context_window": 131_072, "reply_reserve": 8_192, "input_budget": 115_078,
                                  "auto_compact_percent": 90, "auto_compact_threshold": 103_570}
     tokens, report = before["next_estimate"]["tokens"], before["last_request"]
-    # GPT OSS's own reported ratio (estimates never scale below 1).
+    # GPT OSS's own reported ratio (estimates never scale below 1), and its report anchors the next estimate.
     old_scale = before["next_estimate"]["scale"]
     assert old_scale == report["next_estimate_scale"] >= 1.0
+    anchor = before["next_estimate"]["anchor"]
+    assert anchor["model"] == GPT and anchor["reported"] == 9000 and tokens == 9000 + math.ceil(anchor["added"] * old_scale)
     socket = Socket()
     manager.listeners.setdefault(session_id, set()).add(socket)
     response = await client.put(f"/api/sessions/{session_id}/model", json={"model": OPUS})
@@ -95,7 +97,7 @@ async def test_a_model_change_moves_the_meter_to_the_new_models_budgets(app_clie
     # The next request goes to Opus 5.5, whose estimates start at its own ratio.
     scale = estimate_scale(manager.get(session_id)["inference_calls"], OPUS)
     assert scale == 1.3
-    scaled = math.ceil(tokens * scale / old_scale)
+    scaled = math.ceil(anchor["raw"] * scale)  # GPT OSS's report cannot anchor an Opus 5.5 estimate.
     assert info["next_estimate"] == {"tokens": scaled, "scale": scale,
                                      "percent_of_input_budget": round(scaled * 100 / 181_568, 1),
                                      "percent_of_threshold": round(scaled * 100 / 163_411, 1)}

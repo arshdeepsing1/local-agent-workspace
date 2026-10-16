@@ -676,6 +676,38 @@ def test_a_compaction_you_asked_for_or_found_running_names_no_threshold(ui, page
     expect(page.locator(".compacting-elapsed")).to_have_count(0)
 
 
+def test_the_compacting_hint_follows_the_servers_progress_and_a_reload(ui, page):
+    # The server names each request, when the compaction started and why it runs; a page opened mid-compaction
+    # gets them from the snapshot. Mutation: ignore the progress and show "Compacting context…" only.
+    progress = ("{ phase: 'handoff', request: 1, started: Date.now() / 1000 - 65, request_started: Date.now() / 1000, "
+                "trigger: 'in_turn' }")
+    start_app(ui, page, "a", setup=f"fake.sessions.set('b', {{ ...makeSession('b', 'Busy chat'), status: 'compacting', "
+                                   f"compaction_progress: {{ ...{progress}, phase: 'summary', request: 3, trigger: 'auto' }} }})")
+    ui.show_session("a")
+    ui.emit("a", "{ type: 'context', context_info: { ...contextInfo, auto_compact_percent: 85 } }")
+    ui.emit("a", {"type": "status", "status": "running"})
+    ui.emit("a", f"{{ type: 'compaction', progress: {progress} }}")  # Sent before the status changes.
+    ui.emit("a", {"type": "status", "status": "compacting"})
+    hint = page.locator(".compacting-hint")
+    expect(hint).to_have_text(re.compile(r"^Compacting context: writing the handoff \(request 1\) · 1 min 0[5-8] s · "
+                                         r"This request's tool results passed the auto-compact threshold \(85%\)\. "
+                                         r"Summary requests are not streamed and can take a few minutes\.$"))
+    ui.emit("a", f"{{ type: 'compaction', progress: {{ ...{progress}, phase: 'condense', request: 2 }} }}")
+    expect(hint).to_contain_text("Compacting context: condensing (request 2) · 1 min 0")
+    expect(hint.locator(".compacting-elapsed")).to_have_attribute("aria-hidden", "true")
+    # The compaction ends with the status: the next one starts without the old progress.
+    ui.emit("a", {"type": "status", "status": "running"})
+    expect(hint).to_have_count(0)
+    ui.emit("a", {"type": "status", "status": "compacting"})
+    expect(hint).to_have_text(re.compile(r"^Compacting context… \d s · The next request passed"))
+    # Opened mid-compaction: the server's start time, request and reason.
+    page.get_by_role("button", name=re.compile("^Busy chat")).click()
+    ui.show_session("b")
+    expect(page.locator(".compacting-hint")).to_have_text(re.compile(
+        r"^Compacting context: summarizing \(request 3\) · 1 min 0[5-8] s · The next request passed the auto-compact "
+        r"threshold\. Summary requests are not streamed and can take a few minutes\.$"))
+
+
 def test_newer_context_survives_an_older_summary_request(ui):
     start_hook(ui, "a")
     ui.show_session("a")

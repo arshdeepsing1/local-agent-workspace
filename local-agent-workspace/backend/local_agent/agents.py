@@ -27,7 +27,7 @@ from .context import (
     condense_output_tokens, effective_input_budget, estimate_prior, estimate_scale,
     estimate_tokens, handoff_output_tokens, handoff_with_contents, has_earlier_turn, last_request_report,
     model_context_window, next_request_estimate, prepare_context, scaled_estimate, summary_byte_limit,
-    summary_output_tokens, verify_declined_message,
+    summary_output_tokens, verify_declined_message, anchor_candidate, double_counted, reported_input,
 )
 from .tools import LIMIT as FILE_LIMIT
 from .tools import write_limit_setting
@@ -602,6 +602,23 @@ def changed_files_text(names, total):
             f"{', '.join(names)}{more}. Read a file again before editing it.")
 
 
+# The step notices (AgentManager.step_notices) of a request that starts at the full prompt-cache level end
+# its last message, after the cache marker, instead of the system message's tail, which comes before the whole
+# conversation: a notice that appears or goes then never rewrites the cached prefix. Only that request carries
+# it; the history, exports and compaction never see it.
+STEP_NOTE = "\n\n[Note from the app, not the user's words or tool output: {notice}]"
+
+
+def step_note(history, notice):
+    """The note to end the last message of history (the request's messages) with, or "" when there is no
+    notice or the last message is no user message or tool result with text."""
+    last = history[-1] if history else None
+    if (not notice or not isinstance(last, dict) or last.get("role") not in ("user", "tool")
+            or not isinstance(last.get("content"), str) or not last["content"]):
+        return ""
+    return STEP_NOTE.format(notice=notice)
+
+
 def output_limit_text(max_output_tokens, thinking=False):
     """Lets the model size long file writes to the configured response limit. thinking: the
     model always thinks, and its thinking counts toward the same limit."""
@@ -778,7 +795,8 @@ def public_queue(queue):
             if isinstance(item, dict) and isinstance(item.get("command"), dict) else item for item in queue]
 
 
-def public_session(session, status="idle"):
+def public_session(session, status="idle", compaction=None):
+    """compaction: the progress of a compaction running now (AgentManager.compaction_view), or None."""
     pending = pending_summary(session)
     queue = session.get("queued_messages")
     return {"permission_mode": "manual", "allowed_directories": [], "allow_rules": [], "disabled_tools": [],
@@ -787,6 +805,7 @@ def public_session(session, status="idle"):
                             "command_jobs", "file_views", "turn_running", "jobs_reported_through", "pending_context")},
             **({"pending_context": pending} if pending else {}),
             **({"queued_messages": public_queue(queue)} if isinstance(queue, list) else {}),
+            **({"compaction_progress": compaction} if compaction else {}),
             "status": status}
 
 
@@ -836,6 +855,14 @@ class AgentManager(LifecycleHooks):
         # 200 (the ledger's system_tail_changed).
         self.cache_levels = {}
         self.system_tails = {}
+        # In memory only: {chat id: anchor} of each chat's estimates, the latest agent request whose whole input
+        # Databricks reported ({count, digest, model, raw, reported}: context.anchored_estimate), and {chat id:
+        # {count, digest}} of the request being sent, which becomes the anchor once it completes (note_last_request).
+        self.estimate_anchors = {}
+        self.anchor_candidates = {}
+        # In memory only: {chat id: progress} of the compaction running in each chat (compaction_progress),
+        # until the chat's status leaves "compacting".
+        self.compactions = {}
         # The lifespan writes the marker after every task and job stopped. It is removed before
         # anything else, so a crash during this run gives a full scan next time. Without it (a
         # crash, a failed shutdown, a fresh or older state folder) every conversation is loaded.
@@ -943,14 +970,19 @@ class AgentManager(LifecycleHooks):
         if any(Path(workspace).expanduser().resolve().is_relative_to(Path(path)) for path in self.worktrees.removing_paths):
             raise ValueError("This managed worktree is being removed. Choose another workspace.")
 
-    def skill_text(self, session, tools, skill_ids=None):
+    def skill_text(self, session, tools, skill_ids=None, parts=None):
+        """The system message's block of the skills selected for the whole chat (active_skills, or skill_ids).
+        parts, a list, receives (id, text) of each skill's part."""
         ids = session.get("active_skills", []) if skill_ids is None else skill_ids
         if len(ids) > 3:
             raise ValueError("Use at most three skills in one conversation.")
         skills = [self.extensions.load_skill(tools, skill_id) for skill_id in ids]
-        text = "\n\n".join(f"Workspace skill: {skill['id']}\n{skill['text']}" for skill in skills)
+        blocks = [(skill["id"], f"Workspace skill: {skill['id']}\n{skill['text']}") for skill in skills]
+        text = "\n\n".join(block for _, block in blocks)
         if len(text.encode("utf-8")) > 8000:
             raise ValueError("Selected skill instructions exceed the combined 8 KB limit. Deselect a skill.")
+        if parts is not None:
+            parts.extend(blocks)
         return text
 
     def select_skill(self, session, tools, skill_id, enabled=True):
@@ -1487,6 +1519,8 @@ class AgentManager(LifecycleHooks):
         """turn_ended: this idle status ends a turn (not a manual compaction)."""
         previous = self.statuses.get(session["id"], "idle")
         self.statuses[session["id"]] = status
+        if status != "compacting":
+            self.compactions.pop(session["id"], None)
         message = {"type": "status", "status": status}
         if status == "idle":
             # How and when the last turn ended, for notifications and the Continue button.
@@ -3565,7 +3599,11 @@ class AgentManager(LifecycleHooks):
         guidance = load_project_instructions(tools, session.get("instruction_directories", []),
                                              session.get("instruction_paths", []))
         tools.instruction_signature = (guidance["text"], list(guidance["warnings"]))
-        tools.skill_signature = self.skill_text(session, tools)
+        chat_skills = []
+        tools.skill_signature = self.skill_text(session, tools, parts=chat_skills)
+        # The context meter lists each skill selected for the whole chat with what it adds to the system message.
+        guidance["sources"].extend({"path": f"Skill /{skill_id}", "scope": "this chat", "status": "loaded",
+                                    "estimated_tokens": estimate_text_tokens(text)} for skill_id, text in chat_skills)
         # The user's own instructions (Settings and their files) apply in every project. They are not part
         # of guidance["text"], so changing them does not block a running turn; neither does the output style.
         home = self.home_tools()
@@ -3842,6 +3880,7 @@ class AgentManager(LifecycleHooks):
                 return await send(fitted(base))
 
         async def summarize(previous, chunk, limit_bytes):
+            await self.compaction_progress(session, "handoff" if handoff_tokens else "summary")
             if handoff_tokens:
                 # The handoff's word target follows its reserve, so a smaller one is asked for a shorter handoff.
                 return await fitting(lambda tokens: self.summarize_context(
@@ -3853,11 +3892,42 @@ class AgentManager(LifecycleHooks):
                 summary_output_tokens(limit_bytes))
 
         async def condense(summary, limit_bytes):
+            await self.compaction_progress(session, "condense")
             return await fitting(lambda tokens: self.summarize_context(
                 session, client, url, headers, build_condense_messages(summary, limit_bytes, preservation_note),
                 max_tokens=tokens + allowance), condense_output_tokens(limit_bytes))
 
         return summarize, condense
+
+    def compaction_trigger(self, session, trigger=None):
+        """prepare_context's on_compaction: a compaction of this chat chose its cut ("manual", "in_turn" or
+        "auto"), so its progress (compaction_progress) starts, unless one started already (Compact now starts
+        it when pressed). With trigger, start it now instead (no callback)."""
+        def chosen(kind):
+            record = self.compactions.get(session["id"])
+            if record is None or record.get("request"):
+                self.compactions[session["id"]] = {"trigger": kind, "started": time.time(), "request": 0}
+            else:
+                record["trigger"] = kind
+        if trigger is not None:
+            self.compactions[session["id"]] = {"trigger": trigger, "started": time.time(), "request": 0}
+            return None
+        return chosen
+
+    async def compaction_progress(self, session, phase):
+        """Before each summary or condensing request of a compaction: its phase ("handoff", "summary" or
+        "condense"), number (from 1; a retry of the same request keeps it), when the request and the compaction
+        started (server time, seconds) and why it runs (compaction_trigger), broadcast as {type: "compaction",
+        progress} and in the chat's snapshot while it compacts (compaction_view)."""
+        now = time.time()
+        record = self.compactions.setdefault(session["id"], {"trigger": None, "started": now, "request": 0})
+        record.update(phase=phase, request=record.get("request", 0) + 1, request_started=now)
+        await self.broadcast(session["id"], {"type": "compaction", "progress": dict(record)})
+
+    def compaction_view(self, session_id):
+        """The progress of the compaction this chat runs now (a copy), or None."""
+        record = self.compactions.get(session_id)
+        return dict(record) if record and self.statuses.get(session_id) == "compacting" else None
 
     def compaction_record(self, session, tools):
         """(record, holder): record(wire, cut, limit=None) returns the app's notes for the app
@@ -4083,6 +4153,7 @@ class AgentManager(LifecycleHooks):
     async def manual_compact(self, session, preservation_note=""):
         committed = False
         try:
+            self.compaction_trigger(session, "manual")
             await self.status(session, "compacting")
             host, token = self.serving.credentials()
             mode = session.get("permission_mode", "manual")
@@ -4112,7 +4183,8 @@ class AgentManager(LifecycleHooks):
                     handoff_path=plan and plan["path"], save_handoff=plan and self.handoff_saver(session, plan),
                     auto_compact_percent=auto_compact_percent(self.settings.values), record_requests=True,
                     app_record=record, output_allowance=allowance, completed_calls=completed_call_ids(session),
-                    model_window=model_context_window(session["model"]))
+                    model_window=model_context_window(session["model"]), anchor=self.estimate_anchor(session),
+                    on_compaction=self.compaction_trigger(session))
             views, updated = forget_summarized_reads(session.get("file_views") or {}, updated, holder["forgotten"])
             info = {**info, "instruction_files": guidance["files"], "instruction_sources": guidance["sources"],
                     "warnings": warnings, "prepared_for_next_turn": True, **last_request(session),
@@ -4406,13 +4478,14 @@ class AgentManager(LifecycleHooks):
                 raise DraftPersistenceError(exc) from exc
 
     @staticmethod
-    def cache_body(payload, prefix, level):
+    def cache_body(payload, prefix, level, note_chars=0):
         """(body, level sent) of an agent request: payload encoded with the prompt-cache markers of level
-        (prompt_cache.marked; prefix is where the system message's stable text ends). The level sent is None
-        for an endpoint without prompt caching (level None) and "off" when level adds no marker."""
+        (prompt_cache.marked; prefix is where the system message's stable text ends, note_chars the length of
+        the step note ending the last message). The level sent is None for an endpoint without prompt caching
+        (level None) and "off" when level adds no marker."""
         if level is None:
             return encode_payload(payload), None
-        sent = prompt_cache.marked(payload, prefix, level)
+        sent = prompt_cache.marked(payload, prefix, level, note_chars)
         return encode_payload(sent), level if prompt_cache.markers(sent) else "off"
 
     async def request_accepted(self, session, event, tail, lowered):
@@ -4453,13 +4526,14 @@ class AgentManager(LifecycleHooks):
         name = name.strip() if isinstance(name, str) else ""
         return name if name and name.lower() != str(session.get("model") or "").strip().lower() else None
 
-    async def fallback_attempt(self, session, error, host, messages, definitions, prefix):
+    async def fallback_attempt(self, session, error, host, messages, definitions, prefix, note_chars=0):
         """The one request to Settings → Fallback endpoint after this agent request failed before its reply
         started (error: a connection failure, HTTP 502/503/504 or a 429, its retries and rate-limit waits used
         up): {model, from, reason, url, payload, body, effort, cache, max_tokens}, or None (with a notice when a
         fallback is set but cannot take this request). The fallback request carries the prepared messages
         with the fallback's own limits, reasoning fields and cache markers, and never another endpoint's
-        (signed) reasoning (reasoning.without_reasoning). Never for compaction, titles or /btw."""
+        (signed) reasoning (reasoning.without_reasoning). note_chars: the last message ends with the request's
+        step note (STEP_NOTE). Never for compaction, titles or /btw."""
         fallback = self.fallback_endpoint(session)
         reason = FALLBACK_REASONS.get(getattr(error, "retry_reason", None))
         if fallback is None or reason is None or not getattr(error, "retryable", False):
@@ -4489,7 +4563,7 @@ class AgentManager(LifecycleHooks):
         needed = scaled_estimate(payload["messages"], definitions,
                                  estimate_scale(session.get("inference_calls"), fallback))
         budget = effective_input_budget(context_window, max_tokens, model_context_window(fallback))
-        body, cache = self.cache_body(payload, prefix, self.cache_level(target))
+        body, cache = self.cache_body(payload, prefix, self.cache_level(target), note_chars)
         if not self.fallback_allowed(fallback):
             skipped = "it is neither an endpoint the app knows nor one you use"
         elif needed > budget:
@@ -4514,8 +4588,31 @@ class AgentManager(LifecycleHooks):
         return {"model": fallback, "from": primary, "reason": reason, "url": serving.invocations_url(host, fallback),
                 "payload": payload, "body": body, "effort": effort, "cache": cache, "max_tokens": max_tokens}
 
+    def estimate_anchor(self, session):
+        """The anchor of the chat's next estimates (estimate_anchors) when its endpoint reported it, else None."""
+        anchor = self.estimate_anchors.get(session["id"])
+        return anchor if isinstance(anchor, dict) and anchor.get("model") == session.get("model") else None
+
+    def keep_anchor(self, session, call):
+        """Make the request just answered the chat's estimate anchor: a completed agent request to the chat's
+        endpoint (not a fallback) whose whole input Databricks reported, unless the report looks counted twice
+        (context.double_counted). Otherwise the previous anchor stays."""
+        candidate = self.anchor_candidates.get(session["id"])
+        usage, raw = call.get("usage"), call.get("estimated_input_tokens")
+        total = reported_input(usage)
+        if (candidate is None or call.get("purpose") != "agent" or call.get("status") != "completed"
+                or call.get("fallback_from") or call.get("model") != session.get("model") or type(raw) is not int
+                or total is None or double_counted(usage, raw)):
+            return
+        self.estimate_anchors[session["id"]] = {**candidate, "model": call["model"], "raw": raw, "reported": total}
+
     async def note_last_request(self, session, call):
-        """Show what Databricks reported for this agent request in the context meter. Never raises."""
+        """Show what Databricks reported for this agent request in the context meter, and anchor later estimates
+        on it (keep_anchor). Never raises."""
+        try:
+            self.keep_anchor(session, call)
+        except Exception:
+            pass
         try:
             info = session.get("context_info")
             if not isinstance(info, dict):
@@ -4538,10 +4635,16 @@ class AgentManager(LifecycleHooks):
             if not isinstance(info, dict):
                 return
             scale = float(estimate_scale(session.get("inference_calls"), session["model"]))
-            tokens = next_request_estimate(model_history(wire), context_state, system, definitions, scale)
+            anchor = self.estimate_anchor(session)
+            tokens, anchored, raw = next_request_estimate(model_history(wire), context_state, system, definitions,
+                                                          scale, anchor)
             budget, threshold = info.get("input_budget"), info.get("auto_compact_threshold")
             info["next_estimate"] = {
                 "tokens": tokens, "scale": scale,  # The scale, so a model change can rescale the estimate.
+                # Anchored on the last report: a Settings save rescales only what was added, and a model change
+                # (another tokenizer) uses the raw estimate scaled for the new model.
+                **({"anchor": {"model": anchor["model"], "reported": anchor["reported"], "added": anchored[1],
+                               "raw": raw}} if anchored else {}),
                 "percent_of_input_budget": round(tokens * 100 / budget, 1) if budget else None,
                 "percent_of_threshold": round(tokens * 100 / threshold, 1) if threshold else None}
             await self.broadcast(session["id"], {"type": "context", "context_info": info})
@@ -4571,10 +4674,21 @@ class AgentManager(LifecycleHooks):
                        "auto_compact_percent": percent, "auto_compact_threshold": threshold}
             estimate = info.get("next_estimate")
             if isinstance(estimate, dict) and type(estimate.get("tokens")) is int:
-                tokens, scale = estimate["tokens"], estimate.get("scale")
+                tokens, scale, anchor = estimate["tokens"], estimate.get("scale"), estimate.get("anchor")
+                estimate = {key: value for key, value in estimate.items() if key != "anchor"}
                 if type(scale) is float and scale > 0:
                     current = float(estimate_scale(session.get("inference_calls"), session.get("model")))
-                    tokens, scale = (tokens, scale) if current == scale else (math.ceil(tokens * current / scale), current)
+                    if isinstance(anchor, dict) and type(anchor.get("raw")) is int:
+                        if anchor.get("model") == session.get("model"):
+                            added = anchor.get("added") if type(anchor.get("added")) is int else 0
+                            tokens = anchor["reported"] + (math.ceil(added * current) if added > 0 else added)
+                            estimate["anchor"] = anchor
+                        else:
+                            tokens = math.ceil(anchor["raw"] * current)  # The new endpoint counts it all anew.
+                        scale = current
+                    else:
+                        tokens, scale = (tokens, scale) if current == scale else (math.ceil(tokens * current / scale),
+                                                                                  current)
                 updated["next_estimate"] = {
                     **estimate, "tokens": tokens, **({"scale": scale} if scale is not None else {}),
                     "percent_of_input_budget": round(tokens * 100 / budget, 1) if budget > 0 else None,
@@ -4711,12 +4825,17 @@ class AgentManager(LifecycleHooks):
         # Settings → slash commands off.
         turn = next((item for item in reversed(session["events"]) if item.get("type") == "user"), None)
         turn = turn if turn is not None and turn.get("in_wire") is False else None
-        skills = ""
+        selected, skills = [], ""
         if self.slash_commands() and not (turn and (turn.get("verbatim") or turn.get("queued"))):
             # A delegated prompt is the parent agent's text (turn_delegated, set by run): never the user's choice.
             selected, skills = self.message_skills(session, tools, prompt, delegated=bool(session.get("turn_delegated")))
             if selected and turn is not None:
                 await self.update_event(session, turn, skills=selected)
+        # The meter lists the skills this message selected, each with what it adds to the message.
+        blocks = skills.split(SKILL_MARKER)[1:]
+        message_sources = [{"path": f"Skill /{skill_id}", "scope": "this message", "status": "loaded",
+                            "estimated_tokens": estimate_text_tokens(SKILL_MARKER + block)}
+                           for skill_id, block in zip(selected, blocks)] if len(blocks) == len(selected) else []
         # Complete interrupted tool exchanges before sending the next user turn.
         wire, context_state = repair_tool_history(session["wire"], session["events"], session.get("context_state", {}))
         # Keep the prefix boundary consistent even if context preparation fails.
@@ -4785,7 +4904,13 @@ class AgentManager(LifecycleHooks):
                 definitions, capped = self.offered_tools(session, external_tools)
                 if capped != (session.get("mcp_capped") or []):
                     await self.capped_notice(session, capped)
-                system, guidance = self.context_inputs(session, tools, mode, self.step_notices(session, tools),
+                notice, history = self.step_notices(session, tools), model_history(wire)
+                # At the full cache level the notices end the last message (STEP_NOTE), added to a copy after the
+                # context is prepared (compaction sees the history as it is), for this request only. Otherwise (and
+                # when that message cannot carry one) they end the system message.
+                level = self.cache_level(session)
+                note = step_note(history, notice) if level == "full" else ""
+                system, guidance = self.context_inputs(session, tools, mode, "" if note else notice,
                                                        available={item["function"]["name"] for item in definitions})
                 plan = self.handoff_plan(session, context_window)
                 allowance = compaction_output_allowance(session["model"], context_window)
@@ -4795,13 +4920,21 @@ class AgentManager(LifecycleHooks):
                 record, holder = self.compaction_record(session, tools)
                 scale = estimate_scale(session.get("inference_calls"), session["model"])
                 messages, next_context, info = await prepare_context(
-                    model_history(wire), context_state, system, definitions, context_window, summarize,
+                    history, context_state, system, definitions, context_window, summarize,
                     reply_reserve=max_output_tokens, condense=condense, default_reply_reserve=default_reply_reserve,
                     scale=scale,
                     handoff_path=plan and plan["path"], save_handoff=plan and self.handoff_saver(session, plan),
                     auto_compact_percent=auto_compact_percent(self.settings.values), record_requests=True,
                     app_record=record, output_allowance=allowance, completed_calls=completed_call_ids(session),
-                    model_window=model_context_window(session["model"]))
+                    model_window=model_context_window(session["model"]), anchor=self.estimate_anchor(session),
+                    on_compaction=self.compaction_trigger(session))
+                # What the next request must start with to anchor its estimate on this one (without the note).
+                self.anchor_candidates[session["id"]] = anchor_candidate(messages)
+                if note and messages[-1] is history[-1]:
+                    messages = [*messages[:-1], {**messages[-1], "content": messages[-1]["content"] + note}]
+                elif note:  # Not expected: the prepared request always ends with the history's last message.
+                    messages = [{**messages[0], "content": messages[0]["content"] + "\n" + notice}, *messages[1:]]
+                    note = ""
                 if "compaction" in info:
                     # Files whose contents were summarized away must be read again before a write.
                     views, next_context = forget_summarized_reads(session.get("file_views") or {}, next_context,
@@ -4815,10 +4948,11 @@ class AgentManager(LifecycleHooks):
                 payload = {"messages": messages, "tools": definitions, "stream": True,
                            "max_tokens": max_output_tokens, **effort["fields"]}
                 # Prompt-cache markers go into the body only; payload stays what estimates, the ledger and the meter read.
-                prefix = guidance["cache_prefix_chars"]
-                body, cache_sent = self.cache_body(payload, prefix, self.cache_level(session))
-                tail = hashlib.sha256(system["content"][prefix:].encode("utf-8")).hexdigest()
-                session["context_info"] = {**info, "instruction_files": guidance["files"], "instruction_sources": guidance["sources"],
+                prefix, note_chars = guidance["cache_prefix_chars"], len(note)
+                body, cache_sent = self.cache_body(payload, prefix, level, note_chars)
+                tail = hashlib.sha256(messages[0]["content"][prefix:].encode("utf-8")).hexdigest()
+                session["context_info"] = {**info, "instruction_files": guidance["files"],
+                                           "instruction_sources": [*guidance["sources"], *message_sources],
                                            "warnings": guidance["warnings"], **last_request(session),
                                            **prior_flag(session), "payload_bytes": len(body),
                                            "payload_limit_bytes": request_limits.PAYLOAD_LIMIT_BYTES}
@@ -4871,7 +5005,7 @@ class AgentManager(LifecycleHooks):
                                 reasoning_resent = True
                                 self.reasoning_rejections[(session["model"], effort["format"])] = field
                                 payload = {key: value for key, value in payload.items() if key not in effort["fields"]}
-                                body, cache_sent = self.cache_body(payload, prefix, cache_sent)
+                                body, cache_sent = self.cache_body(payload, prefix, cache_sent, note_chars)
                                 effort = reasoning.without_fields(effort, field)
                                 retry_reason = "reasoning_rejected"
                                 await self.event(session, "notice", text=(
@@ -4886,7 +5020,8 @@ class AgentManager(LifecycleHooks):
                                 # messages, then none). The lower level is remembered only once one is accepted;
                                 # if even the unmarked request fails, its error is shown and nothing is remembered.
                                 lowered["named"] = lowered.get("named", False) or getattr(exc, "cache_named", False)
-                                body, cache_sent = self.cache_body(payload, prefix, prompt_cache.next_level(cache_sent))
+                                body, cache_sent = self.cache_body(payload, prefix, prompt_cache.next_level(cache_sent),
+                                                                   note_chars)
                                 lowered["level"] = cache_sent
                                 retry_reason = "cache_rejected"
                                 # No notice moves the reply (reply_after_notices), so its rejected details go here.
@@ -4920,7 +5055,7 @@ class AgentManager(LifecycleHooks):
                                         advice := self.itpm_advice(session, getattr(exc, "rate_limit", None))):
                                     exc.args = (str(exc) + advice,)
                                 fallback = await self.fallback_attempt(session, exc, host, messages, definitions,
-                                                                       prefix)
+                                                                       prefix, note_chars)
                                 if fallback is None:
                                     raise exc
                                 payload, body, effort = fallback["payload"], fallback["body"], fallback["effort"]

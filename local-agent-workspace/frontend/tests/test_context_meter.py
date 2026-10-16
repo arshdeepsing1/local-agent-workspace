@@ -462,3 +462,55 @@ def test_request_details_show_what_a_429_without_a_limit_type_said(ui, page):
         rate_limit: { message: 'Too Many Requests' } } }""")
     expect(definition(page, "Rate limit")).to_have_text("type not named")
     expect(definition(page, "Databricks message")).to_have_text("Too Many Requests")
+
+
+def test_an_anchored_estimate_says_so(ui, page):
+    # The estimate is the input Databricks reported for the previous request plus what was added since.
+    ui.mount("components/ContextMeter.js", f"""{{ info: {{ ...{CONTEXT}, estimate_anchor: {{ reported: 5000, added: 800 }},
+        auto_compact_percent: 90, auto_compact_threshold: 108748,
+        next_estimate: {{ tokens: 6100, scale: 1.25, anchor: {{ model: 'm', reported: 5800, added: 240, raw: 7000 }},
+                         percent_of_input_budget: 5, percent_of_threshold: 5.6 }} }} }}""")
+    page.get_by_text("Last model input · ~5%").click()
+    expect(page.locator(".context-anchor")).to_have_text(
+        "Anchored on the last reported count: 5,000 tokens Databricks reported for the previous request + ~1,000 tokens "
+        "added since. Only what changed is estimated from text size.")
+    expect(page.get_by_text("Next request: ~6,100 tokens (5% of the input budget, anchored on the last reported count) "
+                            "before your next message. Automatic compaction runs when it passes ~108,748 tokens.")).to_be_visible()
+    # A request that shrank since (a shorter system message, fewer tools).
+    ui.rerender(f"{{ info: {{ ...{CONTEXT}, estimated_tokens: 4800, estimate_anchor: {{ reported: 5000, added: -200 }} }} }}")
+    expect(page.locator(".context-anchor")).to_contain_text("for the previous request − ~200 tokens removed since.")
+    # Without an anchor: no such line.
+    ui.rerender(f"{{ info: {CONTEXT} }}")
+    expect(page.locator(".context-anchor")).to_have_count(0)
+    expect(page.get_by_text(re.compile("anchored on the last reported count"))).to_have_count(0)
+
+
+def test_tool_definitions_are_split_per_mcp_server(ui, page):
+    breakdown = """breakdown: { system_instructions: 1000, tool_definitions: 2000, messages_and_results: 2500, summary: 0,
+        request_overhead: 500 }"""
+    ui.mount("components/ContextMeter.js", f"""{{ info: {{ ...{CONTEXT}, {breakdown},
+        tool_groups: {{ 'Built-in tools': 1400, 'MCP docs': 450, 'MCP git_hub': 150 }} }} }}""")
+    page.get_by_text("Last model input · ~5%").click()
+    tools = definition(page, "Tool definitions")
+    expect(tools).to_contain_text("~2,000 tokens")
+    expect(tools.locator("li")).to_have_text(["Built-in tools · ~1,400 tokens", "MCP docs · ~450 tokens",
+                                              "MCP git_hub · ~150 tokens"])
+    # Only built-in tools: the total alone.
+    ui.rerender(f"""{{ info: {{ ...{CONTEXT}, {breakdown}, tool_groups: {{ 'Built-in tools': 2000 }} }} }}""")
+    expect(definition(page, "Tool definitions")).to_have_text("~2,000 tokens")
+
+
+def test_selected_skills_are_listed_one_by_one(ui, page):
+    ui.mount("components/ContextMeter.js", f"""{{ info: {{ ...{INFO}, instruction_sources: [
+        {{ path: 'Skill index', scope: 'this workspace', status: 'loaded', estimated_tokens: 120 }},
+        {{ path: 'Skill /style', scope: 'this chat', status: 'loaded', estimated_tokens: 40 }},
+        {{ path: 'Skill /review', scope: 'this message', status: 'loaded', estimated_tokens: 310 }},
+    ] }} }}""")
+    page.get_by_text(re.compile("Last model input")).click()
+    items = page.locator(".context-details li")
+    expect(items).to_have_text([
+        re.compile(r"^\s*Skill index · applies to this workspace · ~120 tokens\s*$"),
+        re.compile(r"^\s*Skill /style · applies to this chat · ~40 tokens\s*$"),
+        re.compile(r"^\s*Skill /review · applies to this message · ~310 tokens\s*$"),
+    ])
+    expect(page.get_by_text(re.compile("A skill your message selected counts in messages and tool results instead."))).to_be_visible()
