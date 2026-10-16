@@ -238,3 +238,32 @@ def test_normalize_rule_canonical_forms():
     assert normalize_rule({"tool": "run_command", "behavior": "deny"}, **CONTEXT) == {"behavior": "deny", "tool": "run_command"}
     # Deny rules may name credential files.
     assert normalize_rule({"tool": "run_command", "behavior": "deny", "argv": ["cat", ".env"]}, **CONTEXT)["prefix"] == ["cat", ".env"]
+
+
+def test_allow_rules_apply_in_the_project_folder_only_and_deny_rules_in_every_folder():
+    rule = {"behavior": "allow", "tool": "run_command", "argv": ["npm", "test"]}
+    for cwd, allowed in ((None, True), (".", True), ("/srv/project", True), ("pkg", False), ("/srv/other", False)):
+        arguments = {"command": "npm test", **({"cwd": cwd} if cwd is not None else {})}
+        assert rule_matches(rule, "run_command", arguments, resolve_path=resolve) is allowed, cwd
+    assert decide("npm test", cwd="pkg").decision == "ask"
+    assert decide("git push", "bypassPermissions", cwd="/srv/other").decision == "deny"
+
+
+def test_an_exact_text_chat_rule_matches_only_its_own_folder():
+    here = {"tool": "run_command", "command": "make"}
+    there = {"tool": "run_command", "command": "make", "cwd": "/srv/project/pkg"}
+    for rule, cwd, expected in ((here, None, True), (here, "pkg", False), (there, "pkg", True), (there, None, False),
+                                (there, "/srv/project/pkg", True), (there, "other", False)):
+        arguments = {"command": "make", **({"cwd": cwd} if cwd is not None else {})}
+        assert rule_matches(rule, "run_command", arguments, resolve_path=resolve) is expected, (rule, cwd)
+
+
+def test_stage_matching_is_exact_per_program():
+    from local_agent.rules import allows_argv, stage_matches
+    deny = {"behavior": "deny", "tool": "run_command", "prefix": ["git", "push"]}
+    assert stage_matches(deny, ("/usr/bin/git", "-C", ".", "push")) and not stage_matches(deny, ("git", "log"))
+    assert stage_matches({"behavior": "ask", "tool": "run_command"}, ("ls",))
+    assert not stage_matches({"behavior": "allow", "tool": "run_command", "argv": ["ls"]}, ("ls",))
+    prefix = {"behavior": "allow", "tool": "run_command", "prefix": ["python", "-m", "pytest"], "flags": ["-q"]}
+    assert allows_argv(prefix, ("python", "-m", "pytest", "-q")) and not allows_argv(prefix, ("python", "-m", "pytest", "-x"))
+    assert not allows_argv({"behavior": "allow", "tool": "run_command", "argv": ["cat", ".env"]}, ("cat", ".env"))

@@ -15,8 +15,13 @@ const SHORT_ALLOW = { 'Always allow this command in this chat': 'Always allow th
 // The line under a card's heading that says why it ran without a card, or how its card was answered.
 export function ruleLine(event) {
   const parts = []
-  if (event.allowed_by_rule) parts.push(`Allowed by a rule for ${RULE_SCOPES[event.rule_scope] || 'this chat'}`)
+  if (event.read_only_pipeline) {
+    // A command the app checked stage by stage (shell_vet); a stage may have run because a rule allows it.
+    parts.push(event.allowed_by_rule ? `Checked by the app: read-only commands and a rule for ${RULE_SCOPES[event.rule_scope] || 'this chat'}`
+      : 'Ran as a read-only command (checked by the app)')
+  } else if (event.allowed_by_rule) parts.push(`Allowed by a rule for ${RULE_SCOPES[event.rule_scope] || 'this chat'}`)
   if (event.read_only_command) parts.push('Ran as a read-only command')
+  if (Array.isArray(event.secret_files) && event.secret_files.length && event.state !== 'pending') parts.push(`Named a secret file: ${event.secret_files.join(', ')}`)
   if (event.approved_by_mode) parts.push(`Approved when you switched to ${modeLabel(event.approved_by_mode)}`)
   // A card edited and then declined, expired, blocked or cancelled was never approved.
   if (event.edited && event.state !== 'pending') parts.push(event.approval === 'approved' ? 'Edited by you before approval' : 'Edited by you')
@@ -155,6 +160,7 @@ export default function ApprovalOptions({ event, sessionId, onError, deciding, o
   return html`
     ${event.protected ? html`<p class="tool-protected">Protected file: ${event.protected}. Edits to it always need your approval.</p>` : null}
     ${event.uncertain ? html`<p class="tool-uncertain">This command could not be checked exactly against your deny and ask rules, so it needs your approval.</p>` : null}
+    ${Array.isArray(event.secret_files) && event.secret_files.length ? html`<p class="tool-secret" role="note">Reads a secret file: ${event.secret_files.map((name, index) => html`${index ? ', ' : ''}<code key=${index}>${name}</code>`)}. If you approve, its contents can reach the model; only known token shapes and your credential file's values are hidden. Such a command asks in every mode and cannot be remembered.</p>` : null}
     ${event.edited ? html`<p class="tool-edited">Edited by you</p>` : null}
     ${event.hook_ask ? html`<p class="tool-hook-ask">The hook ${event.hook_ask.hook_id} asked for your approval${event.hook_ask.reason ? `: ${event.hook_ask.reason}` : '.'} A hook's request cannot be remembered as a rule.</p>` : null}
     ${event.hook_change ? html`<p class="tool-hook-ask">The hook ${(event.hook_change.hooks || []).join(', ')} changed what the agent proposed; this card shows what would run.</p>` : null}

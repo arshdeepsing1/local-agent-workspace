@@ -319,7 +319,8 @@ def mode_item(page, label):
 
 BYPASS_TEXT = ("Switch this chat to Bypass permissions?\n\nEvery action will run without asking, including commands and edits "
                "outside the project, and any approval cards waiting now will be approved. Deny rules, ask rules, "
-               "credential exclusions and approvals a hook asks for still apply.")
+               "credential exclusions, cards for commands that name credential files and approvals a hook asks for "
+               "still apply.")
 
 
 def test_bypass_needs_confirmation_and_sends_confirm(ui, page):
@@ -388,8 +389,9 @@ def test_dont_ask_is_listed_and_selectable(ui, page):
 
 
 def test_never_asks_lists_read_only_commands_in_auto_and_plan(ui, page):
-    read_only = ("A fixed list of read-only command forms, such as pwd, ls -la, git status, git diff --stat, "
-                 "git log --oneline and git show; other arguments still ask")
+    read_only = ("Read-only commands: pwd, ls and read-only git, and commands or pipelines of read-only programs the "
+                 "app checks (cat, head, grep, rg, find, sed -n, wc …) on paths in approved folders; anything else still "
+                 "asks")
     menu = open_menu(ui, page)
     menu.locator(".never-asks>summary").click()
     for text in ("Reading, listing and searching files in the project and granted folders", "Listing jobs and reading their output",
@@ -544,7 +546,7 @@ def test_badges_stay_small_so_long_rules_are_not_cut_off(ui, page):
 def test_rule_labels(ui):
     ui.start()
     labels = ui.js("""import('/static/js/components/PermissionsMenu.js').then(({ ruleLabel }) => [
-      { tool: 'run_command', command: 'make  test' },
+      { tool: 'run_command', command: 'make  test' }, { tool: 'run_command', command: 'make', cwd: '/srv/other' },
       { behavior: 'allow', tool: 'run_command', argv: ['git', 'commit', '-m', "it's"] },
       { behavior: 'allow', tool: 'run_command', prefix: ['git', 'status'], flags: ['-s', '--short'] },
       { behavior: 'allow', tool: 'run_command', prefix: ['git', 'status'], flags: [] },
@@ -556,7 +558,7 @@ def test_rule_labels(ui):
       { behavior: 'deny', tool: 'write_file' },
     ].map(ruleLabel))""")
     assert labels == [
-        "Command: make  test", "Command: git commit -m 'it'\\''s'",
+        "Command: make  test", "Command: make in /srv/other", "Command: git commit -m 'it'\\''s'",
         "Commands starting with git status with options -s --short", "Commands starting with git status with no other arguments",
         "Commands starting with rm -rf (any options)", "Every command", "File edits", "File edits under /srv/x",
         "All tools of MCP server docs", "Tool: mcp__docs__search", "Hook: check", "Subagents", "Stopping jobs", "Tool: write_file",

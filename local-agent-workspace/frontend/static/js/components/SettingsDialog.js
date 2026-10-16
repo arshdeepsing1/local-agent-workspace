@@ -113,6 +113,7 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
   const [error, setError] = useState('')
   // The variable names as typed; the form holds them as a list.
   const [envText, setEnvText] = useState((settings.command_env || []).join(' '))
+  const [secretText, setSecretText] = useState((settings.secret_file_patterns || []).join(' '))
   // The limit as typed: a number input reports "2." as "" or "2", so the form keeps the text and its number.
   const [spendingText, setSpendingText] = useState(String(settings.spending_limit_dbu ?? 0))
   const [styles, setStyles] = useState(BUILT_IN_STYLES)
@@ -257,6 +258,7 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         e.preventDefault()
         // The server checks this too; saying it here avoids its raw validation error.
         if ((form.command_env || []).length > 32) { setError('List at most 32 environment variable names.'); return }
+        if ((form.secret_file_patterns || []).length > 32) { setError('List at most 32 secret file name patterns.'); return }
         setSaving(true); setError(''); void onSave(form).then(onClose).catch(e => setError(e.message)).finally(() => setSaving(false))
       }}>
         <div class="settings-layout">
@@ -400,7 +402,10 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         <${More} topic="file write limit">Larger files cost more tokens to rewrite. Recovery keeps copies of edited files, up to 256 MB in total; change review keeps one copy per changed file until you Keep or Undo.<//>
         <label>Environment variables for commands<input value=${envText} spellcheck=${false} placeholder="JAVA_HOME NVM_DIR CONDA_PREFIX"
           onInput=${e => { const text = e.currentTarget.value; setEnvText(text); field('command_env', [...new Set(text.split(/[\s,]+/).filter(Boolean))]) }} /></label>
-        <p class="field-help">Commands get a minimal environment; names listed here are passed from the environment the server was started with. Never list secrets you do not want commands to see; the Databricks token and variables that change how programs start (LD_*, BASH_ENV, NODE_OPTIONS and similar) are never passed.</p>`)}
+        <p class="field-help">Commands get a minimal environment; names listed here are passed from the environment the server was started with. Never list secrets you do not want commands to see; the Databricks token and variables that change how programs start (LD_*, BASH_ENV, NODE_OPTIONS and similar) are never passed.</p>
+        <label>Secret file names for commands<input value=${secretText} spellcheck=${false} placeholder="*.tfvars prod-*.yaml"
+          onInput=${e => { const text = e.currentTarget.value; setSecretText(text); field('secret_file_patterns', [...new Set(text.split(/[\s,]+/).filter(Boolean))]) }} /></label>
+        <p class="field-help">A command that names a file matching one of these patterns, or a built-in credential name (.env, *.pem, id_rsa, .databrickscfg and similar), always shows an approval card that warns about it, in every mode, and read-only commands checked by the app never read it. File tools keep their fixed credential exclusions.</p>`)}
         ${group('notifications', html`
         <label class="settings-checkbox"><input type="checkbox" checked=${form.system_notifications === true}
           onChange=${e => field('system_notifications', e.currentTarget.checked)} />Desktop notification when no browser tab is open</label>

@@ -168,7 +168,14 @@ async def test_a_file_the_agent_edited_earlier_keeps_the_agent_baseline(runtime)
 
 async def test_credential_files_are_not_tracked(runtime):
     manager, session, project = runtime
-    await run(manager, session, "echo TOKEN=synthetic > .env && echo x > notes.txt")
+    # A command naming a credential file asks even in Bypass (its card warns); approved, it runs as usual.
+    task = asyncio.create_task(run(manager, session, "echo TOKEN=synthetic > .env && echo x > notes.txt"))
+    for _ in range(300):
+        if manager.pending:
+            break
+        await asyncio.sleep(0.01)
+    manager.decide(*next(iter(manager.pending)), True)
+    await asyncio.wait_for(task, 30)
     assert list(listed(manager, session)) == ["notes.txt"]
 
 

@@ -22,9 +22,10 @@ EDIT_RULE_TOOLS = ("write_file", "edit_file", "insert_activity_log", "move_path"
 def rule_for(name, arguments):
     """The rule that "Allow for this chat" stores for an action, or None when it cannot be remembered.
 
-    Commands match by their exact text (only surrounding whitespace is removed),
-    MCP tools by their exact name, and hooks by their exact ID. Folder access and
-    every other card has no rule.
+    Commands match by their exact text (only surrounding whitespace is removed; the
+    caller adds the folder of a command run with cwd outside the project), MCP tools
+    by their exact name, and hooks by their exact ID. Folder access and every other
+    card has no rule.
     """
     name = name if isinstance(name, str) else ""
     arguments = arguments if isinstance(arguments, dict) else {}
@@ -67,6 +68,7 @@ class AllowRule(BaseModel):
     prefix: list[str] | None = Field(default=None, max_length=16)
     flags: list[str] | None = Field(default=None, max_length=64)
     path: str | None = Field(default=None, max_length=4096, strict=True)
+    cwd: str | None = Field(default=None, max_length=4096, strict=True)  # an exact-text chat rule's folder
 
 
 class RuleChange(BaseModel):

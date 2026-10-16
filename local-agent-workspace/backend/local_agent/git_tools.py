@@ -179,12 +179,13 @@ async def partial_clone(workspace, git):
     return any(names.split(b"\0"))
 
 
-async def hardened_git_command(workspace, args, forbidden_roots, env=None):
+async def hardened_git_command(workspace, args, forbidden_roots, env=None, pathspecs=()):
     """(argv, env) for a read-only Git command: status, diff, show, log, ls-files, branch
     or rev-parse, with the programs a repository's configuration can name switched off
     (fsmonitor, hooks, filters, textconv, external diff, signature checks), credential
     files left out of diffs, status, diffs and file lists limited to the workspace (the
-    pathspec '.'), and no fetch of missing objects in a partial clone.
+    pathspec '.', or the checked pathspecs a vetted command gives after '--'), and no
+    fetch of missing objects in a partial clone.
     Git is found first, so a planted git never runs, not even for the filter query."""
     git = find_git(env if env is not None else git_environment(), forbidden_roots)
     if not args:
@@ -198,13 +199,17 @@ async def hardened_git_command(workspace, args, forbidden_roots, env=None):
     filters = await configured_filters(workspace, git=git)
     if not honours_no_lazy_fetch(await git_version(workspace, git)) and await partial_clone(workspace, git):
         raise ValueError(PARTIAL_CLONE_REFUSED)
-    paths = ["--", ".", *DIFF_EXCLUDES]
+    pathspecs = list(pathspecs or ())
+    if pathspecs and (sub not in ("status", "diff", "show", "log", "ls-files")
+                      or any(not isinstance(item, str) or not item or item.startswith(":") for item in pathspecs)):
+        raise ValueError("These Git paths are not allowed in a read-only command.")
+    paths = ["--", *(pathspecs or ["."]), *DIFF_EXCLUDES]
     part = {
         "status": [sub, "--ignore-submodules=dirty", *rest, *paths],
         "diff": [sub, "--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty", *rest, *paths],
         # --sparse: show the commit even when it changes nothing under the pathspec.
         "show": [sub, "--no-ext-diff", "--no-textconv", "--no-show-signature", "--sparse", *rest, *paths],
-        "log": [sub, "--no-show-signature", *rest],
+        "log": [sub, "--no-show-signature", *rest, *(["--", *pathspecs] if pathspecs else [])],
         "ls-files": [sub, *rest, *paths],
     }.get(sub, [sub, *rest])
     argv = [git, *SAFE_OPTIONS, "-c", "log.showSignature=false", *filter_overrides(filters), "--no-optional-locks",

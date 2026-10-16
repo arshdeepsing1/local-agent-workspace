@@ -1,8 +1,11 @@
 import asyncio
+import glob
 import hashlib
+import itertools
 import json
 import os
 import re
+import shutil
 import time
 import uuid
 from datetime import datetime, timezone
@@ -11,14 +14,16 @@ from pathlib import Path
 
 import httpx
 
-from .tools import TOOL_DEFINITIONS, WorkspaceTools, file_error
+from .tools import IGNORED, TOOL_DEFINITIONS, WorkspaceTools, file_error
 from .jobs import (CREDENTIAL_ENV, DENIED_ENV, DENIED_ENV_PREFIXES, ENVIRONMENT_KEYS, ENVIRONMENT_NAME, HEAD_CHARS,
                    DEFAULT_WAIT_SECONDS, JOB_NOTICE_STATES, MIN_HEAD_CHARS, TAIL_CHARS, job_command, job_ending,
                    job_runtime, suggested_wait, until_pattern, wait_page)
 from .tools import read_page_bytes
 from .permissions import MODE_LABELS, SCOPE_NAMES, denied_tools, evaluate, log, mode_prompt
 from .rules import (APP_ROOT, RuleStore, card_rule_options, default_rule, normalize_rule, project_key, protected_reason,
-                    rule_label, rule_matches, same_rule, text_names_credential)
+                    rule_label, rule_matches, same_rule, text_names_credential, text_words)
+from . import secret_paths, shell_vet
+from .redaction import redact_tokens
 from .activity import ACTIVITY_TOOL, activity_content, activity_log, local_time, redact_secrets
 from .context import (
     DEFAULT_AUTO_COMPACT_PERCENT, MAX_AUTO_COMPACT_PERCENT,
@@ -33,12 +38,13 @@ from .tools import LIMIT as FILE_LIMIT
 from .tools import write_limit_setting
 from . import diagnostics, notebooks
 from .edits import clip_result, preview_diff, split_lines
-from .config import DEFAULT_APPROVAL_MINUTES, DEFAULT_MAX_AGENT_STEPS, follow_limits
+from .config import DEFAULT_APPROVAL_MINUTES, DEFAULT_MAX_AGENT_STEPS, follow_limits, read_env
 from .instructions import load_project_instructions, load_user_instructions, note_instruction_path, user_tools
 from . import memory as project_memory
 from .output_styles import style_block
 from .jobs import JobManager, shell_note, validate_command_options
-from .command_exec import prepare_command
+from .command_exec import absolute_path_entries, prepare_command, resolve_executable
+from . import git_tools
 from .recovery import CheckpointManager
 from .changes import ChangeReview
 from .shell_changes import ShellChangeTracker
@@ -97,6 +103,10 @@ from .tool_profiles import covering_tool
 
 
 MAX_OUTPUT_LIMIT_RETRIES = 2
+# Credential-file assignments whose values are redacted from every tool result, by key name (M6j).
+SECRET_KEY = re.compile(r"(?i)token|secret|passw|key|credential|auth|cookie")
+# Results that carry what a command or an MCP server printed: their secret shapes are redacted too.
+SHAPE_REDACTED_TOOLS = frozenset({"run_command", "get_job_output", "wait_job", "stop_job", "list_jobs", "get_tool_output"})
 # Databricks accepts at most this many functions in one request (built-in and MCP tools together).
 MAX_REQUEST_TOOLS = 32
 # A turn's MCP server status as a chat keeps it (Agent tools → Extensions): these fields only.
@@ -402,17 +412,18 @@ def tool_arguments(calls):
     return arguments
 
 
-def redact_value(value, tokens):
-    """value with each token replaced by [REDACTED] in every string inside dicts and lists."""
+def redact_value(value, tokens, *, shapes=False):
+    """value with each token replaced by [REDACTED] in every string inside dicts and lists; with shapes, also
+    the high-confidence secret shapes (redaction.redact_tokens: GitHub, Databricks and AWS keys, ...)."""
     if isinstance(value, str):
         for token in tokens:
             if token:
                 value = value.replace(token, "[REDACTED]")
-        return value
+        return redact_tokens(value) if shapes else value
     if isinstance(value, dict):
-        return {key: redact_value(item, tokens) for key, item in value.items()}
+        return {key: redact_value(item, tokens, shapes=shapes) for key, item in value.items()}
     if isinstance(value, list):
-        return [redact_value(item, tokens) for item in value]
+        return [redact_value(item, tokens, shapes=shapes) for item in value]
     return value
 
 
@@ -1007,13 +1018,32 @@ class AgentManager(LifecycleHooks):
         return self.live.get(session_id) or self.store.get(session_id)
 
     def redaction_tokens(self):
-        """The secrets no card, result, title, ledger entry or export may show: the Databricks token and the
-        values the enabled MCP servers' secret references resolve to."""
+        """The secrets no card, result, title, ledger entry or export may show: the Databricks token, the
+        values the enabled MCP servers' secret references resolve to, and the credential file's other
+        secret-looking values (keys naming a token, secret, password, key, credential, auth or cookie)."""
         try:
             tokens = [self.settings.credentials()[1]]
         except (ValueError, OSError):
             tokens = []
-        return tokens + self.extensions.secret_values()
+        return tokens + self.extensions.secret_values() + self.credential_file_values()
+
+    def credential_file_values(self):
+        """The credential file's secret-looking values of 8 characters or more (cached by size and time)."""
+        path = self.settings.values.get("env_file") if isinstance(self.settings.values, dict) else ""
+        if not path:
+            return []
+        try:
+            target = Path(path).expanduser()
+            info = target.stat()
+            key = (str(target), info.st_mtime_ns, info.st_size)
+            cached = self.__dict__.get("_credential_values")
+            if cached and cached[0] == key:
+                return list(cached[1])
+            values = [value for name, value in read_env(target).items() if SECRET_KEY.search(name) and len(value) >= 8]
+        except (OSError, UnicodeError, ValueError):
+            return []
+        self.__dict__["_credential_values"] = (key, values)
+        return list(values)
 
     async def job_update(self, job):
         """Show a job's progress on its tool card, and note when an agent's background job ends.
@@ -1305,22 +1335,36 @@ class AgentManager(LifecycleHooks):
         return "\n".join(text for text in (self.changed_files_notice(session, tools), self.background_jobs_notice(session))
                          if text)
 
-    async def command_tool(self, session, event, arguments, *, argv=None, read_only=False):
+    async def command_tool(self, session, event, arguments, *, argv=None, read_only=False, script=None):
         """Run a command: arguments['command'] through the shell, or, with argv, argv
-        without a shell (arguments['command'] is then its display text). read_only
-        runs a read-only command hardened (command_exec.prepare_command)."""
-        options = {}
-        if argv is not None:
+        without a shell (arguments['command'] is then its display text), or, with script
+        (a vetted command's shell_vet.Plan), the script the app builds from it. read_only
+        runs a read-only command hardened (command_exec.prepare_command). Every form runs
+        in the command's cwd (checked by _execute_tool), else in the project."""
+        workspace = str(Path(session["workspace"]).resolve())
+        folder = str(self.command_start(self.session_tools(session), arguments))
+        options = {"cwd": folder} if folder != workspace else {}
+        forbidden = [Path(workspace), *(Path(p).resolve() for p in session.get("allowed_directories", [])),
+                     *(Path(p) for p in self.standing_directories())]
+        if script is not None:
+            if arguments.get("background"):
+                raise ValueError("Checked read-only commands run in the foreground only.")
+            read_only = script.read_only
+            # Read-only stages never see the Python environment; a stage a rule allows does, as it would alone.
+            env = self.jobs.command_environment(python_venv=not read_only)
+
+            async def git_command(cwd, args, paths):
+                return await git_tools.hardened_git_command(cwd, args, forbidden, env=env, pathspecs=paths)
+            text = await shell_vet.script(script, find_program=lambda name: self.vetted_program(name, env, forbidden),
+                                          git_command=git_command)
+            options = {"script": text, "env": env, **({"cwd": script.cwd} if script.cwd != workspace else {})}
+        elif argv is not None:
             if read_only and arguments.get("background"):
                 raise ValueError("Read-only commands run in the foreground only.")
-            forbidden = [Path(session["workspace"]).resolve(),
-                         *(Path(p).resolve() for p in session.get("allowed_directories", [])),
-                         *(Path(p) for p in self.standing_directories())]
             # The read-only path (pwd, ls, hardened Git) never sees the Python environment.
-            argv, env = await prepare_command(argv, workspace=session["workspace"], forbidden_roots=forbidden,
-                                              read_only=read_only,
+            argv, env = await prepare_command(argv, workspace=folder, forbidden_roots=forbidden, read_only=read_only,
                                               env=self.jobs.command_environment(python_venv=not read_only))
-            options = {"argv": argv, "env": env}
+            options.update(argv=argv, env=env)
         tracker = None
         if not arguments.get("background") and not read_only:
             # Files the command changes join the change review (Git folders only; see shell_changes).
@@ -1334,7 +1378,7 @@ class AgentManager(LifecycleHooks):
         try:
             # job_started: the card shows how long the command has run against its timeout.
             await self.update_event(session, event, job_id=job["id"], job_started=job["created"], output=job["output"],
-                                    **({"without_shell": True} if argv is not None else {}))
+                                    **({"without_shell": True} if argv is not None and script is None else {}))
             if not job["background"]:
                 job = await self.jobs.wait(job["id"])
                 await self.track_shell_changes(session, tracker)
@@ -1635,6 +1679,9 @@ class AgentManager(LifecycleHooks):
             rule = rule_for(event.get("name"), event.get("input"))
             if rule is None:
                 raise ValueError("This action cannot be allowed for the whole chat.")
+            folder = event.get("command_cwd")
+            if rule.get("tool") == "run_command" and folder and folder != str(self.session_tools(session).root):
+                rule["cwd"] = folder  # A command approved in another folder is allowed there only.
             rules = session.get("allow_rules") or []
             if rule not in rules and len(rules) >= MAX_ALLOW_RULES:
                 raise ValueError(f"This chat already allows {MAX_ALLOW_RULES} actions. Remove one in the Permissions menu first.")
@@ -1678,7 +1725,118 @@ class AgentManager(LifecycleHooks):
                         chat_rules=session.get("allow_rules") or [], project_rules=saved["project"],
                         user_rules=saved["user"], resolve_path=tools.resolve, protected=protected,
                         disabled=set(session.get("disabled_tools") or []), subagent=bool(session.get("is_subagent")),
-                        credential_file=str(tools.credential_file) if tools.credential_file else None)
+                        credential_file=str(tools.credential_file) if tools.credential_file else None,
+                        vet=lambda values, allow: self.vet_command(tools, values, allow),
+                        secrets=lambda values: self.secret_words(tools, values))
+
+    def command_start(self, tools, arguments):
+        """The folder a command starts in: its resolved cwd, else the project (no access check here)."""
+        cwd = arguments.get("cwd") if isinstance(arguments, dict) else None
+        if isinstance(cwd, str):
+            try:
+                return tools.resolve(cwd)
+            except (ValueError, OSError):
+                pass
+        return tools.root
+
+    def secret_words(self, tools, arguments):
+        """The words of a command that name credential-looking files (secret_paths), at most five: as written,
+        the configured credential file under a relative name, what its globs match where it runs, and its cwd."""
+        text = arguments.get("command") if isinstance(arguments, dict) else None
+        if not isinstance(text, str):
+            return []
+        credential = str(tools.credential_file) if tools.credential_file else None
+        patterns = secret_paths.patterns_setting(self.settings.values)
+        folder = str(self.command_start(tools, arguments))
+        found = []
+
+        def note(word, shown=None):
+            shown = shown or word
+            if len(found) < 5 and shown not in found and secret_paths.looks_secret(word, credential, patterns):
+                found.append(shown)
+        for word in text_words(text):
+            note(word)
+            if credential and not word.startswith(("/", "~")) and os.path.realpath(os.path.join(folder, word)) == credential:
+                note(credential, word)
+            if any(character in word for character in "*?[") and len(found) < 5:
+                pattern = os.path.expanduser(word) if word.startswith("~") else word
+                try:
+                    for match in itertools.islice(glob.iglob(pattern, root_dir=folder), shell_vet.MAX_GLOB_MATCHES):
+                        note(match)
+                except (OSError, ValueError):
+                    pass
+        cwd = arguments.get("cwd")
+        if isinstance(cwd, str):
+            note(cwd)
+            note(folder, cwd)
+        return found
+
+    def vet_roots(self, tools):
+        """The folders a vetted command may read: the project, the chat's folder grants and the default code folder."""
+        return [tools.root, *tools.allowed_directories]
+
+    def vetted_path(self, tools, roots, value):
+        """A vetted command's path, resolved, or shell_vet.Refused: outside the approved folders (whatever the
+        mode), excluded from file tools, or credential-looking."""
+        try:
+            resolved = tools.resolve(value)
+        except (ValueError, OSError) as exc:
+            raise shell_vet.Refused(f"{value} is excluded ({str(exc).rstrip('.').lower()})") from None
+        if not any(resolved.is_relative_to(root) for root in roots):
+            raise shell_vet.Refused(f"{value} is outside the project and the folders this chat may use")
+        credential = str(tools.credential_file) if tools.credential_file else None
+        if secret_paths.looks_secret(str(resolved), credential, secret_paths.patterns_setting(self.settings.values)):
+            raise shell_vet.Refused(f"{value} looks like a credential file")
+        return resolved
+
+    @staticmethod
+    def vetted_program(name, env, forbidden):
+        """The absolute program a vetted stage runs: found on the absolute PATH entries, never inside the
+        project, the chat's folders or the default code folder (so a planted grep never runs)."""
+        found = shutil.which(name, path=os.pathsep.join(absolute_path_entries(env)))
+        if not found:
+            raise shell_vet.Refused(f"{name} was not found on PATH")
+        program = Path(found).resolve()
+        if any(program.is_relative_to(Path(root).resolve()) for root in forbidden):
+            raise shell_vet.Refused(f"{name} resolves to {program}, inside the project or a folder this chat may use")
+        return found
+
+    def search_excludes(self, patterns):
+        """(names, folders) a vetted recursive search skips: credential-looking names, and the generated folders
+        and the app's state folder (by name), which file tools leave out too."""
+        names, folders = secret_paths.grep_excludes(patterns)
+        return names, sorted({*folders, *IGNORED, Path(self.settings.state_dir).name})
+
+    def vet_command(self, tools, arguments, allow):
+        """(shell_vet.Plan, None) when a command passes the app's read-only check in this chat, else (None, why).
+        allow(argv) is evaluate's allow-rule match for one stage (None in Plan)."""
+        try:
+            roots = self.vet_roots(tools)
+            start = tools.root
+            if arguments.get("cwd") is not None:
+                start = self.vetted_path(tools, roots, str(arguments["cwd"]))
+                if not start.is_dir():
+                    raise shell_vet.Refused("its cwd is not a folder")
+            env = self.jobs.command_environment(python_venv=False)
+            credential = str(tools.credential_file) if tools.credential_file else None
+            patterns = secret_paths.patterns_setting(self.settings.values)
+
+            def rule_program(name, folder):
+                try:
+                    return resolve_executable(name, self.jobs.command_environment(), folder)
+                except ValueError as exc:
+                    raise shell_vet.Refused(str(exc).rstrip(".")) from None
+            context = shell_vet.Context(
+                cwd=start, root=tools.root, home=Path.home(),
+                check_path=lambda value: self.vetted_path(tools, roots, value),
+                find_program=lambda name: self.vetted_program(name, env, roots),
+                secret=lambda word: secret_paths.looks_secret(word, credential, patterns),
+                allow=allow, rule_program=rule_program, excludes=self.search_excludes(patterns))
+            return shell_vet.vet(arguments.get("command"), context), None
+        except shell_vet.Refused as exc:
+            return None, str(exc)
+        except (ValueError, OSError, TypeError):
+            return None, "it could not be checked"
 
     @staticmethod
     def verdict_fields(verdict):
@@ -1688,6 +1846,10 @@ class AgentManager(LifecycleHooks):
             fields.update(allowed_by_rule=True, rule_scope=verdict.scope)
         if verdict.source == "read_only_command":
             fields["read_only_command"] = True
+        if verdict.source == "read_only_pipeline":
+            fields["read_only_pipeline"] = True
+            if verdict.rule:  # A stage ran because an allow rule allows it (shell_vet phase 2).
+                fields.update(allowed_by_rule=True, rule_scope=verdict.scope)
         if verdict.argv is not None:
             fields["without_shell"] = True
         return fields
@@ -1695,9 +1857,10 @@ class AgentManager(LifecycleHooks):
     def card_fields(self, tools, name, arguments, verdict, editable=()):
         """The pending-only fields of an approval card: what it can remember and edit, and why it asks."""
         options = card_rule_options(name, arguments, **self.rule_context(tools))
-        if verdict.protected or (verdict.decision == "ask" and (verdict.source == "rule" or verdict.uncertain)):
-            # Protected files, Always ask rules and commands that cannot be checked exactly always ask:
-            # a remembered allow rule would never apply to them.
+        if verdict.protected or verdict.secret or (verdict.decision == "ask" and (verdict.source == "rule"
+                                                                                  or verdict.uncertain)):
+            # Protected files, credential-looking files, Always ask rules and commands that cannot be checked
+            # exactly always ask: a remembered allow rule would never apply to them.
             rememberable = []
         elif name == "run_command":
             rememberable = (["chat", "project", "user"] if options and options.get("argv") is not None
@@ -1707,6 +1870,8 @@ class AgentManager(LifecycleHooks):
         fields = {"rememberable": rememberable, "rule_options": options, "editable": list(editable)}
         if verdict.protected:
             fields["protected"] = verdict.protected
+        if verdict.secret:
+            fields["secret_files"] = list(verdict.secret)
         if verdict.uncertain:
             fields["uncertain"] = True
         return fields
@@ -1726,6 +1891,9 @@ class AgentManager(LifecycleHooks):
             return "Protected files are always confirmed; this approval cannot be remembered."
         if event.get("hook_ask"):
             return "A before-tool hook asked for this approval; it cannot be remembered."
+        if event.get("secret_files"):
+            return ("Commands that name credential files (or files that look like them) always ask; this approval "
+                    "cannot be remembered.")
         tools = self.session_tools(session)
         verdict = self.permission(session, tools, event.get("name"), event.get("input"))
         if event.get("uncertain") or (verdict.decision == "ask" and verdict.source == "rule"):
@@ -2812,7 +2980,16 @@ class AgentManager(LifecycleHooks):
                     validate_command_options(arguments["command"], arguments.get("timeout_seconds", 60), arguments.get("max_output_bytes", 80000))
                     if type(arguments.get("background", False)) is not bool:
                         raise ValueError("background must be true or false.")
-                    preview = self.command_preview(arguments)
+                    if "cwd" in arguments:
+                        if (output := await self.command_folder_access(session, tools, event, arguments)) is not None:
+                            return output
+                        # A folder-access card may have waited while the mode or rules changed; the new grant
+                        # can also make a vetted command run without a card now.
+                        verdict = self.hooked_permission(session, tools, name, arguments, forced)
+                        if verdict.decision == "deny":
+                            await self.update_event(session, event, state="rejected", output=verdict.message)
+                            return verdict.message
+                    preview = self.command_preview(arguments, event.get("command_cwd"))
                 else:
                     preview = self.file_change_preview(tools, name, arguments)
                 await self.update_event(session, event, preview=preview)
@@ -2855,6 +3032,11 @@ class AgentManager(LifecycleHooks):
             # to Plan, or from Bypass to Manual): follow the current ones before anything runs.
             tools.unrestricted = session.get("permission_mode", "manual") == "bypassPermissions"
             if name in PATH_TOOLS and (output := await access_refusal()) is not None:
+                return output
+            if (name == "run_command" and isinstance(arguments.get("cwd"), str) and not tools.unrestricted
+                    and not tools.permitted(tools.resolve(arguments["cwd"]))):
+                output = "Not run: the command's folder (cwd) is no longer one this chat may use. Ask the user first."
+                await self.update_event(session, event, state="rejected", output=output)
                 return output
             if (current := self.hooked_permission(session, tools, name, arguments, forced)).decision == "deny":
                 await self.update_event(session, event, state="rejected", output=current.message)
@@ -2993,7 +3175,9 @@ class AgentManager(LifecycleHooks):
                     finally:
                         await self.status(session, "running")
             elif name == "run_command":
-                if verdict.argv is not None and verdict.decision == "allow":
+                if verdict.script is not None and verdict.decision == "allow":
+                    result = await self.command_tool(session, event, arguments, script=verdict.script)
+                elif verdict.argv is not None and verdict.decision == "allow":
                     result = await self.command_tool(session, event, arguments, argv=list(verdict.argv),
                                                      read_only=verdict.read_only)
                 else:
@@ -3064,7 +3248,10 @@ class AgentManager(LifecycleHooks):
                 result = await tools.execute(name, arguments)
             # Redacted before the hard cap and any shortening: a cut through the token leaves a part
             # the exact match no longer finds. The cap applies to the card and the model alike.
-            result = bound_result(redact_value(result, self.redaction_tokens()), TOOL_RESULT_HARD_LIMIT)
+            result = redact_value(result, self.redaction_tokens())
+            if name in SHAPE_REDACTED_TOOLS or name.startswith("mcp__"):
+                result = redact_value(result, (), shapes=True)  # Token shapes a command or server printed.
+            result = bound_result(result, TOOL_RESULT_HARD_LIMIT)
             output = result if isinstance(result, str) else json.dumps(result, indent=2)
             if edited_note and origin != "verify":  # Verify reads the JSON result; its card says it was edited.
                 output = edited_note + "\n" + output
@@ -3137,11 +3324,41 @@ class AgentManager(LifecycleHooks):
         return output
 
     @staticmethod
-    def command_preview(arguments):
-        return (arguments["command"] + f"\n\nTimeout: {arguments.get('timeout_seconds', 60)} seconds"
+    def command_preview(arguments, folder=None):
+        """A command card's text; folder is the resolved cwd when the command names one."""
+        return (arguments["command"] + (f"\n\nRuns in: {folder}" if folder else "")
+                + f"\n\nTimeout: {arguments.get('timeout_seconds', 60)} seconds"
                 + f" · Output limit: {arguments.get('max_output_bytes', 80000)} bytes"
                 + ("\nBackground job: continues after this chat turn; stop it in Terminal or with stop_job."
                    if arguments.get("background") else "\nForeground command: Stop response also stops this job."))
+
+    async def command_folder_access(self, session, tools, event, arguments):
+        """None when run_command's cwd is a folder this chat may use, after a folder-access card when it is
+        outside the project, the chat's grants and the default code folder; else the refusal the model gets.
+        Plan and Don't ask show no card; Bypass needs none. Never widens access without the card."""
+        value = arguments["cwd"]
+        target = tools.resolve(value)  # Credential, generated and state folders are refused here.
+        if not target.is_dir():
+            raise ValueError(f"cwd must be an existing folder: {value}")
+        await self.update_event(session, event, command_cwd=str(target))
+        if tools.permitted(target):
+            return None
+        if session.get("permission_mode") == "plan":
+            output = ("Not run: Plan mode runs commands only in the project and the folders this chat may use. "
+                      "Describe this step in the plan instead.")
+            await self.update_event(session, event, state="rejected", output=output)
+            return output
+        access = {}
+        if await self.ensure_access(session, tools, value, True, access, ("run_command", arguments)):
+            return None
+        output = (access["blocked_reason"] if access["approval"] == "blocked" else
+                  "The user did not answer the folder access request in time, so the command did not run. Ask the "
+                  "user before trying again." if access["approval"] == "expired" else
+                  declined(access, "folder access", "Do not retry or use a command to circumvent this decision."))
+        await self.update_event(session, event, state="rejected", output=output, approval=access["approval"],
+                                **({"decline_note": access["decline_note"]} if access.get("decline_note") else {}),
+                                **({"blocked_reason": output} if access["approval"] == "blocked" else {}))
+        return output
 
     def memory_preview(self, session, arguments):
         """A remember card's text: the note as it would be saved, and where."""
@@ -3171,7 +3388,7 @@ class AgentManager(LifecycleHooks):
             if verdict.decision == "deny":
                 raise ValueError("The edited action is blocked: " + verdict.message)
             if name == "run_command":
-                preview = self.command_preview(new)
+                preview = self.command_preview(new, event.get("command_cwd"))
             elif name == "remember":
                 preview = self.memory_preview(session, new)
             else:
@@ -3186,9 +3403,11 @@ class AgentManager(LifecycleHooks):
             if event.get("hook_ask"):
                 fields["rememberable"] = []  # A card a hook asked for stays one that cannot be remembered.
             event.pop("uncertain", None)
+            event.pop("secret_files", None)
             # Changed back to the agent's own proposal: not an edit, so the agent is not told it was.
             await self.update_event(session, event, input=new, preview=preview, edited=new != proposed,
-                                    **{key: fields[key] for key in ("rule_options", "rememberable", "uncertain") if key in fields})
+                                    **{key: fields[key] for key in ("rule_options", "rememberable", "uncertain",
+                                                                    "secret_files") if key in fields})
         return revise
 
     @staticmethod

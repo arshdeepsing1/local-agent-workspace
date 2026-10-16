@@ -613,3 +613,6 @@ body.panel-resizing{cursor:col-resize;user-select:none}
 .extension-entry .field-help code{overflow-wrap:anywhere}
 .extensions-preview .import-warning{background:#f4ecdf;color:#796143;border-radius:8px;padding:9px 11px;font-size:12px}
 @media(max-width:600px){.extension-fields{grid-template-columns:minmax(0,1fr)}.extension-value-row,.extension-value-row:has(> input:nth-of-type(3)){grid-template-columns:minmax(0,1fr) auto}.extension-value-row>:not(button){grid-column:1}.extension-value-row>button{grid-column:2;grid-row:1}}
+/* 2026-10-16 cmdsafety: the secret-file warning on command cards. */
+.tool-secret{padding:8px 10px;border-radius:6px;background:#f6e4e1;color:#7a3b31;overflow-wrap:anywhere}
+.tool-secret code{font-size:12px;overflow-wrap:anywhere}

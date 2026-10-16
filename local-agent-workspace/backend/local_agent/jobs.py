@@ -170,11 +170,19 @@ def command_environment(extra_env=None):
 # and pathspecs.
 ARGV_LIMIT = 64
 PREPARED_ARGV_LIMIT = 256
+# A vetted command (shell_vet) runs as a script the app built: /bin/sh -c <script>, up to this many characters.
+SCRIPT_SHELL = "/bin/sh"
+MAX_SCRIPT_CHARS = 200_000
 
 
-def validate_argv(argv, limit=ARGV_LIMIT):
+def validate_argv(argv, limit=ARGV_LIMIT, *, script=False):
     """An argument vector run without a shell: 1 to limit text tokens, each without NUL
-    and at most 1,000 characters."""
+    and at most 1,000 characters. script: exactly [SCRIPT_SHELL, '-c', <the app's script>]."""
+    if script:
+        if (not isinstance(argv, list) or len(argv) != 3 or argv[:2] != [SCRIPT_SHELL, "-c"]
+                or not isinstance(argv[2], str) or "\0" in argv[2] or not 0 < len(argv[2]) <= MAX_SCRIPT_CHARS):
+            raise ValueError("A checked command's script must be text of at most 200,000 characters without NUL.")
+        return
     if (not isinstance(argv, list) or not 1 <= len(argv) <= limit
             or not all(isinstance(token, str) and "\0" not in token and len(token) <= 1000 for token in argv)
             or not argv[0]):
@@ -205,7 +213,7 @@ async def spawn(argv, workspace, env, separate_stderr=False):
 
 
 async def run_process(command, workspace, timeout_seconds=60, max_output_bytes=80_000, on_output=None,
-                      extra_env=None, *, argv=None, env=None, separate_stderr=False):
+                      extra_env=None, *, argv=None, env=None, separate_stderr=False, script=False):
     """Run a noninteractive command, retaining bounded output while draining its pipe.
 
     command is the text run by the shell, or with argv the display text of argv,
@@ -216,7 +224,7 @@ async def run_process(command, workspace, timeout_seconds=60, max_output_bytes=8
     (at most max_output_bytes too), and on_output sees stdout only."""
     validate_command_options(command, timeout_seconds, max_output_bytes)
     if argv is not None:
-        validate_argv(argv, PREPARED_ARGV_LIMIT)
+        validate_argv(argv, PREPARED_ARGV_LIMIT, script=script)
     env = env if env is not None else command_environment(extra_env)
     process = await spawn(list(argv) if argv is not None else shell_argv(command), workspace, env, separate_stderr)
 
@@ -547,12 +555,19 @@ class JobManager:
         return env
 
     async def start(self, command, workspace, session_id=None, timeout_seconds=60,
-                    max_output_bytes=80_000, background=False, *, argv=None, env=None):
-        """Start a job. command is the shell text, or with argv its display text: argv
-        then runs without a shell, with env as its whole environment when given.
-        argv and env are never stored or published."""
+                    max_output_bytes=80_000, background=False, *, argv=None, env=None, cwd=None, script=None):
+        """Start a job. command is the shell text, or with argv (or script) its display text: argv
+        then runs without a shell, script (a vetted command's, shell_vet) as SCRIPT_SHELL -c script,
+        with env as the whole environment when given. cwd: the folder it runs in when it is not the
+        workspace (run_command's cwd); the job still belongs to the workspace. argv, script and env
+        are never stored or published."""
         validate_command_options(command, timeout_seconds, max_output_bytes)
-        if argv is not None:
+        if script is not None:
+            if argv is not None:
+                raise ValueError("A job runs an argument vector or a script, not both.")
+            argv = [SCRIPT_SHELL, "-c", script]
+            validate_argv(argv, script=True)
+        elif argv is not None:
             validate_argv(argv, PREPARED_ARGV_LIMIT)
             argv = list(argv)
         if env is not None and (not isinstance(env, dict)
@@ -567,6 +582,10 @@ class JobManager:
         workspace = str(Path(workspace).expanduser().resolve())
         if not Path(workspace).is_dir():
             raise ValueError("Choose an existing command working directory.")
+        if cwd is not None:
+            cwd = str(Path(cwd).expanduser().resolve())
+            if not Path(cwd).is_dir():
+                raise ValueError("The command's folder (cwd) does not exist.")
         tokens = tuple(token for token in self.redaction_tokens() if isinstance(token, str) and token)
 
         def sanitize(text, partial=False):
@@ -586,7 +605,11 @@ class JobManager:
                "command": sanitize(command), "state": "running", "created": now, "updated": now,
                "exit_code": None, "output": "", "truncated": False, "timeout_seconds": timeout_seconds,
                "max_output_bytes": max_output_bytes, "background": bool(background)}
-        if argv is not None:
+        if cwd is not None and cwd != workspace:
+            job["cwd"] = cwd
+        if script is not None:
+            job["checked_script"] = True
+        elif argv is not None:
             job["without_shell"] = True
         self._jobs[job["id"]] = job
         self._persist(job, mirror=True)
@@ -598,12 +621,12 @@ class JobManager:
             await self.stop(job["id"])
             raise
         if job["state"] == "running":
-            task = asyncio.create_task(self._run(job, command, sanitize, argv, env and dict(env)))
+            task = asyncio.create_task(self._run(job, command, sanitize, argv, env and dict(env), script is not None))
             self._tasks[job["id"]] = task
             task.add_done_callback(lambda done: self._tasks.pop(job["id"], None))
         return copy.deepcopy(job)
 
-    async def _run(self, job, command, sanitize, argv=None, env=None):
+    async def _run(self, job, command, sanitize, argv=None, env=None, script=False):
         async def output(text, truncated):
             job.update(output=sanitize(text, partial=True), truncated=truncated, updated=time.time())
             self._persist(job)
@@ -614,8 +637,8 @@ class JobManager:
         try:
             if env is None:
                 env = self.command_environment()
-            result = await run_process(command, job["workspace"], job["timeout_seconds"],
-                                       job["max_output_bytes"], output, argv=argv, env=env)
+            result = await run_process(command, job.get("cwd") or job["workspace"], job["timeout_seconds"],
+                                       job["max_output_bytes"], output, argv=argv, env=env, script=script)
             job["state"] = "completed" if result["exit_code"] == 0 else "failed"
         except CommandTimeout as error:
             result = error.result
@@ -665,11 +688,12 @@ class JobManager:
 
     def expected_seconds(self, job):
         """How long this command usually runs: the median duration of the latest runs (at most five)
-        of the same command text in the same folder that completed, or, when none did, that failed
-        (a run that fails at once says little about a full one). Stopped and timed-out runs never
-        count. None when there is no such run."""
+        of the same command text in the same folder (its cwd) that completed, or, when none did, that
+        failed (a run that fails at once says little about a full one). Stopped and timed-out runs
+        never count. None when there is no such run."""
+        folder = job.get("cwd") or job["workspace"]
         same = [other for other in self._jobs.values() if other["id"] != job["id"]
-                and other["command"] == job["command"] and other["workspace"] == job["workspace"]]
+                and other["command"] == job["command"] and (other.get("cwd") or other["workspace"]) == folder]
         for states in (("completed",), ("failed",)):
             runs = sorted((other for other in same if other["state"] in states),
                           key=lambda other: other["updated"], reverse=True)[:5]

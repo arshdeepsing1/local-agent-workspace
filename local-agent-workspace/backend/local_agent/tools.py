@@ -13,7 +13,8 @@ from .edits import plan_change, preview_diff
 from .jobs import bounded_regex, run_process
 
 IGNORED = {".git", "node_modules", ".venv", ".codex_venv", "__pycache__", ".local", ".pytest_cache", "dist"}
-SECRET_NAMES = {".env", "env_vars.txt", ".netrc", ".npmrc", "credentials", "credentials.json", "id_rsa", "id_ed25519"}
+SECRET_NAMES = {".env", "env_vars.txt", ".netrc", ".npmrc", "credentials", "credentials.json", "id_rsa", "id_ed25519",
+                "id_ecdsa", "id_dsa", ".databrickscfg", ".git-credentials", ".pypirc", ".pgpass"}
 LIMIT = 80_000
 DEFAULT_WRITE_LIMIT = 80_000
 MIN_WRITE_LIMIT = 16_000
@@ -777,7 +778,9 @@ TOOL_DEFINITIONS = [
     definition("run_command", "Run a noninteractive workspace command under the selected permission mode. Streams output; returns a job ID and bounded first output page. Default foreground Stop cancels the job. Set background=true to continue beyond this turn; use get_job_output/list_jobs/stop_job. Do not daemonize or use shell '&'.",
                {"command": STRING, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "default": 60},
                 "max_output_bytes": {"type": "integer", "minimum": 1024, "maximum": 1000000, "default": 80000},
-                "background": {"type": "boolean", "default": False}}, ["command"]),
+                "background": {"type": "boolean", "default": False},
+                "cwd": {"type": "string", "description": "Folder to run in (default: the project); use instead of cd … &&"}},
+               ["command"]),
     definition("list_jobs", "List a page of command jobs belonging to this conversation, including state and exit code. Follow next_offset for older jobs.",
                {"offset": {"type": "integer", "minimum": 0, "maximum": 104, "default": 0}}, []),
     definition("get_job_output", "Read a bounded output page for a job in this conversation. Follow next_offset; poll running jobs only when useful. Offsets count characters in retained output; truncated means later process output was discarded.",

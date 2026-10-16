@@ -325,7 +325,7 @@ export function useWorkspace() {
   }
   const saveSettings = async next => {
     const { workspace, model, env_file, context_window, max_output_tokens, max_agent_steps, compaction_handoffs, approval_timeout_minutes,
-      system_notifications, user_instructions, write_limit_kb, command_env, rate_limit_auto_continue, auto_keep_changes,
+      system_notifications, user_instructions, write_limit_kb, command_env, secret_file_patterns, rate_limit_auto_continue, auto_keep_changes,
       coding_dir, python_venv, auto_compact_percent, reasoning_effort, reasoning_format, thinking_summaries, prompt_caching, subagent_defaults,
       spending_limit_dbu, fallback_model, user_agents_file, user_claude_file, project_memory, output_style } = next
     const saved = await api('/settings', 'PUT', {
@@ -337,6 +337,7 @@ export function useWorkspace() {
       ...(typeof user_instructions === 'string' ? { user_instructions } : {}),
       ...(Number.isInteger(write_limit_kb) ? { write_limit_kb } : {}),
       ...(Array.isArray(command_env) ? { command_env } : {}),
+      ...(Array.isArray(secret_file_patterns) ? { secret_file_patterns } : {}),
       ...(typeof rate_limit_auto_continue === 'boolean' ? { rate_limit_auto_continue } : {}),
       ...(typeof auto_keep_changes === 'boolean' ? { auto_keep_changes } : {}),
       ...(typeof coding_dir === 'string' ? { coding_dir } : {}),
