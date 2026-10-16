@@ -306,6 +306,7 @@ def test_slash_commands_off_sends_typed_commands_and_runs_chosen_ones(ui, page):
     ui.wait("fake.requests('/api/sessions/a/messages', 'POST').length === 1")
     assert ui.bodies("/api/sessions/a/messages", "POST") == [{"text": "/rename Typed title"}]
     assert not ui.requests("/api/sessions/a/title", "PUT")
+    expect(box).to_have_value("")  # The send finished: the composer ignores Enter while one is in flight.
     box.press_sequentially("/ren")
     menu = page.get_by_role("listbox", name="Commands and skills")
     expect(menu.get_by_role("group", name="Skills")).to_have_count(0)
