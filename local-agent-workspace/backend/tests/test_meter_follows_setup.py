@@ -98,7 +98,7 @@ async def test_a_model_change_moves_the_meter_to_the_new_models_budgets(app_clie
     scale = estimate_scale(manager.get(session_id)["inference_calls"], OPUS)
     assert scale == 1.3
     scaled = math.ceil(anchor["raw"] * scale)  # GPT OSS's report cannot anchor an Opus 5.5 estimate.
-    assert info["next_estimate"] == {"tokens": scaled, "scale": scale,
+    assert info["next_estimate"] == {"tokens": scaled, "scale": scale, "held_anchor": anchor,
                                      "percent_of_input_budget": round(scaled * 100 / 181_568, 1),
                                      "percent_of_threshold": round(scaled * 100 / 163_411, 1)}
     # The last request's report and estimate are what was sent.
@@ -106,6 +106,15 @@ async def test_a_model_change_moves_the_meter_to_the_new_models_budgets(app_clie
     assert limits_of(manager.store.get(session_id)["context_info"]) == expected
     assert [message["type"] for message in socket.messages] == ["model", "context"]
     assert limits_of(socket.messages[-1]["context_info"]) == expected
+    # Back to GPT OSS with no request between: its report anchors the next request again, as it will when sent.
+    response = await client.put(f"/api/sessions/{session_id}/model", json={"model": GPT})
+    assert response.json()["context_info"]["next_estimate"] == before["next_estimate"]
+    assert manager.estimate_anchor(manager.get(session_id))["reported"] == 9000
+    # After a restart nothing anchors the next request, so a Settings save leaves the estimate scaled.
+    manager.estimate_anchors.clear()
+    await manager.refresh_meter_limits(manager.get(session_id))
+    upcoming = manager.get(session_id)["context_info"]["next_estimate"]
+    assert "anchor" not in upcoming and upcoming["tokens"] == math.ceil(anchor["raw"] * old_scale)
 
 
 async def test_a_settings_save_moves_open_idle_chats_and_leaves_running_ones(app_client, monkeypatch, settings):

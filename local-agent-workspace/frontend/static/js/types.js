@@ -252,6 +252,7 @@
 //   auto_compact_threshold?, auto_compact_percent?, compaction_deferred? (over the threshold but within the input
 //   budget, and no cut brings it under the threshold: sent as it was), compaction?: Compaction (when this request compacted), last_request?: LastRequest,
 //   next_estimate?: { tokens, scale?, anchor? ({ model, reported, added, raw }: anchored like estimate_anchor),
+//   held_anchor? (the same, kept after a change to another model so a change back anchors again),
 //   percent_of_input_budget, percent_of_threshold } (the app's estimate of the
 //   next request before the user's next message; set when a turn ends), payload_bytes? (the size of the request
 //   body sent), payload_limit_bytes? (the Databricks per-request limit, 4,000,000) }. After a model change or a

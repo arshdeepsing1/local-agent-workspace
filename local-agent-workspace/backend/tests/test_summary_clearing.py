@@ -129,6 +129,14 @@ async def test_an_in_turn_compaction_keeps_its_results():
     _, _, info = await prepare_context(wire, {}, SYSTEM, [], 32_768, summarize, reply_reserve=4_096)
     assert info.get("compacted_in_turn") and "cleared_results" not in info["compaction"]
     assert "Output cleared" not in "".join(calls)
+    # Earlier turns summarized with it are cleared as usual: all but the latest three, the long request's included.
+    earlier = [message for number in range(5) for message in (
+        user(f"Turn {number}"), read_call(f"e{number}", f"e{number}.txt"), result(f"e{number}", "e" * 2_500),
+        {"role": "assistant", "content": "ok"})]
+    calls, summarize = summary_counter()
+    _, _, info = await prepare_context([*earlier, *wire], {}, SYSTEM, [], 32_768, summarize, reply_reserve=4_096)
+    assert info["compaction"]["trigger"] == "in_turn" and info["compaction"]["cleared_results"] == 3
+    assert "Output cleared" in "".join(calls) and "y" * 2_000 in "".join(calls)
 
 
 def test_the_summary_handoff_and_condense_prompts_say_the_app_records_the_files():

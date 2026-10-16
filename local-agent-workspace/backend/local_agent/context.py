@@ -329,8 +329,8 @@ def double_counted(usage, estimate):
 # in the same order, with more after them) is estimated as what Databricks reported for that request plus
 # the scaled estimate of what changed since. The prefix is then counted exactly; only the new content uses
 # the learned scale. Kept in memory per chat (AgentManager.estimate_anchors), never saved: after a restart,
-# a compaction, a rewind or an edit, a model change or a report that cannot anchor, the scaled estimate
-# applies until the next report.
+# a compaction, a rewind or an edit, or a change to another model, the scaled estimate applies until the
+# next report; a report that cannot anchor (AgentManager.keep_anchor) leaves the previous anchor.
 
 def anchor_digest(messages):
     """sha256 of messages (a request's messages after its system message) as canonical JSON."""
@@ -387,22 +387,24 @@ def context_breakdown(messages, tools, has_summary=False, scale=1.0, total=None)
 BUILT_IN_GROUP = "Built-in tools"
 
 
-def tool_group(name):
+def tool_group(name, servers=()):
     """The meter's group of a tool definition: "MCP <server>" for an MCP server's tool (mcp__<server>__<tool>),
-    else BUILT_IN_GROUP (the app's tools)."""
+    else BUILT_IN_GROUP (the app's tools). servers: the configured server IDs; the longest that names the tool
+    wins, so a saved ID containing "__" keeps its own row. Otherwise the server ends at the first "__"."""
     if isinstance(name, str) and name.startswith("mcp__") and "__" in name[5:]:
-        return "MCP " + name[5:].split("__", 1)[0]
+        named = [server for server in servers or () if isinstance(server, str) and name.startswith(f"mcp__{server}__")]
+        return "MCP " + (max(named, key=len) if named else name[5:].split("__", 1)[0])
     return BUILT_IN_GROUP
 
 
-def tool_groups(tools, tokens):
-    """{group: tokens}: tokens (the breakdown's tool_definitions) split over tool_group in proportion to each
-    group's definitions, built-in tools first, then the servers in the order they are offered. The parts add
-    up to tokens exactly; {} without tools."""
+def tool_groups(tools, tokens, servers=()):
+    """{group: tokens}: tokens (the breakdown's tool_definitions) split over tool_group(name, servers) in
+    proportion to each group's definitions, built-in tools first, then the servers in the order they are
+    offered. The parts add up to tokens exactly; {} without tools."""
     sizes = {}
     for tool in tools or ():
         function = tool.get("function") if isinstance(tool, dict) else None
-        group = tool_group(function.get("name") if isinstance(function, dict) else None)
+        group = tool_group(function.get("name") if isinstance(function, dict) else None, servers)
         sizes[group] = sizes.get(group, 0) + _weighted_size(tool)
     if not sizes:
         return {}
@@ -1249,7 +1251,7 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
                           default_reply_reserve=DEFAULT_MAX_OUTPUT_TOKENS,
                           auto_compact_percent=MAX_AUTO_COMPACT_PERCENT, record_requests=False, app_record=None,
                           output_allowance=0, completed_calls=None, model_window=None, anchor=None,
-                          on_compaction=None):
+                          on_compaction=None, tool_servers=()):
     """(messages, state, info) for the next request, compacting earlier turns when needed.
 
     Compaction runs when force_compact is set or the estimate passes auto_compact_percent
@@ -1264,7 +1266,8 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
     plus the scaled new content, for the threshold, the budget checks and the meter; cut candidates,
     the summary requests and the byte guard keep the scaled or raw estimate. on_compaction(trigger)
     is called once a compaction's cut is chosen, before its first summary request ("manual",
-    "in_turn" or "auto"). The defaults keep the behaviour before these options.
+    "in_turn" or "auto"). tool_servers (the MCP server IDs) names the meter's tool groups (tool_group).
+    The defaults keep the behaviour before these options.
     """
     if not MIN_CONTEXT_WINDOW <= context_window <= MAX_CONTEXT_WINDOW:
         raise ValueError(f"Choose a context window between {MIN_CONTEXT_WINDOW} and {MAX_CONTEXT_WINDOW}.")
@@ -1557,7 +1560,7 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
     info = {"estimated_tokens": estimate, "input_budget": input_budget, "context_window": context_window,
             "reply_reserve": reply_reserve, "compactions": state["compactions"],
             "summarized_messages": state["through"], "estimate_method": "weighted_utf8",
-            "breakdown": breakdown, "tool_groups": tool_groups(tools, breakdown["tool_definitions"]),
+            "breakdown": breakdown, "tool_groups": tool_groups(tools, breakdown["tool_definitions"], tool_servers),
             "auto_compact_threshold": threshold, "auto_compact_percent": auto_compact_percent,
             # Whether Compact now has earlier turns to summarize. It describes the chat until its next
             # user message, which prepares a request again; steps within a turn add no turn start.

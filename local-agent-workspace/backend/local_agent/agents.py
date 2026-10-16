@@ -2489,9 +2489,12 @@ class AgentManager(LifecycleHooks):
         async def summarize(*args):
             raise TooLong
         try:
+            # Anchored like the chat's own requests (the question extends the last reported one), so a question
+            # fits whenever the chat's own next request does.
             messages, _, _ = await prepare_context(
                 model_history(history), state, system, definitions, context_window, summarize,
-                reply_reserve=reserve, scale=estimate_scale(session.get("inference_calls"), session["model"]))
+                reply_reserve=reserve, scale=estimate_scale(session.get("inference_calls"), session["model"]),
+                anchor=self.estimate_anchor(session))
         except ValueError as exc:
             if isinstance(exc.__cause__, TooLong):
                 raise ValueError(SIDE_TOO_LONG) from None
@@ -4184,7 +4187,7 @@ class AgentManager(LifecycleHooks):
                     auto_compact_percent=auto_compact_percent(self.settings.values), record_requests=True,
                     app_record=record, output_allowance=allowance, completed_calls=completed_call_ids(session),
                     model_window=model_context_window(session["model"]), anchor=self.estimate_anchor(session),
-                    on_compaction=self.compaction_trigger(session))
+                    on_compaction=self.compaction_trigger(session), tool_servers=self.mcp_server_ids())
             views, updated = forget_summarized_reads(session.get("file_views") or {}, updated, holder["forgotten"])
             info = {**info, "instruction_files": guidance["files"], "instruction_sources": guidance["sources"],
                     "warnings": warnings, "prepared_for_next_turn": True, **last_request(session),
@@ -4588,6 +4591,13 @@ class AgentManager(LifecycleHooks):
         return {"model": fallback, "from": primary, "reason": reason, "url": serving.invocations_url(host, fallback),
                 "payload": payload, "body": body, "effort": effort, "cache": cache, "max_tokens": max_tokens}
 
+    def mcp_server_ids(self):
+        """The configured MCP server IDs (the meter's tool groups: context.tool_group)."""
+        config = getattr(self.extensions, "config", None)
+        servers = config.get("servers") if isinstance(config, dict) else None
+        return [server["id"] for server in servers or ()
+                if isinstance(server, dict) and isinstance(server.get("id"), str)]
+
     def estimate_anchor(self, session):
         """The anchor of the chat's next estimates (estimate_anchors) when its endpoint reported it, else None."""
         anchor = self.estimate_anchors.get(session["id"])
@@ -4674,17 +4684,23 @@ class AgentManager(LifecycleHooks):
                        "auto_compact_percent": percent, "auto_compact_threshold": threshold}
             estimate = info.get("next_estimate")
             if isinstance(estimate, dict) and type(estimate.get("tokens")) is int:
-                tokens, scale, anchor = estimate["tokens"], estimate.get("scale"), estimate.get("anchor")
-                estimate = {key: value for key, value in estimate.items() if key != "anchor"}
+                tokens, scale = estimate["tokens"], estimate.get("scale")
+                anchor = estimate.get("anchor") or estimate.get("held_anchor")
+                estimate = {key: value for key, value in estimate.items() if key not in ("anchor", "held_anchor")}
                 if type(scale) is float and scale > 0:
                     current = float(estimate_scale(session.get("inference_calls"), session.get("model")))
                     if isinstance(anchor, dict) and type(anchor.get("raw")) is int:
-                        if anchor.get("model") == session.get("model"):
+                        live = self.estimate_anchor(session)  # The next request's anchor (none after a restart).
+                        if (live is not None and anchor.get("model") == live["model"]
+                                and anchor.get("reported") == live.get("reported")):
                             added = anchor.get("added") if type(anchor.get("added")) is int else 0
                             tokens = anchor["reported"] + (math.ceil(added * current) if added > 0 else added)
                             estimate["anchor"] = anchor
                         else:
-                            tokens = math.ceil(anchor["raw"] * current)  # The new endpoint counts it all anew.
+                            tokens = math.ceil(anchor["raw"] * current)  # Counted anew (another endpoint) or scaled.
+                            if anchor.get("model") != session.get("model"):
+                                # Held for a change back with no request between: estimate_anchors keeps it.
+                                estimate["held_anchor"] = anchor
                         scale = current
                     else:
                         tokens, scale = (tokens, scale) if current == scale else (math.ceil(tokens * current / scale),
@@ -4927,7 +4943,7 @@ class AgentManager(LifecycleHooks):
                     auto_compact_percent=auto_compact_percent(self.settings.values), record_requests=True,
                     app_record=record, output_allowance=allowance, completed_calls=completed_call_ids(session),
                     model_window=model_context_window(session["model"]), anchor=self.estimate_anchor(session),
-                    on_compaction=self.compaction_trigger(session))
+                    on_compaction=self.compaction_trigger(session), tool_servers=self.mcp_server_ids())
                 # What the next request must start with to anchor its estimate on this one (without the note).
                 self.anchor_candidates[session["id"]] = anchor_candidate(messages)
                 if note and messages[-1] is history[-1]:

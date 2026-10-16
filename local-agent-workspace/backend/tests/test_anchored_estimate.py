@@ -107,6 +107,12 @@ def test_tool_groups_split_the_definitions_exactly():
     assert list(groups) == ["Built-in tools", "MCP docs", "MCP git_hub"] and sum(groups.values()) == 1_234
     assert groups["MCP docs"] > groups["MCP git_hub"]
     assert tool_groups(tools[1:2], 50) == {"MCP docs": 50}
+    # A saved server ID containing "__" keeps its own row when the configured IDs are known.
+    legacy = [{"type": "function", "function": {"name": f"mcp__team__{part}__search", "parameters": {}}}
+              for part in ("a", "b")]
+    assert list(tool_groups(legacy, 100)) == ["MCP team"]
+    assert list(tool_groups(legacy, 100, ["team", "team__a", "team__b"])) == ["MCP team__a", "MCP team__b"]
+    assert list(tool_groups(tools, 100, ["team__a"])) == ["Built-in tools", "MCP docs", "MCP git_hub"]
 
 
 # Agent requests (fake Databricks gateway)
@@ -216,6 +222,22 @@ async def test_a_report_that_cannot_anchor_leaves_the_scaled_estimate(runtime, m
         agent_calls(session)[-1]["estimated_input_tokens"] * estimate_scale(session["inference_calls"], session["model"]))
 
 
+async def test_a_report_that_cannot_anchor_keeps_the_previous_anchor(runtime, monkeypatch):
+    manager, session, _ = runtime
+    good = lambda raw: {"prompt_tokens": raw * 7 // 10, "completion_tokens": 5}
+    doubled = lambda raw: {"prompt_tokens": raw, "cache_read_input_tokens": raw, "completion_tokens": 5}
+    usages = [good, doubled, good]
+    gateway(monkeypatch, lambda raw: usages.pop(0)(raw))
+    await manager.run(session, "Hello " * 100)
+    first = agent_calls(session)[-1]
+    await manager.run(session, "Again")  # Its report looks counted twice: the first one still anchors.
+    await manager.run(session, "And once more")
+    # That prefix is still exactly what Databricks counted for the first request.
+    assert session["context_info"]["estimate_anchor"]["reported"] == first["usage"]["input_tokens"]
+    assert session["context_info"]["estimate_anchor"]["added"] == (
+        agent_calls(session)[-1]["estimated_input_tokens"] - first["estimated_input_tokens"])
+
+
 async def test_a_prose_heavy_chat_compacts_later_than_with_the_scaled_estimate(runtime, monkeypatch):
     manager = runtime[0]
     # Plain prose: Databricks counts about 70% of the heuristic, and the scale never goes below 1.
@@ -265,3 +287,48 @@ async def test_a_step_note_never_breaks_the_anchor(runtime, monkeypatch):
     info, calls = session["context_info"], agent_calls(session)
     assert info["estimate_anchor"]["reported"] == calls[-2]["usage"]["input_tokens"]
     assert calls[-1]["estimated_input_tokens"] == estimate_tokens(unmarked(bodies[-1])["messages"], bodies[-1]["tools"])
+
+
+async def test_a_side_question_fits_while_the_anchored_chat_has_room(runtime, monkeypatch):
+    """/btw estimates the conversation as the chat's own requests do: a prose chat, which now compacts later,
+    never refuses a side question as too long before it compacts."""
+    from local_agent import agents
+    from local_agent.agents import SIDE_TOO_LONG
+    manager, session, _ = runtime
+    gateway(monkeypatch, lambda raw: {"prompt_tokens": raw * 7 // 10, "completion_tokens": 5})
+    prepared, original = [], agents.prepare_context
+
+    async def watched(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        prepared.append(result[2])
+        return result
+    monkeypatch.setattr(agents, "prepare_context", watched)
+    anchored = 0
+    for turn in range(1, 60):
+        await manager.run(session, f"Part {turn}: " + "the quick brown fox jumps over the lazy dog " * 60)
+        if session.get("context_state", {}).get("compactions"):
+            break
+        prepared.clear()
+        try:
+            await manager.side_question(session["id"], "What was part one about?")
+        except ValueError as exc:
+            assert str(exc) != SIDE_TOO_LONG, (turn, session["context_info"]["next_estimate"])
+            raise
+        anchored += "estimate_anchor" in prepared[-1]
+    else:
+        raise AssertionError("never compacted")
+    # It compacted later than the scaled estimate would have (turn 17), and every question was anchored.
+    assert turn > 20 and anchored == turn - 1
+
+
+async def test_the_meter_groups_tools_by_the_configured_server_ids(runtime, monkeypatch):
+    manager, session, _ = runtime
+    gateway(monkeypatch)
+    # Saved before new IDs had to avoid "__" (enabled=False: nothing starts).
+    manager.extensions.config = {"servers": [{"id": server, "name": server, "transport": "stdio", "command": "program",
+                                              "enabled": False} for server in ("team", "team__a")], "hooks": []}
+    external = [{"type": "function", "function": {"name": f"mcp__{server}__search", "description": "Search.",
+                                                  "parameters": {"type": "object", "properties": {}}}}
+                for server in ("team", "team__a")]
+    await manager._run_databricks(session, "Hello", external)
+    assert list(session["context_info"]["tool_groups"]) == ["Built-in tools", "MCP team", "MCP team__a"]

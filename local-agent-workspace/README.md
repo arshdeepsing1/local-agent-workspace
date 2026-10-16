@@ -799,11 +799,11 @@ when opening a conversation or performing restart recovery.
   Before each model request the app checks the 200 most recent of these files and, if
   any changed or were deleted (your editor saves, an Undo, a command), adds one line
   naming up to 10 of them; it repeats on each request until the file is read again. A
-  deleted file is named once. The background-jobs line (see **Background jobs**) goes the
-  same way. With **Prompt caching** at **Automatic** on a Claude endpoint, these lines end
-  the request's last message (your message or the last tool result), after its cache
-  marker, as `[Note from the app, not the user's words or tool output: …]`: that request
-  only, never the saved history, an export or a summary. So a line that appears or goes
+  deleted file is named once. The line naming finished background jobs (see **Local access
+  and limits**) goes the same way. With **Prompt caching** at **Automatic** on a Claude
+  endpoint, these lines end the request's last message (your message or the last tool
+  result), after its cache marker, as `[Note from the app, not the user's words or tool
+  output: …]`: that request only, never the saved history, an export or a summary. So a line that appears or goes
   never rewrites the cached conversation. Otherwise (Documented forms only, Off, other
   endpoints) they end the system message, as before. The system message keeps its stable
   parts first and puts the folder grants and the current date last. On Claude endpoints the
@@ -1488,11 +1488,12 @@ then exact, which matters most for text the heuristic overestimates, such as pla
 a chat compacts later, closer to its real size. The context details say "Anchored on the last
 reported count: N tokens Databricks reported for the previous request + ~M tokens added since",
 and the next-request estimate says it is anchored. The anchor is kept in memory only: after a
-restart, a compaction, a rewind or an edited message, a model change, a fallback request, or a
-report that is partial, misses input tokens or looks counted twice, the scaled estimate applies
-until the next report. The automatic compaction threshold, the budget checks and the meter use
-the anchored estimate; the usage ledger, the estimate scale, the cuts compaction considers and
-the 4 MB check keep the heuristic estimate.
+restart, a compaction, a rewind or an edited message, or a change to another model (changing
+back before any request anchors again), the scaled estimate applies until the next report. A fallback request, or a report
+that is partial, misses input tokens or looks counted twice, leaves the previous anchor (with
+none, the scaled estimate). The automatic compaction threshold, the budget checks, side questions
+(`/btw`) and the meter use the anchored estimate; the usage ledger, the estimate scale, the cuts
+compaction considers and the 4 MB check keep the heuristic estimate.
 Expanded context details attribute that same estimate to system/project
 instructions (including skills selected for the chat), tool definitions (split per MCP server,
 for example "Built-in tools · ~5,900 tokens" and "MCP docs · ~640 tokens", when an MCP server's
@@ -1584,7 +1585,8 @@ example `[Output cleared by the app before summarizing: 16 KB from read_file src
 older turn. …]`; a failed or timed-out command keeps the last 600 bytes of its output, where
 the error usually is. The assistant's replies, which used those results, stay. A long chat
 then needs fewer and smaller paid summary requests; the agent's own context and the saved
-history keep every result, and a compaction inside one long request (one turn) keeps them all.
+history keep every result, and a compaction inside one long request keeps that request's results
+(only turns older than the latest three are cleared, as above).
 The compaction record in the notice's data counts them (`cleared_results`, `cleared_bytes`).
 The summary, handoff and condense prompts say that the app records the files read and changed
 itself (the app record below), so the summary's **Files read and changed** names only the files
