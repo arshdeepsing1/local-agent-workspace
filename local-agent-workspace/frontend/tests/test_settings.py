@@ -57,6 +57,44 @@ def test_saved_values_show_and_the_put_carries_the_new_fields(ui, page):
     assert body["rate_limit_auto_continue"] is False
 
 
+def test_prompt_caching_is_chosen_in_the_model_group_and_saved(ui, page):
+    dialog = open_settings(ui, page, setup="fake.settings = { ...fake.settings, prompt_caching: 'auto' }")
+    group = dialog.get_by_role("group", name="Model and context")
+    caching = group.get_by_role("combobox", name="Prompt caching")
+    expect(caching).to_have_value("auto")
+    expect(caching.locator("option")).to_have_text(["Automatic (Claude endpoints)", "Documented forms only", "Off"])
+    expect(group.get_by_text(re.compile(r"^Marks the stable start of each agent request so Databricks can bill repeated "
+                                        r"input at the cache-read rate \(about 5% of the input price\)\. Writes cost 25% "
+                                        r"more; entries expire after 5 minutes\. Documented forms only marks just your "
+                                        r"last message or the last tool call\.$"))).to_be_visible()
+    caching.select_option("off")
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    assert ui.bodies("/api/settings", "PUT")[0]["prompt_caching"] == "off"
+
+
+def test_documented_forms_only_is_chosen_and_saved(ui, page):
+    dialog = open_settings(ui, page)
+    caching = dialog.get_by_role("combobox", name="Prompt caching")
+    expect(caching).to_have_value("auto")
+    caching.select_option(label="Documented forms only")
+    expect(caching).to_have_value("messages")
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    assert ui.bodies("/api/settings", "PUT")[0]["prompt_caching"] == "messages"
+    # Saved, it is shown again when Settings open next.
+    page.get_by_role("button", name="Settings", exact=True).click()
+    expect(page.get_by_role("dialog").get_by_role("combobox", name="Prompt caching")).to_have_value("messages")
+
+
+def test_a_saved_prompt_caching_choice_is_shown_and_kept(ui, page):
+    dialog = open_settings(ui, page, setup="fake.settings = { ...fake.settings, prompt_caching: 'off' }")
+    expect(dialog.get_by_role("combobox", name="Prompt caching")).to_have_value("off")
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    assert ui.bodies("/api/settings", "PUT")[0]["prompt_caching"] == "off"
+
+
 def test_a_rejected_name_shows_the_server_message(ui, page):
     dialog = open_settings(ui, page, setup="""fake.override = (path, options) => path === '/api/settings' && options.method === 'PUT'
       ? fake.json({ detail: 'LD_PRELOAD changes how programs start and cannot be passed to commands.' }, 400) : undefined""")

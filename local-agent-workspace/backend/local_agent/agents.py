@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -49,13 +50,13 @@ from .planning import CallAllowance, DelegateManager, DelegationGate, TaskManage
 from .interactions import InteractionManager
 from .feature_tools import FEATURE_TOOLS
 from .tool_profiles import tool_allowed, filter_tools
-from . import reasoning
-from .reasoning import reasoning_delta
+from . import prompt_cache, reasoning
+from .reasoning import reasoning_delta, reasoning_shape
 from . import spending
 from .titles import fallback_title, generate_title, needs_title
 from .telemetry import (
     InferenceError, begin_inference_call, finish_inference_call, http_error_kind,
-    record_response_id, reported_usage, request_tag_headers, stream_error_kind,
+    record_response_id, reported_usage, request_tag_headers, stream_error_kind, usage_keys,
 )
 from .model_stream import ToolCallBuffer, error_body_prefix, sse_data
 from .tool_schema import validate_arguments
@@ -70,7 +71,7 @@ from .context import retained_request as context_retained
 from . import history
 from .tool_errors import tool_error_text
 from .projects import ProjectSettings
-from .model_profiles import default_limits, effective_limits, thinking_reserve
+from .model_profiles import default_limits, effective_limits, prompt_caching, thinking_reserve
 from . import user_paths
 from . import mentions
 from .composer_api import (MAX_QUEUED, MAX_QUEUED_CHARS, SHELL_ONE_LINE, SIDE_QUESTION_PREFIX, SIDE_TOO_LONG,
@@ -757,6 +758,12 @@ class AgentManager(LifecycleHooks):
         # In memory only: {(endpoint, request format): field} for reasoning fields Databricks rejected
         # with HTTP 400. Requests to that endpoint go without them until a restart or a Settings save.
         self.reasoning_rejections = {}
+        # In memory only: {endpoint: prompt_cache level} after Databricks rejected cache markers with HTTP 400
+        # and a lower level went through; until a restart or a Settings save. And {chat id: hash of the
+        # system message's changing part} of each chat's latest agent request that Databricks answered with HTTP
+        # 200 (the ledger's system_tail_changed).
+        self.cache_levels = {}
+        self.system_tails = {}
         # The lifespan writes the marker after every task and job stopped. It is removed before
         # anything else, so a crash during this run gives a full scan next time. Without it (a
         # crash, a failed shutdown, a fresh or older state folder) every conversation is loaded.
@@ -1820,6 +1827,17 @@ class AgentManager(LifecycleHooks):
         model = session["model"]
         rejected = self.reasoning_rejections.get((model, reasoning.request_format(model, setting)))
         return reasoning.effort_request(model, effort, setting, values.get("thinking_summaries") is not False, rejected)
+
+    def cache_level(self, session):
+        """The prompt_cache level the chat's next agent request starts at, or None for an endpoint that never
+        gets cache markers (no Databricks-hosted Claude profile): the lower of Settings → Prompt caching
+        ("full" for Automatic, "messages" for Documented forms only, "off") and the level a rejection lowered
+        this endpoint to (cache_levels)."""
+        if not prompt_caching(session["model"]):
+            return None
+        chosen = {"auto": "full", "messages": "messages"}.get(self.settings.values.get("prompt_caching", "auto"), "off")
+        remembered = self.cache_levels.get(session["model"], "full")
+        return max(chosen, remembered, key=prompt_cache.LEVELS.index)
 
     async def rules_changed(self, scope, session=None):
         """Publish and re-check after a rule change: the chat, every live chat of the project, or every live chat."""
@@ -3224,8 +3242,9 @@ class AgentManager(LifecycleHooks):
                 guidance["sources"].append({"path": "Agent index", "scope": "this workspace", "status": "loaded",
                                             "estimated_tokens": estimate_text_tokens(agents)})
         # Stable text first and the parts that change between requests last, so a
-        # provider's prompt prefix caching can reuse the longest possible prefix.
-        system = {"role": "system", "content": SYSTEM_PROMPT + "\n" + user_block + mode_prompt(mode, bool(session.get("is_subagent")))
+        # provider's prompt prefix caching can reuse the longest possible prefix. Agent
+        # requests to Claude endpoints mark where the stable text ends (prompt_cache.py).
+        stable = (SYSTEM_PROMPT + "\n" + user_block + mode_prompt(mode, bool(session.get("is_subagent")))
                   + (f"\nEnforced tool profile: {session['tool_profile']}. Commands, MCP tools and hooks are unavailable."
                      if session.get("tool_profile", "inherit") != "inherit" else "")
                   + "\nWorkspace: " + session["workspace"]
@@ -3237,11 +3256,12 @@ class AgentManager(LifecycleHooks):
                   + ("\n" + index if index else "")
                   + ("\n" + agents if agents else "")
                   + "\n" + guidance["text"] + "\n" + tools.skill_signature
-                  + ("\nProject instruction warnings: " + json.dumps(guidance["warnings"]) if guidance["warnings"] else "")
-                  + "\nAdditional allowed folders: " + json.dumps(session.get("allowed_directories", []))
-                  + "\n" + current_time_text(commands=available is None or "run_command" in available)
-                  + ("\n" + notice if notice else "")}
-        return system, guidance
+                  + ("\nProject instruction warnings: " + json.dumps(guidance["warnings"]) if guidance["warnings"] else ""))
+        tail = ("\nAdditional allowed folders: " + json.dumps(session.get("allowed_directories", []))
+                + "\n" + current_time_text(commands=available is None or "run_command" in available)
+                + ("\n" + notice if notice else ""))
+        guidance["cache_prefix_chars"] = len(stable)
+        return {"role": "system", "content": stable + tail}, guidance
 
     def input_budget(self, session):
         """The input budget prepare_context uses for this chat's requests."""
@@ -3714,11 +3734,14 @@ class AgentManager(LifecycleHooks):
             await self.status(session, "idle")
 
     async def model_response(self, session, event, client, url, headers, payload, retry_reason=None, body=None,
-                             effort=None):
+                             effort=None, cache=None, accepted=None):
         """One streamed agent request. retry_reason (ledger only) names why the app sent it automatically.
-        body is payload already encoded (request_limits.encode_payload); those exact bytes are sent.
-        effort is the request's reasoning (AgentManager.reasoning_request), recorded in request_info and
-        the ledger; a 400 that names one of its fields marks the error with reasoning_rejected."""
+        body is payload already encoded (request_limits.encode_payload); those exact bytes are sent (with
+        any prompt-cache markers; payload has none). effort is the request's reasoning
+        (AgentManager.reasoning_request), recorded in request_info and the ledger; a 400 that names one of
+        its fields marks the error with reasoning_rejected. cache ({prompt_cache, system_tail_changed}) is
+        copied into the ledger. accepted, when given, is awaited once Databricks answers HTTP 200, before
+        the stream is read."""
         body = encode_payload(payload) if body is None else body
         started = request_clock()
         info = dict(event["request_info"])
@@ -3748,6 +3771,13 @@ class AgentManager(LifecycleHooks):
             for key, name in (("effort_field", "effort_field"), ("skipped", "reasoning_skipped")):
                 if effort.get(key):
                     call[name] = effort[key]
+        if cache is not None:
+            if cache.get("prompt_cache") in prompt_cache.LEVELS:
+                call["prompt_cache"] = cache["prompt_cache"]  # The level of cache markers this attempt carried.
+            if cache.get("system_tail_changed") is True:
+                call["system_tail_changed"] = True
+        # The response's shape for the ledger (names and flags only; finish_inference_call bounds them).
+        shape = {}
         # Record the attempt durably before sending it to the provider. Later
         # stream checkpoints replace this running state with the final outcome.
         self.store.save(session)
@@ -3771,6 +3801,9 @@ class AgentManager(LifecycleHooks):
                                      content=body) as response:
                 info["http_status"] = response.status_code
                 draft.changed()
+                if response.status_code == 200 and accepted is not None:
+                    await accepted()
+                    event["request_info"] = info  # Moving the reply below a notice replaced its request details.
                 if response.status_code != 200:
                     error_text, truncated = await error_body_prefix(response)
                     diagnostic = self.settings.redact(error_text)
@@ -3793,8 +3826,10 @@ class AgentManager(LifecycleHooks):
                             info["rate_limit"] = request_info_fields(rate)
                     elif response.status_code in SERVER_RETRY_STATUSES:
                         mark_retryable(error, "server_error", response.headers, error_text)
-                    elif response.status_code == 400 and effort is not None:
-                        error.reasoning_rejected = reasoning.rejected_field(error_text, effort)
+                    elif response.status_code == 400:
+                        if effort is not None:
+                            error.reasoning_rejected = reasoning.rejected_field(error_text, effort)
+                        error.cache_named = prompt_cache.rejected(error_text)  # The notice's wording only.
                     raise error
                 async for data in sse_data(response):
                     if data == "[DONE]":
@@ -3803,6 +3838,8 @@ class AgentManager(LifecycleHooks):
                     if not isinstance(chunk, dict):
                         raise InferenceError("The model returned an invalid streaming response.", "invalid_response")
                     record_response_id(call, chunk.get("id"))
+                    if isinstance(chunk.get("usage"), dict):
+                        shape["usage_keys"] = usage_keys(chunk["usage"], shape.get("usage_keys", ()))
                     usage = reported_usage(chunk.get("usage"))
                     if usage:
                         # Streaming counts are cumulative snapshots, never additive deltas.
@@ -3816,6 +3853,12 @@ class AgentManager(LifecycleHooks):
                     for choice in choices:
                         delta = choice.get("delta", {})
                         summary, thought = reasoning_delta(delta)
+                        if thought:
+                            kind, signed = reasoning_shape(delta)
+                            if kind:
+                                shape.setdefault("reasoning_shape", kind)  # The first delta's shape.
+                            if signed:
+                                shape["reasoning_signature"] = True
                         if thought and thinking["since"] is None:
                             # Even an item with no text (thinking the endpoint does not show) starts the clock.
                             thinking["since"] = thinking_clock()
@@ -3939,7 +3982,7 @@ class AgentManager(LifecycleHooks):
                 elif (info.get("usage") or {}).get("reasoning_tokens"):
                     # Reasoning the endpoint counted but did not show: about the time before the answer began.
                     event["reasoning_seconds"] = round(max(0.0, end - thinking["sent"]), 1)
-            finish_inference_call(call, info)
+            finish_inference_call(call, {**info, **shape})
             await draft.close()
             if call.get("purpose") == "agent":
                 await self.note_last_request(session, call)
@@ -3949,6 +3992,36 @@ class AgentManager(LifecycleHooks):
                 info.update(status="error", error_kind="unknown")
                 await self.broadcast(session["id"], {"type": "event", "event": event})
                 raise DraftPersistenceError(exc) from exc
+
+    @staticmethod
+    def cache_body(payload, prefix, level):
+        """(body, level sent) of an agent request: payload encoded with the prompt-cache markers of level
+        (prompt_cache.marked; prefix is where the system message's stable text ends). The level sent is None
+        for an endpoint without prompt caching (level None) and "off" when level adds no marker."""
+        if level is None:
+            return encode_payload(payload), None
+        sent = prompt_cache.marked(payload, prefix, level)
+        return encode_payload(sent), level if prompt_cache.markers(sent) else "off"
+
+    async def request_accepted(self, session, event, tail, lowered):
+        """Databricks answered an agent request with HTTP 200: its system tail hash is what the chat's next request
+        compares with (system_tail_changed), and a lower cache level it was sent at after a rejection is kept."""
+        self.system_tails[session["id"]] = tail
+        if lowered:
+            await self.cache_lowered(session, event, lowered)
+
+    async def cache_lowered(self, session, event, lowered):
+        """Databricks accepted a request sent again with fewer cache markers after an HTTP 400: requests to
+        the endpoint use that level until a restart or a Settings save, and a notice above the reply says so."""
+        level, named = lowered.pop("level"), lowered.pop("named", False)
+        self.cache_levels[session["model"]] = level
+        await self.event(session, "notice", text=(
+            f"Databricks rejected {'prompt caching (cache_control)' if named else 'the cache markers'} for "
+            f"{session['model']} (HTTP 400), so the app sent the request again "
+            f"{'with fewer cache markers' if level != 'off' else 'without them'}. Requests to this endpoint use that "
+            "until the app restarts or Settings are saved. To stop sending cache markers, set Settings → Model and "
+            "context → Prompt caching to Off."))
+        await self.reply_after_notices(session, event)
 
     async def note_last_request(self, session, call):
         """Show what Databricks reported for this agent request in the context meter. Never raises."""
@@ -4230,7 +4303,10 @@ class AgentManager(LifecycleHooks):
                 # The exact bytes sent: the meter shows the size of this request in the same update.
                 payload = {"messages": messages, "tools": definitions, "stream": True,
                            "max_tokens": max_output_tokens, **effort["fields"]}
-                body = encode_payload(payload)
+                # Prompt-cache markers go into the body only; payload stays what estimates, the ledger and the meter read.
+                prefix = guidance["cache_prefix_chars"]
+                body, cache_sent = self.cache_body(payload, prefix, self.cache_level(session))
+                tail = hashlib.sha256(system["content"][prefix:].encode("utf-8")).hexdigest()
                 session["context_info"] = {**info, "instruction_files": guidance["files"], "instruction_sources": guidance["sources"],
                                            "warnings": guidance["warnings"], **last_request(session),
                                            **prior_flag(session), "payload_bytes": len(body),
@@ -4247,26 +4323,36 @@ class AgentManager(LifecycleHooks):
                     # Requests that got no usable status (429, 502/503/504, a failed connection)
                     # are repeated unchanged, sharing one budget; then, for a rate limit only,
                     # up to MAX_RATE_LIMIT_WAITS longer waits per turn when Settings allows them.
-                    transient_attempt, reasoning_resent = 0, False
+                    # A 400 to a request with cache markers sends it again one level lower; lowered holds that
+                    # level until Databricks accepts it (its own budget: the transient one is not used).
+                    transient_attempt, reasoning_resent, lowered = 0, False, {}
                     while True:
                         try:
                             # Another chat's 429 on this endpoint: wait with it instead of adding to the overload.
                             await self.wait_for_rate_limit(session, "the model request", max_output_tokens)
                             await self.reply_after_notices(session, event)
+                            # Compared with the tail of the chat's last request Databricks answered (HTTP 200), so
+                            # a failed attempt moves nothing and the attempt that is served keeps the flag.
+                            previous_tail = self.system_tails.get(session["id"])
                             ordered_calls, arguments = await self.model_response(
                                 session, event, client, url, headers, payload, retry_reason=retry_reason, body=body,
-                                effort=effort)
+                                effort=effort, cache={"prompt_cache": cache_sent,
+                                                      "system_tail_changed": previous_tail not in (None, tail)},
+                                accepted=lambda: self.request_accepted(session, event, tail, lowered))
                             break
                         except InferenceError as exc:
                             field = getattr(exc, "reasoning_rejected", None)
-                            if field and not reasoning_resent:
+                            # A 400 that names caching to a request with markers goes down the cache levels first,
+                            # even when it also mentions a reasoning term; other reasoning-field 400s come first.
+                            cache_named = cache_sent not in (None, "off") and getattr(exc, "cache_named", False)
+                            if field and not reasoning_resent and not cache_named:
                                 # A 400 before any stream that names a reasoning field this request added: the
                                 # guess about the endpoint's fields was wrong. Send it once more without them, and
                                 # skip them for this endpoint and format until a restart or a Settings save.
                                 reasoning_resent = True
                                 self.reasoning_rejections[(session["model"], effort["format"])] = field
                                 payload = {key: value for key, value in payload.items() if key not in effort["fields"]}
-                                body = encode_payload(payload)
+                                body, cache_sent = self.cache_body(payload, prefix, cache_sent)
                                 effort = reasoning.without_fields(effort, field)
                                 retry_reason = "reasoning_rejected"
                                 await self.event(session, "notice", text=(
@@ -4274,6 +4360,16 @@ class AgentManager(LifecycleHooks):
                                     "so the app sent the request again without reasoning fields. Requests to this "
                                     "endpoint skip them until the app restarts or Settings are saved. To send them "
                                     "another way, change Settings → Reasoning → Request format."))
+                                continue
+                            if exc.http_status == 400 and cache_sent not in (None, "off"):
+                                # A 400 before any stream to a request with cache markers: Databricks may word a
+                                # rejection of them any way, so send it again with fewer markers (full, then
+                                # messages, then none). The lower level is remembered only once one is accepted;
+                                # if even the unmarked request fails, its error is shown and nothing is remembered.
+                                lowered["named"] = lowered.get("named", False) or getattr(exc, "cache_named", False)
+                                body, cache_sent = self.cache_body(payload, prefix, prompt_cache.next_level(cache_sent))
+                                lowered["level"] = cache_sent
+                                retry_reason = "cache_rejected"
                                 continue
                             if not getattr(exc, "retryable", False):
                                 raise

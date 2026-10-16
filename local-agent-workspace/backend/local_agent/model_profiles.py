@@ -47,6 +47,11 @@ LIMITS_CHECKED = "2026-10-13"
 # not billing). Databricks documents the Anthropic fields on its Anthropic Messages route; that its
 # chat-completions route (the one this app uses) passes them on is unverified, so a 400 naming one
 # of them makes the app resend without them (AgentManager.model_response, reasoning.rejected_field).
+#
+# Prompt caching (checked 2026-10-16: the Databricks Foundation Model APIs reference): "cache_control":
+# {"type": "ephemeral"} on content parts and assistant tool_calls is accepted only by Databricks-hosted
+# Claude models. prompt_caching marks the endpoints that get cache
+# markers on agent requests (prompt_cache.py); endpoints without a profile get none.
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 MODEL_PROFILES = {
     "databricks-claude-opus-5-5": {
@@ -55,14 +60,14 @@ MODEL_PROFILES = {
         "recommended_context_window": 200_000, "recommended_max_output_tokens": 16_384,
         "thinking_reserve": 4_096,
         "reasoning_format": "anthropic", "effort_levels": CLAUDE_EFFORTS, "default_effort": "medium",
-        "thinking": "always", "effort_map": {}},
+        "thinking": "always", "effort_map": {}, "prompt_caching": True},
     "databricks-claude-opus-4-8": {
         "label": "Claude Opus 4.8", "context_max": None, "output_max": None,
         "itpm": 1_000_000, "otpm": 100_000,
         "recommended_context_window": None, "recommended_max_output_tokens": None,
         "thinking_reserve": None,
         "reasoning_format": "anthropic", "effort_levels": CLAUDE_EFFORTS, "default_effort": None,
-        "thinking": "adaptive", "effort_map": {}},
+        "thinking": "adaptive", "effort_map": {}, "prompt_caching": True},
     "databricks-gpt-oss-120b": {
         "label": "GPT OSS 120B", "context_max": 131_072, "output_max": None,
         "itpm": 1_000_000, "otpm": 100_000,
@@ -70,7 +75,7 @@ MODEL_PROFILES = {
         "thinking_reserve": None,
         # Databricks maps minimal to low and xhigh or max to high; the app sends high itself.
         "reasoning_format": "openai", "effort_levels": ("low", "medium", "high"), "default_effort": "medium",
-        "thinking": None, "effort_map": {"xhigh": "high", "max": "high"}},
+        "thinking": None, "effort_map": {"xhigh": "high", "max": "high"}, "prompt_caching": False},
 }
 # Endpoints that take reasoning like a profiled one but whose limits are not in the table.
 REASONING_ALIASES = {"databricks-gpt-oss-20b": ("databricks-gpt-oss-120b", "GPT OSS 20B")}
@@ -94,6 +99,11 @@ def reasoning_profile(model):
     if profile is None or not profile.get("reasoning_format"):
         return None
     return {"label": label or profile["label"], **{key: profile[key] for key in REASONING_KEYS}}
+
+
+def prompt_caching(model):
+    """True for an endpoint whose agent requests get prompt-cache markers (a Databricks-hosted Claude profile)."""
+    return bool((profile_for(model) or {}).get("prompt_caching"))
 
 
 def known_endpoints():

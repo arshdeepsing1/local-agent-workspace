@@ -12,6 +12,7 @@ from local_agent import mentions
 from local_agent.agents import AgentManager, forget_summarized_reads
 from local_agent.api import create_app
 from local_agent.config import Settings
+from local_agent.prompt_cache import unmarked
 from local_agent.context import (
     SAFETY_MARGIN, SUMMARY_SECTIONS, compaction_output_allowance, condense_output_tokens, estimate_scale,
     estimate_tokens, handoff_output_tokens, summary_byte_limit, summary_output_tokens, verify_declined_message,
@@ -123,8 +124,9 @@ async def test_the_next_scale_falls_from_the_opus_prior_to_the_reported_ratio(ru
         payload = json.loads(request.content)
         if not payload["stream"]:
             return summary_reply("A title")
-        # Report 1.2 times the unscaled estimate: 7.7 percent fewer than the 1.3 prior's estimate.
-        reported["tokens"] = round(estimate_tokens(payload["messages"], payload["tools"]) * 1.2)
+        # Report 1.2 times the unscaled estimate (of the request without its cache markers, as the app
+        # estimates it): 7.7 percent fewer than the 1.3 prior's estimate.
+        reported["tokens"] = round(estimate_tokens(unmarked(payload)["messages"], payload["tools"]) * 1.2)
         return sse(reply_chunk(usage={"prompt_tokens": reported["tokens"], "completion_tokens": 5}))
 
     mock_gateway(monkeypatch, gateway)

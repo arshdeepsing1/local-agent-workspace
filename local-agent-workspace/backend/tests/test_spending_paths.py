@@ -14,6 +14,7 @@ from local_agent.agents import AgentManager
 from local_agent.api import create_app
 from local_agent.config import Settings
 from local_agent.notify import attention_message
+from local_agent.prompt_cache import unmarked
 from local_agent.store import Store
 
 OPUS = "databricks-claude-opus-5-5"
@@ -42,7 +43,7 @@ def sse(delta, finish, usage=USAGE):
 
 
 def is_child(body):
-    first = next((m["content"] for m in body["messages"] if m["role"] == "user"), "")
+    first = next((m["content"] for m in unmarked(body)["messages"] if m["role"] == "user"), "")  # Without cache markers.
     return isinstance(first, str) and first.startswith("Delegated task:\n")
 
 

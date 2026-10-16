@@ -56,6 +56,8 @@ frontend that runs without a build step.
 - A reasoning effort per conversation (Default, Fast, Medium, High, Extra high, Max) sent in the
   fields each endpoint takes, and a collapsible Thinking block with the endpoint's thinking
   summary and how long it thought.
+- Prompt caching on Claude endpoints: agent requests mark their stable start, so input that repeats
+  an earlier step is billed at the cache-read rate.
 - Collapsible activity.
 - Responsive desktop/mobile UI, bundled fonts, and no credential storage in the browser.
 
@@ -733,7 +735,9 @@ when opening a conversation or performing restart recovery.
   any changed or were deleted (your editor saves, an Undo, a command), adds one line at
   the end of the system message naming up to 10 of them. A deleted file is named once.
   The system message keeps its stable parts first and puts the folder grants, the current
-  date and this line last, so a provider that caches prompt prefixes can reuse more. It
+  date and this line last. On Claude endpoints the stable part is cached on its own (see
+  **Prompt caching**), so when one of these last lines changes, the next request still reads
+  the stable part from the cache but writes the conversation after it again. It
   gives the local date and time zone but not the time of day, so it changes once a day
   rather than once a minute; the model runs `date` when it needs the exact time (a chat
   without `run_command`, such as a `read_only` subagent, is not told to).
@@ -1037,8 +1041,10 @@ Claude-style usage reports them separately. OpenAI-style usage counts cached tok
 inside `prompt_tokens` (`prompt_tokens_details.cached_tokens`); the app then records
 `prompt_tokens` minus the cached count as uncached input, so totals, the DBU estimate
 and the estimate scale do not count the cache twice (a cached count larger than
-`prompt_tokens` is left as reported). How Claude endpoints on Databricks fill these
-fields has not yet been checked against a live response. Ledger records saved before
+`prompt_tokens` is left as reported). Claude endpoints on Databricks report the cache counts
+as top-level `cache_read_input_tokens` and `cache_creation_input_tokens`; that their
+`prompt_tokens` then excludes them, as the app assumes, is still to be confirmed by one cached
+request (see **Prompt caching**). Ledger records saved before
 this change keep the counts they were saved with; those that used OpenAI-style cached
 tokens stay double-counted, because they hold only the combined input count.
 The Usage section starts with a **Last model input** row: the reported input tokens of
@@ -1107,8 +1113,9 @@ The ledger and the CSV (the `retry_reason` column, after `attempt`) record why t
 sent a request automatically: `rate_limit`, `server_error` or `network` for a repeat
 of the same request, `rate_limit_wait` after an automatic wait, `output_limit`,
 `invalid_tool_arguments` or `incomplete_response` for the request after a hidden
-continuation, `verify` for a Verify fix round, and `reasoning_rejected` for the resend
-without reasoning fields (see **Reasoning effort and thinking**). The Usage section's **Automatic
+continuation, `verify` for a Verify fix round, `reasoning_rejected` for the resend
+without reasoning fields (see **Reasoning effort and thinking**), and `cache_rejected` for the resend
+with fewer cache markers (see **Prompt caching**). The Usage section's **Automatic
 retries** tile counts these calls; **429 responses** counts rate-limited calls. The CSV's
 `effort` column (after `max_output_tokens`) and the call table name the reasoning effort a
 request asked for; it is empty for a request at Default that sent no reasoning fields.
@@ -1132,6 +1139,7 @@ ends the turn with a notice (a subagent ends with an error its parent sees), the
 continue. A reply that arrives over the limit ends the turn the same way, without Verify or stop
 hooks (they could only continue with a refused request; a subagent's final reply still reaches
 its parent), and messages queued while it ran stay queued. It is a soft cap: one response can pass it before the next request is stopped.
+Cache reads and writes count at their own rates (see **Prompt caching**).
 Calls to endpoints without price data count as nothing and are listed as not counted; title
 and compaction requests are counted but never stopped. A subagent follows its parent's limit
 (a subagent chat without its parent, such as a copy of one, has its own), and its spend is kept
@@ -1179,7 +1187,9 @@ without reasoning fields (a rejected request is not billed), posts one notice na
 field and **Settings → Reasoning → Request format**, and sends no reasoning fields to that
 endpoint in that format until the app restarts or you save Settings. Both attempts are in the
 usage ledger; the second has `retry_reason` `reasoning_rejected`. A 400 that names none of
-them is shown as an error and not repeated.
+them is not sent again without reasoning fields; on Claude endpoints the cache-marker fallback
+(see **Prompt caching**) may still send it again with fewer cache markers before the error is shown,
+and a 400 that names caching too (`cache_control`) goes to that fallback first.
 
 **Show thinking summaries** (on by default) adds `"display": "summarized"` to `thinking`.
 Claude Opus 5.5 omits its thinking text unless asked, so without it no thinking is shown; the
@@ -1193,6 +1203,70 @@ The app shows thinking text only as the endpoint returns it (redacted, up to 12,
 characters) and never sends earlier thinking back to the model. **Request details** under a
 reply show **Effort**, for example "High (output_config.effort)", and the reasoning fields
 sent.
+
+### Prompt caching
+
+Agent and subagent requests to Databricks-hosted Claude endpoints (Claude Opus 5.5 and Opus 4.8)
+carry prompt-cache markers (`"cache_control": {"type": "ephemeral"}`), so Databricks can bill
+input that repeats an earlier request at the cache-read rate. Each agent step sends the whole
+conversation again, so most of a step's input is the step before it: cache reads cost 2.857 DBU
+per million tokens on Claude Opus 5.5 instead of 57.143 for uncached input, and cache writes
+71.429 (25% more than uncached input). Titles, `/btw` side questions and compaction requests carry
+no markers (they share no start with the next request, so a marker would only add the write
+cost), and other endpoints (GPT OSS, endpoints without a profile) get none.
+
+Each agent request gets two markers: one where the system message's stable part ends (before the
+folder grants, the date and the step notices; see **Changed files** above) and one on its last
+message (your message or the last tool result). Each request then writes the conversation up to
+its end, and the next step reads it back. The markers are added to the request body only: the
+context meter's estimate, the estimate scale and compaction see the request without them; the
+request size and the 4 MB check count the bytes sent. A change in the stable part (another
+permission mode, a selected skill, edited project or custom instructions) makes the next request
+write everything again.
+
+A cache entry expires 5 minutes after it was last written or read. A step that comes more than 5
+minutes after the one before it (an approval card left waiting, a long command, a pause before your
+next message) writes the conversation again at the write rate, and a request that no other follows
+within 5 minutes paid the write cost for nothing: a single short question costs up to 25% more input
+than without caching.
+
+Databricks documents the markers on message content parts and on assistant tool calls; it does not
+document them for the system message or a tool result, which need list content for those roles.
+So when Databricks answers HTTP 400 before any reply streams to a request with markers, whatever
+the error says, the app sends it again with fewer: first only the documented forms (your last
+message, or the last tool call before its results), then none. Once Databricks accepts one, a
+notice says so above the reply, and requests to that endpoint use that level until the app
+restarts or you save Settings; if even the request without markers fails, its error is shown and
+nothing is remembered. These resends do not use up the retries after rate limits and server errors.
+A 400 that names a reasoning field the request added (see **Reasoning effort and thinking**) is
+handled by that fallback first, unless it also names caching (`cache_control`, `prompt caching`,
+`ephemeral`): then the markers go first and the reasoning fields stay. Each resend has
+`retry_reason` `cache_rejected` in the usage ledger, and each agent call to a Claude endpoint
+records the markers it was sent with as `prompt_cache` (`full`, `messages` or `off`).
+
+**Settings → Model and context → Prompt caching** is **Automatic (Claude endpoints)** (the
+default), **Documented forms only** or **Off**, which sends no markers at all. **Documented forms
+only** sends only the forms Databricks documents, the first step of the fallback above: one marker
+on your last message, or on the last tool call before its results, and none on the system message
+or a tool result. The fallback steps down only when Databricks rejects the markers; if it accepts
+them but silently ignores the undocumented ones, nothing steps down and most of each step's input
+is billed as uncached input. In the **Cache read** column of **Agent tools → Usage** that shows as
+cache reads that stay at about the size of the system message and the tool definitions on every
+step, instead of covering the conversation before it: choose **Documented forms only** then. A rejection that lowered an endpoint
+to no markers still applies until a restart or a Settings save.
+
+How Databricks counts `prompt_tokens` while the cache is in use is still to be confirmed by one
+cached request: the context meter, the estimate scale and the DBU estimate assume it excludes the
+cache reads and writes, which Databricks reports as `cache_read_input_tokens` and
+`cache_creation_input_tokens`. To help check it, the ledger in the conversation file keeps, for
+each agent and subagent request (not titles, `/btw` side questions or compaction), the key names
+of the usage object Databricks sent (`usage_keys`, never values), the shape that carried the
+model's reasoning (`reasoning_shape`) and whether a reasoning signature came
+(`reasoning_signature`, never the signature), and for an agent request whose system message's
+changing part differed from the chat's last request that Databricks answered,
+`system_tail_changed` (the conversation after it was written to the cache again; a retry after a
+429 or a server error keeps the flag, because the failed attempt wrote nothing). They are not CSV
+columns.
 
 ### Context and project instructions
 
@@ -2555,9 +2629,20 @@ Thinking display, subagents, background jobs and change review before using a pa
   (effort `low` to `max` in `output_config.effort`, default `medium`; `budget_tokens` or
   disabled thinking is refused with HTTP 400), Opus 4.8 thinks only with
   `thinking.type: "adaptive"`, GPT OSS takes `reasoning_effort` `low`/`medium`/`high`. Claude
-  endpoints stream a summary only when the request asks for `thinking.display: "summarized"`; longer
-  efforts think longer and report more reasoning tokens. Each request's reasoning fields are
-  printed in the terminal.
+  endpoints stream a summary only when the request asks for `thinking.display: "summarized"`, after
+  a short pause and ending with a blank line, as the real route does; longer efforts think longer and
+  use more output tokens. Each request's reasoning fields are printed in the terminal.
+- Usage has the shape the real route reports: for Claude endpoints `prompt_tokens` (the uncached
+  part), `completion_tokens`, `total_tokens` and top-level `cache_read_input_tokens` and
+  `cache_creation_input_tokens`, without reasoning tokens; GPT OSS keeps the OpenAI-style shape
+  (cached tokens inside `prompt_tokens`, `completion_tokens_details.reasoning_tokens`).
+- Claude endpoints take the app's cache markers (only `{"type": "ephemeral"}`, at most 4; other
+  endpoints refuse them with HTTP 400) and keep an in-memory prefix cache per endpoint (5 minutes,
+  refreshed on each read), so a step reads what the step before it wrote; the terminal prints
+  `cache: read N, wrote M` per request. `--cache documented` refuses list content for the system
+  message and tool results (the forms Databricks does not document), `--cache reject` refuses any
+  `cache_control`, to rehearse the fallback in **Prompt caching**, and `--cache ignore` accepts the
+  markers and reports no cache use (the default is `accept`).
 - `--claude-fields anthropic|openai|none` makes the simulated route refuse one style of
   reasoning field for Claude endpoints, to rehearse what happens if the real chat-completions
   route does (the default `both` accepts either).

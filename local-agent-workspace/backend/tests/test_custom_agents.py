@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 from local_agent import custom_agents, planning
+from local_agent.prompt_cache import unmarked
 from local_agent.agents import AgentManager
 from local_agent.api import create_app
 from local_agent.config import DEFAULT_SUBAGENT_DEFAULTS, Settings, subagent_defaults
@@ -383,7 +384,8 @@ class Gateway:
         if body.get("stream") is not True:  # A title request.
             return httpx.Response(200, json={"choices": [{"message": {"content": "A title"}, "finish_reason": "stop"}]})
         endpoint = request.url.path.split("/")[2]
-        first = next((m["content"] for m in body["messages"] if m["role"] == "user"), "")
+        # Without cache markers: a child's first request marks its one user message.
+        first = next((m["content"] for m in unmarked(body)["messages"] if m["role"] == "user"), "")
         if isinstance(first, str) and first.startswith("Delegated task:\n"):
             self.requests["child"].append((endpoint, body))
             return reply(self.child_text)
