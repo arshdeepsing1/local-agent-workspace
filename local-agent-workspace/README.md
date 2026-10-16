@@ -2811,8 +2811,9 @@ Text that does not mention the rule's program (`npm test | tee out` with a deny 
 **Credential-looking files.** A command that names a file that looks like a credential always shows
 an approval card, in every mode, Bypass and Don't ask included, and no rule skips it; Plan does not
 run it. The card says which word matched ("Reads a secret file: `~/.databrickscfg`") and cannot be
-remembered, and a mode or rule change never approves it. Such names are `.env*` (`.env`,
-`.env.local`, `.envrc`, `.env-prod`; not `.env.example`), the file tools' other credential names
+remembered, and a mode or rule change never approves it. Such names are `.env`, `.envrc` and
+`.env.*`, `.env-*`, `.env_*` (`.env.local`, `.env-prod`; not `.env.example`, an `.envs` folder or
+`.environment`), the file tools' other credential names
 (`.netrc`, `.npmrc`, `.pgpass`, `.pypirc`, `.git-credentials`, `.databrickscfg`, `credentials`,
 `id_rsa`, `id_ed25519`, `id_ecdsa`, `id_dsa`, `env_vars.txt`), other private keys and key stores
 (`id_rsa*` but not `*.pub`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`), files in `.ssh` (except

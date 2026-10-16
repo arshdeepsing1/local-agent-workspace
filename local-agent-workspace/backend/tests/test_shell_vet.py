@@ -281,7 +281,8 @@ def test_recursive_searches_skip_credential_names(world):
     plan, _ = plan_of(world, "grep -rn TOKEN")
     run = plan.stages[0].run
     assert "--exclude=.env" in run and "--exclude=*.pem" in run and "--exclude-dir=.ssh" in run
-    assert "--exclude=.env*" in run and "--exclude=*token" in run
+    assert "--exclude=.env.*" in run and "--exclude=.envrc" in run and "--exclude=*token" in run
+    assert "--exclude=.env*" not in run  # An .envs folder or .environment file is searched.
     assert run[-2:] == ("TOKEN", ".")
     plan, _ = plan_of(world, "grep -n TOKEN README.md")
     assert not any(word.startswith("--exclude") for word in plan.stages[0].run)

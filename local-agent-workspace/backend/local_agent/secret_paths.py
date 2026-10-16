@@ -3,8 +3,9 @@
 looks_secret(word) says whether one command word or path names such a file, and returns the part
 that matched (the approval card names it). Two kinds of names count:
 
-- Credential files, in any folder: the file tools' SECRET_NAMES and `.env*` (`.envrc`, `.env.local`,
-  `.env-prod`; not `.env.example`);
+- Credential files, in any folder: the file tools' SECRET_NAMES, `.env`, `.envrc` and `.env.*`, `.env-*`,
+  `.env_*` (`.env.local`, `.env-prod`; not `.env.example`, and not other names that merely start with `.env`,
+  such as an `.envs` folder or `.environment`);
   private keys (`id_rsa`, `id_ed25519`, ... but not their `.pub`); key and certificate stores
   (`*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`, `*.keystore`); every file in `.ssh` except public
   keys, `known_hosts`, `authorized_keys` and `config`; every file in `.gnupg`; `.aws/credentials`
@@ -68,10 +69,15 @@ def patterns_setting(values):
         return ()
 
 
+def env_file(name):
+    """True for a casefolded dotenv file name: .env, .envrc, .env.<x>, .env-<x> or .env_<x>, not .env.example."""
+    return name in (".env", ".envrc") or (name[:5] in (".env.", ".env-", ".env_") and name != ".env.example")
+
+
 def _named_by_parts(parts, patterns):
     """The part of a path (as casefolded parts) that makes it a credential file, or None."""
     for index, part in enumerate(parts):
-        if part in SECRET_NAMES or (part.startswith(".env") and part != ".env.example") or part in OTHER_NAMES:
+        if part in SECRET_NAMES or env_file(part) or part in OTHER_NAMES:
             return part
         if any(fnmatch.fnmatchcase(part, pattern) for pattern in patterns):
             return part
@@ -169,7 +175,7 @@ def grep_excludes(patterns=()):
     An extension-less name counts when it ends in one of the WORDS (`db_token`): a glob cannot say "no
     extension", and rg applies these to folders too (a `tokens` folder stays searched), so other names that
     merely contain one (`secret_key`, `secrets`) are still searched."""
-    names = sorted({*SECRET_NAMES, *OTHER_NAMES, ".env*", *(f"{key}*" for key in KEY_NAMES),
+    names = sorted({*SECRET_NAMES, *OTHER_NAMES, ".env", ".envrc", ".env.*", ".env-*", ".env_*", *(f"{key}*" for key in KEY_NAMES),
                     *(f"*{suffix}" for suffix in KEY_SUFFIXES), "*.kubeconfig", *patterns,
                     *(f"*{word}*{suffix}" for word in WORDS for suffix in sorted(DATA_SUFFIXES)),
                     *(f".*{word}*" for word in WORDS), *(f"*{word}" for word in WORDS)})

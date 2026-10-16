@@ -271,3 +271,10 @@ async def test_settings_accept_secret_patterns(runtime):
     assert saved["secret_file_patterns"] == ["*.tfvars"]
     with pytest.raises(ValueError, match="every file"):
         manager.settings.update({"secret_file_patterns": ["*"]})
+
+
+@pytest.mark.parametrize("name,secret", [
+    (".env", True), (".envrc", True), (".env.local", True), (".env-prod", True), (".env_test", True),
+    (".env.example", False), (".envs/README.md", False), (".environment", False), (".envoy.yaml", False)])
+def test_dotenv_names_are_credential_files_but_other_env_prefixes_are_not(name, secret):
+    assert bool(looks_secret(name)) is secret
