@@ -22,11 +22,12 @@ from .rules import (APP_ROOT, RuleStore, card_rule_options, default_rule, normal
 from .activity import ACTIVITY_TOOL, activity_content, activity_log, local_time, redact_secrets
 from .context import (
     DEFAULT_AUTO_COMPACT_PERCENT, MAX_AUTO_COMPACT_PERCENT,
-    MIN_AUTO_COMPACT_PERCENT, OUTPUT_LIMIT_CONTINUATION, SAFETY_MARGIN, SUMMARY_MAX_TOKENS,
+    MIN_AUTO_COMPACT_PERCENT, OUTPUT_LIMIT_CONTINUATION, SUMMARY_MAX_TOKENS,
     build_condense_messages, build_handoff_messages, build_summary_messages, compaction_output_allowance,
-    condense_output_tokens, estimate_prior, estimate_scale, estimate_tokens, handoff_output_tokens, handoff_with_contents,
-    last_request_report, model_context_window, next_request_estimate, prepare_context, summary_byte_limit,
-    summary_output_tokens, verify_declined_message,
+    condense_output_tokens, effective_input_budget, estimate_margin_window, estimate_prior, estimate_scale,
+    estimate_tokens, handoff_output_tokens, handoff_with_contents, has_earlier_turn, last_request_report,
+    model_context_window, next_request_estimate, prepare_context, summary_byte_limit, summary_output_tokens,
+    verify_declined_message,
 )
 from .tools import LIMIT as FILE_LIMIT
 from .tools import write_limit_setting
@@ -3246,7 +3247,7 @@ class AgentManager(LifecycleHooks):
     def input_budget(self, session):
         """The input budget prepare_context uses for this chat's requests."""
         context_window, max_output_tokens = self.request_limits(session)
-        return context_window - max_output_tokens - SAFETY_MARGIN
+        return effective_input_budget(context_window, max_output_tokens, estimate_margin_window(session["model"]))
 
     def coding_dir_text(self, session):
         """The system prompt line for the default code folder, or ""."""
@@ -3600,9 +3601,12 @@ class AgentManager(LifecycleHooks):
         if not isinstance(compaction, dict):
             return
         n, after = compaction["number"], compaction["after_tokens"]
+        # The summary and condense requests apart; a compaction saved before they were counted apart has "requests".
+        condensed = compaction.get("condense_requests") or 0
         summarized = (f"{plural(compaction['summarized_messages'], 'earlier message')} "
                       f"{'was' if compaction['summarized_messages'] == 1 else 'were'} summarized in "
-                      f"{plural(compaction['requests'], 'request')}")
+                      f"{plural(compaction.get('summarize_requests', compaction['requests'] - condensed), 'request')}"
+                      + (f" and condensed in {condensed:,}" if condensed else ""))
         over = (f"about {compaction['before_tokens']:,} estimated input tokens, over the "
                 f"{info.get('auto_compact_percent', 100)}% auto-compact threshold of {compaction['threshold_tokens']:,}")
         if compaction["trigger"] == "manual":
@@ -3627,15 +3631,23 @@ class AgentManager(LifecycleHooks):
         if adjustment == "condensed" and not info.get("handoff_path"):
             # With a handoff, condensing it into the summary is expected.
             text += f" The summary was longer than {limit:,} bytes, so a short extra request condensed it."
+        elif adjustment == "condensed_trimmed":
+            text += (f" The condensed summary was still longer than {limit:,} bytes, so the app shortened its least "
+                     "important sections" + ("; the saved handoff has them in full." if info.get("handoff_path")
+                                             else "."))
         elif adjustment == "trimmed":
             text += (f" The summary was longer than {limit:,} bytes and could not be condensed, so part of it was "
-                     "omitted from the model's context.")
+                     "omitted from the model's context" + ("; the saved handoff has it in full."
+                                                          if info.get("handoff_path") else "."))
         fitted = info.get("summary_fitted_to_budget")
         if fitted:
             # The summary was within its byte limit; the whole request was not.
             text += (" The request after compaction was over the input budget (non-ASCII text and escapes count more "
-                     "than plain text), so " + ("a short extra request condensed the summary to fit." if fitted == "condensed"
-                                                else "part of the summary was omitted to fit."))
+                     "than plain text), so " + {
+                         "condensed": "a short extra request condensed the summary to fit.",
+                         "condensed_trimmed": "a short extra request condensed the summary and the app shortened its "
+                                              "least important sections to fit."}.get(
+                         fitted, "part of the summary was omitted to fit."))
         await self.event(session, "notice", text=text, compaction=compaction)
 
     def start_compaction(self, session_id, preservation_note=""):
@@ -3648,9 +3660,8 @@ class AgentManager(LifecycleHooks):
             raise ValueError("This conversation uses an unsupported runtime and is read-only.")
         if not isinstance(preservation_note, str) or len(preservation_note) > 1000:
             raise ValueError("The preservation note must be at most 1,000 characters.")
-        through = session.get("context_state", {}).get("through", 0)
-        if not any(index > through and message.get("role") == "user" and not is_continuation(message)
-                   for index, message in enumerate(session["wire"])):
+        # prepare_context's own check (a steered message is not a turn start), before any task starts.
+        if not has_earlier_turn(session["wire"], session.get("context_state")):
             raise ValueError("No earlier turns to compact. The latest turn is kept intact.")
         self.workspace_available(session["workspace"])
         self._pause_queue(session)
@@ -3692,7 +3703,8 @@ class AgentManager(LifecycleHooks):
                     scale=estimate_scale(session.get("inference_calls"), session["model"]),
                     handoff_path=plan and plan["path"], save_handoff=plan and self.handoff_saver(session, plan),
                     auto_compact_percent=auto_compact_percent(self.settings.values), record_requests=True,
-                    app_record=record, output_allowance=allowance, completed_calls=completed_call_ids(session))
+                    app_record=record, output_allowance=allowance, completed_calls=completed_call_ids(session),
+                    model_window=estimate_margin_window(session["model"]))
             views, updated = forget_summarized_reads(session.get("file_views") or {}, updated, holder["forgotten"])
             info = {**info, "instruction_files": guidance["files"], "instruction_sources": guidance["sources"],
                     "warnings": warnings, "prepared_for_next_turn": True, **last_request(session),
@@ -3992,14 +4004,15 @@ class AgentManager(LifecycleHooks):
         request. A running chat is left alone until status() makes it idle: note_last_request reads the
         in-flight request's budget from the stored info, and a turn keeps its budgets. Never raises."""
         import math
-        from .context import SAFETY_MARGIN, compaction_threshold
+        from .context import compaction_threshold
         try:
             info = session.get("context_info")
             if (not isinstance(info, dict) or type(info.get("input_budget")) is not int
                     or self.statuses.get(session["id"], "idle") != "idle" or session.get("turn_running")):
                 return
             context_window, reply_reserve = self.request_limits(session)
-            budget = context_window - reply_reserve - SAFETY_MARGIN
+            budget = effective_input_budget(context_window, reply_reserve, estimate_margin_window(
+                session.get("model") or self.settings.values["model"]))
             percent = auto_compact_percent(self.settings.values)
             threshold = compaction_threshold(budget, percent)
             updated = {**info, "context_window": context_window, "reply_reserve": reply_reserve, "input_budget": budget,
@@ -4161,6 +4174,9 @@ class AgentManager(LifecycleHooks):
                 wire.pop()
             self.store.save(session)
         wire.append({"role": "user", "content": prompt if content is None else content})
+        if isinstance(meter := session.get("context_info"), dict) and meter.get("compactable") is False:
+            # This turn's first request replaces the meter; a turn that ends before it leaves this one.
+            meter["compactable"] = has_earlier_turn(wire, session.get("context_state"))
         self._content_sent(session)  # Its @ files are now seen and its ! output no longer pending.
         context_window, max_output_tokens = self.request_limits(session)
         self.mark_user_in_wire(session)  # No await since the prompt was appended above.
@@ -4217,7 +4233,8 @@ class AgentManager(LifecycleHooks):
                     scale=scale,
                     handoff_path=plan and plan["path"], save_handoff=plan and self.handoff_saver(session, plan),
                     auto_compact_percent=auto_compact_percent(self.settings.values), record_requests=True,
-                    app_record=record, output_allowance=allowance, completed_calls=completed_call_ids(session))
+                    app_record=record, output_allowance=allowance, completed_calls=completed_call_ids(session),
+                    model_window=estimate_margin_window(session["model"]))
                 if "compaction" in info:
                     # Files whose contents were summarized away must be read again before a write.
                     views, next_context = forget_summarized_reads(session.get("file_views") or {}, next_context,

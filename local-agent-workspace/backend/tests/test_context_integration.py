@@ -59,7 +59,9 @@ async def test_compaction_preserves_archive_and_survives_restart(runtime, monkey
     async def gateway(request):
         payload = json.loads(request.content)
         requests.append(payload)
-        assert estimate_tokens(payload["messages"], payload.get("tools", ())) <= 32768 - 8192 - 2048
+        # An agent request fits the input budget; a summary request the window minus its own output reserve.
+        reserve = 8192 if payload["stream"] else payload["max_tokens"]
+        assert estimate_tokens(payload["messages"], payload.get("tools", ())) <= 32768 - reserve - 2048
         if not payload["stream"]:
             assert "tools" not in payload
             return httpx.Response(200, json={"choices": [{"message": {"content": "Earlier steps completed; use focused changes."}, "finish_reason": "stop"}]})

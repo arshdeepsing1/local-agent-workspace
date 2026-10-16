@@ -9,8 +9,8 @@ from local_agent.agents import AgentManager, public_session
 from local_agent.api import create_app
 from local_agent.config import Settings
 from local_agent.context import (
-    DEFAULT_CONTEXT_WINDOW, MIN_CONTEXT_WINDOW, SUMMARY_MAX_TOKENS, build_summary_messages, estimate_tokens,
-    VERIFY_CONTINUATION_PREFIX, handoff_output_tokens, prepare_context,
+    DEFAULT_CONTEXT_WINDOW, MIN_CONTEXT_WINDOW, STEER_PREFIX, SUMMARY_MAX_TOKENS, build_summary_messages,
+    estimate_tokens, VERIFY_CONTINUATION_PREFIX, handoff_output_tokens, has_earlier_turn, prepare_context,
 )
 from local_agent.instructions import load_project_instructions
 from local_agent.store import Store
@@ -101,9 +101,13 @@ async def test_manual_compaction_preserves_archive_recent_exchanges_and_never_ru
     assert len(requests) == 1
     assert saved["wire"] == original["wire"]
     assert saved["events"][:1] == original["events"]
-    assert saved["context_state"]["through"] == 2
+    # A manual compaction summarizes every turn before the latest one, the preceding turn included.
+    assert saved["context_state"]["through"] == 6
+    assert "Read current status." in requests[0]["messages"][1]["content"]
     assert saved["context_state"]["compactions"] == 3
     assert saved["context_info"]["prepared_for_next_turn"] is True
+    # Nothing is left to compact until the next message (the meter disables Compact now).
+    assert saved["context_info"]["compactable"] is False
     handoffs = list((project / "handoffs" / "auto").glob("*-compaction-3.md"))
     assert len(handoffs) == 1 and "Migration completed and must remain compatible." in handoffs[0].read_text()
     assert saved["context_state"]["handoff_files"] == [
@@ -247,6 +251,67 @@ def test_manual_compaction_rejects_no_earlier_turn_and_busy_sessions_before_infe
     with pytest.raises(ValueError, match="Stop the current response"):
         manager.start_compaction(session["id"])
     assert session["id"] not in manager.tasks
+
+
+async def test_a_steered_message_alone_is_no_earlier_turn_and_answers_400_before_a_task(runtime):
+    # A message the user sent while the agent worked sits inside the latest turn: prepare_context never cuts
+    # there, so the request is refused at once instead of starting a compaction that fails with an error event.
+    manager, session, _ = runtime
+    app = create_app(manager.settings)
+    chat = app.state.manager.store.create(manager.settings.values)
+    chat["wire"] = [*session["wire"], {"role": "user", "content": STEER_PREFIX + "Also check the docs."},
+                    {"role": "assistant", "content": "Checked."}]
+    chat["context_state"] = {"summary": "Prior decisions", "through": 6, "compactions": 2}
+    app.state.manager.store.save(chat)
+    assert has_earlier_turn(chat["wire"], {"through": 5}) and not has_earlier_turn(chat["wire"], chat["context_state"])
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+            headers = {"X-Local-Token": (await client.get("/api/bootstrap")).json()["token"]}
+            response = await client.post(f"/api/sessions/{chat['id']}/compact", headers=headers, json={})
+            assert response.status_code == 400
+            assert response.json()["detail"] == "No earlier turns to compact. The latest turn is kept intact."
+        assert chat["id"] not in app.state.manager.tasks
+        assert app.state.manager.store.get(chat["id"])["events"] == chat["events"]
+    finally:
+        app.state.manager.store.db.close()
+
+
+async def test_a_turn_that_fails_before_its_first_request_leaves_compact_now_available(runtime, monkeypatch):
+    # The meter's flag is set when a request is prepared; a turn refused before that still started a turn.
+    from local_agent.telemetry import InferenceError
+    manager, session, _ = runtime
+    session["context_state"]["through"] = 6
+    session["context_info"] = {"compactable": False, "compactions": 2}
+    manager.store.save(session)
+    monkeypatch.setattr(manager, "otpm_preflight", lambda session, max_tokens: InferenceError(
+        "Refused before sending.", "output_tokens_over_limit", None))
+    await manager.run(session, "A new request")
+    assert session["wire"][-1] == {"role": "user", "content": "A new request"}
+    assert session["context_info"] == {"compactable": True, "compactions": 2}
+    assert manager.store.get(session["id"])["context_info"]["compactable"] is True
+
+
+async def test_manual_compaction_summarizes_every_turn_but_the_latest():
+    # Three earlier turns; the preceding one is small enough that an automatic compaction keeps it verbatim.
+    turn = lambda number, size: [{"role": "user", "content": f"Request {number}: " + "r" * size},
+                                 {"role": "assistant", "content": f"Answer {number}."}]
+    wire = [*turn(1, 12_000), *turn(2, 12_000), *turn(3, 1_000), {"role": "user", "content": "Latest request"},
+            {"role": "user", "content": STEER_PREFIX + "Steered into the latest turn."}]
+    chunks = []
+
+    async def summarize(previous, chunk, limit_bytes):
+        chunks.append(chunk)
+        return "Earlier turns summarized."
+
+    system = {"role": "system", "content": "Follow the user's current request."}
+    _, state, info = await prepare_context(wire, {}, system, [], DEFAULT_CONTEXT_WINDOW, summarize, force_compact=True)
+    assert state["through"] == 6 and info["compaction"]["summarized_messages"] == 6
+    assert all(f"Request {number}" in "".join(chunks) for number in (1, 2, 3))
+    assert info["compactable"] is False
+    # The same history over the threshold of an automatic compaction keeps the preceding turn.
+    _, automatic, info = await prepare_context(wire, {}, system, [], MIN_CONTEXT_WINDOW, summarize,
+                                               reply_reserve=1024, auto_compact_percent=50)
+    assert automatic["through"] == 4 and info["compactable"] is True
 
 
 async def test_preservation_note_is_counted_in_each_bounded_summary_request():

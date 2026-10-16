@@ -179,9 +179,13 @@
 //   'output_tokens_over_limit' (Max output tokens above the endpoint's reported OTPM limit).
 // ContextInfo: { estimated_tokens, input_budget, context_window, reply_reserve,
 //   compactions, summarized_messages, estimate_method, instruction_files, warnings,
-//   instruction_sources?, prepared_for_next_turn?, breakdown?, estimate_scale?, summary_adjustment? (the summary was over its
-//   byte limit), summary_fitted_to_budget?: 'condensed'|'trimmed' (shortened because the request after compaction
-//   was over the input budget),
+//   instruction_sources?, prepared_for_next_turn?, breakdown?, estimate_scale?, summary_adjustment?: 'condensed'|
+//   'condensed_trimmed'|'trimmed' (the summary was over its byte limit: condensed by a request; condensed but still
+//   over, so the app shortened its least important sections; or shortened without a successful condense),
+//   summary_fitted_to_budget?: 'condensed'|'condensed_trimmed'|'trimmed' (shortened because the request after
+//   compaction was over the input budget), handoff_path? (the handoff this compaction saved),
+//   compactable? (false: Compact now has no earlier turn to summarize until the next user message; absent on
+//   older meters, which allow it),
 //   estimate_prior? (true: estimate_scale is the model's starting ratio, not yet from reported counts),
 //   auto_compact_threshold?, auto_compact_percent?, compaction_deferred? (over the threshold but within the input
 //   budget, and no cut brings it under the threshold: sent as it was), compaction?: Compaction (when this request compacted), last_request?: LastRequest,
@@ -191,7 +195,8 @@
 //   Settings save the budget fields, the threshold and next_estimate of an idle chat follow the new setup;
 //   estimated_tokens, estimate_scale and last_request still describe the last request.
 // Compaction: { number, trigger: 'manual'|'in_turn'|'auto', before_tokens, after_tokens, threshold_tokens,
-//   summarized_messages, requests (summary and condense requests), elided_bytes, superseded_results }
+//   summarized_messages, requests (summary and condense requests), summarize_requests?, condense_requests? (the
+//   two apart; absent on older compactions), elided_bytes, superseded_results }
 // LastRequest (what Databricks reported for the latest agent request): { call_id, model, status, finish_reason?,
 //   partial (ended without a finish reason: counts may be incomplete), input_tokens (= uncached + cache read +
 //   cache write), uncached_input_tokens, cache_read_input_tokens, cache_creation_input_tokens, output_tokens?,

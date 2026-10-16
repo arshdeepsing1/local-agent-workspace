@@ -184,7 +184,7 @@ export default function App() {
         ${active?.status === 'awaiting_approval' ? html`<p class="composer-hint" role="status">${(name => name === 'ask_user' ? 'The agent is waiting for your answer above.' : name === 'submit_plan' ? 'A plan is waiting for your review above.' : 'An action is waiting for your approval above.')(active.events?.findLast(event => event.state === 'pending')?.name)}</p>` : null}
         ${active?.status === 'compacting' ? html`<p class="composer-hint" role="status">Compacting context…</p>` : null}
         ${active?.status === 'naming' ? html`<p class="composer-hint" role="status">Creating conversation title…</p>` : null}
-        <${ContextMeter} key=${`context-${app.viewKey}`} info=${active?.context_info} model=${active?.model} busy=${busy}
+        <${ContextMeter} key=${`context-${app.viewKey}`} info=${active?.context_info} model=${active?.model} busy=${busy} status=${active?.status}
           onCompact=${active && app.ready && app.online && app.settings?.configured ? async preservationNote => {
             await api(`/sessions/${encodeURIComponent(active.id)}/compact`, 'POST', { preservation_note: preservationNote })
           } : undefined} />

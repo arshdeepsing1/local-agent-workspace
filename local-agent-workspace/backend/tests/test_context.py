@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import json
+import math
 import re
 
 import pytest
@@ -11,8 +12,8 @@ from local_agent.context import (
     context_boundary, context_breakdown, context_messages, estimate_tokens, prepare_context, retained_request,
 )
 from local_agent.context import (
-    INCOMPLETE_RESPONSE_CONTINUATION, INVALID_ARGUMENTS_CONTINUATION, VERIFY_CONTINUATION_PREFIX, is_continuation,
-    turn_start,
+    INCOMPLETE_RESPONSE_CONTINUATION, INVALID_ARGUMENTS_CONTINUATION, STEER_PREFIX, VERIFY_CONTINUATION_PREFIX,
+    has_earlier_turn, is_continuation, turn_start,
 )
 
 
@@ -103,7 +104,7 @@ async def test_small_context_requires_no_compaction_and_reports_estimated_budget
                     "compactions": 0, "summarized_messages": 0, "estimate_method": "weighted_utf8",
                     "breakdown": context_breakdown(messages, TOOLS),
                     "auto_compact_threshold": DEFAULT_CONTEXT_WINDOW - REPLY_RESERVE - SAFETY_MARGIN,
-                    "auto_compact_percent": 100}
+                    "auto_compact_percent": 100, "compactable": False}  # One turn: Compact now has nothing to do.
 
 
 async def test_dynamic_reply_reserve_is_budgeted_without_mutating_wire():
@@ -308,9 +309,9 @@ async def test_repeated_compaction_only_summarizes_newly_archived_messages():
 
 async def test_final_serialized_request_is_checked_before_committing_summary():
     wire = long_history()
-    # The retained turns fit beside a plain placeholder summary of the maximum
+    # The latest turn fits beside a plain placeholder summary of the maximum
     # size, but JSON escaping doubles a backslash summary's serialized size.
-    wire[2] = user("x" * 54000)
+    wire[4] = user("x" * 54000)
     state = {}
     original = copy.deepcopy((wire, state))
 
@@ -402,6 +403,13 @@ async def test_repeated_compaction_in_one_turn_gives_the_summarizer_the_request_
         [wire[0], *wire[first["through"]:second["through"]]], ensure_ascii=False)
     assert messages[2] == wire[0] and messages[3:] == wire[second["through"]:]
     assert info["compacted_in_turn"] is True and second["compactions"] == 2
+    # A cut inside the only turn leaves Compact now nothing to summarize, until a new turn starts.
+    assert info["compactable"] is False
+    wire.extend([assistant("All files read."), user("Next request")])
+    _, _, info = await prepare_context(wire, second, SYSTEM, TOOLS, DEFAULT_CONTEXT_WINDOW, forbidden_summary)
+    assert "compaction" not in info and info["compactable"] is True
+    # Steered and hidden app messages start no turn.
+    assert not has_earlier_turn([*wire[:-1], user(STEER_PREFIX + "Also this."), VERIFY_MESSAGE], second)
 
 
 async def test_request_before_an_output_limit_continuation_is_the_one_kept():
@@ -504,3 +512,67 @@ async def test_a_transcript_that_fits_one_summary_request_is_probed_once(monkeyp
     probes.clear()
     await prepare_context(wire, {}, SYSTEM, TOOLS, 262_144, summarize, force_compact=True)
     assert len(chunks) == 1 and len(probes) <= 2  # One probe, plus the final request check.
+
+
+# --- Estimate margins against the provider's real window (a budget at the window) -----
+
+async def test_summary_requests_keep_room_for_denser_counting_against_the_real_window():
+    # At a budget equal to the 1,000,000-token window, a summary request sized with the agent scale (1.2) could
+    # count about a sixth more and pass the window. Against model_window each one still fits at 1.2 times its
+    # scaled estimate, so a transcript that fits one request without the margin takes two.
+    from local_agent.context import COMPACTION_ESTIMATE_FACTOR, build_handoff_messages, scaled_estimate
+    window, reserve, scale, handoff, allowance = 1_000_000, 16_384, 1.2, 16_000, 8_192
+    wire = [user("First: " + "f" * 900_000), assistant("Done."), user("Second: " + "s" * 1_400_000),
+            assistant("Done."), user("Latest request")]
+
+    async def run(model_window):
+        sizes = []
+
+        async def summarize(previous, chunk, limit_bytes):
+            # The request AgentManager.compaction_requests sends for a handoff.
+            request = build_handoff_messages(previous, chunk, "", handoff)
+            sizes.append(scaled_estimate(request, (), scale))
+            return "## Goal and current status\nHandoff."
+
+        async def save(documents, number, record):
+            return True
+        _, state, info = await prepare_context(
+            wire, {}, SYSTEM, TOOLS, window, summarize, reply_reserve=reserve, scale=scale,
+            handoff_path="handoffs/auto/h.md", save_handoff=save, auto_compact_percent=90, output_allowance=allowance,
+            model_window=model_window)
+        assert state["through"] == 4 and info["compaction"]["summarize_requests"] == len(sizes)
+        return sizes
+
+    margin, plain = await run(1_000_000), await run(None)
+    assert len(margin) == 2 and len(plain) == 1
+    over = lambda size: math.ceil(size * COMPACTION_ESTIMATE_FACTOR) + handoff + allowance + SAFETY_MARGIN
+    assert all(over(size) <= 1_000_000 for size in margin)
+    assert over(plain[0]) > 1_000_000  # The request the margin avoids.
+
+
+async def test_a_budget_at_the_real_window_keeps_five_percent_for_estimate_error():
+    # A 1,000,000 budget with 16,384 output tokens on a 1,000,000-token window: an estimate 4% low would pass
+    # the window, so the input budget is lowered to (1,000,000 - 16,384 - 2,048) / 1.05.
+    from local_agent.context import effective_input_budget, estimate_margin_window
+    wire = [user("Hello"), assistant("Hi")]
+    _, _, info = await prepare_context(wire, {}, SYSTEM, TOOLS, 1_000_000, forbidden_summary, reply_reserve=16_384,
+                                       auto_compact_percent=90, model_window=1_000_000)
+    assert info["input_budget"] == 934_826 and info["auto_compact_threshold"] == 841_343
+    assert effective_input_budget(1_000_000, 16_384) == 981_568
+    # Budgets well below the window are unchanged: the default 200,000 and up to about 950,000 here.
+    for budget in (200_000, 950_000):
+        assert effective_input_budget(budget, 16_384, 1_000_000) == budget - 16_384 - SAFETY_MARGIN
+        _, _, info = await prepare_context(wire, {}, SYSTEM, TOOLS, budget, forbidden_summary, reply_reserve=16_384,
+                                           model_window=1_000_000)
+        assert info["input_budget"] == budget - 16_384 - SAFETY_MARGIN
+    # The margins apply to a model whose counts run above the heuristic (a starting ratio); other budgets
+    # stay as Settings gives them, also at their endpoint's full window.
+    assert estimate_margin_window("databricks-claude-opus-5-5") == 1_000_000
+    assert estimate_margin_window("databricks-gpt-oss-120b") is None and estimate_margin_window("m") is None
+    # An error names the lowered budget's arithmetic.
+    with pytest.raises(ValueError) as error:
+        await prepare_context([user("x" * 2_900_000)], {}, SYSTEM, TOOLS, 1_000_000, forbidden_summary,
+                              reply_reserve=16_384, model_window=1_000_000)
+    assert ("The input budget is 934,826 tokens: 1,000,000 context budget minus 16,384 reserved for output minus "
+            "the 2,048-token safety margin is 981,568, lowered so that a request whose estimate is a few percent "
+            "low still fits the model's context window.") in str(error.value)

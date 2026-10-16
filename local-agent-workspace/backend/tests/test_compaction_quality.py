@@ -11,13 +11,13 @@ from local_agent.composer_api import STEER_PREFIX
 from local_agent.context import (
     APP_PROMPT_LABELS, CARRY_DIVISOR, ELIDED_ARGUMENT, HANDOFF_EXTRA_SECTIONS, INCOMPLETE_RESPONSE_CONTINUATION,
     INVALID_ARGUMENTS_CONTINUATION, MAX_CONTEXT_WINDOW, OUTLINE_HEADING, OUTPUT_LIMIT_CONTINUATION,
-    REQUEST_CLIP_MARKER, REQUIRED_SUMMARY_SECTIONS, SAFETY_MARGIN, SECTION_TRIM_MARKER, SUMMARY_PREFIX,
-    SUMMARY_SECTIONS, VERIFY_CONTINUATION_PREFIX, VERIFY_LABEL, VERIFY_NOTE_LABEL, app_record_limit,
+    PRECEDING_TURN_PERCENT, REQUEST_CLIP_MARKER, REQUIRED_SUMMARY_SECTIONS, SAFETY_MARGIN, SECTION_TRIM_MARKER,
+    SUMMARY_PREFIX, SUMMARY_SECTIONS, VERIFY_CONTINUATION_PREFIX, VERIFY_LABEL, VERIFY_NOTE_LABEL, app_record_limit,
     build_condense_messages, build_handoff_messages, build_summary_messages, compaction_output_allowance,
     context_messages, elision_limit, estimate_scale, estimate_tokens, fit_summary, handoff_output_tokens,
     handoff_pointer, handoff_with_contents, last_request_report, merge_user_requests, model_context_window,
-    prepare_context, render_app_record, request_text, summary_byte_limit, summary_output_tokens, summary_sections,
-    summary_transcript, trim_summary, verify_declined_message,
+    prepare_context, render_app_record, request_text, scaled_estimate, summary_byte_limit, summary_output_tokens,
+    summary_sections, summary_transcript, trim_summary, verify_declined_message,
 )
 from local_agent.mentions import HEADER
 from local_agent.tools import WorkspaceTools, read_page_bytes
@@ -272,6 +272,49 @@ async def test_a_lower_auto_compact_percent_triggers_earlier():
         await prepare_context(wire, {}, SYSTEM, TOOLS, window, never, auto_compact_percent=49)
 
 
+def turn_with_reads(request, reads, size, prefix):
+    """A turn of one request and reads tool exchanges whose results are size bytes each."""
+    wire = [user(request)]
+    for n in range(reads):
+        call_id = f"{prefix}-{n}"
+        wire += [{"role": "assistant", "content": None, "tool_calls": [{"id": call_id, "type": "function", "function": {
+                     "name": "read_file", "arguments": json.dumps({"path": f"src/{prefix}{n}.py"})}}]},
+                 {"role": "tool", "tool_call_id": call_id, "content": "c" * size}]
+    return wire
+
+
+@pytest.mark.parametrize("preceding_reads", [30, 3])
+async def test_automatic_compaction_keeps_the_preceding_turn_only_with_headroom(preceding_reads):
+    # The shape of a real chat at the default budgets (200,000 and 16,384, 90%): small earlier turns, a
+    # preceding turn of about 55% of the threshold (a plan the user answered) and a current turn of about
+    # 35%. Keeping both came to about 93% of the threshold: the turn was summarized a few steps later,
+    # after each of those steps sent it again. A small preceding turn still stays verbatim.
+    async def summarize(previous, chunk, limit):
+        return "## Goal and current status\nSummary."
+
+    old_size = 20_000 if preceding_reads == 30 else 100_000
+    wire = [message for n in range(4) for message in (user(f"Earlier request {n}: " + "o" * old_size),
+                                                       assistant(f"Done {n}."))]
+    preceding = len(wire)
+    wire += [*turn_with_reads("Plan the change and list the options.", preceding_reads, 9_000, "plan"),
+             assistant("Option 1 or option 2?")]
+    latest = len(wire)
+    wire += turn_with_reads("Yes, option 2.", 19, 9_000, "work")
+    _, state, info = await prepare_context(wire, {}, SYSTEM, TOOLS, 200_000, summarize, reply_reserve=16_384,
+                                           auto_compact_percent=90)
+    threshold = info["auto_compact_threshold"]
+    assert threshold == 163_411 and info["compaction"]["before_tokens"] > threshold
+    if preceding_reads == 30:
+        assert state["through"] == latest
+        assert info["estimated_tokens"] <= threshold * PRECEDING_TURN_PERCENT // 100
+        # The old rule's cut: under the threshold, but with almost no headroom.
+        kept = scaled_estimate([SYSTEM, *context_messages(wire, {**state, "through": preceding})], TOOLS)
+        assert threshold * 90 // 100 < kept <= threshold
+    else:
+        assert state["through"] == preceding
+        assert info["estimated_tokens"] <= threshold * PRECEDING_TURN_PERCENT // 100
+
+
 async def test_over_the_threshold_with_nothing_to_summarize_sends_the_request_as_it_is():
     wire = [user("One large first request: " + "q" * 150_000)]
     messages, state, info = await prepare_context(wire, {}, SYSTEM, TOOLS, 65_536, never, auto_compact_percent=50)
@@ -285,11 +328,16 @@ async def test_the_cut_prefers_the_threshold_and_falls_back_to_the_budget():
 
     window, budget = 65_536, 65_536 - 8192 - SAFETY_MARGIN
     # Cutting before the last turn fits the budget but not the threshold; cutting before the
-    # latest request fits the threshold and is chosen. At 100 percent the earlier cut is enough.
+    # latest request fits the threshold and is chosen. At 100 percent the earlier cut fits too,
+    # but it would leave the request at over 90% of the limit, so the latest cut is chosen again.
     wire = history([60_000, 60_000, 140_000])
     _, state, _ = await prepare_context(wire, {}, SYSTEM, TOOLS, window, summarize, auto_compact_percent=90)
     assert state["through"] == len(wire) - 1
-    _, state, _ = await prepare_context(wire, {}, SYSTEM, TOOLS, window, summarize)
+    _, state, info = await prepare_context(wire, {}, SYSTEM, TOOLS, window, summarize)
+    assert state["through"] == len(wire) - 1 and info["estimated_tokens"] <= budget * PRECEDING_TURN_PERCENT // 100
+    # A preceding turn that leaves headroom (at most 60% of the limit) is still kept.
+    wire = history([60_000, 60_000, 60_000])
+    _, state, info = await prepare_context(wire, {}, SYSTEM, TOOLS, window, summarize)
     assert state["through"] == len(wire) - 3
     # The latest request alone is over the threshold but within the budget: still compacted.
     wire = history([60_000, 60_000], latest="Latest: " + "z" * 120_000)
@@ -581,6 +629,7 @@ async def test_compaction_info_counts_summary_and_condense_requests():
     assert compaction["before_tokens"] > compaction["threshold_tokens"] >= compaction["after_tokens"]
     assert compaction["after_tokens"] == info["estimated_tokens"]
     assert compaction["requests"] == 2 and compaction["summarized_messages"] == state["through"]
+    assert compaction["summarize_requests"] == 1 and compaction["condense_requests"] == 1
     assert compaction["superseded_results"] == 0 and compaction["elided_bytes"] == 0
 
 
@@ -609,10 +658,29 @@ def test_the_opus_5_5_estimate_prior_applies_until_counts_are_reported():
         assert estimate_scale([], model) == 1.0
     sample = {"model": "databricks-claude-opus-5-5", "status": "completed", "estimated_input_tokens": 10_000,
               "usage": {"input_tokens": 11_000}}
-    assert estimate_scale([sample], "databricks-claude-opus-5-5") == 1.1
+    # The prior keeps the weight of 20,000 estimated tokens: (11,000 + 1.3 x 20,000) / (10,000 + 20,000).
+    assert estimate_scale([sample], "databricks-claude-opus-5-5") == 1.233
     assert context.estimate_prior([], "databricks-claude-opus-5-5") is True
     assert context.estimate_prior([sample], "databricks-claude-opus-5-5") is False
     assert context.estimate_prior([], "databricks-gpt-oss-120b") is False
+
+
+def test_a_first_request_of_system_message_and_tools_does_not_replace_the_prior():
+    # A chat's first request is mostly the system message and tool definitions, which count about 1.03;
+    # its first file reads count 1.2-1.4, so the plain ratio would underestimate them.
+    first = {"model": "databricks-claude-opus-5-5", "status": "completed", "estimated_input_tokens": 9_176,
+             "usage": {"input_tokens": 9_475}}
+    assert estimate_scale([first], "databricks-claude-opus-5-5") == 1.216
+    # A model without a starting ratio uses the plain ratio, as before.
+    assert estimate_scale([{**first, "model": "databricks-gpt-oss-120b"}], "databricks-gpt-oss-120b") == 1.033
+    # With five large samples the prior hardly moves the learned ratio.
+    samples = [{**first, "estimated_input_tokens": 100_000, "usage": {"input_tokens": 120_000}}] * 5
+    assert estimate_scale(samples, "databricks-claude-opus-5-5") == pytest.approx(1.2, abs=0.005)
+    # The scale still never goes below 1, and never above the clamp.
+    low = [{**first, "estimated_input_tokens": 100_000, "usage": {"input_tokens": 50_000}}] * 5
+    assert estimate_scale(low, "databricks-claude-opus-5-5") == 1.0
+    high = [{**first, "estimated_input_tokens": 100_000, "usage": {"input_tokens": 400_000}}] * 5
+    assert estimate_scale(high, "databricks-claude-opus-5-5") == context.MAX_ESTIMATE_SCALE
 
 
 def test_model_context_window_ignores_case_and_the_system_ai_prefix():
