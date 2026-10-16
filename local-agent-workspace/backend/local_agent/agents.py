@@ -1306,7 +1306,8 @@ class AgentManager(LifecycleHooks):
                                     max_output_bytes=arguments.get("max_output_bytes", 80000),
                                     background=arguments.get("background", False), **options)
         try:
-            await self.update_event(session, event, job_id=job["id"], output=job["output"],
+            # job_started: the card shows how long the command has run against its timeout.
+            await self.update_event(session, event, job_id=job["id"], job_started=job["created"], output=job["output"],
                                     **({"without_shell": True} if argv is not None else {}))
             if not job["background"]:
                 job = await self.jobs.wait(job["id"])

@@ -491,7 +491,9 @@ when opening a conversation or performing restart recovery.
   line counts. **Keep** accepts the changes. **Undo** puts the file back as it was before
   the agent first changed it in this conversation; a file the agent created is removed.
   The **Keep** and **Undo** buttons on the bar act on every listed file; the check and
-  arrow buttons on a row act on that file only. A file you keep while the agent still works
+  arrow buttons on a row act on that file only. A row names a file outside the project by the
+  allowed folder or default code folder it is in (`other/pkg` for `/srv/other/pkg/mod.py`), or
+  by `…/` and its last two folders; its tooltip keeps the full path. A file you keep while the agent still works
   is listed again when the agent changes it again; if it is open in the Workspace panel,
   its review opens again, and an open file without unsaved edits follows the agent's later
   edits.
@@ -638,6 +640,9 @@ when opening a conversation or performing restart recovery.
   next to Restore errors in **Agent tools** → **Checkpoints**.
   A chat waiting for approval shows **Needs approval** in the sidebar and counts in the tab
   title; **Notify me** also tells you when this page is hidden or another chat is open.
+  A card that starts waiting scrolls into view, also when you scrolled up to read, and the hint
+  under the message box ("An action is waiting for your approval above.") has **Show**, which
+  brings the card back into view and moves keyboard focus to it.
 - **Allow for this chat**: next to Decline and Approve, a card offers **Always allow this
   command in this chat** (commands), **Allow edits in this chat** (`write_file`, `edit_file`,
   `insert_activity_log`, `move_path`, `delete_path`, `notebook_edit`), **Allow this tool in
@@ -670,6 +675,12 @@ when opening a conversation or performing restart recovery.
   action does not mean the task itself is finished. Expand command cards to see the
   full command (including inline Python), options, and output separately. A long file
   is read in pages, so a read card names the lines it covered (`lines 109–243`).
+  A file card names a file in the project by its project path and one in an allowed folder or
+  the default code folder as `<folder>/rest`, and a command that starts with `cd <folder> &&`
+  into the project or one of those folders reads `<folder> › rest` in its heading; the tooltip, the expanded card and the
+  approval card keep the full path and command. A running command shows how long it has run
+  against its timeout (`running · 8 min 42 s of 40 min`; `8:42` in a narrow chat) and, collapsed,
+  its latest output line.
   A command that exits non-zero, times out or is interrupted shows a warning icon, a label
   (`exit 1`, `signal 9` for a process ended by a signal, `timed out` or `interrupted`) and its
   last output line under the collapsed card (`Exit 1 · …`; when output past `max_output_bytes`
@@ -1617,8 +1628,11 @@ itself stays verbatim after the summary, followed by its latest exchanges up to 
 the input budget, so later results have room before another compaction. The summary
 (and handoff) request is asked to keep the facts the unfinished work needs from the
 files and output read so far, and a notice reports the compaction. Manual **Compact
-now** summarizes every turn before the latest one and keeps the latest turn intact.
-Summaries persist across restarts, while the full display transcript and original model/tool history remain
+now** summarizes every turn before the latest one and keeps the latest turn intact. While a
+compaction runs, the hint under the message box counts the time (`Compacting context… 1 min 50 s`)
+and, for an automatic compaction, says that the next request passed the auto-compact threshold;
+summary requests are not streamed, so a large one can take a few minutes. Summaries persist across
+restarts, while the full display transcript and original model/tool history remain
 in that conversation's JSONL file. Summary requests are additional billed inference. A failed or stopped
 summary leaves the previous summary state intact and performs no tools. Summaries
 can lose details; they are not an exact substitute for the original transcript.

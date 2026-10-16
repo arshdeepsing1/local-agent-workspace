@@ -1,5 +1,6 @@
-import { html, useState } from '../lib.js'
+import { html, useMemo, useState } from '../lib.js'
 import { Check, ChevronDown, ChevronRight, File, Undo2 } from '../icons.js'
+import { changedFileFolder, pathShortener } from '../paths.js'
 
 export const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`
 export const STATUS_LABELS = { created: 'New file', modified: 'Modified', deleted: 'Deleted', unavailable: 'Unavailable' }
@@ -15,10 +16,14 @@ export function DiffStat({ added, removed }) {
 //   error? } | null; via_session_id marks a subagent's edit, source 'command' a file a command changed
 //   (on narrow screens those badges shrink to S and C, keeping their full word for screen readers).
 // Props: changes, busy (a response is running; Undo waits for it), onOpen(path),
-//   onAction(action, files) -> Promise, onError(message)
-export default function ChangesBar({ changes, busy, onOpen, onAction, onError }) {
+//   onAction(action, files) -> Promise, onError(message), roots (absolute folders outside the project: the chat's
+//   allowed folders and the default code folder; a file in one is shown under "<folder name>/<folder within it>",
+//   any other absolute path under "…/" and its last two folders; the full path stays in the title and labels)
+export default function ChangesBar({ changes, busy, onOpen, onAction, onError, roots = [] }) {
   const [open, setOpen] = useState(false)
   const [working, setWorking] = useState(false)
+  const rootsKey = JSON.stringify(roots)
+  const shorten = useMemo(() => pathShortener(null, JSON.parse(rootsKey)), [rootsKey])
   const files = changes?.files || []
   if (!files.length && !changes?.error) return null
   const run = async (action, items) => {
@@ -43,11 +48,11 @@ export default function ChangesBar({ changes, busy, onOpen, onAction, onError })
       </div>
     </div>` : null}
     ${open && files.length ? html`<ul class="changes-list">${files.map(item => {
-      const slash = item.path.lastIndexOf('/')
+      const folder = changedFileFolder(item.path, shorten)
       return html`<li key=${item.path} class="changes-file">
         <button class="changes-open" title=${`Review ${item.path}`} onClick=${() => onOpen(item.path)}>
-          <${File} size=${14} /><span class="changes-name">${item.path.slice(slash + 1)}</span>
-          ${slash > 0 ? html`<span class="changes-dir">${item.path.slice(0, slash)}</span>` : null}
+          <${File} size=${14} /><span class="changes-name">${item.path.slice(item.path.lastIndexOf('/') + 1)}</span>
+          ${folder ? html`<span class="changes-dir">${folder}</span>` : null}
           ${item.status !== 'modified' ? html`<small class=${`changes-status ${item.status}`}>${STATUS_LABELS[item.status] || item.status}</small>` : null}
           ${item.via_session_id ? html`<small class="changes-status subagent" data-short="S" title="Changed by a subagent of this conversation">Subagent</small>` : null}
           ${item.source === 'command' ? html`<small class="changes-status command" data-short="C" title="Changed by a command the agent ran">Command</small>` : null}

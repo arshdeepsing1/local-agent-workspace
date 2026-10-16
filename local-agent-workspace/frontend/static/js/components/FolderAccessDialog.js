@@ -1,7 +1,8 @@
 import { html, useEffect, useRef, useState } from '../lib.js'
 import { Check, Folder, LoaderCircle, X } from '../icons.js'
 import { api } from '../api.js'
-import { standingFolder, inside } from './FileRoots.js'
+import { standingFolder } from './FileRoots.js'
+import { inside } from '../paths.js'
 
 // Check result: { accessible, path, error, python_executable? }
 // codingDir: Settings coding_dir_status; the default code folder is allowed in every conversation.

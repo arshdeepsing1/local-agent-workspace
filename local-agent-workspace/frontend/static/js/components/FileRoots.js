@@ -2,9 +2,8 @@ import { html, useEffect, useRef, useState } from '../lib.js'
 import { Folder, FolderPlus, X } from '../icons.js'
 import { api } from '../api.js'
 import { plural } from './ChangesBar.js'
+import { inside, shortNames } from '../paths.js'
 
-// True when an absolute path lies inside the absolute folder `root`.
-export const inside = (path, root) => path.startsWith(root.endsWith('/') ? root : `${root}/`)
 // The default code folder from Settings (coding_dir_status) as a folder every chat may use, or null when it is
 // off, not usable, the project itself or inside the project. { path, missing }.
 export function standingFolder(codingDir, workspace) {
@@ -14,22 +13,6 @@ export function standingFolder(codingDir, workspace) {
 }
 const parentFolder = path => path.slice(0, path.lastIndexOf('/')) || '/'
 const OUTSIDE_SUGGESTIONS = 3
-
-// Visible names for absolute folders: the last folder name, with as many parent names as it takes to
-// tell equal names apart (the full path stays in the title and the accessible name).
-export function shortNames(paths) {
-  const parts = paths.map(path => path.split('/').filter(Boolean))
-  const depth = parts.map(() => 1)
-  const name = index => parts[index].slice(-depth[index]).join('/')
-  for (let longer = true; longer;) {
-    longer = false
-    const names = parts.map((_, index) => name(index))
-    names.forEach((value, index) => {
-      if (depth[index] < parts[index].length && names.some((other, at) => at !== index && other === value)) { depth[index]++; longer = true }
-    })
-  }
-  return new Map(paths.map((path, index) => [path, depth[index] >= parts[index].length ? path : name(index)]))
-}
 
 // The project's folders added to Files (view only: they never change what the agent may access).
 // folders: [{ path, missing }]; add(path) resolves to the added folder's absolute path.

@@ -643,13 +643,37 @@ def test_context_updates_ignore_abandoned_sockets(ui):
 
 
 def test_compaction_shows_busy_and_stop_works(ui, page):
+    # F7: the hint counts the time since compaction started and says why it runs and why it can take minutes.
+    # Mutation: render the static "Compacting context…".
     start_app(ui, page, "a", setup="fake.override = path => path === '/api/sessions/a/stop' ? fake.json({ ok: true }) : undefined")
     ui.show_session("a")
+    ui.emit("a", "{ type: 'context', context_info: { ...contextInfo, auto_compact_percent: 85 } }")
+    ui.emit("a", {"type": "status", "status": "running"})
     ui.emit("a", {"type": "status", "status": "compacting"})
-    expect(page.get_by_role("status")).to_have_text("Compacting context…")
+    hint = page.get_by_role("status")
+    expect(hint).to_contain_text("Compacting context…")
+    expect(hint).to_contain_text("The next request passed the auto-compact threshold (85%). Summary requests are not "
+                                 "streamed and can take a few minutes.")
+    elapsed = hint.locator(".compacting-elapsed")
+    expect(elapsed).to_have_text(re.compile(r"^[0-2] s$"))
+    expect(elapsed).to_have_text(re.compile(r"^[1-3] s$"))  # It keeps counting.
+    expect(elapsed).to_have_attribute("aria-hidden", "true")  # Not announced every second.
     expect(send(page)).to_have_count(0)
     page.get_by_role("button", name="Stop response").click()
     ui.wait("fake.requests('/api/sessions/a/stop', 'POST').length === 1")
+
+
+def test_a_compaction_you_asked_for_or_found_running_names_no_threshold(ui, page):
+    # Compact now starts from idle; a chat opened mid-compaction has no known start, so no time is shown.
+    start_app(ui, page, "a", setup="fake.sessions.set('b', { ...makeSession('b', 'Busy chat'), status: 'compacting' })")
+    ui.show_session("a")
+    ui.emit("a", {"type": "status", "status": "compacting"})
+    hint = page.get_by_role("status")
+    expect(hint).to_have_text(re.compile(r"^Compacting context… \d s · Summary requests are not streamed and can take a few minutes\.$"))
+    page.get_by_role("button", name=re.compile("^Busy chat")).click()
+    ui.show_session("b")
+    expect(page.get_by_role("status")).to_have_text("Compacting context… · Summary requests are not streamed and can take a few minutes.")
+    expect(page.locator(".compacting-elapsed")).to_have_count(0)
 
 
 def test_newer_context_survives_an_older_summary_request(ui):
