@@ -521,13 +521,15 @@ def test_read_and_edit_tool_sets_stay_derived():
 
 
 def test_mode_prompts_are_exact():
+    read_only = ("pwd, ls, read-only git status/diff/log/show/branch, and commands or pipelines of read-only programs "
+                 "the app checks, such as cat, head, tail, grep, rg, find, sed -n, awk, sort and wc, on paths in "
+                 "approved folders")
     assert mode_prompt("auto") == (
-        "Auto mode: file edits run directly, and a fixed list of read-only commands (pwd, ls, and read-only git "
-        "status/diff/log/show/branch commands) runs without an approval card; other commands and actions need an "
-        "approval card unless a rule the user saved allows them.")
+        f"Auto mode: file edits run directly, and read-only commands run without an approval card: {read_only}. "
+        "Other commands and actions need an approval card unless a rule the user saved allows them.")
     first = ("Plan mode: inspect files and describe a concrete plan with the proposed steps and content, rather than "
              "merely refusing an implementation request. File changes and commands are blocked, except read-only "
-             "commands from a fixed list (pwd, ls, git status/diff/log/show/branch).")
+             f"commands: {read_only}.")
     assert mode_prompt("plan") == first + (
         " Use ask_user for clarifying questions. When the plan is complete, call submit_plan with the full plan: the "
         "user can approve it and switch modes, and you then implement it in this same turn. Do not invent mode names.")
@@ -536,10 +538,10 @@ def test_mode_prompts_are_exact():
     assert mode_prompt("dontAsk") == (
         "Don't ask mode: actions run only when the mode or a rule the user saved allows them; anything else is blocked "
         "without an approval card. If an action is blocked, continue with what you can do and tell the user what "
-        "needs their approval.")
+        "needs their approval. A command that names a credential-looking file always shows a card.")
     assert mode_prompt("bypassPermissions") == (
-        "Bypass permissions mode: actions run without approval cards. Deny and ask rules the user saved and file-tool "
-        "credential exclusions still apply.")
+        "Bypass permissions mode: actions run without approval cards, except commands that name credential-looking "
+        "files. Deny and ask rules the user saved and file-tool credential exclusions still apply.")
     assert mode_prompt("manual") == "Manual mode: reads run directly; file changes and commands require an approval card."
     assert mode_prompt("acceptEdits") == "Accept edits mode: file edits run directly; commands require an approval card."
 

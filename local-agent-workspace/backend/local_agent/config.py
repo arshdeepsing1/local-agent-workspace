@@ -154,6 +154,8 @@ class Settings:
             "output_style": "default",
             "write_limit_kb": 80,
             "command_env": [],
+            # Settings → Commands (secret_paths.py): file name patterns that count as credential files for commands.
+            "secret_file_patterns": [],
             "rate_limit_auto_continue": True,
             "auto_keep_changes": False,
             # Settings → Reasoning (reasoning.py): the effort new chats start with, how requests ask
@@ -316,6 +318,8 @@ class Settings:
                 raise ValueError(f"{name} cannot be passed to commands.")
             if name in DENIED_ENV or name.startswith(DENIED_ENV_PREFIXES):
                 raise ValueError(f"{name} changes how programs start and cannot be passed to commands.")
+        from .secret_paths import check_patterns  # tools imports jobs; keep this module's imports light.
+        candidate["secret_file_patterns"] = check_patterns(candidate["secret_file_patterns"])
         if type(candidate["rate_limit_auto_continue"]) is not bool:
             raise ValueError("Continue after rate limits must be on or off.")
         if type(candidate["auto_keep_changes"]) is not bool:

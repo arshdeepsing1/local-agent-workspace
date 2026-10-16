@@ -176,6 +176,7 @@ class SettingsEdit(BaseModel):
     output_style: str | None = Field(default=None, min_length=1, max_length=40, strict=True)  # output_styles.STYLE_ID
     write_limit_kb: int | None = Field(default=None, ge=MIN_WRITE_LIMIT_KB, le=MAX_WRITE_LIMIT_KB, strict=True)
     command_env: list[str] | None = Field(default=None, max_length=MAX_COMMAND_ENV, strict=True)
+    secret_file_patterns: list[str] | None = Field(default=None, max_length=32, strict=True)  # secret_paths
     rate_limit_auto_continue: bool | None = Field(default=None, strict=True)
     reasoning_effort: Effort | None = None
     reasoning_format: RequestFormat | None = None

@@ -631,3 +631,6 @@ body.panel-resizing{cursor:col-resize;user-select:none}
 .sent-with .attachment-chip{font-family:inherit}
 .queue-tag{font-size:11px;color:var(--muted);border:1px solid #dededb;border-radius:5px;padding:0 5px;white-space:nowrap}
 .skill-notes{color:#87593b}
+/* 2026-10-16 cmdsafety: the secret-file warning on command cards. */
+.tool-secret{padding:8px 10px;border-radius:6px;background:#f6e4e1;color:#7a3b31;overflow-wrap:anywhere}
+.tool-secret code{font-size:12px;overflow-wrap:anywhere}

@@ -36,7 +36,7 @@ def test_the_new_fields_render_with_their_defaults_and_help(ui, page):
 
 def test_saved_values_show_and_the_put_carries_the_new_fields(ui, page):
     dialog = open_settings(ui, page, setup="""fake.settings = { ...fake.settings, user_instructions: 'Be brief.',
-      write_limit_kb: 120, command_env: ['JAVA_HOME', 'NVM_DIR'], rate_limit_auto_continue: true }""")
+      write_limit_kb: 120, command_env: ['JAVA_HOME', 'NVM_DIR'], secret_file_patterns: ['*.tfvars'], rate_limit_auto_continue: true }""")
     instructions = dialog.get_by_role("textbox", name="Custom instructions")
     expect(instructions).to_have_value("Be brief.")
     expect(dialog.get_by_text("9 / 8,000")).to_be_visible()
@@ -47,10 +47,14 @@ def test_saved_values_show_and_the_put_carries_the_new_fields(ui, page):
     dialog.get_by_role("spinbutton", name="File write limit (KB)").fill("200")
     names.fill("JAVA_HOME,  CONDA_PREFIX\tGOPATH, ")
     expect(names).to_have_value("JAVA_HOME,  CONDA_PREFIX\tGOPATH, ")
+    secrets = dialog.get_by_role("textbox", name="Secret file names for commands")
+    expect(secrets).to_have_value("*.tfvars")
+    secrets.fill("*.tfvars, prod-*.yaml  *.tfvars")
     dialog.get_by_role("checkbox", name="Continue automatically after rate limits").click()
     dialog.get_by_role("button", name="Save settings").click()
     expect(page.get_by_role("dialog")).to_have_count(0)
     body = ui.bodies("/api/settings", "PUT")[0]
+    assert body["secret_file_patterns"] == ["*.tfvars", "prod-*.yaml"]
     assert body["user_instructions"] == "Answer in short paragraphs.\nPrefer standard library modules."
     assert body["write_limit_kb"] == 200
     assert body["command_env"] == ["JAVA_HOME", "CONDA_PREFIX", "GOPATH"]

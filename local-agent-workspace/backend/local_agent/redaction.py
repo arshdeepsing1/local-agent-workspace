@@ -18,7 +18,22 @@ SECRET_PATTERNS = (
 )
 
 
+# The shapes that are almost never anything but a credential: applied to what commands and MCP tools
+# return before the model sees it (redact_tokens). The generic name=value pattern above is left out
+# there, because source code and logs match it far too often.
+TOKEN_PATTERNS = (*SECRET_PATTERNS[:3],
+                  (re.compile(r"(?i)(\bbearer\s+)(?!\$)[A-Za-z0-9._~+/=-]{20,}"), r"\1[REDACTED]"),
+                  SECRET_PATTERNS[5])
+
+
 def redact_secrets(text):
     for pattern, replacement in SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def redact_tokens(text):
+    """text with GitHub, Databricks and AWS access-key shapes, long Bearer tokens and URL passwords replaced."""
+    for pattern, replacement in TOKEN_PATTERNS:
         text = pattern.sub(replacement, text)
     return text

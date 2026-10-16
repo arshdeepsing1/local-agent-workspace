@@ -66,6 +66,37 @@ def test_cards_ran_by_a_rule_say_so_without_expanding(ui, page):
     expect(card.get_by_role("button", name="run command make test")).to_be_visible()
 
 
+def test_a_checked_read_only_command_says_so(ui, page):
+    show(ui, """[{ id: 'checked', type: 'tool', name: 'run_command', state: 'completed', read_only_pipeline: true,
+      input: { command: 'grep -n x a.py | head' }, output: '{}' }, { id: 'mixed', type: 'tool', name: 'run_command',
+      state: 'completed', read_only_pipeline: true, allowed_by_rule: true, rule_scope: 'project',
+      input: { command: 'make test 2>&1 | tail -5' }, output: '{}' }]""")
+    expect(page.get_by_text("Ran as a read-only command (checked by the app)", exact=True)).to_have_count(1)
+    expect(page.get_by_text("Checked by the app: read-only commands and a rule for this project", exact=True)).to_have_count(1)
+    expect(page.get_by_text("Allowed by a rule for this project", exact=True)).to_have_count(0)
+
+
+def test_a_command_naming_a_secret_file_warns_and_offers_nothing_to_remember(ui, page):
+    show(ui, f"[{pending('secret', 'run_command', ", input: { command: 'cat ~/.databrickscfg' }, rememberable: [], secret_files: ['~/.databrickscfg']")}]")
+    warning = page.locator(".tool-secret")
+    expect(warning).to_have_text("Reads a secret file: ~/.databrickscfg. If you approve, its contents can reach the model; "
+                                 "only known token shapes and your credential file's values are hidden. Such a command asks "
+                                 "in every mode and cannot be remembered.")
+    expect(warning.locator("code")).to_have_text("~/.databrickscfg")
+    expect(page.get_by_role("button", name=re.compile("in this chat$"))).to_have_count(0)
+    expect(page.get_by_role("button", name="Always allow…")).to_have_count(0)
+    page.get_by_role("button", name="Approve").click()
+    ui.wait("fake.calls.length === 1")
+    assert decisions(ui, "secret") == [{"allowed": True}]
+
+
+def test_a_finished_secret_command_names_the_file_in_its_rule_line(ui, page):
+    show(ui, """[{ id: 'done', type: 'tool', name: 'run_command', state: 'completed', approval: 'approved',
+      secret_files: ['.env', 'id_rsa'], input: { command: 'cat .env id_rsa' }, output: '{}' }]""")
+    expect(page.get_by_text("Named a secret file: .env, id_rsa", exact=True)).to_be_visible()
+    expect(page.locator(".tool-secret")).to_have_count(0)
+
+
 # Decline with a note
 
 def test_decline_sends_the_note_and_approve_does_not(ui, page):

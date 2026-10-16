@@ -40,9 +40,14 @@ function leadingCd(command) {
 }
 
 // The collapsed heading of a command card: "cd <folder> && rest" reads "<folder name> › rest" when the folder is the
-// project or inside a known folder, so the command itself is not cut off. Display only: the title, the accessible
-// name, the expanded card and the approval card keep the whole command.
-export function commandHeading(command, shorten, projectName = '') {
+// project or inside a known folder, so the command itself is not cut off. A command run with cwd reads
+// "<folder> › command" the same way (cwd: the resolved folder, else as the agent gave it). Display only: the title,
+// the accessible name, the expanded card and the approval card keep the whole command.
+export function commandHeading(command, shorten, projectName = '', cwd = '') {
+  if (typeof cwd === 'string' && cwd) {
+    const short = shorten(cwd)
+    if (short !== '.') return `${short} › ${command}`
+  }
   const cd = leadingCd(command)
   const short = cd ? shorten(cd[0]) : null
   if (!cd || short === cd[0]) return command
@@ -61,7 +66,7 @@ function summarizeTools(events, shorten = path => path, projectName = '') {
     const input = event.input || {}
     let subject = String(input.path || input.file_path || input.command || input.query || input.task || input.title || '')
     let shown = PATH_SUBJECTS.has(event.name) && input.path && typeof input.path === 'string' ? shorten(input.path)
-      : event.name === 'run_command' && typeof input.command === 'string' ? commandHeading(input.command, shorten, projectName) : subject
+      : event.name === 'run_command' && typeof input.command === 'string' ? commandHeading(input.command, shorten, projectName, event.command_cwd || input.cwd) : subject
     let suffix = ''
     if (event.name === 'read_file') suffix = readRange(event)
     if (event.name === 'find_files') {

@@ -5,6 +5,8 @@
 //   when the next request's estimate passes this share of the input budget), approval_timeout_minutes? (0 = no limit),
 //   system_notifications? (server notifications while no page is open),
 //   auto_keep_changes? (true: Keep every listed change when a chat's reply ends), host, configured,
+//   secret_file_patterns? (at most 32 file name patterns, such as '*.tfvars': a command naming such a file
+//   always shows an approval card with a warning, like the built-in credential names; secret_paths.py),
 //   spending_limit_dbu? (0-100000, default 0 = none: the spending limit of chats without their own; spending.py),
 //   coding_dir (default folder for new standalone code: the saved or .env value, '' = off),
 //   python_venv (virtual environment the agent's commands, Verify, hooks and the Terminal use, '' = off),
@@ -142,7 +144,10 @@
 //   approval?: 'approved'|'declined'|'expired'|'blocked', approval_expires? (epoch seconds, only with a limit),
 //   decline_note? (the user's note sent with Decline), allowed_by_rule? (true: ran by a Rule, no card),
 //   rule_scope?: 'chat'|'project'|'user' (with allowed_by_rule), read_only_command? (true: ran from the fixed
-//   read-only command list), approved_by_mode? (the mode whose switch approved a waiting card),
+//   read-only command list), read_only_pipeline? (true: a command the app checked as read-only and ran as its own
+//   script, shell_vet; with allowed_by_rule when a part ran because a rule allows it), command_cwd? (the resolved
+//   folder of a run_command with cwd), secret_files? (the words of a command that look like credential files: its
+//   card warns and cannot be remembered), approved_by_mode? (the mode whose switch approved a waiting card),
 //   without_shell? (true: the command ran as an argv without a shell), job_id? and job_started? (a command
 //   card's job and when it started, epoch seconds: a running card shows its time against input.timeout_seconds),
 //   edited? (true: the user edited the action before approving it), blocked_reason? (with approval 'blocked': why it did not run),

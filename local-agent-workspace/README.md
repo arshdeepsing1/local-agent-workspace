@@ -730,8 +730,9 @@ when opening a conversation or performing restart recovery.
   is read in pages, so a read card names the lines it covered (`lines 109–243`).
   A file card names a file in the project by its project path and one in an allowed folder or
   the default code folder as `<folder>/rest`, and a command that starts with `cd <folder> &&`
-  into the project or one of those folders reads `<folder> › rest` in its heading; the tooltip, the expanded card and the
-  approval card keep the full path and command. A running command shows how long it has run
+  into the project or one of those folders, or that runs in such a folder with `cwd`, reads
+  `<folder> › rest` in its heading; the tooltip, the expanded card and the
+  approval card keep the full path and command (the card adds "Runs in: <folder>"). A running command shows how long it has run
   against its timeout (`running · 8 min 42 s of 40 min`; `8:42` in a narrow chat) and, collapsed,
   its latest output line.
   A command that exits non-zero, times out or is interrupted shows a warning icon, a label
@@ -2596,11 +2597,11 @@ waits (see **Mode changes while the agent works** below).
 | Mode | Agent behavior |
 | --- | --- |
 | Manual | Read approved folders; ask before edits, commands, stopping jobs and subagents. |
-| Auto | Accept file edits, run the fixed list of read-only commands (below), stop jobs and start subagents; ask for other commands and actions. |
+| Auto | Accept file edits, run read-only commands (the fixed list and the commands the app checks, below), stop jobs and start subagents; ask for other commands and actions. |
 | Accept edits | Accept file edits and start subagents; ask before commands and other actions. |
-| Don't ask | Run only what the mode's reads or a saved rule allows; block everything else without an approval card. |
-| Plan | Read/search approved folders, run the read-only command list, and describe a plan; block file changes and other commands. Subagents still need a card. |
-| Bypass permissions | Run actions and access external folders without approval cards. Deny and ask rules still apply, and credential/generated-file exclusions still apply to file tools. |
+| Don't ask | Run only what the mode's reads or a saved rule allows; block everything else without an approval card, except a command that names a credential-looking file, which shows its card. |
+| Plan | Read/search approved folders, run read-only commands (the fixed list and the commands the app checks), and describe a plan; block file changes and other commands. Subagents still need a card. |
+| Bypass permissions | Run actions and access external folders without approval cards, except a command that names a credential-looking file. Deny and ask rules still apply, and credential/generated-file exclusions still apply to file tools. |
 
 Reading, listing and searching files, reading job output, waiting for a job, skills and
 structured tasks are available in every mode without a card. Stopping a job is a command
@@ -2645,6 +2646,10 @@ Rule kinds:
   must all appear somewhere in the command in any order (`git push` also matches
   `git -C . push --force` and `/usr/bin/git push`), with combined short options split
   (`rm -rf` matches `rm -r -f` and `rm -fr`); a deny or ask rule without words covers every command.
+  An allow rule for an exact command or a prefix applies only to a command that runs in the
+  project folder (no `cwd`, or the project itself), because another folder has other Makefiles
+  and scripts; **Allow for this chat** on a card for another folder remembers the exact text
+  with that folder and matches only there. Deny and ask rules apply in every folder.
 - **File edits** (`write_file`, `edit_file`, `insert_activity_log`, `move_path`, `delete_path`,
   `notebook_edit`), optionally only under one absolute folder. An allow rule needs every path the
   tool touches inside the folder; a deny or ask rule applies when any of them is (both ends of a move).
@@ -2672,9 +2677,9 @@ because an allow rule would never apply to it.
 
 **No shell.** Commands allowed by an exact or prefix rule, and commands on the read-only list,
 run without a shell: shell syntax (`; & | < > ( ) { } [ ] * ? ~ ! # $ ^`, backticks,
-backslashes, tabs and line breaks) never matches such a rule. A command allowed by its exact
-text in this chat, and any command you approve on a card, still runs through the shell exactly
-as approved.
+backslashes, tabs and line breaks) never matches such a rule. A command the app checks
+(below) runs as a script the app writes itself. A command allowed by its exact text in this
+chat, and any command you approve on a card, still runs through the shell exactly as approved.
 
 **Read-only commands.** Auto and Plan run this fixed list without a card, in the foreground
 only: `pwd`; `ls` with no option or `-l`, `-a`, `-la`, `-al`, `-1`; `git status` (plain,
@@ -2682,17 +2687,73 @@ only: `pwd`; `ls` with no option or `-l`, `-a`, `-la`, `-al`, `-1`; `git status`
 `--staged`, `--cached --stat`); `git log --oneline` (optionally `-n 20`); `git show` (plain or
 `--stat`); `git branch` (plain or `--show-current`); `git rev-parse HEAD`,
 `--abbrev-ref HEAD` and `--show-toplevel`; `git ls-files`. There are no test runners, package
-managers, search tools, interpreters or `git remote` on the list. A command on the list runs
+managers, interpreters or `git remote` on the list. A command on the list runs
 hardened (see **Local access and limits**) whatever mode or rule allowed it; when you approve it
 on a card, it runs through the shell like any approved command.
 
-**Uncertain commands.** A command that a deny or ask rule might cover but that cannot be checked
+**Commands the app checks.** Auto and Plan also run, without a card and in the foreground
+only, a command or pipeline whose every part is a read-only program the app knows, with each
+option and operand checked: `cat`, `head`, `tail` (not `-f`), `wc`, `grep` (not `-R`), `rg`
+(not `--pre`, `-z` or `-L`), `sort` (not `-o`, `-T` or `--compress-program`), `uniq` (one
+file, so never an output file), `cut`, `tr`, `nl`, `tac`, `paste`, `comm`, `cmp`, `diff`
+(files only, not `-r`), `ls`, `du`, `find` (tests and `-print` only: never `-exec`, `-delete`,
+`-fprint` or `-L`), `sed` (only `-n`, `-E` and scripts that print, delete, substitute or
+transliterate: no `-i`, `w`, `r` or `e`), `awk` (no `system`, `getline`, `ARGV`, `ENVIRON`, pipes
+or `print >` to a file; `-F` and `-v` only), `echo`, `pwd`, `basename`, `dirname`, `date +FORMAT`,
+`true` and `false`, and Git `status`, `diff`, `show`, `log` (no `-p`), `branch` (listing only),
+`rev-parse` and `ls-files` with their read-only options, `-C <folder>` and `-- <paths>`. Parts
+may be joined by `|`, `&&`, `||`, `;` and line breaks, start with `cd <folder> &&`, and use
+`2>&1`, `>/dev/null`, `2>/dev/null` and `</dev/null`. Every path and every folder (also `cwd`)
+must be in the project, a folder granted to the chat or the default code folder, and must not
+look like a credential file (below); recursive searches skip credential-looking names,
+generated folders and the app's state folder. Anything else asks as before: `$`, backticks,
+other redirects, here-documents, `&`, parentheses, braces, `!`, an assignment or a path as the
+first word, globs that match more than 500 files, programs not on the list (`xargs`, `tee`,
+`env`, `python`, `curl`, `make`...) and options not on each program's list. The app never hands
+your text to a shell: it expands globs and `~` itself, writes a script with every word quoted,
+runs each program from the absolute `PATH` entries outside the project, the chat's folders and
+the default code folder (a planted `grep` in the project makes the command ask), Git through
+the hardened read-only Git below, and runs it with `/bin/sh`. In Auto, a part that an exact or
+prefix allow rule allows may join such a command when it runs in the project folder and is not
+fed by a pipe (`python -m pytest -q 2>&1 | tail -20` with a rule for `python -m pytest -q`).
+The card reads "Ran as a read-only command (checked by the app)". In Plan, a refused command's
+message says what the check refused, so the agent can adjust it. Manual, Accept edits, Don't
+ask and Bypass decide on such commands as before.
+
+**Uncertain commands.** A command the app checks (above) is matched against deny and ask rules
+part by part, exactly, so a deny rule for one of its programs blocks it. A command that a deny or ask rule might cover but that cannot be checked
 exactly gets a card, even in Bypass: shell syntax that contains the rule's program as a word, `$`,
 backticks, backslashes or glob characters, or an `alias` or `source` line; a wrapper such as
 `env`, `command`, `nohup` or `sh -c`; an inline interpreter, also with combined or attached
 options (`perl -le`, `python3 -Ic`, `node --eval=…`); or a never-allowed option such as `git -c`.
 Text that does not mention the rule's program (`npm test | tee out` with a deny rule for
 `git push`) is not uncertain.
+
+**Credential-looking files.** A command that names a file that looks like a credential always shows
+an approval card, in every mode, Bypass and Don't ask included, and no rule skips it; Plan does not
+run it. The card says which word matched ("Reads a secret file: `~/.databrickscfg`") and cannot be
+remembered, and a mode or rule change never approves it. Such names are `.env*` (`.env`,
+`.env.local`, `.envrc`, `.env-prod`; not `.env.example`), the file tools' other credential names
+(`.netrc`, `.npmrc`, `.pgpass`, `.pypirc`, `.git-credentials`, `.databrickscfg`, `credentials`,
+`id_rsa`, `id_ed25519`, `id_ecdsa`, `id_dsa`, `env_vars.txt`), other private keys and key stores
+(`id_rsa*` but not `*.pub`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`), files in `.ssh` (except
+public keys, `known_hosts`, `authorized_keys` and `config`) and `.gnupg`, `.aws/credentials` and
+`.aws/config`, `.kube/config` and other kube configs, `.docker/config.json`,
+`.config/gh/hosts.yml`, `.my.cnf`, `.vault-token`, data files whose name contains token, secret,
+password, credential or apikey (`api_token.txt`, `secrets.yaml`, `secrets/db_token`; not
+`tokenizer.py`, `tokenizer.json` or `secret_santa.md`), the configured credential file under any
+spelling, what a glob in the command matches, and the name patterns in **Settings → Commands and
+files → Secret file names for commands** (`*.tfvars`). A relative name counts in the folder the
+command reads it from, its `cwd` or a `cd <folder>` in it (`cat config` in `~/.kube`), and a link
+counts as the file it points at. The check reads the command's words, so a program that finds such
+a file itself is not caught: recursive `grep` and `rg` that the app checks skip them (a name
+without an extension only when it ends in the word, such as `db_token`, not `secret_key`), and
+output redaction stays. Command and MCP results are redacted before the agent sees them: the
+Databricks token, the credential file's values for keys that name a token, secret, password, key,
+credential, auth or cookie (8 characters or more), MCP secret references, and GitHub, Databricks
+and AWS access-key shapes, long Bearer tokens and passwords in URLs. Six more names joined the file
+tools' exclusions and the diff exclusions: `.databrickscfg`, `.git-credentials`, `.pypirc`,
+`.pgpass`, `id_ecdsa` and `id_dsa`.
 
 **Protected files.** Edits always show a card, in every mode except Bypass and even with an allow
 rule, when a path (requested or resolved, inside or outside the project) is in `.vscode`, `.idea`,
@@ -2708,9 +2769,10 @@ Don't ask blocks these edits.
 is checked again at once: switching to Accept edits approves a waiting edit, switching to Plan
 blocks waiting edits and commands ("Not run: the user switched this chat to Plan mode while this
 card was waiting.") but approves a waiting command from the read-only list and leaves a subagent
-card waiting, switching to Don't ask blocks waiting cards, and switching to Bypass approves
+card waiting, switching to Don't ask blocks waiting cards (except one for a credential-looking file), and switching to Bypass approves
 waiting cards, including folder access (without adding a folder grant), except a card a
-before-tool hook asked for (`"ask"`), which waits for your answer. Before-tool hooks run before an
+before-tool hook asked for (`"ask"`) and a command that names a credential-looking file, which
+wait for your answer. Before-tool hooks run before an
 action's own card, so an action whose hook card waited is checked again after the hook: it gets
 its own card (and a folder-access card outside the project) when the new mode needs one. Switching to Bypass asks for confirmation for that reason.
 Each new model request uses the current mode, and a running subagent follows the parent's
@@ -2795,7 +2857,7 @@ projects when you do not say where; files that belong to the open project stay i
 relative paths still mean the project. Every conversation may use the folder without a Folder
 access card, like the project: Plan stays read-only, Manual asks before each edit, Accept edits
 edits without asking, Don't ask refuses what would need a card, and Bypass is unchanged.
-Commands still run in the project folder. A folder that does not exist yet is created by the
+Commands run in the project folder unless they name a `cwd`. A folder that does not exist yet is created by the
 agent's first approved write there. Folder access lists it as "Default code folder · all
 conversations", and Workspace → Files shows it as a root ("Created on first write" until then).
 Settings refuses the filesystem root, system folders (`/etc`, `/usr`, `/System` and similar),
@@ -2968,7 +3030,14 @@ non-ASCII letters, and single-file searches do not use rg. When rg fails, for ex
 in a folder with an unreadable file, takes more than 5 seconds, or prints too much,
 the search reads every file itself: slower, with the same results.
 
-`run_command` accepts `timeout_seconds`, `max_output_bytes`, and `background`.
+`run_command` accepts `timeout_seconds`, `max_output_bytes`, `background` and `cwd`, the
+folder it runs in (default: the project; the tool asks the agent to use it instead of
+`cd <folder> &&`). A `cwd` in the project, a folder granted to the chat or the default code
+folder runs there after the usual command card; any other folder first shows the
+**Folder access** card (the same grant file tools use), which Don't ask refuses and Bypass
+skips; Plan refuses it. Credential, generated and state folders are refused, and a symbolic
+link is followed to the folder it names, which must be approved. Background jobs keep their
+folder, and `expected_seconds` counts runs of the same command in the same folder.
 It returns a job ID and the first output page. When a command failed, timed out, or
 was stopped and its output does not fit one page, the first result shows up to 1,500
 characters of the start and up to 4,500 of the end of the retained output instead
@@ -3239,6 +3308,8 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `backend/local_agent/jobs.py`: streamed processes, managed jobs, and cleanup.
 - `backend/local_agent/command_exec.py`: commands run from an argument vector without a shell (read-only `pwd` and `ls` from `/bin`, hardened Git).
 - `backend/local_agent/rules.py`: the rule engine (command parsing, rule matching, uncertain commands), protected paths, the read-only command list and the saved `permission_rules.json`.
+- `backend/local_agent/shell_vet.py`: commands the app checks as read-only: a conservative shell lexer, the per-program option table, path and glob checks, and the quoted script it runs.
+- `backend/local_agent/secret_paths.py`: credential-looking file names, for the approval card that commands naming them always show and for the exclusions of checked searches.
 - `backend/local_agent/permissions.py`: the permission modes, the one decision every tool call and waiting card goes through (turned-off tools, rules, protected files, Don't ask), and model instructions.
 - `backend/local_agent/approvals.py`: rules from cards and the Permissions menu (chat, project and all-project routes, reset), edit before approving, turned-off tools and the tool list, decline-note wording, and 409 details naming a busy chat.
 - `backend/local_agent/interactions.py`: `ask_user` questions and `submit_plan` reviews that wait for the user inside a turn.
@@ -3260,7 +3331,7 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `backend/local_agent/result_budget.py`: the 128 KiB tool-result cap and the per-response context allowance.
 - `backend/local_agent/activity.py`: app-generated activity log for handoffs (`insert_activity_log`).
 - `backend/local_agent/transcript.py` / `scripts/conversation_transcript.py`: Markdown transcripts of saved conversations (also `GET /api/sessions/<id>/transcript.md`).
-- `backend/local_agent/redaction.py`: common secret shapes replaced in logs, handoffs and transcripts.
+- `backend/local_agent/redaction.py`: common secret shapes replaced in logs, handoffs and transcripts, and the high-confidence ones in command and MCP results.
 - `skills/`: skills shipped with the app and offered in every workspace; `handoff/SKILL.md` is the detailed handoff skill. A workspace's `.agents/skills/<id>/` replaces the shipped skill with that ID.
 - `backend/local_agent/telemetry.py`: inference ledger, validated usage, DBU estimates, and failure categories.
 - `backend/local_agent/usage_export.py` / `scripts/usage_report.py`: usage rows and CSV correlated with conversation history.

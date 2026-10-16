@@ -460,6 +460,23 @@ def test_a_leading_cd_into_a_known_folder_is_shortened_in_the_heading_only(ui, p
     assert page.locator("pre[aria-label=Command]").evaluate("e => e.textContent") == command
 
 
+@pytest.mark.parametrize("fields, shown", [
+    ({"command_cwd": "/srv/other/pkg"}, "other/pkg › grep -n x a.py"),
+    ({"command_cwd": "/project/src"}, "src › grep -n x a.py"),
+    ({"input_cwd": "/srv/other"}, "other › grep -n x a.py"),
+    ({"command_cwd": "/project"}, "grep -n x a.py"),
+    ({"command_cwd": "/elsewhere/x"}, "/elsewhere/x › grep -n x a.py"),
+])
+def test_a_command_with_a_cwd_names_its_folder_in_the_heading(ui, page, fields, shown):
+    event = json.loads(tool(command="grep -n x a.py", output=job_page("completed", 0, "ok\n")))
+    if "input_cwd" in fields:
+        event["input"]["cwd"] = fields.pop("input_cwd")
+    event.update(fields)
+    show_in(ui, [json.dumps(event)])
+    expect(page.locator(".tool-subject")).to_have_text(shown)
+    expect(page.locator(".tool-heading")).to_have_accessible_name("run command grep -n x a.py")
+
+
 def test_a_pending_command_card_keeps_the_whole_command_in_its_body(ui, page):
     command = "cd /srv/other/pkg && python -m pytest -q tests"
     show_in(ui, [json.dumps({"id": "p", "type": "tool", "name": "run_command", "state": "pending", "input": {"command": command}})])
