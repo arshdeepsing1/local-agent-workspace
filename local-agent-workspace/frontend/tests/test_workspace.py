@@ -128,17 +128,18 @@ def test_settings_edit_and_save_only_databricks_fields(ui, page):
     expect(steps).to_have_attribute("max", "64")
     expect(dialog.get_by_text(re.compile("not individual tool calls"))).to_be_visible()
     expect(dialog.get_by_label("Agent runtime")).to_have_count(0)
-    # No agent runtime options: CLAUDE.md is named only as a project instruction file.
-    # No Claude CLI runtime settings (a model name such as Claude Opus 5.5 in help text, or the Claude endpoints that
-    # Prompt caching applies to, is fine).
-    expect(dialog.get_by_text(re.compile(r"Claude(?!\.md| Opus|-opus| endpoints\))|MCP|skills", re.I))).to_have_count(0)
+    # No agent runtime options: CLAUDE.md is named only as an instruction file (the project's, or the read-only
+    # ~/.claude/CLAUDE.md). No Claude CLI runtime settings (a model name such as Claude Opus 5.5 in help text, or the
+    # Claude endpoints that Prompt caching applies to, is fine).
+    expect(dialog.get_by_text(re.compile(r"(?<!\.)Claude(?!\.md|\.local\.md| Opus|-opus| endpoints\))|MCP|skills", re.I))).to_have_count(0)
     expect(dialog.get_by_role("combobox", name="Prompt caching").locator("option").first).to_have_text(
         "Automatic (Claude endpoints)")
     checkboxes = dialog.get_by_role("checkbox")
-    expect(checkboxes).to_have_count(6)
+    expect(checkboxes).to_have_count(9)
     expect(dialog.locator("label:has(input[type=checkbox])")).to_have_text([
         "Save a detailed handoff at each compaction", "Show thinking summaries",
         "Keep agent changes automatically when a reply finishes", "Continue automatically after rate limits",
+        "Load my instructions file ~/.agents/AGENTS.md", "Also load ~/.claude/CLAUDE.md", "Project memory",
         "Run commands typed with /", "Desktop notification when no browser tab is open"])
     dialog.get_by_label("Project folder").fill("/updated-project")
     endpoint.select_option(label="Other endpoint…")
