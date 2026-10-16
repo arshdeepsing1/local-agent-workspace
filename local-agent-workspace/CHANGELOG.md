@@ -4,6 +4,110 @@ Notable changes to Local Agent Workspace, newest first. Dates are UTC.
 
 ## Unreleased
 
+From the stress tests of 2026-10-16 on a live Databricks workspace (Claude Opus 5.5):
+
+- Prompt caching on Claude endpoints: agent and subagent requests to Claude Opus 5.5 and Opus
+  4.8 mark where the system message's stable part ends and their last message (`"cache_control":
+  {"type": "ephemeral"}`), so input that repeats an earlier step is billed at the cache-read
+  rate (about 5% of the input price; writes cost 25% more and expire after 5 minutes). Titles,
+  `/btw` side questions, compaction requests and other endpoints get no markers. **Settings →
+  Model and context → Prompt caching** is Automatic, Documented forms only (only the marker
+  forms Databricks documents, for a route that ignores the others instead of rejecting them) or
+  Off.
+- When Databricks answers HTTP 400 to a request with cache markers, the app sends it again with
+  fewer (only the documented forms, then none) and, once one is accepted, says so in a notice
+  and keeps that level for the endpoint until a restart or a Settings save. The resend is marked
+  `cache_rejected` in the usage ledger and does not use up the retries after rate limits. A 400
+  that names caching drops the markers before any reasoning field.
+- The usage ledger keeps, per agent and subagent request, the cache markers it was sent with
+  (`prompt_cache`), whether its system message's changing part differed from the chat's last
+  answered request (`system_tail_changed`), the key names of the usage Databricks sent
+  (`usage_keys`), the shape that carried the reasoning (`reasoning_shape`) and whether a
+  reasoning signature came (`reasoning_signature`); names and flags only, never values.
+- Simulator: Claude endpoints report usage in the real route's shape (top-level cache read and
+  write counts, no reasoning tokens), check cache markers and keep a 5-minute prefix cache
+  (`cache: read N, wrote M` per request); `--cache documented|reject|ignore` rehearses a route
+  that refuses some or all markers. Claude summaries start after a short pause and end with a
+  blank line.
+- Automatic compaction keeps the turn before the latest one verbatim only when the request then
+  needs at most 60% of the auto-compact threshold, so a compaction leaves room for the next
+  steps. Before, it could keep a large preceding turn and leave the request at over 90% of the
+  threshold, so the next steps each resent that turn and it was summarized a few minutes later.
+- **Compact now** summarizes every turn before the latest one (it used to keep the preceding
+  turn too, so a manual compaction often freed little).
+- When there is nothing to compact (every earlier turn is already summarized, or the chat has
+  one turn), the context meter disables the note field and **Compact now** and says why, until
+  your next message. A compaction request in that state is refused at once, also when the only
+  message after the summary was sent while the agent worked; before, it started and then failed
+  with an error.
+- An oversized summary is condensed by one request instead of up to two, and that request asks
+  for about four fifths of the size limit, because models overshoot a size they are given. A
+  condensed summary still over the limit has its least important sections shortened by the app
+  at no cost. The compaction notice and the meter now say so accurately (the saved handoff has
+  the shortened sections in full) and count the summary and condensing requests apart.
+- The Claude Opus 5.5 starting estimate ratio (1.3) is no longer replaced by the first report:
+  it keeps the weight of 20,000 estimated tokens, so a first request that is mostly system
+  message and tool definitions no longer makes the next large file reads look up to about 14%
+  smaller than they are. Compaction requests, and reports that look like they counted cached
+  tokens twice, no longer change the agent estimate scale.
+- At a context budget close to the window of an endpoint the app knows (Opus 5.5: 1,000,000
+  tokens; GPT OSS 120B: 131,072), the input budget keeps 5% of the window for estimate error
+  (934,826 on Opus 5.5 at 1,000,000 and 16,384; 115,078 at GPT OSS 120B's defaults, which fill
+  its window), and each summary request leaves room for counting 1.2 times its estimate, so a
+  near-full request is not rejected for passing the window. Opus 5.5 budgets up to about
+  950,000, including the default 200,000, are unchanged. Settings names the budget requests use
+  next to the estimated input budget, also in the auto-compact figure.
+- The context meter's details close when the chat starts waiting for your approval or answer, so
+  they never cover the new card.
+- Rate limits: a 429 body that gives only an error code and a message (as Databricks sends them)
+  now names its limit too: the app reads input or output tokens per minute, queries per hour,
+  minute or second from the message's words (one type only; numbers in words are never read, so
+  no limit is learned from them). Queries per minute (QPM) is a new limit label.
+- Every HTTP 429 before streaming is retried, whatever its body says (also an empty, plain-text
+  or proxy page). A rate limit reported inside the stream is labelled a rate limit and still not
+  retried.
+- Rate-limit notices (a retry, an automatic continue, a wait for another chat) have **Details**
+  with the 429 behind them: its code, its message (redacted, at most 200 characters) and the
+  wait Databricks asked for, or "Retry-After: none". Request details show the message of a final
+  429 even when it names no limit, and the usage ledger keeps the message, the requested wait
+  and whether it came in a `Retry-After` header (the CSV is unchanged).
+- A chat waiting for another chat's rate limit now retries 1 to 3 seconds after that chat's own
+  retry instead of at almost the same moment.
+- Settings: Max output tokens above the endpoint's output-tokens-per-minute limit is a warning,
+  no longer an error: Databricks documents that such a request is rejected, but some workspaces
+  accept more. The README and the context-budget note say that Databricks admits short bursts
+  above its per-minute limits.
+- Claude Opus 5.5 reasoning fields were checked on a live workspace: the chat-completions route
+  accepts thinking at every effort level, streams the summary and counts thinking in output
+  tokens. Request details now read "In output tokens (not reported separately)" for Reasoning
+  tokens on such requests instead of "Unavailable", and usage totals show a token field no call
+  reported as unavailable rather than 0.
+- Request details show when a reply's thinking text began, for example "Thinking text began
+  after 9.0 s" (Databricks sends it a few seconds after thinking starts; "Thought for N s" is
+  unchanged).
+- The system message names the shell commands run with (zsh, bash or sh, and that zsh does not
+  split an unquoted `$VAR`) and asks polling loops to print one line per check.
+- The step-limit notice adds what the turn cost, for example "This turn used about 42.5 DBU
+  (estimate)." (left out without price data). The README recommends a per-chat spending limit
+  for anyone raising Agent steps; the default stays 32.
+- A card that starts waiting for you (an approval, a question or a plan) scrolls into view also
+  when you had scrolled up, and the hint under the message box ("An action is waiting for your
+  approval above.") has **Show**, which brings the waiting card back into view and moves
+  keyboard focus to it.
+- The changes bar names a file outside the project by the allowed folder or default code folder
+  it is in (`other/pkg` instead of the whole absolute folder), or by `…/` and its last two
+  folders; the tooltip and the Keep and Undo labels keep the full path.
+- File tool cards name a file in the project by its project path and one in an allowed folder or
+  the default code folder as `<folder>/rest`, so the file name is no longer cut off. A command
+  that starts with `cd <folder> &&` into the project or such a folder reads `<folder> › rest` in
+  its heading; the tooltip, the expanded card and the approval card keep the whole command.
+- A running command card counts how long it has run against its timeout (`running · 8 min 42 s
+  of 40 min`, `8:42` in a narrow chat) and shows its latest output line while collapsed, so a
+  quiet command no longer looks stuck.
+- "Compacting context…" counts the time since compaction started and, for an automatic
+  compaction, says that the next request passed the auto-compact threshold and that summary
+  requests, which are not streamed, can take a few minutes.
+
 Follow-up of 2026-10-15:
 
 - Custom agents: Markdown files in a project's `.agents/agents` (or `.claude/agents`) define
