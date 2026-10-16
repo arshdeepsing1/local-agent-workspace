@@ -724,3 +724,29 @@ def test_a_report_that_is_not_json_shows_no_report(ui, page):
     expect(page.get_by_label("Subagent progress")).to_contain_text("Subagent: failed")
     expect(page.locator(".delegation-report")).to_have_count(0)
     expect(page.locator(".delegation-elapsed")).to_have_count(0)  # Older progress has no start time.
+
+
+def test_a_question_or_plan_that_starts_waiting_comes_into_view(ui, page):
+    # F1 (b): also for question and plan cards, after the user scrolled up. Mutation: count only tool cards.
+    page.set_viewport_size({"width": 1280, "height": 700})
+    history = [event for n in range(10) for event in (
+        {"id": f"u{n}", "type": "user", "text": f"Step {n}"},
+        {"id": f"r{n}", "type": "assistant", "text": "A long reply. " * 120})]
+    question = {"id": "ask", "type": "tool", "name": "ask_user", "state": "pending", "output": "",
+                "input": {"questions": [{"question": "Which database?", "options": [{"label": "SQLite"}, {"label": "Postgres"}]}]}}
+    plan = {"id": "plan", "type": "tool", "name": "submit_plan", "state": "pending", "output": "", "input": {"plan": "Do it."}}
+    props = "{{ session: makeSession({}), onError: fake.spy('onError') }}"
+    show(ui, json.dumps(history))
+    page.add_style_tag(content=".transcript{height:600px}")  # The app's column; mounted alone it would grow.
+
+    def scroll_up():
+        page.locator(".transcript").evaluate("e => { e.style.scrollBehavior = 'auto'; e.scrollTop = 0; e.dispatchEvent(new Event('scroll')) }")
+        expect(page.get_by_text("Step 0", exact=True)).to_be_in_viewport()
+
+    scroll_up()
+    ui.rerender(props.format(json.dumps(history + [question])))
+    expect(page.locator(".question-card.needs-answer")).to_be_in_viewport()
+    scroll_up()
+    answered = {**question, "state": "completed", "question_outcome": "skipped"}
+    ui.rerender(props.format(json.dumps(history + [answered, plan])))
+    expect(page.locator(".plan-card.needs-answer")).to_be_in_viewport()

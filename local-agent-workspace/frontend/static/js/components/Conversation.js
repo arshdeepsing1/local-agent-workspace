@@ -12,6 +12,7 @@ import RewindDialog from './RewindDialog.js'
 import ForkDialog from './ForkDialog.js'
 import { backupTitle, setRewindNotice } from '../rewindNotice.js'
 import { agentLabel, agentSettingsText, elapsedText } from '../subagents.js'
+import { pathShortener } from '../paths.js'
 
 // A long file is read in pages. Naming the lines each read covered keeps the
 // pages of one file from looking like the same read repeated.
@@ -26,24 +27,60 @@ function readRange(event) {
   return Number.isInteger(start) && start > 1 ? ` · from line ${start}` : ''
 }
 
-// Returns Map<event id, { subject, taskStatus? }> for every tool event.
-function summarizeTools(events) {
+// A command that starts with "cd <folder> &&" (one plain or quoted absolute folder, no shell expansion and no
+// operators inside it) as [folder, rest]; null otherwise.
+const LEADING_CD = /^\s*cd\s+(?:'([^'\n&;|<>]+)'|"([^"\n$`\\&;|<>]+)"|([^\s'"$`\\;&|<>(){}*?[\]~]+))\s*&&\s*(\S[\s\S]*)$/
+function leadingCd(command) {
+  const match = LEADING_CD.exec(command)
+  const folder = match && (match[1] ?? match[2] ?? match[3])
+  if (!folder?.startsWith('/') || folder.split('/').some(part => part === '.' || part === '..')) return null
+  return [folder, match[4]]
+}
+
+// The collapsed heading of a command card: "cd <folder> && rest" reads "<folder name> › rest" when the folder is the
+// project or inside a known folder, so the command itself is not cut off. Display only: the title, the accessible
+// name, the expanded card and the approval card keep the whole command.
+export function commandHeading(command, shorten, projectName = '') {
+  const cd = leadingCd(command)
+  const short = cd ? shorten(cd[0]) : null
+  if (!cd || short === cd[0]) return command
+  return `${short === '.' ? projectName || '.' : short} › ${cd[1]}`
+}
+
+// Returns Map<event id, { subject, shown, taskStatus? }> for every tool event. subject is the full text (the title
+// and accessible name); shown is what the heading shows: a path inside the project relative to it, one in an
+// allowed folder as "<folder name>/rest" (shorten: pathShortener), and a leading cd into such a folder shortened.
+function summarizeTools(events, shorten = path => path, projectName = '') {
   const taskTitles = new Map()
   const summaries = new Map()
+  const flat = text => text.slice(0, 240).replace(/\s+/g, ' ')
   for (const event of events) {
     if (event.type !== 'tool') continue
     const input = event.input || {}
     let subject = String(input.path || input.file_path || input.command || input.query || input.task || input.title || '')
-    if (event.name === 'read_file') subject += readRange(event)
-    if (event.name === 'find_files') subject = `${input.pattern ?? ''}` + (input.path && input.path !== '.' ? ` in ${input.path}` : '')
-    if (event.name === 'wait_job') subject = String(input.job_id ?? '').slice(0, 8) + (input.until_regex ? ` until /${input.until_regex}/` : '')
+    let shown = PATH_SUBJECTS.has(event.name) && input.path && typeof input.path === 'string' ? shorten(input.path)
+      : event.name === 'run_command' && typeof input.command === 'string' ? commandHeading(input.command, shorten, projectName) : subject
+    let suffix = ''
+    if (event.name === 'read_file') suffix = readRange(event)
+    if (event.name === 'find_files') {
+      const where = input.path && input.path !== '.' ? input.path : ''
+      subject = `${input.pattern ?? ''}` + (where ? ` in ${where}` : '')
+      shown = `${input.pattern ?? ''}` + (where ? ` in ${shorten(where)}` : '')
+    }
+    if (event.name === 'wait_job') subject = shown = String(input.job_id ?? '').slice(0, 8) + (input.until_regex ? ` until /${input.until_regex}/` : '')
     if (event.name === 'outline_file') {
-      subject += (Number.isInteger(input.max_level) && input.max_level < 6 ? ` · to level ${input.max_level}` : '')
+      suffix = (Number.isInteger(input.max_level) && input.max_level < 6 ? ` · to level ${input.max_level}` : '')
         + (Number.isInteger(input.offset) && input.offset > 0 ? ` · from entry ${input.offset}` : '')
     }
-    if (event.name === 'project_overview') subject = input.path && input.path !== '.' ? String(input.path) : 'workspace'
+    if (event.name === 'project_overview') {
+      const where = input.path && input.path !== '.' ? String(input.path) : ''
+      subject = where || 'workspace'
+      shown = where && shorten(where) !== '.' ? shorten(where) : 'workspace'
+    }
+    subject += suffix
+    shown += suffix
     // A hook card names its hook and the tool it ran for (lifecycle events have no tool).
-    if (String(event.name || '').startsWith('hook_') && input.hook_id) subject = `${input.hook_id}${input.tool ? ` · ${input.tool}` : ''}`
+    if (String(event.name || '').startsWith('hook_') && input.hook_id) subject = shown = `${input.hook_id}${input.tool ? ` · ${input.tool}` : ''}`
     let taskStatus
     if (event.name === 'create_task' || event.name === 'update_task') {
       let task = {}
@@ -51,14 +88,14 @@ function summarizeTools(events) {
         const result = JSON.parse(event.output || '{}')
         if (result && typeof result === 'object' && !Array.isArray(result)) task = result
       } catch { /* Older or failed events can contain plain-text output. */ }
-      subject = String(task.title || input.title || taskTitles.get(String(input.task_id)) || input.task_id || '')
+      subject = shown = String(task.title || input.title || taskTitles.get(String(input.task_id)) || input.task_id || '')
       if (event.state === 'completed') {
         if (typeof task.id === 'string' && subject) taskTitles.set(task.id, subject)
         const status = task.status || input.status
         if (typeof status === 'string') taskStatus = status.replace(/_/g, ' ')
       }
     }
-    summaries.set(event.id, { subject: subject.slice(0, 240).replace(/\s+/g, ' '), taskStatus })
+    summaries.set(event.id, { subject: flat(subject), shown: flat(shown), taskStatus })
   }
   return summaries
 }
@@ -431,6 +468,8 @@ function DelegationStatus({ event, onSelectSession, onOpenPath }) {
 // Tools whose input names one file: the file the card's Open file button opens.
 const FILE_INPUTS = { read_file: 'path', write_file: 'path', edit_file: 'path', insert_activity_log: 'path',
   notebook_read: 'path', notebook_edit: 'path', move_path: 'destination', outline_file: 'path' }
+// Tools whose heading names input.path (summarizeTools shortens it).
+const PATH_SUBJECTS = new Set([...Object.keys(FILE_INPUTS), 'delete_path', 'list_files', 'find_files', 'search_files', 'project_overview'])
 
 // What the agent received when it differs from the card (the per-response context allowance).
 function allowanceNote(event) {
@@ -448,6 +487,32 @@ function allowanceNote(event) {
 // Shorter heading labels for narrow chat columns (styles.css swaps them in; the heading's name keeps the full label).
 const SHORT_STATUS = { 'started in background': 'background' }
 
+// "45 s", "10 min", "1 h": a command's time limit (run_command takes 1 to 3,600 seconds).
+const limitText = seconds => seconds >= 3600 && seconds % 3600 === 0 ? `${seconds / 3600} h`
+  : seconds >= 60 && seconds < 3600 && seconds % 60 === 0 ? `${seconds / 60} min` : elapsedText(seconds)
+
+// "8:42", "1:02:03": the short form of a running time for narrow chat columns.
+const clockText = seconds => {
+  const total = Math.max(0, Math.round(seconds))
+  const [hours, minutes, rest] = [Math.floor(total / 3600), Math.floor(total / 60) % 60, String(total % 60).padStart(2, '0')]
+  return hours ? `${hours}:${String(minutes).padStart(2, '0')}:${rest}` : `${minutes}:${rest}`
+}
+
+// How long a running command has run against its time limit, counted each second: "running · 8 min 42 s of 40 min"
+// (a narrow chat column shows "8:42"). started: epoch seconds (the event's job_started).
+function CommandClock({ started, limit }) {
+  const [now, setNow] = useState(() => Date.now() / 1000)
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now() / 1000), 1000)
+    return () => clearInterval(timer)
+  }, [])
+  const seconds = Math.max(0, now - started)
+  return html`<span class="tool-status neutral tool-clock" data-short=${clockText(seconds)}>running · ${elapsedText(seconds)} of ${limitText(limit)}</span>`
+}
+
+// The newest non-empty line of a running command's output (a progress line ended by a carriage return counts).
+const latestLine = output => clip(String(output || '').slice(-4000).split(/\r\n|\r|\n/).map(line => line.trim()).filter(Boolean).at(-1) || '')
+
 function ToolCard({ event, summary, result, status, failure = null, sessionId, onError, onSelectSession, onOpenPath }) {
   const [expanded, setExpanded] = useState(false)
   const filePath = event.input?.[FILE_INPUTS[event.name]]
@@ -460,6 +525,11 @@ function ToolCard({ event, summary, result, status, failure = null, sessionId, o
   const allowInChat = pending ? allowLabel(event) : null
   const rule = ruleLine(event)
   const hooked = hookSummary(event)
+  // A running agent command shows its time against its limit and, collapsed, its latest output line.
+  const runningCommand = event.state === 'running' && event.name === 'run_command'
+  const clock = runningCommand && typeof event.job_started === 'number'
+  const limit = Number.isInteger(event.input?.timeout_seconds) && event.input.timeout_seconds > 0 ? event.input.timeout_seconds : 60
+  const liveLine = runningCommand && !expanded ? latestLine(event.output) : ''
   const decide = async (allowed, extra = {}) => {
     setDeciding(true)
     // The note goes to the model with a Decline; extra is { remember: true } (an exact rule for this chat) or { scope, rule? }.
@@ -472,14 +542,16 @@ function ToolCard({ event, summary, result, status, failure = null, sessionId, o
     <button class="tool-heading" onClick=${() => setExpanded(v => !v)} aria-expanded=${expanded || pending}
       aria-label=${[title, summary.subject, summary.taskStatus ? `Task: ${summary.taskStatus}` : '', status.label].filter(Boolean).join(' ')}>
       ${event.name?.toLowerCase().includes('command') || event.name === 'Bash' ? html`<${Terminal} size=${16} />` : html`<${FileText} size=${16} />`}
-      <span class="tool-name">${title}</span><span class="tool-subject" title=${summary.subject}>${summary.subject}</span>
+      <span class="tool-name">${title}</span><span class="tool-subject" title=${summary.subject}>${summary.shown ?? summary.subject}</span>
       ${summary.taskStatus ? html`<span class="tool-task-status">Task: ${summary.taskStatus}</span>` : null}
       ${status.tone === 'running' ? html`<${LoaderCircle} size=${14} className="spin" />` : status.tone === 'ok' ? html`<${Check} size=${14} className="success-icon" />`
         : status.tone === 'warn' ? html`<${CircleAlert} size=${14} className="warning-icon" />` : null}
       ${status.label ? html`<span class=${`tool-status ${status.labelTone === 'neutral' ? 'neutral' : ''}`} data-short=${SHORT_STATUS[status.label]}>${status.label}</span>` : null}
+      ${clock ? html`<${CommandClock} started=${event.job_started} limit=${limit} />` : null}
       ${expanded || pending ? html`<${ChevronDown} size=${14} />` : html`<${ChevronRight} size=${14} />`}
     </button>
     <${DelegationStatus} event=${event} onSelectSession=${onSelectSession} onOpenPath=${onOpenPath} />
+    ${liveLine ? html`<p class="tool-live" title=${liveLine}>${liveLine}</p>` : null}
     ${rule ? html`<p class="tool-rule">${rule}</p>` : null}
     ${hooked ? html`<p class="hook-outcome">${hooked}</p>` : null}
     ${expanded || pending ? html`<div class="tool-body">
@@ -609,11 +681,27 @@ function Reply({ text, reasoning, truncated, started, seconds, requestInfo, onOp
     </div></div>`
 }
 
+// The cards waiting for your answer (an approval, a question, a plan): one per pending tool event, in transcript order.
+export const PENDING_CARDS = '.tool-card.needs-approval, .question-card.needs-answer, .plan-card.needs-answer'
+
+// Scrolls a waiting card into view and, with focus, moves keyboard focus to where answering starts: a tool card's
+// heading (it names the action; Tab reaches the buttons), a question's first option, a plan's first review button.
+export function revealCard(card, focus = false) {
+  if (!card) return
+  card.scrollIntoView({ block: 'nearest' })
+  if (!focus) return
+  const target = card.matches('.tool-card') ? card.querySelector('.tool-heading')
+    : card.querySelector('input:not(:disabled)') || card.querySelector(':is(.plan-actions, .approval-buttons) button:not(:disabled)')
+  target?.focus({ preventScroll: true })
+}
+
 // onOpenPath({ path, line? }) opens a file named in a reply or a tool card in the Workspace panel.
 // onLoadEarlier() -> Promise loads the page of messages before the first loaded one (session.events_start > 0).
 // busy: the chat is not idle (message actions other than Copy are hidden).
 // onPrefill(text) puts text in an empty composer and returns false when a typed draft was kept.
-export default function Conversation({ session, onError, onSelectSession, onOpenPath, busy = false, onPrefill, onLoadEarlier }) {
+// roots: absolute folders besides the chat's allowed folders (the default code folder) whose files tool cards name
+// as "<folder name>/rest".
+export default function Conversation({ session, onError, onSelectSession, onOpenPath, busy = false, onPrefill, onLoadEarlier, roots = [] }) {
   const container = useRef(null)
   const bottom = useRef(null)
   const follow = useRef(true)
@@ -634,12 +722,28 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
     anchor.current = el ? { top: el.scrollTop, height: el.scrollHeight, focused: document.activeElement === event?.currentTarget } : null
     void Promise.resolve(onLoadEarlier?.()).catch(error => { anchor.current = null; onError?.(error.message) })
   }
-  const toolSummaries = useMemo(() => summarizeTools(session.events), [session.events])
+  const rootsKey = JSON.stringify([...(session.allowed_directories || []), ...roots])
+  const shorten = useMemo(() => pathShortener(session.workspace, JSON.parse(rootsKey)), [session.workspace, rootsKey])
+  const projectName = String(session.workspace || '').split('/').filter(Boolean).at(-1) || ''
+  const toolSummaries = useMemo(() => summarizeTools(session.events, shorten, projectName), [session.events, shorten, projectName])
   // Map<event id, { result, status }>: parsed once per event (see toolState).
   const toolStates = useMemo(() => new Map(session.events.filter(event => event.type === 'tool').map(event => [event.id, toolState(event)])), [session.events])
   const last = session.events[session.events.length - 1]
   useEffect(() => { if (follow.current) bottom.current?.scrollIntoView({ block: 'end' }) }, [last?.id, last?.text, last?.state])
   useEffect(() => { follow.current = true; bottom.current?.scrollIntoView({ block: 'end' }) }, [session.id])
+  // A card that starts waiting for you is scrolled into view, also when you scrolled up to read: it is the one moment
+  // you must act. Only when it starts waiting, so reading older output is not disturbed afterwards; while the view
+  // follows the end, the scroll above already shows the last card.
+  const waitingIds = useRef(null)
+  useEffect(() => {
+    const waiting = session.events.filter(event => event.type === 'tool' && event.state === 'pending').map(event => event.id)
+    const before = waitingIds.current
+    waitingIds.current = new Set(waiting)
+    if (!before) return
+    const index = waiting.findLastIndex(id => !before.has(id))
+    if (index < 0 || (follow.current && waiting[index] === last?.id)) return
+    revealCard(container.current?.querySelectorAll(PENDING_CARDS)[index])
+  }, [session.events])
   const tools = session.events.filter(event => event.type === 'tool')
   // Edit and resend, Retry, Rewind and Fork from here (history.py on the server).
   const [editing, setEditing] = useState(null)  // the user event id being edited

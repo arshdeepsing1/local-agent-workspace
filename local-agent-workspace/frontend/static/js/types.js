@@ -120,8 +120,9 @@
 //   decline_note? (the user's note sent with Decline), allowed_by_rule? (true: ran by a Rule, no card),
 //   rule_scope?: 'chat'|'project'|'user' (with allowed_by_rule), read_only_command? (true: ran from the fixed
 //   read-only command list), approved_by_mode? (the mode whose switch approved a waiting card),
-//   without_shell? (true: the command ran as an argv without a shell), edited? (true: the user edited the
-//   action before approving it), blocked_reason? (with approval 'blocked': why it did not run),
+//   without_shell? (true: the command ran as an argv without a shell), job_id? and job_started? (a command
+//   card's job and when it started, epoch seconds: a running card shows its time against input.timeout_seconds),
+//   edited? (true: the user edited the action before approving it), blocked_reason? (with approval 'blocked': why it did not run),
 //   protected? (the reason a file is protected), model_output? (what the agent received when it differs from
 //   output), result_withheld?: { estimated_tokens, allowance_tokens } (a read whose result did not fit the
 //   response's context allowance: the agent got a result_deferred message), result_shortened?: true (an action's

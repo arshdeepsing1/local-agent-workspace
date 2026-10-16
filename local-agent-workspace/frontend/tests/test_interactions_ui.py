@@ -256,17 +256,23 @@ def test_the_composer_hint_names_the_waiting_card(ui, page):
     ui.show_session("a")
     ui.emit("a", {"type": "status", "status": "awaiting_approval"})
     hint = page.locator(".composer-hint")
-    expect(hint).to_have_text("The agent is waiting for your answer above.")
+    expect(hint.get_by_role("status")).to_have_text("The agent is waiting for your answer above.")
+    # Show moves focus to where answering starts: a question's first option, a plan's first review button.
+    hint.get_by_role("button", name="Show", exact=True).click()
+    expect(page.get_by_role("radio", name=re.compile("^SQLite"))).to_be_focused()
     ui.emit("a", {"type": "event", "event": {**json.loads(question_event("completed")), "question_outcome": "skipped"}})
     ui.emit("a", {"type": "event", "event": {"id": "plan", "type": "tool", "name": "submit_plan", "state": "pending",
                                              "input": {"plan": "Do it."}, "output": ""}})
-    expect(hint).to_have_text("A plan is waiting for your review above.")
+    expect(hint.get_by_role("status")).to_have_text("A plan is waiting for your review above.")
+    hint.get_by_role("button", name="Show", exact=True).click()
+    expect(page.get_by_role("button", name="Keep planning")).to_be_focused()
     ui.emit("a", {"type": "event", "event": {"id": "plan", "type": "tool", "name": "submit_plan", "state": "completed",
                                              "input": {"plan": "Do it."}, "output": "", "plan_outcome": "approved",
                                              "plan_mode": "manual"}})
     ui.emit("a", {"type": "event", "event": {"id": "w", "type": "tool", "name": "write_file", "state": "pending",
                                              "input": {"path": "a.txt"}, "preview": "diff"}})
-    expect(hint).to_have_text("An action is waiting for your approval above.")
+    expect(hint.get_by_role("status")).to_have_text("An action is waiting for your approval above.")
+    expect(hint).to_contain_text("Show")
 
 
 # Phones

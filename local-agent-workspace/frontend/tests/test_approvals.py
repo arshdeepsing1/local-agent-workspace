@@ -435,3 +435,62 @@ def test_cards_without_saved_scopes_keep_the_single_buttons(ui, page):
     expect(old.get_by_role("button", name="Always allow…")).to_have_count(0)
     protected = page.locator(".tool-card").nth(1)
     expect(protected.get_by_role("button")).to_have_text(["write file.env", "Decline", "Approve"])
+
+
+# A waiting card the user scrolled away from (2026-10-16 F1)
+
+LONG_CHAT = json.dumps([event for n in range(12) for event in (
+    {"id": f"u{n}", "type": "user", "text": f"Step {n}"},
+    {"id": f"r{n}", "type": "assistant", "text": "A long reply.\n\n" + "Some detail about the change. " * 40})])
+
+
+def long_chat(ui, page):
+    page.set_viewport_size({"width": 1280, "height": 700})
+    ui.app(session="a", scenario="workspace", setup=f"fake.sessions.set('a', {{ ...makeSession('a', 'Long chat'), events: {LONG_CHAT} }})")
+    ui.show_session("a")
+    expect(page.locator(".transcript .user-message").first).to_be_attached()
+    ui.emit("a", {"type": "status", "status": "running"})
+
+
+def scroll_to_top(page):
+    transcript = page.locator(".transcript")
+    transcript.evaluate("e => { e.style.scrollBehavior = 'auto'; e.scrollTop = 0; e.dispatchEvent(new Event('scroll')) }")
+    expect(page.get_by_text("Step 0", exact=True)).to_be_in_viewport()
+
+
+WAITING = {"id": "w", "type": "tool", "name": "write_file", "state": "pending", "input": {"path": "a.txt", "content": "x"},
+           "preview": "--- a.txt\n+++ a.txt\n+x"}
+
+
+def test_a_card_that_starts_waiting_comes_into_view_after_scrolling_up(ui, page):
+    # Mutation: keep the scroll on follow.current only (the card stays below the fold).
+    long_chat(ui, page)
+    scroll_to_top(page)
+    ui.emit("a", {"type": "event", "event": {**WAITING, "state": "running"}})
+    ui.emit("a", {"type": "event", "event": WAITING})
+    ui.emit("a", {"type": "status", "status": "awaiting_approval"})
+    card = page.locator(".tool-card.needs-approval")
+    expect(card).to_be_in_viewport()
+    # Only when it starts waiting: an unrelated update later does not pull the view back.
+    scroll_to_top(page)
+    ui.emit("a", {"type": "event", "event": {**WAITING, "preview": "--- a.txt\n+++ a.txt\n+y"}})
+    ui.emit("a", "{ type: 'context', context_info: contextInfo }")
+    expect(page.get_by_text("Step 0", exact=True)).to_be_in_viewport()
+    expect(card).not_to_be_in_viewport()
+
+
+def test_show_in_the_hint_scrolls_to_the_waiting_card_and_focuses_it(ui, page):
+    # Mutation: drop the Show button, or focus nothing.
+    long_chat(ui, page)
+    ui.emit("a", {"type": "event", "event": WAITING})
+    ui.emit("a", {"type": "status", "status": "awaiting_approval"})
+    card = page.locator(".tool-card.needs-approval")
+    expect(card).to_be_in_viewport()
+    scroll_to_top(page)
+    expect(card).not_to_be_in_viewport()
+    hint = page.locator(".composer-hint")
+    expect(hint.get_by_role("status")).to_have_text("An action is waiting for your approval above.")
+    hint.get_by_role("button", name="Show", exact=True).click()
+    expect(card).to_be_in_viewport()
+    # Focus lands on the card's heading, which names the action; Tab reaches its buttons.
+    expect(card.get_by_role("button", name="write file a.txt", exact=True)).to_be_focused()

@@ -1,16 +1,18 @@
-import { html, resolve, useEffect, useRef, useState } from './lib.js'
+import { html, resolve, useEffect, useMemo, useRef, useState } from './lib.js'
 import { Folder, Laptop, Menu, PanelRight, Pencil, Terminal, Wrench, X } from './icons.js'
 import { api } from './api.js'
 import { useWorkspace } from './useWorkspace.js'
 import { useAttention } from './attention.js'
 import Sidebar, { Brand } from './components/Sidebar.js'
 import Composer from './components/Composer.js'
-import Conversation from './components/Conversation.js'
+import Conversation, { PENDING_CARDS, revealCard } from './components/Conversation.js'
 import AgentToolsDialog from './components/AgentToolsDialog.js'
 import SettingsDialog from './components/SettingsDialog.js'
 import WorkspacePanel from './components/WorkspacePanel.js'
 import FolderAccessDialog from './components/FolderAccessDialog.js'
-import { inside } from './components/FileRoots.js'
+import { standingFolder } from './components/FileRoots.js'
+import { inside } from './paths.js'
+import { elapsedText } from './subagents.js'
 import PermissionRulesDialog from './components/PermissionRulesDialog.js'
 import ContextMeter from './components/ContextMeter.js'
 import ChangesBar, { plural } from './components/ChangesBar.js'
@@ -109,6 +111,20 @@ export default function App() {
     app.setError(message)
   }
   const changedFiles = app.changes?.files.length || 0
+  // Absolute folders outside the project whose files the changes bar and tool cards name by the folder: the chat's
+  // allowed folders and the default code folder.
+  const standingPath = standingFolder(app.settings?.coding_dir_status, workspace)?.path
+  const allowedKey = JSON.stringify(active?.allowed_directories || [])
+  const pathRoots = useMemo(() => [...JSON.parse(allowedKey), ...(standingPath ? [standingPath] : [])], [allowedKey, standingPath])
+  // The status this chat had before its current one, as this page saw it change: a compaction that follows idle is
+  // one you asked for (Compact now), one that follows a running turn is automatic. since: when it changed (ms), null
+  // when the chat was first seen with it (opened or reloaded mid-compaction).
+  const statusSeen = useRef({ id: null, status: null, before: null, since: null })
+  if (statusSeen.current.id !== (active?.id ?? null) || statusSeen.current.status !== (active?.status ?? null)) {
+    const same = statusSeen.current.id === (active?.id ?? null)
+    statusSeen.current = { id: active?.id ?? null, status: active?.status ?? null,
+      before: same ? statusSeen.current.status : null, since: same ? Date.now() : null }
+  }
   // A missing default code folder is created by the agent's first write (a file tool or a command): check it
   // again when a change lands inside it, when a reply ends and when the Workspace panel opens, so Files keeps it
   // browsable after the change list empties.
@@ -117,6 +133,8 @@ export default function App() {
   useEffect(() => {
     if (missingCodingDir && (changedInMissing || !busy)) void app.refreshSettings().catch(() => {})
   }, [missingCodingDir, changedInMissing, busy, workspaceOpen])
+  // The hint's Show: the card it names (the last one waiting) comes into view with focus, wherever you scrolled.
+  const showWaiting = () => revealCard([...document.querySelectorAll(`.transcript :is(${PENDING_CARDS})`)].at(-1), true)
   const openReview = path => { setReview({ path, viewKey: app.viewKey }); setWorkspaceOpen(true) }
   const openFileAt = ({ path, line }) => { setOpenPath({ path, line, viewKey: app.viewKey }); setWorkspaceOpen(true) }
   // Removing a rule saves the chat (a newer 'updated'); like a rename, your own change is not news.
@@ -165,7 +183,7 @@ export default function App() {
       ${!app.online ? html`<div class="connection-banner" role="status">Reconnecting to your local server… Refresh if the server was restarted.</div>` : null}
       ${app.online && app.connection && !app.connection.connected ? html`<${ConnectionBanner} app=${app} onSettings=${() => setSettingsOpen(true)} onError=${showError} />` : null}
       ${hasMessages && active ? html`<${Conversation} key=${active.id} session=${active} onError=${showError} onSelectSession=${app.setActiveId} onOpenPath=${openFileAt}
-          busy=${busy} onLoadEarlier=${app.loadEarlier} onPrefill=${text => { if (draft.trim()) return false; setDraft(text); return true }} />` :
+          roots=${standingPath ? [standingPath] : []} busy=${busy} onLoadEarlier=${app.loadEarlier} onPrefill=${text => { if (draft.trim()) return false; setDraft(text); return true }} />` :
         html`<div class="welcome"><div class="welcome-content">
           <div class="welcome-heading"><${Brand} /><h1>What’s up next?</h1></div>
           <div class="suggestions"><button class="outline" onClick=${() => setDraft('Explore this project. Read the relevant files and explain its structure and how to run it.')}><${Folder} size=${16} />Explore this project</button>
@@ -174,15 +192,17 @@ export default function App() {
             <${WorktreeChat} key=${app.viewKey} sessionId=${app.activeId} onSelectSession=${app.setActiveId} onError=${showError} /></div>
         </div></div>`}
       <div class="chat-composer"><div class="composer-bars"><${RewindNotice} sessionId=${app.activeId} onSelectSession=${app.setActiveId} />
-        <${ChangesBar} key=${`changes-${app.viewKey}`} changes=${app.changes} busy=${busy} onOpen=${openReview} onAction=${app.reviewChanges} onError=${showError} />
+        <${ChangesBar} key=${`changes-${app.viewKey}`} changes=${app.changes} roots=${pathRoots} busy=${busy} onOpen=${openReview} onAction=${app.reviewChanges} onError=${showError} />
         <${TaskChecklist} key=${`tasks-${app.viewKey}`} tasks=${app.tasks} />
         <${ContinueButton} session=${active} disabled=${!app.ready || !app.online || app.modelSaving || !app.settings?.configured} onSend=${app.send} onError=${showError} />
         <${QueueBar} session=${active} onRemove=${app.removeQueued} onSend=${app.sendQueued} onError=${showError}
           onEdit=${async item => { await app.removeQueued(item.id); setDraft(current => current ? `${current}\n${item.text}` : item.text) }} />
         <${SideAnswer} side=${app.sideAnswer} onDismiss=${app.dismissSide} onError=${showError} /></div>
         ${composer}
-        ${active?.status === 'awaiting_approval' ? html`<p class="composer-hint" role="status">${(name => name === 'ask_user' ? 'The agent is waiting for your answer above.' : name === 'submit_plan' ? 'A plan is waiting for your review above.' : 'An action is waiting for your approval above.')(active.events?.findLast(event => event.state === 'pending')?.name)}</p>` : null}
-        ${active?.status === 'compacting' ? html`<p class="composer-hint" role="status">Compacting context…</p>` : null}
+        ${active?.status === 'awaiting_approval' ? html`<p class="composer-hint"><span role="status">${(name => name === 'ask_user' ? 'The agent is waiting for your answer above.' : name === 'submit_plan' ? 'A plan is waiting for your review above.' : 'An action is waiting for your approval above.')(active.events?.findLast(event => event.state === 'pending')?.name)}</span>
+          <button class="composer-hint-show" onClick=${showWaiting}>Show</button></p>` : null}
+        ${active?.status === 'compacting' ? html`<${CompactingHint} key=${active.id} since=${statusSeen.current.since}
+          automatic=${statusSeen.current.before == null ? null : statusSeen.current.before !== 'idle'} percent=${active.context_info?.auto_compact_percent} />` : null}
         ${active?.status === 'naming' ? html`<p class="composer-hint" role="status">Creating conversation title…</p>` : null}
         <${ContextMeter} key=${`context-${app.viewKey}`} info=${active?.context_info} model=${active?.model} busy=${busy}
           onCompact=${active && app.ready && app.online && app.settings?.configured ? async preservationNote => {
@@ -207,6 +227,21 @@ export default function App() {
       busy=${busy || (!!app.activeId && !active)} bypass=${app.permissionMode === 'bypassPermissions'} onAllow=${app.allowFolder} onRemove=${app.removeFolder} onClose=${() => setFoldersOpen(false)} />` : null}
     ${rulesOpen && app.settings ? html`<${PermissionRulesDialog} key=${app.viewKey} onAdd=${app.addRule} onClose=${() => setRulesOpen(false)} returnFocus=${rulesOpen.done} />` : null}
   </div>`
+}
+
+// "Compacting context… 1 min 50 s · why": the time since this page saw the chat start compacting (none after opening
+// it mid-compaction; it is not announced every second), and the reason: automatic is true for a compaction a turn
+// started, false for Compact now, null when unknown. percent: the chat's auto-compact share of the input budget.
+function CompactingHint({ since, automatic, percent }) {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (since == null) return undefined
+    const timer = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(timer)
+  }, [since])
+  const reason = automatic ? `The next request passed the auto-compact threshold${typeof percent === 'number' ? ` (${percent}%)` : ''}. ` : ''
+  return html`<p class="composer-hint compacting-hint" role="status">Compacting context…${since != null
+    ? html` <span class="compacting-elapsed" aria-hidden="true">${elapsedText(Math.max(0, now - since) / 1000)}</span>` : null} · ${reason}Summary requests are not streamed and can take a few minutes.</p>`
 }
 
 // Why Databricks cannot be used, with Check again (keeps focus while it checks and says what it found) and Open settings.
