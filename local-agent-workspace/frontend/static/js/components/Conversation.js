@@ -654,6 +654,19 @@ function Attachments({ items }) {
   return html`<ul class="attachment-chips" aria-label="Attachments">${items.map((item, index) => html`<li key=${index} class="attachment-chip">${attachmentLabel(item)}</li>`)}</ul>`
 }
 
+// What went to the agent with a user message besides its text: the command templates it ran (commands: [{ name,
+// path }], expanded after the text), the skills it selected for itself (skills: [id]), or verbatim (sent as plain text).
+function SentWith({ event }) {
+  const commands = Array.isArray(event.commands) ? event.commands : []
+  const skills = Array.isArray(event.skills) ? event.skills : []
+  if (!commands.length && !skills.length && !event.verbatim) return null
+  return html`<ul class="attachment-chips sent-with" aria-label="Sent with this message">
+    ${commands.map(item => html`<li key=${`command-${item.name}`} class="attachment-chip" title=${`The agent got the text of ${item.path} after your message`}>Command /${item.name} · ${item.path}</li>`)}
+    ${skills.map(id => html`<li key=${`skill-${id}`} class="attachment-chip" title="The skill's instructions went with this message only">Skill /${id}</li>`)}
+    ${event.verbatim ? html`<li class="attachment-chip">Sent as plain text</li>` : null}
+  </ul>`
+}
+
 // What user_prompt hooks did to a message (lifecycle_hooks.prompt_hooks): hook_blocked ({ hook_id, reason }: never
 // sent), hook_edit ({ hooks, original }: the text shown is the hook's replacement) and hook_notes ([{ event, hook_id,
 // context }]: context the model received after the message).
@@ -866,7 +879,8 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
     setRetrying(true)
     try {
       const result = await api(`/sessions/${encodeURIComponent(session.id)}/rewind`, 'POST',
-        { before_event_id: cuts.latestUser.id, conversation: true, resend_text: cuts.latestUser.text })
+        { before_event_id: cuts.latestUser.id, conversation: true, resend_text: cuts.latestUser.text,
+          ...(cuts.latestUser.verbatim ? { resend_verbatim: true } : {}) })
       resent(result, cuts.latestUser.text)
     } catch (e) { onError(e) }
     finally { setRetrying(false) }
@@ -900,7 +914,7 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
           setEditing(null)
           resent(result, text)
         }} />`
-      if (event.type === 'user') return html`<div class=${`user-message${event.steered ? ' steered' : ''}${event.hook_blocked ? ' hook-blocked' : ''}`} key=${event.id}>${event.steered ? html`<small class="steered-label">Sent while the agent was working</small>` : null}${event.origin?.kind === 'delegated' ? html`<small class="delegation-origin">Delegated by parent conversation</small>` : null}<${HookMessageLabel} event=${event} />${event.text}<${Attachments} items=${event.attachments} /><${HookMessageDetails} event=${event} />${event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}${event.text || idle ? html`<div class="message-actions">${event.text ? html`<${CopyAction} text=${event.text} label="Copy message" />` : null}${idle ? html`<${ActionButton} label="Edit message" icon=${Pencil} target=${`edit:${event.id}`} onClick=${() => setEditing(event.id)} /><${ActionButton} label="Rewind to here" icon=${Undo2} onClick=${() => setRewinding(event)} />` : null}</div>` : null}</div>`
+      if (event.type === 'user') return html`<div class=${`user-message${event.steered ? ' steered' : ''}${event.hook_blocked ? ' hook-blocked' : ''}`} key=${event.id}>${event.steered ? html`<small class="steered-label">Sent while the agent was working</small>` : null}${event.origin?.kind === 'delegated' ? html`<small class="delegation-origin">Delegated by parent conversation</small>` : null}<${HookMessageLabel} event=${event} />${event.text}<${Attachments} items=${event.attachments} /><${SentWith} event=${event} /><${HookMessageDetails} event=${event} />${event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}${event.text || idle ? html`<div class="message-actions">${event.text ? html`<${CopyAction} text=${event.text} label="Copy message" />` : null}${idle ? html`<${ActionButton} label="Edit message" icon=${Pencil} target=${`edit:${event.id}`} onClick=${() => setEditing(event.id)} /><${ActionButton} label="Rewind to here" icon=${Undo2} onClick=${() => setRewinding(event)} />` : null}</div>` : null}</div>`
       if (event.type === 'tool' && event.name === 'ask_user') return html`<${QuestionCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
       if (event.type === 'tool' && event.name === 'submit_plan') return html`<${PlanCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
       if (event.type === 'tool') return html`<${ToolCard} key=${event.id} event=${event} summary=${toolSummaries.get(event.id)} result=${toolStates.get(event.id).result} status=${toolStates.get(event.id).status} failure=${toolStates.get(event.id).failure} sessionId=${session.id} onError=${onError} onSelectSession=${onSelectSession} onOpenPath=${onOpenPath} />`

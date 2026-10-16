@@ -171,6 +171,9 @@ class Settings:
             # Settings → Model and context (AgentManager.fallback_endpoint): the endpoint an agent or subagent
             # request goes to once when its own failed before the reply started; "" = none.
             "fallback_model": "",
+            # Settings → Commands and files (commands.py): /<name> at the start of a message runs a command template
+            # and /<skill-id> selects a skill for that message; off sends such text as typed.
+            "slash_commands": True,
         }
         self.migrated_from = None
         if self.path.exists():
@@ -325,6 +328,8 @@ class Settings:
             raise ValueError("Show thinking summaries must be on or off.")
         if candidate["prompt_caching"] not in PROMPT_CACHING:
             raise ValueError("Prompt caching must be one of: " + ", ".join(PROMPT_CACHING) + ".")
+        if type(candidate["slash_commands"]) is not bool:
+            raise ValueError("Slash commands must be on or off.")
         candidate["spending_limit_dbu"] = validate_limit(candidate["spending_limit_dbu"], "Default spending limit")
         sent = values.get("subagent_defaults")
         if isinstance(sent, dict):

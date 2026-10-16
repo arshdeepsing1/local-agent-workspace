@@ -45,7 +45,8 @@ from .shell_changes import ShellChangeTracker
 from .workspace_folders import WorkspaceFolders, _within
 from .worktrees import WorktreeManager
 from .extensions import ExtensionManager
-from .extensions import skill_index
+from .extensions import RESERVED_COMMANDS, skill_index
+from . import commands as command_templates
 from . import custom_agents
 from .context import estimate_text_tokens
 from .planning import CallAllowance, DelegateManager, DelegationGate, TaskManager
@@ -71,7 +72,7 @@ from .store import UnreadableConversation
 from .approvals import MAX_ALLOW_RULES, busy_status, declined, rule_for
 from .notify import SystemNotifier, attention_message
 from .context import INCOMPLETE_RESPONSE_CONTINUATION, INVALID_ARGUMENTS_CONTINUATION, VERIFY_CONTINUATION_PREFIX
-from .context import HOOK_CONTINUATION_PREFIX, is_app_prompt, is_continuation
+from .context import HOOK_CONTINUATION_PREFIX, SKILL_MARKER, is_app_prompt, is_continuation
 from .lifecycle_hooks import LifecycleHooks, ToolHookNotes, blocked_prompt_notice, hook_contexts, shown_arguments
 from .context import retained_request as context_retained
 from . import history
@@ -101,6 +102,7 @@ MAX_OUTPUT_LIMIT_RETRIES = 2
 MAX_REQUEST_TOOLS = 32
 # A turn's MCP server status as a chat keeps it (Agent tools → Extensions): these fields only.
 MCP_STATUS_FIELDS = ("id", "name", "status", "error", "stderr_tail", "server_info", "retry_seconds")
+MESSAGE_SKILL_CHARS = 60_000  # The skill text one message may add, with its $ARGUMENTS filled in.
 HANDOFF_FOLDER = "handoffs/auto"
 # "/<skill-id>" as its own word: after the start, a space or an opening bracket or
 # quote, and before the end, a space or closing punctuation. "/tmp/x" or "~/x" never match.
@@ -339,8 +341,8 @@ with that path; the app requests folder access when needed. Never claim you cann
 access an external folder without attempting the file tool. Use glob="*.csv" when
 asked about CSV files. When a listed skill fits the task, load it with use_skill before acting.
 A user message that contains /<skill-id> as a word (or starts with /skill <skill-id>) has
-selected that skill, and its instructions are included here: follow them, treating the rest
-of the message as the request.
+selected that skill for that message, and its instructions follow it: follow them, treating the
+rest of the message as the request.
 Record multi-step work with create_task/update_task; keep status truthful.
 Use delegate_task to keep this context small: give a subagent broad codebase exploration, reading
 many or large files, wide searches, running a long command and summarizing its output, or an
@@ -770,13 +772,21 @@ def delegated_prompt(session):
 SPENDING_STOP_REPLY = "[No reply: the spending limit stopped this turn before a model request.]"
 
 
+def public_queue(queue):
+    """Queued messages as pages get them: a queued command without its expanded text (only the model gets it)."""
+    return [{**item, "command": {key: value for key, value in item["command"].items() if key != "expanded"}}
+            if isinstance(item, dict) and isinstance(item.get("command"), dict) else item for item in queue]
+
+
 def public_session(session, status="idle"):
     pending = pending_summary(session)
+    queue = session.get("queued_messages")
     return {"permission_mode": "manual", "allowed_directories": [], "allow_rules": [], "disabled_tools": [],
             **{k: v for k, v in session.items()
                if k not in ("wire", "context_state", "instruction_directories", "instruction_paths", "inference_calls",
                             "command_jobs", "file_views", "turn_running", "jobs_reported_through", "pending_context")},
             **({"pending_context": pending} if pending else {}),
+            **({"queued_messages": public_queue(queue)} if isinstance(queue, list) else {}),
             "status": status}
 
 
@@ -954,21 +964,28 @@ class AgentManager(LifecycleHooks):
         self.store.save(session)
         return {"active_skills": ids}
 
-    def requested_skills(self, tools, prompt, session=None):
+    def requested_skills(self, tools, prompt, session=None, delegated=False):
         """The skills a message names: `/skill <id> …` at its start, or a listed
         skill's `/<id>` as a word anywhere ("/handoff …", "… use /handoff to …").
         Other slashes, such as paths, leave the message ordinary text. A custom agent's
         delegated first prompt names none: the skills its file lists are loaded already, and
-        its instructions (in that prompt) must not load others or go over the limit of three."""
+        its instructions (in that prompt) must not load others or go over the limit of three.
+        A skill whose ID is one of the app's commands (RESERVED_COMMANDS) or a command
+        template's name, or whose frontmatter sets user-invocable: false, is not selected by
+        `/<id>`; the first two still are by `/skill <id>`. delegated: the parent agent wrote the
+        prompt (delegate_task, which starts it with its own label), so a skill whose frontmatter sets
+        disable-model-invocation is not selected by it."""
         if session is not None and session.get("agent_file") and session.get("turn_delegated"):
             return []
         words = prompt.split(maxsplit=2)
-        if words and words[0] == "/skill" and len(words) > 1:
+        if words and words[0] == "/skill" and len(words) > 1 and not delegated:
             return [words[1]]
         if "/" not in prompt:
             return []
         try:
-            listed = {skill["id"] for skill in self.extensions.skills(tools)}
+            listed = {skill["id"] for skill in self.extensions.skills(tools)
+                      if skill.get("user_invocable") is not False and skill["id"] not in RESERVED_COMMANDS
+                      and not (delegated and skill.get("disable_model_invocation"))}
         except (OSError, ValueError):
             return []  # The skills list reports a broken skills folder.
         found = []
@@ -978,7 +995,92 @@ class AgentManager(LifecycleHooks):
                 skill_id = skill_id.rstrip(".")  # A sentence can end right after it.
             if skill_id in listed and skill_id not in found:
                 found.append(skill_id)
+        if found:
+            # A command template owns its name, as /<name> at the start of a message runs it.
+            names = {item["name"] for item in command_templates.discover(tools.root)["commands"]}
+            found = [skill_id for skill_id in found if skill_id not in names]
         return found
+
+    def slash_commands(self):
+        """Settings → slash commands: typed /<name> runs command templates and selects skills (default on)."""
+        return self.settings.values.get("slash_commands", True) is not False
+
+    def message_skills(self, session, tools, prompt, delegated=False):
+        """(ids, text) of the skills a message selects for itself (requested_skills): the labelled
+        instructions the model gets after that message only, so the system message (and its prompt
+        cache) stays the same. $ARGUMENTS in a skill becomes the text after its /<id> at the start of the
+        message, else the whole message. At most three skills and 8 KB of skill text per message;
+        ValueError beyond, or for a skill that cannot be used. delegated: a subagent's delegated prompt,
+        which the parent agent wrote: its skills are labelled as named in the task, and one that only the
+        user may select (disable-model-invocation) is left out."""
+        ids = self.requested_skills(tools, prompt, session, delegated)
+        if not ids:
+            return [], ""
+        if len(ids) > 3:
+            raise ValueError("Select at most three skills in one message.")
+        blocks, size, selected = [], 0, []
+        words, start = prompt.split(maxsplit=2), command_templates.leading(prompt)
+        for skill_id in ids:
+            try:
+                skill = self.extensions.load_skill(tools, skill_id)
+            except (OSError, ValueError) as exc:
+                raise ValueError(f"/{skill_id} could not be used: {self.settings.redact(str(exc)) or type(exc).__name__}") from None
+            if delegated and skill.get("disable_model_invocation"):
+                continue  # Its file changed after the listing: still never chosen by the model.
+            if skill.get("user_invocable") is False:
+                raise ValueError(f"/{skill_id} is not selected with / (its frontmatter sets user-invocable: false).")
+            size += len(skill["text"].encode("utf-8"))
+            arguments = (words[2] if len(words) > 2 else "") if words[:2] == ["/skill", skill_id] else (
+                start[1] if start and start[0] == skill_id else prompt.strip())
+            label = (f"{skill_id} named by the parent agent in this delegated task. Its instructions follow: follow them "
+                     "for the task above.]\n" if delegated else
+                     f"{skill_id} selected by the user for this message. Its instructions follow: "
+                     "follow them, treating the user's message above as the request.]\n")
+            blocks.append(SKILL_MARKER + label + skill["text"].replace("$ARGUMENTS", arguments))
+            selected.append(skill_id)
+        if size > 8000:
+            raise ValueError("The skills this message selects exceed the combined 8 KB limit. Select fewer.")
+        text = "".join(blocks)
+        if len(text) > MESSAGE_SKILL_CHARS:
+            raise ValueError("The skills' instructions with this message's text in $ARGUMENTS are too long. Shorten the message.")
+        return selected, text
+
+    def prepared_message(self, tools, text, verbatim=False):
+        """A message as it is sent or queued: {text, verbatim?, command?: {name, path, expanded}}. A message
+        that starts with /<name> of a command template (commands.py) carries its expanded text, unless it is
+        sent as plain text or Settings turned slash commands off. ValueError when it cannot be expanded."""
+        if verbatim:
+            return {"text": text, "verbatim": True}
+        found = command_templates.leading(text) if self.slash_commands() else None
+        if not found or found[0] in RESERVED_COMMANDS:
+            return {"text": text}
+        listing = command_templates.discover(tools.root, self.settings.redact, with_text=True)
+        command = next((item for item in listing["commands"] if item["name"] == found[0]), None)
+        if command is None:
+            # Its file, or a folder that holds it and could not be read (more than 100 entries, unreadable).
+            problem = (next((item for item in listing["errors"] if item["path"].rsplit("/", 1)[-1] == f"{found[0]}.md"), None)
+                       or command_templates.unread_folder(tools.root, found[0], listing["errors"]))
+            if problem:
+                raise ValueError(f"/{found[0]} could not be used: {problem['path']}: {problem['error']}")
+            return {"text": text}
+        return {"text": text, "command": {"name": command["name"], "path": command["path"],
+                                          "expanded": command_templates.expand(command["text"], found[1])}}
+
+    @staticmethod
+    def message_parts(items):
+        """(scan, blocks, fields) for prepared messages sent as one: scan the text whose @ tokens attach
+        (a plain-text message's are left out), blocks the expanded commands as the model gets them after the
+        typed text and its attachments, fields the user event's extras (commands, verbatim)."""
+        scan = "\n\n".join("" if item.get("verbatim") else item["text"] + (
+            "\n\n" + item["command"]["expanded"] if isinstance(item.get("command"), dict) else "") for item in items)
+        commands = [item["command"] for item in items if isinstance(item.get("command"), dict)]
+        blocks = "".join(command_templates.block(command, command.get("expanded", "")) for command in commands)
+        fields = {}
+        if commands:
+            fields["commands"] = [{"name": command["name"], "path": command["path"]} for command in commands]
+        if items and all(item.get("verbatim") for item in items):
+            fields["verbatim"] = True
+        return scan, blocks, fields
 
     @staticmethod
     def metadata_page(items, offset, key):
@@ -1967,9 +2069,11 @@ class AgentManager(LifecycleHooks):
         """The tool definitions offered in the next model request (offered_tools)."""
         return self.offered_tools(session, external_tools)[0]
 
-    def start(self, session_id, prompt, *, from_queue=False):
-        """Start a turn. @ files and pending ! output are attached now, so a refused file is an
-        error before anything runs (from_queue: queued messages, refused files become a note).
+    def start(self, session_id, prompt, *, from_queue=False, verbatim=False, items=None):
+        """Start a turn. @ files and pending ! output are attached now, and a command template is
+        expanded, so a refused file or a broken command is an error before anything runs (from_queue:
+        queued messages, given as items, whose commands were expanded when they were queued; refused
+        files become a note). verbatim: sent as plain text, without a command, skills or @ files.
         Queued messages still waiting are leftovers of a stop or failure: they are paused."""
         if session_id in self.tasks and not self.tasks[session_id].done():
             raise ValueError("A response is already running in this conversation.")
@@ -1979,11 +2083,19 @@ class AgentManager(LifecycleHooks):
         if session.get("runtime", "databricks") != "databricks":
             raise ValueError("This conversation uses an unsupported runtime and is read-only. Start a new Databricks conversation.")
         self.workspace_available(session["workspace"])
-        content, attachments, views = None, None, []
+        content, attachments, views, fields = None, None, [], {}
         if not delegated_prompt(session):
+            tools = self.session_tools(session)
+            prepared = items if items is not None else [self.prepared_message(tools, prompt, verbatim)]
+            scan, blocks, fields = self.message_parts(prepared)
             expanded, attachments, views = mentions.expand_context(
-                self, session, self.session_tools(session), prompt, on_error="inline" if from_queue else "raise")
+                self, session, tools, prompt, on_error="inline" if from_queue else "raise", scan=scan)
+            expanded += blocks
             content = expanded if expanded != prompt else None
+            if from_queue:
+                fields["queued"] = True  # Sent from the queue: its /<skill-id> words select no skill.
+            elif not fields.get("verbatim") and self.slash_commands():
+                self.message_skills(session, tools, prompt)  # A skill that cannot be used is an error now.
         if not from_queue:
             self._pause_queue(session)
         # The files count as seen only once the model receives them (_content_sent).
@@ -1991,7 +2103,8 @@ class AgentManager(LifecycleHooks):
         self.live[session_id] = session
         self.store.keep_encodings(session_id)
         self.statuses[session_id] = "running"
-        task = self.tasks[session_id] = asyncio.create_task(self.run(session, prompt, content, attachments or None))
+        task = self.tasks[session_id] = asyncio.create_task(self.run(session, prompt, content, attachments or None,
+                                                                     **({"fields": fields} if fields else {})))
         task.add_done_callback(lambda done: self._after_task(session_id, "turn", done))
 
     async def stop(self, session_id):
@@ -2018,11 +2131,12 @@ class AgentManager(LifecycleHooks):
         task = self.tasks.get(session_id)
         return task is not None and not task.done()
 
-    async def submit_message(self, session_id, text):
-        """Send a message: start it when the chat is idle, else queue it for the running task."""
+    async def submit_message(self, session_id, text, verbatim=False):
+        """Send a message: start it when the chat is idle, else queue it for the running task.
+        verbatim: sent as plain text (no command, skill or @ file)."""
         if self.busy_task(session_id):
-            return await self.enqueue(session_id, text)
-        self.start(session_id, text)
+            return await self.enqueue(session_id, text, verbatim)
+        self.start(session_id, text, verbatim=verbatim)
         return {"ok": True}
 
     @staticmethod
@@ -2031,12 +2145,13 @@ class AgentManager(LifecycleHooks):
         return queue if isinstance(queue, list) else []
 
     async def publish_queue(self, session, error=None):
-        await self.broadcast(session["id"], {"type": "queue", "queued_messages": self.queue_of(session),
+        await self.broadcast(session["id"], {"type": "queue", "queued_messages": public_queue(self.queue_of(session)),
                                              **({"error": error} if error else {})})
 
-    async def enqueue(self, session_id, text):
+    async def enqueue(self, session_id, text, verbatim=False):
         """Queue a message while a turn, compaction or ! command runs. @ tokens are checked now;
-        their snapshot is taken when the message is sent."""
+        their snapshot is taken when the message is sent. A command template is expanded now
+        (prepared_message), so its errors show at once."""
         session = self.get(session_id)
         if not session:
             raise ValueError("Conversation not found.")
@@ -2047,20 +2162,21 @@ class AgentManager(LifecycleHooks):
         if sum(len(item.get("text", "")) + 2 for item in queue) + len(text) > MAX_QUEUED_CHARS:
             raise ValueError("Queued messages can contain at most 50,000 characters in total.")
         tools = self.session_tools(session)
-        mentions.expand_context(self, session, tools, text, include_pending=False)
+        prepared = self.prepared_message(tools, text, verbatim)
+        mentions.expand_context(self, session, tools, text, include_pending=False, scan=self.message_parts([prepared])[0])
         if queue:
             # Queued messages are sent together (steering, the follow-up, Send queued messages),
             # so their files must also fit one message.
             try:
                 mentions.expand_context(self, session, tools, "\n\n".join([*(item.get("text", "") for item in queue), text]),
-                                        include_pending=False, on_error="inline")
+                                        include_pending=False, on_error="inline",
+                                        scan=self.message_parts([*queue, prepared])[0])
             except ValueError as exc:
                 raise ValueError(f"Queued messages are sent as one message. {exc}") from None
-        session["queued_messages"] = [*queue, {"id": str(uuid.uuid4()), "text": text, "created": time.time(),
-                                               "paused": False}]
+        session["queued_messages"] = [*queue, {"id": str(uuid.uuid4()), **prepared, "created": time.time(), "paused": False}]
         self.store.save(session)
         await self.publish_queue(session)
-        return {"ok": True, "queued": True, "queued_messages": session["queued_messages"]}
+        return {"ok": True, "queued": True, "queued_messages": public_queue(session["queued_messages"])}
 
     async def remove_queued(self, session_id, item_id):
         """Remove one queued message; KeyError when it is no longer queued."""
@@ -2080,7 +2196,7 @@ class AgentManager(LifecycleHooks):
         entries = list(self.queue_of(session or {}) if entries is None else entries)
         if not entries:
             raise ValueError("No messages are queued.")
-        self.start(session_id, "\n\n".join(item["text"] for item in entries), from_queue=True)
+        self.start(session_id, "\n\n".join(item["text"] for item in entries), from_queue=True, items=entries)
         session = self.live[session_id]
         sent = {item["id"] for item in entries}
         session["queued_messages"] = [item for item in self.queue_of(session) if item.get("id") not in sent]
@@ -2099,8 +2215,10 @@ class AgentManager(LifecycleHooks):
         if not entries or not wire or wire[-1].get("role") == "user" or is_app_prompt(wire[-1]):
             return
         text = "\n\n".join(item["text"] for item in entries)
+        scan, blocks, extras = self.message_parts(entries)
         try:
-            content, attachments, views = mentions.expand_context(self, session, tools, text, on_error="inline")
+            content, attachments, views = mentions.expand_context(self, session, tools, text, on_error="inline", scan=scan)
+            content += blocks
         except ValueError as exc:
             # A limit error (too many or too large files) does not fail the turn: the messages wait, paused.
             for item in entries:
@@ -2130,7 +2248,7 @@ class AgentManager(LifecycleHooks):
         if await waits(message):
             return
         sent = {item["id"] for item in entries}
-        fields = {"text": text, "steered": True, **({"attachments": attachments} if attachments else {})}
+        fields = {"text": text, "steered": True, **extras, **({"attachments": attachments} if attachments else {})}
         if self.has_hooks(session, "user_prompt"):
             # The hooks edit, extend or block the message (block: it never reaches the model). Their cards
             # come first; fields collects what they did for the message's event, added below.
@@ -2424,7 +2542,8 @@ class AgentManager(LifecycleHooks):
                 current["inference_ledger_version"] = scratch["inference_ledger_version"]
                 self.store.save(current)
 
-    async def run(self, session, prompt, content=None, attachments=None):
+    async def run(self, session, prompt, content=None, attachments=None, fields=None):
+        """One turn. fields: extras of its user event (start: commands, verbatim, queued)."""
         terminal_reason = "completed"
         first_event = len(session["events"])
         storage_error_reported = False
@@ -2452,7 +2571,7 @@ class AgentManager(LifecycleHooks):
             await self.status(session, "running")
             # A subagent's first message carries the context of its parent's subagent_start hooks.
             noted, note = self.first_message_notes(session) if origin else ({}, "")
-            user_event = await self.event(session, "user", text=prompt, **origin, **noted,
+            user_event = await self.event(session, "user", text=prompt, **origin, **noted, **(fields or {}),
                                           **({"attachments": attachments} if attachments else {}))
             if note:
                 content = (content if content is not None else prompt) + note
@@ -2940,8 +3059,12 @@ class AgentManager(LifecycleHooks):
                 result = (("No changes. " if after == before else "") + clip_result(result)
                           + diagnostics.report(tools.display_path(target), before, after))
             elif name == "list_skills":
-                result = self.metadata_page(self.extensions.skills(tools), arguments.get("offset", 0), "skills")
+                # A skill whose frontmatter sets disable-model-invocation is only for the user to select.
+                listed = [skill for skill in self.extensions.skills(tools) if not skill.get("disable_model_invocation")]
+                result = self.metadata_page(listed, arguments.get("offset", 0), "skills")
             elif name == "use_skill":
+                if self.extensions.load_skill(tools, arguments["skill_id"]).get("disable_model_invocation"):
+                    raise ValueError("Only the user can select this skill (its frontmatter sets disable-model-invocation).")
                 result = self.select_skill(session, tools, arguments["skill_id"])
                 result["message"] = "Skill activated. Its complete instructions will be included in the next model request; review them before taking action."
             elif name == "list_tasks":
@@ -4583,8 +4706,17 @@ class AgentManager(LifecycleHooks):
         mode = session.get("permission_mode", "manual")
         tools = self.session_tools(session)
         definitions = filter_tools(session, [*TOOL_DEFINITIONS, *self.feature_definitions(session), *external_tools])
-        for skill_id in self.requested_skills(tools, prompt, session):
-            self.select_skill(session, tools, skill_id)
+        # Skills the message selects with /<skill-id> go with this message only (message_skills): the system
+        # message keeps its prompt cache. Not for a message sent as plain text or from the queue, or with
+        # Settings → slash commands off.
+        turn = next((item for item in reversed(session["events"]) if item.get("type") == "user"), None)
+        turn = turn if turn is not None and turn.get("in_wire") is False else None
+        skills = ""
+        if self.slash_commands() and not (turn and (turn.get("verbatim") or turn.get("queued"))):
+            # A delegated prompt is the parent agent's text (turn_delegated, set by run): never the user's choice.
+            selected, skills = self.message_skills(session, tools, prompt, delegated=bool(session.get("turn_delegated")))
+            if selected and turn is not None:
+                await self.update_event(session, turn, skills=selected)
         # Complete interrupted tool exchanges before sending the next user turn.
         wire, context_state = repair_tool_history(session["wire"], session["events"], session.get("context_state", {}))
         # Keep the prefix boundary consistent even if context preparation fails.
@@ -4601,7 +4733,7 @@ class AgentManager(LifecycleHooks):
             else:
                 wire.pop()
             self.store.save(session)
-        wire.append({"role": "user", "content": prompt if content is None else content})
+        wire.append({"role": "user", "content": (prompt if content is None else content) + skills})
         compactable = False
         if isinstance(meter := session.get("context_info"), dict) and meter.get("compactable") is False:
             # This turn's first request replaces the meter; a turn that ends before it leaves this one.

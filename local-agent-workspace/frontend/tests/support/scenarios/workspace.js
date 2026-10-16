@@ -74,6 +74,8 @@ fake.handle = (path, options) => {
   }
   if (path === '/api/bootstrap') return fake.json({ token: 'test-token', settings: fake.settings })
   if (path === '/api/skills' || path.startsWith('/api/skills?')) return fake.json(skills)
+  if (path === '/api/commands' || path.startsWith('/api/commands?')) return fake.json({ commands: fake.commands || [], errors: [],
+    folders: ['.agents/commands', '.claude/commands', '~/.agents/commands', '~/.claude/commands'] })
   if (path === '/api/connection') return fake.json({ connected: true, models: ['test-model', 'other-model', 'latest-model'], error: null })
   if (path === '/api/settings' && options.method === 'PUT') {
     fake.settings = { ...fake.settings, ...body() }

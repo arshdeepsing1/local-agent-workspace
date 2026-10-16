@@ -154,7 +154,7 @@ def _fingerprint(path):
     return [info.st_size, info.st_mtime_ns]
 
 
-def expand_context(manager, session, tools, text, include_pending=True, on_error="raise"):
+def expand_context(manager, session, tools, text, include_pending=True, on_error="raise", scan=None):
     """(content, attachments, views) for a user message.
 
     content is what the model receives (text itself when nothing attaches);
@@ -162,9 +162,12 @@ def expand_context(manager, session, tools, text, include_pending=True, on_error
     or {kind: 'shell', command, exit_code}); views the (path, fingerprint) pairs the
     caller records with remember_file once the message is sent. With on_error='inline' a
     refused token becomes a '(Could not attach …)' line instead of an error; the
-    5-file and 32,000-character limits always apply to the files that attached."""
+    5-file and 32,000-character limits always apply to the files that attached.
+    scan is the text whose @ tokens attach, when it is not text: '' for a message sent as
+    plain text (verbatim), or the typed message with its expanded command."""
     items, notes, total = [], [], 0
-    for mention in parse_mentions(text):
+    scan = text if scan is None else scan
+    for mention in parse_mentions(scan):
         try:
             item = _snapshot(manager, session, tools, mention)
         except MentionError as exc:
@@ -189,7 +192,7 @@ def expand_context(manager, session, tools, text, include_pending=True, on_error
         return text, [], []
     nonce = secrets.token_hex(6)
     while any(nonce in item["text"] or nonce in item.get("command", "") or nonce in item.get("display", "")
-              for item in items) or nonce in text:
+              for item in items) or nonce in text or nonce in scan:
         nonce = secrets.token_hex(6)
     blocks, attachments = [], []
     for item in items:

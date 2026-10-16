@@ -50,7 +50,9 @@ frontend that runs without a build step.
   read or wrote changed since (your saves, an Undo, a command).
 - An unreadable conversation file does not stop the app: it is skipped, left unchanged,
   and named in a notice.
-- Explicit MCP servers, workspace skills with a `/` command menu, and approval-controlled
+- Built-in `/` commands (`/clear`, `/compact`, `/model`, `/mode`, `/rename`, `/copy` and more),
+  custom command files with `$ARGUMENTS`, and skills sent with one message, all in one `/` menu.
+- Explicit MCP servers, workspace and personal skills, and approval-controlled
   hooks around tool calls, your messages and the end of a turn, which can answer in JSON.
 - Persistent tasks with dependencies, shown as a live checklist above the message box,
   and subagents the model starts on its own (explore, general, editor, or a custom agent
@@ -376,14 +378,58 @@ when opening a conversation or performing restart recovery.
   holds a connection to the server (`/api/presence`). It starts the notifier directly, with
   the title and message as arguments (no shell) and a 5-second limit; for `notify-send`,
   `<`, `>` and `&` in a title are escaped so that notification servers show them as text.
-- **Skills (`/`)**: type `/` at the start of the message box to list the skills this
-  conversation can use, with their descriptions; keep typing to filter. Use ↑/↓ to
-  highlight one and Enter or Tab (or click it) to insert `/<skill-id> `, then add your
-  request and press Enter to send. Esc closes the list. A message that contains a
-  listed skill's command as a word, at its start or anywhere else (`Read the notes and
-  use /handoff to …`), selects that skill for the whole message. Other text with `/`,
-  such as a path (`/tmp/x.log`, `~/handoff/`), is sent unchanged.
-  See **Agent tools: MCP, skills, and hooks** below.
+- **Commands and skills (`/`)**: type `/` at the start of the message box to list, in three
+  groups, the app's commands, your custom commands and the skills this conversation can use, with
+  their descriptions and arguments; keep typing to filter (a name typed in full comes first). Use
+  ↑/↓ to highlight one and Enter or Tab (or click it) to choose it; Esc closes the list. A built-in
+  command that takes nothing runs when you choose it with Enter or a click (Tab only inserts it),
+  and so does one with optional arguments typed in full; anything else is inserted as `/<name> `,
+  so its arguments or your request can follow. See **Agent tools: MCP, skills, and hooks** below.
+  - **Built-in commands** act in this page: they are never sent to the agent and never queued. When
+    one fails, its reason shows above the chat and the command stays in the box.
+    - `/new`: a new conversation.
+    - `/clear`: a new conversation with this one's model, permission mode and reasoning effort; this
+      one is kept in the sidebar. Folder access is not copied. From a chat in Bypass permissions it
+      first asks the same confirmation as the permission menu (Cancel starts the new chat in Manual).
+      Choosing another model in that new chat changes only it, not the Settings default.
+    - `/compact [note]`: **Compact now**, with an optional preservation note of at most 1,000
+      characters; refused, with the context meter's explanation, when there is nothing to compact yet.
+    - `/model [name]`: switches this chat's model, by endpoint name or label in any case
+      (`/model gpt oss 120b`); alone, it moves focus to the model list.
+    - `/mode [mode]`: `manual`, `auto`, `accept-edits`, `plan`, `dont-ask` or `bypass` (which asks for
+      confirmation first, as the permission menu does); alone, it opens the permission menu.
+    - `/context`: opens the context meter's details.
+    - `/usage` and `/export`: open **Agent tools → Usage** or **Agent tools → Export**.
+    - `/fork`: copies the completed conversation, as **Fork completed conversation**, and opens the copy.
+    - `/rename <title>`: renames the conversation.
+    - `/copy`: copies the last reply; `/copy all` copies the conversation as Markdown, as **Copy
+      conversation** does.
+    - `/help`: lists the commands above the box.
+    - `/btw <question>`: a side question (see below).
+
+    While a reply runs, `/compact`, `/model` and `/fork` are refused (stop the reply first); the
+    others run at once. Only a command alone, or followed by its arguments, is a command: a path
+    (`/tmp/x.log`), an unknown word (`/unknown`) and a command that takes nothing followed by text
+    (`/help me with the parser`) are sent as ordinary messages. Skills and custom commands cannot
+    take these names (or `btw` and `skill`) over.
+  - **Skills**: a message that contains a listed skill's `/<skill-id>` as a word, at its start or
+    anywhere else (`Read the notes and use /handoff to …`), or starts with `/skill <skill-id>`,
+    sends that skill's instructions with that message only: the next message does not carry them,
+    and the system message stays the same, so its prompt cache is kept. At most three skills and
+    8 KB of skill text go with one message, and a chip under the message names each. To have a
+    skill in every request of a chat, check it in **Agent tools → Extensions**. Messages that wait
+    in the queue select no skill. A skill whose ID is a command's name (built-in or custom) is listed
+    as `/skill <id>`, and only that form selects it. Other text with `/`, such as a path
+    (`/tmp/x.log`, `~/handoff/`), is sent unchanged.
+  - **Custom commands** (`/<name>` from a command file) send the file's text with your message; see
+    **Custom commands** under **Agent tools: MCP, skills, and hooks**.
+  - **Send as plain text**: the **T** button below the box, or Shift+Alt+Enter, sends the next
+    message exactly as typed (the button turns off again after that message): no built-in or custom
+    command, no skill, no `@` file snapshot and no `!` shell command (the `/` and `@` lists do not
+    open). Output of an earlier `!` command that waits for your next message still goes with it. The message shows **Sent as plain text**,
+    and **Retry** and **Edit** send it the same way again. With **Settings → Commands and files →
+    Run commands typed with /** turned off (it is on by default), typed `/` text is sent as it is in
+    every message; built-in commands then run only when chosen in the `/` menu.
 - **Messages while the agent works (queue and steering)**: while a reply, a compaction or a `!`
   command runs, the box keeps **Stop response** and adds **Queue message**; Enter queues too, and
   Esc in the box stops the reply. At most 3 messages (50,000 characters in total) can wait; they
@@ -413,7 +459,8 @@ when opening a conversation or performing restart recovery.
   do tokens inside code: a fenced block, or a code span on one line (a run of backticks closes
   only at the next run of the same length, as in the quoted lines of review comments). Secrets in snapshots are redacted like command output, before a snapshot is
   shortened to 8,000 characters. An attached file counts as read, so the agent may
-  edit it without reading it again. Only your typed text selects skills.
+  edit it without reading it again. Only your typed text selects skills (not an attached file or a
+  custom command's text).
 - **Shell commands (`!`)**: a message starting with `!` runs the rest as one shell command in the
   project folder, like **Workspace → Terminal** Run, when the chat is idle, for at most 60 seconds
   (use **Workspace → Terminal** for longer commands). It is an explicit user action, so it runs in
@@ -2067,26 +2114,35 @@ server.run()  # stdio
 Install workspace skills at `.agents/skills/<skill-id>/SKILL.md`. Skills in
 `.claude/skills/<skill-id>/SKILL.md`, the layout another coding tool uses, are read too;
 the app never writes there. Skills shipped with the app in `skills/<skill-id>/SKILL.md`
-are available in every workspace. For one ID, `.agents/skills` wins over
-`.claude/skills`, which wins over the shipped skill; a workspace entry takes the ID over
-even when it fails to load. A `.claude/skills` folder that resolves outside the project
-(for example a link to a shared folder), cannot be read, or has more than 100 entries or
-30 skills, is skipped without an error, and the shipped skills stay available. Optional simple
-frontmatter supplies `name` and `description`. Enable a discovered skill in the panel, use `/<skill-id>` as a word in a
-message (type `/` at the start to choose from the list), begin a message with
-`/skill <skill-id>`, or ask the
-model to use its `list_skills` / `use_skill` tools. Selection persists per chat, instructions reload
-on each model request, and a newly selected/changed skill must reach the model
-before a write, command, or MCP call. At most three selected skills fit a combined
-8 KB instruction budget. Skills never override user instructions or permissions;
+are available in every workspace, and so are your own skills in your home folder:
+`~/.agents/skills/<skill-id>/SKILL.md` and, read only, `~/.claude/skills/<skill-id>/SKILL.md`
+(listed with `~/` paths). For one ID, `.agents/skills` wins over `.claude/skills`, then
+`~/.agents/skills`, `~/.claude/skills` and the shipped skill; a workspace entry, or one of yours,
+takes the ID over even when it fails to load. A `.claude/skills` folder that resolves outside the
+project (for example a link to a shared folder), or one of your folders, that cannot be read or
+has more than 100 entries or 30 skills, is skipped without an error, and the shipped skills stay
+available; each of your two folders has its own limit of 30. Optional simple frontmatter supplies
+`name`, `description`, `argument-hint` (shown in the `/` menu), `disable-model-invocation: true`
+(left out of the skill index and `list_skills`, `use_skill` refuses it, a `delegate_task` task that
+names it does not select it, and a custom agent's `skills` list leaves it out: only you select it) and
+`user-invocable: false` (not in the `/` menu, and neither `/<skill-id>` nor `/skill <skill-id>`
+selects it; the model loads it, and you can still check it in **Agent tools → Extensions**). In a skill's text, `$ARGUMENTS` becomes the text after
+`/<skill-id>` (or `/skill <skill-id>`) when the message starts with it, otherwise the whole message.
+Enable a discovered skill in the panel, or ask the model to use its `list_skills` / `use_skill`
+tools: that selection persists per chat, its instructions are part of every request's system
+message and reload on each model request, and a newly selected/changed skill must reach the model
+before a write, command, or MCP call. At most three such skills fit a combined 8 KB instruction
+budget. `/<skill-id>` as a word in a message (type `/` at the start to choose from the list), or a
+message that begins with `/skill <skill-id>`, sends the skill with that message only (see
+**Commands and skills** above), with the same limits per message. Skills never override user instructions or permissions;
 this version has no marketplace, installer, dependency execution, or automatic
 matching engine.
 
-Every model request's system message includes a skill index: one line per listed skill
-with its ID and description (whitespace collapsed, at most 150 characters), at most 30
+Every model request's system message includes a skill index: one line per listed skill (except
+those whose frontmatter sets `disable-model-invocation: true`) with its ID and description (whitespace collapsed, at most 150 characters), at most 30
 lines and 2,000 bytes, then "… and N more (call list_skills)". The model is told to load
 a listed skill with `use_skill` when it fits the task. Skill descriptions from
-`.agents/skills` and `.claude/skills` therefore reach the system message of every chat in
+`.agents/skills` and `.claude/skills` (and your own folders) therefore reach the system message of every chat in
 that workspace, with the same trust as `AGENTS.md`: review skills you did not write. The
 context details list the index as **Skill index · applies to this workspace**.
 
@@ -2103,6 +2159,42 @@ by a project's own copy:
 - `/init` (`skills/init/SKILL.md`): drafts or updates the project's `AGENTS.md` (under 4 KB:
   overview, commands, layout, conventions, gotchas) from the README, manifests and CI files,
   keeping your own sections. `AGENTS.md` is a protected file, so the write shows an approval card.
+
+**Custom commands.** A command file is a Markdown file whose text goes with your message when the
+message starts with `/<name>`: `.agents/commands/<name>.md` in the project, then
+`.claude/commands/<name>.md` (the layout another coding tool uses, read only), then your own
+`~/.agents/commands/<name>.md` and `~/.claude/commands/<name>.md` (read only); for one name the first
+file that loads is used, and the app never writes to these folders. Names have letters, digits, `.`,
+`_` and `-`; the built-in commands' names (and `btw`, `skill`) are refused. At most 30 commands of
+8 KB each are read, from at most 100 entries per folder; a project folder that resolves outside the
+project is refused. In the file's text, `$ARGUMENTS` becomes what you typed after the name and
+`$1` to `$9` its words (quotes keep words together; a missing one is empty); a file with neither gets
+`Arguments: <what you typed>` on a last line. The result has at most 50,000 characters. Optional
+frontmatter between two `---` lines sets `description` and `argument-hint` for the `/` menu (without
+a description, the file's first line is shown). `allowed-tools` and `model`, which another tool uses to
+widen a command's permissions or to switch its model, are ignored and listed as ignored: a command never
+changes the chat's tools, permission mode, rules or model. A `` !`command` `` line is never run; it
+reaches the agent as text. An `@path` in the expanded text attaches the file as if you had typed it,
+with the same permission checks and limits. The conversation shows what you typed, with a
+**Command /<name>** chip; the agent gets your message followed by the expanded text, labelled as the
+command, and the record of your earlier requests that compaction keeps holds only what you typed. A
+command in a message you queue while the agent works is expanded when you queue it, so a broken file
+or a refused `@` file is reported at once. A command file that cannot be used makes `/<name>` an error
+that names the file, and so does a command folder that holds `<name>.md` but could not be read as a
+whole (for example one with more than 100 entries). **Agent tools → Extensions** lists the commands,
+their notes and the files that could not be read. Command files are project content, like
+`AGENTS.md`: review files you did not write before you run them. For example, `.agents/commands/check.md`:
+
+```markdown
+---
+description: Review one file for correctness bugs
+argument-hint: <path> [focus]
+---
+Review @$1 for correctness bugs, with a focus on $2. Report each one with path:line.
+```
+
+`/check src/parser.py "error handling"` then sends the review request with a snapshot of
+`src/parser.py` (the quotes keep the two words together as `$2`; without them `$2` is `error`).
 
 The app ships a detailed handoff skill at `skills/handoff/SKILL.md`, available in every
 workspace: send `/handoff Create a handoff for this conversation` (or type `/han` and
@@ -2397,7 +2489,7 @@ Report each finding with path:line, its severity and a suggested fix.
 | `profile` | `read_only` (the default), `file_editor` or `inherit`, as for `tool_profile`. |
 | `model` | Optional Databricks serving endpoint name, only one you already use: the Settings model, a **Settings → Subagents** model or the model of one of your chats (not a subagent chat). Any other endpoint runs on the chat's model, with a note in Agent types and on the approval card. Left out (or `inherit`): the chat's model. |
 | `effort` | Optional `default`, `low` (Fast), `medium`, `high`, `xhigh` or `max`; left out: the chat's effort. |
-| `skills` | Optional: up to three skill IDs loaded into the subagent like selected skills; one that does not load is left out with a note in its first prompt. A `/skill` word in the instructions or the task loads no other skill. |
+| `skills` | Optional: up to three skill IDs loaded into the subagent like selected skills; one that does not load, or whose frontmatter sets `disable-model-invocation: true` (the model chooses when an agent runs), is left out with a note in its first prompt. A `/skill` word in the instructions or the task loads no other skill. |
 | `max_steps` | Optional 1–24: the subagent's steps when the call gives no `max_steps` (a call's own value wins). |
 
 The parser is small and strict: `key: value` lines, `[a, b]` or `- item` lists, `"..."` or

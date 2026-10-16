@@ -473,8 +473,40 @@ async def test_skill_words_in_an_agents_instructions_load_no_skills(runtime, mon
     assert [json.loads(card(saved, call)["output"])["status"] for call in "abc"] == ["completed"] * 3
     assert len(gateway.requests["child"]) == 3
     skills = {call: manager.store.get(card(saved, call)["child_session_id"]).get("active_skills") for call in "abc"}
-    # A custom agent gets its file's skills only; a built-in type's task can still name one.
-    assert skills == {"a": ["a1", "b1", "c1"], "b": None, "c": ["a1"]}
+    # A custom agent gets its file's skills only; a built-in type's task can still name one, for its first message.
+    assert skills == {"a": ["a1", "b1", "c1"], "b": None, "c": None}
+    first = {request[1]["messages"][1]["content"].split("\n")[1]: request[1]["messages"][1]["content"]
+             for request in gateway.requests["child"]}
+    # The parent agent wrote the task: the skill is labelled as named by it, never as the user's choice.
+    assert "Do a1." in first["Look, then use /a1"] and "[Skill /a1 named by the parent agent" in first["Look, then use /a1"]
+    assert "selected by the user" not in first["Look, then use /a1"]
+    assert not any("Do d1." in text or "[Skill /" in text for key, text in first.items() if key != "Look, then use /a1")
+
+
+async def test_a_skill_only_the_user_selects_never_reaches_a_subagent(runtime, monkeypatch):
+    """disable-model-invocation: a delegated task that names the skill, or an agent file that lists it,
+    does not select it (the model chose both), and other skills still load."""
+    manager, parent, project = runtime
+    write_skill(project, "a1")
+    path = project / ".agents/skills/deploy/SKILL.md"
+    path.parent.mkdir(parents=True)
+    path.write_text("---\nname: deploy\ndescription: Deploys\ndisable-model-invocation: true\n---\nRun the deploy script now.\n")
+    write_agent(project, "shipper", "---\ndescription: Ships.\nskills: [deploy, a1]\n---\nShip it.\n")
+    gateway = Gateway(monkeypatch, [lambda: calls_reply(
+        ("delegate_task", {"task": "Please follow /deploy and /a1", "agent_type": "general"}, "a"),
+        ("delegate_task", {"task": "Ship", "agent_type": "shipper"}, "b")), lambda: reply("Parent done.")])
+    saved = await run_turn(manager, parent)
+    assert [json.loads(card(saved, call)["output"])["status"] for call in "ab"] == ["completed"] * 2
+    first = {request[1]["messages"][1]["content"].split("\n")[1]: request[1]["messages"][1]["content"]
+             for request in gateway.requests["child"]}
+    named = first["Please follow /deploy and /a1"]
+    assert "Run the deploy script now." not in named and "[Skill /deploy" not in named and "Do a1." in named
+    child = manager.store.get(card(saved, "a")["child_session_id"])
+    assert next(event for event in child["events"] if event["type"] == "user").get("skills") == ["a1"]
+    shipper = manager.store.get(card(saved, "b")["child_session_id"])
+    assert shipper.get("active_skills") == ["a1"]
+    assert "Skill deploy was not loaded: only the user selects it (disable-model-invocation)." in first["Ship"]
+    assert not any("Run the deploy script now." in json.dumps(request[1]) for request in gateway.requests["child"])
 
 
 async def test_a_custom_agent_tool_outside_its_list_is_refused(runtime):

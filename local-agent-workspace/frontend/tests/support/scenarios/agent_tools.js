@@ -75,5 +75,7 @@ fake.handle = (path, options) => {
   if (path === '/api/extensions/test') return fake.json({ tools: ['example.search'] })
   if (path.startsWith('/api/extensions/import')) return fake.json({ ...importPreview, source: body().source })
   if (path === '/api/skills' || path.startsWith('/api/skills?')) return fake.json([skill])
+  if (path === '/api/commands' || path.startsWith('/api/commands?')) return fake.json({ commands: fake.commands || [], errors: [],
+    folders: ['.agents/commands', '.claude/commands', '~/.agents/commands', '~/.claude/commands'] })
   if (path.endsWith('/skills')) return fake.json({ active_skills: body().enabled ? ['skill'] : [] })
 }

@@ -334,6 +334,22 @@ def test_extensions_save_test_and_skill_toggle(ui, page):
     assert ui.bodies("/api/sessions/a/skills") == [{"skill_id": "skill", "enabled": True}]
 
 
+def test_extensions_list_custom_commands_with_their_notes_and_skill_frontmatter(ui, page):
+    open_tab(ui, page, "Extensions", """fake.commands = [{ name: 'review', description: 'Review the diff', argument_hint: '[path]',
+        path: '.agents/commands/review.md', source: 'project', ignored: ['allowed-tools'],
+        notes: ["allowed-tools is ignored: a command never changes this chat's tools, permissions or model."] }]
+      fake.override = path => path === '/api/skills?session_id=a' ? fake.json([{ id: 'deploy', name: 'deploy', description: 'Deploy',
+        path: '~/.agents/skills/deploy/SKILL.md', argument_hint: '[environment]', disable_model_invocation: true, reserved: true }]) : undefined""")
+    commands = page.get_by_role("group", name="Custom commands")
+    expect(commands).to_contain_text("/review [path]")
+    expect(commands).to_contain_text(".agents/commands/review.md")
+    expect(commands).to_contain_text("allowed-tools is ignored: a command never changes this chat's tools, permissions or model.")
+    expect(page.locator(".agent-tools-section")).to_contain_text("~/.agents/commands, ~/.claude/commands")
+    expect(page.get_by_role("checkbox", name=re.compile("deploy"))).to_be_visible()
+    expect(page.locator(".skill-notes").first).to_have_text(
+        "Arguments: [environment] · Only you select it (disable-model-invocation) · A command has its name: use /skill deploy in a message")
+
+
 def test_invalid_extension_json_is_not_sent(ui, page):
     open_tab(ui, page, "Extensions")
     editor = json_editor(page)

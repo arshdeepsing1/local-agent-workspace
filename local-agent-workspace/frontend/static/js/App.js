@@ -25,6 +25,8 @@ import SideAnswer from './components/SideAnswer.js'
 import { removeDraft, useSavedDrafts } from './drafts.js'
 import { RewindNotice } from './rewindNotice.js'
 import WorktreeChat from './components/WorktreeChat.js'
+import CommandHelp from './components/CommandHelp.js'
+import { runCommand } from './commands.js'
 
 export default function App() {
   const app = useWorkspace()
@@ -32,15 +34,19 @@ export default function App() {
   // Message drafts are saved in localStorage per conversation ('new' before it exists).
   const draftKey = app.activeId || 'new'
   const [draft, setDraft, forgetDraft, releaseDraft] = useSavedDrafts(app.viewKey, draftKey)
-  const send = async text => {
+  const send = async (text, options) => {
     const restore = draftKey === 'new' ? releaseDraft('new') : null
     let id
-    try { id = await app.send(text) }
+    try { id = await app.send(text, options) }
     catch (error) { restore?.(); throw error }
     forgetDraft(text, draftKey, id)
   }
   const [settingsOpen, setSettingsOpen] = useState(false)
+  // false, true, or the section to open ('Usage' or 'Export' from /usage and /export).
   const [agentToolsOpen, setAgentToolsOpen] = useState(false)
+  // /help and /copy: { key (the view it belongs to), help? , text? }; /context opens the meter's details.
+  const [commandNotice, setCommandNotice] = useState(null)
+  const [contextSignal, setContextSignal] = useState(0)
   const [workspaceOpen, setWorkspaceOpen] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [foldersOpen, setFoldersOpen] = useState(false)
@@ -144,7 +150,30 @@ export default function App() {
     const updated = await app.removeRule(scope, rule)
     if (scope === 'chat' && typeof updated?.updated === 'number') attention.renamed(id, before, updated.updated)
   }
-  const composer = html`<${Composer} key=${app.viewKey} value=${draft} setValue=${setDraft} model=${active?.model || app.settings?.model || app.settings?.default_model || 'databricks-claude-opus-5-5'}
+  const rename = async (id, title) => {
+    const before = app.sessions.find(item => item.id === id)?.updated
+    attention.renamed(id, before, (await app.renameSession(id, title)).updated)
+  }
+  // Built-in / commands (commands.js): they act in this page and are never sent or queued.
+  const model = active?.model || app.draftModel || app.settings?.model || app.settings?.default_model || 'databricks-claude-opus-5-5'
+  const command = (id, args) => {
+    setCommandNotice(null)
+    return runCommand(id, args, {
+      app, session: active, busy, models: Array.from(new Set([model, ...(app.connection?.models || [])])),
+      // After the command has finished: the message box's controls are disabled while it runs.
+      choose: () => setTimeout(() => document.querySelector('.chat-composer select[aria-label="Model"]')?.focus()),
+      openMenu: () => setTimeout(() => document.querySelector('.chat-composer .permission-trigger')?.click()),
+      openContext: () => setContextSignal(value => value + 1),
+      openAgentTools: tab => setAgentToolsOpen(tab),
+      rename, notify: text => setCommandNotice({ key: app.viewKey, text }),
+      help: () => setCommandNotice({ key: app.viewKey, help: true }),
+    }).then(() => {
+      // /new, /clear and /fork open another view: the command, saved as this view's draft when the view
+      // switched, is removed, so this chat does not reopen (after a reload) with the command in its box.
+      if (id === 'new' || id === 'clear' || id === 'fork') forgetDraft(`/${id}`, draftKey)
+    })
+  }
+  const composer = html`<${Composer} key=${app.viewKey} value=${draft} setValue=${setDraft} model=${model}
     workspace=${active?.workspace || app.settings?.workspace || ''} worktree=${active?.worktree} mode=${app.permissionMode} onMode=${app.setPermissionMode} onProject=${() => setSettingsOpen(true)}
     onFolders=${() => { setFoldersOpen(true); void app.refreshSettings().catch(() => {}) }} rules=${app.rules.chat} onRemoveRule=${removeRule}
     projectRules=${app.rules.project} userRules=${app.rules.user} rulesProblem=${app.rules.problem} onLoadRules=${app.loadRules}
@@ -157,15 +186,14 @@ export default function App() {
     onSend=${send} onError=${showError} onAttach=${() => setWorkspaceOpen(true)}
     onShell=${app.runShell} onSideQuestion=${app.askSide} loadFiles=${app.loadMentionFiles} pendingContext=${active?.pending_context}
     loadSkills=${() => api(`/skills${app.activeId ? `?session_id=${encodeURIComponent(app.activeId)}` : ''}`)}
+    loadCommands=${() => api(`/commands${app.activeId ? `?session_id=${encodeURIComponent(app.activeId)}` : ''}`)}
+    onCommand=${command} slashCommands=${app.settings?.slash_commands !== false}
     onStop=${() => { if (active) void api(`/sessions/${active.id}/stop`, 'POST').catch(e => showError(e.message)) }} />`
   return html`<div class=${`app-shell ${workspaceOpen ? 'workspace-visible' : ''}`}>
     <${Sidebar} settings=${app.settings} connection=${app.connection} online=${app.online} sessions=${app.sessions} activeId=${app.activeId}
       open=${sidebarOpen} close=${() => setSidebarOpen(false)} onNew=${app.newConversation}
       onSelect=${app.setActiveId} onSettings=${() => setSettingsOpen(true)}
-      attention=${attention} onRename=${async (id, title) => {
-        const before = app.sessions.find(item => item.id === id)?.updated
-        attention.renamed(id, before, (await app.renameSession(id, title)).updated)
-      }}
+      attention=${attention} onRename=${rename}
       onMeta=${app.setMeta} onSearch=${app.searchConversations} onError=${showError}
       onDelete=${(id, children) => app.deleteSession(id, children).then(deleted => deleted.forEach(removeDraft)).catch(e => showError(e.message))} />
     <main class="main-area" inert=${drawerOpen}>
@@ -197,14 +225,15 @@ export default function App() {
         <${ContinueButton} session=${active} disabled=${!app.ready || !app.online || app.modelSaving || !app.settings?.configured} onSend=${app.send} onError=${showError} />
         <${QueueBar} session=${active} onRemove=${app.removeQueued} onSend=${app.sendQueued} onError=${showError}
           onEdit=${async item => { await app.removeQueued(item.id); setDraft(current => current ? `${current}\n${item.text}` : item.text) }} />
-        <${SideAnswer} side=${app.sideAnswer} onDismiss=${app.dismissSide} onError=${showError} /></div>
+        <${SideAnswer} side=${app.sideAnswer} onDismiss=${app.dismissSide} onError=${showError} />
+        <${CommandHelp} notice=${commandNotice?.key === app.viewKey ? commandNotice : null} onDismiss=${() => setCommandNotice(null)} /></div>
         ${composer}
         ${active?.status === 'awaiting_approval' ? html`<p class="composer-hint"><span role="status">${(name => name === 'ask_user' ? 'The agent is waiting for your answer above.' : name === 'submit_plan' ? 'A plan is waiting for your review above.' : 'An action is waiting for your approval above.')(active.events?.findLast(event => event.state === 'pending')?.name)}</span>
           <button class="composer-hint-show" onClick=${showWaiting}>Show</button></p>` : null}
         ${active?.status === 'compacting' ? html`<${CompactingHint} key=${active.id} since=${statusSeen.current.since}
           automatic=${statusSeen.current.before == null ? null : statusSeen.current.before !== 'idle'} percent=${active.context_info?.auto_compact_percent} />` : null}
         ${active?.status === 'naming' ? html`<p class="composer-hint" role="status">Creating conversation title…</p>` : null}
-        <${ContextMeter} key=${`context-${app.viewKey}`} info=${active?.context_info} model=${active?.model} busy=${busy} status=${active?.status}
+        <${ContextMeter} key=${`context-${app.viewKey}`} info=${active?.context_info} model=${active?.model} busy=${busy} status=${active?.status} openSignal=${contextSignal}
           onCompact=${active && app.ready && app.online && app.settings?.configured ? async preservationNote => {
             await api(`/sessions/${encodeURIComponent(active.id)}/compact`, 'POST', { preservation_note: preservationNote })
           } : undefined} />
@@ -220,7 +249,8 @@ export default function App() {
       onSendComments=${text => app.send(text)}
       open=${openPath?.viewKey === app.viewKey ? openPath : null} onOpened=${() => setOpenPath(null)}
       onAttach=${path => { setDraft(current => `${current}${current ? '\n' : ''}Please read the ${path.startsWith('/') ? 'file' : 'project file'}: ${path}`); setWorkspaceOpen(false) }} />` : null}
-    ${agentToolsOpen && app.settings && (!app.activeId || active) ? html`<${AgentToolsDialog} key=${editorKey} session=${active} onSaveTools=${app.setDisabledTools} workspace=${workspace} changedFiles=${active && app.changes ? changedFiles : null} onClose=${() => setAgentToolsOpen(false)} onError=${showError} onSelectSession=${id => { setAgentToolsOpen(false); app.setActiveId(id); void app.refreshSessions().catch(e => showError(e.message)) }} />` : null}
+    ${agentToolsOpen && app.settings && (!app.activeId || active) ? html`<${AgentToolsDialog} key=${editorKey} session=${active} onSaveTools=${app.setDisabledTools}
+      initialTab=${typeof agentToolsOpen === 'string' ? agentToolsOpen : undefined} workspace=${workspace} changedFiles=${active && app.changes ? changedFiles : null} onClose=${() => setAgentToolsOpen(false)} onError=${showError} onSelectSession=${id => { setAgentToolsOpen(false); app.setActiveId(id); void app.refreshSessions().catch(e => showError(e.message)) }} />` : null}
     ${settingsOpen && app.settings ? html`<${SettingsDialog} settings=${app.settings} connection=${app.connection} onSave=${app.saveSettings} onClose=${() => setSettingsOpen(false)} />` : null}
     ${foldersOpen && app.settings ? html`<${FolderAccessDialog} key=${app.viewKey} workspace=${active?.workspace || app.settings.workspace} folders=${active?.allowed_directories || []}
       codingDir=${app.settings.coding_dir_status}

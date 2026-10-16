@@ -21,6 +21,8 @@
 //   requests to Databricks-hosted Claude endpoints; 'messages' = only the documented forms; default 'auto'),
 //   fallback_model: string ('' = none: the endpoint an agent or subagent request goes to once when the model
 //   endpoint failed before the reply started; one with built-in facts or one the user uses; chats on it have none),
+//   slash_commands: boolean (default true: /name at the start of a message runs a built-in or custom command and
+//   /skill-id selects a skill for that message; false sends such text as typed, and built-ins run only from the / menu),
 //   endpoint_profiles: [{ model, label }] (endpoints with built-in facts),
 //   user_agents_file: boolean (load ~/.agents/AGENTS.md; default true), user_claude_file: boolean (also load the
 //   read-only ~/.claude/CLAUDE.md; default false), project_memory: boolean (offer remember and load the project's notes;
@@ -75,7 +77,8 @@
 //   which use Settings.reasoning_effort; kept by forks and imports; also in summaries),
 //   spending_limit_dbu?: number (the chat's own spending limit; 0 = none; absent: Settings.spending_limit_dbu;
 //   kept by forks and imports) }
-// POST /sessions { permission_mode, reasoning_effort? } creates a chat (Settings' effort when absent).
+// POST /sessions { permission_mode, reasoning_effort?, model? } creates a chat (Settings' effort and model when absent;
+//   /clear sends the replaced chat's).
 // PUT /sessions/<id>/reasoning-effort { reasoning_effort } -> Session, also while busy: the agent's next model request
 //   (and a running subagent's) uses it. Pushed as { type: 'reasoning_effort', reasoning_effort }.
 // PUT /sessions/<id>/spending-limit { spending_limit_dbu: number 0..100000 | null (follow Settings) } -> Session, also
@@ -197,7 +200,8 @@
 //   { before_event_id, conversation: { possible, reason: string | null, events_removed, messages_removed,
 //   summary_dropped }, code: { possible, reason: string | null, files: [{ path, status: 'restore'|'unchanged'|
 //   'drifted'|'interleaved'|'unavailable', error? }] } }
-// Rewind (POST /sessions/<id>/rewind { before_event_id, conversation?: boolean, code?: boolean, resend_text? };
+// Rewind (POST /sessions/<id>/rewind { before_event_id, conversation?: boolean, code?: boolean, resend_text?,
+//   resend_verbatim? (a message sent as plain text is resent as plain text) };
 //   needs an idle chat, and an idle workspace for code): { session: Session, backup_session_id: string | null,
 //   files: [{ path, status }], resent: boolean, resend_error? }. 409 detail { message, files } when a file
 //   changed; 500 detail { message } when files were rewound but the conversation could not be saved.
@@ -266,22 +270,29 @@
 // Composer (M4): Session.queued_messages?: QueuedMessage[]; Session.pending_context?: [{ kind: 'shell', command,
 //   exit_code }] (! output attached to the next message; its text stays on the server). Pushed as
 //   { type: 'pending_context', pending_context } when a command adds one and when a message takes them.
-// QueuedMessage: { id, text, created, paused } (paused: left over from a stop or failure; sent only by
+// POST /sessions/<id>/messages { text, verbatim? } (verbatim: sent as plain text: no command template, no skill, no @ file).
+// QueuedMessage: { id, text, created, paused, verbatim?, command?: { name, path } (a command template expanded when it
+//   was queued; the server keeps the expanded text) } (paused: left over from a stop or failure; sent only by
 //   'Send queued messages'). POST /sessions/<id>/messages while busy -> { ok, queued: true, queued_messages };
 //   otherwise { ok: true }. 400 when 3 are waiting or their text would exceed 50,000 characters.
 //   DELETE /sessions/<id>/queue/<item id> -> { queued_messages } (404 'This queued message was already sent.');
 //   POST /sessions/<id>/queue/send (idle only) sends all of them as one message.
 //   Socket: { type: 'queue', queued_messages, error? } (error: why a queue could not start; stored as session.queue_error).
 // User AgentEvent extras: attachments?: [{ kind: 'file', path, start_line, end_line, truncated } |
-//   { kind: 'shell', command, exit_code }]; steered?, in_wire? (true: queued, sent mid-turn).
+//   { kind: 'shell', command, exit_code }]; steered?, in_wire? (true: queued, sent mid-turn); queued? (sent from the
+//   queue as the next turn); commands?: [{ name, path }] (command templates whose text the agent got after the message);
+//   skills?: string[] (skills the message selected for itself with /<id>); verbatim? (sent as plain text).
 // POST /sessions/<id>/shell { command (one line, 1..2000), timeout_seconds?, max_output_bytes? } -> 202 { ok }
 //   (idle only; runs in every mode; shows a 'user_command' tool event).
 // POST /sessions/<id>/side-question { question (1..4000) } -> { answer, request_info: { status, finish_reason, usage? } };
 //   409 while another side question of the chat is answered.
 // GET /sessions/<id>/mention-files?q= (or /mention-files?q= before a chat exists) -> [{ path, name }] (at most 30;
 //   only paths an @ token can spell). Queued messages must also fit one message's @ limits together.
-// Skill: { id, name, description, path } (path is workspace-relative, or absolute
-//   for a skill shipped with the app)
+// Skill: { id, name, description, path, argument_hint?, disable_model_invocation? (true: only the user selects it),
+//   user_invocable? (false: only the agent loads it), reserved? (true: a built-in or custom command has its name, so
+//   only /skill <id> selects it) } (path is workspace-relative, ~/… for the user's own, or absolute for a shipped skill)
+// GET /commands?session_id= -> { commands: [{ name, description, argument_hint, path, source: 'project'|'user', ignored:
+//   string[] (frontmatter such as allowed-tools that is never used), notes: string[] }], errors: [{ path, error }], folders }
 // AgentTypes (GET /agents?session_id=, the session optional): { built_in: [{ name, built_in: true, profile,
 //   description, model, effort }] ('' model or effort: the chat's; Settings.subagent_defaults), custom: [{ name,
 //   built_in: false, description, path (workspace-relative), profile, tools (null: every tool of the profile),

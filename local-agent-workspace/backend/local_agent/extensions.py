@@ -23,6 +23,15 @@ SKILL_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 TOOL_SELECTOR = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 # Workspace skill folders in order of precedence; the app only reads .claude/skills.
 WORKSPACE_SKILL_ROOTS = (".agents/skills", ".claude/skills")
+# The user's own skill folders in their home folder, after the workspace's and before the shipped skills
+# (~/.claude/skills is only read, like .claude/skills).
+USER_SKILL_ROOTS = (".agents/skills", ".claude/skills")
+USER_HOME = None  # The folder holding the user's .agents and .claude folders; None: the home folder (tests set one).
+# The app's built-in / commands (frontend commands.js), plus /btw and /skill: a skill or command template with
+# one of these names never takes the name over; `/skill <id>` still selects such a skill.
+RESERVED_COMMANDS = frozenset({"new", "clear", "compact", "model", "mode", "context", "usage", "export", "fork",
+                               "rename", "copy", "help", "btw", "skill"})
+SKILL_FLAGS = {"disable-model-invocation": "disable_model_invocation", "user-invocable": "user_invocable"}
 SKILL_INDEX_ENTRIES = 30
 SKILL_INDEX_BYTES = 2_000
 SKILL_INDEX_DESCRIPTION = 150
@@ -172,6 +181,16 @@ def shown_hook_output(stdout, stderr, limit):
     first = bounded_result(stdout, limit=max(limit // 2, limit - len(json.dumps(tail).encode())))
     second = bounded_result(tail, limit=limit - len(json.dumps(first["output"]).encode()))
     return first["output"] + second["output"], first["truncated"] or second["truncated"]
+
+
+def user_home():
+    """The folder that holds the user's own .agents and .claude folders, or None when it is unknown."""
+    if USER_HOME is not None:
+        return Path(USER_HOME)
+    try:
+        return Path.home()
+    except (RuntimeError, KeyError, OSError):
+        return None
 
 
 def _text(value, label, limit, optional=False):
@@ -541,21 +560,30 @@ class ExtensionManager:
         if len(raw) > SKILL_LIMIT or b"\x00" in raw:
             raise ValueError("Skills must be UTF-8 text of at most 8 KB.")
         text = raw.decode("utf-8")
-        name, description = skill_id, ""
+        name, description, extra = skill_id, "", {}
         lines = text.splitlines()
         if lines and lines[0] == "---":
             for line in lines[1:]:
                 if line == "---":
                     break
                 key, separator, value = line.partition(":")
-                if separator and key in {"name", "description"}:
-                    value = value.strip().strip("\"'")
-                    if key == "name":
-                        name = value[:80]
-                    else:
-                        description = value[:300]
+                key = key.strip()
+                if not separator:
+                    continue
+                value = value.strip().strip("\"'")
+                if key == "name":
+                    name = value[:80]
+                elif key == "description":
+                    description = value[:300]
+                elif key == "argument-hint" and value:
+                    extra["argument_hint"] = self.settings.redact(" ".join(value.split()))[:80]
+                elif key in SKILL_FLAGS and value.lower() in ("true", "false"):
+                    # Kept only when it differs from the default: disable-model-invocation false, user-invocable true.
+                    flag = value.lower() == "true"
+                    if flag == (key == "disable-model-invocation"):
+                        extra[SKILL_FLAGS[key]] = flag
         return {"id": skill_id, "name": self.settings.redact(name), "description": self.settings.redact(description),
-                "path": path, "text": self.settings.redact(text)}
+                "path": path, **extra, "text": self.settings.redact(text)}
 
     @staticmethod
     def _in_workspace(tools, skill_id, roots=WORKSPACE_SKILL_ROOTS):
@@ -599,6 +627,33 @@ class ExtensionManager:
     def _usable_roots(claude):
         return WORKSPACE_SKILL_ROOTS if claude is not None else WORKSPACE_SKILL_ROOTS[:1]
 
+    def _user_skill(self, skill_id, root):
+        home = user_home()
+        folder = home / root / skill_id
+        target = folder / "SKILL.md"
+        if folder.is_symlink() or target.is_symlink() or not stat.S_ISREG(target.stat().st_mode):
+            raise ValueError(f"Your own skills must be regular files in ~/{root}.")
+        return self._read_skill(skill_id, target, f"~/{root}/{skill_id}/SKILL.md")
+
+    def _user_skills(self):
+        """[(root, skills, ids)] of the user's own skill folders (USER_SKILL_ROOTS) that can be used: ids are
+        the IDs with an entry there, also one that fails to load. A folder that is missing, not a folder,
+        unreadable, or has more than 100 entries or 30 skills is skipped, as for .claude/skills, and takes
+        no skill ID over."""
+        home = user_home()
+        found = []
+        for root in USER_SKILL_ROOTS if home is not None else ():
+            folder = home / root
+            try:
+                if not folder.is_dir():
+                    continue
+                skills = self._discover(folder, lambda skill_id, root=root: self._user_skill(skill_id, root))
+                ids = {entry.name for entry in itertools.islice(folder.iterdir(), 101) if os.path.lexists(entry / "SKILL.md")}
+            except (OSError, ValueError, RuntimeError):
+                continue
+            found.append((root, skills, ids))
+        return found
+
     def skills(self, tools):
         folder = tools.path(".agents/skills")
         skills = []
@@ -612,15 +667,27 @@ class ExtensionManager:
             shipped = self._discover(self.app_skills, self._app_skill) if self.app_skills.is_dir() else []
         except (OSError, ValueError):
             shipped = []
-        return (skills + [skill for skill in claude or [] if not self._in_workspace(tools, skill["id"], WORKSPACE_SKILL_ROOTS[:1])]
-                + [skill for skill in shipped if not self._in_workspace(tools, skill["id"], roots)])
+        listed = (skills + [skill for skill in claude or []
+                            if not self._in_workspace(tools, skill["id"], WORKSPACE_SKILL_ROOTS[:1])])
+        # The user's own skills (each folder with its own limit of 30), then the shipped skills: an ID the
+        # workspace defines, or an earlier folder, takes it over.
+        taken = set()
+        for _, found, ids in self._user_skills():
+            listed += [skill for skill in found if skill["id"] not in taken and not self._in_workspace(tools, skill["id"], roots)]
+            taken |= ids
+        return listed + [skill for skill in shipped if skill["id"] not in taken and not self._in_workspace(tools, skill["id"], roots)]
 
     def load_skill(self, tools, skill_id):
         if not isinstance(skill_id, str) or not SKILL_IDENTIFIER.fullmatch(skill_id):
             return self._skill(tools, skill_id)
         roots = self._usable_roots(self._claude_skills(tools))
-        if not self._in_workspace(tools, skill_id, roots) and os.path.lexists(self.app_skills / skill_id / "SKILL.md"):
-            return self._app_skill(skill_id)
+        if not self._in_workspace(tools, skill_id, roots):
+            # Like a workspace entry, a user entry for this ID takes it over even when it fails to load.
+            for root, _, ids in self._user_skills():
+                if skill_id in ids:
+                    return self._user_skill(skill_id, root)
+            if os.path.lexists(self.app_skills / skill_id / "SKILL.md"):
+                return self._app_skill(skill_id)
         return self._skill(tools, skill_id, roots=roots)
 
     async def run_hook(self, hook, payload, workspace, env=None):
@@ -679,7 +746,9 @@ class ExtensionManager:
 
 def skill_index(skills) -> str:
     """A short list of skill IDs and descriptions for the system message, at most
-    SKILL_INDEX_ENTRIES lines and SKILL_INDEX_BYTES bytes; '' without skills."""
+    SKILL_INDEX_ENTRIES lines and SKILL_INDEX_BYTES bytes; '' without skills. Skills whose
+    frontmatter sets disable-model-invocation are left out: only the user selects them."""
+    skills = [skill for skill in skills or [] if not skill.get("disable_model_invocation")]
     if not skills:
         return ""
     header = "Skills you can load with use_skill when one fits the task (list_skills shows details):\n"

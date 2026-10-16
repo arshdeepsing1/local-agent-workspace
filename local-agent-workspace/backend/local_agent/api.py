@@ -64,6 +64,8 @@ class RevalidatedStaticFiles(StaticFiles):
 
 class Prompt(BaseModel):
     text: str = Field(min_length=1, max_length=50000)
+    # Sent as typed: no command template, no skill selected by /<id>, no @ file attached.
+    verbatim: bool = Field(default=False, strict=True)
 
 
 class CompactionRequest(BaseModel):
@@ -85,6 +87,7 @@ RequestFormat = Literal["auto", "anthropic", "openai", "none"]  # reasoning.REQU
 class SessionPermissions(BaseModel):
     permission_mode: PermissionMode = "manual"
     reasoning_effort: Effort | None = None  # A new chat's effort; Settings' default when absent.
+    model: str | None = Field(default=None, min_length=1, max_length=256, strict=True)  # /clear: the old chat's model.
 
 
 class SessionEffort(BaseModel):
@@ -178,6 +181,7 @@ class SettingsEdit(BaseModel):
     reasoning_format: RequestFormat | None = None
     thinking_summaries: bool | None = Field(default=None, strict=True)
     prompt_caching: Literal["auto", "messages", "off"] | None = None  # config.PROMPT_CACHING
+    slash_commands: bool | None = Field(default=None, strict=True)
     spending_limit_dbu: float | None = Field(default=None, ge=0, le=MAX_LIMIT_DBU, allow_inf_nan=False, strict=True)
     coding_dir: str | None = Field(default=None, max_length=4096, strict=True)
     python_venv: str | None = Field(default=None, max_length=4096, strict=True)
@@ -467,10 +471,15 @@ def create_app(settings=None):
     @app.post("/api/sessions")
     async def create_session(body: SessionPermissions | None = None):
         manager.workspace_available(settings.values["workspace"])
+        model = body.model.strip() if body and body.model else ""
+        if body and body.model and not model:
+            raise ValueError("Enter a model endpoint name.")
         session = store.create(settings.values)
         session["permission_mode"] = body.permission_mode if body else "manual"
         if body and body.reasoning_effort:
             session["reasoning_effort"] = body.reasoning_effort
+        if model:
+            session["model"] = model
         store.save(session)
         return public_session(session)
 
@@ -675,7 +684,7 @@ def create_app(settings=None):
         if not body.text.strip():
             raise ValueError("Enter a message.")
         # Starts the message, or queues it while a turn, compaction or ! command runs.
-        return await manager.submit_message(session_id, body.text.strip())
+        return await manager.submit_message(session_id, body.text.strip(), verbatim=body.verbatim)
 
     @app.post("/api/sessions/{session_id}/stop")
     async def stop(session_id: str):

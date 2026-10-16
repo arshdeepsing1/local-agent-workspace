@@ -207,20 +207,27 @@ async def test_plan_skips_hooks_but_can_track_tasks(runtime):
 
 
 async def test_skill_is_loaded_explicitly_and_fresh(runtime, monkeypatch):
+    """`/skill <id>` sends the skill with that message; a skill selected for the chat (the panel or use_skill)
+    is in every request's system message and reloads each time."""
     manager, session, project, tools = runtime
     skill = project / '.agents/skills/review/SKILL.md'
     skill.parent.mkdir(parents=True)
     skill.write_text('Review rule: trace behavior.')
     seen = []
     async def handler(request):
-        seen.append(json.loads(request.content)['messages'][0]['content'])
+        messages = json.loads(request.content)['messages']
+        seen.append((messages[0]['content'], messages[-1]['content']))
         return stream('Reviewed')
     gateway(monkeypatch, handler)
     await manager.run_databricks(session, '/skill review inspect the code')
-    assert 'Review rule: trace behavior.' in seen[-1]
+    system, user = seen[-1]
+    assert 'Review rule: trace behavior.' not in system and 'Review rule: trace behavior.' in user
+    assert user.startswith('/skill review inspect the code\n\n---\n[Skill /review selected by the user for this message.')
+    assert session.get('active_skills', []) == []
+    manager.select_skill(session, tools, 'review')
     skill.write_text('Review rule: test the change.')
     await manager.run_databricks(session, 'Continue')
-    assert 'Review rule: test the change.' in seen[-1]
+    assert 'Review rule: test the change.' in seen[-1][0] and seen[-1][1] == 'Continue'
     assert session['active_skills'] == ['review']
 
 
@@ -334,12 +341,15 @@ async def test_slash_skill_id_selects_a_listed_skill_and_other_slashes_stay_text
         assert session.get('active_skills', []) == []
         assert 'Review rule' not in seen[-1][0] and seen[-1][1] == prompt
     await manager.run_databricks(session, '/review')
-    assert session['active_skills'] == ['review']
+    assert session.get('active_skills', []) == []
     system, user = seen[-1]
-    assert 'Workspace skill: review\nReview rule: trace behavior.' in system and user == '/review'
+    assert 'Review rule' not in system and user.startswith('/review\n\n---\n[Skill /review') and user.endswith('Review rule: trace behavior.')
     assert 'contains /<skill-id> as a word' in system
     await manager.run_databricks(session, '/review   the parser too')
-    assert session['active_skills'] == ['review']
+    assert session.get('active_skills', []) == [] and seen[-1][1].endswith('Review rule: trace behavior.')
+    # The next message does not carry it again.
+    await manager.run_databricks(session, 'Thanks')
+    assert seen[-1][1] == 'Thanks' and 'Review rule' not in seen[-1][0]
 
 
 async def test_skill_command_inside_a_longer_request_selects_it_but_paths_do_not(runtime, monkeypatch):
@@ -351,7 +361,7 @@ async def test_skill_command_inside_a_longer_request_selects_it_but_paths_do_not
         skill.write_text(f'{skill_id} rules.')
     seen = []
     async def handler(request):
-        seen.append(json.loads(request.content)['messages'][0]['content'])
+        seen.append(json.loads(request.content)['messages'][-1]['content'])
         return stream('Done')
     gateway(monkeypatch, handler)
     for prompt in ('Summarize /tmp/handoff/notes.md and ~/handoff', 'Is x /handoffs y or a/handoff the same?'):
@@ -359,7 +369,7 @@ async def test_skill_command_inside_a_longer_request_selects_it_but_paths_do_not
         assert session.get('active_skills', []) == [] and 'handoff rules.' not in seen[-1]
     await manager.run_databricks(session, 'Read ~/notes/project*.md and handoffs/*.md and use /handoff skill '
                                           'to create a detailed handoff in handoffs/, then /review.')
-    assert session['active_skills'] == ['handoff', 'review']
+    assert session.get('active_skills', []) == []
     assert 'handoff rules.' in seen[-1] and 'review rules.' in seen[-1]
 
 
@@ -371,13 +381,13 @@ async def test_shipped_skill_works_in_any_workspace_until_the_workspace_defines_
     manager.extensions.app_skills = tmp_path / 'skills'
     seen = []
     async def handler(request):
-        seen.append(json.loads(request.content)['messages'][0]['content'])
+        seen.append(json.loads(request.content)['messages'][-1]['content'])
         return stream('Done')
     gateway(monkeypatch, handler)
     await manager.run_databricks(session, '/handoff Create a handoff')
-    assert session['active_skills'] == ['handoff'] and 'Shipped handoff rules.' in seen[-1]
+    assert 'Shipped handoff rules.' in seen[-1]
     own = project / '.agents/skills/handoff/SKILL.md'
     own.parent.mkdir(parents=True)
     own.write_text('Project handoff rules.')
-    await manager.run_databricks(session, 'Continue')
+    await manager.run_databricks(session, '/handoff Again')
     assert 'Project handoff rules.' in seen[-1] and 'Shipped handoff rules.' not in seen[-1]

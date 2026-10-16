@@ -8,6 +8,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError
 
+from .composer_api import MAX_QUEUED
 from .context import LARGE_SUMMARY_MAX_BYTES, MAX_ESTIMATE_SCALE, context_boundary
 from .extensions import HOOK_CONTEXT_CHARS, HOOK_EVENTS, HOOK_REPORT_CHARS, MAX_HOOKS
 from .lifecycle_hooks import SHOWN_ARGUMENTS_BYTES
@@ -110,6 +111,16 @@ class Attachment(Record):
     truncated: bool | None = None
     command: str | None = Field(default=None, max_length=2000)
     exit_code: int | None = None
+
+
+# A skill ID or a command template's name (extensions.SKILL_IDENTIFIER).
+SkillId = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")]
+
+
+class CommandRef(Record):
+    """A command template a user message ran (AgentManager.message_parts): its name and file, never its text."""
+    name: SkillId
+    path: str = Field(min_length=1, max_length=4096)
 
 
 class Withheld(Record):
@@ -233,6 +244,13 @@ class Event(Record):
     # while the agent was working. Notices: stop_phase says what a Stop interrupted.
     in_wire: bool | None = None
     steered: bool | None = None
+    # User events: the command templates the message ran (queued messages sent as one can run several),
+    # the skills it selected for itself (/<skill-id>), and whether it was sent as plain text (verbatim;
+    # Retry and Edit send it so again) or from the queue (queued: it selected no skill).
+    commands: list[CommandRef] | None = Field(default=None, max_length=MAX_QUEUED)
+    skills: list[SkillId] | None = Field(default=None, max_length=3)
+    verbatim: bool | None = None
+    queued: bool | None = None
     attachments: list[Attachment] | None = Field(default=None, max_length=10)
     stop_phase: Literal["streaming", "tools", "waiting"] | None = None
     details: str | None = Field(default=None, max_length=1000)  # A rate-limit notice's Details (the 429).

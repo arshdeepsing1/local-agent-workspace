@@ -59,7 +59,8 @@ const ADJUSTMENTS = {
   condensed_trimmed: 'The condensed conversation summary was still over its size limit, so the app shortened its least important sections',
 }
 
-export default function ContextMeter({ info, model, busy = false, status, onCompact }) {
+// openSignal: a number that /context increases to open the details (a change after mounting only).
+export default function ContextMeter({ info, model, busy = false, status, onCompact, openSignal = 0 }) {
   const [note, setNote] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
@@ -80,6 +81,15 @@ export default function ContextMeter({ info, model, busy = false, status, onComp
   useEffect(() => {
     if (status === 'awaiting_approval' && details.current?.open) details.current.open = false
   }, [status])
+  const signalSeen = useRef(openSignal)
+  useEffect(() => {
+    if (openSignal === signalSeen.current) return
+    signalSeen.current = openSignal
+    if (!details.current) return
+    details.current.open = true
+    setOpen(true)
+    details.current.querySelector('summary')?.focus()
+  }, [openSignal])
   if (!info) return html`<p class="context-empty">Context usage is estimated after the first turn.</p>`
   const legacyEstimate = info.estimate_method === 'conservative_utf8'
   const percent = Math.round(info.estimated_tokens / info.input_budget * 100)

@@ -6,6 +6,8 @@ from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import approvals, custom_agents, mcp_import, memory, output_styles
+from . import commands as command_templates
+from .extensions import RESERVED_COMMANDS
 from .agents import public_session
 from .approvals import busy_conflict, busy_status, ensure_idle
 from .planning import transcript_name
@@ -334,7 +336,19 @@ def register_features(app, manager, settings, store, session_or_404, workspace_t
 
     @app.get("/api/skills")
     async def skills(session_id: str | None = None):
-        return manager.extensions.skills(workspace_tools(session_id))
+        """The chat's skills (or the default workspace's). reserved: its ID is one of the app's commands or a
+        command template's name, so only `/skill <id>` selects it in a message."""
+        tools = workspace_tools(session_id)
+        listed = manager.extensions.skills(tools)
+        names = RESERVED_COMMANDS | {item["name"] for item in command_templates.discover(tools.root)["commands"]}
+        return [{**skill, "reserved": True} if skill["id"] in names else skill for skill in listed]
+
+    @app.get("/api/commands")
+    async def commands(session_id: str | None = None):
+        """The command templates of the chat's workspace and the user's own folders: {commands, errors, folders}."""
+        tools = workspace_tools(session_id)
+        return {**command_templates.discover(tools.root, settings.redact),
+                "folders": [*command_templates.WORKSPACE_ROOTS, *(f"~/{root}" for root in command_templates.USER_ROOTS)]}
 
     @app.post("/api/sessions/{session_id}/skills")
     async def select_skill(session_id: str, body: SkillRequest):

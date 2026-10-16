@@ -33,6 +33,7 @@ class RewindRequest(BaseModel):
     conversation: bool = Field(default=False, strict=True)
     code: bool = Field(default=False, strict=True)
     resend_text: str | None = Field(default=None, min_length=1, max_length=50000, strict=True)
+    resend_verbatim: bool = Field(default=False, strict=True)  # Resent as plain text, as the message was sent.
 
 
 # Never copied into a rewind backup: the usage ledger and jobs stay with the live chat, and authority,
@@ -246,14 +247,19 @@ def register_portability(app, manager, settings, store, session_or_404):
         except HistoryError as exc:
             raise HTTPException(400, str(exc)) from exc
         if body.resend_text is not None:
-            # The resend's own checks (a refused @ file, the attachment limits, a missing project folder)
-            # run before anything changes, so a refusal leaves the chat as it was and the edit open.
+            # The resend's own checks (a refused @ file, the attachment limits, a missing project folder,
+            # a command template or skill that cannot be used) run before anything changes, as start runs
+            # them, so a refusal leaves the chat as it was and the edit open.
             remaining = {**session, "events": session["events"][:event_cut]}
             try:
                 manager.workspace_available(session["workspace"])
                 if not delegated_prompt(remaining):
-                    mentions.expand_context(manager, remaining, manager.session_tools(session),
-                                            body.resend_text.strip(), include_pending=False)
+                    text, resend_tools = body.resend_text.strip(), manager.session_tools(session)
+                    prepared = manager.prepared_message(resend_tools, text, body.resend_verbatim)
+                    mentions.expand_context(manager, remaining, resend_tools, text, include_pending=False,
+                                            scan=manager.message_parts([prepared])[0])
+                    if not body.resend_verbatim and manager.slash_commands():
+                        manager.message_skills(remaining, resend_tools, text)
             except ValueError as exc:
                 raise HTTPException(400, settings.redact(str(exc))) from exc
         files = []
@@ -303,7 +309,7 @@ def register_portability(app, manager, settings, store, session_or_404):
         result = {"backup_session_id": backup_id, "files": files, "resent": False}
         if body.resend_text is not None:
             try:
-                manager.start(session_id, body.resend_text.strip())
+                manager.start(session_id, body.resend_text.strip(), verbatim=body.resend_verbatim)
                 result["resent"] = True
             except ValueError as exc:
                 result["resend_error"] = settings.redact(str(exc))
