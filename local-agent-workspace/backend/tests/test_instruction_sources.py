@@ -67,6 +67,42 @@ def test_rule_paths_take_a_list_or_commas_and_claude_rules_are_read_after_agents
     assert load_project_instructions(tools, [], ["web/sub/app.js"])["files"] == []
 
 
+@pytest.mark.parametrize("field", ["src/**/*.{ts,tsx}, docs/*.md", "[src/**/*.{ts,tsx}, docs/*.md]"])
+def test_a_comma_inside_glob_braces_stays_in_its_glob(tmp_path, field):
+    write(tmp_path, ".agents/rules/ts.md", f"---\npaths: {field}\n---\nTypeScript rule.")
+    tools = WorkspaceTools(str(tmp_path))
+    for path in ("src/app.ts", "src/ui/view.tsx", "docs/guide.md"):
+        result = load_project_instructions(tools, [], [path])
+        assert loaded(result) == [".agents/rules/ts.md"], path
+        assert ('[Project rule: ".agents/rules/ts.md"; applies to files matching: ["src/**/*.{ts,tsx}", "docs/*.md"]]'
+                in result["text"])
+    assert load_project_instructions(tools, [], ["src/app.js"])["files"] == []
+
+
+@pytest.mark.parametrize("field", ["paths: []", "paths:"])
+def test_an_empty_paths_field_omits_the_rule_instead_of_applying_everywhere(tmp_path, field):
+    write(tmp_path, ".agents/rules/none.md", f"---\n{field}\n---\nEmpty paths rule.")
+    write(tmp_path, ".agents/rules/plain.md", "---\ndescription: no paths\n---\nPlain rule.")
+    result = load_project_instructions(WorkspaceTools(str(tmp_path)), [], ["src/app.py"])
+    assert result["files"] == [".agents/rules/plain.md"] and "Empty paths rule" not in result["text"]
+    assert result["warnings"] == ['.agents/rules/none.md: paths is empty: list the globs the rule applies to, such as '
+                                  '["src/**/*.py"], or leave paths out for a rule that applies everywhere.']
+
+
+def test_the_imports_of_a_path_scoped_rule_are_headed_with_its_globs(tmp_path):
+    write(tmp_path, ".agents/rules/python.md", '---\npaths: ["src/**/*.py"]\n---\nPython rule. See @../../docs/py.md')
+    write(tmp_path, "docs/py.md", "No print in library code. @more.md")
+    write(tmp_path, "docs/more.md", "More Python notes.")
+    result = load_project_instructions(WorkspaceTools(str(tmp_path)), [], ["src/app.py"])
+    text = result["text"]
+    assert '[Imported by ".agents/rules/python.md": "docs/py.md"; applies to files matching: ["src/**/*.py"]]' in text
+    assert '[Imported by "docs/py.md": "docs/more.md"; applies to files matching: ["src/**/*.py"]]' in text
+    assert 'scope: "."' not in text
+    assert {source["path"]: source["scope"] for source in result["sources"]} == {
+        ".agents/rules/python.md": "files matching src/**/*.py", "docs/py.md": "files matching src/**/*.py",
+        "docs/more.md": "files matching src/**/*.py"}
+
+
 def test_a_broken_or_oversize_rule_is_omitted_with_a_reason(tmp_path):
     write(tmp_path, ".agents/rules/broken.md", "---\npaths: [unclosed\n---\nBroken.")
     write(tmp_path, ".agents/rules/empty.md", "---\npaths: [1, 2]\n---\nNot globs.")
@@ -189,6 +225,24 @@ def test_the_user_files_follow_their_settings_and_have_their_own_budget(tmp_path
     assert len(both["text"].encode("utf-8")) < 2 * MAX_USER_FILE_BYTES
     assert both["warnings"] == ["~/.claude/CLAUDE.md: " + claude["reason"]]
     assert load_user_instructions({}, tools) == {"text": "", "warnings": [], "sources": []}
+
+
+def test_loaded_files_and_imports_have_the_token_and_secret_shapes_redacted(agent):
+    manager, session, project, _ = agent
+    home = instructions.user_home()
+    write(project, "AGENTS.md", "See @notes/dev.txt for the gateway.")
+    write(project, "notes/dev.txt", "Gateway key test-token; GITHUB_TOKEN=abc123")
+    write(project, ".agents/rules/keys.md", "Rotate test-token monthly.")
+    write(home, ".agents/AGENTS.md", "My setup: @~/notes/gateway.cfg")
+    write(home, "notes/gateway.cfg", "[DEFAULT]\ntoken = test-token\npassword: hunter22\n")
+    tools = manager.session_tools(session)
+    system, guidance = manager.context_inputs(session, tools, "manual")
+    content = system["content"]
+    assert "test-token" not in content and "abc123" not in content and "hunter22" not in content
+    assert "Gateway key [REDACTED]; GITHUB_TOKEN=[REDACTED]" in content and "Rotate [REDACTED] monthly." in content
+    assert "token = [REDACTED]\npassword: [REDACTED]" in content
+    assert {"notes/dev.txt", "~/notes/gateway.cfg"} <= {source["path"] for source in guidance["sources"]}
+    assert manager.guidance_matches(session, tools)
 
 
 def test_user_file_imports_stay_inside_home_and_skip_credentials(tmp_path):

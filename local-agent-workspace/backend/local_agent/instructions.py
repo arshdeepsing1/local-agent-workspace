@@ -9,6 +9,7 @@ file, relative to the importing file, up to three levels deep. Project content s
 
 The user's files (~/.agents/AGENTS.md, and ~/.claude/CLAUDE.md when Settings turns it on) stay inside the home folder
 with their imports, have 8,000 bytes each and never hold back a write, like Settings → Custom instructions.
+Loaded text has the configured token and common secret shapes replaced with [REDACTED].
 
 Over a budget, whole files load first, in order; the start of the first files that did not fit fills the rest
 ("trimmed"), and the others are omitted. Every file is only read: nothing here runs or writes anything.
@@ -21,6 +22,7 @@ from pathlib import Path
 
 from .context import estimate_text_tokens
 from .mentions import MENTION, TRAILING, _masked
+from .redaction import redact_secrets
 from .tools import WorkspaceTools, file_error
 
 MAX_INSTRUCTION_BYTES = 24_000
@@ -107,22 +109,24 @@ class _Reader:
         return "~/" + relative if self.home else relative
 
     def read(self, target, limit=None):
-        """(identity, text) of a regular file; FileNotFoundError when it is missing."""
+        """(identity, text) of a regular file, without the configured token or common secret shapes;
+        FileNotFoundError when it is missing."""
         metadata = target.stat()
         if not stat.S_ISREG(metadata.st_mode):
             raise ValueError("Instructions must be a regular text file.")
         if limit is not None and metadata.st_size > limit:
             raise ValueError(f"A rule file is at most {limit:,} bytes.")
-        return (metadata.st_dev, metadata.st_ino), self.tools.read_file(str(target))
+        return (metadata.st_dev, metadata.st_ino), redact_secrets(self.tools.redact(self.tools.read_file(str(target))))
 
     @staticmethod
     def omitted(label, scope, reason):
         return {"label": label, "scope": scope, "status": "omitted", "reason": reason}
 
-    def imported(self, importer, folder, text, scope, depth):
+    def imported(self, importer, folder, text, scope, depth, where=None):
         """The entries text imports with @path (depth first), each followed by its own imports. A token that is
-        not a file stays prose; a missing or refused one that looks like a file is listed as omitted."""
-        entries, count = [], 0
+        not a file stays prose; a missing or refused one that looks like a file is listed as omitted.
+        where: what their headers say about where they apply (default: the scope)."""
+        entries, count, where = [], 0, where or f"scope: {json.dumps(scope)}"
         for token in _imports(text):
             name = f"{importer} → @{token}"
             try:
@@ -155,14 +159,14 @@ class _Reader:
             self.seen.add(identity)
             label = self.label(target)
             entries.append({"label": label, "scope": scope, "content": content, "identity": identity,
-                            "header": f"\n\n[Imported by {json.dumps(importer)}: {json.dumps(label)}; "
-                                      f"scope: {json.dumps(scope)}]\n"})
-            entries.extend(self.imported(label, target.parent, content, scope, depth + 1))
+                            "header": f"\n\n[Imported by {json.dumps(importer)}: {json.dumps(label)}; {where}]\n"})
+            entries.extend(self.imported(label, target.parent, content, scope, depth + 1, where))
         return entries
 
-    def file(self, relative, scope, header, limit=None, body=None):
+    def file(self, relative, scope, header, limit=None, body=None, rescope=None):
         """Entries for one file and its imports ([] when it is missing or already loaded). header(label) is its
-        header line; body(text) -> its content (a rule's text after the frontmatter), called first."""
+        header line; body(text) -> its content (a rule's text after the frontmatter), called first; then
+        rescope() -> None, or (scope, where) for the file and its imports (a rule's paths)."""
         label = "~/" + relative.as_posix() if self.home else relative.as_posix()
         try:
             target = self.target(relative)
@@ -174,9 +178,10 @@ class _Reader:
         if identity in self.seen:
             return []
         content = body(text) if body else text
+        scope, where = (rescope() if rescope else None) or (scope, None)
         self.seen.add(identity)
         return [{"label": label, "scope": scope, "header": header(label), "content": content, "identity": identity},
-                *self.imported(label, target.parent, content, scope, 1)]
+                *self.imported(label, target.parent, content, scope, 1, where)]
 
 
 def _fit(entries, budget, what, limit=None):
@@ -219,13 +224,31 @@ def _fit(entries, budget, what, limit=None):
     return sections, sources, warnings, files
 
 
+def _split_globs(value):
+    """The comma-separated globs of one string; a comma inside {a,b} braces belongs to its glob."""
+    parts, current, depth = [], "", 0
+    for char in value:
+        if char == "," and not depth:
+            parts.append(current)
+            current = ""
+            continue
+        depth += 1 if char == "{" else -1 if char == "}" and depth else 0
+        current += char
+    return [*parts, current]
+
+
 def _paths_field(fields):
-    """A rule's globs from its frontmatter: a list of strings, or one string with commas; [] without paths."""
-    value = fields.get("paths", [])
-    items = (value if isinstance(value, list) else [part.strip() for part in value.split(",")]
-             if isinstance(value, str) else None)
+    """A rule's globs from its frontmatter: a list of strings, or one string with commas; [] without paths
+    (an empty paths is an error, not a rule for every file)."""
+    if "paths" not in fields:
+        return []
+    value = fields["paths"]
+    items = value if isinstance(value, list) else _split_globs(value) if isinstance(value, str) else None
     if items is None or not all(isinstance(item, str) and item.strip() for item in items):
         raise ValueError('paths must be a list of glob patterns, such as ["src/**/*.py"].')
+    if not items:
+        raise ValueError('paths is empty: list the globs the rule applies to, such as ["src/**/*.py"], or leave '
+                         "paths out for a rule that applies everywhere.")
     return [item.strip() for item in items]
 
 
@@ -266,20 +289,20 @@ def _rules(reader, paths):
                 fields, rest = frontmatter(text)
                 globs.extend(_paths_field(fields))
                 return rest + "\n"
+
+            def where(globs=globs):  # The rule's and its imports' headers say where they apply.
+                return f"applies to files matching: {json.dumps(globs)}" if globs else 'scope: "."'
             try:
-                entries = reader.file(relative, ".", lambda label, globs=globs: (
-                    f"\n\n[Project rule: {json.dumps(label)}; "
-                    + (f"applies to files matching: {json.dumps(globs)}]\n" if globs else 'scope: "."]\n')),
-                    limit=MAX_RULE_BYTES, body=body)
+                entries = reader.file(
+                    relative, ".", lambda label, where=where: f"\n\n[Project rule: {json.dumps(label)}; {where()}]\n",
+                    limit=MAX_RULE_BYTES, body=body,
+                    rescope=lambda globs=globs, where=where: globs and ("files matching " + ", ".join(globs), where()))
                 if globs and entries and "status" not in entries[0]:
                     matchers = [compile_glob(glob) for glob in globs]
                     if not any(glob_match(matcher, path, deadline) for path in paths for matcher in matchers):
                         # Not loaded yet: its file and imports may still load from another file.
                         reader.seen.difference_update(entry["identity"] for entry in entries if "identity" in entry)
                         continue
-                    scope = "files matching " + ", ".join(globs)
-                    for entry in entries:
-                        entry["scope"] = scope
                     matched.extend(entries)
                 else:
                     always.extend(entries)

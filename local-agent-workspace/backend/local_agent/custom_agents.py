@@ -112,8 +112,8 @@ def _scalar(value, number):
 
 
 def _items(text, number):
-    """The items of an inline [a, b] list."""
-    items, current, quote = [], "", None
+    """The items of an inline [a, b] list (a comma inside {a,b} braces, as in a glob, stays in its item)."""
+    items, current, quote, depth = [], "", None, 0
     for char in text:
         if quote:
             current += char
@@ -122,10 +122,11 @@ def _items(text, number):
         elif char in "\"'":
             quote = char
             current += char
-        elif char == ",":
+        elif char == "," and not depth:
             items.append(current.strip())
             current = ""
         else:
+            depth += 1 if char == "{" else -1 if char == "}" and depth else 0
             current += char
     if quote:
         raise ValueError(f"Line {number}: a quoted list item is not closed.")

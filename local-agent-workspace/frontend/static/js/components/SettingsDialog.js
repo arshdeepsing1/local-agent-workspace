@@ -346,7 +346,7 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         <label>Output style<select value=${style} onChange=${e => field('output_style', e.currentTarget.value)}>
           ${styleChoices.map(item => html`<option key=${item.id} value=${item.id}>${item.name}</option>`)}
         </select></label>
-        <p class="field-help">How the agent writes its replies: Concise keeps them short, Explanatory explains the reasons behind its work. A project can add styles in .agents/output-styles/, and you in ~/.agents/output-styles/.</p>
+        <p class="field-help">How the agent writes its replies: Concise keeps them short, Explanatory explains the reasons behind its work. A project can add styles in .agents/output-styles/, and you in ~/.agents/output-styles/ (yours win for the same name).</p>
         <label class="settings-checkbox"><input type="checkbox" checked=${form.project_memory !== false}
           onChange=${e => field('project_memory', e.currentTarget.checked)} />Project memory</label>
         <p class="field-help">The agent can save short notes about a project, each with your approval, and later chats in that project see them. Review, edit and delete them in Agent tools → Memory.</p>`)}

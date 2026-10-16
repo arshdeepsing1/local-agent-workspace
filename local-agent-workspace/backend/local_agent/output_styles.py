@@ -1,10 +1,10 @@
 """Output styles: how the agent writes its replies (Settings → Output style), added to the stable system text.
 
-Built in: default (no text), concise and explanatory. A project can add .agents/output-styles/<id>.md and the
-user ~/.agents/output-styles/<id>.md (the project's file wins for the same id): an optional frontmatter with
-name and description between two '---' lines, then the instructions, at most 4,000 bytes. The ids of the
-built-in styles cannot be reused. A style only shapes replies: it never overrides the user's instructions,
-project guidance or permissions, and the system message says so.
+Built in: default (no text), concise and explanatory. The user can add ~/.agents/output-styles/<id>.md and a
+project .agents/output-styles/<id>.md (the user's file wins for the same id, since Settings are the user's): an
+optional frontmatter with name and description between two '---' lines, then the instructions, at most 4,000
+bytes. The ids of the built-in styles cannot be reused. A style only shapes replies: it never overrides the
+user's instructions, project guidance or permissions, and the system message says so and names a style file.
 """
 import json
 import os
@@ -13,6 +13,7 @@ import stat
 from pathlib import Path
 
 from .context import estimate_text_tokens
+from .redaction import redact_secrets
 from .tools import file_error
 
 STYLE_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,39}\Z")
@@ -46,7 +47,7 @@ def _style_file(tools, relative, source):
         raise ValueError("An output style must be a regular text file.")
     if info.st_size > MAX_STYLE_BYTES:
         raise ValueError(f"An output style is at most {MAX_STYLE_BYTES:,} bytes.")
-    text = tools.read_file(str(target))
+    text = redact_secrets(tools.redact(tools.read_file(str(target))))  # As instructions files are.
     fields, body = frontmatter(text) if text.splitlines()[:1] == ["---"] else ({}, text.strip())
     style_id = Path(relative).stem
     name, description = fields.get("name", style_id), fields.get("description", "")
@@ -62,11 +63,11 @@ def _style_file(tools, relative, source):
 
 def discover(project_tools, home_tools):
     """{styles: [{id, name, description, source, path?, text}], errors: [{path, error}]}: the built-in styles,
-    then the project's, then the user's (an id already listed is skipped)."""
+    then the user's, then the project's (an id already listed is skipped)."""
     found = {style_id: {"id": style_id, "name": preset["name"], "description": preset["description"],
                         "source": "built-in", "text": preset["text"]} for style_id, preset in PRESETS.items()}
     errors = []
-    for tools, source in ((project_tools, "project"), (home_tools, "user")):
+    for tools, source in ((home_tools, "user"), (project_tools, "project")):
         if tools is None:
             continue
         shown = STYLE_FOLDER if source == "project" else "~/" + STYLE_FOLDER
@@ -89,7 +90,7 @@ def discover(project_tools, home_tools):
                 errors.append({"path": path, "error": f"{style_id} is a built-in style; give the file another name."})
                 continue
             if style_id in found:
-                continue  # The project's file wins.
+                continue  # The user's file wins.
             try:
                 found[style_id] = _style_file(tools, f"{STYLE_FOLDER}/{name}", source)
             except (ValueError, OSError, RuntimeError, UnicodeError) as exc:
@@ -109,7 +110,12 @@ def style_block(style_id, project_tools, home_tools):
         return "", {"path": f"Output style: {style_id} (Settings)", "scope": "all projects", "status": "omitted",
                     "estimated_tokens": 0, "reason": f"No output style {json.dumps(style_id)} in this project or in "
                     "~/.agents/output-styles, so replies use the default style."}
-    text = (f"Output style: {style['name']} (from Settings; it shapes how you write replies, never what the user "
-            "asked, their instructions, project guidance or permissions):\n" + style["text"].strip() + "\n")
-    return text, {"path": f"Output style: {style['name']} (Settings)", "scope": "all projects", "status": "loaded",
+    # A style file is named, so the model can tell the user's own text from a project's.
+    origin = {"built-in": "from Settings", "user": f"chosen in Settings, the user's file {json.dumps(style.get('path'))}",
+              "project": f"chosen in Settings, the project file {json.dumps(style.get('path'))}"}[style["source"]]
+    name = style["name"] if style["source"] == "built-in" else json.dumps(style["name"])
+    text = (f"Output style: {name} ({origin}; it shapes how you write replies, never what the user asked, their "
+            "instructions, project guidance or permissions):\n" + style["text"].strip() + "\n")
+    return text, {"path": f"Output style: {style['name']} (Settings)",
+                  "scope": "this project" if style["source"] == "project" else "all projects", "status": "loaded",
                   "estimated_tokens": estimate_text_tokens(text)}

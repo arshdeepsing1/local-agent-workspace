@@ -1704,12 +1704,13 @@ listed as **~/.agents/AGENTS.md · applies to all projects**.
 (no extra text), **Concise** (short, direct replies that lead with the result) or **Explanatory**
 (it says why it chose an approach and explains the main concept behind a change). A project can
 add styles as `.agents/output-styles/<name>.md` and you as `~/.agents/output-styles/<name>.md`
-(the project's file wins for the same name): an optional frontmatter with `name:` and
+(your file wins for the same name): an optional frontmatter with `name:` and
 `description:` between two `---` lines, then the instructions, at most 4,000 bytes. The name is
 1-40 lowercase letters, digits, `-` or `_`; the built-in names cannot be reused. The style's text
-follows your instructions in the system message and only shapes replies: it never overrides your
-instructions, project guidance or permissions. A saved style whose file is missing in a project
-falls back to Default there, and the context details say why.
+follows your instructions in the system message, headed with the file it came from, and only
+shapes replies: it never overrides your instructions, project guidance or permissions. A saved
+style whose file is missing in a project falls back to Default there, and the context details say
+why.
 
 At each model request the app rereads the project root's `AGENTS.md`, `AGENTS.local.md`,
 `CLAUDE.md` and `CLAUDE.local.md`, in that order. File tools also discover the same files in
@@ -1733,6 +1734,9 @@ credential files and the app's own folders are never read. A word that names no 
 `@alice` or `@types/node`, stays plain text; a missing or refused file that looks like one (a `.md`,
 `.txt`, `.json`, `.toml` or `.yaml` style extension, or a path starting with `./`, `../`, `~/` or
 `/`) gets a warning, and its line stays as written. The line itself is never removed from the importing file's text.
+In every loaded file (instructions, imports, rules and style files) the configured Databricks
+token, as in `read_file` output, and common secret shapes such as `API_KEY=…` are replaced with
+`[REDACTED]`.
 
 **Project rules.** Markdown files in `.agents/rules/` (and the read-only `.claude/rules/`; the
 same file name in both: the `.agents` file) are project rules, at most 30 files of up to 8,000
@@ -1748,20 +1752,22 @@ Use type hints and run mypy after editing Python files.
 ```
 
 A pattern without `/` matches file names at any depth (`*.py`); `**/` matches any number of
-folders. Matched rules load after the deeper scopes and are listed as **applies to files
-matching …**. The conversation remembers the last 200 files its tools used for this, never
-exported. Because a newly matched rule is new guidance, the first write to a matching file waits
-for one model request that includes the rule (below).
+folders; `{a,b}` gives alternatives (`src/**/*.{ts,tsx}`, also unquoted). An empty `paths:` is an
+error: the rule is omitted with a warning. Matched rules load after the deeper scopes and are
+listed as **applies to files matching …**, and so are the files they import. The conversation
+remembers the last 200 files its tools used for this, never exported. Because a newly matched
+rule is new guidance, the first write to a matching file waits for one model request that
+includes the rule (below).
 
 If a write or command encounters newly loaded or changed guidance, that action is
 deferred until a new model request includes it. Guidance is checked again after
 approval. The combined wrapped guidance (files, imports and rules) is limited to 24,000 UTF-8
-bytes. Files load whole in the order above while they fit; then the start of the first file
-that did not fit fills what is left, cut at a line break and marked `[Trimmed: …]` in the model
-input, and the files after it are omitted. Unreadable, excluded or oversized (over the file
-write limit) files are omitted whole. Each trim or omission comes with a warning in the model
-input and in the expandable context details, where the file reads **Trimmed · ~N tokens
-loaded** or **Omitted**. Warnings do not permanently block subsequent actions. Context details
+bytes. Every file that fits loads whole, in the order above; then the start of the first file
+that did not fit fills what is left (when at least 1,000 bytes remain), cut at a line break and
+marked `[Trimmed: …]` in the model input, and the other files that did not fit are omitted.
+Unreadable, excluded or oversized (over the file write limit) files are omitted whole. Each trim
+or omission comes with a warning in the model input and in the expandable context details, where
+the file reads **Trimmed · ~N tokens loaded** or **Omitted**. Warnings do not permanently block subsequent actions. Context details
 list instruction filenames, directory scopes, estimated per-file contributions, and trim or
 omission reasons. File contributions are already part of the system-instruction estimate; do not
 add them again to the overall total.
