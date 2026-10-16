@@ -1,6 +1,7 @@
 """The default code folder and Python environment in Settings, Folder access, Files and the Terminal;
 live endpoint limit warnings; and Claude Opus 5.5 as the default model."""
 import re
+from datetime import datetime
 
 from playwright.sync_api import expect
 
@@ -229,6 +230,44 @@ def test_the_auto_compact_hint_names_what_a_capped_endpoint_gets(ui, page):
                               exact=False)).to_be_visible()  # Output capped at 128,000.
     dialog.get_by_label("Max output tokens per request").fill("16384")
     expect(dialog.get_by_text("With these settings that is about 253,411 tokens. Lower", exact=False)).to_be_visible()
+
+
+def pause_after_the_first_check(ui, page):
+    """Let the limits check of the opened dialog go out, then stop the page's clock: later checks wait for ui.tick."""
+    page.clock.pause_at(datetime.fromtimestamp(ui.js("Date.now()") / 1000 + 1))
+
+
+def test_the_request_budget_note_waits_for_the_check_of_the_budgets_in_the_form(ui, page):
+    # An endpoint without a profile: requests use the plain input budget, so no note, also before a check answers.
+    dialog = open_settings(ui, page, clock=True)
+    pause_after_the_first_check(ui, page)
+    expect(dialog.get_by_text("No built-in limits for this endpoint.", exact=False)).to_be_visible()
+    help_text = dialog.get_by_text("Current estimated input budget:", exact=False)
+    output = dialog.get_by_label("Max output tokens per request")
+    output.focus()
+    output.press("End")
+    output.press_sequentially("0")  # 8192 -> 81920, checked after the pause.
+    expect(help_text).to_contain_text("Current estimated input budget: 47,104 tokens. The endpoint")
+    expect(dialog.get_by_text("With these settings that is about 42,393 tokens. Lower", exact=False)).to_be_visible()
+
+
+def test_the_request_budget_note_follows_an_edit_once_it_is_checked(ui, page):
+    dialog = open_settings(ui, page, settings_setup(model=f"'{OPUS}'", context_window="1000000",
+                                                    max_output_tokens="16384"), clock=True)
+    pause_after_the_first_check(ui, page)
+    help_text = dialog.get_by_text("Current estimated input budget:", exact=False)
+    expect(help_text).to_contain_text("981,568 tokens (934,826 for requests to this endpoint, keeping 5%")
+    output = dialog.get_by_label("Max output tokens per request")
+    output.focus()
+    output.press("End")
+    output.press("Backspace")  # 16384 -> 1638: the earlier answer names another budget, so no note yet.
+    expect(help_text).to_contain_text("Current estimated input budget: 996,314 tokens. The endpoint")
+    expect(dialog.get_by_text("With these settings that is about 896,682 tokens. Lower", exact=False)).to_be_visible()
+    ui.tick(300)
+    expect(help_text).to_contain_text("996,314 tokens (948,870 for requests to this endpoint, keeping 5% of its window "
+                                      "for estimate error).")
+    expect(dialog.get_by_text("that is about 896,682 tokens (853,983 for requests to this endpoint).",
+                              exact=False)).to_be_visible()
 
 
 def test_the_migration_note(ui, page):

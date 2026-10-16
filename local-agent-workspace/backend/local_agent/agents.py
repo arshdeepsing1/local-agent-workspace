@@ -3803,7 +3803,9 @@ class AgentManager(LifecycleHooks):
         the stream is read."""
         body = encode_payload(payload) if body is None else body
         started = request_clock()
-        info = dict(event["request_info"])
+        # Each attempt's details describe that attempt only: an earlier attempt's http_status would make a network
+        # failure look answered (never repeated) and its error_kind would stay on a reply that then succeeds.
+        info = {"model": event["request_info"].get("model", session["model"]), "status": "running"}
         # Recorded unless the request is the plain default (no effort chosen, nothing sent or skipped).
         if effort is not None and not reasoning.plain_default(effort):
             info["reasoning"] = reasoning.request_record(effort)
@@ -4442,6 +4444,9 @@ class AgentManager(LifecycleHooks):
                                 body, cache_sent = self.cache_body(payload, prefix, prompt_cache.next_level(cache_sent))
                                 lowered["level"] = cache_sent
                                 retry_reason = "cache_rejected"
+                                # No notice moves the reply (reply_after_notices), so its rejected details go here.
+                                await self.update_event(session, event,
+                                                        request_info={"model": session["model"], "status": "running"})
                                 continue
                             if not getattr(exc, "retryable", False):
                                 raise

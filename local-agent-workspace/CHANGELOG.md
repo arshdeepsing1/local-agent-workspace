@@ -18,7 +18,9 @@ From the stress tests of 2026-10-16 on a live Databricks workspace (Claude Opus 
   fewer (only the documented forms, then none) and, once one is accepted, says so in a notice
   and keeps that level for the endpoint until a restart or a Settings save. The resend is marked
   `cache_rejected` in the usage ledger and does not use up the retries after rate limits. A 400
-  that names caching drops the markers before any reasoning field.
+  that names caching drops the markers before any reasoning field. A failed connection or a
+  timeout on the resend is handled as on any request, not taken for another rejection, and the
+  reply that is then answered shows no error category.
 - The usage ledger keeps, per agent and subagent request, the cache markers it was sent with
   (`prompt_cache`), whether its system message's changing part differed from the chat's last
   answered request (`system_tail_changed`), the key names of the usage Databricks sent
@@ -26,9 +28,10 @@ From the stress tests of 2026-10-16 on a live Databricks workspace (Claude Opus 
   reasoning signature came (`reasoning_signature`); names and flags only, never values.
 - Simulator: Claude endpoints report usage in the real route's shape (top-level cache read and
   write counts, no reasoning tokens), check cache markers and keep a 5-minute prefix cache
-  (`cache: read N, wrote M` per request); `--cache documented|reject|ignore` rehearses a route
-  that refuses some or all markers. Claude summaries start after a short pause and end with a
-  blank line.
+  (`cache: read N, wrote M` per request), counting input at about 1.1 times the app's estimate as
+  the real route does; `--cache documented|reject` rehearses a route that refuses some or all
+  markers, and `--cache ignore` one that accepts them but caches nothing. Claude summaries start
+  after a short pause and end with a blank line.
 - Automatic compaction keeps the turn before the latest one verbatim only when the request then
   needs at most 60% of the auto-compact threshold, so a compaction leaves room for the next
   steps. Before, it could keep a large preceding turn and leave the request at over 90% of the

@@ -195,6 +195,26 @@ def test_a_second_request_reads_the_first_ones_marked_prefix(gateway):
     assert plain["cache_read_input_tokens"] == plain["cache_creation_input_tokens"] == 0
 
 
+def test_claude_input_counts_are_a_little_above_the_app_estimate(simulator):
+    # As on the real route, so a rehearsed cache accounting check ((uncached + reads + writes) / estimate) is near 1.
+    from local_agent.context import estimate_tokens
+    from local_agent.prompt_cache import unmarked
+    rules = "Use the tools to read and change files in the project; say what you changed. " * 120
+    source = "def greet(name):\n    return f'Hello, {name}!'\n\n" * 300
+    body = {"messages": [
+        {"role": "system", "content": [{"type": "text", "text": rules, **MARK}, {"type": "text", "text": "\nDate: today"}]},
+        {"role": "user", "content": "Read the app"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function", "function": {
+            "name": "read_file", "arguments": json.dumps({"path": "src/app.py"})}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": [{"type": "text", "text": source, **MARK}]}],
+        "tools": [{"type": "function", "function": {"name": "read_file", "description": "Read a file. " * 40,
+                                                    "parameters": {"type": "object"}}}], "stream": True}
+    read, written, total = simulator.PromptCache().use("e", body)
+    plain = unmarked(body)
+    assert (read, written) == (0, total)  # Written up to the last marker: here the whole request.
+    assert 1.0 <= total / estimate_tokens(plain["messages"], plain["tools"]) <= 1.2
+
+
 def test_cache_entries_expire_after_five_minutes_unless_read(simulator):
     cache = simulator.PromptCache()
     body = cached_request()

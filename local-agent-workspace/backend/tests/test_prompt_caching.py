@@ -181,6 +181,10 @@ def notices(session):
     return [event["text"] for event in session["events"] if event["type"] == "notice"]
 
 
+def last_reply(session):
+    return next(event for event in reversed(session["events"]) if event["type"] == "assistant")
+
+
 async def test_agent_requests_carry_markers_and_keep_a_stable_prefix_across_steps(runtime, monkeypatch):
     manager, session, project = runtime
     (project / "note.txt").write_text("first\n")
@@ -300,9 +304,14 @@ async def test_a_rejection_lowers_the_level_once_and_later_requests_keep_it(runt
     replies = [event for event in session["events"] if event["type"] == "assistant"]
     assert len(replies) == 1 and replies[0]["text"] == "Done." and replies[0]["request_info"]["status"] == "completed"
     assert replies[0]["request_info"]["http_status"] == 200
+    # The rejected attempt's error category stays on its own ledger call, not on the reply that succeeded.
+    assert "error_kind" not in replies[0]["request_info"]
+    assert "error_kind" not in last_reply(manager.store.get(session["id"]))["request_info"]
     calls = agent_calls(session)
     assert [(call["attempt"], call["status"], call.get("http_status"), call.get("retry_reason"), call["prompt_cache"])
             for call in calls] == [(1, "error", 400, None, "full"), (2, "completed", 200, "cache_rejected", "messages")]
+    assert calls[0]["error_kind"] == "invalid_request" and "error_kind" not in calls[1]
+    assert session_metrics(session)["calls"][1].get("error_kind") is None
     assert session_metrics(session)["calls"][1]["retry_reason"] == "cache_rejected"
     assert manager.cache_levels == {OPUS: "messages"}
     # The next turn starts at the remembered level: no rejection and no second notice.
@@ -347,6 +356,103 @@ async def test_a_lowered_request_that_is_rate_limited_keeps_its_own_retries(runt
     assert [call.get("retry_reason") for call in agent_calls(session)] == [None, "cache_rejected", "rate_limit"]
     assert manager.cache_levels == {OPUS: "messages"}
     assert sum("prompt caching (cache_control)" in text for text in notices(session)) == 1
+
+
+async def test_a_rate_limit_before_a_rejection_leaves_no_error_on_the_answered_attempt(runtime, monkeypatch):
+    manager, session, _ = runtime
+    monkeypatch.setattr("local_agent.agents.transient_retry_delay", lambda error, attempt: 0)
+    answers = [httpx.Response(429, json={"error_code": "REQUEST_LIMIT_EXCEEDED", "message": "Slow down."}),
+               httpx.Response(400, json={"message": "cache_control: unsupported"}), reply()]
+    mock_gateway(monkeypatch, lambda body: answers.pop(0))
+    await manager.run(session, "Hello")
+    calls = agent_calls(session)
+    assert [(call["status"], call.get("http_status"), call.get("error_kind"), call.get("retry_reason"))
+            for call in calls] == [("error", 429, "rate_limit", None), ("error", 400, "invalid_request", "rate_limit"),
+                                   ("completed", 200, None, "cache_rejected")]
+    info = last_reply(session)["request_info"]
+    assert info["status"] == "completed" and info["http_status"] == 200
+    assert "error_kind" not in info and "rate_limit" not in info
+
+
+def network_after_rejection(*kinds, message="messages[0].content: Input should be a valid string"):
+    """Agent requests answered in turn by kinds: "400" (a rejection), "connect" (no connection), "timeout" (no data
+    before the headers) or "ok"."""
+    answers = list(kinds)
+
+    def respond(body):
+        kind = answers.pop(0)
+        if kind == "400":
+            return httpx.Response(400, json={"message": message})
+        if kind == "connect":
+            raise httpx.ConnectError("connection refused")
+        if kind == "timeout":
+            raise httpx.ReadTimeout("timed out")
+        return reply()
+    return respond
+
+
+async def test_a_connection_failure_on_the_resend_is_retried_at_the_same_level(runtime, monkeypatch):
+    manager, session, _ = runtime
+    monkeypatch.setattr("local_agent.agents.transient_retry_delay", lambda error, attempt: 0)
+    bodies = mock_gateway(monkeypatch, network_after_rejection("400", "connect", "ok"))
+    await manager.run(session, "Hello")
+    # A failed connection is no second rejection: the same level is sent again, and only it is remembered.
+    assert [markers(body) for body in agent_bodies(bodies)] == [2, 1, 1]
+    assert [(call["status"], call.get("http_status"), call.get("error_kind"), call.get("retry_reason"),
+             call["prompt_cache"]) for call in agent_calls(session)] == [
+        ("error", 400, "invalid_request", None, "full"), ("error", None, "network", "cache_rejected", "messages"),
+        ("completed", 200, None, "network", "messages")]
+    assert manager.cache_levels == {OPUS: "messages"}
+    texts = notices(session)
+    assert len(texts) == 2 and texts[0].startswith("The connection to Databricks failed before the reply started.")
+    assert texts[1].startswith(f"Databricks rejected the cache markers for {OPUS} (HTTP 400), so the app sent the "
+                               "request again with fewer cache markers.")
+    assert last_reply(session)["text"] == "Done." and "error_kind" not in last_reply(session)["request_info"]
+
+
+async def test_the_reply_shows_running_again_while_the_resend_is_sent(runtime, monkeypatch):
+    manager, session, _ = runtime
+    shown, seen = {}, []  # The reply's request details the page was last sent; those at each request.
+    respond = network_after_rejection("400", "ok")
+    broadcast = manager.broadcast
+
+    async def page(session_id, data):
+        if data.get("type") == "event" and data["event"]["type"] == "assistant":
+            shown.update(info=dict(data["event"]["request_info"]))
+        await broadcast(session_id, data)
+
+    def watch(body):
+        seen.append((dict(last_reply(manager.store.get(session["id"]))["request_info"]), shown.get("info", {})))
+        return respond(body)
+    monkeypatch.setattr(manager, "broadcast", page)
+    mock_gateway(monkeypatch, watch)
+    await manager.run(session, "Hello")
+    # The resend's details (stored and on the page) are not the rejected attempt's status and error.
+    assert [[{key: info.get(key) for key in ("status", "http_status", "error_kind")} for info in pair]
+            for pair in seen] == [[{"status": "running", "http_status": None, "error_kind": None}] * 2] * 2
+
+
+async def test_a_connection_failure_on_the_unmarked_resend_keeps_the_network_retries(runtime, monkeypatch):
+    manager, session, _ = runtime
+    monkeypatch.setattr("local_agent.agents.transient_retry_delay", lambda error, attempt: 0)
+    bodies = mock_gateway(monkeypatch, network_after_rejection(
+        "400", "400", "connect", "ok", message="Unrecognized request argument supplied: cache_control"))
+    await manager.run(session, "Hello")
+    assert [markers(body) for body in agent_bodies(bodies)] == [2, 1, 0, 0]
+    assert [call.get("http_status") for call in agent_calls(session)] == [400, 400, None, 200]
+    assert manager.cache_levels == {OPUS: "off"} and session["events"][-1]["type"] != "error"
+
+
+async def test_a_read_timeout_on_the_resend_is_not_sent_again(runtime, monkeypatch):
+    manager, session, _ = runtime
+    bodies = mock_gateway(monkeypatch, network_after_rejection("400", "timeout", "ok"))
+    await manager.run(session, "Hello")
+    # Databricks may still be generating (and billing) a request that timed out: never resent, nothing remembered.
+    assert [markers(body) for body in agent_bodies(bodies)] == [2, 1]
+    assert [(call.get("http_status"), call.get("error_kind")) for call in agent_calls(session)] == [
+        (400, "invalid_request"), (None, "network")]
+    assert manager.cache_levels == {} and notices(session) == []
+    assert session["events"][-1]["type"] == "error" and "sent no data" in session["events"][-1]["text"]
 
 
 async def test_a_reasoning_field_rejection_is_handled_first(runtime, monkeypatch):

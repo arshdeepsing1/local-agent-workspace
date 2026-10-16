@@ -153,7 +153,7 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         result => {
           if (request !== limitsRequest.current) return
           const follow = following(result)
-          if (!follow) { setLimits(result); return }
+          if (!follow) { setLimits({ ...result, query: { model, context, output } }); return }
           followed.current = follow.followed
           setLimits(null)  // The new budgets are checked next.
           setForm(current => ({ ...current, ...follow.next }))
@@ -168,7 +168,11 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
     && recommended.max_output_tokens === form.max_output_tokens
   const recommendedText = recommended ? `${limits.profile.label} defaults (${recommended.context_window.toLocaleString('en-US')} context, ${recommended.max_output_tokens.toLocaleString('en-US')} output)` : ''
   const field = (key, value) => setForm(current => ({ ...current, [key]: value }))
-  const effective = limits?.effective
+  // The check's answer for the endpoint and budgets now in the form only: after an edit an older answer
+  // would name another budget (and reason) until the next check answers.
+  const query = limits?.query
+  const effective = query && query.model === model && query.context === form.context_window
+    && query.output === form.max_output_tokens ? limits.effective : null
   // The input budget requests to this endpoint use, when it differs: its maxima (clamped) and, near its
   // window, the margin for estimate error (input_budget; computed here for a check without it).
   const requestBudget = effective ? effective.input_budget ?? effective.context_window - effective.max_output_tokens - 2048 : null

@@ -2713,8 +2713,9 @@ Thinking display, subagents, background jobs and change review before using a pa
   use more output tokens. Each request's reasoning fields are printed in the terminal.
 - Usage has the shape the real route reports: for Claude endpoints `prompt_tokens` (the uncached
   part), `completion_tokens`, `total_tokens` and top-level `cache_read_input_tokens` and
-  `cache_creation_input_tokens`, without reasoning tokens; GPT OSS keeps the OpenAI-style shape
-  (cached tokens inside `prompt_tokens`, `completion_tokens_details.reasoning_tokens`).
+  `cache_creation_input_tokens`, without reasoning tokens, and input counts about 1.1 times the
+  app's own estimate, as the real route counts; GPT OSS keeps the OpenAI-style shape (cached
+  tokens inside `prompt_tokens`, `completion_tokens_details.reasoning_tokens`).
 - Claude endpoints take the app's cache markers (only `{"type": "ephemeral"}`, at most 4; other
   endpoints refuse them with HTTP 400) and keep an in-memory prefix cache per endpoint (5 minutes,
   refreshed on each read), so a step reads what the step before it wrote; the terminal prints

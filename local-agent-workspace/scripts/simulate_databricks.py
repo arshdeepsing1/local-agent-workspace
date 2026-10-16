@@ -27,8 +27,9 @@ for Claude endpoints (the real route is not verified yet): both (default), anthr
 Prompt caching: Claude endpoints take "cache_control": {"type": "ephemeral"} on content parts and
 assistant tool_calls (at most 4; other endpoints refuse it with HTTP 400) and report usage as the real
 route does: prompt_tokens (the uncached remainder), completion_tokens, total_tokens and top-level
-cache_read_input_tokens and cache_creation_input_tokens. A prefix cache in memory (per endpoint, 5
-minutes, refreshed on each read) answers a request that repeats an earlier one's marked prefix.
+cache_read_input_tokens and cache_creation_input_tokens, with input counts about 1.1 times the app's
+estimate, as the real route counts. A prefix cache in memory (per endpoint, 5 minutes, refreshed on each
+read) answers a request that repeats an earlier one's marked prefix.
 --cache chooses how the route treats the markers: accept (default), documented (refuses list content
 for role system or tool, the forms Databricks does not document), reject (refuses any cache_control)
 or ignore (accepts them and reports no cache use).
@@ -68,6 +69,10 @@ THINKING = {"low": (0.6, 120), "medium": (1.5, 400), "high": (3.0, 1_200), "xhig
 CACHE_TTL_SECONDS = 300  # An ephemeral cache entry lives 5 minutes from its last write or read.
 CACHE_LOOKBACK = 20  # Block boundaries before a marker checked for an earlier entry (as Anthropic documents).
 CACHE_MODES = ("accept", "documented", "reject", "ignore")
+# Bytes of a request's JSON per simulated Claude input token. The real route counts about 1.03-1.4 times the app's
+# estimate (about 3 bytes a token; measured on Claude Opus 5.5, see context.estimate_scale), so simulated counts
+# come to about 1.1 times it and a rehearsed cache accounting check reads near 1.
+CLAUDE_BYTES_PER_TOKEN = 2.7
 FIRST_REASONING_DELAY = 2.0  # Seconds (before --speed) a Claude endpoint takes before its first reasoning chunk.
 ENDPOINTS = {
     "databricks-claude-opus-5-5": {"family": "claude", "always_thinks": True, "default": "medium"},
@@ -232,7 +237,7 @@ class PromptCache:
         for index, (block, marked) in enumerate(cache_blocks(body)):
             text = json.dumps(block, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
             digest.update(text.encode() + b"\n")
-            total += max(1, len(text) // 4)
+            total += max(1, round(len(text.encode("utf-8")) / CLAUDE_BYTES_PER_TOKEN))
             sizes.append(total)
             keys.append((endpoint, digest.hexdigest()))
             if marked:
