@@ -1,5 +1,6 @@
 """Commands that name credential-looking files: the name table, a card in every mode, and redacted results (M6j)."""
 import asyncio
+import fnmatch
 import json
 from pathlib import Path
 
@@ -11,7 +12,7 @@ from local_agent.instructions import load_project_instructions
 from local_agent.permissions import MODE_LABELS, evaluate
 from local_agent.redaction import redact_tokens
 from local_agent.rules import named_credentials, normalize_rule
-from local_agent.secret_paths import check_patterns, looks_secret, patterns_setting
+from local_agent.secret_paths import check_patterns, grep_excludes, looks_secret, named_in_folder, patterns_setting
 from local_agent.store import Store
 from local_agent.tools import SECRET_NAMES, WorkspaceTools
 
@@ -28,7 +29,8 @@ from local_agent.tools import SECRET_NAMES, WorkspaceTools
     ("notes/secrets.yaml", "secrets.yaml"), ("api_token.txt", "api_token.txt"), ("db_password.json", "db_password.json"),
     ("secrets/db_token", "db_token"), (".npm-token", ".npm-token"), ("CREDENTIALS.JSON", "credentials.json"),
     ("--env-file=.env", ".env"), ("DATABRICKS_CONFIG_FILE=~/.databrickscfg", ".databrickscfg"),
-    ("apikey.cfg", "apikey.cfg"),
+    ("apikey.cfg", "apikey.cfg"), (".envrc", ".envrc"), (".env_local", ".env_local"), ("deploy/.env-prod", ".env-prod"),
+    (".ENV.LOCAL", ".env.local"),
 ])
 def test_credential_looking_names(word, matched):
     assert looks_secret(word) == matched
@@ -61,6 +63,40 @@ def test_the_configured_credential_file_and_user_patterns():
 def test_secret_pattern_setting_is_checked(value, message):
     with pytest.raises(ValueError, match=message):
         check_patterns(value)
+
+
+def test_recursive_search_excludes_cover_the_names():
+    names, folders = grep_excludes(("*.tfvars",))
+    for name in (".env", ".envrc", ".env-prod", ".env.local", "db_token", "api_secret", "api_token.txt", "id_rsa_old",
+                 "server.pem", ".npm-token", "prod.tfvars"):
+        assert any(fnmatch.fnmatchcase(name, glob) for glob in names), name
+    for name in ("tokenizer.py", "README.md", "password_reset.ts", "src", "tokens"):
+        assert not any(fnmatch.fnmatchcase(name, glob) for glob in names), name
+    assert ".ssh" in folders
+
+
+def test_names_read_in_another_folder(tmp_path):
+    kube, ssh, project = tmp_path / ".kube", tmp_path / ".ssh", tmp_path / "project"
+    for folder in (kube / "sub", ssh, project):
+        folder.mkdir(parents=True)
+    (kube / "config").write_text("x")
+    (ssh / "work_key").write_text("x")
+    (ssh / "known_hosts").write_text("x")
+    (project / "token").write_text("x")
+    (project / "kc").symlink_to(kube / "config")
+    assert named_in_folder(kube, "config") == ".kube/config"
+    assert named_in_folder(kube / "sub", "../config") == ".kube/config"
+    assert named_in_folder(ssh, "work_key") == ".ssh/work_key"
+    assert named_in_folder(ssh, "--identity=work_key") == ".ssh/work_key"
+    assert named_in_folder(project, "kc") == ".kube/config"  # A link: the file it points at.
+    for folder, word in ((ssh, "known_hosts"), (ssh, "ls"), (kube, "missing"), (project, "token"), (project, "-n"),
+                         (kube, "/srv/x"), (tmp_path, "project")):
+        assert named_in_folder(folder, word) is None, word
+    # A folder inside a credential-looking one adds nothing: the folder's own word names it.
+    nested = tmp_path / "credentials" / "app"
+    nested.mkdir(parents=True)
+    (nested / "README.md").write_text("x")
+    assert named_in_folder(nested, "README.md") is None
 
 
 def test_unambiguous_names_join_the_file_tool_exclusions(tmp_path):
@@ -188,6 +224,33 @@ async def test_the_credential_file_by_a_relative_name_and_a_glob_also_ask(runtim
     manager.settings.values["secret_file_patterns"] = ["*.tfvars"]
     verdict = manager.permission(session, tools, "run_command", {"command": "terraform plan -var-file=prod.tfvars"})
     assert (verdict.decision, verdict.secret) == ("ask", ("-var-file=prod.tfvars",))
+
+
+@pytest.mark.parametrize("mode", ["bypassPermissions", "dontAsk"])
+async def test_relative_names_count_where_the_command_reads_them(runtime, mode):
+    manager, session, project, tools, credentials = runtime
+    session["permission_mode"] = mode
+    tools.unrestricted = mode == "bypassPermissions"
+    home = project.parent
+    (home / ".kube" / "sub").mkdir(parents=True)
+    (home / ".kube" / "config").write_text("token: x\n")
+    (home / ".ssh").mkdir()
+    (home / ".ssh" / "work_key").write_text("x\n")
+    (project / "kc").symlink_to(home / ".kube" / "config")
+    (project / "token").write_text("x\n")
+    kube, ssh = str(home / ".kube"), str(home / ".ssh")
+    for arguments, shown in (({"command": "cat config", "cwd": kube}, ("config",)),
+                             ({"command": "cat ../config", "cwd": kube + "/sub"}, ("../config",)),
+                             ({"command": "cat work_key", "cwd": ssh}, ("work_key",)),
+                             ({"command": "head -1 *", "cwd": ssh}, ("work_key",)),
+                             ({"command": f"cd {kube} && cat config"}, ("config",)),
+                             ({"command": "cat databricks.env", "cwd": str(credentials.parent)}, ("databricks.env",)),
+                             ({"command": "cat kc"}, ("kc",))):
+        verdict = manager.permission(session, tools, "run_command", arguments)
+        assert (verdict.decision, verdict.source, verdict.secret) == ("ask", "secret", shown), arguments
+    for arguments in ({"command": "ls", "cwd": ssh}, {"command": "grep -rn token README.md"}):
+        verdict = manager.permission(session, tools, "run_command", arguments)
+        assert verdict.source != "secret" and not verdict.secret, arguments
 
 
 async def test_a_card_edited_to_drop_the_file_loses_the_warning(runtime):

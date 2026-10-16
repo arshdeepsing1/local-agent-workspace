@@ -190,10 +190,12 @@ REFUSED = [
     ("awk 'BEGIN { ARGV[1] = \"/etc/hosts\"; ARGC = 2 } { print }'", "ARGV"),
     ("awk '@include \"x\"'", "@"),
     ("awk -f prog.awk README.md", "awk -f"),
+    ("awk 'BEGIN { for (k in ENVIRON) print k, ENVIRON[k] }'", "ENVIRON"),
     ("cat ../outside.txt", "outside the project"),
     ("cd .. && cat outside.txt", "outside the project"),
     ("cat ~/.ssh/id_rsa", "credential"),
     ("cat .env", "credential"),
+    ("cat .envrc", "credential"),
     ("cat notes/secrets.yaml", "credential"),
     ("ls keys/*", "credential"),
     ("grep -f .env README.md", "credential"),
@@ -279,6 +281,7 @@ def test_recursive_searches_skip_credential_names(world):
     plan, _ = plan_of(world, "grep -rn TOKEN")
     run = plan.stages[0].run
     assert "--exclude=.env" in run and "--exclude=*.pem" in run and "--exclude-dir=.ssh" in run
+    assert "--exclude=.env*" in run and "--exclude=*token" in run
     assert run[-2:] == ("TOKEN", ".")
     plan, _ = plan_of(world, "grep -n TOKEN README.md")
     assert not any(word.startswith("--exclude") for word in plan.stages[0].run)
@@ -472,9 +475,12 @@ async def test_plan_runs_vetted_commands_and_manual_still_asks(runtime):
 
 async def test_recursive_grep_never_reads_credential_files(runtime):
     manager, session, project, tools = runtime
+    (project / ".envrc").write_text("export TOKEN=envrc-secret\n")
+    (project / "notes" / "db_token").write_text("TOKEN=db-token-secret\n")
     result = json.loads(await run(manager, session, tools, "grep -rn = . | sort", "g"))
     assert "src/a.py:1:alpha = 1" in result["output"]
     assert "project-env-secret" not in result["output"] and "secrets.yaml" not in result["output"]
+    assert "envrc-secret" not in result["output"] and "db-token-secret" not in result["output"]
 
 
 async def test_awk_sed_and_sort_run(runtime):

@@ -1740,35 +1740,59 @@ class AgentManager(LifecycleHooks):
         return tools.root
 
     def secret_words(self, tools, arguments):
-        """The words of a command that name credential-looking files (secret_paths), at most five: as written,
-        the configured credential file under a relative name, what its globs match where it runs, and its cwd."""
+        """The words of a command that name credential-looking files (secret_paths), at most five: as written;
+        under a relative name in the folders it reads them from (its cwd, or a `cd <folder>` in it): the
+        configured credential file, a file there such as `config` in `~/.kube`, or a link to one; what its
+        globs match there; and its cwd."""
         text = arguments.get("command") if isinstance(arguments, dict) else None
         if not isinstance(text, str):
             return []
         credential = str(tools.credential_file) if tools.credential_file else None
         patterns = secret_paths.patterns_setting(self.settings.values)
-        folder = str(self.command_start(tools, arguments))
+        folders = [str(self.command_start(tools, arguments))]
         found = []
 
-        def note(word, shown=None):
-            shown = shown or word
-            if len(found) < 5 and shown not in found and secret_paths.looks_secret(word, credential, patterns):
+        def add(shown):
+            if len(found) < 5 and shown not in found:
                 found.append(shown)
-        for word in text_words(text):
-            note(word)
-            if credential and not word.startswith(("/", "~")) and os.path.realpath(os.path.join(folder, word)) == credential:
-                note(credential, word)
-            if any(character in word for character in "*?[") and len(found) < 5:
-                pattern = os.path.expanduser(word) if word.startswith("~") else word
+
+        def note(word, shown=None):
+            if secret_paths.looks_secret(word, credential, patterns):
+                add(shown or word)
+            if word.startswith(("/", "~")):
+                return
+            for folder in folders:
                 try:
-                    for match in itertools.islice(glob.iglob(pattern, root_dir=folder), shell_vet.MAX_GLOB_MATCHES):
-                        note(match)
+                    if credential and os.path.realpath(os.path.join(folder, word)) == credential:
+                        add(shown or word)
                 except (OSError, ValueError):
-                    pass
+                    continue  # Not a path (a NUL in it): the command's own checks refuse it.
+                if secret_paths.named_in_folder(folder, word, patterns):
+                    add(shown or word)
+        words = text_words(text)
+        for index, word in enumerate(words):
+            if len(found) >= 5:
+                break
+            note(word)
+            if word in ("cd", "pushd") and index + 1 < len(words) and len(folders) < 4:
+                try:
+                    target = os.path.realpath(os.path.join(folders[-1], os.path.expanduser(words[index + 1])))
+                except (OSError, ValueError):
+                    target = ""
+                if target and os.path.isdir(target) and target not in folders:
+                    folders.append(target)  # Later relative names may be read there.
+            if any(character in word for character in "*?["):
+                pattern = os.path.expanduser(word) if word.startswith("~") else word
+                for folder in folders:
+                    try:
+                        for match in itertools.islice(glob.iglob(pattern, root_dir=folder), shell_vet.MAX_GLOB_MATCHES):
+                            note(match)
+                    except (OSError, ValueError):
+                        pass
         cwd = arguments.get("cwd")
-        if isinstance(cwd, str):
-            note(cwd)
-            note(folder, cwd)
+        if isinstance(cwd, str) and (secret_paths.looks_secret(cwd, credential, patterns)
+                                     or secret_paths.looks_secret(folders[0], credential, patterns)):
+            add(cwd)
         return found
 
     def vet_roots(self, tools):

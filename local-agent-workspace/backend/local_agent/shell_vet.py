@@ -744,16 +744,18 @@ def _sed(program, words, cwd, ctx):
     return [*run, *(["--"] if dashed else []), *operands]
 
 
-AWK_DENIED = frozenset({"system", "getline", "close", "ARGV", "ARGC", "PROCINFO", "SYMTAB", "FUNCTAB"})
+AWK_DENIED = frozenset({"system", "getline", "close", "ARGV", "ARGC", "PROCINFO", "SYMTAB", "FUNCTAB",
+                        "ENVIRON"})
 AWK_KEYWORDS = frozenset({"print", "printf", "return", "if", "while", "for", "do", "else", "in", "delete", "exit",
                           "next", "nextfile", "function", "func", "BEGIN", "END", "case", "default", "switch"})
 AWK_OPERATORS = frozenset("(,{};!~=&|?:+-*/%^<>[\n")  # '/' here is division: it follows an operand
 
 
 def check_awk(source):
-    """Refused unless an awk program cannot run commands, read other files or write any: no system(),
-    getline, close(), ARGV/ARGC, @-directives or pipes, and no > or >> after print or printf (a comparison
-    inside parentheses is fine). A '/' starts a regular expression only after an operator or a keyword."""
+    """Refused unless an awk program cannot run commands, read other files or the environment, or write any:
+    no system(), getline, close(), ARGV/ARGC, ENVIRON, @-directives or pipes, and no > or >> after print or
+    printf (a comparison inside parentheses is fine). A '/' starts a regular expression only after an
+    operator or a keyword."""
     i, n = 0, len(source)
     depth = 0
     printing = None  # the parenthesis depth of the print statement being read
@@ -799,7 +801,8 @@ def check_awk(source):
                 j += 1
             name = source[i:j]
             if name in AWK_DENIED:
-                raise Refused(f"its awk program uses {name}, which can run commands or read other files")
+                raise Refused(f"its awk program uses {name}, which can run commands or read other files or the "
+                              "environment")
             if name in ("print", "printf"):
                 printing = depth
             previous = "operator" if name in AWK_KEYWORDS else "operand"

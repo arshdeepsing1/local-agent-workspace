@@ -3,7 +3,8 @@
 looks_secret(word) says whether one command word or path names such a file, and returns the part
 that matched (the approval card names it). Two kinds of names count:
 
-- Credential files, in any folder: the file tools' SECRET_NAMES and `.env.*` (not `.env.example`);
+- Credential files, in any folder: the file tools' SECRET_NAMES and `.env*` (`.envrc`, `.env.local`,
+  `.env-prod`; not `.env.example`);
   private keys (`id_rsa`, `id_ed25519`, ... but not their `.pub`); key and certificate stores
   (`*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`, `*.keystore`); every file in `.ssh` except public
   keys, `known_hosts`, `authorized_keys` and `config`; every file in `.gnupg`; `.aws/credentials`
@@ -17,7 +18,8 @@ that matched (the approval card names it). Two kinds of names count:
   bare word such as `token` in `grep -rn token src`, which is a search pattern, nor a URL.
 
 Plus the configured credential file (by path) and the name patterns from Settings → Secret file
-names (`*.tfvars`). Pure functions, standard library only.
+names (`*.tfvars`). named_in_folder(folder, word) adds what a relative word names where the command
+reads it (`config` in `~/.kube`, a link to a key). Standard library only.
 """
 import fnmatch
 import os
@@ -69,7 +71,7 @@ def patterns_setting(values):
 def _named_by_parts(parts, patterns):
     """The part of a path (as casefolded parts) that makes it a credential file, or None."""
     for index, part in enumerate(parts):
-        if part in SECRET_NAMES or (part.startswith(".env.") and part != ".env.example") or part in OTHER_NAMES:
+        if part in SECRET_NAMES or (part.startswith(".env") and part != ".env.example") or part in OTHER_NAMES:
             return part
         if any(fnmatch.fnmatchcase(part, pattern) for pattern in patterns):
             return part
@@ -103,6 +105,10 @@ def _named_by_name(name, is_path):
     return suffix == "" and (name.startswith(".") or is_path)
 
 
+def _parts(path):
+    return [part.casefold() for part in PurePosixPath(path).parts if part != "/"]
+
+
 def looks_secret(word, credential_file=None, patterns=()):
     """The matched part when a command word (or the value after its first '=') names a credential-looking
     file, else None. patterns are casefolded name patterns; credential_file is an absolute path."""
@@ -117,7 +123,7 @@ def looks_secret(word, credential_file=None, patterns=()):
             continue
         if configured and (candidate == configured or os.path.expanduser(candidate) == configured):
             return candidate
-        parts = [part.casefold() for part in PurePosixPath(candidate).parts if part != "/"]
+        parts = _parts(candidate)
         if not parts:
             continue
         found = _named_by_parts(parts, patterns)
@@ -128,11 +134,44 @@ def looks_secret(word, credential_file=None, patterns=()):
     return None
 
 
+def named_in_folder(folder, word, patterns=()):
+    """The matched part when a relative command word (or the value after its first '='), read in folder,
+    names an existing credential-looking file because of that folder or a link, else None: `config` in
+    `~/.kube`, any key in `~/.ssh`, `../config` in `~/.kube/sub`, a link to `~/.ssh/id_rsa`. looks_secret
+    checks the word as written. A folder that itself looks like one, or sits in one, adds nothing here: the
+    check of its own word (the cwd, `cd <folder>`) names it."""
+    if not isinstance(word, str) or not word:
+        return None
+    folder = os.path.realpath(folder)
+    for candidate in (word, word.partition("=")[2]):
+        if not candidate or candidate.startswith(("/", "~", "-")) or "://" in candidate:
+            continue
+        joined = os.path.join(folder, candidate)
+        try:
+            if not os.path.lexists(joined):
+                continue
+            target = os.path.realpath(joined)
+        except (OSError, ValueError):
+            continue
+        if target != os.path.normpath(joined):  # A link: the file it points at is read.
+            found = looks_secret(target, None, patterns)
+            if found:
+                return found
+        if _named_by_parts(_parts(os.path.commonpath([folder, target])), patterns) is None:
+            found = _named_by_parts(_parts(target), patterns)
+            if found:
+                return found
+    return None
+
+
 def grep_excludes(patterns=()):
-    """Name globs a recursive search (grep -r, rg) skips so that it never reads a credential-looking file."""
-    names = sorted({*SECRET_NAMES, *OTHER_NAMES, ".env.*", *(f"{key}*" for key in KEY_NAMES),
+    """Name globs a recursive search (grep -r, rg) skips so that it never reads a credential-looking file.
+    An extension-less name counts when it ends in one of the WORDS (`db_token`): a glob cannot say "no
+    extension", and rg applies these to folders too (a `tokens` folder stays searched), so other names that
+    merely contain one (`secret_key`, `secrets`) are still searched."""
+    names = sorted({*SECRET_NAMES, *OTHER_NAMES, ".env*", *(f"{key}*" for key in KEY_NAMES),
                     *(f"*{suffix}" for suffix in KEY_SUFFIXES), "*.kubeconfig", *patterns,
                     *(f"*{word}*{suffix}" for word in WORDS for suffix in sorted(DATA_SUFFIXES)),
-                    *(f".*{word}*" for word in WORDS)})
+                    *(f".*{word}*" for word in WORDS), *(f"*{word}" for word in WORDS)})
     folders = sorted({".ssh", ".gnupg", ".aws", ".kube", ".docker"})
     return names, folders

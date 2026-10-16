@@ -2606,8 +2606,8 @@ option and operand checked: `cat`, `head`, `tail` (not `-f`), `wc`, `grep` (not 
 file, so never an output file), `cut`, `tr`, `nl`, `tac`, `paste`, `comm`, `cmp`, `diff`
 (files only, not `-r`), `ls`, `du`, `find` (tests and `-print` only: never `-exec`, `-delete`,
 `-fprint` or `-L`), `sed` (only `-n`, `-E` and scripts that print, delete, substitute or
-transliterate: no `-i`, `w`, `r` or `e`), `awk` (no `system`, `getline`, `ARGV`, pipes or
-`print >` to a file; `-F` and `-v` only), `echo`, `pwd`, `basename`, `dirname`, `date +FORMAT`,
+transliterate: no `-i`, `w`, `r` or `e`), `awk` (no `system`, `getline`, `ARGV`, `ENVIRON`, pipes
+or `print >` to a file; `-F` and `-v` only), `echo`, `pwd`, `basename`, `dirname`, `date +FORMAT`,
 `true` and `false`, and Git `status`, `diff`, `show`, `log` (no `-p`), `branch` (listing only),
 `rev-parse` and `ls-files` with their read-only options, `-C <folder>` and `-- <paths>`. Parts
 may be joined by `|`, `&&`, `||`, `;` and line breaks, start with `cd <folder> &&`, and use
@@ -2637,28 +2637,31 @@ options (`perl -le`, `python3 -Ic`, `node --eval=…`); or a never-allowed optio
 Text that does not mention the rule's program (`npm test | tee out` with a deny rule for
 `git push`) is not uncertain.
 
-**Credential-looking files.** A command that names a file that looks like a credential always
-shows an approval card, in every mode, Bypass and Don't ask included, and no rule skips it; Plan
-does not run it. The card says which word matched ("Reads a secret file: `~/.databrickscfg`")
-and cannot be remembered, and a mode or rule change never approves it. Such names are the file
-tools' credential names (`.env` and `.env.*` except `.env.example`, `.netrc`, `.npmrc`,
-`.pgpass`, `.pypirc`, `.git-credentials`, `.databrickscfg`, `credentials`, `id_rsa`,
-`id_ed25519`, `id_ecdsa`, `id_dsa`, `env_vars.txt`), other private keys and key stores (`id_rsa*`
-but not `*.pub`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`), files in `.ssh` (except public
-keys, `known_hosts`, `authorized_keys` and `config`) and `.gnupg`, `.aws/credentials` and
+**Credential-looking files.** A command that names a file that looks like a credential always shows
+an approval card, in every mode, Bypass and Don't ask included, and no rule skips it; Plan does not
+run it. The card says which word matched ("Reads a secret file: `~/.databrickscfg`") and cannot be
+remembered, and a mode or rule change never approves it. Such names are `.env*` (`.env`,
+`.env.local`, `.envrc`, `.env-prod`; not `.env.example`), the file tools' other credential names
+(`.netrc`, `.npmrc`, `.pgpass`, `.pypirc`, `.git-credentials`, `.databrickscfg`, `credentials`,
+`id_rsa`, `id_ed25519`, `id_ecdsa`, `id_dsa`, `env_vars.txt`), other private keys and key stores
+(`id_rsa*` but not `*.pub`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`), files in `.ssh` (except
+public keys, `known_hosts`, `authorized_keys` and `config`) and `.gnupg`, `.aws/credentials` and
 `.aws/config`, `.kube/config` and other kube configs, `.docker/config.json`,
 `.config/gh/hosts.yml`, `.my.cnf`, `.vault-token`, data files whose name contains token, secret,
 password, credential or apikey (`api_token.txt`, `secrets.yaml`, `secrets/db_token`; not
 `tokenizer.py`, `tokenizer.json` or `secret_santa.md`), the configured credential file under any
 spelling, what a glob in the command matches, and the name patterns in **Settings → Commands and
-files → Secret file names for commands** (`*.tfvars`). The check reads the command's words, so a program
-that finds such a file itself is not caught: recursive `grep` and `rg` that the app checks skip
-them, and output redaction stays. Command and MCP results are redacted before the agent sees
-them: the Databricks token, the credential file's values for keys that name a token, secret,
-password, key, credential, auth or cookie (8 characters or more), MCP secret references, and
-GitHub, Databricks and AWS access-key shapes, long Bearer tokens and passwords in URLs. Six more
-names joined the file tools' exclusions and the diff exclusions: `.databrickscfg`,
-`.git-credentials`, `.pypirc`, `.pgpass`, `id_ecdsa` and `id_dsa`.
+files → Secret file names for commands** (`*.tfvars`). A relative name counts in the folder the
+command reads it from, its `cwd` or a `cd <folder>` in it (`cat config` in `~/.kube`), and a link
+counts as the file it points at. The check reads the command's words, so a program that finds such
+a file itself is not caught: recursive `grep` and `rg` that the app checks skip them (a name
+without an extension only when it ends in the word, such as `db_token`, not `secret_key`), and
+output redaction stays. Command and MCP results are redacted before the agent sees them: the
+Databricks token, the credential file's values for keys that name a token, secret, password, key,
+credential, auth or cookie (8 characters or more), MCP secret references, and GitHub, Databricks
+and AWS access-key shapes, long Bearer tokens and passwords in URLs. Six more names joined the file
+tools' exclusions and the diff exclusions: `.databrickscfg`, `.git-credentials`, `.pypirc`,
+`.pgpass`, `id_ecdsa` and `id_dsa`.
 
 **Protected files.** Edits always show a card, in every mode except Bypass and even with an allow
 rule, when a path (requested or resolved, inside or outside the project) is in `.vscode`, `.idea`,
