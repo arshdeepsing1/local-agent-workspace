@@ -186,6 +186,7 @@ def finish_inference_call(call, info):
             call["rate_limit_message"] = message[:200]  # Already redacted, whitespace collapsed.
         if (seconds := _seconds(rate_limit.get("retry_after"))) is not None:
             call["retry_after"] = seconds  # The wait Databricks asked for: Retry-After, else the body's retry_after.
+        # Whether that wait came in a Retry-After header (agents.rate_limit_fields keeps only a header it read).
         call["retry_after_header"] = isinstance(rate_limit.get("retry_after_header"), str)
     call["finished"] = _now()
     return call

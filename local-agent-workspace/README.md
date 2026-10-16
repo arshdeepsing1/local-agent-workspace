@@ -1208,7 +1208,9 @@ The app shows thinking text only as the endpoint returns it (redacted, up to 12,
 characters) and never sends earlier thinking back to the model. **Request details** under a
 reply show **Effort**, for example "High (output_config.effort)", and the reasoning fields
 sent. Claude Opus 5.5 reports no reasoning tokens (its thinking is counted in output tokens), so
-**Reasoning tokens** there reads "In output tokens (not reported separately)".
+**Reasoning tokens** there reads "In output tokens (not reported separately)" for a request that
+asked for Claude reasoning. A request at Default with **Show thinking summaries** off sends no
+reasoning fields, so it reads "Unavailable".
 
 ### Context and project instructions
 

@@ -192,14 +192,16 @@ def transient_retry_delay(error, attempt):
 def rate_limit_fields(info, headers, payload):
     """request_info["rate_limit"] of a 429: what its body named (rate_limits.request_info_fields), with
     retry_after the wait Databricks asked for (the Retry-After header, else the body's retry_after) and
-    retry_after_header the header as sent."""
+    retry_after_header the header as sent when the wait came from it (not a header the app could not
+    read, such as a date in the past)."""
     fields = request_info_fields(info)
     fields.pop("retry_after", None)
-    requested = requested_delay(headers, payload)
+    header = (headers or {}).get("retry-after")
+    from_header = requested_delay({"retry-after": header})
+    requested = from_header if from_header is not None else requested_delay({}, payload)
     if requested is not None:
         fields["retry_after"] = round(requested, 3)
-    header = (headers or {}).get("retry-after")
-    if isinstance(header, str) and header.strip():
+    if from_header is not None and isinstance(header, str):
         fields["retry_after_header"] = clip(header.strip(), 64)
     return fields
 
@@ -213,11 +215,13 @@ def rate_limit_details(error):
     head += f": {message}" if message else ""
     headers, payload = getattr(error, "retry_headers", None) or {}, getattr(error, "retry_payload", None)
     header = headers.get("retry-after")
-    if header is not None:
-        seconds = requested_delay({"retry-after": header})
-        wait = "Retry-After: " + (f"{round(seconds, 1):g} s" if seconds is not None else clip(str(header), 40))
+    # The wait the retry used: the header when it reads as seconds or a future date, else the body's.
+    if (seconds := requested_delay({"retry-after": header})) is not None:
+        wait = f"Retry-After: {round(seconds, 1):g} s"
     elif (seconds := requested_delay({}, payload)) is not None:
         wait = f"retry_after: {round(seconds, 1):g} s"  # In the body, not a header.
+    elif header is not None and str(header).strip():
+        wait = "Retry-After: " + clip(str(header).strip(), 40)  # Unreadable: the app chose the wait.
     else:
         wait = "Retry-After: none"
     return f"{head} · {wait}"
@@ -301,7 +305,7 @@ Call tools directly to fulfill the user's request: this application applies the
 selected permission mode and shows any needed approval controls. Do not ask for permission in
 chat before issuing a tool call. If an approval is denied, respect the decision.
 Commands default to a 60-second timeout; choose timeout_seconds up to 3600 if needed.
-""" + shell_note() + """
+{shell_note}
 Use background=true for a managed job that must outlive this turn, never shell '&' or daemon detachment.
 Use list_jobs/get_job_output to inspect jobs, wait_job to wait until a background job finishes or prints a line you expect, and stop_job to terminate them. Size each wait to the job: wait_job returns as soon as the job ends, so for a quick build or test wait about as long as it should take (a few seconds to a minute), use until_regex for a server's ready line, idle_seconds when output stops once it is ready, and follow next_wait_seconds or expected_seconds (earlier runs of the same command) instead of always waiting the maximum. A failed command's first result shows the start and the end of its retained output. Use find_files to locate files by name. Background jobs
 continue after this turn is stopped and end on explicit job Stop, timeout, or app shutdown.
@@ -333,6 +337,12 @@ run in parallel as several delegate_task calls in one response; never split edit
 MCP tools and configured hooks require separate approval except in Bypass; Plan blocks them.
 Prefer surgical edits. Don't modify unrelated files.
 """
+
+
+def system_prompt():
+    """SYSTEM_PROMPT with the sentences about the shell commands run with (jobs.shell_note), read for each
+    request so that they follow shell_argv's choice (zsh on a Mac, bash on most Linux machines)."""
+    return SYSTEM_PROMPT.replace("{shell_note}", shell_note(), 1)
 
 
 def visible_text(content):
@@ -3258,7 +3268,7 @@ class AgentManager(LifecycleHooks):
                                             "estimated_tokens": estimate_text_tokens(agents)})
         # Stable text first and the parts that change between requests last, so a
         # provider's prompt prefix caching can reuse the longest possible prefix.
-        system = {"role": "system", "content": SYSTEM_PROMPT + "\n" + user_block + mode_prompt(mode, bool(session.get("is_subagent")))
+        system = {"role": "system", "content": system_prompt() + "\n" + user_block + mode_prompt(mode, bool(session.get("is_subagent")))
                   + (f"\nEnforced tool profile: {session['tool_profile']}. Commands, MCP tools and hooks are unavailable."
                      if session.get("tool_profile", "inherit") != "inherit" else "")
                   + "\nWorkspace: " + session["workspace"]

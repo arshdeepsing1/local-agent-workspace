@@ -290,6 +290,27 @@ async def test_a_final_429_records_the_message_and_the_retry_after_header(runtim
                for call in calls)
 
 
+async def test_a_retry_after_header_the_app_cannot_read_is_not_named_as_the_wait(runtime, monkeypatch, delays):
+    """A date in the past: the body's retry_after is the wait, and nothing says it came in the header."""
+    manager, new_session, _ = runtime
+    manager.settings.values["rate_limit_auto_continue"] = False
+    session = new_session()
+
+    async def gateway(request):
+        return httpx.Response(429, headers={"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"},
+                              json={"error_code": "REQUEST_LIMIT_EXCEEDED", "message": "Slow down", "retry_after": 4})
+    mock_gateway(monkeypatch, gateway)
+    await manager.run(session, "Hello")
+    assert delays == [4.0, 4.0, 4.0]
+    reply = next(event for event in session["events"] if event["type"] == "assistant")
+    assert reply["request_info"]["rate_limit"] == {"code": "REQUEST_LIMIT_EXCEEDED", "message": "Slow down",
+                                                   "retry_after": 4.0}
+    assert {event["details"] for event in session["events"] if event["type"] == "notice"} == {
+        "HTTP 429 REQUEST_LIMIT_EXCEEDED: Slow down · retry_after: 4 s"}
+    calls = [call for call in session["inference_calls"] if call["purpose"] == "agent"]
+    assert all(call["retry_after"] == 4.0 and call["retry_after_header"] is False for call in calls)
+
+
 async def test_an_export_keeps_a_429_without_a_limit_type_and_its_details(runtime, monkeypatch, delays):
     manager, new_session, _ = runtime
     manager.settings.values["rate_limit_auto_continue"] = False
@@ -317,6 +338,10 @@ def test_the_details_name_a_retry_after_in_the_body_or_none():
     error.rate_limit = parse_rate_limit({"error_code": "LIMITED", "message": "LIMITED: try later"})
     error.retry_headers = {"retry-after": "soon"}
     assert rate_limit_details(error) == "HTTP 429: LIMITED: try later · Retry-After: soon"
+    error.retry_payload = {"retry_after": 3}  # The body's wait is the one used, not the unreadable header.
+    assert rate_limit_details(error) == "HTTP 429: LIMITED: try later · retry_after: 3 s"
+    error.retry_headers, error.retry_payload = {"retry-after": " "}, None
+    assert rate_limit_details(error) == "HTTP 429: LIMITED: try later · Retry-After: none"
 
 
 async def test_an_otpm_type_from_words_without_a_number_refuses_nothing(runtime, monkeypatch, delays):

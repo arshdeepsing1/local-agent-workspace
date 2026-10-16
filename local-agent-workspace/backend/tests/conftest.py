@@ -25,6 +25,16 @@ def no_ripgrep(monkeypatch):
     monkeypatch.setattr(search, "ripgrep", lambda: None)
 
 
+@pytest.fixture(autouse=True)
+def mac_shell_prompt(monkeypatch):
+    """A system prompt that names zsh, as on a Mac, whatever shell this machine has, so that a
+    test near a token threshold gives the same result on every runner. Commands still run with
+    this machine's shell; tests of the prompt's own choice patch agents.shell_note back."""
+    from local_agent import agents, jobs
+    note = " ".join((jobs.SHELL_NOTES["/bin/zsh"], jobs.POLLING_NOTE))
+    monkeypatch.setattr(agents, "shell_note", lambda: note)
+
+
 @pytest.fixture
 def real_ripgrep(monkeypatch):
     """Search with the installed rg; the test is skipped when rg is not installed."""

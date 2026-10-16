@@ -178,7 +178,8 @@
 //   rate_limit?: { limit_type?, limit?, current?, retry_after?, code?, message?, retry_after_header? } (on a 429 that
 //   ended the request: limit_type from the body's field or its words, absent when it names none; code: error_code or
 //   the error's code or type; message: the body's message, redacted, at most 200 characters; retry_after: the wait
-//   Databricks asked for, from the Retry-After header or the body; retry_after_header: that header as sent),
+//   Databricks asked for, from the Retry-After header or the body; retry_after_header: that header as sent, when
+//   the wait came from it, not when the app could not read it, for example a date in the past),
 //   reasoning?: { effort, format, fields, sent_effort?, effort_field?, skipped?: 'rejected'|'rejected_earlier',
 //   rejected_field? } (absent when the request was at Default and sent nothing) }.
 //   error_kind includes 'rate_limit', 'payload_too_large' (over the 4 MB request limit; not sent) and

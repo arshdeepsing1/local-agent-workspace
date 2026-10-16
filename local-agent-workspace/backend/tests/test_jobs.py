@@ -51,11 +51,14 @@ def test_shell_selection_disables_startup_files(monkeypatch, available, expected
     (set(), ""),
 ])
 def test_the_system_prompt_names_the_shell_commands_run_with(monkeypatch, available, expected):
-    from local_agent.agents import SYSTEM_PROMPT
-    assert shell_note() in SYSTEM_PROMPT  # Built from this machine's choice.
+    from local_agent import agents
+    monkeypatch.setattr(agents, "shell_note", shell_note)  # conftest's mac_shell_prompt pins the zsh text.
     monkeypatch.setattr("local_agent.jobs.Path.is_file", lambda path: str(path) in available)
     polling = "A loop that polls CI or a deploy should print one line per check."
-    assert shell_note() == (f"{expected} {polling}" if expected else polling)
+    note = f"{expected} {polling}" if expected else polling
+    assert shell_note() == note
+    # Read for each request, so the prompt follows this machine's shell.
+    assert "if needed.\n" + note + "\nUse background=true" in agents.system_prompt()
 
 
 async def test_output_arrives_before_exit(tmp_path):
