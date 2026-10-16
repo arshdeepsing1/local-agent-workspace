@@ -78,8 +78,9 @@ async def test_a_model_change_moves_the_meter_to_the_new_models_budgets(app_clie
     manager, client = app_client
     session_id = await turn_on(manager, client, monkeypatch, GPT)
     before = manager.get(session_id)["context_info"]
-    assert limits_of(before) == {"context_window": 131_072, "reply_reserve": 8_192, "input_budget": 120_832,
-                                 "auto_compact_percent": 90, "auto_compact_threshold": 108_748}
+    # GPT OSS 120B's default budget is its whole window, so the input budget keeps 5% of it for estimate error.
+    assert limits_of(before) == {"context_window": 131_072, "reply_reserve": 8_192, "input_budget": 115_078,
+                                 "auto_compact_percent": 90, "auto_compact_threshold": 103_570}
     tokens, report = before["next_estimate"]["tokens"], before["last_request"]
     # GPT OSS's own reported ratio (estimates never scale below 1).
     old_scale = before["next_estimate"]["scale"]
@@ -157,10 +158,12 @@ async def test_a_budget_at_the_opus_window_keeps_a_margin_in_the_meter_and_the_r
         await manager.run(manager.get(session_id), "Again")
     info = manager.get(session_id)["context_info"]
     assert limits_of(info) == expected and info["last_request"]["input_budget"] == 934_826
-    # GPT OSS 120B at its own full window (capped there; its output tokens follow its default) keeps the plain budget.
+    # GPT OSS 120B at its own full window (capped there; its output tokens follow its default) keeps the same
+    # margin against its 131,072-token window.
     gpt = manager.get(await turn_on(manager, client, monkeypatch, GPT))
     assert manager.request_limits(gpt) == (131_072, 8_192)
-    assert manager.input_budget(gpt) == gpt["context_info"]["input_budget"] == 131_072 - 8_192 - 2_048
+    assert manager.input_budget(gpt) == gpt["context_info"]["input_budget"] == (131_072 - 8_192 - 2_048) * 100 // 105
+    assert gpt["context_info"]["last_request"]["input_budget"] == 115_078
 
 
 async def test_a_chat_running_during_a_settings_save_follows_when_its_turn_ends(app_client, monkeypatch, settings):

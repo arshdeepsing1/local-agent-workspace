@@ -166,7 +166,11 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
   const recommendedText = recommended ? `${limits.profile.label} defaults (${recommended.context_window.toLocaleString('en-US')} context, ${recommended.max_output_tokens.toLocaleString('en-US')} output)` : ''
   const field = (key, value) => setForm(current => ({ ...current, [key]: value }))
   const effective = limits?.effective
-  const capped = effective?.clamped ? effective.context_window - effective.max_output_tokens - 2048 : null
+  // The input budget requests to this endpoint use, when it differs: its maxima (clamped) and, near its
+  // window, the margin for estimate error (input_budget; computed here for a check without it).
+  const requestBudget = effective ? effective.input_budget ?? effective.context_window - effective.max_output_tokens - 2048 : null
+  const capped = requestBudget !== null && requestBudget !== inputBudget ? requestBudget : null
+  const cappedReason = effective?.clamped ? 'which accepts less' : 'keeping 5% of its window for estimate error'
   const number = key => event => field(key, Number(event.currentTarget.value))
   // A focused field must not end under the sticky footer. For a text box the browser scrolls only its
   // caret into view, so on a phone the lower part of Custom instructions could stay hidden.
@@ -255,7 +259,7 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         <p class="field-help">Set at or below your endpoint's total context limit, not your account usage quota. We reserve the output budget below plus 2,048 tokens for safety; the remainder is the estimated input budget.</p>
         <label>Max output tokens per request<input type="number" required min=${1024} max=${131072} step=${1}
           value=${form.max_output_tokens || ''} onInput=${number('max_output_tokens')} /></label>
-        <p class="field-help">Current estimated input budget: ${inputBudget.toLocaleString()} tokens${capped ? ` (${capped.toLocaleString()} for requests to this endpoint, which accepts less)` : ''}. The endpoint must support this value; a larger response budget leaves less room for input and can increase usage.</p>
+        <p class="field-help">Current estimated input budget: ${inputBudget.toLocaleString()} tokens${capped ? ` (${capped.toLocaleString()} for requests to this endpoint, ${cappedReason})` : ''}. The endpoint must support this value; a larger response budget leaves less room for input and can increase usage.</p>
         ${inputBudget < 16384 ? html`<p class="form-error" role="alert">This leaves too little room for a working conversation. Lower Max output tokens or increase the context budget; raising output does not fix a full context.</p>` : null}
         ${limits ? html`<div class="settings-limits">
           ${limits.warnings.map(warning => html`<p key=${warning.code} class=${LIMIT_LEVELS[warning.level] || 'field-help'}

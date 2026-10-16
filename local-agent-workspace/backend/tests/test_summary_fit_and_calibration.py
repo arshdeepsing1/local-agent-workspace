@@ -358,7 +358,9 @@ async def test_agent_keeps_an_oversized_summary_by_condensing_or_trimming(runtim
     assert [item["status"] for item in compactions][-1] == ("completed" if condense_status == 200 else "error")
     assert all(type(item["estimated_input_tokens"]) is int for item in compactions)
     expected = "condensed it" if condense_status == 200 else "could not be condensed"
-    assert any(expected in text for text in notices(session))
+    text = next(text for text in notices(session) if expected in text)
+    # The condensing request is counted whether or not it worked, without claiming it condensed anything.
+    assert "summarized in 2 requests, plus 1 condensing request;" in text and "condensed in" not in text
     assert not [event for event in session["events"] if event["type"] == "error"]
 
 

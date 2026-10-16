@@ -1216,18 +1216,21 @@ turn, including existing conversations. The configured total includes space for 
 reply. **Max output tokens** accepts 1,024–131,072, but must be below the context budget minus
 the 2,048-token safety margin. The output setting is also the reply reserve, so the Opus 5.5
 defaults leave an estimated input budget of 181,568 tokens (120,832 at 131,072 and 8,192).
-Near Opus 5.5's 1,000,000-token window the input budget also keeps 5% of the window for
-estimate error, because the endpoint rejects a request over its window and the app's estimate
-can be a few percent low: it is at most (1,000,000 − Max output tokens − 2,048) ÷ 1.05, which is
-934,826 at 1,000,000 and 16,384. Budgets up to about 950,000 are unchanged. Settings shows the
-budget before this margin; the context meter shows the one requests use.
+Near the window of an endpoint in the profile table (Opus 5.5: 1,000,000 tokens; GPT OSS 120B:
+131,072) the input budget also keeps 5% of the window for estimate error, because the endpoint
+rejects a request over its window and the app's estimate can be a few percent low: it is at most
+(window − Max output tokens − 2,048) ÷ 1.05, which is 934,826 on Opus 5.5 at 1,000,000 and
+16,384, and 115,078 at GPT OSS 120B's defaults of 131,072 and 8,192, which fill its window. Opus
+5.5 budgets up to about 950,000, including its defaults, are unchanged. Settings names the
+budget requests use next to the estimated input budget when they differ, and the context meter
+shows it.
 
 While you edit these fields, Settings shows warnings from the profile (they never block saving)
 and, for an endpoint with recommended values, a **Use … defaults** button, which reads **Using …
 defaults** while the form holds them. When the endpoint
 field changes, budgets still at the saved model's defaults change to the new endpoint's defaults
 in the form, as Save would store them, and the estimated input budget also names what requests
-to an endpoint with lower maxima get. The numbers are
+to an endpoint with lower maxima, or with the margin above, get. The numbers are
 Databricks's documented pay-per-token defaults for the Enterprise tier, also partner models'
 quota Tier 1 ([limits page](https://docs.databricks.com/gcp/en/machine-learning/foundation-model-apis/limits),
 checked 2026-10-13): Opus 5.5, Opus 4.8 and GPT OSS 120B each allow 1,000,000 input tokens
@@ -1281,7 +1284,7 @@ measurements.
 automatic compaction runs: when the next request's estimate passes that share of the
 input budget (the budget left after the reply and safety reserves). With the default
 settings (Claude Opus 5.5 at 200,000 and 16,384) that is about 163,411 tokens; at 131,072 and 8,192 it is
-about 108,748. Lower values compact sooner and keep requests
+about 108,748 (103,570 on GPT OSS 120B, whose window those budgets fill). Lower values compact sooner and keep requests
 smaller; 100 waits until the input budget is full. Compaction looks for a cut that
 brings the request under the threshold. When no cut does (for example a large first
 request, or a large request after a few short turns) and the request still fits the
@@ -1365,10 +1368,11 @@ Goal and current status; Open tasks and next steps; User requirements, preferenc
 constraints (with your exact words); Decisions and reasons; Errors, causes and fixes;
 Files read and changed; Commands and results. A conversation long enough to need
 several summary requests passes each request's summary on whole to the next one and
-condenses only once, at the end. Near Opus 5.5's 1,000,000-token window, each summary request
-also leaves room for counting 1.2 times its estimate (compaction requests count more densely
-than agent requests), so a near-full compaction may take two summary requests instead of one
-the endpoint could reject; budgets well below the window, such as the default, are unchanged.
+condenses only once, at the end. Near the window of an endpoint in the profile table (Opus 5.5:
+1,000,000 tokens; GPT OSS 120B: 131,072), each summary request also leaves room for counting
+1.2 times its estimate (compaction requests count more densely than agent requests), so a
+near-full compaction may take two summary requests instead of one the endpoint could reject;
+budgets well below the window, such as the Opus 5.5 default, are unchanged.
 The retained summary may use about an eighth of the
 input budget, between 3,500 and 12,000 UTF-8 bytes, and up to 32,000 bytes on large
 budgets (a twelfth of the input budget): 15,130 bytes with the default settings, 12,000 at
@@ -1389,7 +1393,7 @@ lines; a share that a short section cannot give goes to the others. Only if whol
 are not enough (for example a summary without those sections) does it keep the start
 and end of the summary. The compaction notice says which happened, and that a saved handoff
 has the shortened sections in full; it counts the summary and condensing requests apart
-("summarized in 1 request and condensed in 1"). The summary's room is reserved in bytes,
+("summarized in 1 request, plus 1 condensing request", also when that request failed). The summary's room is reserved in bytes,
 but escapes and non-ASCII text count more toward the estimate: when the request after a
 compaction is still over the input budget, the summary, already paid for, is shortened
 (or condensed once) to fit rather than discarded, and the compaction notice and the meter

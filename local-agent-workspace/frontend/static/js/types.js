@@ -33,7 +33,9 @@
 //       recommended_max_output_tokens, thinking_reserve, model, output_concurrency_limit, context_rate_limit } | null,
 //     recommended: { context_window, max_output_tokens } | null,
 //     defaults: { context_window, max_output_tokens } (this endpoint's defaults, with or without a profile),
-//     effective: { context_window, max_output_tokens, clamped }, warnings: [{ code, level: 'error'|'warning'|'note', text }],
+//     effective: { context_window, max_output_tokens, clamped, input_budget (what requests use: the capped budgets
+//       less the reply reserve and 2,048, and near a known endpoint window 5% less for estimate error) },
+//     warnings: [{ code, level: 'error'|'warning'|'note', text }],
 //     note }
 // Bootstrap (GET /bootstrap): { token, settings: Settings, storage_problems: StorageProblem[] }
 // StorageProblem: { file, reason } a conversation file in the state folder that could not

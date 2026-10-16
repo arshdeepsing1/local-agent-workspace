@@ -553,7 +553,7 @@ async def test_summary_requests_keep_room_for_denser_counting_against_the_real_w
 async def test_a_budget_at_the_real_window_keeps_five_percent_for_estimate_error():
     # A 1,000,000 budget with 16,384 output tokens on a 1,000,000-token window: an estimate 4% low would pass
     # the window, so the input budget is lowered to (1,000,000 - 16,384 - 2,048) / 1.05.
-    from local_agent.context import effective_input_budget, estimate_margin_window
+    from local_agent.context import effective_input_budget, model_context_window
     wire = [user("Hello"), assistant("Hi")]
     _, _, info = await prepare_context(wire, {}, SYSTEM, TOOLS, 1_000_000, forbidden_summary, reply_reserve=16_384,
                                        auto_compact_percent=90, model_window=1_000_000)
@@ -565,10 +565,11 @@ async def test_a_budget_at_the_real_window_keeps_five_percent_for_estimate_error
         _, _, info = await prepare_context(wire, {}, SYSTEM, TOOLS, budget, forbidden_summary, reply_reserve=16_384,
                                            model_window=1_000_000)
         assert info["input_budget"] == budget - 16_384 - SAFETY_MARGIN
-    # The margins apply to a model whose counts run above the heuristic (a starting ratio); other budgets
-    # stay as Settings gives them, also at their endpoint's full window.
-    assert estimate_margin_window("databricks-claude-opus-5-5") == 1_000_000
-    assert estimate_margin_window("databricks-gpt-oss-120b") is None and estimate_margin_window("m") is None
+    # Every endpoint whose window the app knows keeps the margin there: GPT OSS 120B's default budget is its
+    # whole 131,072-token window. An endpoint without a known window keeps the plain budget.
+    assert model_context_window("databricks-claude-opus-5-5") == 1_000_000
+    assert model_context_window("databricks-gpt-oss-120b") == 131_072 and model_context_window("m") is None
+    assert effective_input_budget(131_072, 8_192, 131_072) == 115_078 == (131_072 - 8_192 - SAFETY_MARGIN) * 100 // 105
     # An error names the lowered budget's arithmetic.
     with pytest.raises(ValueError) as error:
         await prepare_context([user("x" * 2_900_000)], {}, SYSTEM, TOOLS, 1_000_000, forbidden_summary,

@@ -593,11 +593,23 @@ def test_the_limits_route(tmp_path, monkeypatch):
         assert result["recommended"] == {"context_window": 200_000, "max_output_tokens": 16_384}
         assert result["warnings"] == [] and result["effective"]["clamped"] is False
         assert result["defaults"] == {"context_window": 200_000, "max_output_tokens": 16_384}
+        assert result["effective"]["input_budget"] == 181_568
+        # The input budget requests use: near the endpoint's window it keeps 5% for estimate error, and it
+        # follows the endpoint's maxima.
+        result = check({"model": OPUS, "context_window": 1_000_000, "max_output_tokens": 16_384})
+        assert result["effective"] == {"context_window": 1_000_000, "max_output_tokens": 16_384, "clamped": False,
+                                       "input_budget": 934_826}
+        result = check({"model": OPUS, "context_window": 1_048_576, "max_output_tokens": 131_072})
+        assert result["effective"] == {"context_window": 1_000_000, "max_output_tokens": 128_000, "clamped": True,
+                                       "input_budget": (1_000_000 - 128_000 - 2_048) * 100 // 105}
+        result = check({"model": "databricks-gpt-oss-120b", "context_window": 131_072, "max_output_tokens": 8_192})
+        assert result["effective"]["input_budget"] == 115_078 and result["effective"]["clamped"] is False
         result = check({"model": f" {OPUS} ", "context_window": 300_000, "max_output_tokens": 30_000})
         assert [item["code"] for item in result["warnings"]] == ["output_concurrency", "context_itpm"]
         result = check({"model": "unknown-endpoint", "context_window": 65_536, "max_output_tokens": 8_192})
         assert result["profile"] is None and result["recommended"] is None
         assert result["defaults"] == {"context_window": 131_072, "max_output_tokens": 8_192}
+        assert result["effective"]["input_budget"] == 65_536 - 8_192 - 2_048
         assert result["note"].startswith("No built-in limits")
         result = check({"model": "databricks-claude-opus-4-8", "context_window": 65_536, "max_output_tokens": 8_192})
         assert result["recommended"] is None

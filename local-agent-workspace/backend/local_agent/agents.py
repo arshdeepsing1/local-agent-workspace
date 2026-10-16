@@ -24,7 +24,7 @@ from .context import (
     DEFAULT_AUTO_COMPACT_PERCENT, MAX_AUTO_COMPACT_PERCENT,
     MIN_AUTO_COMPACT_PERCENT, OUTPUT_LIMIT_CONTINUATION, SUMMARY_MAX_TOKENS,
     build_condense_messages, build_handoff_messages, build_summary_messages, compaction_output_allowance,
-    condense_output_tokens, effective_input_budget, estimate_margin_window, estimate_prior, estimate_scale,
+    condense_output_tokens, effective_input_budget, estimate_prior, estimate_scale,
     estimate_tokens, handoff_output_tokens, handoff_with_contents, has_earlier_turn, last_request_report,
     model_context_window, next_request_estimate, prepare_context, summary_byte_limit, summary_output_tokens,
     verify_declined_message,
@@ -3247,7 +3247,7 @@ class AgentManager(LifecycleHooks):
     def input_budget(self, session):
         """The input budget prepare_context uses for this chat's requests."""
         context_window, max_output_tokens = self.request_limits(session)
-        return effective_input_budget(context_window, max_output_tokens, estimate_margin_window(session["model"]))
+        return effective_input_budget(context_window, max_output_tokens, model_context_window(session["model"]))
 
     def coding_dir_text(self, session):
         """The system prompt line for the default code folder, or ""."""
@@ -3602,11 +3602,12 @@ class AgentManager(LifecycleHooks):
             return
         n, after = compaction["number"], compaction["after_tokens"]
         # The summary and condense requests apart; a compaction saved before they were counted apart has "requests".
+        # A condensing request is counted when sent, also when it failed, so the count claims no success.
         condensed = compaction.get("condense_requests") or 0
         summarized = (f"{plural(compaction['summarized_messages'], 'earlier message')} "
                       f"{'was' if compaction['summarized_messages'] == 1 else 'were'} summarized in "
                       f"{plural(compaction.get('summarize_requests', compaction['requests'] - condensed), 'request')}"
-                      + (f" and condensed in {condensed:,}" if condensed else ""))
+                      + (f", plus {plural(condensed, 'condensing request')}" if condensed else ""))
         over = (f"about {compaction['before_tokens']:,} estimated input tokens, over the "
                 f"{info.get('auto_compact_percent', 100)}% auto-compact threshold of {compaction['threshold_tokens']:,}")
         if compaction["trigger"] == "manual":
@@ -3704,7 +3705,7 @@ class AgentManager(LifecycleHooks):
                     handoff_path=plan and plan["path"], save_handoff=plan and self.handoff_saver(session, plan),
                     auto_compact_percent=auto_compact_percent(self.settings.values), record_requests=True,
                     app_record=record, output_allowance=allowance, completed_calls=completed_call_ids(session),
-                    model_window=estimate_margin_window(session["model"]))
+                    model_window=model_context_window(session["model"]))
             views, updated = forget_summarized_reads(session.get("file_views") or {}, updated, holder["forgotten"])
             info = {**info, "instruction_files": guidance["files"], "instruction_sources": guidance["sources"],
                     "warnings": warnings, "prepared_for_next_turn": True, **last_request(session),
@@ -4011,7 +4012,7 @@ class AgentManager(LifecycleHooks):
                     or self.statuses.get(session["id"], "idle") != "idle" or session.get("turn_running")):
                 return
             context_window, reply_reserve = self.request_limits(session)
-            budget = effective_input_budget(context_window, reply_reserve, estimate_margin_window(
+            budget = effective_input_budget(context_window, reply_reserve, model_context_window(
                 session.get("model") or self.settings.values["model"]))
             percent = auto_compact_percent(self.settings.values)
             threshold = compaction_threshold(budget, percent)
@@ -4174,12 +4175,16 @@ class AgentManager(LifecycleHooks):
                 wire.pop()
             self.store.save(session)
         wire.append({"role": "user", "content": prompt if content is None else content})
+        compactable = False
         if isinstance(meter := session.get("context_info"), dict) and meter.get("compactable") is False:
             # This turn's first request replaces the meter; a turn that ends before it leaves this one.
-            meter["compactable"] = has_earlier_turn(wire, session.get("context_state"))
+            meter["compactable"] = compactable = has_earlier_turn(wire, session.get("context_state"))
         self._content_sent(session)  # Its @ files are now seen and its ! output no longer pending.
         context_window, max_output_tokens = self.request_limits(session)
         self.mark_user_in_wire(session)  # No await since the prompt was appended above.
+        if compactable:
+            # An open page keeps the meter it last received: Compact now is available again.
+            await self.broadcast(session["id"], {"type": "context", "context_info": meter})
         # After mark_user_in_wire: the notice saves, and a save must not hold the prompt with in_wire False.
         await self.limits_notice(session)
         default_reply_reserve = default_limits(session["model"])[1]
@@ -4234,7 +4239,7 @@ class AgentManager(LifecycleHooks):
                     handoff_path=plan and plan["path"], save_handoff=plan and self.handoff_saver(session, plan),
                     auto_compact_percent=auto_compact_percent(self.settings.values), record_requests=True,
                     app_record=record, output_allowance=allowance, completed_calls=completed_call_ids(session),
-                    model_window=estimate_margin_window(session["model"]))
+                    model_window=model_context_window(session["model"]))
                 if "compaction" in info:
                     # Files whose contents were summarized away must be read again before a write.
                     views, next_context = forget_summarized_reads(session.get("file_views") or {}, next_context,

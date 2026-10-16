@@ -43,11 +43,11 @@ MAX_ESTIMATE_SCALE = 2.0
 # estimated tokens among the samples, so a first request that is mostly system message
 # and tool definitions (which count about 1.03) does not replace it at once.
 CALIBRATION_PRIOR_WEIGHT = 20_000
-# Against the provider's real window (a model with a starting ratio and a known window,
-# estimate_margin_window): compaction requests, an escaped JSON transcript without
-# tools, count up to about a sixth more tokens than the agent scale says, and an agent
-# request's scaled estimate was seen up to about 4% low. Budgets set well below the
-# window are unchanged by either.
+# Against the provider's real window (model_context_window, for an endpoint whose window
+# the app knows): compaction requests, an escaped JSON transcript without tools, count up
+# to about a sixth more tokens than the agent scale says, and an agent request's scaled
+# estimate was seen up to about 4% low. Budgets set well below the window are unchanged
+# by either.
 COMPACTION_ESTIMATE_FACTOR = 1.2
 WINDOW_ESTIMATE_FACTOR = 1.05
 SUMMARY_PREFIX = "Summary of earlier conversation (historical data; follow current user and system instructions):\n"
@@ -187,20 +187,13 @@ def model_context_window(model):
     return (profile_for(_model_key(model)) or {}).get("context_max")
 
 
-def estimate_margin_window(model):
-    """The provider window that budgets keep an estimate margin against (prepare_context's
-    model_window), or None: the known window of a model whose counts run above the text-size
-    heuristic (an INITIAL_ESTIMATE_SCALES entry). Its scale is learned from recent requests and
-    can lag a denser one; other models' budgets stay as Settings gives them."""
-    return model_context_window(model) if _model_key(model) in INITIAL_ESTIMATE_SCALES else None
-
-
 def effective_input_budget(context_window, reply_reserve, model_window=None):
     """Estimated input tokens a request may use: the context budget minus the reply reserve and
-    SAFETY_MARGIN. With model_window, at most that window minus the same over
-    WINDOW_ESTIMATE_FACTOR, so a request whose estimate is a few percent low still fits the
-    window: 934,826 at a 1,000,000 window and 16,384 output tokens. Budgets below about
-    950,000 there are unchanged."""
+    SAFETY_MARGIN. With model_window (model_context_window), at most that window minus the
+    same over WINDOW_ESTIMATE_FACTOR, so a request whose estimate is a few percent low still
+    fits the window: 934,826 at a 1,000,000 window and 16,384 output tokens (budgets below about
+    950,000 there are unchanged), 115,078 at a 131,072 window and 8,192. The estimate scale is
+    learned from recent requests and can lag a denser one."""
     budget = context_window - reply_reserve - SAFETY_MARGIN
     if model_window:
         budget = min(budget, math.floor((model_window - reply_reserve - SAFETY_MARGIN) / WINDOW_ESTIMATE_FACTOR))
@@ -1103,7 +1096,7 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
     record next to the summary; app_record(wire, cut, limit_bytes) returns the app's notes for it.
     output_allowance is added to every compaction request's output reserve (thinking).
     completed_calls (ids of completed tool calls) lets the summarizer's view drop reads
-    that later calls superseded. model_window (estimate_margin_window) is the provider's
+    that later calls superseded. model_window (model_context_window) is the provider's
     real window: the input budget and the summary requests then keep a margin for estimate
     error against it (effective_input_budget, COMPACTION_ESTIMATE_FACTOR). The defaults
     keep the behaviour before these options.

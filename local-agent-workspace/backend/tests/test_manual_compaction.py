@@ -283,12 +283,22 @@ async def test_a_turn_that_fails_before_its_first_request_leaves_compact_now_ava
     session["context_state"]["through"] = 6
     session["context_info"] = {"compactable": False, "compactions": 2}
     manager.store.save(session)
+    sent = []
+    broadcast = manager.broadcast
+
+    async def recorded(session_id, data):
+        sent.append(data)
+        await broadcast(session_id, data)
+    monkeypatch.setattr(manager, "broadcast", recorded)
     monkeypatch.setattr(manager, "otpm_preflight", lambda session, max_tokens: InferenceError(
         "Refused before sending.", "output_tokens_over_limit", None))
     await manager.run(session, "A new request")
     assert session["wire"][-1] == {"role": "user", "content": "A new request"}
     assert session["context_info"] == {"compactable": True, "compactions": 2}
     assert manager.store.get(session["id"])["context_info"]["compactable"] is True
+    # An open page is told too, so its Compact now is enabled again (refresh_meter_limits sees no change).
+    assert [data["context_info"] for data in sent if data["type"] == "context"] == [
+        {"compactable": True, "compactions": 2}]
 
 
 async def test_manual_compaction_summarizes_every_turn_but_the_latest():
