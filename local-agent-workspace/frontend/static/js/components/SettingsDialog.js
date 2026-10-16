@@ -84,6 +84,19 @@ function endpointChoices(settings, connection) {
   return names.map(name => ({ value: name, label: `${labels.get(name) || modelLabel(name)} · ${name}` }))
 }
 
+// Settings → Fallback endpoint's list: endpoints with built-in limits, those Settings → Subagents name and the saved
+// one, without the model endpoint unless the form has it (chats on it then have no fallback). The server also
+// accepts an endpoint one of your chats uses, typed with Other endpoint… (AgentManager.fallback_allowed).
+function fallbackChoices(settings, form, model) {
+  const profiles = Array.isArray(settings.endpoint_profiles) ? settings.endpoint_profiles : []
+  const labels = new Map(profiles.map(item => [item.model, item.label]))
+  const subagents = Object.values(form.subagent_defaults || {}).map(item => item?.model)
+  const names = [...new Set([...profiles.map(item => item.model), ...subagents, settings.fallback_model, form.fallback_model]
+    .filter(name => typeof name === 'string' && name.trim()))]
+  return names.filter(name => name !== model || name === form.fallback_model)
+    .map(name => ({ value: name, label: `${labels.get(name) || modelLabel(name)} · ${name}` }))
+}
+
 export default function SettingsDialog({ settings, connection, onSave, onClose }) {
   const dialog = useRef(null)
   const [form, setForm] = useState(settings)
@@ -105,6 +118,10 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
   const [otherEndpoint, setOtherEndpoint] = useState(() => !choices.some(choice => choice.value === settings.model))
   const otherInput = useRef(null)
   const otherFocus = useRef(false)
+  // Fallback endpoint → Other endpoint…: a typed name, open while chosen like the endpoint field's.
+  const [otherFallback, setOtherFallback] = useState(false)
+  const fallbackInput = useRef(null)
+  const fallbackFocus = useRef(false)
   const sections = useRef({})
   const [activeSection, setActiveSection] = useState(SECTIONS[0][0])
   const jumping = useRef(0)
@@ -139,6 +156,9 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
   useEffect(() => {
     if (otherEndpoint && otherFocus.current) { otherFocus.current = false; otherInput.current?.focus() }
   }, [otherEndpoint])
+  useEffect(() => {
+    if (otherFallback && fallbackFocus.current) { fallbackFocus.current = false; fallbackInput.current?.focus() }
+  }, [otherFallback])
   // Warnings for these budgets on this endpoint, from the server's limit table. They never block saving.
   useEffect(() => {
     const { context_window: context, max_output_tokens: output } = form
@@ -213,6 +233,8 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
   }
   const group = (id, children) => html`<fieldset class="settings-group" id=${`settings-${id}`} tabIndex=${-1}
     ref=${element => { sections.current[id] = element }}><legend>${SECTIONS.find(item => item[0] === id)[1]}</legend>${children}</fieldset>`
+  const fallback = (form.fallback_model || '').trim()
+  const fallbacks = fallbackChoices(settings, form, model)
   const fields = preview?.fields || {}
   const currentLevel = levels.find(level => level.value === effort) || levels[0]
   const subagents = { ...SUBAGENT_DEFAULTS, ...(form.subagent_defaults || {}) }
@@ -286,7 +308,22 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         <label>Prompt caching<select value=${form.prompt_caching || 'auto'} onChange=${e => field('prompt_caching', e.currentTarget.value)}>
           ${CACHING.map(([value, label]) => html`<option key=${value} value=${value}>${label}</option>`)}
         </select></label>
-        <p class="field-help">Marks the stable start of each agent request so Databricks can bill repeated input at the cache-read rate (about 5% of the input price). Writes cost 25% more; entries expire after 5 minutes. Documented forms only marks just your last message or the last tool call.</p>`)}
+        <p class="field-help">Marks the stable start of each agent request so Databricks can bill repeated input at the cache-read rate (about 5% of the input price). Writes cost 25% more; entries expire after 5 minutes. Documented forms only marks just your last message or the last tool call.</p>
+        <label>Fallback endpoint<select value=${otherFallback ? OTHER_ENDPOINT : fallback} onChange=${e => {
+          const value = e.currentTarget.value
+          if (value === OTHER_ENDPOINT) { fallbackFocus.current = true; setOtherFallback(true); return }
+          setOtherFallback(false)
+          field('fallback_model', value)
+        }}>
+          <option value="">None</option>
+          ${fallbacks.map(choice => html`<option key=${choice.value} value=${choice.value}>${choice.label}</option>`)}
+          <option value=${OTHER_ENDPOINT}>Other endpoint…</option>
+        </select></label>
+        ${otherFallback ? html`<label>Fallback endpoint name<input ref=${fallbackInput} spellcheck=${false} value=${form.fallback_model || ''}
+          onInput=${e => field('fallback_model', e.currentTarget.value)} placeholder="An endpoint one of your chats uses" /></label>` : null}
+        ${fallback && fallback === model ? html`<p class="settings-note" role="status">This is the model endpoint: chats on it have no fallback.</p>` : null}
+        <p class="field-help">When the model endpoint fails before a reply starts (no connection, HTTP 502, 503 or 504, or a rate limit) and the automatic retries do not help, that one request goes to this endpoint. The next request tries the model endpoint again.</p>
+        <${More} topic="fallback endpoint">The request uses the fallback's own limits, reasoning fields and prompt caching, and is not sent when the conversation does not fit its context window. Titles, /btw and compaction never fall back. Only endpoints with built-in limits or ones you already use (here, in Subagents or in a chat) are accepted, because each request carries the conversation. Request details then show Answered by with the fallback, and its usage is priced at that endpoint's rates.<//>`)}
         ${group('reasoning', html`
         <label>Default effort for new chats<select value=${effort} onChange=${e => field('reasoning_effort', e.currentTarget.value)}>
           ${levels.map(level => html`<option key=${level.value} value=${level.value}>${levelLabel(level)}</option>`)}

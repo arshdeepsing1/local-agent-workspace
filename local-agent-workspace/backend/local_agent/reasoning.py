@@ -237,6 +237,25 @@ def reasoning_parts(content):
     return "".join(texts), seen
 
 
+REASONING_ITEMS = ("reasoning", "thinking", "redacted_thinking")
+
+
+def without_reasoning(messages):
+    """messages with no reasoning in assistant messages (reasoning, thinking and redacted thinking content items,
+    and reasoning_content or reasoning fields), for a request to an endpoint other than the one that wrote them:
+    a reasoning signature is valid only for its own model. The app's history keeps none today; this keeps a
+    fallback request (AgentManager.fallback_attempt) free of them if history ever does."""
+    result = []
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            message = {key: value for key, value in message.items() if key not in ("reasoning_content", "reasoning")}
+            if isinstance(message.get("content"), list):
+                message["content"] = [part for part in message["content"]
+                                      if not (isinstance(part, dict) and part.get("type") in REASONING_ITEMS)]
+        result.append(message)
+    return result
+
+
 def reasoning_delta(delta):
     """(text, seen) for one streamed delta: reasoning items in delta.content, delta.reasoning_content
     (a string) and delta.reasoning (a string or {"text"} / {"summary"})."""

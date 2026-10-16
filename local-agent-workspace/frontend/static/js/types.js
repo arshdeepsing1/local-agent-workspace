@@ -19,6 +19,8 @@
 //   (how agent requests ask for it; 'auto' = per endpoint), thinking_summaries: boolean (thinking.display 'summarized'
 //   for adaptive Claude endpoints; default true), prompt_caching: 'auto'|'messages'|'off' (cache markers on agent
 //   requests to Databricks-hosted Claude endpoints; 'messages' = only the documented forms; default 'auto'),
+//   fallback_model: string ('' = none: the endpoint an agent or subagent request goes to once when the model
+//   endpoint failed before the reply started; one with built-in facts or one the user uses; chats on it have none),
 //   endpoint_profiles: [{ model, label }] (endpoints with built-in facts) }
 // Effort: 'default' (no effort field: the endpoint's own) | 'low' (labelled Fast) | 'medium' | 'high' | 'xhigh' (Extra
 //   high) | 'max'. Labels: types.js EFFORT_LABELS.
@@ -32,7 +34,9 @@
 // GET /settings -> Settings (the folder states checked again). PUT /settings { ...editable fields } -> Settings.
 // POST /settings/limits { model, context_window, max_output_tokens } -> LimitsCheck:
 //   { profile: { label, context_max, output_max, itpm, otpm, recommended_context_window,
-//       recommended_max_output_tokens, thinking_reserve, model, output_concurrency_limit, context_rate_limit } | null,
+//       recommended_max_output_tokens, thinking_reserve, reasoning fields, prompt_caching, vision (image_url content
+//       parts documented), structured_output (false: unconfirmed), model, output_concurrency_limit,
+//       context_rate_limit } | null,
 //     recommended: { context_window, max_output_tokens } | null,
 //     defaults: { context_window, max_output_tokens } (this endpoint's defaults, with or without a profile),
 //     effective: { context_window, max_output_tokens, clamped, input_budget (what requests use: the capped budgets
@@ -186,7 +190,10 @@
 //   Databricks asked for, from the Retry-After header or the body; retry_after_header: that header as sent, when
 //   the wait came from it, not when the app could not read it, for example a date in the past),
 //   reasoning?: { effort, format, fields, sent_effort?, effort_field?, skipped?: 'rejected'|'rejected_earlier',
-//   rejected_field? } (absent when the request was at Default and sent nothing) }.
+//   rejected_field? } (absent when the request was at Default and sent nothing),
+//   fallback_from?, fallback_reason? (a request Settings → Fallback endpoint answered: model is that endpoint,
+//   fallback_from the chat's, which failed before the reply started; fallback_reason 'HTTP 503', 'connection
+//   failure' or 'rate limit, HTTP 429') }.
 //   error_kind includes 'rate_limit', 'payload_too_large' (over the 4 MB request limit; not sent) and
 //   'output_tokens_over_limit' (Max output tokens above the endpoint's reported OTPM limit).
 // ContextInfo: { estimated_tokens, input_budget, context_window, reply_reserve,
@@ -223,7 +230,8 @@
 // Metrics (GET /sessions/<id>/metrics): { scope, session_id, complete, totals, calls, by_purpose, by_model,
 //   pricing, last_input: LastRequest | null }. A call has effort?, effort_field? and reasoning_skipped? like
 //   RequestInfo.reasoning; retry_reason 'reasoning_rejected' marks the resend without reasoning fields, and
-//   'cache_rejected' the resend with fewer cache markers. Agent calls also have prompt_cache? ('full'|'messages'|'off':
+//   'cache_rejected' the resend with fewer cache markers, 'fallback' a request to Settings → Fallback endpoint
+//   (its fallback_from names the chat's endpoint). Agent calls also have prompt_cache? ('full'|'messages'|'off':
 //   the cache markers sent, on Claude endpoints), system_tail_changed? (true), usage_keys? (the raw usage key names),
 //   reasoning_shape? and reasoning_signature? (true).
 // Job: { id, session_id, workspace, command, state, created, updated, exit_code,

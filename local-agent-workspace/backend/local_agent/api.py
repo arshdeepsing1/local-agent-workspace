@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field, model_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .agents import AgentManager, public_session
-from .config import APP_ROOT, MAX_APPROVAL_MINUTES, MAX_MAX_AGENT_STEPS, MIN_MAX_AGENT_STEPS, Settings
+from .config import APP_ROOT, ENDPOINT_NAME, MAX_APPROVAL_MINUTES, MAX_MAX_AGENT_STEPS, MIN_MAX_AGENT_STEPS, Settings
 from .config import MAX_COMMAND_ENV, MAX_USER_INSTRUCTIONS, MAX_WRITE_LIMIT_KB, MIN_WRITE_LIMIT_KB
 from .context import (
     MAX_CONTEXT_WINDOW, MAX_MAX_OUTPUT_TOKENS, MIN_CONTEXT_WINDOW, MIN_MAX_OUTPUT_TOKENS, SAFETY_MARGIN,
@@ -25,7 +25,7 @@ from .context import (
 )
 from .context import MAX_AUTO_COMPACT_PERCENT, MIN_AUTO_COMPACT_PERCENT
 from .model_profiles import default_limits, effective_limits, limit_warnings, limits_note, public_profile
-from . import reasoning
+from . import reasoning, serving
 from .user_paths import standing_directories
 from .store import Store, UnreadableConversation
 from . import conversation_search
@@ -179,6 +179,8 @@ class SettingsEdit(BaseModel):
     python_venv: str | None = Field(default=None, max_length=4096, strict=True)
     # Settings → Subagents: {explore|general|editor: {model, effort}}; config.subagent_defaults checks it.
     subagent_defaults: dict[str, dict[str, str]] | None = None
+    # Settings → Model and context: "" = none; config.Settings.update and AgentManager.fallback_allowed check it.
+    fallback_model: str | None = Field(default=None, max_length=128, strict=True)
 
 
 class LimitsQuery(BaseModel):
@@ -352,12 +354,12 @@ def create_app(settings=None):
         # with an error status), 'network' (no answer) or 'invalid_response' (an answer the app cannot read).
         # An unreadable credential file (OSError) still reaches the global handler (HTTP 400).
         try:
-            host, token = settings.credentials()
+            host, token = manager.serving.credentials()
         except ValueError as exc:
             return {"connected": False, "models": [], "error": settings.redact(str(exc)), "error_kind": "credentials"}
         try:
-            async with httpx.AsyncClient(timeout=20, follow_redirects=False) as client:
-                response = await client.get(host + "/api/2.0/serving-endpoints", headers={"Authorization": f"Bearer {token}"})
+            async with manager.serving.client(serving.LISTING_TIMEOUT) as client:
+                response = await client.get(serving.endpoints_url(host), headers=serving.request_headers(token))
         except httpx.HTTPError as exc:
             return {"connected": False, "models": [], "error": settings.redact(str(exc) or type(exc).__name__),
                     "error_kind": "network"}
@@ -389,6 +391,14 @@ def create_app(settings=None):
     @app.put("/api/settings")
     async def update_settings(body: SettingsEdit):
         manager.workspace_available(body.workspace)
+        fallback = (body.fallback_model or "").strip()
+        # A new fallback endpoint is one the app knows or the user already uses (this save's models count).
+        sent = [entry.get("model") for entry in (body.subagent_defaults or {}).values() if isinstance(entry, dict)]
+        if (ENDPOINT_NAME.match(fallback) and fallback != settings.values.get("fallback_model")
+                and not manager.fallback_allowed(fallback, [body.model, *sent])):
+            raise ValueError(f"The fallback endpoint {fallback} is neither an endpoint with built-in limits nor one "
+                             "you use (the Settings model, Settings → Subagents or one of your chats). Requests carry "
+                             "the conversation, so the app sends them only to endpoints you already chose.")
         result = settings.update(body.model_dump(exclude_none=True))
         # A request format Databricks rejected, and cache markers it rejected, are tried again after any Settings save.
         manager.reasoning_rejections.clear()

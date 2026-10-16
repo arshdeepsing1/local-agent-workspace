@@ -60,6 +60,8 @@ export default function RequestDetails({ info, reasoningWait, reasoningText = fa
     <div class="request-details-body">
       <dl>
         <div><dt>Model endpoint</dt><dd>${info.model}</dd></div>
+        ${info.fallback_from ? html`<div><dt>${['completed', 'interrupted'].includes(info.status) ? 'Answered by' : 'Sent to'}</dt><dd>${info.model} (fallback)</dd></div>
+          <div><dt>Fallback from</dt><dd>${info.fallback_from}${info.fallback_reason ? ` (${info.fallback_reason})` : ''}</dd></div>` : null}
         <div><dt>Request status</dt><dd>${info.status}</dd></div>
         <div><dt>Finish reason</dt><dd>${info.finish_reason ?? 'Unavailable'}</dd></div>
         <div><dt>HTTP status</dt><dd>${info.http_status ?? 'Unavailable'}</dd></div>

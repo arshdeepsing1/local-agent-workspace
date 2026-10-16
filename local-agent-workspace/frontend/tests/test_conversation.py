@@ -212,6 +212,27 @@ def test_usage_snapshot_for_event_without_text(ui, page):
     expect(details).not_to_have_attribute("open", "")
 
 
+def test_a_reply_from_the_fallback_endpoint_says_so(ui, page):
+    show(ui, """[{ id: 'fallback', type: 'assistant', text: 'Answered.', request_info: { model: 'databricks-gpt-oss-120b',
+      status: 'completed', http_status: 200, fallback_from: 'databricks-claude-opus-5-5', fallback_reason: 'HTTP 503' } },
+      { id: 'own', type: 'assistant', text: 'Own.', request_info: { model: 'databricks-claude-opus-5-5', status: 'completed' } },
+      { id: 'failed', type: 'assistant', request_info: { model: 'databricks-gpt-oss-120b', status: 'error', http_status: 503,
+        fallback_from: 'databricks-claude-opus-5-5', fallback_reason: 'connection failure' } }]""")
+    fallback, own, failed = page.locator("details.request-details").all()
+    fallback.locator("summary").click()
+    expect(definition(fallback, "Model endpoint")).to_have_text("databricks-gpt-oss-120b")
+    expect(definition(fallback, "Answered by")).to_have_text("databricks-gpt-oss-120b (fallback)")
+    expect(definition(fallback, "Fallback from")).to_have_text("databricks-claude-opus-5-5 (HTTP 503)")
+    own.locator("summary").click()
+    expect(definition(own, "Model endpoint")).to_have_text("databricks-claude-opus-5-5")
+    expect(own.get_by_text("Answered by")).to_have_count(0)
+    # A fallback request that failed too did not answer.
+    failed.locator("summary").click()
+    expect(definition(failed, "Sent to")).to_have_text("databricks-gpt-oss-120b (fallback)")
+    expect(definition(failed, "Fallback from")).to_have_text("databricks-claude-opus-5-5 (connection failure)")
+    expect(failed.get_by_text("Answered by")).to_have_count(0)
+
+
 def test_claude_reasoning_tokens_read_as_part_of_the_output(ui, page):
     usage = "{ input_tokens: 1000, output_tokens: 200, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }"
     anthropic = "{ effort: 'high', format: 'anthropic', fields: { thinking: { type: 'adaptive' } }, effort_field: 'output_config.effort' }"

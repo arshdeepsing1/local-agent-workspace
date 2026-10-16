@@ -161,6 +161,9 @@ class Settings:
             # Settings → Agent (spending.py): the soft cap in estimated DBU of chats without their own; 0 = none.
             "spending_limit_dbu": 0,
             "subagent_defaults": subagent_defaults(None),
+            # Settings → Model and context (AgentManager.fallback_endpoint): the endpoint an agent or subagent
+            # request goes to once when its own failed before the reply started; "" = none.
+            "fallback_model": "",
         }
         self.migrated_from = None
         if self.path.exists():
@@ -186,6 +189,9 @@ class Settings:
                 self.values["spending_limit_dbu"] = validate_limit(float(limit) if isinstance(limit, str) else limit)
             except ValueError:
                 self.values["spending_limit_dbu"] = 0
+            fallback = self.values["fallback_model"]  # A hand-edited name that is not one means none.
+            fallback = fallback.strip() if isinstance(fallback, str) else ""
+            self.values["fallback_model"] = fallback if ENDPOINT_NAME.match(fallback) else ""
         # Budgets not saved follow the model's defaults; saved ones win.
         limits = dict(zip(LIMIT_KEYS, default_limits(self.values["model"])))
         ordered = {}
@@ -314,6 +320,13 @@ class Settings:
                     for kind, entry in sent.items()}
             candidate["subagent_defaults"] = {**current, **sent}
         candidate["subagent_defaults"] = subagent_defaults(candidate["subagent_defaults"])
+        fallback = candidate["fallback_model"]
+        fallback = fallback.strip() if isinstance(fallback, str) else fallback
+        if not isinstance(fallback, str) or (fallback and not ENDPOINT_NAME.match(fallback)):
+            raise ValueError("The fallback endpoint must be empty (none) or an endpoint name of letters, digits, '.', "
+                             "'_' and '-' (at most 128 characters).")
+        # Equal to the model (the new-chat model picker may choose it): chats on it simply have no fallback.
+        candidate["fallback_model"] = fallback
         for key, label, check in (("coding_dir", "Default code folder", user_paths.check_coding_dir_setting),
                                   ("python_venv", "Python environment", user_paths.check_python_venv_setting)):
             value = candidate[key]

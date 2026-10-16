@@ -57,6 +57,12 @@ LIMITS_CHECKED = "2026-10-13"
 # {"type": "ephemeral"} on content parts and assistant tool_calls is accepted only by Databricks-hosted
 # Claude models. prompt_caching marks the endpoints that get cache
 # markers on agent requests (prompt_cache.py); endpoints without a profile get none.
+#
+# Capability flags, read by the features that need them (supports) and shown by public_profile: vision is
+# True where Databricks documents image_url content parts in chat messages (its hosted Claude models) and
+# False for the text-only GPT OSS models; no live request has checked it on this route yet.
+# structured_output (response_format with a JSON schema, together with tools) is not confirmed for any of
+# these endpoints, so it is False (unknown is never treated as supported) until a check shows otherwise.
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 MODEL_PROFILES = {
     "databricks-claude-opus-5-5": {
@@ -65,14 +71,14 @@ MODEL_PROFILES = {
         "recommended_context_window": 200_000, "recommended_max_output_tokens": 16_384,
         "thinking_reserve": 4_096,
         "reasoning_format": "anthropic", "effort_levels": CLAUDE_EFFORTS, "default_effort": "medium",
-        "thinking": "always", "effort_map": {}, "prompt_caching": True},
+        "thinking": "always", "effort_map": {}, "prompt_caching": True, "vision": True, "structured_output": False},
     "databricks-claude-opus-4-8": {
         "label": "Claude Opus 4.8", "context_max": None, "output_max": None,
         "itpm": 1_000_000, "otpm": 100_000,
         "recommended_context_window": None, "recommended_max_output_tokens": None,
         "thinking_reserve": None,
         "reasoning_format": "anthropic", "effort_levels": CLAUDE_EFFORTS, "default_effort": None,
-        "thinking": "adaptive", "effort_map": {}, "prompt_caching": True},
+        "thinking": "adaptive", "effort_map": {}, "prompt_caching": True, "vision": True, "structured_output": False},
     "databricks-gpt-oss-120b": {
         "label": "GPT OSS 120B", "context_max": 131_072, "output_max": None,
         "itpm": 1_000_000, "otpm": 100_000,
@@ -80,11 +86,13 @@ MODEL_PROFILES = {
         "thinking_reserve": None,
         # Databricks maps minimal to low and xhigh or max to high; the app sends high itself.
         "reasoning_format": "openai", "effort_levels": ("low", "medium", "high"), "default_effort": "medium",
-        "thinking": None, "effort_map": {"xhigh": "high", "max": "high"}, "prompt_caching": False},
+        "thinking": None, "effort_map": {"xhigh": "high", "max": "high"}, "prompt_caching": False,
+        "vision": False, "structured_output": False},
 }
 # Endpoints that take reasoning like a profiled one but whose limits are not in the table.
 REASONING_ALIASES = {"databricks-gpt-oss-20b": ("databricks-gpt-oss-120b", "GPT OSS 20B")}
 REASONING_KEYS = ("reasoning_format", "effort_levels", "default_effort", "thinking", "effort_map")
+CAPABILITY_FLAGS = ("prompt_caching", "vision", "structured_output")
 
 
 def profile_for(model):
@@ -108,7 +116,15 @@ def reasoning_profile(model):
 
 def prompt_caching(model):
     """True for an endpoint whose agent requests get prompt-cache markers (a Databricks-hosted Claude profile)."""
-    return bool((profile_for(model) or {}).get("prompt_caching"))
+    return supports(model, "prompt_caching")
+
+
+def supports(model, flag):
+    """True when the endpoint's profile documents the capability flag (CAPABILITY_FLAGS); False for an
+    endpoint without a profile or a flag it does not set: unknown is never treated as supported."""
+    if flag not in CAPABILITY_FLAGS:
+        raise ValueError(f"Unknown capability flag: {flag}.")
+    return (profile_for(model) or {}).get(flag) is True
 
 
 def known_endpoints():

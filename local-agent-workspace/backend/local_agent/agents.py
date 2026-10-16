@@ -8,7 +8,6 @@ import uuid
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from urllib.parse import quote
 
 import httpx
 
@@ -27,8 +26,8 @@ from .context import (
     build_condense_messages, build_handoff_messages, build_summary_messages, compaction_output_allowance,
     condense_output_tokens, effective_input_budget, estimate_prior, estimate_scale,
     estimate_tokens, handoff_output_tokens, handoff_with_contents, has_earlier_turn, last_request_report,
-    model_context_window, next_request_estimate, prepare_context, summary_byte_limit, summary_output_tokens,
-    verify_declined_message,
+    model_context_window, next_request_estimate, prepare_context, scaled_estimate, summary_byte_limit,
+    summary_output_tokens, verify_declined_message,
 )
 from .tools import LIMIT as FILE_LIMIT
 from .tools import write_limit_setting
@@ -57,8 +56,10 @@ from . import spending
 from .titles import fallback_title, generate_title, needs_title
 from .telemetry import (
     InferenceError, begin_inference_call, call_estimated_dbu, finish_inference_call, http_error_kind,
-    record_response_id, reported_usage, request_tag_headers, stream_error_kind, usage_keys,
+    record_response_id, reported_usage, stream_error_kind, usage_keys,
 )
+from . import serving
+from .serving import ServingClient
 from .model_stream import ToolCallBuffer, error_body_prefix, sse_data
 from .tool_schema import validate_arguments
 from .drafts import DraftPersistenceError, STORAGE_ERRORS, StreamDraft
@@ -72,7 +73,7 @@ from .context import retained_request as context_retained
 from . import history
 from .tool_errors import tool_error_text
 from .projects import ProjectSettings
-from .model_profiles import default_limits, effective_limits, prompt_caching, thinking_reserve
+from .model_profiles import default_limits, effective_limits, known_endpoints, prompt_caching, thinking_reserve
 from . import user_paths
 from . import mentions
 from .composer_api import (MAX_QUEUED, MAX_QUEUED_CHARS, SHELL_ONE_LINE, SIDE_QUESTION_PREFIX, SIDE_TOO_LONG,
@@ -80,7 +81,7 @@ from .composer_api import (MAX_QUEUED, MAX_QUEUED_CHARS, SHELL_ONE_LINE, SIDE_QU
 import math
 import random
 from . import request_limits
-from .request_limits import LONG_REQUEST_TIMEOUT, STREAM_READ_TIMEOUT, PayloadTooLarge, check_payload, encode_payload
+from .request_limits import STREAM_READ_TIMEOUT, PayloadTooLarge, check_payload, encode_payload
 from .rate_limits import (ITPM, OTPM, CompactionOverOtpm, RATE_LIMIT_WAIT_CAP, RateLimitGate, describe, otpm_too_low,
                           parse_rate_limit, request_info_fields)
 from .context import in_turn_tokens
@@ -111,6 +112,10 @@ NETWORK_RETRY_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTime
 # Compaction is not streamed: a read failure there may follow an accepted, billed request.
 SUMMARY_NETWORK_RETRY_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout, httpx.WriteError)
 MAX_RATE_LIMIT_WAITS = 2  # Extra waits per turn after the retries, when Settings allows them.
+# The failures before a reply started after which an agent request goes once to Settings → Fallback endpoint
+# (retry reasons, once the retries and rate-limit waits are used up), and how its notice names them.
+FALLBACK_REASONS = {"network": "connection failure", "server_error": "HTTP {status}",
+                    "rate_limit": "rate limit, HTTP 429"}
 # RATE_LIMIT_WAIT_CAP (120 s) is imported from rate_limits above.
 # A request still running near Databricks' execution limit gets one notice per turn.
 EXECUTION_NOTICE_MARGIN = 10
@@ -769,6 +774,8 @@ def public_session(session, status="idle"):
 class AgentManager(LifecycleHooks):
     def __init__(self, store, settings):
         self.store, self.settings = store, settings
+        # Every model request and the endpoint listing (serving.py); tests may replace it with a ReplayClient.
+        self.serving = ServingClient(settings)
         self.live = {}
         self.tasks = {}
         self.listeners = {}
@@ -1218,18 +1225,19 @@ class AgentManager(LifecycleHooks):
             for job_id in [key for key in seen if self.jobs.get(key) is None]:
                 seen.pop(job_id, None)
 
-    async def wait_for_rate_limit(self, session, purpose, max_tokens):
-        """Wait while Databricks asked another chat to pause requests to this endpoint, plus 1 to 3
-        seconds of jitter, so a waiting chat retries after that chat's own retry rather than with it.
-        The notice's Details are that chat's 429. Stop cancels the wait."""
-        seconds = self.rate_gate.remaining(session["model"], session["id"], max_tokens)
+    async def wait_for_rate_limit(self, session, purpose, max_tokens, model=None):
+        """Wait while Databricks asked another chat to pause requests to this endpoint (model, default the
+        chat's), plus 1 to 3 seconds of jitter, so a waiting chat retries after that chat's own retry rather
+        than with it. The notice's Details are that chat's 429. Stop cancels the wait."""
+        model = model or session["model"]
+        seconds = self.rate_gate.remaining(model, session["id"], max_tokens)
         if seconds < 0.5:
             return
         jitter = self.rate_rng.uniform(1.0, 3.0)
-        details = self.rate_gate.details(session["model"])
+        details = self.rate_gate.details(model)
         await self.event(session, "notice", text=(
             f"Waiting {seconds_text(math.ceil(seconds))} before {purpose}: Databricks rate-limited another chat's request "
-            f"to {session['model']}."), **({"details": details} if details else {}))
+            f"to {model}."), **({"details": details} if details else {}))
         await asyncio.sleep(seconds + jitter)
 
     def otpm_preflight(self, session, max_tokens):
@@ -2274,7 +2282,7 @@ class AgentManager(LifecycleHooks):
             state["through"] = len(history)
         if not merge:
             history.append({"role": "user", "content": text})
-        host, token = self.settings.credentials()
+        host, token = self.serving.credentials()
         mode = session.get("permission_mode", "manual")
         tools = self.session_tools(session)
         system, _ = self.context_inputs(session, tools, mode)
@@ -2312,14 +2320,12 @@ class AgentManager(LifecycleHooks):
         call = begin_inference_call(scratch, "side_question", session["model"], max_output_tokens=reserve, attempt=1,
                                     estimated_input_tokens=estimate_tokens(messages, definitions))
         info = {"status": "running"}
-        url = host + "/serving-endpoints/" + quote(session["model"], safe="") + "/invocations"
+        url = serving.invocations_url(host, session["model"])
         try:
             # Not streamed, and a model that always thinks cannot skip thinking: allow a long answer time.
-            async with httpx.AsyncClient(timeout=httpx.Timeout(LONG_REQUEST_TIMEOUT, connect=20),
-                                         follow_redirects=False) as client:
-                response = await client.post(url, headers={"Authorization": f"Bearer {token}",
-                                                           **request_tag_headers(scratch, call),
-                                                           "Content-Type": "application/json"}, content=body)
+            async with self.serving.client(serving.LONG_TIMEOUT) as client:
+                response = await client.post(url, headers=serving.request_headers(token, scratch, call, json_body=True),
+                                             content=body)
             info["http_status"] = response.status_code
             try:
                 payload = response.json()
@@ -2429,7 +2435,7 @@ class AgentManager(LifecycleHooks):
             if completed and needs_title(session, self.redact_title):
                 previous_title = session["title"]
                 await self.status(session, "naming")
-                title = await generate_title(self.settings, session, self.store.save)
+                title = await generate_title(self.serving, session, self.store.save)
                 if title and needs_title(session, self.redact_title) and session["title"] == previous_title:
                     session.update(title=title, title_generated=True)
                     self.store.save(session)
@@ -3363,7 +3369,7 @@ class AgentManager(LifecycleHooks):
         estimated_input_tokens = estimate_tokens(messages)
         # Not streamed: a summary of a large context can take minutes; Databricks allows
         # up to 597 seconds per request.
-        timeout = httpx.Timeout(LONG_REQUEST_TIMEOUT, connect=20)
+        timeout = serving.LONG_TIMEOUT
         body = encode_payload({"messages": messages, "stream": False, "max_tokens": max_tokens})
         if len(body) > request_limits.PAYLOAD_LIMIT_BYTES:
             raise ValueError(f"The context compaction request would be {len(body) / 1_000_000:.1f} MB, above the "
@@ -3381,8 +3387,7 @@ class AgentManager(LifecycleHooks):
             # exit cannot erase a request that Databricks may already have billed.
             self.store.save(session)
             try:
-                response = await client.post(url, headers={**headers, **request_tag_headers(session, call),
-                                                           "Content-Type": "application/json"},
+                response = await client.post(url, headers=serving.call_headers(headers, session, call),
                                              content=body, timeout=timeout)
                 info = {"status": "running", "http_status": response.status_code}
                 try:
@@ -3742,7 +3747,7 @@ class AgentManager(LifecycleHooks):
         committed = False
         try:
             await self.status(session, "compacting")
-            host, token = self.settings.credentials()
+            host, token = self.serving.credentials()
             mode = session.get("permission_mode", "manual")
             tools = self.session_tools(session)
             system, guidance = self.context_inputs(session, tools, mode)
@@ -3753,14 +3758,14 @@ class AgentManager(LifecycleHooks):
                 definitions = filter_tools(session, [*TOOL_DEFINITIONS, *[tool for tool in FEATURE_TOOLS
                     if not session.get("is_subagent") or tool["function"]["name"] != "delegate_task"]])
                 warnings.append("No saved tool definitions: this preview includes built-in tools only. External tool costs refresh on the next model request.")
-            url = host + "/serving-endpoints/" + quote(session["model"], safe="") + "/invocations"
-            headers = {"Authorization": f"Bearer {token}"}
+            url = serving.invocations_url(host, session["model"])
+            headers = serving.request_headers(token)
             context_window, max_output_tokens = self.request_limits(session)
             await self.limits_notice(session)
             plan = self.handoff_plan(session, context_window)
             allowance = compaction_output_allowance(session["model"], context_window)
             record, holder = self.compaction_record(session, tools)
-            async with httpx.AsyncClient(timeout=httpx.Timeout(120, connect=20), follow_redirects=False) as client:
+            async with self.serving.client(serving.COMPACTION_CLIENT_TIMEOUT) as client:
                 summarize, condense = self.compaction_requests(
                     session, client, url, headers, preservation_note, plan and plan["tokens"], allowance)
                 _, updated, info = await prepare_context(
@@ -3793,19 +3798,24 @@ class AgentManager(LifecycleHooks):
             await self.status(session, "idle")
 
     async def model_response(self, session, event, client, url, headers, payload, retry_reason=None, body=None,
-                             effort=None, cache=None, accepted=None):
+                             effort=None, cache=None, accepted=None, fallback=None):
         """One streamed agent request. retry_reason (ledger only) names why the app sent it automatically.
         body is payload already encoded (request_limits.encode_payload); those exact bytes are sent (with
         any prompt-cache markers; payload has none). effort is the request's reasoning
         (AgentManager.reasoning_request), recorded in request_info and the ledger; a 400 that names one of
         its fields marks the error with reasoning_rejected. cache ({prompt_cache, system_tail_changed}) is
         copied into the ledger. accepted, when given, is awaited once Databricks answers HTTP 200, before
-        the stream is read."""
+        the stream is read. fallback ({model, from, reason}: AgentManager.fallback_attempt) is a request to
+        Settings → Fallback endpoint (url) instead of the chat's: request_info and the ledger name both."""
         body = encode_payload(payload) if body is None else body
         started = request_clock()
+        model = fallback["model"] if fallback else session["model"]
         # Each attempt's details describe that attempt only: an earlier attempt's http_status would make a network
         # failure look answered (never repeated) and its error_kind would stay on a reply that then succeeds.
-        info = {"model": event["request_info"].get("model", session["model"]), "status": "running"}
+        info = {"model": model if fallback else event["request_info"].get("model", session["model"]),
+                "status": "running"}
+        if fallback:
+            info.update(fallback_from=fallback["from"], fallback_reason=fallback["reason"])
         # Recorded unless the request is the plain default (no effort chosen, nothing sent or skipped).
         if effort is not None and not reasoning.plain_default(effort):
             info["reasoning"] = reasoning.request_record(effort)
@@ -3815,11 +3825,13 @@ class AgentManager(LifecycleHooks):
             for item in session.get("inference_calls", []))
         messages = payload.get("messages")
         call = begin_inference_call(
-            session, "agent", session["model"], event_id=event["id"],
+            session, "agent", model, event_id=event["id"],
             max_output_tokens=payload.get("max_tokens"), attempt=attempt,
             estimated_input_tokens=(estimate_tokens(messages, payload.get("tools", ()))
                                     if isinstance(messages, list) else None),
             retry_reason=retry_reason)
+        if fallback:
+            call["fallback_from"] = fallback["from"]  # The chat's endpoint, which failed before this attempt.
         if effort is not None and not reasoning.plain_default(effort):
             call["effort"] = effort["effort"]
             # What went out: the level sent (a mapped one on endpoints with fewer levels), or none
@@ -3857,8 +3869,7 @@ class AgentManager(LifecycleHooks):
                 draft.changed()
                 await self.broadcast(session["id"], {"type": "event", "event": event})
         try:
-            async with client.stream("POST", url, headers={**headers, **request_tag_headers(session, call),
-                                                           "Content-Type": "application/json"},
+            async with client.stream("POST", url, headers=serving.call_headers(headers, session, call),
                                      content=body) as response:
                 info["http_status"] = response.status_code
                 draft.changed()
@@ -3881,7 +3892,9 @@ class AgentManager(LifecycleHooks):
                             parsed = json.loads(error_text)
                         except (json.JSONDecodeError, TypeError, ValueError):
                             parsed = None
-                        error, rate = self.rate_limit_error(session, error, response.headers, parsed,
+                        # A fallback's 429 is the fallback endpoint's (its rate-limit pause and OTPM limit).
+                        error, rate = self.rate_limit_error(session if not fallback else {**session, "model": model},
+                                                            error, response.headers, parsed,
                                                             payload.get("max_tokens"), diagnostic)
                         info["rate_limit"] = rate_limit_fields(rate, response.headers, parsed)
                     elif response.status_code in SERVER_RETRY_STATUSES:
@@ -4086,6 +4099,79 @@ class AgentManager(LifecycleHooks):
             "context → Prompt caching to Off."))
         await self.reply_after_notices(session, event)
 
+    def fallback_allowed(self, name, extra=()):
+        """True for an endpoint agent requests may fall back to, as for a custom agent's model: one with built-in
+        facts (model_profiles) or one the user already uses (custom_agents.used_endpoints), extra (a Settings
+        save's models) counted as used. Requests carry the conversation, so never an endpoint nobody chose."""
+        name = name.strip() if isinstance(name, str) else ""
+        if not name:
+            return False
+        if name.lower() in {item["model"] for item in known_endpoints()}:
+            return True
+        used = custom_agents.used_endpoints(self.settings, self.store.list())
+        return name in used | {item.strip() for item in extra if isinstance(item, str)}
+
+    def fallback_endpoint(self, session):
+        """Settings → Fallback endpoint for this chat's agent requests, or None (none set, or the chat's own)."""
+        name = self.settings.values.get("fallback_model")
+        name = name.strip() if isinstance(name, str) else ""
+        return name if name and name.lower() != str(session.get("model") or "").strip().lower() else None
+
+    async def fallback_attempt(self, session, error, host, messages, definitions, prefix):
+        """The one request to Settings → Fallback endpoint after this agent request failed before its reply
+        started (error: a connection failure, HTTP 502/503/504 or a 429, its retries and rate-limit waits used
+        up): {model, from, reason, url, payload, body, effort, cache, max_tokens}, or None (with a notice when a
+        fallback is set but cannot take this request). The fallback request carries the prepared messages
+        with the fallback's own limits, reasoning fields and cache markers, and never another endpoint's
+        (signed) reasoning (reasoning.without_reasoning). Never for compaction, titles or /btw."""
+        fallback = self.fallback_endpoint(session)
+        reason = FALLBACK_REASONS.get(getattr(error, "retry_reason", None))
+        if fallback is None or reason is None or not getattr(error, "retryable", False):
+            return None
+        primary, reason = session["model"], reason.format(status=error.http_status)
+        target = {**session, "model": fallback}  # Read by the request helpers only, never saved.
+        context_window, max_tokens = self.request_limits(target)
+        effort = self.reasoning_request(target)
+        messages = reasoning.without_reasoning(messages)
+        # The system message names the response limit (output_limit_text): the fallback's own, not the chat's.
+        system = messages[0] if messages and messages[0].get("role") == "system" else {}
+        stated = output_limit_text(self.request_limits(session)[1], thinking=bool(thinking_reserve(primary)))
+        limit_text = output_limit_text(max_tokens, thinking=bool(thinking_reserve(fallback)))
+        content = system.get("content")
+        if (isinstance(content, str) and stated != limit_text and content.count(stated) == 1
+                and content.index(stated) < prefix):
+            messages = [{**system, "content": content.replace(stated, limit_text)}, *messages[1:]]
+            prefix += len(limit_text) - len(stated)  # Where the stable text ends moves with it.
+        payload = {"messages": messages, "tools": definitions, "stream": True, "max_tokens": max_tokens,
+                   **effort["fields"]}
+        needed = scaled_estimate(payload["messages"], definitions,
+                                 estimate_scale(session.get("inference_calls"), fallback))
+        budget = effective_input_budget(context_window, max_tokens, model_context_window(fallback))
+        body, cache = self.cache_body(payload, prefix, self.cache_level(target))
+        if not self.fallback_allowed(fallback):
+            skipped = "it is neither an endpoint with built-in limits nor one you use"
+        elif needed > budget:
+            skipped = (f"this conversation's request (about {needed:,} tokens) does not fit its input budget of "
+                       f"{budget:,} tokens")
+        elif len(body) > request_limits.PAYLOAD_LIMIT_BYTES:
+            skipped = "the request is above the 4 MB request limit"
+        elif self.otpm_preflight(target, max_tokens) is not None:
+            skipped = (f"its {max_tokens:,} max output tokens are above the output-tokens-per-minute limit Databricks "
+                       "reported for it")
+        else:
+            skipped = None
+        if skipped:
+            await self.event(session, "notice", text=(
+                f"{primary} failed before the reply started ({reason}). The fallback endpoint {fallback} was not "
+                f"tried: {skipped}."))
+            return None
+        await self.event(session, "notice", text=(
+            f"{primary} failed before the reply started ({reason}, after the automatic retries), so the app sent "
+            f"this request once to the fallback endpoint {fallback} (Settings → Model and context). The next "
+            f"request tries {primary} again."))
+        return {"model": fallback, "from": primary, "reason": reason, "url": serving.invocations_url(host, fallback),
+                "payload": payload, "body": body, "effort": effort, "cache": cache, "max_tokens": max_tokens}
+
     async def note_last_request(self, session, call):
         """Show what Databricks reported for this agent request in the context meter. Never raises."""
         try:
@@ -4274,7 +4360,7 @@ class AgentManager(LifecycleHooks):
         return None
 
     async def _run_databricks(self, session, prompt, external_tools, content=None):
-        host, token = self.settings.credentials()
+        host, token = self.serving.credentials()
         mode = session.get("permission_mode", "manual")
         tools = self.session_tools(session)
         definitions = filter_tools(session, [*TOOL_DEFINITIONS, *[tool for tool in FEATURE_TOOLS
@@ -4311,11 +4397,10 @@ class AgentManager(LifecycleHooks):
         # After mark_user_in_wire: the notice saves, and a save must not hold the prompt with in_wire False.
         await self.limits_notice(session)
         default_reply_reserve = default_limits(session["model"])[1]
-        url = host + "/serving-endpoints/" + quote(session["model"], safe="") + "/invocations"
-        headers = {"Authorization": f"Bearer {token}"}
+        url = serving.invocations_url(host, session["model"])
+        headers = serving.request_headers(token)
         # A prefill of a large context with adaptive thinking can stay silent for minutes.
-        timeout = httpx.Timeout(connect=20, read=STREAM_READ_TIMEOUT, write=120, pool=20)
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+        async with self.serving.client(serving.stream_timeout(STREAM_READ_TIMEOUT)) as client:
             steps = (session.get("max_steps", 6) if session.get("is_subagent")
                      else self.settings.values.get("max_agent_steps", DEFAULT_MAX_AGENT_STEPS))
             # What the chat had spent and how many calls it had before this turn (the step-limit notice).
@@ -4399,22 +4484,30 @@ class AgentManager(LifecycleHooks):
                     # up to MAX_RATE_LIMIT_WAITS longer waits per turn when Settings allows them.
                     # A 400 to a request with cache markers sends it again one level lower; lowered holds that
                     # level until Databricks accepts it (its own budget: the transient one is not used).
-                    transient_attempt, reasoning_resent, lowered = 0, False, {}
+                    # After those, one request to Settings → Fallback endpoint (fallback, fallback_attempt) when the
+                    # failure came before the reply started; the next step tries the chat's endpoint again.
+                    transient_attempt, reasoning_resent, lowered, fallback = 0, False, {}, None
                     while True:
                         try:
                             # Another chat's 429 on this endpoint: wait with it instead of adding to the overload.
-                            await self.wait_for_rate_limit(session, "the model request", max_output_tokens)
+                            await self.wait_for_rate_limit(
+                                session, "the model request", fallback["max_tokens"] if fallback else max_output_tokens,
+                                model=fallback and fallback["model"])
                             await self.reply_after_notices(session, event)
                             # Compared with the tail of the chat's last request Databricks answered (HTTP 200), so
                             # a failed attempt moves nothing and the attempt that is served keeps the flag.
                             previous_tail = self.system_tails.get(session["id"])
                             ordered_calls, arguments = await self.model_response(
-                                session, event, client, url, headers, payload, retry_reason=retry_reason, body=body,
+                                session, event, client, fallback["url"] if fallback else url, headers, payload,
+                                retry_reason=retry_reason, body=body,
                                 effort=effort, cache={"prompt_cache": cache_sent,
                                                       "system_tail_changed": previous_tail not in (None, tail)},
-                                accepted=lambda: self.request_accepted(session, event, tail, lowered))
+                                accepted=lambda: self.request_accepted(session, event, tail, lowered),
+                                fallback=fallback)
                             break
                         except InferenceError as exc:
+                            if fallback is not None:
+                                raise  # One fallback attempt: its own failure ends the request.
                             field = getattr(exc, "reasoning_rejected", None)
                             # A 400 that names caching to a request with markers goes down the cache levels first,
                             # even when it also mentions a reasoning term; other reasoning-field 400s come first.
@@ -4474,7 +4567,13 @@ class AgentManager(LifecycleHooks):
                                 if exc.retry_reason == "rate_limit" and (
                                         advice := self.itpm_advice(session, getattr(exc, "rate_limit", None))):
                                     exc.args = (str(exc) + advice,)
-                                raise
+                                fallback = await self.fallback_attempt(session, exc, host, messages, definitions,
+                                                                       prefix)
+                                if fallback is None:
+                                    raise exc
+                                payload, body, effort = fallback["payload"], fallback["body"], fallback["effort"]
+                                cache_sent, lowered, retry_reason = fallback["cache"], {}, "fallback"
+                                continue
                             details = rate_limit_details(exc) if exc.retry_reason == "rate_limit" else None
                             if exc.retry_reason == "rate_limit":
                                 self.rate_gate.note(session["model"], session["id"], delay,
