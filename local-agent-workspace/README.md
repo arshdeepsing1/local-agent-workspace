@@ -1308,29 +1308,32 @@ columns.
 agent and subagent requests. When the chat's endpoint fails before a reply starts (no connection,
 HTTP 502, 503 or 504, or HTTP 429) and the automatic retries are used up (and, for a rate limit, the
 automatic waits too; see **Request details**), the app sends that one request to the fallback
-endpoint, with a notice naming both. It is never used after the reply started, for HTTP 400, 401,
-403 or 500, for a content-filter stop, or for titles, `/btw` side questions and compaction. Only one
-request goes there: the next request, also the next step of the same turn, tries the chat's endpoint
-again, and the chat keeps its own endpoint. When the fallback request fails too, its error ends the
-request.
+endpoint, with a notice naming both. With **Settings → Continue automatically after rate limits**
+off there are no waits, so a rate-limited request goes to the fallback right after the retries. It
+is never used after the reply started, for HTTP 400, 401, 403 or 500, for a content-filter stop, or
+for titles, `/btw` side questions and compaction. Only one request goes there: the next request,
+also the next step of the same turn, tries the chat's endpoint again, and the chat keeps its own
+endpoint. When the fallback request fails too, its error ends the request.
 
 The fallback request carries the same prepared conversation with the fallback endpoint's own limits
-(its context window and Max output tokens, as for a chat on that endpoint), its own reasoning fields
-(see **Reasoning effort and thinking**: GPT OSS gets `reasoning_effort`, Claude the `thinking` fields)
-and its own prompt-cache markers (none for GPT OSS). A conversation that does not fit the fallback's
-input budget, for example a long Claude chat on GPT OSS 120B with its 131,072-token window, is not
-sent there: a notice says so and the original error stands. Requests never carry the model's
-reasoning (thinking text or signatures) back in the history, and a fallback request drops any, so no
-endpoint receives another's.
+(its context window and Max output tokens, as for a chat on that endpoint; for an endpoint whose
+context window the app does not know, such as GPT OSS 20B, Claude Opus 4.8 or a typed name, budgets
+you customised count only up to its defaults of 131,072 and 8,192 tokens unless it is the Settings
+model), its own reasoning fields (see **Reasoning effort and thinking**: GPT OSS gets
+`reasoning_effort`, Claude the `thinking` fields) and its own prompt-cache markers (none for GPT
+OSS). A conversation that does not fit the fallback's input budget, for example a long Claude chat
+on GPT OSS 120B with its 131,072-token window, is not sent there: a notice says so and the original
+error stands. Requests never carry the model's reasoning (thinking text or signatures) back in the
+history, and a fallback request drops any, so no endpoint receives another's.
 
-Because each request carries the conversation, Settings accepts only an endpoint with built-in limits
-(the ones the endpoint chooser labels) or one you already use: the Settings model, a Settings →
-Subagents model or the model of one of your chats (the same rule as a custom agent's model).
-**Other endpoint…** takes a typed name; chats on the fallback endpoint itself have no fallback. The
-reply's **Request details** show **Answered by** with the fallback (**Sent to** when it failed too)
-and **Fallback from** with the chat's endpoint and why it failed; **Agent tools → Usage** lists the
-call under the fallback endpoint, priced at that endpoint's rates (an endpoint without price data,
-such as GPT OSS, is not counted by the spending limit, as for any other call).
+Because each request carries the conversation, Settings accepts only an endpoint the app knows (the
+ones the endpoint chooser labels) or one you already use: the Settings model, a Settings → Subagents
+model or the model of one of your chats (the same rule as a custom agent's model). **Other
+endpoint…** takes a typed name; chats on the fallback endpoint itself have no fallback. The reply's
+**Request details** show **Answered by** with the fallback (**Sent to** when it failed too) and
+**Fallback from** with the chat's endpoint and why it failed; **Agent tools → Usage** lists the call
+under the fallback endpoint, priced at that endpoint's rates (an endpoint without price data, such
+as GPT OSS, is not counted by the spending limit, as for any other call).
 
 ### Context and project instructions
 

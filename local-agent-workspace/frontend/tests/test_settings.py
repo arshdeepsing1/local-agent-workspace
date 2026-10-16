@@ -100,7 +100,7 @@ def test_the_fallback_endpoint_is_chosen_in_the_model_group_and_saved(ui, page):
     group = dialog.get_by_role("group", name="Model and context")
     fallback = group.get_by_role("combobox", name="Fallback endpoint")
     expect(fallback).to_have_value("")
-    # Endpoints with built-in limits, never the model endpoint itself, and a typed name for one a chat uses.
+    # The endpoints the app knows, never the model endpoint itself, and a typed name for one a chat uses.
     expect(fallback.locator("option")).to_have_text([
         "None", "Claude Opus 5.5 · databricks-claude-opus-5-5", "Claude Opus 4.8 · databricks-claude-opus-4-8",
         "GPT OSS 120B · databricks-gpt-oss-120b", "GPT OSS 20B · databricks-gpt-oss-20b", "Other endpoint…"])

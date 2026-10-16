@@ -84,7 +84,7 @@ function endpointChoices(settings, connection) {
   return names.map(name => ({ value: name, label: `${labels.get(name) || modelLabel(name)} · ${name}` }))
 }
 
-// Settings → Fallback endpoint's list: endpoints with built-in limits, those Settings → Subagents name and the saved
+// Settings → Fallback endpoint's list: the endpoints the app knows, those Settings → Subagents name and the saved
 // one, without the model endpoint unless the form has it (chats on it then have no fallback). The server also
 // accepts an endpoint one of your chats uses, typed with Other endpoint… (AgentManager.fallback_allowed).
 function fallbackChoices(settings, form, model) {
@@ -323,7 +323,7 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
           onInput=${e => field('fallback_model', e.currentTarget.value)} placeholder="An endpoint one of your chats uses" /></label>` : null}
         ${fallback && fallback === model ? html`<p class="settings-note" role="status">This is the model endpoint: chats on it have no fallback.</p>` : null}
         <p class="field-help">When the model endpoint fails before a reply starts (no connection, HTTP 502, 503 or 504, or a rate limit) and the automatic retries do not help, that one request goes to this endpoint. The next request tries the model endpoint again.</p>
-        <${More} topic="fallback endpoint">The request uses the fallback's own limits, reasoning fields and prompt caching, and is not sent when the conversation does not fit its context window. Titles, /btw and compaction never fall back. Only endpoints with built-in limits or ones you already use (here, in Subagents or in a chat) are accepted, because each request carries the conversation. Request details then show Answered by with the fallback, and its usage is priced at that endpoint's rates.<//>`)}
+        <${More} topic="fallback endpoint">The request uses the fallback's own limits, reasoning fields and prompt caching, and is not sent when the conversation does not fit its context window (or, when the app does not know that window, its default context budget). Titles, /btw and compaction never fall back. Only endpoints the app knows or ones you already use (here, in Subagents or in a chat) are accepted, because each request carries the conversation. Request details then show Answered by with the fallback, and its usage is priced at that endpoint's rates.<//>`)}
         ${group('reasoning', html`
         <label>Default effort for new chats<select value=${effort} onChange=${e => field('reasoning_effort', e.currentTarget.value)}>
           ${levels.map(level => html`<option key=${level.value} value=${level.value}>${levelLabel(level)}</option>`)}

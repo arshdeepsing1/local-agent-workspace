@@ -396,7 +396,7 @@ def create_app(settings=None):
         sent = [entry.get("model") for entry in (body.subagent_defaults or {}).values() if isinstance(entry, dict)]
         if (ENDPOINT_NAME.match(fallback) and fallback != settings.values.get("fallback_model")
                 and not manager.fallback_allowed(fallback, [body.model, *sent])):
-            raise ValueError(f"The fallback endpoint {fallback} is neither an endpoint with built-in limits nor one "
+            raise ValueError(f"The fallback endpoint {fallback} is neither an endpoint the app knows nor one "
                              "you use (the Settings model, Settings → Subagents or one of your chats). Requests carry "
                              "the conversation, so the app sends them only to endpoints you already chose.")
         result = settings.update(body.model_dump(exclude_none=True))

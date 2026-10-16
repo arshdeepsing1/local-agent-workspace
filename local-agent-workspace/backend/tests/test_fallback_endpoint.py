@@ -5,6 +5,7 @@ import json
 import re
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -14,12 +15,14 @@ from local_agent.reasoning import without_reasoning
 from local_agent.agents import AgentManager, MAX_TRANSIENT_RETRIES, output_limit_text
 from local_agent.api import create_app
 from local_agent.config import Settings
+from local_agent.context import effective_input_budget
 from local_agent.model_profiles import thinking_reserve
 from local_agent.serving import ReplayClient, sse_chunks
 from local_agent.store import Store
 from local_agent.telemetry import REQUEST_TAGS_HEADER, estimated_dbu, session_metrics
 
 OPUS, OPUS_48, GPT = "databricks-claude-opus-5-5", "databricks-claude-opus-4-8", "databricks-gpt-oss-120b"
+GPT_20B = "databricks-gpt-oss-20b"  # Reasoning like GPT OSS 120B; no limits in model_profiles.
 USAGE = {"prompt_tokens": 1_000, "completion_tokens": 20}
 RATE_LIMITED = {"error_code": "REQUEST_LIMIT_EXCEEDED", "message": "Exceeded workspace rate limit"}
 
@@ -211,6 +214,95 @@ async def test_a_conversation_too_large_for_the_fallback_is_not_sent_there(runti
     assert any(event["type"] == "error" and "HTTP 503" in event["text"] for event in session["events"])
 
 
+@pytest.mark.parametrize("settings_model, sent_max_tokens", [(OPUS, 8_192), (GPT_20B, 32_000)])
+async def test_a_fallback_without_a_known_window_keeps_to_its_default_budgets(runtime, delays, settings_model,
+                                                                              sent_max_tokens):
+    manager, session = runtime
+    # Budgets customised for the chat's endpoint; the app does not know GPT OSS 20B's window.
+    manager.settings.values.update(context_window=1_000_000, max_output_tokens=32_000, fallback_model=GPT_20B)
+    failing = agent({"model": OPUS, "status": 503, "text": "busy", "times": 1 + MAX_TRANSIENT_RETRIES})
+    if settings_model == OPUS:
+        transport = replay(manager, failing)
+        await manager.run(session, "Summarize this: " + "lorem ipsum " * 50_000)
+        assert transport.unmatched == [] and transport.bodies(GPT_20B) == []
+        assert notices(session)[-1].endswith(
+            f"does not fit its input budget of {effective_input_budget(131_072, 8_192):,} tokens.")
+    # A request that fits goes there with its default output limit, or the Settings one on the Settings model,
+    # whose budgets are the ones customised for it.
+    manager.settings.values["model"] = settings_model
+    second = manager.store.create({**manager.settings.values, "model": OPUS})
+    second.update(title="Short", title_generated=True)
+    transport = replay(manager, failing, agent({"model": GPT_20B, "chunks": sse_chunks("Short.")}))
+    await manager.run(second, "A short question")
+    assert transport.unmatched == [] and transport.remaining() == []
+    body = transport.bodies(GPT_20B)[0]
+    assert body["max_tokens"] == sent_max_tokens and transport.bodies(OPUS)[0]["max_tokens"] == 32_000
+    assert output_limit_text(sent_max_tokens, thinking=False) in body["messages"][0]["content"]
+    assert replies(second)[-1]["request_info"]["model"] == GPT_20B
+
+
+@pytest.mark.parametrize("steps", [6, 1])
+async def test_an_output_limit_on_the_fallback_names_that_requests_own_limit(runtime, delays, steps):
+    manager, session = runtime
+    manager.settings.values["max_agent_steps"] = steps
+    transport = replay(manager, agent({"model": OPUS, "status": 503, "text": "busy", "times": 1 + MAX_TRANSIENT_RETRIES}),
+                       agent({"model": GPT, "chunks": sse_chunks("Cut", "length")}),
+                       *([agent({"model": OPUS, "chunks": sse_chunks("Done.")})] if steps > 1 else []))
+    await manager.run(session, "Hello")
+    assert transport.unmatched == [] and transport.remaining() == []
+    assert transport.bodies(GPT)[0]["max_tokens"] == 8_192 and transport.bodies(OPUS)[0]["max_tokens"] == 16_384
+    if steps > 1:
+        assert notices(session)[-1] == ("The response reached the 8,192-token output limit; no tools from it ran. "
+                                        "Automatically continuing in smaller steps (1 of 2).")
+        assert replies(session)[-1]["text"] == "Done."
+    else:
+        errors = [event["text"] for event in session["events"] if event["type"] == "error"]
+        assert errors[-1].startswith("The model reached the 8,192-token output limit on the final configured model "
+                                     "request (1).")
+
+
+async def test_a_chat_answered_by_the_fallback_can_be_exported_and_forked(tmp_path, monkeypatch, delays):
+    monkeypatch.setattr("local_agent.config.APP_ROOT", tmp_path)
+    monkeypatch.setenv("LOCAL_AGENT_MODEL", OPUS)
+    project = tmp_path / "project"
+    project.mkdir()
+    settings = Settings(tmp_path / "state")
+    settings.values.update(workspace=str(project), env_file="", fallback_model=GPT)
+    app = create_app(settings)
+    manager = app.state.manager
+    try:
+        session = manager.store.create(settings.values)
+        session.update(title="Fallback", title_generated=True)
+        transport = replay(manager, agent({"model": OPUS, "status": 503, "text": "busy",
+                                           "times": 1 + MAX_TRANSIENT_RETRIES}),
+                           agent({"model": GPT, "chunks": sse_chunks("From the fallback.")}),
+                           agent({"model": OPUS, "chunks": sse_chunks("From the chat's endpoint.")}))
+        await manager.run(session, "Hello")
+        await manager.run(session, "Again")
+        assert transport.unmatched == [] and transport.remaining() == []
+
+        def answered(events):
+            return [(event["text"], event["request_info"]["model"], event["request_info"].get("fallback_from"),
+                     event["request_info"].get("fallback_reason")) for event in events if event["type"] == "assistant"]
+        expected = [("From the fallback.", GPT, OPUS, "HTTP 503"), ("From the chat's endpoint.", OPUS, None, None)]
+        assert answered(session["events"]) == expected
+        second_message = [event for event in session["events"] if event["type"] == "user"][1]
+        transport_app = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport_app, base_url="http://testserver") as client:
+            client.headers["X-Local-Token"] = (await client.get("/api/bootstrap")).json()["token"]
+            exported = await client.get(f"/api/sessions/{session['id']}/export")
+            assert exported.status_code == 200, exported.text
+            assert answered(exported.json()["sessions"][0]["events"]) == expected
+            whole = await client.post(f"/api/sessions/{session['id']}/fork")
+            cut = await client.post(f"/api/sessions/{session['id']}/fork",
+                                    json={"before_event_id": second_message["id"]})
+        assert whole.status_code == 201 and cut.status_code == 201, (whole.text, cut.text)
+        assert answered(manager.store.get(whole.json()["id"])["events"]) == expected
+        assert answered(manager.store.get(cut.json()["id"])["events"]) == expected[:1]
+    finally:
+        manager.store.db.close()
+
+
 async def test_a_fallback_nobody_chose_is_not_sent_the_conversation(runtime, delays):
     manager, session = runtime
     manager.settings.values["fallback_model"] = "databricks-unlisted-model"  # A hand-edited settings file.
@@ -218,8 +310,8 @@ async def test_a_fallback_nobody_chose_is_not_sent_the_conversation(runtime, del
     transport = replay(manager, failing)
     await manager.run(session, "Hello")
     assert transport.unmatched == [] and notices(session)[-1].endswith(
-        "The fallback endpoint databricks-unlisted-model was not tried: it is neither an endpoint with built-in "
-        "limits nor one you use.")
+        "The fallback endpoint databricks-unlisted-model was not tried: it is neither an endpoint the app knows "
+        "nor one you use.")
     # Once one of the user's own chats uses it, it may answer.
     manager.store.create({**manager.settings.values, "model": "databricks-unlisted-model"})
     transport = replay(manager, failing, agent({"model": "databricks-unlisted-model", "chunks": sse_chunks("Hi.")}))
@@ -285,7 +377,7 @@ def test_settings_accept_only_an_endpoint_the_app_knows_or_the_user_uses(tmp_pat
         assert save(fallback_model=OPUS).json()["fallback_model"] == OPUS
         assert "letters, digits" in save(fallback_model="not a name!").json()["detail"]
         refused = save(fallback_model="databricks-unlisted-model")
-        assert refused.status_code == 400 and "neither an endpoint with built-in limits" in refused.json()["detail"]
+        assert refused.status_code == 400 and "neither an endpoint the app knows" in refused.json()["detail"]
         saved = save(fallback_model=" " + GPT + " ")
         assert saved.status_code == 200 and saved.json()["fallback_model"] == GPT
         assert json.loads(settings.path.read_text())["fallback_model"] == GPT

@@ -4131,6 +4131,12 @@ class AgentManager(LifecycleHooks):
         primary, reason = session["model"], reason.format(status=error.http_status)
         target = {**session, "model": fallback}  # Read by the request helpers only, never saved.
         context_window, max_tokens = self.request_limits(target)
+        if (model_context_window(fallback) is None
+                and fallback.lower() != str(self.settings.values.get("model") or "").strip().lower()):
+            # No known window (GPT OSS 20B, Opus 4.8, a typed endpoint): budgets customised for another endpoint
+            # count only up to this one's defaults, as for a subagent on its own endpoint (base_limits).
+            own = default_limits(fallback)
+            context_window, max_tokens = min(context_window, own[0]), min(max_tokens, own[1])
         effort = self.reasoning_request(target)
         messages = reasoning.without_reasoning(messages)
         # The system message names the response limit (output_limit_text): the fallback's own, not the chat's.
@@ -4149,7 +4155,7 @@ class AgentManager(LifecycleHooks):
         budget = effective_input_budget(context_window, max_tokens, model_context_window(fallback))
         body, cache = self.cache_body(payload, prefix, self.cache_level(target))
         if not self.fallback_allowed(fallback):
-            skipped = "it is neither an endpoint with built-in limits nor one you use"
+            skipped = "it is neither an endpoint the app knows nor one you use"
         elif needed > budget:
             skipped = (f"this conversation's request (about {needed:,} tokens) does not fit its input budget of "
                        f"{budget:,} tokens")
@@ -4615,6 +4621,8 @@ class AgentManager(LifecycleHooks):
                         continue
                     if exc.kind != "output_limit":
                         raise
+                    # The limit of the request that stopped: a fallback request carries its endpoint's own.
+                    stopped_at = fallback["max_tokens"] if fallback else max_output_tokens
                     if consecutive_output_retries < MAX_OUTPUT_LIMIT_RETRIES and has_another_step:
                         consecutive_output_retries += 1
                         await self.update_event(
@@ -4624,16 +4632,16 @@ class AgentManager(LifecycleHooks):
                         self.store.save(session)
                         await self.event(
                             session, "notice",
-                            text=(f"The response reached the {max_output_tokens:,}-token output limit; no tools "
+                            text=(f"The response reached the {stopped_at:,}-token output limit; no tools "
                                   f"from it ran. Automatically continuing in smaller steps "
                                   f"({consecutive_output_retries} of {MAX_OUTPUT_LIMIT_RETRIES})."))
                         retry_reason = "output_limit"
                         continue
                     if not has_another_step:
-                        detail = (f"The model reached the {max_output_tokens:,}-token output limit on the final "
+                        detail = (f"The model reached the {stopped_at:,}-token output limit on the final "
                                   f"configured model request ({steps}).")
                     else:
-                        detail = (f"The model still reached the {max_output_tokens:,}-token output limit after "
+                        detail = (f"The model still reached the {stopped_at:,}-token output limit after "
                                   "two automatic retries.")
                     raise InferenceError(
                         detail + " No tools from the last response ran. Raise Max output tokens or Agent steps "
