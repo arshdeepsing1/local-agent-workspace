@@ -1,9 +1,11 @@
+import json
 from pathlib import Path
+from typing import Literal
 
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
-from . import approvals, custom_agents
+from . import approvals, custom_agents, mcp_import
 from .agents import public_session
 from .approvals import busy_conflict, busy_status, ensure_idle
 from .planning import transcript_name
@@ -43,6 +45,11 @@ class SkillRequest(BaseModel):
 
 class SubagentProfileRequest(BaseModel):
     tool_profile: str = Field(strict=True, max_length=32)
+
+
+class ImportRequest(BaseModel):
+    source: Literal["project", "desktop", "text"]
+    text: str = Field(default="", max_length=mcp_import.MAX_FILE_BYTES)
 
 
 def register_features(app, manager, settings, store, session_or_404, workspace_tools, ui_tools=None):
@@ -220,6 +227,48 @@ def register_features(app, manager, settings, store, session_or_404, workspace_t
     async def test_extensions():
         extensions_idle()
         return await manager.extensions.test()
+
+    @app.post("/api/extensions/import")
+    async def import_extensions(body: ImportRequest, session_id: str | None = None):
+        """A preview of the MCP servers in this chat's project .mcp.json, the Claude desktop app's
+        configuration or pasted JSON, as disabled entries: nothing is saved or started, and no
+        environment or header value is returned (each becomes a secret reference)."""
+        existing = [server["id"] for server in manager.extensions.public_config()["servers"]]
+        tokens = manager.redaction_tokens()
+        shown = None
+        try:
+            if body.source == "text":
+                return {"source": "text", **mcp_import.parse_text(body.text, existing, tokens)}
+            if body.source == "project":
+                tools = workspace_tools(session_id)
+                path, shown = tools.root / ".mcp.json", ".mcp.json"
+                if path.is_symlink():
+                    raise ValueError(".mcp.json is a symbolic link; only a regular file is imported.")
+                tools.path(".mcp.json")  # Credential and excluded-folder checks.
+            else:
+                path = mcp_import.desktop_config_path()
+                shown = str(path)
+            text = mcp_import.read_config_file(path, settings.values.get("env_file"))
+            data = json.loads(text)
+        except FileNotFoundError:
+            raise HTTPException(404, f"No {shown or 'configuration file'} was found.") from None
+        except json.JSONDecodeError as error:
+            raise HTTPException(400, f"{shown} is not valid JSON ({error.msg} at line {error.lineno}).") from None
+        except (ValueError, UnicodeError, OSError) as error:
+            raise HTTPException(400, settings.redact(str(error))) from None
+        try:
+            return {"source": body.source, "path": shown, **mcp_import.parse(data, existing, tokens)}
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from None
+
+    @app.get("/api/sessions/{session_id}/tool-images/{image_id}")
+    async def tool_image(session_id: str, image_id: str):
+        """An image an MCP tool returned in this chat, kept in memory for its card ({mime_type, data})."""
+        session_or_404(session_id)
+        image = manager.results.image(session_id, image_id)
+        if image is None:
+            raise HTTPException(404, "This image is no longer available: images are kept in memory until the app restarts.")
+        return image
 
     @app.get("/api/skills")
     async def skills(session_id: str | None = None):

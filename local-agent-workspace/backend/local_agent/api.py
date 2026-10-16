@@ -628,6 +628,7 @@ def create_app(settings=None):
                 manager.task_board.delete_session(member)
                 manager.checkpoints.delete_session(member)
                 manager.changes.delete_session(member)
+                manager.results.delete_session(member)
                 store.delete(member)
                 manager.live.pop(member, None)
                 manager.statuses.pop(member, None)

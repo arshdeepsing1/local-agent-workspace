@@ -8,7 +8,7 @@ from . import custom_agents
 from .permissions import denied_tools
 from .reasoning import EFFORT_LABELS
 from .spending import own_spend
-from .tool_profiles import PROFILES, child_profile, covering_tool, validate_profile
+from .tool_profiles import PROFILES, child_profile, covering_tool, server_off, validate_profile
 
 
 class TaskManager:
@@ -515,7 +515,8 @@ class DelegateManager:
         disabled = parent.get("disabled_tools") or []
         saved = self.manager.rules.rules(parent["workspace"])
         denied = denied_tools(parent.get("allow_rules") or [], saved["project"], saved["user"], tools)
-        usable = [name for name in tools if name not in denied and name not in disabled and not covering_tool(name, disabled)]
+        usable = [name for name in tools if name not in denied and name not in disabled and not covering_tool(name, disabled)
+                  and not server_off(name, disabled)]
         if not usable:
             raise ValueError(f"None of the {spec['name']} agent's tools ({', '.join(tools)}) is available in this chat: "
                              "each is turned off or blocked by a deny rule. Use another agent_type.")

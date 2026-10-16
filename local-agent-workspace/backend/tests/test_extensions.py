@@ -57,8 +57,13 @@ def test_config_validation(config):
 def test_http_config_and_server_caps():
     server = {"id": "remote", "transport": "http", "url": "https://example.com/mcp", "enabled": True}
     assert validate_config({"servers": [server]})["servers"][0]["url"] == server["url"]
-    with pytest.raises(ValueError, match="at most 4"):
+    with pytest.raises(ValueError, match="Enable at most 4 MCP servers"):
         validate_config({"servers": [{**server, "id": f"remote{n}"} for n in range(5)]})
+    # Up to 12 configured, 4 of them enabled.
+    many = [{**server, "id": f"remote{n}", "enabled": n < 4} for n in range(12)]
+    assert len(validate_config({"servers": many})["servers"]) == 12
+    with pytest.raises(ValueError, match="at most 12"):
+        validate_config({"servers": [*many, {**server, "id": "remote12", "enabled": False}]})
 
 
 def test_hook_selectors_and_failure_phase_roundtrip(manager):

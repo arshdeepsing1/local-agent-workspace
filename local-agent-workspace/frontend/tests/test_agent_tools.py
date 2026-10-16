@@ -310,9 +310,15 @@ def test_rejected_task_update_keeps_previous_status(ui, page):
     expect(page.get_by_role("checkbox", name="Complete task Inspect source")).not_to_be_checked()
 
 
+def json_editor(page):
+    """The Extensions editor's JSON view (the form is the default)."""
+    page.get_by_role("button", name="Edit as JSON").click()
+    return page.get_by_role("textbox", name="Extension configuration (JSON)")
+
+
 def test_extensions_save_test_and_skill_toggle(ui, page):
     open_tab(ui, page, "Extensions")
-    editor = page.get_by_role("textbox", name="Extension configuration (JSON)")
+    editor = json_editor(page)
     expect(editor).to_have_value(re.compile("servers"))
     config = {"servers": [{"id": "example", "name": "Example", "transport": "stdio", "command": "example-server", "args": [], "enabled": True}], "hooks": []}
     editor.fill(json.dumps(config))
@@ -330,7 +336,7 @@ def test_extensions_save_test_and_skill_toggle(ui, page):
 
 def test_invalid_extension_json_is_not_sent(ui, page):
     open_tab(ui, page, "Extensions")
-    editor = page.get_by_role("textbox", name="Extension configuration (JSON)")
+    editor = json_editor(page)
     expect(editor).to_have_value(re.compile("servers"))
     editor.fill("not JSON")
     page.get_by_role("button", name="Save configuration").click()
@@ -342,7 +348,7 @@ def test_extension_editor_locked_while_loading_and_saving(ui, page):
     open_tab(ui, page, "Extensions", """const loading = fake.defer('loading'), saving = fake.defer('saving')
       fake.override = (path, options) => path === '/api/extensions' ? (options.method === 'PUT' ? saving.promise
         : loading.promise.then(response => response.clone())) : undefined  // The Overview reads it too.""")
-    editor = page.get_by_role("textbox", name="Extension configuration (JSON)")
+    editor = json_editor(page)
     expect(editor).to_be_disabled()
     expect(page.get_by_role("button", name="Save configuration")).to_be_disabled()
     original = {"servers": [], "hooks": [{"id": "old-hook", "event": "before_tool", "command": "old-command", "timeout_seconds": 10, "enabled": True}]}
@@ -441,18 +447,46 @@ def test_child_conversation_cannot_widen_its_profile(ui, page):
 
 def test_mcp_results_per_server_and_stale_results_cleared(ui, page):
     open_tab(ui, page, "Extensions", """fake.override = path => path === '/api/extensions/test' ? fake.json({ tools: ['mcp__ok__search'], servers: [
-      { id: 'ok', name: 'Search server', status: 'connected', tools: ['mcp__ok__search'] },
-      { id: 'bad', name: 'Broken server', status: 'failed', tools: [], error: 'Connection refused' },
+      { id: 'ok', name: 'Search server', status: 'connected', tools: ['mcp__ok__search'], server_info: { name: 'search-mcp', version: '1.4.0' },
+        instructions: 'Search before you read.', tool_annotations: { mcp__ok__search: { read_only: true } } },
+      { id: 'bad', name: 'Broken server', status: 'failed', tools: [], error: 'Connection refused', stderr_tail: 'fatal: no config [REDACTED]' },
       { id: 'off', name: 'Unused server', status: 'disabled', tools: [] },
     ] }) : undefined""")
     expect(page.get_by_text("Review code")).to_be_visible()
     page.get_by_role("button", name="Test saved configuration").click()
-    expect(page.get_by_text("Connection refused")).to_be_visible()
-    expect(page.get_by_text("Connected during test · 1 tools")).to_be_visible()
-    expect(page.get_by_text("Disabled · not started")).to_be_visible()
+    results = page.get_by_label("MCP server test results")
+    expect(results.get_by_text("Connection refused")).to_be_visible()
+    expect(results.get_by_text("Connected during test · 1 tool · server: search-mcp 1.4.0")).to_be_visible()
+    expect(results.get_by_text("Server says: read-only")).to_be_visible()
+    expect(results.get_by_text("Disabled · not started")).to_be_visible()
+    results.get_by_text("Server stderr (end)").click()
+    expect(results.get_by_text("fatal: no config [REDACTED]")).to_be_visible()
+    expect(results.get_by_text("Server instructions (shown here only; never sent to the agent)")).to_be_visible()
     page.get_by_role("button", name="Save configuration").click()
     expect(page.get_by_text("Configuration saved.")).to_be_visible()
     expect(page.get_by_text("Connection refused")).to_have_count(0)
+
+
+def test_last_turn_mcp_status_in_extensions_and_overview(ui, page):
+    setup = """window.selected = { ...session(), mcp_status: [
+      { id: 'docs', name: 'Docs', status: 'connected', tool_count: 3, server_info: { name: 'docs-mcp', version: '2.0' },
+        capped: ['mcp__docs__extra'] },
+      { id: 'broken', name: 'Broken', status: 'failed', tool_count: 0, error: 'could not connect or list tools: No such file',
+        stderr_tail: 'Traceback: missing module', retry_seconds: 42 },
+      { id: 'quiet', name: 'Quiet', status: 'off', tool_count: 0 }] }"""
+    open_dialog(ui, setup, "selected")
+    expect(overview_row(page, "MCP servers").locator(".overview-value")).to_have_text("Last turn: 1 connected · 1 failed · 1 off in this chat")
+    overview_row(page, "MCP servers").get_by_role("button", name="Open Extensions").click()
+    status = page.get_by_label("MCP servers in the last turn")
+    expect(status.get_by_text("Connected · 3 tools · server: docs-mcp 2.0")).to_be_visible()
+    expect(status.get_by_text("Not offered (Databricks takes at most 32 tools per request): mcp__docs__extra")).to_be_visible()
+    expect(status.get_by_text("Failed · tried again in about 42 s")).to_be_visible()
+    expect(status.get_by_text("could not connect or list tools: No such file")).to_be_visible()
+    expect(status.get_by_text("Turned off in this chat · not started")).to_be_visible()
+    # A push from the running chat updates it.
+    ui.rerender("dialogProps({ ...selected, mcp_status: [{ id: 'docs', name: 'Docs', status: 'connected', tool_count: 4 }] })")
+    expect(status.get_by_text("Connected · 4 tools")).to_be_visible()
+    expect(status.get_by_text("Failed · tried again in about 42 s")).to_have_count(0)
 
 
 # The dialog keeps one size: the tabs stay put and only the tab content scrolls
@@ -725,3 +759,160 @@ def test_every_section_is_readable(ui, page):
                                  "...visual.iconFailures(document.querySelector('.agent-tools-dialog'))]")
         assert problems == [], (tab, problems)
         assert page.evaluate("() => visual.smallText(document.querySelector('.agent-tools-dialog'))") == [], tab
+
+
+# Extensions: the form editor, its JSON round trip, and the import preview
+
+FULL_CONFIG = {
+    "servers": [
+        {"id": "github", "name": "GitHub", "transport": "stdio", "command": "github-mcp-server", "args": ["stdio", ""],
+         "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": {"secret": "GITHUB_TOKEN"}, "LOG_LEVEL": "debug"}, "enabled": True},
+        {"id": "sql", "name": "Workspace SQL", "transport": "http", "url": "https://workspace.example.com/api/2.0/mcp/sql",
+         "headers": {"X-Api-Key": {"secret": "API_KEY", "prefix": "Key "}}, "workspace_credentials": True, "enabled": False},
+    ],
+    "hooks": [{"id": "check", "event": "before_tool", "tools": ["write_file"], "command": "check-edit", "timeout_seconds": 5,
+               "enabled": True},
+              {"id": "stop", "event": "agent_stop", "command": "stop-check", "timeout_seconds": 10, "enabled": False}],
+}
+
+
+def open_extensions(ui, page, config=FULL_CONFIG):
+    open_tab(ui, page, "Extensions", f"window.config = {json.dumps(config)}")
+    expect(page.get_by_role("textbox", name="Server 1 ID")).to_have_value("github") if config["servers"] else None
+
+
+def test_the_form_shows_servers_hooks_and_references_and_round_trips(ui, page):
+    open_extensions(ui, page)
+    expect(page.get_by_role("textbox", name="Server 1 command")).to_have_value("github-mcp-server")
+    expect(page.get_by_role("textbox", name="Server 1 arguments")).to_have_value("stdio\n")
+    expect(page.get_by_role("combobox", name="Server 1 environment variable 1 kind")).to_have_value("secret")
+    expect(page.get_by_role("textbox", name="Server 1 environment variable 1 credential-file key")).to_have_value("GITHUB_TOKEN")
+    expect(page.get_by_role("textbox", name="Server 1 environment variable 2 value")).to_have_value("debug")
+    expect(page.get_by_role("textbox", name="Server 2 URL")).to_have_value("https://workspace.example.com/api/2.0/mcp/sql")
+    expect(page.get_by_role("textbox", name="Server 2 header 1 prefix")).to_have_value("Key ")
+    expect(page.get_by_role("checkbox", name="Server 2 uses workspace credentials")).to_be_checked()
+    expect(page.get_by_role("checkbox", name="Server 2 enabled")).not_to_be_checked()
+    expect(page.get_by_role("textbox", name="Hook 1 tool names")).to_have_value("write_file")
+    expect(page.get_by_role("combobox", name="Hook 2 event")).to_have_value("agent_stop")
+    # Form -> JSON -> form keeps every field.
+    editor = json_editor(page)
+    assert json.loads(editor.input_value()) == FULL_CONFIG
+    page.get_by_role("button", name="Form", exact=True).click()
+    page.get_by_role("button", name="Save configuration").click()
+    expect(page.get_by_text("Configuration saved.")).to_be_visible()
+    assert ui.bodies("/api/extensions", "PUT") == [FULL_CONFIG]
+
+
+def test_editing_in_the_form_saves_the_changed_configuration(ui, page):
+    open_extensions(ui, page)
+    page.get_by_role("combobox", name="Server 1 environment variable 2 kind").select_option("secret")
+    page.get_by_role("textbox", name="Server 1 environment variable 2 credential-file key").fill("LEVEL")
+    page.get_by_role("button", name="Remove Server 2 header 1").click()
+    page.get_by_role("checkbox", name="Server 2 uses workspace credentials").uncheck()
+    page.get_by_role("button", name="Remove hook 2").click()
+    page.get_by_role("combobox", name="Hook 1 tools").select_option("all")
+    page.get_by_role("button", name="Add server").click()
+    page.get_by_role("textbox", name="Server 3 ID").fill("docs")
+    page.get_by_role("combobox", name="Server 3 transport").select_option("http")
+    page.get_by_role("textbox", name="Server 3 URL").fill("https://mcp.example.com/mcp")
+    page.get_by_role("button", name="Add header").last.click()
+    page.get_by_role("textbox", name="Server 3 header 1 name").fill("Authorization")
+    page.get_by_role("textbox", name="Server 3 header 1 credential-file key").fill("DOCS_TOKEN")
+    page.get_by_role("textbox", name="Server 3 header 1 prefix").fill("Bearer ")
+    page.get_by_role("button", name="Save configuration").click()
+    expect(page.get_by_text("Configuration saved.")).to_be_visible()
+    [saved] = ui.bodies("/api/extensions", "PUT")
+    assert saved["servers"][0]["env"] == {"GITHUB_PERSONAL_ACCESS_TOKEN": {"secret": "GITHUB_TOKEN"}, "LOG_LEVEL": {"secret": "LEVEL"}}
+    assert "headers" not in saved["servers"][1] and "workspace_credentials" not in saved["servers"][1]
+    assert saved["servers"][2] == {"id": "docs", "name": "docs", "transport": "http", "url": "https://mcp.example.com/mcp",
+                                   "headers": {"Authorization": {"secret": "DOCS_TOKEN", "prefix": "Bearer "}}, "enabled": False}
+    assert saved["hooks"] == [{"id": "check", "event": "before_tool", "command": "check-edit", "timeout_seconds": 5, "enabled": True}]
+
+
+def test_json_that_does_not_parse_keeps_the_json_view(ui, page):
+    open_extensions(ui, page)
+    editor = json_editor(page)
+    editor.fill('{"servers": [')
+    page.get_by_role("button", name="Form", exact=True).click()
+    expect(page.get_by_role("alert")).to_contain_text("The JSON is not valid")
+    expect(editor).to_be_visible()
+    editor.fill(json.dumps({"servers": [{**FULL_CONFIG["servers"][0], "name": "Changed in JSON"}], "hooks": []}))
+    page.get_by_role("button", name="Form", exact=True).click()
+    expect(page.get_by_role("textbox", name="Server 1 name")).to_have_value("Changed in JSON")
+    expect(page.get_by_role("textbox", name="Server 2 ID")).to_have_count(0)
+
+
+def test_import_preview_adds_disabled_servers_to_the_form_without_saving(ui, page):
+    open_extensions(ui, page, {"servers": [{"id": "github", "name": "Mine", "transport": "stdio", "command": "mine", "args": [],
+                                            "enabled": True}], "hooks": []})
+    page.get_by_text("Import MCP servers").click()
+    page.get_by_role("button", name="This project's .mcp.json").click()
+    preview = page.get_by_role("region", name="Import preview")
+    expect(preview.get_by_role("heading")).to_contain_text("1 server to add, disabled")
+    expect(preview).to_contain_text("GITHUB_TOKEN")
+    expect(preview).to_contain_text("SSE servers are not supported")
+    expect(preview).to_contain_text("runs its command (for example npx or uvx)")
+    assert ui.bodies("/api/extensions/import?session_id=a", "POST") == [{"source": "project"}]
+    assert ui.requests("/api/extensions", "PUT") == []
+    preview.get_by_role("button", name="Add to the form").click()
+    expect(page.get_by_role("region", name="Import preview")).to_have_count(0)
+    expect(page.get_by_role("status")).to_contain_text("Added 1 disabled server to the form")
+    expect(page.get_by_role("textbox", name="Server 2 ID")).to_have_value("github-2")  # Unique in the form.
+    expect(page.get_by_role("checkbox", name="Server 2 enabled")).not_to_be_checked()
+    assert ui.requests("/api/extensions", "PUT") == []
+    page.get_by_role("button", name="Save configuration").click()
+    expect(page.get_by_text("Configuration saved.")).to_be_visible()
+    [saved] = ui.bodies("/api/extensions", "PUT")
+    assert saved["servers"][1]["id"] == "github-2" and saved["servers"][1]["enabled"] is False
+    assert saved["servers"][1]["env"] == {"GITHUB_PERSONAL_ACCESS_TOKEN": {"secret": "GITHUB_TOKEN"}}
+    # Pasted text is previewed the same way.
+    page.get_by_role("textbox", name="Configuration to import (JSON)").fill('{"mcpServers": {}}')
+    page.get_by_role("button", name="Preview pasted servers").click()
+    expect(page.get_by_role("region", name="Import preview")).to_be_visible()
+    assert ui.bodies("/api/extensions/import", "POST")[-1] == {"source": "text", "text": '{"mcpServers": {}}'}
+
+
+def test_a_refused_import_is_shown(ui, page):
+    open_tab(ui, page, "Extensions", """fake.override = path => path.startsWith('/api/extensions/import')
+      ? fake.json({ detail: 'No .mcp.json was found.' }, 404) : undefined""")
+    page.get_by_text("Import MCP servers").click()
+    page.get_by_role("button", name="This project's .mcp.json").click()
+    expect(page.get_by_role("alert").first).to_contain_text("No .mcp.json was found.")
+
+
+def test_each_mcp_server_can_be_turned_off_in_the_chat(ui, page):
+    open_tab(ui, page, "Tools", """window.toolList = { ...toolList, disabled: ['run_command', 'mcp__gone__*', 'mcp__docs__search'],
+      servers: [{ id: 'docs', name: 'Docs', enabled: true }, { id: 'sql', name: 'Workspace SQL', enabled: false }] }""")
+    tools = page.get_by_role("region", name="Tools")
+    docs = tools.get_by_role("checkbox", name="Use the Docs server in this chat")
+    expect(docs).to_be_checked()
+    expect(tools.get_by_role("group", name="MCP servers")).to_contain_text("Disabled in Extensions")
+    # A switch for a server no longer configured is listed with the turned-off MCP tools.
+    expect(tools.get_by_role("list", name="Turned-off MCP tools")).to_contain_text("mcp__gone__*")
+    docs.uncheck()
+    tools.get_by_role("button", name="Save tools").click()
+    expect(tools.get_by_role("status")).to_have_text("Tools saved for this chat.")
+    assert ui.bodies("/api/sessions/a/disabled-tools", "PUT") == [{"tools": ["run_command", "mcp__gone__*", "mcp__docs__search", "mcp__docs__*"]}]
+    expect(tools.get_by_role("list", name="Turned-off MCP tools")).not_to_contain_text("mcp__docs__*")
+
+
+def test_the_extensions_form_is_readable(ui, page):
+    from test_visual_tokens import CONTRAST_JS
+    page.add_init_script(script=CONTRAST_JS)
+    open_extensions(ui, page)
+    page.get_by_text("Import MCP servers").click()
+    page.get_by_role("button", name="This project's .mcp.json").click()
+    expect(page.get_by_role("region", name="Import preview")).to_be_visible()
+    problems = page.evaluate("() => [...visual.failures(document.querySelector('.agent-tools-dialog')), "
+                             "...visual.iconFailures(document.querySelector('.agent-tools-dialog'))]")
+    assert problems == []
+    assert page.evaluate("() => visual.smallText(document.querySelector('.agent-tools-dialog'))") == []
+
+
+@pytest.mark.parametrize("width", [390, 1280])
+def test_the_extensions_form_fits_without_sideways_scrolling(ui, page, width):
+    page.set_viewport_size({"width": width, "height": 900})
+    open_extensions(ui, page)
+    overflow = page.evaluate("""() => [...document.querySelectorAll('.extension-entry')].filter(entry =>
+      entry.scrollWidth > entry.clientWidth + 1).length""")
+    assert overflow == 0

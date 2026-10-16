@@ -563,3 +563,43 @@ body.panel-resizing{cursor:col-resize;user-select:none}
 .composer-hint-show{font-size:11px;padding:1px 6px;margin-left:4px;border-radius:5px;color:var(--ink);text-decoration:underline;text-underline-offset:2px}
 .tool-clock,.compacting-elapsed{font-variant-numeric:tabular-nums}
 .tool-live{margin:0 13px 10px;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* 2026-10-16 mcp: the Extensions form editor and import preview, MCP server status, server hints and images on tool cards. */
+.extensions-editor{margin:12px 0}
+.extensions-mode{display:flex;gap:6px;margin:0 0 12px}
+.extensions-mode button[aria-pressed=true]{background:var(--sidebar);border-color:var(--ink)}
+.extensions-form h4{font-size:13px;margin:16px 0 4px}
+.extensions-form>.field-help{margin:0 0 10px}
+.extensions-form>.outline{margin:2px 0 6px}
+.extension-entry{border:1px solid var(--border);border-radius:9px;margin:0 0 12px;padding:10px 12px 12px;min-width:0}
+.extension-entry legend{font-size:12px;font-weight:500;padding:0 4px;overflow-wrap:anywhere}
+.extension-entry label{display:block;font-size:12px;margin:8px 0 0;min-width:0}
+.extension-fields{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.4fr) minmax(0,1.4fr);gap:10px}
+.extension-fields label{margin-top:0}
+.extensions-editor input:not([type=checkbox]),.extensions-editor select,.extensions-editor textarea{display:block;width:100%;max-width:100%;margin-top:4px;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--ink);padding:7px 9px;font-size:13px}
+.extensions-editor textarea{resize:vertical;font:12px/1.5 'SFMono-Regular',Consolas,monospace}
+.extensions-editor .agent-tools-config textarea{min-height:220px}
+.extensions-editor .extension-check{display:flex;align-items:center;gap:0;font-size:12px}
+.extension-values{margin:10px 0 0;padding:8px 0 0;border-top:1px dashed var(--border)}
+.extension-values-title{display:block;font-size:12px;font-weight:500;margin-bottom:4px}
+.extension-value-row{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr) minmax(0,1.4fr) auto;gap:6px;align-items:center;margin:0 0 6px}
+.extension-value-row:has(> input:nth-of-type(3)){grid-template-columns:minmax(0,1.2fr) minmax(0,1fr) minmax(0,1.4fr) minmax(0,.9fr) auto}
+.extension-value-row input,.extension-value-row select{margin-top:0!important}
+.extension-entry-actions{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:10px;flex-wrap:wrap}
+.extensions-import .agent-tools-actions{margin:8px 0}
+.extensions-paste textarea{min-height:90px!important}
+.extensions-preview{margin:12px 0;padding:12px 14px;border:1px solid var(--border);border-radius:9px;background:var(--surface);overflow-wrap:anywhere}
+.extensions-preview h4{margin:0 0 8px;font-size:13px}
+.extensions-preview h4 small,.extensions-preview li small{color:var(--muted);font-size:11px;font-weight:400}
+.extensions-preview ul,.mcp-tools{margin:6px 0 10px;padding-left:18px}
+.extensions-preview li small{display:block;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.mcp-stderr{margin:6px 0}
+.mcp-stderr summary{font-size:12px}
+.mcp-tools li{font-size:12px}
+.mcp-tools small{display:inline!important}
+.tool-hints{margin:0 13px 10px;font-size:11px;color:var(--muted);overflow-wrap:anywhere}
+.mcp-images{margin:8px 0}
+.mcp-image{margin:6px 0}
+.mcp-image img{display:block;max-width:100%;max-height:360px;border:1px solid var(--border);border-radius:7px;background:var(--surface)}
+.mcp-image .outline{font-size:12px;padding:6px 11px}
+@media(max-width:600px){.extension-fields{grid-template-columns:minmax(0,1fr)}.extension-value-row,.extension-value-row:has(> input:nth-of-type(3)){grid-template-columns:minmax(0,1fr) auto}.extension-value-row>:not(button){grid-column:1}.extension-value-row>button{grid-column:2;grid-row:1}}

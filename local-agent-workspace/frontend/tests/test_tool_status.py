@@ -533,3 +533,41 @@ def test_a_running_command_fits_a_phone_heading(ui, page):
     assert page.locator(".tool-subject").evaluate("e => e.getBoundingClientRect().width") >= 60
     box, card = clock.bounding_box(), page.locator(".tool-card").bounding_box()
     assert box["width"] > 0 and box["x"] + box["width"] <= card["x"] + card["width"]
+
+
+# MCP cards: the server's hints, a long result kept for get_tool_output, and images shown on request
+
+def mcp_card(**fields):
+    page = {"output": "Summary\n[image/png, 2 KB; shown in the chat, not sent to the model]", "is_error": False,
+            "truncated": True, "result_id": "out-0123456789ab", "next_offset": 7800, "total_chars": 30000}
+    return json.dumps({"id": "mcp", "type": "tool", "name": "mcp__docs__search", "state": "completed",
+                       "input": {"query": "q"}, "output": json.dumps(page, indent=2), **fields})
+
+
+def test_an_mcp_card_shows_server_hints_the_kept_rest_and_images(ui, page):
+    show(ui, mcp_card(mcp_annotations={"title": "Search", "read_only": True, "open_world": True},
+                      mcp_images=[{"id": "img-0123456789ab", "mime_type": "image/png", "bytes": 2048}]))
+    hints = page.locator(".tool-hints")
+    expect(hints).to_have_text("Server says: read-only · reaches outside services")
+    expect(hints).to_have_attribute("title", "Hints from the MCP server. They never change approvals.")
+    page.locator(".tool-heading").click()
+    expect(page.locator(".tool-job-state")).to_have_text("First 7,800 of 30,000 characters shown. The agent can read "
+                                                          "the rest with get_tool_output until the app restarts.")
+    ui.run("""fake.handle = path => path === '/api/sessions/parent/tool-images/img-0123456789ab'
+      ? fake.json({ mime_type: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==' })
+      : fake.json({ ok: true })""")
+    page.get_by_role("button", name="Show image 1 (image/png, 2 KB)").click()
+    image = page.get_by_role("img", name="MCP tool image 1 (image/png, 2 KB)")
+    expect(image).to_be_visible()
+    assert image.get_attribute("src").startswith("data:image/png;base64,iVBOR")
+
+
+def test_an_image_no_longer_kept_says_so(ui, page):
+    show(ui, mcp_card(mcp_images=[{"id": "img-0123456789ab", "mime_type": "image/png", "bytes": 2048}]))
+    ui.run("""fake.handle = path => path.includes('/tool-images/')
+      ? fake.json({ detail: 'This image is no longer available: images are kept in memory until the app restarts.' }, 404)
+      : fake.json({ ok: true })""")
+    page.locator(".tool-heading").click()
+    page.get_by_role("button", name="Show image 1 (image/png, 2 KB)").click()
+    expect(page.locator(".mcp-image .form-error")).to_contain_text("no longer available")
+    expect(page.locator(".tool-hints")).to_have_count(0)  # No hints given.

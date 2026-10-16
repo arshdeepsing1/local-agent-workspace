@@ -244,7 +244,8 @@ async def test_get_task_is_in_every_tool_profile(runtime, monkeypatch, profile):
     gateway(monkeypatch, handler)
     await manager.run_databricks(session, "Which task is next?")
     assert "get_task" in seen[0]
-    assert len([*TOOL_DEFINITIONS, *FEATURE_TOOLS]) == 27
+    # get_tool_output is offered only once a long MCP result of the chat was kept.
+    assert len([*TOOL_DEFINITIONS, *FEATURE_TOOLS]) == 28 and "get_tool_output" not in seen[0]
 
 
 # API: task routes push the list, the stream sends it on connect, and the transcript export.

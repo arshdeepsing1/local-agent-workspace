@@ -43,4 +43,8 @@ FEATURE_TOOLS = [
                    "required": ["question", "options"], "additionalProperties": False}}}, ["questions"]),
     definition("submit_plan", "Plan mode only: present your finished plan (Markdown) for the user's review. The user can approve it and switch this chat to Accept edits or Manual mode, and you then implement it in this same turn, or ask you to keep planning with feedback. Make it the last tool call in its response.",
                {"plan": {"type": "string", "maxLength": 20000}, "title": {"type": "string", "maxLength": 120}}, ["plan"]),
+    # Offered once this chat has a kept result (result_store.py); then in every request, so the list stays stable.
+    definition("get_tool_output", "Read more of a long MCP tool result: pass the result_id and next_offset it gave. Results are kept in memory for this app run only.",
+               {"result_id": {"type": "string", "maxLength": 40}, "offset": {"type": "integer", "minimum": 0, "maximum": 1000000},
+                "max_chars": {"type": "integer", "minimum": 1, "maximum": 8000}}, ["result_id"]),
 ]

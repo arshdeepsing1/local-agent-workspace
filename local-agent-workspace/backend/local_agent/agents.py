@@ -50,7 +50,9 @@ from .context import estimate_text_tokens
 from .planning import CallAllowance, DelegateManager, DelegationGate, TaskManager
 from .interactions import InteractionManager
 from .feature_tools import FEATURE_TOOLS
-from .tool_profiles import tool_allowed, filter_tools
+from .tool_profiles import tool_allowed, filter_tools, off_servers, server_off
+from .mcp_client import RETRY_SECONDS
+from .result_store import ResultStore
 from . import prompt_cache, reasoning
 from .reasoning import reasoning_delta, reasoning_shape
 from . import spending
@@ -92,6 +94,10 @@ from .tool_profiles import covering_tool
 
 
 MAX_OUTPUT_LIMIT_RETRIES = 2
+# Databricks accepts at most this many functions in one request (built-in and MCP tools together).
+MAX_REQUEST_TOOLS = 32
+# A turn's MCP server status as a chat keeps it (Agent tools → Extensions): these fields only.
+MCP_STATUS_FIELDS = ("id", "name", "status", "error", "stderr_tail", "server_info", "retry_seconds")
 HANDOFF_FOLDER = "handoffs/auto"
 # "/<skill-id>" as its own word: after the start, a space or an opening bracket or
 # quote, and before the end, a space or closing punctuation. "/tmp/x" or "~/x" never match.
@@ -794,6 +800,7 @@ class AgentManager(LifecycleHooks):
         self.delegates = DelegateManager(self)
         self.interactions = InteractionManager(self)
         self.extension_connections = {}
+        self.results = ResultStore()  # In memory: long MCP results (get_tool_output) and their images.
         self.notifier = SystemNotifier()
         self.closing = False
         # In memory only: {(endpoint, request format): field} for reasoning fields Databricks rejected
@@ -985,10 +992,13 @@ class AgentManager(LifecycleHooks):
         return self.live.get(session_id) or self.store.get(session_id)
 
     def redaction_tokens(self):
+        """The secrets no card, result, title, ledger entry or export may show: the Databricks token and the
+        values the enabled MCP servers' secret references resolve to."""
         try:
-            return [self.settings.credentials()[1]]
+            tokens = [self.settings.credentials()[1]]
         except (ValueError, OSError):
-            return []
+            tokens = []
+        return tokens + self.extensions.secret_values()
 
     async def job_update(self, job):
         """Show a job's progress on its tool card, and note when an agent's background job ends.
@@ -1907,18 +1917,34 @@ class AgentManager(LifecycleHooks):
             await self.publish_permissions(item)
             await self.recheck_pending(item, "rules")
 
-    def step_definitions(self, session, external_tools):
-        """The tool definitions offered in the next model request: the profile's tools, without
-        turned-off tools, tools an unconditional deny rule covers, and submit_plan outside Plan."""
-        definitions = filter_tools(session, [*TOOL_DEFINITIONS, *[tool for tool in FEATURE_TOOLS
-                                   if not session.get("is_subagent") or tool["function"]["name"] != "delegate_task"],
-                                   *external_tools])
+    @staticmethod
+    def feature_definitions(session):
+        """The FEATURE_TOOLS a chat is offered: not delegate_task in a subagent; get_tool_output once a long
+        result of this chat was kept, and from then on in every request, so the tool list stays stable."""
+        return [tool for tool in FEATURE_TOOLS
+                if not (session.get("is_subagent") and tool["function"]["name"] == "delegate_task")
+                and (tool["function"]["name"] != "get_tool_output" or session.get("tool_output_offered"))]
+
+    def offered_tools(self, session, external_tools):
+        """(definitions, capped): the tool definitions offered in the next model request (the profile's
+        tools, without turned-off tools, tools an unconditional deny rule covers, and submit_plan outside
+        Plan) and the names of the MCP tools left out because Databricks accepts at most
+        MAX_REQUEST_TOOLS functions per request: the built-in tools first, then MCP tools in server order."""
+        definitions = filter_tools(session, [*TOOL_DEFINITIONS, *self.feature_definitions(session), *external_tools])
         saved = self.rules.rules(session["workspace"])
         names = [item["function"]["name"] for item in definitions]
         denied = denied_tools(session.get("allow_rules") or [], saved["project"], saved["user"], names)
         offer_plan = session.get("permission_mode", "manual") == "plan" and not session.get("is_subagent")
-        return [item for item in definitions if item["function"]["name"] not in denied
-                and (offer_plan or item["function"]["name"] != "submit_plan")]
+        definitions = [item for item in definitions if item["function"]["name"] not in denied
+                       and (offer_plan or item["function"]["name"] != "submit_plan")]
+        builtin = [item for item in definitions if not item["function"]["name"].startswith("mcp__")]
+        external = [item for item in definitions if item["function"]["name"].startswith("mcp__")]
+        room = max(0, MAX_REQUEST_TOOLS - len(builtin))
+        return [*builtin, *external[:room]], [item["function"]["name"] for item in external[room:]]
+
+    def step_definitions(self, session, external_tools):
+        """The tool definitions offered in the next model request (offered_tools)."""
+        return self.offered_tools(session, external_tools)[0]
 
     def start(self, session_id, prompt, *, from_queue=False):
         """Start a turn. @ files and pending ! output are attached now, so a refused file is an
@@ -2278,8 +2304,8 @@ class AgentManager(LifecycleHooks):
         mode = session.get("permission_mode", "manual")
         tools = self.session_tools(session)
         system, _ = self.context_inputs(session, tools, mode)
-        definitions = state.get("tool_definitions") or filter_tools(session, [*TOOL_DEFINITIONS, *[
-            tool for tool in FEATURE_TOOLS if not session.get("is_subagent") or tool["function"]["name"] != "delegate_task"]])
+        definitions = state.get("tool_definitions") or filter_tools(session, [*TOOL_DEFINITIONS,
+                                                                              *self.feature_definitions(session)])
         context_window, max_output_tokens = self.request_limits(session)
         # A model that always thinks spends part of the reserve on thinking.
         reserve = min(max_output_tokens, max(1024, min(max_output_tokens, 4096)) + thinking_reserve(session["model"]))
@@ -2568,9 +2594,14 @@ class AgentManager(LifecycleHooks):
         return sent
 
     async def _execute_tool(self, session, tools, name, arguments, call_id, origin, allowance, gate, notes):
+        # An MCP tool's annotations (read-only, destructive, ...) are the server's hints: shown on the card,
+        # never used to decide a permission.
+        hints = (getattr(self.extension_connections.get(session["id"]), "annotations", None) or {}).get(name) \
+            if isinstance(name, str) and name.startswith("mcp__") else None
         event = notes.event = await self.event(session, "tool", name=name, input=arguments, call_id=call_id,
                                                state="running", output="",
-                                               **({"verify": True} if origin == "verify" else {}))
+                                               **({"verify": True} if origin == "verify" else {}),
+                                               **({"mcp_annotations": hints} if isinstance(hints, dict) else {}))
         invoked = False
         views_key = views_prev = None
         try:
@@ -2579,10 +2610,13 @@ class AgentManager(LifecycleHooks):
             if not tool_allowed(session, name):
                 disabled = session.get("disabled_tools") or []
                 cover = covering_tool(name, disabled)
+                switch = server_off(name, disabled)
                 listed = session.get("agent_tools")
                 output = (f"The user turned off {name} in this chat. Use other tools." if name in disabled else
                           f"The user turned off {cover} in this chat, which also covers {name}. Use other tools."
                           if cover else
+                          f"The user turned off the MCP server {switch[5:-3]} in this chat, which includes {name}. Use "
+                          "other tools." if switch else
                           f"The {session.get('agent_type')} agent's tools list does not include {name}. Use only the "
                           "available tools." if isinstance(listed, list) and name not in listed else
                           f"The {session['tool_profile']} tool profile does not permit {name}. Use only the available tools.")
@@ -2656,6 +2690,9 @@ class AgentManager(LifecycleHooks):
                     raise ValueError("Project or skill instructions changed. Review refreshed guidance before using MCP tools.")
                 if name not in mcp_names:
                     raise ValueError("MCP tool is not available in this turn.")
+                if name in (session.get("mcp_capped") or ()):
+                    raise ValueError(f"{name} was not offered in this request: Databricks accepts at most "
+                                     f"{MAX_REQUEST_TOOLS} tools per request. Use the tools you were given.")
                 await self.update_event(session, event, preview=json.dumps(arguments, indent=2))
                 if verdict.decision == "ask":
                     allowed, verdict = await self.request_approval(session, tools, event, name, arguments, forced=forced)
@@ -2803,6 +2840,15 @@ class AgentManager(LifecycleHooks):
             invoked = notes.ran = True
             if name.startswith("mcp__"):
                 result = await connection.call(name, arguments)
+                # Images go to the card (kept in memory), never to the model; their text says so.
+                images = result.pop("images", None) if isinstance(result, dict) else None
+                if images:
+                    await self.update_event(session, event, mcp_images=images)
+                if isinstance(result, dict) and result.get("result_id") and not session.get("tool_output_offered"):
+                    session["tool_output_offered"] = True  # get_tool_output is offered from the next request on.
+            elif name == "get_tool_output":
+                result = self.results.page(session["id"], arguments["result_id"], arguments.get("offset", 0),
+                                           arguments.get("max_chars", 4000))
             elif name in ("write_file", "edit_file"):
                 turn_id = next((item["id"] for item in reversed(session["events"]) if item["type"] == "user"), None)
                 result = self.checkpoints.apply_edit(tools, name, arguments, session_id=session["id"], turn_id=turn_id,
@@ -3245,15 +3291,66 @@ class AgentManager(LifecycleHooks):
                 isinstance(listed, list) and not any(name.startswith("mcp__") for name in listed)):
             # Restricted children must not start external servers during discovery.
             return await self._run_databricks(session, prompt, [], **({"content": content} if content is not None else {}))
-        async with self.extensions.turn() as connection:
+        # Servers this chat turned off never start; a server that fails is skipped and the others work.
+        async with self.extensions.turn(off=off_servers(session.get("disabled_tools"))) as connection:
             definitions = await connection.discover()
             connection.tool_names = {item["function"]["name"] for item in definitions}
+            connection.results = self.results.chat(session["id"])
+            await self.mcp_status_changed(session, getattr(connection, "status", None))
             self.extension_connections[session["id"]] = connection
             try:
                 return await self._run_databricks(session, prompt, definitions,
                                                   **({"content": content} if content is not None else {}))
             finally:
                 self.extension_connections.pop(session["id"], None)
+
+    async def mcp_status_changed(self, session, status):
+        """Keep this turn's MCP server status for Agent tools (session mcp_status: MCP_STATUS_FIELDS and a
+        tool count; not sent to the model, not exported) and post one notice for each server that failed or
+        was skipped when the previous turn's status for it differs: a broken server is named once in a
+        chat until it works again."""
+        if not isinstance(status, list):
+            return
+        previous = {item.get("id"): item for item in session.get("mcp_status") or [] if isinstance(item, dict)}
+        if not status and not previous:
+            return
+        kept = []
+        for item in status:
+            entry = {key: item[key] for key in MCP_STATUS_FIELDS if key in item}
+            entry["tool_count"] = len(item.get("tools") or [])
+            kept.append(entry)
+            if item["status"] in ("failed", "skipped") and previous.get(item["id"], {}).get("status") != item["status"]:
+                error = str(item.get("error") or "it did not start").rstrip(".")
+                retry = (f" It is tried again {RETRY_SECONDS} seconds after the failure; Agent tools → Extensions shows "
+                         "details." if item["status"] == "failed" else "")
+                await self.event(session, "notice", text=f"MCP server {item['name']} was skipped this turn: {error}. "
+                                 f"Its tools are unavailable; other servers work.{retry}")
+        for item in kept:
+            if (capped := [name for name in session.get("mcp_capped") or [] if name.startswith(f"mcp__{item['id']}__")]):
+                item["capped"] = capped
+        session["mcp_status"] = kept
+        self.store.save(session)
+        await self.broadcast(session["id"], {"type": "mcp_status", "mcp_status": kept})
+
+    async def capped_notice(self, session, capped):
+        """Name the MCP tools the 32-function limit leaves out, once for each new set (offered_tools)."""
+        if capped:
+            session["mcp_capped"] = list(capped)
+            shown = ", ".join(capped[:12]) + (f" and {len(capped) - 12} more" if len(capped) > 12 else "")
+            await self.event(session, "notice", text=(
+                f"Databricks accepts at most {MAX_REQUEST_TOOLS} tools per request, so {len(capped)} MCP "
+                f"tool{'s' if len(capped) != 1 else ''} {'were' if len(capped) != 1 else 'was'} not offered: {shown}. "
+                "Turn off tools or servers this chat does not need in Agent tools → Tools."))
+        else:
+            session.pop("mcp_capped", None)
+        status = session.get("mcp_status")
+        if isinstance(status, list):
+            for item in (item for item in status if isinstance(item, dict)):
+                item.pop("capped", None)
+                if names := [name for name in capped if name.startswith(f"mcp__{item.get('id')}__")]:
+                    item["capped"] = names
+            await self.broadcast(session["id"], {"type": "mcp_status", "mcp_status": status})
+        self.store.save(session)
 
     def context_inputs(self, session, tools, mode, notice="", *, available=None):
         """(system message, guidance). available: the names of the tools offered in this request
@@ -3750,8 +3847,7 @@ class AgentManager(LifecycleHooks):
             definitions = state.get("tool_definitions")
             warnings = list(guidance["warnings"])
             if definitions is None:
-                definitions = filter_tools(session, [*TOOL_DEFINITIONS, *[tool for tool in FEATURE_TOOLS
-                    if not session.get("is_subagent") or tool["function"]["name"] != "delegate_task"]])
+                definitions = filter_tools(session, [*TOOL_DEFINITIONS, *self.feature_definitions(session)])
                 warnings.append("No saved tool definitions: this preview includes built-in tools only. External tool costs refresh on the next model request.")
             url = host + "/serving-endpoints/" + quote(session["model"], safe="") + "/invocations"
             headers = {"Authorization": f"Bearer {token}"}
@@ -4277,8 +4373,7 @@ class AgentManager(LifecycleHooks):
         host, token = self.settings.credentials()
         mode = session.get("permission_mode", "manual")
         tools = self.session_tools(session)
-        definitions = filter_tools(session, [*TOOL_DEFINITIONS, *[tool for tool in FEATURE_TOOLS
-                       if not session.get("is_subagent") or tool["function"]["name"] != "delegate_task"], *external_tools])
+        definitions = filter_tools(session, [*TOOL_DEFINITIONS, *self.feature_definitions(session), *external_tools])
         for skill_id in self.requested_skills(tools, prompt, session):
             self.select_skill(session, tools, skill_id)
         # Complete interrupted tool exchanges before sending the next user turn.
@@ -4347,7 +4442,9 @@ class AgentManager(LifecycleHooks):
                 # The mode, rules and turned-off tools can change while a turn runs; each step follows them.
                 mode = session.get("permission_mode", "manual")
                 tools.unrestricted = mode == "bypassPermissions"
-                definitions = self.step_definitions(session, external_tools)
+                definitions, capped = self.offered_tools(session, external_tools)
+                if capped != (session.get("mcp_capped") or []):
+                    await self.capped_notice(session, capped)
                 system, guidance = self.context_inputs(session, tools, mode, self.step_notices(session, tools),
                                                        available={item["function"]["name"] for item in definitions})
                 plan = self.handoff_plan(session, context_window)
