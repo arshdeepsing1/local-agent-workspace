@@ -31,7 +31,7 @@ export function pathShortener(workspace, roots = []) {
     .filter(root => root !== '/' && root !== project)
   const names = shortNames(folders)
   const deepest = path => folders.filter(root => path === root || inside(path, root)).sort((a, b) => b.length - a.length)[0]
-  return path => {
+  const shorten = path => {
     if (typeof path !== 'string' || !path.startsWith('/')) return path
     const clean = trimSlash(path)
     const root = deepest(clean)
@@ -42,6 +42,14 @@ export function pathShortener(workspace, roots = []) {
     if (!root) return path
     return clean === root ? names.get(root) : `${names.get(root)}/${clean.slice(root.length + 1)}`
   }
+  // True when shorten names an absolute path by the project or one of the folders. Its text can still equal the path:
+  // a top-level folder ("/data") is named by its full path.
+  shorten.known = path => {
+    if (typeof path !== 'string' || !path.startsWith('/')) return false
+    const clean = trimSlash(path)
+    return Boolean(deepest(clean) || (project && (clean === project || inside(clean, project))))
+  }
+  return shorten
 }
 
 // The folder a changes-bar row names for a file: relative paths keep their folder, a file in one of `roots` is named
@@ -51,8 +59,7 @@ export function changedFileFolder(path, shorten) {
   if (slash <= 0) return ''
   const folder = path.slice(0, slash)
   if (!path.startsWith('/')) return folder
-  const short = shorten(folder)
-  if (short !== folder) return short
+  if (shorten.known ? shorten.known(folder) : shorten(folder) !== folder) return shorten(folder)
   const parts = folder.split('/').filter(Boolean)
   return parts.length > 2 ? `…/${parts.slice(-2).join('/')}` : folder
 }

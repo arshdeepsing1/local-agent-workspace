@@ -442,6 +442,9 @@ def test_two_allowed_folders_with_the_same_name_stay_apart(ui, page):
     ("cd /srv/other/../etc && cat x", "cd /srv/other/../etc && cat x"),
     ('cd "$HOME/other" && ls', 'cd "$HOME/other" && ls'),
     ("cd /srv/other; rm -rf build", "cd /srv/other; rm -rf build"),
+    # A line break before "&&" or after cd ends the cd command: the shell rejects or runs on its own what follows.
+    ("cd /srv/other\n&& ls", "cd /srv/other && ls"),
+    ("cd\n/srv/other && ls", "cd /srv/other && ls"),
     ("cd '/srv/other/a && rm -rf b' && ls", "cd '/srv/other/a && rm -rf b' && ls"),
 ])
 def test_a_leading_cd_into_a_known_folder_is_shortened_in_the_heading_only(ui, page, command, shown):

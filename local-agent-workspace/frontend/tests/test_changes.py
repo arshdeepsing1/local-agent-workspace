@@ -209,15 +209,18 @@ def test_a_file_outside_the_project_is_listed_by_its_full_path_and_opens_for_rev
 
 def test_rows_name_folders_outside_the_project_by_their_allowed_folder(ui, page):
     # F2. Mutation: show the raw parent folder (a long absolute path, cut off mid-path).
-    paths = ["src/app.py", "/srv/other/pkg/mod.py", "/srv/other/top.py", "/elsewhere/a/b/c.txt", "/opt/x.txt", "README.md"]
+    # A top-level allowed folder is named by its full path ("/data"); a file deep in it still names that folder.
+    # Mutation: take "the short form equals the path" for "under no folder" (gives "…/b/c").
+    paths = ["src/app.py", "/srv/other/pkg/mod.py", "/srv/other/top.py", "/elsewhere/a/b/c.txt", "/opt/x.txt", "README.md",
+             "/data/a/b/c/d.csv"]
     files = ", ".join(f"{{ path: {json.dumps(path)}, status: 'modified', added: 1, removed: 0, current_hash: 'h{index}' }}"
                       for index, path in enumerate(paths))
-    mount_bar(ui, changes=f"{{ added: 6, removed: 0, files: [{files}] }}", roots="['/srv/other', '/srv/code']")
-    page.get_by_role("button", name=re.compile("^6 files changed")).click()
+    mount_bar(ui, changes=f"{{ added: 7, removed: 0, files: [{files}] }}", roots="['/srv/other', '/srv/code', '/data']")
+    page.get_by_role("button", name=re.compile("^7 files changed")).click()
     rows = page.locator(".changes-file")
-    expect(rows.locator(".changes-name")).to_have_text(["app.py", "mod.py", "top.py", "c.txt", "x.txt", "README.md"])
+    expect(rows.locator(".changes-name")).to_have_text(["app.py", "mod.py", "top.py", "c.txt", "x.txt", "README.md", "d.csv"])
     assert rows.evaluate_all("items => items.map(item => item.querySelector('.changes-dir')?.textContent ?? null)") == [
-        "src", "other/pkg", "other", "…/a/b", "/opt", None]
+        "src", "other/pkg", "other", "…/a/b", "/opt", None, "/data/a/b/c"]
     # The full path stays in the title and in every accessible name.
     for path in paths:
         expect(page.get_by_title(f"Review {path}", exact=True)).to_be_visible()

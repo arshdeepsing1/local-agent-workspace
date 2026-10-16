@@ -28,8 +28,9 @@ function readRange(event) {
 }
 
 // A command that starts with "cd <folder> &&" (one plain or quoted absolute folder, no shell expansion and no
-// operators inside it) as [folder, rest]; null otherwise.
-const LEADING_CD = /^\s*cd\s+(?:'([^'\n&;|<>]+)'|"([^"\n$`\\&;|<>]+)"|([^\s'"$`\\;&|<>(){}*?[\]~]+))\s*&&\s*(\S[\s\S]*)$/
+// operators inside it) as [folder, rest]; null otherwise. Only spaces or tabs between cd, the folder and "&&": a line
+// break there ends the cd, and the shell then rejects or runs on its own what follows.
+const LEADING_CD = /^\s*cd[ \t]+(?:'([^'\n&;|<>]+)'|"([^"\n$`\\&;|<>]+)"|([^\s'"$`\\;&|<>(){}*?[\]~]+))[ \t]*&&\s*(\S[\s\S]*)$/
 function leadingCd(command) {
   const match = LEADING_CD.exec(command)
   const folder = match && (match[1] ?? match[2] ?? match[3])
@@ -686,12 +687,26 @@ export const PENDING_CARDS = '.tool-card.needs-approval, .question-card.needs-an
 
 // Scrolls a waiting card into view and, with focus, moves keyboard focus to where answering starts: a tool card's
 // heading (it names the action; Tab reaches the buttons), a question's first option, a plan's first review button.
+// A card taller than the transcript cannot be shown whole; the view then keeps in sight the focused control (a long
+// plan's review buttons on a phone, where they are not sticky), or without focus an approval card's end with its
+// buttons.
 export function revealCard(card, focus = false) {
-  if (!card) return
-  card.scrollIntoView({ block: 'nearest' })
-  if (!focus) return
-  const target = card.matches('.tool-card') ? card.querySelector('.tool-heading')
+  const box = card?.closest('.transcript')
+  if (!box) return
+  const tool = card.matches('.tool-card')
+  const target = !focus ? null : tool ? card.querySelector('.tool-heading')
     : card.querySelector('input:not(:disabled)') || card.querySelector(':is(.plan-actions, .approval-buttons) button:not(:disabled)')
+  // Where the view ends up is found with instant scrolls (the browser's own 'nearest', scroll-padding included) and
+  // then reached with the transcript's smooth scroll from where it was.
+  const from = box.scrollTop
+  card.scrollIntoView({ block: 'nearest', behavior: 'instant' })
+  const top = box.getBoundingClientRect().top + box.clientTop
+  const seen = element => (place => place.top >= top - 0.5 && place.bottom <= top + box.clientHeight + 0.5)(element.getBoundingClientRect())
+  if (target && !seen(target)) target.scrollIntoView({ block: 'nearest', behavior: 'instant' })
+  else if (!target && tool && !seen(card)) card.scrollIntoView({ block: 'end', behavior: 'instant' })
+  const to = box.scrollTop
+  box.scrollTo({ top: from, behavior: 'instant' })
+  box.scrollTo({ top: to })
   target?.focus({ preventScroll: true })
 }
 
@@ -735,15 +750,29 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
   // you must act. Only when it starts waiting, so reading older output is not disturbed afterwards; while the view
   // follows the end, the scroll above already shows the last card.
   const waitingIds = useRef(null)
+  // The card that just started waiting, until the 'awaiting_approval' status that usually follows it.
+  const justWaiting = useRef(null)
+  const pendingIds = () => session.events.filter(event => event.type === 'tool' && event.state === 'pending').map(event => event.id)
   useEffect(() => {
-    const waiting = session.events.filter(event => event.type === 'tool' && event.state === 'pending').map(event => event.id)
+    const waiting = pendingIds()
     const before = waitingIds.current
     waitingIds.current = new Set(waiting)
     if (!before) return
     const index = waiting.findLastIndex(id => !before.has(id))
-    if (index < 0 || (follow.current && waiting[index] === last?.id)) return
+    if (index < 0) return
+    justWaiting.current = session.status === 'awaiting_approval' ? null : waiting[index]
+    if (follow.current && waiting[index] === last?.id) return
     revealCard(container.current?.querySelectorAll(PENDING_CARDS)[index])
   }, [session.events])
+  // That status puts a hint under the message box, which makes the transcript shorter and can cut off the bottom of
+  // the card, where Approve is: the card is brought into view again, once.
+  useEffect(() => {
+    const id = justWaiting.current
+    if (session.status !== 'awaiting_approval' || id == null) return
+    justWaiting.current = null
+    const index = pendingIds().indexOf(id)
+    if (index >= 0) revealCard(container.current?.querySelectorAll(PENDING_CARDS)[index])
+  }, [session.status])
   const tools = session.events.filter(event => event.type === 'tool')
   // Edit and resend, Retry, Rewind and Fork from here (history.py on the server).
   const [editing, setEditing] = useState(null)  // the user event id being edited

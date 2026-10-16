@@ -375,6 +375,19 @@ def test_plan_actions_stay_at_the_end_of_the_card_in_a_narrow_column(ui, page, w
     assert ui.js("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
 
 
+def test_show_on_a_phone_brings_a_long_plans_review_buttons_into_view(ui, page):
+    # The plan is taller than the transcript and its actions are not sticky here: Show scrolls to them, so focus does
+    # not land out of sight. Mutation: scroll only the card into view before focusing.
+    card = plan_app(ui, page, 390, 844)
+    assert card.bounding_box()["height"] > ui.js("document.querySelector('.transcript').clientHeight")
+    page.locator(".transcript").evaluate("e => { e.style.scrollBehavior = 'auto'; e.scrollTop = 0; e.dispatchEvent(new Event('scroll')) }")
+    page.locator(".composer-hint").get_by_role("button", name="Show", exact=True).click()
+    expect(page.get_by_role("button", name="Keep planning")).to_be_focused()
+    ui.wait("""(() => { const button = document.activeElement.getBoundingClientRect()
+      const list = document.querySelector('.transcript').getBoundingClientRect()
+      return button.top >= list.top - 1 && button.bottom <= list.bottom + 1 })()""")
+
+
 LINKED_PLAN = "# Exporter plan\\n\\n## Steps\\n\\n" + "\\n".join(
     f"{n}. Step {n}: change [the exporter](https://example.com/{n}) so that it writes one more section of the report, keep "
     "the existing sections in the same order, and check it with a test." for n in range(1, 25))
