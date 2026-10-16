@@ -96,6 +96,7 @@ class DisabledTools(BaseModel):
 MAX_RULE_JSON = 8 * 1024
 MAX_EDIT_JSON = 600 * 1024
 MCP_TOOL = re.compile(r"^mcp__[A-Za-z0-9_-]{1,64}__[A-Za-z0-9_.-]{1,128}$")
+MCP_SERVER_SWITCH = re.compile(r"^mcp__[a-z][a-z0-9_-]{0,19}__\*$")  # turns a whole server off in a chat
 
 
 # Why a conversation is not idle, and what the user can do about it.
@@ -255,7 +256,7 @@ def register_approvals(app, manager, store, session_or_404):
         known = {*known_tool_names(), "ask_user", "submit_plan"}
         names = []
         for name in body.tools:
-            if not isinstance(name, str) or not (name in known or MCP_TOOL.match(name)):
+            if not isinstance(name, str) or not (name in known or MCP_TOOL.match(name) or MCP_SERVER_SWITCH.match(name)):
                 raise ValueError(f"Unknown tool: {str(name)[:80]}.")
             if name not in names:
                 names.append(name)
@@ -267,4 +268,7 @@ def register_approvals(app, manager, store, session_or_404):
         session = session_or_404(session_id) if session_id else None
         tools = [{"name": item["function"]["name"], "description": short_description(item["function"].get("description", ""))}
                  for item in [*TOOL_DEFINITIONS, *FEATURE_TOOLS]]
-        return {"tools": tools, "disabled": list((session or {}).get("disabled_tools", []))}
+        # The configured MCP servers: a chat can turn each off (mcp__<id>__*), so its process never starts.
+        servers = [{"id": item["id"], "name": manager.settings.redact(item["name"]), "enabled": item["enabled"]}
+                   for item in manager.extensions.public_config()["servers"]]
+        return {"tools": tools, "disabled": list((session or {}).get("disabled_tools", [])), "servers": servers}

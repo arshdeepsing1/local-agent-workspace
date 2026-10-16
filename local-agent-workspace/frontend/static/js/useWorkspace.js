@@ -275,6 +275,7 @@ export function useWorkspace() {
         }
         if (data.type === 'queue') setSession(current => current?.id === activeId ? { ...current, queued_messages: data.queued_messages || [], queue_error: data.error || null } : current)
         if (data.type === 'pending_context') setSession(current => current?.id === activeId ? { ...current, pending_context: data.pending_context || [] } : current)
+        if (data.type === 'mcp_status') setSession(current => current?.id === activeId ? { ...current, mcp_status: data.mcp_status || [] } : current)
         if (data.type === 'title') {
           setSession(current => current?.id === activeId ? { ...current, title: data.title } : current)
           setSessions(current => current.map(item => item.id === activeId ? { ...item, title: data.title } : item))

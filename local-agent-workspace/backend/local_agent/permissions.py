@@ -10,7 +10,7 @@ import logging
 from dataclasses import dataclass
 from typing import Literal
 
-from .tool_profiles import COVERED_BY
+from .tool_profiles import COVERED_BY, server_off
 from .rules import (EDIT_KINDS_RULE, behavior_of, has_matcher, parse_command, read_only_argv, rule_label, rule_matches,
                     uncertain_match)
 
@@ -22,7 +22,7 @@ MODE_LABELS = {"manual": "Manual", "auto": "Auto", "acceptEdits": "Accept edits"
 
 TOOL_KINDS = {
     **dict.fromkeys(("list_files", "find_files", "read_file", "search_files", "list_jobs", "get_job_output", "wait_job",
-                     "notebook_read", "outline_file", "project_overview"), "read"),
+                     "notebook_read", "outline_file", "project_overview", "get_tool_output"), "read"),
     **dict.fromkeys(("list_skills", "use_skill", "list_tasks", "get_task", "create_task", "update_task"), "task"),
     "ask_user": "question",
     "submit_plan": "plan",
@@ -140,6 +140,9 @@ def evaluate(mode, name, arguments, *, chat_rules=(), project_rules=(), user_rul
     # (0) Tools the user turned off in this chat, directly or through a tool that covers this one.
     if name in set(disabled or ()):
         return Verdict("deny", "disabled", f"The user turned off {name} in this chat. Use other tools.")
+    if switch := server_off(name, disabled):
+        return Verdict("deny", "disabled", f"The user turned off the MCP server {switch[5:-3]} in this chat, which "
+                       f"includes {name}. Use other tools.")
     for cover in covers:
         if cover in set(disabled or ()):
             return Verdict("deny", "disabled", f"The user turned off {cover} in this chat, which also covers {name}. "

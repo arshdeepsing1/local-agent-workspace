@@ -1849,8 +1849,8 @@ Open **Agent tools** in the header. Its sections are listed on the left (a scrol
 narrow window) in two groups: **This chat** (Overview, Tasks, Subagents, Tools, Usage, Export)
 and **Project** (Checkpoints, Verify, Memory, Worktrees, Extensions). The dialog opens on the section
 you used last in this browser, or **Overview**: the chat's model and permission mode, how many
-tools are on, its subagents running and finished, task progress, files with unreviewed changes,
-and for the project its file checkpoints, Verify command, memory notes (see **Project memory**),
+tools are on, its MCP servers in the last turn, its subagents running and finished, task progress, files with
+unreviewed changes, and for the project its file checkpoints, Verify command, memory notes (see **Project memory**),
 managed worktrees and MCP servers and hooks, each with **Open** for its section. A value that cannot be loaded reads
 **Could not load**; its section shows the error.
 
@@ -1916,24 +1916,25 @@ with `{before_event_id?, title?, worktree_branch?}` forks from a point.
 
 ### Agent tools: MCP, skills, and hooks
 
-**Extensions** edits the global explicit configuration. Saving enabled MCP servers
-authorizes their startup for tool discovery on each turn; **Test saved configuration**
-connects and lists tools without model inference. Servers can run over stdio
-(command and argument array) or Streamable HTTP (URL). Use absolute executable and
-script paths. Project files cannot automatically register or launch servers.
-No custom environment, authentication headers, OAuth, resource browsing, or MCP
-prompt workflow is implemented in this release. Keep credentials out of this JSON.
-The test reports each server independently as connected, failed (with a diagnostic),
-or disabled; disabled servers are not started. Results are a test snapshot, not a
-persistent live-health monitor. Failed test connections cannot contribute stale tools.
-Each server is tested independently; a collection of individually healthy servers
-must still fit the aggregate tool/schema limits when a chat starts.
+**Extensions** edits the global explicit configuration: a form (one block per server and per
+hook), or **Edit as JSON** for the same configuration as text; switching keeps every field (the
+form shows arguments with a line break, such as a `python -c` script, as they are: change them
+in **Edit as JSON**).
+Saving enabled MCP servers authorizes their startup for tool discovery on each turn; **Test
+saved configuration** connects and lists tools without model inference. Servers can run over
+stdio (command and argument array) or Streamable HTTP (URL). Use absolute executable and
+script paths. Project files cannot automatically register or launch servers. Up to 12
+servers can be configured and 4 enabled at a time. OAuth, SSE servers, resource browsing and
+MCP prompt workflows are not implemented.
 
 ```json
 {
   "servers": [
     {"id": "example", "name": "Example", "transport": "stdio",
-     "command": "/absolute/path/to/server", "args": [], "enabled": false}
+     "command": "/absolute/path/to/server", "args": [],
+     "env": {"API_TOKEN": {"secret": "EXAMPLE_TOKEN"}, "LOG_LEVEL": "info"}, "enabled": false},
+    {"id": "remote", "name": "Remote", "transport": "http", "url": "https://mcp.example.com/mcp",
+     "headers": {"Authorization": {"secret": "REMOTE_TOKEN", "prefix": "Bearer "}}, "enabled": false}
   ],
   "hooks": [
     {"id": "check", "event": "before_tool", "tools": ["write_file", "edit_file"], "command": "your-check-command",
@@ -1942,19 +1943,126 @@ must still fit the aggregate tool/schema limits when a chat starts.
 }
 ```
 
-The model sees names such as `mcp__example__tool`. MCP calls require their own
+**Secrets.** A stdio server's `env` and an HTTP server's `headers` (at most 16 each) hold text
+or a secret reference, `{"secret": "NAME"}` (a header may add a `"prefix"`: a scheme word and
+one space, such as `"Bearer "`). The app reads `NAME=…` from your credential file (`LOCAL_AGENT_ENV_FILE`) each
+time the server starts; the value is never saved in the configuration, never shown, and
+(when it has 8 characters or more) replaced by `[REDACTED]` in tool results, errors, test diagnostics, hook output, cards, titles,
+the usage ledger and exports, and in the tool descriptions and schemas a server sends (a server
+whose tool name holds one fails; a server that re-encodes a secret, for example in base64, is
+not caught). A missing key fails only that server, with a note naming the key. Plain values whose
+name or content looks like a secret (`TOKEN`, `KEY`, `SECRET`, `PASSWORD`, `AUTH`, `COOKIE`, a
+known token shape, your Databricks token) are refused with the reference to use instead.
+Variables that change how programs start (`PATH`, `LD_*`, `DYLD_*`, `PYTHON*`, `NODE_OPTIONS`,
+`BASH_ENV`, `ENV`) and the app's own `DBRICKS_*`/`DATABRICKS_*` credentials cannot be set, the
+`Host` and `Content-Length` headers are the transport's, and secret headers need an https URL
+(plain http only to `localhost`). A reference whose value is your Databricks token fails that
+server: the token is sent only with `workspace_credentials` (below). Other environment variables of the app are not passed to
+stdio servers, as before.
+
+For example, a local GitHub MCP server: command `github-mcp-server`, argument `stdio`, and
+`"env": {"GITHUB_PERSONAL_ACCESS_TOKEN": {"secret": "GITHUB_TOKEN"}}` with
+`GITHUB_TOKEN=…` in your credential file; or a remote one: its Streamable HTTP URL with
+`"headers": {"Authorization": {"secret": "GITHUB_TOKEN", "prefix": "Bearer "}}`.
+
+**Databricks managed MCP servers.** `"workspace_credentials": true` on an HTTP server sends
+your Databricks token as `Authorization: Bearer …`, only when the URL is https on your
+workspace's own host and port (checked at every connect; a redirect to another host is not
+followed, so the token never leaves that host), and it cannot be combined with your own Authorization header.
+Databricks documents managed servers under `/api/2.0/mcp/`, such as
+`/api/2.0/mcp/functions/{catalog}/{schema}` (Unity Catalog functions),
+`/api/2.0/mcp/vector-search/{catalog}/{schema}`, `/api/2.0/mcp/genie/{space_id}` and
+`/api/2.0/mcp/sql`; verify which managed servers your workspace has. Their tools run on your
+workspace compute (SQL warehouses, Genie, Vector Search) and are billed; each call still asks
+for approval as below, and the token has your token's full access.
+
+**Import.** **Import MCP servers** reads this project's `.mcp.json`, the Claude desktop app's
+`claude_desktop_config.json` (`~/Library/Application Support/Claude/` on macOS,
+`~/.config/Claude/` on Linux) or pasted JSON with an `mcpServers` object, and shows a preview:
+the servers it adds, the credential-file keys to add, the keys your credential file already
+has with the server that would get each once enabled (names only, never values), and what it
+skipped (SSE servers, a command, argument or URL that looks like it holds a secret, including
+the value after a flag such as `--api-key` or `--token`, entries without a command or URL) or
+left out (such as `cwd`). For this project's `.mcp.json` it also warns that the project chose
+these servers. **Add to the form** adds them disabled; nothing is saved or started
+until you save and enable a server. Environment and header values are never copied: each
+becomes a secret reference named after the `${VAR}` that is the whole value (a `Bearer`,
+`Basic` or `Token` scheme stays as the prefix), or after its key; for a value that mixes text
+and a variable, such as a database URL with `${DB_PASSWORD}` in it, the preview says to put the
+whole value under that key. Only a regular
+file of at most 64 KB is read (not a symbolic link or your credential file). An imported
+server runs its command (for example `npx` or `uvx`) with your account's access once enabled,
+so check each command first.
+
+**In a chat.** Each server connects on its own: one that fails to start, answer within 15
+seconds or list its tools is closed at once and skipped; its tools are unavailable and the
+other servers work. The chat gets one notice naming it (not again on later turns while it
+stays broken), and a server that failed is tried again only 60 seconds after the failure, so
+a broken server does not delay every turn (**Test saved configuration** tries it at once, and
+saving a change resets the wait). A server whose tools would go over 32 MCP tools or 16 KB of
+tool definitions, with the servers before it, is skipped the same way, and is not started again
+while the servers before it take the same room (saving a change or **Test saved configuration**
+tries it again). **Agent tools →
+Extensions → Last turn in this chat** (and a line on the Overview) shows each server's status:
+connected with its tool count and the server's name and version, failed or skipped with the
+reason and the end of a stdio server's error output (at most 2,000 characters, redacted; only
+its last 8 KB is kept in memory while the server runs, nothing is written to disk),
+turned off in this chat, or disabled. The test results also show a server's own instructions
+(shown there only, never sent to the agent). A server turned off in **Agent tools → Tools**
+never starts in that chat.
+
+Databricks accepts at most 32 tools per request, built-in and MCP tools together. Built-in
+tools come first, then MCP tools in server order; the MCP tools that do not fit are named once
+in a notice and in **Extensions**, and a call to one is refused. Turn off tools or servers a
+chat does not need to make room.
+
+The model sees names such as `mcp__example__tool`, so a new server ID cannot contain `__`. MCP calls require their own
 approval in Manual, Auto, and Accept edits; Plan blocks them, Don't ask blocks them unless a
 rule allows them, and Bypass permits them unless a deny or ask rule covers them. **Allow this
 tool in this chat** approves one exact tool name for the rest of the chat; a saved rule for the
 project or all projects can allow one tool or all tools of a server (see **Permission rules**). MCP servers and hook commands have the user's OS/network access, not the
 file tools' folder restrictions. Credential environment variables are stripped
-from local server/hook processes. Up to four servers, 32 tools, and 16 KB of tool
-schemas are supported; each call has a 60-second deadline and bounded 8 KB result.
-Connections close at turn end or cancellation. A discovery failure is reported,
-not silently interpreted as an empty working integration.
+from local server/hook processes. Each call has a 60-second deadline.
+Connections close at turn end or cancellation.
 An MCP result with `is_error=true` is displayed as an error even when the server
 request itself succeeded. Its bounded diagnostic remains available to the model;
 the app does not automatically retry the action.
+
+**Results.** Text stays text; an embedded text resource is labelled with its URI and type;
+a link becomes one line; structured content follows the text as JSON (unless it repeats it);
+binary resources and audio are described. Images are described for the model and never sent
+to it: the card keeps at most two (PNG, JPEG, GIF or WebP, up to 512 KB each) in memory and
+shows one with **Show image**. A result goes to the model in an 8 KB first page; when it is
+longer, the app keeps the whole text (up to 1,000,000 characters, redacted) in memory and the
+result carries `result_id` and `next_offset`, and from the next request on the chat offers
+`get_tool_output` to read the rest in pages of up to 8,000 characters. When a response's
+result allowance shortens an MCP result, the agent gets its beginning and end with `result_id`
+and `next_offset` 0, so it can read the omitted part (a result that fit in one page is kept for
+this too). It reads like
+`read_file`: no card, allowed in Plan, within a response's result allowance. The app keeps at
+most 20 results per chat and 8,000,000 characters in all (the least recently used go first);
+they are gone after a restart or when the chat is deleted, and the agent is told to call the
+tool again. Once offered, `get_tool_output` stays in that chat's tool list, so the tool
+definitions do not change from request to request. A card shows the server's hints about a
+tool, such as **Server says: read-only**; they are the server's claims and never change an
+approval.
+
+To write a small local tool server in Python with the `mcp` package the app already installs:
+
+```python
+# /absolute/path/to/my_tools.py — configure command: /absolute/path/to/python, args: [this file]
+from mcp.server import MCPServer
+from mcp.types import ToolAnnotations
+
+server = MCPServer("My tools", log_level="ERROR")
+
+@server.tool(annotations=ToolAnnotations(read_only_hint=True))
+def word_count(text: str) -> str:
+    """Count the words in a text."""
+    return str(len(text.split()))
+
+server.run()  # stdio
+```
 
 Install workspace skills at `.agents/skills/<skill-id>/SKILL.md`. Skills in
 `.claude/skills/<skill-id>/SKILL.md`, the layout another coding tool uses, are read too;
@@ -2544,10 +2652,11 @@ from a new chat creates the chat first.
 **Turned-off tools.** **Agent tools → Tools** turns tools off for one chat. They are not
 offered to the agent and calls to them are refused. Subagents, forks and imports keep the setting.
 The tools are grouped (Files, Search, Commands and jobs, Git, Tasks and subagents, Skills,
-Other); **Filter tools** matches names, groups and descriptions, and each group has
+MCP, Other); **Filter tools** matches names, groups and descriptions, and each group has
 **All on** and **All off** for the tools it shows. Each tool shows the first sentence of its
-description; hover it for more. MCP tools are turned off by their full name, and nothing
-changes until **Save tools**.
+description; hover it for more. Each configured MCP server has a switch: off, its process
+never starts in that chat (stored as `mcp__<server>__*`; subagents inherit it). One MCP tool
+is turned off by its full name, and nothing changes until **Save tools**.
 
 **Don't ask** never shows a card: actions that the mode or a rule does not allow are refused,
 and the agent is told to continue without them. Folder access outside the project is refused,
@@ -3072,7 +3181,8 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `backend/local_agent/notify.py`: optional desktop notifications (status and title only) when no page is open.
 - `backend/local_agent/changes.py`: the agent's file changes per conversation, their diffs, Keep and Undo.
 - `backend/local_agent/shell_changes.py`: the files a foreground `run_command` changed, from Git status before and after it.
-- `backend/local_agent/extensions.py` / `mcp_client.py`: skills, hooks, MCP lifecycle.
+- `backend/local_agent/extensions.py` / `mcp_client.py`: skills, hooks, MCP configuration (secret references, workspace credentials) and lifecycle (each server isolated, its status, content flattening).
+- `backend/local_agent/mcp_import.py` / `result_store.py`: the `.mcp.json` import preview, and long MCP results and images kept in memory (`get_tool_output`).
 - `backend/local_agent/planning.py` / `feature_tools.py`: tasks and subagents (agent types, the slot limit, parallel batches, the subagents index).
 - `backend/local_agent/feature_api.py`: scoped feature endpoints.
 - `backend/local_agent/reasoning.py`: reasoning effort request fields per endpoint and format, the rejection

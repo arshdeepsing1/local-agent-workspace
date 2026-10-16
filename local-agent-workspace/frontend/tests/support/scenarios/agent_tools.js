@@ -5,6 +5,12 @@ window.worktree = { id: 'worktree', path: '/project-worktree', branch: 'feature/
 window.task = { id: 'task', title: 'Inspect source', description: 'Find the parser', status: 'pending', depends_on: [] }
 window.config = { servers: [], hooks: [] }
 window.skill = { id: 'skill', name: 'Review code', description: 'Review changes carefully', path: '/skills/review/SKILL.md' }
+// POST /api/extensions/import: a preview (mcp_import.parse), nothing saved.
+window.importPreview = { source: 'project', path: '.mcp.json', needs: ['GITHUB_TOKEN'],
+  entries: [{ id: 'github', name: 'GitHub', enabled: false, transport: 'stdio', command: 'github-mcp-server', args: ['stdio'],
+    env: { GITHUB_PERSONAL_ACCESS_TOKEN: { secret: 'GITHUB_TOKEN' } } }],
+  skipped: [{ name: 'legacy', reason: 'SSE servers are not supported; use the server\'s Streamable HTTP URL if it has one.' }],
+  ignored: [{ name: 'GitHub', fields: ['cwd'] }] }
 window.projectSettings = { workspace: '/project', verify_command: 'pytest -q', verify_timeout_seconds: 600, verify_max_rounds: 2 }
 window.toolList = { tools: [
   { name: 'read_file', description: 'Read numbered lines from a text file. Pages follow next_line.' },
@@ -67,6 +73,7 @@ fake.handle = (path, options) => {
   if (path.startsWith('/api/project-settings')) return fake.json(options.method === 'PUT' ? { ...projectSettings, ...body() } : projectSettings)
   if (path === '/api/extensions') return fake.json(options.method === 'PUT' ? body() : config)
   if (path === '/api/extensions/test') return fake.json({ tools: ['example.search'] })
+  if (path.startsWith('/api/extensions/import')) return fake.json({ ...importPreview, source: body().source })
   if (path === '/api/skills' || path.startsWith('/api/skills?')) return fake.json([skill])
   if (path.endsWith('/skills')) return fake.json({ active_skills: body().enabled ? ['skill'] : [] })
 }

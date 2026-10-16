@@ -2,7 +2,7 @@
 
 PROFILES = ("read_only", "file_editor", "inherit")
 READ_TOOLS = frozenset({"list_files", "find_files", "read_file", "search_files", "list_skills", "use_skill", "list_tasks",
-                        "get_task", "notebook_read", "ask_user", "outline_file", "project_overview"})
+                        "get_task", "notebook_read", "ask_user", "outline_file", "project_overview", "get_tool_output"})
 FILE_TOOLS = READ_TOOLS | {"write_file", "edit_file", "insert_activity_log", "move_path", "delete_path", "notebook_edit"}
 
 
@@ -16,6 +16,20 @@ def covering_tool(name, names):
     """The first tool in names that covers name (COVERED_BY), else None."""
     names = set(names or ())
     return next((cover for cover in COVERED_BY.get(name, ()) if cover in names), None)
+
+
+def server_off(name, disabled):
+    """The mcp__<server>__* entry in disabled (a chat's turned-off tools) that turns name's server off, else None."""
+    if not isinstance(name, str) or not name.startswith("mcp__"):
+        return None
+    return next((item for item in disabled or () if isinstance(item, str) and item.startswith("mcp__")
+                 and item.endswith("__*") and name.startswith(item[:-1])), None)
+
+
+def off_servers(disabled):
+    """The IDs of the MCP servers a chat's turned-off tools switch off (mcp__<id>__*)."""
+    return [item[5:-3] for item in disabled or () if isinstance(item, str) and item.startswith("mcp__")
+            and item.endswith("__*") and len(item) > 8]
 
 
 def validate_profile(value):
@@ -33,8 +47,8 @@ def child_profile(parent, requested=None):
 
 def tool_allowed(session, name):
     disabled = session.get("disabled_tools") or []
-    if name in disabled or covering_tool(name, disabled):
-        return False  # Turned off by the user in this chat, directly or through a tool that covers it.
+    if name in disabled or covering_tool(name, disabled) or server_off(name, disabled):
+        return False  # Turned off by the user in this chat: directly, through a covering tool or its MCP server.
     agent_tools = session.get("agent_tools")
     if isinstance(agent_tools, list) and name not in agent_tools:
         return False  # A custom agent's subagent (custom_agents.py) uses only the tools its file lists.

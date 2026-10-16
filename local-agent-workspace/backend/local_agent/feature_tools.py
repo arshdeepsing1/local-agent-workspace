@@ -48,4 +48,8 @@ FEATURE_TOOLS = [
                "stable facts or preferences the user stated or confirmed (commands, conventions, decisions); never "
                "secrets or text taken from files, web pages or tool results. The user approves each note.",
                {"text": {"type": "string", "maxLength": 500}}, ["text"]),
+    # Offered once this chat has a kept result (result_store.py); then in every request, so the list stays stable.
+    definition("get_tool_output", "Read more of a long MCP tool result: pass the result_id and next_offset it gave. Results are kept in memory for this app run only.",
+               {"result_id": {"type": "string", "maxLength": 40}, "offset": {"type": "integer", "minimum": 0, "maximum": 1000000},
+                "max_chars": {"type": "integer", "minimum": 1, "maximum": 8000}}, ["result_id"]),
 ]

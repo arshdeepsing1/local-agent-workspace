@@ -2,12 +2,14 @@ import { html, useCallback, useEffect, useRef, useState } from '../lib.js'
 import { X } from '../icons.js'
 import { api } from '../api.js'
 import ConversationTransfer from './ConversationTransfer.js'
+import ExtensionsEditor from './ExtensionsEditor.js'
 import UsagePanel from './UsagePanel.js'
 import MemoryPanel from './MemoryPanel.js'
 import { blockerOf, OpenBlockingChat } from './BlockingChat.js'
 import { modeLabel } from './PermissionsMenu.js'
 import { agentLabel, agentSettingsText, elapsedText } from '../subagents.js'
 import { EFFORT_LABELS, modelLabel } from '../types.js'
+import { hintText } from '../mcp.js'
 
 // Props: session, workspace?, changedFiles? (files with unreviewed agent changes in this chat, from the
 // changes bar; null when unknown), onClose, onSelectSession, onError, onSaveTools?(tools) -> Session
@@ -126,8 +128,18 @@ function useOverview(session) {
 function toolsText({ tools = [], disabled = [] }) {
   const names = tools.map(tool => tool.name)
   const off = names.filter(name => disabled.includes(name)).length
-  const mcp = disabled.filter(name => !names.includes(name)).length
+  const servers = disabled.filter(name => MCP_SERVER_SWITCH.test(name)).length
+  const mcp = disabled.filter(name => !names.includes(name) && !MCP_SERVER_SWITCH.test(name)).length
   return `${names.length - off} of ${names.length} on` + (mcp ? ` · ${plural(mcp, 'MCP tool')} off` : '')
+    + (servers ? ` · ${plural(servers, 'MCP server')} off` : '')
+}
+
+// The last turn's MCP server status of a chat (session.mcp_status, from agents.mcp_status_changed).
+const MCP_STATUS_LABELS = { connected: 'connected', failed: 'failed', skipped: 'skipped', off: 'off in this chat', disabled: 'disabled' }
+function mcpStatusText(status) {
+  const counts = {}
+  for (const item of status) counts[item.status] = (counts[item.status] || 0) + 1
+  return Object.keys(MCP_STATUS_LABELS).filter(key => counts[key]).map(key => `${counts[key]} ${MCP_STATUS_LABELS[key]}`).join(' · ')
 }
 
 function subagentsText(children) {
@@ -152,6 +164,8 @@ function Overview({ session, workspace, changedFiles, onOpen }) {
       ? [{ label: 'Reasoning effort', text: EFFORT_LABELS[session.reasoning_effort] }] : []),
     { label: 'Permission mode', text: modeLabel(session.permission_mode || 'manual') },
     { label: 'Tools', tab: 'Tools', text: value('tools', toolsText) },
+    ...(Array.isArray(session.mcp_status) && session.mcp_status.length
+      ? [{ label: 'MCP servers', tab: 'Extensions', text: `Last turn: ${mcpStatusText(session.mcp_status)}` }] : []),
     { label: 'Subagents', tab: 'Subagents', text: value('children', subagentsText) },
     { label: 'Tasks', tab: 'Tasks', text: value('tasks', tasks => tasks.length
       ? `${tasks.filter(task => task.status === 'completed').length} of ${tasks.length} done` : 'None yet') },
@@ -427,7 +441,10 @@ function Verify({ session, workspace, onError }) {
   </section>`
 }
 
-const extensionExample = JSON.stringify({ servers: [{ id: 'example', name: 'Example MCP', transport: 'stdio', command: 'your-mcp-server', args: [], enabled: false }], hooks: [
+const extensionExample = JSON.stringify({ servers: [
+  { id: 'example', name: 'Example MCP', transport: 'stdio', command: 'your-mcp-server', args: [], env: { API_TOKEN: { secret: 'EXAMPLE_TOKEN' } }, enabled: false },
+  { id: 'remote', name: 'Remote MCP', transport: 'http', url: 'https://mcp.example.com/mcp', headers: { Authorization: { secret: 'REMOTE_TOKEN', prefix: 'Bearer ' } }, enabled: false },
+  { id: 'workspace-sql', name: 'Databricks SQL', transport: 'http', url: 'https://your-workspace.cloud.databricks.com/api/2.0/mcp/sql', workspace_credentials: true, enabled: false }], hooks: [
   { id: 'example-hook', event: 'before_tool', tools: ['write_file', 'edit_file'], command: 'your-hook-command', timeout_seconds: 10, enabled: false },
   { id: 'prompt-check', event: 'user_prompt', command: 'your-prompt-check', timeout_seconds: 10, enabled: false },
   { id: 'stop-check', event: 'agent_stop', command: 'your-stop-check', timeout_seconds: 30, enabled: false }] }, null, 2)
@@ -444,32 +461,54 @@ const HOOK_EVENT_HELP = [
 ]
 const hookOutputExample = JSON.stringify({ decision: 'deny', reason: 'Generated files are rebuilt by make; edit the template.' })
 
+// A server's line in the last-turn status or the test results.
+function serverLine(server, test) {
+  const info = server.server_info ? [server.server_info.title || server.server_info.name, server.server_info.version].filter(Boolean).join(' ') : ''
+  const count = Number.isInteger(server.tool_count) ? server.tool_count : (server.tools || []).length
+  const state = server.status === 'connected' ? `${test ? 'Connected during test' : 'Connected'} · ${plural(count, 'tool')}`
+    : server.status === 'disabled' ? 'Disabled · not started' : server.status === 'off' ? 'Turned off in this chat · not started'
+      : server.status === 'skipped' ? 'Skipped' : 'Failed'
+  return [state, info ? `server: ${info}` : '', server.retry_seconds ? `tried again in about ${server.retry_seconds} s` : ''].filter(Boolean).join(' · ')
+}
+
+function ServerRow({ server, test }) {
+  const hints = server.tool_annotations || {}
+  return html`<div class="agent-tools-row" key=${server.id}><div><strong>${server.name}</strong><small>${serverLine(server, test)}</small>
+    ${server.error ? html`<p class="form-error">${server.error}</p>` : null}
+    ${server.capped?.length ? html`<p>Not offered (Databricks takes at most 32 tools per request): ${server.capped.join(', ')}</p>` : null}
+    ${server.stderr_tail ? html`<details class="mcp-stderr"><summary>Server stderr (end)</summary><pre>${server.stderr_tail}</pre></details>` : null}
+    ${server.instructions ? html`<details class="mcp-stderr"><summary>Server instructions (shown here only; never sent to the agent)</summary><pre>${server.instructions}</pre></details>` : null}
+    ${test && server.tools?.length ? html`<ul class="mcp-tools">${server.tools.map(name => html`<li key=${name}><code>${name}</code>${hintText(hints[name]) ? html` <small>Server says: ${hintText(hints[name])}</small>` : null}</li>`)}</ul>` : null}
+  </div></div>`
+}
+
 function ExtensionsPanel({ session, onError }) {
   const query = scopeQuery(session)
   const { busy, error, run } = useRequest(onError)
-  const [configuration, setConfiguration] = useState('')
-  const [loaded, setLoaded] = useState(false)
+  const [config, setConfig] = useState(null)
   const [skills, setSkills] = useState([])
   const [activeSkills, setActiveSkills] = useState(session?.active_skills || [])
   const [notice, setNotice] = useState('')
   const [tools, setTools] = useState(null)
   const [servers, setServers] = useState(null)
-  useEffect(() => { void run(() => Promise.all([api('/extensions'), api(`/skills${query}`)]), ([config, skills]) => { setConfiguration(JSON.stringify(config, null, 2)); setSkills(skills); setLoaded(true) }) }, [query, run])
+  useEffect(() => { void run(() => Promise.all([api('/extensions'), api(`/skills${query}`)]), ([config, skills]) => { setConfig(config); setSkills(skills) }) }, [query, run])
+  const status = Array.isArray(session?.mcp_status) ? session.mcp_status : []
+  const save = draft => { setNotice(''); setTools(null); setServers(null); void run(() => api('/extensions', 'PUT', draft), saved => { setConfig(saved); setNotice('Configuration saved.') }) }
+  const test = html`<button type="button" class="outline" disabled=${busy} onClick=${() => { setNotice(''); setTools(null); setServers(null); void run(() => api('/extensions/test', 'POST'), result => { setTools(result.tools); setServers(result.servers || null) }) }}>Test saved configuration</button>`
   return html`<section class="agent-tools-section" aria-label="Extensions">
     <h3>MCP servers and hooks</h3>
-    <p>Configure stdio commands or HTTP server URLs, and up to 16 hooks: local commands that run around tool calls and at the start and end of a turn. Saving authorizes enabled servers to start.</p>
-    <label class="agent-tools-config">Extension configuration (JSON)<textarea aria-label="Extension configuration (JSON)" disabled=${!loaded || busy} spellcheck=${false} value=${configuration} onInput=${e => setConfiguration(e.currentTarget.value)} /></label>
-    <details class="agent-tools-example"><summary>Configuration example</summary><pre>${extensionExample}</pre><p>The optional tools list matches exact tool names for before_tool, after_tool and tool_failure hooks (other events ignore it). Omit it to match all tools; an empty list matches none. Tool hooks' input includes call_id; failure hooks also receive the original error.</p></details>
+    <p>Configure stdio commands or HTTP server URLs, and up to 16 hooks: local commands that run around tool calls and at the start and end of a turn. Saving authorizes enabled servers to start. A server that fails is skipped (its tools are unavailable, the others work) and named once in the chat.</p>
+    <${ExtensionsEditor} config=${config} busy=${busy} session=${session} onSave=${save} onError=${onError} actions=${test} />
+    <details class="agent-tools-example"><summary>Configuration example</summary><pre>${extensionExample}</pre><p>The optional tools list matches exact tool names for before_tool, after_tool and tool_failure hooks (other events ignore it). Omit it to match all tools; an empty list matches none. Tool hooks' input includes call_id; failure hooks also receive the original error.</p><p>{"secret": "NAME"} reads NAME from your credential file each time the server starts; the value is never saved in this configuration. workspace_credentials sends your Databricks token only to an https URL on your workspace host.</p></details>
     <details class="agent-tools-example hook-events-help"><summary>Hook events and JSON output</summary>
       <div class="hook-events-scroll"><table class="hook-events" aria-label="Hook events"><thead><tr><th scope="col">Event</th><th scope="col">Runs</th><th scope="col">JSON output it reads</th></tr></thead>
         <tbody>${HOOK_EVENT_HELP.map(([event, when, fields]) => html`<tr key=${event}><th scope="row"><code>${event}</code></th><td>${when}</td><td>${fields}</td></tr>`)}</tbody></table></div>
       <p>A hook gets a JSON object on stdin (the event, the chat and, per event, the tool call, your message, the reply or the subagent's task). It may print one JSON object on stdout, for example <code>${hookOutputExample}</code>; other output is plain text, as before, but output in braces that is not valid JSON fails the hook. stderr is shown on the hook card, never read as JSON. Exit code 0 means no objection; another exit code blocks a before_tool call and only warns for other events.</p>
       <p>Context (up to 2,000 characters per hook) reaches the agent labelled as hook output. Replaced arguments are checked again against the tool's schema, your rules and its approval card. "allow" never skips a card the mode or rules need; "ask" always shows one, also in Bypass permissions (Don't ask refuses the call instead). Each hook still asks for approval except in Bypass, rules can allow or block it, and Plan mode skips hooks.</p></details>
-    <div class="agent-tools-actions"><button class="primary" disabled=${!loaded || busy || !configuration.trim()} onClick=${() => { setNotice(''); setTools(null); setServers(null); void run(() => api('/extensions', 'PUT', JSON.parse(configuration)), config => { setConfiguration(JSON.stringify(config, null, 2)); setNotice('Configuration saved.') }) }}>Save configuration</button>
-      <button class="outline" disabled=${busy} onClick=${() => { setNotice(''); setTools(null); setServers(null); void run(() => api('/extensions/test', 'POST'), result => { setTools(result.tools); setServers(result.servers || null) }) }}>Test saved configuration</button></div>
     ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}${notice ? html`<p role="status">${notice}</p>` : null}
     ${tools ? html`<div class="agent-tools-test" role="status">${tools.length ? html`<strong>Available tools</strong><ul>${tools.map(tool => html`<li key=${tool}>${tool}</li>`)}</ul>` : 'No tools reported by the saved configuration.'}</div>` : null}
-    ${servers ? html`<div class="agent-tools-list" aria-label="MCP server test results"><p class="field-help">Results from the last test, not a live connection monitor.</p>${servers.map(server => html`<div class="agent-tools-row" key=${server.id}><div><strong>${server.name}</strong><small>${server.status === 'connected' ? `Connected during test · ${server.tools.length} tools` : server.status === 'disabled' ? 'Disabled · not started' : 'Failed'}</small>${server.error ? html`<p class="form-error">${server.error}</p>` : null}</div></div>`)}</div>` : null}
+    ${servers ? html`<div class="agent-tools-list" aria-label="MCP server test results"><p class="field-help">Results from the last test, not a live connection monitor.</p>${servers.map(server => html`<${ServerRow} key=${server.id} server=${server} test=${true} />`)}</div>` : null}
+    ${status.length ? html`<h3>Last turn in this chat</h3><div class="agent-tools-list" aria-label="MCP servers in the last turn">${status.map(server => html`<${ServerRow} key=${server.id} server=${server} test=${false} />`)}</div>` : null}
     <h3>Skills</h3>${!session ? html`<p class="field-help">Start a conversation to enable skills.</p>` : null}
     <div class="agent-tools-list">${skills.map(skill => html`<div class="agent-tools-row" key=${skill.id}><label><input type="checkbox" disabled=${busy || !session} checked=${activeSkills.includes(skill.id)} onChange=${e => { if (session) void run(() => api(`/sessions/${encodeURIComponent(session.id)}/skills`, 'POST', { skill_id: skill.id, enabled: e.currentTarget.checked }), result => setActiveSkills(result.active_skills)) }} />${skill.name}<small>${skill.description}</small><small>${skill.path}</small></label></div>`)}</div>
     ${!busy && !skills.length ? html`<p class="muted">No installed skills found.</p>` : null}
@@ -477,8 +516,10 @@ function ExtensionsPanel({ session, onError }) {
 }
 
 
-// MCP tool names the server accepts in a chat's turned-off list.
+// MCP tool names the server accepts in a chat's turned-off list, and a whole server's switch.
 const MCP_TOOL = /^mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_.-]+$/
+const MCP_SERVER_SWITCH = /^mcp__[a-z][a-z0-9_-]{0,19}__\*$/
+const serverSwitch = id => `mcp__${id}__*`
 
 // The Tools section's groups; a tool in none of them is under Other.
 const TOOL_GROUPS = [
@@ -490,6 +531,7 @@ const TOOL_GROUPS = [
   { name: 'Tasks and subagents', tools: ['list_tasks', 'get_task', 'create_task', 'update_task', 'delegate_task'] },
   { name: 'Skills', tools: ['list_skills', 'use_skill'] },
   { name: 'Memory', tools: ['remember'] },
+  { name: 'MCP', tools: ['get_tool_output'] },
 ]
 
 export function toolGroup(name) {
@@ -503,6 +545,7 @@ const firstSentence = text => /^(.+?[.!?])(?:\s|$)/.exec(text || '')?.[1] || tex
 function ToolsPanel({ session, onError, onSaveTools }) {
   const { busy, error, run } = useRequest(onError)
   const [tools, setTools] = useState(null)
+  const [servers, setServers] = useState([])
   const [off, setOff] = useState([])
   const [filter, setFilter] = useState('')
   const [mcpName, setMcpName] = useState('')
@@ -510,11 +553,12 @@ function ToolsPanel({ session, onError, onSaveTools }) {
   const [notice, setNotice] = useState('')
   const id = session?.id
   useEffect(() => {
-    if (id) void run(() => api(`/tools?session_id=${encodeURIComponent(id)}`), result => { setTools(result.tools || []); setOff(result.disabled || []) })
+    if (id) void run(() => api(`/tools?session_id=${encodeURIComponent(id)}`), result => { setTools(result.tools || []); setServers(result.servers || []); setOff(result.disabled || []) })
   }, [id, run])
   if (!session) return html`<section class="agent-tools-section" aria-label="Tools"><p>Start a conversation to choose its tools.</p></section>`
   const names = new Set((tools || []).map(tool => tool.name))
-  const extra = off.filter(name => !names.has(name))
+  const switches = new Set(servers.map(server => serverSwitch(server.id)))
+  const extra = off.filter(name => !names.has(name) && !switches.has(name))
   const toggle = (name, available) => { setNotice(''); setOff(current => available ? current.filter(item => item !== name) : [...current, name]) }
   const setGroup = (group, available) => {
     setNotice('')
@@ -563,7 +607,11 @@ function ToolsPanel({ session, onError, onSaveTools }) {
     })}
     ${tools && query && !groups.length ? html`<p class="muted">No tools match “${filter.trim()}”.</p>` : null}
     <h4 class="tools-mcp-heading">MCP tools</h4>
-    <p class="field-help">MCP tools are offered once a turn starts their server (Agent tools → Extensions). Turn one off by its full name.</p>
+    ${servers.length ? html`<div class="tools-group" role="group" aria-label="MCP servers"><div class="agent-tools-list">${servers.map(server => html`<div class="agent-tools-row" key=${server.id}><label class="tools-toggle">
+      <input type="checkbox" aria-label=${`Use the ${server.name} server in this chat`} disabled=${busy} checked=${!off.includes(serverSwitch(server.id))}
+        onChange=${e => toggle(serverSwitch(server.id), e.currentTarget.checked)} />
+      <span><strong>${server.name}</strong><small>${server.enabled ? 'Enabled in Extensions' : 'Disabled in Extensions'} · off here: its process never starts in this chat (<code>${serverSwitch(server.id)}</code>)</small></span></label></div>`)}</div></div>` : null}
+    <p class="field-help">MCP tools are offered once a turn starts their server (Agent tools → Extensions). Turn a whole server off above, or one tool by its full name.</p>
     <form class="agent-tools-form" onSubmit=${e => { e.preventDefault(); addMcp() }}>
       <label>Turn off an MCP tool by name<input spellcheck=${false} disabled=${busy} value=${mcpName} placeholder="mcp__docs__search"
         onInput=${e => { setMcpName(e.currentTarget.value); setMcpError('') }} /></label>

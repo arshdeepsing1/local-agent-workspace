@@ -60,7 +60,9 @@
 //   http_status?: number (with error_kind 'http') }
 // Session: { id, title, workspace, model, status, events: AgentEvent[], updated,
 //   permission_mode: 'manual'|'auto'|'acceptEdits'|'dontAsk'|'plan'|'bypassPermissions', allowed_directories,
-//   allow_rules: Rule[] (this chat's rules), disabled_tools?: string[] (turned-off tools), context_info?, active_skills?,
+//   allow_rules: Rule[] (this chat's rules), disabled_tools?: string[] (turned-off tools; 'mcp__<server id>__*' turns a
+//   whole MCP server off in the chat, so it never starts), context_info?, active_skills?,
+//   mcp_status?: McpServerStatus[] (the last turn's MCP servers; pushed as { type: 'mcp_status', mcp_status }),
 //   parent_session_id?, is_subagent?, delegation?, tool_profile?, subagent_tool_profile?,
 //   agent_type?: 'explore'|'general'|'editor' or a custom agent's name (a subagent), subagents?: SubagentEntry[] (a parent's index of its
 //   subagent chats; left out of GET /sessions list items),
@@ -169,6 +171,19 @@
 //   what ran), hook_ask?: { hook_id, reason } (a hook asked for its card) and hook_blocked?: { hook_id, reason }.
 //   A user event can carry hook_blocked? (never sent), hook_edit?: { hooks, original } (text is the hook's
 //   replacement) and hook_notes?: [{ event, hook_id, context }] (context sent to the model after the message).
+//   MCP cards (name 'mcp__<server>__<tool>'): mcp_annotations?: { title?, read_only?, destructive?, idempotent?,
+//   open_world? } (the server's hints, shown, never used for permissions) and mcp_images?: [{ id, mime_type, bytes }]
+//   (GET /sessions/<id>/tool-images/<id> -> { mime_type, data } while the app runs; never sent to the model). A long
+//   result's output JSON has result_id, next_offset, total_chars (and rest_not_kept) for get_tool_output.
+// McpServerStatus: { id, name, status: 'connected'|'failed'|'skipped'|'off'|'disabled', tool_count, error?,
+//   stderr_tail? (redacted end of a stdio server's stderr), server_info?: { name, title?, version? },
+//   retry_seconds? (a failed server is tried again after 60 s), capped?: string[] (tools left out by the
+//   32-tool request limit) }. POST /extensions/test returns { tools, servers: [the same, with tools: string[],
+//   instructions?, tool_annotations?] }. POST /extensions/import?session_id= { source: 'project'|'desktop'|'text',
+//   text? } -> { source, path?, entries (disabled servers), needs: string[] (credential-file keys), present: string[]
+//   (needed keys the credential file already has; names only), skipped: [{ name, reason }], ignored: [{ name, fields }],
+//   notes: [{ name, text }] (values to put whole in the credential file) }: a preview, nothing is saved. GET /tools also returns
+//   servers: [{ id, name, enabled }].
 // Delegation: { status: 'queued'|'running'|'awaiting_approval'|...|'completed'|'failed'|'cancelled'|'interrupted',
 //   completed_tools, last_tool?, terminal_reason?, agent_type?, started?, ended? (epoch seconds) }. A finished
 //   delegate_task card's output is the JSON result { child_session_id, agent_type, tool_profile, status,

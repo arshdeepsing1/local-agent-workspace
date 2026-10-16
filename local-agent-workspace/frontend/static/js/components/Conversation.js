@@ -13,6 +13,7 @@ import ForkDialog from './ForkDialog.js'
 import { backupTitle, setRewindNotice } from '../rewindNotice.js'
 import { agentLabel, agentSettingsText, elapsedText } from '../subagents.js'
 import { pathShortener } from '../paths.js'
+import { hintText } from '../mcp.js'
 
 // A long file is read in pages. Naming the lines each read covered keeps the
 // pages of one file from looking like the same read repeated.
@@ -143,6 +144,9 @@ export function resultOf(event) {
   try { page = JSON.parse(json) } catch { return null }
   if (!page || typeof page !== 'object' || Array.isArray(page) || typeof page.output !== 'string') return null
   return { note, text: page.output, raw: text, mcpError: page.is_error === true,
+    // A long MCP result: the rest is kept in memory for get_tool_output (result_store.py).
+    kept: typeof page.result_id === 'string' && Number.isInteger(page.total_chars)
+      ? { shown: Number(page.next_offset) || page.output.length, total: page.total_chars, restNotKept: page.rest_not_kept === true } : null,
     job: 'state' in page ? { state: String(page.state), exitCode: page.exit_code, background: !!page.background,
       total: page.total_chars, truncated: page.truncated === true, shown: shownPart(page),
       // wait_job: why the wait ended ('matched', 'timeout', 'idle' or 'exited') and the line that matched.
@@ -270,6 +274,31 @@ function HookResult({ result }) {
   </div>`
 }
 
+// Images an MCP tool returned (event.mcp_images: { id, mime_type, bytes }), kept in memory by the app and
+// never sent to the model; each loads when asked.
+const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp'])
+function McpImages({ images, sessionId }) {
+  const [shown, setShown] = useState({})
+  const load = async image => {
+    setShown(current => ({ ...current, [image.id]: { loading: true } }))
+    try {
+      const data = await api(`/sessions/${encodeURIComponent(sessionId)}/tool-images/${encodeURIComponent(image.id)}`)
+      setShown(current => ({ ...current, [image.id]: IMAGE_TYPES.has(data.mime_type) && typeof data.data === 'string'
+        ? { src: `data:${data.mime_type};base64,${data.data}` } : { error: 'This image cannot be shown.' } }))
+    } catch (e) { setShown(current => ({ ...current, [image.id]: { error: e.message } })) }
+  }
+  return html`<div class="mcp-images"><p class="tool-detail-label">Images (shown here, not sent to the model)</p>
+    ${images.map((image, index) => {
+      const state = shown[image.id] || {}
+      const label = `image ${index + 1} (${image.mime_type}, ${Math.max(1, Math.round(image.bytes / 1024)).toLocaleString()} KB)`
+      return html`<div class="mcp-image" key=${image.id}>
+        ${state.src ? html`<img src=${state.src} alt=${`MCP tool ${label}`} />`
+          : html`<button type="button" class="outline" disabled=${!!state.loading} onClick=${() => load(image)}>Show ${label}</button>`}
+        ${state.error ? html`<p class="form-error">${state.error}</p>` : null}
+      </div>`
+    })}</div>`
+}
+
 // failure: what a failed tool told the agent (toolError), or null.
 function ToolDetails({ event, pending, result = null, failure = null }) {
   const { command, ...options } = event.input || {}
@@ -285,6 +314,7 @@ function ToolDetails({ event, pending, result = null, failure = null }) {
     ${result ? html`${result.note && !event.edited ? html`<p class="tool-rule">${result.note}</p>` : null}
         <p class="tool-detail-label">Output</p><pre aria-label="Output">${result.text || 'No output.'}</pre>
         ${job ? html`<p class="muted tool-job-state">${jobStateLine(job)}</p>` : null}
+        ${result.kept ? html`<p class="muted tool-job-state">First ${result.kept.shown.toLocaleString()} of ${result.kept.total.toLocaleString()} characters shown${result.kept.restNotKept ? ' (the server sent more; the rest was not kept)' : ''}. The agent can read the rest with get_tool_output until the app restarts.</p>` : null}
         <details class="tool-raw"><summary>Raw result</summary><pre aria-label="Raw result">${result.raw}</pre></details>`
       : !pending || event.output ? html`<p class="tool-detail-label">Output</p><pre aria-label="Output">${event.output || (event.state === 'running' ? 'Waiting for output…' : 'No output.')}</pre>` : null}
     ${failure ? html`<p class="tool-detail-label">Error category</p><p>${failure.label}</p>
@@ -528,6 +558,7 @@ function ToolCard({ event, summary, result, status, failure = null, sessionId, o
   const allowInChat = pending ? allowLabel(event) : null
   const rule = ruleLine(event)
   const hooked = hookSummary(event)
+  const hints = hintText(event.mcp_annotations)
   // A running agent command shows its time against its limit and, collapsed, its latest output line.
   const runningCommand = event.state === 'running' && event.name === 'run_command'
   const clock = runningCommand && typeof event.job_started === 'number'
@@ -557,6 +588,7 @@ function ToolCard({ event, summary, result, status, failure = null, sessionId, o
     ${liveLine ? html`<p class="tool-live" title=${liveLine}>${liveLine}</p>` : null}
     ${rule ? html`<p class="tool-rule">${rule}</p>` : null}
     ${hooked ? html`<p class="hook-outcome">${hooked}</p>` : null}
+    ${hints ? html`<p class="tool-hints" title="Hints from the MCP server. They never change approvals.">Server says: ${hints}</p>` : null}
     ${expanded || pending ? html`<div class="tool-body">
       ${pending ? html`<p>Local needs your approval to ${title.toLowerCase()}.${event.approval_expires
           ? ` If you do not answer by ${expiryTime(event.approval_expires)}, it will not run.` : ''}</p>
@@ -566,7 +598,9 @@ function ToolCard({ event, summary, result, status, failure = null, sessionId, o
             <textarea rows=${2} maxLength=${2000} spellcheck=${false} value=${note} disabled=${deciding}
               onInput=${e => setNote(e.currentTarget.value)} /></label>`} />`
         : html`${event.state === 'completed' && allowanceNote(event) ? html`<p class="tool-allowance">${allowanceNote(event)}</p>` : null}
-          <${ToolDetails} event=${event} pending=${false} result=${result} failure=${failure} /><small class="muted">Action: ${actionText(event, status)}${status.label ? html` · <span class="tool-status-text">${status.label}</span>` : ''}</small>
+          <${ToolDetails} event=${event} pending=${false} result=${result} failure=${failure} />
+          ${Array.isArray(event.mcp_images) && event.mcp_images.length ? html`<${McpImages} images=${event.mcp_images} sessionId=${sessionId} />` : null}
+          <small class="muted">Action: ${actionText(event, status)}${status.label ? html` · <span class="tool-status-text">${status.label}</span>` : ''}</small>
           ${onOpenPath && typeof filePath === 'string' && filePath ? html`<button class="outline tool-open-file"
             onClick=${() => onOpenPath(startLine ? { path: filePath, line: startLine } : { path: filePath })}><${FileText} size=${14} />Open file</button>` : null}`}
     </div>` : null}

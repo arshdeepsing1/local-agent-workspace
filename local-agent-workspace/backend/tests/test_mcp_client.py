@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import os
 import signal
@@ -115,8 +116,10 @@ async def test_disabled_servers_are_never_started(extension_manager, local_serve
 async def test_connection_failure_is_actionable(extension_manager, local_server):
     local_server["command"] = "/does/not/exist"
     extension_manager.update_config({"servers": [local_server]})
-    with pytest.raises(ValueError, match="MCP server local"):
-        await extension_manager.discover()
+    async with extension_manager.turn() as connection:
+        assert await connection.discover() == []
+        [entry] = connection.status
+    assert entry["status"] == "failed" and "could not connect" in entry["error"] and "/does/not/exist" in entry["error"]
 
 
 async def test_initialize_timeout_reaps_unresponsive_server(extension_manager, local_server, tmp_path, monkeypatch):
@@ -124,10 +127,13 @@ async def test_initialize_timeout_reaps_unresponsive_server(extension_manager, l
     server.write_text("import os,time,sys; from pathlib import Path; Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(30)")
     local_server["args"] = [str(server), str(tmp_path / "server.pid")]
     extension_manager.update_config({"servers": [local_server]})
-    monkeypatch.setattr("local_agent.mcp_client.CONNECT_TIMEOUT", .1)
-    with pytest.raises(ValueError, match="could not connect"):
-        await extension_manager.discover()
-    assert not process_exists(int((tmp_path / "server.pid").read_text()))
+    monkeypatch.setattr("local_agent.mcp_client.CONNECT_TIMEOUT", .5)
+    async with extension_manager.turn() as connection:
+        assert await connection.discover() == []
+        assert connection.status[0]["status"] == "failed"
+        assert "did not answer within" in connection.status[0]["error"]
+        # Closed at once, on this task, before the turn goes on.
+        assert not process_exists(int((tmp_path / "server.pid").read_text()))
 
 
 async def test_tool_result_error_is_retained(extension_manager, local_server):
@@ -163,21 +169,148 @@ async def test_diagnostics_check_every_server_and_redact_failures(extension_mana
     assert not process_exists(int((tmp_path / "server.pid").read_text()))
 
 
-async def test_failed_or_closed_discovery_never_reuses_partial_tools(extension_manager, local_server, tmp_path):
-    bad = {**local_server, "id": "broken", "command": "/does/not/exist"}
-    extension_manager.update_config({"servers": [local_server, bad]})
+async def test_a_broken_server_is_skipped_and_the_others_work(extension_manager, local_server, tmp_path):
+    bad = {**local_server, "id": "broken", "name": "Broken", "command": "/does/not/exist"}
+    extension_manager.update_config({"servers": [bad, local_server]})
     async with extension_manager.turn() as connection:
-        with pytest.raises(ValueError, match="MCP server broken"):
-            await connection.discover()
-        assert connection.registry == {} and connection.definitions == [] and connection.tool_names == set()
-        with pytest.raises(ValueError, match="no longer available"):
-            await connection.call("mcp__local__echo", {"text": "must not run"})
-        with pytest.raises(ValueError, match="start a new turn"):
-            await connection.discover()
+        definitions = await connection.discover()
+        names = {item["function"]["name"] for item in definitions}
+        assert names == {"mcp__local__echo", "mcp__local__fail", "mcp__local__slow"} == connection.tool_names
+        assert [item["status"] for item in connection.status] == ["failed", "connected"]
+        assert not any(name.startswith("mcp__broken__") for name in connection.registry)
+        assert (await connection.call("mcp__local__echo", {"text": "works"}))["output"] == "works env=None"
+        with pytest.raises(ValueError, match="not available"):
+            await connection.call("mcp__broken__echo", {"text": "never"})
     assert not process_exists(int((tmp_path / "server.pid").read_text()))
     assert connection.tool_names == set()
     with pytest.raises(ValueError, match="no longer available"):
         await connection.call("mcp__local__echo", {"text": "must not run"})
+    with pytest.raises(ValueError, match="start a new turn"):
+        await connection.discover()
+
+
+async def test_a_server_failing_mid_listing_leaves_none_of_its_tools(extension_manager, local_server, tmp_path, monkeypatch):
+    from local_agent import mcp_client
+    original = mcp_client.validate_schema
+    seen = []
+
+    def failing(schema):
+        seen.append(schema)
+        if len(seen) == 2:  # The server's second tool.
+            raise ValueError("Unsupported schema")
+        return original(schema)
+    monkeypatch.setattr(mcp_client, "validate_schema", failing)
+    extension_manager.update_config({"servers": [local_server]})
+    async with extension_manager.turn() as connection:
+        assert await connection.discover() == []
+        assert connection.registry == {} and connection.status[0]["status"] == "failed"
+        assert "Unsupported schema" in connection.status[0]["error"]
+        assert not process_exists(int((tmp_path / "server.pid").read_text()))
+
+
+async def test_cancellation_while_the_second_server_connects_reaps_both(extension_manager, local_server, tmp_path):
+    slow = tmp_path / "unresponsive.py"
+    slow.write_text("import os,time,sys; from pathlib import Path; Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(30)")
+    second = {**local_server, "id": "second", "args": [str(slow), str(tmp_path / "second.pid")]}
+    extension_manager.update_config({"servers": [local_server, second]})
+
+    async def turn():
+        async with extension_manager.turn() as connection:
+            await connection.discover()
+
+    task = asyncio.create_task(turn())
+    async with asyncio.timeout(10):
+        while not (tmp_path / "second.pid").exists() or not (tmp_path / "second.pid").read_text():
+            await asyncio.sleep(.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 10)
+    assert not process_exists(int((tmp_path / "server.pid").read_text()))
+    assert not process_exists(int((tmp_path / "second.pid").read_text()))
+
+
+async def test_stderr_tail_and_server_info_are_shown_redacted(extension_manager, tmp_path):
+    extension_manager.settings.redact = lambda text: text.replace("secret-token", "[REDACTED]")
+    server = tmp_path / "crash.py"
+    server.write_text("import sys\nsys.stderr.write('x' * 5000 + '\\nstarting\\nfatal: bad config secret-token\\n')\nsys.exit(3)\n")
+    crash = {"id": "crash", "name": "Crash", "transport": "stdio", "command": sys.executable, "args": [str(server)],
+             "enabled": True}
+    extension_manager.update_config({"servers": [crash]})
+    async with extension_manager.turn() as connection:
+        await connection.discover()
+        [entry] = connection.status
+    assert entry["status"] == "failed"
+    assert entry["stderr_tail"].endswith("fatal: bad config [REDACTED]") and "secret-token" not in json.dumps(entry)
+    assert len(entry["stderr_tail"]) <= 2000
+
+
+async def test_a_chatty_server_keeps_only_the_end_of_its_stderr(extension_manager, tmp_path):
+    from local_agent.mcp_client import STDERR_KEPT_BYTES
+    server = tmp_path / "chatty.py"
+    # 3 MB of stderr before it serves: a pipe nobody drained would block it (and a file would keep it all).
+    server.write_text('''import os, sys
+from mcp.server import MCPServer
+for number in range(30_000):
+    sys.stderr.write(f"log line {number:06d} " + "x" * 90 + "\\n")
+sys.stderr.write("ready\\n")
+sys.stderr.flush()
+server = MCPServer("Chatty", log_level="ERROR")
+@server.tool()
+def fail() -> str:
+    sys.stderr.write("y" * 200_000 + "\\nlast words\\n")
+    sys.stderr.flush()
+    os._exit(1)
+server.run()
+''')
+    chatty = {"id": "chatty", "name": "Chatty", "transport": "stdio", "command": sys.executable, "args": [str(server)],
+              "enabled": True}
+    extension_manager.update_config({"servers": [chatty]})
+    before = set(tmp_path.iterdir())
+    async with extension_manager.turn() as connection:
+        assert [item["function"]["name"] for item in await connection.discover()] == ["mcp__chatty__fail"]
+        errlog = connection.errlogs["chatty"]
+        errlog.drain()
+        assert len(errlog.kept) <= STDERR_KEPT_BYTES and bytes(errlog.kept).endswith(b"ready\n")
+        with pytest.raises(ValueError, match="last words"):
+            await connection.call("mcp__chatty__fail", {})
+        assert len(errlog.kept) <= STDERR_KEPT_BYTES
+    assert errlog.closed and set(tmp_path.iterdir()) == before  # Nothing written to disk.
+
+
+async def test_status_reports_server_info_and_turned_off_servers(extension_manager, local_server, tmp_path):
+    other = {**local_server, "id": "other", "args": [local_server["args"][0], str(tmp_path / "other.pid"), "unused"]}
+    disabled = {**local_server, "id": "unused", "enabled": False}
+    extension_manager.update_config({"servers": [local_server, other, disabled]})
+    async with extension_manager.turn(off=["other"]) as connection:
+        await connection.discover()
+        status = {item["id"]: item for item in connection.status}
+    assert status["local"]["status"] == "connected" and status["local"]["server_info"]["name"] == "Local test"
+    assert status["local"]["tools"] == ["mcp__local__echo", "mcp__local__fail", "mcp__local__slow"]
+    assert status["other"]["status"] == "off" and status["unused"]["status"] == "disabled"
+    assert not (tmp_path / "other.pid").exists()  # A server the chat turned off never starts.
+
+
+async def test_a_failed_server_waits_before_it_is_tried_again(extension_manager, local_server, tmp_path, monkeypatch):
+    marker = tmp_path / "starts.txt"
+    script = tmp_path / "count.py"
+    script.write_text(f"from pathlib import Path\nwith open({str(marker)!r}, 'a') as f: f.write('x')\nraise SystemExit(1)\n")
+    broken = {**local_server, "id": "broken", "args": [str(script)]}
+    extension_manager.update_config({"servers": [broken]})
+    for _ in range(2):
+        async with extension_manager.turn() as connection:
+            await connection.discover()
+    assert marker.read_text() == "x"  # Not started again within RETRY_SECONDS.
+    assert connection.status[0]["status"] == "failed" and 50 < connection.status[0]["retry_seconds"] <= 60
+    extension_manager.failures["broken"]["at"] -= 61
+    async with extension_manager.turn() as connection:
+        await connection.discover()
+    assert marker.read_text() == "xx"
+    # The Test button tries it at once, also while a chat would wait.
+    assert (await extension_manager.test())["servers"][0]["status"] == "failed"
+    assert marker.read_text() == "xxx" and "broken" in extension_manager.failures
+    # A saved change is tried again at once.
+    extension_manager.update_config({"servers": [local_server]})
+    assert extension_manager.failures == {}
 
 
 def test_model_names_are_bounded_and_unambiguous_after_sanitizing():
@@ -195,12 +328,40 @@ def test_unicode_result_budget_includes_json_escaping():
     assert set(result["output"]) == {"🌍"}
 
 
-async def test_schema_budget_failure_reaps_server(extension_manager, local_server, tmp_path, monkeypatch):
+async def test_schema_budget_skips_the_server_and_reaps_it(extension_manager, local_server, tmp_path, monkeypatch):
     monkeypatch.setattr("local_agent.mcp_client.MAX_DEFINITION_BYTES", 20)
     extension_manager.update_config({"servers": [local_server]})
-    with pytest.raises(Exception, match="MCP|TaskGroup"):
-        await extension_manager.discover()
-    assert not process_exists(int((tmp_path / "server.pid").read_text()))
+    async with extension_manager.turn() as connection:
+        assert await connection.discover() == []
+        assert connection.status[0]["status"] == "skipped" and "enable fewer servers or tools" in connection.status[0]["error"]
+        assert not process_exists(int((tmp_path / "server.pid").read_text()))
+    # The skip is remembered: while the servers before it leave the same room, it is not started again.
+    (tmp_path / "server.pid").unlink()
+    async with extension_manager.turn() as connection:
+        assert await connection.discover() == []
+        assert connection.status[0]["status"] == "skipped" and "retry_seconds" not in connection.status[0]
+    assert not (tmp_path / "server.pid").exists()
+    # Saving the configuration tries it again at once.
+    extension_manager.update_config({"servers": [local_server]})
+    async with extension_manager.turn() as connection:
+        await connection.discover()
+        assert connection.status[0]["status"] == "skipped"
+    assert (tmp_path / "server.pid").exists()
+
+
+async def test_the_aggregate_cap_keeps_the_earlier_servers_tools(extension_manager, local_server, tmp_path, monkeypatch):
+    monkeypatch.setattr("local_agent.mcp_client.MAX_TOOLS", 4)
+    second = {**local_server, "id": "second", "args": [local_server["args"][0], str(tmp_path / "second.pid"), "unused"]}
+    extension_manager.update_config({"servers": [local_server, second]})
+    async with extension_manager.turn() as connection:
+        definitions = await connection.discover()
+        assert [item["status"] for item in connection.status] == ["connected", "skipped"]
+        assert {item["function"]["name"] for item in definitions} == {"mcp__local__echo", "mcp__local__fail", "mcp__local__slow"}
+        assert not process_exists(int((tmp_path / "second.pid").read_text()))
+    # With the first server off in a chat there is room: the remembered skip does not apply.
+    async with extension_manager.turn(off=["local"]) as connection:
+        assert len(await connection.discover()) == 3
+        assert [item["status"] for item in connection.status] == ["off", "connected"]
 
 
 async def test_actual_streamable_http_server(extension_manager, tmp_path):
@@ -239,3 +400,80 @@ server.run(transport="streamable-http", port=int(sys.argv[1]))
         if process.returncode is None:
             os.killpg(process.pid, signal.SIGKILL)
         await process.wait()
+
+
+@pytest.fixture
+def rich_server(tmp_path):
+    server = tmp_path / "rich_server.py"
+    server.write_text('''import base64
+from mcp.server import MCPServer
+from mcp.types import (AudioContent, BlobResourceContents, EmbeddedResource, ImageContent, ResourceLink, TextContent,
+                       TextResourceContents, ToolAnnotations)
+server = MCPServer("Rich", log_level="ERROR")
+PNG = base64.b64encode(b"0" * 2008).decode()
+@server.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False, title="Show content"))
+def rich() -> list:
+    return [TextContent(type="text", text="Summary"),
+            ImageContent(type="image", data=PNG, mime_type="image/png"),
+            ImageContent(type="image", data=PNG, mime_type="image/svg+xml"),
+            EmbeddedResource(type="resource", resource=TextResourceContents(uri="file:///notes.txt", mime_type="text/plain",
+                                                                            text="Inside the resource")),
+            EmbeddedResource(type="resource", resource=BlobResourceContents(uri="file:///data.bin", blob=PNG)),
+            ResourceLink(type="resource_link", uri="https://example.com/doc", name="doc", description="The manual"),
+            AudioContent(type="audio", data=PNG, mime_type="audio/wav")]
+@server.tool(annotations=ToolAnnotations(destructive_hint=True))
+def long() -> str:
+    return "x" * 30000
+server.run()
+''')
+    return {"id": "rich", "name": "Rich", "transport": "stdio", "command": sys.executable, "args": [str(server)],
+            "enabled": True}
+
+
+async def test_rich_content_is_flattened_images_described_and_annotations_kept(extension_manager, rich_server):
+    from local_agent.result_store import ResultStore
+    store = ResultStore()
+    extension_manager.update_config({"servers": [rich_server]})
+    async with extension_manager.turn() as connection:
+        await connection.discover()
+        assert connection.annotations == {"mcp__rich__rich": {"title": "Show content", "read_only": True, "open_world": False},
+                                          "mcp__rich__long": {"destructive": True}}
+        connection.results = store.chat("chat")
+        result = await connection.call("mcp__rich__rich", {})
+        long = await connection.call("mcp__rich__long", {})
+    lines = result["output"].split("\n")
+    assert lines[0] == "Summary"
+    assert lines[1] == "[image/png, 2 KB; shown in the chat, not sent to the model]"
+    assert lines[2] == "[image/svg+xml, 2 KB; not shown or sent to the model]"
+    assert lines[3:5] == ["Resource file:///notes.txt (text/plain):", "Inside the resource"]
+    assert lines[5] == "[Resource file:///data.bin: 2 KB of binary data, not shown.]"
+    assert lines[6] == "Link: doc https://example.com/doc — The manual"
+    assert lines[7] == "[audio/wav audio, 2 KB; not sent to the model]"
+    [image] = result["images"]
+    assert image["mime_type"] == "image/png" and image["bytes"] == 2008
+    assert base64.b64decode(store.image("chat", image["id"])["data"]) == b"0" * 2008
+    assert "result_id" not in result  # It fits its first page.
+    assert long["truncated"] is True and long["total_chars"] == 30000 and long["next_offset"] == len(long["output"])
+    assert len(json.dumps(long, indent=2).encode()) <= 8000
+    assert store.page("chat", long["result_id"], long["next_offset"])["output"] == "x" * 4000
+
+
+def test_structured_content_follows_the_text_unless_it_repeats_it():
+    from local_agent.mcp_client import flatten_content
+    result = SimpleNamespace(content=[SimpleNamespace(type="text", text="x hi")], structured_content={"result": "x hi"})
+    assert flatten_content(result) == ("x hi", [])
+    result = SimpleNamespace(content=[SimpleNamespace(type="text", text="Found 2")], structured_content={"items": [1, 2]})
+    assert flatten_content(result)[0] == 'Found 2\nStructured content (JSON):\n{"items": [1, 2]}'
+    assert flatten_content(SimpleNamespace(content=[], structured_content={"a": 1}))[0] == '{"a": 1}'
+    # Only an exact repeat is left out: a short value that merely occurs in the text is kept.
+    result = SimpleNamespace(content=[SimpleNamespace(type="text", text="Created 1 issue in project a")],
+                             structured_content={"issue_number": 1})
+    assert flatten_content(result)[0].endswith('Structured content (JSON):\n{"issue_number": 1}')
+    result = SimpleNamespace(content=[SimpleNamespace(type="text", text="Done")], structured_content={"status": "o"})
+    assert flatten_content(result)[0].endswith('{"status": "o"}')
+    # A repeat of one text part (or its JSON) next to other content is still left out.
+    result = SimpleNamespace(content=[SimpleNamespace(type="text", text='{\n  "a": 1\n}'),
+                                      SimpleNamespace(type="resource_link", name="doc", uri="https://example.com/d",
+                                                      description=None)],
+                             structured_content={"a": 1})
+    assert "Structured content" not in flatten_content(result)[0]

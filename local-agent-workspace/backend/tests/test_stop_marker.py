@@ -189,7 +189,7 @@ async def test_stop_before_the_prompt_reaches_the_history_never_marks_the_previo
             await asyncio.Event().wait()
 
     @contextlib.asynccontextmanager
-    async def turn():
+    async def turn(**options):
         yield Connection()
 
     monkeypatch.setattr(manager.extensions, "turn", turn)

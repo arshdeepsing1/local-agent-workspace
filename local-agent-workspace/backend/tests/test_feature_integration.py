@@ -123,7 +123,7 @@ async def test_mcp_connection_same_task_and_tools_sent(runtime, monkeypatch):
             calls.append(name)
             return 'echo result'
     @asynccontextmanager
-    async def turn():
+    async def turn(**options):
         owner.append(asyncio.current_task())
         try:
             yield Connection()
