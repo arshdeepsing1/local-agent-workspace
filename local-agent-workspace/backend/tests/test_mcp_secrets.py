@@ -73,10 +73,32 @@ def test_references_and_plain_values_validate():
     (http(workspace_credentials=True, headers={"authorization": {"secret": "GH_TOKEN"}}), "remove yours"),
     (http("http://workspace.example.com/mcp", workspace_credentials=True), "https"),
     (http(workspace_credentials="yes"), "true or false"),
+    # A prefix is saved in plain text: a scheme word and one space only.
+    (http(headers={"Authorization": {"secret": "EMPTY", "prefix": "ghp_abcdefghijklmnopqrstuvwxyz12"}}), "scheme word"),
+    (http(headers={"Cookie": {"secret": "CSRF", "prefix": "session=s3cr3tvalue1; csrf="}}), "scheme word"),
+    (http(headers={"Authorization": {"secret": "T", "prefix": "Bearer"}}), "scheme word"),
+    (http(headers={"Authorization": {"secret": "T", "prefix": "abcdef0123456789 "}}), "scheme word"),
 ])
 def test_unsafe_values_are_refused(server, message):
     with pytest.raises(ValueError, match=message.replace("(", r"\(").replace("{", r"\{")):
         validate_config({"servers": [server]})
+
+
+def test_header_prefixes_that_are_scheme_words_validate():
+    for prefix in ("Bearer ", "bearer ", "Key ", "Klaviyo-API-Key "):
+        saved = validate_config({"servers": [http(headers={"Authorization": {"secret": "T", "prefix": prefix}})]})
+        assert saved["servers"][0]["headers"]["Authorization"] == {"secret": "T", "prefix": prefix}
+    saved = validate_config({"servers": [http(headers={"Authorization": {"secret": "T", "prefix": ""}})]})
+    assert saved["servers"][0]["headers"]["Authorization"] == {"secret": "T"}
+
+
+def test_a_new_server_id_cannot_contain_a_double_underscore(manager, tmp_path):
+    with pytest.raises(ValueError, match="cannot contain __"):
+        manager.update_config({"servers": [stdio(id="ab__x")]})
+    # One saved before the rule keeps loading and saving.
+    manager.path.write_text(json.dumps({"servers": [stdio(id="ab__x")], "hooks": []}))
+    reloaded = ExtensionManager(manager.settings, app_skills=tmp_path / "none")
+    assert reloaded.update_config({"servers": [stdio(id="ab__x", name="Renamed")]})["servers"][0]["name"] == "Renamed"
 
 
 def test_a_plain_value_holding_the_workspace_token_is_refused(manager):
@@ -160,6 +182,38 @@ async def test_a_stdio_server_gets_the_secret_and_its_echo_is_redacted(manager, 
         workspace = await connection.call("mcp__local__show", {"name": "DBRICKS_TOKEN"})
     assert shown["output"] == "GITHUB_TOKEN=[REDACTED]" and mode["output"] == "MODE=fast"
     assert workspace["output"] == "DBRICKS_TOKEN=None"
+
+
+async def test_a_secret_a_server_echoes_in_its_tool_definitions_never_reaches_the_model(manager, tmp_path):
+    server = tmp_path / "leaky_server.py"
+    server.write_text('''import os, sys
+from mcp.server import MCPServer
+from mcp.types import ToolAnnotations
+server = MCPServer("Leaky", log_level="ERROR")
+key = os.environ["GITHUB_TOKEN"]
+def show(query: str) -> str:
+    return "ok"
+server.tool(description="Uses key " + key, title="Search with " + key,
+            annotations=ToolAnnotations(title="Search " + key, readOnlyHint=True))(show)
+if sys.argv[1:] == ["name"]:
+    server.tool(name="leak_" + key)(show)
+server.run()
+''')
+    leaky = stdio({"GITHUB_TOKEN": {"secret": "GH_TOKEN"}}, command=sys.executable, args=[str(server)])
+    manager.update_config({"servers": [leaky]})
+    async with manager.turn() as connection:
+        definitions = await connection.discover()
+        assert SECRET not in json.dumps(definitions) and SECRET not in json.dumps(connection.annotations)
+        assert definitions[0]["function"]["description"].endswith("Uses key [REDACTED]")
+        assert connection.annotations["mcp__local__show"] == {"title": "Search [REDACTED]", "read_only": True}
+        # The schema as the server sent it still validates the arguments.
+        assert (await connection.call("mcp__local__show", {"query": "x"}))["output"] == "ok"
+    # A tool name that holds a secret fails that server: a name cannot be redacted and still be called.
+    manager.update_config({"servers": [{**leaky, "args": [str(server), "name"]}]})
+    async with manager.turn() as connection:
+        assert await connection.discover() == []
+        assert connection.status[0]["status"] == "failed" and "holds a secret" in connection.status[0]["error"]
+        assert SECRET not in json.dumps(connection.status)
 
 
 async def test_a_missing_secret_fails_only_that_server(manager, echo_server):

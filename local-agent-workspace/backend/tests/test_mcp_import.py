@@ -128,3 +128,56 @@ def test_symbolic_links_large_and_credential_files_are_refused(client, tmp_path)
     (workspace / ".env").mkdir()
     with pytest.raises(ValueError, match="Credential"):
         manager.session_tools(manager.get(sid)).path(".env/.mcp.json")
+
+
+def test_a_header_keeps_only_a_scheme_and_a_mixed_value_is_named_after_its_key():
+    preview = mcp_import.parse({"mcpServers": {
+        "api": {"url": "https://mcp.example.com/mcp", "headers": {"Cookie": "session=s3cr3tvalue1; csrf=${CSRF}",
+                                                                   "Authorization": "bearer ${API_TOKEN}",
+                                                                   "X-Signed": "Token sig-${SIGNATURE}"}},
+        "db": {"command": "db-mcp", "env": {"DATABASE_URL": "postgres://app:${DB_PASSWORD}@db.example.com/app",
+                                            "LEVEL": "$LOG_LEVEL"}}}})
+    assert "s3cr3tvalue1" not in json.dumps(preview) and "db.example.com" not in json.dumps(preview)
+    api, db = preview["entries"]
+    # Literal text before a variable is never kept as a prefix; only a scheme word is.
+    assert api["headers"] == {"Cookie": {"secret": "COOKIE"}, "Authorization": {"secret": "API_TOKEN", "prefix": "bearer "},
+                              "X-Signed": {"secret": "X_SIGNED", "prefix": "Token "}}
+    # A value that mixes text and a variable is named after its key, so the server never gets the variable alone.
+    assert db["env"] == {"DATABASE_URL": {"secret": "DATABASE_URL"}, "LEVEL": {"secret": "LOG_LEVEL"}}
+    assert preview["needs"] == ["COOKIE", "API_TOKEN", "X_SIGNED", "DATABASE_URL", "LOG_LEVEL"]
+    notes = {(item["name"], item["text"].split(" mixes")[0]): item["text"] for item in preview["notes"]}
+    assert set(notes) == {("api", "Cookie"), ("api", "X-Signed"), ("db", "DATABASE_URL")}
+    assert "put the whole value under DATABASE_URL" in notes["db", "DATABASE_URL"]
+    assert "the part after Token under X_SIGNED" in notes["api", "X-Signed"]
+
+
+@pytest.mark.parametrize("args, skipped", [
+    (["-y", "search-mcp", "--api-key", "abcdef0123456789abcdef0123456789"], True),
+    (["--api-key=abcdef0123456789abcdef0123456789"], True),
+    (["--password", "hunter2"], True),
+    (["--auth", "${SEARCH_KEY}"], True),  # Arguments take no references: added by hand.
+    (["--token-file", "/srv/other/token"], False),
+    (["--no-auth", "serve"], False),
+    (["--api-key"], False),
+    (["--verbose", "stdio"], False),
+])
+def test_a_secret_after_a_flag_skips_the_server(args, skipped):
+    preview = mcp_import.parse({"mcpServers": {"search": {"command": "npx", "args": args}}})
+    assert bool(preview["skipped"]) is skipped and bool(preview["entries"]) is not skipped
+    if skipped:
+        assert "abcdef0123456789" not in json.dumps(preview) and "hunter2" not in json.dumps(preview)
+
+
+def test_an_imported_id_has_no_double_underscore():
+    entries = mcp_import.parse({"mcpServers": {"my__server": {"command": "x"}, "a___b": {"command": "y"}}})["entries"]
+    assert [entry["id"] for entry in entries] == ["my_server", "a_b"]
+
+
+def test_the_preview_names_keys_the_credential_file_already_has(client, tmp_path):
+    client, workspace, home, manager = client
+    credentials = tmp_path / "credentials.env"
+    credentials.write_text("DOCS_TOKEN=synthetic-docs-token-value\n")
+    manager.settings.values["env_file"] = str(credentials)
+    preview = client.post("/api/extensions/import", json={"source": "text", "text": json.dumps(PROJECT)}).json()
+    assert preview["present"] == ["DOCS_TOKEN"] and "DOCS_TOKEN" in preview["needs"]
+    assert "synthetic-docs-token-value" not in json.dumps(preview)  # Names only, never a value.

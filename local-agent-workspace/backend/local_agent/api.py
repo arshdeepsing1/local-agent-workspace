@@ -443,8 +443,10 @@ def create_app(settings=None):
     async def list_sessions():
         counts = manager.changes.counts()
         # A parent's subagents index (up to 200 entries) is left out: the list is fetched often while
-        # subagents work, and /sessions/<id>/children lists them.
-        return [{**{k: v for k, v in s.items() if k != "subagents"}, "status": manager.statuses.get(s["id"], "idle"),
+        # subagents work, and /sessions/<id>/children lists them. So is the last turn's MCP server status
+        # (errors and stderr tails), which the open chat has.
+        return [{**{k: v for k, v in s.items() if k not in ("subagents", "mcp_status")},
+                 "status": manager.statuses.get(s["id"], "idle"),
                  "unreviewed_changes": counts.get(s["id"], 0)}
                 for s in store.list()]
 

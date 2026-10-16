@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 import re
-import tempfile
 import time
 from contextlib import AsyncExitStack, suppress
 
@@ -27,6 +26,8 @@ MAX_RESULT_BYTES = 8_000
 # A server that failed is not started again in any chat for this long (the Test button still tries it).
 RETRY_SECONDS = 60
 STDERR_TAIL_CHARS = 2_000  # the end of a stdio server's stderr shown after a failure
+STDERR_KEPT_BYTES = 4 * STDERR_TAIL_CHARS  # what is kept of it in memory while the server runs
+STDERR_READS = 16  # 64 KB reads of a server's stderr per wakeup, so a flood cannot hold the event loop
 INSTRUCTIONS_CHARS = 1_000  # a server's own instructions, shown in Agent tools only; never sent to the model
 # A result longer than its first page is kept (result_store.py) up to this many characters.
 FULL_RESULT_CHARS = 1_000_000
@@ -86,19 +87,21 @@ def _decoded_size(data):
     return len(data) * 3 // 4 - data[-2:].count("=") if isinstance(data, str) else 0
 
 
-def _structured_text(structured, text):
-    """structured content as JSON for after the text, or "" when the text already says it (a tool
-    returning text also sends it as {"result": text})."""
+def _structured_text(structured, text, parts=()):
+    """structured content as JSON for after the text, or "" when the text or one of its text parts is
+    exactly it (a tool returning text also sends it as {"result": text})."""
     values = [structured]
     if isinstance(structured, dict) and len(structured) == 1:
         values.append(next(iter(structured.values())))
+    texts = [item.strip() for item in (text, *parts) if isinstance(item, str) and item.strip()]
     for value in values:
-        shown = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-        if shown.strip() and shown.strip() in text:
-            return ""
-        with suppress(ValueError, TypeError):
-            if text.strip() and json.loads(text) == value:
+        shown = (value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)).strip()
+        for item in texts:
+            if shown == item:
                 return ""
+            with suppress(ValueError, TypeError, RecursionError):
+                if json.loads(item) == value:
+                    return ""
     shown = json.dumps(structured, ensure_ascii=False)
     if len(shown) > STRUCTURED_CHARS:
         shown = shown[:STRUCTURED_CHARS] + " […structured content shortened by the app]"
@@ -110,11 +113,12 @@ def flatten_content(result):
     kept, a binary one and audio are described; a link is one line; an image is described for the model
     and kept for the card (at most MAX_IMAGES of MAX_IMAGE_BYTES, IMAGE_TYPES only); structured
     content follows as JSON. images: [{mime_type, data (base64), bytes}]."""
-    parts, images = [], []
+    parts, images, texts = [], [], []
     for content in result.content:
         kind = getattr(content, "type", "")
         if kind == "text":
             parts.append(content.text)
+            texts.append(content.text)
         elif kind == "resource":
             resource = content.resource
             mime = f" ({resource.mime_type})" if resource.mime_type else ""
@@ -144,7 +148,7 @@ def flatten_content(result):
             parts.append(f"[MCP {kind or 'unknown'} content omitted.]")
     text = "\n".join(parts)
     if result.structured_content is not None:
-        structured = _structured_text(result.structured_content, text)
+        structured = _structured_text(result.structured_content, text, texts)
         if structured:
             text = (text + "\nStructured content (JSON):\n" if text else "") + structured
     return text, images
@@ -167,6 +171,68 @@ def _signature(server):
     return json.dumps(server, sort_keys=True)
 
 
+def _redacted(value, redact):
+    """value with redact applied to every string (keys too) inside objects and lists."""
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, dict):
+        return {redact(key) if isinstance(key, str) else key: _redacted(item, redact) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redacted(item, redact) for item in value]
+    return value
+
+
+class StderrTail:
+    """A stdio server's stderr: a pipe the event loop drains, keeping only the last STDERR_KEPT_BYTES
+    bytes in memory, so a chatty server neither fills a disk nor blocks on a full pipe. file is what
+    the server writes to; close() ends both sides."""
+
+    def __init__(self):
+        self.kept = bytearray()
+        self.loop = asyncio.get_running_loop()
+        self._read, write = os.pipe()
+        os.set_blocking(self._read, False)
+        self.file = os.fdopen(write, "wb", buffering=0)
+        try:
+            self.loop.add_reader(self._read, self.drain)
+        except (NotImplementedError, RuntimeError):  # A loop that cannot watch a pipe: nothing is kept.
+            self.close()
+            self.file = open(os.devnull, "wb")
+
+    @property
+    def closed(self):
+        return self.file.closed
+
+    def drain(self):
+        """Read what the server wrote so far (at most STDERR_READS reads; the loop calls again)."""
+        for _ in range(STDERR_READS):
+            if self._read is None:
+                return
+            try:
+                data = os.read(self._read, 65_536)
+            except BlockingIOError:
+                return
+            except OSError:
+                data = b""
+            if not data:
+                self._stop()
+                return
+            self.kept += data
+            del self.kept[:-STDERR_KEPT_BYTES]
+
+    def _stop(self):
+        if self._read is not None:
+            with suppress(Exception):
+                self.loop.remove_reader(self._read)
+            with suppress(OSError):
+                os.close(self._read)
+            self._read = None
+
+    def close(self):
+        self._stop()
+        self.file.close()
+
+
 class SkipServer(ValueError):
     """A server that works but would exceed the aggregate tool limits: skipped, not failed."""
 
@@ -184,13 +250,12 @@ class MCPConnection:
     ValueError (a missing secret). results, when set by the caller, keeps long results
     and images (result_store.ChatResults)."""
 
-    def __init__(self, servers, redact, *, off=(), failures=None, resolve=None, state_dir=None, clock=time.monotonic):
+    def __init__(self, servers, redact, *, off=(), failures=None, resolve=None, clock=time.monotonic):
         self.servers = copy.deepcopy(servers)
         self.redact = redact
         self.off = set(off)
         self.failures = failures if failures is not None else {}
         self.resolve = resolve
-        self.state_dir = state_dir
         self.clock = clock
         self.stack = AsyncExitStack()
         self.registry = {}
@@ -228,16 +293,9 @@ class MCPConnection:
         """The redacted end of a stdio server's stderr, or ""."""
         if errlog is None or errlog.closed:
             return ""
-        try:
-            descriptor = errlog.fileno()
-            size = os.fstat(descriptor).st_size
-            # pread leaves the offset the server writes at alone. Read more than is shown: a token
-            # cut at the start of the window is redacted whole first.
-            start = max(0, size - 2 * STDERR_TAIL_CHARS)
-            text = os.pread(descriptor, size - start, start).decode("utf-8", errors="replace")
-        except (OSError, ValueError):
-            return ""
-        text = self.redact(text)
+        errlog.drain()
+        # More than is shown: a token cut at the start of the window is redacted whole first.
+        text = self.redact(bytes(errlog.kept[-2 * STDERR_TAIL_CHARS:]).decode("utf-8", errors="replace"))
         if len(text) > STDERR_TAIL_CHARS:
             text = text[-STDERR_TAIL_CHARS:]
             text = text.split("\n", 1)[1] if "\n" in text[:200] else text
@@ -259,30 +317,39 @@ class MCPConnection:
                 continue
             failed = self.failures.get(server["id"])
             if failed and failed["signature"] == _signature(server):
-                waited = self.clock() - failed["at"]
-                if waited < RETRY_SECONDS:
-                    entry.update({key: value for key, value in failed["entry"].items() if key not in ("id", "name")},
-                                 retry_seconds=max(1, round(RETRY_SECONDS - waited)))
+                kept = {key: value for key, value in failed["entry"].items() if key not in ("id", "name")}
+                if "skipped_after" in failed:
+                    # Skipped by the aggregate limits: not started again while the servers before it
+                    # leave the same room (a configuration change or Test saved configuration retries it).
+                    if failed["skipped_after"] == self._used():
+                        entry.update(kept)
+                        continue
+                elif (waited := self.clock() - failed["at"]) < RETRY_SECONDS:
+                    entry.update(kept, retry_seconds=max(1, round(RETRY_SECONDS - waited)))
                     continue
             await self._connect(server, entry)
         self._discovered = True
         self.tool_names = set(self.registry)
         return copy.deepcopy(self.definitions)
 
+    def _used(self):
+        """The room the servers connected so far take: [tool count, definition bytes]."""
+        return [len(self.definitions), len(json.dumps(self.definitions).encode())]
+
     async def _connect(self, server, entry):
         """Connect one server on its own stack and merge its tools, or record why it did not."""
         stack = AsyncExitStack()
         errlog = None
         tools = []
+        used = self._used()
         try:
             async with asyncio.timeout(CONNECT_TIMEOUT):
                 env, headers = self.resolve(server) if self.resolve else ({}, {})
                 if server["transport"] == "stdio":
                     base = {key: value for key, value in os.environ.items() if key in ENVIRONMENT_KEYS}
                     parameters = StdioServerParameters(command=server["command"], args=server["args"], env={**base, **env})
-                    # stderr needs a real file descriptor; the file is already unlinked.
-                    errlog = tempfile.TemporaryFile(dir=self.state_dir)
-                    streams = await stack.enter_async_context(stdio_client(parameters, errlog=errlog))
+                    errlog = StderrTail()  # stderr needs a real file descriptor: a pipe drained into memory.
+                    streams = await stack.enter_async_context(stdio_client(parameters, errlog=errlog.file))
                 else:
                     client = await stack.enter_async_context(httpx2.AsyncClient(
                         timeout=httpx2.Timeout(CONNECT_TIMEOUT, read=CALL_TIMEOUT), trust_env=False,
@@ -299,11 +366,16 @@ class MCPConnection:
                         name = model_tool_name(server["id"], tool.name)
                         if name in self.registry or name in names:
                             raise ValueError("MCP tools have duplicate or colliding names.")
+                        if self.redact(tool.name) != tool.name:
+                            raise ValueError("a tool name holds a secret value.")
                         names.add(name)
                         validate_schema(tool.input_schema)
+                        # What the model gets is redacted (a server can echo its secrets in a description);
+                        # the registry validates arguments against the schema as the server sent it.
                         tools.append((name, tool, {"type": "function", "function": {"name": name,
-                            "description": f"External MCP tool from {server['name']}: {tool.description or tool.name}",
-                            "parameters": tool.input_schema}}))
+                            "description": self.redact(f"External MCP tool from {server['name']}: "
+                                                       f"{tool.description or tool.name}"),
+                            "parameters": _redacted(tool.input_schema, self.redact)}}))
                     cursor = page.next_cursor
                     if not cursor:
                         break
@@ -334,9 +406,9 @@ class MCPConnection:
                 detail = f"did not answer within {CONNECT_TIMEOUT} seconds."
             entry.update(status="skipped" if skipped else "failed", error=bounded_error(self.redact(detail))[:1000],
                          **({"stderr_tail": tail} if tail else {}))
-            if not skipped:
-                self.failures[server["id"]] = {"at": self.clock(), "signature": _signature(server),
-                                               "entry": {key: value for key, value in entry.items()}}
+            self.failures[server["id"]] = {"at": self.clock(), "signature": _signature(server),
+                                           "entry": {key: value for key, value in entry.items()},
+                                           **({"skipped_after": used} if skipped else {})}
             return
         # Closed in reverse order at turn end, on this task.
         self.stack.push_async_exit(stack.__aexit__)
@@ -345,8 +417,11 @@ class MCPConnection:
             self.errlogs[server["id"]] = errlog
         self.failures.pop(server["id"], None)
         for name, tool, definition in tools:
+            annotations = annotations_of(tool)
+            if annotations and "title" in annotations:
+                annotations["title"] = self.redact(annotations["title"])
             self.registry[name] = {"server_id": server["id"], "tool_name": tool.name, "session": session,
-                                   "schema": copy.deepcopy(tool.input_schema), "annotations": annotations_of(tool)}
+                                   "schema": copy.deepcopy(tool.input_schema), "annotations": annotations}
             self.definitions.append(definition)
         info = initialized.server_info
         entry.update(status="connected", tools=[name for name, _, _ in tools],

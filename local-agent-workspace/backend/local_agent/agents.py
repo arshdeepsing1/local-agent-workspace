@@ -51,7 +51,7 @@ from .planning import CallAllowance, DelegateManager, DelegationGate, TaskManage
 from .interactions import InteractionManager
 from .feature_tools import FEATURE_TOOLS
 from .tool_profiles import tool_allowed, filter_tools, off_servers, server_off
-from .mcp_client import RETRY_SECONDS
+from .mcp_client import FULL_RESULT_CHARS, RETRY_SECONDS
 from .result_store import ResultStore
 from . import prompt_cache, reasoning
 from .reasoning import reasoning_delta, reasoning_shape
@@ -87,8 +87,8 @@ from .rate_limits import (ITPM, OTPM, CompactionOverOtpm, RATE_LIMIT_WAIT_CAP, R
                           parse_rate_limit, request_info_fields)
 from .context import in_turn_tokens
 from .model_profiles import CONCURRENT_REQUESTS
-from .result_budget import (ALLOWANCE_MARGIN_TOKENS, FULL_RESULT_TOOLS, TOOL_RESULT_HARD_LIMIT, ResultAllowance,
-                            bound_result, cap_text, deferred_text, shorten_result, shortened_hint)
+from .result_budget import (ALLOWANCE_MARGIN_TOKENS, FULL_RESULT_TOOLS, MCP_SHORTENED_HINT, TOOL_RESULT_HARD_LIMIT,
+                            ResultAllowance, bound_result, cap_text, deferred_text, shorten_result, shortened_hint)
 from .permissions import tool_kind
 from .tool_profiles import covering_tool
 
@@ -3041,6 +3041,9 @@ class AgentManager(LifecycleHooks):
                     # The action ran; its result is shortened, never withheld. A result with
                     # nothing long enough to shorten is sent as it is.
                     short = shorten_result(result, hint=shortened_hint(name))
+                    if (short["omitted_bytes"] and name.startswith("mcp__") and isinstance(result, dict)
+                            and isinstance(result.get("output"), str)):
+                        short = shorten_result(self.readable_result(session, result), hint=MCP_SHORTENED_HINT)
                     if short["omitted_bytes"]:
                         text = json.dumps(short, indent=2)
                         if edited_note and origin != "verify":
@@ -3303,6 +3306,16 @@ class AgentManager(LifecycleHooks):
                                                   **({"content": content} if content is not None else {}))
             finally:
                 self.extension_connections.pop(session["id"], None)
+
+    def readable_result(self, session, result):
+        """An MCP result the response's allowance shortens, pointing at its whole text from offset 0, so the
+        omitted part can be read with get_tool_output (offered from the next request on). A result whose
+        first page was all of it is kept now."""
+        if not result.get("result_id"):
+            kept = result["output"][:FULL_RESULT_CHARS]
+            result = {**result, "result_id": self.results.add(session["id"], kept), "total_chars": len(kept)}
+        session["tool_output_offered"] = True
+        return {**result, "next_offset": 0}
 
     async def mcp_status_changed(self, session, status):
         """Keep this turn's MCP server status for Agent tools (session mcp_status: MCP_STATUS_FIELDS and a

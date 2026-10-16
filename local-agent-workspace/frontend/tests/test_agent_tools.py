@@ -872,6 +872,40 @@ def test_import_preview_adds_disabled_servers_to_the_form_without_saving(ui, pag
     assert ui.bodies("/api/extensions/import", "POST")[-1] == {"source": "text", "text": '{"mcpServers": {}}'}
 
 
+def test_an_argument_with_a_line_break_survives_the_form(ui, page):
+    script = {"id": "inline", "name": "Inline", "transport": "stdio", "command": "/srv/other/python",
+              "args": ["-c", "import sys\nprint(1)"], "enabled": False}
+    open_tab(ui, page, "Extensions", f"window.config = {json.dumps({'servers': [script, {**script, 'id': 'plain', 'args': ['serve']}], 'hooks': []})}")
+    expect(page.get_by_role("textbox", name="Server 1 ID")).to_have_value("inline")
+    note = page.get_by_role("note", name="Server 1 arguments")
+    expect(note).to_contain_text("has a line break")
+    expect(page.get_by_role("textbox", name="Server 1 arguments")).to_have_count(0)
+    expect(page.get_by_role("textbox", name="Server 2 arguments")).to_have_value("serve")
+    page.get_by_role("textbox", name="Server 1 name").fill("Inline script")
+    page.get_by_role("button", name="Save configuration").click()
+    expect(page.get_by_text("Configuration saved.")).to_be_visible()
+    [saved] = ui.bodies("/api/extensions", "PUT")
+    assert saved["servers"][0] == {**script, "name": "Inline script"} and saved["servers"][1]["args"] == ["serve"]
+
+
+def test_the_import_preview_names_keys_already_in_the_credential_file(ui, page):
+    open_tab(ui, page, "Extensions", """window.importPreview = { ...importPreview, present: ['GITHUB_TOKEN'],
+      notes: [{ name: 'GitHub', text: 'DATABASE_URL mixes text with a variable: put the whole value under DATABASE_URL in your credential file (the text was not imported).' }] }""")
+    page.get_by_text("Import MCP servers").click()
+    page.get_by_role("button", name="This project's .mcp.json").click()
+    preview = page.get_by_role("region", name="Import preview")
+    expect(preview.get_by_role("list", name="Keys from your credential file")).to_have_text(
+        "GitHub gets GITHUB_TOKEN (github-mcp-server)")
+    expect(preview).not_to_contain_text("Add these keys")
+    expect(preview).to_contain_text("put the whole value under DATABASE_URL")
+    expect(preview.get_by_role("note")).to_contain_text("part of the project folder")
+    # Pasted JSON is the user's own text: no project warning.
+    page.get_by_role("textbox", name="Configuration to import (JSON)").fill('{"mcpServers": {}}')
+    page.get_by_role("button", name="Preview pasted servers").click()
+    expect(preview.get_by_role("list", name="Keys from your credential file")).to_be_visible()
+    expect(preview.get_by_role("note")).to_have_count(0)
+
+
 def test_a_refused_import_is_shown(ui, page):
     open_tab(ui, page, "Extensions", """fake.override = path => path.startsWith('/api/extensions/import')
       ? fake.json({ detail: 'No .mcp.json was found.' }, 404) : undefined""")

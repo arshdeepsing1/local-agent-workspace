@@ -25,6 +25,7 @@ MARKER_RESERVE = 64  # Bytes kept free for one OMITTED marker.
 SHORTENED_HINT = ("This step's context allowance was used up by earlier results, so the app shortened this result; "
                   "the action itself ran.")
 COMMAND_SHORTENED_HINT = SHORTENED_HINT + " Read the rest of the output with get_job_output and its job_id."
+MCP_SHORTENED_HINT = SHORTENED_HINT + " The whole result is kept: read it with get_tool_output, its result_id and next_offset."
 JOB_TOOLS = ("wait_job", "get_job_output", "list_jobs")
 # Tools whose results are always sent in full and charged: a job page (job_seen() has
 # advanced), and the user's own answers and plan feedback, which are short and bounded

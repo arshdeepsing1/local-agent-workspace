@@ -232,13 +232,18 @@ def register_features(app, manager, settings, store, session_or_404, workspace_t
     async def import_extensions(body: ImportRequest, session_id: str | None = None):
         """A preview of the MCP servers in this chat's project .mcp.json, the Claude desktop app's
         configuration or pasted JSON, as disabled entries: nothing is saved or started, and no
-        environment or header value is returned (each becomes a secret reference)."""
+        environment or header value is returned (each becomes a secret reference). present: the
+        needed keys the credential file already has (names only), which an enabled server would get."""
         existing = [server["id"] for server in manager.extensions.public_config()["servers"]]
         tokens = manager.redaction_tokens()
         shown = None
+
+        def preview(found):
+            keys = manager.extensions.credential_keys()
+            return {**found, "present": [name for name in found["needs"] if name in keys]}
         try:
             if body.source == "text":
-                return {"source": "text", **mcp_import.parse_text(body.text, existing, tokens)}
+                return {"source": "text", **preview(mcp_import.parse_text(body.text, existing, tokens))}
             if body.source == "project":
                 tools = workspace_tools(session_id)
                 path, shown = tools.root / ".mcp.json", ".mcp.json"
@@ -257,7 +262,7 @@ def register_features(app, manager, settings, store, session_or_404, workspace_t
         except (ValueError, UnicodeError, OSError) as error:
             raise HTTPException(400, settings.redact(str(error))) from None
         try:
-            return {"source": body.source, "path": shown, **mcp_import.parse(data, existing, tokens)}
+            return {"source": body.source, "path": shown, **preview(mcp_import.parse(data, existing, tokens))}
         except ValueError as error:
             raise HTTPException(400, str(error)) from None
 

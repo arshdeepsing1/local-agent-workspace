@@ -13,6 +13,11 @@ let rows = 0
 const rowKey = () => `row-${++rows}`
 const lines = text => text === '' ? [] : text.split('\n')
 const isObject = value => value && typeof value === 'object' && !Array.isArray(value)
+// Arguments the form edits one per line: a list of strings without line breaks. Others stay in rest.
+const lineArgs = args => Array.isArray(args) && args.every(arg => typeof arg === 'string' && !arg.includes('\n'))
+// The credential-file keys a server's env or headers refer to.
+const referencedKeys = server => Object.values({ ...(isObject(server.env) ? server.env : {}), ...(isObject(server.headers) ? server.headers : {}) })
+  .filter(isObject).map(value => value.secret)
 
 // The form's model of a configuration. rest keeps fields the form has no control for, so a round trip
 // through the form never drops what the JSON said (the server still validates it).
@@ -28,8 +33,11 @@ export function toForm(config) {
       if (field === 'env' && headers !== undefined) other.headers = headers
       if (field === 'headers' && env !== undefined) other.env = env
       if (field === 'env' && workspace !== undefined) other.workspace_credentials = workspace
+      // An argument with a line break (python -c with a script) would become several lines: kept as it is.
+      const argsKept = !lineArgs(args)
+      if (argsKept) other.args = args
       return { key: rowKey(), id: String(id), name: String(name), transport, command: String(command),
-        args: Array.isArray(args) ? args.join('\n') : '', url: String(url), enabled: enabled === true,
+        args: argsKept ? '' : args.join('\n'), argsKept, url: String(url), enabled: enabled === true,
         workspace: field === 'headers' && workspace === true, rest: other,
         values: Object.entries(isObject(source) ? source : {}).map(([key, value]) => isObject(value)
           ? { key: rowKey(), name: key, secret: true, value: String(value.secret ?? ''), prefix: String(value.prefix ?? '') }
@@ -52,7 +60,7 @@ export function toConfig(form) {
       const values = Object.fromEntries(server.values.filter(item => item.name.trim() || item.value.trim()).map(item =>
         [item.name.trim(), item.secret ? { secret: item.value.trim(), ...(!stdio && item.prefix ? { prefix: item.prefix } : {}) } : item.value]))
       return { ...server.rest, id: server.id.trim(), name: server.name.trim() || server.id.trim(), transport: server.transport,
-        ...(stdio ? { command: server.command, args: lines(server.args) } : { url: server.url.trim() }),
+        ...(stdio ? { command: server.command, ...(server.argsKept ? {} : { args: lines(server.args) }) } : { url: server.url.trim() }),
         ...(Object.keys(values).length ? { [stdio ? 'env' : 'headers']: values } : {}),
         ...(!stdio && server.workspace ? { workspace_credentials: true } : {}),
         enabled: server.enabled }
@@ -63,7 +71,7 @@ export function toConfig(form) {
   }
 }
 
-const emptyServer = () => ({ key: rowKey(), id: '', name: '', transport: 'stdio', command: '', args: '', url: '', enabled: false,
+const emptyServer = () => ({ key: rowKey(), id: '', name: '', transport: 'stdio', command: '', args: '', argsKept: false, url: '', enabled: false,
   workspace: false, values: [], rest: {} })
 const emptyHook = () => ({ key: rowKey(), id: '', event: 'before_tool', command: '', timeout: '10', enabled: false, match: 'all',
   tools: '', rest: {} })
@@ -93,8 +101,10 @@ function ServerFields({ server, index, busy, onChange, onRemove }) {
     </div>
     ${stdio ? html`<label>Command<input aria-label=${`Server ${n} command`} spellcheck=${false} value=${server.command}
         placeholder="/absolute/path/to/server" onInput=${e => onChange({ command: e.currentTarget.value })} /></label>
-      <label>Arguments, one per line<textarea aria-label=${`Server ${n} arguments`} rows=${2} spellcheck=${false} value=${server.args}
-        onInput=${e => onChange({ args: e.currentTarget.value })} /></label>`
+      ${server.argsKept ? html`<p class="field-help" role="note" aria-label=${`Server ${n} arguments`}>Arguments: <code>${JSON.stringify(server.rest.args)}</code>.
+          One of them has a line break, so the form keeps them as they are: change them with Edit as JSON.</p>`
+        : html`<label>Arguments, one per line<textarea aria-label=${`Server ${n} arguments`} rows=${2} spellcheck=${false} value=${server.args}
+        onInput=${e => onChange({ args: e.currentTarget.value })} /></label>`}`
       : html`<label>URL<input aria-label=${`Server ${n} URL`} spellcheck=${false} value=${server.url} placeholder="https://mcp.example.com/mcp"
         onInput=${e => onChange({ url: e.currentTarget.value })} /></label>
       <label class="extension-check"><input type="checkbox" aria-label=${`Server ${n} uses workspace credentials`} checked=${server.workspace}
@@ -158,14 +168,24 @@ function HookFields({ hook, index, busy, onChange, onRemove }) {
 
 function ImportPreview({ preview, onAdd, onCancel }) {
   const count = preview.entries.length
+  // Keys the credential file already has (names only): an imported server gets them once enabled.
+  const present = new Set(preview.present || [])
+  const missing = preview.needs.filter(name => !present.has(name))
+  const receiving = preview.entries.map(entry => ({ entry, keys: referencedKeys(entry).filter(name => present.has(name)) }))
+    .filter(item => item.keys.length)
+  const codes = names => names.map((name, index) => html`${index ? ', ' : ''}<code key=${name}>${name}</code>`)
   return html`<div class="extensions-preview" role="region" aria-label="Import preview">
     <h4>${count ? `${count} server${count === 1 ? '' : 's'} to add, disabled` : 'No server can be imported'}${preview.path ? html` <small>from ${preview.path}</small>` : null}</h4>
     ${count ? html`<ul>${preview.entries.map(entry => html`<li key=${entry.id}><strong>${entry.name}</strong> <code>${entry.id}</code>
       <small>${entry.transport === 'stdio' ? [entry.command, ...(entry.args || [])].join(' ') : entry.url}</small></li>`)}</ul>` : null}
-    ${preview.needs.length ? html`<p>Add these keys to your credential file before you enable them (the values were not imported):
-      ${preview.needs.map((name, index) => html`${index ? ', ' : ' '}<code key=${name}>${name}</code>`)}.</p>` : null}
+    ${missing.length ? html`<p>Add these keys to your credential file before you enable them (the values were not imported): ${codes(missing)}.</p>` : null}
+    ${receiving.length ? html`<p>Already in your credential file, and sent once you enable the server:</p><ul aria-label="Keys from your credential file">
+      ${receiving.map(({ entry, keys }) => html`<li key=${entry.id}><strong>${entry.name}</strong> gets ${codes(keys)} (<code>${
+        entry.transport === 'stdio' ? entry.command : entry.url}</code>)</li>`)}</ul>` : null}
+    ${(preview.notes || []).length ? html`<p>Check before you enable:</p><ul>${preview.notes.map((item, index) => html`<li key=${index}><strong>${item.name}</strong>: ${item.text}</li>`)}</ul>` : null}
     ${preview.skipped.length ? html`<p>Not imported:</p><ul>${preview.skipped.map(item => html`<li key=${item.name}><strong>${item.name}</strong>: ${item.reason}</li>`)}</ul>` : null}
     ${(preview.ignored || []).length ? html`<p class="field-help">Left out (this app does not use them): ${preview.ignored.map(item => `${item.name}: ${item.fields.join(', ')}`).join('; ')}.</p>` : null}
+    ${preview.source === 'project' ? html`<p class="import-warning" role="note">This .mcp.json is part of the project folder, so whoever wrote the project chose these servers. Enable one only if you trust its command and URL, above all one that would get a key from your credential file.</p>` : null}
     <p class="field-help">An imported server runs its command (for example npx or uvx) with your account's access once you enable it. Check each command and URL first.</p>
     <div class="agent-tools-actions"><button type="button" class="primary" disabled=${!count} onClick=${onAdd}>Add to the form</button>
       <button type="button" class="outline" onClick=${onCancel}>Cancel</button></div>

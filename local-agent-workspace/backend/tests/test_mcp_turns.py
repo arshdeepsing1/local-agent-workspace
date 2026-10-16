@@ -170,6 +170,46 @@ async def test_at_most_32_functions_built_ins_first(runtime):
     assert definitions[-1]["function"]["name"] == "mcp__many__tool05" and capped[0] == "mcp__many__tool06"
 
 
+def test_the_largest_built_in_tool_set_fits_the_request_limit(runtime):
+    from local_agent.agents import TOOL_DEFINITIONS
+    from local_agent.feature_tools import FEATURE_TOOLS
+    manager, session, _, _ = runtime
+    # Every built-in tool at once (Plan mode, get_tool_output offered, nothing turned off) leaves room for MCP tools.
+    assert len(TOOL_DEFINITIONS) + len(FEATURE_TOOLS) <= MAX_REQUEST_TOOLS
+    session.update(permission_mode="plan", tool_output_offered=True, disabled_tools=[])
+    definitions, capped = manager.offered_tools(session, [])
+    assert len(definitions) == len(TOOL_DEFINITIONS) + len(FEATURE_TOOLS) and capped == []
+
+
+async def test_a_shortened_mcp_result_can_be_read_from_the_start(runtime):
+    from local_agent.result_budget import ResultAllowance
+    manager, session, _, _ = runtime
+    whole = "".join(f"line {number:05d}\n" for number in range(2000))
+    results = manager.results.chat(session["id"])
+
+    class Connection:
+        definitions = mcp_tools(2)
+        tool_names = {"mcp__many__tool00", "mcp__many__tool01"}
+        annotations = {}
+
+        async def call(self, name, arguments):
+            if name == "mcp__many__tool00":
+                return {"output": whole[:7000], "is_error": False, "truncated": True, "result_id": results.add(whole),
+                        "next_offset": 7000, "total_chars": len(whole)}
+            return {"output": "short " + "y" * 3000, "is_error": False, "truncated": False}
+    manager.extension_connections[session["id"]] = Connection()
+    tools = manager.session_tools(session)
+    # The response's allowance shortens the first page: the model is pointed at offset 0, not past the omitted part.
+    output = json.loads(await manager.execute_tool(session, tools, "mcp__many__tool00", {}, "c1", allowance=ResultAllowance(10)))
+    assert output["result_shortened"] is True and output["next_offset"] == 0 and "get_tool_output" in output["hint"]
+    assert manager.results.page(session["id"], output["result_id"], 0, 8000)["output"].startswith("line 00000\n")
+    assert session["tool_output_offered"] is True
+    # A result whose first page was all of it is kept now, so its omitted part can be read too.
+    output = json.loads(await manager.execute_tool(session, tools, "mcp__many__tool01", {}, "c2", allowance=ResultAllowance(10)))
+    assert output["result_shortened"] is True and output["next_offset"] == 0
+    assert manager.results.page(session["id"], output["result_id"], 0, 8000)["output"] == "short " + "y" * 3000
+
+
 async def test_capped_tools_are_named_once_and_refused(runtime, monkeypatch):
     manager, session, _, socket = runtime
     exactly_builtins(manager, session, 27)
@@ -269,6 +309,12 @@ def test_api_routes_for_images_and_the_server_switch(tmp_path, monkeypatch):
         image_id = manager.results.add_image(sid, "image/png", "aGVsbG8=")
         assert client.get(f"/api/sessions/{sid}/tool-images/{image_id}").json() == {"mime_type": "image/png", "data": "aGVsbG8="}
         assert client.get(f"/api/sessions/{sid}/tool-images/img-000000000000").status_code == 404
+        # The last turn's MCP status (errors, stderr tails) stays out of the often fetched list.
+        session = manager.get(sid)
+        session["mcp_status"] = [{"id": "docs", "name": "Docs", "status": "failed", "error": "e", "stderr_tail": "x" * 2000}]
+        manager.store.save(session)
+        assert "mcp_status" not in next(item for item in client.get("/api/sessions").json() if item["id"] == sid)
+        assert client.get(f"/api/sessions/{sid}").json()["mcp_status"][0]["status"] == "failed"
         # Deleting the chat empties its part of the store.
         assert client.delete(f"/api/sessions/{sid}").status_code == 200
         assert manager.results.image(sid, image_id) is None

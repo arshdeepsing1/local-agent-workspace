@@ -2,9 +2,11 @@
 
 A preview only: every entry is disabled, never started, and saved only when the user saves
 Agent tools → Extensions. Environment variable and header values are never copied: each
-becomes a secret reference ({"secret": NAME}) named after the ${VAR} it uses or after its key,
-and the preview lists the names to add to the credential file. A server whose command,
-arguments or URL looks like it holds a secret is skipped, so no value is echoed.
+becomes a secret reference ({"secret": NAME}) named after the ${VAR} it is or after its key,
+and the preview lists the names to add to the credential file (a value that mixes text and a
+variable is named after its key, with a note to put the whole value there). A server whose
+command, arguments (including the one after a flag such as --api-key) or URL looks like it
+holds a secret is skipped, so no value is echoed.
 """
 import json
 import re
@@ -13,12 +15,14 @@ import sys
 from pathlib import Path
 
 from .extensions import (DENIED_SERVER_ENV, DENIED_SERVER_ENV_PREFIXES, ENV_NAME, IDENTIFIER, MAX_SERVER_VALUES,
-                         secret_reference_name, validate_config)
+                         looks_secret, secret_reference_name, validate_config)
 from .redaction import redact_secrets
 
 MAX_FILE_BYTES = 64 * 1024
 VARIABLE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]{0,63})(?::-[^}]*)?\}|\$([A-Za-z_][A-Za-z0-9_]{0,63})")
 SCHEME = re.compile(r"(?i)^(bearer|basic|token) ")
+# Parts of a flag name that say its value names a place or a kind, not a secret (--token-file, --auth-type).
+NOT_SECRET_FLAG_PARTS = {"FILE", "PATH", "DIR", "ENV", "VAR", "TYPE", "MODE", "URL", "NAME", "HEADER"}
 SUPPORTED = {"command", "args", "env", "url", "headers", "type", "transport"}
 
 
@@ -50,7 +54,8 @@ def read_config_file(path, credential_file=None):
 
 
 def _identifier(name, taken):
-    base = re.sub(r"[^a-z0-9_-]+", "-", name.lower()).strip("-_") or "server"
+    # No "__": it separates the server from the tool in mcp__<server>__<tool>.
+    base = re.sub(r"_{2,}", "_", re.sub(r"[^a-z0-9_-]+", "-", name.lower())).strip("-_") or "server"
     if not base[0].isalpha():
         base = "mcp-" + base
     base = base[:20].rstrip("-_") or "server"
@@ -64,17 +69,38 @@ def _identifier(name, taken):
 
 
 def _reference(name, value, header=False):
-    """A secret reference for value: named after the ${VAR} it uses, else after name. A header keeps the
-    text before the variable (or a Bearer/Basic/Token scheme) as its prefix."""
+    """(reference, note): a secret reference for value, named after the ${VAR} that is the whole value, else
+    after name. A header keeps a Bearer/Basic/Token scheme as its prefix; no other text of the value is
+    kept. note (else None) says to put the whole value under the key when it mixes text and a variable."""
     text = value if isinstance(value, str) else ""
-    match = VARIABLE.search(text)
+    scheme = SCHEME.match(text) if header else None
+    rest = text[scheme.end():] if scheme else text
+    match = VARIABLE.fullmatch(rest.strip())
     reference = {"secret": (match.group(1) or match.group(2)) if match else secret_reference_name(name)}
-    if header:
-        prefix = text[:match.start()] if match and not text[match.end():].strip() else (
-            scheme.group(0) if (scheme := SCHEME.match(text)) else "")
-        if prefix and len(prefix) <= 32 and not any(char in prefix for char in "\r\n$"):
-            reference["prefix"] = prefix
-    return reference
+    if scheme:
+        reference["prefix"] = scheme.group(0)
+    note = None
+    if not match and VARIABLE.search(rest):
+        whole = f"the part after {scheme.group(0).strip()}" if scheme else "the whole value"
+        note = (f"{name} mixes text with a variable: put {whole} under {reference['secret']} in your credential "
+                "file (the text was not imported).")
+    return reference, note
+
+
+def _secret_argument(args):
+    """Whether an argument is a flag that names a secret (--api-key, --token, --password) with its value
+    (--api-key=…) or followed by one."""
+    for index, arg in enumerate(args):
+        if not isinstance(arg, str) or not arg.startswith("-"):
+            continue
+        flag, equals, value = arg.lstrip("-").partition("=")
+        parts = set(re.split(r"[_-]", flag.upper()))
+        if not flag or not looks_secret(flag) or parts & NOT_SECRET_FLAG_PARTS or flag.lower().startswith(("no-", "no_")):
+            continue
+        following = args[index + 1] if index + 1 < len(args) else None
+        if (equals and value) or (not equals and isinstance(following, str) and following and not following.startswith("-")):
+            return True
+    return False
 
 
 def _secret_in(values, tokens):
@@ -83,17 +109,18 @@ def _secret_in(values, tokens):
 
 
 def parse(data, existing_ids=(), tokens=()):
-    """{entries, needs, skipped, ignored}: the servers of data ({"mcpServers": {name: spec}}, or
+    """{entries, needs, skipped, ignored, notes}: the servers of data ({"mcpServers": {name: spec}}, or
     {"servers": {...}}) as disabled entries that validate_config accepts; needs: the credential-file
     keys their references name; skipped: [{name, reason}]; ignored: [{name, fields}] (fields such
-    as cwd that this app does not use). tokens: secrets that must not appear in what is returned."""
+    as cwd that this app does not use); notes: [{name, text}] (values to put whole in the credential
+    file). tokens: secrets that must not appear in what is returned."""
     if not isinstance(data, dict):
         raise ValueError("The configuration must be a JSON object with an mcpServers object.")
     servers = data.get("mcpServers", data.get("servers"))
     if not isinstance(servers, dict):
         raise ValueError("No mcpServers object was found in this configuration.")
     taken = set(existing_ids)
-    entries, needs, skipped, ignored = [], [], [], []
+    entries, needs, skipped, ignored, notes_shown = [], [], [], [], []
     for name, spec in list(servers.items())[:50]:
         label = str(name)[:80] or "server"
         if not isinstance(spec, dict):
@@ -104,13 +131,13 @@ def parse(data, existing_ids=(), tokens=()):
             skipped.append({"name": label, "reason": "SSE servers are not supported; use the server's Streamable HTTP "
                                                     "URL if it has one."})
             continue
-        if _secret_in([spec.get("command"), spec.get("url"), *(spec.get("args") or [] if isinstance(spec.get("args"), list) else [])],
-                      tokens):
+        arguments = spec.get("args") if isinstance(spec.get("args"), list) else []
+        if _secret_in([spec.get("command"), spec.get("url"), *arguments], tokens) or _secret_argument(arguments):
             skipped.append({"name": label, "reason": "Its command, arguments or URL look like they hold a secret, which "
                                                     "is never imported. Add it by hand with a secret reference."})
             continue
         entry = {"id": _identifier(label, taken), "name": label, "enabled": False}
-        notes = []
+        notes, values_notes = [], []
         if isinstance(spec.get("command"), str) and kind in ("", "stdio"):
             entry.update(transport="stdio", command=spec["command"],
                          args=spec.get("args") if isinstance(spec.get("args"), list) else [])
@@ -120,7 +147,8 @@ def parse(data, existing_ids=(), tokens=()):
                         or key.startswith(DENIED_SERVER_ENV_PREFIXES) or len(env) >= MAX_SERVER_VALUES:
                     notes.append(f"env {str(key)[:64]}")
                     continue
-                env[key] = _reference(key, value)
+                env[key], note = _reference(key, value)
+                values_notes.extend([note] if note else [])
             if env:
                 entry["env"] = env
         elif isinstance(spec.get("url"), str) and kind in ("", "http", "streamable-http", "streamablehttp"):
@@ -130,7 +158,8 @@ def parse(data, existing_ids=(), tokens=()):
                 if len(headers) >= MAX_SERVER_VALUES:
                     notes.append(f"headers {str(key)[:64]}")
                     continue
-                headers[str(key)] = _reference(str(key), value, header=True)
+                headers[str(key)], note = _reference(str(key), value, header=True)
+                values_notes.extend([note] if note else [])
             if headers:
                 entry["headers"] = headers
         else:
@@ -139,7 +168,7 @@ def parse(data, existing_ids=(), tokens=()):
             continue
         notes.extend(sorted(str(key)[:40] for key in spec if key not in SUPPORTED))
         try:
-            entry = validate_config({"servers": [entry]})["servers"][0]
+            entry = validate_config({"servers": [entry]}, saved_ids=())["servers"][0]
         except ValueError as error:
             skipped.append({"name": label, "reason": str(error)})
             taken.discard(entry["id"])
@@ -147,11 +176,12 @@ def parse(data, existing_ids=(), tokens=()):
         entries.append(entry)
         if notes:
             ignored.append({"name": label, "fields": notes[:20]})
+        notes_shown.extend({"name": label, "text": note} for note in values_notes)
         for field in ("env", "headers"):
             for value in (entry.get(field) or {}).values():
                 if isinstance(value, dict) and value["secret"] not in needs:
                     needs.append(value["secret"])
-    return {"entries": entries, "needs": needs, "skipped": skipped, "ignored": ignored}
+    return {"entries": entries, "needs": needs, "skipped": skipped, "ignored": ignored, "notes": notes_shown}
 
 
 def parse_text(text, existing_ids=(), tokens=()):

@@ -244,6 +244,39 @@ async def test_stderr_tail_and_server_info_are_shown_redacted(extension_manager,
     assert len(entry["stderr_tail"]) <= 2000
 
 
+async def test_a_chatty_server_keeps_only_the_end_of_its_stderr(extension_manager, tmp_path):
+    from local_agent.mcp_client import STDERR_KEPT_BYTES
+    server = tmp_path / "chatty.py"
+    # 3 MB of stderr before it serves: a pipe nobody drained would block it (and a file would keep it all).
+    server.write_text('''import os, sys
+from mcp.server import MCPServer
+for number in range(30_000):
+    sys.stderr.write(f"log line {number:06d} " + "x" * 90 + "\\n")
+sys.stderr.write("ready\\n")
+sys.stderr.flush()
+server = MCPServer("Chatty", log_level="ERROR")
+@server.tool()
+def fail() -> str:
+    sys.stderr.write("y" * 200_000 + "\\nlast words\\n")
+    sys.stderr.flush()
+    os._exit(1)
+server.run()
+''')
+    chatty = {"id": "chatty", "name": "Chatty", "transport": "stdio", "command": sys.executable, "args": [str(server)],
+              "enabled": True}
+    extension_manager.update_config({"servers": [chatty]})
+    before = set(tmp_path.iterdir())
+    async with extension_manager.turn() as connection:
+        assert [item["function"]["name"] for item in await connection.discover()] == ["mcp__chatty__fail"]
+        errlog = connection.errlogs["chatty"]
+        errlog.drain()
+        assert len(errlog.kept) <= STDERR_KEPT_BYTES and bytes(errlog.kept).endswith(b"ready\n")
+        with pytest.raises(ValueError, match="last words"):
+            await connection.call("mcp__chatty__fail", {})
+        assert len(errlog.kept) <= STDERR_KEPT_BYTES
+    assert errlog.closed and set(tmp_path.iterdir()) == before  # Nothing written to disk.
+
+
 async def test_status_reports_server_info_and_turned_off_servers(extension_manager, local_server, tmp_path):
     other = {**local_server, "id": "other", "args": [local_server["args"][0], str(tmp_path / "other.pid"), "unused"]}
     disabled = {**local_server, "id": "unused", "enabled": False}
@@ -302,7 +335,18 @@ async def test_schema_budget_skips_the_server_and_reaps_it(extension_manager, lo
         assert await connection.discover() == []
         assert connection.status[0]["status"] == "skipped" and "enable fewer servers or tools" in connection.status[0]["error"]
         assert not process_exists(int((tmp_path / "server.pid").read_text()))
-    assert extension_manager.failures == {}  # A skip is not a failure: no waiting before the next turn.
+    # The skip is remembered: while the servers before it leave the same room, it is not started again.
+    (tmp_path / "server.pid").unlink()
+    async with extension_manager.turn() as connection:
+        assert await connection.discover() == []
+        assert connection.status[0]["status"] == "skipped" and "retry_seconds" not in connection.status[0]
+    assert not (tmp_path / "server.pid").exists()
+    # Saving the configuration tries it again at once.
+    extension_manager.update_config({"servers": [local_server]})
+    async with extension_manager.turn() as connection:
+        await connection.discover()
+        assert connection.status[0]["status"] == "skipped"
+    assert (tmp_path / "server.pid").exists()
 
 
 async def test_the_aggregate_cap_keeps_the_earlier_servers_tools(extension_manager, local_server, tmp_path, monkeypatch):
@@ -314,6 +358,10 @@ async def test_the_aggregate_cap_keeps_the_earlier_servers_tools(extension_manag
         assert [item["status"] for item in connection.status] == ["connected", "skipped"]
         assert {item["function"]["name"] for item in definitions} == {"mcp__local__echo", "mcp__local__fail", "mcp__local__slow"}
         assert not process_exists(int((tmp_path / "second.pid").read_text()))
+    # With the first server off in a chat there is room: the remembered skip does not apply.
+    async with extension_manager.turn(off=["local"]) as connection:
+        assert len(await connection.discover()) == 3
+        assert [item["status"] for item in connection.status] == ["off", "connected"]
 
 
 async def test_actual_streamable_http_server(extension_manager, tmp_path):
@@ -417,3 +465,15 @@ def test_structured_content_follows_the_text_unless_it_repeats_it():
     result = SimpleNamespace(content=[SimpleNamespace(type="text", text="Found 2")], structured_content={"items": [1, 2]})
     assert flatten_content(result)[0] == 'Found 2\nStructured content (JSON):\n{"items": [1, 2]}'
     assert flatten_content(SimpleNamespace(content=[], structured_content={"a": 1}))[0] == '{"a": 1}'
+    # Only an exact repeat is left out: a short value that merely occurs in the text is kept.
+    result = SimpleNamespace(content=[SimpleNamespace(type="text", text="Created 1 issue in project a")],
+                             structured_content={"issue_number": 1})
+    assert flatten_content(result)[0].endswith('Structured content (JSON):\n{"issue_number": 1}')
+    result = SimpleNamespace(content=[SimpleNamespace(type="text", text="Done")], structured_content={"status": "o"})
+    assert flatten_content(result)[0].endswith('{"status": "o"}')
+    # A repeat of one text part (or its JSON) next to other content is still left out.
+    result = SimpleNamespace(content=[SimpleNamespace(type="text", text='{\n  "a": 1\n}'),
+                                      SimpleNamespace(type="resource_link", name="doc", uri="https://example.com/d",
+                                                      description=None)],
+                             structured_content={"a": 1})
+    assert "Structured content" not in flatten_content(result)[0]

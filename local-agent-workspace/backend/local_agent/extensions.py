@@ -36,6 +36,8 @@ SERVER_VALUE_CHARS = 4_096
 ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]{0,63}\Z")
 SECRET_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
 HEADER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,63}\Z")
+# A secret header's prefix: a scheme word and one space ("Bearer "); any other text belongs in the secret.
+HEADER_PREFIX = re.compile(r"[A-Za-z][A-Za-z-]{0,23} \Z")
 # Never set for a server: what changes how its program or shell starts, and the app's own credentials.
 DENIED_SERVER_ENV = DENIED_ENV | CREDENTIAL_ENV | {"PATH", "PYTHONPATH", "PYTHONHOME"}
 DENIED_SERVER_ENV_PREFIXES = (*DENIED_ENV_PREFIXES, "PYTHON", "DBRICKS_", "DATABRICKS_", "LOCAL_AGENT_")
@@ -225,9 +227,10 @@ def _server_values(entry, field, server_id, tokens=()):
             item = {"secret": key}
             if "prefix" in value:
                 prefix = value["prefix"]
-                if (not isinstance(prefix, str) or len(prefix) > 32
-                        or any(ord(char) < 32 or ord(char) == 127 for char in prefix)):
-                    raise ValueError(f"MCP server {server_id}: a header prefix is text of at most 32 characters.")
+                # Saved in plain text, so never a value: a scheme word only (letters and -, then one space).
+                if not isinstance(prefix, str) or (prefix and not HEADER_PREFIX.fullmatch(prefix)):
+                    raise ValueError(f"MCP server {server_id}: a header prefix is a scheme word and one space, such as "
+                                     '"Bearer " (at most 25 characters); put any other text in the credential-file value.')
                 if prefix:
                     item["prefix"] = prefix
             result[name] = item
@@ -265,8 +268,10 @@ def workspace_match(url, workspace):
         return False
 
 
-def validate_config(config, tokens=()):
-    """The checked configuration. tokens: secrets a plain env or header value must not contain."""
+def validate_config(config, tokens=(), saved_ids=None):
+    """The checked configuration. tokens: secrets a plain env or header value must not contain.
+    saved_ids (when saving): the server IDs already saved; a new server ID cannot contain "__", which
+    separates the server from the tool in mcp__<server>__<tool> (a saved one keeps working)."""
     if not isinstance(config, dict) or set(config) - {"servers", "hooks"}:
         raise ValueError("Extension configuration contains unsupported fields.")
     result = {"servers": [], "hooks": []}
@@ -280,6 +285,9 @@ def validate_config(config, tokens=()):
                 raise ValueError("Extension IDs must start with a lowercase letter and contain at most 20 lowercase letters, digits, _ or -.")
             if entry["id"] in identifiers:
                 raise ValueError(f"Duplicate {key} ID: {entry['id']}.")
+            if key == "servers" and saved_ids is not None and "__" in entry["id"] and entry["id"] not in saved_ids:
+                raise ValueError(f"MCP server ID {entry['id']} cannot contain __ (it separates the server from the tool "
+                                 "in tool names).")
             identifiers.add(entry["id"])
             if type(entry.get("enabled", False)) is not bool:
                 raise ValueError("enabled must be true or false.")
@@ -383,6 +391,10 @@ class ExtensionManager:
         except (OSError, UnicodeError, ValueError):
             return {}
 
+    def credential_keys(self):
+        """The names (never the values) of the credential file's assignments."""
+        return set(self._credential_values())
+
     def secret_values(self):
         """The resolved values of the enabled servers' secret references (8 characters or more), to redact."""
         keys = [key for server in self.config["servers"] if server["enabled"] for key in references(server)]
@@ -455,7 +467,7 @@ class ExtensionManager:
             tokens = [credentials()[1]] if credentials else []
         except (ValueError, OSError):
             tokens = []
-        candidate = validate_config(config, tokens)
+        candidate = validate_config(config, tokens, saved_ids={server["id"] for server in self.config["servers"]})
         descriptor, filename = tempfile.mkstemp(prefix="extensions-", suffix=".tmp", dir=self.settings.state_dir)
         try:
             with os.fdopen(descriptor, "w") as target:
@@ -472,8 +484,7 @@ class ExtensionManager:
         """This turn's connection. off: IDs of servers the chat turned off, never started."""
         tokens = self._tokens()
         async with MCPConnection(self.config["servers"], lambda text: self._redact(text, tokens), off=off,
-                                 failures=self.failures, resolve=self.resolve,
-                                 state_dir=self.settings.state_dir) as connection:
+                                 failures=self.failures, resolve=self.resolve) as connection:
             yield connection
 
     async def discover(self):
@@ -490,8 +501,7 @@ class ExtensionManager:
             self.failures.pop(server["id"], None)
             try:
                 # Enter and close on this task even when initialization fails.
-                async with MCPConnection([server], redact, failures=self.failures, resolve=self.resolve,
-                                         state_dir=self.settings.state_dir) as connection:
+                async with MCPConnection([server], redact, failures=self.failures, resolve=self.resolve) as connection:
                     await connection.discover()
                     item = connection.status[0]
                     if connection.annotations:

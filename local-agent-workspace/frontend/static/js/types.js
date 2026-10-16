@@ -167,8 +167,9 @@
 //   retry_seconds? (a failed server is tried again after 60 s), capped?: string[] (tools left out by the
 //   32-tool request limit) }. POST /extensions/test returns { tools, servers: [the same, with tools: string[],
 //   instructions?, tool_annotations?] }. POST /extensions/import?session_id= { source: 'project'|'desktop'|'text',
-//   text? } -> { source, path?, entries (disabled servers), needs: string[] (credential-file keys), skipped:
-//   [{ name, reason }], ignored: [{ name, fields }] }: a preview, nothing is saved. GET /tools also returns
+//   text? } -> { source, path?, entries (disabled servers), needs: string[] (credential-file keys), present: string[]
+//   (needed keys the credential file already has; names only), skipped: [{ name, reason }], ignored: [{ name, fields }],
+//   notes: [{ name, text }] (values to put whole in the credential file) }: a preview, nothing is saved. GET /tools also returns
 //   servers: [{ id, name, enabled }].
 // Delegation: { status: 'queued'|'running'|'awaiting_approval'|...|'completed'|'failed'|'cancelled'|'interrupted',
 //   completed_tools, last_tool?, terminal_reason?, agent_type?, started?, ended? (epoch seconds) }. A finished
