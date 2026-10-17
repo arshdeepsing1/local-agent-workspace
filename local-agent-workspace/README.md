@@ -129,6 +129,12 @@ private state. The example paths must be replaced. The installation command
 installs runtime libraries automatically; add `./backend[test]` instead of
 `./backend` only if you need to run the backend tests.
 
+To read the text of PDF files (attached to a message, or read by the agent with `read_file`),
+also install the optional documents extra, the `pypdf` package, and restart the app:
+`.venv/bin/python -m pip install -c constraints.txt -e './backend[documents]'` (combine extras
+as `./backend[documents,test]`). Without it a PDF's text is not read and the app says so; Word,
+Excel and PowerPoint files need nothing extra.
+
 Without `LOCAL_AGENT_MODEL`, or with it empty, the app uses `databricks-claude-opus-5-5` (Claude Opus 5.5,
 with a 200,000-token context budget and 16,384 Max output tokens). `LOCAL_AGENT_MODEL` in
 `.env` applies only while no model is saved in Settings: once you save Settings (or choose a
@@ -208,6 +214,7 @@ The backend installation automatically installs FastAPI, Uvicorn, HTTPX, regex, 
 MCP (`mcp==2.2.0`), and the MCP HTTP transport dependency HTTPX2. No Claude SDK,
 Claude CLI, or sibling SDK checkout is required. An optional MCP server may have
 its own runtime requirements, such as Node; install those only for the servers you choose.
+The optional documents extra adds `pypdf` (pure Python) for PDF text.
 
 To move selected chat history between machines, use **Agent tools → Export →
 Export conversation**, then import the JSON on the other machine and explicitly
@@ -238,7 +245,11 @@ database.
 subagent conversations (32 total, 16 MiB maximum). Export requires idle chats. A reply's
 signed thinking (kept only while **Settings → Reasoning → Send earlier thinking back** is on,
 see **Reasoning effort and thinking**) is left out unless you tick **Export with reasoning**;
-forks keep it.
+forks keep it. The text of documents attached to messages is exported (it is in the message the
+model received), but attached images are not: in the bundle each one becomes a note in its
+message, such as `[Image shot.png, 1280×720: not in exported or imported conversations, so it was
+not sent.]`, and so does an image reference in an imported bundle. Forks and rewind backups keep
+the images, with their own copies of the files.
 Imports preserve historical messages, tool results, summaries, and usage, remap
 conversation/event/call IDs and included child links, and cancel historical active
 states. Credential settings, hooks/MCP configuration, task-board records, jobs, file checkpoint ownership,
@@ -471,12 +482,59 @@ when opening a conversation or performing restart recovery.
   the message shows only your text and the file names. Snapshots follow the chat's own file
   access: credential files, generated folders, the app's state folder, folders the chat may not
   read (use **Folder access** first) and read deny rules or a turned-off `read_file` refuse the
-  message with an error. Missing paths, folders and words such as `@dist` stay plain text, and so
-  do tokens inside code: a fenced block, or a code span on one line (a run of backticks closes
+  message with an error, as does a PDF, Word, Excel or PowerPoint file: attach it with **Attach
+  files** instead, or ask the agent to read it (`read_file` reads its text). Missing paths,
+  folders and words such as `@dist` stay plain text, and so do tokens inside code: a fenced block, or a code span on one line (a run of backticks closes
   only at the next run of the same length, as in the quoted lines of review comments). Secrets in snapshots are redacted like command output, before a snapshot is
   shortened to 8,000 characters. An attached file counts as read, so the agent may
   edit it without reading it again. Only your typed text selects skills (not an attached file or a
   custom command's text).
+- **Attached documents and images**: paste, drop on the message box, or **Attach files** (the
+  paperclip below the box) adds PDF, Word (`.docx`), Excel (`.xlsx`), PowerPoint (`.pptx`), CSV,
+  TSV, text and Markdown files, and PNG, JPEG, GIF and WebP images to your next message: at most
+  8 files, each at most 20 MB. Copied text pastes as text, also when the app it came from adds a
+  picture of it (as spreadsheets do). Each file uploads at once and is kept with the chat (see
+  **Conversation storage**); a new conversation is created for its first file. Its chip shows the
+  type, the pages, sheets or slides or the pixel size, and the estimated tokens; **Remove** drops
+  it, and the message waits until every file has uploaded. Files go with a message, also one sent
+  as plain text or queued, but not with a `!` command or a `/btw` question. They are not part of
+  a saved draft, so after a reload attach them again. The message shows chips with the names
+  (exports and transcripts too); **Edit message**, **Retry response** and editing a queued
+  message keep its files, and **Edit message** can leave one out (**Do not send … again**). An
+  imported chat has no attached files, so these send its messages without them.
+- **Documents**: the app reads their text itself (Word, Excel and PowerPoint files with the Python
+  standard library; PDF with the optional documents extra, see **Install**) and the agent gets it
+  fenced as data after your text, like an `@` snapshot, redacted like command output: at most
+  50,000 characters per document and 100,000 per message. A longer document is shortened and the
+  agent is told so (`read_file` reads a document in full once it is saved in the project); a
+  document that would get less than 1,000 characters of what is left is refused with a message.
+  Word headings become `#` lines, tables and sheets tab-separated rows (at most 5,000 rows and 200
+  columns per sheet and 32,767 characters per cell, Excel's own limit; hidden sheets are marked),
+  and `--- Page N ---`, `--- Sheet: name ---` and
+  `--- Slide N ---` lines mark pages, sheets and slides. The text stays in the message once it is
+  sent, so later requests resend it unchanged and it stays in the prompt cache. Scanned PDF pages
+  have no text (the app does no OCR) and are counted in a note. Without the documents extra a PDF's
+  chip says that reading PDF text needs it, and **Attach as path** sends the path where the app
+  saved the file instead of its text: file tools cannot open the app's state folder, so the agent
+  can read it only with a command, which follows the permission mode.
+- **Images** go only to endpoints that take image input: Claude Opus 5.5 and Opus 4.8, unless
+  **Check endpoint capabilities** found image parts rejected; not GPT OSS or an endpoint without a
+  profile. For those the chip warns, and sending is refused with a message naming the endpoint
+  and where to choose another one. An image can be at most 2.5 MB and 8,000 pixels on a side, and
+  a message at most 4 images and 2.5 MB of them, so their base64 copy fits the 4 MB request limit;
+  the app does not shrink images (attach a smaller copy, such as a JPEG or a crop). An image is
+  sent as an `image_url` part with a base64 data URL before your text, after a short text part
+  naming it as your file whose text is data, not instructions, in the request body only:
+  the conversation file keeps a reference to it (name, type, size), never the image. It is
+  estimated at width × height / 750 tokens, after scaling to at most 2,576 pixels on the long side
+  and 3.75 megapixels (so at most 5,000 tokens; a 1280×720 screenshot is 1,229), and the meter
+  and the 4 MB check count it. Every later request of the chat sends it again (cached on Claude
+  endpoints) until a compaction summarizes its turn: the summary request gets a note naming the
+  image instead. After a switch to an endpoint without image input, in a request to a fallback
+  endpoint without it, or when its file is gone, an image becomes a note in its message, such as
+  `[Image shot.png, 1280×720: not sent, databricks-gpt-oss-120b does not take images.]`. If an
+  endpoint answers the images with an HTTP 400 that names them, the app sends the request again
+  with notes, says so, and sends that endpoint no images until it restarts or Settings are saved.
 - **Shell commands (`!`)**: a message starting with `!` runs the rest as one shell command in the
   project folder, like **Workspace → Terminal** Run, when the chat is idle, for at most 60 seconds
   (use **Workspace → Terminal** for longer commands). It is an explicit user action, so it runs in
@@ -1083,6 +1141,12 @@ workspace anyway, because commands run in the workspace can still reach it.
   its parent (`parent_session_id`, `parent_event_id`), and the parent's header lists its
   subagents with their task, type, status and file (see **Linked transcripts** under
   **Agent tools: tasks, subagents, and activity**).
+- `uploads/<conversation-id>/`: the files attached to the chat's messages, each as
+  `<sha256>.<extension>` with its record (`.json`: name, type, size, estimated tokens) and, for a
+  document, its extracted text (`.extracted.txt`, so a `.txt` file stays as it was); folders 0700,
+  files 0600. A chat keeps at most 100 attached files and 200 MB. Deleting the chat deletes its
+  folder; a fork or rewind backup gets its own copies (hard links where possible). The folder is
+  never exported, and an imported chat has no attached files: their chips keep the names.
 - `conversations/<conversation-id>.state.json`: the chat's "Allow for this chat" rules and
   the size and modification time of the files the agent last read or wrote (paths only, no
   contents). It sits beside the JSONL file so earlier versions of the app can still open the
@@ -1953,7 +2017,8 @@ A message you send while the agent works (**steering**) is part of the current t
 turn of its own: compaction never cuts there, keeps it verbatim after the summary together
 with the turn's request, and never summarizes the tool results the model has not answered
 yet. A queued message that would not fit the context budget together with the latest tool
-results waits (not paused) for a later step boundary, with one notice per turn. If no
+results, or would take the request over the 4 MB limit (attached images count in full, see
+**Images**), waits (not paused) for a later step boundary, with one notice per turn. If no
 boundary has room for it before the reply completes, it is sent as the next turn; after
 Stop, an error or the step limit it waits like any queued message (see **Messages while the
 agent works**).
@@ -3256,7 +3321,14 @@ the start of a regular file. Lines longer than 128 KB are refused. Lines end at 
 and one CR before it is dropped, so CRLF files read normally. Bytes that are not valid
 UTF-8 are shown as U+FFFD (�) and the first 20 such lines are listed in
 `invalid_utf8_lines`; files with NUL bytes are refused as binary. Reads can therefore
-inspect larger files without loading them into the editor. File reads, search results,
+inspect larger files without loading them into the editor. A `.pdf`, `.docx`, `.xlsx` or
+`.pptx` file (up to 20 MB) is read as its extracted text, the same text an attached document
+sends (see **Documents** above; PDF needs the documents extra): numbered lines wrapped at 500
+characters, with `extracted` naming the type and the number of pages, sheets or slides, and
+`notes` for what was left out. Office files are ZIP archives: the app reads at most 10,000 parts
+and 64 MB of uncompressed XML, counted as it reads, and refuses XML with a DOCTYPE or entity
+declaration. The text of the last 4 documents read is kept in memory by path, size and
+modification time, so paging through one extracts it once. File reads, search results,
 and job-output pages have explicit continuation markers. The filesystem can change
 between pages.
 
@@ -3763,6 +3835,8 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `backend/local_agent/api.py`: local API, WebSocket stream, page presence socket, workspace endpoints.
 - `backend/local_agent/agents.py`: session/approval events and the Databricks tool loop.
 - `backend/local_agent/tools.py`: scoped file queries/edits and tool definitions.
+- `backend/local_agent/documents.py` / `uploads.py`: text from PDF, Word, Excel and PowerPoint files and image
+  headers; files attached to messages (kept per chat, sent as text or image parts).
 - `backend/local_agent/jobs.py`: streamed processes, managed jobs, and cleanup.
 - `backend/local_agent/command_exec.py`: commands run from an argument vector without a shell (read-only `pwd` and `ls` from `/bin`, hardened Git).
 - `backend/local_agent/rules.py`: the rule engine (command parsing, rule matching, uncertain commands), protected paths, the read-only command list and the saved `permission_rules.json`.

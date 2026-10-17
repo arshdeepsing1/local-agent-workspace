@@ -8,6 +8,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError
 
+from . import uploads as attached
 from .composer_api import MAX_QUEUED
 from .context import LARGE_SUMMARY_MAX_BYTES, MAX_ESTIMATE_SCALE, context_boundary
 from .extensions import HOOK_CONTEXT_CHARS, HOOK_EVENTS, HOOK_REPORT_CHARS, MAX_HOOKS
@@ -105,15 +106,34 @@ class Answer(Record):
     other: str | None = Field(default=None, max_length=1000)
 
 
+UploadId = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+ImageType = Literal["image/png", "image/jpeg", "image/gif", "image/webp"]  # uploads.IMAGE_EXTENSIONS
+Pixels = Annotated[int, Field(ge=1, le=100_000)]
+
+
 class Attachment(Record):
-    """Metadata of an @ file snapshot or a ! command output sent with a user message (never its content)."""
-    kind: Literal["file", "shell"]
+    """Metadata of an @ file snapshot, a ! command output, or a document or image attached from the composer
+    (uploads.py), sent with a user message (never its content)."""
+    kind: Literal["file", "shell", "document", "image"]
     path: str | None = Field(default=None, max_length=4096)
     start_line: int | None = Field(default=None, ge=1)
     end_line: int | None = Field(default=None, ge=0)
     truncated: bool | None = None
     command: str | None = Field(default=None, max_length=2000)
     exit_code: int | None = None
+    # Attached documents and images: the file's name and upload id, a document's format, the characters sent
+    # (units: its pages, sheets or slides), whether it went as a path only; an image's type, size and bytes.
+    name: str | None = Field(default=None, max_length=attached.NAME_CHARS)
+    upload: UploadId | None = None
+    format: Literal["pdf", "docx", "xlsx", "pptx", "csv", "tsv", "txt", "md"] | None = None  # documents.EXTENSIONS
+    chars: int | None = Field(default=None, ge=0)
+    units: Literal["page", "sheet", "slide"] | None = None
+    count: int | None = Field(default=None, ge=0)
+    as_path: bool | None = None
+    media_type: ImageType | None = None
+    width: Pixels | None = None
+    height: Pixels | None = None
+    bytes: int | None = Field(default=None, ge=0)
 
 
 # A skill ID or a command template's name (extensions.SKILL_IDENTIFIER).
@@ -255,7 +275,8 @@ class Event(Record):
     verbatim: bool | None = None
     queued: bool | None = None
     git_context: bool | None = None  # User events: the app sent a Git snapshot with it (git_tools.git_context).
-    attachments: list[Attachment] | None = Field(default=None, max_length=10)
+    # At most 5 @ files and 5 ! outputs (mentions.py) and 8 attached files (uploads.MAX_MESSAGE_FILES).
+    attachments: list[Attachment] | None = Field(default=None, max_length=10 + attached.MAX_MESSAGE_FILES)
     stop_phase: Literal["streaming", "tools", "waiting"] | None = None
     details: str | None = Field(default=None, max_length=1000)  # A rate-limit notice's Details (the 429).
     # Hooks (lifecycle_hooks): a hook card's structured result; on a tool card, the arguments a
@@ -297,12 +318,24 @@ class ReasoningSidecar(Record):
     bytes: int = Field(ge=0, le=MAX_SIDECAR_BYTES)
 
 
+class ImageRef(Record):
+    """An image a user message carries (uploads.py): sent as an image part, kept in the chat's uploads folder.
+    Only forks keep them; an export turns each into a note in its message's text."""
+    upload: UploadId
+    name: str = Field(max_length=attached.NAME_CHARS)
+    media_type: ImageType
+    width: Pixels
+    height: Pixels
+    bytes: int = Field(ge=1, le=attached.MAX_IMAGE_BYTES)
+
+
 class Message(Record):
     role: Literal["user", "assistant", "tool"]
     content: str | None = None
     tool_calls: list[ToolCall] | None = Field(default=None, max_length=256)
     tool_call_id: str | None = None
     reasoning: ReasoningSidecar | None = None  # Assistant replies only.
+    images: list[ImageRef] | None = Field(default=None, max_length=attached.MAX_MESSAGE_IMAGES)  # User messages only.
 
 
 class ContextState(Record):
@@ -503,13 +536,17 @@ def _validate_wire(wire, *, complete=False):
             raise ValueError("User messages and tool results require text content.")
         if role != "assistant" and message.get("reasoning") is not None:
             raise ValueError("Only assistant replies can carry reasoning.")
+        if role != "user" and message.get("images") is not None:
+            raise ValueError("Only user messages can carry images.")
     if complete and pending:
         raise ValueError("Only a completed conversation can be forked.")
 
 
-def export_bundle(sessions, root_id, with_reasoning=False):
+def export_bundle(sessions, root_id, with_reasoning=False, keep_images=False):
     """A validated bundle of these conversations. Replies' signed reasoning (reasoning_replay's sidecars) is
-    left out unless with_reasoning (an export "with reasoning", and forks, which keep the chat's endpoint)."""
+    left out unless with_reasoning (an export "with reasoning", and forks, which keep the chat's endpoint).
+    Attached images stay references only in a fork (keep_images: it gets copies of the files); an export has
+    no image files, so each becomes a note in its message's text (attached documents are in that text)."""
     records = []
     for source in sessions:
         record = {key: value for key, value in source.items() if key in Conversation.model_fields}
@@ -517,6 +554,8 @@ def export_bundle(sessions, root_id, with_reasoning=False):
             record["wire"] = [{key: value for key, value in message.items() if key != "reasoning"}
                               if isinstance(message, dict) and "reasoning" in message else message
                               for message in record.get("wire", [])]
+        if not keep_images:
+            record["wire"] = [attached.images_as_notes(message, attached.NOT_EXPORTED) for message in record.get("wire", [])]
         record["events"] = [{key: value for key, value in event.items() if key in Event.model_fields}
                             for event in record["events"]]
         # Keep only the fields a bundle defines; newer display details such as
@@ -651,8 +690,17 @@ def fresh_copies(bundle, workspace, *, kind="import"):
                 source["parent_call_id"] = remapped_call
         if source.get("delegation") and not source["delegation"].get("terminal_reason"):
             source["delegation"].update(status="interrupted", terminal_reason="interrupted")
+        if kind != "fork":
+            # An imported image has no file in this app: a note says what it was.
+            source["wire"] = [attached.images_as_notes(message, attached.NOT_EXPORTED) for message in source["wire"]]
         for event in source["events"]:
             event["id"] = events[old_id][event["id"]]
+            if kind != "fork" and isinstance(event.get("attachments"), list):
+                # Nor are attached files imported: their chips keep the names, and Retry response and Edit
+                # message send the message without them (a document's text stays in the message sent then).
+                event["attachments"] = [{key: value for key, value in item.items() if key != "upload"}
+                                        if isinstance(item, dict) and item.get("kind") in ("document", "image")
+                                        else item for item in event["attachments"]]
             child = event.pop("child_session_id", None)
             if child in ids:
                 event["child_session_id"] = ids[child]

@@ -1,16 +1,20 @@
-"""Composer routes: queued messages, ! shell commands, /btw side questions and the @ file menu.
+"""Composer routes: queued messages, ! shell commands, /btw side questions, the @ file menu and
+files attached to a message (uploads.py).
 
 Messages themselves still go through POST /api/sessions/{id}/messages (api.py), which
 starts them or, while the chat is busy, queues them (AgentManager.submit_message).
 """
 import asyncio
 import copy
+from urllib.parse import unquote
 
-from fastapi import HTTPException, Query
+from fastapi import HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
+from . import uploads as attached
 from .approvals import ensure_idle
 from .context import STEER_PREFIX, is_app_prompt  # noqa: F401 (STEER_PREFIX is re-exported here)
+from .model_profiles import profile_for
 
 MAX_QUEUED = 3
 MAX_QUEUED_CHARS = 50_000
@@ -50,6 +54,23 @@ class ShellCommand(BaseModel):
 class SideQuestion(BaseModel):
     model_config = ConfigDict(extra="forbid")
     question: str = Field(min_length=1, max_length=4000, strict=True)
+
+
+class UploadRef(BaseModel):
+    """A file attached to a message (POST /uploads gave its id); as_path sends its saved path instead of its text."""
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(pattern=r"^[0-9a-f]{64}$", strict=True)
+    as_path: bool = Field(default=False, strict=True)
+
+
+def upload_refs_field():
+    """The uploads field of a message body: at most MAX_MESSAGE_FILES references."""
+    return Field(default_factory=list, max_length=attached.MAX_MESSAGE_FILES)
+
+
+def upload_refs(refs):
+    """The uploads of a request body as AgentManager takes them: [{id, as_path?}]."""
+    return [ref.model_dump(exclude_defaults=True) for ref in refs or ()]
 
 
 def register_composer(app, manager, settings, store, session_or_404):
@@ -101,6 +122,36 @@ def register_composer(app, manager, settings, store, session_or_404):
             return manager.session_tools(session)
         return WorkspaceTools(settings.values["workspace"], settings.values["env_file"],
                               write_limit=write_limit_setting(settings.values), excluded_roots=(settings.state_dir,))
+
+    @app.post("/api/sessions/{session_id}/uploads")
+    async def upload(session_id: str, request: Request):
+        """A file pasted, dropped or chosen in the composer: the raw bytes as the body, its name in X-File-Name
+        (URL-encoded). The answer is its record (uploads.public_record); a message sends it by its id."""
+        session = session_or_404(session_id)
+        name = unquote(request.headers.get("x-file-name", ""), errors="replace")[:1000]
+        limit = attached.MAX_UPLOAD_BYTES
+        too_large = (f"{attached.clean_name(name)} is larger than {limit // 1_000_000} MB, the most a file attached to a "
+                     "message can be.")
+        length = request.headers.get("content-length")
+        if length and (not length.isdigit() or int(length) > limit):
+            raise HTTPException(413, too_large)
+        data = bytearray()
+        async for chunk in request.stream():
+            if len(data) + len(chunk) > limit:
+                raise HTTPException(413, too_large)
+            data.extend(chunk)
+        # Text extraction can take seconds (a long PDF): not on the event loop.
+        record = await asyncio.to_thread(manager.uploads.save, session_id, name, bytes(data))
+        try:
+            gone = store.header(session_id) is None
+        except (ValueError, OSError):
+            gone = False  # Unreadable, not deleted.
+        if gone:
+            manager.uploads.delete_session(session_id)  # Deleted while the file was read: nothing is left behind.
+            raise HTTPException(404, "Conversation not found.")
+        model = session["model"]
+        vision = manager.supports(model, "vision") if record["kind"] == "image" else None
+        return attached.public_record(record, vision, model, (profile_for(model) or {}).get("label"))
 
     @app.get("/api/sessions/{session_id}/mention-files")
     async def session_mention_files(session_id: str, q: str = Query(default="", max_length=200)):

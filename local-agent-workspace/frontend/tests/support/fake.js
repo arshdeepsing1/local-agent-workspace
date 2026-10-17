@@ -11,6 +11,8 @@
 //                                (a small copy of backend reasoning.preview for the endpoints tests use)
 //   GET /api/endpoints/<model>/checks and /state answer "nothing saved" unless a test overrides them
 //   GET /api/git/pr answers "gh is not installed" unless a test overrides it
+//   POST /api/sessions/<id>/uploads answers fake.uploadRecord(name, file) (a file attached in the composer; uploads.py)
+//                                unless a test overrides it; fake.uploads lists [{ session, name, file }]
 (() => {
   const json = (body, status = 200) => new Response(JSON.stringify(body), {
     status, headers: { 'Content-Type': 'application/json' },
@@ -129,6 +131,19 @@
     { id: 'concise', name: 'Concise', description: 'Short, direct replies that lead with the result.', source: 'built-in' },
     { id: 'explanatory', name: 'Explanatory', description: 'Explains the reasoning and concepts behind the work.', source: 'built-in' }]
   fake.memory = { project: '/project', notes: [], bytes: 0, max_bytes: 4000, max_notes: 50, max_note_chars: 500, enabled: true, problem: null }
+  // An uploaded file's record: an image is 640×480, a PDF has 3 pages, the id counts the uploads (64 hex digits).
+  fake.uploads = []
+  fake.uploadRecord = (name, file) => {
+    const id = fake.uploads.length.toString(16).padStart(64, '0')
+    const format = (/\.([^.]+)$/.exec(name)?.[1] || '').toLowerCase()
+    if (['png', 'jpg', 'jpeg', 'gif', 'webp'].includes(format)) {
+      const type = format === 'jpg' ? 'jpeg' : format
+      return { id, name, kind: 'image', format: type === 'jpeg' ? 'jpg' : type, media_type: `image/${type}`, width: 640, height: 480,
+        bytes: file?.size || 0, estimated_tokens: 410 }
+    }
+    return { id, name, kind: 'document', format, media_type: 'application/octet-stream', bytes: file?.size || 0, chars: 1200,
+      truncated: false, notes: [], estimated_tokens: 300, ...(format === 'pdf' ? { units: 'page', count: 3 } : {}) }
+  }
   // Endpoint checks (Settings → Check endpoint capabilities…, Agent tools → Overview) default to none saved and no
   // serving state.
   const defaults = (path, options) => path === '/api/settings/reasoning' && options.method === 'POST'
@@ -140,7 +155,11 @@
     : /^\/api\/endpoints\/[^/]+\/state$/.test(path) ? json({ ready: null, task: null, error: 'Not in tests.' })
     // The Changes view's pull request chip: gh is not installed unless a test says otherwise.
     : /^\/api\/git\/pr(?:\?|$)/.test(path) ? json({ available: false, code: 'no_gh', reason: 'GitHub CLI (gh) is not installed or not on PATH.' })
-    : undefined
+    : /^\/api\/sessions\/[^/]+\/uploads$/.test(path) && options.method === 'POST' ? (() => {
+      const name = decodeURIComponent(options.headers?.['X-File-Name'] || '')
+      fake.uploads.push({ session: path.split('/')[3], name, file: options.body })
+      return json(fake.uploadRecord(name, options.body))
+    })() : undefined
 
   window.fetch = async (input, options = {}) => {
     const path = String(input)

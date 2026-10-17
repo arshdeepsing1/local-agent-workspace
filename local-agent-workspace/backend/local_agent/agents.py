@@ -61,6 +61,7 @@ from .feature_tools import FEATURE_TOOLS, FINDINGS_TOOL
 from .tool_profiles import tool_allowed, filter_tools, off_servers, server_off
 from .mcp_client import FULL_RESULT_CHARS, RETRY_SECONDS
 from .result_store import ResultStore
+from . import uploads as attached
 from . import web_fetch
 from . import prompt_cache, reasoning, reasoning_replay
 from .reasoning import reasoning_delta, reasoning_shape
@@ -99,7 +100,7 @@ from . import request_limits
 from .request_limits import STREAM_READ_TIMEOUT, PayloadTooLarge, check_payload, encode_payload
 from .rate_limits import (ITPM, OTPM, CompactionOverOtpm, RATE_LIMIT_WAIT_CAP, RateLimitGate, describe, otpm_too_low,
                           parse_rate_limit, request_info_fields)
-from .context import in_turn_tokens
+from .context import in_turn_bytes_fit, in_turn_tokens
 from .model_profiles import CONCURRENT_REQUESTS
 from .result_budget import (ALLOWANCE_MARGIN_TOKENS, FULL_RESULT_TOOLS, MCP_SHORTENED_HINT, TOOL_RESULT_HARD_LIMIT,
                             ResultAllowance, bound_result, cap_text, deferred_text, shorten_result, shortened_hint)
@@ -867,6 +868,7 @@ class AgentManager(LifecycleHooks):
         self.interactions = InteractionManager(self)
         self.extension_connections = {}
         self.results = ResultStore()  # In memory: long MCP and web_fetch results (get_tool_output), MCP images.
+        self.uploads = attached.Uploads(settings.state_dir / "uploads")  # Files attached from the composer.
         # web_fetch and web_search (web_fetch.py): tests replace the connection backend (a factory), the ports a
         # fetch may use, and the search provider's transport.
         self.web_options = {"backend": None, "ports": web_fetch.PORTS, "search_transport": None}
@@ -884,6 +886,9 @@ class AgentManager(LifecycleHooks):
         # In memory only: endpoints that rejected signed reasoning sent back (Settings → Reasoning → Send earlier
         # thinking back) with HTTP 400; until a restart or a Settings save.
         self.replay_rejections = set()
+        # In memory only: endpoints that answered image parts (uploads.expand_images) with an HTTP 400 naming
+        # them; their requests carry notes instead until a restart or a Settings save.
+        self.vision_rejections = set()
         # Endpoint check results (Settings → Model and context → Check endpoint…), read by cache_level and
         # replay_model; endpoint_checks_api registers the runner.
         self.endpoint_checks = CheckStore(settings.state_dir)
@@ -1134,15 +1139,17 @@ class AgentManager(LifecycleHooks):
             raise ValueError("The skills' instructions with this message's text in $ARGUMENTS are too long. Shorten the message.")
         return selected, text
 
-    def prepared_message(self, tools, text, verbatim=False):
-        """A message as it is sent or queued: {text, verbatim?, command?: {name, path, expanded}}. A message
-        that starts with /<name> of a command template (commands.py) carries its expanded text, unless it is
-        sent as plain text or Settings turned slash commands off. ValueError when it cannot be expanded."""
+    def prepared_message(self, tools, text, verbatim=False, uploads=()):
+        """A message as it is sent or queued: {text, verbatim?, command?: {name, path, expanded}, uploads?}. A
+        message that starts with /<name> of a command template (commands.py) carries its expanded text, unless it
+        is sent as plain text or Settings turned slash commands off. uploads: the files attached from the composer
+        ([{id, as_path?}]), also with plain text. ValueError when it cannot be expanded."""
+        attached_files = {"uploads": list(uploads)} if uploads else {}
         if verbatim:
-            return {"text": text, "verbatim": True}
+            return {"text": text, "verbatim": True, **attached_files}
         found = command_templates.leading(text) if self.slash_commands() else None
         if not found or found[0] in RESERVED_COMMANDS:
-            return {"text": text}
+            return {"text": text, **attached_files}
         listing = command_templates.discover(tools.root, self.settings.redact, with_text=True)
         command = next((item for item in listing["commands"] if item["name"] == found[0]), None)
         if command is None:
@@ -1151,9 +1158,20 @@ class AgentManager(LifecycleHooks):
                        or command_templates.unread_folder(tools.root, found[0], listing["errors"]))
             if problem:
                 raise ValueError(f"/{found[0]} could not be used: {problem['path']}: {problem['error']}")
-            return {"text": text}
+            return {"text": text, **attached_files}
         return {"text": text, "command": {"name": command["name"], "path": command["path"],
-                                          "expanded": command_templates.expand(command["text"], found[1])}}
+                                          "expanded": command_templates.expand(command["text"], found[1])},
+                **attached_files}
+
+    @staticmethod
+    def message_uploads(items):
+        """The files attached to prepared messages sent as one ([{id, as_path?}], each file once, in order)."""
+        found = {}
+        for item in items:
+            for ref in item.get("uploads") or () if isinstance(item, dict) else ():
+                if isinstance(ref, dict) and isinstance(ref.get("id"), str):
+                    found.setdefault(ref["id"], {key: ref[key] for key in ("id", "as_path") if key in ref})
+        return list(found.values())
 
     @staticmethod
     def message_parts(items):
@@ -2325,8 +2343,9 @@ class AgentManager(LifecycleHooks):
 
     def supports(self, model, flag):
         """model_profiles.supports for this endpoint, unless an endpoint check showed it rejects the capability
-        (an image part refused: vision is off). A check never turns a capability on."""
-        if not model_profiles_supports(model, flag):
+        (an image part refused: vision is off), or images were rejected with an HTTP 400 since the last restart
+        or Settings save. A check never turns a capability on."""
+        if not model_profiles_supports(model, flag) or (flag == "vision" and model in self.vision_rejections):
             return False
         return flag not in ("vision", "structured_output") or not self.endpoint_checks.refused(model, flag)
 
@@ -2420,11 +2439,11 @@ class AgentManager(LifecycleHooks):
         """The tool definitions offered in the next model request (offered_tools)."""
         return self.offered_tools(session, external_tools)[0]
 
-    def start(self, session_id, prompt, *, from_queue=False, verbatim=False, items=None):
-        """Start a turn. @ files and pending ! output are attached now, and a command template is
-        expanded, so a refused file or a broken command is an error before anything runs (from_queue:
-        queued messages, given as items, whose commands were expanded when they were queued; refused
-        files become a note). verbatim: sent as plain text, without a command, skills or @ files.
+    def start(self, session_id, prompt, *, from_queue=False, verbatim=False, items=None, uploads=()):
+        """Start a turn. @ files, attached files (uploads: [{id, as_path?}]) and pending ! output are attached
+        now, and a command template is expanded, so a refused file or a broken command is an error before
+        anything runs (from_queue: queued messages, given as items, whose commands were expanded when they were
+        queued; refused files become a note). verbatim: sent as plain text, without a command, skills or @ files.
         Queued messages still waiting are leftovers of a stop or failure: they are paused."""
         if session_id in self.tasks and not self.tasks[session_id].done():
             raise ValueError("A response is already running in this conversation.")
@@ -2437,10 +2456,11 @@ class AgentManager(LifecycleHooks):
         content, attachments, views, fields = None, None, [], {}
         if not delegated_prompt(session):
             tools = self.session_tools(session)
-            prepared = items if items is not None else [self.prepared_message(tools, prompt, verbatim)]
+            prepared = items if items is not None else [self.prepared_message(tools, prompt, verbatim, uploads)]
             scan, blocks, fields = self.message_parts(prepared)
             expanded, attachments, views = mentions.expand_context(
-                self, session, tools, prompt, on_error="inline" if from_queue else "raise", scan=scan)
+                self, session, tools, prompt, on_error="inline" if from_queue else "raise", scan=scan,
+                uploads=self.message_uploads(prepared))
             expanded += blocks
             content = expanded if expanded != prompt else None
             if from_queue:
@@ -2485,12 +2505,13 @@ class AgentManager(LifecycleHooks):
         task = self.tasks.get(session_id)
         return task is not None and not task.done()
 
-    async def submit_message(self, session_id, text, verbatim=False):
+    async def submit_message(self, session_id, text, verbatim=False, uploads=()):
         """Send a message: start it when the chat is idle, else queue it for the running task.
-        verbatim: sent as plain text (no command, skill or @ file)."""
+        verbatim: sent as plain text (no command, skill or @ file). uploads: files attached from the
+        composer ([{id, as_path?}])."""
         if self.busy_task(session_id):
-            return await self.enqueue(session_id, text, verbatim)
-        self.start(session_id, text, verbatim=verbatim)
+            return await self.enqueue(session_id, text, verbatim, uploads)
+        self.start(session_id, text, verbatim=verbatim, uploads=uploads)
         return {"ok": True}
 
     @staticmethod
@@ -2502,9 +2523,9 @@ class AgentManager(LifecycleHooks):
         await self.broadcast(session["id"], {"type": "queue", "queued_messages": public_queue(self.queue_of(session)),
                                              **({"error": error} if error else {})})
 
-    async def enqueue(self, session_id, text, verbatim=False):
-        """Queue a message while a turn, compaction or ! command runs. @ tokens are checked now;
-        their snapshot is taken when the message is sent. A command template is expanded now
+    async def enqueue(self, session_id, text, verbatim=False, uploads=()):
+        """Queue a message while a turn, compaction or ! command runs. @ tokens and attached files are
+        checked now; their snapshot is taken when the message is sent. A command template is expanded now
         (prepared_message), so its errors show at once."""
         session = self.get(session_id)
         if not session:
@@ -2516,15 +2537,21 @@ class AgentManager(LifecycleHooks):
         if sum(len(item.get("text", "")) + 2 for item in queue) + len(text) > MAX_QUEUED_CHARS:
             raise ValueError("Queued messages can contain at most 50,000 characters in total.")
         tools = self.session_tools(session)
-        prepared = self.prepared_message(tools, text, verbatim)
-        mentions.expand_context(self, session, tools, text, include_pending=False, scan=self.message_parts([prepared])[0])
+        prepared = self.prepared_message(tools, text, verbatim, uploads)
+        mentions.expand_context(self, session, tools, text, include_pending=False, scan=self.message_parts([prepared])[0],
+                                uploads=self.message_uploads([prepared]))
+        if prepared.get("uploads"):
+            # Names for the queue's chips (the files themselves are read when the message is sent).
+            prepared["uploads"] = [{**ref, **({"name": record["name"], "kind": record["kind"]} if (
+                record := self.uploads.get(session["id"], ref["id"])) else {})} for ref in prepared["uploads"]]
         if queue:
             # Queued messages are sent together (steering, the follow-up, Send queued messages),
             # so their files must also fit one message.
             try:
                 mentions.expand_context(self, session, tools, "\n\n".join([*(item.get("text", "") for item in queue), text]),
                                         include_pending=False, on_error="inline",
-                                        scan=self.message_parts([*queue, prepared])[0])
+                                        scan=self.message_parts([*queue, prepared])[0],
+                                        uploads=self.message_uploads([*queue, prepared]))
             except ValueError as exc:
                 raise ValueError(f"Queued messages are sent as one message. {exc}") from None
         session["queued_messages"] = [*queue, {"id": str(uuid.uuid4()), **prepared, "created": time.time(), "paused": False}]
@@ -2571,7 +2598,8 @@ class AgentManager(LifecycleHooks):
         text = "\n\n".join(item["text"] for item in entries)
         scan, blocks, extras = self.message_parts(entries)
         try:
-            content, attachments, views = mentions.expand_context(self, session, tools, text, on_error="inline", scan=scan)
+            content, attachments, views = mentions.expand_context(self, session, tools, text, on_error="inline", scan=scan,
+                                                                  uploads=self.message_uploads(entries))
             content += blocks
         except ValueError as exc:
             # A limit error (too many or too large files) does not fail the turn: the messages wait, paused.
@@ -2583,7 +2611,7 @@ class AgentManager(LifecycleHooks):
 
         async def waits(message):
             """Whether message does not fit the budget now; it then waits, with one notice per turn."""
-            if fits is None or fits({"role": "user", "content": message}):
+            if fits is None or fits({"role": "user", "content": message, **({"images": refs} if refs else {})}):
                 return False
             notified = self.__dict__.setdefault("_steer_wait_notices", set())
             turn = next((event["id"] for event in reversed(session["events"]) if event.get("type") == "user"
@@ -2594,11 +2622,13 @@ class AgentManager(LifecycleHooks):
                 notified.add((session["id"], turn))
                 await self.event(session, "notice", text=(
                     "Your queued message waits for a later step: together with the latest tool results it would not "
-                    "fit in the context budget. If the reply completes first, it is sent as the next message; after "
-                    "Stop, an error or the step limit it stays queued until you click Send queued messages."))
+                    "fit in the context budget or the 4 MB request limit. If the reply completes first, it is sent as "
+                    "the next message; after Stop, an error or the step limit it stays queued until you click Send "
+                    "queued messages."))
             await self.publish_queue(session)
             return True
         message = STEER_PREFIX + content
+        refs = attached.image_refs(attachments)
         if await waits(message):
             return
         sent = {item["id"] for item in entries}
@@ -2621,7 +2651,7 @@ class AgentManager(LifecycleHooks):
         session["queued_messages"] = [item for item in self.queue_of(session) if item.get("id") not in sent]
         for target, seen in views:
             self.remember_file(session, target, seen)
-        wire.append({"role": "user", "content": message})
+        wire.append({"role": "user", "content": message, **({"images": refs} if refs else {})})
         self._drop_pending(session)
         # No await between the wire append and the event: event() appends the user event before
         # its first await, so the wire and the events never disagree (m4-history-branching).
@@ -2822,7 +2852,10 @@ class AgentManager(LifecycleHooks):
         # Nothing is sent when it could not succeed: over the 4 MB request limit, while Databricks
         # asked another chat to pause requests to this endpoint, or above the learned OTPM limit.
         try:
-            body = check_payload({"messages": messages, "tools": definitions, "stream": False, "max_tokens": reserve})
+            # The conversation's attached images go as the chat's own requests send them (uploads.expand_images).
+            sent = attached.expand_images({"messages": messages}, self.uploads.folder(session["id"]),
+                                          self.supports(session["model"], "vision"), session["model"])["messages"]
+            body = check_payload({"messages": sent, "tools": definitions, "stream": False, "max_tokens": reserve})
         except PayloadTooLarge as exc:
             raise ValueError(str(exc)) from None
         waiting = self.rate_gate.remaining(session["model"], session["id"], reserve)
@@ -4575,20 +4608,27 @@ class AgentManager(LifecycleHooks):
                       f"{'was' if compaction['summarized_messages'] == 1 else 'were'} summarized in "
                       f"{plural(compaction.get('summarize_requests', compaction['requests'] - condensed), 'request')}"
                       + (f", plus {plural(condensed, 'condensing request')}" if condensed else ""))
-        over = (f"about {compaction['before_tokens']:,} estimated input tokens, over the "
-                f"{info.get('auto_compact_percent', 100)}% auto-compact threshold of {compaction['threshold_tokens']:,}")
+        needed = (f"needed about {compaction['before_tokens']:,} estimated input tokens, over the "
+                  f"{info.get('auto_compact_percent', 100)}% auto-compact threshold of "
+                  f"{compaction['threshold_tokens']:,}")
+        size = compaction.get("before_bytes")
+        if type(size) is int:  # Compacted for the 4 MB request limit, within the token threshold.
+            needed = (f"would be {size / 1_000_000:.1f} MB, over the app's "
+                      f"{request_limits.PAYLOAD_TARGET_BYTES / 1_000_000:.1f} MB target for the 4 MB request limit "
+                      "(attached images count in full)")
         if compaction["trigger"] == "manual":
             text = (f"Context compacted (compaction {n}): {summarized}; about {after:,} estimated input tokens "
                     "remain. The full conversation history is preserved.")
         elif compaction["trigger"] == "in_turn":
-            grew = ("outgrew the context budget" if compaction["before_tokens"] > info["input_budget"]
+            grew = ("made it too large for the 4 MB request limit" if type(size) is int
+                    else "outgrew the context budget" if compaction["before_tokens"] > info["input_budget"]
                     else "passed the auto-compact threshold")
             text = (f"This request's tool results {grew}, so its earlier results were summarized "
                     "and it continues. The request and its latest results are kept as they are; the full history is "
-                    f"preserved. Compaction {n}: the request needed {over}; {summarized}, and it now needs about "
+                    f"preserved. Compaction {n}: the request {needed}; {summarized}, and it now needs about "
                     f"{after:,}.")
         else:
-            text = (f"Context compacted automatically (compaction {n}): the next request needed {over}. "
+            text = (f"Context compacted automatically (compaction {n}): the next request {needed}. "
                     f"{summarized[0].upper() + summarized[1:]}; the request now needs about {after:,}. The app keeps "
                     "your earlier requests (long ones shortened), the task checklist and the files touched next to "
                     "the summary. The full history is preserved.")
@@ -4814,6 +4854,7 @@ class AgentManager(LifecycleHooks):
                             error.reasoning_rejected = reasoning.rejected_field(error_text, effort)
                         error.cache_named = prompt_cache.rejected(error_text)  # The notice's wording only.
                         error.replay_named = bool(replayed) and reasoning_replay.rejected(error_text)
+                        error.images_named = attached.images_rejected(error_text)
                     raise error
                 async for data in sse_data(response):
                     if data == "[DONE]":
@@ -4988,16 +5029,18 @@ class AgentManager(LifecycleHooks):
                 await self.broadcast(session["id"], {"type": "event", "event": event})
                 raise DraftPersistenceError(exc) from exc
 
-    @staticmethod
-    def cache_body(payload, prefix, level, note_chars=0):
+    def cache_body(self, session, payload, prefix, level, note_chars=0, model=None):
         """(body, level sent) of an agent request: payload encoded with the prompt-cache markers of level
         (prompt_cache.marked; prefix is where the system message's stable text ends, note_chars the length of
-        the step note ending the last message). The level sent is None for an endpoint without prompt caching
-        (level None) and "off" when level adds no marker."""
-        if level is None:
-            return encode_payload(payload), None
-        sent = prompt_cache.marked(payload, prefix, level, note_chars)
-        return encode_payload(sent), level if prompt_cache.markers(sent) else "off"
+        the step note ending the last message), and the images attached to its user messages as image parts
+        for an endpoint that takes them (model: the request's endpoint when it is not the chat's, a fallback),
+        else as notes (uploads.expand_images: only the body ever holds an image). The level sent is None for
+        an endpoint without prompt caching (level None) and "off" when level adds no marker."""
+        model = model or session["model"]
+        sent = payload if level is None else prompt_cache.marked(payload, prefix, level, note_chars)
+        sent_level = None if level is None else level if prompt_cache.markers(sent) else "off"
+        sent = attached.expand_images(sent, self.uploads.folder(session["id"]), self.supports(model, "vision"), model)
+        return encode_payload(sent), sent_level
 
     async def request_accepted(self, session, event, tail, lowered, replay_dropped=None):
         """Databricks answered an agent request with HTTP 200: its system tail hash is what the chat's next request
@@ -5083,7 +5126,7 @@ class AgentManager(LifecycleHooks):
         needed = scaled_estimate(payload["messages"], definitions,
                                  estimate_scale(session.get("inference_calls"), fallback))
         budget = effective_input_budget(context_window, max_tokens, model_context_window(fallback))
-        body, cache = self.cache_body(payload, prefix, self.cache_level(target), note_chars)
+        body, cache = self.cache_body(session, payload, prefix, self.cache_level(target), note_chars, model=fallback)
         if not self.fallback_allowed(fallback):
             skipped = "it is neither an endpoint the app knows nor one you use"
         elif needed > budget:
@@ -5393,7 +5436,10 @@ class AgentManager(LifecycleHooks):
             self.store.save(session)
         # A new turn: no earlier reply's signed reasoning is sent back again, so the history keeps none of it.
         reasoning_replay.prune(wire)
-        wire.append({"role": "user", "content": (prompt if content is None else content) + git_block + skills})
+        # The images attached to the message go in the wire as references (uploads.expand_images sends them).
+        refs = attached.image_refs(turn.get("attachments")) if turn is not None else []
+        wire.append({"role": "user", "content": (prompt if content is None else content) + git_block + skills,
+                     **({"images": refs} if refs else {})})
         compactable = False
         if isinstance(meter := session.get("context_info"), dict) and meter.get("compactable") is False:
             # This turn's first request replaces the meter; a turn that ends before it leaves this one.
@@ -5524,7 +5570,7 @@ class AgentManager(LifecycleHooks):
                            "max_tokens": max_output_tokens, **effort["fields"]}
                 # Prompt-cache markers go into the body only; payload stays what estimates, the ledger and the meter read.
                 prefix, note_chars = guidance["cache_prefix_chars"], len(note)
-                body, cache_sent = self.cache_body(payload, prefix, level, note_chars)
+                body, cache_sent = self.cache_body(session, payload, prefix, level, note_chars)
                 tail = hashlib.sha256(messages[0]["content"][prefix:].encode("utf-8")).hexdigest()
                 session["context_info"] = {**info, "instruction_files": guidance["files"],
                                            "instruction_sources": [*guidance["sources"], *message_sources],
@@ -5570,6 +5616,20 @@ class AgentManager(LifecycleHooks):
                         except InferenceError as exc:
                             if fallback is not None:
                                 raise  # One fallback attempt: its own failure ends the request.
+                            if (exc.http_status == 400 and getattr(exc, "images_named", False)
+                                    and attached.IMAGE_PART in body):
+                                # The endpoint does not take the image parts after all: its requests carry notes
+                                # instead (cache_body reads supports), so later messages of the chat still work.
+                                self.vision_rejections.add(session["model"])
+                                body, cache_sent = self.cache_body(session, payload, prefix, cache_sent, note_chars)
+                                retry_reason = "images_rejected"
+                                await self.event(session, "notice", text=(
+                                    f"Databricks rejected the images sent to {session['model']} (HTTP 400), so the "
+                                    "app sent the request again with a note in place of each image. Requests to this "
+                                    "endpoint send no images until the app restarts or Settings are saved; "
+                                    "Settings → Model and context → Check endpoint capabilities records whether it "
+                                    "takes them."))
+                                continue
                             if replayed and exc.http_status == 400:
                                 # Signed reasoning sent back may be what Databricks rejected: send the request once
                                 # more without it, before the other fallbacks. A 400 that names it is remembered
@@ -5578,7 +5638,7 @@ class AgentManager(LifecycleHooks):
                                 if replay_dropped["named"]:
                                     self.replay_rejections.add(session["model"])
                                 payload = {**payload, "messages": messages}
-                                body, cache_sent = self.cache_body(payload, prefix, cache_sent, note_chars)
+                                body, cache_sent = self.cache_body(session, payload, prefix, cache_sent, note_chars)
                                 replayed, retry_reason = 0, "replay_rejected"
                                 await self.update_event(session, event,
                                                         request_info={"model": session["model"], "status": "running"})
@@ -5612,7 +5672,7 @@ class AgentManager(LifecycleHooks):
                                             "(HTTP 400), so the app sent the request again without reasoning fields. "
                                             "Requests to this endpoint skip them until the app restarts or Settings are "
                                             "saved. To send them another way, change Settings → Reasoning → Request format.")
-                                body, cache_sent = self.cache_body(payload, prefix, cache_sent, note_chars)
+                                body, cache_sent = self.cache_body(session, payload, prefix, cache_sent, note_chars)
                                 retry_reason = "reasoning_rejected"
                                 await self.event(session, "notice", text=text)
                                 continue
@@ -5622,8 +5682,8 @@ class AgentManager(LifecycleHooks):
                                 # messages, then none). The lower level is remembered only once one is accepted;
                                 # if even the unmarked request fails, its error is shown and nothing is remembered.
                                 lowered["named"] = lowered.get("named", False) or getattr(exc, "cache_named", False)
-                                body, cache_sent = self.cache_body(payload, prefix, prompt_cache.next_level(cache_sent),
-                                                                   note_chars)
+                                body, cache_sent = self.cache_body(session, payload, prefix,
+                                                                   prompt_cache.next_level(cache_sent), note_chars)
                                 lowered["level"] = cache_sent
                                 retry_reason = "cache_rejected"
                                 # No notice moves the reply (reply_after_notices), so its rejected details go here.
@@ -5794,7 +5854,8 @@ class AgentManager(LifecycleHooks):
                 if step_index + 1 < steps and wrap_up is None and not spending.reached(self, session):
                     await self.drain_queue(session, wire, tools, fits=lambda message: in_turn_tokens(
                         [*model_history(wire), message], context_state, system, definitions, input_budget,
-                        scale) <= input_budget)
+                        scale) <= input_budget and in_turn_bytes_fit(
+                        [*model_history(wire), message], context_state, system, definitions, input_budget))
             if steps > 0:
                 await self.refresh_next_estimate(session, system, definitions, wire, context_state)
         # A chat a script created with its own Agent steps does not follow the Settings value.

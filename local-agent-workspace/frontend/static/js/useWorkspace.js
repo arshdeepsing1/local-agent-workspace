@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from './lib.js'
-import { api, ApiError, OFFLINE_MESSAGE, refreshToken, setToken, streamProtocols, streamUrl } from './api.js'
+import { api, ApiError, apiUpload, OFFLINE_MESSAGE, refreshToken, setToken, streamProtocols, streamUrl } from './api.js'
 
 // Selection: { id: string | null, key: string, creating?: Promise<Session> }
 const sessionInUrl = () => new URL(window.location.href).searchParams.get('session')
@@ -340,11 +340,19 @@ export function useWorkspace() {
     }
     return target.id
   }
-  // options.verbatim: sent as plain text (no command, skill or @ file on the server).
+  // options.verbatim: sent as plain text (no command, skill or @ file on the server); options.uploads: the files
+  // attached in the composer ([{ id, as_path? }], uploadFile).
   const send = async (text, options) => {
     const id = await ensureSession(selected.current)
-    await api(`/sessions/${id}/messages`, 'POST', { text, ...(options?.verbatim ? { verbatim: true } : {}) })
+    await api(`/sessions/${id}/messages`, 'POST', { text, ...(options?.verbatim ? { verbatim: true } : {}),
+      ...(options?.uploads?.length ? { uploads: options.uploads } : {}) })
     return id
+  }
+  // A file pasted, dropped or chosen in the composer, kept with the chat (created first in a new conversation)
+  // until a message sends it: resolves to its record (UploadRecord).
+  const uploadFile = async file => {
+    const id = await ensureSession(selected.current)
+    return apiUpload(`/sessions/${id}/uploads`, file)
   }
   const saveSettings = async next => {
     const { workspace, model, env_file, context_window, max_output_tokens, max_agent_steps, compaction_handoffs, approval_timeout_minutes,
@@ -643,7 +651,7 @@ export function useWorkspace() {
   const rulesHere = savedRules.key === selection.key ? savedRules : null
   return { settings, connection, connectionChecking, sessions, session: activeSession, activeId, viewKey: selection.key, error,
     online: online && reachable, offlineError: error === OFFLINE_MESSAGE, ready,
-    setError: reportError, setActiveId: selectSession, newConversation, send, saveSettings, refreshSettings, deleteSession, renameSession, changeModel,
+    setError: reportError, setActiveId: selectSession, newConversation, send, uploadFile, saveSettings, refreshSettings, deleteSession, renameSession, changeModel,
     draftModel: activeId ? null : draftModel,
     runShell, askSide, removeQueued, sendQueued, loadMentionFiles, sideAnswer: sideAnswer.key === selection.key ? sideAnswer.value : null, dismissSide,
     modelSaving: modelSaves.has(selection.key) || (!activeId && defaultModelSave.current !== null),

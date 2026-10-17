@@ -13,7 +13,7 @@ import posixpath
 import re
 
 from . import request_limits
-from .request_limits import encode_payload, request_bytes_over
+from .request_limits import encode_payload, image_bytes, request_bytes_over
 
 
 DEFAULT_CONTEXT_WINDOW = 131072
@@ -154,6 +154,7 @@ ELIDED_ARGUMENT = ("[The app omitted {total:,} bytes of {field} before summarizi
 CLEARED_RESULT = ("[Output cleared by the app before summarizing: {size} from {tool}{target}, in an older turn. "
                   "{log}Record only what the conversation did with it; do not guess what it said.]")
 CLEARED_LOG = "The handoff's activity log lists the call. "
+OMITTED_IMAGE = "[The app omitted an image the user attached to this message before summarizing: {image}.]"
 CLEARED_ERROR_TAIL = "\nThe failed command's output ended with:\n"
 FAILED_STATES = ("failed", "timed_out")
 UNPARSED_ARGUMENT_MARKER = " [truncated by the app]"
@@ -238,8 +239,38 @@ def _weighted_size(value):
     return ascii_bytes + 3 * non_ascii_bytes
 
 
+# Images a user attached (uploads.py) are estimated like Claude counts them, about width × height / 750 tokens,
+# counted at most IMAGE_LONG_SIDE pixels on the long side and IMAGE_PIXELS pixels in all (larger images are
+# scaled down by the endpoint first): at most about 5,000 tokens. An endpoint that scales images down further
+# counts fewer, so the estimate errs high until a reported count anchors it.
+IMAGE_TOKEN_PIXELS = 750
+IMAGE_LONG_SIDE = 2_576
+IMAGE_PIXELS = 3_750_000
+
+
+def image_tokens(width, height):
+    """The estimated input tokens of one image of width × height pixels."""
+    if type(width) is not int or type(height) is not int or width < 1 or height < 1:
+        return 0
+    pixels = width * height * min(1.0, IMAGE_LONG_SIDE / max(width, height)) ** 2
+    return max(1, math.ceil(round(min(pixels, IMAGE_PIXELS) / IMAGE_TOKEN_PIXELS, 6)))
+
+
+def message_image_tokens(message):
+    """The estimated tokens of the images a user message carries (its "images" references)."""
+    refs = message.get("images") if isinstance(message, dict) else None
+    return sum(image_tokens(ref.get("width"), ref.get("height")) for ref in refs if isinstance(ref, dict)) \
+        if isinstance(refs, list) else 0
+
+
+def request_size(messages, tools=()):
+    """The bytes of a request body of these messages and tools, their attached images included (as sent)."""
+    return len(encode_payload({"messages": messages, "tools": list(tools)})) + image_bytes(messages)
+
+
 def estimate_tokens(messages, tools=()):
-    return (_weighted_size({"messages": messages, "tools": tools}) + 2) // 3 + 256
+    return ((_weighted_size({"messages": messages, "tools": tools}) + 2) // 3 + 256
+            + sum(message_image_tokens(message) for message in messages))
 
 
 def scaled_estimate(messages, tools=(), scale=1.0):
@@ -377,7 +408,7 @@ def context_breakdown(messages, tools, has_summary=False, scale=1.0, total=None)
     for index, message in enumerate(messages):
         category = ("system_instructions" if index == 0 else "summary"
                     if has_summary and index == 1 else "messages_and_results")
-        sizes[category] += _weighted_size(message)
+        sizes[category] += _weighted_size(message) + 3 * message_image_tokens(message)
     if total is not None:
         scale = total / max(1, estimate_tokens(messages, tools))
     breakdown = {category: int(size // 3 * scale) for category, size in sizes.items()}
@@ -720,6 +751,12 @@ def _changed_paths(name, arguments):
     return [value for value in values if isinstance(value, str)]
 
 
+def _image_label(ref):
+    """An image reference as notes name it: 'shot.png, 1280×720'."""
+    width, height = ref.get("width"), ref.get("height")
+    return f"{ref.get('name') or 'image'}" + (f", {width}×{height}" if type(width) is int and type(height) is int else "")
+
+
 def _frozen(value):
     """A hashable value, equal exactly when the dicts and lists are equal (1 == 1.0, as before)."""
     if isinstance(value, dict):
@@ -819,6 +856,12 @@ def summary_transcript(archived, later, result_limit, completed_calls=None, keep
             start = _attachment_start(content)
             if start >= 0 and _size(content[start:]) > result_limit:
                 message = {**message, "content": content[:start] + clip_result(content[start:], result_limit, stats)}
+            if message.get("images"):
+                # The summarizer gets no images: each becomes a note, so the summary can still name it.
+                notes = "".join("\n" + OMITTED_IMAGE.format(image=_image_label(ref))
+                                for ref in message["images"] if isinstance(ref, dict))
+                message = {key: value for key, value in message.items() if key != "images"}
+                message["content"] = message["content"] + notes
         elif role == "assistant" and isinstance(message.get("tool_calls"), list):
             shortened = [_shortened_call(call, stats) for call in message["tool_calls"]]
             if any(new is not old for new, old in zip(shortened, message["tool_calls"])):
@@ -857,9 +900,9 @@ def request_text(message, limit_bytes=REQUEST_CLIP_BYTES):
     """A user request as the app record keeps it, or None for other messages.
 
     App prompts are not requests, except the note a user wrote when declining
-    Verify. The steering prefix, @ attachments, an expanded command and selected skills
-    are left out (only the typed words stay); long requests keep their start and end
-    within limit_bytes UTF-8 bytes."""
+    Verify. The steering prefix, @ attachments and attached documents, an expanded command and
+    selected skills are left out (only the typed words stay), and attached images are named;
+    long requests keep their start and end within limit_bytes UTF-8 bytes."""
     if not isinstance(message, dict) or message.get("role") != "user" or not isinstance(message.get("content"), str):
         return None
     if is_app_prompt(message):
@@ -871,6 +914,8 @@ def request_text(message, limit_bytes=REQUEST_CLIP_BYTES):
     start = _attachment_start(text)
     if start >= 0:
         text = text[:start] + (" [attachments omitted]" if _has_attachments(text[start:]) else "")
+    if message.get("images"):
+        text += " [images: " + "; ".join(_image_label(ref) for ref in message["images"] if isinstance(ref, dict)) + "]"
     return _clip_request(text, limit_bytes)
 
 
@@ -1322,6 +1367,8 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
     # happens when the estimator undercounts bytes, so the check usually costs nothing.
     # It takes the unscaled estimate: an anchored one can be lower and is no bound on the bytes.
     over_bytes = request_bytes_over(messages, tools, raw, request_limits.PAYLOAD_TARGET_BYTES)
+    # A compaction only the bytes call for (images count in full but in few tokens) says so in its notice.
+    before_bytes = request_size(messages, tools) if over_bytes and not force_compact and estimate <= threshold else None
 
     if force_compact or estimate > threshold or over_bytes:
         if force_compact and not has_earlier_turn(wire, state):
@@ -1398,9 +1445,8 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
             # least) when it fits the input budget and makes the request smaller, so a request
             # just over the 4 MB limit can still be sent. check_payload refuses it if it cannot.
             latest = responses[-1] if responses else boundaries[-1] if boundaries else None
-            if latest is not None and needed_at(latest) <= input_budget and len(encode_payload(
-                    {"messages": [system_message, *retained_at(latest)], "tools": list(tools)})) < len(
-                    encode_payload({"messages": messages, "tools": list(tools)})):
+            if latest is not None and needed_at(latest) <= input_budget and request_size(
+                    [system_message, *retained_at(latest)], tools) < request_size(messages, tools):
                 cut, in_turn, byte_fallback = latest, bool(responses), True
         if cut is None:
             if not force_compact and estimate <= input_budget:
@@ -1536,7 +1582,7 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
         # The byte fallback only had to make the request smaller; check_payload is its limit.
         byte_limit = request_limits.PAYLOAD_LIMIT_BYTES if byte_fallback else request_limits.PAYLOAD_TARGET_BYTES
         if request_bytes_over(messages, tools, estimate, byte_limit):
-            size = len(encode_payload({"messages": messages, "tools": list(tools)}))
+            size = request_size(messages, tools)
             raise budget_error(
                 f"The summary and latest turns would be a {size / 1_000_000:.1f} MB request, above the Databricks "
                 "4 MB request limit.", context_window, reply_reserve, input_budget, default_reply_reserve)
@@ -1556,6 +1602,7 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
             "number": updated["compactions"],
             "trigger": "manual" if force_compact else "in_turn" if in_turn else "auto",
             "before_tokens": before, "after_tokens": estimate, "threshold_tokens": threshold,
+            **({"before_bytes": before_bytes} if before_bytes else {}),
             "summarized_messages": cut - state["through"],
             "requests": requests["summarize"] + requests["condense"],
             "summarize_requests": requests["summarize"], "condense_requests": requests["condense"],
@@ -1681,15 +1728,32 @@ def in_turn_tokens(wire, state, system_message, tools, input_budget, scale=1.0, 
     it), the handoff pointer with room for one more file, the turn's request and steered
     messages, and everything from that response on. Results of that response admitted
     within input_budget minus this therefore never make in-turn compaction fail."""
+    return scaled_estimate(_in_turn_messages(wire, state, system_message, input_budget, record), tools, scale)
+
+
+def _in_turn_messages(wire, state, system_message, input_budget, record):
+    """The request in_turn_tokens measures (the whole one before the turn's first model response)."""
     state = state or {}
     index = next((position for position in range(len(wire) - 1, -1, -1)
                   if wire[position].get("role") == "assistant"), None)
     if index is None:
-        return scaled_estimate([system_message, *context_messages(wire, state)], tools, scale)
+        return [system_message, *context_messages(wire, state)]
     pointer = handoff_pointer([*(state.get("handoff_files") or []), {"path": "x" * 128, "compaction": 999}])
     placeholder = {"role": "user", "content": SUMMARY_PREFIX + "x" * summary_byte_limit(input_budget)
                    + "x" * (app_record_limit(input_budget) if record else 0) + pointer}
-    return scaled_estimate([system_message, placeholder, *retained_request(wire, index), *wire[index:]], tools, scale)
+    return [system_message, placeholder, *retained_request(wire, index), *wire[index:]]
+
+
+def in_turn_bytes_fit(wire, state, system_message, tools, input_budget, *, record=True):
+    """Whether the next request stays under the app's byte target (request_limits), attached images included:
+    as it is, or after the in-turn cut in_turn_tokens measures, which compaction makes when it is over. A
+    message steered into a turn whose request carries large images can pass it with few tokens."""
+    for messages in ([system_message, *context_messages(wire, state or {})],
+                     _in_turn_messages(wire, state, system_message, input_budget, record)):
+        if not request_bytes_over(messages, tools, estimate_tokens(messages, tools),
+                                  request_limits.PAYLOAD_TARGET_BYTES):
+            return True
+    return False
 
 
 def next_request_estimate(wire, state, system, tools, scale, anchor=None):

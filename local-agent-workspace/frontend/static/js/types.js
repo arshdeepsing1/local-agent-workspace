@@ -260,12 +260,15 @@
 // GET /sessions/<id>/children -> list items of its subagent chats, each with status, transcript and subagent?: SubagentEntry.
 // Attachment (metadata only, never content): { kind: 'file', path, start_line, end_line, truncated? }
 //   | { kind: 'shell', command (at most 2,000 characters), exit_code }
+//   | { kind: 'document', name, upload, format, chars (sent), truncated, units?: 'page'|'sheet'|'slide', count?, as_path? }
+//   | { kind: 'image', upload, name, media_type, width, height, bytes }
 // RewindPreview (GET /sessions/<id>/rewind-preview?before_event_id=<user event id>; read-only, also while busy):
 //   { before_event_id, conversation: { possible, reason: string | null, events_removed, messages_removed,
 //   summary_dropped }, code: { possible, reason: string | null, files: [{ path, status: 'restore'|'unchanged'|
 //   'drifted'|'interleaved'|'unavailable', error? }] } }
 // Rewind (POST /sessions/<id>/rewind { before_event_id, conversation?: boolean, code?: boolean, resend_text?,
-//   resend_verbatim? (a message sent as plain text is resent as plain text) };
+//   resend_verbatim? (a message sent as plain text is resent as plain text), resend_uploads? ([{ id, as_path? }]: its
+//   attached files, sent again) };
 //   needs an idle chat, and an idle workspace for code): { session: Session, backup_session_id: string | null,
 //   files: [{ path, status }], resent: boolean, resend_error? }. 409 detail { message, files } when a file
 //   changed; 500 detail { message } when files were rewound but the conversation could not be saved.
@@ -318,7 +321,8 @@
 // Compaction: { number, trigger: 'manual'|'in_turn'|'auto', before_tokens, after_tokens, threshold_tokens,
 //   summarized_messages, requests (summary and condense requests), summarize_requests?, condense_requests? (the
 //   two apart; absent on older compactions), elided_bytes, superseded_results, cleared_results?, cleared_bytes? (tool
-//   results of older turns the summary requests left out, and the bytes saved; only when there were any) }
+//   results of older turns the summary requests left out, and the bytes saved; only when there were any),
+//   before_bytes? (the request's size when only the 4 MB request limit called for the compaction) }
 // LastRequest (what Databricks reported for the latest agent request): { call_id, model, status, finish_reason?,
 //   partial (ended without a finish reason: counts may be incomplete), input_tokens (= uncached + cache read +
 //   cache write), uncached_input_tokens, cache_read_input_tokens, cache_creation_input_tokens, output_tokens?,
@@ -333,7 +337,8 @@
 // Metrics (GET /sessions/<id>/metrics): { scope, session_id, complete, totals, calls, by_purpose, by_model,
 //   pricing, last_input: LastRequest | null, spending: Spending, turn_limits: TurnLimits }. A call has effort?, effort_field? and reasoning_skipped? like
 //   RequestInfo.reasoning; retry_reason 'reasoning_rejected' marks the resend without reasoning fields, and
-//   'cache_rejected' the resend with fewer cache markers, 'fallback' a request to Settings → Fallback endpoint
+//   'cache_rejected' the resend with fewer cache markers, 'images_rejected' the resend with notes in place of
+//   attached images, 'fallback' a request to Settings → Fallback endpoint
 //   (its fallback_from names the chat's endpoint). Agent calls also have prompt_cache? ('full'|'messages'|'off':
 //   the cache markers sent, on Claude endpoints), system_tail_changed? (true), usage_keys? (the raw usage key names),
 //   reasoning_shape? and reasoning_signature? (true).
@@ -343,8 +348,13 @@
 // Composer (M4): Session.queued_messages?: QueuedMessage[]; Session.pending_context?: [{ kind: 'shell', command,
 //   exit_code }] (! output attached to the next message; its text stays on the server). Pushed as
 //   { type: 'pending_context', pending_context } when a command adds one and when a message takes them.
-// POST /sessions/<id>/messages { text, verbatim? } (verbatim: sent as plain text: no command template, no skill, no @ file).
-// QueuedMessage: { id, text, created, paused, verbatim?, command?: { name, path } (a command template expanded when it
+// POST /sessions/<id>/messages { text, verbatim?, uploads?: [{ id, as_path? }] } (verbatim: sent as plain text: no command
+//   template, no skill, no @ file; uploads: files attached in the composer, at most 8, also with plain text).
+// POST /sessions/<id>/uploads (body: the file's bytes, header X-File-Name: its URL-encoded name) -> UploadRecord:
+//   { id (sha256), name, kind: 'document'|'image', format, media_type, bytes, estimated_tokens, a document's chars,
+//   truncated, notes, units?, count?, unreadable? (a PDF without the documents extra: send it with as_path), an image's
+//   width, height and vision_refusal? (the chat's endpoint does not take images) }; 400 or 413 with the reason.
+// QueuedMessage: { id, text, created, paused, verbatim?, uploads?: [{ id, as_path?, name, kind }], command?: { name, path } (a command template expanded when it
 //   was queued; the server keeps the expanded text) } (paused: left over from a stop or failure; sent only by
 //   'Send queued messages'). POST /sessions/<id>/messages while busy -> { ok, queued: true, queued_messages };
 //   otherwise { ok: true }. 400 when 3 are waiting or their text would exceed 50,000 characters.

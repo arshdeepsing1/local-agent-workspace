@@ -33,6 +33,23 @@ def _json(text):
     return value if isinstance(value, dict) else {}
 
 
+def _attachment(item):
+    """How the transcript names an attachment of a user message: an @ file, ! output, or an attached document or
+    image (its name only: a transcript holds neither the document's text nor the image)."""
+    kind = item.get("kind")
+    if kind == "file":
+        return (f"{_code('@' + str(item.get('path')))} lines {item.get('start_line')}–{item.get('end_line')}"
+                + (", shortened" if item.get("truncated") else ""))
+    if kind == "document":
+        return (f"document {_code(str(item.get('name') or 'document'))}" + (" (as a path)" if item.get("as_path")
+                else ", shortened" if item.get("truncated") else ""))
+    if kind == "image":
+        size = (f" {item['width']}×{item['height']}" if type(item.get("width")) is int and type(item.get("height")) is int
+                else "")
+        return f"image {_code(str(item.get('name') or 'image'))}{size}"
+    return f"output of {_code('! ' + str(item.get('command', '')))} (exit {item.get('exit_code')})"
+
+
 def _when(timestamp):
     try:
         return datetime.fromtimestamp(float(timestamp)).astimezone().strftime("%Y-%m-%d %H:%M %Z")
@@ -315,7 +332,7 @@ def transcript(session, *, excerpt_chars=EXCERPT_CHARS, redact=lambda text: text
             lines += ["---", "", f"## Turn {turn} · {_when(event.get('created'))}", "",
                       f"**User{' (delegated by the parent conversation)' if delegated else ''}:**", "",
                       _demote_headings(text) or "(empty message)", ""]
-            lines += ["_Attached when sent: " + "; ".join((f"{_code('@' + str(item.get('path')))} lines {item.get('start_line')}–{item.get('end_line')}" + (", shortened" if item.get("truncated") else "")) if item.get("kind") == "file" else f"output of {_code('! ' + str(item.get('command', '')))} (exit {item.get('exit_code')})" for item in event["attachments"] if isinstance(item, dict)) + "_", ""] if isinstance(event.get("attachments"), list) and event["attachments"] else []
+            lines += ["_Attached when sent: " + "; ".join(_attachment(item) for item in event["attachments"] if isinstance(item, dict)) + "_", ""] if isinstance(event.get("attachments"), list) and event["attachments"] else []
         elif kind == "assistant" and text:
             lines += ["**Assistant:**", "", _demote_headings(text), ""]
         elif kind in ("notice", "error") and text:
