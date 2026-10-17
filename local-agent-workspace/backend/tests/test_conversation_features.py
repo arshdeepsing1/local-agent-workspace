@@ -246,7 +246,9 @@ async def test_get_task_is_in_every_tool_profile(runtime, monkeypatch, profile):
     assert "get_task" in seen[0]
     # get_tool_output is offered only once a long MCP or web_fetch result of the chat was kept, and web_search only
     # once Settings → Web access names a provider.
-    assert len([*TOOL_DEFINITIONS, *FEATURE_TOOLS]) == 31 and "get_tool_output" not in seen[0]
+    # submit_report only in a subagent, get_subagent_result once the chat started a background subagent.
+    assert len([*TOOL_DEFINITIONS, *FEATURE_TOOLS]) == 33 and "get_tool_output" not in seen[0]
+    assert "submit_report" not in seen[0] and "get_subagent_result" not in seen[0]
     assert "web_search" not in seen[0] and ("web_fetch" in seen[0]) == (profile == "inherit")
 
 

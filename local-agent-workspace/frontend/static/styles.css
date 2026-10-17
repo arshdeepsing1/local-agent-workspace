@@ -657,3 +657,23 @@ body.panel-resizing{cursor:col-resize;user-select:none}
 .hook-trust>span{flex:1 1 220px;min-width:0;font-size:12px;line-height:1.5;overflow-wrap:anywhere}
 .hook-trust .hook-trusted{color:#4f6b3f}
 .hook-trust .outline{font-size:12px;padding:6px 11px}
+/* 2026-10-16 subagents: background subagents, answering or stopping one from its parent's card, its structured report, the sibling-change note, Usage with subagents and agent file limits. */
+.delegation-progress .delegation-background{border:1px dashed var(--border);border-radius:10px;padding:0 7px;font-size:11px;color:var(--ink)}
+.subagent-controls{display:flex;flex-wrap:wrap;align-items:center;gap:6px;flex-basis:100%;min-width:0}
+.subagent-controls .subagent-pending{flex-basis:100%;margin:0;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.subagent-controls .danger{color:#98492f}
+.subagent-report{margin-top:6px;padding:10px 12px;background:var(--surface);border:1px solid var(--border);border-radius:7px;color:var(--ink);font-size:13px;line-height:1.6;max-height:420px;overflow:auto}
+.delegation-report .subagent-report .markdown{margin:0;padding:0;border:0;max-height:none}
+.subagent-report h4{font-size:12.5px;font-weight:600;margin:10px 0 4px}.subagent-report ul{margin:0;padding-left:18px}
+.subagent-findings li{margin:2px 0;overflow-wrap:anywhere}
+.subagent-finding-path{display:inline;padding:0;border:0;background:none;color:inherit;font:inherit;cursor:pointer;text-decoration:underline;text-decoration-color:#b9b2a3;text-underline-offset:2px}
+.subagent-finding-path:hover{color:var(--accent)}
+.tool-sibling{margin:0 13px 10px;font-size:11px;color:#87593b;overflow-wrap:anywhere}
+.usage-subagents{margin-top:18px}.usage-subagents h3{margin-bottom:0}.usage-subagents .usage-cards{grid-template-columns:repeat(3,minmax(0,1fr))}
+.usage-subagent-list>summary{cursor:pointer;font-size:12px;width:fit-content;margin-bottom:8px}
+.usage-subagent-list table{width:100%;border-collapse:collapse;background:var(--surface);font-size:11px}
+.usage-subagent-list th,.usage-subagent-list td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);white-space:nowrap}
+.usage-subagent-list th{font-weight:500;color:var(--muted)}.usage-subagent-list td:first-child{white-space:normal;min-width:12rem}
+.usage-subagent-list td:first-child small{color:var(--muted);overflow-wrap:anywhere}.usage-subagent-list button{font-size:11px;padding:4px 9px}
+.agent-type-limits{overflow-wrap:anywhere}
+@media(max-width:600px){.usage-subagents .usage-cards{grid-template-columns:repeat(2,minmax(0,1fr))}}

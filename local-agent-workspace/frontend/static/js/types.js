@@ -5,6 +5,8 @@
 //   when the next request's estimate passes this share of the input budget), approval_timeout_minutes? (0 = no limit),
 //   system_notifications? (server notifications while no page is open),
 //   auto_keep_changes? (true: Keep every listed change when a chat's reply ends), host, configured,
+//   background_subagent_wake? (true: an idle chat gets an app message, and so a paid turn, when one of its background
+//   subagents finishes; default false; planning.DelegateManager.maybe_wake),
 //   secret_file_patterns? (at most 32 file name patterns, such as '*.tfvars': a command naming such a file
 //   always shows an approval card with a warning, like the built-in credential names; secret_paths.py),
 //   spending_limit_dbu? (0-100000, default 0 = none: the spending limit of chats without their own; spending.py),
@@ -222,9 +224,17 @@
 //   notes: [{ name, text }] (values to put whole in the credential file) }: a preview, nothing is saved. GET /tools also returns
 //   servers: [{ id, name, enabled }].
 // Delegation: { status: 'queued'|'running'|'awaiting_approval'|...|'completed'|'failed'|'cancelled'|'interrupted',
-//   completed_tools, last_tool?, terminal_reason?, agent_type?, started?, ended? (epoch seconds) }. A finished
-//   delegate_task card's output is the JSON result { child_session_id, agent_type, tool_profile, status,
-//   terminal_reason, steps_used, tool_calls, changed_files, changed_files_total?, transcript, output }.
+//   completed_tools, last_tool?, terminal_reason?, agent_type?, started?, ended? (epoch seconds), background? (true:
+//   delegate_task background), pending?: { event_id, name, kind: 'approval'|'question'|'plan', title, expires? } (the
+//   child's waiting card while awaiting_approval: POST /sessions/<child>/approvals/<event_id> { allowed } answers an
+//   approval) }. A finished delegate_task card's output is the JSON result { child_session_id, agent_type,
+//   tool_profile, status, terminal_reason, steps_used, tool_calls, changed_files, changed_files_total?, transcript,
+//   report?: { summary, findings?: [{ path?, line?, text }], files_changed?, next_steps?, findings_total?, ... } (its
+//   submit_report), output (its final reply, '' with a report) }. A background one's output is { child_session_id
+//   (null while queued), agent_type, status: 'running'|'queued', background: true, transcript, message }; its result
+//   arrives later as the card's delegation_result, and the parent gets a notice { subagent_id, subagent_status }.
+//   A tool card a running sibling subagent's change made ask has sibling_change: { subagent_id, agent_type, path }.
+//   A user message the app sent after a background subagent finished has background_wake: true.
 // SubagentEntry: { id, task (200 characters), agent_type, status, created, ended, transcript ('conversations/<id>.jsonl'
 //   in the state folder, null once deleted), steps_used?, tool_calls?, deleted? }.
 // GET /sessions/<id>/children -> list items of its subagent chats, each with status, transcript and subagent?: SubagentEntry.
@@ -306,7 +316,11 @@
 //   'cache_rejected' the resend with fewer cache markers, 'fallback' a request to Settings → Fallback endpoint
 //   (its fallback_from names the chat's endpoint). Agent calls also have prompt_cache? ('full'|'messages'|'off':
 //   the cache markers sent, on Claude endpoints), system_tail_changed? (true), usage_keys? (the raw usage key names),
-//   reasoning_shape? and reasoning_signature? (true).
+//   reasoning_shape? and reasoning_signature? (true). A chat with subagents adds subagents: { totals (calls and token
+//   sums of its subagents, null for a field one did not report), children: [{ id, agent_type, task, status,
+//   estimated_dbu, usage: { calls, input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens }
+//   | null, deleted? }], without_usage (entries from before usage was kept) }. GET /sessions/<id>/usage.csv?
+//   include_subagents=true adds the subagent chats' rows.
 // Job: { id, session_id, workspace, command, state, created, updated, exit_code,
 //   output?, truncated, timeout_seconds, max_output_bytes, background,
 //   without_shell? (true: ran from an argument vector without a shell) }
@@ -340,7 +354,9 @@
 //   description, model, effort }] ('' model or effort: the chat's; Settings.subagent_defaults), custom: [{ name,
 //   built_in: false, description, path (workspace-relative), profile, tools (null: every tool of the profile),
 //   model, effort (null: the chat's), unused_model? (the file's endpoint, which the user does not use: model is
-//   then null and a note says so), skills, max_steps, notes, instructions_chars }], errors: [{ path, error }],
+//   then null and a note says so), skills, max_steps, notes, instructions_chars, disallowed_tools, permission_mode
+//   (null: the chat's; applies only when narrower), mcp_servers (null: every configured one), memory ('none' or null),
+//   initial_prompt_chars, background, shipped? (true: agents/<name>.md of the app, such as plan) }], errors: [{ path, error }],
 //   folders, index_bytes }. Settings.subagent_defaults: { explore|general|editor: { model, effort } }.
 //   A delegation's progress (event.delegation) and a subagents index entry carry the model and effort it started with.
 // Changes (pushed as { type: 'changes', changes } and returned by Keep/Undo): {

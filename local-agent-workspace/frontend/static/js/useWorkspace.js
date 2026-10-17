@@ -343,6 +343,7 @@ export function useWorkspace() {
     const { workspace, model, env_file, context_window, max_output_tokens, max_agent_steps, compaction_handoffs, approval_timeout_minutes,
       system_notifications, user_instructions, write_limit_kb, command_env, secret_file_patterns, rate_limit_auto_continue, auto_keep_changes,
       coding_dir, python_venv, auto_compact_percent, reasoning_effort, reasoning_format, thinking_summaries, prompt_caching, subagent_defaults,
+      background_subagent_wake,
       spending_limit_dbu, fallback_model, user_agents_file, user_claude_file, project_memory, output_style, slash_commands, thinking_replay,
       web_fetch, web_search_provider, web_search_url, web_search_key } = next
     const saved = await api('/settings', 'PUT', {
@@ -368,6 +369,7 @@ export function useWorkspace() {
       ...(typeof fallback_model === 'string' ? { fallback_model: fallback_model.trim() } : {}),
       ...(typeof slash_commands === 'boolean' ? { slash_commands } : {}),
       ...(subagent_defaults && typeof subagent_defaults === 'object' ? { subagent_defaults } : {}),
+      ...(typeof background_subagent_wake === 'boolean' ? { background_subagent_wake } : {}),
       ...(typeof user_agents_file === 'boolean' ? { user_agents_file } : {}),
       ...(typeof user_claude_file === 'boolean' ? { user_claude_file } : {}),
       ...(typeof project_memory === 'boolean' ? { project_memory } : {}),

@@ -190,6 +190,7 @@ class SettingsEdit(BaseModel):
     python_venv: str | None = Field(default=None, max_length=4096, strict=True)
     # Settings → Subagents: {explore|general|editor: {model, effort}}; config.subagent_defaults checks it.
     subagent_defaults: dict[str, dict[str, str]] | None = None
+    background_subagent_wake: bool | None = Field(default=None, strict=True)  # planning.DelegateManager.maybe_wake
     # Settings → Model and context: "" = none; config.Settings.update and AgentManager.fallback_allowed check it.
     fallback_model: str | None = Field(default=None, max_length=128, strict=True)
     # Settings → Web access: config.Settings.check_web_settings checks them; the key is a credential-file entry name.
@@ -641,12 +642,30 @@ def create_app(settings=None):
     @app.get("/api/sessions/{session_id}/metrics")
     async def get_session_metrics(session_id: str):
         session = session_or_404(session_id)
-        return {**session_metrics(session), "spending": spending.status(manager, session)}
+        metrics = {**session_metrics(session), "spending": spending.status(manager, session)}
+        if session.get("subagents"):
+            # This chat's subagents (Agent tools → Usage: the chat and its subagents, and each one).
+            metrics["subagents"] = manager.delegates.usage_rollup(session)
+        return metrics
 
     @app.get("/api/sessions/{session_id}/usage.csv")
-    async def export_session_usage(session_id: str):
+    async def export_session_usage(session_id: str, include_subagents: bool = False):
+        """include_subagents adds the rows of the chat's subagent chats that still exist (conversation_id
+        tells them apart), numbered on after the chat's own."""
         session = session_or_404(session_id)
-        text = usage_csv(usage_rows(session, redact=lambda value: settings.redact(redact_secrets(value))))
+        redact = lambda value: settings.redact(redact_secrets(value))  # noqa: E731
+        rows = usage_rows(session, redact=redact)
+        if include_subagents:
+            for entry in session.get("subagents") or []:
+                if not isinstance(entry, dict) or entry.get("deleted") or not isinstance(entry.get("id"), str):
+                    continue
+                try:
+                    child = manager.get(entry["id"])
+                except (ValueError, OSError):
+                    continue  # An unreadable subagent chat is reported by the store.
+                if child and child.get("parent_session_id") == session_id:
+                    rows += [{**row, "n": len(rows) + number} for number, row in enumerate(usage_rows(child, redact=redact), 1)]
+        text = usage_csv(rows)
         return Response(text, media_type="text/csv; charset=utf-8", headers={
             "Content-Disposition": f'attachment; filename="usage-{session_id[:8]}.csv"',
             "Cache-Control": "no-store"})

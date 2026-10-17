@@ -26,8 +26,10 @@ MODE_LABELS = {"manual": "Manual", "auto": "Auto", "acceptEdits": "Accept edits"
 
 TOOL_KINDS = {
     **dict.fromkeys(("list_files", "find_files", "read_file", "search_files", "list_jobs", "get_job_output", "wait_job",
-                     "notebook_read", "outline_file", "project_overview", "get_tool_output"), "read"),
-    **dict.fromkeys(("list_skills", "use_skill", "list_tasks", "get_task", "create_task", "update_task"), "task"),
+                     "notebook_read", "outline_file", "project_overview", "get_tool_output", "get_subagent_result"), "read"),
+    # submit_report: a subagent's final report to its parent (planning.py), never a card.
+    **dict.fromkeys(("list_skills", "use_skill", "list_tasks", "get_task", "create_task", "update_task", "submit_report"),
+                    "task"),
     "ask_user": "question",
     "submit_plan": "plan",
     **dict.fromkeys(("write_file", "edit_file", "insert_activity_log", "move_path", "delete_path", "notebook_edit"),
@@ -54,7 +56,7 @@ READ_ONLY_SUMMARY = ("pwd, ls, read-only git status/diff/log/show/branch, and co
                      "paths in approved folders")
 PLAN_HEAD = f"Plan mode is read-only. Only read-only commands run in Plan mode: {READ_ONLY_SUMMARY}."
 PLAN_TAIL = " Describe the plan, or call submit_plan when it is ready."
-PLAN_TAIL_SUBAGENT = " Return the plan as your final reply."
+PLAN_TAIL_SUBAGENT = " Return the plan in your report (submit_report)."
 PLAN_DENIED = PLAN_HEAD + PLAN_TAIL
 PLAN_DENIED_SUBAGENT = PLAN_HEAD + PLAN_TAIL_SUBAGENT
 # The modes in which shell text is vetted (shell_vet); every other mode decides on it as before.
@@ -299,7 +301,7 @@ PLAN_PROMPT = ("Plan mode: inspect files and describe a concrete plan with the p
 def mode_prompt(mode: str, subagent: bool = False) -> str:
     if mode == "plan":
         if subagent:
-            return PLAN_PROMPT + " Use ask_user only when a decision blocks you. Return the finished plan as your final reply."
+            return PLAN_PROMPT + " Use ask_user only when a decision blocks you. Return the finished plan with submit_report."
         return (PLAN_PROMPT + " Use ask_user for clarifying questions. When the plan is complete, call submit_plan with "
                 "the full plan: the user can approve it and switch modes, and you then implement it in this same turn. "
                 "Do not invent mode names.")

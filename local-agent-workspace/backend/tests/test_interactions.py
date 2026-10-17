@@ -375,7 +375,7 @@ async def test_subagents_cannot_submit_plans(runtime):
     session.update(permission_mode="plan", is_subagent=True)
     await bounded(manager.execute_tool(session, tools, "submit_plan", PLAN, "call"))
     event = tool_event(session)
-    assert (event["state"], event["output"]) == ("error", "Subagents cannot submit plans; return the plan as your final reply.")
+    assert (event["state"], event["output"]) == ("error", "Subagents cannot submit plans; return the plan in your report (submit_report).")
     assert not manager.interactions.waiting
 
 

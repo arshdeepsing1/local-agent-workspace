@@ -55,10 +55,10 @@ from .extensions import RESERVED_COMMANDS, skill_index
 from . import commands as command_templates
 from . import custom_agents
 from .context import estimate_text_tokens
-from .planning import CallAllowance, DelegateManager, DelegationGate, TaskManager
+from .planning import REPORT_SUBMITTED, REPORT_SUBMITTED_REPLY, CallAllowance, DelegateManager, DelegationGate, TaskManager
 from .interactions import InteractionManager
 from .feature_tools import FEATURE_TOOLS
-from .tool_profiles import tool_allowed, filter_tools, off_servers, server_off
+from .tool_profiles import agent_refusal, tool_allowed, filter_tools, off_servers, server_off
 from .mcp_client import FULL_RESULT_CHARS, RETRY_SECONDS
 from .result_store import ResultStore
 from . import web_fetch
@@ -78,7 +78,7 @@ from .tool_schema import validate_arguments
 from .drafts import DraftPersistenceError, STORAGE_ERRORS, StreamDraft
 from .store import UnreadableConversation
 from .approvals import MAX_ALLOW_RULES, busy_status, declined, rule_for
-from .notify import SystemNotifier, attention_message
+from .notify import SystemNotifier, attention_message, short_title
 from .context import INCOMPLETE_RESPONSE_CONTINUATION, INVALID_ARGUMENTS_CONTINUATION, VERIFY_CONTINUATION_PREFIX
 from .context import HOOK_CONTINUATION_PREFIX, SKILL_MARKER, is_app_prompt, is_continuation
 from .lifecycle_hooks import LifecycleHooks, ToolHookNotes, blocked_prompt_notice, hook_contexts, shown_arguments
@@ -818,7 +818,8 @@ def public_session(session, status="idle", compaction=None):
     return {"permission_mode": "manual", "allowed_directories": [], "allow_rules": [], "disabled_tools": [],
             **{k: v for k, v in session.items()
                if k not in ("wire", "context_state", "instruction_directories", "instruction_paths", "inference_calls",
-                            "command_jobs", "file_views", "turn_running", "jobs_reported_through", "pending_context")},
+                            "command_jobs", "file_views", "turn_running", "jobs_reported_through", "pending_context",
+                            "subagents_reported_through")},
             **({"pending_context": pending} if pending else {}),
             **({"queued_messages": public_queue(queue)} if isinstance(queue, list) else {}),
             **({"compaction_progress": compaction} if compaction else {}),
@@ -1163,7 +1164,8 @@ class AgentManager(LifecycleHooks):
     # run_hooks and the other hook events: lifecycle_hooks.LifecycleHooks.
 
     def get(self, session_id):
-        return self.live.get(session_id) or self.store.get(session_id)
+        # A chat whose background subagents run stays in memory while it is idle (DelegateManager.held_session).
+        return self.live.get(session_id) or self.delegates.held_session(session_id) or self.store.get(session_id)
 
     def redaction_tokens(self):
         """The secrets no card, result, title, ledger entry or export may show: the Databricks token, the
@@ -1199,7 +1201,7 @@ class AgentManager(LifecycleHooks):
         Runs within JobManager's update timeout and a broadcast can take longer, so the
         notice is recorded (appended and saved) before anything is awaited."""
         notices = self.__dict__.setdefault("_job_notices", set())  # Job ids already noted while running.
-        session = self.live.get(job["session_id"])
+        session = self.live.get(job["session_id"]) or self.delegates.held_session(job["session_id"])
         if (job.get("background") and job["state"] in JOB_NOTICE_STATES and job["id"] not in notices
                 and job["session_id"] is not None):
             stored = session
@@ -1479,8 +1481,10 @@ class AgentManager(LifecycleHooks):
         return advice
 
     def step_notices(self, session, tools):
-        """The notices for the next model request: changed files and finished background jobs."""
-        return "\n".join(text for text in (self.changed_files_notice(session, tools), self.background_jobs_notice(session))
+        """The notices for the next model request: changed files, finished background jobs and background
+        subagents that ended."""
+        return "\n".join(text for text in (self.changed_files_notice(session, tools), self.background_jobs_notice(session),
+                                           "" if session.get("is_subagent") else self.delegates.background_notice(session))
                          if text)
 
     async def command_tool(self, session, event, arguments, *, argv=None, read_only=False, script=None):
@@ -1620,6 +1624,18 @@ class AgentManager(LifecycleHooks):
         if desktop:
             self.notifier.send(message)
 
+    def notify_background(self, session, text):
+        """A desktop notification (Settings → Notifications, while no page is open) and the notification hooks
+        when a background subagent of an idle chat ended: the text and the chat's title, never transcript text."""
+        if self.busy_task(session["id"]):
+            return  # The running turn reports it.
+        page_open = bool(self.pages or any(self.listeners.values()))
+        message = f"{text}: {short_title(self.redact_title(str(session.get('title') or '')))}"
+        if self.has_hooks(session, "notification"):
+            self.notification_hooks(session, "background_subagent", message, page_open)
+        if self.settings.values.get("system_notifications") is True and not page_open:
+            self.notifier.send(message)
+
     def redact_title(self, text):
         """Text shown outside the chat (titles, notifications) without credentials or secret shapes."""
         return self.settings.redact(redact_secrets(text))
@@ -1633,10 +1649,13 @@ class AgentManager(LifecycleHooks):
                               secrets=self.redaction_tokens())
 
     def track_change(self, session, record, tools):
-        """Track an applied agent file edit in this chat's review and, for a subagent, in its parent's."""
+        """Track an applied agent file edit in this chat's review and, for a subagent, in its parent's (and
+        among the files its run changed, which its running siblings ask before changing: sibling_claim)."""
         self.changes.track(record, tools)
         if session.get("is_subagent") and session.get("parent_session_id"):
             self.changes.track(record, tools, session_id=session["parent_session_id"], via=session["id"])
+            if isinstance(record.get("target"), str):
+                self.delegates.claim(session, [record["target"]])
 
     async def track_shell_changes(self, session, tracker):
         """Add the files a finished command changed to the review (and a subagent's parent's), then push."""
@@ -1651,6 +1670,19 @@ class AgentManager(LifecycleHooks):
                     self.changes.track_state(parent_id, tracker.tools, target, baseline, via=session["id"])
         except STORAGE_ERRORS as exc:
             log.warning("Could not record the files a command changed: %s", type(exc).__name__)
+        if parent_id and changed:
+            # A command's changes are known only after it ran: a file a running sibling changed too is named
+            # in the parent chat instead of asked about.
+            shared = [(target, claim[0]) for target, _ in changed
+                      if (claim := self.delegates.sibling_claim(session, [str(target)]))]
+            self.delegates.claim(session, [str(target) for target, _ in changed])
+            parent = self.get(parent_id)
+            if shared and parent is not None:
+                names = ", ".join(tracker.tools.display_path(Path(target)) for target, _ in shared[:5])
+                await self.event(parent, "notice", text=(
+                    f"Subagents {session['id'][:8]} and {shared[0][1][:8]} of this chat both changed {names}"
+                    + (f" and {len(shared) - 5} more" if len(shared) > 5 else "")
+                    + ": a command changed them after the other subagent did. Review the result."))
         if changed:
             await self.publish_changes(session)
             await self.publish_parent_changes(session)
@@ -2074,6 +2106,8 @@ class AgentManager(LifecycleHooks):
             return "Protected files are always confirmed; this approval cannot be remembered."
         if event.get("hook_ask"):
             return "A before-tool hook asked for this approval; it cannot be remembered."
+        if event.get("sibling_change"):
+            return "Another subagent of this chat changed this file during its run; this approval cannot be remembered."
         if event.get("secret_files"):
             return ("Commands that name credential files (or files that look like them) always ask; this approval "
                     "cannot be remembered.")
@@ -2128,7 +2162,8 @@ class AgentManager(LifecycleHooks):
         editable = EDITABLE.get(name, ()) if reviser is not None else ()
         event.update(self.card_fields(tools, name, card["arguments"], verdict, editable))
         if forced:
-            event.update(rememberable=[], hook_ask=forced)  # The hook asks again next time: no rule would apply.
+            # The hook (or the sibling subagent's change) asks again next time: no rule would apply.
+            event.update(rememberable=[], **({"hook_ask": forced} if forced.get("hook_id") else {}))
         self.pending_checks[key] = recheck
         if reviser is not None:
             self.card_revisers[key] = reviser
@@ -2190,7 +2225,9 @@ class AgentManager(LifecycleHooks):
         if interactions is not None:
             await interactions.mode_changed(session, old, mode)
         for child in self.active_children(session):
-            await self.change_mode(child, mode, notice=notice)
+            # A custom agent's permission_mode stays when it is narrower than the chat's new mode.
+            agent_mode = child.get("agent_permission_mode")
+            await self.change_mode(child, custom_agents.narrow_mode(agent_mode, mode) if agent_mode else mode, notice=notice)
 
     async def set_disabled_tools(self, session, names):
         """Turn tools off (or on again) for this conversation and a running subagent."""
@@ -2318,7 +2355,8 @@ class AgentManager(LifecycleHooks):
             await self.recheck_pending(item, "rules")
 
     def feature_definitions(self, session):
-        """The feature tools a chat can be offered: no delegate_task or remember in a subagent; remember while
+        """The feature tools a chat can be offered: no delegate_task or remember in a subagent, and submit_report
+        only there (get_subagent_result once the chat started a background subagent); remember while
         Settings → Project memory is on, or in a chat it was offered to before; get_tool_output once a long result
         of this chat was kept; web_fetch while Settings → Web access allows it and web_search while it names a
         search provider, or in a chat they were offered to before. Once offered, a tool stays offered, so the
@@ -2326,7 +2364,11 @@ class AgentManager(LifecycleHooks):
         subagent = bool(session.get("is_subagent"))
         memory = not subagent and (self.settings.values.get("project_memory", True) is True
                                    or session.get("memory_tool") is True)
+        # submit_report: a subagent's structured final report; get_subagent_result: once the chat started a
+        # background subagent.
         offered = {"remember": memory, "get_tool_output": bool(session.get("tool_output_offered")),
+                   "submit_report": subagent,
+                   "get_subagent_result": not subagent and session.get("background_subagents_offered") is True,
                    "web_fetch": self.settings.values.get("web_fetch", True) is True or session.get("web_fetch_tool") is True,
                    "web_search": (web_fetch.search_setup(self.settings.values) is not None
                                   or session.get("web_search_tool") is True)}
@@ -2359,11 +2401,12 @@ class AgentManager(LifecycleHooks):
         """The tool definitions offered in the next model request (offered_tools)."""
         return self.offered_tools(session, external_tools)[0]
 
-    def start(self, session_id, prompt, *, from_queue=False, verbatim=False, items=None):
+    def start(self, session_id, prompt, *, from_queue=False, verbatim=False, items=None, extra=None):
         """Start a turn. @ files and pending ! output are attached now, and a command template is
         expanded, so a refused file or a broken command is an error before anything runs (from_queue:
         queued messages, given as items, whose commands were expanded when they were queued; refused
         files become a note). verbatim: sent as plain text, without a command, skills or @ files.
+        extra: fields of the user event (background_wake: the app's message after a background subagent).
         Queued messages still waiting are leftovers of a stop or failure: they are paused."""
         if session_id in self.tasks and not self.tasks[session_id].done():
             raise ValueError("A response is already running in this conversation.")
@@ -2386,6 +2429,7 @@ class AgentManager(LifecycleHooks):
                 fields["queued"] = True  # Sent from the queue: its /<skill-id> words select no skill.
             elif not fields.get("verbatim") and self.slash_commands():
                 self.message_skills(session, tools, prompt)  # A skill that cannot be used is an error now.
+            fields.update(extra or {})
         if not from_queue:
             self._pause_queue(session)
         # The files count as seen only once the model receives them (_content_sent).
@@ -2619,6 +2663,10 @@ class AgentManager(LifecycleHooks):
             if kind == "compaction" and session["events"] and session["events"][-1].get("type") == "error":
                 return
             if not any(not item.get("paused") for item in self.queue_of(session)):
+                if (kind == "turn" and not session.get("is_subagent")
+                        and self.settings.values.get("background_subagent_wake") is True):
+                    # A background subagent that finished after this turn's last step may continue the chat.
+                    self._background(self.delegates.maybe_wake(session_id))
                 return
             self._background(self._send_after(session_id))
         except Exception:
@@ -3042,14 +3090,20 @@ class AgentManager(LifecycleHooks):
                 disabled = session.get("disabled_tools") or []
                 cover = covering_tool(name, disabled)
                 switch = server_off(name, disabled)
-                listed = session.get("agent_tools")
+                refusal = agent_refusal(session, name)
+                agent = session.get("agent_type")
                 output = (f"The user turned off {name} in this chat. Use other tools." if name in disabled else
                           f"The user turned off {cover} in this chat, which also covers {name}. Use other tools."
                           if cover else
                           f"The user turned off the MCP server {switch[5:-3]} in this chat, which includes {name}. Use "
                           "other tools." if switch else
-                          f"The {session.get('agent_type')} agent's tools list does not include {name}. Use only the "
-                          "available tools." if isinstance(listed, list) and name not in listed else
+                          "submit_report is only for subagents: answer in your reply." if name == "submit_report" else
+                          f"The {agent} agent's tools list does not include {name}. Use only the available tools."
+                          if refusal == "tools" else
+                          f"The {agent} agent's file disallows {name} (disallowed_tools). Use only the available tools."
+                          if refusal == "disallowed_tools" else
+                          f"The {agent} agent's file does not list the MCP server of {name} (mcp_servers). Use only the "
+                          "available tools." if refusal == "mcp_servers" else
                           f"The {session['tool_profile']} tool profile does not permit {name}. Use only the available tools.")
                 await self.update_event(session, event, state="rejected", output=output)
                 return output
@@ -3226,6 +3280,18 @@ class AgentManager(LifecycleHooks):
                 if name in ("move_path", "delete_path"):
                     self.checkpoints.check_file_operation(tools, name, arguments)
                 original = self.change_targets(tools, name, arguments)
+                if name != "run_command" and (claim := self.delegates.sibling_claim(session, original)):
+                    # Another running subagent of this chat changed the file during its run: this change asks
+                    # first, in every mode (Don't ask refuses it), naming that subagent.
+                    sibling = self.get(claim[0]) or {}
+                    shared = {"subagent_id": claim[0], "agent_type": sibling.get("agent_type") or "general",
+                              "path": tools.display_path(Path(claim[1]))}
+                    forced = forced or {"sibling": shared}
+                    await self.update_event(session, event, sibling_change=shared)
+                    verdict = self.hooked_permission(session, tools, name, arguments, forced)
+                    if verdict.decision == "deny":
+                        await self.update_event(session, event, state="rejected", output=verdict.message)
+                        return verdict.message
                 # Replacing, deleting or cell-editing a file needs the file as this conversation
                 # last saw it. edit_file needs exact old_text instead; the activity log is exempt.
                 guarded = []
@@ -3429,6 +3495,16 @@ class AgentManager(LifecycleHooks):
                 note = self.memory.add(session["workspace"], arguments["text"], self.settings.redact)
                 result = {"saved": note["text"], "message": "Saved to project memory. Later chats in this project see "
                           "it in their system message; the user can edit or delete it in Agent tools → Memory."}
+            elif name == "submit_report":
+                if not session.get("turn_delegated"):
+                    raise ValueError("No parent chat waits for a report in this turn (the user continued this subagent "
+                                     "chat). Answer in your reply instead.")
+                result = REPORT_SUBMITTED  # The turn ends after this response (_run_databricks); delegate() reads it.
+            elif name == "get_subagent_result":
+                if session.get("is_subagent"):
+                    raise ValueError("Subagents have no background subagents.")
+                result = await self.delegates.subagent_result(session, arguments.get("subagent_id"),
+                                                              arguments.get("wait_seconds", 0))
             elif name == "delegate_task":
                 def still_allowed():
                     """After a wait for a free slot: the chat may have turned the tool off, added a deny
@@ -3443,11 +3519,22 @@ class AgentManager(LifecycleHooks):
                                 "starting it now needs approval. It did not start; delegate again to ask.")
                     return None
 
+                # The agent its card showed, else the one the call names now (an unknown agent_type fails here).
+                spec = approved or self.delegates.agent_spec(session, arguments.get("agent_type"), arguments.get("tool_profile"))
+                background = self.delegates.background_call(arguments, spec)
+                call = {key: value for key, value in arguments.items() if key != "background"}
+
                 def start():
-                    return self.delegates.delegate(session, **arguments, parent_event=event, recheck=still_allowed,
-                                                   spec=approved)
+                    if background:
+                        # Returns once the child runs or queues; the chat goes on (get_subagent_result reads it).
+                        session["background_subagents_offered"] = True
+                        return self.delegates.start_background(session, call, parent_event=event, recheck=still_allowed,
+                                                               spec=spec)
+                    return self.delegates.delegate(session, **call, parent_event=event, recheck=still_allowed, spec=spec)
                 if gate is not None:
                     result = await gate.run(start)  # run_delegations sets the chat's status.
+                elif background:
+                    result = await start()
                 else:
                     await self.status(session, "delegating")
                     try:
@@ -3680,8 +3767,8 @@ class AgentManager(LifecycleHooks):
                 raise ValueError("This approval is no longer pending.")
             card["arguments"] = new
             fields = self.card_fields(tools, name, new, verdict, EDITABLE[name])
-            if event.get("hook_ask"):
-                fields["rememberable"] = []  # A card a hook asked for stays one that cannot be remembered.
+            if event.get("hook_ask") or event.get("sibling_change"):
+                fields["rememberable"] = []  # A card a hook (or a sibling's change) asked for cannot be remembered.
             event.pop("uncertain", None)
             event.pop("secret_files", None)
             # Changed back to the agent's own proposal: not an edit, so the agent is not told it was.
@@ -3860,12 +3947,16 @@ class AgentManager(LifecycleHooks):
 
     async def _run_turn(self, session, prompt, content=None):
         listed = session.get("agent_tools")
+        servers = session.get("agent_mcp_servers")  # A custom agent's mcp_servers: only these start.
         if session.get("tool_profile", "inherit") != "inherit" or (
-                isinstance(listed, list) and not any(name.startswith("mcp__") for name in listed)):
+                isinstance(listed, list) and not any(name.startswith("mcp__") for name in listed)) or servers == []:
             # Restricted children must not start external servers during discovery.
             return await self._run_databricks(session, prompt, [], **({"content": content} if content is not None else {}))
+        off = off_servers(session.get("disabled_tools"))
+        if isinstance(servers, list):
+            off = [*off, *(server for server in self.mcp_server_ids() if server not in servers)]
         # Servers this chat turned off never start; a server that fails is skipped and the others work.
-        async with self.extensions.turn(off=off_servers(session.get("disabled_tools"))) as connection:
+        async with self.extensions.turn(off=off) as connection:
             definitions = await connection.discover()
             connection.tool_names = {item["function"]["name"] for item in definitions}
             connection.results = self.results.chat(session["id"])
@@ -4069,8 +4160,9 @@ class AgentManager(LifecycleHooks):
         return block, sources + files["sources"], files["warnings"]
 
     def memory_text(self, session):
-        """The project memory block of this chat's project ('' while Settings turns memory off)."""
-        if self.settings.values.get("project_memory", True) is not True:
+        """The project memory block of this chat's project ('' while Settings turns memory off, and for the
+        subagent of an agent file with memory: none)."""
+        if self.settings.values.get("project_memory", True) is not True or session.get("agent_memory") == "none":
             return ""
         try:
             return self.memory.block(session["workspace"])
@@ -5661,6 +5753,16 @@ class AgentManager(LifecycleHooks):
                             # message from it if the app stops before the next save. Each save rewrites
                             # the whole conversation file.
                             self.store.save(session)
+                if self.report_submitted(session, event, ordered_calls):
+                    # submit_report ends a subagent's delegated turn: its report is the final answer (delegate()
+                    # reads it), so no request follows for a closing reply. The history gets one, as a turn ends.
+                    wire.append({"role": "assistant", "content": REPORT_SUBMITTED_REPLY})
+                    self.store.save(session)
+                    if await self.stop_hooks(session, wire, stop_state, step_index + 1 < steps) == "continue":
+                        retry_reason = "stop_hook"
+                        continue
+                    await self.refresh_next_estimate(session, system, definitions, wire, context_state)
+                    return True
                 if step_index + 1 < steps and not spending.reached(self, session):
                     await self.drain_queue(session, wire, tools, fits=lambda message: in_turn_tokens(
                         [*model_history(wire), message], context_state, system, definitions, input_budget,
@@ -5672,6 +5774,19 @@ class AgentManager(LifecycleHooks):
                                "calls. Completed actions were kept. Increase Agent steps in Settings or send a "
                                "message to continue." + self.turn_cost(session, *turn_start)),
                          terminal_reason="step_limit")
+
+    @staticmethod
+    def report_submitted(session, reply, calls):
+        """Whether a submit_report call of this response (reply: its assistant event) completed in a subagent's
+        delegated turn."""
+        if not (session.get("is_subagent") and session.get("turn_delegated")) or not any(
+                call["function"]["name"] == "submit_report" for call in calls):
+            return False
+        ids = {call["id"] for call in calls if call["function"]["name"] == "submit_report"}
+        events = session["events"]
+        start = next((index for index in range(len(events) - 1, -1, -1) if events[index] is reply), 0)
+        return any(item.get("type") == "tool" and item.get("name") == "submit_report" and item.get("call_id") in ids
+                   and item.get("state") == "completed" for item in events[start:])
 
     def spent_so_far(self, session):
         """(estimated DBU, unpriced calls) of a chat and its subagents (spending.chat_spend); a subagent's own."""

@@ -45,13 +45,30 @@ def child_profile(parent, requested=None):
     return min((ceiling, inherited, requested), key=PROFILES.index)
 
 
+def agent_refusal(session, name):
+    """Why a custom agent's subagent (custom_agents.py) may not use name, else None: its file's tools list
+    does not include it, its disallowed_tools take it away, or its mcp_servers leave out the tool's server."""
+    agent_tools = session.get("agent_tools")
+    if isinstance(agent_tools, list) and name not in agent_tools:
+        return "tools"
+    denied = session.get("agent_denied_tools")
+    if isinstance(denied, list) and (name in denied or covering_tool(name, denied) or server_off(name, denied)):
+        return "disallowed_tools"
+    servers = session.get("agent_mcp_servers")
+    if isinstance(servers, list) and isinstance(name, str) and name.startswith("mcp__") and not any(
+            name.startswith(f"mcp__{server}__") for server in servers):
+        return "mcp_servers"
+    return None
+
+
 def tool_allowed(session, name):
     disabled = session.get("disabled_tools") or []
     if name in disabled or covering_tool(name, disabled) or server_off(name, disabled):
         return False  # Turned off by the user in this chat: directly, through a covering tool or its MCP server.
-    agent_tools = session.get("agent_tools")
-    if isinstance(agent_tools, list) and name not in agent_tools:
-        return False  # A custom agent's subagent (custom_agents.py) uses only the tools its file lists.
+    if name == "submit_report":
+        return bool(session.get("is_subagent"))  # A subagent's final report, whatever its tools (feature_tools.py).
+    if agent_refusal(session, name):
+        return False
     profile = validate_profile(session.get("tool_profile", "inherit"))
     return profile == "inherit" or name in (READ_TOOLS if profile == "read_only" else FILE_TOOLS)
 

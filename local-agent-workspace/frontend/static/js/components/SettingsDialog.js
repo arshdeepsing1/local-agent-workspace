@@ -433,6 +433,9 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         ${SUBAGENT_TYPES.map(([kind, label, help]) => html`<${SubagentDefaults} key=${kind} label=${label} help=${help}
           value=${subagents[kind] || {}} choices=${choices} onChange=${(key, value) => subagentField(kind, key, value)} />`)}
         <p class="field-help">Explore starts at Fast: reading and searching rarely needs long thinking. Default sends no effort field, so the subagent's endpoint uses its own.</p>
+        <label class="settings-checkbox"><input type="checkbox" checked=${form.background_subagent_wake === true}
+          onChange=${e => field('background_subagent_wake', e.currentTarget.checked)} />Continue the chat when a background subagent finishes</label>
+        <p class="field-help">The agent can start a subagent in the background and keep working. When one finishes while the chat is idle, the chat gets a notice; with this on, the app also sends it a short message so the agent reads the report and goes on. Off by default: each such turn is a paid model request.</p>
         <${More} topic="subagent defaults">A subagent on another endpoint than its chat keeps its requests within that endpoint's default budgets when the Model and context budgets are larger. Custom agents (a project's Markdown agent files) set their own model and effort; Agent tools → Subagents lists them and where their files go. A running subagent keeps the model it started with, and one whose type sets an effort keeps it when you change the chat's effort.<//>`)}
         ${group('commands', html`
         <label class="settings-checkbox"><input type="checkbox" checked=${form.slash_commands !== false}

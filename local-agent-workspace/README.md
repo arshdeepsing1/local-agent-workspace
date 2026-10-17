@@ -915,7 +915,9 @@ when opening a conversation or performing restart recovery.
     message** or **Continue** instead. It is not offered when the latest turn included a
     message sent while the agent was working; use **Edit message** then.
   - **Rewind to here** opens a dialog: **Conversation and code**, **Conversation
-    only** or **Code only**. It shows how many messages and replies go, whether the
+    only** or **Code only**. While a background subagent of the chat runs, rewinding (and
+    so editing or retrying a message) and forking wait: they are refused with a message
+    until it ends or you stop it. It shows how many messages and replies go, whether the
     summary of earlier turns is dropped (when it covers messages after the point; the
     next message may compact again), and each file the agent edited from that message
     on: **Will be restored**, **Already as it was**, **Changed since the agent's last
@@ -1121,8 +1123,14 @@ It does not estimate missing token counts. This is not an account-wide report or
 invoice: regional uplifts, provisioned endpoints, negotiated pricing, credits, and
 delayed billing adjustments can differ. Older chats that predate the ledger show
 visible agent-call totals as incomplete because title, summary, and retry attempts
-cannot be reconstructed. A delegated child's requests stay in its own conversation's
-usage (its parent's spending limit counts them).
+cannot be reconstructed. A delegated child's requests are in its own conversation's
+usage, and its parent's **Usage** adds **This chat and its subagents**: the chat's calls and tokens
+together with those of every subagent it started (also one that was deleted or that you continued
+yourself), the estimated cost of both, and under it each subagent with its calls, tokens, estimated
+DBU and **Open**. A subagent from before this version has no token totals and is named as left out.
+**Export with subagents** downloads one CSV with the chat's rows and then those of its subagent chats
+that still exist (`conversation_id` tells them apart; `GET /api/sessions/<id>/usage.csv?include_subagents=true`).
+Its parent's spending limit counts them too.
 Databricks responses may omit usage.
 See the [Databricks API reference](https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/api-reference)
 for the provider's usage fields. The context meter below shows the input Databricks
@@ -2410,7 +2418,7 @@ within 32 KB). Each one has an `event`:
 | `subagent_start` | Before a subagent's first model request | `context` |
 | `subagent_stop` | When a subagent would end with its final reply | `decision` (`"block"` with `reason`), `report` |
 | `before_compaction` | Once per compaction (automatic, or **Compact now**), before its first summary request | `context` (it cannot stop a compaction) |
-| `notification` | When the app notifies: a chat needs your approval, finished, stopped with an error, or reached the step or spending limit; only without asking | none: output is ignored |
+| `notification` | When the app notifies: a chat needs your approval, finished, stopped with an error, or reached the step or spending limit, or a background subagent of an idle chat finished or failed; only without asking | none: output is ignored |
 
 **Input.** Each hook gets one JSON object on stdin with `event` and the conversation's
 `session_id`. Tool events add `tool`, `arguments`, a stable `call_id`, `result` (after
@@ -2426,7 +2434,7 @@ reply), `continuations` (how often hooks continued this turn), `workspace`, `mod
 (`subagent_start`) or `reply` and `continuations` (`subagent_stop`). `before_compaction` adds
 `trigger` (`auto` or `manual`), `preservation_note` (your note for **Compact now**),
 `estimated_input_tokens`, `threshold`, `input_budget`, `workspace`, `model` and
-`permission_mode`; `notification` adds `status`, `message` (the notification's text), `title`
+`permission_mode`; `notification` adds `status` (`background_subagent` for a background subagent), `message` (the notification's text), `title`
 (the chat's title, redacted and shortened) and `page_open`, never transcript text. Tool events
 also add `agent`, the chat or subagent that made the call: `{"session_id", "is_subagent",
 "agent_type", "parent_session_id", "agent_file"}` (the subagent's type, such as `explore` or a
@@ -2551,8 +2559,13 @@ otherwise the chat's model (and its reasoning setting when the chat has one). It
 permission mode, folder grants, turned-off tools, and "Allow for this chat" rules (a copy:
 rules the child adds stay in the child); project and all-project rules apply to it as to the
 parent. Children cannot delegate again or start managed background jobs. The child's first
-prompt asks it to end with a concise report: a summary, key findings with `path:line`
-references, files changed, and open questions or risks.
+prompt asks it to end with `submit_report`, a tool only subagents get: a structured report with a
+`summary` (up to 2,000 characters), `findings` (up to 30, each with `text` and optionally `path` and
+`line`), `files_changed` (up to 20) and `next_steps` (up to 10; open questions and risks go there too).
+The tool checks the report against its schema, so an incomplete one is an error the model fixes and
+sends again, and a valid one ends the subagent's turn without another model request. A subagent that
+answers in plain text instead still reports that reply, as before. In a subagent chat you continue
+yourself, `submit_report` is refused: answer there in the reply.
 
 Several `delegate_task` calls next to each other in one model response run in parallel.
 Their approval cards (Manual and Plan ask) come one at a time, in call order, and none of
@@ -2562,25 +2575,67 @@ subagents run at once over all chats (a chat and three subagents is the model en
 request budget, see **Rate limits**); a further one waits for a free slot and its card says
 **waiting for a free slot**. Every call gets exactly one result, in call order, also when a
 child fails or is stopped. Files are shared, so the model gives parallel subagents
-independent work, never edits that could conflict.
+independent work, never edits that could conflict. If two running subagents of one chat change the
+same file anyway, the second one's change asks first, in every mode: its approval card says which
+other subagent (type and ID) changed the file during its run, and you approve it only if both changes
+should stay (Don't ask, which shows no cards, refuses the change and the subagent reports it). Paths
+are compared after resolving links. Once a subagent's run ends, its files are free again; the parent
+chat's own edits never ask for this reason. A file a command changed is only known after the command
+ran, so a command that changes a file another running subagent changed adds a notice in the parent
+chat instead.
 
-The parent receives a bounded result (at most 6,000 bytes as JSON; the report is shortened
-first): `child_session_id`, `agent_type`, `tool_profile`, `status`
+The parent receives a bounded result (at most 6,000 bytes as JSON; the prose report is shortened
+first, then the file list, then a structured report): `child_session_id`, `agent_type`, `tool_profile`, `status`
 (completed/failed/cancelled), `terminal_reason` (completion, user Stop, step limit,
 inference/tool error, or interruption), `steps_used`, `tool_calls`, `changed_files` (paths
 its file tools changed, at most 20; `changed_files_total` when there were more; files a
-command changed are in the changes bar), `transcript`, and `output` (the report).
+command changed are in the changes bar), `transcript`, `report` (its `submit_report` report, with
+secrets redacted; when the result is too large its lists lose their last items first, with a
+`*_total` count) and `output` (its final reply: empty with a report, the whole report without one,
+after any errors; a `subagent_stop` hook's replacement report replaces both).
 Each subagent has its own card: its type, the effort and model it started with (for example
 **Fast · Claude Opus 5.5**), live status (running, waiting for approval,
 waiting for a free slot, completed, failed, cancelled), completed actions, last tool, how
 long it has run, **Open subagent** and, once it ended, a collapsible **Report** with the
-files it changed. Progress metadata does not copy child tool payloads into the parent's
-context. **Open subagent** opens the child to review its work or approve actions;
-**Back to parent conversation** returns to the parent. Stop on the parent stops all its
-subagents, also those still waiting for a slot. The child's first prompt is labeled
+files it changed (a structured report shows its summary, its findings with `path:line` links that
+open the file, and its next steps). Progress metadata does not copy child tool payloads into the
+parent's context. **Open subagent** opens the child to review its work or approve actions;
+**Back to parent conversation** returns to the parent. While a subagent runs, its card has **Stop
+subagent**, which stops only that one (its call returns as cancelled; the chat and its other
+subagents go on). While it waits for your approval, the card names what it waits on (for example
+**Waits for approval: run command · npm test**, or the file a file tool would change) with **Allow** and **Decline**, which answer that card in the
+subagent like its own buttons (to edit the action first or allow it for the chat, open the
+subagent); a question or a plan shows **Answer in subagent**. Stop on the parent stops all its
+subagents, also those still waiting for a slot and those in the background. The child's first prompt is labeled
 **Delegated by parent conversation** and retains the spawning action ID; later human
 messages are not labeled delegated. A subagent chat is named by its task until it gets a
 title. Unfinished delegated runs are marked interrupted on restart rather than left running.
+
+**Background subagents.** With `background: true` (or an agent file's `background: true` when the
+call does not say), `delegate_task` returns at once with the child's ID, `status` (`running`, or
+`queued` while all three subagent slots are taken) and `background: true`, and the chat goes on; its
+turn may end while the subagent works. The card shows **Background** and its live progress. When the
+subagent ends, its result goes on its card (its **Report**), a notice in the chat says so (for example
+**Background subagent explore finished: Map the parser**, with **Open subagent**), and the next
+model request of the chat names it once: "Background subagents ended since your last step: …". The
+model reads the result with `get_subagent_result` (offered once the chat started a background
+subagent, then in every request so the tool list stays the same): with `subagent_id` (its ID or
+first 8 characters) its status and, once it ended, its whole result; without, the chat's background
+subagents and their status; `wait_seconds` (up to 300) waits for it, or for any of them, to end. A
+result it read is not named again. While no page is open, a desktop notification (Settings →
+Notifications) and the notification hooks report a background subagent that finished or failed while
+the chat was idle, and the sidebar marks the chat as changed. **Settings → Subagents →
+Continue the chat when a background subagent finishes** (off by default: each such turn is a paid
+model request) sends an idle chat a short app message, labelled **Sent by the app when a background
+subagent finished**, so the agent reads the report and goes on; it starts one turn for what ended
+since the chat's last step, and a turn that was running when the subagent ended is told at its next
+step instead. **Stop** on the chat while it works and **Stop subagent** on a card stop background
+subagents too, and so does deleting the chat; a restart marks a running one interrupted
+and says so in the chat. While background subagents run, rewinding (also editing or retrying a
+message) and forking the chat are refused with a message naming how many run, because their
+progress and results still go to it. The chat's spending limit counts them while they run. A chat
+with background subagents running stays in memory while it is idle, so their reports, hooks and
+your next message all change the same copy.
 
 **Linked transcripts.** Every subagent is a conversation of its own:
 `conversations/<id>.jsonl` in the state folder, like any chat. Its header (the first line)
@@ -2588,10 +2643,12 @@ keeps `parent_session_id`, `parent_event_id` (the parent's card) and `parent_cal
 `agent_type`, `tool_profile`, `max_steps`, and `delegation` (status, completed actions, last
 tool, the `model` and `effort` it started with, start and end times). A child whose agent set
 them also keeps `agent_model`, `agent_effort`, and for a custom agent `agent_file` and
-`agent_tools` (exports, imports and forks keep them, so a copy never gets more tools). The
-parent's header keeps a `subagents` index, one entry per child: `{id, task (its first 200
-characters), agent_type, status, created, ended, transcript, model, effort}`, plus
-`steps_used` and `tool_calls` once it ended. An entry is added when the
+`agent_tools`, and what its agent file took away or narrowed: `agent_denied_tools`,
+`agent_mcp_servers`, `agent_permission_mode` and `agent_memory` (exports, imports and forks keep
+them, so a copy never gets more tools). The parent's header keeps a `subagents` index, one entry per
+child: `{id, task (its first 200 characters), agent_type, status, created, ended, transcript, model,
+effort}`, `background` for a background subagent, its estimated spend and `usage` (calls and token
+totals, refreshed after each of its turns), plus `steps_used` and `tool_calls` once it ended. An entry is added when the
 child starts and updated when it ends and by restart recovery; the newest 200 are kept.
 Deleting a subagent chat keeps its entry, marked `deleted` and without a transcript; deleting
 the parent with its subagents removes them all. An import rebuilds the index of each copied
@@ -2602,8 +2659,10 @@ none. The sessions list (`GET /api/sessions`) leaves the index out;
 **Agent tools → Subagents** lists the chat's subagents with their type, status, tool profile,
 effort and model, task, steps and tool calls, start and end, and transcript file name, with
 **Open** for each. Below them, **Agent types** lists what `delegate_task` can start in this
-project: the built-in types with their Settings defaults, each custom agent (description, file,
-profile, tools, model, effort, default steps, skills, and notes such as ignored tool names), and
+project: the built-in types with their Settings defaults, each custom agent (description, file
+or **Shipped with the app**, profile, tools, model, effort, default steps, skills, what it narrows:
+its mode, disallowed tools, MCP servers, memory, the length of its initial prompt and whether it runs
+in the background, and notes such as ignored tool names), and
 every agent file that cannot be used, with the reason (**Refresh agent types** reads the files again).
 **Subagents → New subagent tool ceiling** selects `inherit`, `read_only`, or `file_editor`
 for future children while the parent is idle. The model may request a narrower
@@ -2618,7 +2677,11 @@ explicit editor/terminal actions.
 
 **Custom agents.** A project can define its own subagents in Markdown files, which the app
 only reads: `.agents/agents/<name>.md`, then `.claude/agents/<name>.md` (when both define a
-name, the `.agents` file is used and the other is noted). Frontmatter between two `---` lines
+name, the `.agents` file is used and the other is noted), then the agents the app ships in its own
+`agents` folder. The app ships **plan**: it investigates the code (read-only commands too, in Plan
+mode, with no file edits and no MCP servers) and returns an implementation plan with goal, steps,
+files, risks and tests, without changing anything. A project file named `plan.md` replaces it (Agent
+types notes that). Frontmatter between two `---` lines
 names the agent and its limits; the rest of the file is its instructions:
 
 ```markdown
@@ -2646,11 +2709,19 @@ Report each finding with path:line, its severity and a suggested fix.
 | `effort` | Optional `default`, `low` (Fast), `medium`, `high`, `xhigh` or `max`; left out: the chat's effort. |
 | `skills` | Optional: up to three skill IDs loaded into the subagent like selected skills; one that does not load, or whose frontmatter sets `disable-model-invocation: true` (the model chooses when an agent runs), is left out with a note in its first prompt. A `/skill` word in the instructions or the task loads no other skill. |
 | `max_steps` | Optional 1–24: the subagent's steps when the call gives no `max_steps` (a call's own value wins). |
+| `disallowed_tools` | Optional: tools the agent may not use, taken away from `tools` or from its profile (its MCP tools by name, or every tool of a server as `mcp__<server>__*`; a tool that covers another, such as `read_file` for `outline_file`, takes that one too). A list that takes away every tool is refused. |
+| `permission_mode` | Optional `plan`, `dontAsk`, `manual` (Claude Code's `default`), `auto`, `acceptEdits` or `bypassPermissions`; left out (or `inherit`): the chat's. It applies only when it is narrower than the chat's mode, also after you change the chat's mode while the subagent runs: Plan < Don't ask < Manual < Auto or Accept edits < Bypass permissions, and where Auto and Accept edits meet, Manual. |
+| `mcp_servers` | Optional: the IDs of the MCP servers (as **Settings → MCP** names them) whose tools the agent may use; only those start for it, and `[]` starts none. Left out: every configured server. Server definitions in the file are not supported; an ID that is not configured is left out with a note. |
+| `memory` | Optional `project` (the default: the subagent reads the project memory, as every chat does) or `none` (without it). `user` and `local` are not supported and read as `project`, with a note. |
+| `initial_prompt` | Optional text of up to 2,000 characters (one line; a double-quoted value may use `\n`), added to the subagent's first prompt after the instructions under **Agent's initial prompt:**. |
+| `background` | Optional `true`: the agent runs in the background when the call does not set `background` (see **Background subagents** above). |
 
 The parser is small and strict: `key: value` lines, `[a, b]` or `- item` lists, `"..."` or
 `'...'` quoting and `#` comment lines; nested or multi-line (`|`, `>`) values are refused.
 Claude Code agent files work too: its tool names `Read`, `Write`, `Edit`, `MultiEdit`, `Glob`,
-`Grep`, `LS`, `Bash`, `NotebookRead`, `NotebookEdit`, `WebFetch` and `WebSearch` stand for this app's, other fields such
+`Grep`, `LS`, `Bash`, `NotebookRead`, `NotebookEdit`, `WebFetch` and `WebSearch` stand for this app's, its field names
+`disallowedTools`, `permissionMode`, `mcpServers`, `initialPrompt` and `maxTurns` (above 24: 24, with a note) are read as
+this app's (a file that sets one field under both names is refused), other fields such
 as `color` are ignored with a note, and its model values `sonnet`, `opus`, `haiku` and `inherit`
 mean the chat's model. An agent file is at most 16 KB (16,384 bytes) with up to 8,000 characters
 of instructions; a folder with more than 100 entries is not read (Agent types says so) and at
@@ -2663,8 +2734,9 @@ reason.
 
 *How the model chooses.* A chat that can delegate gets an **agent index** in its system
 message, right after the skill index: each agent's name and description (shortened to 150
-characters), at most 30 lines and 2,000 bytes, with a count of any left out. It changes only
-when agent files change, so the endpoint's prompt prefix caching keeps working. `agent_type` in
+characters), at most 30 lines and 2,000 bytes, with a count of any left out (with the app's plan
+agent, every chat that can delegate has one). It changes only when agent files change, so the
+endpoint's prompt prefix caching keeps working. `agent_type` in
 `delegate_task` is a plain string rather than an enum, because custom names differ per project
 while the tool definitions stay the same in every request; the server checks it, and an unknown
 name returns an error that lists every available type (and why a file of that name cannot be
@@ -2696,12 +2768,15 @@ allows. It cannot send the subagent's requests, and the project content they car
 endpoint you do not already use (see `model` above). Its profile is intersected with the chat's
 subagent tool ceiling and any requested `tool_profile` (the narrowest wins), its tools with that profile and without those the chat has
 turned off or an unconditional deny rule covers (a delegation with none of its tools left is
-refused, and the first prompt lists only the tools it has), the chat's turned-off tools, rules
-and permission mode apply as to any subagent, and subagents never delegate. A tool outside the
+refused, and the first prompt lists only the tools it has), `disallowed_tools` and `mcp_servers`
+only take tools away, `permission_mode` only narrows the chat's mode, the chat's turned-off tools,
+rules and permission mode apply as to any subagent, and subagents never delegate. A tool outside the
 agent's list is refused like a turned-off one. In Manual mode the approval card names the agent
 and everything it sets, for example **Start a subagent (security-auditor · read-only · model
-Claude Sonnet 4.5 · effort Fast; separate paid model requests, at most 8 steps)**, followed by
-the task, the agent file, its tools and skills, and the exact endpoint; the subagent that starts
+Claude Sonnet 4.5 · effort Fast; separate paid model requests, at most 8 steps)** (**Start a
+background subagent** for one in the background, and **mode Plan** when its mode is narrower than the
+chat's), followed by the task, the agent file, its tools, disallowed tools, MCP servers, permission
+mode, skills, whether it reads the project memory, its initial prompt, and the exact endpoint; the subagent that starts
 is the one the card showed, even if its file changes before you approve. Text the app shows or
 sends from agent files is redacted (the Databricks token and common secret shapes).
 
@@ -3563,6 +3638,7 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `backend/local_agent/transcript.py` / `scripts/conversation_transcript.py`: Markdown transcripts of saved conversations (also `GET /api/sessions/<id>/transcript.md`).
 - `backend/local_agent/redaction.py`: common secret shapes replaced in logs, handoffs and transcripts, and the high-confidence ones in command and MCP results.
 - `skills/`: skills shipped with the app and offered in every workspace; `handoff/SKILL.md` is the detailed handoff skill. A workspace's `.agents/skills/<id>/` replaces the shipped skill with that ID.
+- `agents/`: agent files shipped with the app (`plan.md`); a project's `.agents/agents/<name>.md` or `.claude/agents/<name>.md` of the same name replaces one.
 - `backend/local_agent/telemetry.py`: inference ledger, validated usage, DBU estimates, and failure categories.
 - `backend/local_agent/usage_export.py` / `scripts/usage_report.py`: usage rows and CSV correlated with conversation history.
 - `backend/local_agent/instructions.py`: scoped project guidance loading (`.local` files, `@path` imports,
@@ -3577,7 +3653,7 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `backend/local_agent/extensions.py` / `mcp_client.py`: skills, hooks, MCP configuration (secret references, workspace credentials) and lifecycle (each server isolated, its status, content flattening).
 - `backend/local_agent/mcp_import.py` / `result_store.py`: the `.mcp.json` import preview, and long MCP and `web_fetch` results and MCP images kept in memory (`get_tool_output`).
 - `backend/local_agent/web_fetch.py`: `web_fetch` (the address guard checked before and at every connection, redirects, HTML to text) and `web_search` (Brave, Tavily or SearXNG).
-- `backend/local_agent/planning.py` / `feature_tools.py`: tasks and subagents (agent types, the slot limit, parallel batches, the subagents index).
+- `backend/local_agent/planning.py` / `feature_tools.py`: tasks and subagents (agent types, the slot limit, parallel batches, background subagents, `submit_report`, sibling file claims, the subagents index and its usage).
 - `backend/local_agent/feature_api.py`: scoped feature endpoints.
 - `backend/local_agent/reasoning.py`: reasoning effort request fields per endpoint and format, the rejection
   check, and the thinking text of streamed deltas.

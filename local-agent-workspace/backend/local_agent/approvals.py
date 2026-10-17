@@ -151,6 +151,19 @@ def ensure_idle(manager, session, action=None):
         raise busy_conflict(session, status, action)
 
 
+def ensure_no_background(manager, session, action):
+    """Rewind and fork read or replace a chat's history: not while its background subagents run (their
+    progress and reports still go to it). HTTP 409 names how many and what ends them."""
+    running = manager.delegates.background_running(session["id"])
+    if running:
+        count = "a background subagent" if running == 1 else f"{running} background subagents"
+        raise HTTPException(409, detail={
+            "message": f"“{clip_title(session.get('title'))}” has {count} running. Wait until "
+                       f"{'it ends' if running == 1 else 'they end'}, or stop {'it' if running == 1 else 'them'} "
+                       f"with Stop subagent on {'its card' if running == 1 else 'their cards'}, before {action}.",
+            "session_id": session["id"], "title": clip_title(session.get("title"), 160)})
+
+
 def workspace_idle(manager, store, root, action):
     """Writing files back is an explicit user action, guarded against active writers in this workspace:
     every chat in the workspace root must be idle and no command may run there (HTTP 409 otherwise)."""

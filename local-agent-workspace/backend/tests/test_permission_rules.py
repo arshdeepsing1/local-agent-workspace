@@ -534,7 +534,7 @@ def test_mode_prompts_are_exact():
         " Use ask_user for clarifying questions. When the plan is complete, call submit_plan with the full plan: the "
         "user can approve it and switch modes, and you then implement it in this same turn. Do not invent mode names.")
     assert mode_prompt("plan", True) == first + (
-        " Use ask_user only when a decision blocks you. Return the finished plan as your final reply.")
+        " Use ask_user only when a decision blocks you. Return the finished plan with submit_report.")
     assert mode_prompt("dontAsk") == (
         "Don't ask mode: actions run only when the mode or a rule the user saved allows them; anything else is blocked "
         "without an approval card. If an action is blocked, continue with what you can do and tell the user what "
@@ -550,7 +550,7 @@ def test_plan_denial_text_for_agents_and_subagents():
     verdict = evaluate("plan", "write_file", {"path": "a", "content": ""})
     assert verdict.message.endswith("Describe the plan, or call submit_plan when it is ready.")
     verdict = evaluate("plan", "write_file", {"path": "a", "content": ""}, subagent=True)
-    assert verdict.message.endswith("Return the plan as your final reply.")
+    assert verdict.message.endswith("Return the plan in your report (submit_report).")
 
 
 # Routes

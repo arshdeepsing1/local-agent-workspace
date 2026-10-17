@@ -202,6 +202,10 @@ export function toolStatus(event, result) {
   }
   if (event.state !== 'completed') return none
   if (own) return { tone: own[0], label: own[1], labelTone: own[2] }
+  // A background subagent's call returned at once; the subagent itself still works.
+  if (event.name === 'delegate_task' && event.delegation?.background && !event.delegation.terminal_reason) {
+    return { tone: 'neutral', label: 'started in background', labelTone: 'neutral' }
+  }
   const job = result?.job
   if (job && !isCommand && JOB_TOOLS.has(event.name)) {
     // A wait reports its outcome first: its line matched, or it timed out (no tick: what it waited for did not come).
@@ -469,18 +473,59 @@ export function expiryTime(seconds, now = new Date()) {
     : when.toLocaleString([], { weekday: 'short', ...options })
 }
 
-// The finished delegate_task result ({ status, output, changed_files, ... }) the parent agent received, or null.
+// The finished delegate_task result ({ status, output, report?, changed_files, ... }) the parent agent received, or
+// null: a background subagent's arrives later, on its card (delegation_result).
 function delegationResult(event) {
-  if (event.name !== 'delegate_task' || event.state !== 'completed' || typeof event.output !== 'string') return null
-  try {
-    const result = JSON.parse(event.output)
-    return result && typeof result === 'object' && typeof result.output === 'string' ? result : null
-  } catch { return null }
+  if (event.name !== 'delegate_task' || event.state !== 'completed') return null
+  const usable = value => value && typeof value === 'object' && typeof value.output === 'string' ? value : null
+  if (event.delegation_result) return usable(event.delegation_result)
+  if (typeof event.output !== 'string') return null
+  try { return usable(JSON.parse(event.output)) } catch { return null }
 }
 
 const DELEGATION_STATUS = { awaiting_approval: 'Waiting for approval', queued: 'waiting for a free slot' }
 
-function DelegationStatus({ event, onSelectSession, onOpenPath }) {
+// A subagent's submit_report report: its summary, findings (path:line opens the file), files and next steps.
+function SubagentReport({ report, onOpenPath }) {
+  const findings = Array.isArray(report.findings) ? report.findings.filter(item => item && typeof item === 'object') : []
+  const steps = Array.isArray(report.next_steps) ? report.next_steps : []
+  const more = (key, shown) => Number.isInteger(report[`${key}_total`]) && report[`${key}_total`] > shown
+    ? html`<li class="muted">and ${report[`${key}_total`] - shown} more</li>` : null
+  return html`<div class="subagent-report">
+    <${Markdown} text=${String(report.summary || '')} onOpenPath=${onOpenPath} />
+    ${findings.length ? html`<h4>Findings</h4><ul class="subagent-findings">${findings.map((item, index) => {
+      const where = item.path ? `${item.path}${Number.isInteger(item.line) ? `:${item.line}` : ''}` : ''
+      return html`<li key=${index}>${where ? onOpenPath ? html`<button class="subagent-finding-path" title=${`Open ${where}`} aria-label=${`Open ${where}`}
+        onClick=${() => onOpenPath(Number.isInteger(item.line) ? { path: item.path, line: item.line } : { path: item.path })}><code>${where}</code></button>`
+        : html`<code>${where}</code>` : null}${where && item.text ? ' ' : ''}${item.text || ''}</li>`
+    })}${more('findings', findings.length)}</ul>` : null}
+    ${Array.isArray(report.files_changed) && report.files_changed.length ? html`<p class="delegation-files"><strong>Files it lists as changed:</strong> ${report.files_changed.join(', ')}</p>` : null}
+    ${steps.length ? html`<h4>Next steps</h4><ul>${steps.map((item, index) => html`<li key=${index}>${item}</li>`)}${more('next_steps', steps.length)}</ul>` : null}
+  </div>`
+}
+
+// Allow or Decline the card a subagent waits on, or open it to answer a question or plan (the child's own
+// approvals route, so its rules and checks apply), and Stop one running subagent.
+function SubagentControls({ event, progress, onSelectSession, onError }) {
+  const [acting, setActing] = useState('')
+  const child = event.child_session_id
+  const pending = progress.status === 'awaiting_approval' ? progress.pending : null
+  if (!child || progress.terminal_reason) return null
+  const act = async (label, path, body) => {
+    setActing(label)
+    try { await api(path, 'POST', body) } catch (cause) { onError?.(cause.message) } finally { setActing('') }
+  }
+  const decide = allowed => act(allowed ? 'allow' : 'decline', `/sessions/${encodeURIComponent(child)}/approvals/${encodeURIComponent(pending.event_id)}`, { allowed })
+  return html`<div class="subagent-controls">
+    ${pending ? html`<p class="subagent-pending" title=${pending.title}>${pending.kind === 'approval' ? `Waits for approval: ${String(pending.name || '').replace(/_/g, ' ')} · ` : pending.kind === 'question' ? 'Asks: ' : 'Plan to review: '}${pending.title}</p>` : null}
+    ${pending?.kind === 'approval' ? html`<button class="outline" disabled=${!!acting} onClick=${() => void decide(true)}>Allow</button>
+      <button class="outline" disabled=${!!acting} onClick=${() => void decide(false)}>Decline</button>` : null}
+    ${pending && pending.kind !== 'approval' && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(child)}>Answer in subagent</button>` : null}
+    <button class="outline danger" disabled=${!!acting} onClick=${() => void act('stop', `/sessions/${encodeURIComponent(child)}/stop`)}>${acting === 'stop' ? 'Stopping…' : 'Stop subagent'}</button>
+  </div>`
+}
+
+function DelegationStatus({ event, onSelectSession, onOpenPath, onError }) {
   const progress = event.delegation
   const running = !!progress && !progress.terminal_reason && typeof progress.started === 'number'
   const [now, setNow] = useState(() => Date.now() / 1000)
@@ -500,17 +545,21 @@ function DelegationStatus({ event, onSelectSession, onOpenPath }) {
     : running ? Math.max(now, started) - started : null
   const result = delegationResult(event)
   const files = Array.isArray(result?.changed_files) ? result.changed_files : []
+  const report = result?.report && typeof result.report === 'object' ? result.report : null
   return html`<div class=${`delegation-progress ${progress.terminal_reason ? `delegation-${progress.status}` : 'delegation-live'}`} aria-label="Subagent progress">
     <span class="delegation-status">Subagent: ${status}</span>
     ${kind ? html`<span class="delegation-type">${agentLabel(kind)}</span>` : null}
+    ${progress.background ? html`<span class="delegation-background" title="The chat went on while it works; a notice says when it ends.">Background</span>` : null}
     ${settings ? html`<span class="delegation-agent" title=${progress.model ? `Effort and model (${progress.model})` : 'Effort'}>${settings}</span>` : null}
     <span>${progress.completed_tools} completed ${progress.completed_tools === 1 ? 'action' : 'actions'}</span>
     ${progress.last_tool ? html`<span>Last tool: ${progress.last_tool.replace(/_/g, ' ')}</span>` : null}
     ${elapsed != null ? html`<span class="delegation-elapsed" title=${progress.terminal_reason ? 'Time it ran' : 'Time running'}>${elapsedText(elapsed)}</span>` : null}
     ${progress.terminal_reason ? html`<span>Reason: ${progress.terminal_reason.replace(/_/g, ' ')}</span>` : null}
     ${event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}
+    <${SubagentControls} event=${event} progress=${progress} onSelectSession=${onSelectSession} onError=${onError} />
     ${result ? html`<details class="delegation-report"><summary>Report</summary>
-      <${Markdown} text=${result.output} onOpenPath=${onOpenPath} />
+      ${report ? html`<${SubagentReport} report=${report} onOpenPath=${onOpenPath} />` : null}
+      ${result.output ? html`<${Markdown} text=${result.output} onOpenPath=${onOpenPath} />` : null}
       ${files.length ? html`<p class="delegation-files"><strong>Files changed:</strong> ${files.join(', ')}${result.changed_files_total > files.length ? ` and ${result.changed_files_total - files.length} more` : ''}</p>` : null}
       <small class="muted">${[Number.isInteger(result.steps_used) ? `${result.steps_used} ${result.steps_used === 1 ? 'step' : 'steps'}` : '',
         Number.isInteger(result.tool_calls) ? `${result.tool_calls} tool ${result.tool_calls === 1 ? 'call' : 'calls'}` : '',
@@ -605,7 +654,8 @@ function ToolCard({ event, summary, result, status, failure = null, sessionId, o
       ${clock ? html`<${CommandClock} started=${event.job_started} limit=${limit} />` : null}
       ${expanded || pending ? html`<${ChevronDown} size=${14} />` : html`<${ChevronRight} size=${14} />`}
     </button>
-    <${DelegationStatus} event=${event} onSelectSession=${onSelectSession} onOpenPath=${onOpenPath} />
+    <${DelegationStatus} event=${event} onSelectSession=${onSelectSession} onOpenPath=${onOpenPath} onError=${onError} />
+    ${event.sibling_change ? html`<p class="tool-sibling">Another subagent of this chat (${agentLabel(event.sibling_change.agent_type)}, ${String(event.sibling_change.subagent_id).slice(0, 8)}) changed ${event.sibling_change.path} during its run${event.state === 'pending' ? ', so this change asks first. Approve it only if both changes should stay.' : '.'}</p>` : null}
     ${liveLine ? html`<p class="tool-live" title=${liveLine}>${liveLine}</p>` : null}
     ${rule ? html`<p class="tool-rule">${rule}</p>` : null}
     ${hooked ? html`<p class="hook-outcome">${hooked}</p>` : null}
@@ -936,7 +986,7 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
           setEditing(null)
           resent(result, text)
         }} />`
-      if (event.type === 'user') return html`<div class=${`user-message${event.steered ? ' steered' : ''}${event.hook_blocked ? ' hook-blocked' : ''}`} key=${event.id}>${event.steered ? html`<small class="steered-label">Sent while the agent was working</small>` : null}${event.origin?.kind === 'delegated' ? html`<small class="delegation-origin">Delegated by parent conversation</small>` : null}<${HookMessageLabel} event=${event} />${event.text}<${Attachments} items=${event.attachments} /><${SentWith} event=${event} /><${HookMessageDetails} event=${event} />${event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}${event.text || idle ? html`<div class="message-actions">${event.text ? html`<${CopyAction} text=${event.text} label="Copy message" />` : null}${idle ? html`<${ActionButton} label="Edit message" icon=${Pencil} target=${`edit:${event.id}`} onClick=${() => setEditing(event.id)} /><${ActionButton} label="Rewind to here" icon=${Undo2} onClick=${() => setRewinding(event)} />` : null}</div>` : null}</div>`
+      if (event.type === 'user') return html`<div class=${`user-message${event.steered ? ' steered' : ''}${event.hook_blocked ? ' hook-blocked' : ''}`} key=${event.id}>${event.steered ? html`<small class="steered-label">Sent while the agent was working</small>` : null}${event.origin?.kind === 'delegated' ? html`<small class="delegation-origin">Delegated by parent conversation</small>` : null}${event.background_wake ? html`<small class="delegation-origin">Sent by the app when a background subagent finished</small>` : null}<${HookMessageLabel} event=${event} />${event.text}<${Attachments} items=${event.attachments} /><${SentWith} event=${event} /><${HookMessageDetails} event=${event} />${event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}${event.text || idle ? html`<div class="message-actions">${event.text ? html`<${CopyAction} text=${event.text} label="Copy message" />` : null}${idle ? html`<${ActionButton} label="Edit message" icon=${Pencil} target=${`edit:${event.id}`} onClick=${() => setEditing(event.id)} /><${ActionButton} label="Rewind to here" icon=${Undo2} onClick=${() => setRewinding(event)} />` : null}</div>` : null}</div>`
       if (event.type === 'tool' && event.name === 'ask_user') return html`<${QuestionCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
       if (event.type === 'tool' && event.name === 'submit_plan') return html`<${PlanCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
       if (event.type === 'tool') return html`<${ToolCard} key=${event.id} event=${event} summary=${toolSummaries.get(event.id)} result=${toolStates.get(event.id).result} status=${toolStates.get(event.id).status} failure=${toolStates.get(event.id).failure} sessionId=${session.id} onError=${onError} onSelectSession=${onSelectSession} onOpenPath=${onOpenPath} />`
@@ -948,7 +998,7 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
       // A rate-limit notice's Details: the 429's code, message and Retry-After (AgentEvent.details).
       const details = error ? error.details : typeof event.details === 'string' && event.details ? event.details : null
       return html`<div class=${classes} key=${event.id} role=${error ? 'note' : undefined}>${error ? html`<p class="notice-summary">${error.summary}</p>` : idle ? idleNotice(event.text) : event.text}${details
-          ? html`<details class="notice-details"><summary>Details</summary><pre>${details}</pre></details>` : null}<${DelegationStatus} event=${event} onSelectSession=${onSelectSession} />${!event.delegation && event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}</div>`
+          ? html`<details class="notice-details"><summary>Details</summary><pre>${details}</pre></details>` : null}<${DelegationStatus} event=${event} onSelectSession=${onSelectSession} onError=${onError} />${!event.delegation && (event.child_session_id || event.subagent_id) && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id || event.subagent_id)}>Open subagent</button>` : null}</div>`
     })}
     ${['running', 'delegating'].includes(session.status) ? html`<div class="working-indicator"><span /><span /><span /><span class="sr-only">Working</span></div>` : null}
     ${rewinding && idle ? html`<${RewindDialog} session=${session} event=${rewinding} onClose=${() => setRewinding(null)}
