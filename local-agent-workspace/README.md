@@ -1105,8 +1105,9 @@ and [open](https://www.databricks.com/product/pricing/foundation-model-serving) 
 Claude Opus 5.5 at 57.143 DBU per million input tokens, 285.714 output, 2.857 cache read and 71.429
 cache write (the 5-minute rate; 1-hour cache writes at 114.286 cannot be told apart in the usage),
 Claude Opus 4.8 at 71.429, 357.143, 7.143 and 89.286, and GPT OSS 120B at 2.143 input and 8.571
-output. The other Claude Opus and Sonnet endpoints and Haiku 4.5, GPT-5, 5.1, 5.2, 5 Mini and
-5 Nano, GPT OSS 20B, Llama 4 Maverick, Llama 3.3 70B, Llama 3.1 8B and Gemma 3 12B are priced too;
+output. The other Claude Opus and Sonnet endpoints and Haiku 4.5, GPT-5, 5.1, 5.2, 5.3 Codex,
+5.4 Mini, 5.4 Nano, 5 Mini and 5 Nano, GPT OSS 20B, Llama 4 Maverick, Llama 3.3 70B, Llama 3.1 8B
+and Gemma 3 12B are priced too;
 **Agent tools → Usage → All chats → List prices** shows the whole table. Endpoints whose price
 depends on the context length are left out, and a cache rate the page does not list (open models,
 GPT cache writes) is priced at the input rate.
@@ -1283,7 +1284,8 @@ request, told to call no tools and to reply with what is done, what remains and 
 tool call in that reply does not run). Then the turn ends with a notice, the chat offers
 **Continue** (which starts a new turn with a new budget), and desktop notifications say "Reached
 the turn budget". Verify and stop hooks do not continue the turn past it, and messages queued
-while it ran stay queued. A subagent counts toward its parent's turn: its tokens add to the
+while it ran stay queued. If you raise or remove the limit while that last request runs, the turn
+goes on as usual from the next request (only that request's tool calls stay unrun). A subagent counts toward its parent's turn: its tokens add to the
 parent's and the parent's start time applies; a subagent that reaches the limit wraps up the same
 way and reports the stop as an error to its parent. The check runs between requests, so one
 response can pass the limit; title and compaction requests count but are never stopped.
@@ -3259,25 +3261,36 @@ python3 scripts/agent_run.py --mode manual --approve ask "Fix the failing test"
 echo "Review the diff" | python3 scripts/agent_run.py --output stream-json -
 ```
 
-- The prompt runs in a new chat, listed in the sidebar like any other (`--session <id>` sends it
-  to an existing idle chat instead). `--workspace` chooses its project folder (an existing absolute
-  folder, never the app's state folder; default the Settings workspace), `--mode` its permission
-  mode (default **Plan**; **Bypass permissions** also needs `--confirm-bypass`), `--model` and
-  `--effort` its endpoint and effort, `--max-steps` its own Agent steps per message, `--max-dbu`
-  its spending limit and `--max-tokens` / `--max-minutes` its turn limits.
+- The prompt runs in a new chat, listed in the sidebar like any other. `--workspace` chooses its
+  project folder (an existing absolute folder, never the app's state folder; default the Settings
+  workspace), `--mode` its permission mode (default **Plan**; **Bypass permissions** also needs
+  `--confirm-bypass`), `--model` and `--effort` its endpoint and effort, `--max-steps` its own Agent
+  steps per message (its step-limit notice then says so), `--max-dbu` its spending limit and
+  `--max-tokens` / `--max-minutes` its turn limits.
+- `--session <id>` sends the prompt to an existing idle chat instead, which keeps its own settings:
+  `--mode`, `--model`, `--effort` and the limits given change that chat, and `--workspace` and
+  `--max-steps` (a new chat's only) are refused. A chat already in **Bypass permissions** also needs
+  `--confirm-bypass` (or another `--mode`).
 - `--output text` (the default) prints the final reply, and a one-line summary on stderr; `json`
   prints one result object; `stream-json` prints every message of the chat as one JSON line (what
   the page gets: the snapshot, events, text deltas, status changes) and then the result.
 - Cards: `--approve deny` (the default) declines every approval card at once with a note that
   nobody can approve in this run, skips questions, and keeps a plan in planning (the agent is told
   to end its turn with the plan as its reply), so nothing waits for the approval timeout.
-  `--approve ask` asks you in the terminal (it needs one). A subagent's cards are answered the same
-  way.
+  `--approve ask` asks you in the terminal (it needs one). What a card shows comes from the agent,
+  so control characters in it (terminal escape sequences, carriage returns, bidirectional
+  overrides) are printed as visible escapes such as `\x1b`, with a note: such text cannot hide or
+  rewrite the command you approve. The final reply is printed the same way when the output is a
+  terminal, and `json` / `stream-json` write such characters as `\u` escapes (the parsed JSON is
+  the same). An answer the app refuses (an Other answer over 1,000 characters, say) is replaced at
+  once by the default (declined, questions skipped, or back to planning), with a message on stderr.
+  A subagent's cards are answered the same way.
 - The result object has `terminal_reason`, `is_error`, `duration_s`, `steps`, `tool_calls`,
   `usage`, `tokens`, `estimated_dbu`, `unpriced_calls`, `subagents`, `changed_files`, `result`
   (the final reply), `exit_code` and `session_id`. Exit codes: 0 completed, 1 an error, 2 a limit
   was reached (Agent steps, spending, or the turn's tokens or time), 3 stopped or interrupted.
-  Ctrl+C stops the turn and prints its result.
+  Ctrl+C stops the turn and prints its result (none when the prompt had not started a turn yet).
+  A token count no call reported is `null`, never 0.
 
 From Python:
 
@@ -3301,9 +3314,11 @@ approval cards (`context` has `session_id`, `event_id`, `preview` and `subagent`
 `Deny(message)`; for a plan, `Allow("acceptEdits")` or `Allow("manual")` approves it into that mode.
 `on_question(questions, context)` answers `ask_user` questions with one
 `{"selected": [label], "other": None}` per question, or `None` to skip them. Without a callback every
-card is declined at once. The client also has `create_session`, `send`, `interrupt`,
+card is declined at once. An answer the app refuses is replaced by that default and reported as an
+`{"type": "answer_refused", "name", "error", "answered"}` message. The client also has `create_session`, `send`, `interrupt`,
 `set_permission_mode` (Bypass needs `confirm=True`), `set_model`, `set_effort`,
-`set_spending_limit`, `set_turn_limits`, `fork`, `rewind`, `events` and `wait_result`.
+`set_spending_limit`, `set_turn_limits`, `fork`, `rewind`, `events` and `wait_result` (`None` for
+an idle chat without a turn newer than `after`).
 
 The client talks to the app on this computer only (`127.0.0.1`, `localhost` or `::1`). It reads
 the local token from `/api/bootstrap` as the page does, and again after the app restarted. A
@@ -3312,8 +3327,10 @@ the snapshot first, then what the page's WebSocket gets, and a `keep_alive` line
 while it is quiet. A turn ends with the idle `status` message, which carries the turn's result
 record (`turn_result`). A reader that falls 1,000 messages behind is dropped, as a stalled page is
 (its stream ends with a `stream_closed` line); the client then opens a new stream, whose snapshot
-shows a turn that ended meanwhile. `POST /api/sessions` takes `workspace` and `max_agent_steps`
-for scripts, and `PUT /api/sessions/<id>/turn-limits` sets a chat's turn limits.
+shows a turn that ended meanwhile. When the app shuts down (Ctrl+C on `run.py`), every stream
+ends at once with `stream_closed` reason `shutdown` and the app stops the running turns, so a
+connected script never holds up the shutdown. `POST /api/sessions` takes `workspace` and
+`max_agent_steps` for scripts, and `PUT /api/sessions/<id>/turn-limits` sets a chat's turn limits.
 
 ## Trying the app offline (simulator)
 
@@ -3554,6 +3571,7 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `backend/local_agent/usage_overview.py`: usage across chats (`GET /api/usage`, `usage_report.py --all`) from each conversation's usage summary.
 - `backend/local_agent/turns.py`: each turn's result record and its token and time limits (the wrap-up request, `budget_limit`).
 - `backend/local_agent/stream_api.py` / `client.py` / `scripts/agent_run.py`: the NDJSON stream of a chat, the stdlib Python client and the headless runner.
+- `backend/local_agent/serve.py`: the uvicorn server of `run.py` and the simulator, which ends the chats' streams before it waits for open responses at shutdown.
 - `backend/local_agent/instructions.py`: scoped project guidance loading (`.local` files, `@path` imports,
   path-scoped project rules, the 24,000-byte budget) and the user's own instruction files.
 - `backend/local_agent/memory.py`: project memory notes in the state folder, keyed by the Git repository.

@@ -4,7 +4,7 @@ import json
 import math
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 
 LEDGER_VERSION = 1
@@ -44,6 +44,9 @@ MODEL_DBU_PER_MILLION = {
     **{f"databricks-claude-sonnet-{version}": _CLAUDE_SONNET_4 for version in ("4-6", "4-5", "4")},
     "databricks-claude-haiku-4-5": {"input_tokens": 14.286, "output_tokens": 71.429, "cache_read_input_tokens": 1.429,
                                     "cache_creation_input_tokens": 17.857},
+    "databricks-gpt-5-4-mini": {"input_tokens": 10.714, "output_tokens": 64.286, "cache_read_input_tokens": 1.071},
+    "databricks-gpt-5-4-nano": {"input_tokens": 2.857, "output_tokens": 17.857, "cache_read_input_tokens": 0.286},
+    "databricks-gpt-5-3-codex": {"input_tokens": 25.0, "output_tokens": 200.0, "cache_read_input_tokens": 2.5},
     "databricks-gpt-5-2": {"input_tokens": 25.0, "output_tokens": 200.0, "cache_read_input_tokens": 2.5},
     "databricks-gpt-5-1": _GPT_5,
     "databricks-gpt-5": _GPT_5,
@@ -469,6 +472,14 @@ def call_tokens(call):
     return sum(usage.get(field, 0) for field in TOKEN_FIELDS)
 
 
+def reported_tokens(records):
+    """The tokens these ledger records processed (call_tokens), or None when none of them reported a token count."""
+    records = [record for record in records if isinstance(record, dict)]
+    if not any(field in reported_usage(record.get("usage")) for record in records for field in TOKEN_FIELDS):
+        return None
+    return sum(call_tokens(record) for record in records)
+
+
 def usage_totals(records):
     """The usage panel's totals (_totals) of these ledger records: counts, token sums (a field no call reported
     is None) and the estimated DBU (None when a call has no estimate)."""
@@ -518,6 +529,14 @@ def usage_summary(session):
     return {"version": SUMMARY_VERSION, "calls": len(records), "rows": rows[-SUMMARY_ROWS:]}
 
 
+def _summary_date(value):
+    """Whether value is a calendar date written YYYY-MM-DD (the form local_date writes)."""
+    try:
+        return date.fromisoformat(value).isoformat() == value
+    except ValueError:
+        return False
+
+
 def summary_rows(summary):
     """The valid rows of a header's usage_summary as dicts (SUMMARY_COLUMNS); [] for a missing or damaged one."""
     if not isinstance(summary, dict) or summary.get("version") != SUMMARY_VERSION or not isinstance(summary.get("rows"), list):
@@ -525,7 +544,7 @@ def summary_rows(summary):
     rows = []
     for row in summary["rows"][-SUMMARY_ROWS:]:
         if (not isinstance(row, list) or len(row) != len(SUMMARY_COLUMNS) or not all(isinstance(item, str) for item in row[:3])
-                or not all(type(item) is int and item >= 0 for item in (*row[3:8], row[9]))
+                or not _summary_date(row[0]) or not all(type(item) is int and item >= 0 for item in (*row[3:8], row[9]))
                 or isinstance(row[8], bool) or not isinstance(row[8], (int, float)) or not math.isfinite(row[8])):
             continue
         rows.append(dict(zip(SUMMARY_COLUMNS, row)))

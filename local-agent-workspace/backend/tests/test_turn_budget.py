@@ -13,6 +13,8 @@ from local_agent.api import create_app
 from local_agent.config import Settings
 from local_agent.prompt_cache import unmarked
 from local_agent.store import Store
+from local_agent.telemetry import reported_tokens
+from local_agent.transcript import turn_summary_text
 
 OPUS = "databricks-claude-opus-5-5"
 REAL_CLIENT = httpx.AsyncClient
@@ -205,6 +207,26 @@ async def test_subagents_count_in_the_parents_result(runtime, monkeypatch):
     assert session["subagents"][0]["tokens"] == 22_000  # The index keeps it for later turns' checks.
 
 
+async def test_a_count_no_call_reported_is_none_not_zero(runtime, monkeypatch):
+    manager, session = runtime
+    parent_replies = [calls_reply(delegation(), usage={}), text_reply("Reported.", usage={})]
+    child_replies = [text_reply("## Report\nNothing.", usage={})]
+    scripted(monkeypatch, lambda requests: parent_replies[len(requests) - 1],
+             lambda children: child_replies[len(children) - 1])
+    session = await started_turn(manager, session, "Delegate")
+    result = session["last_turn_result"]
+    assert result["usage"]["input_tokens"] is None and result["tokens"] is None
+    assert result["subagents"]["count"] == 1 and result["subagents"]["tokens"] is None
+    assert session["subagents"][0]["tokens"] is None  # The subagents index tells it apart from 0 too.
+    assert "— in / — out" in turn_summary_text(result)
+
+
+def test_reported_tokens_tells_an_unreported_count_from_zero():
+    assert reported_tokens([]) is None and reported_tokens([{"usage": {}}, "damaged", {"usage": None}]) is None
+    assert reported_tokens([{"usage": {"prompt_tokens": 0, "completion_tokens": 0}}]) == 0
+    assert reported_tokens([{"usage": {}}, {"usage": {"prompt_tokens": 5, "completion_tokens": 2}}]) == 7
+
+
 # The budget
 
 async def test_the_token_limit_gives_one_wrap_up_request_then_ends_the_turn(runtime, monkeypatch):
@@ -305,6 +327,40 @@ async def test_a_change_during_the_turn_applies_from_the_next_request(runtime, m
     requests, _ = scripted(monkeypatch, replies)
     await manager.run(session, "Work")
     assert len(requests) == 3 and session["terminal_reason"] == "budget_limit"
+
+
+async def test_a_limit_raised_during_the_wrap_up_request_lets_the_turn_go_on(runtime, monkeypatch):
+    manager, session = runtime
+    manager.settings.values["max_agent_steps"] = 6
+    session["turn_token_limit"] = 20_000
+
+    def replies(requests):
+        if len(requests) == 3:  # The wrap-up request: the limit is raised now, as the route does.
+            session["turn_token_limit"] = 10_000_000
+        return calls_reply((f"c{len(requests)}", "list_tasks", {}))
+    requests, _ = scripted(monkeypatch, replies)
+    await manager.run(session, "Work")
+    # Only the wrap-up request's own tool call is refused; from the next request on the turn goes on as usual.
+    assert ["Do not call any tools" in system_text(body) for body in requests] == [False, False, True, False, False, False]
+    states = [event["state"] for event in session["events"] if event["type"] == "tool"]
+    assert states == ["completed", "completed", "rejected", "completed", "completed", "completed"]
+    assert session["terminal_reason"] == "step_limit" and manager.budget_wrapups == set()
+
+
+async def test_a_wrap_up_reply_after_the_limit_was_removed_ends_the_turn_as_usual(runtime, monkeypatch):
+    manager, session = runtime
+    session["turn_token_limit"] = 10_000
+
+    def replies(requests):
+        if len(requests) == 2:  # The wrap-up request: the limit is removed now.
+            session["turn_token_limit"] = 0
+            return text_reply("Summary: one step done.")
+        return calls_reply(("c1", "list_tasks", {}))
+    requests, _ = scripted(monkeypatch, replies)
+    await manager.run(session, "Work")
+    assert len(requests) == 2 and session["terminal_reason"] == "completed"
+    assert not any(event.get("terminal_reason") == "budget_limit" for event in session["events"])
+    assert manager.budget_wrapups == set()
 
 
 # Settings and the route

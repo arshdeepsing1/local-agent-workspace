@@ -83,6 +83,15 @@ def test_the_summary_is_bounded_and_damaged_rows_are_skipped():
     assert summary_rows({**summary, "version": 2}) == [] and summary_rows(None) == [] and summary_rows({"rows": "x"}) == []
 
 
+def test_a_summary_row_whose_date_is_not_a_date_is_skipped():
+    # '2026-10-15x' sorts inside the window as a string; '20261015' is ISO's basic form, not the one written.
+    rows = [[day, "m", "agent", 1, 10, 0, 0, 5, 0.001, 0] for day in ("2026-10-15x", "20261015", "2026-02-30", "2026-10-15")]
+    summary = {"version": 1, "calls": 4, "rows": rows}
+    assert [row["date"] for row in summary_rows(summary)] == ["2026-10-15"]
+    value = overview([({"workspace": "/project"}, summary)], 7, today=date(2026, 10, 16))
+    assert value["totals"]["calls"] == 1 and value["totals"]["chats"] == 1
+
+
 # The overview
 
 def chat(workspace, *calls, worktree=None):
@@ -237,8 +246,11 @@ async def test_a_running_chat_counts_its_live_ledger(api):
 
 def test_more_pay_per_token_endpoints_have_cited_list_prices():
     for model in ("databricks-claude-sonnet-5", "databricks-claude-haiku-4-5", "databricks-gpt-5", GPT_OSS,
-                  "databricks-meta-llama-3-3-70b-instruct"):
+                  "databricks-meta-llama-3-3-70b-instruct", "databricks-gpt-5-3-codex", "databricks-gpt-5-4-mini",
+                  "databricks-gpt-5-4-nano"):
         assert model in MODEL_DBU_PER_MILLION
+    assert MODEL_DBU_PER_MILLION["databricks-gpt-5-4-mini"] == {"input_tokens": 10.714, "output_tokens": 64.286,
+                                                               "cache_read_input_tokens": 1.071}
     assert pricing_source(OPUS) == PRICING_SOURCE and pricing_source(GPT_OSS) == OPEN_PRICING_SOURCE
     assert pricing_source("team-endpoint") is None and pricing_source(None) is None
     # GPT OSS lists input and output only: a reported cache read is priced at its input rate.

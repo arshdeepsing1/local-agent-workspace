@@ -8,7 +8,7 @@ from . import custom_agents
 from .permissions import denied_tools
 from .reasoning import EFFORT_LABELS
 from .spending import own_spend
-from .telemetry import call_tokens
+from .telemetry import reported_tokens
 from .tool_profiles import PROFILES, child_profile, covering_tool, server_off, validate_profile
 
 
@@ -177,7 +177,7 @@ def index_entry(child, task):
         # What it spent so far, for its parent's spending limit (spending.py) and turn budget (turns.py); a
         # header has no ledger.
         entry["estimated_dbu"], entry["unpriced_calls"] = own_spend(child)
-        entry["tokens"] = sum(call_tokens(call) for call in child["inference_calls"])
+        entry["tokens"] = reported_tokens(child["inference_calls"])  # None: no call reported a count.
     return entry
 
 

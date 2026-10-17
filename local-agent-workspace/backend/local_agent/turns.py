@@ -22,7 +22,7 @@ import time
 from .config import TURN_LIMITS
 from .planning import changed_paths
 from .spending import root_of
-from .telemetry import USAGE_FIELDS, call_estimated_dbu, call_tokens, usage_totals
+from .telemetry import USAGE_FIELDS, call_estimated_dbu, call_tokens, reported_tokens, usage_totals
 
 LIMIT_KEYS = TURN_LIMITS  # {Settings key: its maximum}
 CHANGED_FILES = 20  # Paths a result lists; changed_files_total counts them all.
@@ -99,11 +99,12 @@ def children(manager, root, turn):
 
 
 def _child_usage(value):
-    """(tokens, estimated DBU, unpriced calls) of a live child (its ledger) or an index entry."""
+    """(tokens or None when none were reported, estimated DBU, unpriced calls) of a live child (its ledger) or an
+    index entry."""
     if isinstance(value.get("inference_calls"), list):
         dbu, unpriced = _spend(value["inference_calls"])
-        return own_tokens(value), dbu, unpriced
-    tokens = value.get("tokens") if type(value.get("tokens")) is int else 0
+        return reported_tokens(value["inference_calls"]), dbu, unpriced
+    tokens = value.get("tokens") if type(value.get("tokens")) is int else None
     dbu = value.get("estimated_dbu")
     dbu = dbu if isinstance(dbu, (int, float)) and not isinstance(dbu, bool) else 0.0
     unpriced = value.get("unpriced_calls") if type(value.get("unpriced_calls")) is int else 0
@@ -129,7 +130,7 @@ def used(manager, session):
     root, turn = scope(manager, session)
     if turn is None:
         return None
-    tokens = own_tokens(root, turn["first_call"]) + sum(_child_usage(value)[0] for value in children(manager, root, turn).values())
+    tokens = own_tokens(root, turn["first_call"]) + sum(_child_usage(value)[0] or 0 for value in children(manager, root, turn).values())
     return root, turn, tokens, max(0.0, clock() - turn["started"])
 
 
@@ -192,20 +193,24 @@ def _delegated_files(events):
 
 def turn_result(manager, session, turn, terminal_reason, ended=None):
     """The turn's result record (types.js TurnResult): its own requests' usage (a token field no call reported is
-    None), its tokens and estimated DBU with its subagents' (DBU None when no request of the turn had price data),
-    and the files its file tools and subagents changed (paths as the tools named them, redacted)."""
+    None), its tokens and estimated DBU with its subagents' (tokens None when no call reported a count, DBU None
+    when no request of the turn had price data), and the files its file tools and subagents changed (paths as the
+    tools named them, redacted)."""
     ended = clock() if ended is None else ended
     events = [event for event in session["events"][turn["first_event"]:] if isinstance(event, dict)]
     calls = [call for call in (session.get("inference_calls") or [])[turn["first_call"]:] if isinstance(call, dict)]
     totals = usage_totals(calls)
     dbu, unpriced = _spend(calls)
     priced = any(call_estimated_dbu(call)[0] is not None for call in calls)
-    child_tokens, child_dbu, child_unpriced = 0, 0.0, 0
+    child_tokens, child_dbu, child_unpriced = None, 0.0, 0
     found = children(manager, session, turn) if not session.get("is_subagent") else {}
     for value in found.values():
         tokens, estimate, missing = _child_usage(value)
-        child_tokens, child_dbu, child_unpriced = child_tokens + tokens, child_dbu + estimate, child_unpriced + missing
+        if tokens is not None:
+            child_tokens = (child_tokens or 0) + tokens
+        child_dbu, child_unpriced = child_dbu + estimate, child_unpriced + missing
         priced = priced or estimate > 0
+    own = reported_tokens(calls)
     redact = manager.settings.redact
     paths = list(dict.fromkeys([redact(path)[:300] for path in changed_paths(events)] + _delegated_files(events)))
     result = {
@@ -215,10 +220,10 @@ def turn_result(manager, session, turn, terminal_reason, ended=None):
         "steps": sum(event.get("type") == "assistant" and isinstance(event.get("request_info"), dict) for event in events),
         "tool_calls": sum(event.get("type") == "tool" and event.get("name") != "user_command" for event in events),
         "usage": {"calls": totals["calls"], **{field: totals[field] for field in USAGE_FIELDS}},
-        "tokens": own_tokens(session, turn["first_call"]) + child_tokens,
+        "tokens": None if own is None and child_tokens is None else (own or 0) + (child_tokens or 0),
         "estimated_dbu": round(dbu + child_dbu, 6) if priced else None,
         "unpriced_calls": unpriced + child_unpriced,
-        "subagents": {"count": len(found), "tokens": child_tokens, "estimated_dbu": round(child_dbu, 6)},
+        "subagents": {"count": len(found), "tokens": 0 if not found else child_tokens, "estimated_dbu": round(child_dbu, 6)},
         "changed_files": paths[:CHANGED_FILES],
     }
     if len(paths) > CHANGED_FILES:

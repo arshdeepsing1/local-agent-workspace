@@ -822,9 +822,9 @@ def patched_settings(gateway, state, workspace):
 def start_app(port=0):
     """Start the app on 127.0.0.1:port (0: any free port) in a thread, inside patched_settings: (server, thread,
     its URL). Set server.should_exit = True and join the thread to stop it (the app's shutdown runs)."""
-    import uvicorn
+    from local_agent import serve
     from local_agent.api import create_app
-    server = uvicorn.Server(uvicorn.Config(create_app(), host="127.0.0.1", port=port, access_log=False, log_level="warning"))
+    server = serve.Server(serve.config(create_app(), port, log_level="warning"))
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
     while not server.started:
@@ -872,10 +872,10 @@ def main():
     workspace = Path(args.workspace).expanduser().resolve() if args.workspace else demo_workspace(state)
     os.environ["PATH"] = str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", "")
     with patched_settings(gateway, state, workspace):
-        import uvicorn
+        from local_agent import serve
         log(f"app on http://127.0.0.1:{args.port}  workspace {workspace}  state {state}")
         log(SCENARIO_HINT)
-        uvicorn.run("local_agent.api:create_app", factory=True, host="127.0.0.1", port=args.port, access_log=False)
+        serve.run("local_agent.api:create_app", args.port)
 
 
 if __name__ == "__main__":

@@ -20,8 +20,10 @@ an approval through can_use_tool(name, input, context) returning Allow() or Deny
 through on_question(questions, context) returning the answers (or None to skip them); a plan (Plan mode's
 submit_plan) through can_use_tool("submit_plan", ...), where Allow(mode) approves it into Manual (or the mode
 given) and Deny keeps planning. Without a callback every approval is declined and questions are skipped at once:
-nothing waits for the approval timeout. A subagent's cards are answered the same way (context["subagent"] is
-True). Every model request is a paid call to your Databricks workspace, made with the app's credentials.
+nothing waits for the approval timeout. An answer the app refuses (an option that is not listed, an Other answer
+over 1,000 characters) is replaced at once by that default and reported as an {"type": "answer_refused", ...}
+message. A subagent's cards are answered the same way (context["subagent"] is True). Every model request is a paid
+call to your Databricks workspace, made with the app's credentials.
 """
 import http.client
 import json
@@ -37,6 +39,11 @@ MAX_NOTE = 2000  # approvals.MAX_DECLINE_NOTE
 NO_APPROVER = "Declined: nobody can approve actions in this scripted run. Continue without this action."
 NO_REVIEWER = ("Nobody can review plans in this scripted run. Do not make changes: end your turn with the plan as "
                "your reply.")
+# The app's answers (HTTP 400) to a card that is no longer waiting: a mode change or Stop answered it first
+# (AgentManager.decide, interactions.QUESTION_GONE and PLAN_GONE).
+CARD_GONE = ("This approval is no longer pending.", "This question is no longer waiting for an answer.",
+             "This plan is no longer waiting for review.")
+SHUT_DOWN = "The app shut down before the turn ended (its shutdown stops running turns)."
 LIMIT_REASONS = ("step_limit", "spending_limit", "budget_limit")
 STOP_REASONS = ("stopped", "interrupted")
 RECONNECTS = 3  # New streams query() opens after the app dropped one whose reader fell behind.
@@ -280,8 +287,10 @@ class LocalAgentClient:
         finally:
             connection.close()
 
-    def wait_result(self, session_id):
-        """The result record of the chat's running turn once it ends, or of its last turn when it is idle."""
+    def wait_result(self, session_id, after=None):
+        """The result record of the chat's running turn once it ends, or of its last turn when it is idle; None
+        when it is idle and had no turn, or none that started after `after` (the started time of an earlier turn's
+        result: a message that never started a turn)."""
         replies = {}
         for message in self.events(session_id):
             for event in _events_of(message):
@@ -289,10 +298,15 @@ class LocalAgentClient:
                     replies[event.get("id")] = dict(event)
             if message.get("type") == "snapshot":
                 session = message.get("session") or {}
-                if session.get("status") == "idle" and isinstance(session.get("last_turn_result"), dict):
-                    return result_record(session_id, session["last_turn_result"], replies)
+                if session.get("status", "idle") == "idle":
+                    last_turn = session.get("last_turn_result")
+                    if not isinstance(last_turn, dict) or (after is not None and last_turn.get("started") == after):
+                        return None
+                    return result_record(session_id, last_turn, replies)
             if message.get("type") == "status" and message.get("status") == "idle" and isinstance(message.get("turn_result"), dict):
                 return result_record(session_id, message["turn_result"], replies)
+            if message.get("type") == "stream_closed" and message.get("reason") == "shutdown":
+                raise LocalAgentError(SHUT_DOWN)
         raise LocalAgentError("The app closed the chat's stream before the turn ended.")
 
     # One prompt
@@ -300,10 +314,12 @@ class LocalAgentClient:
     def query(self, prompt, *, session_id=None, workspace=None, permission_mode="plan", model=None, effort=None,
               max_steps=None, spending_limit_dbu=None, turn_token_limit=None, turn_time_limit_minutes=None,
               can_use_tool=None, on_question=None, verbatim=False):
-        """Send prompt to a new chat (or the idle chat session_id) and yield its messages (each with session_id;
-        a subagent's cards and messages also come, with subagent True) until the turn ends, then one result
-        record: {type: 'result', session_id, terminal_reason, is_error, exit_code, duration_s, steps, tool_calls,
-        usage, tokens, estimated_dbu, unpriced_calls, subagents, changed_files, result (the final reply)}."""
+        """Send prompt to a new chat (or the idle chat session_id, which keeps its own mode, endpoint, effort,
+        folder and limits: the options of a new chat are not applied to it) and yield its messages (each with
+        session_id; a subagent's cards and messages also come, with subagent True) until the turn ends, then one
+        result record: {type: 'result', session_id, terminal_reason, is_error, exit_code, duration_s, steps,
+        tool_calls, usage, tokens, estimated_dbu, unpriced_calls, subagents, changed_files, result (the final
+        reply)}."""
         if session_id is None:
             session_id = self.create_session(workspace, permission_mode, model, effort, max_steps, spending_limit_dbu,
                                              turn_token_limit, turn_time_limit_minutes)["id"]
@@ -321,6 +337,8 @@ class LocalAgentClient:
                     # A reader that fell behind was dropped: a new stream starts with a fresh snapshot.
                     if closed != "slow_reader" or stop.is_set():
                         break
+                if closed == "shutdown":
+                    messages.put((chat_id, subagent, {"type": "stream_error", "error": SHUT_DOWN}))
             except LocalAgentError as exc:
                 messages.put((chat_id, subagent, {"type": "stream_error", "error": str(exc)}))
             finally:
@@ -363,7 +381,9 @@ class LocalAgentClient:
                         follow(event["child_session_id"], True)
                     if event.get("type") == "tool" and event.get("state") == "pending" and (chat_id, event.get("id")) not in answered:
                         answered.add((chat_id, event["id"]))
-                        self._answer(chat_id, subagent, event, can_use_tool, on_question)
+                        refused = self._answer(chat_id, subagent, event, can_use_tool, on_question)
+                        if refused is not None:
+                            yield refused
                 if kind == "delta" and chat_id == session_id and message.get("id") in replies:
                     reply = replies[message["id"]]
                     reply["text"] = (reply.get("text") or "") + str(message.get("text") or "")
@@ -384,10 +404,11 @@ class LocalAgentClient:
                     pass
 
     def _answer(self, chat_id, subagent, event, can_use_tool, on_question):
-        """Answer one waiting card. A callback that raises still answers it (declined, or questions skipped)."""
+        """Answer one waiting card. A callback that raises still answers it (declined, or questions skipped). An
+        answer the app refuses is replaced by that default: returns the answer_refused message, else None."""
         name, arguments = event.get("name"), event.get("input") if isinstance(event.get("input"), dict) else {}
         context = {"session_id": chat_id, "event_id": event["id"], "preview": event.get("preview"), "subagent": subagent}
-        verdict, answers, failure = None, None, None
+        verdict, answers, failure, refused = None, None, None, None
         try:
             if name == "ask_user":
                 answers = on_question(arguments.get("questions") or [], context) if on_question else None
@@ -395,25 +416,40 @@ class LocalAgentClient:
                 verdict = can_use_tool(name, arguments, context)
         except BaseException as exc:
             verdict, answers, failure = None, None, exc
-        try:
-            if name == "ask_user":
-                self.answer_questions(chat_id, event["id"], answers)
-            elif name == "submit_plan":
-                if isinstance(verdict, Allow):
-                    self.answer_plan(chat_id, event["id"], verdict.mode if verdict.mode in ("acceptEdits", "manual") else "manual")
-                else:
-                    self.answer_plan(chat_id, event["id"], "keep_planning",
-                                     verdict.message if isinstance(verdict, Deny) and verdict.message else NO_REVIEWER)
-            elif isinstance(verdict, Allow):
-                self.answer_approval(chat_id, event["id"], True)
-            else:
-                self.answer_approval(chat_id, event["id"], False,
-                                     verdict.message if isinstance(verdict, Deny) and verdict.message else NO_APPROVER)
-        except LocalAgentError as exc:
-            if exc.status != 400:  # 400: the card is no longer waiting (a mode change or Stop answered it).
-                raise
+        for attempt in (1, 2):
+            try:
+                self._send_answer(chat_id, name, event["id"], verdict, answers)
+            except LocalAgentError as exc:
+                detail = exc.detail.get("detail") if isinstance(exc.detail, dict) else None
+                if exc.status != 400 or attempt == 2 and detail not in CARD_GONE:
+                    raise
+                if detail not in CARD_GONE:
+                    refused, verdict, answers = str(detail or exc), None, None  # Again, with the default.
+                    continue
+            break
         if failure is not None:
             raise failure
+        if refused is None:
+            return None
+        fallback = "skipped" if name == "ask_user" else "keep_planning" if name == "submit_plan" else "declined"
+        return {"type": "answer_refused", "session_id": chat_id, "event_id": event["id"], "name": name, "error": refused,
+                "answered": fallback, **({"subagent": True} if subagent else {})}
+
+    def _send_answer(self, chat_id, name, event_id, verdict, answers):
+        """The card's answer: the callback's, or (verdict and answers None) declined, keep planning or skipped."""
+        if name == "ask_user":
+            self.answer_questions(chat_id, event_id, answers)
+        elif name == "submit_plan":
+            if isinstance(verdict, Allow):
+                self.answer_plan(chat_id, event_id, verdict.mode if verdict.mode in ("acceptEdits", "manual") else "manual")
+            else:
+                self.answer_plan(chat_id, event_id, "keep_planning",
+                                 verdict.message if isinstance(verdict, Deny) and verdict.message else NO_REVIEWER)
+        elif isinstance(verdict, Allow):
+            self.answer_approval(chat_id, event_id, True)
+        else:
+            self.answer_approval(chat_id, event_id, False,
+                                 verdict.message if isinstance(verdict, Deny) and verdict.message else NO_APPROVER)
 
 
 def _events_of(message):

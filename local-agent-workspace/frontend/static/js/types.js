@@ -112,9 +112,10 @@
 // TurnResult (turns.turn_result; on the turn's last reply as turn_result, in the header as last_turn_result and in
 //   the idle status that ends the turn): { terminal_reason, is_error, started, ended (epoch seconds), duration_s,
 //   steps (agent replies), tool_calls, usage: { calls, input_tokens, output_tokens, cache_read_input_tokens,
-//   cache_creation_input_tokens, reasoning_tokens } (the turn's own calls; null = no call reported it), tokens (every
-//   processed token, its subagents' included), estimated_dbu: number | null (no priced call), unpriced_calls,
-//   subagents: { count, tokens, estimated_dbu }, changed_files: string[] (at most 20), changed_files_total? }.
+//   cache_creation_input_tokens, reasoning_tokens } (the turn's own calls; null = no call reported it), tokens: number |
+//   null (every processed token, its subagents' included; null: no call reported a count), estimated_dbu: number | null
+//   (no priced call), unpriced_calls, subagents: { count, tokens (null: none of them reported a count), estimated_dbu },
+//   changed_files: string[] (at most 20), changed_files_total? }.
 // GET /usage?days=1..90 (30) -> { days, since, until, totals: { calls, input_tokens, cache_read_input_tokens,
 //   cache_creation_input_tokens, output_tokens, estimated_dbu, unpriced_calls, chats }, by_day: [{ date, ... }] (every
 //   local date, oldest first), by_model: [{ key, priced, ... }], by_purpose: [{ key, label, ... }], by_project:

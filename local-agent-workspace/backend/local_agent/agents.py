@@ -5162,6 +5162,10 @@ class AgentManager(LifecycleHooks):
                         return False
                     wrap_up = turns.wrap_up_notice(budget[0])
                     self.budget_wrapups.add(session["id"])
+                elif wrap_up is not None:
+                    # The limit was raised or removed during the wrap-up request: the turn goes on as usual.
+                    wrap_up = None
+                    self.budget_wrapups.discard(session["id"])
                 if (refusal := self.otpm_preflight(session, max_output_tokens)) is not None:
                     raise refusal
                 # The mode, rules and turned-off tools can change while a turn runs; each step follows them.
@@ -5419,12 +5423,15 @@ class AgentManager(LifecycleHooks):
                         "in Settings if your endpoint supports it, or send a message to continue.",
                         "output_limit", exc.http_status) from exc
                 if not ordered_calls:
-                    if wrap_up is not None:
+                    if wrap_up is not None and (budget := turns.reached(self, session)) is not None:
                         # The wrap-up reply ends the turn: no Verify round or stop hook continues it.
                         await self.refresh_next_estimate(session, system, definitions, wire, context_state)
-                        await self.budget_stop(session, wire, turns.stop_text(*(turns.reached(self, session) or (
-                            "its budget", False)), wrapped=True))
+                        await self.budget_stop(session, wire, turns.stop_text(*budget, wrapped=True))
                         return False
+                    if wrap_up is not None:
+                        # The limit was raised during the wrap-up request: its reply ends the turn as any other.
+                        wrap_up = None
+                        self.budget_wrapups.discard(session["id"])
                     if spending.reached(self, session):
                         # Verify and stop hooks could only continue with a request the limit refuses. A
                         # subagent's final reply is still its report; a chat says why the turn ends here.
@@ -5482,10 +5489,15 @@ class AgentManager(LifecycleHooks):
                         scale) <= input_budget)
             if steps > 0:
                 await self.refresh_next_estimate(session, system, definitions, wire, context_state)
+        # A chat a script created with its own Agent steps does not follow the Settings value.
+        own_steps = not session.get("is_subagent") and type(session.get("max_agent_steps")) is int
         await self.event(session, "error" if session.get("is_subagent") else "notice",
                          text=(f"Reached the {steps}-request agent limit. This counts model requests, not tool "
-                               "calls. Completed actions were kept. Increase Agent steps in Settings or send a "
-                               "message to continue." + self.turn_cost(session, *turn_start)),
+                               "calls. Completed actions were kept. "
+                               + ("This chat's own limit was set when a script created it, not in Settings: send a "
+                                  "message to continue." if own_steps else
+                                  "Increase Agent steps in Settings or send a message to continue.")
+                               + self.turn_cost(session, *turn_start)),
                          terminal_reason="step_limit")
 
     def spent_so_far(self, session):

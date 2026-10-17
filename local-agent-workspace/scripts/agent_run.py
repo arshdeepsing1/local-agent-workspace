@@ -7,12 +7,14 @@ Usage (from the local-agent-workspace folder; needs only Python 3 and the app ru
     echo "List the TODOs" | python3 scripts/agent_run.py --output json -
 
 The prompt runs in a new chat of the app (listed in its sidebar like any other) with Plan mode by default,
-which changes nothing. --output text prints the final reply (and a one-line summary to stderr), json one
+which changes nothing; --session sends it to an existing idle chat instead (--mode, --model and --effort
+then change that chat). --output text prints the final reply (and a one-line summary to stderr), json one
 result object, stream-json every message of the chat as one JSON line and then the result. Cards are
 declined by default (--approve deny: nothing waits for the approval timeout, and questions are skipped);
---approve ask asks you in the terminal (a TTY only); --mode bypassPermissions also needs --confirm-bypass.
-Exit codes: 0 completed, 1 error, 2 a limit was reached (steps, spending or the turn's tokens or time),
-3 stopped or interrupted (Ctrl+C stops the turn).
+--approve ask asks you in the terminal (a TTY only; control characters in what the agent wrote are shown
+as escapes). Bypass permissions, chosen with --mode or already set on the --session chat, needs
+--confirm-bypass. Exit codes: 0 completed, 1 error, 2 a limit was reached (steps, spending or the turn's
+tokens or time), 3 stopped or interrupted (Ctrl+C stops the turn).
 
 The script talks to the app at --url (default http://127.0.0.1:8765) and never starts a server itself,
 so it cannot run a second app on the same state folder. Every model request is a paid call to your
@@ -20,6 +22,7 @@ Databricks workspace.
 """
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -29,17 +32,48 @@ from local_agent.client import DEFAULT_URL, Allow, Deny, LocalAgentClient, Local
 
 MODES = ("plan", "manual", "acceptEdits", "auto", "dontAsk", "bypassPermissions")
 EFFORTS = ("default", "low", "medium", "high", "xhigh", "max")
+# What a card shows comes from the model (and so from web pages, files or tool output it read): control characters
+# other than newline and tab (terminal escape sequences included), DEL, C1 controls and bidirectional overrides are
+# printed as visible escapes, so that text cannot erase or rewrite what the terminal shows before you answer.
+CONTROLS = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+ESCAPED_NOTE = "(It contains control characters, shown as \\x.. or \\u.... escapes.)"
+FALLBACKS = {"skipped": "the questions were skipped", "keep_planning": "the plan went back to planning",
+             "declined": "the action was declined"}
+
+
+def shown(text):
+    """(text with its control characters as visible escapes, whether there were any)."""
+    text = str(text)
+    escaped = CONTROLS.sub(lambda match: f"\\x{ord(match[0]):02x}" if ord(match[0]) < 0x100 else f"\\u{ord(match[0]):04x}", text)
+    return escaped, escaped != text
+
+
+def json_text(value, **options):
+    """value as JSON for the terminal or a pipe: json.dumps escapes C0 controls but leaves C1 controls and
+    bidirectional overrides raw, so they are written as \\u escapes too (the parsed JSON is the same)."""
+    return CONTROLS.sub(lambda match: f"\\u{ord(match[0]):04x}", json.dumps(value, ensure_ascii=False, **options))
+
+
+def show(text):
+    """Print model-written text to the terminal (stderr) as shown(); True when something was escaped."""
+    text, escaped = shown(text)
+    print(text, file=sys.stderr)
+    return escaped
 
 
 def ask_tool(name, arguments, context):
     """--approve ask: one approval in the terminal."""
     who = " (subagent)" if context.get("subagent") else ""
     if name == "submit_plan":
-        print(f"\nPlan{who}: {arguments.get('title') or ''}\n{arguments.get('plan') or ''}", file=sys.stderr)
+        print(f"\nPlan{who}:", file=sys.stderr)
+        if show(f"{arguments.get('title') or ''}\n{arguments.get('plan') or ''}"):
+            print(ESCAPED_NOTE, file=sys.stderr)
         answer = input("Approve it? [m = yes, in Manual / a = yes, in Accept edits / N = keep planning] ").strip().lower()
         return Allow("acceptEdits") if answer == "a" else Allow("manual") if answer in ("m", "y", "yes") else Deny()
     preview = context.get("preview") or json.dumps(arguments, ensure_ascii=False)[:2000]
-    print(f"\nApproval{who}: {name}\n{preview}", file=sys.stderr)
+    print(f"\nApproval{who}: {shown(name)[0]}", file=sys.stderr)
+    if show(preview):
+        print(ESCAPED_NOTE, file=sys.stderr)
     if input("Allow it? [y/N] ").strip().lower() in ("y", "yes"):
         return Allow()
     note = input("Note for the agent (optional): ").strip()
@@ -51,10 +85,12 @@ def ask_questions(questions, context):
     answers = []
     for question in questions:
         options = question.get("options") or []
-        print(f"\n{question.get('question')}", file=sys.stderr)
+        print("", file=sys.stderr)
+        escaped = show(question.get("question"))
         for number, option in enumerate(options, start=1):
-            print(f"  {number}. {option.get('label')}" + (f" - {option['description']}" if option.get("description") else ""),
-                  file=sys.stderr)
+            escaped = show(f"  {number}. {option.get('label')}" + (f" - {option['description']}" if option.get("description") else "")) or escaped
+        if escaped:
+            print(ESCAPED_NOTE, file=sys.stderr)
         typed = input("Choose a number, or type your own answer (empty skips): ").strip()
         if not typed:
             return None
@@ -83,12 +119,14 @@ def main(argv=None):
     parser.add_argument("--url", default=DEFAULT_URL, help=f"the running app (default {DEFAULT_URL})")
     parser.add_argument("--workspace", help="the project folder (default: the Settings workspace)")
     parser.add_argument("--session", help="send to this existing, idle chat instead of a new one")
-    parser.add_argument("--mode", choices=MODES, default="plan", help="permission mode of a new chat (default plan)")
+    parser.add_argument("--mode", choices=MODES,
+                        help="permission mode (default plan for a new chat; with --session: changes the chat's)")
     parser.add_argument("--confirm-bypass", action="store_true",
-                        help="needed with --mode bypassPermissions: actions then run without approval cards")
-    parser.add_argument("--model", help="endpoint (default: the Settings model)")
-    parser.add_argument("--effort", choices=EFFORTS, help="reasoning effort (default: the Settings default)")
-    parser.add_argument("--max-steps", type=int, help="agent steps per message for this chat (1-64)")
+                        help="needed for Bypass permissions (--mode or the --session chat's): actions then run "
+                             "without approval cards")
+    parser.add_argument("--model", help="endpoint (default: the Settings model, or the --session chat's)")
+    parser.add_argument("--effort", choices=EFFORTS, help="reasoning effort (default: the Settings default, or the --session chat's)")
+    parser.add_argument("--max-steps", type=int, help="agent steps per message for a new chat (1-64)")
     parser.add_argument("--max-dbu", type=float, help="spending limit of this chat in estimated DBU")
     parser.add_argument("--max-tokens", type=int, help="token limit of the turn (every processed token)")
     parser.add_argument("--max-minutes", type=int, help="time limit of the turn in minutes")
@@ -101,16 +139,33 @@ def main(argv=None):
         parser.error("the prompt is empty")
     if args.mode == "bypassPermissions" and not args.confirm_bypass:
         parser.error("--mode bypassPermissions runs actions without approval cards: add --confirm-bypass")
+    if args.session is not None and (args.workspace is not None or args.max_steps is not None):
+        parser.error("--workspace and --max-steps apply to a new chat only: leave them out with --session")
     if args.approve == "ask" and not (sys.stdin.isatty() and sys.stderr.isatty()):
         parser.error("--approve ask needs a terminal (and a prompt given as an argument)")
     interactive = args.approve == "ask"
     client = LocalAgentClient(args.url)
-    result, session_id = None, args.session
+    result, session_id, previous = None, args.session, None
     try:
         if session_id is None:
-            session_id = client.create_session(args.workspace, args.mode, args.model, args.effort, args.max_steps,
-                                               args.max_dbu, args.max_tokens, args.max_minutes)["id"]
-        elif any(value is not None for value in (args.max_dbu, args.max_tokens, args.max_minutes)):
+            session_id = client.create_session(args.workspace, args.mode or "plan", args.model, args.effort,
+                                               args.max_steps, args.max_dbu, args.max_tokens, args.max_minutes)["id"]
+        else:
+            chat = client.info(session_id)
+            if chat.get("status", "idle") != "idle":
+                raise LocalAgentError("This chat is busy: wait for its turn to end, or use another chat.")
+            if args.mode is None and chat.get("permission_mode") == "bypassPermissions" and not args.confirm_bypass:
+                print("agent_run: this chat is in Bypass permissions, which runs actions without approval cards: add "
+                      "--confirm-bypass, or choose another --mode.", file=sys.stderr)
+                return 1
+            # The started time of its last turn: Ctrl+C before this prompt started a turn gives no result.
+            previous = chat["last_turn_result"].get("started") if isinstance(chat.get("last_turn_result"), dict) else None
+            if args.mode is not None:
+                client.set_permission_mode(session_id, args.mode, confirm=args.mode == "bypassPermissions")
+            if args.model is not None:
+                client.set_model(session_id, args.model)
+            if args.effort is not None:
+                client.set_effort(session_id, args.effort)
             if args.max_dbu is not None:
                 client.set_spending_limit(session_id, args.max_dbu)
             if args.max_tokens is not None or args.max_minutes is not None:
@@ -121,15 +176,21 @@ def main(argv=None):
             for message in messages:
                 if message["type"] == "result":
                     result = message
+                elif message["type"] == "answer_refused":
+                    print(f"agent_run: the app refused that answer ({shown(message['error'])[0]}): "
+                          f"{FALLBACKS.get(message['answered'], 'it was declined')}.", file=sys.stderr)
                 if args.output == "stream-json":
-                    print(json.dumps(message, ensure_ascii=False), flush=True)
+                    print(json_text(message), flush=True)
         except KeyboardInterrupt:
             print("\nStopping the turn…", file=sys.stderr)
             messages.close()  # Its streams end now.
             client.interrupt(session_id)
-            result = client.wait_result(session_id)  # The stopped turn's result.
+            result = client.wait_result(session_id, after=previous)  # The stopped turn's result.
+            if result is None:
+                print("agent_run: stopped before the prompt started a turn.", file=sys.stderr)
+                return 3
             if args.output == "stream-json":
-                print(json.dumps(result, ensure_ascii=False), flush=True)
+                print(json_text(result), flush=True)
     except LocalAgentError as exc:
         print(f"agent_run: {exc}", file=sys.stderr)
         return 1
@@ -139,9 +200,9 @@ def main(argv=None):
         print("agent_run: the turn ended without a result.", file=sys.stderr)
         return 1
     if args.output == "json":
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        print(json_text(result, indent=2))
     elif args.output == "text":
-        print(result["result"])
+        print(shown(result["result"])[0] if sys.stdout.isatty() else result["result"])
         print(summary_line(result), file=sys.stderr)
     return result["exit_code"]
 
