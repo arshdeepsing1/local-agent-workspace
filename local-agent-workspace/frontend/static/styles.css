@@ -713,3 +713,16 @@ code.finding-location{color:#55564f;text-decoration:none}
 .composer-block.dragging-files .composer{border-color:var(--accent);box-shadow:0 0 0 3px #a35a4026}
 .edit-message-files{overflow-wrap:anywhere}.edit-message-file .icon-button{width:22px;height:22px;padding:4px;margin-left:2px;vertical-align:middle}
 @media(max-width:600px){.upload-name{max-width:18ch}}
+/* 2026-10-16 scheduler: Agent tools → Schedules (the list, a run waiting for Run, the history, the form) and the banners of ready runs and of the token's expiry. */
+.schedules-list{list-style:none;margin:14px 0;padding:0}.schedule-item{padding:13px 0;border-bottom:1px solid var(--border);min-width:0}
+.schedule-head{display:flex;align-items:flex-start;justify-content:space-between;gap:15px}
+.schedule-text{min-width:0;flex:1;overflow-wrap:anywhere}.schedule-text strong{font-weight:500}.schedule-text small{display:block;color:var(--muted);font-size:11px}
+.schedule-state{display:inline-block;font-size:11px;padding:1px 7px;border-radius:9px;background:#efede6;color:#655b4c;margin-left:4px}
+.schedule-ready{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin:9px 0 0;padding:9px 11px;border-radius:8px;background:#f4ecdf;color:#796143;font-size:12px}.schedule-ready>span{flex:1 1 200px;min-width:0}
+.schedule-history{margin:8px 0 0;font-size:12px}.schedule-history>summary{color:var(--muted);width:fit-content}
+.schedule-history ol{list-style:none;margin:6px 0 0;padding:0}.schedule-history li{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:6px 0;border-top:1px solid var(--border);overflow-wrap:anywhere}
+.schedule-history li>span{min-width:0;flex:1}.schedule-history li small{display:block;color:var(--muted);font-size:11px}.schedule-when{font-variant-numeric:tabular-nums}
+.schedule-form{padding:14px;border:1px solid var(--border);border-radius:9px;background:var(--surface)}.schedule-form>.field-help,.schedule-form>.settings-note{margin:-4px 0 0}
+.schedule-form select{display:block;margin-top:5px;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--ink);padding:8px 10px;font-size:13px;max-width:100%}
+.schedule-limits{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:11px}.schedule-alerts .connection-banner{border-bottom:1px solid #eadfcd}
+@media(max-width:600px){.schedule-head{flex-direction:column;gap:8px}.schedule-limits{grid-template-columns:minmax(0,1fr)}}

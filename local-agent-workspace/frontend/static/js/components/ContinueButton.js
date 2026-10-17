@@ -13,6 +13,8 @@ export const CONTINUE_MESSAGE = 'Continue from where you stopped.'
 //     (backend spending.py); Continue stops again until the limit is raised.
 //   'budget_limit': the turn reached its token or time limit (backend turns.py) and
 //     wrapped up; Continue starts a new turn with a new budget.
+//   'approval_expired': a scheduled run's card waited the schedule's approval limit (backend
+//     schedules.py), so the run stopped; Continue is your own turn, with Settings' approval wait.
 //   'stopped': Stop ("Stopped. You can continue this conversation.").
 //   'interrupted': a server restart (or an import) found the turn still running
 //     and marked its events cancelled / its request_info interrupted.
@@ -42,6 +44,7 @@ export function stopReason(session) {
   if (reason === 'step_limit') return 'The agent reached its step limit.'
   if (reason === 'spending_limit') return 'The conversation reached its spending limit. Raise it in Agent tools → Usage, then continue.'
   if (reason === 'budget_limit') return 'The turn reached its token or time limit and wrapped up.'
+  if (reason === 'approval_expired') return 'This scheduled run stopped: a card waited its approval limit without an answer.'
   if (reason === 'stopped') return 'The response was stopped.'
   if (reason === 'interrupted') return 'The response was interrupted.'
   if (reason === 'inference_error') {

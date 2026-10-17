@@ -2,6 +2,7 @@ import ast
 import json
 import os
 import re
+from datetime import date
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -52,6 +53,8 @@ DEFAULT_SUBAGENT_DEFAULTS = {"explore": {"model": "", "effort": "low"}, "general
                              "editor": {"model": "", "effort": ""}}
 # A Databricks serving endpoint name (letters, digits, '.', '_' and '-'), as subagent model overrides take it.
 ENDPOINT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+# Settings → Credentials → Token expires on: "" or a date (schedules.token_warning warns 7 days before).
+EXPIRY_DATE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
 
 
 def subagent_defaults(value, strict=True):
@@ -121,6 +124,19 @@ def follow_limits(follow, defaults, current):
     if follow[0] and (type(output) is not int or output < defaults[0] - SAFETY_MARGIN):
         context_window = defaults[0]
     return context_window, output
+
+
+def valid_expiry(value):
+    """Whether value is a token expiry date Settings takes: "" or YYYY-MM-DD."""
+    if value == "":
+        return True
+    if not isinstance(value, str) or not EXPIRY_DATE.match(value):
+        return False
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
 
 
 def credential_assignments(values):
@@ -195,6 +211,10 @@ class Settings:
             "web_search_provider": "",
             "web_search_url": "",
             "web_search_key": "",
+            # Settings → Agent (schedules.py): the scheduler runs the schedules of Agent tools → Schedules on its own
+            # (off: they run only with Run now), and Settings → Credentials: the day the Databricks token expires.
+            "schedules_enabled": False,
+            "token_expires_on": "",
         }
         self.migrated_from = None
         if self.path.exists():
@@ -223,6 +243,10 @@ class Settings:
             for key, maximum in TURN_LIMITS.items():  # A hand-edited limit that is not a whole number means none.
                 if type(self.values[key]) is not int or not 0 <= self.values[key] <= maximum:
                     self.values[key] = 0
+            if type(self.values["schedules_enabled"]) is not bool:  # Hand-edited: anything but true is off.
+                self.values["schedules_enabled"] = False
+            if not valid_expiry(self.values["token_expires_on"]):
+                self.values["token_expires_on"] = ""
             fallback = self.values["fallback_model"]  # A hand-edited name that is not one means none.
             fallback = fallback.strip() if isinstance(fallback, str) else ""
             self.values["fallback_model"] = fallback if ENDPOINT_NAME.match(fallback) else ""
@@ -250,6 +274,7 @@ class Settings:
 
     def public(self):
         from . import user_paths  # rules.py imports this module; user_paths imports tools.
+        from .schedules import token_warning
         try:
             host, _ = self.credentials()
             configured = True
@@ -259,6 +284,7 @@ class Settings:
                 "coding_dir_status": user_paths.coding_dir_status(self),
                 "python_venv_status": user_paths.python_venv_status(self), "default_model": DEFAULT_MODEL,
                 "default_limits": dict(zip(LIMIT_KEYS, default_limits(self.values["model"]))),
+                "token_warning": token_warning(self.values["token_expires_on"]),
                 "endpoint_profiles": known_endpoints(),
                 **({"model_migrated_from": self.migrated_from} if self.migrated_from is not None else {})}
 
@@ -378,6 +404,12 @@ class Settings:
             raise ValueError("Prompt caching must be one of: " + ", ".join(PROMPT_CACHING) + ".")
         if type(candidate["slash_commands"]) is not bool:
             raise ValueError("Slash commands must be on or off.")
+        if type(candidate["schedules_enabled"]) is not bool:
+            raise ValueError("Scheduled runs must be on or off.")
+        expiry = candidate["token_expires_on"]
+        candidate["token_expires_on"] = expiry = expiry.strip() if isinstance(expiry, str) else expiry
+        if not valid_expiry(expiry):
+            raise ValueError("Token expires on must be empty or a date such as 2026-12-31.")
         self.check_web_settings(candidate)
         candidate["spending_limit_dbu"] = validate_limit(candidate["spending_limit_dbu"], "Default spending limit")
         for key, label, unit in (("turn_token_limit", "Token limit per turn", "tokens"),

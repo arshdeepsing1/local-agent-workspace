@@ -24,7 +24,7 @@ const REASONS = {
   completed: 'completed', tool_error: 'completed with a failed tool', step_limit: 'reached the step limit',
   spending_limit: 'reached the spending limit', budget_limit: 'reached the turn\'s token or time limit',
   stopped: 'stopped', interrupted: 'interrupted', error: 'ended with an error', inference_error: 'ended with an error',
-  hook_blocked: 'blocked by a hook',
+  hook_blocked: 'blocked by a hook', approval_expired: 'stopped at its scheduled run\'s approval limit',
 }
 
 export function turnSummary(result) {

@@ -508,7 +508,7 @@ def test_last_turn_mcp_status_in_extensions_and_overview(ui, page):
 # The dialog keeps one size: the tabs stay put and only the tab content scrolls
 
 TABS = ["Overview", "Tasks", "Subagents", "Tools", "Usage", "Export", "Checkpoints", "Verify", "Memory", "Worktrees",
-        "Extensions"]
+        "Extensions", "Schedules"]
 
 
 def tabs_top(ui):

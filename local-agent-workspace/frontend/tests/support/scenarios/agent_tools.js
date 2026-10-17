@@ -70,6 +70,9 @@ fake.handle = (path, options) => {
   if (path.endsWith('/disabled-tools')) return fake.json({ ...session(), disabled_tools: body().tools })
   if (path.endsWith('/subagent-profile')) return fake.json({ ...session(), subagent_tool_profile: body().tool_profile })
   if (path.endsWith('/metrics')) return fake.json(metrics)
+  // Agent tools → Schedules: none in this project, with scheduled runs off.
+  if (/^\/api\/schedules(?:\?|$)/.test(path)) return fake.json({ enabled: false, running: false, problem: null, project: '/project',
+    other_projects: 0, token_warning: null, limits: {}, schedules: [] })
   if (path.startsWith('/api/project-settings')) return fake.json(options.method === 'PUT' ? { ...projectSettings, ...body() } : projectSettings)
   if (path === '/api/extensions') return fake.json(options.method === 'PUT' ? body() : config)
   if (path === '/api/extensions/test') return fake.json({ tools: ['example.search'] })
