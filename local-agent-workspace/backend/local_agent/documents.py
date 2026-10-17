@@ -29,6 +29,7 @@ MAX_UNCOMPRESSED = 64_000_000
 MAX_TEXT_CHARS = 2_000_000
 MAX_SHEET_ROWS = 5_000
 MAX_SHEET_COLUMNS = 200
+MAX_CELL_CHARS = 32_767  # Excel's own limit for a cell: one shared string can fill many cells.
 MAX_PDF_PAGES = 2_000
 PDF_SECONDS = 60.0  # Pages after this are left out (a note says so).
 LINE_CHARS = 500
@@ -135,23 +136,40 @@ def _webp_size(data):
 
 # --- Documents ------------------------------------------------------------------
 
+SPACES = re.compile(" *")
+
+
 class _Text:
     """Extracted lines within MAX_TEXT_CHARS; truncated once something was left out."""
 
     def __init__(self):
         self.lines, self.size, self.limit, self.truncated = [], 0, MAX_TEXT_CHARS, False
 
+    def room(self):
+        """The characters that can still be added."""
+        return self.limit - self.size
+
     def add(self, line):
         if self.truncated:
             return False
         line = line.replace("\x00", "")
-        while len(line) > LINE_CHARS:  # read_file pages by line.
-            cut = line.rfind(" ", 0, LINE_CHARS)
-            cut = cut if cut > LINE_CHARS // 2 else LINE_CHARS
-            if not self._append(line[:cut]):
+        # What lies past the limit is never kept, so a huge line is clipped before it is wrapped.
+        clip = self.room() + LINE_CHARS
+        clipped = len(line) > clip and not SPACES.fullmatch(line, clip)
+        line = line[:clip] if len(line) > clip else line
+        start = 0
+        while len(line) - start > LINE_CHARS:  # read_file pages by line; walked by index, never re-sliced.
+            cut = line.rfind(" ", start, start + LINE_CHARS)
+            cut = cut if cut > start + LINE_CHARS // 2 else start + LINE_CHARS
+            if not self._append(line[start:cut]):
                 return False
-            line = line[cut:].lstrip(" ")
-        return self._append(line)
+            start = SPACES.match(line, cut).end()
+        if not self._append(line[start:]):
+            return False
+        if clipped:
+            self.truncated = True
+            return False
+        return True
 
     def _append(self, line):
         if self.size + len(line) + 1 > self.limit:
@@ -407,33 +425,40 @@ def _cell_text(cell, strings):
 
 
 def _sheet(data, strings, out, name):
-    """One worksheet as tab-separated rows; returns whether it was cut at the row or column limit."""
+    """One worksheet as tab-separated rows; returns what was cut: 1 rows or columns past the limits, 2 cells
+    longer than MAX_CELL_CHARS (both bits can be set)."""
     rows = cut = 0
     for _, element in ElementTree.iterparse(io.BytesIO(_checked_xml(data))):
         if _local(element.tag) != "row":
             continue
-        cells, position = {}, 0
+        cells, position, length = {}, 0, 0
         for cell in element:
             if _local(cell.tag) != "c":
                 continue
             column = _column(cell.get("r"))
             position = column if column is not None else position
+            if length > out.room() + LINE_CHARS:
+                break  # The row is already longer than the text can still take.
             if position < MAX_SHEET_COLUMNS:
-                text = _cell_text(cell, strings).replace("\t", " ").replace("\r", " ").replace("\n", " ")
+                text = _cell_text(cell, strings)
+                if len(text) > MAX_CELL_CHARS:
+                    text, cut = text[:MAX_CELL_CHARS], cut | 2
+                text = text.replace("\t", " ").replace("\r", " ").replace("\n", " ")
                 if text:
                     cells[position] = text
+                    length += len(text) + 1
             else:
-                cut = 1
+                cut |= 1
             position += 1
         element.clear()
         if not cells:
             continue
         rows += 1
         if rows > MAX_SHEET_ROWS:
-            return True
+            return cut | 1
         if not out.add("\t".join(cells.get(index, "") for index in range(max(cells) + 1))):
-            return False
-    return bool(cut)
+            return cut
+    return cut
 
 
 def _xlsx(archive, out, notes):
@@ -450,9 +475,13 @@ def _xlsx(archive, out, notes):
         hidden = " (hidden)" if sheet.get("state") in ("hidden", "veryHidden") else ""
         if not out.add(f"--- Sheet: {sheet.get('name') or count}{hidden} ---"):
             break
-        if _sheet(archive.read(target), strings, out, sheet.get("name")):
+        cut = _sheet(archive.read(target), strings, out, sheet.get("name"))
+        if cut & 1:
             notes.append(f"Sheet {sheet.get('name') or count}: only the first {MAX_SHEET_ROWS:,} rows and "
                          f"{MAX_SHEET_COLUMNS} columns with values are included.")
+        if cut & 2:
+            notes.append(f"Sheet {sheet.get('name') or count}: cells longer than {MAX_CELL_CHARS:,} characters "
+                         "were cut.")
         if not out.add(""):
             break
     return count

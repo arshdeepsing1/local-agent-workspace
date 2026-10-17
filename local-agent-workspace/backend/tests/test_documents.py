@@ -3,6 +3,7 @@ xml.etree within limits, PDF through the optional pypdf package, image headers, 
 import io
 import struct
 import sys
+import time
 import types
 import zipfile
 import zlib
@@ -99,6 +100,39 @@ def test_xlsx_rows_and_columns_are_bounded(monkeypatch):
     result = extract(xlsx({"Big": rows}), "xlsx")
     assert result["text"] == "--- Sheet: Big ---\n1\t1\n2\t2"
     assert result["notes"] == ["Sheet Big: only the first 2 rows and 2 columns with values are included."]
+
+
+def column_name(index):
+    name, index = "", index + 1
+    while index:
+        index, rest = divmod(index - 1, 26)
+        name = chr(65 + rest) + name
+    return name
+
+
+def test_one_shared_string_in_every_cell_of_a_row_is_bounded():
+    """A file of a few KB whose one long shared string fills all 200 columns of a row (as text, 200 times the
+    string): each cell is clipped and the row stops at what the text can still take, so it extracts at once."""
+    cells = [f'<c r="{column_name(index)}1" t="s"><v>0</v></c>' for index in range(200)]
+    data = xlsx({"S": [cells, cells]}, strings=("x" * 1_000_000,))
+    assert len(data) < 10_000
+    start = time.monotonic()
+    result = extract(data, "xlsx")
+    assert time.monotonic() - start < 10  # Minutes before the cells were clipped and lines walked by index.
+    assert result["truncated"] and len(result["text"]) <= documents.MAX_TEXT_CHARS
+    assert "Sheet S: cells longer than 32,767 characters were cut." in result["notes"]
+    one = extract(xlsx({"S": [['<c r="A1" t="s"><v>0</v></c>']]}, strings=("y" * 40_000,)), "xlsx")
+    assert one["text"].count("y") == documents.MAX_CELL_CHARS and not one["truncated"]
+    assert one["notes"] == ["Sheet S: cells longer than 32,767 characters were cut."]
+
+
+def test_a_huge_line_is_clipped_before_it_is_wrapped():
+    start = time.monotonic()
+    result = extract(b"x" * 19_000_000, "txt")
+    assert time.monotonic() - start < 5  # Wrapping re-sliced the rest of the line for every 500 characters.
+    assert result["truncated"] and set(map(len, result["text"].split("\n"))) == {documents.LINE_CHARS}
+    spaces = extract(b"a" + b" " * 3_000_000, "txt")  # Only spaces past the limit: nothing was left out.
+    assert spaces["text"].rstrip() == "a" and not spaces["truncated"]
 
 
 def test_pptx_slides_in_presentation_order():

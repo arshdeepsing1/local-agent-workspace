@@ -664,5 +664,5 @@ body.panel-resizing{cursor:col-resize;user-select:none}
 .attachment-warning,.attachment-note{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;margin:0 0 7px;font-size:12px;line-height:1.5;overflow-wrap:anywhere}
 .attachment-warning{color:#98492f}.attachment-note{color:var(--muted)}.attachment-warning .outline,.attachment-note .outline{font-size:12px;padding:4px 10px}
 .composer-block.dragging-files .composer{border-color:var(--accent);box-shadow:0 0 0 3px #a35a4026}
-.edit-message-files{overflow-wrap:anywhere}
+.edit-message-files{overflow-wrap:anywhere}.edit-message-file .icon-button{width:22px;height:22px;padding:4px;margin-left:2px;vertical-align:middle}
 @media(max-width:600px){.upload-name{max-width:18ch}}

@@ -478,8 +478,9 @@ when opening a conversation or performing restart recovery.
   the message shows only your text and the file names. Snapshots follow the chat's own file
   access: credential files, generated folders, the app's state folder, folders the chat may not
   read (use **Folder access** first) and read deny rules or a turned-off `read_file` refuse the
-  message with an error. Missing paths, folders and words such as `@dist` stay plain text, and so
-  do tokens inside code: a fenced block, or a code span on one line (a run of backticks closes
+  message with an error, as does a PDF, Word, Excel or PowerPoint file: attach it with **Attach
+  files** instead, or ask the agent to read it (`read_file` reads its text). Missing paths,
+  folders and words such as `@dist` stay plain text, and so do tokens inside code: a fenced block, or a code span on one line (a run of backticks closes
   only at the next run of the same length, as in the quoted lines of review comments). Secrets in snapshots are redacted like command output, before a snapshot is
   shortened to 8,000 characters. An attached file counts as read, so the agent may
   edit it without reading it again. Only your typed text selects skills (not an attached file or a
@@ -495,7 +496,8 @@ when opening a conversation or performing restart recovery.
   as plain text or queued, but not with a `!` command or a `/btw` question. They are not part of
   a saved draft, so after a reload attach them again. The message shows chips with the names
   (exports and transcripts too); **Edit message**, **Retry response** and editing a queued
-  message keep its files.
+  message keep its files, and **Edit message** can leave one out (**Do not send … again**). An
+  imported chat has no attached files, so these send its messages without them.
 - **Documents**: the app reads their text itself (Word, Excel and PowerPoint files with the Python
   standard library; PDF with the optional documents extra, see **Install**) and the agent gets it
   fenced as data after your text, like an `@` snapshot, redacted like command output: at most
@@ -503,7 +505,8 @@ when opening a conversation or performing restart recovery.
   agent is told so (`read_file` reads a document in full once it is saved in the project); a
   document that would get less than 1,000 characters of what is left is refused with a message.
   Word headings become `#` lines, tables and sheets tab-separated rows (at most 5,000 rows and 200
-  columns per sheet; hidden sheets are marked), and `--- Page N ---`, `--- Sheet: name ---` and
+  columns per sheet and 32,767 characters per cell, Excel's own limit; hidden sheets are marked),
+  and `--- Page N ---`, `--- Sheet: name ---` and
   `--- Slide N ---` lines mark pages, sheets and slides. The text stays in the message once it is
   sent, so later requests resend it unchanged and it stays in the prompt cache. Scanned PDF pages
   have no text (the app does no OCR) and are counted in a note. Without the documents extra a PDF's
@@ -516,7 +519,8 @@ when opening a conversation or performing restart recovery.
   and where to choose another one. An image can be at most 2.5 MB and 8,000 pixels on a side, and
   a message at most 4 images and 2.5 MB of them, so their base64 copy fits the 4 MB request limit;
   the app does not shrink images (attach a smaller copy, such as a JPEG or a crop). An image is
-  sent as an `image_url` part with a base64 data URL before your text, in the request body only:
+  sent as an `image_url` part with a base64 data URL before your text, after a short text part
+  naming it as your file whose text is data, not instructions, in the request body only:
   the conversation file keeps a reference to it (name, type, size), never the image. It is
   estimated at width × height / 750 tokens, after scaling to at most 2,576 pixels on the long side
   and 3.75 megapixels (so at most 5,000 tokens; a 1280×720 screenshot is 1,229), and the meter
@@ -524,7 +528,9 @@ when opening a conversation or performing restart recovery.
   endpoints) until a compaction summarizes its turn: the summary request gets a note naming the
   image instead. After a switch to an endpoint without image input, in a request to a fallback
   endpoint without it, or when its file is gone, an image becomes a note in its message, such as
-  `[Image shot.png, 1280×720: not sent, databricks-gpt-oss-120b does not take images.]`.
+  `[Image shot.png, 1280×720: not sent, databricks-gpt-oss-120b does not take images.]`. If an
+  endpoint answers the images with an HTTP 400 that names them, the app sends the request again
+  with notes, says so, and sends that endpoint no images until it restarts or Settings are saved.
 - **Shell commands (`!`)**: a message starting with `!` runs the rest as one shell command in the
   project folder, like **Workspace → Terminal** Run, when the chat is idle, for at most 60 seconds
   (use **Workspace → Terminal** for longer commands). It is an explicit user action, so it runs in
@@ -1103,9 +1109,10 @@ workspace anyway, because commands run in the workspace can still reach it.
   **Agent tools: tasks, subagents, and activity**).
 - `uploads/<conversation-id>/`: the files attached to the chat's messages, each as
   `<sha256>.<extension>` with its record (`.json`: name, type, size, estimated tokens) and, for a
-  document, its extracted text (`.txt`); folders 0700, files 0600. A chat keeps at most 100
-  attached files and 200 MB. Deleting the chat deletes its folder; a fork or rewind backup gets
-  its own copies (hard links where possible). The folder is never exported.
+  document, its extracted text (`.extracted.txt`, so a `.txt` file stays as it was); folders 0700,
+  files 0600. A chat keeps at most 100 attached files and 200 MB. Deleting the chat deletes its
+  folder; a fork or rewind backup gets its own copies (hard links where possible). The folder is
+  never exported, and an imported chat has no attached files: their chips keep the names.
 - `conversations/<conversation-id>.state.json`: the chat's "Allow for this chat" rules and
   the size and modification time of the files the agent last read or wrote (paths only, no
   contents). It sits beside the JSONL file so earlier versions of the app can still open the
@@ -1922,7 +1929,8 @@ A message you send while the agent works (**steering**) is part of the current t
 turn of its own: compaction never cuts there, keeps it verbatim after the summary together
 with the turn's request, and never summarizes the tool results the model has not answered
 yet. A queued message that would not fit the context budget together with the latest tool
-results waits (not paused) for a later step boundary, with one notice per turn. If no
+results, or would take the request over the 4 MB limit (attached images count in full, see
+**Images**), waits (not paused) for a later step boundary, with one notice per turn. If no
 boundary has room for it before the reply completes, it is sent as the next turn; after
 Stop, an error or the step limit it waits like any queued message (see **Messages while the
 agent works**).

@@ -1364,6 +1364,8 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
     # happens when the estimator undercounts bytes, so the check usually costs nothing.
     # It takes the unscaled estimate: an anchored one can be lower and is no bound on the bytes.
     over_bytes = request_bytes_over(messages, tools, raw, request_limits.PAYLOAD_TARGET_BYTES)
+    # A compaction only the bytes call for (images count in full but in few tokens) says so in its notice.
+    before_bytes = request_size(messages, tools) if over_bytes and not force_compact and estimate <= threshold else None
 
     if force_compact or estimate > threshold or over_bytes:
         if force_compact and not has_earlier_turn(wire, state):
@@ -1597,6 +1599,7 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
             "number": updated["compactions"],
             "trigger": "manual" if force_compact else "in_turn" if in_turn else "auto",
             "before_tokens": before, "after_tokens": estimate, "threshold_tokens": threshold,
+            **({"before_bytes": before_bytes} if before_bytes else {}),
             "summarized_messages": cut - state["through"],
             "requests": requests["summarize"] + requests["condense"],
             "summarize_requests": requests["summarize"], "condense_requests": requests["condense"],
@@ -1722,15 +1725,32 @@ def in_turn_tokens(wire, state, system_message, tools, input_budget, scale=1.0, 
     it), the handoff pointer with room for one more file, the turn's request and steered
     messages, and everything from that response on. Results of that response admitted
     within input_budget minus this therefore never make in-turn compaction fail."""
+    return scaled_estimate(_in_turn_messages(wire, state, system_message, input_budget, record), tools, scale)
+
+
+def _in_turn_messages(wire, state, system_message, input_budget, record):
+    """The request in_turn_tokens measures (the whole one before the turn's first model response)."""
     state = state or {}
     index = next((position for position in range(len(wire) - 1, -1, -1)
                   if wire[position].get("role") == "assistant"), None)
     if index is None:
-        return scaled_estimate([system_message, *context_messages(wire, state)], tools, scale)
+        return [system_message, *context_messages(wire, state)]
     pointer = handoff_pointer([*(state.get("handoff_files") or []), {"path": "x" * 128, "compaction": 999}])
     placeholder = {"role": "user", "content": SUMMARY_PREFIX + "x" * summary_byte_limit(input_budget)
                    + "x" * (app_record_limit(input_budget) if record else 0) + pointer}
-    return scaled_estimate([system_message, placeholder, *retained_request(wire, index), *wire[index:]], tools, scale)
+    return [system_message, placeholder, *retained_request(wire, index), *wire[index:]]
+
+
+def in_turn_bytes_fit(wire, state, system_message, tools, input_budget, *, record=True):
+    """Whether the next request stays under the app's byte target (request_limits), attached images included:
+    as it is, or after the in-turn cut in_turn_tokens measures, which compaction makes when it is over. A
+    message steered into a turn whose request carries large images can pass it with few tokens."""
+    for messages in ([system_message, *context_messages(wire, state or {})],
+                     _in_turn_messages(wire, state, system_message, input_budget, record)):
+        if not request_bytes_over(messages, tools, estimate_tokens(messages, tools),
+                                  request_limits.PAYLOAD_TARGET_BYTES):
+            return True
+    return False
 
 
 def next_request_estimate(wire, state, system, tools, scale, anchor=None):

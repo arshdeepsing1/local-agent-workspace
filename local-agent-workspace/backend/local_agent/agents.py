@@ -99,7 +99,7 @@ from . import request_limits
 from .request_limits import STREAM_READ_TIMEOUT, PayloadTooLarge, check_payload, encode_payload
 from .rate_limits import (ITPM, OTPM, CompactionOverOtpm, RATE_LIMIT_WAIT_CAP, RateLimitGate, describe, otpm_too_low,
                           parse_rate_limit, request_info_fields)
-from .context import in_turn_tokens
+from .context import in_turn_bytes_fit, in_turn_tokens
 from .model_profiles import CONCURRENT_REQUESTS
 from .result_budget import (ALLOWANCE_MARGIN_TOKENS, FULL_RESULT_TOOLS, MCP_SHORTENED_HINT, TOOL_RESULT_HARD_LIMIT,
                             ResultAllowance, bound_result, cap_text, deferred_text, shorten_result, shortened_hint)
@@ -879,6 +879,9 @@ class AgentManager(LifecycleHooks):
         # In memory only: endpoints that rejected signed reasoning sent back (Settings → Reasoning → Send earlier
         # thinking back) with HTTP 400; until a restart or a Settings save.
         self.replay_rejections = set()
+        # In memory only: endpoints that answered image parts (uploads.expand_images) with an HTTP 400 naming
+        # them; their requests carry notes instead until a restart or a Settings save.
+        self.vision_rejections = set()
         # Endpoint check results (Settings → Model and context → Check endpoint…), read by cache_level and
         # replay_model; endpoint_checks_api registers the runner.
         self.endpoint_checks = CheckStore(settings.state_dir)
@@ -2281,8 +2284,9 @@ class AgentManager(LifecycleHooks):
 
     def supports(self, model, flag):
         """model_profiles.supports for this endpoint, unless an endpoint check showed it rejects the capability
-        (an image part refused: vision is off). A check never turns a capability on."""
-        if not model_profiles_supports(model, flag):
+        (an image part refused: vision is off), or images were rejected with an HTTP 400 since the last restart
+        or Settings save. A check never turns a capability on."""
+        if not model_profiles_supports(model, flag) or (flag == "vision" and model in self.vision_rejections):
             return False
         return flag not in ("vision", "structured_output") or not self.endpoint_checks.refused(model, flag)
 
@@ -2554,8 +2558,9 @@ class AgentManager(LifecycleHooks):
                 notified.add((session["id"], turn))
                 await self.event(session, "notice", text=(
                     "Your queued message waits for a later step: together with the latest tool results it would not "
-                    "fit in the context budget. If the reply completes first, it is sent as the next message; after "
-                    "Stop, an error or the step limit it stays queued until you click Send queued messages."))
+                    "fit in the context budget or the 4 MB request limit. If the reply completes first, it is sent as "
+                    "the next message; after Stop, an error or the step limit it stays queued until you click Send "
+                    "queued messages."))
             await self.publish_queue(session)
             return True
         message = STEER_PREFIX + content
@@ -4507,20 +4512,27 @@ class AgentManager(LifecycleHooks):
                       f"{'was' if compaction['summarized_messages'] == 1 else 'were'} summarized in "
                       f"{plural(compaction.get('summarize_requests', compaction['requests'] - condensed), 'request')}"
                       + (f", plus {plural(condensed, 'condensing request')}" if condensed else ""))
-        over = (f"about {compaction['before_tokens']:,} estimated input tokens, over the "
-                f"{info.get('auto_compact_percent', 100)}% auto-compact threshold of {compaction['threshold_tokens']:,}")
+        needed = (f"needed about {compaction['before_tokens']:,} estimated input tokens, over the "
+                  f"{info.get('auto_compact_percent', 100)}% auto-compact threshold of "
+                  f"{compaction['threshold_tokens']:,}")
+        size = compaction.get("before_bytes")
+        if type(size) is int:  # Compacted for the 4 MB request limit, within the token threshold.
+            needed = (f"would be {size / 1_000_000:.1f} MB, over the app's "
+                      f"{request_limits.PAYLOAD_TARGET_BYTES / 1_000_000:.1f} MB target for the 4 MB request limit "
+                      "(attached images count in full)")
         if compaction["trigger"] == "manual":
             text = (f"Context compacted (compaction {n}): {summarized}; about {after:,} estimated input tokens "
                     "remain. The full conversation history is preserved.")
         elif compaction["trigger"] == "in_turn":
-            grew = ("outgrew the context budget" if compaction["before_tokens"] > info["input_budget"]
+            grew = ("made it too large for the 4 MB request limit" if type(size) is int
+                    else "outgrew the context budget" if compaction["before_tokens"] > info["input_budget"]
                     else "passed the auto-compact threshold")
             text = (f"This request's tool results {grew}, so its earlier results were summarized "
                     "and it continues. The request and its latest results are kept as they are; the full history is "
-                    f"preserved. Compaction {n}: the request needed {over}; {summarized}, and it now needs about "
+                    f"preserved. Compaction {n}: the request {needed}; {summarized}, and it now needs about "
                     f"{after:,}.")
         else:
-            text = (f"Context compacted automatically (compaction {n}): the next request needed {over}. "
+            text = (f"Context compacted automatically (compaction {n}): the next request {needed}. "
                     f"{summarized[0].upper() + summarized[1:]}; the request now needs about {after:,}. The app keeps "
                     "your earlier requests (long ones shortened), the task checklist and the files touched next to "
                     "the summary. The full history is preserved.")
@@ -4743,6 +4755,7 @@ class AgentManager(LifecycleHooks):
                             error.reasoning_rejected = reasoning.rejected_field(error_text, effort)
                         error.cache_named = prompt_cache.rejected(error_text)  # The notice's wording only.
                         error.replay_named = bool(replayed) and reasoning_replay.rejected(error_text)
+                        error.images_named = attached.images_rejected(error_text)
                     raise error
                 async for data in sse_data(response):
                     if data == "[DONE]":
@@ -5482,6 +5495,20 @@ class AgentManager(LifecycleHooks):
                         except InferenceError as exc:
                             if fallback is not None:
                                 raise  # One fallback attempt: its own failure ends the request.
+                            if (exc.http_status == 400 and getattr(exc, "images_named", False)
+                                    and attached.IMAGE_PART in body):
+                                # The endpoint does not take the image parts after all: its requests carry notes
+                                # instead (cache_body reads supports), so later messages of the chat still work.
+                                self.vision_rejections.add(session["model"])
+                                body, cache_sent = self.cache_body(session, payload, prefix, cache_sent, note_chars)
+                                retry_reason = "images_rejected"
+                                await self.event(session, "notice", text=(
+                                    f"Databricks rejected the images sent to {session['model']} (HTTP 400), so the "
+                                    "app sent the request again with a note in place of each image. Requests to this "
+                                    "endpoint send no images until the app restarts or Settings are saved; "
+                                    "Settings → Model and context → Check endpoint capabilities records whether it "
+                                    "takes them."))
+                                continue
                             if replayed and exc.http_status == 400:
                                 # Signed reasoning sent back may be what Databricks rejected: send the request once
                                 # more without it, before the other fallbacks. A 400 that names it is remembered
@@ -5697,7 +5724,8 @@ class AgentManager(LifecycleHooks):
                 if step_index + 1 < steps and not spending.reached(self, session):
                     await self.drain_queue(session, wire, tools, fits=lambda message: in_turn_tokens(
                         [*model_history(wire), message], context_state, system, definitions, input_budget,
-                        scale) <= input_budget)
+                        scale) <= input_budget and in_turn_bytes_fit(
+                        [*model_history(wire), message], context_state, system, definitions, input_budget))
             if steps > 0:
                 await self.refresh_next_estimate(session, system, definitions, wire, context_state)
         await self.event(session, "error" if session.get("is_subagent") else "notice",

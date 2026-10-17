@@ -291,7 +291,8 @@
 // Compaction: { number, trigger: 'manual'|'in_turn'|'auto', before_tokens, after_tokens, threshold_tokens,
 //   summarized_messages, requests (summary and condense requests), summarize_requests?, condense_requests? (the
 //   two apart; absent on older compactions), elided_bytes, superseded_results, cleared_results?, cleared_bytes? (tool
-//   results of older turns the summary requests left out, and the bytes saved; only when there were any) }
+//   results of older turns the summary requests left out, and the bytes saved; only when there were any),
+//   before_bytes? (the request's size when only the 4 MB request limit called for the compaction) }
 // LastRequest (what Databricks reported for the latest agent request): { call_id, model, status, finish_reason?,
 //   partial (ended without a finish reason: counts may be incomplete), input_tokens (= uncached + cache read +
 //   cache write), uncached_input_tokens, cache_read_input_tokens, cache_creation_input_tokens, output_tokens?,
@@ -306,7 +307,8 @@
 // Metrics (GET /sessions/<id>/metrics): { scope, session_id, complete, totals, calls, by_purpose, by_model,
 //   pricing, last_input: LastRequest | null }. A call has effort?, effort_field? and reasoning_skipped? like
 //   RequestInfo.reasoning; retry_reason 'reasoning_rejected' marks the resend without reasoning fields, and
-//   'cache_rejected' the resend with fewer cache markers, 'fallback' a request to Settings → Fallback endpoint
+//   'cache_rejected' the resend with fewer cache markers, 'images_rejected' the resend with notes in place of
+//   attached images, 'fallback' a request to Settings → Fallback endpoint
 //   (its fallback_from names the chat's endpoint). Agent calls also have prompt_cache? ('full'|'messages'|'off':
 //   the cache markers sent, on Claude endpoints), system_tail_changed? (true), usage_keys? (the raw usage key names),
 //   reasoning_shape? and reasoning_signature? (true).

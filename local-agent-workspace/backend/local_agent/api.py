@@ -419,10 +419,12 @@ def create_app(settings=None):
                              "you use (the Settings model, Settings → Subagents or one of your chats). Requests carry "
                              "the conversation, so the app sends them only to endpoints you already chose.")
         result = settings.update(body.model_dump(exclude_none=True))
-        # A request format Databricks rejected, and cache markers it rejected, are tried again after any Settings save.
+        # A request format Databricks rejected, and cache markers and images it rejected, are tried again after any
+        # Settings save.
         manager.reasoning_rejections.clear()
         manager.cache_levels.clear()
         manager.replay_rejections.clear()
+        manager.vision_rejections.clear()
         # Open chats' meters follow the new budgets and threshold; others follow when opened (stream).
         for session_id in [key for key, sockets in manager.listeners.items() if sockets]:
             try:

@@ -16,7 +16,7 @@ from pathlib import Path
 
 from . import uploads as attached
 from .activity import redact_secrets
-from .documents import format_label
+from .documents import BINARY_FORMATS, document_format, format_label
 from .model_profiles import profile_for
 from .tool_profiles import tool_allowed
 from .tools import IGNORED, MAX_PAGE_BYTES, file_error
@@ -44,6 +44,8 @@ TOO_LONG = "Attached files exceed 32,000 characters; attach smaller line ranges.
 ACCESS_HINT = " Use Folder access above the message box first."
 READ_DENIED = "reading this file is not allowed in this chat."
 READ_ASKS = "reading this file needs approval; ask the agent to read it instead."
+DOCUMENT_MENTION = ("@ attaches text files. Attach this document with Attach files (the paperclip below the message "
+                    "box), or ask the agent to read it: read_file reads its text.")
 
 
 MIN_DOCUMENT_CHARS = 1_000  # Less room than this in a message's document allowance refuses the next document.
@@ -126,6 +128,9 @@ def _snapshot(manager, session, tools, mention):
         raise MentionError(token, file_error(exc)) from None
     if (refusal := read_check(manager, session, tools, path)) is not None:
         raise MentionError(token, refusal)
+    if document_format(target.name) in BINARY_FORMATS:
+        # Extracting its text can take a while, and this runs on the event loop: an upload reads it in a thread.
+        raise MentionError(token, DOCUMENT_MENTION)
     first = mention["start"] or 1
     want = mention["end"] - first + 1 if mention["start"] else WHOLE_FILE_LINES
     seen = _fingerprint(target)  # Before the read: a change during it then counts as unseen.

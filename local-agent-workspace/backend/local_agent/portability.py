@@ -694,6 +694,12 @@ def fresh_copies(bundle, workspace, *, kind="import"):
             source["wire"] = [attached.images_as_notes(message, attached.NOT_EXPORTED) for message in source["wire"]]
         for event in source["events"]:
             event["id"] = events[old_id][event["id"]]
+            if kind != "fork" and isinstance(event.get("attachments"), list):
+                # Nor are attached files imported: their chips keep the names, and Retry response and Edit
+                # message send the message without them (a document's text stays in the message sent then).
+                event["attachments"] = [{key: value for key, value in item.items() if key != "upload"}
+                                        if isinstance(item, dict) and item.get("kind") in ("document", "image")
+                                        else item for item in event["attachments"]]
             child = event.pop("child_session_id", None)
             if child in ids:
                 event["child_session_id"] = ids[child]

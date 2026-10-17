@@ -90,7 +90,7 @@ def test_files_the_app_does_not_take_are_refused_before_uploading(ui, page):
     choose(page, ("tool.exe", "application/octet-stream", b"MZ"))
     expect(page.get_by_role("alert")).to_contain_text("tool.exe cannot be attached: attach PDF, Word (.docx)")
     choose(page, ("big.png", "image/png", b"x" * 2_500_001))
-    expect(page.get_by_role("alert")).to_contain_text("big.png is 2.5 MB; images can be at most 2.5 MB. The app does not shrink images")
+    expect(page.get_by_role("alert")).to_contain_text("big.png is larger than 2.5 MB, the most an image can be. The app does not shrink images")
     assert ui.requests("/api/sessions/a/uploads", "POST") == []
     # A refusal from the server (a damaged document) leaves no chip.
     ui.run("""fake.override = (path, options) => path === '/api/sessions/a/uploads'
@@ -166,27 +166,54 @@ def test_a_sent_message_names_its_files_and_edit_and_retry_send_them_again(ui, p
     page.get_by_role("button", name="Edit message").click()
     expect(page.locator(".edit-message-files")).to_have_text(
         "Sent again with: report.pdf · 3 pages · shortened; shot.png · 640×480; paper.pdf · as a path")
+    # A file can stay behind (for example an image after a switch to an endpoint without image input).
+    page.get_by_role("button", name="Do not send shot.png again").click()
+    expect(page.locator(".edit-message-files")).to_have_text(
+        "Sent again with: report.pdf · 3 pages · shortened; paper.pdf · as a path")
     page.get_by_role("button", name="Send edited message").click()
     ui.wait("fake.requests('/api/sessions/a/rewind', 'POST').length === 2")
-    assert ui.bodies("/api/sessions/a/rewind", "POST")[1]["resend_uploads"] == uploads
+    assert ui.bodies("/api/sessions/a/rewind", "POST")[1]["resend_uploads"] == [uploads[0], uploads[2]]
+
+
+def test_an_imported_message_names_its_files_and_sends_none_again(ui, page):
+    """An imported chat has no attached files (their events keep the names, no upload ids)."""
+    imported = json.loads(json.dumps(SENT))
+    for item in imported[0]["attachments"]:
+        del item["upload"]
+    start(ui, page, events=imported)
+    message = page.locator(".user-message")
+    expect(message.get_by_role("list", name="Attachments").get_by_role("listitem")).to_have_count(3)
+    ui.run("""fake.override = (path, options) => path === '/api/sessions/a/rewind'
+      ? fake.json({ session: fake.sessions.get('a'), backup_session_id: 'b', files: [], resent: true }) : undefined""")
+    page.get_by_role("button", name="Retry response").click()
+    ui.wait("fake.requests('/api/sessions/a/rewind', 'POST').length === 1")
+    assert "resend_uploads" not in ui.bodies("/api/sessions/a/rewind", "POST")[0]
+    message.hover()
+    page.get_by_role("button", name="Edit message").click()
+    expect(page.get_by_role("textbox", name="Edit message")).to_be_visible()
+    expect(page.locator(".edit-message-files")).to_have_count(0)
 
 
 def test_editing_a_queued_message_brings_its_files_back(ui, page):
     queued = [{"id": "q1", "text": "Then read this", "created": 1, "paused": True,
-               "uploads": [{"id": "5".zfill(64), "name": "spec.docx", "kind": "document"}]}]
+               "uploads": [{"id": "5".zfill(64), "name": "spec.docx", "kind": "document"},
+                           {"id": "6".zfill(64), "name": "shot.png", "kind": "image"}]}]
     setup = FILES + f"\nfake.sessions.set('a', {{ ...makeSession('a', 'Files'), queued_messages: {json.dumps(queued)} }})"
     ui.app(session="a", scenario="workspace", setup=setup)
     ui.show_session("a")
     ui.run("""fake.override = (path, options) => path === '/api/sessions/a/queue/q1' && options.method === 'DELETE'
       ? fake.json({ queued_messages: [] }) : path.includes('mention-files?') ? fake.json([]) : undefined""")
     bar = page.get_by_role("group", name="Queued messages")
-    expect(bar.locator(".queue-tag")).to_have_text("spec.docx")
+    expect(bar.locator(".queue-tag")).to_have_text(["spec.docx", "shot.png"])
     bar.get_by_role("button", name="Edit queued message: Then read this").click()
     expect(page.get_by_role("textbox", name="Message")).to_have_value("Then read this")
-    expect(chips(page)).to_contain_text("spec.docx")
+    expect(chips(page)).to_have_count(2)
+    expect(chips(page).nth(0)).to_contain_text("spec.docx")
+    # Only its name and kind come back: no pixel size to show.
+    expect(chips(page).nth(1).locator(".upload-detail")).to_have_text("Image")
     page.get_by_role("button", name="Send message").click()
     ui.wait("fake.requests('/api/sessions/a/messages', 'POST').length === 1")
-    assert ui.bodies("/api/sessions/a/messages", "POST")[0]["uploads"] == [{"id": "5".zfill(64)}]
+    assert ui.bodies("/api/sessions/a/messages", "POST")[0]["uploads"] == [{"id": "5".zfill(64)}, {"id": "6".zfill(64)}]
 
 
 def test_long_file_names_fit_a_phone(coarse_ui, coarse_page):

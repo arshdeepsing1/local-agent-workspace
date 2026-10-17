@@ -17,10 +17,6 @@ export const ACCEPT = [...Object.keys(DOCUMENTS).map(extension => `.${extension}
 const extension = name => (/\.([^./\\]+)$/.exec(name || '')?.[1] || '').toLowerCase()
 const plural = (count, unit) => `${count.toLocaleString('en-US')} ${unit}${count === 1 ? '' : 's'}`
 
-export function sizeText(bytes) {
-  return bytes >= 100_000 ? `${(bytes / 1e6).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1000)).toLocaleString('en-US')} KB`
-}
-
 // 'image', 'document' or null (a type the app does not take), from the file's type or name.
 export function fileKind(file) {
   if (IMAGES[file.type] || IMAGE_EXTENSIONS[extension(file.name)]) return 'image'
@@ -32,9 +28,9 @@ export function fileProblem(file) {
   const kind = fileKind(file)
   if (!kind) return `${file.name || 'This file'} cannot be attached: attach PDF, Word (.docx), Excel (.xlsx), PowerPoint (.pptx), CSV, TSV, text or Markdown files, or PNG, JPEG, GIF or WebP images.`
   if (!file.size) return `${file.name} is empty.`
-  if (file.size > MAX_UPLOAD_BYTES) return `${file.name} is ${sizeText(file.size)}; attached files can be at most 20 MB.`
+  if (file.size > MAX_UPLOAD_BYTES) return `${file.name} is larger than 20 MB, the most a file attached to a message can be.`
   if (kind === 'image' && file.size > MAX_IMAGE_BYTES) {
-    return `${file.name} is ${sizeText(file.size)}; images can be at most 2.5 MB. The app does not shrink images: attach a smaller copy (for example a JPEG or a cropped screenshot).`
+    return `${file.name} is larger than 2.5 MB, the most an image can be. The app does not shrink images: attach a smaller copy (for example a JPEG or a cropped screenshot).`
   }
   return null
 }
@@ -43,7 +39,8 @@ export function fileProblem(file) {
 export function recordDetail(record) {
   if (!record) return ''
   const parts = [record.kind === 'image' ? IMAGES[record.media_type] || 'Image' : DOCUMENTS[record.format] || 'Document']
-  if (record.kind === 'image') parts.push(`${record.width}×${record.height}`)
+  // A queued message's files come back with their name and kind only.
+  if (record.kind === 'image') { if (Number.isInteger(record.width) && Number.isInteger(record.height)) parts.push(`${record.width}×${record.height}`) }
   else if (UNITS[record.units] && Number.isInteger(record.count)) parts.push(plural(record.count, UNITS[record.units]))
   if (record.unreadable) parts.push('text not read')
   else if (Number.isInteger(record.estimated_tokens)) parts.push(`~${record.estimated_tokens.toLocaleString('en-US')} tokens`)
