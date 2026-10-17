@@ -40,6 +40,8 @@ def run(page, text, busy=False):
     box.fill(text)
     if not busy:
         expect(page.get_by_role("combobox", name="Model")).to_be_enabled(timeout=10_000)
+    # A command typed alone keeps the / menu open, and Enter does nothing there until its list has arrived.
+    expect(page.get_by_text("Loading skills…")).to_have_count(0, timeout=10_000)
     box.press("Enter")
 
 
