@@ -319,7 +319,8 @@ def mode_item(page, label):
 
 BYPASS_TEXT = ("Switch this chat to Bypass permissions?\n\nEvery action will run without asking, including commands and edits "
                "outside the project, and any approval cards waiting now will be approved. Deny rules, ask rules, "
-               "credential exclusions and approvals a hook asks for still apply.")
+               "credential exclusions, cards for commands that name credential files and approvals a hook asks for "
+               "still apply.")
 
 
 def test_bypass_needs_confirmation_and_sends_confirm(ui, page):
@@ -388,8 +389,9 @@ def test_dont_ask_is_listed_and_selectable(ui, page):
 
 
 def test_never_asks_lists_read_only_commands_in_auto_and_plan(ui, page):
-    read_only = ("A fixed list of read-only command forms, such as pwd, ls -la, git status, git diff --stat, "
-                 "git log --oneline and git show; other arguments still ask")
+    read_only = ("Read-only commands: pwd, ls and read-only git, and commands or pipelines of read-only programs the "
+                 "app checks (cat, head, grep, rg, find, sed -n, wc …) on paths in approved folders; anything else still "
+                 "asks")
     menu = open_menu(ui, page)
     menu.locator(".never-asks>summary").click()
     for text in ("Reading, listing and searching files in the project and granted folders", "Listing jobs and reading their output",
@@ -544,7 +546,7 @@ def test_badges_stay_small_so_long_rules_are_not_cut_off(ui, page):
 def test_rule_labels(ui):
     ui.start()
     labels = ui.js("""import('/static/js/components/PermissionsMenu.js').then(({ ruleLabel }) => [
-      { tool: 'run_command', command: 'make  test' },
+      { tool: 'run_command', command: 'make  test' }, { tool: 'run_command', command: 'make', cwd: '/srv/other' },
       { behavior: 'allow', tool: 'run_command', argv: ['git', 'commit', '-m', "it's"] },
       { behavior: 'allow', tool: 'run_command', prefix: ['git', 'status'], flags: ['-s', '--short'] },
       { behavior: 'allow', tool: 'run_command', prefix: ['git', 'status'], flags: [] },
@@ -556,7 +558,7 @@ def test_rule_labels(ui):
       { behavior: 'deny', tool: 'write_file' },
     ].map(ruleLabel))""")
     assert labels == [
-        "Command: make  test", "Command: git commit -m 'it'\\''s'",
+        "Command: make  test", "Command: make in /srv/other", "Command: git commit -m 'it'\\''s'",
         "Commands starting with git status with options -s --short", "Commands starting with git status with no other arguments",
         "Commands starting with rm -rf (any options)", "Every command", "File edits", "File edits under /srv/x",
         "All tools of MCP server docs", "Tool: mcp__docs__search", "Hook: check", "Subagents", "Stopping jobs", "Tool: write_file",
@@ -656,6 +658,37 @@ def test_edit_and_tool_rules(ui, page):
     ]
 
 
+def test_web_fetch_rules_name_a_domain(ui, page):
+    dialog = open_dialog(ui, page)
+    dialog.get_by_role("combobox", name="Applies to").select_option(label="Web fetches")
+    domain = dialog.get_by_role("textbox", name="Domain")
+    expect(dialog.get_by_text("Allow names one host exactly; other hosts, also its subdomains, still ask.")).to_be_visible()
+    expect(dialog.get_by_role("button", name="Add rule")).to_be_disabled()
+    domain.fill(" docs.python.org ")
+    dialog.get_by_role("button", name="Add rule").click()
+    expect(dialog).to_have_count(0)
+    page.get_by_role("button", name=MENU).click()
+    page.get_by_role("menuitem", name="Add a rule…").click()
+    dialog.get_by_role("combobox", name="Behavior").select_option(label="Deny")
+    dialog.get_by_role("combobox", name="Applies to").select_option(label="Web fetches")
+    expect(dialog.get_by_text("Deny and Always ask cover the domain and its subdomains; leave it empty for every web fetch.")).to_be_visible()
+    dialog.get_by_role("button", name="Add rule").click()
+    expect(dialog).to_have_count(0)
+    assert ui.bodies("/api/permission-rules", "POST") == [
+        {"scope": "project", "session_id": "a", "rule": {"tool": "web_fetch", "behavior": "allow", "domain": "docs.python.org"}},
+        {"scope": "project", "session_id": "a", "rule": {"tool": "web_fetch", "behavior": "deny"}},
+    ]
+
+
+def test_web_rules_have_plain_labels_in_the_menu(ui, page):
+    menu = open_menu(ui, page, setup="""fake.userRules = [{ behavior: 'allow', tool: 'web_fetch', domain: 'docs.python.org' },
+      { behavior: 'deny', tool: 'web_fetch', domain: 'example.com' }, { behavior: 'allow', tool: 'web_search' }]""")
+    user = menu.get_by_role("group", name="All projects", exact=True)
+    expect(user.get_by_role("menuitem", name="Remove rule: Fetches from docs.python.org", exact=True)).to_be_visible()
+    expect(user.get_by_role("menuitem", name="Remove rule: Fetches from example.com and its subdomains")).to_be_visible()
+    expect(user.get_by_role("menuitem", name="Remove rule: Web searches")).to_be_visible()
+
+
 def test_cancel_and_escape_close_the_dialog(ui, page):
     dialog = open_dialog(ui, page)
     dialog.get_by_role("button", name="Cancel").click()
@@ -712,7 +745,8 @@ def open_tools(ui, page, selected="session()"):
 def test_the_tools_tab_loads_toggles_and_saves(ui, page):
     tools = open_tools(ui, page)
     tabs = page.get_by_role("navigation", name="Agent tools sections").get_by_role("button").all_inner_texts()
-    assert tabs == ["Overview", "Tasks", "Subagents", "Tools", "Usage", "Export", "Checkpoints", "Verify", "Worktrees", "Extensions"]
+    assert tabs == ["Overview", "Tasks", "Subagents", "Tools", "Usage", "Export", "Checkpoints", "Verify", "Memory", "Worktrees",
+                    "Extensions", "Schedules"]
     expect(tools).to_contain_text("Turned-off tools are not offered to the agent in this chat, and calls to them are refused. "
                                   "Changes apply from the agent's next step. Subagents, forks and imports keep this setting.")
     # Each checkbox is named by its tool alone; the description describes it.

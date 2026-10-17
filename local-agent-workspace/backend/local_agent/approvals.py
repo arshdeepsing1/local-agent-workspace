@@ -22,9 +22,10 @@ EDIT_RULE_TOOLS = ("write_file", "edit_file", "insert_activity_log", "move_path"
 def rule_for(name, arguments):
     """The rule that "Allow for this chat" stores for an action, or None when it cannot be remembered.
 
-    Commands match by their exact text (only surrounding whitespace is removed),
-    MCP tools by their exact name, and hooks by their exact ID. Folder access and
-    every other card has no rule.
+    Commands match by their exact text (only surrounding whitespace is removed; the
+    caller adds the folder of a command run with cwd outside the project), MCP tools
+    by their exact name, hooks by their exact ID, and web fetches by their host
+    (web_fetch.domain_of). Folder access and every other card has no rule.
     """
     name = name if isinstance(name, str) else ""
     arguments = arguments if isinstance(arguments, dict) else {}
@@ -38,8 +39,12 @@ def rule_for(name, arguments):
     if name.startswith("hook_"):
         hook = arguments.get("hook_id")
         return {"tool": "hook", "hook": hook} if isinstance(hook, str) and hook else None
-    if name in ("delegate_task", "stop_job"):
+    if name in ("delegate_task", "stop_job", "remember", "web_search"):
         return {"tool": name}
+    if name == "web_fetch":
+        from .web_fetch import domain_of
+        domain = domain_of(arguments.get("url"))
+        return {"tool": "web_fetch", "domain": domain} if domain else None
     return None
 
 
@@ -67,6 +72,8 @@ class AllowRule(BaseModel):
     prefix: list[str] | None = Field(default=None, max_length=16)
     flags: list[str] | None = Field(default=None, max_length=64)
     path: str | None = Field(default=None, max_length=4096, strict=True)
+    cwd: str | None = Field(default=None, max_length=4096, strict=True)  # an exact-text chat rule's folder
+    domain: str | None = Field(default=None, max_length=253, strict=True)
 
 
 class RuleChange(BaseModel):
@@ -96,6 +103,7 @@ class DisabledTools(BaseModel):
 MAX_RULE_JSON = 8 * 1024
 MAX_EDIT_JSON = 600 * 1024
 MCP_TOOL = re.compile(r"^mcp__[A-Za-z0-9_-]{1,64}__[A-Za-z0-9_.-]{1,128}$")
+MCP_SERVER_SWITCH = re.compile(r"^mcp__[a-z][a-z0-9_-]{0,19}__\*$")  # turns a whole server off in a chat
 
 
 # Why a conversation is not idle, and what the user can do about it.
@@ -141,6 +149,19 @@ def ensure_idle(manager, session, action=None):
     status = busy_status(manager, session["id"])
     if status != "idle":
         raise busy_conflict(session, status, action)
+
+
+def ensure_no_background(manager, session, action):
+    """Rewind and fork read or replace a chat's history: not while its background subagents run (their
+    progress and reports still go to it). HTTP 409 names how many and what ends them."""
+    running = manager.delegates.background_running(session["id"])
+    if running:
+        count = "a background subagent" if running == 1 else f"{running} background subagents"
+        raise HTTPException(409, detail={
+            "message": f"“{clip_title(session.get('title'))}” has {count} running. Wait until "
+                       f"{'it ends' if running == 1 else 'they end'}, or stop {'it' if running == 1 else 'them'} "
+                       f"with Stop subagent on {'its card' if running == 1 else 'their cards'}, before {action}.",
+            "session_id": session["id"], "title": clip_title(session.get("title"), 160)})
 
 
 def workspace_idle(manager, store, root, action):
@@ -255,7 +276,7 @@ def register_approvals(app, manager, store, session_or_404):
         known = {*known_tool_names(), "ask_user", "submit_plan"}
         names = []
         for name in body.tools:
-            if not isinstance(name, str) or not (name in known or MCP_TOOL.match(name)):
+            if not isinstance(name, str) or not (name in known or MCP_TOOL.match(name) or MCP_SERVER_SWITCH.match(name)):
                 raise ValueError(f"Unknown tool: {str(name)[:80]}.")
             if name not in names:
                 names.append(name)
@@ -267,4 +288,7 @@ def register_approvals(app, manager, store, session_or_404):
         session = session_or_404(session_id) if session_id else None
         tools = [{"name": item["function"]["name"], "description": short_description(item["function"].get("description", ""))}
                  for item in [*TOOL_DEFINITIONS, *FEATURE_TOOLS]]
-        return {"tools": tools, "disabled": list((session or {}).get("disabled_tools", []))}
+        # The configured MCP servers: a chat can turn each off (mcp__<id>__*), so its process never starts.
+        servers = [{"id": item["id"], "name": manager.settings.redact(item["name"]), "enabled": item["enabled"]}
+                   for item in manager.extensions.public_config()["servers"]]
+        return {"tools": tools, "disabled": list((session or {}).get("disabled_tools", [])), "servers": servers}

@@ -54,7 +54,19 @@ export function attentionFor(before, session) {
   // Not finished: the chat offers Continue.
   if (session.terminal_reason === 'step_limit') return { state: 'step_limit', body: `Reached the step limit: ${title}` }
   if (session.terminal_reason === 'spending_limit') return { state: 'spending_limit', body: `Reached the spending limit: ${title}` }
+  if (session.terminal_reason === 'budget_limit') return { state: 'budget_limit', body: `Reached the turn budget: ${title}` }
+  if (session.terminal_reason === 'approval_expired') return { state: 'approval_expired', body: `Stopped at the approval limit: ${title}` }
   return { state: 'finished', body: `Finished: ${title}` }
+}
+
+// A background subagent (delegate_task background) that finished or failed while its chat is idle: { state, body }
+// for that chat, or null. Its chat's turn already reported its own end, and a running turn learns of it itself.
+// `before` is the subagent's last known { delegation } status.
+export function backgroundEnd(before, session, parent) {
+  const delegation = session.delegation
+  if (!session.is_subagent || delegation?.background !== true || before.delegation === delegation.status) return null
+  if (!['completed', 'failed'].includes(delegation.status) || !parent || parent.status !== 'idle') return null
+  return { state: 'background', body: `Background subagent ${delegation.status === 'completed' ? 'finished' : 'failed'}: ${shortTitle(parent.title)}` }
 }
 
 // Held open while this page is: the server's desktop notifications are only for
@@ -147,24 +159,35 @@ export function useAttention({ sessions, activeId, ready, onSelect }) {
   useEffect(() => {
     if (!ready) return
     const before = previous.current
-    previous.current = new Map(sessions.map(item => [item.id, { status: item.status, turn_ended: item.turn_ended }]))
+    previous.current = new Map(sessions.map(item => [item.id, { status: item.status, turn_ended: item.turn_ended,
+      delegation: item.delegation?.status }]))
     if (!before) return
     for (const id of shown.current.keys()) if (!previous.current.has(id)) dismiss(id)
     const { enabled, activeId, onSelect } = current.current
+    const allowed = enabled && notificationsSupported() && window.Notification.permission === 'granted'
+    const notify = (id, note) => {
+      try {
+        const notification = new window.Notification('Local', { body: note.body, tag: `${id}:${note.state}` })
+        notification.onclick = () => { window.focus(); onSelect(id); notification.close() }
+        shown.current.set(id, notification)
+      } catch { /* Some browsers allow notifications only from a service worker. */ }
+    }
     for (const item of sessions) {
       // A chat seen for the first time (created or imported elsewhere) has no finished turn to report.
-      const last = before.get(item.id) || { status: 'idle', turn_ended: item.turn_ended }
+      const last = before.get(item.id) || { status: 'idle', turn_ended: item.turn_ended, delegation: item.delegation?.status }
+      const parent = item.is_subagent ? sessions.find(other => other.id === item.parent_session_id) : null
+      const ended = backgroundEnd(last, item, parent)
+      if (ended && allowed && (document.hidden || parent.id !== activeId)) {
+        dismiss(parent.id)
+        notify(parent.id, ended)
+      }
       if (last.status === item.status && last.turn_ended === item.turn_ended) continue
       // The previous notification no longer applies (an approval was answered, a new turn began).
       dismiss(item.id)
       const note = attentionFor(last, item)
-      if (!note || !enabled || !notificationsSupported() || window.Notification.permission !== 'granted') continue
+      if (!note || !allowed) continue
       if (!document.hidden && item.id === activeId) continue
-      try {
-        const notification = new window.Notification('Local', { body: note.body, tag: `${item.id}:${note.state}` })
-        notification.onclick = () => { window.focus(); onSelect(item.id); notification.close() }
-        shown.current.set(item.id, notification)
-      } catch { /* Some browsers allow notifications only from a service worker. */ }
+      notify(item.id, note)
     }
   }, [ready, sessions])
 

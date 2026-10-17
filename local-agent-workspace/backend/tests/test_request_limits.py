@@ -160,8 +160,8 @@ async def test_a_byte_triggered_compaction_that_cannot_reach_the_target_still_sh
 
 
 async def test_the_byte_checks_add_no_serialization_of_their_own(monkeypatch):
-    """fits() and the trigger use the scaled estimate as the bound: every estimate_tokens call in a
-    compaction comes from a scaled_estimate."""
+    """fits() uses the scaled estimate as the bound and the trigger the raw estimate it scales: every other
+    estimate_tokens call in a compaction comes from a scaled_estimate."""
     from local_agent import context
     counts = {"estimate": 0, "scaled": 0}
     estimate, scaled = context.estimate_tokens, context.scaled_estimate
@@ -186,7 +186,7 @@ async def test_the_byte_checks_add_no_serialization_of_their_own(monkeypatch):
     messages, state, info = await prepare_context(wire, {}, {"role": "system", "content": "s"}, [], 32768, summarize,
                                                   reply_reserve=4096)
     assert info["compactions"] == 1 and info.get("compacted_in_turn")
-    assert counts["scaled"] > 3 and counts["estimate"] == counts["scaled"]
+    assert counts["scaled"] > 3 and counts["estimate"] == counts["scaled"] + 1  # The first estimate, taken raw.
 
 
 async def test_the_measured_body_is_sent_and_shown_before_the_request(runtime, monkeypatch):

@@ -1,5 +1,6 @@
 import { html, useEffect, useRef, useState } from '../lib.js'
 import { api, apiFile, apiJsonText } from '../api.js'
+import { copyLoaded } from '../commands.js'
 
 const MAX_BYTES = 16 * 1024 * 1024
 
@@ -11,19 +12,11 @@ function saveFile(text, name, type) {
   try { link.click() } finally { link.remove(); URL.revokeObjectURL(url) }
 }
 
-// Copy text that is still loading. Safari allows a clipboard write only during
-// the click, so the write starts at once and receives the text when it arrives.
-async function copyLoaded(load) {
-  if (window.ClipboardItem && navigator.clipboard?.write) {
-    const blob = load().then(text => new Blob([text], { type: 'text/plain' }))
-    await navigator.clipboard.write([new ClipboardItem({ 'text/plain': blob })])
-  } else await navigator.clipboard.writeText(await load())
-}
-
 export default function ConversationTransfer({ sessionId, workspace, busy = false, onSelectSession, onError }) {
   const [destination, setDestination] = useState(workspace)
   const [file, setFile] = useState(null)
   const [includeChildren, setIncludeChildren] = useState(false)
+  const [withReasoning, setWithReasoning] = useState(false)
   const [pending, setPending] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
@@ -67,7 +60,7 @@ export default function ConversationTransfer({ sessionId, workspace, busy = fals
     <p>Conversation files include messages, tool output, summaries, and reported usage, which may contain private data or pasted secrets. Review before sharing. Credential/settings files, file checkpoints, task-board records, and managed jobs are not copied.</p>
     <div class="agent-tools-actions">
       <button class="outline" disabled=${disabled || !sessionId} onClick=${() => void run(async () => {
-        const bundle = await api(`/sessions/${encodeURIComponent(sessionId)}/export?include_children=${includeChildren}`)
+        const bundle = await api(`/sessions/${encodeURIComponent(sessionId)}/export?include_children=${includeChildren}${withReasoning ? '&with_reasoning=true' : ''}`)
         if (!alive.current) return
         saveFile(JSON.stringify(bundle), `conversation-${sessionId}.json`, 'application/json')
         setNotice('Conversation file exported.')
@@ -78,6 +71,7 @@ export default function ConversationTransfer({ sessionId, workspace, busy = fals
       })}>Fork completed conversation</button>
     </div>
     <label class="agent-tools-task"><input type="checkbox" disabled=${disabled || !sessionId} checked=${includeChildren} onChange=${e => setIncludeChildren(e.currentTarget.checked)} />Include subagent conversations in export (up to 32 total)</label>
+    <label class="agent-tools-task"><input type="checkbox" disabled=${disabled || !sessionId} checked=${withReasoning} onChange=${e => setWithReasoning(e.currentTarget.checked)} />Export with reasoning (the latest turn's signed thinking, kept only while Send earlier thinking back is on)</label>
     <p class="field-help">Fork copies the full completed conversation into the same workspace. It does not copy child conversations or modify the source. Stop any active response before exporting or forking.</p>
     <form class="agent-tools-form" onSubmit=${e => { e.preventDefault(); void run(async () => {
       if (!file) throw new Error('Choose a conversation JSON file.')

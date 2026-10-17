@@ -220,3 +220,20 @@ def test_folders_with_a_shared_prefix_have_distinct_visible_names(ui, page):
     group.get_by_role("button", name=f"Remove {folders[3]} from Files").click()
     expect(group.get_by_role("button", name=f"Added to Files: {folders[2]}", exact=True)).to_be_focused()
     expect(group.locator(".file-roots-name")).to_have_text(["Project", "client-alpha-api", "app"])
+
+
+def test_the_changes_bar_and_tool_cards_name_files_by_their_folder(ui, page):
+    # F2/F3 in the whole app: the chat's allowed folder and the default code folder from Settings are the roots.
+    # Mutation: leave the default code folder out of App's roots.
+    event = {"id": "w", "type": "tool", "name": "write_file", "state": "completed", "input": {"path": "/srv/code/app/main.py"},
+             "output": ""}
+    start(ui, page, setup="fake.settings.coding_dir_status = { path: '/srv/code', state: 'ready', message: 'Ready.', source: 'settings' }\n"
+                          f"fake.sessions.set('a', {{ ...makeSession('a', 'Other conversation'), allowed_directories: ['/srv/notes'], "
+                          f"events: [{json.dumps(event)}] }})")
+    push(ui, "changedFile('/srv/notes/sub/todo.md')", "changedFile('/srv/code/app/main.py')", "changedFile('note.txt')")
+    page.get_by_role("region", name="Changed files").get_by_role("button", name=re.compile("^3 files changed")).click()
+    expect(page.locator(".changes-file .changes-dir")).to_have_text(["notes/sub", "code/app"])
+    expect(page.get_by_title("Review /srv/notes/sub/todo.md", exact=True)).to_be_visible()
+    subject = page.locator(".tool-card .tool-subject")
+    expect(subject).to_have_text("code/app/main.py")
+    expect(subject).to_have_attribute("title", "/srv/code/app/main.py")

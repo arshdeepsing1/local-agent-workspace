@@ -127,9 +127,10 @@ def _after_turn(event):
 def turn_end(events):
     """The terminal_reason the latest turn of these events ended with, or None when they do not show it.
 
-    The same reasons run() records: 'stopped' (the Stop notice), 'step_limit', 'spending_limit',
-    'interrupted' (a reply a restart cut short), 'inference_error' or 'error', else 'completed' (or
-    'tool_error' when a tool failed) when the turn's last reply completed."""
+    The same reasons run() records: 'stopped' (the Stop notice), 'step_limit', 'spending_limit', 'budget_limit',
+    'approval_expired' (a scheduled run's approval limit), 'interrupted' (a reply a restart cut short),
+    'inference_error' or 'error', else 'completed' (or 'tool_error' when a tool failed) when the turn's last reply
+    completed."""
     start = next((index for index in range(len(events) - 1, -1, -1) if events[index].get("type") == "user"), None)
     if start is None:
         return None
@@ -137,7 +138,7 @@ def turn_end(events):
     for event in reversed(turn):
         if event.get("type") == "notice" and event.get("stop_phase"):
             return "stopped"
-        if event.get("terminal_reason") in ("step_limit", "spending_limit"):
+        if event.get("terminal_reason") in ("step_limit", "spending_limit", "budget_limit", "approval_expired"):
             return event["terminal_reason"]
         info = event.get("request_info") or {}
         if (info.get("status"), info.get("error_kind")) == ("interrupted", "incomplete_response"):
@@ -185,6 +186,18 @@ def cut_session(session, before_event_id=None, *, keep_local=False):
         result["terminal_reason"] = reason
     else:
         result.pop("terminal_reason", None)
+    if event_cut < len(session["events"]):
+        # Scripts read the header's result record: the remaining last turn's (its last reply's footer), never a
+        # removed turn's.
+        reply = None
+        for event in reversed(result["events"]):
+            if event.get("type") == "user":
+                break
+            reply = reply or (event if event.get("type") == "assistant" else None)
+        if reply is not None and isinstance(reply.get("turn_result"), dict):
+            result["last_turn_result"] = reply["turn_result"]
+        else:
+            result.pop("last_turn_result", None)
     if keep_local and before_event_id is not None:
         restored = _carried_output(session, before_event_id)
         if restored:

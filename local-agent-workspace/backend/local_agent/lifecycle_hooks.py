@@ -16,24 +16,36 @@ Events (extensions.HOOK_EVENTS):
 - agent_stop / subagent_stop (stop_hooks): when a turn would end with a final reply; subagent_stop
   only for a subagent's delegated turn (a subagent chat the user continues is an ordinary chat).
 - subagent_start (subagent_start_hooks): before a subagent's first request.
-Subagent events run in the parent chat: its mode, rules and cards.
+- before_compaction (compaction_hook): once per compaction, before its first summary request; its
+  context joins the preservation note. It cannot block: a decision is ignored (listed on its card).
+- notification (notification_hooks): for each of the app's own notifications (notify.attention_message),
+  in the background, only when the hook may run without a card (Bypass or an allow rule), output ignored.
+Subagent events run in the parent chat: its mode, rules and cards. A tool event's stdin, and any event's
+of a subagent chat, names the agent it belongs to (hook_agent).
 """
 import asyncio
+import fnmatch
 import json
+import logging
 
 from .approvals import declined
 from .context import HOOK_CONTINUATION_PREFIX
 from .extensions import TOOL_HOOK_EVENTS
 from .permissions import Verdict
+from .planning import report_text, submitted_report
 from .result_budget import cap_text
-from .tool_profiles import covering_tool
+from .notify import short_title
+from .tool_profiles import COVERED_BY
 from .tool_schema import validate_arguments
+
+log = logging.getLogger("local_agent.hooks")
 
 # Consecutive continuations a stop hook may ask for in one turn.
 STOP_CAPS = {"agent_stop": 3, "subagent_stop": 2}
 WARNING_LABELS = {"after_tool": "After-tool hook", "tool_failure": "Failure-hook", "user_prompt": "User-prompt hook",
                   "session_start": "Session-start hook", "agent_stop": "Agent-stop hook",
-                  "subagent_start": "Subagent-start hook", "subagent_stop": "Subagent-stop hook"}
+                  "subagent_start": "Subagent-start hook", "subagent_stop": "Subagent-stop hook",
+                  "before_compaction": "Before-compaction hook", "notification": "Notification hook"}
 WARNING_TAILS = {
     "after_tool": "The tool action already completed.",
     "tool_failure": "The original tool error is unchanged.",
@@ -42,9 +54,15 @@ WARNING_TAILS = {
     "agent_stop": "This hook did not keep the agent working.",
     "subagent_start": "The subagent started without this hook's context.",
     "subagent_stop": "This hook did not change the subagent's report.",
+    "before_compaction": "The compaction ran without this hook's context.",
+    "notification": "",
 }
 HOOK_ASK_DONT_ASK = ("Not run: a before-tool hook ({hook}) asked for your approval, which Don't ask mode does not show. "
                      "Continue without it and tell the user which action needs their approval.")
+# A subagent's change to a file a running sibling changed (AgentManager._execute_tool, DelegateManager.sibling_claim).
+SIBLING_DONT_ASK = ("Not run: another subagent of this chat ({subagent}, {kind}) changed {path} during this run, and such "
+                    "a change needs an approval card, which Don't ask mode does not show. Leave the file to that "
+                    "subagent and say so in your report.")
 PAYLOAD_TEXT_BYTES = 48_000  # a prompt, reply or task in a hook's stdin (run_hook refuses more than 128 KB)
 NOTE_CHARS = 4_000  # all hook context added to one tool result or one message
 SHOWN_ARGUMENTS_BYTES = 16_000  # arguments a card keeps for its before/after view
@@ -99,6 +117,11 @@ def note_lines(notes, heading):
         lines.append(line)
         used += len(line)
     return f"\n\n[{heading}]\n" + "\n".join(lines)
+
+
+def selects(selectors, name):
+    """True when a hook's tools list selects name: an exact name or a glob pattern (* and ?, case-sensitive)."""
+    return isinstance(name, str) and any(fnmatch.fnmatchcase(name, selector) for selector in selectors)
 
 
 def hook_contexts(outcomes, event):
@@ -173,12 +196,13 @@ class LifecycleHooks:
                 continue
             cover = None
             if phase in TOOL_HOOK_EVENTS:
-                # A hook for read_file also runs for outline_file, and one for list_files or find_files for
-                # project_overview (COVERED_BY), as their rules and turned-off tools do.
+                # Names or glob patterns (selects). A hook for read_file also runs for outline_file, and one for
+                # list_files or find_files for project_overview (COVERED_BY), as their rules and turned-off tools do.
                 selected = hook.get("tools")
-                cover = None if selected is None or name in selected else covering_tool(name, selected)
-                if selected is not None and name not in selected and cover is None:
-                    continue
+                if selected is not None and not selects(selected, name):
+                    cover = next((tool for tool in COVERED_BY.get(name, ()) if selects(selected, tool)), None)
+                    if cover is None:
+                        continue
             found.append((hook, cover))
         return found
 
@@ -226,7 +250,12 @@ class LifecycleHooks:
                         allowed, _ = await self.request_approval(owner, hook_tools, event, f"hook_{phase}",
                                                                  {"hook_id": hook["id"]})
                     finally:
-                        if status != "running" and (owner is not session or not asyncio.current_task().cancelling()):
+                        # ended: the owner has no running turn, so this hook runs in a background subagent's task
+                        # (its turn may have ended during the wait, after approve() set it running).
+                        turn = self.tasks.get(owner["id"])
+                        ended = turn is None or turn.done()
+                        if (status != "running" or ended) and (owner is not session or ended
+                                                               or not asyncio.current_task().cancelling()):
                             await self.after_hook_card(owner, event, status)
                     if not allowed:
                         approval = event.get("approval")
@@ -240,13 +269,16 @@ class LifecycleHooks:
                     return outcomes
                 if tool_event:
                     stdin = {"event": phase, "session_id": session["id"], "tool": name, "arguments": arguments,
-                             "call_id": call_id, **({"covered_by": cover} if cover else {})}
+                             "call_id": call_id, **({"covered_by": cover} if cover else {}),
+                             "agent": self.hook_agent(session)}
                     if result is not None:
                         stdin["result"] = result
                     if phase == "tool_failure":
                         stdin.update(error=error, outcome="error")
                 else:
                     stdin = {"event": phase, **fields}
+                    if session.get("is_subagent"):
+                        stdin.setdefault("agent", self.hook_agent(session))
                 # The Python environment applies; variables named in Settings are not passed to hooks.
                 outcome = await self.extensions.run_hook(hook, stdin, owner["workspace"],
                                                          env=self.jobs.command_environment(named=False))
@@ -284,17 +316,40 @@ class LifecycleHooks:
     async def after_hook_card(self, owner, event, previous):
         """After a hook card in a chat that was not just running (a subagent's card in its delegating
         parent): approve() left it running, so put back its previous status, or awaiting_approval
-        while another of its cards waits. A card a stopped subagent left waiting shows cancelled."""
+        while another of its cards waits. A card a stopped subagent left waiting shows cancelled. A
+        parent whose turn is over (an idle parent of a background subagent, or its turn ended while the card
+        waited) becomes idle again, and stays running when the user started a turn there while the card
+        waited."""
         if event.get("state") == "pending":
             await self.update_event(owner, event, state="cancelled")
         task = self.tasks.get(owner["id"])
-        if previous is None or task is None or task.done() or task.cancelling():
-            return  # The owner's turn is over or stopping: its own end sets its status.
         waiting = any(key[0] == owner["id"] and not future.done() for key, future in self.pending.items())
+        if previous == "idle" or task is None or task.done():
+            if task is None or task.done():
+                status = "awaiting_approval" if waiting else "idle"
+            elif task.cancelling():
+                return  # The new turn is stopping: its own end sets the status.
+            else:
+                status = "awaiting_approval" if waiting else "running"
+            if self.statuses.get(owner["id"], "idle") != status:
+                await self.status(owner, status)
+            return
+        if previous is None or task.cancelling():
+            return  # The owner's turn is stopping: its own end sets its status.
         # Another card's own wait ended meanwhile: the chat was delegating under it.
         status = "awaiting_approval" if waiting else "delegating" if previous == "awaiting_approval" else previous
         if self.statuses.get(owner["id"]) != status:
             await self.status(owner, status)
+
+    @staticmethod
+    def hook_agent(session):
+        """The agent an event belongs to, in hook stdin: the chat itself, or a subagent with its type
+        (explore, general, editor or a custom agent's name), its parent chat and its custom agent file."""
+        subagent = bool(session.get("is_subagent"))
+        return {"session_id": session["id"], "is_subagent": subagent,
+                "agent_type": (session.get("agent_type") or "general") if subagent else None,
+                "parent_session_id": session.get("parent_session_id") if subagent else None,
+                "agent_file": session.get("agent_file") if subagent else None}
 
     @staticmethod
     def hook_summary(parsed, arguments=None, prompt=None):
@@ -311,17 +366,83 @@ class LifecycleHooks:
             summary["ignored"] = list(parsed["ignored"])
         return summary
 
+    # Compaction and notifications -------------------------------------------------------------
+
+    def compaction_hook(self, session, trigger, preservation_note, note):
+        """The before_compaction callback for prepare_context (trigger 'auto' or 'manual'), or None without such
+        hooks. prepare_context calls it once, when it compacts, before the first summary request (so before the
+        status turns compacting); it returns the preservation note those requests use: the user's note, then
+        each hook's context, labelled as the user's local hook. note is the dict whose "text" the summary
+        callbacks read (compaction_requests). A hook cannot stop a compaction (its output fields have no
+        decision, so a "block" is ignored and listed on its card)."""
+        if not self.has_hooks(session, "before_compaction"):
+            return None
+
+        async def before(info):
+            payload = {"session_id": session["id"], "trigger": trigger, "preservation_note": preservation_note,
+                       "estimated_input_tokens": info.get("estimated_input_tokens"), "threshold": info.get("threshold"),
+                       "input_budget": info.get("input_budget"), "workspace": session["workspace"],
+                       "model": session["model"], "permission_mode": session.get("permission_mode", "manual")}
+            outcomes = await self.run_hooks(session, "before_compaction", payload=payload)
+            notes = hook_contexts(outcomes, "before_compaction")
+            if notes:
+                added = note_lines(notes, "Context from the user's local before_compaction hooks (not the user's "
+                                          "words):").strip()
+                note["text"] = (preservation_note + "\n\n" if preservation_note else "") + added
+            return note["text"]
+        return before
+
+    def notification_hooks(self, session, status, message, page_open, schedule_id=None):
+        """Run the enabled notification hooks for one of the app's notifications (notify.attention_message) in
+        the background. A hook runs only when it may run without a card (Bypass, or an allow rule such as
+        Extensions' Run without asking): a card would itself notify. At most one run of a hook at a time (a
+        notification while it runs is dropped); its output is ignored except for a log line when it fails.
+        stdin: the status, the message, the short redacted title and whether a page is open; never chat text.
+        A scheduled run's notification (schedules.py) has no chat: session_id '' and its schedule_id."""
+        hooks = self.matching_hooks(session, "notification")
+        if not hooks:
+            return
+        running = self.__dict__.setdefault("_notification_runs", {})
+        tools = self.session_tools(session)
+        payload = {"event": "notification", "session_id": session["id"], "status": status, "message": message,
+                   "title": short_title(self.redact_title(str(session.get("title") or ""))), "page_open": page_open}
+        if schedule_id is not None:
+            payload["schedule_id"] = schedule_id
+        if session.get("is_subagent"):
+            payload["agent"] = self.hook_agent(session)
+        for hook, _ in hooks:
+            if self.permission(session, tools, "hook_notification", {"hook_id": hook["id"]}).decision != "allow":
+                continue  # Agent tools → Extensions says that it needs Run without asking.
+            if (task := running.get(hook["id"])) is not None and not task.done():
+                continue
+            running[hook["id"]] = asyncio.get_running_loop().create_task(
+                self.notification_hook(hook, payload, session["workspace"]))
+
+    async def notification_hook(self, hook, payload, workspace):
+        try:
+            outcome = await self.extensions.run_hook(hook, payload, workspace, env=self.jobs.command_environment(named=False))
+        except Exception as exc:  # noqa: BLE001 - a notification hook never affects a conversation.
+            log.warning("Notification hook %s could not run: %s", hook["id"], type(exc).__name__)
+            return
+        if outcome["exit_code"] != 0 or outcome.get("timed_out"):
+            log.warning("Notification hook %s failed (exit %s).", hook["id"], outcome["exit_code"])
+
     # Tool calls ------------------------------------------------------------------------------
 
     def hooked_permission(self, session, tools, name, arguments, forced=None):
-        """The tool's Verdict; forced (a before-tool hook's ask) turns an allow into a card, never the
-        other way. In Don't ask such a call is refused: that mode never shows a card."""
+        """The tool's Verdict; forced (a before-tool hook's ask, or {sibling}: a running sibling subagent
+        changed the file) turns an allow into a card, never the other way. In Don't ask such a call is
+        refused: that mode never shows a card."""
         verdict = self.permission(session, tools, name, arguments)
         if not forced or verdict.decision != "allow":
             return verdict
-        if session.get("permission_mode") == "dontAsk":
+        if "dontAsk" in (session.get("permission_mode"), self.mode_ceiling(session)):
+            if forced.get("sibling"):
+                shared = forced["sibling"]
+                return Verdict("deny", "dont_ask", SIBLING_DONT_ASK.format(
+                    subagent=str(shared["subagent_id"])[:8], kind=shared["agent_type"], path=shared["path"]))
             return Verdict("deny", "dont_ask", HOOK_ASK_DONT_ASK.format(hook=forced["hook_id"]))
-        return Verdict("ask", "hook", protected=verdict.protected)
+        return Verdict("ask", "sibling" if forced.get("sibling") else "hook", protected=verdict.protected)
 
     async def before_tool_hooks(self, session, name, arguments, definition, call_id, *, fixed=False):
         """Run one call's before-tool hooks. Returns {arguments, forced, contexts, refusal, changed_by}.
@@ -477,14 +598,18 @@ class LifecycleHooks:
         no delegation to report to: its turns are the user's own and run agent_stop in that chat."""
         subagent = bool(session.get("is_subagent") and session.get("turn_delegated"))
         phase = "subagent_stop" if subagent else "agent_stop"
-        # The parent waits on this delegation, so it is live: never a stored copy that a card's answer
-        # would save over the parent's newer state.
-        owner = self.live.get(session.get("parent_session_id")) if subagent else session
+        # The parent waits on this delegation, so it is live, or it went on without it (a background
+        # subagent) and is held in memory while it is idle: never a stored copy that a card's answer would
+        # save over the parent's newer state.
+        parent_id = session.get("parent_session_id")
+        owner = (self.live.get(parent_id) or self.delegates.held_session(parent_id)) if subagent else session
         if owner is None or not self.has_hooks(owner, phase):
             session.pop("hook_report", None)
             return "done"
         reply = next((item.get("text") for item in reversed(session["events"])
                       if item.get("type") == "assistant" and item.get("text")), "")
+        if subagent and (report := submitted_report(session["events"])) is not None:
+            reply = report_text(report)  # Its submit_report report is what the parent receives.
         reply, shortened = fit_text(reply)
         payload = {"session_id": owner["id"], "reply": reply, "reply_shortened": shortened,
                    "continuations": state["blocks"], "workspace": session["workspace"], "model": session["model"],

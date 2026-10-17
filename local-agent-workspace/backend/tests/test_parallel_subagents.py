@@ -18,8 +18,8 @@ from local_agent.titles import needs_title
 REAL_CLIENT = httpx.AsyncClient
 
 
-@pytest.fixture
-async def runtime(tmp_path, monkeypatch):
+async def make_runtime(tmp_path, monkeypatch):
+    """(manager, parent, project) with a parent chat in Bypass permissions; other test files' runtime too."""
     monkeypatch.setattr("local_agent.config.APP_ROOT", tmp_path)
     project = tmp_path / "project"
     project.mkdir()
@@ -38,6 +38,12 @@ async def runtime(tmp_path, monkeypatch):
         await manager.stop(session_id)
     await manager.jobs.shutdown()
     store.db.close()
+
+
+@pytest.fixture
+async def runtime(tmp_path, monkeypatch):
+    async for value in make_runtime(tmp_path, monkeypatch):
+        yield value
 
 
 def frame(delta, finish=None):

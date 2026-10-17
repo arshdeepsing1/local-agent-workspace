@@ -6,10 +6,13 @@ never matches a rule itself.
 Allow rules match NARROWLY: an exact argv, or an exact prefix followed only by
 listed options, and never a command that can run other programs (a wrapper such
 as env or sh, an inline interpreter, a never-flag such as git -c) or that names
-a credential file. Deny and ask rules match BROADLY: the program's basename plus
-every rule word somewhere in the command, with short-option clusters expanded.
-A command a deny or ask rule might cover but that cannot be checked exactly is
-"uncertain" and gets an approval card.
+a credential-looking file (secret_paths). An allow rule for an argv or prefix
+applies only to a command run in the project folder (no cwd, or the project's
+own); an exact-text chat rule remembers the folder it was approved in. Deny and
+ask rules match BROADLY, in any folder: the program's basename plus every rule
+word somewhere in the command, with short-option clusters expanded. A command a
+deny or ask rule might cover but that cannot be checked exactly is "uncertain"
+and gets an approval card; a vetted command (shell_vet) is checked stage by stage.
 """
 import json
 import os
@@ -20,7 +23,8 @@ import uuid
 from pathlib import Path, PurePosixPath
 
 from .config import APP_ROOT  # noqa: F401  (agents.py checks protected paths against it)
-from .tools import SECRET_NAMES, parts_below
+from .secret_paths import looks_secret
+from .tools import parts_below
 
 MAX_COMMAND_TEXT = 50_000
 MAX_TOKENS = 64
@@ -58,6 +62,8 @@ UNCERTAIN_TEXT = frozenset("$`\\*?[{")
 # '=', ',' and ':' too, so the program in an alias definition (alias p='git push') is a word of its own.
 WORD_SPLIT = re.compile(r"[\s;&|<>()!#^~=,:]+")
 UNCERTAIN_WORDS = frozenset({"alias", "source"})
+# The words a credential check reads: split like WORD_SPLIT, but a word keeps its '~' and its 'name='.
+CREDENTIAL_SPLIT = re.compile(r"[\s;&|<>()`$!#{}^,:]+")
 
 # The fixed list of read-only commands that run without a card in Auto and Plan.
 READ_ONLY_COMMANDS = frozenset(tuple(text.split()) for text in (
@@ -70,8 +76,9 @@ READ_ONLY_COMMANDS = frozenset(tuple(text.split()) for text in (
 READ_ONLY_SPELLINGS = {"/bin/pwd": "pwd", "/bin/ls": "ls"}
 
 PROTECTED_DIRS = frozenset({".vscode", ".idea", ".husky", ".githooks", ".agents", ".claude", ".devcontainer"})
-PROTECTED_FILES = frozenset(name.casefold() for name in ("AGENTS.md", "CLAUDE.md", "CLAUDE.local.md", ".gitattributes",
-                                                         ".gitmodules", ".pre-commit-config.yaml", ".envrc"))
+PROTECTED_FILES = frozenset(name.casefold() for name in ("AGENTS.md", "AGENTS.local.md", "CLAUDE.md", "CLAUDE.local.md",
+                                                         ".gitattributes", ".gitmodules", ".pre-commit-config.yaml",
+                                                         ".envrc"))
 HOME_FILES = frozenset({".bashrc", ".bash_profile", ".bash_login", ".profile", ".zshrc", ".zshenv", ".zprofile",
                         ".zlogin", ".gitconfig", ".ssh"})
 EDIT_KINDS_RULE = "edits"
@@ -159,30 +166,33 @@ def opaque(argv):
             or any(never_flag(program, token) for token in argv[1:]))
 
 
-def names_credential(token, credential_file=None):
-    """True when a command word names a credential file (or carries one after '=')."""
-    candidates = [token]
-    if "=" in token:
-        candidates.append(token.split("=", 1)[1])
-    configured = str(credential_file) if credential_file else ""
-    for candidate in candidates:
-        if not candidate:
-            continue
-        for part in PurePosixPath(candidate).parts:
-            folded = part.casefold()
-            if folded in SECRET_NAMES or (folded.startswith(".env.") and folded != ".env.example"):
-                return True
-        if configured and (candidate == configured or os.path.expanduser(candidate) == configured):
-            return True
-    return False
+def names_credential(token, credential_file=None, patterns=()):
+    """True when a command word names a credential-looking file (or carries one after '='); see secret_paths."""
+    return looks_secret(token, credential_file, patterns) is not None
+
+
+def text_words(text):
+    """The words of command text as a credential check sees them: quotes and backslashes removed, split at
+    whitespace, shell syntax, ',' and ':' (a word keeps its '~' and its 'name=': names_credential reads both)."""
+    return [word for word in CREDENTIAL_SPLIT.split(text.replace("'", "").replace('"', "").replace("\\", "")) if word]
+
+
+def named_credentials(text, credential_file=None, patterns=(), limit=5):
+    """The words of command text that name credential-looking files (at most limit, each once)."""
+    if not isinstance(text, str):
+        return []
+    found = []
+    for word in text_words(text):
+        if word not in found and names_credential(word, credential_file, patterns):
+            found.append(word)
+            if len(found) >= limit:
+                break
+    return found
 
 
 def text_names_credential(text, credential_file=None):
     """True when any word of command text (quotes removed, split at shell syntax and '=') names a credential file."""
-    if not isinstance(text, str):
-        return False
-    return any(word and names_credential(word, credential_file)
-               for word in WORD_SPLIT.split(text.replace("'", "").replace('"', "")))
+    return bool(named_credentials(text, credential_file, limit=1))
 
 
 def read_only_argv(argv):
@@ -203,7 +213,7 @@ def same_rule(first, second):
 
 
 def has_matcher(rule):
-    return any(key in rule for key in ("command", "argv", "prefix", "flags", "path", "hook"))
+    return any(key in rule for key in ("command", "argv", "prefix", "flags", "path", "hook", "domain"))
 
 
 def rule_label(rule):
@@ -211,7 +221,7 @@ def rule_label(rule):
     tool = rule.get("tool", "")
     if tool == "run_command":
         if "command" in rule:
-            return f"the command {rule['command']}"
+            return f"the command {rule['command']}" + (f" in {rule['cwd']}" if rule.get("cwd") else "")
         if "argv" in rule:
             return "the command " + shlex.join(rule["argv"])
         if "prefix" in rule:
@@ -229,6 +239,14 @@ def rule_label(rule):
         return "subagents"
     if tool == "stop_job":
         return "stopping jobs"
+    if tool == "remember":
+        return "saving project memory"
+    if tool == "web_fetch":
+        if not rule.get("domain"):
+            return "web fetches"
+        return f"fetches from {rule['domain']}" + ("" if behavior_of(rule) == "allow" else " and its subdomains")
+    if tool == "web_search":
+        return "web searches"
     if tool.startswith("mcp__") and tool.endswith("__*"):
         return f"all tools of MCP server {tool[5:-3]}"
     return f"the tool {tool}"
@@ -236,7 +254,7 @@ def rule_label(rule):
 
 MCP_NAME = re.compile(r"^mcp__[A-Za-z0-9_-]{1,64}__[A-Za-z0-9_.-]{1,128}$")
 MCP_WILDCARD = re.compile(r"^mcp__([A-Za-z0-9_-]{1,64})__\*$")
-RULE_KEYS = frozenset({"behavior", "tool", "command", "argv", "prefix", "flags", "path", "hook"})
+RULE_KEYS = frozenset({"behavior", "tool", "command", "argv", "prefix", "flags", "path", "hook", "domain"})
 DRAFT_KEYS = frozenset({"behavior", "tool", "text", "match", "options"})
 
 
@@ -336,8 +354,8 @@ def normalize_rule(draft, *, resolve_path, credential_file=None, credential_toke
                 if behavior != "allow" or "prefix" not in draft:
                     raise ValueError("Allowed options apply only to allow rules with a prefix.")
                 rule["flags"] = _tokens(draft["flags"], "The options", MAX_TOKENS)
-            if "path" in draft or "hook" in draft:
-                raise ValueError("A command rule has no path or hook.")
+            if "path" in draft or "hook" in draft or "domain" in draft:
+                raise ValueError("A command rule has no path, hook or domain.")
         if "prefix" in rule:
             if not rule["prefix"]:
                 raise ValueError("Enter a command.")
@@ -367,6 +385,15 @@ def normalize_rule(draft, *, resolve_path, credential_file=None, credential_toke
             rule["path"] = str(resolve_path(path))
             if not Path(rule["path"]).is_absolute():
                 raise ValueError("Enter an absolute folder path.")
+    elif tool == "web_fetch":
+        # Allow names one host exactly; deny and ask cover a domain and its subdomains, or every fetch.
+        from .web_fetch import normalize_domain
+        if is_draft or set(draft) - {"behavior", "tool", "domain"}:
+            raise ValueError("A web fetch rule can only name a domain.")
+        if "domain" in draft:
+            rule["domain"] = normalize_domain(draft["domain"])
+        elif behavior == "allow":
+            raise ValueError("An allow rule for web fetches must name one domain, such as docs.python.org.")
     elif tool == "hook":
         if set(draft) - {"behavior", "tool", "hook"}:
             raise ValueError("A hook rule can only name a hook.")
@@ -383,7 +410,7 @@ def normalize_rule(draft, *, resolve_path, credential_file=None, credential_toke
         if MCP_WILDCARD.match(tool):
             if behavior == "allow":
                 raise ValueError("A rule for every tool of an MCP server can only deny or ask.")
-        elif tool in ("delegate_task", "stop_job") or MCP_NAME.match(tool):
+        elif tool in ("delegate_task", "stop_job", "remember", "web_search") or MCP_NAME.match(tool):
             pass
         elif tool in TOOL_KINDS:
             if behavior != "deny":
@@ -412,6 +439,59 @@ def _flag_allowed(token, flags):
     return False
 
 
+def command_folder(arguments, resolve_path):
+    """The resolved folder a run_command call names with cwd, None without one, or "" when it cannot be resolved."""
+    cwd = arguments.get("cwd") if isinstance(arguments, dict) else None
+    if cwd is None:
+        return None
+    if resolve_path is None or not isinstance(cwd, str):
+        return ""
+    try:
+        return str(resolve_path(cwd))
+    except (ValueError, OSError, TypeError):
+        return ""
+
+
+def at_project_root(arguments, resolve_path):
+    """True when a command runs in the project folder: no cwd, or one that resolves to the project itself."""
+    folder = command_folder(arguments, resolve_path)
+    if folder is None:
+        return True
+    try:
+        return bool(folder) and folder == str(resolve_path("."))
+    except (ValueError, OSError, TypeError):
+        return False
+
+
+def _same_folder(stored, arguments, resolve_path):
+    """An exact-text chat rule's folder (None: the project) against the folder the call runs in."""
+    if at_project_root(arguments, resolve_path):
+        return stored is None
+    return stored is not None and command_folder(arguments, resolve_path) == stored
+
+
+def allows_argv(rule, argv, credential_file=None):
+    """True when a command allow rule (an argv or a prefix) allows exactly this argument vector."""
+    if (rule.get("tool") != "run_command" or behavior_of(rule) != "allow" or "command" in rule or not argv
+            or opaque(argv) or any(names_credential(token, credential_file) for token in argv)):
+        return False
+    argv = list(argv)
+    if "argv" in rule:
+        return argv == rule["argv"]
+    if "prefix" in rule:
+        prefix, flags = rule["prefix"], rule.get("flags") or []
+        return argv[:len(prefix)] == prefix and all(_flag_allowed(token, flags) for token in argv[len(prefix):])
+    return False
+
+
+def stage_matches(rule, argv):
+    """True when a command deny or ask rule covers one stage of a vetted command, compared word by word."""
+    if rule.get("tool") != "run_command" or behavior_of(rule) == "allow" or "command" in rule:
+        return False
+    words = rule.get("prefix") or rule.get("argv")
+    return not words or _program_matches(words, list(argv))
+
+
 def rule_matches(rule, name, arguments, *, resolve_path, credential_file=None):
     """True when the rule applies to this tool call (allow narrowly, deny and ask broadly)."""
     from .permissions import EDIT_TOOL_PATHS, tool_kind
@@ -425,18 +505,12 @@ def rule_matches(rule, name, arguments, *, resolve_path, credential_file=None):
         if not isinstance(text, str):
             return False
         if "command" in rule:
-            return behavior == "allow" and text.strip() == rule["command"]
+            return (behavior == "allow" and text.strip() == rule["command"]
+                    and _same_folder(rule.get("cwd"), arguments, resolve_path))
         argv, _ = parse_command(text)
         if behavior == "allow":
-            if argv is None or opaque(argv) or any(names_credential(token, credential_file) for token in argv):
-                return False
-            if "argv" in rule:
-                return argv == rule["argv"]
-            if "prefix" in rule:
-                prefix, flags = rule["prefix"], rule.get("flags") or []
-                return (argv[:len(prefix)] == prefix
-                        and all(_flag_allowed(token, flags) for token in argv[len(prefix):]))
-            return False
+            # Another folder has other Makefiles and scripts: argv and prefix rules apply in the project only.
+            return argv is not None and at_project_root(arguments, resolve_path) and allows_argv(rule, argv, credential_file)
         words = rule.get("prefix") or rule.get("argv")
         if not words:
             return True
@@ -462,6 +536,16 @@ def rule_matches(rule, name, arguments, *, resolve_path, credential_file=None):
     if tool == "hook":
         return (isinstance(name, str) and name.startswith("hook_")
                 and (rule.get("hook") is None or arguments.get("hook_id") == rule["hook"]))
+    if tool == "web_fetch":
+        if name != "web_fetch":
+            return False
+        from .web_fetch import domain_of
+        domain, host = rule.get("domain"), domain_of(arguments.get("url"))
+        if not domain:
+            return behavior != "allow"
+        if host is None:
+            return behavior != "allow"  # A URL that cannot be checked never matches an allow rule.
+        return host == domain if behavior == "allow" else host == domain or host.endswith("." + domain)
     if isinstance(tool, str):
         wildcard = MCP_WILDCARD.match(tool)
         if wildcard:
@@ -498,13 +582,18 @@ def default_rule(name, arguments):
     kind = tool_kind(name)
     if kind == "command":
         argv, _ = parse_command(arguments.get("command"))
-        if argv is None or opaque(argv) or any(names_credential(token) for token in argv):
-            return None
+        if (argv is None or opaque(argv) or any(names_credential(token) for token in argv)
+                or arguments.get("cwd") is not None):
+            return None  # A command in another folder is remembered only by its exact text, in this chat.
         return {"argv": argv, "behavior": "allow", "tool": "run_command"}
     if kind == "edit":
         return {"behavior": "allow", "tool": EDIT_KINDS_RULE}
-    if kind in ("mcp", "delegate", "job_stop"):
+    if kind in ("mcp", "delegate", "job_stop", "memory") or name == "web_search":
         return {"behavior": "allow", "tool": name}
+    if name == "web_fetch":
+        from .web_fetch import domain_of
+        domain = domain_of(arguments.get("url"))
+        return {"behavior": "allow", "domain": domain, "tool": "web_fetch"} if domain else None
     if kind == "hook":
         hook = arguments.get("hook_id")
         return {"behavior": "allow", "hook": hook, "tool": "hook"} if isinstance(hook, str) and hook else None
@@ -531,6 +620,8 @@ def card_rule_options(name, arguments, *, resolve_path=None, credential_file=Non
         argv, reason = parse_command(arguments.get("command"))
         if argv is None:
             return {"argv": None, "prefixes": [], "reason": f"This command {reason}."}
+        if not at_project_root(arguments, resolve_path):
+            return {"argv": None, "prefixes": [], "reason": "This command runs in another folder than the project."}
         context = {"resolve_path": resolve_path, "credential_file": credential_file, "credential_tokens": credential_tokens}
         exact = None
         try:
@@ -562,6 +653,9 @@ def card_rule_options(name, arguments, *, resolve_path=None, credential_file=Non
             except (ValueError, OSError):
                 folder = None
         return {"folder": folder}
+    if name == "web_fetch":
+        from .web_fetch import domain_of
+        return {"domain": domain_of(arguments.get("url"))}
     return None
 
 

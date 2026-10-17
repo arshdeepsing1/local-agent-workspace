@@ -22,9 +22,11 @@ from local_agent.transcript import transcript
 
 
 def ended(message):
-    """An idle status message without its turn_ended time (checked by the attention tests)."""
+    """An idle status message without its turn_ended time (checked by the attention tests) and the turn's result
+    record (test_turn_budget.py), which names the same terminal_reason."""
     assert message.get("turn_ended"), message
-    return {key: value for key, value in message.items() if key != "turn_ended"}
+    assert message["turn_result"]["terminal_reason"] == message.get("terminal_reason"), message
+    return {key: value for key, value in message.items() if key not in ("turn_ended", "turn_result")}
 
 class Socket:
     def __init__(self):
@@ -244,7 +246,13 @@ async def test_get_task_is_in_every_tool_profile(runtime, monkeypatch, profile):
     gateway(monkeypatch, handler)
     await manager.run_databricks(session, "Which task is next?")
     assert "get_task" in seen[0]
-    assert len([*TOOL_DEFINITIONS, *FEATURE_TOOLS]) == 27
+    # get_tool_output is offered only once a long MCP or web_fetch result of the chat was kept, and web_search only
+    # once Settings → Web access names a provider, report_findings once a skill that names it was selected,
+    # submit_report only in a subagent, get_subagent_result once the chat started a background subagent.
+    assert len([*TOOL_DEFINITIONS, *FEATURE_TOOLS]) == 34 and "get_tool_output" not in seen[0]
+    assert "submit_report" not in seen[0] and "get_subagent_result" not in seen[0]
+    assert "web_search" not in seen[0] and ("web_fetch" in seen[0]) == (profile == "inherit")
+    assert "report_findings" not in seen[0]
 
 
 # API: task routes push the list, the stream sends it on connect, and the transcript export.

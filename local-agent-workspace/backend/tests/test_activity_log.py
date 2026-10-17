@@ -34,7 +34,7 @@ def command(event_id, created, text, state="completed", exit_code=0, job_state="
 def history(workspace):
     return [
         {"id": "u1", "type": "user", "created": 1790238000.0, "text": "Deploy it"},
-        command("c1", 1790238001.0, "export GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwx123456 && git push"),
+        command("c1", 1790238001.0, "export GITHUB_TOKEN=ghp" + "_abcdefghijklmnopqrstuvwx123456 && git push"),
         command("c2", 1790238002.0, "make pipeline-test JOB=nightly_export_v2", exit_code=2, job_state="failed"),
         command("c3", 1790238003.0, "rm -rf build", state="rejected"),
         tool_event("r1", "read_file", 1790238004.0, input={"path": "notes.md"}),
@@ -48,11 +48,11 @@ def history(workspace):
 # --- Rendering ----------------------------------------------------------------
 
 @pytest.mark.parametrize("raw, expected", [
-    ("export GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwx123456", "export GITHUB_TOKEN=[REDACTED]"),
+    ("export GITHUB_TOKEN=ghp" + "_abcdefghijklmnopqrstuvwx123456", "export GITHUB_TOKEN=[REDACTED]"),
     ("git clone https://user:s3cret@github.com/org/repo", "git clone https://user:[REDACTED]@github.com/org/repo"),
     ("curl -H 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz'", "curl -H 'Authorization: Bearer [REDACTED]'"),
     ("databricks --token dapi" + "0123456789abcdef" * 2, "databricks --token [REDACTED]"),
-    ("aws configure set aws_access_key_id AKIAABCDEFGHIJKLMNOP", "aws configure set aws_access_key_id [REDACTED]"),
+    ("aws configure set aws_access_key_id AKIA" + "ABCDEFGHIJKLMNOP", "aws configure set aws_access_key_id [REDACTED]"),
     ("snowsql --password='hunter2' -a acct", "snowsql --password='[REDACTED]' -a acct"),
 ])
 def test_known_secret_shapes_are_redacted(raw, expected):

@@ -63,7 +63,7 @@ def test_fork_selects_only_the_new_id(ui, page):
 
 def test_export_uses_child_scope_and_downloads_returned_json(ui, page):
     show(ui, "fake.handle = () => fake.json({ format: 'local-agent-workspace.conversations', version: 1 }); fake.captureDownloads()")
-    page.get_by_role("checkbox").check()
+    page.get_by_role("checkbox", name="Include subagent conversations in export (up to 32 total)").check()
     page.get_by_role("button", name="Export conversation").click()
     expect(page.get_by_role("status")).to_have_text("Conversation file exported.")
     assert ui.js("fake.calls.map(call => call.path)") == ["/api/sessions/source/export?include_children=true"]

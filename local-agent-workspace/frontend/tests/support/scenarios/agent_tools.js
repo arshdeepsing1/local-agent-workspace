@@ -5,6 +5,12 @@ window.worktree = { id: 'worktree', path: '/project-worktree', branch: 'feature/
 window.task = { id: 'task', title: 'Inspect source', description: 'Find the parser', status: 'pending', depends_on: [] }
 window.config = { servers: [], hooks: [] }
 window.skill = { id: 'skill', name: 'Review code', description: 'Review changes carefully', path: '/skills/review/SKILL.md' }
+// POST /api/extensions/import: a preview (mcp_import.parse), nothing saved.
+window.importPreview = { source: 'project', path: '.mcp.json', needs: ['GITHUB_TOKEN'],
+  entries: [{ id: 'github', name: 'GitHub', enabled: false, transport: 'stdio', command: 'github-mcp-server', args: ['stdio'],
+    env: { GITHUB_PERSONAL_ACCESS_TOKEN: { secret: 'GITHUB_TOKEN' } } }],
+  skipped: [{ name: 'legacy', reason: 'SSE servers are not supported; use the server\'s Streamable HTTP URL if it has one.' }],
+  ignored: [{ name: 'GitHub', fields: ['cwd'] }] }
 window.projectSettings = { workspace: '/project', verify_command: 'pytest -q', verify_timeout_seconds: 600, verify_max_rounds: 2 }
 window.toolList = { tools: [
   { name: 'read_file', description: 'Read numbered lines from a text file. Pages follow next_line.' },
@@ -31,7 +37,7 @@ window.agentTypes = {
   ],
   custom: [{ name: 'security-auditor', built_in: false, description: 'Reviews code for injection and secrets handling.',
     path: '.agents/agents/security-auditor.md', profile: 'read_only', tools: ['read_file', 'search_files'], model: 'databricks-claude-sonnet-4-5',
-    effort: 'low', skills: ['review'], max_steps: 8, notes: ['Ignored unknown tools: web_fetch.'], instructions_chars: 120 }],
+    effort: 'low', skills: ['review'], max_steps: 8, notes: ['Ignored unknown tools: browser_open.'], instructions_chars: 120 }],
   errors: [{ path: '.claude/agents/broken.md', error: 'description is required: one line (at most 300 characters) that tells the model when to use this agent.' }],
   folders: ['.agents/agents', '.claude/agents'], index_bytes: 210,
 }
@@ -64,9 +70,22 @@ fake.handle = (path, options) => {
   if (path.endsWith('/disabled-tools')) return fake.json({ ...session(), disabled_tools: body().tools })
   if (path.endsWith('/subagent-profile')) return fake.json({ ...session(), subagent_tool_profile: body().tool_profile })
   if (path.endsWith('/metrics')) return fake.json(metrics)
+  // Agent tools → Schedules: none in this project, with scheduled runs off.
+  if (/^\/api\/schedules(?:\?|$)/.test(path)) return fake.json({ enabled: false, running: false, problem: null, project: '/project',
+    other_projects: 0, token_warning: null, limits: {}, schedules: [] })
   if (path.startsWith('/api/project-settings')) return fake.json(options.method === 'PUT' ? { ...projectSettings, ...body() } : projectSettings)
   if (path === '/api/extensions') return fake.json(options.method === 'PUT' ? body() : config)
   if (path === '/api/extensions/test') return fake.json({ tools: ['example.search'] })
+  if (path.startsWith('/api/extensions/import')) return fake.json({ ...importPreview, source: body().source })
   if (path === '/api/skills' || path.startsWith('/api/skills?')) return fake.json([skill])
+  if (path === '/api/commands' || path.startsWith('/api/commands?')) return fake.json({ commands: fake.commands || [], errors: [],
+    folders: ['.agents/commands', '.claude/commands', '~/.agents/commands', '~/.claude/commands'] })
   if (path.endsWith('/skills')) return fake.json({ active_skills: body().enabled ? ['skill'] : [] })
+  // Saved rules for all projects (the Extensions hook shortcut adds and removes an allow rule for one hook ID).
+  if (path.startsWith('/api/permission-rules')) {
+    const rules = fake.userRules || (fake.userRules = [])
+    if (options.method === 'POST') rules.push(body().rule)
+    if (options.method === 'DELETE') fake.userRules = rules.filter(rule => rule.hook !== body().rule.hook)
+    return fake.json({ chat: [], project: [], user: fake.userRules, project_path: '/project', problem: null })
+  }
 }

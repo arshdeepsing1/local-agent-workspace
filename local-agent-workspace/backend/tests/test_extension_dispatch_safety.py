@@ -111,8 +111,10 @@ async def test_failure_hook_has_original_redacted_error_and_cannot_replace_it(ru
     assert "failure hook also failed" not in model_output and "synthetic-token" not in model_output
     output = json.loads(model_output)["message"]  # Hooks and the card get the plain message.
     assert "original tool failure" in output and "synthetic-token" not in output
+    agent = {"session_id": session["id"], "is_subagent": False, "agent_type": None, "parent_session_id": None,
+             "agent_file": None}
     assert payloads == [{"event": "tool_failure", "session_id": session["id"], "tool": "read_file",
-        "arguments": {"path": "note.txt"}, "call_id": "failed-call", "error": output, "outcome": "error"}]
+        "arguments": {"path": "note.txt"}, "call_id": "failed-call", "agent": agent, "error": output, "outcome": "error"}]
     assert session["events"][0]["output"] == output
     assert "original tool error is unchanged" in session["events"][-1]["text"]
 
@@ -245,8 +247,10 @@ async def test_a_before_tool_hook_on_a_covering_tool_blocks_the_covered_tool(run
     payloads = recorded_hooks(manager, 1)
     output = await manager.execute_tool(session, tools, name, arguments, "c1")
     assert f"Before-tool hook blocked {name}: Hook failed (exit 1)" in output and "40M" not in output
+    agent = {"session_id": session["id"], "is_subagent": False, "agent_type": None, "parent_session_id": None,
+             "agent_file": None}
     assert payloads == [{"event": "before_tool", "session_id": session["id"], "tool": name, "arguments": arguments,
-                         "call_id": "c1", "covered_by": selected[0]}]
+                         "call_id": "c1", "covered_by": selected[0], "agent": agent}]
 
 
 async def test_an_after_tool_hook_on_read_file_sees_outline_calls_and_an_empty_list_none(runtime):

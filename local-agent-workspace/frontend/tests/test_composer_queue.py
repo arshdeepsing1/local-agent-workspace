@@ -135,6 +135,43 @@ def test_sending_queued_messages_moves_focus_to_the_message_box(ui, page):
     expect(message(page)).to_be_focused()
 
 
+def test_editing_a_queued_plain_text_message_keeps_it_plain_text(ui, page):
+    # Back in the box with Send as plain text on: its '!' does not run as a shell command, nor '/x' as a command.
+    queued = [{"id": "q1", "text": "!git status", "created": 1, "paused": True, "verbatim": True},
+              {"id": "q2", "text": "/rename Shipping notes", "created": 2, "paused": True, "verbatim": True},
+              {"id": "q3", "text": "!ls", "created": 3, "paused": True}]
+    start_app(ui, page, queued_messages=queued, setup="""
+const queueOverride = fake.override
+fake.override = (path, options) => {
+  if (path.startsWith('/api/sessions/a/queue/') && options.method === 'DELETE') {
+    const left = fake.sessions.get('a').queued_messages.filter(item => item.id !== path.split('/').pop())
+    fake.sessions.set('a', { ...fake.sessions.get('a'), queued_messages: left })
+    return fake.json({ queued_messages: left })
+  }
+  return queueOverride(path, options)
+}""")
+    bar = queue_bar(page)
+    toggle = page.get_by_role("button", name="Send as plain text")
+    expect(bar.locator(".queue-tag", has_text="Plain text")).to_have_count(2)
+    for number, text in ((1, "!git status"), (2, "/rename Shipping notes")):
+        bar.get_by_role("button", name=f"Edit queued message: {text}", exact=True).click()
+        expect(message(page)).to_have_value(text)
+        expect(toggle).to_have_attribute("aria-pressed", "true")
+        expect(page.get_by_role("status").filter(has_text="Plain text: sent exactly as typed")).to_be_visible()
+        message(page).press("Enter")
+        ui.wait(f"fake.requests('/api/sessions/a/messages', 'POST').length === {number}")
+        expect(message(page)).to_have_value("")
+        expect(toggle).to_have_attribute("aria-pressed", "false")
+    assert ui.bodies("/api/sessions/a/messages", "POST") == [{"text": "!git status", "verbatim": True},
+                                                              {"text": "/rename Shipping notes", "verbatim": True}]
+    assert ui.requests("/api/sessions/a/shell") == [] and ui.requests("/api/sessions/a/title") == []
+    # A queued message that was not plain text comes back as it was typed.
+    bar.get_by_role("button", name="Edit queued message: !ls", exact=True).click()
+    expect(message(page)).to_have_value("!ls")
+    expect(toggle).to_have_attribute("aria-pressed", "false")
+    expect(page.get_by_role("status").filter(has_text="Shell command: Enter runs it")).to_be_visible()
+
+
 def test_escape_in_the_message_box_stops_a_busy_chat(ui, page):
     start_app(ui, page, status="running")
     message(page).press("Escape")
@@ -289,6 +326,7 @@ def test_the_slash_menu_offers_the_side_question_first(ui, page):
     expect(first).to_contain_text("/btw")
     expect(first).to_contain_text("Side question")
     expect(first).to_contain_text("Ask about this conversation without adding to it (one model request).")
+    expect(page.get_by_text("Loading skills…")).to_have_count(0)  # Enter does nothing until the list arrived.
     box.press("Enter")
     expect(box).to_have_value("/btw ")
 

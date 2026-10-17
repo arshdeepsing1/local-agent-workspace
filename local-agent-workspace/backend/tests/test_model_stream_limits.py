@@ -200,16 +200,23 @@ async def test_maximum_existing_file_size_with_json_escaping_still_executes(runt
 async def test_large_http_error_stops_reading_closes_stream_and_preserves_redacted_category(runtime, monkeypatch):
     manager, session = runtime
     manager.settings.redact = lambda value: value.replace("private-token", "[REDACTED]")
-    stream = Chunks([b"Provider failure private-token " + b"x" * 4096,
-                     *[b"x" * 4096 for _ in range(100)]])
+    # Every 429 is retried (each attempt gets its own stream), without waiting here.
+    manager.settings.values["rate_limit_auto_continue"] = False
+    streams = []
+
+    async def sleep(delay):
+        pass
 
     async def gateway(request):
-        return httpx.Response(429, stream=stream)
+        streams.append(Chunks([b"Provider failure private-token " + b"x" * 4096,
+                               *[b"x" * 4096 for _ in range(100)]]))
+        return httpx.Response(429, stream=streams[-1])
 
     mock_gateway(monkeypatch, gateway)
+    monkeypatch.setattr("local_agent.agents.asyncio.sleep", sleep)
     await manager.run(session, "Hello")
-    assert stream.received <= MAX_ERROR_BODY_BYTES // 4096
-    assert stream.closed
+    assert len(streams) == 4
+    assert all(stream.received <= MAX_ERROR_BODY_BYTES // 4096 and stream.closed for stream in streams)
     info = next(item["request_info"] for item in session["events"] if "request_info" in item)
     assert info["http_status"] == 429 and info["error_kind"] == "rate_limit"
     error = session["events"][-1]

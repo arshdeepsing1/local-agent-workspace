@@ -1,10 +1,11 @@
 """Tool calls that wait for the user inside a turn: ask_user questions and submit_plan reviews.
 
 They wait in their own registry, not in AgentManager.pending, so approval routes and
-approval re-checks never resolve them. The wait uses the Approval wait setting and the
-'awaiting_approval' status, so notifications, sidebar badges and subagent progress work
-as for approval cards. mode_changed closes a waiting plan when the chat leaves Plan mode
-and skips waiting questions when it switches to Don't ask.
+approval re-checks never resolve them. The wait uses the Approval wait setting (a scheduled
+run's approval limit in its turn: AgentManager.approval_seconds) and the 'awaiting_approval'
+status, so notifications, sidebar badges and subagent progress work as for approval cards.
+mode_changed closes a waiting plan when the chat leaves Plan mode and skips waiting
+questions when it switches to Don't ask.
 """
 import asyncio
 import json
@@ -17,6 +18,7 @@ from .config import DEFAULT_APPROVAL_MINUTES
 
 MODE_LABELS = {"manual": "Manual", "auto": "Auto", "acceptEdits": "Accept edits", "plan": "Plan",
                "bypassPermissions": "Bypass permissions", "dontAsk": "Don't ask"}
+MINUTE = 60  # Seconds in a minute of an approval wait (tests shorten it).
 MAX_OTHER = 1000
 MAX_FEEDBACK = 2000
 DONT_ASK = "Nobody can answer questions in Don't ask mode. Continue with your best judgment and state your assumptions."
@@ -83,10 +85,11 @@ def require_last_call(session, event, name):
             f"Call {name} again, after the other calls or in a response of its own.")
 
 
-def wait_seconds(settings):
-    """The Approval wait in seconds, or None (no limit), exactly as approval cards use it."""
-    minutes = settings.values.get("approval_timeout_minutes", DEFAULT_APPROVAL_MINUTES)
-    return minutes * 60 if type(minutes) is int and minutes > 0 else None
+def wait_seconds(settings, minutes=None):
+    """The Approval wait (or these minutes: a scheduled run's approval limit) in seconds, or None (no limit), exactly
+    as approval cards use it."""
+    minutes = settings.values.get("approval_timeout_minutes", DEFAULT_APPROVAL_MINUTES) if minutes is None else minutes
+    return minutes * MINUTE if type(minutes) is int and minutes > 0 else None
 
 
 class InteractionManager:
@@ -101,11 +104,15 @@ class InteractionManager:
         return await self.review_plan(session, event, arguments)
 
     async def wait(self, session, event, kind, **extra):
-        """The user's answer (a dict), or None when the wait expired. Stop cancels the wait."""
+        """The user's answer (a dict), or None when the wait expired (at once in a scheduled run that already
+        reached its approval limit). Stop cancels the wait."""
+        run = self.manager.scheduled_run(session)
+        if run is not None and run.get("expired"):
+            return None
         future = asyncio.get_running_loop().create_future()
         key = (session["id"], event["id"])
         self.waiting[key] = {"future": future, "kind": kind, "session": session, **extra}
-        seconds = wait_seconds(self.manager.settings)
+        seconds = self.manager.approval_seconds(session)
         try:
             await self.manager.update_event(session, event, state="pending",
                                             **({"approval_expires": time.time() + seconds} if seconds else {}))
@@ -113,6 +120,7 @@ class InteractionManager:
             try:
                 return await asyncio.wait_for(future, timeout=seconds)
             except TimeoutError:
+                self.manager.approval_expired(session)
                 return None
         finally:
             self.waiting.pop(key, None)
@@ -143,7 +151,7 @@ class InteractionManager:
             raise InteractionError("submit_plan is only available in Plan mode. Describe the plan in your reply instead.",
                                    "unavailable_tool")
         if session.get("is_subagent"):
-            raise InteractionError("Subagents cannot submit plans; return the plan as your final reply.", "unavailable_tool")
+            raise InteractionError("Subagents cannot submit plans; return the plan in your report (submit_report).", "unavailable_tool")
         require_last_call(session, event, "submit_plan")
         answer = await self.wait(session, event, "plan")
         update = self.manager.update_event

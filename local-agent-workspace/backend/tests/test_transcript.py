@@ -55,6 +55,17 @@ def test_transcript_keeps_messages_in_order_and_shortens_tool_results():
     assert transcript({"events": []}).startswith("# Transcript: Untitled conversation\n")
 
 
+def test_the_apps_message_after_a_background_subagent_is_not_labelled_as_yours():
+    from local_agent.planning import WAKE_TEXT
+    wake = WAKE_TEXT.format(id="1234abcd", kind="explore", ending="finished")
+    session = {"events": [{"id": "u1", "type": "user", "text": "Map it in the background"},
+                          {"id": "u2", "type": "user", "text": wake, "verbatim": True, "background_wake": True}]}
+    text = transcript(session)
+    first, second = text.split("## Turn 2", 1)
+    assert "**User:**" in first and "**User:**" not in second
+    assert "**App (sent when a background subagent finished):**" in second and "the background subagent 1234abcd" in second
+
+
 def test_configured_credentials_are_redacted_too():
     session = {"events": [{"type": "user", "text": "My token is private-value-123"}]}
     assert "private-value-123" not in transcript(session, redact=lambda text: text.replace("private-value-123", "[REDACTED]"))
@@ -142,3 +153,24 @@ def test_outline_and_overview_lines():
     text = transcript({"id": "c1", "title": "Outline", "events": events})
     assert "- Outlined `docs/h.md` to level 2\n" in text and "- Project overview of `.`\n" in text
     assert "- Outlined `a.py`\n" in text
+
+
+def test_each_turn_ends_with_its_result_line():
+    from local_agent.transcript import turn_summary_text
+    result = {"terminal_reason": "completed", "steps": 8, "tool_calls": 14, "duration_s": 130.4, "estimated_dbu": 1.42,
+              "usage": {"calls": 9, "input_tokens": 22_000, "cache_read_input_tokens": 160_000, "cache_creation_input_tokens": 0,
+                        "output_tokens": 3_100, "reasoning_tokens": None},
+              "subagents": {"count": 2}}
+    assert turn_summary_text(result) == "8 steps · 14 tools · 2 min 10 s · 182k in (160k cached) / 3.1k out · ~1.4 DBU · 2 subagents"
+    # A count no call reported is '—', never 0; no DBU part without price data.
+    unreported = {"steps": 1, "tool_calls": 0, "duration_s": 4, "estimated_dbu": None, "usage": {"input_tokens": None,
+                                                                                                   "output_tokens": 12}}
+    assert turn_summary_text(unreported) == "1 step · 0 tools · 4 s · — in / 12 out"
+    assert turn_summary_text(None) == ""
+    session = recorded()
+    session["events"][5]["turn_result"] = result  # a2, the first turn's last reply.
+    session["events"].append({"id": "a3", "type": "assistant", "text": "Reviewed.", "turn_result": unreported})
+    text = transcript({"id": "c0ffee00-1111", **session})
+    first, rest = text.split("_Turn: 8 steps", 1)
+    assert "The pod IP changed" in first and "Review it" in rest and "Review it" not in first
+    assert text.rstrip().endswith("_Turn: 1 step · 0 tools · 4 s · — in / 12 out_")

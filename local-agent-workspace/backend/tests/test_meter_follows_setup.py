@@ -78,12 +78,15 @@ async def test_a_model_change_moves_the_meter_to_the_new_models_budgets(app_clie
     manager, client = app_client
     session_id = await turn_on(manager, client, monkeypatch, GPT)
     before = manager.get(session_id)["context_info"]
-    assert limits_of(before) == {"context_window": 131_072, "reply_reserve": 8_192, "input_budget": 120_832,
-                                 "auto_compact_percent": 90, "auto_compact_threshold": 108_748}
+    # GPT OSS 120B's default budget is its whole window, so the input budget keeps 5% of it for estimate error.
+    assert limits_of(before) == {"context_window": 131_072, "reply_reserve": 8_192, "input_budget": 115_078,
+                                 "auto_compact_percent": 90, "auto_compact_threshold": 103_570}
     tokens, report = before["next_estimate"]["tokens"], before["last_request"]
-    # GPT OSS's own reported ratio (estimates never scale below 1).
+    # GPT OSS's own reported ratio (estimates never scale below 1), and its report anchors the next estimate.
     old_scale = before["next_estimate"]["scale"]
     assert old_scale == report["next_estimate_scale"] >= 1.0
+    anchor = before["next_estimate"]["anchor"]
+    assert anchor["model"] == GPT and anchor["reported"] == 9000 and tokens == 9000 + math.ceil(anchor["added"] * old_scale)
     socket = Socket()
     manager.listeners.setdefault(session_id, set()).add(socket)
     response = await client.put(f"/api/sessions/{session_id}/model", json={"model": OPUS})
@@ -94,8 +97,8 @@ async def test_a_model_change_moves_the_meter_to_the_new_models_budgets(app_clie
     # The next request goes to Opus 5.5, whose estimates start at its own ratio.
     scale = estimate_scale(manager.get(session_id)["inference_calls"], OPUS)
     assert scale == 1.3
-    scaled = math.ceil(tokens * scale / old_scale)
-    assert info["next_estimate"] == {"tokens": scaled, "scale": scale,
+    scaled = math.ceil(anchor["raw"] * scale)  # GPT OSS's report cannot anchor an Opus 5.5 estimate.
+    assert info["next_estimate"] == {"tokens": scaled, "scale": scale, "held_anchor": anchor,
                                      "percent_of_input_budget": round(scaled * 100 / 181_568, 1),
                                      "percent_of_threshold": round(scaled * 100 / 163_411, 1)}
     # The last request's report and estimate are what was sent.
@@ -103,6 +106,15 @@ async def test_a_model_change_moves_the_meter_to_the_new_models_budgets(app_clie
     assert limits_of(manager.store.get(session_id)["context_info"]) == expected
     assert [message["type"] for message in socket.messages] == ["model", "context"]
     assert limits_of(socket.messages[-1]["context_info"]) == expected
+    # Back to GPT OSS with no request between: its report anchors the next request again, as it will when sent.
+    response = await client.put(f"/api/sessions/{session_id}/model", json={"model": GPT})
+    assert response.json()["context_info"]["next_estimate"] == before["next_estimate"]
+    assert manager.estimate_anchor(manager.get(session_id))["reported"] == 9000
+    # After a restart nothing anchors the next request, so a Settings save leaves the estimate scaled.
+    manager.estimate_anchors.clear()
+    await manager.refresh_meter_limits(manager.get(session_id))
+    upcoming = manager.get(session_id)["context_info"]["next_estimate"]
+    assert "anchor" not in upcoming and upcoming["tokens"] == math.ceil(anchor["raw"] * old_scale)
 
 
 async def test_a_settings_save_moves_open_idle_chats_and_leaves_running_ones(app_client, monkeypatch, settings):
@@ -135,6 +147,34 @@ async def test_a_settings_save_moves_open_idle_chats_and_leaves_running_ones(app
     assert sockets[running].messages == []
     # A chat not open is not rewritten on every save; opening it brings it up to date (below).
     assert manager.store.get(closed)["context_info"]["input_budget"] == 181_568
+
+
+async def test_a_budget_at_the_opus_window_keeps_a_margin_in_the_meter_and_the_requests(app_client, monkeypatch,
+                                                                                          settings):
+    # A 1,000,000-token budget on Opus 5.5's 1,000,000-token window: the input budget keeps 5% for estimate
+    # error, (1,000,000 - 16,384 - 2,048) / 1.05, in the meter after a save and in the next request.
+    manager, client = app_client
+    session_id = await turn_on(manager, client, monkeypatch, OPUS)
+    manager.listeners.setdefault(session_id, set()).add(Socket())  # Open, so a save refreshes its meter.
+    editable = {"workspace": settings.values["workspace"], "model": OPUS, "env_file": ""}
+    response = await client.put("/api/settings", json={**editable, "context_window": 1_000_000,
+                                                       "max_output_tokens": 16_384})
+    assert response.status_code == 200
+    expected = {"context_window": 1_000_000, "reply_reserve": 16_384, "input_budget": 934_826,
+                "auto_compact_percent": 90, "auto_compact_threshold": 841_343}
+    assert limits_of(manager.get(session_id)["context_info"]) == expected
+    assert manager.input_budget(manager.get(session_id)) == 934_826
+    with monkeypatch.context() as patch:
+        mock_gateway(patch)
+        await manager.run(manager.get(session_id), "Again")
+    info = manager.get(session_id)["context_info"]
+    assert limits_of(info) == expected and info["last_request"]["input_budget"] == 934_826
+    # GPT OSS 120B at its own full window (capped there; its output tokens follow its default) keeps the same
+    # margin against its 131,072-token window.
+    gpt = manager.get(await turn_on(manager, client, monkeypatch, GPT))
+    assert manager.request_limits(gpt) == (131_072, 8_192)
+    assert manager.input_budget(gpt) == gpt["context_info"]["input_budget"] == (131_072 - 8_192 - 2_048) * 100 // 105
+    assert gpt["context_info"]["last_request"]["input_budget"] == 115_078
 
 
 async def test_a_chat_running_during_a_settings_save_follows_when_its_turn_ends(app_client, monkeypatch, settings):

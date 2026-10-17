@@ -361,8 +361,11 @@ async def test_parent_progress_is_live_correlated_and_contains_no_child_payloads
     assert child["events"][0]["origin"] == {"kind": "delegated", "parent_session_id": parent["id"],
                                             "parent_event_id": spawning["id"], "parent_call_id": "call-review"}
     started = event["delegation"].pop("started")
+    # The card it waits on, so the parent's card can answer it; never the child's tool payloads.
     assert event["delegation"] == {"status": "awaiting_approval", "completed_tools": 0, "last_tool": "read_file",
-                                   "agent_type": "general", "model": "synthetic-model", "effort": "default"}
+                                   "agent_type": "general", "model": "synthetic-model", "effort": "default",
+                                   "pending": {"event_id": child["events"][1]["id"], "name": "read_file",
+                                               "kind": "approval", "title": "read file", "review": True}}
     event["delegation"]["started"] = started
     assert "private child contents" not in json.dumps(saved)
     assert saved["wire"] == []

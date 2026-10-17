@@ -139,6 +139,8 @@ async def test_deny_rules_block_paths_and_mcp_tools_in_bypass(runtime, tmp_path)
 def test_unconditional_deny_rules_remove_tools_from_the_definitions(runtime):
     manager, session, _, _ = runtime
     _, external = connection(manager, session)
+    # Turned off, the helpers that can join mid-turn keep no place: all three MCP tools fit (joinable_helpers).
+    session["disabled_tools"] = ["get_tool_output", "report_findings", "get_subagent_result"]
     offered = names(manager.step_definitions(session, external))
     assert {"run_command", "mcp__docs__search", "mcp__docs__fetch", "mcp__other__echo"} <= offered
     manager.rules.add("user", session["workspace"], {"behavior": "deny", "tool": "mcp__docs__*"})
@@ -252,7 +254,9 @@ def test_rule_store_limits(tmp_path, monkeypatch):
 # Protected paths
 
 @pytest.mark.parametrize("relative", [".vscode/settings.json", ".github/workflows/ci.yml", ".github/actions/a/action.yml",
-                                      "AGENTS.md", "docs/CLAUDE.md", "CLAUDE.local.md", ".gitattributes", ".envrc",
+                                      "AGENTS.md", "docs/CLAUDE.md", "CLAUDE.local.md", "src/AGENTS.local.md",
+                                      ".gitattributes", ".envrc", ".agents/rules/python.md",
+                                      ".agents/output-styles/terse.md",
                                       ".claude/settings.json", ".agents/permissions.json", ".husky/pre-commit",
                                       ".pre-commit-config.yaml", ".devcontainer/devcontainer.json", ".IDEA/x.xml"])
 def test_protected_reason_covers_configuration_that_runs_code(relative):
@@ -519,24 +523,31 @@ def test_read_and_edit_tool_sets_stay_derived():
 
 
 def test_mode_prompts_are_exact():
+    read_only = ("pwd, ls, read-only git status/diff/log/show/branch, and commands or pipelines of read-only programs "
+                 "the app checks, such as cat, head, tail, grep, rg, find, sed -n, awk, sort and wc, on paths in "
+                 "approved folders")
     assert mode_prompt("auto") == (
-        "Auto mode: file edits run directly, and a fixed list of read-only commands (pwd, ls, and read-only git "
-        "status/diff/log/show/branch commands) runs without an approval card; other commands and actions need an "
-        "approval card unless a rule the user saved allows them.")
+        f"Auto mode: file edits run directly, and read-only commands run without an approval card: {read_only}. "
+        "Other commands and actions need an approval card unless a rule the user saved allows them.")
     first = ("Plan mode: inspect files and describe a concrete plan with the proposed steps and content, rather than "
              "merely refusing an implementation request. File changes and commands are blocked, except read-only "
-             "commands from a fixed list (pwd, ls, git status/diff/log/show/branch).")
+             f"commands: {read_only}.")
     assert mode_prompt("plan") == first + (
         " Use ask_user for clarifying questions. When the plan is complete, call submit_plan with the full plan: the "
         "user can approve it and switch modes, and you then implement it in this same turn. Do not invent mode names.")
     assert mode_prompt("plan", True) == first + (
+        " Use ask_user only when a decision blocks you. Return the finished plan with submit_report.")
+    # A subagent chat the user continues has no parent waiting for a report.
+    assert mode_prompt("plan", True, reports=False) == first + (
         " Use ask_user only when a decision blocks you. Return the finished plan as your final reply.")
     assert mode_prompt("dontAsk") == (
         "Don't ask mode: actions run only when the mode or a rule the user saved allows them; anything else is blocked "
         "without an approval card. If an action is blocked, continue with what you can do and tell the user what "
-        "needs their approval.")
+        "needs their approval. A command that names a credential-looking file always shows a card.")
     assert mode_prompt("bypassPermissions") == (
-        "Bypass permissions mode: actions run without approval cards. Deny and ask rules the user saved and file-tool "
+        "Bypass permissions mode: actions run without approval cards, except commands that name credential-looking "
+        "files, calls a hook asks about and a subagent's change to a file another running subagent changed. remember "
+        "saves a note only when a rule the user saved allows it. Deny and ask rules the user saved and file-tool "
         "credential exclusions still apply.")
     assert mode_prompt("manual") == "Manual mode: reads run directly; file changes and commands require an approval card."
     assert mode_prompt("acceptEdits") == "Accept edits mode: file edits run directly; commands require an approval card."
@@ -546,6 +557,8 @@ def test_plan_denial_text_for_agents_and_subagents():
     verdict = evaluate("plan", "write_file", {"path": "a", "content": ""})
     assert verdict.message.endswith("Describe the plan, or call submit_plan when it is ready.")
     verdict = evaluate("plan", "write_file", {"path": "a", "content": ""}, subagent=True)
+    assert verdict.message.endswith("Return the plan in your report (submit_report).")
+    verdict = evaluate("plan", "write_file", {"path": "a", "content": ""}, subagent=True, reports=False)
     assert verdict.message.endswith("Return the plan as your final reply.")
 
 

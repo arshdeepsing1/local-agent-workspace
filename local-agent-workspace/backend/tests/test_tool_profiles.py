@@ -99,7 +99,10 @@ async def test_read_only_request_filters_schemas_and_never_starts_mcp(runtime, m
     async def handler(request):
         body = json.loads(request.content)
         requests.append(body)
-        assert {tool['function']['name'] for tool in body['tools']} == READ_TOOLS
+        # get_tool_output only once a long MCP result of the chat was kept; report_findings once a review skill is.
+        # submit_report: a subagent's final report, whatever its profile, but only in a turn its parent delegated
+        # (this turn is the chat's own, as when the user continues a subagent chat).
+        assert {tool['function']['name'] for tool in body['tools']} == READ_TOOLS - {'get_tool_output', 'report_findings'}
         return httpx.Response(200, text='data: ' + json.dumps({'choices': [{'delta': {'content': 'Inspected.'}, 'finish_reason': 'stop'}]}) + '\n\ndata: [DONE]\n\n')
     client = httpx.AsyncClient
     monkeypatch.setattr(httpx, 'AsyncClient', lambda **kwargs: client(**kwargs, transport=httpx.MockTransport(handler)))

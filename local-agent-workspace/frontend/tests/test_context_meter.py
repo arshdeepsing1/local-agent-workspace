@@ -67,6 +67,23 @@ def test_instruction_sources_scopes_costs_and_reasons(ui, page):
     expect(page.get_by_text("Approximately 6,000 of 22,768 input tokens used.")).to_be_visible()
 
 
+def test_trimmed_files_rules_user_files_and_memory_are_listed_with_their_scope(ui, page):
+    ui.mount("components/ContextMeter.js", f"""{{ info: {{ ...{INFO}, instruction_sources: [
+        {{ path: 'AGENTS.md', scope: '.', status: 'trimmed', estimated_tokens: 5900,
+           reason: 'Trimmed to fit the 24,000-byte limit for project instructions: 23,507 of 33,000 bytes loaded.' }},
+        {{ path: '.agents/rules/python.md', scope: 'files matching src/**/*.py', status: 'loaded', estimated_tokens: 40 }},
+        {{ path: '~/.agents/AGENTS.md', scope: 'all projects', status: 'loaded', estimated_tokens: 30 }},
+        {{ path: 'Project memory', scope: 'this project', status: 'loaded', estimated_tokens: 62 }},
+    ] }} }}""")
+    page.get_by_text(re.compile("Last model input")).click()
+    items = page.locator(".context-details li")
+    expect(items.filter(has_text="AGENTS.md").first).to_contain_text("scope: . and descendants · Trimmed · ~5,900 tokens loaded")
+    expect(page.get_by_text(re.compile("^Trimmed to fit the 24,000-byte limit"))).to_be_visible()
+    expect(items.filter(has_text="python.md")).to_contain_text(".agents/rules/python.md · applies to files matching src/**/*.py · ~40 tokens")
+    expect(items.filter(has_text="~/.agents/AGENTS.md")).to_contain_text("~/.agents/AGENTS.md · applies to all projects · ~30 tokens")
+    expect(items.filter(has_text="Project memory")).to_contain_text("Project memory · applies to this project · ~62 tokens")
+
+
 def test_submits_note_once_and_prevents_duplicates(ui, page):
     ui.mount("components/ContextMeter.js", f"""{{ info: {INFO},
         onCompact: fake.spy('compact', () => fake.defer('compact').promise) }}""")
@@ -88,6 +105,46 @@ def test_rejected_compaction_keeps_the_note(ui, page):
     page.get_by_role("button", name="Compact now").click()
     expect(page.get_by_role("alert")).to_have_text("No earlier turns to compact.")
     expect(page.get_by_role("textbox")).to_have_value("Keep decisions")
+
+
+def test_compact_now_is_unavailable_when_there_is_nothing_to_compact(ui, page):
+    ui.mount("components/ContextMeter.js", f"""{{ info: {{ ...{INFO}, compactable: false }},
+        onCompact: fake.spy('compact') }}""")
+    page.get_by_text(re.compile("Last model input")).click()
+    button = page.get_by_role("button", name="Compact now")
+    expect(button).to_be_disabled()
+    expect(page.get_by_role("textbox", name="Preservation note (optional)")).to_be_disabled()
+    note = ("Nothing to compact yet: earlier turns are already summarized and the latest turn is kept whole. "
+            "Compact now is available again after your next message.")
+    expect(page.get_by_text(note)).to_be_visible()
+    expect(button).to_have_accessible_description(note)
+    expect(page.get_by_text(re.compile("Summarizes earlier turns"))).to_have_count(0)
+    button.click(force=True)
+    assert ui.spy("compact") == []
+    # Before any compaction: a conversation with one turn.
+    ui.rerender(f"{{ info: {{ ...{INFO}, compactions: 0, compactable: false }}, onCompact: fake.spy('compact') }}")
+    expect(page.get_by_text(re.compile(r"^Nothing to compact yet: this conversation has one turn"))).to_be_visible()
+    # A new turn makes it available again, as does an older saved meter without the flag.
+    for flag in ("compactable: true, ", ""):
+        ui.rerender(f"{{ info: {{ ...{INFO}, {flag}}}, onCompact: fake.spy('compact') }}")
+        expect(button).to_be_enabled()
+        expect(page.get_by_text(re.compile("Summarizes earlier turns"))).to_be_visible()
+        expect(page.get_by_text(re.compile("Nothing to compact yet"))).to_have_count(0)
+
+
+def test_open_details_close_when_the_chat_waits_for_approval(ui, page):
+    # The details float over the transcript; a new approval card must not sit under them.
+    ui.mount("components/ContextMeter.js", f"{{ info: {INFO}, busy: true, status: 'running' }}")
+    details = page.locator("details.context-meter")
+    page.get_by_text(re.compile("Last model input")).click()
+    expect(details).to_have_attribute("open", "")
+    ui.rerender(f"{{ info: {INFO}, busy: true, status: 'awaiting_approval' }}")
+    expect(details).not_to_have_attribute("open", "")
+    # They can be opened again while the approval waits, and other statuses leave them open.
+    page.get_by_text(re.compile("Last model input")).click()
+    expect(details).to_have_attribute("open", "")
+    ui.rerender(f"{{ info: {INFO}, busy: true, status: 'running' }}")
+    expect(details).to_have_attribute("open", "")
 
 
 def test_busy_disables_compaction_and_preview_is_labelled(ui, page):
@@ -115,6 +172,18 @@ def test_calibrated_estimate_and_summary_adjustments(ui, page):
     ui.rerender(f"{{ info: {{ ...{CONTEXT}, summary_adjustment: 'trimmed' }} }}")
     expect(page.get_by_text(re.compile("Heuristic text-size estimate"))).to_be_visible()
     expect(page.get_by_text(re.compile(r"part of it was omitted\. Full history is preserved\."))).to_be_visible()
+    # Condensed, but still too long: the app shortened its least important sections (kept in the handoff).
+    handoff = "handoff_path: 'handoffs/auto/h.md'"
+    ui.rerender(f"{{ info: {{ ...{CONTEXT}, summary_adjustment: 'condensed_trimmed', {handoff} }} }}")
+    expect(page.get_by_text("The condensed conversation summary was still over its size limit, so the app shortened "
+                            "its least important sections; the saved handoff has them in full. Full history is "
+                            "preserved.")).to_be_visible()
+    expect(page.get_by_text(re.compile("part of it was omitted"))).to_have_count(0)
+    ui.rerender(f"{{ info: {{ ...{CONTEXT}, summary_adjustment: 'condensed_trimmed' }} }}")
+    expect(page.get_by_text(re.compile(r"least important sections\. Full history is preserved\.$"))).to_be_visible()
+    ui.rerender(f"{{ info: {{ ...{CONTEXT}, summary_fitted_to_budget: 'condensed_trimmed' }} }}")
+    expect(page.get_by_text(re.compile("condensed the summary and the app shortened its least important sections to "
+                                       "fit"))).to_be_visible()
     # Within its own limit, but the request after compaction was over the input budget.
     ui.rerender(f"{{ info: {{ ...{CONTEXT}, summary_fitted_to_budget: 'trimmed' }} }}")
     expect(page.get_by_text(re.compile(r"^The request after the latest compaction was over the input budget .*so part "
@@ -184,6 +253,14 @@ def test_reported_input_is_shown_with_percentages_and_the_threshold_mark(ui, pag
     expect(page.get_by_text("Approximately 8,000 of 120,832 input tokens used.")).to_be_visible()
     expect(page.get_by_text("Automatic compaction at 90% of the input budget: about 108,748 input tokens "
                             "(Settings → Auto-compact at).")).to_be_visible()
+
+
+def test_a_threshold_set_by_a_project_settings_file_names_the_file(ui, page):
+    ui.mount("components/ContextMeter.js", f"{{ info: {{ ...{REPORTED}, auto_compact_percent: 70, auto_compact_source: 'local' }} }}")
+    page.get_by_text("Last model input · 10,000 tokens · 8.3%").click()
+    expect(page.get_by_text(re.compile(r"^Automatic compaction at 70% of the input budget: about 108,748 input tokens "
+                                       r"\(set by this project's \.agents/settings\.local\.json\)\.$"))).to_be_visible()
+    expect(page.get_by_text("Settings → Auto-compact at", exact=False)).to_have_count(0)
 
 
 def test_a_report_from_before_a_compaction_is_labelled_and_the_estimate_leads(ui, page):
@@ -377,5 +454,71 @@ def test_request_details_show_the_rate_limit_of_a_final_429(ui, page):
     page.get_by_text("Request details · error").click()
     expect(definition(page, "Rate limit")).to_have_text(
         "input tokens per minute: limit 1,000,000, current 1,200,000, retry after 12 s")
+    expect(page.locator("dt", has_text="Databricks message")).to_have_count(0)
     ui.rerender("{ info: { model: 'm', status: 'error', http_status: 429, error_kind: 'rate_limit' } }")
     expect(page.locator("dt", has_text="Rate limit")).to_have_count(0)
+
+
+def test_request_details_show_what_a_429_without_a_limit_type_said(ui, page):
+    ui.mount("components/RequestDetails.js", """{ info: { model: 'm', status: 'error', http_status: 429,
+        error_kind: 'rate_limit', rate_limit: { code: 'REQUEST_LIMIT_EXCEEDED', message: 'Exceeded workspace rate limit',
+        retry_after: 7, retry_after_header: '7' } } }""")
+    page.get_by_text("Request details · error").click()
+    expect(definition(page, "Rate limit")).to_have_text("type not named, retry after 7 s (Retry-After header)")
+    expect(definition(page, "Databricks message")).to_have_text("REQUEST_LIMIT_EXCEEDED: Exceeded workspace rate limit")
+    ui.rerender("""{ info: { model: 'm', status: 'error', http_status: 429, error_kind: 'rate_limit',
+        rate_limit: { message: 'Too Many Requests' } } }""")
+    expect(definition(page, "Rate limit")).to_have_text("type not named")
+    expect(definition(page, "Databricks message")).to_have_text("Too Many Requests")
+
+
+def test_an_anchored_estimate_says_so(ui, page):
+    # The estimate is the input Databricks reported for the previous request plus what was added since.
+    ui.mount("components/ContextMeter.js", f"""{{ info: {{ ...{CONTEXT}, estimate_anchor: {{ reported: 5000, added: 800 }},
+        auto_compact_percent: 90, auto_compact_threshold: 108748,
+        next_estimate: {{ tokens: 6100, scale: 1.25, anchor: {{ model: 'm', reported: 5800, added: 240, raw: 7000 }},
+                         percent_of_input_budget: 5, percent_of_threshold: 5.6 }} }} }}""")
+    page.get_by_text("Last model input · ~5%").click()
+    expect(page.locator(".context-anchor")).to_have_text(
+        "Anchored on the last reported count: 5,000 tokens Databricks reported for the previous request + ~1,000 tokens "
+        "added since. Only what changed is estimated from text size.")
+    expect(page.get_by_text("Next request: ~6,100 tokens (5% of the input budget, anchored on the last reported count) "
+                            "before your next message. Automatic compaction runs when it passes ~108,748 tokens.")).to_be_visible()
+    # A request that shrank since (a shorter system message, fewer tools).
+    ui.rerender(f"{{ info: {{ ...{CONTEXT}, estimated_tokens: 4800, estimate_anchor: {{ reported: 5000, added: -200 }} }} }}")
+    expect(page.locator(".context-anchor")).to_contain_text("for the previous request − ~200 tokens removed since.")
+    # Without an anchor: no such line.
+    ui.rerender(f"{{ info: {CONTEXT} }}")
+    expect(page.locator(".context-anchor")).to_have_count(0)
+    expect(page.get_by_text(re.compile("anchored on the last reported count"))).to_have_count(0)
+
+
+def test_tool_definitions_are_split_per_mcp_server(ui, page):
+    breakdown = """breakdown: { system_instructions: 1000, tool_definitions: 2000, messages_and_results: 2500, summary: 0,
+        request_overhead: 500 }"""
+    ui.mount("components/ContextMeter.js", f"""{{ info: {{ ...{CONTEXT}, {breakdown},
+        tool_groups: {{ 'Built-in tools': 1400, 'MCP docs': 450, 'MCP git_hub': 150 }} }} }}""")
+    page.get_by_text("Last model input · ~5%").click()
+    tools = definition(page, "Tool definitions")
+    expect(tools).to_contain_text("~2,000 tokens")
+    expect(tools.locator("li")).to_have_text(["Built-in tools · ~1,400 tokens", "MCP docs · ~450 tokens",
+                                              "MCP git_hub · ~150 tokens"])
+    # Only built-in tools: the total alone.
+    ui.rerender(f"""{{ info: {{ ...{CONTEXT}, {breakdown}, tool_groups: {{ 'Built-in tools': 2000 }} }} }}""")
+    expect(definition(page, "Tool definitions")).to_have_text("~2,000 tokens")
+
+
+def test_selected_skills_are_listed_one_by_one(ui, page):
+    ui.mount("components/ContextMeter.js", f"""{{ info: {{ ...{INFO}, instruction_sources: [
+        {{ path: 'Skill index', scope: 'this workspace', status: 'loaded', estimated_tokens: 120 }},
+        {{ path: 'Skill /style', scope: 'this chat', status: 'loaded', estimated_tokens: 40 }},
+        {{ path: 'Skill /review', scope: 'this message', status: 'loaded', estimated_tokens: 310 }},
+    ] }} }}""")
+    page.get_by_text(re.compile("Last model input")).click()
+    items = page.locator(".context-details li")
+    expect(items).to_have_text([
+        re.compile(r"^\s*Skill index · applies to this workspace · ~120 tokens\s*$"),
+        re.compile(r"^\s*Skill /style · applies to this chat · ~40 tokens\s*$"),
+        re.compile(r"^\s*Skill /review · applies to this message · ~310 tokens\s*$"),
+    ])
+    expect(page.get_by_text(re.compile("A skill your message selected counts in messages and tool results instead."))).to_be_visible()

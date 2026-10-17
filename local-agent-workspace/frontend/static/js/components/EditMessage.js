@@ -1,6 +1,8 @@
 import { html, useAutoFocus, useState } from '../lib.js'
 import { api } from '../api.js'
 import { blockerOf, OpenBlockingChat } from './BlockingChat.js'
+import { sentLabel, sentUploads } from '../attachments.js'
+import { X } from '../icons.js'
 
 // Files a refused file rewind names (a 409 with detail.files).
 export function RefusedFiles({ error }) {
@@ -8,7 +10,9 @@ export function RefusedFiles({ error }) {
   return files.length ? html`<ul class="rewind-refused" aria-label="Files that changed">${files.map(path => html`<li key=${path}>${path}</li>`)}</ul>` : null
 }
 
-// Edit and resend: replaces a user message and everything after it (POST /rewind with resend_text).
+// Edit and resend: replaces a user message and everything after it (POST /rewind with resend_text). The documents
+// and images the message was sent with go again (resend_uploads), except those removed here (an imported chat has
+// none: its files were not imported).
 // Props: sessionId, event (the user event), onSent(result, text), onCancel, onSelectSession(id) (opens a chat that
 // blocks the file rewind).
 export default function EditMessage({ sessionId, event, onSent, onCancel, onSelectSession }) {
@@ -17,12 +21,15 @@ export default function EditMessage({ sessionId, event, onSent, onCancel, onSele
   const [sending, setSending] = useState(false)
   const [error, setError] = useState(null)
   const input = useAutoFocus()
+  const [files, setFiles] = useState(() => (event.attachments || []).filter(item =>
+    (item?.kind === 'document' || item?.kind === 'image') && typeof item.upload === 'string'))
   const send = async () => {
     if (sending || !text.trim()) return
     setSending(true); setError(null)
     try {
       const result = await api(`/sessions/${encodeURIComponent(sessionId)}/rewind`, 'POST',
-        { before_event_id: event.id, conversation: true, code, resend_text: text })
+        { before_event_id: event.id, conversation: true, code, resend_text: text, ...(event.verbatim ? { resend_verbatim: true } : {}),
+          ...(files.length ? { resend_uploads: sentUploads({ attachments: files }) } : {}) })
       onSent(result, text)
     } catch (e) { setError(e); setSending(false) }
   }
@@ -35,6 +42,10 @@ export default function EditMessage({ sessionId, event, onSent, onCancel, onSele
       spellcheck=${false} maxLength=${50000} value=${text} disabled=${sending} onInput=${e => setText(e.currentTarget.value)} />
     <label class="edit-message-option"><input type="checkbox" checked=${code} disabled=${sending}
       onChange=${e => setCode(e.currentTarget.checked)} /><span>Also undo file changes made from this message on</span></label>
+    ${files.length ? html`<p class="field-help edit-message-files">Sent again with: ${files.map((item, index) => html`<span
+      class="edit-message-file" key=${item.upload}>${index ? '; ' : ''}${sentLabel(item)}<button type="button" class="icon-button"
+      aria-label=${`Do not send ${item.name || 'this file'} again`} title="Do not send again" disabled=${sending}
+      onClick=${() => setFiles(current => current.filter(other => other !== item))}><${X} size=${12} /></button></span>`)}</p>` : null}
     <p class="field-help">Replaces this message and everything after it. The current version is kept as an archived conversation.</p>
     ${error ? html`<div class="form-error" role="alert"><p>${error.message}</p><${RefusedFiles} error=${error} />
       <${OpenBlockingChat} blocker=${blockerOf(error)} currentId=${sessionId} onSelect=${onSelectSession} /></div>` : null}

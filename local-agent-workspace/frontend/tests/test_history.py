@@ -244,6 +244,39 @@ def test_no_retry_after_steering(ui, page):
     expect(page.get_by_role("button", name="Retry response")).to_have_count(0)
 
 
+WAKE = {"id": "w3", "type": "user", "text": "[Sent by the app: the background subagent 1a2b3c4d (explore) finished. Read its "
+        "report with get_subagent_result and continue the task.]", "in_wire": True, "verbatim": True, "background_wake": True}
+
+
+def test_the_apps_message_after_a_background_subagent_is_not_yours_to_edit(ui, page):
+    start(ui, page, events=EVENTS + [WAKE, {"id": "a3", "type": "assistant", "text": "Read it; all done."}],
+          extra="window.resendError = 'The project folder is gone.'")
+    message = page.locator(".user-message").nth(2)
+    expect(message.locator(".delegation-origin")).to_have_text("Sent by the app when a background subagent finished")
+    expect(message.get_by_role("list", name="Sent with this message")).to_have_count(0)  # Not "Sent as plain text".
+    expect(message.get_by_role("button", name="Edit message")).to_have_count(0)
+    expect(page.get_by_role("button", name="Edit message")).to_have_count(2)
+    # Retry sends the same text again (the server keeps it the app's); a failed one leaves your message box empty.
+    page.get_by_role("button", name="Retry response").click()
+    ui.wait("fake.requests('/api/sessions/a/rewind', 'POST').length === 1")
+    assert rewind_posts(ui) == [{"before_event_id": "w3", "conversation": True, "resend_text": WAKE["text"],
+                                 "resend_verbatim": True}]
+    expect(page.locator(".app-error")).to_contain_text("The project folder is gone.")
+    expect(message_box(page)).to_have_value("")
+
+
+def test_rewinding_to_the_apps_message_does_not_put_it_in_your_message_box(ui, page):
+    start(ui, page, events=EVENTS + [WAKE, {"id": "a3", "type": "assistant", "text": "Read it; all done."}])
+    page.locator(".user-message").nth(2).get_by_role("button", name="Rewind to here").click()
+    dialog = page.get_by_role("dialog", name="Rewind conversation")
+    dialog.get_by_role("radio", name="Conversation only").check()
+    dialog.get_by_role("button", name="Rewind").click()
+    expect(dialog).to_have_count(0)
+    assert rewind_posts(ui) == [{"before_event_id": "w3", "conversation": True, "code": False}]
+    expect(page.get_by_role("status").filter(has_text="Rewound.")).to_be_visible()
+    expect(message_box(page)).to_have_value("")
+
+
 def test_actions_are_hidden_while_busy(ui, page):
     start(ui, page)
     expect(page.get_by_role("button", name="Edit message")).to_have_count(2)

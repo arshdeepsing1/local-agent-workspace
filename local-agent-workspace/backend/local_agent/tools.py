@@ -9,11 +9,13 @@ from pathlib import Path
 
 import regex as safe_regex
 
+from . import documents
 from .edits import plan_change, preview_diff
 from .jobs import bounded_regex, run_process
 
 IGNORED = {".git", "node_modules", ".venv", ".codex_venv", "__pycache__", ".local", ".pytest_cache", "dist"}
-SECRET_NAMES = {".env", "env_vars.txt", ".netrc", ".npmrc", "credentials", "credentials.json", "id_rsa", "id_ed25519"}
+SECRET_NAMES = {".env", "env_vars.txt", ".netrc", ".npmrc", "credentials", "credentials.json", "id_rsa", "id_ed25519",
+                "id_ecdsa", "id_dsa", ".databrickscfg", ".git-credentials", ".pypirc", ".pgpass"}
 LIMIT = 80_000
 DEFAULT_WRITE_LIMIT = 80_000
 MIN_WRITE_LIMIT = 16_000
@@ -43,6 +45,7 @@ INVALID_LINE_NAMES = 20
 ENCODING_NOTE = "Some bytes are not valid UTF-8 and are shown as U+FFFD (\ufffd)."
 FIND_OFFSET_LIMIT = 200_000
 EXCLUDED_ROOT = "The app's settings and conversation folder is excluded from file tools."
+MAX_RAW_BYTES = 20_000_000  # A file's bytes for the Workspace preview and Download (read_bytes).
 
 
 def _integer(value, name, minimum, maximum=None):
@@ -167,6 +170,11 @@ def _decode_line(raw):
 def _text_cost(text):
     """Bytes a string adds inside a JSON string, as _output_size counts them."""
     return len(json.dumps(text)) - 2
+
+
+class NotText(ValueError):
+    """A file the text editor cannot open (binary, not UTF-8 or over the size limit): the Workspace panel offers a
+    preview or Download instead."""
 
 
 class WorkspaceTools:
@@ -315,11 +323,33 @@ class WorkspaceTools:
         target = self.path(path)
         limit = self.write_limit
         if target.stat().st_size > limit:
-            raise ValueError(f"File is too large for the text editor ({limit // 1000:,} KB limit).")
-        text = target.read_text(encoding="utf-8")
+            raise NotText(f"File is too large for the text editor ({limit // 1000:,} KB limit).")
+        try:
+            text = target.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            raise NotText("This file is not UTF-8 text, so the text editor cannot open it.") from None
         if "\x00" in text:
-            raise ValueError("Binary files cannot be opened in the text editor.")
+            raise NotText("Binary files cannot be opened in the text editor.")
         return text
+
+    def read_bytes(self, path: str, limit: int = MAX_RAW_BYTES):
+        """(resolved path, bytes) of a file for the Workspace preview and Download (GET /api/file/raw), with the
+        same exclusions as read_file. The resolved name is opened without following a link put in its place."""
+        target = self.path(path)
+        descriptor = os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        try:
+            info = os.fstat(descriptor)
+        except OSError:
+            os.close(descriptor)
+            raise
+        if not stat.S_ISREG(info.st_mode):
+            os.close(descriptor)
+            raise ValueError("Only files can be previewed or downloaded.")
+        with os.fdopen(descriptor, "rb") as source:
+            data = source.read(limit + 1) if info.st_size <= limit else b""
+        if info.st_size > limit or len(data) > limit:
+            raise ValueError(f"File is too large to preview or download here ({limit // 1_000_000} MB limit).")
+        return target, data
 
     def read_file_range(self, path: str, start_line: int = 1, max_lines: int = 400, *,
                         tail_lines=None, page_bytes=QUERY_OUTPUT_LIMIT, outline_hint=False):
@@ -342,6 +372,9 @@ class WorkspaceTools:
             result["tail"] = True
         if _output_size(result) > limit:
             raise ValueError(f"Path or line offset exceeds the {size_name} ranged output limit.")
+        fmt = documents.document_format(target.name)
+        if fmt in documents.BINARY_FORMATS:
+            return self._read_document(target, fmt, start_line, max_lines, tail_lines, result, limit)
         deadline = time.monotonic() + QUERY_TIMEOUT
         if tail_lines is not None:
             return self._read_tail(target, info.st_size, tail_lines, result, limit, deadline)
@@ -623,6 +656,49 @@ class WorkspaceTools:
             result["files"].append(item)
         return result
 
+    def _read_document(self, target, fmt, start_line, max_lines, tail_lines, result, limit):
+        """read_file of a PDF, Word, Excel or PowerPoint file: its extracted text (documents.py), numbered and
+        paged like a text file's lines, with what it was extracted from ("--- Page N ---" lines mark pages,
+        sheets or slides)."""
+        try:
+            extracted = documents.read_file_text(target, fmt)
+        except documents.DocumentError as exc:
+            raise ValueError(str(exc)) from None
+        size_name = f"{limit // 1000} KB"
+        described = f"text extracted from this {documents.format_label(fmt)}"
+        if extracted["units"] and type(extracted["count"]) is int:
+            described += f" ({extracted['count']:,} {extracted['units']}{'s' if extracted['count'] != 1 else ''})"
+        result["extracted"] = described
+        if extracted["notes"]:
+            result["notes"] = extracted["notes"][:5]
+        lines = extracted["text"].split("\n") if extracted["text"] else []
+        total = len(lines)
+        if tail_lines is not None:
+            numbers = range(total, max(0, total - tail_lines), -1)
+        else:
+            numbers = range(start_line, min(total, start_line + max_lines - 1) + 1)
+        kept, cost = [], 0
+        for number in numbers:
+            entry = f"{number}: {lines[number - 1]}"
+            entry_cost = _text_cost(entry) + (2 if kept else 0)
+            first, last = (number, total) if tail_lines is not None else (start_line, number)
+            metadata = {**result, "start_line": first, "end_line": last, "truncated": False,
+                        "next_line": None if tail_lines is not None else max(1000, number + 1)}
+            if _output_size(metadata) + cost + entry_cost > limit:
+                if not kept:
+                    raise ValueError(f"Line {number} is too large for the {size_name} ranged output limit.")
+                result["truncated"] = True
+                if tail_lines is None:
+                    result["next_line"] = number
+                break
+            kept.append(entry)
+            cost += entry_cost
+            result.update(start_line=first, end_line=last)
+        if tail_lines is None and not result["truncated"] and result["end_line"] < total:
+            result.update(next_line=result["end_line"] + 1, truncated=True)
+        result["content"] = "\n".join(reversed(kept) if tail_lines is not None else kept)
+        return result
+
     def _read_tail(self, target, size, tail_lines, result, limit, deadline):
         """The last tail_lines lines of a regular file, read backwards from its end."""
         size_name = f"{limit // 1000} KB"
@@ -752,7 +828,7 @@ TOOL_DEFINITIONS = [
                 "include_ignored": {"type": "boolean", "default": False},
                 "offset": {"type": "integer", "minimum": 0, "maximum": 200000},
                 "max_results": {"type": "integer", "minimum": 1, "maximum": 500, "default": 200}}, ["pattern"]),
-    definition("read_file", "Read numbered lines from a regular text file: from start_line (default 1), or the last tail_lines lines, which suits logs. Pages are up to 8–128 KB depending on the context budget; max_lines defaults to 400, or more (up to 2,000) on large budgets; follow next_line. Bytes that are not valid UTF-8 are shown as � and listed in invalid_utf8_lines. Forward reads scan at most 8 MB from the start; tail_lines works on files up to 512 MB. External paths trigger folder access approval.",
+    definition("read_file", "Read numbered lines from a text file, or the text of a PDF, DOCX, XLSX or PPTX file: from start_line (default 1), or the last tail_lines lines, which suits logs. Pages are up to 8–128 KB depending on the context budget; max_lines defaults to 400, or up to 2,000 on large budgets; follow next_line. Invalid UTF-8 bytes show as � (listed in invalid_utf8_lines). Forward reads scan at most 8 MB; tail_lines works on files up to 512 MB. External paths trigger folder access approval.",
                {"path": STRING, "start_line": {"type": "integer", "minimum": 1},
                 "max_lines": {"type": "integer", "minimum": 1, "maximum": 2000},
                 "tail_lines": {"type": "integer", "minimum": 1, "maximum": 2000}}, ["path"]),
@@ -777,7 +853,9 @@ TOOL_DEFINITIONS = [
     definition("run_command", "Run a noninteractive workspace command under the selected permission mode. Streams output; returns a job ID and bounded first output page. Default foreground Stop cancels the job. Set background=true to continue beyond this turn; use get_job_output/list_jobs/stop_job. Do not daemonize or use shell '&'.",
                {"command": STRING, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "default": 60},
                 "max_output_bytes": {"type": "integer", "minimum": 1024, "maximum": 1000000, "default": 80000},
-                "background": {"type": "boolean", "default": False}}, ["command"]),
+                "background": {"type": "boolean", "default": False},
+                "cwd": {"type": "string", "description": "Folder to run in (default: the project); use instead of cd … &&"}},
+               ["command"]),
     definition("list_jobs", "List a page of command jobs belonging to this conversation, including state and exit code. Follow next_offset for older jobs.",
                {"offset": {"type": "integer", "minimum": 0, "maximum": 104, "default": 0}}, []),
     definition("get_job_output", "Read a bounded output page for a job in this conversation. Follow next_offset; poll running jobs only when useful. Offsets count characters in retained output; truncated means later process output was discarded.",

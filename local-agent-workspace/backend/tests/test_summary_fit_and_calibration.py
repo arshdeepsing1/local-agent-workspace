@@ -57,7 +57,9 @@ def test_summary_and_condense_prompts_state_the_active_limit():
     summary_prompt = build_summary_messages("prev", "chunk", "", 8448)[0]["content"]
     condense = build_condense_messages("long summary", 8448, "Keep the migration plan")
     assert "8,448 UTF-8 bytes" in summary_prompt and "1,056 words" in summary_prompt
-    assert "8,448 UTF-8 bytes" in condense[0]["content"]
+    # A condense request is asked for four fifths of the limit it must meet (models overshoot a target).
+    assert "at most 6,758 UTF-8 bytes (about 675 words)" in condense[0]["content"]
+    assert "8,448" not in condense[0]["content"]
     assert "Keep the migration plan" in condense[1]["content"]
     assert condense[1]["content"].endswith("Summary to shorten:\nlong summary")
 
@@ -123,7 +125,7 @@ async def test_oversized_summary_is_trimmed_when_condensing_is_unavailable_or_fa
     assert SUMMARY_TRIM_MARKER in summary
     # A condensed reply that is shorter but still too long is trimmed in preference.
     assert ("shorter" in summary) is (outcome == "still_long")
-    assert info["summary_adjustment"] == "trimmed"
+    assert info["summary_adjustment"] == ("condensed_trimmed" if outcome == "still_long" else "trimmed")
 
 
 @pytest.mark.parametrize("raised", ["condense", "summarize"])
@@ -153,24 +155,26 @@ def test_trim_keeps_valid_utf8_start_and_end_within_limit(text):
     assert trim_summary("short", 3500) == "short"
 
 
-async def test_a_condensed_summary_still_too_long_is_condensed_once_more_before_trimming():
-    # Reported: condensing a long compaction handoff to 12,000 bytes came back too
-    # long, so the summary lost its middle part.
-    replies = ["z" * 5000, "Complete short summary."]
+async def test_a_condensed_summary_still_too_long_is_trimmed_without_a_second_request():
+    # Reported: a second condense request rarely fit (about 6% and 22% over after the first) and took as
+    # long as the first, so the app shortens the least important sections of the condensed text instead.
     received = []
 
     async def condense(summary, limit_bytes):
         received.append(len(summary))
-        return replies[len(received) - 1]
+        return "## Goal and current status\n" + "w" * 4000
 
     fitted, adjustment = await fit_summary("y" * 9000, 3500, condense)
-    assert (fitted, adjustment) == ("Complete short summary.", "condensed")
-    assert received == [9000, 5000]
+    assert adjustment == "condensed_trimmed" and fitted.startswith("## Goal") and len(fitted.encode()) <= 3500
+    assert received == [9000]
+
+    async def fits(summary, limit_bytes):
+        received.append(len(summary))
+        return "Complete short summary."
 
     received.clear()
-    replies[1] = "w" * 4000  # Still too long after two requests: trim the shortest text.
-    fitted, adjustment = await fit_summary("y" * 9000, 3500, condense)
-    assert adjustment == "trimmed" and fitted.startswith("w") and len(received) == 2
+    assert await fit_summary("y" * 9000, 3500, fits) == ("Complete short summary.", "condensed")
+    assert received == [9000]
 
 
 def test_condense_requests_get_output_room_for_their_byte_limit():
@@ -220,6 +224,28 @@ def test_estimate_scale_only_uses_the_latest_five_samples():
     old = [call(input_tokens=19000)] * 3
     recent = [call(input_tokens=11000)] * 5
     assert estimate_scale([*old, *recent], "m") == 1.1
+
+
+def test_compaction_requests_are_left_out_of_the_calibration():
+    # An escaped transcript without tool definitions counts differently from agent requests.
+    agent = {**call(input_tokens=11000), "purpose": "agent"}
+    compaction = {**call(input_tokens=13800), "purpose": "compaction"}
+    assert estimate_scale([agent, compaction], "m") == 1.1
+    assert estimate_scale([compaction], "m") == 1.0
+    # Calls without a purpose (older records) still count, and compactions take no sample's place.
+    assert estimate_scale([call(input_tokens=12000), *[compaction] * 5], "m") == 1.2
+
+
+def test_a_sample_that_looks_counted_twice_with_prompt_caching_is_skipped():
+    # Databricks may include cached tokens in its prompt count too: uncached input alone near the estimate
+    # plus the cache buckets would push the scale towards the 2.0 clamp.
+    doubled = call(input_tokens=10500, cache_read_input_tokens=9000, cache_creation_input_tokens=500)
+    assert estimate_scale([doubled], "m") == 1.0
+    assert estimate_scale([call(input_tokens=11000), doubled], "m") == 1.1
+    # Separate buckets that add up to about the estimate still count, as does a high ratio without caching.
+    assert estimate_scale([call(input_tokens=1200, cache_read_input_tokens=10800)], "m") == 1.2
+    assert estimate_scale([call(input_tokens=7000, cache_read_input_tokens=5000)], "m") == 1.2
+    assert estimate_scale([call(input_tokens=17000)], "m") == 1.7
 
 
 async def test_scaled_estimate_triggers_compaction_the_raw_estimate_would_skip():
@@ -332,7 +358,9 @@ async def test_agent_keeps_an_oversized_summary_by_condensing_or_trimming(runtim
     assert [item["status"] for item in compactions][-1] == ("completed" if condense_status == 200 else "error")
     assert all(type(item["estimated_input_tokens"]) is int for item in compactions)
     expected = "condensed it" if condense_status == 200 else "could not be condensed"
-    assert any(expected in text for text in notices(session))
+    text = next(text for text in notices(session) if expected in text)
+    # The condensing request is counted whether or not it worked, without claiming it condensed anything.
+    assert "summarized in 2 requests, plus 1 condensing request;" in text and "condensed in" not in text
     assert not [event for event in session["events"] if event["type"] == "error"]
 
 

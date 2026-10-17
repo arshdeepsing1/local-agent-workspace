@@ -83,6 +83,9 @@ async def test_foreground_streams_before_completion_and_returns_paged_output(run
         "command": "printf 'first\\n'; sleep .3; printf 'last\\n'"}, "stream"))
     await asyncio.wait_for(first_output.wait(), 2)
     assert not task.done()
+    # The running card carries the job's start time, so the page can show how long it has run.
+    event = next(event for event in session["events"] if event.get("call_id") == "stream")
+    assert event["state"] == "running" and event["job_started"] == manager.jobs.get(event["job_id"])["created"]
     result = json.loads(await task)
     assert result["output"] == "first\nlast\n"
     assert result["state"] == "completed"

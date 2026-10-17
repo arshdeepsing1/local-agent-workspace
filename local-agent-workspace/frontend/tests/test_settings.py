@@ -36,7 +36,7 @@ def test_the_new_fields_render_with_their_defaults_and_help(ui, page):
 
 def test_saved_values_show_and_the_put_carries_the_new_fields(ui, page):
     dialog = open_settings(ui, page, setup="""fake.settings = { ...fake.settings, user_instructions: 'Be brief.',
-      write_limit_kb: 120, command_env: ['JAVA_HOME', 'NVM_DIR'], rate_limit_auto_continue: true }""")
+      write_limit_kb: 120, command_env: ['JAVA_HOME', 'NVM_DIR'], secret_file_patterns: ['*.tfvars'], rate_limit_auto_continue: true }""")
     instructions = dialog.get_by_role("textbox", name="Custom instructions")
     expect(instructions).to_have_value("Be brief.")
     expect(dialog.get_by_text("9 / 8,000")).to_be_visible()
@@ -47,14 +47,97 @@ def test_saved_values_show_and_the_put_carries_the_new_fields(ui, page):
     dialog.get_by_role("spinbutton", name="File write limit (KB)").fill("200")
     names.fill("JAVA_HOME,  CONDA_PREFIX\tGOPATH, ")
     expect(names).to_have_value("JAVA_HOME,  CONDA_PREFIX\tGOPATH, ")
+    secrets = dialog.get_by_role("textbox", name="Secret file names for commands")
+    expect(secrets).to_have_value("*.tfvars")
+    secrets.fill("*.tfvars, prod-*.yaml  *.tfvars")
     dialog.get_by_role("checkbox", name="Continue automatically after rate limits").click()
     dialog.get_by_role("button", name="Save settings").click()
     expect(page.get_by_role("dialog")).to_have_count(0)
     body = ui.bodies("/api/settings", "PUT")[0]
+    assert body["secret_file_patterns"] == ["*.tfvars", "prod-*.yaml"]
     assert body["user_instructions"] == "Answer in short paragraphs.\nPrefer standard library modules."
     assert body["write_limit_kb"] == 200
     assert body["command_env"] == ["JAVA_HOME", "CONDA_PREFIX", "GOPATH"]
     assert body["rate_limit_auto_continue"] is False
+
+
+def test_prompt_caching_is_chosen_in_the_model_group_and_saved(ui, page):
+    dialog = open_settings(ui, page, setup="fake.settings = { ...fake.settings, prompt_caching: 'auto' }")
+    group = dialog.get_by_role("group", name="Model and context")
+    caching = group.get_by_role("combobox", name="Prompt caching")
+    expect(caching).to_have_value("auto")
+    expect(caching.locator("option")).to_have_text(["Automatic (Claude endpoints)", "Documented forms only", "Off"])
+    expect(group.get_by_text(re.compile(r"^Marks the stable start of each agent request so Databricks can bill repeated "
+                                        r"input at the cache-read rate \(about 5% of the input price\)\. Writes cost 25% "
+                                        r"more; entries expire after 5 minutes\. Documented forms only marks just your "
+                                        r"last message or the last tool call\.$"))).to_be_visible()
+    caching.select_option("off")
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    assert ui.bodies("/api/settings", "PUT")[0]["prompt_caching"] == "off"
+
+
+def test_documented_forms_only_is_chosen_and_saved(ui, page):
+    dialog = open_settings(ui, page)
+    caching = dialog.get_by_role("combobox", name="Prompt caching")
+    expect(caching).to_have_value("auto")
+    caching.select_option(label="Documented forms only")
+    expect(caching).to_have_value("messages")
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    assert ui.bodies("/api/settings", "PUT")[0]["prompt_caching"] == "messages"
+    # Saved, it is shown again when Settings open next.
+    page.get_by_role("button", name="Settings", exact=True).click()
+    expect(page.get_by_role("dialog").get_by_role("combobox", name="Prompt caching")).to_have_value("messages")
+
+
+def test_a_saved_prompt_caching_choice_is_shown_and_kept(ui, page):
+    dialog = open_settings(ui, page, setup="fake.settings = { ...fake.settings, prompt_caching: 'off' }")
+    expect(dialog.get_by_role("combobox", name="Prompt caching")).to_have_value("off")
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    assert ui.bodies("/api/settings", "PUT")[0]["prompt_caching"] == "off"
+
+
+def test_the_fallback_endpoint_is_chosen_in_the_model_group_and_saved(ui, page):
+    dialog = open_settings(ui, page)
+    group = dialog.get_by_role("group", name="Model and context")
+    fallback = group.get_by_role("combobox", name="Fallback endpoint")
+    expect(fallback).to_have_value("")
+    # The endpoints the app knows, never the model endpoint itself, and a typed name for one a chat uses.
+    expect(fallback.locator("option")).to_have_text([
+        "None", "Claude Opus 5.5 · databricks-claude-opus-5-5", "Claude Opus 4.8 · databricks-claude-opus-4-8",
+        "GPT OSS 120B · databricks-gpt-oss-120b", "GPT OSS 20B · databricks-gpt-oss-20b", "Other endpoint…"])
+    expect(group.get_by_text(re.compile(r"^When the model endpoint fails before a reply starts .* The next request tries "
+                                        r"the model endpoint again\.$"))).to_be_visible()
+    fallback.select_option("databricks-gpt-oss-120b")
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    assert ui.bodies("/api/settings", "PUT")[0]["fallback_model"] == "databricks-gpt-oss-120b"
+    page.get_by_role("button", name="Settings", exact=True).click()
+    dialog = page.get_by_role("dialog")
+    fallback = dialog.get_by_role("combobox", name="Fallback endpoint")
+    expect(fallback).to_have_value("databricks-gpt-oss-120b")
+    fallback.select_option("Other endpoint…")
+    name = dialog.get_by_role("textbox", name="Fallback endpoint name")
+    expect(name).to_be_focused()
+    name.fill(" team-endpoint ")
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    assert ui.bodies("/api/settings", "PUT")[1]["fallback_model"] == "team-endpoint"
+
+
+def test_a_fallback_equal_to_the_model_endpoint_is_explained(ui, page):
+    dialog = open_settings(ui, page, setup="fake.settings = { ...fake.settings, fallback_model: 'other-model' }")
+    fallback = dialog.get_by_role("combobox", name="Fallback endpoint")
+    expect(fallback).to_have_value("other-model")
+    note = dialog.get_by_text("This is the model endpoint: chats on it have no fallback.")
+    expect(note).to_have_count(0)
+    dialog.get_by_role("combobox", name="Databricks model endpoint").select_option("other-model")
+    expect(note).to_be_visible()
+    expect(fallback).to_have_value("other-model")  # Still listed while the form has it.
+    fallback.select_option("")
+    expect(note).to_have_count(0)
 
 
 def test_a_rejected_name_shows_the_server_message(ui, page):
@@ -182,10 +265,11 @@ def test_save_is_always_visible(ui, page, width, height):
     expect(dialog.get_by_role("group", name="Model and context").get_by_role("spinbutton", name="Context budget (tokens)")).to_be_visible()
     expect(dialog.get_by_role("group", name="Project").get_by_role("textbox", name="Project folder")).to_be_visible()
     groups = dialog.locator("fieldset.settings-group")
-    expect(groups).to_have_count(8)
-    assert [groups.nth(n).locator("legend").inner_text() for n in range(8)] == [
-        "Project", "Model and context", "Reasoning", "Agent", "Subagents", "Commands and files", "Notifications", "Credentials"]
-    for n in range(8):
+    expect(groups).to_have_count(10)
+    assert [groups.nth(n).locator("legend").inner_text() for n in range(10)] == [
+        "Project", "Model and context", "Reasoning", "Agent", "Subagents", "Commands and files", "Web access", "Appearance",
+        "Notifications", "Credentials"]
+    for n in range(10):
         expect(dialog.get_by_role("group", name=groups.nth(n).locator("legend").inner_text(), exact=True)).to_have_count(1)
     # The footer spans the dialog's padding without making it scroll sideways (phones have less padding).
     fits = ui.js("""(d => { const box = d.getBoundingClientRect(), footer = d.querySelector('form > footer').getBoundingClientRect()
@@ -216,7 +300,7 @@ def test_focused_fields_stay_above_the_footer(ui, page, width, height):
     dialog = open_settings_at(ui, page, width, height)
     dialog.get_by_role("textbox", name="Project folder").focus()
     hidden = []
-    for _ in range(60):
+    for _ in range(120):  # Every focusable control of the dialog, then the footer.
         state = ui.js("""(a => ({ name: a.getAttribute('aria-label') || a.labels?.[0]?.textContent.trim().slice(0, 40) || a.textContent.trim(),
           inFooter: !!a.closest('form > footer'), top: a.getBoundingClientRect().top, bottom: a.getBoundingClientRect().bottom,
           height: a.getBoundingClientRect().height }))(document.activeElement)""")
@@ -242,3 +326,119 @@ def test_an_invalid_field_is_shown_above_the_footer(ui, page, width, height):
     expect(limit).to_be_focused()
     assert limit.bounding_box()["y"] + limit.bounding_box()["height"] <= footer_top(ui) + 0.5
     assert ui.bodies("/api/settings", "PUT") == []
+
+
+# The user's instruction files, the output style and project memory (Settings → Agent)
+
+def test_instruction_files_output_style_and_memory_show_their_defaults_and_save(ui, page):
+    dialog = open_settings(ui, page, setup="""fake.override = path => path === '/api/output-styles' ? fake.json({ styles: [
+      { id: 'default', name: 'Default', source: 'built-in' }, { id: 'concise', name: 'Concise', source: 'built-in' },
+      { id: 'explanatory', name: 'Explanatory', source: 'built-in' },
+      { id: 'teacher', name: 'Teacher', source: 'project', path: '.agents/output-styles/teacher.md' }], errors: [] }) : undefined""")
+    group = dialog.get_by_role("group", name="Agent")
+    agents = group.get_by_role("checkbox", name="Load my instructions file ~/.agents/AGENTS.md")
+    claude = group.get_by_role("checkbox", name="Also load ~/.claude/CLAUDE.md")
+    memory = group.get_by_role("checkbox", name="Project memory")
+    style = group.get_by_role("combobox", name="Output style")
+    expect(agents).to_be_checked()
+    expect(claude).not_to_be_checked()
+    expect(memory).to_be_checked()
+    expect(style).to_have_value("default")
+    expect(style.locator("option")).to_have_text(["Default", "Concise", "Explanatory", "Teacher"])
+    expect(group.get_by_text(re.compile(r"^Your own instruction files for every project, added after Custom instructions"))).to_be_visible()
+    expect(group.get_by_text(re.compile(r"Review, edit and delete them in Agent tools → Memory\.$"))).to_be_visible()
+    claude.check()
+    agents.uncheck()
+    memory.uncheck()
+    style.select_option("teacher")
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    body = ui.bodies("/api/settings", "PUT")[0]
+    assert (body["user_agents_file"], body["user_claude_file"], body["project_memory"], body["output_style"]) == (
+        False, True, False, "teacher")
+
+
+def test_a_saved_style_without_its_file_stays_selected_and_says_so(ui, page):
+    dialog = open_settings(ui, page, setup="fake.settings = { ...fake.settings, output_style: 'gone' }")
+    style = dialog.get_by_role("combobox", name="Output style")
+    expect(style).to_have_value("gone")
+    expect(style.locator("option:checked")).to_have_text("gone (no such style file here)")
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    assert ui.bodies("/api/settings", "PUT")[0]["output_style"] == "gone"
+
+
+def test_the_built_in_styles_are_offered_when_the_style_list_fails(ui, page):
+    dialog = open_settings(ui, page, setup="""fake.override = path => path === '/api/output-styles'
+      ? fake.json({ detail: 'Broken' }, 500) : undefined""")
+    style = dialog.get_by_role("combobox", name="Output style")
+    expect(style.locator("option")).to_have_text(["Default", "Concise", "Explanatory"])
+
+
+# Settings → Web access
+
+def test_web_access_turns_fetch_off_and_names_a_search_provider_without_its_key(ui, page):
+    dialog = open_settings(ui, page)
+    group = dialog.get_by_role("group", name="Web access")
+    fetch = group.get_by_role("checkbox", name="Let the agent fetch web pages (web_fetch)")
+    provider = group.get_by_role("combobox", name="Web search provider")
+    expect(fetch).to_be_checked()
+    expect(provider).to_have_value("")
+    expect(group.get_by_role("textbox", name="SearXNG address")).to_have_count(0)
+    provider.select_option("brave")
+    key = group.get_by_role("textbox", name="API key entry in your credential file")
+    expect(key).to_have_attribute("placeholder", "BRAVE_API_KEY")
+    expect(group.get_by_text("The name of the entry, for example BRAVE_API_KEY=… in your credential file.", exact=False)).to_be_visible()
+    provider.select_option("searxng")
+    expect(key).to_have_count(0)
+    group.get_by_role("textbox", name="SearXNG address").fill("http://127.0.0.1:8888")
+    fetch.uncheck()
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    body = ui.bodies("/api/settings", "PUT")[0]
+    assert (body["web_fetch"], body["web_search_provider"], body["web_search_url"]) == (False, "searxng", "http://127.0.0.1:8888")
+
+
+def test_web_access_shows_what_the_saved_provider_still_needs(ui, page):
+    dialog = open_settings(ui, page, setup="""fake.settings = { ...fake.settings, web_search_provider: 'tavily', web_search_key: '',
+      web_search_status: { provider: 'Tavily', ready: false, key_name: 'TAVILY_API_KEY',
+        problem: 'Add TAVILY_API_KEY=… to your credential file: web search with Tavily reads its API key there.' } }""")
+    group = dialog.get_by_role("group", name="Web access")
+    expect(group.get_by_role("status")).to_have_text(
+        "Add TAVILY_API_KEY=… to your credential file: web search with Tavily reads its API key there.")
+    group.get_by_role("textbox", name="API key entry in your credential file").fill("MY_TAVILY")
+    expect(group.get_by_role("status")).to_have_count(0)  # Checked again when saved.
+
+
+# Settings → Appearance → Text size (textSize.js): every font size at once, kept in this browser only.
+
+def test_text_size_scales_all_text_at_once_and_is_kept_in_this_browser(ui, page):
+    dialog = open_settings(ui, page)
+    size = dialog.get_by_role("group", name="Appearance").get_by_role("combobox", name="Text size")
+    expect(size).to_have_value("100")
+    legend = "parseFloat(getComputedStyle(document.querySelector('.settings-group legend')).fontSize)"
+    base = ui.js(legend)
+    size.select_option("125")
+    assert ui.js(legend) == pytest.approx(base * 1.25)
+    assert ui.js("localStorage.getItem('local.textSize')") == "125"
+    assert ui.js("document.documentElement.scrollWidth <= innerWidth")  # No sideways scroll.
+    ui.app(scenario="workspace")  # The page again: the size comes back from this browser's storage.
+    expect(page.get_by_role("combobox", name="Model")).to_have_value("test-model")
+    assert ui.js("getComputedStyle(document.documentElement).getPropertyValue('--text-scale').trim()") == "1.25"
+    page.get_by_role("button", name="Settings", exact=True).click()
+    size = page.get_by_role("dialog").get_by_role("combobox", name="Text size")
+    expect(size).to_have_value("125")
+    size.select_option("100")
+    assert ui.js(legend) == pytest.approx(base)
+    assert ui.js("localStorage.getItem('local.textSize')") is None
+    assert ui.bodies("/api/settings", "PUT") == []  # Never saved with Settings.
+
+
+@pytest.mark.parametrize("width,height", LAYOUT_VIEWPORTS)
+def test_the_largest_text_size_keeps_the_workspace_within_the_window(ui, page, width, height):
+    page.set_viewport_size({"width": width, "height": height})
+    ui.app(scenario="workspace", setup="localStorage.setItem('local.textSize', '150')")
+    expect(page.get_by_role("combobox", name="Model")).to_have_value("test-model")
+    assert ui.js("getComputedStyle(document.documentElement).getPropertyValue('--text-scale').trim()") == "1.5"
+    assert ui.js("document.documentElement.scrollWidth <= innerWidth")
+    expect(page.get_by_role("textbox", name="Message")).to_be_in_viewport()

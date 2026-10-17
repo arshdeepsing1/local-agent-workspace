@@ -2,6 +2,7 @@ import ast
 import json
 import os
 import re
+from datetime import date
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -10,6 +11,7 @@ from .context import (
 )
 from .context import DEFAULT_AUTO_COMPACT_PERCENT, MAX_AUTO_COMPACT_PERCENT, MIN_AUTO_COMPACT_PERCENT
 from .model_profiles import DEFAULT_MODEL, LEGACY_DEFAULT_LIMITS, LEGACY_DEFAULT_MODEL, default_limits, known_endpoints
+from .output_styles import STYLE_ID
 from .reasoning import DEFAULT_EFFORT, DEFAULT_FORMAT, EFFORT_LEVELS, REQUEST_FORMATS
 from .spending import validate_limit
 
@@ -26,6 +28,10 @@ MAX_USER_INSTRUCTIONS = 8_000
 MIN_WRITE_LIMIT_KB = 16
 MAX_WRITE_LIMIT_KB = 1000
 MAX_COMMAND_ENV = 32
+# Settings → Agent (turns.py): a turn's token limit (every token its requests processed) and wall-clock limit.
+MAX_TURN_TOKENS = 100_000_000
+MAX_TURN_MINUTES = 1_440
+TURN_LIMITS = {"turn_token_limit": MAX_TURN_TOKENS, "turn_time_limit_minutes": MAX_TURN_MINUTES}
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
 # Never passed to commands; equal to jobs.CREDENTIAL_ENV, DENIED_ENV and DENIED_ENV_PREFIXES.
 CREDENTIAL_ENV = {"DBRICKS_TOKEN", "DATABRICKS_TOKEN", "DBRICKS_URL", "DATABRICKS_HOST", "LOCAL_AGENT_ENV_FILE"}
@@ -35,6 +41,8 @@ DENIED_ENV_PREFIXES = ("LD_", "DYLD_")
 # Settings that .env or the process environment can set; settings.json holds only values chosen in Settings.
 ENV_KEYS = {"coding_dir": "LOCAL_AGENT_CODING_DIR", "python_venv": "LOCAL_AGENT_PYTHON_VENV"}
 LIMIT_KEYS = ("context_window", "max_output_tokens")
+# Settings → Prompt caching: Automatic (Claude endpoints), Documented forms only (prompt_cache level "messages") or Off.
+PROMPT_CACHING = ("auto", "messages", "off")
 # settings.json files without this version were written before the default model changed (see Settings.__init__).
 SETTINGS_VERSION = 2
 # Settings → Subagents: each built-in subagent type's endpoint and reasoning effort; "" is the chat's own.
@@ -45,6 +53,57 @@ DEFAULT_SUBAGENT_DEFAULTS = {"explore": {"model": "", "effort": "low"}, "general
                              "editor": {"model": "", "effort": ""}}
 # A Databricks serving endpoint name (letters, digits, '.', '_' and '-'), as subagent model overrides take it.
 ENDPOINT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+# Settings → Credentials → Token expires on: "" or a date (schedules.token_warning warns 7 days before).
+EXPIRY_DATE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
+
+
+# Settings a project's settings files may set (settings_layers.py): what a chat in the project runs with. Each is
+# checked by check_setting, as a Settings save checks it.
+LAYERABLE = ("model", "reasoning_effort", "context_window", "max_output_tokens", "auto_compact_percent",
+             "max_agent_steps", "compaction_handoffs", "prompt_caching", "output_style", "auto_keep_changes",
+             "spending_limit_dbu")
+
+
+def check_setting(key, value):
+    """A LAYERABLE setting's value checked as a Settings save checks it: the value to use, or ValueError with the
+    save's message. The output limit is checked against the context budget by the caller."""
+    if key == "model":
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("Enter a model or model-service ID.")
+    elif key == "context_window":
+        if type(value) is not int or not MIN_CONTEXT_WINDOW <= value <= MAX_CONTEXT_WINDOW:
+            raise ValueError(f"Context budget must be an integer from {MIN_CONTEXT_WINDOW:,} to {MAX_CONTEXT_WINDOW:,} tokens.")
+    elif key == "max_output_tokens":
+        if type(value) is not int or not MIN_MAX_OUTPUT_TOKENS <= value <= MAX_MAX_OUTPUT_TOKENS:
+            raise ValueError(f"Output-token limit must be an integer from {MIN_MAX_OUTPUT_TOKENS:,} to {MAX_MAX_OUTPUT_TOKENS:,}.")
+    elif key == "max_agent_steps":
+        if type(value) is not int or not MIN_MAX_AGENT_STEPS <= value <= MAX_MAX_AGENT_STEPS:
+            raise ValueError(f"Agent step limit must be an integer from {MIN_MAX_AGENT_STEPS} to {MAX_MAX_AGENT_STEPS}.")
+    elif key == "compaction_handoffs":
+        if type(value) is not bool:
+            raise ValueError("Compaction handoffs must be on or off.")
+    elif key == "auto_compact_percent":
+        if type(value) is not int or not MIN_AUTO_COMPACT_PERCENT <= value <= MAX_AUTO_COMPACT_PERCENT:
+            raise ValueError(f"Auto-compact threshold must be an integer from {MIN_AUTO_COMPACT_PERCENT} to "
+                             f"{MAX_AUTO_COMPACT_PERCENT} percent.")
+    elif key == "output_style":
+        if not isinstance(value, str) or not STYLE_ID.match(value):
+            raise ValueError("Output style must be default, concise, explanatory or the name of a style file "
+                             "(1-40 lowercase letters, digits, - or _).")
+    elif key == "auto_keep_changes":
+        if type(value) is not bool:
+            raise ValueError("Automatic Keep must be on or off.")
+    elif key == "reasoning_effort":
+        if value not in EFFORT_LEVELS:
+            raise ValueError("Default reasoning effort must be one of: " + ", ".join(EFFORT_LEVELS) + ".")
+    elif key == "prompt_caching":
+        if value not in PROMPT_CACHING:
+            raise ValueError("Prompt caching must be one of: " + ", ".join(PROMPT_CACHING) + ".")
+    elif key == "spending_limit_dbu":
+        return validate_limit(value, "Default spending limit")
+    else:
+        raise ValueError(f"{key} is not a setting a project can set.")
+    return value
 
 
 def subagent_defaults(value, strict=True):
@@ -116,6 +175,19 @@ def follow_limits(follow, defaults, current):
     return context_window, output
 
 
+def valid_expiry(value):
+    """Whether value is a token expiry date Settings takes: "" or YYYY-MM-DD."""
+    if value == "":
+        return True
+    if not isinstance(value, str) or not EXPIRY_DATE.match(value):
+        return False
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
 def credential_assignments(values):
     return {key: values[key] if key in values else values[alias]
             for key, alias in (("DBRICKS_URL", "DATABRICKS_HOST"), ("DBRICKS_TOKEN", "DATABRICKS_TOKEN"))
@@ -143,8 +215,18 @@ class Settings:
             "approval_timeout_minutes": DEFAULT_APPROVAL_MINUTES,
             "system_notifications": False,
             "user_instructions": "",
+            # Settings → Agent (instructions.py, memory.py, output_styles.py): the user's own instruction files
+            # (~/.agents/AGENTS.md on, the read-only ~/.claude/CLAUDE.md off), project memory and the reply style.
+            "user_agents_file": True,
+            "user_claude_file": False,
+            "project_memory": True,
+            "output_style": "default",
+            # Settings → Agent (git_tools.git_context): each turn's first message carries a short Git snapshot.
+            "git_context": True,
             "write_limit_kb": 80,
             "command_env": [],
+            # Settings → Commands (secret_paths.py): file name patterns that count as credential files for commands.
+            "secret_file_patterns": [],
             "rate_limit_auto_continue": True,
             "auto_keep_changes": False,
             # Settings → Reasoning (reasoning.py): the effort new chats start with, how requests ask
@@ -152,9 +234,39 @@ class Settings:
             "reasoning_effort": DEFAULT_EFFORT,
             "reasoning_format": DEFAULT_FORMAT,
             "thinking_summaries": True,
+            # Settings → Reasoning (reasoning_replay.py): send a turn's signed thinking back with its tool results
+            # (experimental; off until an endpoint check shows the route accepts it).
+            "thinking_replay": False,
+            # Settings → Model and context (prompt_cache.py): "auto" marks the stable start of agent requests to
+            # Databricks-hosted Claude endpoints for prompt caching; "messages" sends only the documented marker
+            # forms (no system message or tool result marker); "off" sends no cache markers.
+            "prompt_caching": "auto",
             # Settings → Agent (spending.py): the soft cap in estimated DBU of chats without their own; 0 = none.
             "spending_limit_dbu": 0,
+            # Settings → Agent (turns.py): the token and time limits of each turn of chats without their own; 0 = none.
+            "turn_token_limit": 0,
+            "turn_time_limit_minutes": 0,
             "subagent_defaults": subagent_defaults(None),
+            # Settings → Subagents (planning.DelegateManager.maybe_wake): an idle chat continues by itself when a
+            # background subagent finishes. Off by default: it starts a paid turn.
+            "background_subagent_wake": False,
+            # Settings → Model and context (AgentManager.fallback_endpoint): the endpoint an agent or subagent
+            # request goes to once when its own failed before the reply started; "" = none.
+            "fallback_model": "",
+            # Settings → Commands and files (commands.py): /<name> at the start of a message runs a command template
+            # and /<skill-id> selects a skill for that message; off sends such text as typed.
+            "slash_commands": True,
+            # Settings → Web access (web_fetch.py): the agent's web_fetch tool (a card for each new domain), and
+            # web_search through a provider: "" (none), "brave", "tavily" or "searxng" (at web_search_url). The API
+            # key stays in the credential file, in the entry web_search_key names ("" = the provider's usual name).
+            "web_fetch": True,
+            "web_search_provider": "",
+            "web_search_url": "",
+            "web_search_key": "",
+            # Settings → Agent (schedules.py): the scheduler runs the schedules of Agent tools → Schedules on its own
+            # (off: they run only with Run now), and Settings → Credentials: the day the Databricks token expires.
+            "schedules_enabled": False,
+            "token_expires_on": "",
         }
         self.migrated_from = None
         if self.path.exists():
@@ -180,6 +292,16 @@ class Settings:
                 self.values["spending_limit_dbu"] = validate_limit(float(limit) if isinstance(limit, str) else limit)
             except ValueError:
                 self.values["spending_limit_dbu"] = 0
+            for key, maximum in TURN_LIMITS.items():  # A hand-edited limit that is not a whole number means none.
+                if type(self.values[key]) is not int or not 0 <= self.values[key] <= maximum:
+                    self.values[key] = 0
+            if type(self.values["schedules_enabled"]) is not bool:  # Hand-edited: anything but true is off.
+                self.values["schedules_enabled"] = False
+            if not valid_expiry(self.values["token_expires_on"]):
+                self.values["token_expires_on"] = ""
+            fallback = self.values["fallback_model"]  # A hand-edited name that is not one means none.
+            fallback = fallback.strip() if isinstance(fallback, str) else ""
+            self.values["fallback_model"] = fallback if ENDPOINT_NAME.match(fallback) else ""
         # Budgets not saved follow the model's defaults; saved ones win.
         limits = dict(zip(LIMIT_KEYS, default_limits(self.values["model"])))
         ordered = {}
@@ -204,17 +326,54 @@ class Settings:
 
     def public(self):
         from . import user_paths  # rules.py imports this module; user_paths imports tools.
+        from .schedules import token_warning
         try:
             host, _ = self.credentials()
             configured = True
         except (ValueError, OSError):
             host, configured = "", False
-        return {**self.values, "host": host, "configured": configured,
+        return {**self.values, "host": host, "configured": configured, "web_search_status": self.web_search_status(),
+                # The Settings project's settings files: what they set and whether they apply (Settings shows the
+                # values and their sources; saving writes only these values, never a file's).
+                "project_layers": self.project_layers().report(self.values["workspace"]),
                 "coding_dir_status": user_paths.coding_dir_status(self),
                 "python_venv_status": user_paths.python_venv_status(self), "default_model": DEFAULT_MODEL,
                 "default_limits": dict(zip(LIMIT_KEYS, default_limits(self.values["model"]))),
+                "token_warning": token_warning(self.values["token_expires_on"]),
                 "endpoint_profiles": known_endpoints(),
                 **({"model_migrated_from": self.migrated_from} if self.migrated_from is not None else {})}
+
+    def project_layers(self):
+        """The project settings files of this state folder's projects (settings_layers.ProjectLayers)."""
+        if getattr(self, "_layers", None) is None:
+            from .settings_layers import ProjectLayers  # It imports this module.
+            self._layers = ProjectLayers(self)
+        return self._layers
+
+    def effective(self, workspace):
+        """Settings for chats in this project folder: these values with a trusted project file's over the keys it
+        sets (settings_layers.py)."""
+        return self.project_layers().effective(workspace)
+
+    def credential_values(self, path=None):
+        """The credential file's assignments (read as data), or {} without one. path: another file (a save's)."""
+        path = self.values.get("env_file") if path is None else path
+        if not path or not isinstance(path, str):
+            return {}
+        try:
+            return read_env(Path(path).expanduser())
+        except (OSError, UnicodeError, ValueError):
+            return {}
+
+    def web_search_status(self):
+        """Settings → Web access: {provider, ready, problem?, key_name?} for the chosen search provider (never the
+        key), or None when web search is off."""
+        from .web_fetch import search_setup
+        setup = search_setup(self.values, self.credential_values)
+        if setup is None:
+            return None
+        return {"provider": setup["label"], "ready": not setup.get("problem"),
+                **{key: setup[key] for key in ("problem", "key_name") if setup.get(key)}}
 
     def env_equivalent(self, key, value, candidate=None):
         """True when value is what .env or the process environment sets for key (coding_dir or
@@ -247,26 +406,12 @@ class Settings:
         workspace = Path(candidate["workspace"]).expanduser().resolve()
         if not workspace.is_dir():
             raise ValueError("Choose an existing project directory.")
-        if not candidate["model"].strip():
-            raise ValueError("Enter a model or model-service ID.")
-        budget = candidate["context_window"]
-        if type(budget) is not int or not MIN_CONTEXT_WINDOW <= budget <= MAX_CONTEXT_WINDOW:
-            raise ValueError(f"Context budget must be an integer from {MIN_CONTEXT_WINDOW:,} to {MAX_CONTEXT_WINDOW:,} tokens.")
-        output_tokens = candidate["max_output_tokens"]
-        if (type(output_tokens) is not int
-                or not MIN_MAX_OUTPUT_TOKENS <= output_tokens <= MAX_MAX_OUTPUT_TOKENS):
-            raise ValueError(f"Output-token limit must be an integer from {MIN_MAX_OUTPUT_TOKENS:,} to {MAX_MAX_OUTPUT_TOKENS:,}.")
-        if output_tokens >= budget - SAFETY_MARGIN:
+        for key in ("model", "context_window", "max_output_tokens"):
+            check_setting(key, candidate[key])
+        if candidate["max_output_tokens"] >= candidate["context_window"] - SAFETY_MARGIN:
             raise ValueError(f"Output-token limit must be below the context budget minus the {SAFETY_MARGIN:,}-token safety margin.")
-        max_steps = candidate["max_agent_steps"]
-        if type(max_steps) is not int or not MIN_MAX_AGENT_STEPS <= max_steps <= MAX_MAX_AGENT_STEPS:
-            raise ValueError(f"Agent step limit must be an integer from {MIN_MAX_AGENT_STEPS} to {MAX_MAX_AGENT_STEPS}.")
-        if type(candidate["compaction_handoffs"]) is not bool:
-            raise ValueError("Compaction handoffs must be on or off.")
-        percent = candidate["auto_compact_percent"]
-        if type(percent) is not int or not MIN_AUTO_COMPACT_PERCENT <= percent <= MAX_AUTO_COMPACT_PERCENT:
-            raise ValueError(f"Auto-compact threshold must be an integer from {MIN_AUTO_COMPACT_PERCENT} to "
-                             f"{MAX_AUTO_COMPACT_PERCENT} percent.")
+        for key in ("max_agent_steps", "compaction_handoffs", "auto_compact_percent"):
+            check_setting(key, candidate[key])
         minutes = candidate["approval_timeout_minutes"]
         if type(minutes) is not int or not 0 <= minutes <= MAX_APPROVAL_MINUTES:
             raise ValueError(f"Approval wait must be 0 (no limit) or 1 to {MAX_APPROVAL_MINUTES:,} minutes.")
@@ -275,6 +420,11 @@ class Settings:
         instructions = candidate["user_instructions"]
         if not isinstance(instructions, str) or len(instructions) > MAX_USER_INSTRUCTIONS or "\x00" in instructions:
             raise ValueError(f"Custom instructions must be text of at most {MAX_USER_INSTRUCTIONS:,} characters.")
+        for key, label in (("user_agents_file", "Load ~/.agents/AGENTS.md"), ("user_claude_file", "Load ~/.claude/CLAUDE.md"),
+                           ("project_memory", "Project memory"), ("git_context", "Git status in messages")):
+            if type(candidate[key]) is not bool:
+                raise ValueError(f"{label} must be on or off.")
+        check_setting("output_style", candidate["output_style"])
         write_limit = candidate["write_limit_kb"]
         if type(write_limit) is not int or not MIN_WRITE_LIMIT_KB <= write_limit <= MAX_WRITE_LIMIT_KB:
             raise ValueError(f"File write limit must be an integer from {MIN_WRITE_LIMIT_KB} to {MAX_WRITE_LIMIT_KB:,} KB.")
@@ -287,17 +437,35 @@ class Settings:
                 raise ValueError(f"{name} cannot be passed to commands.")
             if name in DENIED_ENV or name.startswith(DENIED_ENV_PREFIXES):
                 raise ValueError(f"{name} changes how programs start and cannot be passed to commands.")
+        from .secret_paths import check_patterns  # tools imports jobs; keep this module's imports light.
+        candidate["secret_file_patterns"] = check_patterns(candidate["secret_file_patterns"])
         if type(candidate["rate_limit_auto_continue"]) is not bool:
             raise ValueError("Continue after rate limits must be on or off.")
-        if type(candidate["auto_keep_changes"]) is not bool:
-            raise ValueError("Automatic Keep must be on or off.")
-        if candidate["reasoning_effort"] not in EFFORT_LEVELS:
-            raise ValueError("Default reasoning effort must be one of: " + ", ".join(EFFORT_LEVELS) + ".")
+        check_setting("auto_keep_changes", candidate["auto_keep_changes"])
+        if type(candidate["background_subagent_wake"]) is not bool:
+            raise ValueError("Continue the chat when a background subagent finishes must be on or off.")
+        check_setting("reasoning_effort", candidate["reasoning_effort"])
         if candidate["reasoning_format"] not in REQUEST_FORMATS:
             raise ValueError("Reasoning request format must be one of: " + ", ".join(REQUEST_FORMATS) + ".")
         if type(candidate["thinking_summaries"]) is not bool:
             raise ValueError("Show thinking summaries must be on or off.")
-        candidate["spending_limit_dbu"] = validate_limit(candidate["spending_limit_dbu"], "Default spending limit")
+        if type(candidate["thinking_replay"]) is not bool:
+            raise ValueError("Send earlier thinking back must be on or off.")
+        check_setting("prompt_caching", candidate["prompt_caching"])
+        if type(candidate["slash_commands"]) is not bool:
+            raise ValueError("Slash commands must be on or off.")
+        if type(candidate["schedules_enabled"]) is not bool:
+            raise ValueError("Scheduled runs must be on or off.")
+        expiry = candidate["token_expires_on"]
+        candidate["token_expires_on"] = expiry = expiry.strip() if isinstance(expiry, str) else expiry
+        if not valid_expiry(expiry):
+            raise ValueError("Token expires on must be empty or a date such as 2026-12-31.")
+        self.check_web_settings(candidate)
+        candidate["spending_limit_dbu"] = check_setting("spending_limit_dbu", candidate["spending_limit_dbu"])
+        for key, label, unit in (("turn_token_limit", "Token limit per turn", "tokens"),
+                                 ("turn_time_limit_minutes", "Time limit per turn", "minutes")):
+            if type(candidate[key]) is not int or not 0 <= candidate[key] <= TURN_LIMITS[key]:
+                raise ValueError(f"{label} must be a whole number of {unit} from 0 (none) to {TURN_LIMITS[key]:,}.")
         sent = values.get("subagent_defaults")
         if isinstance(sent, dict):
             # Types and fields left out keep their current values.
@@ -306,6 +474,13 @@ class Settings:
                     for kind, entry in sent.items()}
             candidate["subagent_defaults"] = {**current, **sent}
         candidate["subagent_defaults"] = subagent_defaults(candidate["subagent_defaults"])
+        fallback = candidate["fallback_model"]
+        fallback = fallback.strip() if isinstance(fallback, str) else fallback
+        if not isinstance(fallback, str) or (fallback and not ENDPOINT_NAME.match(fallback)):
+            raise ValueError("The fallback endpoint must be empty (none) or an endpoint name of letters, digits, '.', "
+                             "'_' and '-' (at most 128 characters).")
+        # Equal to the model (the new-chat model picker may choose it): chats on it simply have no fallback.
+        candidate["fallback_model"] = fallback
         for key, label, check in (("coding_dir", "Default code folder", user_paths.check_coding_dir_setting),
                                   ("python_venv", "Python environment", user_paths.check_python_venv_setting)):
             value = candidate[key]
@@ -331,6 +506,37 @@ class Settings:
         temp.replace(self.path)
         self.migrated_from = None
         return self.public()
+
+    def check_web_settings(self, candidate):
+        """Settings → Web access, checked (and the address and key name tidied) in candidate."""
+        from .web_fetch import KEY_NAME, PROVIDERS, check_search_url
+        if type(candidate["web_fetch"]) is not bool:
+            raise ValueError("Web fetch must be on or off.")
+        provider = candidate["web_search_provider"]
+        if provider != "" and provider not in PROVIDERS:
+            raise ValueError("Web search provider must be none, brave, tavily or searxng.")
+        address, name = candidate["web_search_url"], candidate["web_search_key"]
+        if not isinstance(address, str) or not isinstance(name, str):
+            raise ValueError("The web search address and key name must be text.")
+        address, name = address.strip(), name.strip()
+        if address:
+            try:
+                address = check_search_url(address)
+            except ValueError:
+                if provider == "searxng":
+                    raise
+                address = ""  # A hidden field another provider does not use.
+        candidate["web_search_url"] = address
+        if provider == "searxng" and not address:
+            raise ValueError("Enter your SearXNG address for web search, such as http://127.0.0.1:8888.")
+        if name and not KEY_NAME.match(name):
+            raise ValueError("The web search key setting is the name of an entry in your credential file (capital "
+                             "letters, digits and _), such as BRAVE_API_KEY; the key itself stays in that file.")
+        if name in CREDENTIAL_ENV:
+            raise ValueError("Web search cannot use your Databricks credentials.")
+        if name and name in self.credential_values(candidate.get("env_file")).values():
+            raise ValueError("Enter the name of the credential-file entry that holds the key, not the key itself.")
+        candidate["web_search_key"] = name
 
     def redact(self, text: str) -> str:
         try:

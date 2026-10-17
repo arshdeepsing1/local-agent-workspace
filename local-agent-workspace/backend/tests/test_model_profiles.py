@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 
 from local_agent import agents as agents_module
 from local_agent import model_profiles
+from local_agent.prompt_cache import unmarked
 from local_agent.agents import AgentManager, output_limit_text
 from local_agent.api import create_app
 from local_agent.config import Settings, read_env
@@ -239,9 +240,15 @@ def test_opus_warning_boundaries(context, output, expected):
 
 def test_warning_levels_and_texts():
     warnings = {item["code"]: item for item in limit_warnings(OPUS, 300_000, 100_001)}
-    assert warnings["output_over_otpm"]["level"] == "error"
+    # Documented, but some workspaces accept more: a warning (role status), not an error.
+    assert warnings["output_over_otpm"]["level"] == "warning"
+    assert warnings["output_over_otpm"]["text"].startswith(
+        "Databricks documents that a request whose Max output tokens is above the endpoint's "
+        "output-tokens-per-minute limit (100,000 by default for Claude Opus 5.5) is rejected with HTTP 429 before it "
+        "starts; some workspaces accept more.")
     assert "Lower it to at most 20,000" in warnings["output_over_otpm"]["text"]
     assert warnings["context_itpm"]["level"] == "note"
+    assert "can reach, after a short burst allowance," in warnings["context_itpm"]["text"]
     assert "Above 250,000 tokens" in warnings["context_itpm"]["text"]
     concurrency = limit_warnings(OPUS, 200_000, 30_000)[0]
     assert concurrency["level"] == "warning" and "Above 20,000, four requests at once" in concurrency["text"]
@@ -566,7 +573,7 @@ async def test_no_request_kind_sends_options_or_a_prefill_opus_5_5_rejects(runti
     await manager.manual_compact(session)  # A handoff.
     assert {"agent", "title", "side_question", "compaction"} <= set(kinds)
     assert kinds.count("compaction") >= 3
-    assert any(body["messages"][-1]["content"] == OUTPUT_LIMIT_CONTINUATION for body in requests)
+    assert any(unmarked(body)["messages"][-1]["content"] == OUTPUT_LIMIT_CONTINUATION for body in requests)
     for body in requests:
         assert not FORBIDDEN_KEYS & set(body), body.keys()
         last = body["messages"][-1]
@@ -593,11 +600,25 @@ def test_the_limits_route(tmp_path, monkeypatch):
         assert result["recommended"] == {"context_window": 200_000, "max_output_tokens": 16_384}
         assert result["warnings"] == [] and result["effective"]["clamped"] is False
         assert result["defaults"] == {"context_window": 200_000, "max_output_tokens": 16_384}
+        assert result["effective"]["input_budget"] == 181_568
+        # The input budget requests use: near the endpoint's window it keeps 5% for estimate error, and it
+        # follows the endpoint's maxima.
+        result = check({"model": OPUS, "context_window": 1_000_000, "max_output_tokens": 16_384})
+        assert result["effective"] == {"context_window": 1_000_000, "max_output_tokens": 16_384, "clamped": False,
+                                       "input_budget": 934_826}
+        result = check({"model": OPUS, "context_window": 1_048_576, "max_output_tokens": 131_072})
+        assert result["effective"] == {"context_window": 1_000_000, "max_output_tokens": 128_000, "clamped": True,
+                                       "input_budget": (1_000_000 - 128_000 - 2_048) * 100 // 105}
+        result = check({"model": "databricks-gpt-oss-120b", "context_window": 131_072, "max_output_tokens": 8_192})
+        assert result["effective"]["input_budget"] == 115_078 and result["effective"]["clamped"] is False
         result = check({"model": f" {OPUS} ", "context_window": 300_000, "max_output_tokens": 30_000})
         assert [item["code"] for item in result["warnings"]] == ["output_concurrency", "context_itpm"]
+        # The capability flags later features read (model_profiles.supports) come with the profile.
+        assert (result["profile"]["vision"], result["profile"]["structured_output"]) == (True, False)
         result = check({"model": "unknown-endpoint", "context_window": 65_536, "max_output_tokens": 8_192})
         assert result["profile"] is None and result["recommended"] is None
         assert result["defaults"] == {"context_window": 131_072, "max_output_tokens": 8_192}
+        assert result["effective"]["input_budget"] == 65_536 - 8_192 - 2_048
         assert result["note"].startswith("No built-in limits")
         result = check({"model": "databricks-claude-opus-4-8", "context_window": 65_536, "max_output_tokens": 8_192})
         assert result["recommended"] is None
@@ -649,3 +670,19 @@ def test_the_profile_module_has_the_documented_constants():
     assert model_profiles.MAX_REQUEST_BYTES == 4_000_000 and model_profiles.MAX_EXECUTION_SECONDS == 597
     assert model_profiles.CONCURRENT_REQUESTS == 4
     assert model_profiles.LEGACY_DEFAULT_LIMITS == (131_072, 8_192)
+
+
+def test_capability_flags_say_only_what_is_documented():
+    from local_agent.model_profiles import CAPABILITY_FLAGS, MODEL_PROFILES, public_profile, supports
+    for profile in MODEL_PROFILES.values():
+        assert all(type(profile[flag]) is bool for flag in CAPABILITY_FLAGS)
+    # Image content parts are documented for the Databricks-hosted Claude models; GPT OSS is text only.
+    models = (OPUS, "databricks-claude-opus-4-8", GPT, "databricks-gpt-oss-20b", "unknown-endpoint", None)
+    assert [supports(model, "vision") for model in models] == [True, True, False, False, False, False]
+    assert supports(" Databricks-Claude-Opus-5-5 ", "vision") is True
+    # Not confirmed for any endpoint yet: unknown is never supported.
+    assert not any(supports(model, "structured_output") for model in models)
+    assert [supports(model, "prompt_caching") for model in models[:3]] == [True, True, False]
+    assert public_profile(GPT)["vision"] is False and public_profile(OPUS)["structured_output"] is False
+    with pytest.raises(ValueError):
+        supports(OPUS, "telepathy")

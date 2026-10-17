@@ -2,12 +2,14 @@ import asyncio
 import mimetypes
 import os
 import secrets
+import sqlite3
 import sys
+import time
 import unicodedata
 from contextlib import asynccontextmanager
 from pathlib import Path, PurePosixPath
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
@@ -17,39 +19,65 @@ from pydantic import BaseModel, Field, model_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .agents import AgentManager, public_session
-from .config import APP_ROOT, MAX_APPROVAL_MINUTES, MAX_MAX_AGENT_STEPS, MIN_MAX_AGENT_STEPS, Settings
+from .config import APP_ROOT, ENDPOINT_NAME, MAX_APPROVAL_MINUTES, MAX_MAX_AGENT_STEPS, MIN_MAX_AGENT_STEPS, Settings
 from .config import MAX_COMMAND_ENV, MAX_USER_INSTRUCTIONS, MAX_WRITE_LIMIT_KB, MIN_WRITE_LIMIT_KB
+from .config import MAX_TURN_MINUTES, MAX_TURN_TOKENS
 from .context import (
     MAX_CONTEXT_WINDOW, MAX_MAX_OUTPUT_TOKENS, MIN_CONTEXT_WINDOW, MIN_MAX_OUTPUT_TOKENS, SAFETY_MARGIN,
+    effective_input_budget, model_context_window,
 )
 from .context import MAX_AUTO_COMPACT_PERCENT, MIN_AUTO_COMPACT_PERCENT
 from .model_profiles import default_limits, effective_limits, limit_warnings, limits_note, public_profile
-from . import reasoning
+from . import reasoning, serving, settings_layers
 from .user_paths import standing_directories
 from .store import Store, UnreadableConversation
 from . import conversation_search
-from .git_tools import file_diff, working_tree_changes, working_tree_status
+from .git_tools import (GH_ENVIRONMENT_KEYS, commit_staged, file_diff, find_git, git_environment, pr_status, stage,
+                        staged_files, working_tree_changes, working_tree_status)
 from .jobs import NOT_STOPPED, TIMEOUT_NOT_STOPPED
-from .tools import WorkspaceTools, file_error
+from .tools import NotText, WorkspaceTools, file_error
 from .workspace_folders import register_workspace_folders
 from .permissions import PermissionMode
-from .telemetry import session_metrics
-from . import spending
+from .telemetry import SUMMARY_VERSION, session_metrics, usage_summary
+from .usage_overview import MAX_DAYS, overview
+from . import spending, turns
 from .spending import MAX_LIMIT_DBU
-from .activity import redact_secrets
 from .usage_export import usage_csv, usage_rows
 from .transcript import transcript, transcript_file_name
 from .feature_api import register_features
 from .portability_api import register_portability
-from .approvals import MAX_DECLINE_NOTE, ensure_idle, register_approvals
-from .composer_api import register_composer
+from .approvals import MAX_DECLINE_NOTE, ensure_idle, register_approvals, workspace_idle
+from .composer_api import UploadRef, register_composer, upload_refs, upload_refs_field
 from .interactions import register_interactions
 from .projects import register_projects
+from .endpoint_checks_api import register_endpoint_checks
+from .stream_api import register_stream, stream_snapshot
+from .schedules import Scheduler
+from .schedules_api import register_schedules
+from .user_paths import checked_workspace
 
+
+USAGE_SCAN = 50  # Chats without a usage summary loaded per GET /api/usage (each once: its summary is saved).
 
 # Browsers refuse ES modules served with a non-JavaScript type, and some systems
 # map .js to text/plain in their mimetypes registry.
 mimetypes.add_type("text/javascript", ".js")
+mimetypes.add_type("application/manifest+json", ".webmanifest")  # The web app manifest (Install app).
+
+
+# GET /api/file/raw serves these inline when a file's bytes start with the signature of its type (WebP: RIFF,
+# then WEBP at byte 8); every other file is a download.
+INLINE_TYPES = {"image/png": b"\x89PNG\r\n\x1a\n", "image/jpeg": b"\xff\xd8\xff", "image/gif": (b"GIF87a", b"GIF89a"),
+                "image/webp": b"RIFF", "application/pdf": b"%PDF-"}
+
+
+INDEX_POLICY = "frame-src blob:; frame-ancestors 'none'"
+
+
+def content_disposition(disposition, name):
+    """A Content-Disposition header for a file name: an ASCII fallback and the UTF-8 name (RFC 6266)."""
+    fallback = "".join(char if 32 <= ord(char) < 127 and char not in '"\\;%' else "_" for char in name) or "file"
+    return f'{disposition}; filename="{fallback}"; filename*=UTF-8\'\'{quote(name, safe="")}'
 
 
 class RevalidatedStaticFiles(StaticFiles):
@@ -63,6 +91,10 @@ class RevalidatedStaticFiles(StaticFiles):
 
 class Prompt(BaseModel):
     text: str = Field(min_length=1, max_length=50000)
+    # Sent as typed: no command template, no skill selected by /<id>, no @ file attached.
+    verbatim: bool = Field(default=False, strict=True)
+    # Files attached from the composer (POST /api/sessions/{id}/uploads), also with plain text.
+    uploads: list[UploadRef] = upload_refs_field()
 
 
 class CompactionRequest(BaseModel):
@@ -78,12 +110,17 @@ class Decision(BaseModel):
 
 
 Effort = Literal["default", "low", "medium", "high", "xhigh", "max"]  # reasoning.EFFORT_LEVELS
-RequestFormat = Literal["auto", "anthropic", "openai", "none"]  # reasoning.REQUEST_FORMATS
+RequestFormat = Literal["auto", "anthropic", "anthropic_budget", "openai", "none"]  # reasoning.REQUEST_FORMATS
 
 
 class SessionPermissions(BaseModel):
     permission_mode: PermissionMode = "manual"
     reasoning_effort: Effort | None = None  # A new chat's effort; Settings' default when absent.
+    model: str | None = Field(default=None, min_length=1, max_length=256, strict=True)  # /clear: the old chat's model.
+    # Scripts (client.py): the chat's project folder, checked like Settings' (the Settings workspace when absent),
+    # and its own Agent steps per message (Settings' when absent).
+    workspace: str | None = Field(default=None, min_length=1, max_length=4096, strict=True)
+    max_agent_steps: int | None = Field(default=None, ge=MIN_MAX_AGENT_STEPS, le=MAX_MAX_AGENT_STEPS, strict=True)
 
 
 class SessionEffort(BaseModel):
@@ -95,6 +132,14 @@ class SessionSpendingLimit(BaseModel):
     """The chat's own limit in DBU (0 = none), or null to follow the Settings default."""
     model_config = {"extra": "forbid"}
     spending_limit_dbu: float | None = Field(ge=0, le=MAX_LIMIT_DBU, allow_inf_nan=False, strict=True)
+
+
+class SessionTurnLimits(BaseModel):
+    """The chat's own turn limits (whole tokens or minutes, 0 = none), or null to follow the Settings default.
+    A field left out keeps its value."""
+    model_config = {"extra": "forbid"}
+    turn_token_limit: int | None = Field(default=None, ge=0, le=MAX_TURN_TOKENS, strict=True)
+    turn_time_limit_minutes: int | None = Field(default=None, ge=0, le=MAX_TURN_MINUTES, strict=True)
 
 
 class ReasoningQuery(BaseModel):
@@ -166,17 +211,64 @@ class SettingsEdit(BaseModel):
     system_notifications: bool | None = Field(default=None, strict=True)
     auto_keep_changes: bool | None = Field(default=None, strict=True)
     user_instructions: str | None = Field(default=None, max_length=MAX_USER_INSTRUCTIONS, strict=True)
+    user_agents_file: bool | None = Field(default=None, strict=True)
+    user_claude_file: bool | None = Field(default=None, strict=True)
+    project_memory: bool | None = Field(default=None, strict=True)
+    git_context: bool | None = Field(default=None, strict=True)  # A Git snapshot in each turn's first message.
+    output_style: str | None = Field(default=None, min_length=1, max_length=40, strict=True)  # output_styles.STYLE_ID
     write_limit_kb: int | None = Field(default=None, ge=MIN_WRITE_LIMIT_KB, le=MAX_WRITE_LIMIT_KB, strict=True)
     command_env: list[str] | None = Field(default=None, max_length=MAX_COMMAND_ENV, strict=True)
+    secret_file_patterns: list[str] | None = Field(default=None, max_length=32, strict=True)  # secret_paths
     rate_limit_auto_continue: bool | None = Field(default=None, strict=True)
     reasoning_effort: Effort | None = None
     reasoning_format: RequestFormat | None = None
     thinking_summaries: bool | None = Field(default=None, strict=True)
+    thinking_replay: bool | None = Field(default=None, strict=True)  # Send earlier thinking back (reasoning_replay.py).
+    prompt_caching: Literal["auto", "messages", "off"] | None = None  # config.PROMPT_CACHING
+    slash_commands: bool | None = Field(default=None, strict=True)
     spending_limit_dbu: float | None = Field(default=None, ge=0, le=MAX_LIMIT_DBU, allow_inf_nan=False, strict=True)
+    turn_token_limit: int | None = Field(default=None, ge=0, le=MAX_TURN_TOKENS, strict=True)  # turns.py; 0 = none
+    turn_time_limit_minutes: int | None = Field(default=None, ge=0, le=MAX_TURN_MINUTES, strict=True)
     coding_dir: str | None = Field(default=None, max_length=4096, strict=True)
     python_venv: str | None = Field(default=None, max_length=4096, strict=True)
     # Settings → Subagents: {explore|general|editor: {model, effort}}; config.subagent_defaults checks it.
     subagent_defaults: dict[str, dict[str, str]] | None = None
+    background_subagent_wake: bool | None = Field(default=None, strict=True)  # planning.DelegateManager.maybe_wake
+    # Settings → Model and context: "" = none; config.Settings.update and AgentManager.fallback_allowed check it.
+    fallback_model: str | None = Field(default=None, max_length=128, strict=True)
+    # Settings → Web access: config.Settings.check_web_settings checks them; the key is a credential-file entry name.
+    web_fetch: bool | None = Field(default=None, strict=True)
+    web_search_provider: Literal["", "brave", "tavily", "searxng"] | None = None
+    web_search_url: str | None = Field(default=None, max_length=2048, strict=True)
+    web_search_key: str | None = Field(default=None, max_length=64, strict=True)
+    # Settings → Agent → Scheduled runs and Settings → Credentials → Token expires on ("" or YYYY-MM-DD): schedules.py.
+    schedules_enabled: bool | None = Field(default=None, strict=True)
+    token_expires_on: str | None = Field(default=None, max_length=10, strict=True)
+
+
+class ProjectTrust(BaseModel):
+    """Trust or Ignore a project's settings files (settings_layers.py), as reviewed: sha256 is the report's."""
+    model_config = {"extra": "forbid"}
+    decision: Literal["trust", "ignore"]
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$", strict=True)
+
+
+class GitStage(BaseModel):
+    """Changes view: stage (staged true) or unstage these workspace-relative files."""
+    model_config = {"extra": "forbid"}
+    paths: list[str] = Field(min_length=1, max_length=4_000, strict=True)  # Both sides of 2,000 renames.
+    staged: bool = Field(strict=True)
+
+
+class GitCommit(BaseModel):
+    model_config = {"extra": "forbid"}
+    message: str = Field(min_length=1, max_length=10_000, strict=True)
+
+
+# The pull request chip (git_tools.pr_status): one gh call per project a minute, or every 5 s with Refresh.
+PR_CACHE_SECONDS = 60
+PR_REFRESH_SECONDS = 5
+GIT_PATH_BYTES = 100_000  # The paths of one staging request, in total (a command line has a size limit).
 
 
 class LimitsQuery(BaseModel):
@@ -235,14 +327,18 @@ def create_app(settings=None):
     settings = settings or Settings()
     store = Store(settings.state_dir / "conversations.sqlite3")
     manager = AgentManager(store, settings)
+    scheduler = manager.scheduler = Scheduler(manager, settings)
     local_token = secrets.token_urlsafe(32)
     deleting_sessions = set()
 
     @asynccontextmanager
     async def lifespan(app):
+        await scheduler.sync()  # Settings → Agent → Scheduled runs (off by default).
         yield
+        await scheduler.stop()  # No new scheduled run starts during the shutdown.
         manager.closing = True  # A Stop during shutdown records the reply as interrupted.
         await asyncio.gather(*(manager.stop(sid) for sid in list(manager.tasks)))
+        await manager.endpoint_runner.stop()  # An endpoint check keeps what came back so far.
         await manager.jobs.shutdown()
         # Everything stopped: the next start reads only conversation headers. If a stop raised,
         # no marker is written and the next start loads every conversation (the safe direction).
@@ -350,12 +446,12 @@ def create_app(settings=None):
         # with an error status), 'network' (no answer) or 'invalid_response' (an answer the app cannot read).
         # An unreadable credential file (OSError) still reaches the global handler (HTTP 400).
         try:
-            host, token = settings.credentials()
+            host, token = manager.serving.credentials()
         except ValueError as exc:
             return {"connected": False, "models": [], "error": settings.redact(str(exc)), "error_kind": "credentials"}
         try:
-            async with httpx.AsyncClient(timeout=20, follow_redirects=False) as client:
-                response = await client.get(host + "/api/2.0/serving-endpoints", headers={"Authorization": f"Bearer {token}"})
+            async with manager.serving.client(serving.LISTING_TIMEOUT) as client:
+                response = await client.get(serving.endpoints_url(host), headers=serving.request_headers(token))
         except httpx.HTTPError as exc:
             return {"connected": False, "models": [], "error": settings.redact(str(exc) or type(exc).__name__),
                     "error_kind": "network"}
@@ -387,10 +483,27 @@ def create_app(settings=None):
     @app.put("/api/settings")
     async def update_settings(body: SettingsEdit):
         manager.workspace_available(body.workspace)
+        fallback = (body.fallback_model or "").strip()
+        # A new fallback endpoint is one the app knows or the user already uses (this save's models count).
+        sent = [entry.get("model") for entry in (body.subagent_defaults or {}).values() if isinstance(entry, dict)]
+        if (ENDPOINT_NAME.match(fallback) and fallback != settings.values.get("fallback_model")
+                and not manager.fallback_allowed(fallback, [body.model, *sent])):
+            raise ValueError(f"The fallback endpoint {fallback} is neither an endpoint the app knows nor one "
+                             "you use (the Settings model, Settings → Subagents or one of your chats). Requests carry "
+                             "the conversation, so the app sends them only to endpoints you already chose.")
         result = settings.update(body.model_dump(exclude_none=True))
-        # A request format Databricks rejected is tried again after any Settings save.
+        await scheduler.sync()  # Scheduled runs turned on or off.
+        # A request format Databricks rejected, and cache markers and images it rejected, are tried again after any
+        # Settings save.
         manager.reasoning_rejections.clear()
-        # Open chats' meters follow the new budgets and threshold; others follow when opened (stream).
+        manager.cache_levels.clear()
+        manager.replay_rejections.clear()
+        manager.vision_rejections.clear()
+        await refresh_open_meters()
+        return result
+
+    async def refresh_open_meters():
+        """Open chats' meters follow new budgets and thresholds; others follow when opened (stream)."""
         for session_id in [key for key, sockets in manager.listeners.items() if sockets]:
             try:
                 session = manager.get(session_id)
@@ -398,7 +511,29 @@ def create_app(settings=None):
                 continue
             if session:
                 await manager.refresh_meter_limits(session)
-        return result
+
+    def layers_folder(session_id):
+        """The project whose settings files a chat (or, without one, a new chat in the Settings project) uses."""
+        return settings_layers.project_folder(session_or_404(session_id) if session_id else None, settings)
+
+    @app.get("/api/settings/project")
+    async def project_settings_files(session_id: str | None = None):
+        """The project's settings files (.agents/settings.json and .agents/settings.local.json): what they set and
+        whether they apply (settings_layers.ProjectLayers.report)."""
+        return settings.project_layers().report(layers_folder(session_id), fresh=True)
+
+    @app.post("/api/settings/project/trust")
+    async def trust_project_settings(body: ProjectTrust, session_id: str | None = None):
+        """Trust or Ignore the project's settings files as reviewed (body.sha256: the report's). HTTP 409 with the
+        new report when they changed meanwhile."""
+        folder = layers_folder(session_id)
+        try:
+            report = settings.project_layers().decide(folder, body.decision, body.sha256)
+        except settings_layers.ChangedFiles as exc:
+            raise HTTPException(409, {"message": str(exc),
+                                      "report": settings.project_layers().report(folder, fresh=True)}) from None
+        await refresh_open_meters()
+        return report
 
     @app.get("/api/settings")
     async def get_settings():
@@ -413,10 +548,17 @@ def create_app(settings=None):
         if profile and profile["recommended_context_window"] and profile["recommended_max_output_tokens"]:
             recommended = {"context_window": profile["recommended_context_window"],
                            "max_output_tokens": profile["recommended_max_output_tokens"]}
+        if profile is not None and profile.get("vision") and not manager.supports(model, "vision"):
+            profile["vision"] = False  # An endpoint check found image parts rejected.
         defaults = default_limits(model)
+        effective = effective_limits(model, body.context_window, body.max_output_tokens)
+        # The input budget requests use (AgentManager.input_budget): the capped budgets, with the
+        # estimate margin near the endpoint's window.
+        effective["input_budget"] = effective_input_budget(effective["context_window"], effective["max_output_tokens"],
+                                                           model_context_window(model))
         return {"profile": profile, "recommended": recommended,
                 "defaults": {"context_window": defaults[0], "max_output_tokens": defaults[1]},
-                "effective": effective_limits(model, body.context_window, body.max_output_tokens),
+                "effective": effective,
                 "warnings": limit_warnings(model, body.context_window, body.max_output_tokens),
                 "note": limits_note(model)}
 
@@ -427,26 +569,42 @@ def create_app(settings=None):
         model = body.model.strip()
         if not model:
             raise ValueError("Enter a model endpoint name.")
-        fmt = reasoning.request_format(model, body.reasoning_format)
-        return reasoning.preview(model, body.reasoning_effort, body.reasoning_format, body.thinking_summaries,
-                                 manager.reasoning_rejections.get((model, fmt)))
+        # What requests use after a rejection: a thinking budget instead of the adaptive fields, or none.
+        setting, rejected, stepped = manager.reasoning_ladder(model, body.reasoning_format)
+        limits = effective_limits(model, settings.values["context_window"], settings.values["max_output_tokens"])
+        return reasoning.preview(model, body.reasoning_effort, setting, body.thinking_summaries, rejected,
+                                 limits["max_output_tokens"], stepped)
 
     @app.get("/api/sessions")
     async def list_sessions():
         counts = manager.changes.counts()
         # A parent's subagents index (up to 200 entries) is left out: the list is fetched often while
-        # subagents work, and /sessions/<id>/children lists them.
-        return [{**{k: v for k, v in s.items() if k != "subagents"}, "status": manager.statuses.get(s["id"], "idle"),
+        # subagents work, and /sessions/<id>/children lists them. So are the last turn's MCP server status
+        # (errors and stderr tails), which the open chat has, its result record (/info has it) and the usage
+        # summary (GET /api/usage).
+        return [{**{k: v for k, v in s.items() if k not in ("subagents", "mcp_status", "usage_summary", "last_turn_result")},
+                 "status": manager.statuses.get(s["id"], "idle"),
                  "unreviewed_changes": counts.get(s["id"], 0)}
                 for s in store.list()]
 
     @app.post("/api/sessions")
     async def create_session(body: SessionPermissions | None = None):
-        manager.workspace_available(settings.values["workspace"])
-        session = store.create(settings.values)
+        workspace = settings.values["workspace"]
+        if body and body.workspace is not None:
+            workspace = str(checked_workspace(body.workspace, settings))
+        manager.workspace_available(workspace)
+        model = body.model.strip() if body and body.model else ""
+        if body and body.model and not model:
+            raise ValueError("Enter a model endpoint name.")
+        # The project's trusted settings files can set a new chat's model and effort (settings_layers.py).
+        session = store.create({**settings.effective(workspace), "workspace": workspace})
         session["permission_mode"] = body.permission_mode if body else "manual"
         if body and body.reasoning_effort:
             session["reasoning_effort"] = body.reasoning_effort
+        if body and body.max_agent_steps is not None:
+            session["max_agent_steps"] = body.max_agent_steps
+        if model:
+            session["model"] = model
         store.save(session)
         return public_session(session)
 
@@ -488,6 +646,17 @@ def create_app(settings=None):
         from .approvals import busy_status
         session = session_or_404(session_id)
         await manager.change_spending_limit(session, body.spending_limit_dbu)
+        return public_session(session, busy_status(manager, session_id))
+
+    @app.put("/api/sessions/{session_id}/turn-limits")
+    async def change_turn_limits(session_id: str, body: SessionTurnLimits):
+        # Allowed while a turn runs: the agent's next model request checks them (and a running subagent's).
+        from .approvals import busy_status
+        session = session_or_404(session_id)
+        changes = {key: getattr(body, key) for key in body.model_fields_set}
+        if not changes:
+            raise HTTPException(400, "Send turn_token_limit or turn_time_limit_minutes.")
+        await manager.change_turn_limits(session, changes)
         return public_session(session, busy_status(manager, session_id))
 
     @app.put("/api/sessions/{session_id}/title")
@@ -578,17 +747,79 @@ def create_app(settings=None):
 
     @app.get("/api/sessions/{session_id}")
     async def get_session(session_id: str):
-        return public_session(session_or_404(session_id), manager.statuses.get(session_id, "idle"))
+        return public_session(session_or_404(session_id), manager.statuses.get(session_id, "idle"),
+                              manager.compaction_view(session_id))
+
+    @app.get("/api/sessions/{session_id}/context")
+    async def get_context(session_id: str):
+        """The chat's context meter as last prepared (estimate, breakdown with tool groups, instruction
+        sources, the last report and the next-request estimate), without building a request."""
+        info = session_or_404(session_id).get("context_info")
+        progress = manager.compaction_view(session_id)
+        return {"status": manager.statuses.get(session_id, "idle"),
+                "context_info": info if isinstance(info, dict) else None,
+                **({"compaction_progress": progress} if progress else {})}
 
     @app.get("/api/sessions/{session_id}/metrics")
     async def get_session_metrics(session_id: str):
         session = session_or_404(session_id)
-        return {**session_metrics(session), "spending": spending.status(manager, session)}
+        metrics = {**session_metrics(session), "spending": spending.status(manager, session),
+                   "turn_limits": turns.status(manager, session)}
+        if session.get("subagents"):
+            # This chat's subagents (Agent tools → Usage: the chat and its subagents, and each one).
+            metrics["subagents"] = manager.delegates.usage_rollup(session)
+        return metrics
+
+    @app.get("/api/usage")
+    async def usage_across_chats(days: int = Query(default=30, ge=1, le=MAX_DAYS)):
+        """Every chat's model calls in the last `days` local days (Agent tools → Usage → All chats), from the usage
+        summaries in their headers. A chat saved before summaries existed is loaded once and its summary saved, at
+        most USAGE_SCAN of them per request; pending_chats counts those left for the next one."""
+        chats, scanned, pending = [], 0, 0
+        for header in store.list():
+            if header["id"] in deleting_sessions:
+                continue
+            if header["id"] in manager.live:  # A running turn: its ledger is newer than its header.
+                chats.append((header, usage_summary(manager.live[header["id"]])))
+                continue
+            summary = header.get("usage_summary")
+            if not isinstance(summary, dict) or summary.get("version") != SUMMARY_VERSION:
+                if scanned >= USAGE_SCAN:
+                    pending += 1
+                    continue
+                scanned += 1
+                try:
+                    full = store.get(header["id"])
+                except (ValueError, OSError):
+                    continue  # Unreadable: reported by the store, not counted.
+                if not full:
+                    continue
+                summary = full["usage_summary"] = usage_summary(full)
+                try:
+                    store.save(full, touch=False)
+                except (OSError, sqlite3.Error):
+                    pass  # Counted now and computed again next time.
+            chats.append((header, summary))
+        return {**overview(chats, days), "pending_chats": pending}
 
     @app.get("/api/sessions/{session_id}/usage.csv")
-    async def export_session_usage(session_id: str):
+    async def export_session_usage(session_id: str, include_subagents: bool = False):
+        """include_subagents adds the rows of the chat's subagent chats that still exist (conversation_id
+        tells them apart), numbered on after the chat's own."""
         session = session_or_404(session_id)
-        text = usage_csv(usage_rows(session, redact=lambda value: settings.redact(redact_secrets(value))))
+        redact = manager.redact_sent
+        rows = usage_rows(session, redact=redact)
+        if include_subagents:
+            for entry in session.get("subagents") or []:
+                if not isinstance(entry, dict) or entry.get("deleted") or not isinstance(entry.get("id"), str):
+                    continue
+                try:
+                    child = manager.get(entry["id"])
+                except (ValueError, OSError):
+                    continue  # An unreadable subagent chat is reported by the store.
+                if child and child.get("parent_session_id") == session_id:
+                    rows += [{**row, "n": len(rows) + number} for number, row in enumerate(usage_rows(child, redact=redact), 1)]
+        text = usage_csv(rows)
         return Response(text, media_type="text/csv; charset=utf-8", headers={
             "Content-Disposition": f'attachment; filename="usage-{session_id[:8]}.csv"',
             "Cache-Control": "no-store"})
@@ -620,9 +851,13 @@ def create_app(settings=None):
                 manager.task_board.delete_session(member)
                 manager.checkpoints.delete_session(member)
                 manager.changes.delete_session(member)
+                manager.results.delete_session(member)
+                manager.uploads.delete_session(member)
                 store.delete(member)
                 manager.live.pop(member, None)
                 manager.statuses.pop(member, None)
+                for remembered in (manager.estimate_anchors, manager.anchor_candidates, manager.compactions):
+                    remembered.pop(member, None)
         finally:
             deleting_sessions.difference_update(family)
         if children == "keep":
@@ -650,7 +885,8 @@ def create_app(settings=None):
         if not body.text.strip():
             raise ValueError("Enter a message.")
         # Starts the message, or queues it while a turn, compaction or ! command runs.
-        return await manager.submit_message(session_id, body.text.strip())
+        return await manager.submit_message(session_id, body.text.strip(), verbatim=body.verbatim,
+                                            uploads=upload_refs(body.uploads))
 
     @app.post("/api/sessions/{session_id}/stop")
     async def stop(session_id: str):
@@ -694,13 +930,7 @@ def create_app(settings=None):
         try:
             # The first snapshot carries the latest 200 events, extended to the whole latest turn
             # (at most 1,000); the page loads earlier ones from /events. Later snapshots are complete.
-            snapshot = public_session(session, manager.statuses.get(session_id, "idle"))
-            events, total = snapshot["events"], len(snapshot["events"])
-            start = max(0, total - 200)
-            latest_user = next((index for index in range(total - 1, -1, -1) if events[index].get("type") == "user"), None)
-            if latest_user is not None and latest_user < start:
-                start = max(latest_user, total - 1000)
-            snapshot.update(events=events[start:], events_start=start, events_total=total)
+            snapshot = stream_snapshot(session, manager.statuses.get(session_id, "idle"), manager.compaction_view(session_id))
             await socket.send_json({"type": "snapshot", "session": snapshot})
             await manager.publish_changes(session)
             try:
@@ -737,8 +967,9 @@ def create_app(settings=None):
     async def files(path: str = ".", session_id: str | None = None):
         return ui_tools(session_id).list_files(path)
 
-    @app.get("/api/file")
-    async def file(path: str, session_id: str | None = None):
+    def opened_file(path, session_id, read):
+        """(the path opened, read(tools, path)) for a file the Workspace panel opens by a path a reply, a tool card
+        or Files named."""
         tools = ui_tools(session_id)
         session = session_or_404(session_id) if session_id else {}
         worktree = session.get("worktree")
@@ -749,7 +980,7 @@ def create_app(settings=None):
             # so the editor never saves into the main checkout by mistake.
             path = locate_file(tools, path, worktree) or path
         try:
-            content = tools.read_file(path)
+            return tools, path, read(tools, path)
         except FileNotFoundError:
             # Replies and tool cards name files in other ways: from the project's own folder name
             # (demo/src/app.py), from the Git repository's root, or in a worktree chat by the source
@@ -758,9 +989,29 @@ def create_app(settings=None):
             if found is None:
                 raise ValueError(f"{path} does not exist in {tools.root}. It may have been moved or deleted, "
                                  "or it was named relative to another folder.") from None
-            path, content = found, tools.read_file(found)
+            return tools, found, read(tools, found)
+
+    @app.get("/api/file")
+    async def file(path: str, session_id: str | None = None):
+        try:
+            tools, path, content = opened_file(path, session_id, lambda tools, path: tools.read_file(path))
+        except NotText as exc:
+            raise HTTPException(400, {"message": settings.redact(str(exc)), "code": "not_text"}) from None
         # The absolute path lets the editor offer an "Open in VS Code" link.
         return {"path": path, "content": content, "absolute": str(tools.path(path))}
+
+    @app.get("/api/file/raw")
+    async def raw_file(path: str, session_id: str | None = None, download: bool = False):
+        """A file's bytes for the Workspace preview and Download (at most 20 MB). Only PNG, JPEG, GIF, WebP and
+        PDF files whose bytes start as that type says are served inline; everything else (HTML and SVG included)
+        is an attachment of type application/octet-stream. Neither ever runs as a page of this origin."""
+        tools, path, (target, data) = opened_file(path, session_id, lambda tools, path: tools.read_bytes(path))
+        kind = mimetypes.guess_type(target.name)[0]
+        inline = not download and kind in INLINE_TYPES and data.startswith(INLINE_TYPES[kind]) \
+            and (kind != "image/webp" or data[8:12] == b"WEBP")
+        return Response(data, media_type=kind if inline else "application/octet-stream", headers={
+            "Content-Disposition": content_disposition("inline" if inline else "attachment", target.name),
+            "Content-Security-Policy": "sandbox; default-src 'none'", "X-Opened-Path": quote(path)})
 
     @app.put("/api/file")
     async def save_file(body: FileEdit):
@@ -781,7 +1032,7 @@ def create_app(settings=None):
         """'credential', 'generated' or None for a workspace-relative path, as the file tools see it."""
         def classify(path):
             name = PurePosixPath(path).name.casefold()
-            if name.endswith(".env") or name.startswith(".env."):
+            if name.endswith(".env") or name.startswith(".env.") and name != ".env.example":
                 return "credential"  # Also left out of every diff by git_tools.DIFF_EXCLUDES.
             try:
                 tools.resolve(path)
@@ -797,29 +1048,113 @@ def create_app(settings=None):
         tools = workspace_tools(session_id)
         return await working_tree_status(tools.root, git_classifier(tools))
 
-    @app.get("/api/git/diff")
-    async def git_diff(path: str, area: Literal["staged", "unstaged", "untracked"], session_id: str | None = None,
-                       orig_path: str | None = None):
-        tools = workspace_tools(session_id)
-        paths = [path] if orig_path is None or area == "untracked" else [path, orig_path]
+    def checked_git_paths(tools, paths, shown):
+        """Refuse paths outside the project, credential files, generated folders and folders. shown: the verb
+        of the refusals ('shown', 'staged')."""
         for value in paths:
             relative = PurePosixPath(value)
             if not value or "\0" in value or relative.is_absolute() or ".." in relative.parts or value.startswith("~"):
                 raise ValueError("Choose a file inside this project's repository.")
         kinds = [git_classifier(tools)(value) for value in paths]
         if "credential" in kinds:
-            raise ValueError("Credential files are not shown.")
+            raise ValueError(f"Credential files are not {shown}.")
         if "generated" in kinds:
-            raise ValueError("Files in generated folders are not shown here.")
+            raise ValueError(f"Files in generated folders are not {shown} here.")
         for value in paths:
             target = tools.root / value
             if value.endswith("/") or PurePosixPath(value) == PurePosixPath(".") or (target.is_dir() and not target.is_symlink()):
                 raise ValueError("Choose one changed file, not a folder.")
-        # Leave the configured credential file out of the diff even under another name.
+
+    def credential_excludes(tools):
+        """The configured credential file as an exclude pathspec, so Git leaves it out even under another name."""
         credential = tools.credential_file
-        excludes = ([f":(exclude,literal){credential.relative_to(tools.root).as_posix()}"]
-                    if credential and credential.is_relative_to(tools.root) and credential != tools.root else [])
-        return await file_diff(tools.root, path, area, paths[1] if len(paths) > 1 else None, tools=tools, excludes=excludes)
+        return ([f":(exclude,literal){credential.relative_to(tools.root).as_posix()}"]
+                if credential and credential.is_relative_to(tools.root) and credential != tools.root else [])
+
+    def git_program(tools):
+        """The git program for the user's own Git actions: never one inside the project or a granted folder."""
+        return find_git(git_environment(), [tools.root, *tools.allowed_directories,
+                                            *(Path(path) for path in standing_directories(settings))])
+
+    @app.get("/api/git/diff")
+    async def git_diff(path: str, area: Literal["staged", "unstaged", "untracked"], session_id: str | None = None,
+                       orig_path: str | None = None):
+        tools = workspace_tools(session_id)
+        paths = [path] if orig_path is None or area == "untracked" else [path, orig_path]
+        checked_git_paths(tools, paths, "shown")
+        return await file_diff(tools.root, path, area, paths[1] if len(paths) > 1 else None, tools=tools,
+                               excludes=credential_excludes(tools))
+
+    @app.post("/api/git/stage")
+    async def git_stage(body: GitStage, session_id: str | None = None):
+        """Stage or unstage the files the user chose in the Changes view: their own action, so no card, but
+        not while a chat or a command in this project runs (it could be changing the same index)."""
+        tools = workspace_tools(session_id)
+        paths = list(dict.fromkeys(body.paths))
+        if sum(len(path.encode("utf-8", errors="replace")) + 1 for path in paths) > GIT_PATH_BYTES:
+            raise ValueError("Too many files at once: stage fewer.")
+        checked_git_paths(tools, paths, "staged")
+        workspace_idle(manager, store, tools.root, "staging files")
+        await stage(tools.root, paths, body.staged, git=git_program(tools), excludes=credential_excludes(tools))
+        return await working_tree_status(tools.root, git_classifier(tools))
+
+    @app.post("/api/git/commit")
+    async def git_commit(body: GitCommit, session_id: str | None = None):
+        """Commit what is staged with the user's message (no hooks or signing program run). Refused when a
+        staged file is outside this project folder or is a credential file."""
+        tools = workspace_tools(session_id)
+        message = body.message.strip()
+        if not message or "\0" in message:
+            raise ValueError("Write a commit message.")
+        workspace_idle(manager, store, tools.root, "committing")
+        git = git_program(tools)
+        prefix, staged = await staged_files(tools.root, git=git)
+        if not staged:
+            raise ValueError("Nothing is staged. Stage the files to commit first.")
+        outside = [path for _, *paths in staged for path in paths if path is not None and not path.startswith(prefix)]
+        if outside:
+            raise ValueError(f"{len(outside):,} staged {'file is' if len(outside) == 1 else 'files are'} outside this "
+                             f"project folder ({outside[0]}). Commit in a terminal, or unstage {'it' if len(outside) == 1 else 'them'} there.")
+        classify = git_classifier(tools)
+        for status, path, original in staged:
+            path, original = path[len(prefix):], original and original[len(prefix):]
+            # A deleted credential file may be committed (git rm --cached .env stops tracking it); its content
+            # under another name may not.
+            if status != "D" and classify(path) == "credential":
+                raise ValueError(f"{path} is a credential file and it is staged. Unstage it in a terminal "
+                                 f"(git restore --staged -- <path>) before committing.")
+            if original and classify(original) == "credential":
+                raise ValueError(f"{path} is staged as a rename or copy of the credential file {original}. Unstage "
+                                 f"it in a terminal (git restore --staged -- <path>) before committing.")
+        commit = await commit_staged(tools.root, message, git=git)
+        return {"commit": commit, "status": await working_tree_status(tools.root, classify)}
+
+    pr_cache, pr_locks = {}, {}
+
+    @app.get("/api/git/pr")
+    async def git_pr(session_id: str | None = None, refresh: bool = False,
+                     branch: str | None = Query(default=None, max_length=300)):
+        """The current branch's pull request from the GitHub CLI, if it is installed and signed in (it calls
+        GitHub, never Databricks), at most once a minute per project and branch (the branch the Changes view
+        shows; gh itself reads the checked-out one) unless refreshed."""
+        tools = workspace_tools(session_id)
+        key = (str(tools.root), branch)
+        if len(pr_cache) > 256:
+            pr_cache.clear()
+        if len(pr_locks) > 64 and not any(lock.locked() for lock in pr_locks.values()):
+            pr_locks.clear()
+        # One gh at a time per project: a second request waits and reads the first one's answer.
+        async with pr_locks.setdefault(key[0], asyncio.Lock()):
+            entry = pr_cache.get(key)
+            if entry is None or time.monotonic() - entry[0] >= (PR_REFRESH_SECONDS if refresh else PR_CACHE_SECONDS):
+                env = {**{key: os.environ[key] for key in GH_ENVIRONMENT_KEYS if os.environ.get(key)},
+                       **manager.jobs.command_environment(python_venv=False)}
+                result = await pr_status(tools.root, env=env,
+                                         forbidden_roots=[*tools.allowed_directories,
+                                                          *(Path(path) for path in standing_directories(settings))],
+                                         redact=lambda text: tools.redact(settings.redact(text)))
+                entry = pr_cache[key] = (time.monotonic(), result)
+        return entry[1]
 
     @app.post("/api/command")
     async def command(body: Prompt, session_id: str | None = None):
@@ -876,6 +1211,9 @@ def create_app(settings=None):
     register_composer(app, manager, settings, store, session_or_404)
     register_interactions(app, manager, session_or_404)
     register_projects(app, manager, settings, workspace_tools)
+    register_endpoint_checks(app, manager, settings)
+    register_stream(app, manager, session_or_404)
+    register_schedules(app, manager, settings, session_or_404, workspace_tools)
     workspace_folders = register_workspace_folders(app, settings, session_or_404)
 
     # The browser loads the frontend source files directly; there is no build step.
@@ -886,7 +1224,10 @@ def create_app(settings=None):
     @app.get("/")
     async def index():
         if (frontend / "index.html").exists():
-            return FileResponse(frontend / "index.html", headers={"Cache-Control": "no-cache"})
+            # frame-src: the Workspace preview's frames (a PDF from a blob, an HTML file in a sandboxed srcdoc
+            # frame) cannot navigate to any address, so a previewed page reaches no network.
+            return FileResponse(frontend / "index.html", headers={"Cache-Control": "no-cache",
+                                                                  "Content-Security-Policy": INDEX_POLICY})
         return JSONResponse({"message": "The frontend folder is missing. See README.md."}, status_code=503)
 
     return app

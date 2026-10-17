@@ -8,10 +8,14 @@ from typing import Annotated, Any, Literal
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError
 
+from . import uploads as attached
+from .composer_api import MAX_QUEUED
+from .config import MAX_MAX_AGENT_STEPS, MAX_TURN_MINUTES, MAX_TURN_TOKENS, MIN_MAX_AGENT_STEPS
 from .context import LARGE_SUMMARY_MAX_BYTES, MAX_ESTIMATE_SCALE, context_boundary
 from .extensions import HOOK_CONTEXT_CHARS, HOOK_EVENTS, HOOK_REPORT_CHARS, MAX_HOOKS
 from .lifecycle_hooks import SHOWN_ARGUMENTS_BYTES
 from .planning import MAX_STEPS, subagent_index
+from .reasoning_replay import MAX_SIDECAR_BYTES, MAX_SIDECAR_ITEMS, REASONING_ITEMS
 from .spending import MAX_LIMIT_DBU
 
 
@@ -35,11 +39,14 @@ class Usage(Record):
 
 
 class RateLimitDetails(Record):
-    """The fields of a final 429 Databricks named (rate_limits.request_info_fields)."""
-    limit_type: str = Field(min_length=1, max_length=64)
+    """What a final 429 said (agents.rate_limit_fields): the limit it named, its code and message, and the wait."""
+    limit_type: str | None = Field(default=None, min_length=1, max_length=64)
     limit: int | None = Field(default=None, ge=0)
     current: int | None = Field(default=None, ge=0)
     retry_after: float | None = Field(default=None, ge=0)
+    code: str | None = Field(default=None, max_length=64)
+    message: str | None = Field(default=None, max_length=200)
+    retry_after_header: str | None = Field(default=None, max_length=64)
 
 
 Effort = Literal["default", "low", "medium", "high", "xhigh", "max"]  # reasoning.EFFORT_LEVELS
@@ -50,7 +57,7 @@ AgentName = Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{0,39}$")]
 class ReasoningInfo(Record):
     """The reasoning a request asked for (reasoning.request_record)."""
     effort: Effort
-    format: Literal["anthropic", "openai", "none"]
+    format: Literal["anthropic", "anthropic_budget", "openai", "none"]
     fields: dict[str, Any] = Field(default_factory=dict)
     sent_effort: str | None = Field(default=None, max_length=16)
     effort_field: str | None = Field(default=None, max_length=64)
@@ -67,6 +74,22 @@ class RequestInfo(Record):
     usage: Usage | None = None
     rate_limit: RateLimitDetails | None = None
     reasoning: ReasoningInfo | None = None
+    # A reply from Settings → Fallback endpoint (model above): the chat's endpoint and why it failed.
+    fallback_from: str | None = Field(default=None, max_length=256)
+    fallback_reason: str | None = Field(default=None, max_length=64)
+    # Earlier replies of the turn this request sent with their signed thinking (reasoning_replay.py).
+    reasoning_replayed: int | None = Field(default=None, ge=0)
+
+
+class PendingCard(Record):
+    """The card a running subagent waits on (planning.DelegateManager.pending_card)."""
+    event_id: str = Field(min_length=1, max_length=512)
+    name: str = Field(max_length=120)
+    kind: Literal["approval", "question", "plan"]
+    title: str = Field(max_length=200)
+    warnings: list[Annotated[str, Field(max_length=80)]] | None = Field(default=None, max_length=8)
+    review: bool | None = None  # The title is not the whole action, or the card warns: no Allow from the parent.
+    expires: float | None = None
 
 
 class Progress(Record):
@@ -79,6 +102,15 @@ class Progress(Record):
     effort: Effort | None = None
     started: float | None = None
     ended: float | None = None
+    background: bool | None = None  # delegate_task background: the parent went on while it worked.
+    pending: PendingCard | None = None
+
+
+class SiblingChange(Record):
+    """sibling_change: another running subagent of the chat changed this file during its run (its card asked)."""
+    subagent_id: str = Field(min_length=1, max_length=512)
+    agent_type: AgentName
+    path: str = Field(max_length=4096)
 
 
 class Origin(Record):
@@ -95,15 +127,44 @@ class Answer(Record):
     other: str | None = Field(default=None, max_length=1000)
 
 
+UploadId = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+ImageType = Literal["image/png", "image/jpeg", "image/gif", "image/webp"]  # uploads.IMAGE_EXTENSIONS
+Pixels = Annotated[int, Field(ge=1, le=100_000)]
+
+
 class Attachment(Record):
-    """Metadata of an @ file snapshot or a ! command output sent with a user message (never its content)."""
-    kind: Literal["file", "shell"]
+    """Metadata of an @ file snapshot, a ! command output, or a document or image attached from the composer
+    (uploads.py), sent with a user message (never its content)."""
+    kind: Literal["file", "shell", "document", "image"]
     path: str | None = Field(default=None, max_length=4096)
     start_line: int | None = Field(default=None, ge=1)
     end_line: int | None = Field(default=None, ge=0)
     truncated: bool | None = None
     command: str | None = Field(default=None, max_length=2000)
     exit_code: int | None = None
+    # Attached documents and images: the file's name and upload id, a document's format, the characters sent
+    # (units: its pages, sheets or slides), whether it went as a path only; an image's type, size and bytes.
+    name: str | None = Field(default=None, max_length=attached.NAME_CHARS)
+    upload: UploadId | None = None
+    format: Literal["pdf", "docx", "xlsx", "pptx", "csv", "tsv", "txt", "md"] | None = None  # documents.EXTENSIONS
+    chars: int | None = Field(default=None, ge=0)
+    units: Literal["page", "sheet", "slide"] | None = None
+    count: int | None = Field(default=None, ge=0)
+    as_path: bool | None = None
+    media_type: ImageType | None = None
+    width: Pixels | None = None
+    height: Pixels | None = None
+    bytes: int | None = Field(default=None, ge=0)
+
+
+# A skill ID or a command template's name (extensions.SKILL_IDENTIFIER).
+SkillId = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")]
+
+
+class CommandRef(Record):
+    """A command template a user message ran (AgentManager.message_parts): its name and file, never its text."""
+    name: SkillId
+    path: str = Field(min_length=1, max_length=4096)
 
 
 class Withheld(Record):
@@ -182,9 +243,11 @@ class Event(Record):
     text: str | None = None
     reasoning_summary: str | None = None
     reasoning_truncated: bool | None = None
-    # When the reply's thinking began (epoch seconds) and how long it took (the Thinking block's label).
+    # When the reply's thinking began (epoch seconds), how long it took (the Thinking block's label) and
+    # how long after the request was sent its first thinking arrived.
     reasoning_started: float | None = Field(default=None, ge=0)
     reasoning_seconds: float | None = Field(default=None, ge=0)
+    reasoning_wait_seconds: float | None = Field(default=None, ge=0)
     request_info: RequestInfo | None = None
     name: str | None = None
     input: dict[str, Any] | None = None
@@ -211,6 +274,12 @@ class Event(Record):
     child_session_id: str | None = None
     origin: Origin | None = None
     delegation: Progress | None = None
+    # A background delegation's final result (its card's Report), and the parent's notice when it ended.
+    delegation_result: dict[str, Any] | None = None
+    subagent_id: str | None = Field(default=None, max_length=512)
+    subagent_status: Literal["completed", "failed", "cancelled", "interrupted"] | None = None
+    sibling_change: SiblingChange | None = None
+    background_wake: bool | None = None  # The app's message that continued a chat after a background subagent.
     terminal_reason: str | None = None
     error_kind: str | None = None
     http_status: int | None = Field(default=None, ge=100, le=599)
@@ -225,8 +294,18 @@ class Event(Record):
     # while the agent was working. Notices: stop_phase says what a Stop interrupted.
     in_wire: bool | None = None
     steered: bool | None = None
-    attachments: list[Attachment] | None = Field(default=None, max_length=10)
+    # User events: the command templates the message ran (queued messages sent as one can run several),
+    # the skills it selected for itself (/<skill-id>), and whether it was sent as plain text (verbatim;
+    # Retry and Edit send it so again) or from the queue (queued: it selected no skill).
+    commands: list[CommandRef] | None = Field(default=None, max_length=MAX_QUEUED)
+    skills: list[SkillId] | None = Field(default=None, max_length=3)
+    verbatim: bool | None = None
+    queued: bool | None = None
+    git_context: bool | None = None  # User events: the app sent a Git snapshot with it (git_tools.git_context).
+    # At most 5 @ files and 5 ! outputs (mentions.py) and 8 attached files (uploads.MAX_MESSAGE_FILES).
+    attachments: list[Attachment] | None = Field(default=None, max_length=10 + attached.MAX_MESSAGE_FILES)
     stop_phase: Literal["streaming", "tools", "waiting"] | None = None
+    details: str | None = Field(default=None, max_length=1000)  # A rate-limit notice's Details (the 429).
     # Hooks (lifecycle_hooks): a hook card's structured result; on a tool card, the arguments a
     # before-tool hook replaced, the card it asked for, or its deny; on a user message, a hook's
     # edit or block and the context hooks added for the model.
@@ -249,11 +328,41 @@ class ToolCall(Record):
     function: Function
 
 
+def _reasoning_items(items):
+    if any(item.get("type") not in REASONING_ITEMS for item in items):
+        raise ValueError("Reasoning items must be reasoning, thinking or redacted thinking.")
+    if len(json.dumps(items, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > MAX_SIDECAR_BYTES:
+        raise ValueError("A reply's reasoning items are too large.")
+    return items
+
+
+class ReasoningSidecar(Record):
+    """A reply's signed reasoning (reasoning_replay.py): the endpoint that wrote it and its items as streamed.
+    In a conversation file only when it was exported with reasoning."""
+    model: str = Field(min_length=1, max_length=256)
+    items: Annotated[list[dict[str, Any]], Field(min_length=1, max_length=MAX_SIDECAR_ITEMS),
+                     AfterValidator(_reasoning_items)]
+    bytes: int = Field(ge=0, le=MAX_SIDECAR_BYTES)
+
+
+class ImageRef(Record):
+    """An image a user message carries (uploads.py): sent as an image part, kept in the chat's uploads folder.
+    Only forks keep them; an export turns each into a note in its message's text."""
+    upload: UploadId
+    name: str = Field(max_length=attached.NAME_CHARS)
+    media_type: ImageType
+    width: Pixels
+    height: Pixels
+    bytes: int = Field(ge=1, le=attached.MAX_IMAGE_BYTES)
+
+
 class Message(Record):
     role: Literal["user", "assistant", "tool"]
     content: str | None = None
     tool_calls: list[ToolCall] | None = Field(default=None, max_length=256)
     tool_call_id: str | None = None
+    reasoning: ReasoningSidecar | None = None  # Assistant replies only.
+    images: list[ImageRef] | None = Field(default=None, max_length=attached.MAX_MESSAGE_IMAGES)  # User messages only.
 
 
 class ContextState(Record):
@@ -265,7 +374,7 @@ class ContextState(Record):
 class InstructionSource(Record):
     path: str
     scope: str
-    status: Literal["loaded", "omitted"]
+    status: Literal["loaded", "trimmed", "omitted"]
     estimated_tokens: int = Field(ge=0)
     reason: str | None = None
 
@@ -292,7 +401,7 @@ class ContextInfo(Record):
     prepared_for_next_turn: bool | None = None
     breakdown: Breakdown | None = None
     estimate_scale: float | None = Field(default=None, ge=1, le=MAX_ESTIMATE_SCALE)
-    summary_adjustment: Literal["condensed", "trimmed"] | None = None
+    summary_adjustment: Literal["condensed", "condensed_trimmed", "trimmed"] | None = None
 
 
 class Conversation(Record):
@@ -318,6 +427,10 @@ class Conversation(Record):
     subagent_tool_profile: Profile = "inherit"
     reasoning_effort: Effort | None = None  # Kept by forks and imports, like the model.
     spending_limit_dbu: float | None = Field(default=None, ge=0, le=MAX_LIMIT_DBU)  # Kept too (not the spend).
+    # Kept too, like the spending limit: the chat's own turn limits (0 = none) and a script's Agent steps.
+    turn_token_limit: int | None = Field(default=None, ge=0, le=MAX_TURN_TOKENS)
+    turn_time_limit_minutes: int | None = Field(default=None, ge=0, le=MAX_TURN_MINUTES)
+    max_agent_steps: int | None = Field(default=None, ge=MIN_MAX_AGENT_STEPS, le=MAX_MAX_AGENT_STEPS)
     max_steps: int | None = Field(default=None, ge=1, le=MAX_STEPS)
     agent_type: AgentName | None = None
     # Kept by forks and imports, like tool_profile: a copy never gets more tools than its source.
@@ -327,6 +440,12 @@ class Conversation(Record):
     agent_file: str | None = Field(default=None, max_length=300)
     agent_model: str | None = Field(default=None, max_length=256)
     agent_effort: Effort | None = None
+    # What its agent file took away or narrowed: disallowed_tools, mcp_servers, permission_mode, memory: none.
+    agent_denied_tools: list[Annotated[str, Field(min_length=1, max_length=300)]] | None = Field(default=None, max_length=64)
+    agent_mcp_servers: list[Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,19}$")]] | None = Field(default=None,
+                                                                                                    max_length=20)
+    agent_permission_mode: Literal["manual", "auto", "acceptEdits", "plan", "bypassPermissions", "dontAsk"] | None = None
+    agent_memory: Literal["none"] | None = None
     # The user's labels. Pinned and archived are view state of this app and are not exported.
     tags: list[Annotated[str, Field(min_length=1, max_length=32)]] | None = Field(default=None, max_length=10)
 
@@ -452,14 +571,28 @@ def _validate_wire(wire, *, complete=False):
                 pending.add(call["id"])
         if role in ("user", "tool") and not isinstance(message.get("content"), str):
             raise ValueError("User messages and tool results require text content.")
+        if role != "assistant" and message.get("reasoning") is not None:
+            raise ValueError("Only assistant replies can carry reasoning.")
+        if role != "user" and message.get("images") is not None:
+            raise ValueError("Only user messages can carry images.")
     if complete and pending:
         raise ValueError("Only a completed conversation can be forked.")
 
 
-def export_bundle(sessions, root_id):
+def export_bundle(sessions, root_id, with_reasoning=False, keep_images=False):
+    """A validated bundle of these conversations. Replies' signed reasoning (reasoning_replay's sidecars) is
+    left out unless with_reasoning (an export "with reasoning", and forks, which keep the chat's endpoint).
+    Attached images stay references only in a fork (keep_images: it gets copies of the files); an export has
+    no image files, so each becomes a note in its message's text (attached documents are in that text)."""
     records = []
     for source in sessions:
         record = {key: value for key, value in source.items() if key in Conversation.model_fields}
+        if not with_reasoning:
+            record["wire"] = [{key: value for key, value in message.items() if key != "reasoning"}
+                              if isinstance(message, dict) and "reasoning" in message else message
+                              for message in record.get("wire", [])]
+        if not keep_images:
+            record["wire"] = [attached.images_as_notes(message, attached.NOT_EXPORTED) for message in record.get("wire", [])]
         record["events"] = [{key: value for key, value in event.items() if key in Event.model_fields}
                             for event in record["events"]]
         # Keep only the fields a bundle defines; newer display details such as
@@ -594,11 +727,24 @@ def fresh_copies(bundle, workspace, *, kind="import"):
                 source["parent_call_id"] = remapped_call
         if source.get("delegation") and not source["delegation"].get("terminal_reason"):
             source["delegation"].update(status="interrupted", terminal_reason="interrupted")
+            source["delegation"].pop("pending", None)
+        if kind != "fork":
+            # An imported image has no file in this app: a note says what it was.
+            source["wire"] = [attached.images_as_notes(message, attached.NOT_EXPORTED) for message in source["wire"]]
         for event in source["events"]:
             event["id"] = events[old_id][event["id"]]
+            if kind != "fork" and isinstance(event.get("attachments"), list):
+                # Nor are attached files imported: their chips keep the names, and Retry response and Edit
+                # message send the message without them (a document's text stays in the message sent then).
+                event["attachments"] = [{key: value for key, value in item.items() if key != "upload"}
+                                        if isinstance(item, dict) and item.get("kind") in ("document", "image")
+                                        else item for item in event["attachments"]]
             child = event.pop("child_session_id", None)
             if child in ids:
                 event["child_session_id"] = ids[child]
+            subagent = event.pop("subagent_id", None)  # A background subagent's notice: the copy, or none.
+            if subagent in ids:
+                event["subagent_id"] = ids[subagent]
             if str(event.get("name")).startswith("hook_subagent_") and isinstance(event.get("input"), dict):
                 # A subagent event's hook card names its subagent: the copy, or none outside the bundle.
                 subagent = event["input"].pop("subagent_session_id", None)
@@ -619,6 +765,7 @@ def fresh_copies(bundle, workspace, *, kind="import"):
                 source["terminal_reason"] = "interrupted"
             if event.get("delegation") and not event["delegation"].get("terminal_reason"):
                 event["delegation"].update(status="interrupted", terminal_reason="interrupted")
+                event["delegation"].pop("pending", None)
     # The subagents index of each copied parent lists its copied children (a bundle does not carry it).
     by_id = {source["id"]: source for source in sessions}
     for parent_id, index in subagent_index(sessions).items():

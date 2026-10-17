@@ -242,8 +242,26 @@ def test_settings_and_folder_access_notes_are_readable(ui, page):
 def test_approval_and_plan_cards_are_readable(ui, page):
     start_chat(ui, page, events=CHAT[:1] + [SPLIT_COMMAND], setup="fake.sessions.get('a').status = 'awaiting_approval'")
     expect(page.locator(".split-button")).to_be_visible()
-    assert_readable(page, ".split-button>button:first-child", ".composer-hint")
+    assert_readable(page, ".split-button>button:first-child", ".composer-hint", ".composer-hint-show")
     assert failures(page, ".main-area") == []
+    page.locator(".composer-hint-show").hover()
+    assert ratio(page, ".composer-hint-show") >= 4.5
+
+
+def test_a_running_command_and_a_compaction_are_readable(ui, page):
+    # The running time and the latest output line of a command card (2026-10-16 F4), and the compaction hint (F7).
+    running = {"id": "run", "type": "tool", "name": "run_command", "state": "running", "job_id": "j",
+               "input": {"command": "python poll.py", "timeout_seconds": 600}, "output": "waiting for the build\n"}
+    start_chat(ui, page, events=CHAT[:1] + [running], setup="fake.sessions.get('a').events[1].job_started = Date.now() / 1000 - 30")
+    expect(page.locator(".tool-clock")).to_be_visible()
+    page.add_style_tag(content="*{animation:none!important}")  # The spinner turns forever; settle() cannot finish it.
+    assert_readable(page, ".tool-clock", ".tool-live")
+    ui.emit("a", {"type": "status", "status": "running"})
+    ui.emit("a", {"type": "status", "status": "compacting"})
+    expect(page.locator(".compacting-elapsed")).to_be_visible()
+    assert_readable(page, ".compacting-hint", ".compacting-elapsed")
+    assert failures(page, ".main-area") == []
+    assert small_text(page, ".main-area") == []
 
 
 def test_the_sticky_plan_actions_are_readable(ui, page):
@@ -340,7 +358,7 @@ def test_message_action_icons_have_three_to_one(ui, page):
 
 # V2, V3: the message box shows focus, and every focusable element gets the same 2 px accent ring
 
-ACCENT = "rgb(163, 90, 64)"
+ACCENT = "rgb(180, 85, 45)"
 
 
 def keyboard_focus(page, locator):

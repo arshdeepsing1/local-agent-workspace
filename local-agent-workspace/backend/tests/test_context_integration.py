@@ -59,7 +59,9 @@ async def test_compaction_preserves_archive_and_survives_restart(runtime, monkey
     async def gateway(request):
         payload = json.loads(request.content)
         requests.append(payload)
-        assert estimate_tokens(payload["messages"], payload.get("tools", ())) <= 32768 - 8192 - 2048
+        # An agent request fits the input budget; a summary request the window minus its own output reserve.
+        reserve = 8192 if payload["stream"] else payload["max_tokens"]
+        assert estimate_tokens(payload["messages"], payload.get("tools", ())) <= 32768 - reserve - 2048
         if not payload["stream"]:
             assert "tools" not in payload
             return httpx.Response(200, json={"choices": [{"message": {"content": "Earlier steps completed; use focused changes."}, "finish_reason": "stop"}]})
@@ -184,14 +186,15 @@ async def test_nested_write_defers_until_guidance_is_sent(runtime, monkeypatch):
 
 async def test_instruction_warnings_are_visible(runtime, monkeypatch):
     manager, session, project = runtime
-    (project / "AGENTS.md").write_text("x" * 17000)
+    (project / "AGENTS.md").write_text("x" * 23500)
+    (project / "CLAUDE.md").write_text("y" * 2000)  # No room left for it within the 24,000-byte limit.
     async def gateway(request):
         assert "Omitted whole file" in json.loads(request.content)["messages"][0]["content"]
         return response()
     mock_gateway(monkeypatch, gateway)
     await manager.run_databricks(session, "Hello")
-    assert session["context_info"]["instruction_files"] == []
-    assert "AGENTS.md" in session["context_info"]["warnings"][0]
+    assert session["context_info"]["instruction_files"] == ["AGENTS.md"]
+    assert session["context_info"]["warnings"][0].startswith("CLAUDE.md: Omitted whole file")
 
 
 @pytest.mark.parametrize("budget", [32768, 65536, DEFAULT_CONTEXT_WINDOW])

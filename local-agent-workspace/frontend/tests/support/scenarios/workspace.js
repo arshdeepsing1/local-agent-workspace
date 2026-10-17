@@ -35,15 +35,15 @@ fake.settings = { ...baseSettings, user_instructions: '', write_limit_kb: 80, co
   coding_dir_status: { path: null, state: 'off', message: 'Not set. New code goes where you ask, or into the project folder.', source: 'none' },
   python_venv_status: { path: null, state: 'off', message: 'Not set. Commands use the Python on the server\'s PATH.', python: null, version: null, source: 'none' },
   default_model: 'databricks-claude-opus-5-5', default_limits: { context_window: 131072, max_output_tokens: 8192 },
-  reasoning_effort: 'default', reasoning_format: 'auto', thinking_summaries: true,
+  reasoning_effort: 'default', reasoning_format: 'auto', thinking_summaries: true, thinking_replay: false, fallback_model: '',
   endpoint_profiles: [{ model: 'databricks-claude-opus-5-5', label: 'Claude Opus 5.5' }, { model: 'databricks-claude-opus-4-8', label: 'Claude Opus 4.8' },
     { model: 'databricks-gpt-oss-120b', label: 'GPT OSS 120B' }, { model: 'databricks-gpt-oss-20b', label: 'GPT OSS 20B' }] }
 // POST /api/settings/limits: canned answers like the server's for Claude Opus 5.5; other endpoints have no profile.
 window.opusProfile = { label: 'Claude Opus 5.5', context_max: 1000000, output_max: 128000, itpm: 1000000, otpm: 100000,
-  recommended_context_window: 200000, recommended_max_output_tokens: 16384, thinking_reserve: 4096,
-  model: 'databricks-claude-opus-5-5', output_concurrency_limit: 20000, context_rate_limit: 250000 }
+  recommended_context_window: 200000, recommended_max_output_tokens: 16384, thinking_reserve: 4096, prompt_caching: true,
+  vision: true, structured_output: false, model: 'databricks-claude-opus-5-5', output_concurrency_limit: 20000, context_rate_limit: 250000 }
 window.limitsCheck = ({ model, context_window, max_output_tokens }) => {
-  const effective = { context_window, max_output_tokens, clamped: false }
+  const effective = { context_window, max_output_tokens, clamped: false, input_budget: context_window - max_output_tokens - 2048 }
   if (model.trim().toLowerCase() !== 'databricks-claude-opus-5-5') {
     return { profile: null, recommended: null, defaults: { context_window: 131072, max_output_tokens: 8192 }, effective, warnings: [],
       note: 'No built-in limits for this endpoint. Set the context budget at or below its context window.' }
@@ -52,6 +52,9 @@ window.limitsCheck = ({ model, context_window, max_output_tokens }) => {
   effective.context_window = Math.min(context_window, 1000000)
   effective.max_output_tokens = Math.min(max_output_tokens, 128000, effective.context_window - 2049)
   effective.clamped = effective.context_window !== context_window || effective.max_output_tokens !== max_output_tokens
+  // Near the 1,000,000-token window the input budget keeps 5% of it for estimate error.
+  effective.input_budget = Math.min(effective.context_window - effective.max_output_tokens - 2048,
+    Math.floor((1000000 - effective.max_output_tokens - 2048) / 1.05))
   if (max_output_tokens > 20000) warnings.push({ code: 'output_concurrency', level: 'warning', text: 'Above 20,000, four requests at once can be rejected with HTTP 429 before they start.' })
   if (context_window > 250000) warnings.push({ code: 'context_itpm', level: 'note', text: 'Above 250,000 tokens, four full steps in one minute reach the input limit.' })
   return { profile: opusProfile, recommended: { context_window: 200000, max_output_tokens: 16384 },
@@ -71,6 +74,8 @@ fake.handle = (path, options) => {
   }
   if (path === '/api/bootstrap') return fake.json({ token: 'test-token', settings: fake.settings })
   if (path === '/api/skills' || path.startsWith('/api/skills?')) return fake.json(skills)
+  if (path === '/api/commands' || path.startsWith('/api/commands?')) return fake.json({ commands: fake.commands || [], errors: [],
+    folders: ['.agents/commands', '.claude/commands', '~/.agents/commands', '~/.claude/commands'] })
   if (path === '/api/connection') return fake.json({ connected: true, models: ['test-model', 'other-model', 'latest-model'], error: null })
   if (path === '/api/settings' && options.method === 'PUT') {
     fake.settings = { ...fake.settings, ...body() }

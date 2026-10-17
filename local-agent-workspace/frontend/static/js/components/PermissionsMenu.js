@@ -11,10 +11,10 @@ export const modes = [
 ]
 export const modeLabel = value => modes.find(m => m.value === value)?.label || value
 
-export const BYPASS_CONFIRM = 'Switch this chat to Bypass permissions?\n\nEvery action will run without asking, including commands and edits outside the project, and any approval cards waiting now will be approved. Deny rules, ask rules, credential exclusions and approvals a hook asks for still apply.'
+export const BYPASS_CONFIRM = 'Switch this chat to Bypass permissions?\n\nEvery action will run without asking, including commands and edits outside the project, and any approval cards waiting now will be approved. Deny rules, ask rules, credential exclusions, cards for commands that name credential files and approvals a hook asks for still apply.'
 
-// The commands Auto and Plan run without asking: the server's fixed list of exact forms (README: Read-only commands).
-const READ_ONLY_NOTE = 'A fixed list of read-only command forms, such as pwd, ls -la, git status, git diff --stat, git log --oneline and git show; other arguments still ask'
+// The commands Auto and Plan run without asking (README: Read-only commands): the fixed list and the commands the app checks.
+const READ_ONLY_NOTE = 'Read-only commands: pwd, ls and read-only git, and commands or pipelines of read-only programs the app checks (cat, head, grep, rg, find, sed -n, wc …) on paths in approved folders; anything else still asks'
 const NEVER_ASKS = ['Reading, listing and searching files in the project and granted folders', 'Listing jobs and reading their output',
   'Tasks and skills', 'Questions and plan reviews from the agent']
 
@@ -23,12 +23,12 @@ const PLAIN_TOKEN = /^[A-Za-z0-9_@%+=:,./-]+$/
 export const quoteToken = token => PLAIN_TOKEN.test(token) ? token : `'${String(token).replace(/'/g, `'\\''`)}'`
 export const quoteArgv = argv => (argv || []).map(quoteToken).join(' ')
 
-// A rule (see types.js): { behavior?, tool, command?, argv?, prefix?, flags?, path?, hook? }.
+// A rule (see types.js): { behavior?, tool, command?, argv?, prefix?, flags?, path?, hook?, domain? }.
 // Returns [text before the code, code or null, text after it]; ruleLabel joins them.
 function ruleParts(rule) {
   const tool = rule.tool || ''
   if (tool === 'run_command') {
-    if (typeof rule.command === 'string') return ['Command: ', rule.command, '']
+    if (typeof rule.command === 'string') return ['Command: ', rule.command, typeof rule.cwd === 'string' && rule.cwd ? ` in ${rule.cwd}` : '']
     if (Array.isArray(rule.argv)) return ['Command: ', quoteArgv(rule.argv), '']
     if (Array.isArray(rule.prefix)) {
       const after = (rule.behavior || 'allow') !== 'allow' ? ' (any options)'
@@ -41,6 +41,12 @@ function ruleParts(rule) {
   if (tool === 'hook') return rule.hook ? [`Hook: ${rule.hook}`, null, ''] : ['Hooks', null, '']
   if (tool === 'delegate_task') return ['Subagents', null, '']
   if (tool === 'stop_job') return ['Stopping jobs', null, '']
+  if (tool === 'remember') return ['Saving project memory', null, '']
+  if (tool === 'web_fetch') {
+    if (!rule.domain) return ['Web fetches', null, '']
+    return ['Fetches from ', rule.domain, (rule.behavior || 'allow') === 'allow' ? '' : ' and its subdomains']
+  }
+  if (tool === 'web_search') return ['Web searches', null, '']
   const server = /^mcp__(.+)__\*$/.exec(tool)?.[1]
   if (server) return ['All tools of MCP server ', server, '']
   return [`Tool: ${tool}`, null, '']

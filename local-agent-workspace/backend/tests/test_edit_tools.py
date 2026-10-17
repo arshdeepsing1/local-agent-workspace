@@ -158,7 +158,7 @@ def test_the_editor_follows_the_write_limit_setting(tmp_path, monkeypatch):
             assert client.put("/api/file", json=body).status_code == 200
         settings.update({"write_limit_kb": 16})
         refused = client.get("/api/file", params={"path": "mid.txt", "session_id": session_id})
-        assert refused.status_code == 400 and "16 KB limit" in refused.json()["detail"]
+        assert refused.status_code == 400 and "16 KB limit" in refused.json()["detail"]["message"]
     assert (workspace / "big.txt").read_text() == "y" * 115_000
 
 

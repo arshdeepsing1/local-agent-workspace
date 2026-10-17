@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from './lib.js'
-import { api, ApiError, OFFLINE_MESSAGE, refreshToken, setToken, streamProtocols, streamUrl } from './api.js'
+import { api, ApiError, apiUpload, OFFLINE_MESSAGE, refreshToken, setToken, streamProtocols, streamUrl } from './api.js'
 
 // Selection: { id: string | null, key: string, creating?: Promise<Session> }
 const sessionInUrl = () => new URL(window.location.href).searchParams.get('session')
@@ -33,6 +33,11 @@ export function useWorkspace() {
   const [draftMode, setDraftMode] = useState('manual')
   // The reasoning effort chosen in a new conversation before it exists (null: the Settings default).
   const [draftEffort, setDraftEffort] = useState(null)
+  // The model of a new conversation that /clear started from another chat (null: the Settings default).
+  const [draftModel, setDraftModel] = useState(null)
+  // What the Settings project's trusted settings files set: a new conversation starts with their model and effort
+  // (backend settings_layers.py).
+  const projectValues = settings?.project_layers?.status === 'trusted' ? settings.project_layers.values || {} : {}
   // Unreviewed agent file changes of one conversation: { id, value: Changes }.
   const [changes, setChanges] = useState({ id: null, value: null })
   const changesPushed = useRef(0)
@@ -53,7 +58,7 @@ export function useWorkspace() {
     const next = { id, key: id ? draftKeys.current.get(id) || id : crypto.randomUUID() }
     selected.current = next
     setSelection({ ...next }); setSession(null); setError(''); setOnline(true)
-    if (!id) { setDraftMode('manual'); setDraftEffort(null) }
+    if (!id) { setDraftMode('manual'); setDraftEffort(null); setDraftModel(null) }
     if (!fromHistory) updateUrl(id)
   }, [updateUrl])
   // message: '' when another notice (the storage notice) already explains why.
@@ -248,6 +253,12 @@ export function useWorkspace() {
           const { spending_limit_dbu: _, ...rest } = current
           return typeof data.spending_limit_dbu === 'number' ? { ...rest, spending_limit_dbu: data.spending_limit_dbu } : rest
         })
+        if (data.type === 'turn_limits') setSession(current => {
+          if (current?.id !== activeId) return current
+          const { turn_token_limit: _tokens, turn_time_limit_minutes: _minutes, ...rest } = current
+          return { ...rest, ...Object.fromEntries(['turn_token_limit', 'turn_time_limit_minutes']
+            .filter(key => Number.isInteger(data[key])).map(key => [key, data[key]])) }
+        })
         if (data.type === 'meta') {
           const meta = { pinned: data.pinned, archived: data.archived, tags: data.tags }
           setSession(current => current?.id === activeId ? { ...current, ...meta } : current)
@@ -256,14 +267,20 @@ export function useWorkspace() {
         if (data.type === 'delta') setSession(current => current?.id === activeId ? {
           ...current, events: current.events.map(e => e.id === data.id ? { ...e, text: (e.text || '') + data.text } : e),
         } : current)
+        // A compaction's progress (phase, request number, start, trigger) lasts until the status leaves 'compacting'.
+        if (data.type === 'compaction') setSession(current => current?.id === activeId ? { ...current, compaction_progress: data.progress } : current)
         if (data.type === 'status') {
           // Keep the sidebar current and prevent an older list response from
           // replacing this newer streamed status.
           sessionsRequest.current++
-          setSession(current => current?.id === activeId ? {
-            ...current, status: data.status, ...('terminal_reason' in data ? { terminal_reason: data.terminal_reason } : {}),
-            ...(data.turn_ended ? { turn_ended: data.turn_ended } : {}),
-          } : current)
+          setSession(current => {
+            if (current?.id !== activeId) return current
+            const { compaction_progress: progress, ...rest } = current
+            return { ...rest, status: data.status, ...('terminal_reason' in data ? { terminal_reason: data.terminal_reason } : {}),
+              ...(data.turn_ended ? { turn_ended: data.turn_ended } : {}),
+              ...(data.turn_result ? { last_turn_result: data.turn_result } : {}),
+              ...(data.status === 'compacting' && progress ? { compaction_progress: progress } : {}) }
+          })
           setSessions(current => current.map(item => item.id === activeId ? {
             ...item, status: data.status, ...(data.terminal_reason ? { terminal_reason: data.terminal_reason } : {}),
             ...(data.turn_ended ? { turn_ended: data.turn_ended, turn_delegated: !!data.turn_delegated } : {}),
@@ -275,6 +292,7 @@ export function useWorkspace() {
         }
         if (data.type === 'queue') setSession(current => current?.id === activeId ? { ...current, queued_messages: data.queued_messages || [], queue_error: data.error || null } : current)
         if (data.type === 'pending_context') setSession(current => current?.id === activeId ? { ...current, pending_context: data.pending_context || [] } : current)
+        if (data.type === 'mcp_status') setSession(current => current?.id === activeId ? { ...current, mcp_status: data.mcp_status || [] } : current)
         if (data.type === 'title') {
           setSession(current => current?.id === activeId ? { ...current, title: data.title } : current)
           setSessions(current => current.map(item => item.id === activeId ? { ...item, title: data.title } : item))
@@ -295,14 +313,22 @@ export function useWorkspace() {
     return () => { closed = true; clearTimeout(timer); socket?.close() }
   }, [activeId, selection.key, ready, refreshSessions, clearMissingSession, checkConnection])
 
-  const newConversation = () => selectSession(null)
+  // options (/clear): { model, mode, effort } the new conversation starts with, from the chat it replaces.
+  const newConversation = options => {
+    selectSession(null)
+    if (!options) return
+    setDraftMode(options.mode || 'manual')
+    setDraftEffort(options.effort || null)
+    setDraftModel(options.model || null)
+  }
   const ensureSession = async target => {
     if (!target.id) {
       // Folder access can create a chat before its first message. Wait for a
       // pending default-model choice before capturing the creation settings.
       if (defaultModelSave.current) await defaultModelSave.current
       // Concurrent first actions in one draft share its creation request.
-      target.creating ||= api('/sessions', 'POST', { permission_mode: draftMode, ...(draftEffort ? { reasoning_effort: draftEffort } : {}) })
+      target.creating ||= api('/sessions', 'POST', { permission_mode: draftMode, ...(draftEffort ? { reasoning_effort: draftEffort } : {}),
+        ...(draftModel ? { model: draftModel } : {}) })
       let created
       try { created = await target.creating }
       catch (error) { target.creating = undefined; throw error }
@@ -317,15 +343,28 @@ export function useWorkspace() {
     }
     return target.id
   }
-  const send = async text => {
+  // options.verbatim: sent as plain text (no command, skill or @ file on the server); options.uploads: the files
+  // attached in the composer ([{ id, as_path? }], uploadFile).
+  const send = async (text, options) => {
     const id = await ensureSession(selected.current)
-    await api(`/sessions/${id}/messages`, 'POST', { text })
+    await api(`/sessions/${id}/messages`, 'POST', { text, ...(options?.verbatim ? { verbatim: true } : {}),
+      ...(options?.uploads?.length ? { uploads: options.uploads } : {}) })
     return id
+  }
+  // A file pasted, dropped or chosen in the composer, kept with the chat (created first in a new conversation)
+  // until a message sends it: resolves to its record (UploadRecord).
+  const uploadFile = async file => {
+    const id = await ensureSession(selected.current)
+    return apiUpload(`/sessions/${id}/uploads`, file)
   }
   const saveSettings = async next => {
     const { workspace, model, env_file, context_window, max_output_tokens, max_agent_steps, compaction_handoffs, approval_timeout_minutes,
-      system_notifications, user_instructions, write_limit_kb, command_env, rate_limit_auto_continue, auto_keep_changes,
-      coding_dir, python_venv, auto_compact_percent, reasoning_effort, reasoning_format, thinking_summaries, subagent_defaults, spending_limit_dbu } = next
+      system_notifications, user_instructions, write_limit_kb, command_env, secret_file_patterns, rate_limit_auto_continue, auto_keep_changes,
+      coding_dir, python_venv, auto_compact_percent, reasoning_effort, reasoning_format, thinking_summaries, prompt_caching, subagent_defaults,
+      background_subagent_wake,
+      spending_limit_dbu, fallback_model, user_agents_file, user_claude_file, project_memory, output_style, slash_commands, thinking_replay,
+      web_fetch, web_search_provider, web_search_url, web_search_key, git_context, turn_token_limit, turn_time_limit_minutes,
+      schedules_enabled, token_expires_on } = next
     const saved = await api('/settings', 'PUT', {
       workspace, model, env_file, context_window, max_output_tokens, max_agent_steps,
       ...(typeof compaction_handoffs === 'boolean' ? { compaction_handoffs } : {}),
@@ -335,15 +374,34 @@ export function useWorkspace() {
       ...(typeof user_instructions === 'string' ? { user_instructions } : {}),
       ...(Number.isInteger(write_limit_kb) ? { write_limit_kb } : {}),
       ...(Array.isArray(command_env) ? { command_env } : {}),
+      ...(Array.isArray(secret_file_patterns) ? { secret_file_patterns } : {}),
       ...(typeof rate_limit_auto_continue === 'boolean' ? { rate_limit_auto_continue } : {}),
       ...(typeof auto_keep_changes === 'boolean' ? { auto_keep_changes } : {}),
       ...(typeof coding_dir === 'string' ? { coding_dir } : {}),
       ...(typeof python_venv === 'string' ? { python_venv } : {}),
       ...(typeof reasoning_effort === 'string' ? { reasoning_effort } : {}),
       ...(Number.isFinite(spending_limit_dbu) ? { spending_limit_dbu } : {}),
+      ...(Number.isInteger(turn_token_limit) ? { turn_token_limit } : {}),
+      ...(Number.isInteger(turn_time_limit_minutes) ? { turn_time_limit_minutes } : {}),
+      ...(typeof schedules_enabled === 'boolean' ? { schedules_enabled } : {}),
+      ...(typeof token_expires_on === 'string' ? { token_expires_on } : {}),
       ...(typeof reasoning_format === 'string' ? { reasoning_format } : {}),
       ...(typeof thinking_summaries === 'boolean' ? { thinking_summaries } : {}),
+      ...(typeof thinking_replay === 'boolean' ? { thinking_replay } : {}),
+      ...(typeof prompt_caching === 'string' ? { prompt_caching } : {}),
+      ...(typeof fallback_model === 'string' ? { fallback_model: fallback_model.trim() } : {}),
+      ...(typeof slash_commands === 'boolean' ? { slash_commands } : {}),
       ...(subagent_defaults && typeof subagent_defaults === 'object' ? { subagent_defaults } : {}),
+      ...(typeof background_subagent_wake === 'boolean' ? { background_subagent_wake } : {}),
+      ...(typeof user_agents_file === 'boolean' ? { user_agents_file } : {}),
+      ...(typeof user_claude_file === 'boolean' ? { user_claude_file } : {}),
+      ...(typeof project_memory === 'boolean' ? { project_memory } : {}),
+      ...(typeof git_context === 'boolean' ? { git_context } : {}),
+      ...(typeof output_style === 'string' && output_style ? { output_style } : {}),
+      ...(typeof web_fetch === 'boolean' ? { web_fetch } : {}),
+      ...(typeof web_search_provider === 'string' ? { web_search_provider } : {}),
+      ...(typeof web_search_url === 'string' ? { web_search_url: web_search_url.trim() } : {}),
+      ...(typeof web_search_key === 'string' ? { web_search_key: web_search_key.trim() } : {}),
     })
     setSettings(saved)
     void checkConnection().catch(e => setError(e.message))
@@ -362,6 +420,9 @@ export function useWorkspace() {
     if (modelSaves.has(scope) || (!target.id && defaultModelSave.current) || !settings) return
     setModelSaves(current => new Set(current).add(scope))
     try {
+      // A new conversation /clear started keeps its own model; choosing another changes only that one. So does
+      // one in a project whose trusted settings file sets the model (it would win over a Settings change).
+      if (!target.id && !creating && (draftModel || projectValues.model)) { setDraftModel(model); return }
       if (!target.id && !creating) {
         const saving = saveSettings({ ...settings, model })
         defaultModelSave.current = saving
@@ -599,12 +660,13 @@ export function useWorkspace() {
   const rulesHere = savedRules.key === selection.key ? savedRules : null
   return { settings, connection, connectionChecking, sessions, session: activeSession, activeId, viewKey: selection.key, error,
     online: online && reachable, offlineError: error === OFFLINE_MESSAGE, ready,
-    setError: reportError, setActiveId: selectSession, newConversation, send, saveSettings, refreshSettings, deleteSession, renameSession, changeModel,
+    setError: reportError, setActiveId: selectSession, newConversation, send, uploadFile, saveSettings, refreshSettings, deleteSession, renameSession, changeModel,
+    draftModel: activeId ? null : draftModel || projectValues.model || null,
     runShell, askSide, removeQueued, sendQueued, loadMentionFiles, sideAnswer: sideAnswer.key === selection.key ? sideAnswer.value : null, dismissSide,
     modelSaving: modelSaves.has(selection.key) || (!activeId && defaultModelSave.current !== null),
     checkConnection, refreshSessions, permissionMode: activeSession?.permission_mode || draftMode, setPermissionMode, allowFolder, removeFolder,
     // A chat saved without an effort, and a new conversation, use the Settings default.
-    reasoningEffort: (activeId ? activeSession?.reasoning_effort : draftEffort) || settings?.reasoning_effort || 'default',
+    reasoningEffort: (activeId ? activeSession?.reasoning_effort : draftEffort || projectValues.reasoning_effort) || settings?.reasoning_effort || 'default',
     changeEffort,
     loadEarlier, setMeta, searchConversations,
     rules: { chat: activeSession?.allow_rules || [], project: rulesHere?.project || [], user: rulesHere?.user || [],

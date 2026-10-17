@@ -15,12 +15,12 @@ log = logging.getLogger(__name__)
 _SAFE_SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 # Kept out of the header record so list and metadata reads stay small.
 _SEPARATE_FIELDS = ("context_state", "instruction_directories", "file_views", "allow_rules", "inference_calls", "command_jobs",
-                    "queued_messages", "pending_context")
+                    "queued_messages", "pending_context", "instruction_paths")
 # Context meter fields left out of list summaries and headers (see Store.summary).
 _METER_FIELDS = ("last_request", "next_estimate")
 # Kept in <id>.state.json beside the conversation file, never in field records: versions
 # before these fields existed reject unknown field records but only read *.jsonl files.
-_SIDECAR_FIELDS = ("file_views", "allow_rules", "queued_messages", "pending_context")
+_SIDECAR_FIELDS = ("file_views", "allow_rules", "queued_messages", "pending_context", "instruction_paths")
 
 
 # JSON encodings of strings this long are kept between saves of a running conversation

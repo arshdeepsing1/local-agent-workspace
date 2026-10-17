@@ -17,12 +17,44 @@ def isolated_defaults(monkeypatch):
     monkeypatch.setenv("LOCAL_AGENT_MODEL", "test-endpoint")
 
 
+@pytest.fixture(scope="session")
+def empty_home(tmp_path_factory):
+    return tmp_path_factory.mktemp("home")
+
+
+@pytest.fixture(autouse=True)
+def isolated_user_folders(monkeypatch, empty_home):
+    """The user's own skill and command folders (~/.agents, ~/.claude) are read from an empty folder, never
+    the developer's home. Tests of those folders set extensions.USER_HOME to their own."""
+    from local_agent import extensions
+    monkeypatch.setattr(extensions, "USER_HOME", empty_home)
+
+
+@pytest.fixture(autouse=True)
+def empty_user_home(tmp_path_factory, monkeypatch):
+    """The user's instruction files (~/.agents/AGENTS.md, ~/.claude/CLAUDE.md) and output styles come from an
+    empty folder, not the developer's home. Tests of those files write into instructions.user_home()."""
+    from local_agent import instructions
+    home = tmp_path_factory.mktemp("home")
+    monkeypatch.setattr(instructions, "user_home", lambda: home)
+
+
 @pytest.fixture(autouse=True)
 def no_ripgrep(monkeypatch):
     """Search without ripgrep by default, so results do not depend on whether it is
     installed. Tests that need it use real_ripgrep."""
     from local_agent import search
     monkeypatch.setattr(search, "ripgrep", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def mac_shell_prompt(monkeypatch):
+    """A system prompt that names zsh, as on a Mac, whatever shell this machine has, so that a
+    test near a token threshold gives the same result on every runner. Commands still run with
+    this machine's shell; tests of the prompt's own choice patch agents.shell_note back."""
+    from local_agent import agents, jobs
+    note = " ".join((jobs.SHELL_NOTES["/bin/zsh"], jobs.POLLING_NOTE))
+    monkeypatch.setattr(agents, "shell_note", lambda: note)
 
 
 @pytest.fixture

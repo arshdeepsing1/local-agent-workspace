@@ -1,5 +1,6 @@
 """Tool cards say when a command failed and show its output as text (Conversation.js resultOf/toolStatus)."""
 import json
+import re
 
 import pytest
 from playwright.sync_api import expect
@@ -390,3 +391,200 @@ def test_the_expanded_card_says_when_the_agent_did_not_get_the_whole_result(ui, 
     card.locator(".tool-heading").click()
     expect(card.locator(".tool-outcome")).to_have_count(0)
     expect(card.locator(".tool-allowance")).to_have_text(note)
+
+
+# Headings name paths in the project and in allowed folders short; a running command shows its time (2026-10-16)
+
+def show_in(ui, events, allowed=("/srv/other",), extra=""):
+    ui.mount("components/Conversation.js", f"{{ session: makeSession([{', '.join(events)}], {{ allowed_directories: "
+             f"{json.dumps(list(allowed))} }}), onError: fake.spy('onError'){extra} }}", setup=SETUP)
+
+
+def file_tool(event_id, name, **input_fields):
+    return json.dumps({"id": event_id, "type": "tool", "name": name, "state": "completed", "input": input_fields, "output": ""})
+
+
+def test_file_cards_name_paths_relative_to_the_project_or_their_folder(ui, page):
+    # F3. Mutation: show summary.subject in the heading (the file name is cut off at the end).
+    show_in(ui, [file_tool("e", "edit_file", path="/srv/other/tests/test_x.py"),
+                 file_tool("w", "write_file", path="/project/src/app.py"),
+                 file_tool("f", "find_files", pattern="*.py", path="/srv/other/pkg"),
+                 file_tool("c", "write_file", path="/srv/code/new.py"),
+                 file_tool("o", "read_file", path="/elsewhere/notes.md"),
+                 file_tool("l", "list_files", path="/srv/other")],
+            extra=", roots: ['/srv/code']")
+    subjects = page.locator(".tool-subject")
+    expect(subjects).to_have_text(["other/tests/test_x.py", "src/app.py", "*.py in other/pkg", "code/new.py",
+                                   "/elsewhere/notes.md", "other"])
+    assert subjects.evaluate_all("els => els.map(el => el.title)") == [
+        "/srv/other/tests/test_x.py", "/project/src/app.py", "*.py in /srv/other/pkg", "/srv/code/new.py",
+        "/elsewhere/notes.md", "/srv/other"]
+    # The accessible names keep the full paths.
+    expect(page.get_by_role("button", name="edit file /srv/other/tests/test_x.py", exact=True)).to_be_visible()
+    expect(page.get_by_role("button", name="write file /project/src/app.py", exact=True)).to_be_visible()
+    page.get_by_text("Activity · 6 actions").click()
+    expect(page.locator(".activity-subject").first).to_have_text(" · /srv/other/tests/test_x.py")
+
+
+def test_two_allowed_folders_with_the_same_name_stay_apart(ui, page):
+    show_in(ui, [file_tool("a", "read_file", path="/srv/one/app/main.py"), file_tool("b", "read_file", path="/srv/two/app/main.py")],
+            allowed=("/srv/one/app", "/srv/two/app"))
+    expect(page.locator(".tool-subject")).to_have_text(["one/app/main.py", "two/app/main.py"])
+
+
+@pytest.mark.parametrize("command, shown", [
+    ("cd /srv/other/pkg && grep -n x a.py", "other/pkg › grep -n x a.py"),
+    ("cd '/srv/other' && make test", "other › make test"),
+    ("cd /project && pytest -q", "project › pytest -q"),
+    ("cd /project/src &&\n  python -m app", "src › python -m app"),
+    # Not shortened: a folder outside the known ones, parent segments, shell expansion, or no command after it.
+    ("cd /elsewhere && ls", "cd /elsewhere && ls"),
+    ("cd /srv/other/../etc && cat x", "cd /srv/other/../etc && cat x"),
+    ('cd "$HOME/other" && ls', 'cd "$HOME/other" && ls'),
+    ("cd /srv/other; rm -rf build", "cd /srv/other; rm -rf build"),
+    # A line break before "&&" or after cd ends the cd command: the shell rejects or runs on its own what follows.
+    ("cd /srv/other\n&& ls", "cd /srv/other && ls"),
+    ("cd\n/srv/other && ls", "cd /srv/other && ls"),
+    ("cd '/srv/other/a && rm -rf b' && ls", "cd '/srv/other/a && rm -rf b' && ls"),
+])
+def test_a_leading_cd_into_a_known_folder_is_shortened_in_the_heading_only(ui, page, command, shown):
+    # F10. Mutation: drop commandHeading (the long cd prefix hides the command), or apply it to the expanded command.
+    show_in(ui, [tool(command=command, output=job_page("completed", 0, "ok\n"))])
+    subject = page.locator(".tool-subject")
+    flat = re.sub(r"\s+", " ", command)
+    expect(subject).to_have_text(shown)
+    expect(subject).to_have_attribute("title", flat)
+    heading = page.locator(".tool-heading")
+    expect(heading).to_have_accessible_name(f"run command {flat}")
+    heading.click()
+    assert page.locator("pre[aria-label=Command]").evaluate("e => e.textContent") == command
+
+
+@pytest.mark.parametrize("fields, shown", [
+    ({"command_cwd": "/srv/other/pkg"}, "other/pkg › grep -n x a.py"),
+    ({"command_cwd": "/project/src"}, "src › grep -n x a.py"),
+    ({"input_cwd": "/srv/other"}, "other › grep -n x a.py"),
+    ({"command_cwd": "/project"}, "grep -n x a.py"),
+    ({"command_cwd": "/elsewhere/x"}, "/elsewhere/x › grep -n x a.py"),
+])
+def test_a_command_with_a_cwd_names_its_folder_in_the_heading(ui, page, fields, shown):
+    event = json.loads(tool(command="grep -n x a.py", output=job_page("completed", 0, "ok\n")))
+    if "input_cwd" in fields:
+        event["input"]["cwd"] = fields.pop("input_cwd")
+    event.update(fields)
+    show_in(ui, [json.dumps(event)])
+    expect(page.locator(".tool-subject")).to_have_text(shown)
+    expect(page.locator(".tool-heading")).to_have_accessible_name("run command grep -n x a.py")
+
+
+def test_a_pending_command_card_keeps_the_whole_command_in_its_body(ui, page):
+    command = "cd /srv/other/pkg && python -m pytest -q tests"
+    show_in(ui, [json.dumps({"id": "p", "type": "tool", "name": "run_command", "state": "pending", "input": {"command": command}})])
+    expect(page.locator(".tool-subject")).to_have_text("other/pkg › python -m pytest -q tests")
+    expect(page.locator("pre[aria-label=Command]")).to_have_text(command)
+
+
+def running(command="python poll.py", started="Date.now() / 1000 - 30", output="", **input_fields):
+    return (f"{{ id: 'run', type: 'tool', name: 'run_command', state: 'running', job_id: 'job-1', job_started: {started}, "
+            f"input: {json.dumps({'command': command, **input_fields})}, output: {json.dumps(output)} }}")
+
+
+def test_a_running_command_shows_its_time_against_its_limit_and_its_latest_line(ui, page):
+    # F4. Mutations: drop CommandClock, or the collapsed latest line (a silent poll looks stuck).
+    show_in(ui, [running(output="waiting for the build\nstep 2 of 9\n\n", timeout_seconds=600)])
+    card = page.locator(".tool-card")
+    clock = card.locator(".tool-clock")
+    expect(clock).to_have_text(re.compile(r"^running · 3[0-2] s of 10 min$"))
+    expect(clock).to_have_text(re.compile(r"^running · 3[1-9] s of 10 min$"))  # It keeps counting.
+    expect(card.locator(".spin")).to_be_visible()
+    live = card.locator(".tool-live")
+    expect(live).to_have_text("step 2 of 9")
+    expect(live).to_have_css("color", "rgb(102, 100, 92)")  # --muted
+    # The accessible name does not change every second.
+    expect(card.locator(".tool-heading")).to_have_accessible_name("run command python poll.py")
+    card.locator(".tool-heading").click()
+    expect(live).to_have_count(0)
+    expect(page.locator("pre[aria-label=Output]")).to_contain_text("step 2 of 9")
+
+
+@pytest.mark.parametrize("fields, label", [
+    ({}, re.compile(r"^running · 8 min 4[2-4] s of 1 min$")),
+    ({"timeout_seconds": 2400}, re.compile(r"^running · 8 min 4[2-4] s of 40 min$")),
+    ({"timeout_seconds": 3600}, re.compile(r"^running · 8 min 4[2-4] s of 1 h$")),
+    ({"timeout_seconds": 90}, re.compile(r"^running · 8 min 4[2-4] s of 1 min 30 s$")),
+])
+def test_the_limit_is_the_commands_timeout(ui, page, fields, label):
+    show_in(ui, [running(started="Date.now() / 1000 - 522", **fields)])
+    expect(page.locator(".tool-clock")).to_have_text(label)
+
+
+def test_a_progress_line_ended_by_a_carriage_return_is_the_latest_line(ui, page):
+    show_in(ui, [running(output="Downloading 10%\rDownloading 55%\r")])
+    expect(page.locator(".tool-live")).to_have_text("Downloading 55%")
+
+
+def test_a_running_card_without_a_start_time_shows_no_clock(ui, page):
+    # Events from before job_started, and the moment before the job starts.
+    show_in(ui, [running(started="undefined", output="")])
+    expect(page.locator(".tool-card .spin")).to_be_visible()
+    expect(page.locator(".tool-clock")).to_have_count(0)
+    expect(page.locator(".tool-live")).to_have_count(0)
+
+
+def test_a_running_command_fits_a_phone_heading(ui, page):
+    # F4 on a phone: the time alone ("8:42"), and the command keeps at least 60 px. Mutation: drop data-short on the clock.
+    page.set_viewport_size({"width": 360, "height": 740})
+    event = {"id": "run", "type": "tool", "name": "run_command", "state": "running", "job_id": "job-1",
+             "input": {"command": "python -m pytest tests/test_a_very_long_name.py", "timeout_seconds": 2400},
+             "output": "collected 9 items\n"}
+    ui.app(session="a", scenario="workspace",
+           setup=f"fake.sessions.set('a', {{ ...makeSession('a', 'Tools'), status: 'running', "
+                 f"events: [{{ ...{json.dumps(event)}, job_started: Date.now() / 1000 - 522 }}] }})")
+    ui.show_session("a")
+    button = page.locator(".tool-heading")
+    clock = page.locator(".tool-clock")
+    expect(clock).to_be_visible()
+    assert re.fullmatch(r'"8:4[2-4]"', clock.evaluate("e => getComputedStyle(e, '::after').content"))
+    sizes = button.evaluate("e => [e.scrollWidth, e.clientWidth]")
+    assert sizes[0] <= sizes[1], sizes
+    assert page.locator(".tool-subject").evaluate("e => e.getBoundingClientRect().width") >= 60
+    box, card = clock.bounding_box(), page.locator(".tool-card").bounding_box()
+    assert box["width"] > 0 and box["x"] + box["width"] <= card["x"] + card["width"]
+
+
+# MCP cards: the server's hints, a long result kept for get_tool_output, and images shown on request
+
+def mcp_card(**fields):
+    page = {"output": "Summary\n[image/png, 2 KB; shown in the chat, not sent to the model]", "is_error": False,
+            "truncated": True, "result_id": "out-0123456789ab", "next_offset": 7800, "total_chars": 30000}
+    return json.dumps({"id": "mcp", "type": "tool", "name": "mcp__docs__search", "state": "completed",
+                       "input": {"query": "q"}, "output": json.dumps(page, indent=2), **fields})
+
+
+def test_an_mcp_card_shows_server_hints_the_kept_rest_and_images(ui, page):
+    show(ui, mcp_card(mcp_annotations={"title": "Search", "read_only": True, "open_world": True},
+                      mcp_images=[{"id": "img-0123456789ab", "mime_type": "image/png", "bytes": 2048}]))
+    hints = page.locator(".tool-hints")
+    expect(hints).to_have_text("Server says: read-only · reaches outside services")
+    expect(hints).to_have_attribute("title", "Hints from the MCP server. They never change approvals.")
+    page.locator(".tool-heading").click()
+    expect(page.locator(".tool-job-state")).to_have_text("First 7,800 of 30,000 characters shown. The agent can read "
+                                                          "the rest with get_tool_output until the app restarts.")
+    ui.run("""fake.handle = path => path === '/api/sessions/parent/tool-images/img-0123456789ab'
+      ? fake.json({ mime_type: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==' })
+      : fake.json({ ok: true })""")
+    page.get_by_role("button", name="Show image 1 (image/png, 2 KB)").click()
+    image = page.get_by_role("img", name="MCP tool image 1 (image/png, 2 KB)")
+    expect(image).to_be_visible()
+    assert image.get_attribute("src").startswith("data:image/png;base64,iVBOR")
+
+
+def test_an_image_no_longer_kept_says_so(ui, page):
+    show(ui, mcp_card(mcp_images=[{"id": "img-0123456789ab", "mime_type": "image/png", "bytes": 2048}]))
+    ui.run("""fake.handle = path => path.includes('/tool-images/')
+      ? fake.json({ detail: 'This image is no longer available: images are kept in memory until the app restarts.' }, 404)
+      : fake.json({ ok: true })""")
+    page.locator(".tool-heading").click()
+    page.get_by_role("button", name="Show image 1 (image/png, 2 KB)").click()
+    expect(page.locator(".mcp-image .form-error")).to_contain_text("no longer available")
+    expect(page.locator(".tool-hints")).to_have_count(0)  # No hints given.

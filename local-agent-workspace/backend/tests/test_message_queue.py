@@ -115,9 +115,9 @@ async def test_a_message_queued_during_an_approval_steers_the_same_turn(runtime,
     ended = []
     status = manager.status
 
-    async def record(session, value, turn_ended=False):
+    async def record(session, value, turn_ended=False, **extra):
         ended.append(turn_ended)
-        await status(session, value, turn_ended)
+        await status(session, value, turn_ended, **extra)
     monkeypatch.setattr(manager, "status", record)
     manager.start(sid, "Write a.txt")
     await until(lambda: manager.pending)

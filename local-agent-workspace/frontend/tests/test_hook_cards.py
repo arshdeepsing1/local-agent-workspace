@@ -100,8 +100,11 @@ def test_the_extensions_help_lists_every_hook_event(ui, page):
     page.get_by_text("Hook events and JSON output").click()
     table = page.get_by_role("table", name="Hook events")
     expect(table.locator("tbody th")).to_have_text(["before_tool", "after_tool", "tool_failure", "user_prompt",
-                                                    "session_start", "agent_stop", "subagent_start", "subagent_stop"])
+                                                    "session_start", "agent_stop", "subagent_start", "subagent_stop",
+                                                    "before_compaction", "notification"])
     expect(table.get_by_role("row", name=re.compile("^agent_stop"))).to_contain_text("at most 3 times")
+    expect(table.get_by_role("row", name=re.compile("^before_compaction"))).to_contain_text("cannot stop a compaction")
+    expect(table.get_by_role("row", name=re.compile("^notification"))).to_contain_text("output is ignored")
     expect(page.get_by_text('"decision":"deny"', exact=False)).to_be_visible()
     page.get_by_text("Configuration example").click()
     example = json.loads(page.locator(".agent-tools-example pre").first.text_content())
@@ -126,3 +129,39 @@ def test_the_hook_events_table_keeps_its_headers_on_a_phone(ui, page):
     table = page.get_by_role("table", name="Hook events")
     expect(table.get_by_role("columnheader", name="JSON output it reads")).to_be_visible()
     assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+
+
+SAVED_HOOKS = """config.hooks = [
+  { id: 'ping', event: 'notification', command: 'notify-me', timeout_seconds: 5, enabled: true },
+  { id: 'files', event: 'before_tool', command: 'check-files', timeout_seconds: 10, enabled: true, tools: ['*_file', 'mcp__docs__*'] }]"""
+
+
+def test_a_saved_hook_can_run_without_asking_in_all_projects(ui, page):
+    ui.mount("components/AgentToolsDialog.js", "{ ...dialogProps(session()) }", scenario="agent_tools", setup=SAVED_HOOKS)
+    page.get_by_role("button", name="Extensions", exact=True).click()
+    ping = page.get_by_role("group", name="Hook 1 approval")
+    expect(ping).to_contain_text("Needs Run without asking (or Bypass permissions) to run")
+    expect(page.get_by_role("group", name="Hook 2 approval")).to_contain_text("Asks for approval each time")
+    ping.get_by_role("button", name="Run without asking (all projects)").click()
+    expect(ping).to_contain_text("Runs without asking in all projects")
+    expect(page.get_by_role("status").filter(has_text="Hook ping now runs without asking in all projects.")).to_be_visible()
+    rule = {"tool": "hook", "behavior": "allow", "hook": "ping"}
+    assert ui.bodies("/api/permission-rules", "POST") == [{"scope": "user", "rule": rule}]
+    ping.get_by_role("button", name="Ask again").click()
+    expect(ping).to_contain_text("Needs Run without asking")
+    assert ui.bodies("/api/permission-rules", "DELETE") == [{"scope": "user", "rule": rule}]
+    # The tool patterns stay one per line; the new events are in the event list.
+    expect(page.get_by_role("textbox", name="Hook 2 tool names")).to_have_value("*_file\nmcp__docs__*")
+    events = page.get_by_role("combobox", name="Hook 1 event").locator("option")
+    expect(events).to_have_text(["before_tool", "after_tool", "tool_failure", "user_prompt", "session_start", "agent_stop",
+                                 "subagent_start", "subagent_stop", "before_compaction", "notification"])
+
+
+def test_an_unsaved_hook_offers_no_shortcut_yet(ui, page):
+    ui.mount("components/AgentToolsDialog.js", "{ ...dialogProps(session()) }", scenario="agent_tools")
+    page.get_by_role("button", name="Extensions", exact=True).click()
+    page.get_by_role("button", name="Add hook").click()
+    page.get_by_role("textbox", name="Hook 1 ID").fill("ping")
+    page.get_by_role("combobox", name="Hook 1 event").select_option("notification")
+    expect(page.get_by_text("Save the hook, then choose Run without asking: notification hooks never show a card.")).to_be_visible()
+    expect(page.get_by_role("button", name="Run without asking (all projects)")).to_have_count(0)

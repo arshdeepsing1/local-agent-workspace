@@ -165,7 +165,7 @@ async def test_api_rejects_extension_changes_and_tests_while_mcp_call_is_active(
             return {"output": "done", "is_error": False, "truncated": False}
 
     @asynccontextmanager
-    async def turn():
+    async def turn(**options):
         owner.append(asyncio.current_task())
         try:
             yield Connection()

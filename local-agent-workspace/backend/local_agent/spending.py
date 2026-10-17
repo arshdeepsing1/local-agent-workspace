@@ -73,7 +73,11 @@ def _limit(manager, root):
     value = root.get("spending_limit_dbu")
     source = "chat"
     if not isinstance(value, (int, float)) or isinstance(value, bool):
-        value, source = manager.settings.values.get("spending_limit_dbu", 0), "settings"
+        # Settings → Agent, or a lower limit from the project's trusted settings file (settings_layers.py).
+        values = manager.chat_values(root) if hasattr(manager, "chat_values") else manager.settings.values
+        value, source = values.get("spending_limit_dbu", 0), "settings"
+        if hasattr(manager, "chat_source") and manager.chat_source(root, "spending_limit_dbu"):
+            source = "project"
     try:
         value = validate_limit(value)
     except ValueError:
@@ -82,7 +86,7 @@ def _limit(manager, root):
 
 
 def limit_for(manager, session):
-    """(limit in DBU or None when off, source 'chat' | 'settings') for this chat or its subagent."""
+    """(limit in DBU or None when off, source 'chat' | 'settings' | 'project') for this chat or its subagent."""
     return _limit(manager, root_of(manager, session))
 
 

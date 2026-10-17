@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from . import approvals, mentions
 from .agents import delegated_prompt, public_session
 from .approvals import busy_status, ensure_idle
+from .composer_api import UploadRef, upload_refs, upload_refs_field
 from .history import HistoryError, cut_points, cut_session, rewind_turn_ids
 from .portability import MAX_BUNDLE_BYTES, MAX_SESSIONS, completed_for_fork, export_bundle, fresh_copies, parse_bundle
 from .recovery import rewind_refusal
@@ -33,14 +34,16 @@ class RewindRequest(BaseModel):
     conversation: bool = Field(default=False, strict=True)
     code: bool = Field(default=False, strict=True)
     resend_text: str | None = Field(default=None, min_length=1, max_length=50000, strict=True)
+    resend_verbatim: bool = Field(default=False, strict=True)  # Resent as plain text, as the message was sent.
+    resend_uploads: list[UploadRef] = upload_refs_field()  # The message's attached files, sent again.
 
 
-# Never copied into a rewind backup: the usage ledger and jobs stay with the live chat, and authority,
+# Never copied into a rewind backup: the usage ledger (and its summary) and jobs stay with the live chat, and authority,
 # links and local state are not carried (its subagents stay linked to the live chat, so the backup has
 # no subagents index). The worktree header stays: it is display metadata (grouping under the project).
 BACKUP_DROPPED = ("pinned", "inference_calls", "command_jobs", "context_info", "file_views", "instruction_directories",
-                  "turn_running", "queued_messages", "pending_context", "parent_session_id", "parent_event_id",
-                  "parent_call_id", "delegation", "subagents")
+                  "instruction_paths", "turn_running", "queued_messages", "pending_context", "parent_session_id",
+                  "parent_event_id", "parent_call_id", "delegation", "subagents", "usage_summary", "last_turn_result")
 
 
 def backup_copy(session):
@@ -101,11 +104,16 @@ def register_portability(app, manager, settings, store, session_or_404):
             store.insert_sessions(copies)
         except sqlite3.IntegrityError as exc:
             raise HTTPException(409, "A generated conversation ID already exists. Retry to create a fresh copy.") from exc
+        if kind == "fork":
+            # A fork keeps the files attached to its messages: its own copies (provenance names the source).
+            for copied in copies:
+                manager.uploads.copy_referenced(copied["provenance"]["source_session_id"], copied["id"], copied)
         return {"session": public_session(next(session for session in copies if session["id"] == root_id)),
                 "imported_count": len(copies)}
 
     @app.get("/api/sessions/{session_id}/export")
-    async def export(session_id: str, include_children: bool = False):
+    async def export(session_id: str, include_children: bool = False, with_reasoning: bool = False):
+        """with_reasoning keeps the replies' signed reasoning (reasoning_replay.py); without it none is exported."""
         sessions = [idle(session_id)]
         if include_children:
             included = {session_id}
@@ -117,7 +125,7 @@ def register_portability(app, manager, settings, store, session_or_404):
                             raise ValueError("Export at most 32 conversations at once. Exclude subagents or export a child separately.")
                         sessions.append(idle(child["id"]))
                         included.add(child["id"])
-        return export_bundle(sessions, session_id)
+        return export_bundle(sessions, session_id, with_reasoning)
 
     @app.post("/api/sessions/import", status_code=201)
     async def import_conversations(request: Request, workspace: str):
@@ -134,10 +142,12 @@ def register_portability(app, manager, settings, store, session_or_404):
 
     @app.post("/api/sessions/{session_id}/fork", status_code=201)
     async def fork(session_id: str, body: ForkRequest | None = None):
+        approvals.ensure_no_background(manager, session_or_404(session_id), "forking this conversation")
         if body is None:
             source = idle(session_id)
             completed_for_fork(source)
-            result = insert(export_bundle([source], session_id), destination(source["workspace"]), "fork")
+            result = insert(export_bundle([source], session_id, True, keep_images=True), destination(source["workspace"]),
+                            "fork")
             return result["session"]
         live = session_or_404(session_id)
         # Like the other history actions: no running turn and no waiting approval, question or plan card.
@@ -147,7 +157,7 @@ def register_portability(app, manager, settings, store, session_or_404):
         source = copy.deepcopy(live)
         try:
             cut, _ = cut_session(source, body.before_event_id)
-            bundle = export_bundle([cut], session_id)
+            bundle = export_bundle([cut], session_id, True, keep_images=True)
         except HistoryError as exc:
             raise HTTPException(400, str(exc)) from exc
         project = root_project(manager, source["workspace"], source.get("worktree"))
@@ -236,6 +246,8 @@ def register_portability(app, manager, settings, store, session_or_404):
             raise HTTPException(400, "Enter a message.")
         session = session_or_404(session_id)
         ensure_idle(manager, session, "rewinding this conversation")
+        approvals.ensure_no_background(manager, session, "rewinding this conversation")
+        resend_uploads = upload_refs(body.resend_uploads)
         try:
             if body.conversation:
                 event_cut, _ = cut_points(session, body.before_event_id)
@@ -246,16 +258,26 @@ def register_portability(app, manager, settings, store, session_or_404):
         except HistoryError as exc:
             raise HTTPException(400, str(exc)) from exc
         if body.resend_text is not None:
-            # The resend's own checks (a refused @ file, the attachment limits, a missing project folder)
-            # run before anything changes, so a refusal leaves the chat as it was and the edit open.
+            # The resend's own checks (a refused @ file, the attachment limits, a missing project folder,
+            # a command template or skill that cannot be used) run before anything changes, as start runs
+            # them, so a refusal leaves the chat as it was and the edit open.
             remaining = {**session, "events": session["events"][:event_cut]}
             try:
                 manager.workspace_available(session["workspace"])
                 if not delegated_prompt(remaining):
-                    mentions.expand_context(manager, remaining, manager.session_tools(session),
-                                            body.resend_text.strip(), include_pending=False)
+                    text, resend_tools = body.resend_text.strip(), manager.session_tools(session)
+                    prepared = manager.prepared_message(resend_tools, text, body.resend_verbatim, resend_uploads)
+                    mentions.expand_context(manager, remaining, resend_tools, text, include_pending=False,
+                                            scan=manager.message_parts([prepared])[0],
+                                            uploads=manager.message_uploads([prepared]))
+                    if not body.resend_verbatim and manager.slash_commands():
+                        manager.message_skills(remaining, resend_tools, text)
             except ValueError as exc:
                 raise HTTPException(400, settings.redact(str(exc))) from exc
+        # Retry of the app's message after a background subagent (the same text again) stays the app's message.
+        cut_event = session["events"][event_cut] if body.conversation and event_cut < len(session["events"]) else {}
+        app_message = (body.resend_text is not None and cut_event.get("background_wake") is True
+                       and body.resend_text.strip() == str(cut_event.get("text") or "").strip())
         files = []
         if body.code:
             plan = manager.checkpoints.rewind_plan(tools, session_id, turns)
@@ -271,6 +293,7 @@ def register_portability(app, manager, settings, store, session_or_404):
             except sqlite3.IntegrityError as exc:
                 raise HTTPException(409, "A generated conversation ID already exists. Retry the rewind.") from exc
             backup_id = backup["id"]
+            manager.uploads.copy_referenced(session_id, backup_id, backup)
 
         def drop_backup():
             if backup_id:
@@ -278,6 +301,7 @@ def register_portability(app, manager, settings, store, session_or_404):
                     store.delete(backup_id)
                 except OSError:
                     pass
+                manager.uploads.delete_session(backup_id)
 
         if body.code:
             try:
@@ -303,7 +327,8 @@ def register_portability(app, manager, settings, store, session_or_404):
         result = {"backup_session_id": backup_id, "files": files, "resent": False}
         if body.resend_text is not None:
             try:
-                manager.start(session_id, body.resend_text.strip())
+                manager.start(session_id, body.resend_text.strip(), verbatim=body.resend_verbatim, uploads=resend_uploads,
+                              extra={"background_wake": True} if app_message else None)
                 result["resent"] = True
             except ValueError as exc:
                 result["resend_error"] = settings.redact(str(exc))

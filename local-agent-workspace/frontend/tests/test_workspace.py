@@ -128,14 +128,22 @@ def test_settings_edit_and_save_only_databricks_fields(ui, page):
     expect(steps).to_have_attribute("max", "64")
     expect(dialog.get_by_text(re.compile("not individual tool calls"))).to_be_visible()
     expect(dialog.get_by_label("Agent runtime")).to_have_count(0)
-    # No agent runtime options: CLAUDE.md is named only as a project instruction file.
-    # No Claude CLI runtime settings (a model name such as Claude Opus 5.5 in help text is fine).
-    expect(dialog.get_by_text(re.compile(r"Claude(?!\.md| Opus|-opus)|MCP|skills", re.I))).to_have_count(0)
+    # No agent runtime options: CLAUDE.md is named only as an instruction file (the project's, or the read-only
+    # ~/.claude/CLAUDE.md). No Claude CLI runtime settings (a model name such as Claude Opus 5.5 in help text, or the
+    # Claude endpoints that Prompt caching applies to, is fine).
+    expect(dialog.get_by_text(re.compile(r"(?<!\.)Claude(?!\.md|\.local\.md| Opus|-opus| endpoints\))|MCP|skills", re.I))).to_have_count(0)
+    expect(dialog.get_by_role("combobox", name="Prompt caching").locator("option").first).to_have_text(
+        "Automatic (Claude endpoints)")
     checkboxes = dialog.get_by_role("checkbox")
-    expect(checkboxes).to_have_count(5)
+    expect(checkboxes).to_have_count(14)
     expect(dialog.locator("label:has(input[type=checkbox])")).to_have_text([
         "Save a detailed handoff at each compaction", "Show thinking summaries",
+        "Send earlier thinking back (experimental)",
         "Keep agent changes automatically when a reply finishes", "Continue automatically after rate limits",
+        "Load my instructions file ~/.agents/AGENTS.md", "Also load ~/.claude/CLAUDE.md", "Project memory",
+        "Git status in messages", "Scheduled runs at their times", "Continue the chat when a background subagent finishes",
+        "Run commands typed with /",
+        "Let the agent fetch web pages (web_fetch)",
         "Desktop notification when no browser tab is open"])
     dialog.get_by_label("Project folder").fill("/updated-project")
     endpoint.select_option(label="Other endpoint…")
@@ -438,7 +446,8 @@ def test_draft_model_changes_default_before_creating_conversation(ui, page):
                                            "max_output_tokens": 8192, "max_agent_steps": 32, "user_instructions": "",
                                            "write_limit_kb": 80, "command_env": [], "rate_limit_auto_continue": True,
                                            "coding_dir": "", "python_venv": "", "reasoning_effort": "default",
-                                           "reasoning_format": "auto", "thinking_summaries": True}]
+                                           "reasoning_format": "auto", "thinking_summaries": True, "thinking_replay": False,
+                                           "fallback_model": ""}]
     send(page).click()
     ui.show_session("created")
     assert ui.js("fake.sessions.get('created').model") == "other-model"
@@ -511,6 +520,24 @@ def test_manual_compaction_keeps_stop_available(ui, page):
     ui.emit("a", {"type": "status", "status": "idle"})
     expect(page.get_by_text("Context preview · ~50%")).to_be_visible()
     expect(page.get_by_role("button", name="Compact now")).to_be_enabled()
+
+
+def test_the_meter_closes_for_an_approval_and_offers_no_compaction_after_one(ui, page):
+    start_app(ui, page, "a", setup="fake.sessions.set('a', { ...makeSession('a'), context_info: contextInfo })")
+    ui.show_session("a")
+    details = page.locator("details.context-meter")
+    page.get_by_text("Last model input · ~50%").click()
+    expect(details).to_have_attribute("open", "")
+    ui.emit("a", {"type": "status", "status": "running"})
+    expect(details).to_have_attribute("open", "")
+    ui.emit("a", {"type": "status", "status": "awaiting_approval"})
+    expect(details).not_to_have_attribute("open", "")
+    # After a compaction that kept only the latest turn there is nothing more to compact until the next message.
+    ui.emit("a", "{ type: 'context', context_info: { ...contextInfo, compactions: 2, compactable: false } }")
+    ui.emit("a", {"type": "status", "status": "idle"})
+    page.get_by_text(re.compile("Last model input")).click()
+    expect(page.get_by_text(re.compile("^Nothing to compact yet: earlier turns are already summa"))).to_be_visible()
+    expect(page.get_by_role("button", name="Compact now")).to_be_disabled()
 
 
 def test_one_composer_after_creating_and_switching(ui, page):
@@ -622,13 +649,69 @@ def test_context_updates_ignore_abandoned_sockets(ui):
 
 
 def test_compaction_shows_busy_and_stop_works(ui, page):
+    # F7: the hint counts the time since compaction started and says why it runs and why it can take minutes.
+    # Mutation: render the static "Compacting context…".
     start_app(ui, page, "a", setup="fake.override = path => path === '/api/sessions/a/stop' ? fake.json({ ok: true }) : undefined")
     ui.show_session("a")
+    ui.emit("a", "{ type: 'context', context_info: { ...contextInfo, auto_compact_percent: 85 } }")
+    ui.emit("a", {"type": "status", "status": "running"})
     ui.emit("a", {"type": "status", "status": "compacting"})
-    expect(page.get_by_role("status")).to_have_text("Compacting context…")
+    hint = page.get_by_role("status")
+    expect(hint).to_contain_text("Compacting context…")
+    expect(hint).to_contain_text("The next request passed the auto-compact threshold (85%). Summary requests are not "
+                                 "streamed and can take a few minutes.")
+    elapsed = hint.locator(".compacting-elapsed")
+    expect(elapsed).to_have_text(re.compile(r"^[0-2] s$"))
+    expect(elapsed).to_have_text(re.compile(r"^[1-3] s$"))  # It keeps counting.
+    expect(elapsed).to_have_attribute("aria-hidden", "true")  # Not announced every second.
     expect(send(page)).to_have_count(0)
     page.get_by_role("button", name="Stop response").click()
     ui.wait("fake.requests('/api/sessions/a/stop', 'POST').length === 1")
+
+
+def test_a_compaction_you_asked_for_or_found_running_names_no_threshold(ui, page):
+    # Compact now starts from idle; a chat opened mid-compaction has no known start, so no time is shown.
+    start_app(ui, page, "a", setup="fake.sessions.set('b', { ...makeSession('b', 'Busy chat'), status: 'compacting' })")
+    ui.show_session("a")
+    ui.emit("a", {"type": "status", "status": "compacting"})
+    hint = page.get_by_role("status")
+    expect(hint).to_have_text(re.compile(r"^Compacting context… \d s · Summary requests are not streamed and can take a few minutes\.$"))
+    page.get_by_role("button", name=re.compile("^Busy chat")).click()
+    ui.show_session("b")
+    expect(page.get_by_role("status")).to_have_text("Compacting context… · Summary requests are not streamed and can take a few minutes.")
+    expect(page.locator(".compacting-elapsed")).to_have_count(0)
+
+
+def test_the_compacting_hint_follows_the_servers_progress_and_a_reload(ui, page):
+    # The server names each request, when the compaction started and why it runs; a page opened mid-compaction
+    # gets them from the snapshot. Mutation: ignore the progress and show "Compacting context…" only.
+    progress = ("{ phase: 'handoff', request: 1, started: Date.now() / 1000 - 65, request_started: Date.now() / 1000, "
+                "trigger: 'in_turn' }")
+    start_app(ui, page, "a", setup=f"fake.sessions.set('b', {{ ...makeSession('b', 'Busy chat'), status: 'compacting', "
+                                   f"compaction_progress: {{ ...{progress}, phase: 'summary', request: 3, trigger: 'auto' }} }})")
+    ui.show_session("a")
+    ui.emit("a", "{ type: 'context', context_info: { ...contextInfo, auto_compact_percent: 85 } }")
+    ui.emit("a", {"type": "status", "status": "running"})
+    ui.emit("a", f"{{ type: 'compaction', progress: {progress} }}")  # Sent before the status changes.
+    ui.emit("a", {"type": "status", "status": "compacting"})
+    hint = page.locator(".compacting-hint")
+    expect(hint).to_have_text(re.compile(r"^Compacting context: writing the handoff \(request 1\) · 1 min 0[5-8] s · "
+                                         r"This request's tool results passed the auto-compact threshold \(85%\)\. "
+                                         r"Summary requests are not streamed and can take a few minutes\.$"))
+    ui.emit("a", f"{{ type: 'compaction', progress: {{ ...{progress}, phase: 'condense', request: 2 }} }}")
+    expect(hint).to_contain_text("Compacting context: condensing (request 2) · 1 min 0")
+    expect(hint.locator(".compacting-elapsed")).to_have_attribute("aria-hidden", "true")
+    # The compaction ends with the status: the next one starts without the old progress.
+    ui.emit("a", {"type": "status", "status": "running"})
+    expect(hint).to_have_count(0)
+    ui.emit("a", {"type": "status", "status": "compacting"})
+    expect(hint).to_have_text(re.compile(r"^Compacting context… \d s · The next request passed"))
+    # Opened mid-compaction: the server's start time, request and reason.
+    page.get_by_role("button", name=re.compile("^Busy chat")).click()
+    ui.show_session("b")
+    expect(page.locator(".compacting-hint")).to_have_text(re.compile(
+        r"^Compacting context: summarizing \(request 3\) · 1 min 0[5-8] s · The next request passed the auto-compact "
+        r"threshold\. Summary requests are not streamed and can take a few minutes\.$"))
 
 
 def test_newer_context_survives_an_older_summary_request(ui):

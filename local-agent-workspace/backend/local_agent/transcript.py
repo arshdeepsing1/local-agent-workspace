@@ -33,6 +33,23 @@ def _json(text):
     return value if isinstance(value, dict) else {}
 
 
+def _attachment(item):
+    """How the transcript names an attachment of a user message: an @ file, ! output, or an attached document or
+    image (its name only: a transcript holds neither the document's text nor the image)."""
+    kind = item.get("kind")
+    if kind == "file":
+        return (f"{_code('@' + str(item.get('path')))} lines {item.get('start_line')}–{item.get('end_line')}"
+                + (", shortened" if item.get("truncated") else ""))
+    if kind == "document":
+        return (f"document {_code(str(item.get('name') or 'document'))}" + (" (as a path)" if item.get("as_path")
+                else ", shortened" if item.get("truncated") else ""))
+    if kind == "image":
+        size = (f" {item['width']}×{item['height']}" if type(item.get("width")) is int and type(item.get("height")) is int
+                else "")
+        return f"image {_code(str(item.get('name') or 'image'))}{size}"
+    return f"output of {_code('! ' + str(item.get('command', '')))} (exit {item.get('exit_code')})"
+
+
 def _when(timestamp):
     try:
         return datetime.fromtimestamp(float(timestamp)).astimezone().strftime("%Y-%m-%d %H:%M %Z")
@@ -124,6 +141,32 @@ def _plan(event, arguments, state, output):
     return "\n".join(lines)
 
 
+def finding_location(item):
+    """path:line, path:line-end_line or path of one report_findings entry."""
+    where = str(item.get("path") or "")
+    line, end = item.get("line"), item.get("end_line")
+    if type(line) is int:
+        where += f":{line}" + (f"-{end}" if type(end) is int and end > line else "")
+    return where
+
+
+def _findings(arguments, state, output):
+    """report_findings: the summary, then each finding with its severity, location, title, detail and fix."""
+    findings = [item for item in arguments.get("findings") or [] if isinstance(item, dict)]
+    lines = [f"- Review findings ({len(findings)})" + (_failure(state, output) or ":")]
+    summary = " ".join(str(arguments.get("summary") or "").split())
+    if summary:
+        lines.append(_indent(summary))
+    for item in findings:
+        title = " ".join(str(item.get("title") or "").split())
+        lines.append(_indent(f"- **{item.get('severity') or 'info'}** {_code(finding_location(item))} {title}".rstrip()))
+        for key, label in (("detail", ""), ("suggestion", "Suggestion: ")):
+            text = " ".join(str(item.get(key) or "").split())
+            if text:
+                lines.append(_indent(_indent(label + text)))
+    return "\n".join(lines)
+
+
 def _tool(event, excerpt_chars):
     name = str(event.get("name") or "tool")
     arguments = event.get("input") if isinstance(event.get("input"), dict) else {}
@@ -135,6 +178,8 @@ def _tool(event, excerpt_chars):
         return _questions(event, arguments, state, output)
     if name == "submit_plan":
         return _plan(event, arguments, state, output)
+    if name == "report_findings":
+        return _findings(arguments, state, output)
     if name == "run_command" and state == "completed":
         status = str(result.get("state") or event.get("job_state") or state).replace("_", " ")
         if type(result.get("exit_code")) is int:
@@ -188,6 +233,53 @@ def _tool(event, excerpt_chars):
     return line
 
 
+def _tokens(value):
+    """'182k', '3.1k', '950' or '—' for a count no call reported."""
+    if type(value) is not int:
+        return "—"
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 10_000:
+        return f"{round(value / 1000)}k"
+    return f"{value / 1000:.1f}k" if value >= 1000 else str(value)
+
+
+def _duration(seconds):
+    seconds = int(round(seconds)) if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) else 0
+    if seconds < 60:
+        return f"{seconds} s"
+    if seconds < 3600:
+        return f"{seconds // 60} min {seconds % 60} s" if seconds % 60 else f"{seconds // 60} min"
+    return f"{seconds // 3600} h {seconds % 3600 // 60} min" if seconds % 3600 // 60 else f"{seconds // 3600} h"
+
+
+def turn_summary_text(result):
+    """One line for a turn's result record (turns.turn_result), as the footer under its last reply shows it:
+    '8 steps · 14 tools · 2 min 10 s · 182k in (160k cached) / 3.1k out · ~1.4 DBU'. A token count no call
+    reported is '—'; no DBU without price data."""
+    if not isinstance(result, dict):
+        return ""
+    def count(value, word):
+        value = value if type(value) is int else 0
+        return f"{value:,} {word}{'' if value == 1 else 's'}"
+    usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+    uncached = usage.get("input_tokens")
+    total_in = None if type(uncached) is not int else uncached + sum(
+        usage.get(key) or 0 for key in ("cache_read_input_tokens", "cache_creation_input_tokens"))
+    cached = usage.get("cache_read_input_tokens")
+    tokens = f"{_tokens(total_in)} in" + (f" ({_tokens(cached)} cached)" if type(cached) is int and cached else "") \
+        + f" / {_tokens(usage.get('output_tokens'))} out"
+    parts = [count(result.get("steps"), "step"), count(result.get("tool_calls"), "tool"), _duration(result.get("duration_s")),
+             tokens]
+    dbu = result.get("estimated_dbu")
+    if isinstance(dbu, (int, float)) and not isinstance(dbu, bool):
+        parts.append(f"~{dbu:,.1f} DBU" if dbu >= 1 else f"~{dbu:.3f} DBU")
+    agents = (result.get("subagents") or {}).get("count") if isinstance(result.get("subagents"), dict) else 0
+    if type(agents) is int and agents:
+        parts.append(count(agents, "subagent"))
+    return " · ".join(parts)
+
+
 def transcript_file_stem(session, *, redact=lambda text: text):
     """<date>-<title>-<id>, the name the transcript script and the app's export give a transcript.
     The title is redacted like the transcript itself, so a secret becomes "-redacted-"."""
@@ -216,9 +308,10 @@ def transcript(session, *, excerpt_chars=EXCERPT_CHARS, redact=lambda text: text
              f"- Started {_when(session.get('created'))}; last updated {_when(session.get('updated'))}",
              "- Written by the app from the saved conversation file. Messages and replies are complete, with their "
              "headings moved two levels down; each tool call shows its main input, questions show the user's "
-             "answers, plans are shown in full with how they were reviewed, and command output is "
+             "answers, plans are shown in full with how they were reviewed, review findings are shown in full, and "
+             "command output is "
              f"shortened to {excerpt_chars:,} characters.", ""]
-    tools, turn = [], 0
+    tools, turn, summary = [], 0, ""
     for event in events:
         kind = event.get("type")
         if kind == "tool":
@@ -228,16 +321,24 @@ def transcript(session, *, excerpt_chars=EXCERPT_CHARS, redact=lambda text: text
             lines += [*tools, ""]
             tools = []
         text = str(event.get("text") or "").strip()
+        if kind == "user" and summary:
+            lines += [f"_Turn: {summary}_", ""]  # The previous turn's result, after its last tool call.
+            summary = ""
+        if kind == "assistant" and isinstance(event.get("turn_result"), dict):
+            summary = turn_summary_text(event["turn_result"])
         if kind == "user":
             turn += 1
             delegated = (event.get("origin") or {}).get("kind") == "delegated"
-            lines += ["---", "", f"## Turn {turn} · {_when(event.get('created'))}", "",
-                      f"**User{' (delegated by the parent conversation)' if delegated else ''}:**", "",
+            # The app's message that continued the chat after a background subagent is not the user's.
+            who = ("User (delegated by the parent conversation)" if delegated else
+                   "App (sent when a background subagent finished)" if event.get("background_wake") is True else "User")
+            lines += ["---", "", f"## Turn {turn} · {_when(event.get('created'))}", "", f"**{who}:**", "",
                       _demote_headings(text) or "(empty message)", ""]
-            lines += ["_Attached when sent: " + "; ".join((f"{_code('@' + str(item.get('path')))} lines {item.get('start_line')}–{item.get('end_line')}" + (", shortened" if item.get("truncated") else "")) if item.get("kind") == "file" else f"output of {_code('! ' + str(item.get('command', '')))} (exit {item.get('exit_code')})" for item in event["attachments"] if isinstance(item, dict)) + "_", ""] if isinstance(event.get("attachments"), list) and event["attachments"] else []
+            lines += ["_Attached when sent: " + "; ".join(_attachment(item) for item in event["attachments"] if isinstance(item, dict)) + "_", ""] if isinstance(event.get("attachments"), list) and event["attachments"] else []
         elif kind == "assistant" and text:
             lines += ["**Assistant:**", "", _demote_headings(text), ""]
         elif kind in ("notice", "error") and text:
             lines += [f"> **{kind.title()}:** " + text.replace("\n", "\n> "), ""]
     lines += [*tools, ""] if tools else []
+    lines += [f"_Turn: {summary}_", ""] if summary else []
     return redact(redact_secrets("\n".join(lines).rstrip() + "\n"))

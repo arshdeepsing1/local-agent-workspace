@@ -6,7 +6,7 @@ import { modeLabel, quoteArgv } from './PermissionsMenu.js'
 // Pending-card fields (see types.js): rememberable, rule_options, editable, protected, uncertain, edited.
 const SCOPE_LABELS = { chat: 'This chat', project: 'This project', user: 'All projects' }
 const RULE_SCOPES = { chat: 'this chat', project: 'this project', user: 'all projects' }
-const FIELD_LABELS = { command: 'Command', content: 'File content', new_text: 'Replacement text' }
+const FIELD_LABELS = { command: 'Command', content: 'File content', new_text: 'Replacement text', text: 'Note' }
 // A shorter visible label for narrow cards. It must be the start of the accessible name (WCAG 2.5.3 Label in Name),
 // so a speech-input user who says what they see still matches. Only the command label is long; the others
 // ("Allow edits in this chat", "Allow subagents in this chat", …) keep their full text at every width.
@@ -15,8 +15,13 @@ const SHORT_ALLOW = { 'Always allow this command in this chat': 'Always allow th
 // The line under a card's heading that says why it ran without a card, or how its card was answered.
 export function ruleLine(event) {
   const parts = []
-  if (event.allowed_by_rule) parts.push(`Allowed by a rule for ${RULE_SCOPES[event.rule_scope] || 'this chat'}`)
+  if (event.read_only_pipeline) {
+    // A command the app checked stage by stage (shell_vet); a stage may have run because a rule allows it.
+    parts.push(event.allowed_by_rule ? `Checked by the app: read-only commands and a rule for ${RULE_SCOPES[event.rule_scope] || 'this chat'}`
+      : 'Ran as a read-only command (checked by the app)')
+  } else if (event.allowed_by_rule) parts.push(`Allowed by a rule for ${RULE_SCOPES[event.rule_scope] || 'this chat'}`)
   if (event.read_only_command) parts.push('Ran as a read-only command')
+  if (Array.isArray(event.secret_files) && event.secret_files.length && event.state !== 'pending') parts.push(`Named a secret file: ${event.secret_files.join(', ')}`)
   if (event.approved_by_mode) parts.push(`Approved when you switched to ${modeLabel(event.approved_by_mode)}`)
   // A card edited and then declined, expired, blocked or cancelled was never approved.
   if (event.edited && event.state !== 'pending') parts.push(event.approval === 'approved' ? 'Edited by you before approval' : 'Edited by you')
@@ -38,12 +43,14 @@ function rememberChoices(event) {
   const offered = (event.rememberable || []).filter(scope => SCOPE_LABELS[scope] && (!legacyOnly || scope === 'chat'))
   const folderOption = typeof options.folder === 'string' && options.folder ? options.folder : null
   const more = offered.some(scope => scope !== 'chat') || (isCommand && !legacyOnly) || !!folderOption
-  return { options, isCommand, legacyOnly, offered, folderOption, more }
+  // web_fetch: the rule allows fetches from this one host (the server's domain rule).
+  const domain = event.name === 'web_fetch' && typeof options.domain === 'string' && options.domain ? options.domain : null
+  return { options, isCommand, legacyOnly, offered, folderOption, more, domain }
 }
 
 // The "Always allow…" form: where the rule is saved and what it matches. The client never widens a rule on its own.
 function RememberOptions({ event, disabled, onApprove }) {
-  const { options, isCommand, legacyOnly, offered, folderOption } = rememberChoices(event)
+  const { options, isCommand, legacyOnly, offered, folderOption, domain } = rememberChoices(event)
   const [scope, setScope] = useState(offered.includes('project') ? 'project' : offered[0])
   const prefixes = isCommand && !legacyOnly && Array.isArray(options.prefixes) ? options.prefixes : []
   const [match, setMatch] = useState('exact')
@@ -70,6 +77,7 @@ function RememberOptions({ event, disabled, onApprove }) {
     <fieldset><legend>Where</legend>
       ${offered.map(value => html`<${Radio} key=${value} name=${`${id}-scope`} value=${value} checked=${scope === value} disabled=${disabled} onChange=${setScope}>${SCOPE_LABELS[value]}</${Radio}>`)}
     </fieldset>
+    ${domain ? html`<p class="remember-domain">Allows fetches from <code>${domain}</code> only (not its subdomains). Each other domain asks.</p>` : null}
     ${isCommand && !legacyOnly ? html`<fieldset><legend>Match</legend>
       <${Radio} name=${`${id}-match`} value="exact" checked=${match === 'exact'} disabled=${disabled} onChange=${setMatch}>Exactly this command <code>${quoteArgv(options.argv)}</code></${Radio}>
       ${prefixes.length ? html`<${Radio} name=${`${id}-match`} value="prefix" checked=${match === 'prefix'} disabled=${disabled} onChange=${setMatch}>Commands starting with</${Radio}>
@@ -110,7 +118,7 @@ function EditAction({ event, sessionId, onError, onClose }) {
   }
   return html`<div class="approval-edit">
     ${fields.map((field, index) => html`<label key=${field}>${FIELD_LABELS[field]}<textarea ref=${index === 0 ? first : null} spellcheck=${false} disabled=${saving}
-      rows=${field === 'command' ? 3 : 8} value=${values[field]} onInput=${e => { const value = e.currentTarget.value; setValues(current => ({ ...current, [field]: value })) }} /></label>`)}
+      rows=${field === 'command' || field === 'text' ? 3 : 8} value=${values[field]} onInput=${e => { const value = e.currentTarget.value; setValues(current => ({ ...current, [field]: value })) }} /></label>`)}
     <div class="approval-buttons"><button class="outline" disabled=${saving} onClick=${onClose}>Cancel edit</button>
       <button class="primary" disabled=${saving || !changed} onClick=${() => void save()}>Save edit</button></div>
   </div>`
@@ -119,7 +127,7 @@ function EditAction({ event, sessionId, onError, onClose }) {
 // The pending body of an approval card below its first sentence: notes, the preview (or the editor),
 // the decline note, the buttons and the "Always allow…" form.
 // onDecide(allowed, extra?): extra is merged into the answer ({ remember } or { scope, rule? }).
-export default function ApprovalOptions({ event, sessionId, onError, deciding, onDecide, allowInChat, details, declineNote }) {
+export default function ApprovalOptions({ event, sessionId, onError, deciding, onDecide, allowInChat, details, declineNote, approveLabel = 'Approve' }) {
   const [editing, setEditing] = useState(false)
   const [remembering, setRemembering] = useState(false)
   const canRemember = !event.protected && (event.rememberable || []).length > 0
@@ -155,6 +163,7 @@ export default function ApprovalOptions({ event, sessionId, onError, deciding, o
   return html`
     ${event.protected ? html`<p class="tool-protected">Protected file: ${event.protected}. Edits to it always need your approval.</p>` : null}
     ${event.uncertain ? html`<p class="tool-uncertain">This command could not be checked exactly against your deny and ask rules, so it needs your approval.</p>` : null}
+    ${Array.isArray(event.secret_files) && event.secret_files.length ? html`<p class="tool-secret" role="note">Reads a secret file: ${event.secret_files.map((name, index) => html`${index ? ', ' : ''}<code key=${index}>${name}</code>`)}. If you approve, its contents can reach the model; only known token shapes and your credential file's values are hidden. Such a command asks in every mode and cannot be remembered.</p>` : null}
     ${event.edited ? html`<p class="tool-edited">Edited by you</p>` : null}
     ${event.hook_ask ? html`<p class="tool-hook-ask">The hook ${event.hook_ask.hook_id} asked for your approval${event.hook_ask.reason ? `: ${event.hook_ask.reason}` : '.'} A hook's request cannot be remembered as a rule.</p>` : null}
     ${event.hook_change ? html`<p class="tool-hook-ask">The hook ${(event.hook_change.hooks || []).join(', ')} changed what the agent proposed; this card shows what would run.</p>` : null}
@@ -171,6 +180,6 @@ export default function ApprovalOptions({ event, sessionId, onError, deciding, o
         onClick=${() => void onDecide(true, { remember: true })}>${chatLabel}</button>` : html`
       ${canRemember ? html`<button class="outline" disabled=${locked} aria-expanded=${remembering} onClick=${() => setRemembering(v => !v)}>Always allow…</button>` : null}
       ${allowInChat ? html`<button class="outline" disabled=${locked} onClick=${() => void onDecide(true, { remember: true })}>${allowInChat}</button>` : null}`}
-      <button class="primary" disabled=${locked} onClick=${() => void onDecide(true)}><${Check} size=${15} />Approve</button></div>
+      <button class="primary" disabled=${locked} onClick=${() => void onDecide(true)}><${Check} size=${15} />${approveLabel}</button></div>
     ${canRemember && !chatOnly && remembering && !editing ? html`<div ref=${rememberForm}><${RememberOptions} event=${event} disabled=${locked} onApprove=${extra => onDecide(true, extra)} /></div>` : null}`
 }

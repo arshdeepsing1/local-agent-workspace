@@ -1,4 +1,5 @@
 """Reviewing the agent's file changes: the changed-files bar, explorer dots and the inline diff."""
+import json
 import re
 
 from playwright.sync_api import expect
@@ -10,9 +11,9 @@ CHANGES = """window.changes = { added: 7, removed: 3, files: [
 ] }"""
 
 
-def mount_bar(ui, changes="window.changes", busy="false", action="async () => ({})"):
+def mount_bar(ui, changes="window.changes", busy="false", action="async () => ({})", roots="[]"):
     ui.mount("components/ChangesBar.js", f"{{ changes: {changes}, busy: {busy}, onOpen: fake.spy('open'), "
-             f"onAction: fake.spy('action', {action}), onError: fake.spy('error') }}", setup=CHANGES)
+             f"onAction: fake.spy('action', {action}), onError: fake.spy('error'), roots: {roots} }}", setup=CHANGES)
 
 
 def bar(page):
@@ -204,6 +205,29 @@ def test_a_file_outside_the_project_is_listed_by_its_full_path_and_opens_for_rev
     # The file list shows the project folder only, so it has no dot for this file.
     page.get_by_role("button", name="Back to files").click()
     expect(page.get_by_role("img", name=re.compile("Changed by the agent|Contains changed files"))).to_have_count(0)
+
+
+def test_rows_name_folders_outside_the_project_by_their_allowed_folder(ui, page):
+    # F2. Mutation: show the raw parent folder (a long absolute path, cut off mid-path).
+    # A top-level allowed folder is named by its full path ("/data"); a file deep in it still names that folder.
+    # Mutation: take "the short form equals the path" for "under no folder" (gives "…/b/c").
+    paths = ["src/app.py", "/srv/other/pkg/mod.py", "/srv/other/top.py", "/elsewhere/a/b/c.txt", "/opt/x.txt", "README.md",
+             "/data/a/b/c/d.csv"]
+    files = ", ".join(f"{{ path: {json.dumps(path)}, status: 'modified', added: 1, removed: 0, current_hash: 'h{index}' }}"
+                      for index, path in enumerate(paths))
+    mount_bar(ui, changes=f"{{ added: 7, removed: 0, files: [{files}] }}", roots="['/srv/other', '/srv/code', '/data']")
+    page.get_by_role("button", name=re.compile("^7 files changed")).click()
+    rows = page.locator(".changes-file")
+    expect(rows.locator(".changes-name")).to_have_text(["app.py", "mod.py", "top.py", "c.txt", "x.txt", "README.md", "d.csv"])
+    assert rows.evaluate_all("items => items.map(item => item.querySelector('.changes-dir')?.textContent ?? null)") == [
+        "src", "other/pkg", "other", "…/a/b", "/opt", None, "/data/a/b/c"]
+    # The full path stays in the title and in every accessible name.
+    for path in paths:
+        expect(page.get_by_title(f"Review {path}", exact=True)).to_be_visible()
+        expect(page.get_by_role("button", name=f"Keep changes to {path}", exact=True)).to_be_visible()
+        expect(page.get_by_role("button", name=f"Undo changes to {path}", exact=True)).to_be_visible()
+    page.get_by_title("Review /srv/other/pkg/mod.py").click()
+    assert ui.spy("open") == [["/srv/other/pkg/mod.py"]]
 
 
 def test_rows_mark_subagent_and_command_changes(ui, page):

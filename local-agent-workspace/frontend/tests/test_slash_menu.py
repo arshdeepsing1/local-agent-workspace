@@ -1,4 +1,4 @@
-"""Skill commands typed in the message box: "/" lists skills, like Claude Desktop."""
+"""The / menu of the message box: "/" lists the app's commands, custom commands and skills, like Claude Desktop."""
 from playwright.sync_api import expect
 
 
@@ -11,8 +11,12 @@ def message(page):
     return page.get_by_role("textbox", name="Message")
 
 
+COMMANDS = ["/btw", "/new", "/clear", "/compact", "/model", "/mode", "/context", "/usage", "/export", "/fork", "/rename",
+            "/copy", "/help"]
+
+
 def skills(page):
-    return page.get_by_role("listbox", name="Skills")
+    return page.get_by_role("listbox", name="Commands and skills")
 
 
 def options(page):
@@ -23,25 +27,30 @@ def sent(ui, session="created"):
     return [body["text"] for body in ui.bodies(f"/api/sessions/{session}/messages", "POST")]
 
 
-def test_slash_lists_skills_for_a_new_conversation_and_filters(ui, page):
+def test_slash_lists_commands_then_skills_for_a_new_conversation_and_filters(ui, page):
     start_app(ui, page)
     message(page).press_sequentially("/")
-    # The built-in /btw (side question) comes first, then the skills.
-    expect(options(page)).to_have_count(3)
-    expect(options(page).nth(0)).to_contain_text("/btw")
-    expect(options(page).nth(1)).to_contain_text("/review")
-    expect(options(page).nth(1)).to_contain_text("Code review")
-    expect(options(page).nth(1)).to_contain_text("Review the current diff for correctness bugs.")
-    expect(options(page).nth(2)).to_contain_text("/handoff")
-    expect(options(page).nth(2)).to_contain_text("Write a detailed cold-start handoff.")
-    # A new conversation uses the default workspace's skills.
-    assert len(ui.requests("/api/skills")) == 1
+    # The built-in commands (the side question first) come first, then the skills.
+    expect(options(page)).to_have_count(len(COMMANDS) + 2)
+    expect(skills(page).get_by_role("group", name="Commands").get_by_role("option")).to_have_count(len(COMMANDS))
+    for index, command in enumerate(COMMANDS):
+        expect(options(page).nth(index).locator(".slash-command")).to_contain_text(command)
+    expect(options(page).nth(10)).to_contain_text("/rename <title>")
+    review, handoff = options(page).nth(len(COMMANDS)), options(page).nth(len(COMMANDS) + 1)
+    expect(skills(page).get_by_role("group", name="Skills").get_by_role("option")).to_have_count(2)
+    expect(review).to_contain_text("/review")
+    expect(review).to_contain_text("Code review")
+    expect(review).to_contain_text("Review the current diff for correctness bugs.")
+    expect(handoff).to_contain_text("/handoff")
+    expect(handoff).to_contain_text("Write a detailed cold-start handoff.")
+    # A new conversation uses the default workspace's skills and commands.
+    assert len(ui.requests("/api/skills")) == 1 and len(ui.requests("/api/commands")) == 1
     message(page).press_sequentially("han")
     expect(options(page)).to_have_count(1)
     expect(options(page)).to_contain_text("/handoff")
     message(page).press_sequentially("x")
     expect(skills(page)).to_have_count(0)
-    expect(page.get_by_role("status").filter(has_text="No skill matches /hanx.")).to_be_visible()
+    expect(page.get_by_role("status").filter(has_text="Nothing matches /hanx.")).to_be_visible()
     assert len(ui.requests("/api/skills")) == 1
 
 
@@ -49,6 +58,7 @@ def test_arrows_choose_and_enter_inserts_before_a_second_enter_sends(ui, page):
     start_app(ui, page)
     box = message(page)
     box.press_sequentially("/")
+    last = len(COMMANDS) + 1
     expect(options(page).nth(0)).to_have_attribute("aria-selected", "true")
     expect(box).to_have_attribute("aria-activedescendant", options(page).nth(0).get_attribute("id"))
     expect(box).to_have_attribute("aria-controls", skills(page).get_attribute("id"))
@@ -56,11 +66,13 @@ def test_arrows_choose_and_enter_inserts_before_a_second_enter_sends(ui, page):
     expect(options(page).nth(1)).to_have_attribute("aria-selected", "true")
     expect(options(page).nth(0)).to_have_attribute("aria-selected", "false")
     expect(box).to_have_attribute("aria-activedescendant", options(page).nth(1).get_attribute("id"))
-    box.press("ArrowDown")
+    box.press("ArrowUp")
+    box.press("ArrowUp")
+    expect(options(page).nth(last)).to_have_attribute("aria-selected", "true")
     box.press("ArrowDown")
     expect(options(page).nth(0)).to_have_attribute("aria-selected", "true")
     box.press("ArrowUp")
-    expect(options(page).nth(2)).to_have_attribute("aria-selected", "true")
+    expect(options(page).nth(last)).to_have_attribute("aria-selected", "true")
     box.press("Enter")
     expect(box).to_have_value("/handoff ")
     expect(skills(page)).to_have_count(0)
@@ -88,7 +100,9 @@ def test_tab_and_click_insert_and_escape_closes_until_the_text_changes(ui, page)
     expect(box).to_be_focused()
     box.fill("")
     box.press_sequentially("/re")
-    expect(options(page)).to_have_count(1)
+    # /rename (a command) and /review (a skill).
+    expect(options(page)).to_have_count(2)
+    expect(options(page).nth(0)).to_contain_text("/rename")
     box.press("Escape")
     expect(page.locator(".slash-menu")).to_have_count(0)
     expect(box).to_have_value("/re")
@@ -124,14 +138,15 @@ def test_an_open_conversation_lists_its_own_skills_again_on_each_opening(ui, pag
     ui.show_session("a")
     box = message(page)
     box.press_sequentially("/")
-    expect(options(page)).to_have_count(2)
-    expect(options(page).nth(1)).to_contain_text("/worktree-skill")
-    expect(options(page).nth(1)).to_contain_text("Worktree skill")
+    expect(options(page)).to_have_count(len(COMMANDS) + 1)
+    expect(options(page).nth(len(COMMANDS))).to_contain_text("/worktree-skill")
+    expect(options(page).nth(len(COMMANDS))).to_contain_text("Worktree skill")
     assert len(ui.requests("/api/skills?session_id=a")) == 1 and not ui.requests("/api/skills")
+    assert len(ui.requests("/api/commands?session_id=a")) == 1 and not ui.requests("/api/commands")
     box.press_sequentially(" ")
     expect(page.locator(".slash-menu")).to_have_count(0)
     box.press("Backspace")
-    expect(options(page)).to_have_count(2)
+    expect(options(page)).to_have_count(len(COMMANDS) + 1)
     assert len(ui.requests("/api/skills?session_id=a")) == 2
 
 
@@ -142,23 +157,23 @@ def test_loading_empty_and_error_states(ui, page):
     box.press_sequentially("/")
     expect(page.get_by_role("status").filter(has_text="Loading skills…")).to_be_visible()
     ui.run("fake.deferreds.skills.resolve(fake.json(skills))")
-    expect(options(page)).to_have_count(3)
-    # A failed reload shows its error instead of the earlier list.
+    expect(options(page)).to_have_count(len(COMMANDS) + 2)
+    # A failed reload shows its error instead of the earlier skills; the built-in commands stay.
     ui.run("""fake.override = path => path === '/api/skills'
       ? fake.json({ detail: 'Skill discovery scans at most 100 entries; reduce the skills directory.' }, 400) : undefined""")
     box.press_sequentially(" ")
     box.press("Backspace")
     expect(page.locator(".slash-menu").get_by_role("alert")).to_have_text(
         "Skill discovery scans at most 100 entries; reduce the skills directory.")
-    expect(skills(page)).to_have_count(0)
+    expect(options(page)).to_have_count(len(COMMANDS))
     ui.run("fake.override = path => path === '/api/skills' ? fake.json([]) : undefined")
     box.press("Escape")
     box.press_sequentially("x")
     box.press("Backspace")
     expect(page.get_by_role("status").filter(
         has_text="No skills found. Add one at .agents/skills/<skill-id>/SKILL.md in your project.")).to_be_visible()
-    # The built-in /btw is still listed; with the list closed, Enter sends the text as typed.
-    expect(options(page)).to_have_count(1)
+    # The built-in commands are still listed; with the list closed, Enter sends the text as typed.
+    expect(options(page)).to_have_count(len(COMMANDS))
     box.press("Escape")
     box.press("Enter")
     ui.wait("fake.requests('/api/sessions/created/messages').length === 1")
@@ -169,11 +184,11 @@ def test_menu_closes_when_the_message_box_loses_focus(ui, page):
     start_app(ui, page)
     box = message(page)
     box.press_sequentially("/")
-    expect(options(page)).to_have_count(3)
+    expect(options(page)).to_have_count(len(COMMANDS) + 2)
     page.locator(".conversation-title").click()  # The welcome heading now sits under the open menu.
     expect(page.locator(".slash-menu")).to_have_count(0)
     box.click()
-    expect(options(page)).to_have_count(3)
+    expect(options(page)).to_have_count(len(COMMANDS) + 2)
 
 
 def test_matching_ranks_id_prefixes_then_name_prefixes_then_substrings(ui):

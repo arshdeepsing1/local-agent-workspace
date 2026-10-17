@@ -2,12 +2,16 @@
 Settings → Subagents defaults, and custom agents defined in Markdown files of the workspace.
 
 A custom agent file is project content, like AGENTS.md, and is only read: .agents/agents/<name>.md
-first, then .claude/agents/<name>.md (the same name in both: the .agents file is used). Its
-frontmatter (between two '---' lines) names the agent, tells the model when to choose it and sets
-its limits; the body is the agent's instructions, which the subagent's first prompt carries (the
-parent's system prompt only gets the short agent index). Nothing in a file widens what the chat
-allows: its tools are intersected with its profile and the chat's subagent ceiling, the chat's
-turned-off tools, rules and permission mode apply as to any subagent, and subagents never delegate.
+first, then .claude/agents/<name>.md (the same name in both: the .agents file is used), then the
+agents shipped with the app (agents/<name>.md in the app folder, such as plan), which a project file
+of the same name replaces. Its frontmatter (between two '---' lines) names the agent, tells the model
+when to choose it and sets its limits; the body is the agent's instructions, which the subagent's
+first prompt carries (the parent's system prompt only gets the short agent index). Nothing in a file
+widens what the chat allows: its tools are intersected with its profile and the chat's subagent
+ceiling, disallowed_tools and mcp_servers only take tools away, its permission_mode applies only when
+it is narrower than the chat's, the chat's turned-off tools and rules apply as to any subagent, and
+subagents never delegate. Claude Code's field names (disallowedTools, permissionMode, mcpServers,
+initialPrompt, maxTurns) are read as this app's.
 
 The parser is small and strict (no YAML library): `key: value` lines, `key: [a, b]`, and `key:`
 followed by `- item` lines; quoted values may use "..." (JSON escapes) or '...'. Lines starting
@@ -20,15 +24,17 @@ import re
 import stat
 from pathlib import Path
 
+from . import config
 from .config import ENDPOINT_NAME
 from .feature_tools import FEATURE_TOOLS
 from .model_profiles import profile_for
 from .reasoning import EFFORT_LABELS, EFFORT_LEVELS
 from .redaction import redact_secrets
-from .tool_profiles import FILE_TOOLS, PROFILES, READ_TOOLS, validate_profile
+from .tool_profiles import FILE_TOOLS, PROFILES, READ_TOOLS, covering_tool, server_off, validate_profile
 from .tools import TOOL_DEFINITIONS
 
 AGENT_ROOTS = (".agents/agents", ".claude/agents")  # In order of precedence.
+APP_AGENTS = "agents"  # The app's own agent files (config.APP_ROOT / agents), after the project's.
 # The built-in types (planning.AGENT_TYPES) and what they are for, as Agent tools lists them.
 BUILT_IN = {
     "explore": ("read_only", "Investigation with read-only tools: find, search, outline and read files."),
@@ -40,8 +46,24 @@ PROFILE_LABELS = {"read_only": "read-only", "file_editor": "file editor", "inher
 NAME = re.compile(r"[a-z][a-z0-9-]{0,39}\Z")
 SKILL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")  # extensions.SKILL_IDENTIFIER
 MCP_TOOL = re.compile(r"mcp__[A-Za-z0-9_-]{1,64}__[A-Za-z0-9_.-]{1,128}\Z")  # rules.MCP_NAME
+MCP_SERVER = re.compile(r"mcp__[a-z][a-z0-9_-]{0,19}__\*\Z")  # Every tool of one MCP server (a chat's turned-off tools).
+SERVER_ID = re.compile(r"[a-z][a-z0-9_-]{0,19}\Z")  # extensions.IDENTIFIER
 KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,63}\Z")
-FIELDS = ("name", "description", "tools", "profile", "model", "effort", "skills", "max_steps")
+FIELDS = ("name", "description", "tools", "disallowed_tools", "profile", "model", "effort", "permission_mode", "skills",
+          "mcp_servers", "memory", "max_steps", "initial_prompt", "background")
+# Claude Code's agent file field names, read as this app's.
+FIELD_ALIASES = {"disallowedTools": "disallowed_tools", "permissionMode": "permission_mode", "mcpServers": "mcp_servers",
+                 "initialPrompt": "initial_prompt", "maxTurns": "max_steps"}
+# permission_mode values (permissions.MODE_LABELS); Claude Code's "default" asks like Manual.
+PERMISSION_MODES = ("plan", "dontAsk", "manual", "auto", "acceptEdits", "bypassPermissions")
+MODE_ALIASES = {"default": "manual"}
+# Narrowest first. Auto and Accept edits are not comparable (Auto runs read-only commands, Accept edits
+# asks for every command): where they meet, Manual applies (narrow_mode). Plan is not narrower than Don't
+# ask, Manual or Accept edits for read-only commands, which it runs without a card: a subagent's verdict is
+# also the chat's mode's when that is stricter (AgentManager.permission, the child's mode_ceiling).
+MODE_RANK = {"plan": 0, "dontAsk": 1, "manual": 2, "auto": 3, "acceptEdits": 3, "bypassPermissions": 4}
+MAX_SERVERS = 20
+INITIAL_PROMPT_CHARS = 2_000
 MAX_AGENTS = 30
 FILE_BYTES = 16_384  # 16 KB per agent file.
 BODY_CHARS = 8_000
@@ -56,7 +78,8 @@ INDEX_DESCRIPTION = 150
 # Claude Code's agent files (.claude/agents) name its own tools; these are this app's equivalents.
 TOOL_ALIASES = {"Read": "read_file", "Write": "write_file", "Edit": "edit_file", "MultiEdit": "edit_file",
                 "Glob": "find_files", "Grep": "search_files", "LS": "list_files", "Bash": "run_command",
-                "NotebookRead": "notebook_read", "NotebookEdit": "notebook_edit"}
+                "NotebookRead": "notebook_read", "NotebookEdit": "notebook_edit", "WebFetch": "web_fetch",
+                "WebSearch": "web_search"}
 # Claude Code's model values: not Databricks endpoints, so the chat's model is used.
 MODEL_ALIASES = ("sonnet", "opus", "haiku")
 INHERIT_VALUES = ("", "inherit", "default-model")
@@ -112,8 +135,8 @@ def _scalar(value, number):
 
 
 def _items(text, number):
-    """The items of an inline [a, b] list."""
-    items, current, quote = [], "", None
+    """The items of an inline [a, b] list (a comma inside {a,b} braces, as in a glob, stays in its item)."""
+    items, current, quote, depth = [], "", None, 0
     for char in text:
         if quote:
             current += char
@@ -122,10 +145,11 @@ def _items(text, number):
         elif char in "\"'":
             quote = char
             current += char
-        elif char == ",":
+        elif char == "," and not depth:
             items.append(current.strip())
             current = ""
         else:
+            depth += 1 if char == "{" else -1 if char == "}" and depth else 0
             current += char
     if quote:
         raise ValueError(f"Line {number}: a quoted list item is not closed.")
@@ -222,12 +246,72 @@ def _tools(value, profile, notes):
     return chosen
 
 
+def denies(name, disallowed):
+    """Whether an agent's disallowed_tools take name away: the name itself, a tool covering it (read_file
+    covers outline_file) or its MCP server (mcp__<server>__*), as for a chat's turned-off tools."""
+    return bool(disallowed) and (name in disallowed or bool(covering_tool(name, disallowed))
+                                 or bool(server_off(name, disallowed)))
+
+
+def _disallowed(value, notes):
+    names = value.split(",") if isinstance(value, str) else value
+    if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
+        raise ValueError("disallowed_tools must be a list of tool names, such as [run_command, web_fetch].")
+    names = [name.strip() for name in names if name.strip()]
+    if len(names) > MAX_TOOLS:
+        raise ValueError(f"disallowed_tools lists more than {MAX_TOOLS} names.")
+    known, chosen, mapped, unknown = known_tools(), [], [], []
+    for name in names:
+        if name in TOOL_ALIASES:
+            mapped.append(f"{name} → {TOOL_ALIASES[name]}")
+            name = TOOL_ALIASES[name]
+        if name not in known and not MCP_TOOL.fullmatch(name) and not MCP_SERVER.fullmatch(name):
+            unknown.append(name[:64])
+        elif name not in chosen:
+            chosen.append(name)
+    if mapped:
+        notes.append("Claude Code tool names used as this app's in disallowed_tools: " + ", ".join(mapped) + ".")
+    if unknown:
+        notes.append("Ignored unknown tools in disallowed_tools: " + ", ".join(unknown) + ".")
+    return chosen
+
+
+def narrow_mode(agent_mode, chat_mode):
+    """The permission mode of an agent's subagent: the agent file's permission_mode when it is narrower
+    than the chat's (MODE_RANK), else the chat's; between Auto and Accept edits, Manual. A file never
+    widens the chat's mode: the chat's mode still decides where it is stricter (mode_ceiling)."""
+    chat_mode = chat_mode if chat_mode in MODE_RANK else "manual"
+    if agent_mode not in MODE_RANK or agent_mode == chat_mode:
+        return chat_mode
+    if MODE_RANK[agent_mode] == MODE_RANK[chat_mode]:
+        return "manual"
+    return agent_mode if MODE_RANK[agent_mode] < MODE_RANK[chat_mode] else chat_mode
+
+
+def _flag(value, key):
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    if type(value) is not bool:
+        raise ValueError(f"{key} must be true or false.")
+    return value
+
+
 def parse_agent(text, stem):
     """An agent definition from a file's text (stem: the file name without .md): {name, description,
-    profile, tools (None: every tool of the profile), model, effort, skills, max_steps, instructions,
-    notes}. ValueError says what is wrong."""
+    profile, tools (None: every tool of the profile), disallowed_tools, model, effort, permission_mode
+    (None: the chat's), skills, mcp_servers (None: every configured server), memory (None: the project
+    memory, read-only; "none": without it), max_steps, initial_prompt, background, instructions, notes}.
+    ValueError says what is wrong."""
     fields, body = frontmatter(text.removeprefix("﻿"))  # Editors on Windows may start a file with a BOM.
-    notes = []
+    notes, renamed = [], []
+    for alias, field in FIELD_ALIASES.items():
+        if alias in fields:
+            if field in fields:
+                raise ValueError(f"{alias} and {field} set the same field; keep one of them.")
+            fields[field] = fields.pop(alias)
+            renamed.append(f"{alias} → {field}")
+    if renamed:
+        notes.append("Claude Code field names used as this app's: " + ", ".join(renamed) + ".")
     unknown = sorted(set(fields) - set(FIELDS))
     if unknown:
         notes.append("Ignored unknown fields: " + ", ".join(unknown) + ".")
@@ -248,6 +332,50 @@ def parse_agent(text, stem):
     if profile not in PROFILES:
         raise ValueError("profile must be read_only (the default), file_editor or inherit.")
     tools = _tools(fields["tools"], profile, notes) if "tools" in fields else None
+    disallowed = _disallowed(fields["disallowed_tools"], notes) if "disallowed_tools" in fields else []
+    if disallowed and tools is not None:
+        tools = [name for name in tools if not denies(name, disallowed)]
+        if not tools:
+            raise ValueError("disallowed_tools takes away every tool that tools lists.")
+    elif disallowed and profile != "inherit" and all(denies(name, disallowed) for name in profile_tools(profile)):
+        raise ValueError(f"disallowed_tools takes away every tool of the {profile} profile.")
+    mode = fields.get("permission_mode")
+    if isinstance(mode, str) and mode.strip() in ("", "inherit"):
+        mode = None
+    elif mode is not None:
+        mode = MODE_ALIASES.get(mode.strip(), mode.strip()) if isinstance(mode, str) else mode
+        if mode not in PERMISSION_MODES:
+            raise ValueError("permission_mode must be plan, dontAsk, manual (Claude Code's default), auto, acceptEdits, "
+                             "bypassPermissions or inherit. It applies only when it is narrower than the chat's mode.")
+    servers = fields.get("mcp_servers")
+    if servers is not None:
+        servers = [item.strip() for item in servers.split(",") if item.strip()] if isinstance(servers, str) else servers
+        if (not isinstance(servers, list) or len(servers) > MAX_SERVERS
+                or any(not isinstance(item, str) or not SERVER_ID.fullmatch(item) for item in servers)):
+            raise ValueError(f"mcp_servers must list at most {MAX_SERVERS} MCP server IDs as Agent tools → Extensions "
+                             "names them, such as [docs] ([] for none); server definitions in an agent file are not "
+                             "supported.")
+        servers = list(dict.fromkeys(servers))
+    memory = fields.get("memory")
+    if memory is not None:
+        value = memory.strip().lower() if isinstance(memory, str) else memory
+        if value in ("project", "true", "inherit", ""):
+            memory = None  # Every subagent reads the project memory in its system message, read-only.
+        elif value in ("none", "false", "off"):
+            memory = "none"
+        elif value in ("user", "local"):
+            notes.append(f"memory {value} is not supported: this app keeps project memory only, which the subagent "
+                         "reads (it cannot save notes).")
+            memory = None
+        else:
+            raise ValueError("memory must be project (the default: the subagent reads the project memory) or none.")
+    initial = fields.get("initial_prompt", "")
+    if not isinstance(initial, str):
+        raise ValueError("initial_prompt must be text (one line; a double-quoted value may use \\n).")
+    initial = initial.strip()
+    if len(initial) > INITIAL_PROMPT_CHARS:
+        raise ValueError(f"initial_prompt has {len(initial):,} characters; at most {INITIAL_PROMPT_CHARS:,}.")
+    background = _flag(fields.get("background", False), "background")
     model = fields.get("model")
     if isinstance(model, str) and model.strip().lower() in INHERIT_VALUES:
         model = None
@@ -272,14 +400,19 @@ def parse_agent(text, stem):
             or len(set(skills)) != len(skills) or len(skills) > MAX_SKILLS):
         raise ValueError(f"skills must list at most {MAX_SKILLS} different skill IDs.")
     steps = fields.get("max_steps")
+    if "maxTurns → max_steps" in renamed and type(steps) is int and steps > MAX_STEPS:
+        notes.append(f"maxTurns {steps} is more than this app's {MAX_STEPS} model requests per subagent; {MAX_STEPS} is used.")
+        steps = MAX_STEPS
     if steps is not None and (type(steps) is not int or not 1 <= steps <= MAX_STEPS):
         raise ValueError(f"max_steps must be a whole number from 1 to {MAX_STEPS}.")
     if len(body) > BODY_CHARS:
         raise ValueError(f"The instructions have {len(body):,} characters; at most {BODY_CHARS:,}.")
-    if "\x00" in body:
+    if "\x00" in body or "\x00" in initial:
         raise ValueError("The file is not text.")
-    return {"name": name, "description": description, "profile": profile, "tools": tools, "model": model,
-            "effort": effort, "skills": list(skills), "max_steps": steps, "instructions": body, "notes": notes}
+    return {"name": name, "description": description, "profile": profile, "tools": tools,
+            "disallowed_tools": disallowed, "model": model, "effort": effort, "permission_mode": mode,
+            "skills": list(skills), "mcp_servers": servers, "memory": memory, "max_steps": steps,
+            "initial_prompt": initial, "background": background, "instructions": body, "notes": notes}
 
 
 def _read(entry):
@@ -305,22 +438,31 @@ def _read(entry):
 
 def _redacted(agent, redact):
     return {**agent, "description": redact(agent["description"]), "instructions": redact(agent["instructions"]),
-            "notes": [redact(note) for note in agent["notes"]]}
+            "initial_prompt": redact(agent["initial_prompt"]), "notes": [redact(note) for note in agent["notes"]]}
+
+
+def app_agents():
+    """The folder of the agents shipped with the app (read when agents are discovered: tests move APP_ROOT)."""
+    return config.APP_ROOT / APP_AGENTS
 
 
 def discover(workspace, redact=lambda text: text):
     """{agents, errors} of a workspace: agents in precedence order (at most MAX_AGENTS), each with its
-    workspace-relative path; errors [{path, error}] for files and folders that could not be used."""
+    workspace-relative path (a shipped agent: agents/<name>.md with shipped true); errors [{path, error}]
+    for files and folders that could not be used."""
     root = Path(workspace).expanduser().resolve()
     agents, errors, names = [], [], {}
-    for folder in AGENT_ROOTS:
-        base = root / folder
+    for folder in (*AGENT_ROOTS, APP_AGENTS):
+        shipped = folder == APP_AGENTS
+        base = app_agents() if shipped else root / folder
         if not os.path.lexists(base):
             continue
         try:
             resolved = base.resolve()
-            if not resolved.is_relative_to(root) or not resolved.is_dir():
+            if not shipped and (not resolved.is_relative_to(root) or not resolved.is_dir()):
                 errors.append({"path": folder, "error": "Agent files must be in a folder inside this workspace."})
+                continue
+            if shipped and not resolved.is_dir():
                 continue
             entries = list(itertools.islice(resolved.iterdir(), SCAN_ENTRIES + 1))
         except (OSError, RuntimeError) as exc:
@@ -349,13 +491,15 @@ def discover(workspace, redact=lambda text: text):
             if first is not None:
                 if first["root"] == folder:
                     errors.append({"path": path, "error": f"{first['path']} already defines {agent['name']}."})
+                elif shipped:
+                    first["notes"].append(f"Used instead of the agent the app ships with this name ({path}).")
                 else:
                     first["notes"].append(f"Used instead of {path}, which has the same name.")
                 continue
             if len(agents) >= MAX_AGENTS:
                 errors.append({"path": path, "error": f"At most {MAX_AGENTS} custom agents are read; this one is ignored."})
                 continue
-            agent.update(path=path, root=folder)
+            agent.update(path=path, root=folder, **({"shipped": True} if shipped else {}))
             names[agent["name"]] = agent
             agents.append(agent)
     return {"agents": agents, "errors": errors}
@@ -415,9 +559,15 @@ def limit_model(agent, used):
 
 
 def public_agent(agent):
-    """A custom agent for Agent tools: its definition without the instructions text."""
-    return {**{key: value for key, value in agent.items() if key not in ("instructions", "root")},
-            "built_in": False, "instructions_chars": len(agent["instructions"])}
+    """A custom agent for Agent tools: its definition without the instructions and initial prompt texts."""
+    return {**{key: value for key, value in agent.items() if key not in ("instructions", "initial_prompt", "root")},
+            "built_in": False, "instructions_chars": len(agent["instructions"]),
+            "initial_prompt_chars": len(agent.get("initial_prompt") or "")}
+
+
+# What a built-in type (and an agent file without these fields) sets: nothing beyond the chat's own.
+NO_AGENT_LIMITS = {"disallowed_tools": [], "permission_mode": None, "mcp_servers": None, "memory": None,
+                   "initial_prompt": "", "background": False}
 
 
 def narrower(*profiles):
@@ -437,7 +587,7 @@ def resolve(agent_type, tool_profile, catalog, defaults):
         return {"name": kind, "custom": False, "requested": narrower(BUILT_IN[agent_type][0] if agent_type else None,
                                                                          tool_profile),
                 "model": entry.get("model") or None, "effort": entry.get("effort") or None, "tools": None,
-                "skills": [], "instructions": "", "max_steps": None, "path": None}
+                "skills": [], "instructions": "", "max_steps": None, "path": None, **NO_AGENT_LIMITS}
     agent = next((item for item in catalog["agents"] if item["name"] == agent_type), None)
     if agent is None:
         names = [*BUILT_IN, *(item["name"] for item in catalog["agents"])]
@@ -448,7 +598,8 @@ def resolve(agent_type, tool_profile, catalog, defaults):
     return {"name": agent["name"], "custom": True, "requested": narrower(agent["profile"], tool_profile),
             "model": agent["model"], "effort": agent["effort"], "tools": agent["tools"], "skills": agent["skills"],
             "instructions": agent["instructions"], "max_steps": agent["max_steps"], "path": agent["path"],
-            "unused_model": agent.get("unused_model")}
+            "unused_model": agent.get("unused_model"), "shipped": agent.get("shipped", False),
+            **{key: agent.get(key, value) for key, value in NO_AGENT_LIMITS.items()}}
 
 
 def child_tools(tools, profile):

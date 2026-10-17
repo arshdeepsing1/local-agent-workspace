@@ -1,7 +1,13 @@
-import { html, useLayoutEffect, useRef, useState } from '../lib.js'
+import { html, useEffect, useLayoutEffect, useRef, useState } from '../lib.js'
 
-// Custom instructions (Settings) and the skill index are not files with a folder scope.
-const WIDE_SCOPES = ['all projects', 'this workspace']
+// Custom instructions (Settings), the skill index and selected skills are not files with a folder scope.
+const WIDE_SCOPES = ['all projects', 'this workspace', 'this project', 'this chat', 'this message']
+// What one loaded instruction source costs: its estimate, marked when the budget cut it (instructions.py).
+const sourceCost = source => source.status === 'loaded' ? `~${source.estimated_tokens.toLocaleString()} tokens`
+  : source.status === 'trimmed' ? `Trimmed · ~${source.estimated_tokens.toLocaleString()} tokens loaded` : 'Omitted · 0 tokens loaded'
+const sourceScope = source => WIDE_SCOPES.includes(source.scope) ? html`${source.path} · applies to ${source.scope}`
+  : source.scope.startsWith('files matching ') ? html`<code>${source.path}</code> · applies to ${source.scope}`
+  : html`<code>${source.path}</code> · scope: <code>${source.scope}</code> and descendants`
 const count = value => typeof value === 'number' ? value.toLocaleString() : 'Not reported'
 
 // The input Databricks reported for one request: total = uncached + cache read + cache write.
@@ -47,7 +53,33 @@ function ReportedInput({ report, current, heading }) {
         : "The app's estimate matched the reported count within 2%."}${cached ? ' Cached tokens still occupy the context window; they are cheaper, not smaller.' : ''}</p>` : null}`
 }
 
-export default function ContextMeter({ info, model, busy = false, onCompact }) {
+// "Anchored on the last reported count: 52,310 tokens … + ~1,204 tokens added since": the estimate is the input
+// Databricks reported for the previous request plus the scaled estimate of what changed since (estimate_anchor).
+function anchoredText(info) {
+  const anchor = info.estimate_anchor
+  if (!anchor || typeof anchor.reported !== 'number') return null
+  const change = info.estimated_tokens - anchor.reported
+  return `Anchored on the last reported count: ${anchor.reported.toLocaleString()} tokens Databricks reported for the previous request ${change >= 0 ? '+' : '−'} ~${Math.abs(change).toLocaleString()} tokens ${change >= 0 ? 'added' : 'removed'} since. Only what changed is estimated from text size.`
+}
+
+// The tool definitions split per MCP server (tool_groups), shown when an MCP server's tools are offered.
+function ToolGroups({ groups }) {
+  const entries = Object.entries(groups || {})
+  if (entries.length < 2) return null
+  return html`<ul class="context-tool-groups">${entries.map(([name, tokens]) => html`<li key=${name}>${name} · ~${tokens.toLocaleString()} tokens</li>`)}</ul>`
+}
+
+// How the latest compaction fitted its summary within the size limit (summary_adjustment).
+const ADJUSTMENTS = {
+  condensed: 'The latest conversation summary was over its size limit and was condensed by a short extra request.',
+  condensed_trimmed: 'The condensed conversation summary was still over its size limit, so the app shortened its least important sections',
+}
+
+// The settings file that sets a chat's auto-compact threshold (auto_compact_source; settings_layers.py).
+const COMPACT_FILES = { project: '.agents/settings.json', local: '.agents/settings.local.json' }
+
+// openSignal: a number that /context increases to open the details (a change after mounting only).
+export default function ContextMeter({ info, model, busy = false, status, onCompact, openSignal = 0 }) {
   const [note, setNote] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
@@ -63,6 +95,20 @@ export default function ContextMeter({ info, model, busy = false, onCompact }) {
     document.addEventListener('focusin', outside)
     return () => { document.removeEventListener('pointerdown', outside); document.removeEventListener('focusin', outside) }
   }, [open])
+  // The open details float over the transcript: they close when the chat starts waiting for an answer,
+  // so they never cover the new approval card.
+  useEffect(() => {
+    if (status === 'awaiting_approval' && details.current?.open) details.current.open = false
+  }, [status])
+  const signalSeen = useRef(openSignal)
+  useEffect(() => {
+    if (openSignal === signalSeen.current) return
+    signalSeen.current = openSignal
+    if (!details.current) return
+    details.current.open = true
+    setOpen(true)
+    details.current.querySelector('summary')?.focus()
+  }, [openSignal])
   if (!info) return html`<p class="context-empty">Context usage is estimated after the first turn.</p>`
   const legacyEstimate = info.estimate_method === 'conservative_utf8'
   const percent = Math.round(info.estimated_tokens / info.input_budget * 100)
@@ -94,6 +140,8 @@ export default function ContextMeter({ info, model, busy = false, onCompact }) {
   // A calibration report replaced the starting ratio the shown estimate used (a cancelled or partial
   // request, or a small one, does not).
   const priorReplaced = reportedIsCurrent && typeof report.next_estimate_scale === 'number' && report.next_estimate_scale !== info.estimate_scale
+  // Compact now has earlier turns to summarize (an older saved meter has no flag: allowed, as before).
+  const compactable = info.compactable !== false
   return html`<details class="context-meter" ref=${details} onToggle=${event => setOpen(event.currentTarget.open)}
     onKeyDown=${event => {
       if (event.key !== 'Escape' || event.isComposing || !details.current?.open) return
@@ -117,22 +165,28 @@ export default function ContextMeter({ info, model, busy = false, onCompact }) {
         <p class="context-heading">App estimate</p>` : null}
       ${legacyEstimate ? html`<p>The saved meter counted bytes as tokens and can overstate context use. It will refresh on the next model request.</p>` : html`
         <p>Approximately ${info.estimated_tokens.toLocaleString()} of ${info.input_budget.toLocaleString()} input tokens used.</p>
+        ${anchoredText(info) ? html`<p class="context-anchor">${anchoredText(info)}</p>` : null}
         <p>${info.estimate_scale && info.estimate_prior ? `Text-size estimate scaled ×${info.estimate_scale.toFixed(2)}, this model's starting ratio ${priorReplaced ? `before Databricks reported input tokens for it; later estimates use ×${report.next_estimate_scale.toFixed(2)}` : 'until Databricks reports input tokens for it'}. Not billing usage.` : info.estimate_scale ? `Text-size estimate scaled ×${info.estimate_scale.toFixed(2)} to match the input tokens Databricks reported for recent requests to this model. Not billing usage.` : 'Heuristic text-size estimate, not a provider token count or billing usage. Actual token counts vary by model.'} ${info.prepared_for_next_turn ? 'Preview after compaction using saved tool definitions, or built-in tools when unavailable. Definitions and instructions may change on the next model request.' : 'Estimate for the last request; updates each model call.'}</p>
-        ${next && typeof next.tokens === 'number' ? html`<p>Next request: ~${next.tokens.toLocaleString()} tokens (${next.percent_of_input_budget}% of the input budget) before your next message. Automatic compaction runs when it passes ~${threshold.toLocaleString()} tokens.</p>` : null}
+        ${next && typeof next.tokens === 'number' ? html`<p>Next request: ~${next.tokens.toLocaleString()} tokens (${next.percent_of_input_budget}% of the input budget${next.anchor ? ', anchored on the last reported count' : ''}) before your next message. Automatic compaction runs when it passes ~${threshold.toLocaleString()} tokens.</p>` : null}
         ${info.compaction_deferred ? html`<p>The estimate passed the auto-compact threshold, but summarizing earlier turns would not bring it under the threshold, so the request was sent as it is. Compaction runs when it would, or when the request no longer fits the input budget.</p>` : null}
-        ${info.summary_adjustment ? html`<p>${info.summary_adjustment === 'condensed' ? 'The latest conversation summary was over its size limit and was condensed by a short extra request.' : 'The latest conversation summary was over its size limit and part of it was omitted.'} Full history is preserved.</p>` : null}
-        ${info.summary_fitted_to_budget ? html`<p>The request after the latest compaction was over the input budget (non-ASCII text and escapes count more than plain text), so ${info.summary_fitted_to_budget === 'condensed' ? 'a short extra request condensed the summary to fit' : 'part of the summary was omitted to fit'}. Full history is preserved.</p>` : null}`}
+        ${info.summary_adjustment ? html`<p>${info.summary_adjustment === 'condensed_trimmed'
+          ? `${ADJUSTMENTS.condensed_trimmed}${info.handoff_path ? '; the saved handoff has them in full.' : '.'}`
+          : ADJUSTMENTS[info.summary_adjustment] ?? 'The latest conversation summary was over its size limit and part of it was omitted.'} Full history is preserved.</p>` : null}
+        ${info.summary_fitted_to_budget ? html`<p>The request after the latest compaction was over the input budget (non-ASCII text and escapes count more than plain text), so ${{
+          condensed: 'a short extra request condensed the summary to fit',
+          condensed_trimmed: 'a short extra request condensed the summary and the app shortened its least important sections to fit',
+        }[info.summary_fitted_to_budget] ?? 'part of the summary was omitted to fit'}. Full history is preserved.</p>` : null}`}
       ${!legacyEstimate && info.breakdown ? html`
         <p class="context-heading">Approximate input breakdown (app estimate)</p>
         <dl class="context-breakdown">
           <div><dt>System instructions</dt><dd>~${info.breakdown.system_instructions.toLocaleString()} tokens</dd></div>
-          <div><dt>Tool definitions</dt><dd>~${info.breakdown.tool_definitions.toLocaleString()} tokens</dd></div>
+          <div><dt>Tool definitions</dt><dd>~${info.breakdown.tool_definitions.toLocaleString()} tokens<${ToolGroups} groups=${info.tool_groups} /></dd></div>
           <div><dt>Messages and tool results</dt><dd>~${info.breakdown.messages_and_results.toLocaleString()} tokens</dd></div>
           <div><dt>Conversation summary</dt><dd>~${info.breakdown.summary.toLocaleString()} tokens</dd></div>
           <div><dt>Request overhead</dt><dd>~${info.breakdown.request_overhead.toLocaleString()} tokens</dd></div>
         </dl>` : null}
       <p>${typeof info.auto_compact_threshold === 'number'
-        ? `Automatic compaction at ${info.auto_compact_percent}% of the input budget: about ${info.auto_compact_threshold.toLocaleString()} input tokens (Settings → Auto-compact at).`
+        ? `Automatic compaction at ${info.auto_compact_percent}% of the input budget: about ${info.auto_compact_threshold.toLocaleString()} input tokens (${COMPACT_FILES[info.auto_compact_source] ? `set by this project's ${COMPACT_FILES[info.auto_compact_source]}` : 'Settings → Auto-compact at'}).`
         : `Automatic compaction threshold: approximately ${info.input_budget.toLocaleString()} input tokens.`}</p>
       <p>Of the ${info.context_window.toLocaleString()}-token context window, ${info.reply_reserve.toLocaleString()} tokens are reserved for the response and ${safetyReserve.toLocaleString()} for safety.</p>
       <p>The response limit is separate from the context window. Increasing the context budget does not increase the response limit.</p>
@@ -141,24 +195,27 @@ export default function ContextMeter({ info, model, busy = false, onCompact }) {
       <p class="context-heading">Loaded instructions</p>
       ${info.instruction_sources?.length ? html`
         <ul>${info.instruction_sources.map(source => html`<li key=${source.path}>
-          ${WIDE_SCOPES.includes(source.scope) ? html`${source.path} · applies to ${source.scope}`
-            : html`<code>${source.path}</code> · scope: <code>${source.scope}</code> and descendants`} · ${source.status === 'loaded' ? `~${source.estimated_tokens.toLocaleString()} tokens` : 'Omitted · 0 tokens loaded'}
+          ${sourceScope(source)} · ${sourceCost(source)}
           ${source.reason ? html`<p>${source.reason}</p>` : null}
         </li>`)}</ul>
-        <p>File costs are estimates included in system instructions above; shared guidance and framing are counted separately.</p>`
+        <p>File costs are estimates included in system instructions above; shared guidance and framing are counted separately.${info.instruction_sources.some(source => source.scope === 'this message') ? ' A skill your message selected counts in messages and tool results instead.' : ''}</p>`
         : info.instruction_files.length ? html`<ul>${info.instruction_files.map(file => html`<li key=${file}><code>${file}</code></li>`)}</ul>` : html`<p>No project instruction files loaded.</p>`}
       ${info.warnings.length ? html`<p class="context-heading">Warnings</p><ul class="context-warnings">${info.warnings.map((warning, index) => html`<li key=${index}>${warning}</li>`)}</ul>` : null}
       ${onCompact ? html`<form class="context-compact" onSubmit=${event => {
         event.preventDefault()
-        if (busy || submitting) return
+        if (busy || submitting || !compactable) return
         setSubmitting(true)
         setError('')
         void onCompact(note.trim()).catch(reason => setError(reason.message)).finally(() => setSubmitting(false))
       }}>
-        <label>Preservation note (optional)<textarea value=${note} maxLength=${1000} disabled=${busy || submitting}
+        <label>Preservation note (optional)<textarea value=${note} maxLength=${1000} disabled=${busy || submitting || !compactable}
           onInput=${event => setNote(event.currentTarget.value)} placeholder="Decisions or details to preserve in the summary" /></label>
-        <p>Summarizes earlier turns using your model and may add inference charges. Full history and the latest turn stay intact. Use Stop to cancel.</p>
-        <button type="submit" class="outline" disabled=${busy || submitting}>${submitting ? 'Starting compaction…' : 'Compact now'}</button>
+        ${compactable ? html`<p>Summarizes earlier turns using your model and may add inference charges. Full history and the latest turn stay intact. Use Stop to cancel.</p>`
+          : html`<p id="context-compact-unavailable">${info.compactions > 0
+            ? 'Nothing to compact yet: earlier turns are already summarized and the latest turn is kept whole. Compact now is available again after your next message.'
+            : 'Nothing to compact yet: this conversation has one turn, and the latest turn is kept whole. Compact now is available after your next message.'}</p>`}
+        <button type="submit" class="outline" disabled=${busy || submitting || !compactable}
+          aria-describedby=${compactable ? undefined : 'context-compact-unavailable'}>${submitting ? 'Starting compaction…' : 'Compact now'}</button>
         ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
       </form>` : null}
     </div>

@@ -174,6 +174,33 @@ def test_a_delegated_turn_notifies_only_when_it_needs_approval(ui, page):
     assert notes(ui)[-1] == ["Local", "Finished: Delegated check", "c:finished"]
 
 
+def test_a_background_subagent_that_ends_while_its_chat_is_idle_notifies_for_that_chat(ui, page):
+    running = {"is_subagent": True, "parent_session_id": "p", "status": "running", "turn_delegated": True,
+               "delegation": {"status": "running", "background": True}}
+    start(ui, page, setup=GRANTED + sessions(("p", "Parent chat", {"status": "idle", "turn_ended": 1}),
+                                             ("c", "Background survey", running),
+                                             ("d", "Second survey", {**running, "delegation": {"status": "running", "background": True}})),
+          clock=True)
+    ui.run("window.pageHidden = true")
+    ui.tick(1500)
+    # Its delegated turn ends first; its card's status follows (both are reported once, by the chat).
+    update(ui, "c", status="idle", terminal_reason="completed", turn_ended=2, updated=2)
+    ui.tick(1500)
+    update(ui, "c", delegation={"status": "completed", "background": True, "terminal_reason": "completed"}, updated=3)
+    update(ui, "p", updated=3)
+    ui.tick(1500)
+    ui.wait("notifications.length === 1")
+    assert notes(ui) == [["Local", "Background subagent finished: Parent chat", "p:background"]]
+    ui.run("notifications[0].onclick()")
+    expect(row(page, "Parent chat")).to_have_attribute("aria-current", "page")
+    # While the chat runs a turn, that turn learns of it: no notification.
+    update(ui, "p", status="running", turn_ended=None)
+    update(ui, "d", status="idle", turn_ended=4, delegation={"status": "failed", "background": True}, updated=4)
+    ui.tick(1500)
+    settle(ui)
+    assert len(notes(ui)) == 1
+
+
 def test_a_subagent_chat_open_in_a_hidden_tab_notifies_when_your_turn_ends(ui, page):
     start(ui, page, "c", setup=GRANTED + sessions(("c", "Delegated check", {"is_subagent": True, "turn_ended": 1,
                                                                             "turn_delegated": True})))
@@ -204,6 +231,16 @@ def test_a_turn_stopped_at_the_spending_limit_says_so(ui, page):
     ui.tick(1500)
     ui.wait("notifications.length === 1")
     assert notes(ui) == [["Local", "Reached the spending limit: Costly job", "a:spending_limit"]]
+
+
+def test_a_turn_that_reached_its_budget_says_so(ui, page):
+    start(ui, page, "b", setup=GRANTED + sessions(("a", "Long job", {"status": "running", "turn_ended": None}),
+                                                   ("b", "Selected chat", {})), clock=True)
+    ui.show_session("b")
+    update(ui, "a", status="idle", terminal_reason="budget_limit", turn_ended=6, updated=6)
+    ui.tick(1500)
+    ui.wait("notifications.length === 1")
+    assert notes(ui) == [["Local", "Reached the turn budget: Long job", "a:budget_limit"]]
 
 
 def test_turn_ends_notify_after_automatic_compaction_but_not_after_a_manual_one(ui, page):

@@ -12,9 +12,11 @@ from local_agent import mentions
 from local_agent.agents import AgentManager, forget_summarized_reads
 from local_agent.api import create_app
 from local_agent.config import Settings
+from local_agent.prompt_cache import unmarked
 from local_agent.context import (
-    SAFETY_MARGIN, SUMMARY_SECTIONS, compaction_output_allowance, condense_output_tokens, estimate_scale,
-    estimate_tokens, handoff_output_tokens, summary_byte_limit, summary_output_tokens, verify_declined_message,
+    CALIBRATION_PRIOR_WEIGHT, SAFETY_MARGIN, SUMMARY_SECTIONS, compaction_output_allowance, condense_output_tokens,
+    estimate_scale, estimate_tokens, handoff_output_tokens, summary_byte_limit, summary_output_tokens,
+    verify_declined_message,
 )
 from local_agent.store import Store
 from local_agent.tools import WorkspaceTools
@@ -114,7 +116,7 @@ async def test_a_streamed_reply_sets_the_reported_input_and_broadcasts_it(runtim
     assert report["estimate_scale"] == 1.0
 
 
-async def test_the_next_scale_falls_from_the_opus_prior_to_the_reported_ratio(runtime, monkeypatch):
+async def test_the_next_scale_moves_from_the_opus_prior_towards_the_reported_ratio(runtime, monkeypatch):
     manager, session, _ = runtime
     session["model"] = "databricks-claude-opus-5-5"
     reported = {}
@@ -123,15 +125,20 @@ async def test_the_next_scale_falls_from_the_opus_prior_to_the_reported_ratio(ru
         payload = json.loads(request.content)
         if not payload["stream"]:
             return summary_reply("A title")
-        # Report 1.2 times the unscaled estimate: 7.7 percent fewer than the 1.3 prior's estimate.
-        reported["tokens"] = round(estimate_tokens(payload["messages"], payload["tools"]) * 1.2)
+        # Report 1.2 times the unscaled estimate (of the request without its cache markers, as the app
+        # estimates it): 7.7 percent fewer than the 1.3 prior's estimate.
+        reported["tokens"] = round(estimate_tokens(unmarked(payload)["messages"], payload["tools"]) * 1.2)
         return sse(reply_chunk(usage={"prompt_tokens": reported["tokens"], "completion_tokens": 5}))
 
     mock_gateway(monkeypatch, gateway)
     await manager.run(session, "Hello")
     report = session["context_info"]["last_request"]
     assert report["estimate_scale"] == 1.3 and report["estimate_gap_percent"] < -2
-    assert report["next_estimate_scale"] == pytest.approx(1.2, abs=0.001)
+    # The prior keeps the weight of CALIBRATION_PRIOR_WEIGHT estimated tokens: a first request of mostly
+    # system message and tool definitions moves the scale towards its ratio without replacing the prior.
+    estimate = next(call for call in session["inference_calls"] if call["purpose"] == "agent")["estimated_input_tokens"]
+    blended = (reported["tokens"] + 1.3 * CALIBRATION_PRIOR_WEIGHT) / (estimate + CALIBRATION_PRIOR_WEIGHT)
+    assert report["next_estimate_scale"] == round(blended, 3) and 1.2 < report["next_estimate_scale"] < 1.3
 
 
 async def test_next_estimate_and_last_request_carry_over_and_mark_a_compaction(runtime, monkeypatch):
@@ -517,8 +524,10 @@ async def test_compaction_requests_get_the_thinking_allowance_on_opus_5_5(runtim
 async def test_a_declined_verify_note_is_recorded_as_the_users_request(runtime, monkeypatch):
     manager, session, _ = runtime
     note = verify_declined_message("pytest", "keep using tabs")
+    # One long turn after the note: the automatic cut then keeps only the new turn (the preceding one would
+    # leave too little headroom), and the record still has room for the note among the summarized requests.
     session["wire"] = [*long_history(2), user("Fix it"), assistant("Edited."), user(note), assistant("Okay."),
-                       *long_history(2)]
+                       *long_history(1)]
     manager.store.save(session)
     mock_gateway(monkeypatch, lambda request: sse(reply_chunk()) if json.loads(request.content)["stream"]
                  else summary_reply())

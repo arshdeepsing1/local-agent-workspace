@@ -53,6 +53,18 @@ def _state_checks(resolved, state_dir):
         raise ValueError("This folder contains the app's state folder; choose a folder that does not.")
 
 
+def checked_workspace(value, settings):
+    """A project folder a script chose for a new chat (POST /api/sessions workspace), checked as Settings checks its
+    workspace (an existing folder; an absolute or ~/ path here), and never the app's state folder or a folder inside
+    it. The resolved folder, or ValueError."""
+    resolved = _resolve(_absolute(value))
+    if _within(resolved, _resolve(Path(settings.state_dir).expanduser())):
+        raise ValueError("This is the app's state folder or inside it, which holds conversations and settings.")
+    if not resolved.is_dir():
+        raise ValueError("Choose an existing project directory.")
+    return resolved
+
+
 def check_coding_dir(value, *, state_dir, env_file="", app_root, home):
     """(resolved folder, missing) for a default code folder, or ValueError with the reason it is refused."""
     path = _absolute(value)

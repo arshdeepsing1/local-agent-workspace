@@ -212,6 +212,43 @@ def test_usage_snapshot_for_event_without_text(ui, page):
     expect(details).not_to_have_attribute("open", "")
 
 
+def test_a_reply_from_the_fallback_endpoint_says_so(ui, page):
+    show(ui, """[{ id: 'fallback', type: 'assistant', text: 'Answered.', request_info: { model: 'databricks-gpt-oss-120b',
+      status: 'completed', http_status: 200, fallback_from: 'databricks-claude-opus-5-5', fallback_reason: 'HTTP 503' } },
+      { id: 'own', type: 'assistant', text: 'Own.', request_info: { model: 'databricks-claude-opus-5-5', status: 'completed' } },
+      { id: 'failed', type: 'assistant', request_info: { model: 'databricks-gpt-oss-120b', status: 'error', http_status: 503,
+        fallback_from: 'databricks-claude-opus-5-5', fallback_reason: 'connection failure' } }]""")
+    fallback, own, failed = page.locator("details.request-details").all()
+    fallback.locator("summary").click()
+    expect(definition(fallback, "Model endpoint")).to_have_text("databricks-gpt-oss-120b")
+    expect(definition(fallback, "Answered by")).to_have_text("databricks-gpt-oss-120b (fallback)")
+    expect(definition(fallback, "Fallback from")).to_have_text("databricks-claude-opus-5-5 (HTTP 503)")
+    own.locator("summary").click()
+    expect(definition(own, "Model endpoint")).to_have_text("databricks-claude-opus-5-5")
+    expect(own.get_by_text("Answered by")).to_have_count(0)
+    # A fallback request that failed too did not answer.
+    failed.locator("summary").click()
+    expect(definition(failed, "Sent to")).to_have_text("databricks-gpt-oss-120b (fallback)")
+    expect(definition(failed, "Fallback from")).to_have_text("databricks-claude-opus-5-5 (connection failure)")
+    expect(failed.get_by_text("Answered by")).to_have_count(0)
+
+
+def test_claude_reasoning_tokens_read_as_part_of_the_output(ui, page):
+    usage = "{ input_tokens: 1000, output_tokens: 200, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }"
+    anthropic = "{ effort: 'high', format: 'anthropic', fields: { thinking: { type: 'adaptive' } }, effort_field: 'output_config.effort' }"
+    show(ui, f"""[
+      {{ id: 'claude', type: 'assistant', text: 'A', request_info: {{ model: 'databricks-claude-opus-5-5', status: 'completed', usage: {usage}, reasoning: {anthropic} }} }},
+      {{ id: 'other', type: 'assistant', text: 'B', request_info: {{ model: 'm', status: 'completed', usage: {usage} }} }},
+      {{ id: 'none', type: 'assistant', text: 'C', request_info: {{ model: 'databricks-claude-opus-5-5', status: 'error', reasoning: {anthropic} }} }}]""")
+    for summary in page.get_by_text(re.compile("^Request details · ")).all():
+        summary.click()
+    rows = page.locator('xpath=//dt[normalize-space()="Reasoning tokens"]/following-sibling::dd[1]')
+    # Claude counts its thinking in output tokens; without usage, or for other endpoints, nothing was reported.
+    expect(rows).to_have_text(["In output tokens (not reported separately)", "Unavailable", "Unavailable"])
+    output = page.locator('xpath=//dt[normalize-space()="Output tokens"]/following-sibling::dd[1]')
+    expect(output).to_have_text(["200", "200", "Unavailable"])
+
+
 def test_request_metadata_updates_in_place(ui, page):
     running = "{ id: 'request', type: 'assistant', request_info: { model: 'model-a', status: 'running' } }"
     show(ui, f"[{running}]")
@@ -724,3 +761,59 @@ def test_a_report_that_is_not_json_shows_no_report(ui, page):
     expect(page.get_by_label("Subagent progress")).to_contain_text("Subagent: failed")
     expect(page.locator(".delegation-report")).to_have_count(0)
     expect(page.locator(".delegation-elapsed")).to_have_count(0)  # Older progress has no start time.
+
+
+def test_a_question_or_plan_that_starts_waiting_comes_into_view(ui, page):
+    # F1 (b): also for question and plan cards, after the user scrolled up. Mutation: count only tool cards.
+    page.set_viewport_size({"width": 1280, "height": 700})
+    history = [event for n in range(10) for event in (
+        {"id": f"u{n}", "type": "user", "text": f"Step {n}"},
+        {"id": f"r{n}", "type": "assistant", "text": "A long reply. " * 120})]
+    question = {"id": "ask", "type": "tool", "name": "ask_user", "state": "pending", "output": "",
+                "input": {"questions": [{"question": "Which database?", "options": [{"label": "SQLite"}, {"label": "Postgres"}]}]}}
+    plan = {"id": "plan", "type": "tool", "name": "submit_plan", "state": "pending", "output": "", "input": {"plan": "Do it."}}
+    props = "{{ session: makeSession({}), onError: fake.spy('onError') }}"
+    show(ui, json.dumps(history))
+    page.add_style_tag(content=".transcript{height:600px}")  # The app's column; mounted alone it would grow.
+
+    def scroll_up():
+        page.locator(".transcript").evaluate("e => { e.style.scrollBehavior = 'auto'; e.scrollTop = 0; e.dispatchEvent(new Event('scroll')) }")
+        expect(page.get_by_text("Step 0", exact=True)).to_be_in_viewport()
+
+    scroll_up()
+    ui.rerender(props.format(json.dumps(history + [question])))
+    expect(page.locator(".question-card.needs-answer")).to_be_in_viewport()
+    scroll_up()
+    answered = {**question, "state": "completed", "question_outcome": "skipped"}
+    ui.rerender(props.format(json.dumps(history + [answered, plan])))
+    expect(page.locator(".plan-card.needs-answer")).to_be_in_viewport()
+
+
+def test_a_turns_last_reply_shows_its_result_summary(ui, page):
+    result = """{ terminal_reason: 'budget_limit', is_error: false, started: 1, ended: 131.4, duration_s: 130.4, steps: 8, tool_calls: 14,
+      usage: { calls: 9, input_tokens: 22000, output_tokens: 3100, cache_read_input_tokens: 160000, cache_creation_input_tokens: 0,
+        reasoning_tokens: null },
+      tokens: 191000, estimated_dbu: 1.42, unpriced_calls: 1, subagents: { count: 2, tokens: 6000, estimated_dbu: 0.2 },
+      changed_files: ['src/app.py', 'README.md'], changed_files_total: 5 }"""
+    unreported = """{ terminal_reason: 'completed', steps: 1, tool_calls: 0, duration_s: 4, estimated_dbu: null, unpriced_calls: 0,
+      usage: { calls: 1, input_tokens: null, output_tokens: 12, cache_read_input_tokens: null }, subagents: { count: 0 }, changed_files: [] }"""
+    show(ui, f"""[{{ id: 'u1', type: 'user', text: 'Work' }},
+      {{ id: 'a1', type: 'assistant', text: 'Working.', request_info: {{ model: 'm', status: 'completed' }} }},
+      {{ id: 'a2', type: 'assistant', text: 'Summary: done and remaining.', request_info: {{ model: 'm', status: 'completed' }},
+        turn_result: {result} }},
+      {{ id: 'u2', type: 'user', text: 'Again' }},
+      {{ id: 'a3', type: 'assistant', text: 'Hi.', request_info: {{ model: 'm', status: 'completed' }}, turn_result: {unreported} }},
+      {{ id: 'a4', type: 'assistant', text: 'Still streaming', request_info: {{ model: 'm', status: 'running' }},
+        turn_result: {unreported} }}]""")
+    footers = page.locator(".turn-summary")
+    expect(footers).to_have_count(2)  # Only replies with a result, and none while one streams.
+    first = footers.first
+    expect(first.locator("summary")).to_have_text(
+        "Turn summary: 8 steps · 14 tools · 2 min 10 s · 182k in (160k cached) / 3.1k out · ~1.4 DBU · 2 subagents")
+    expect(first.locator("p")).to_be_hidden()
+    first.locator("summary").click()
+    expect(first.locator("p")).to_have_text(
+        "This turn reached the turn's token or time limit. 191,000 tokens processed, its subagents included. "
+        "1 call without price data not in the DBU estimate. Changed: src/app.py, README.md and 3 more.")
+    # A count no call reported shows '—', never 0; no DBU part without price data.
+    expect(footers.nth(1).locator("summary")).to_have_text("Turn summary: 1 step · 0 tools · 4 s · — in / 12 out")

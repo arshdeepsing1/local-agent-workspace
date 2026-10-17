@@ -20,14 +20,21 @@ def test_legacy_settings_do_not_restore_removed_options(tmp_path, monkeypatch):
     settings.credentials = lambda: ("https://gateway.example", "fake-token")
     expected = {**editable, "context_window": 131072, "max_output_tokens": 8192, "max_agent_steps": 32,
                 "compaction_handoffs": True, "auto_compact_percent": 90, "approval_timeout_minutes": 60, "system_notifications": False,
-                "user_instructions": "", "write_limit_kb": 80, "command_env": [], "rate_limit_auto_continue": True,
+                "user_instructions": "", "user_agents_file": True, "user_claude_file": False, "project_memory": True,
+                "output_style": "default", "git_context": True, "write_limit_kb": 80, "command_env": [], "secret_file_patterns": [],
+                "rate_limit_auto_continue": True,
                 "auto_keep_changes": False, "reasoning_effort": "default", "reasoning_format": "auto",
-                "thinking_summaries": True, "spending_limit_dbu": 0, "subagent_defaults": DEFAULT_SUBAGENT_DEFAULTS, "coding_dir": "", "python_venv": ""}
+                "thinking_summaries": True, "thinking_replay": False, "prompt_caching": "auto", "spending_limit_dbu": 0, "subagent_defaults": DEFAULT_SUBAGENT_DEFAULTS,
+                "background_subagent_wake": False, "fallback_model": "",
+                "turn_token_limit": 0, "turn_time_limit_minutes": 0, "slash_commands": True, "web_fetch": True,
+                "web_search_provider": "", "web_search_url": "", "web_search_key": "", "schedules_enabled": False,
+                "token_expires_on": "", "coding_dir": "", "python_venv": ""}
     assert settings.values == expected
     with TestClient(create_app(settings)) as client:
         bootstrap = client.get("/api/bootstrap").json()
         assert set(bootstrap["settings"]) == {*expected, "host", "configured", "coding_dir_status",
-                                              "python_venv_status", "default_model", "default_limits", "endpoint_profiles"}
+                                              "python_venv_status", "default_model", "default_limits", "endpoint_profiles",
+                                              "web_search_status", "token_warning", "project_layers"}
         assert bootstrap["settings"]["default_limits"] == {"context_window": 131072, "max_output_tokens": 8192}
         headers = {"X-Local-Token": bootstrap["token"]}
         # Old clients may still send these keys, but they cannot enable a mode.

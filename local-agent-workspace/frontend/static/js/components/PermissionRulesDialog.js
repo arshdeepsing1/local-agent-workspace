@@ -3,22 +3,23 @@ import { X } from '../icons.js'
 
 const BEHAVIORS = [['allow', 'Allow'], ['ask', 'Always ask'], ['deny', 'Deny']]
 const SCOPES = [['chat', 'This chat'], ['project', 'This project'], ['user', 'All projects']]
-const TARGETS = [['command', 'A command'], ['edits', 'File edits'], ['tool', 'A tool']]
+const TARGETS = [['command', 'A command'], ['edits', 'File edits'], ['web', 'Web fetches'], ['tool', 'A tool']]
 
 // The draft sent to POST /permission-rules; the server parses and checks it (see types.js).
-export function ruleDraft({ behavior, target, match, text, options, folder, tool }) {
+export function ruleDraft({ behavior, target, match, text, options, folder, tool, domain = '' }) {
   if (target === 'command') {
     return { tool: 'run_command', behavior, text: text.trim(), match,
       ...(match === 'prefix' && behavior === 'allow' && options.trim() ? { options: options.trim() } : {}) }
   }
   if (target === 'edits') return { tool: 'edits', behavior, ...(folder.trim() ? { path: folder.trim() } : {}) }
+  if (target === 'web') return { tool: 'web_fetch', behavior, ...(domain.trim() ? { domain: domain.trim() } : {}) }
   return { tool: tool.trim(), behavior }
 }
 
 // Props: onAdd(scope, draft) -> Promise, onClose, returnFocus? (called when the dialog goes away)
 export default function PermissionRulesDialog({ onAdd, onClose, returnFocus }) {
   const dialog = useRef(null)
-  const [form, setForm] = useState({ behavior: 'allow', scope: 'project', target: 'command', match: 'exact', text: '', options: '', folder: '', tool: '' })
+  const [form, setForm] = useState({ behavior: 'allow', scope: 'project', target: 'command', match: 'exact', text: '', options: '', folder: '', tool: '', domain: '' })
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   useEffect(() => {
@@ -38,7 +39,8 @@ export default function PermissionRulesDialog({ onAdd, onClose, returnFocus }) {
   }
   const radio = (key, value, label) => html`<label class="choice" key=${value}><input type="radio" name=${`rule-${key}`} value=${value}
     checked=${form[key] === value} disabled=${saving} onChange=${() => set(key, value)} /><span>${label}</span></label>`
-  const ready = form.target === 'command' ? !!form.text.trim() : form.target === 'tool' ? !!form.tool.trim() : true
+  const ready = form.target === 'command' ? !!form.text.trim() : form.target === 'tool' ? !!form.tool.trim()
+    : form.target === 'web' ? form.behavior !== 'allow' || !!form.domain.trim() : true
   return html`<dialog ref=${dialog} class="settings-dialog permission-rules-dialog" aria-labelledby="permission-rules-title"
     onCancel=${onClose} onClick=${e => { if (e.target === dialog.current) onClose() }}>
     <form class="dialog-content" onSubmit=${submit}>
@@ -60,9 +62,13 @@ export default function PermissionRulesDialog({ onAdd, onClose, returnFocus }) {
       ${form.target === 'edits' ? html`<label>Only under this folder<input spellcheck=${false} disabled=${saving} value=${form.folder}
         placeholder="/srv/project/src" onInput=${e => set('folder', e.currentTarget.value)} /></label>
         <p class="field-help">Optional. An absolute path; leave it empty for every file edit.</p>` : null}
+      ${form.target === 'web' ? html`<label>Domain<input spellcheck=${false} disabled=${saving} value=${form.domain} required=${form.behavior === 'allow'}
+        placeholder="docs.python.org" onInput=${e => set('domain', e.currentTarget.value)} /></label>
+        <p class="field-help">${form.behavior === 'allow' ? 'Allow names one host exactly; other hosts, also its subdomains, still ask.'
+          : 'Deny and Always ask cover the domain and its subdomains; leave it empty for every web fetch.'}</p>` : null}
       ${form.target === 'tool' ? html`<label>Tool name<input required spellcheck=${false} disabled=${saving} value=${form.tool}
         placeholder="mcp__docs__search" onInput=${e => set('tool', e.currentTarget.value)} /></label>
-        <p class="field-help">For example mcp__docs__search, mcp__docs__* or delegate_task.</p>` : null}
+        <p class="field-help">For example mcp__docs__search, mcp__docs__*, delegate_task, remember (project memory) or web_search.</p>` : null}
       ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
       <footer><button type="button" class="outline" onClick=${onClose}>Cancel</button>
         <button type="submit" class="primary" disabled=${saving || !ready}>Add rule</button></footer>

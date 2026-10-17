@@ -55,6 +55,10 @@ def attention_message(session, previous, status, turn_ended=False):
         return f"Reached the step limit: {title}"
     if reason == "spending_limit":
         return f"Reached the spending limit: {title}"
+    if reason == "budget_limit":
+        return f"Reached the turn budget: {title}"
+    if reason == "approval_expired":  # A scheduled run's card waited its approval limit (schedules.py).
+        return f"Stopped at the approval limit: {title}"
     return f"Finished: {title}"
 
 

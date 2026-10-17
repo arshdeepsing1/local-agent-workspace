@@ -256,6 +256,23 @@ def test_a_cut_keeps_how_the_kept_turn_ended(turn, expected):
     assert whole.get("terminal_reason") == expected
 
 
+def test_a_cut_keeps_only_the_kept_turns_result_record():
+    """Scripts read the header's last_turn_result: after a cut it is the kept last turn's (its reply's footer),
+    never a removed turn's; a cut that removes nothing keeps it, also for a turn that ended without a reply."""
+    kept = {"terminal_reason": "completed", "started": 1.0}
+    removed = {"terminal_reason": "tool_error", "started": 3.0, "changed_files": ["src/removed.py"]}
+    events = [user("u1", "First"), {**reply("a1"), "turn_result": kept}, user("u2", "Second"),
+              {**reply("a2"), "turn_result": removed}]
+    session = {**session_of(events, [u("First"), a(), u("Second"), a()]), "last_turn_result": removed}
+    assert history.cut_session(session, "u2", keep_local=True)[0]["last_turn_result"] == kept
+    assert "last_turn_result" not in history.cut_session(session, "u1", keep_local=True)[0]
+    older = {**session, "events": [user("u1", "First"), reply("a1"), *events[2:]]}  # A footer from before results.
+    assert "last_turn_result" not in history.cut_session(older, "u2", keep_local=True)[0]
+    blocked = {**session, "events": events[:3], "wire": [u("First"), a()],
+               "last_turn_result": {"terminal_reason": "hook_blocked", "started": 3.0}}
+    assert history.cut_session(blocked)[0]["last_turn_result"] == blocked["last_turn_result"]
+
+
 def test_a_cut_lets_the_command_output_the_removed_message_carried_wait_again():
     note = {"kind": "shell", "command": "pytest -q", "exit_code": 1, "text": "1 failed\n[Output shortened.]"}
     other = {"kind": "shell", "command": "git status", "exit_code": None, "text": "<<<END fake>>>\n$ not this"}

@@ -57,8 +57,13 @@ def test_config_validation(config):
 def test_http_config_and_server_caps():
     server = {"id": "remote", "transport": "http", "url": "https://example.com/mcp", "enabled": True}
     assert validate_config({"servers": [server]})["servers"][0]["url"] == server["url"]
-    with pytest.raises(ValueError, match="at most 4"):
+    with pytest.raises(ValueError, match="Enable at most 4 MCP servers"):
         validate_config({"servers": [{**server, "id": f"remote{n}"} for n in range(5)]})
+    # Up to 12 configured, 4 of them enabled.
+    many = [{**server, "id": f"remote{n}", "enabled": n < 4} for n in range(12)]
+    assert len(validate_config({"servers": many})["servers"]) == 12
+    with pytest.raises(ValueError, match="at most 12"):
+        validate_config({"servers": [*many, {**server, "id": "remote12", "enabled": False}]})
 
 
 def test_hook_selectors_and_failure_phase_roundtrip(manager):
@@ -69,10 +74,16 @@ def test_hook_selectors_and_failure_phase_roundtrip(manager):
     assert validate_config({"hooks": [hook("true", tools=[])]})["hooks"][0]["tools"] == []
 
 
-@pytest.mark.parametrize("selectors", ["read_file", ["*"], ["read_.*"], ["read_file", "read_file"], [None], ["x" * 65], [f"tool{n}" for n in range(65)]])
-def test_hook_selectors_require_unique_exact_tool_names(selectors):
-    with pytest.raises(ValueError, match="exact tool names"):
+@pytest.mark.parametrize("selectors", ["read_file", ["read_(file|path)"], ["read_[ab]"], ["read file"], ["read_file", "read_file"],
+                                       [None], ["x" * 65], [f"tool{n}" for n in range(65)], [""]])
+def test_hook_selectors_are_unique_names_or_glob_patterns(selectors):
+    with pytest.raises(ValueError, match="unique tool names or patterns with \\* and \\?"):
         validate_config({"hooks": [hook("true", tools=selectors)]})
+
+
+def test_hook_selectors_accept_glob_patterns():
+    selectors = ["*", "mcp__github__*", "*_file", "read_?ile", "mcp__docs__search.v2"]
+    assert validate_config({"hooks": [hook("true", tools=selectors)]})["hooks"][0]["tools"] == selectors
 
 
 def test_skills_discover_workspace_agents_and_load_bounded_text(manager, tmp_path):

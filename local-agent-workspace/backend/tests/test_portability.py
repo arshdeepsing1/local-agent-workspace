@@ -231,6 +231,33 @@ async def test_fork_preserves_full_history_compaction_and_source_without_childre
         manager.run_databricks.assert_not_called()
 
 
+async def test_command_skill_and_plain_text_marks_of_a_message_survive_export_import_and_fork(runtime):
+    """A user event's commands, skills, verbatim and queued fields (the chips, and how Retry and Edit resend
+    a plain-text message) are kept by export, import and fork; malformed ones are refused."""
+    app, manager, source, destination = runtime
+    marks = {"verbatim": True, "queued": True, "skills": ["review"],
+             "commands": [{"name": "check", "path": ".agents/commands/check.md"}]}
+    source["events"][0].update(marks)
+    manager.store.save(source)
+    async with await client_for(app) as client:
+        bundle = (await client.get(f"/api/sessions/{source['id']}/export")).json()
+        assert {key: bundle["sessions"][0]["events"][0].get(key) for key in marks} == marks
+        imported = await client.post("/api/sessions/import", params={"workspace": str(destination)}, json=bundle)
+        assert imported.status_code == 201, imported.text
+        event = manager.store.get(imported.json()["session"]["id"])["events"][0]
+        assert {key: event.get(key) for key in marks} == marks
+        fork = await client.post(f"/api/sessions/{source['id']}/fork")
+        assert fork.status_code == 201, fork.text
+        event = manager.store.get(fork.json()["id"])["events"][0]
+        assert {key: event.get(key) for key in marks} == marks
+        for field, value in (("skills", ["a", "b", "c", "d"]), ("skills", ["../x"]),
+                             ("commands", [{"name": "check", "path": "x", "expanded": "Text"}])):
+            broken = copy.deepcopy(bundle)
+            broken["sessions"][0]["events"][0][field] = value
+            rejected = await client.post("/api/sessions/import", params={"workspace": str(destination)}, json=broken)
+            assert rejected.status_code == 400, (field, value)
+
+
 async def test_file_views_stay_local_in_export_import_and_fork(runtime):
     """What the source conversation last read is about its own files: never copied."""
     app, manager, source, destination = runtime

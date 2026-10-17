@@ -2,14 +2,20 @@ import { html, useCallback, useEffect, useRef, useState } from '../lib.js'
 import { X } from '../icons.js'
 import { api } from '../api.js'
 import ConversationTransfer from './ConversationTransfer.js'
+import ExtensionsEditor from './ExtensionsEditor.js'
 import UsagePanel from './UsagePanel.js'
+import MemoryPanel from './MemoryPanel.js'
+import SchedulesPanel from './SchedulesPanel.js'
 import { blockerOf, OpenBlockingChat } from './BlockingChat.js'
 import { modeLabel } from './PermissionsMenu.js'
 import { agentLabel, agentSettingsText, elapsedText } from '../subagents.js'
 import { EFFORT_LABELS, modelLabel } from '../types.js'
+import { hintText } from '../mcp.js'
+import { CapabilityTable } from './EndpointChecksDialog.js'
 
 // Props: session, workspace?, changedFiles? (files with unreviewed agent changes in this chat, from the
-// changes bar; null when unknown), onClose, onSelectSession, onError, onSaveTools?(tools) -> Session
+// changes bar; null when unknown), onClose, onSelectSession, onError, onSaveTools?(tools) -> Session,
+// initialTab? (a section to open, as /usage and /export do; remembered like a chosen one)
 const profileLabels = { inherit: 'Inherit permitted tools', read_only: 'Read-only files', file_editor: 'Read and edit files' }
 const taskStatuses = ['pending', 'in_progress', 'completed', 'cancelled']
 const scopeQuery = session => session ? `?session_id=${encodeURIComponent(session.id)}` : ''
@@ -18,7 +24,7 @@ const plural = (count, one, many = `${one}s`) => `${count.toLocaleString('en-US'
 // The sections, grouped in the navigation on the left (one scrolling row below 640 px).
 export const SECTIONS = [
   { group: 'This chat', tabs: ['Overview', 'Tasks', 'Subagents', 'Tools', 'Usage', 'Export'] },
-  { group: 'Project', tabs: ['Checkpoints', 'Verify', 'Worktrees', 'Extensions'] },
+  { group: 'Project', tabs: ['Checkpoints', 'Verify', 'Memory', 'Worktrees', 'Extensions', 'Schedules'] },
 ]
 const TABS = SECTIONS.flatMap(section => section.tabs)
 const TAB_KEY = 'agent-tools-tab'
@@ -62,7 +68,11 @@ export default function AgentToolsDialog(props) {
 function AgentToolsScope(props) {
   const dialog = useRef(null)
   const nav = useRef(null)
-  const [tab, setTab] = useState(rememberedTab)
+  const [tab, setTab] = useState(() => {
+    if (!TABS.includes(props.initialTab)) return rememberedTab()
+    rememberTab(props.initialTab)
+    return props.initialTab
+  })
   useEffect(() => { dialog.current?.showModal() }, [])
   // In the narrow layout the navigation is one scrolling row: keep the open section's button in view.
   useEffect(() => { nav.current?.querySelector('[aria-pressed="true"]')?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' }) }, [tab])
@@ -76,13 +86,16 @@ function AgentToolsScope(props) {
     Tasks: () => html`<${Tasks} ...${props} />`,
     Subagents: () => html`<${Subagents} ...${props} />`,
     Tools: () => html`<${ToolsPanel} ...${props} />`,
-    Usage: () => html`<${UsagePanel} session=${props.session} onError=${props.onError} />`,
+    Usage: () => html`<${UsagePanel} session=${props.session} onError=${props.onError}
+      onSelectSession=${id => { props.onSelectSession(id); props.onClose() }} />`,
     Export: () => html`<${ConversationTransfer} sessionId=${props.session?.id} workspace=${props.session?.workspace || props.workspace || ''}
       busy=${!!props.session && props.session.status !== 'idle'} onError=${props.onError} onSelectSession=${id => { props.onSelectSession(id); props.onClose() }} />`,
     Checkpoints: () => html`<${Checkpoints} ...${props} />`,
     Verify: () => html`<${Verify} ...${props} />`,
+    Memory: () => html`<${MemoryPanel} session=${props.session} onError=${props.onError} />`,
     Worktrees: () => html`<${Worktrees} ...${props} />`,
     Extensions: () => html`<${ExtensionsPanel} ...${props} />`,
+    Schedules: () => html`<${SchedulesPanel} session=${props.session} onError=${props.onError} onSelectSession=${id => { props.onSelectSession(id); props.onClose() }} />`,
   }
   return html`<dialog class="agent-tools-dialog" ref=${dialog} aria-label="Agent tools" onCancel=${props.onClose} onClick=${e => { if (e.target === dialog.current) props.onClose() }}>
     <div class="agent-tools-content">
@@ -108,9 +121,11 @@ function useOverview(session) {
     const query = id ? `?session_id=${encodeURIComponent(id)}` : ''
     const path = id ? `/sessions/${encodeURIComponent(id)}` : null
     const requests = {
-      checkpoints: () => api(`/checkpoints${query}`), project: () => api(`/project-settings${query}`),
+      checkpoints: () => api(`/checkpoints${query}`), project: () => api(`/project-settings${query}`), memory: () => api(`/memory${query}`),
       extensions: () => api('/extensions'), worktrees: () => api(`/worktrees${query}`),
-      ...(path ? { tools: () => api(`/tools${query}`), children: () => api(`${path}/children`), tasks: () => api(`${path}/tasks`) } : {}),
+      ...(path ? { tools: () => api(`/tools${query}`), children: () => api(`${path}/children`), tasks: () => api(`${path}/tasks`),
+        // The chat endpoint's saved checks (Settings → Model and context → Check endpoint capabilities…); no model request.
+        endpoint: () => api(`/endpoints/${encodeURIComponent(session.model)}/checks`) } : {}),
     }
     for (const [key, request] of Object.entries(requests)) {
       Promise.resolve().then(request).then(value => { if (alive) setData(current => ({ ...current, [key]: { value } })) },
@@ -124,14 +139,31 @@ function useOverview(session) {
 function toolsText({ tools = [], disabled = [] }) {
   const names = tools.map(tool => tool.name)
   const off = names.filter(name => disabled.includes(name)).length
-  const mcp = disabled.filter(name => !names.includes(name)).length
+  const servers = disabled.filter(name => MCP_SERVER_SWITCH.test(name)).length
+  const mcp = disabled.filter(name => !names.includes(name) && !MCP_SERVER_SWITCH.test(name)).length
   return `${names.length - off} of ${names.length} on` + (mcp ? ` · ${plural(mcp, 'MCP tool')} off` : '')
+    + (servers ? ` · ${plural(servers, 'MCP server')} off` : '')
+}
+
+// The last turn's MCP server status of a chat (session.mcp_status, from agents.mcp_status_changed).
+const MCP_STATUS_LABELS = { connected: 'connected', failed: 'failed', skipped: 'skipped', off: 'off in this chat', disabled: 'disabled' }
+function mcpStatusText(status) {
+  const counts = {}
+  for (const item of status) counts[item.status] = (counts[item.status] || 0) + 1
+  return Object.keys(MCP_STATUS_LABELS).filter(key => counts[key]).map(key => `${counts[key]} ${MCP_STATUS_LABELS[key]}`).join(' · ')
 }
 
 function subagentsText(children) {
   if (!children.length) return 'None yet'
   const running = children.filter(child => child.status && child.status !== 'idle').length
   return `${running.toLocaleString('en-US')} running · ${(children.length - running).toLocaleString('en-US')} finished`
+}
+
+function endpointText({ saved }) {
+  const results = Object.values(saved?.results || {})
+  if (!results.length) return 'Not checked yet (Settings → Model and context → Check endpoint capabilities…)'
+  const accepted = results.filter(result => result.status === 'accepted').length
+  return `Checked ${String(saved.checked || '').slice(0, 10)}: ${accepted} of ${plural(results.length, 'check')} accepted`
 }
 
 function extensionsText({ servers = [], hooks = [] }) {
@@ -150,6 +182,8 @@ function Overview({ session, workspace, changedFiles, onOpen }) {
       ? [{ label: 'Reasoning effort', text: EFFORT_LABELS[session.reasoning_effort] }] : []),
     { label: 'Permission mode', text: modeLabel(session.permission_mode || 'manual') },
     { label: 'Tools', tab: 'Tools', text: value('tools', toolsText) },
+    ...(Array.isArray(session.mcp_status) && session.mcp_status.length
+      ? [{ label: 'MCP servers', tab: 'Extensions', text: `Last turn: ${mcpStatusText(session.mcp_status)}` }] : []),
     { label: 'Subagents', tab: 'Subagents', text: value('children', subagentsText) },
     { label: 'Tasks', tab: 'Tasks', text: value('tasks', tasks => tasks.length
       ? `${tasks.filter(task => task.status === 'completed').length} of ${tasks.length} done` : 'None yet') },
@@ -158,10 +192,13 @@ function Overview({ session, workspace, changedFiles, onOpen }) {
       ? `Spending limit: ${session.spending_limit_dbu ? `${session.spending_limit_dbu} DBU` : 'none'} (this chat)`
       : 'Model calls, tokens, estimated cost and spending limit' },
     { label: 'Export', tab: 'Export', text: 'Markdown transcript, conversation file, fork' },
+    { label: 'Endpoint checks', text: value('endpoint', endpointText) },
   ] : []
   const project = [
     { label: 'Checkpoints', tab: 'Checkpoints', text: value('checkpoints', items => items.length ? plural(items.length, 'file checkpoint') : 'None yet') },
     { label: 'Verify', tab: 'Verify', text: value('project', settings => settings.verify_command ? html`<code>${settings.verify_command}</code>` : 'Off') },
+    { label: 'Memory', tab: 'Memory', text: value('memory', memory => !memory.enabled ? 'Off in Settings'
+      : memory.notes.length ? plural(memory.notes.length, 'note') : 'None yet') },
     { label: 'Worktrees', tab: 'Worktrees', text: value('worktrees', items => items.length ? plural(items.length, 'managed worktree') : 'None') },
     { label: 'Extensions', tab: 'Extensions', text: value('extensions', extensionsText) },
   ]
@@ -172,6 +209,8 @@ function Overview({ session, workspace, changedFiles, onOpen }) {
     <h3>This chat</h3>
     ${session ? html`<dl class="overview-list" aria-label="This chat">${chat.map(row)}</dl>`
       : html`<p>Start a conversation to see its tools, tasks, subagents and usage here.</p>`}
+    ${data.endpoint?.value?.saved ? html`<details class="overview-capabilities"><summary>Endpoint capabilities · ${session.model}</summary>
+      <${CapabilityTable} rows=${data.endpoint.value.capabilities} label=${`Endpoint capabilities of ${session.model}`} /></details>` : null}
     <h3>Project</h3>
     ${folder ? html`<p class="field-help overview-folder">${folder}</p>` : null}
     <dl class="overview-list" aria-label="Project">${project.map(row)}</dl>
@@ -346,6 +385,19 @@ function SessionSubagents({ session, onError, onSelectSession, onClose }) {
   </section>`
 }
 
+// What an agent file narrows or adds beyond its tools (custom_agents.parse_agent): its permission mode (only when
+// narrower than the chat's), disallowed tools, MCP servers, memory, initial prompt and background default.
+const MODE_NAMES = { plan: 'Plan', dontAsk: "Don't ask", manual: 'Manual', auto: 'Auto', acceptEdits: 'Accept edits',
+  bypassPermissions: 'Bypass permissions' }
+function agentLimits(agent) {
+  return [agent.permission_mode ? `Mode: ${MODE_NAMES[agent.permission_mode] || agent.permission_mode} at most` : '',
+    agent.disallowed_tools?.length ? `Not: ${agent.disallowed_tools.join(', ')}` : '',
+    Array.isArray(agent.mcp_servers) ? `MCP servers: ${agent.mcp_servers.join(', ') || 'none'}` : '',
+    agent.memory === 'none' ? 'Without project memory' : '',
+    agent.initial_prompt_chars ? `Initial prompt (${agent.initial_prompt_chars.toLocaleString('en-US')} characters)` : '',
+    agent.background ? 'Runs in the background' : ''].filter(Boolean).join(' · ')
+}
+
 // The agent types delegate_task offers in this chat's project (GET /agents): the built-in ones with their
 // Settings → Subagents defaults, the project's custom agent files, and the files that cannot be used.
 function AgentTypes({ session, onError }) {
@@ -361,7 +413,7 @@ function AgentTypes({ session, onError }) {
   const errors = agents?.errors || []
   return html`<div class="agent-types">
     <div class="agent-tools-section-heading"><h3>Agent types</h3><button class="outline" disabled=${busy} onClick=${() => void refresh()}>Refresh agent types</button></div>
-    <p>The agent chooses a type for each subagent. Set the built-in types' model and effort in Settings → Subagents. Custom agents are Markdown files in this project's <code>.agents/agents</code> or <code>.claude/agents</code> folder; their tools never go beyond this chat's tool ceiling.</p>
+    <p>The agent chooses a type for each subagent. Set the built-in types' model and effort in Settings → Subagents. Custom agents are Markdown files in this project's <code>.agents/agents</code> or <code>.claude/agents</code> folder (the app ships a plan agent, which a project file of the same name replaces); their tools and mode never go beyond this chat's.</p>
     ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
     ${agents ? html`<ul class="agent-types-list" aria-label="Agent types">
       ${builtIn.map(agent => html`<li key=${agent.name} class="agent-type-row">
@@ -375,7 +427,8 @@ function AgentTypes({ session, onError }) {
         <small>${[profileLabels[agent.profile], Array.isArray(agent.tools) ? `Tools: ${agent.tools.join(', ')}` : 'Every tool of its profile',
           effort(agent.effort), model(agent.model), Number.isInteger(agent.max_steps) ? `${agent.max_steps} steps by default` : '',
           agent.skills?.length ? `Skills: ${agent.skills.join(', ')}` : ''].filter(Boolean).join(' · ')}</small>
-        <small class="agent-type-file">File: <code>${agent.path}</code></small>
+        ${agentLimits(agent) ? html`<small class="agent-type-limits">${agentLimits(agent)}</small>` : null}
+        <small class="agent-type-file">${agent.shipped ? 'Shipped with the app: ' : 'File: '}<code>${agent.path}</code></small>
         ${(agent.notes || []).map((note, index) => html`<small key=${index} class="agent-type-note">${note}</small>`)}
       </li>`)}
       ${errors.map(item => html`<li key=${item.path} class="agent-type-row agent-type-error">
@@ -423,7 +476,10 @@ function Verify({ session, workspace, onError }) {
   </section>`
 }
 
-const extensionExample = JSON.stringify({ servers: [{ id: 'example', name: 'Example MCP', transport: 'stdio', command: 'your-mcp-server', args: [], enabled: false }], hooks: [
+const extensionExample = JSON.stringify({ servers: [
+  { id: 'example', name: 'Example MCP', transport: 'stdio', command: 'your-mcp-server', args: [], env: { API_TOKEN: { secret: 'EXAMPLE_TOKEN' } }, enabled: false },
+  { id: 'remote', name: 'Remote MCP', transport: 'http', url: 'https://mcp.example.com/mcp', headers: { Authorization: { secret: 'REMOTE_TOKEN', prefix: 'Bearer ' } }, enabled: false },
+  { id: 'workspace-sql', name: 'Databricks SQL', transport: 'http', url: 'https://your-workspace.cloud.databricks.com/api/2.0/mcp/sql', workspace_credentials: true, enabled: false }], hooks: [
   { id: 'example-hook', event: 'before_tool', tools: ['write_file', 'edit_file'], command: 'your-hook-command', timeout_seconds: 10, enabled: false },
   { id: 'prompt-check', event: 'user_prompt', command: 'your-prompt-check', timeout_seconds: 10, enabled: false },
   { id: 'stop-check', event: 'agent_stop', command: 'your-stop-check', timeout_seconds: 30, enabled: false }] }, null, 2)
@@ -437,44 +493,104 @@ const HOOK_EVENT_HELP = [
   ['agent_stop', 'When the agent would end its turn', 'decision "block" (with reason): it keeps working, at most 3 times'],
   ['subagent_start', "Before a subagent's first request", 'context'],
   ['subagent_stop', 'When a subagent would finish', 'decision "block" (with reason): one more round, at most 2; report (a replacement)'],
+  ['before_compaction', 'Before context is compacted (automatic or Compact now)', 'context (added to the preservation note); it cannot stop a compaction'],
+  ['notification', 'When the app notifies (approval needed, finished, stopped with an error); only without asking', 'none: output is ignored'],
 ]
 const hookOutputExample = JSON.stringify({ decision: 'deny', reason: 'Generated files are rebuilt by make; edit the template.' })
+
+// A server's line in the last-turn status or the test results.
+function serverLine(server, test) {
+  const info = server.server_info ? [server.server_info.title || server.server_info.name, server.server_info.version].filter(Boolean).join(' ') : ''
+  const count = Number.isInteger(server.tool_count) ? server.tool_count : (server.tools || []).length
+  const state = server.status === 'connected' ? `${test ? 'Connected during test' : 'Connected'} · ${plural(count, 'tool')}`
+    : server.status === 'disabled' ? 'Disabled · not started' : server.status === 'off' ? 'Turned off in this chat · not started'
+      : server.status === 'skipped' ? 'Skipped' : 'Failed'
+  return [state, info ? `server: ${info}` : '', server.retry_seconds ? `tried again in about ${server.retry_seconds} s` : ''].filter(Boolean).join(' · ')
+}
+
+function ServerRow({ server, test }) {
+  const hints = server.tool_annotations || {}
+  return html`<div class="agent-tools-row" key=${server.id}><div><strong>${server.name}</strong><small>${serverLine(server, test)}</small>
+    ${server.error ? html`<p class="form-error">${server.error}</p>` : null}
+    ${server.capped?.length ? html`<p>Not offered (Databricks takes at most 32 tools per request, and the tools a chat can add mid-turn keep their places): ${server.capped.join(', ')}</p>` : null}
+    ${server.stderr_tail ? html`<details class="mcp-stderr"><summary>Server stderr (end)</summary><pre>${server.stderr_tail}</pre></details>` : null}
+    ${server.instructions ? html`<details class="mcp-stderr"><summary>Server instructions (shown here only; never sent to the agent)</summary><pre>${server.instructions}</pre></details>` : null}
+    ${test && server.tools?.length ? html`<ul class="mcp-tools">${server.tools.map(name => html`<li key=${name}><code>${name}</code>${hintText(hints[name]) ? html` <small>Server says: ${hintText(hints[name])}</small>` : null}</li>`)}</ul>` : null}
+  </div></div>`
+}
 
 function ExtensionsPanel({ session, onError }) {
   const query = scopeQuery(session)
   const { busy, error, run } = useRequest(onError)
-  const [configuration, setConfiguration] = useState('')
-  const [loaded, setLoaded] = useState(false)
+  const [config, setConfig] = useState(null)
   const [skills, setSkills] = useState([])
   const [activeSkills, setActiveSkills] = useState(session?.active_skills || [])
   const [notice, setNotice] = useState('')
   const [tools, setTools] = useState(null)
   const [servers, setServers] = useState(null)
-  useEffect(() => { void run(() => Promise.all([api('/extensions'), api(`/skills${query}`)]), ([config, skills]) => { setConfiguration(JSON.stringify(config, null, 2)); setSkills(skills); setLoaded(true) }) }, [query, run])
+  // Command templates (GET /commands): { commands, errors, folders }; null until loaded or when it failed.
+  const [templates, setTemplates] = useState(null)
+  // Hook IDs an all-projects allow rule runs without asking (GET /permission-rules); null until loaded.
+  const [userRules, setUserRules] = useState(null)
+  useEffect(() => { void run(() => Promise.all([api('/extensions'), api(`/skills${query}`), api(`/commands${query}`).catch(() => null),
+    api('/permission-rules').catch(() => null)]),
+  ([config, skills, commands, rules]) => { setConfig(config); setSkills(skills); setTemplates(commands); setUserRules(rules?.user || null) }) }, [query, run])
+  const trust = userRules ? {
+    trusted: new Set(userRules.filter(rule => rule.tool === 'hook' && (rule.behavior || 'allow') === 'allow' && rule.hook).map(rule => rule.hook)),
+    onTrust: (id, on) => {
+      setNotice('')
+      const rule = { tool: 'hook', behavior: 'allow', hook: id }
+      void run(() => api('/permission-rules', on ? 'POST' : 'DELETE', { scope: 'user', rule }), result => {
+        setUserRules(result.user || [])
+        setNotice(on ? `Hook ${id} now runs without asking in all projects.` : `Hook ${id} asks for approval again.`)
+      })
+    },
+  } : null
+  const status = Array.isArray(session?.mcp_status) ? session.mcp_status : []
+  const save = draft => { setNotice(''); setTools(null); setServers(null); void run(() => api('/extensions', 'PUT', draft), saved => { setConfig(saved); setNotice('Configuration saved.') }) }
+  const test = html`<button type="button" class="outline" disabled=${busy} onClick=${() => { setNotice(''); setTools(null); setServers(null); void run(() => api('/extensions/test', 'POST'), result => { setTools(result.tools); setServers(result.servers || null) }) }}>Test saved configuration</button>`
   return html`<section class="agent-tools-section" aria-label="Extensions">
     <h3>MCP servers and hooks</h3>
-    <p>Configure stdio commands or HTTP server URLs, and up to 16 hooks: local commands that run around tool calls and at the start and end of a turn. Saving authorizes enabled servers to start.</p>
-    <label class="agent-tools-config">Extension configuration (JSON)<textarea aria-label="Extension configuration (JSON)" disabled=${!loaded || busy} spellcheck=${false} value=${configuration} onInput=${e => setConfiguration(e.currentTarget.value)} /></label>
-    <details class="agent-tools-example"><summary>Configuration example</summary><pre>${extensionExample}</pre><p>The optional tools list matches exact tool names for before_tool, after_tool and tool_failure hooks (other events ignore it). Omit it to match all tools; an empty list matches none. Tool hooks' input includes call_id; failure hooks also receive the original error.</p></details>
+    <p>Configure stdio commands or HTTP server URLs, and up to 16 hooks: local commands that run around tool calls and at the start and end of a turn. Saving authorizes enabled servers to start. A server that fails is skipped (its tools are unavailable, the others work) and named once in the chat.</p>
+    <${ExtensionsEditor} config=${config} busy=${busy} session=${session} onSave=${save} onError=${onError} actions=${test} trust=${trust} />
+    <details class="agent-tools-example"><summary>Configuration example</summary><pre>${extensionExample}</pre><p>The optional tools list selects tools for before_tool, after_tool and tool_failure hooks (other events ignore it): exact names or patterns with * and ?, such as mcp__github__* or *_file. Omit it to match all tools; an empty list matches none. Tool hooks' input includes call_id and agent (the chat or the subagent that made the call); failure hooks also receive the original error.</p><p>{"secret": "NAME"} reads NAME from your credential file each time the server starts; the value is never saved in this configuration. workspace_credentials sends your Databricks token only to an https URL on your workspace host.</p></details>
     <details class="agent-tools-example hook-events-help"><summary>Hook events and JSON output</summary>
       <div class="hook-events-scroll"><table class="hook-events" aria-label="Hook events"><thead><tr><th scope="col">Event</th><th scope="col">Runs</th><th scope="col">JSON output it reads</th></tr></thead>
         <tbody>${HOOK_EVENT_HELP.map(([event, when, fields]) => html`<tr key=${event}><th scope="row"><code>${event}</code></th><td>${when}</td><td>${fields}</td></tr>`)}</tbody></table></div>
       <p>A hook gets a JSON object on stdin (the event, the chat and, per event, the tool call, your message, the reply or the subagent's task). It may print one JSON object on stdout, for example <code>${hookOutputExample}</code>; other output is plain text, as before, but output in braces that is not valid JSON fails the hook. stderr is shown on the hook card, never read as JSON. Exit code 0 means no objection; another exit code blocks a before_tool call and only warns for other events.</p>
-      <p>Context (up to 2,000 characters per hook) reaches the agent labelled as hook output. Replaced arguments are checked again against the tool's schema, your rules and its approval card. "allow" never skips a card the mode or rules need; "ask" always shows one, also in Bypass permissions (Don't ask refuses the call instead). Each hook still asks for approval except in Bypass, rules can allow or block it, and Plan mode skips hooks.</p></details>
-    <div class="agent-tools-actions"><button class="primary" disabled=${!loaded || busy || !configuration.trim()} onClick=${() => { setNotice(''); setTools(null); setServers(null); void run(() => api('/extensions', 'PUT', JSON.parse(configuration)), config => { setConfiguration(JSON.stringify(config, null, 2)); setNotice('Configuration saved.') }) }}>Save configuration</button>
-      <button class="outline" disabled=${busy} onClick=${() => { setNotice(''); setTools(null); setServers(null); void run(() => api('/extensions/test', 'POST'), result => { setTools(result.tools); setServers(result.servers || null) }) }}>Test saved configuration</button></div>
+      <p>Context (up to 2,000 characters per hook) reaches the agent labelled as hook output. Replaced arguments are checked again against the tool's schema, your rules and its approval card. "allow" never skips a card the mode or rules need; "ask" always shows one, also in Bypass permissions (Don't ask refuses the call instead). Each hook still asks for approval except in Bypass, rules can allow or block it (Run without asking saves an allow rule for all projects), and Plan mode skips hooks. Notification hooks never show a card: they run only without asking.</p></details>
     ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}${notice ? html`<p role="status">${notice}</p>` : null}
     ${tools ? html`<div class="agent-tools-test" role="status">${tools.length ? html`<strong>Available tools</strong><ul>${tools.map(tool => html`<li key=${tool}>${tool}</li>`)}</ul>` : 'No tools reported by the saved configuration.'}</div>` : null}
-    ${servers ? html`<div class="agent-tools-list" aria-label="MCP server test results"><p class="field-help">Results from the last test, not a live connection monitor.</p>${servers.map(server => html`<div class="agent-tools-row" key=${server.id}><div><strong>${server.name}</strong><small>${server.status === 'connected' ? `Connected during test · ${server.tools.length} tools` : server.status === 'disabled' ? 'Disabled · not started' : 'Failed'}</small>${server.error ? html`<p class="form-error">${server.error}</p>` : null}</div></div>`)}</div>` : null}
+    ${servers ? html`<div class="agent-tools-list" aria-label="MCP server test results"><p class="field-help">Results from the last test, not a live connection monitor.</p>${servers.map(server => html`<${ServerRow} key=${server.id} server=${server} test=${true} />`)}</div>` : null}
+    ${status.length ? html`<h3>Last turn in this chat</h3><div class="agent-tools-list" aria-label="MCP servers in the last turn">${status.map(server => html`<${ServerRow} key=${server.id} server=${server} test=${false} />`)}</div>` : null}
     <h3>Skills</h3>${!session ? html`<p class="field-help">Start a conversation to enable skills.</p>` : null}
-    <div class="agent-tools-list">${skills.map(skill => html`<div class="agent-tools-row" key=${skill.id}><label><input type="checkbox" disabled=${busy || !session} checked=${activeSkills.includes(skill.id)} onChange=${e => { if (session) void run(() => api(`/sessions/${encodeURIComponent(session.id)}/skills`, 'POST', { skill_id: skill.id, enabled: e.currentTarget.checked }), result => setActiveSkills(result.active_skills)) }} />${skill.name}<small>${skill.description}</small><small>${skill.path}</small></label></div>`)}</div>
+    <p class="field-help">Checked skills are part of every request in this chat. /skill-id in a message sends a skill with that message only.</p>
+    <div class="agent-tools-list">${skills.map(skill => html`<div class="agent-tools-row" key=${skill.id}><label><input type="checkbox" disabled=${busy || !session} checked=${activeSkills.includes(skill.id)} onChange=${e => { if (session) void run(() => api(`/sessions/${encodeURIComponent(session.id)}/skills`, 'POST', { skill_id: skill.id, enabled: e.currentTarget.checked }), result => setActiveSkills(result.active_skills)) }} />${skill.name}<small>${skill.description}</small><small>${skill.path}</small>
+      ${skillNotes(skill) ? html`<small class="skill-notes">${skillNotes(skill)}</small>` : null}</label></div>`)}</div>
     ${!busy && !skills.length ? html`<p class="muted">No installed skills found.</p>` : null}
+    <h3>Custom commands</h3>
+    <p class="field-help">Type /name at the start of a message to send a command file's text with it: $ARGUMENTS becomes what you type after the name, $1 to $9 its words. Files are read from ${(templates?.folders || ['.agents/commands', '.claude/commands', '~/.agents/commands', '~/.claude/commands']).join(', ')} (in that order); the app never writes there.</p>
+    ${templates ? html`<div class="agent-tools-list" role="group" aria-label="Custom commands">${templates.commands.map(item => html`<div class="agent-tools-row" key=${item.name}><div>
+      <strong>/${item.name}${item.argument_hint ? ` ${item.argument_hint}` : ''}</strong>${item.description ? html`<small>${item.description}</small>` : null}<small>${item.path}</small>
+      ${item.notes.map((note, index) => html`<small key=${index} class="skill-notes">${note}</small>`)}</div></div>`)}
+      ${templates.errors.map(item => html`<div class="agent-tools-row" key=${`error-${item.path}`}><div><strong>${item.path}</strong><p class="form-error">${item.error}</p></div></div>`)}</div>
+      ${!busy && !templates.commands.length && !templates.errors.length ? html`<p class="muted">No command files found.</p>` : null}`
+      : config ? html`<p class="muted">Custom commands could not be listed.</p>` : null}
   </section>`
 }
 
+// What a skill's frontmatter and name change (GET /skills): the argument hint, who may load it, a reserved name.
+function skillNotes(skill) {
+  return [skill.argument_hint ? `Arguments: ${skill.argument_hint}` : '',
+    skill.disable_model_invocation ? 'Only you select it (disable-model-invocation)' : '',
+    skill.user_invocable === false ? 'Not offered with / (user-invocable: false)' : '',
+    skill.reserved ? `A command has its name: use /skill ${skill.id} in a message` : ''].filter(Boolean).join(' · ')
+}
 
-// MCP tool names the server accepts in a chat's turned-off list.
+// MCP tool names the server accepts in a chat's turned-off list, and a whole server's switch.
 const MCP_TOOL = /^mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_.-]+$/
+const MCP_SERVER_SWITCH = /^mcp__[a-z][a-z0-9_-]{0,19}__\*$/
+const serverSwitch = id => `mcp__${id}__*`
 
 // The Tools section's groups; a tool in none of them is under Other.
 const TOOL_GROUPS = [
@@ -484,7 +600,10 @@ const TOOL_GROUPS = [
   { name: 'Commands and jobs', tools: ['run_command', 'list_jobs', 'get_job_output', 'wait_job', 'stop_job'] },
   { name: 'Git', match: name => /^git_/.test(name) },
   { name: 'Tasks and subagents', tools: ['list_tasks', 'get_task', 'create_task', 'update_task', 'delegate_task'] },
-  { name: 'Skills', tools: ['list_skills', 'use_skill'] },
+  { name: 'Skills', tools: ['list_skills', 'use_skill', 'report_findings'] },
+  { name: 'Memory', tools: ['remember'] },
+  { name: 'MCP', tools: ['get_tool_output'] },
+  { name: 'Web', tools: ['web_fetch', 'web_search'] },
 ]
 
 export function toolGroup(name) {
@@ -498,6 +617,7 @@ const firstSentence = text => /^(.+?[.!?])(?:\s|$)/.exec(text || '')?.[1] || tex
 function ToolsPanel({ session, onError, onSaveTools }) {
   const { busy, error, run } = useRequest(onError)
   const [tools, setTools] = useState(null)
+  const [servers, setServers] = useState([])
   const [off, setOff] = useState([])
   const [filter, setFilter] = useState('')
   const [mcpName, setMcpName] = useState('')
@@ -505,11 +625,12 @@ function ToolsPanel({ session, onError, onSaveTools }) {
   const [notice, setNotice] = useState('')
   const id = session?.id
   useEffect(() => {
-    if (id) void run(() => api(`/tools?session_id=${encodeURIComponent(id)}`), result => { setTools(result.tools || []); setOff(result.disabled || []) })
+    if (id) void run(() => api(`/tools?session_id=${encodeURIComponent(id)}`), result => { setTools(result.tools || []); setServers(result.servers || []); setOff(result.disabled || []) })
   }, [id, run])
   if (!session) return html`<section class="agent-tools-section" aria-label="Tools"><p>Start a conversation to choose its tools.</p></section>`
   const names = new Set((tools || []).map(tool => tool.name))
-  const extra = off.filter(name => !names.has(name))
+  const switches = new Set(servers.map(server => serverSwitch(server.id)))
+  const extra = off.filter(name => !names.has(name) && !switches.has(name))
   const toggle = (name, available) => { setNotice(''); setOff(current => available ? current.filter(item => item !== name) : [...current, name]) }
   const setGroup = (group, available) => {
     setNotice('')
@@ -558,7 +679,11 @@ function ToolsPanel({ session, onError, onSaveTools }) {
     })}
     ${tools && query && !groups.length ? html`<p class="muted">No tools match “${filter.trim()}”.</p>` : null}
     <h4 class="tools-mcp-heading">MCP tools</h4>
-    <p class="field-help">MCP tools are offered once a turn starts their server (Agent tools → Extensions). Turn one off by its full name.</p>
+    ${servers.length ? html`<div class="tools-group" role="group" aria-label="MCP servers"><div class="agent-tools-list">${servers.map(server => html`<div class="agent-tools-row" key=${server.id}><label class="tools-toggle">
+      <input type="checkbox" aria-label=${`Use the ${server.name} server in this chat`} disabled=${busy} checked=${!off.includes(serverSwitch(server.id))}
+        onChange=${e => toggle(serverSwitch(server.id), e.currentTarget.checked)} />
+      <span><strong>${server.name}</strong><small>${server.enabled ? 'Enabled in Extensions' : 'Disabled in Extensions'} · off here: its process never starts in this chat (<code>${serverSwitch(server.id)}</code>)</small></span></label></div>`)}</div></div>` : null}
+    <p class="field-help">MCP tools are offered once a turn starts their server (Agent tools → Extensions). Turn a whole server off above, or one tool by its full name.</p>
     <form class="agent-tools-form" onSubmit=${e => { e.preventDefault(); addMcp() }}>
       <label>Turn off an MCP tool by name<input spellcheck=${false} disabled=${busy} value=${mcpName} placeholder="mcp__docs__search"
         onInput=${e => { setMcpName(e.currentTarget.value); setMcpError('') }} /></label>

@@ -882,3 +882,14 @@ async def test_read_only_git_runs_no_program_named_in_a_submodule(runtime, hosti
     assert touched(markers) == []
     if command in ("git diff", "git diff --cached", "git show"):
         assert "Subproject commit" in result["output"]
+
+
+async def test_a_stop_before_the_job_task_starts_cancels_the_job_not_its_waiter(store, tmp_path):
+    """Terminal → Stop job right after a foreground command started (its task not yet run): the turn waiting for
+    the command sees a cancelled job; before, the job task's CancelledError reached the turn and stopped it."""
+    manager = JobManager(store, lambda text: text, None)
+    job = await manager.start("sleep 30", tmp_path)  # Its task is scheduled, not yet run.
+    waiter = asyncio.create_task(manager.wait(job["id"]))
+    stopped = await manager.stop(job["id"])  # Cancels the job's task before its first step.
+    waited = await asyncio.wait_for(waiter, 10)
+    assert waited["state"] == stopped["state"] == "cancelled" and not waiter.cancelled()

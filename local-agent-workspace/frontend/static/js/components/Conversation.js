@@ -12,6 +12,10 @@ import RewindDialog from './RewindDialog.js'
 import ForkDialog from './ForkDialog.js'
 import { backupTitle, setRewindNotice } from '../rewindNotice.js'
 import { agentLabel, agentSettingsText, elapsedText } from '../subagents.js'
+import { pathShortener } from '../paths.js'
+import { hintText } from '../mcp.js'
+import { turnSummary } from '../turnResult.js'
+import { sentLabel, sentUploads } from '../attachments.js'
 
 // A long file is read in pages. Naming the lines each read covered keeps the
 // pages of one file from looking like the same read repeated.
@@ -26,24 +30,72 @@ function readRange(event) {
   return Number.isInteger(start) && start > 1 ? ` · from line ${start}` : ''
 }
 
-// Returns Map<event id, { subject, taskStatus? }> for every tool event.
-function summarizeTools(events) {
+// A command that starts with "cd <folder> &&" (one plain or quoted absolute folder, no shell expansion and no
+// operators inside it) as [folder, rest]; null otherwise. Only spaces or tabs between cd, the folder and "&&": a line
+// break there ends the cd, and the shell then rejects or runs on its own what follows.
+const LEADING_CD = /^\s*cd[ \t]+(?:'([^'\n&;|<>]+)'|"([^"\n$`\\&;|<>]+)"|([^\s'"$`\\;&|<>(){}*?[\]~]+))[ \t]*&&\s*(\S[\s\S]*)$/
+function leadingCd(command) {
+  const match = LEADING_CD.exec(command)
+  const folder = match && (match[1] ?? match[2] ?? match[3])
+  if (!folder?.startsWith('/') || folder.split('/').some(part => part === '.' || part === '..')) return null
+  return [folder, match[4]]
+}
+
+// The collapsed heading of a command card: "cd <folder> && rest" reads "<folder name> › rest" when the folder is the
+// project or inside a known folder, so the command itself is not cut off. A command run with cwd reads
+// "<folder> › command" the same way (cwd: the resolved folder, else as the agent gave it). Display only: the title,
+// the accessible name, the expanded card and the approval card keep the whole command.
+export function commandHeading(command, shorten, projectName = '', cwd = '') {
+  if (typeof cwd === 'string' && cwd) {
+    const short = shorten(cwd)
+    if (short !== '.') return `${short} › ${command}`
+  }
+  const cd = leadingCd(command)
+  const short = cd ? shorten(cd[0]) : null
+  if (!cd || short === cd[0]) return command
+  return `${short === '.' ? projectName || '.' : short} › ${cd[1]}`
+}
+
+// Returns Map<event id, { subject, shown, taskStatus? }> for every tool event. subject is the full text (the title
+// and accessible name); shown is what the heading shows: a path inside the project relative to it, one in an
+// allowed folder as "<folder name>/rest" (shorten: pathShortener), and a leading cd into such a folder shortened.
+function summarizeTools(events, shorten = path => path, projectName = '') {
   const taskTitles = new Map()
   const summaries = new Map()
+  const flat = text => text.slice(0, 240).replace(/\s+/g, ' ')
   for (const event of events) {
     if (event.type !== 'tool') continue
     const input = event.input || {}
     let subject = String(input.path || input.file_path || input.command || input.query || input.task || input.title || '')
-    if (event.name === 'read_file') subject += readRange(event)
-    if (event.name === 'find_files') subject = `${input.pattern ?? ''}` + (input.path && input.path !== '.' ? ` in ${input.path}` : '')
-    if (event.name === 'wait_job') subject = String(input.job_id ?? '').slice(0, 8) + (input.until_regex ? ` until /${input.until_regex}/` : '')
+    let shown = PATH_SUBJECTS.has(event.name) && input.path && typeof input.path === 'string' ? shorten(input.path)
+      : event.name === 'run_command' && typeof input.command === 'string' ? commandHeading(input.command, shorten, projectName, event.command_cwd || input.cwd) : subject
+    let suffix = ''
+    if (event.name === 'read_file') suffix = readRange(event)
+    if (event.name === 'find_files') {
+      const where = input.path && input.path !== '.' ? input.path : ''
+      subject = `${input.pattern ?? ''}` + (where ? ` in ${where}` : '')
+      shown = `${input.pattern ?? ''}` + (where ? ` in ${shorten(where)}` : '')
+    }
+    if (event.name === 'remember') subject = shown = String(input.text ?? '')
+    if (event.name === 'web_fetch') subject = shown = String(input.url ?? '')
+    if (event.name === 'report_findings') {
+      const count = Array.isArray(input.findings) ? input.findings.length : 0
+      subject = shown = `${count} ${count === 1 ? 'finding' : 'findings'}`
+    }
+    if (event.name === 'wait_job') subject = shown = String(input.job_id ?? '').slice(0, 8) + (input.until_regex ? ` until /${input.until_regex}/` : '')
     if (event.name === 'outline_file') {
-      subject += (Number.isInteger(input.max_level) && input.max_level < 6 ? ` · to level ${input.max_level}` : '')
+      suffix = (Number.isInteger(input.max_level) && input.max_level < 6 ? ` · to level ${input.max_level}` : '')
         + (Number.isInteger(input.offset) && input.offset > 0 ? ` · from entry ${input.offset}` : '')
     }
-    if (event.name === 'project_overview') subject = input.path && input.path !== '.' ? String(input.path) : 'workspace'
+    if (event.name === 'project_overview') {
+      const where = input.path && input.path !== '.' ? String(input.path) : ''
+      subject = where || 'workspace'
+      shown = where && shorten(where) !== '.' ? shorten(where) : 'workspace'
+    }
+    subject += suffix
+    shown += suffix
     // A hook card names its hook and the tool it ran for (lifecycle events have no tool).
-    if (String(event.name || '').startsWith('hook_') && input.hook_id) subject = `${input.hook_id}${input.tool ? ` · ${input.tool}` : ''}`
+    if (String(event.name || '').startsWith('hook_') && input.hook_id) subject = shown = `${input.hook_id}${input.tool ? ` · ${input.tool}` : ''}`
     let taskStatus
     if (event.name === 'create_task' || event.name === 'update_task') {
       let task = {}
@@ -51,14 +103,14 @@ function summarizeTools(events) {
         const result = JSON.parse(event.output || '{}')
         if (result && typeof result === 'object' && !Array.isArray(result)) task = result
       } catch { /* Older or failed events can contain plain-text output. */ }
-      subject = String(task.title || input.title || taskTitles.get(String(input.task_id)) || input.task_id || '')
+      subject = shown = String(task.title || input.title || taskTitles.get(String(input.task_id)) || input.task_id || '')
       if (event.state === 'completed') {
         if (typeof task.id === 'string' && subject) taskTitles.set(task.id, subject)
         const status = task.status || input.status
         if (typeof status === 'string') taskStatus = status.replace(/_/g, ' ')
       }
     }
-    summaries.set(event.id, { subject: subject.slice(0, 240).replace(/\s+/g, ' '), taskStatus })
+    summaries.set(event.id, { subject: flat(subject), shown: flat(shown), taskStatus })
   }
   return summaries
 }
@@ -104,6 +156,9 @@ export function resultOf(event) {
   try { page = JSON.parse(json) } catch { return null }
   if (!page || typeof page !== 'object' || Array.isArray(page) || typeof page.output !== 'string') return null
   return { note, text: page.output, raw: text, mcpError: page.is_error === true,
+    // A long MCP result: the rest is kept in memory for get_tool_output (result_store.py).
+    kept: typeof page.result_id === 'string' && Number.isInteger(page.total_chars)
+      ? { shown: Number(page.next_offset) || page.output.length, total: page.total_chars, restNotKept: page.rest_not_kept === true } : null,
     job: 'state' in page ? { state: String(page.state), exitCode: page.exit_code, background: !!page.background,
       total: page.total_chars, truncated: page.truncated === true, shown: shownPart(page),
       // wait_job: why the wait ended ('matched', 'timeout', 'idle' or 'exited') and the line that matched.
@@ -153,6 +208,10 @@ export function toolStatus(event, result) {
   }
   if (event.state !== 'completed') return none
   if (own) return { tone: own[0], label: own[1], labelTone: own[2] }
+  // A background subagent's call returned at once; the subagent itself still works.
+  if (event.name === 'delegate_task' && event.delegation?.background && !event.delegation.terminal_reason) {
+    return { tone: 'neutral', label: 'started in background', labelTone: 'neutral' }
+  }
   const job = result?.job
   if (job && !isCommand && JOB_TOOLS.has(event.name)) {
     // A wait reports its outcome first: its line matched, or it timed out (no tick: what it waited for did not come).
@@ -231,6 +290,31 @@ function HookResult({ result }) {
   </div>`
 }
 
+// Images an MCP tool returned (event.mcp_images: { id, mime_type, bytes }), kept in memory by the app and
+// never sent to the model; each loads when asked.
+const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp'])
+function McpImages({ images, sessionId }) {
+  const [shown, setShown] = useState({})
+  const load = async image => {
+    setShown(current => ({ ...current, [image.id]: { loading: true } }))
+    try {
+      const data = await api(`/sessions/${encodeURIComponent(sessionId)}/tool-images/${encodeURIComponent(image.id)}`)
+      setShown(current => ({ ...current, [image.id]: IMAGE_TYPES.has(data.mime_type) && typeof data.data === 'string'
+        ? { src: `data:${data.mime_type};base64,${data.data}` } : { error: 'This image cannot be shown.' } }))
+    } catch (e) { setShown(current => ({ ...current, [image.id]: { error: e.message } })) }
+  }
+  return html`<div class="mcp-images"><p class="tool-detail-label">Images (shown here, not sent to the model)</p>
+    ${images.map((image, index) => {
+      const state = shown[image.id] || {}
+      const label = `image ${index + 1} (${image.mime_type}, ${Math.max(1, Math.round(image.bytes / 1024)).toLocaleString()} KB)`
+      return html`<div class="mcp-image" key=${image.id}>
+        ${state.src ? html`<img src=${state.src} alt=${`MCP tool ${label}`} />`
+          : html`<button type="button" class="outline" disabled=${!!state.loading} onClick=${() => load(image)}>Show ${label}</button>`}
+        ${state.error ? html`<p class="form-error">${state.error}</p>` : null}
+      </div>`
+    })}</div>`
+}
+
 // failure: what a failed tool told the agent (toolError), or null.
 function ToolDetails({ event, pending, result = null, failure = null }) {
   const { command, ...options } = event.input || {}
@@ -246,6 +330,7 @@ function ToolDetails({ event, pending, result = null, failure = null }) {
     ${result ? html`${result.note && !event.edited ? html`<p class="tool-rule">${result.note}</p>` : null}
         <p class="tool-detail-label">Output</p><pre aria-label="Output">${result.text || 'No output.'}</pre>
         ${job ? html`<p class="muted tool-job-state">${jobStateLine(job)}</p>` : null}
+        ${result.kept ? html`<p class="muted tool-job-state">First ${result.kept.shown.toLocaleString()} of ${result.kept.total.toLocaleString()} characters shown${result.kept.restNotKept ? ' (the server sent more; the rest was not kept)' : ''}. The agent can read the rest with get_tool_output until the app restarts.</p>` : null}
         <details class="tool-raw"><summary>Raw result</summary><pre aria-label="Raw result">${result.raw}</pre></details>`
       : !pending || event.output ? html`<p class="tool-detail-label">Output</p><pre aria-label="Output">${event.output || (event.state === 'running' ? 'Waiting for output…' : 'No output.')}</pre>` : null}
     ${failure ? html`<p class="tool-detail-label">Error category</p><p>${failure.label}</p>
@@ -367,7 +452,23 @@ export function allowLabel(event) {
   if (name.startsWith('hook_')) return 'Allow this hook in this chat'
   if (name === 'delegate_task') return 'Allow subagents in this chat'
   if (name === 'stop_job') return 'Allow stopping jobs in this chat'
+  if (name === 'remember') return 'Allow saving memory in this chat'
+  // web_search: approving the card allows searches for the rest of the chat, so it needs no second button.
+  if (name === 'web_fetch') return webDomain(event) ? `Allow ${webDomain(event)} in this chat` : null
   return null
+}
+
+// The host a web_fetch card asks about (the server's checked IDNA form, web_domain), or the URL's host.
+export function webDomain(event) {
+  if (typeof event.web_domain === 'string' && event.web_domain) return event.web_domain
+  try { return new URL(String(event.input?.url || '')).hostname || '' } catch { return '' }
+}
+
+// The first sentence of a pending card.
+function approvalAsk(event, title) {
+  if (event.name === 'web_fetch' && webDomain(event)) return `Local needs your approval to fetch from ${webDomain(event)}.`
+  if (event.name === 'web_search') return `Local needs your approval to search the web${event.web_provider ? ` with ${event.web_provider}` : ''}.`
+  return `Local needs your approval to ${title.toLowerCase()}.`
 }
 
 // The time an approval card expires, with the weekday when that is not today (limits reach 24 hours).
@@ -378,18 +479,62 @@ export function expiryTime(seconds, now = new Date()) {
     : when.toLocaleString([], { weekday: 'short', ...options })
 }
 
-// The finished delegate_task result ({ status, output, changed_files, ... }) the parent agent received, or null.
+// The finished delegate_task result ({ status, output, report?, changed_files, ... }) the parent agent received, or
+// null: a background subagent's arrives later, on its card (delegation_result).
 function delegationResult(event) {
-  if (event.name !== 'delegate_task' || event.state !== 'completed' || typeof event.output !== 'string') return null
-  try {
-    const result = JSON.parse(event.output)
-    return result && typeof result === 'object' && typeof result.output === 'string' ? result : null
-  } catch { return null }
+  if (event.name !== 'delegate_task' || event.state !== 'completed') return null
+  const usable = value => value && typeof value === 'object' && typeof value.output === 'string' ? value : null
+  if (event.delegation_result) return usable(event.delegation_result)
+  if (typeof event.output !== 'string') return null
+  try { return usable(JSON.parse(event.output)) } catch { return null }
 }
 
 const DELEGATION_STATUS = { awaiting_approval: 'Waiting for approval', queued: 'waiting for a free slot' }
 
-function DelegationStatus({ event, onSelectSession, onOpenPath }) {
+// A subagent's submit_report report: its summary, findings (path:line opens the file), files and next steps.
+function SubagentReport({ report, onOpenPath }) {
+  const findings = Array.isArray(report.findings) ? report.findings.filter(item => item && typeof item === 'object') : []
+  const steps = Array.isArray(report.next_steps) ? report.next_steps : []
+  const more = (key, shown) => Number.isInteger(report[`${key}_total`]) && report[`${key}_total`] > shown
+    ? html`<li class="muted">and ${report[`${key}_total`] - shown} more</li>` : null
+  return html`<div class="subagent-report">
+    <${Markdown} text=${String(report.summary || '')} onOpenPath=${onOpenPath} />
+    ${findings.length ? html`<h4>Findings</h4><ul class="subagent-findings">${findings.map((item, index) => {
+      const where = item.path ? `${item.path}${Number.isInteger(item.line) ? `:${item.line}` : ''}` : ''
+      return html`<li key=${index}>${where ? onOpenPath ? html`<button class="subagent-finding-path" title=${`Open ${where}`} aria-label=${`Open ${where}`}
+        onClick=${() => onOpenPath(Number.isInteger(item.line) ? { path: item.path, line: item.line } : { path: item.path })}><code>${where}</code></button>`
+        : html`<code>${where}</code>` : null}${where && item.text ? ' ' : ''}${item.text || ''}</li>`
+    })}${more('findings', findings.length)}</ul>` : null}
+    ${Array.isArray(report.files_changed) && report.files_changed.length ? html`<p class="delegation-files"><strong>Files it lists as changed:</strong> ${report.files_changed.join(', ')}</p>` : null}
+    ${steps.length ? html`<h4>Next steps</h4><ul>${steps.map((item, index) => html`<li key=${index}>${item}</li>`)}${more('next_steps', steps.length)}</ul>` : null}
+  </div>`
+}
+
+// Allow or Decline the card a subagent waits on, or open it to answer a question or plan (the child's own
+// approvals route, so its rules and checks apply), and Stop one running subagent. A card whose title does not
+// show the whole action, or that warns (pending.review), is reviewed in the subagent: no Allow here.
+function SubagentControls({ event, progress, onSelectSession, onError }) {
+  const [acting, setActing] = useState('')
+  const child = event.child_session_id
+  const pending = progress.status === 'awaiting_approval' ? progress.pending : null
+  if (!child || progress.terminal_reason) return null
+  const act = async (label, path, body) => {
+    setActing(label)
+    try { await api(path, 'POST', body) } catch (cause) { onError?.(cause.message) } finally { setActing('') }
+  }
+  const decide = allowed => act(allowed ? 'allow' : 'decline', `/sessions/${encodeURIComponent(child)}/approvals/${encodeURIComponent(pending.event_id)}`, { allowed })
+  return html`<div class="subagent-controls">
+    ${pending ? html`<p class="subagent-pending" title=${pending.title}>${pending.kind === 'approval' ? `Waits for approval: ${String(pending.name || '').replace(/_/g, ' ')} · ` : pending.kind === 'question' ? 'Asks: ' : 'Plan to review: '}${pending.title}</p>` : null}
+    ${pending?.kind === 'approval' && Array.isArray(pending.warnings) && pending.warnings.length ? html`<p class="subagent-pending-warning">Its card warns: ${pending.warnings.join('; ')}.</p>` : null}
+    ${pending?.kind === 'approval' && !pending.review ? html`<button class="outline" disabled=${!!acting} onClick=${() => void decide(true)}>Allow</button>` : null}
+    ${pending?.kind === 'approval' && pending.review && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(child)}>Review in subagent</button>` : null}
+    ${pending?.kind === 'approval' ? html`<button class="outline" disabled=${!!acting} onClick=${() => void decide(false)}>Decline</button>` : null}
+    ${pending && pending.kind !== 'approval' && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(child)}>Answer in subagent</button>` : null}
+    <button class="outline danger" disabled=${!!acting} onClick=${() => void act('stop', `/sessions/${encodeURIComponent(child)}/stop`)}>${acting === 'stop' ? 'Stopping…' : 'Stop subagent'}</button>
+  </div>`
+}
+
+function DelegationStatus({ event, onSelectSession, onOpenPath, onError }) {
   const progress = event.delegation
   const running = !!progress && !progress.terminal_reason && typeof progress.started === 'number'
   const [now, setNow] = useState(() => Date.now() / 1000)
@@ -409,17 +554,21 @@ function DelegationStatus({ event, onSelectSession, onOpenPath }) {
     : running ? Math.max(now, started) - started : null
   const result = delegationResult(event)
   const files = Array.isArray(result?.changed_files) ? result.changed_files : []
+  const report = result?.report && typeof result.report === 'object' ? result.report : null
   return html`<div class=${`delegation-progress ${progress.terminal_reason ? `delegation-${progress.status}` : 'delegation-live'}`} aria-label="Subagent progress">
     <span class="delegation-status">Subagent: ${status}</span>
     ${kind ? html`<span class="delegation-type">${agentLabel(kind)}</span>` : null}
+    ${progress.background ? html`<span class="delegation-background" title="The chat went on while it works; a notice says when it ends.">Background</span>` : null}
     ${settings ? html`<span class="delegation-agent" title=${progress.model ? `Effort and model (${progress.model})` : 'Effort'}>${settings}</span>` : null}
     <span>${progress.completed_tools} completed ${progress.completed_tools === 1 ? 'action' : 'actions'}</span>
     ${progress.last_tool ? html`<span>Last tool: ${progress.last_tool.replace(/_/g, ' ')}</span>` : null}
     ${elapsed != null ? html`<span class="delegation-elapsed" title=${progress.terminal_reason ? 'Time it ran' : 'Time running'}>${elapsedText(elapsed)}</span>` : null}
     ${progress.terminal_reason ? html`<span>Reason: ${progress.terminal_reason.replace(/_/g, ' ')}</span>` : null}
     ${event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}
+    <${SubagentControls} event=${event} progress=${progress} onSelectSession=${onSelectSession} onError=${onError} />
     ${result ? html`<details class="delegation-report"><summary>Report</summary>
-      <${Markdown} text=${result.output} onOpenPath=${onOpenPath} />
+      ${report ? html`<${SubagentReport} report=${report} onOpenPath=${onOpenPath} />` : null}
+      ${result.output ? html`<${Markdown} text=${result.output} onOpenPath=${onOpenPath} />` : null}
       ${files.length ? html`<p class="delegation-files"><strong>Files changed:</strong> ${files.join(', ')}${result.changed_files_total > files.length ? ` and ${result.changed_files_total - files.length} more` : ''}</p>` : null}
       <small class="muted">${[Number.isInteger(result.steps_used) ? `${result.steps_used} ${result.steps_used === 1 ? 'step' : 'steps'}` : '',
         Number.isInteger(result.tool_calls) ? `${result.tool_calls} tool ${result.tool_calls === 1 ? 'call' : 'calls'}` : '',
@@ -431,6 +580,8 @@ function DelegationStatus({ event, onSelectSession, onOpenPath }) {
 // Tools whose input names one file: the file the card's Open file button opens.
 const FILE_INPUTS = { read_file: 'path', write_file: 'path', edit_file: 'path', insert_activity_log: 'path',
   notebook_read: 'path', notebook_edit: 'path', move_path: 'destination', outline_file: 'path' }
+// Tools whose heading names input.path (summarizeTools shortens it).
+const PATH_SUBJECTS = new Set([...Object.keys(FILE_INPUTS), 'delete_path', 'list_files', 'find_files', 'search_files', 'project_overview'])
 
 // What the agent received when it differs from the card (the per-response context allowance).
 function allowanceNote(event) {
@@ -448,6 +599,32 @@ function allowanceNote(event) {
 // Shorter heading labels for narrow chat columns (styles.css swaps them in; the heading's name keeps the full label).
 const SHORT_STATUS = { 'started in background': 'background' }
 
+// "45 s", "10 min", "1 h": a command's time limit (run_command takes 1 to 3,600 seconds).
+const limitText = seconds => seconds >= 3600 && seconds % 3600 === 0 ? `${seconds / 3600} h`
+  : seconds >= 60 && seconds < 3600 && seconds % 60 === 0 ? `${seconds / 60} min` : elapsedText(seconds)
+
+// "8:42", "1:02:03": the short form of a running time for narrow chat columns.
+const clockText = seconds => {
+  const total = Math.max(0, Math.round(seconds))
+  const [hours, minutes, rest] = [Math.floor(total / 3600), Math.floor(total / 60) % 60, String(total % 60).padStart(2, '0')]
+  return hours ? `${hours}:${String(minutes).padStart(2, '0')}:${rest}` : `${minutes}:${rest}`
+}
+
+// How long a running command has run against its time limit, counted each second: "running · 8 min 42 s of 40 min"
+// (a narrow chat column shows "8:42"). started: epoch seconds (the event's job_started).
+function CommandClock({ started, limit }) {
+  const [now, setNow] = useState(() => Date.now() / 1000)
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now() / 1000), 1000)
+    return () => clearInterval(timer)
+  }, [])
+  const seconds = Math.max(0, now - started)
+  return html`<span class="tool-status neutral tool-clock" data-short=${clockText(seconds)}>running · ${elapsedText(seconds)} of ${limitText(limit)}</span>`
+}
+
+// The newest non-empty line of a running command's output (a progress line ended by a carriage return counts).
+const latestLine = output => clip(String(output || '').slice(-4000).split(/\r\n|\r|\n/).map(line => line.trim()).filter(Boolean).at(-1) || '')
+
 function ToolCard({ event, summary, result, status, failure = null, sessionId, onError, onSelectSession, onOpenPath }) {
   const [expanded, setExpanded] = useState(false)
   const filePath = event.input?.[FILE_INPUTS[event.name]]
@@ -460,6 +637,12 @@ function ToolCard({ event, summary, result, status, failure = null, sessionId, o
   const allowInChat = pending ? allowLabel(event) : null
   const rule = ruleLine(event)
   const hooked = hookSummary(event)
+  const hints = hintText(event.mcp_annotations)
+  // A running agent command shows its time against its limit and, collapsed, its latest output line.
+  const runningCommand = event.state === 'running' && event.name === 'run_command'
+  const clock = runningCommand && typeof event.job_started === 'number'
+  const limit = Number.isInteger(event.input?.timeout_seconds) && event.input.timeout_seconds > 0 ? event.input.timeout_seconds : 60
+  const liveLine = runningCommand && !expanded ? latestLine(event.output) : ''
   const decide = async (allowed, extra = {}) => {
     setDeciding(true)
     // The note goes to the model with a Decline; extra is { remember: true } (an exact rule for this chat) or { scope, rule? }.
@@ -472,26 +655,33 @@ function ToolCard({ event, summary, result, status, failure = null, sessionId, o
     <button class="tool-heading" onClick=${() => setExpanded(v => !v)} aria-expanded=${expanded || pending}
       aria-label=${[title, summary.subject, summary.taskStatus ? `Task: ${summary.taskStatus}` : '', status.label].filter(Boolean).join(' ')}>
       ${event.name?.toLowerCase().includes('command') || event.name === 'Bash' ? html`<${Terminal} size=${16} />` : html`<${FileText} size=${16} />`}
-      <span class="tool-name">${title}</span><span class="tool-subject" title=${summary.subject}>${summary.subject}</span>
+      <span class="tool-name">${title}</span><span class="tool-subject" title=${summary.subject}>${summary.shown ?? summary.subject}</span>
       ${summary.taskStatus ? html`<span class="tool-task-status">Task: ${summary.taskStatus}</span>` : null}
       ${status.tone === 'running' ? html`<${LoaderCircle} size=${14} className="spin" />` : status.tone === 'ok' ? html`<${Check} size=${14} className="success-icon" />`
         : status.tone === 'warn' ? html`<${CircleAlert} size=${14} className="warning-icon" />` : null}
       ${status.label ? html`<span class=${`tool-status ${status.labelTone === 'neutral' ? 'neutral' : ''}`} data-short=${SHORT_STATUS[status.label]}>${status.label}</span>` : null}
+      ${clock ? html`<${CommandClock} started=${event.job_started} limit=${limit} />` : null}
       ${expanded || pending ? html`<${ChevronDown} size=${14} />` : html`<${ChevronRight} size=${14} />`}
     </button>
-    <${DelegationStatus} event=${event} onSelectSession=${onSelectSession} onOpenPath=${onOpenPath} />
+    <${DelegationStatus} event=${event} onSelectSession=${onSelectSession} onOpenPath=${onOpenPath} onError=${onError} />
+    ${event.sibling_change ? html`<p class="tool-sibling">Another subagent of this chat (${agentLabel(event.sibling_change.agent_type)}, ${String(event.sibling_change.subagent_id).slice(0, 8)}) changed ${event.sibling_change.path} during its run${event.state === 'pending' ? ', so this change asks first. Approve it only if both changes should stay.' : '.'}</p>` : null}
+    ${liveLine ? html`<p class="tool-live" title=${liveLine}>${liveLine}</p>` : null}
     ${rule ? html`<p class="tool-rule">${rule}</p>` : null}
     ${hooked ? html`<p class="hook-outcome">${hooked}</p>` : null}
+    ${hints ? html`<p class="tool-hints" title="Hints from the MCP server. They never change approvals.">Server says: ${hints}</p>` : null}
     ${expanded || pending ? html`<div class="tool-body">
-      ${pending ? html`<p>Local needs your approval to ${title.toLowerCase()}.${event.approval_expires
+      ${pending ? html`<p>${approvalAsk(event, title)}${event.approval_expires
           ? ` If you do not answer by ${expiryTime(event.approval_expires)}, it will not run.` : ''}</p>
         <${ApprovalOptions} event=${event} sessionId=${sessionId} onError=${onError} deciding=${deciding} onDecide=${decide} allowInChat=${allowInChat}
+          approveLabel=${event.name === 'web_fetch' ? 'Allow once' : 'Approve'}
           details=${html`<${ToolDetails} event=${event} pending=${true} />`}
           declineNote=${html`<label class="decline-note"><span>Tell the agent why (optional)</span>
             <textarea rows=${2} maxLength=${2000} spellcheck=${false} value=${note} disabled=${deciding}
               onInput=${e => setNote(e.currentTarget.value)} /></label>`} />`
         : html`${event.state === 'completed' && allowanceNote(event) ? html`<p class="tool-allowance">${allowanceNote(event)}</p>` : null}
-          <${ToolDetails} event=${event} pending=${false} result=${result} failure=${failure} /><small class="muted">Action: ${actionText(event, status)}${status.label ? html` · <span class="tool-status-text">${status.label}</span>` : ''}</small>
+          <${ToolDetails} event=${event} pending=${false} result=${result} failure=${failure} />
+          ${Array.isArray(event.mcp_images) && event.mcp_images.length ? html`<${McpImages} images=${event.mcp_images} sessionId=${sessionId} />` : null}
+          <small class="muted">Action: ${actionText(event, status)}${status.label ? html` · <span class="tool-status-text">${status.label}</span>` : ''}</small>
           ${onOpenPath && typeof filePath === 'string' && filePath ? html`<button class="outline tool-open-file"
             onClick=${() => onOpenPath(startLine ? { path: filePath, line: startLine } : { path: filePath })}><${FileText} size=${14} />Open file</button>` : null}`}
     </div>` : null}
@@ -530,8 +720,10 @@ function Markdown({ text, streaming = false, onOpenPath }) {
   return html`<div class="markdown" ref=${element} onClick=${open} dangerouslySetInnerHTML=${{ __html: markup }} />`
 }
 
-// Chips under a user message for its @ file snapshots and ! command outputs (metadata only).
+// Chips under a user message for its @ file snapshots, ! command outputs and attached documents and images
+// (metadata only).
 export function attachmentLabel(item) {
+  if (item?.kind === 'document' || item?.kind === 'image') return sentLabel(item)
   if (item?.kind === 'shell') {
     const command = String(item.command || '')
     return `! ${command.length > 60 ? `${command.slice(0, 59)}…` : command} · exit ${item.exit_code ?? '?'}`
@@ -543,6 +735,72 @@ export function attachmentLabel(item) {
 function Attachments({ items }) {
   if (!Array.isArray(items) || !items.length) return null
   return html`<ul class="attachment-chips" aria-label="Attachments">${items.map((item, index) => html`<li key=${index} class="attachment-chip">${attachmentLabel(item)}</li>`)}</ul>`
+}
+
+// What went to the agent with a user message besides its text: the command templates it ran (commands: [{ name,
+// path }], expanded after the text), the skills it selected for itself (skills: [id]), verbatim (sent as plain text;
+// the app's own message after a background subagent always is, and says so above it instead),
+// and git_context (the app's Git snapshot: Settings → Git status in messages).
+function SentWith({ event }) {
+  const commands = Array.isArray(event.commands) ? event.commands : []
+  const skills = Array.isArray(event.skills) ? event.skills : []
+  const verbatim = event.verbatim && !event.background_wake
+  if (!commands.length && !skills.length && !verbatim && !event.git_context) return null
+  return html`<ul class="attachment-chips sent-with" aria-label="Sent with this message">
+    ${commands.map(item => html`<li key=${`command-${item.name}`} class="attachment-chip" title=${`The agent got the text of ${item.path} after your message`}>Command /${item.name} · ${item.path}</li>`)}
+    ${skills.map(id => html`<li key=${`skill-${id}`} class="attachment-chip" title="The skill's instructions went with this message only">Skill /${id}</li>`)}
+    ${verbatim ? html`<li class="attachment-chip">Sent as plain text</li>` : null}
+    ${event.git_context ? html`<li class="attachment-chip" title="The branch, upstream, change counts and recent commits, read by the app when you sent this">Git status</li>` : null}
+  </ul>`
+}
+
+// report_findings (a review skill's result): { summary, findings: [{ path, line?, end_line?, severity, title, detail?,
+// suggestion? }] }, as the app recorded it (redacted) in the tool event's input.
+const SEVERITIES = ['high', 'medium', 'low', 'info']
+const findingSeverity = item => SEVERITIES.includes(item?.severity) ? item.severity : 'info'
+export function findingLocation(item) {
+  const line = Number.isInteger(item?.line) && item.line > 0 ? item.line : null
+  const end = line && Number.isInteger(item.end_line) && item.end_line > line ? item.end_line : null
+  return `${String(item?.path || '')}${line ? `:${line}` : ''}${end ? `-${end}` : ''}`
+}
+export function findingsMarkdown(report) {
+  const findings = Array.isArray(report?.findings) ? report.findings : []
+  const lines = ['## Review findings', '']
+  if (report?.summary) lines.push(String(report.summary).trim(), '')
+  if (!findings.length) lines.push('No findings.')
+  findings.forEach((item, index) => {
+    lines.push(`${index + 1}. **${findingSeverity(item)}** \`${findingLocation(item)}\` ${String(item.title || '').trim()}`)
+    if (item.detail) lines.push(`   ${String(item.detail).trim().replace(/\n/g, '\n   ')}`)
+    if (item.suggestion) lines.push(`   Suggestion: ${String(item.suggestion).trim().replace(/\n/g, '\n   ')}`)
+  })
+  return lines.join('\n') + '\n'
+}
+
+// The card of a recorded report_findings call: counts by severity, each finding with its severity, a link that opens
+// the file at its line (onOpenPath), its title, detail and suggestion, and Copy as Markdown.
+function FindingsCard({ event, onOpenPath }) {
+  const report = event.input && typeof event.input === 'object' ? event.input : {}
+  const findings = (Array.isArray(report.findings) ? report.findings : []).filter(item => item && typeof item === 'object')
+  const counts = SEVERITIES.map(level => [level, findings.filter(item => findingSeverity(item) === level).length]).filter(([, count]) => count)
+  return html`<section class="findings-card" aria-label="Review findings">
+    <header><span class="findings-title">Review findings</span>
+      <span class="findings-counts">${counts.length ? counts.map(([level, count]) => html`<span key=${level} class=${`finding-severity ${level}`}>${count} ${level}</span>`) : html`<span class="finding-severity info">none</span>`}</span>
+      <${CopyAction} text=${findingsMarkdown({ ...report, findings })} label="Copy findings as Markdown" /></header>
+    ${report.summary ? html`<p class="findings-summary">${report.summary}</p>` : null}
+    ${findings.length ? html`<ol class="findings-list">${findings.map((item, index) => {
+      const level = findingSeverity(item)
+      const where = findingLocation(item)
+      const line = Number.isInteger(item.line) && item.line > 0 ? item.line : undefined
+      return html`<li key=${index} class=${`finding ${level}`}>
+        <div class="finding-head"><span class=${`finding-severity ${level}`}>${level}</span>
+          ${onOpenPath && item.path ? html`<button type="button" class="finding-location" title=${`Open ${where}`}
+            onClick=${() => onOpenPath(line ? { path: item.path, line } : { path: item.path })}>${where}</button>` : html`<code class="finding-location">${where}</code>`}
+          <span class="finding-title">${item.title}</span></div>
+        ${item.detail ? html`<p class="finding-detail">${item.detail}</p>` : null}
+        ${item.suggestion ? html`<p class="finding-suggestion"><strong>Suggestion:</strong> ${item.suggestion}</p>` : null}
+      </li>`
+    })}</ol>` : html`<p class="findings-empty">No findings.</p>`}
+  </section>`
 }
 
 // What user_prompt hooks did to a message (lifecycle_hooks.prompt_hooks): hook_blocked ({ hook_id, reason }: never
@@ -599,21 +857,60 @@ function Thinking({ text, truncated, started, seconds, streaming, answering, rea
   </details>`
 }
 
-function Reply({ text, reasoning, truncated, started, seconds, requestInfo, onOpenPath, actions = null }) {
+// The turn's result under its last reply (turnResult.js): steps, tools, time, tokens and DBU; opened, how it ended.
+function TurnFooter({ result }) {
+  const summary = turnSummary(result)
+  if (!summary) return null
+  return html`<details class="turn-summary"><summary><span class="sr-only">Turn summary: </span>${summary.text}</summary>
+    <p>${summary.details}</p></details>`
+}
+
+function Reply({ text, reasoning, truncated, started, seconds, wait, requestInfo, onOpenPath, actions = null, turnResult = null }) {
   const streaming = requestInfo?.status === 'running'
   return html`<div class="assistant-reply"><${Brand} small=${true} />
     <div class="reply-content"><${Thinking} text=${reasoning} truncated=${truncated} started=${started} seconds=${seconds}
       streaming=${streaming} answering=${!!text} reasoningTokens=${requestInfo?.usage?.reasoning_tokens} /><${Markdown} text=${text} streaming=${streaming} onOpenPath=${onOpenPath} />
       ${text || actions ? html`<div class="message-actions">${text ? html`<${CopyAction} text=${text} label="Copy response" />` : null}${actions}</div>` : null}
-      ${requestInfo ? html`<${RequestDetails} info=${requestInfo} />` : null}
+      ${requestInfo ? html`<${RequestDetails} info=${requestInfo} reasoningWait=${wait} reasoningText=${!!reasoning} />` : null}
+      ${turnResult && !streaming ? html`<${TurnFooter} result=${turnResult} />` : null}
     </div></div>`
+}
+
+// The cards waiting for your answer (an approval, a question, a plan): one per pending tool event, in transcript order.
+export const PENDING_CARDS = '.tool-card.needs-approval, .question-card.needs-answer, .plan-card.needs-answer'
+
+// Scrolls a waiting card into view and, with focus, moves keyboard focus to where answering starts: a tool card's
+// heading (it names the action; Tab reaches the buttons), a question's first option, a plan's first review button.
+// A card taller than the transcript cannot be shown whole; the view then keeps in sight the focused control (a long
+// plan's review buttons on a phone, where they are not sticky), or without focus an approval card's end with its
+// buttons.
+export function revealCard(card, focus = false) {
+  const box = card?.closest('.transcript')
+  if (!box) return
+  const tool = card.matches('.tool-card')
+  const target = !focus ? null : tool ? card.querySelector('.tool-heading')
+    : card.querySelector('input:not(:disabled)') || card.querySelector(':is(.plan-actions, .approval-buttons) button:not(:disabled)')
+  // Where the view ends up is found with instant scrolls (the browser's own 'nearest', scroll-padding included) and
+  // then reached with the transcript's smooth scroll from where it was.
+  const from = box.scrollTop
+  card.scrollIntoView({ block: 'nearest', behavior: 'instant' })
+  const top = box.getBoundingClientRect().top + box.clientTop
+  const seen = element => (place => place.top >= top - 0.5 && place.bottom <= top + box.clientHeight + 0.5)(element.getBoundingClientRect())
+  if (target && !seen(target)) target.scrollIntoView({ block: 'nearest', behavior: 'instant' })
+  else if (!target && tool && !seen(card)) card.scrollIntoView({ block: 'end', behavior: 'instant' })
+  const to = box.scrollTop
+  box.scrollTo({ top: from, behavior: 'instant' })
+  box.scrollTo({ top: to })
+  target?.focus({ preventScroll: true })
 }
 
 // onOpenPath({ path, line? }) opens a file named in a reply or a tool card in the Workspace panel.
 // onLoadEarlier() -> Promise loads the page of messages before the first loaded one (session.events_start > 0).
 // busy: the chat is not idle (message actions other than Copy are hidden).
 // onPrefill(text) puts text in an empty composer and returns false when a typed draft was kept.
-export default function Conversation({ session, onError, onSelectSession, onOpenPath, busy = false, onPrefill, onLoadEarlier }) {
+// roots: absolute folders besides the chat's allowed folders (the default code folder) whose files tool cards name
+// as "<folder name>/rest".
+export default function Conversation({ session, onError, onSelectSession, onOpenPath, busy = false, onPrefill, onLoadEarlier, roots = [] }) {
   const container = useRef(null)
   const bottom = useRef(null)
   const follow = useRef(true)
@@ -634,12 +931,42 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
     anchor.current = el ? { top: el.scrollTop, height: el.scrollHeight, focused: document.activeElement === event?.currentTarget } : null
     void Promise.resolve(onLoadEarlier?.()).catch(error => { anchor.current = null; onError?.(error.message) })
   }
-  const toolSummaries = useMemo(() => summarizeTools(session.events), [session.events])
+  const rootsKey = JSON.stringify([...(session.allowed_directories || []), ...roots])
+  const shorten = useMemo(() => pathShortener(session.workspace, JSON.parse(rootsKey)), [session.workspace, rootsKey])
+  const projectName = String(session.workspace || '').split('/').filter(Boolean).at(-1) || ''
+  const toolSummaries = useMemo(() => summarizeTools(session.events, shorten, projectName), [session.events, shorten, projectName])
   // Map<event id, { result, status }>: parsed once per event (see toolState).
   const toolStates = useMemo(() => new Map(session.events.filter(event => event.type === 'tool').map(event => [event.id, toolState(event)])), [session.events])
   const last = session.events[session.events.length - 1]
   useEffect(() => { if (follow.current) bottom.current?.scrollIntoView({ block: 'end' }) }, [last?.id, last?.text, last?.state])
   useEffect(() => { follow.current = true; bottom.current?.scrollIntoView({ block: 'end' }) }, [session.id])
+  // A card that starts waiting for you is scrolled into view, also when you scrolled up to read: it is the one moment
+  // you must act. Only when it starts waiting, so reading older output is not disturbed afterwards; while the view
+  // follows the end, the scroll above already shows the last card.
+  const waitingIds = useRef(null)
+  // The card that just started waiting, until the 'awaiting_approval' status that usually follows it.
+  const justWaiting = useRef(null)
+  const pendingIds = () => session.events.filter(event => event.type === 'tool' && event.state === 'pending').map(event => event.id)
+  useEffect(() => {
+    const waiting = pendingIds()
+    const before = waitingIds.current
+    waitingIds.current = new Set(waiting)
+    if (!before) return
+    const index = waiting.findLastIndex(id => !before.has(id))
+    if (index < 0) return
+    justWaiting.current = session.status === 'awaiting_approval' ? null : waiting[index]
+    if (follow.current && waiting[index] === last?.id) return
+    revealCard(container.current?.querySelectorAll(PENDING_CARDS)[index])
+  }, [session.events])
+  // That status puts a hint under the message box, which makes the transcript shorter and can cut off the bottom of
+  // the card, where Approve is: the card is brought into view again, once.
+  useEffect(() => {
+    const id = justWaiting.current
+    if (session.status !== 'awaiting_approval' || id == null) return
+    justWaiting.current = null
+    const index = pendingIds().indexOf(id)
+    if (index >= 0) revealCard(container.current?.querySelectorAll(PENDING_CARDS)[index])
+  }, [session.status])
   const tools = session.events.filter(event => event.type === 'tool')
   // Edit and resend, Retry, Rewind and Fork from here (history.py on the server).
   const [editing, setEditing] = useState(null)  // the user event id being edited
@@ -687,7 +1014,7 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
   const focusMessageBox = () => document.querySelector('textarea[aria-label="Message"]')?.focus()
   // After a conversation rewind whose resend failed, the text to send waits in the message box.
   const resent = (result, text) => {
-    const draftKept = result.resend_error && onPrefill ? onPrefill(text) === false : false
+    const draftKept = result.resend_error && onPrefill && text ? onPrefill(text) === false : false
     rewound({ backupId: result.backup_session_id }, draftKept)
     if (result.resend_error) onError(result.resend_error)
     focusMessageBox()
@@ -697,8 +1024,11 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
     setRetrying(true)
     try {
       const result = await api(`/sessions/${encodeURIComponent(session.id)}/rewind`, 'POST',
-        { before_event_id: cuts.latestUser.id, conversation: true, resend_text: cuts.latestUser.text })
-      resent(result, cuts.latestUser.text)
+        { before_event_id: cuts.latestUser.id, conversation: true, resend_text: cuts.latestUser.text,
+          ...(cuts.latestUser.verbatim ? { resend_verbatim: true } : {}),
+          ...(sentUploads(cuts.latestUser).length ? { resend_uploads: sentUploads(cuts.latestUser) } : {}) })
+      // The server keeps the app's message after a background subagent the app's; it is never put in your message box.
+      resent(result, cuts.latestUser.background_wake ? '' : cuts.latestUser.text)
     } catch (e) { onError(e) }
     finally { setRetrying(false) }
   }
@@ -731,24 +1061,28 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
           setEditing(null)
           resent(result, text)
         }} />`
-      if (event.type === 'user') return html`<div class=${`user-message${event.steered ? ' steered' : ''}${event.hook_blocked ? ' hook-blocked' : ''}`} key=${event.id}>${event.steered ? html`<small class="steered-label">Sent while the agent was working</small>` : null}${event.origin?.kind === 'delegated' ? html`<small class="delegation-origin">Delegated by parent conversation</small>` : null}<${HookMessageLabel} event=${event} />${event.text}<${Attachments} items=${event.attachments} /><${HookMessageDetails} event=${event} />${event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}${event.text || idle ? html`<div class="message-actions">${event.text ? html`<${CopyAction} text=${event.text} label="Copy message" />` : null}${idle ? html`<${ActionButton} label="Edit message" icon=${Pencil} target=${`edit:${event.id}`} onClick=${() => setEditing(event.id)} /><${ActionButton} label="Rewind to here" icon=${Undo2} onClick=${() => setRewinding(event)} />` : null}</div>` : null}</div>`
+      if (event.type === 'user') return html`<div class=${`user-message${event.steered ? ' steered' : ''}${event.hook_blocked ? ' hook-blocked' : ''}`} key=${event.id}>${event.steered ? html`<small class="steered-label">Sent while the agent was working</small>` : null}${event.origin?.kind === 'delegated' ? html`<small class="delegation-origin">Delegated by parent conversation</small>` : null}${event.background_wake ? html`<small class="delegation-origin">Sent by the app when a background subagent finished</small>` : null}<${HookMessageLabel} event=${event} />${event.text}<${Attachments} items=${event.attachments} /><${SentWith} event=${event} /><${HookMessageDetails} event=${event} />${event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}${event.text || idle ? html`<div class="message-actions">${event.text ? html`<${CopyAction} text=${event.text} label="Copy message" />` : null}${idle ? html`${event.background_wake ? null : html`<${ActionButton} label="Edit message" icon=${Pencil} target=${`edit:${event.id}`} onClick=${() => setEditing(event.id)} />`}<${ActionButton} label="Rewind to here" icon=${Undo2} onClick=${() => setRewinding(event)} />` : null}</div>` : null}</div>`
       if (event.type === 'tool' && event.name === 'ask_user') return html`<${QuestionCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
       if (event.type === 'tool' && event.name === 'submit_plan') return html`<${PlanCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
+      if (event.type === 'tool' && event.name === 'report_findings' && event.state === 'completed') return html`<${FindingsCard} key=${event.id} event=${event} onOpenPath=${onOpenPath} />`
       if (event.type === 'tool') return html`<${ToolCard} key=${event.id} event=${event} summary=${toolSummaries.get(event.id)} result=${toolStates.get(event.id).result} status=${toolStates.get(event.id).status} failure=${toolStates.get(event.id).failure} sessionId=${session.id} onError=${onError} onSelectSession=${onSelectSession} onOpenPath=${onOpenPath} />`
-      if (event.type === 'assistant') return event.text || event.reasoning_summary || event.request_info || event.reasoning_started ? html`<${Reply} key=${event.id} text=${event.text || ''} reasoning=${event.reasoning_summary} truncated=${event.reasoning_truncated} started=${event.reasoning_started} seconds=${event.reasoning_seconds} requestInfo=${event.request_info} onOpenPath=${onOpenPath} actions=${event.text ? replyActions(event) : null} />` : null
+      if (event.type === 'assistant') return event.text || event.reasoning_summary || event.request_info || event.reasoning_started ? html`<${Reply} key=${event.id} text=${event.text || ''} reasoning=${event.reasoning_summary} truncated=${event.reasoning_truncated} started=${event.reasoning_started} seconds=${event.reasoning_seconds} wait=${event.reasoning_wait_seconds} requestInfo=${event.request_info} onOpenPath=${onOpenPath} actions=${event.text ? replyActions(event) : null} turnResult=${event.turn_result} />` : null
       const marker = event.type !== 'error' && (!!event.stop_phase || event.text === STOPPED_TEXT)
       const classes = ['conversation-notice', event.type === 'error' && 'error', marker && 'stop-marker', event.compaction && 'compaction'].filter(Boolean).join(' ')
       if (marker) return html`<div class=${classes} key=${event.id} title=${event.text}>${STOP_TEXT[event.stop_phase] || 'Stopped'}</div>`
       const error = event.type === 'error' ? noticeError(event) : null
-      return html`<div class=${classes} key=${event.id} role=${error ? 'note' : undefined}>${error ? html`<p class="notice-summary">${error.summary}</p>${error.details
-          ? html`<details class="notice-details"><summary>Details</summary><pre>${error.details}</pre></details>` : null}` : idle ? idleNotice(event.text) : event.text}<${DelegationStatus} event=${event} onSelectSession=${onSelectSession} />${!event.delegation && event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}</div>`
+      // A rate-limit notice's Details: the 429's code, message and Retry-After (AgentEvent.details).
+      const details = error ? error.details : typeof event.details === 'string' && event.details ? event.details : null
+      return html`<div class=${classes} key=${event.id} role=${error ? 'note' : undefined}>${error ? html`<p class="notice-summary">${error.summary}</p>` : idle ? idleNotice(event.text) : event.text}${details
+          ? html`<details class="notice-details"><summary>Details</summary><pre>${details}</pre></details>` : null}<${DelegationStatus} event=${event} onSelectSession=${onSelectSession} onError=${onError} />${!event.delegation && (event.child_session_id || event.subagent_id) && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id || event.subagent_id)}>Open subagent</button>` : null}</div>`
     })}
     ${['running', 'delegating'].includes(session.status) ? html`<div class="working-indicator"><span /><span /><span /><span class="sr-only">Working</span></div>` : null}
     ${rewinding && idle ? html`<${RewindDialog} session=${session} event=${rewinding} onClose=${() => setRewinding(null)}
       onSelectSession=${onSelectSession}
       onRewound=${result => {
         setRewinding(null)
-        rewound(result, result.conversation && onPrefill ? onPrefill(rewinding.text || '') === false : false)
+        // The app's message after a background subagent is not put in your message box as yours.
+        rewound(result, result.conversation && onPrefill && !rewinding.background_wake ? onPrefill(rewinding.text || '') === false : false)
         if (result.conversation) focusMessageBox()
       }} />` : null}
     ${forking !== undefined && onSelectSession ? html`<${ForkDialog} session=${session} beforeEventId=${forking.beforeEventId}
