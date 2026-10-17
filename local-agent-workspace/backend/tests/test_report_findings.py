@@ -149,14 +149,23 @@ async def test_a_custom_agent_whose_skill_names_it_is_offered_it(tmp_path, monke
     store.save(parent)
     write_agent(project, "reviewer", "---\ndescription: Reviews diffs.\nskills: [review]\n---\nReview the diff.\n")
     write_agent(project, "mapper", "---\ndescription: Maps.\nskills: [verify]\n---\nMap it.\n")
+    # A tools list does not take the skill's tool away; disallowed_tools does.
+    write_agent(project, "narrow", "---\ndescription: Reviews.\nskills: [review]\ntools: [read_file, search_files]\n"
+                                   "---\nReview it.\n")
+    write_agent(project, "silent", "---\ndescription: Reviews.\nskills: [review]\ntools: [read_file]\n"
+                                   "disallowed_tools: [report_findings]\n---\nReview it.\n")
     gateway = Gateway(monkeypatch, [lambda: calls_reply(("delegate_task", {"task": "Review", "agent_type": "reviewer"}, "a"),
-                                                        ("delegate_task", {"task": "Map", "agent_type": "mapper"}, "b")),
+                                                        ("delegate_task", {"task": "Map", "agent_type": "mapper"}, "b"),
+                                                        ("delegate_task", {"task": "Narrow", "agent_type": "narrow"}, "c"),
+                                                        ("delegate_task", {"task": "Silent", "agent_type": "silent"}, "d")),
                                     lambda: reply("Done.")])
     try:
         saved = await run_turn(manager, parent)
         tools = {body["messages"][1]["content"].split("\n")[1]: [tool["function"]["name"] for tool in body["tools"]]
                  for _, body in gateway.requests["child"]}
         assert FINDINGS_TOOL in tools["Review"] and FINDINGS_TOOL not in tools["Map"]
+        assert set(tools["Narrow"]) == {"read_file", "search_files", FINDINGS_TOOL, "submit_report"}
+        assert tools["Silent"] == ["read_file", "submit_report"]
         assert manager.store.get(card(saved, "a")["child_session_id"])["findings_tool"] is True
         assert FINDINGS_TOOL not in offered(manager, saved)  # The parent selected no review skill.
     finally:
@@ -164,8 +173,10 @@ async def test_a_custom_agent_whose_skill_names_it_is_offered_it(tmp_path, monke
         store.db.close()
 
 
-async def test_a_subagents_findings_reach_the_parent_with_its_report(tmp_path, monkeypatch):
-    """The parent model sees only the child's report, never its card: the findings are listed in it."""
+@pytest.mark.parametrize("tools_line", ["", "tools: [read_file, search_files]\n"])
+async def test_a_subagents_findings_reach_the_parent_with_its_report(tmp_path, monkeypatch, tools_line):
+    """The parent model sees only the child's report, never its card: the findings are listed in it (also when the
+    agent file has a tools list, which does not take report_findings away)."""
     from test_custom_agents import REAL_CLIENT, calls_reply, card, reply, run_turn, write_agent
     from local_agent.prompt_cache import unmarked
     monkeypatch.setattr("local_agent.config.APP_ROOT", tmp_path)
@@ -181,7 +192,7 @@ async def test_a_subagents_findings_reach_the_parent_with_its_report(tmp_path, m
     parent = store.create(settings.values)
     parent.update(title="Parent", title_generated=True, permission_mode="bypassPermissions")
     store.save(parent)
-    write_agent(project, "reviewer", "---\ndescription: Reviews diffs.\nskills: [review]\n---\nReview the diff.\n")
+    write_agent(project, "reviewer", f"---\ndescription: Reviews diffs.\nskills: [review]\n{tools_line}---\nReview the diff.\n")
     report = {"summary": "One bug.", "findings": [{**FINDING, "detail": f"Logs {TOKEN} too."}]}
     requests = {"parent": [], "child": []}
 

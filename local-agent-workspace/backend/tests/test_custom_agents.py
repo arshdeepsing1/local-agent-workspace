@@ -531,6 +531,26 @@ async def test_a_custom_agent_tool_outside_its_list_is_refused(runtime):
     assert not (project / "x.txt").exists()
 
 
+async def test_a_tools_list_keeps_get_tool_output_for_a_kept_result_and_disallowed_tools_takes_it_away(runtime):
+    """get_tool_output follows the chat's rules like submit_report: a long web_fetch result of an agent whose
+    tools list names web_fetch can be read on; disallowed_tools still takes the helper away."""
+    manager, parent, project = runtime
+    child = manager.store.create({"workspace": str(project), "model": "test-model"})
+    child.update(is_subagent=True, tool_profile="inherit", agent_type="researcher", agent_tools=["read_file", "web_fetch"])
+    offered_now = lambda: [item["function"]["name"] for item in manager.offered_tools(child, [])[0]]
+    assert offered_now() == ["read_file", "web_fetch", "submit_report"]
+    result_id = manager.results.add(child["id"], "word " * 3000, "Untrusted web content")
+    child["tool_output_offered"] = True  # What a long web_fetch or MCP result sets (AgentManager.fetch_page).
+    assert offered_now() == ["read_file", "get_tool_output", "web_fetch", "submit_report"]
+    output = await manager.execute_tool(child, manager.session_tools(child), "get_tool_output",
+                                        {"result_id": result_id, "offset": 10, "max_chars": 20}, "g")
+    assert json.loads(output)["output"] == "word " * 4
+    child["agent_denied_tools"] = ["get_tool_output"]
+    assert "get_tool_output" not in offered_now()
+    output = await manager.execute_tool(child, manager.session_tools(child), "get_tool_output", {"result_id": result_id}, "h")
+    assert output == "The researcher agent's file disallows get_tool_output (disallowed_tools). Use only the available tools."
+
+
 async def test_no_tool_of_the_agent_fits_the_ceiling_and_unknown_names_are_refused_before_a_child(runtime):
     manager, parent, project = runtime
     write_agent(project, "runner", agent_text("Runs things.", profile="inherit", tools="[run_command]"))
@@ -1051,13 +1071,20 @@ async def test_only_the_agents_mcp_servers_start(runtime):
     with pytest.raises(Stop):
         await manager._run_turn(child, "x")
     assert seen == [["third", "other", "third"]]
+    # Nor do the servers its disallowed_tools take away whole, or whose tools its tools list names none of.
+    without = {key: value for key, value in child.items() if key != "agent_mcp_servers"}
+    for narrowed, expected in (({"agent_denied_tools": ["mcp__docs__*", "mcp__other__one"]}, ["third", "docs"]),
+                               ({"agent_tools": ["read_file", "mcp__docs__x"]}, ["third", "other", "third"])):
+        with pytest.raises(Stop):
+            await manager._run_turn({**without, **narrowed}, "x")
+        assert seen[-1] == expected
     ran = []
 
     async def without_servers(session, prompt, external, **extra):
         ran.append(external)
     manager._run_databricks = without_servers
     await manager._run_turn({**child, "agent_mcp_servers": []}, "x")  # mcp_servers: [] starts none.
-    assert ran == [[]] and len(seen) == 1
+    assert ran == [[]] and len(seen) == 3
 
 
 async def test_a_parent_mode_change_keeps_the_agents_narrower_mode(runtime):

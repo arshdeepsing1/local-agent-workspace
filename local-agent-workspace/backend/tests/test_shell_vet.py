@@ -280,12 +280,30 @@ def test_globs_expand_in_the_cwd_sorted_without_dotfiles(world):
 def test_recursive_searches_skip_credential_names(world):
     plan, _ = plan_of(world, "grep -rn TOKEN")
     run = plan.stages[0].run
-    assert "--exclude=.env" in run and "--exclude=*.pem" in run and "--exclude-dir=.ssh" in run
-    assert "--exclude=.env.*" in run and "--exclude=.envrc" in run and "--exclude=*token" in run
-    assert "--exclude=.env*" not in run  # An .envs folder or .environment file is searched.
+    # grep compares --exclude names case-sensitively: each glob names every case (.ENV, SERVER.PEM, .SSH).
+    assert "--exclude=.[eE][nN][vV]" in run and "--exclude=*.[pP][eE][mM]" in run and "--exclude-dir=.[sS][sS][hH]" in run
+    assert "--exclude=.[eE][nN][vV].*" in run and "--exclude=.[eE][nN][vV][rR][cC]" in run
+    assert "--exclude=*[tT][oO][kK][eE][nN]" in run
+    assert "--exclude=.[eE][nN][vV]*" not in run  # An .envs folder or .environment file is searched.
     assert run[-2:] == ("TOKEN", ".")
     plan, _ = plan_of(world, "grep -n TOKEN README.md")
     assert not any(word.startswith("--exclude") for word in plan.stages[0].run)
+
+
+def test_grep_exclusions_name_every_case_or_the_search_is_not_vetted(world):
+    assert shell_vet.any_case_glob("prod-[ab].yaml") == "[pP][rR][oO][dD]-[abAB].[yY][aA][mM][lL]"
+    assert shell_vet.any_case_glob("[!a-c]*.key") == "[!a-cA-C]*.[kK][eE][yY]"
+    assert shell_vet.any_case_glob("x[0-9]_?.tfvars") == "[xX][0-9]_?.[tT][fF][vV][aA][rR][sS]"
+    for pattern in ("[a-Z].key", "[^a].key", "[[:alpha:]].key", "a\\b", "é.key", "[a"):
+        assert shell_vet.any_case_glob(pattern) is None, pattern
+    manager = world[0]
+    manager.settings.values["secret_file_patterns"] = ["é.key"]
+    try:
+        plan, reason = plan_of(world, "grep -rn TOKEN")
+        assert plan is None and "cannot skip a secret file name pattern in every case; use rg" in reason
+        assert plan_of(world, "grep -n TOKEN README.md")[0] is not None  # Not recursive: no exclusions needed.
+    finally:
+        manager.settings.values.pop("secret_file_patterns")
 
 
 @needs_rg
@@ -482,6 +500,25 @@ async def test_recursive_grep_never_reads_credential_files(runtime):
     assert "src/a.py:1:alpha = 1" in result["output"]
     assert "project-env-secret" not in result["output"] and "secrets.yaml" not in result["output"]
     assert "envrc-secret" not in result["output"] and "db-token-secret" not in result["output"]
+
+
+@pytest.mark.parametrize("mode", ["auto", "plan"])
+async def test_recursive_grep_skips_credential_files_whatever_the_case_of_their_names(runtime, mode):
+    """The file tools and the command check compare names casefolded; grep's --exclude does not."""
+    manager, session, project, tools = runtime
+    session["permission_mode"] = mode
+    manager.settings.values["secret_file_patterns"] = ["*.tfvars"]
+    (project / "infra").mkdir()
+    (project / "keys" / ".SSH").mkdir()
+    for path, text in ((".ENV", "env-upper"), (".Env.Local", "envlocal-mixed"), ("keys/SERVER.PEM", "pem-upper"),
+                       ("notes/API_TOKEN.TXT", "token-upper"), ("infra/PROD.TFVARS", "tfvars-upper"),
+                       ("keys/.SSH/id_test", "ssh-upper"), ("infra/prod.tfvars", "tfvars-lower")):
+        (project / path).write_text(f"value = {text}\n")
+    output = json.loads(await run(manager, session, tools, "grep -rn = .", "g"))["output"]
+    assert event_of(session, "g")["state"] == "completed" and "src/a.py:1:alpha = 1" in output
+    leaked = [text for text in ("env-upper", "envlocal-mixed", "pem-upper", "token-upper", "tfvars-upper", "ssh-upper",
+                                "tfvars-lower") if text in output]
+    assert leaked == []
 
 
 async def test_awk_sed_and_sort_run(runtime):

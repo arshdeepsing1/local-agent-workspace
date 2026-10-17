@@ -15,7 +15,6 @@ import secrets
 from pathlib import Path
 
 from . import uploads as attached
-from .activity import redact_secrets
 from .documents import BINARY_FORMATS, document_format, format_label
 from .model_profiles import profile_for
 from .tool_profiles import tool_allowed
@@ -141,8 +140,9 @@ def _snapshot(manager, session, tools, mention):
         raise MentionError(token, file_error(exc)) from None
     content, last = result["content"], result["end_line"]
     shortened = (last < mention["end"]) if mention["start"] else result["next_line"] is not None
-    # Redacted before it is shortened: a cut through a secret would leave a part no pattern matches.
-    content = manager.settings.redact(redact_secrets(content))
+    # Redacted before it is shortened (a cut through a secret would leave a part no pattern matches), like
+    # read_file and command output: the credential file's values and MCP secret references too.
+    content = manager.redact_sent(content)
     if len(content) > FILE_CHARS:
         cut = content.rfind("\n", 0, FILE_CHARS + 1)
         content = content[:cut] if cut > 0 else content[:FILE_CHARS]
@@ -215,7 +215,7 @@ def _uploaded(manager, session, uploads, notes, on_error):
             if content is None:
                 raise MentionError(name, "it is no longer available; attach it again.")
             # Redacted before it is shortened, as an @ snapshot.
-            content = manager.settings.redact(redact_secrets(content))
+            content = manager.redact_sent(content)
             limit = min(attached.DOCUMENT_CHARS, room)
             if content and limit < min(MIN_DOCUMENT_CHARS, len(content)):
                 raise ValueError(DOCUMENTS_TOO_LONG.format(limit=attached.DOCUMENTS_CHARS, name=name))

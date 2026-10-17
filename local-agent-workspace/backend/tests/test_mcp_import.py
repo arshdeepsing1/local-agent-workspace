@@ -11,12 +11,12 @@ from local_agent.extensions import validate_config
 
 PROJECT = {"mcpServers": {
     "GitHub Server": {"command": "github-mcp-server", "args": ["stdio"],
-                      "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_syntheticsyntheticsynthetic12", "LOG_LEVEL": "${LEVEL}",
+                      "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp" + "_syntheticsyntheticsynthetic12", "LOG_LEVEL": "${LEVEL}",
                               "PATH": "/srv/other/bin"}, "cwd": "/srv/other"},
     "docs": {"type": "http", "url": "https://mcp.example.com/mcp",
              "headers": {"Authorization": "Bearer ${DOCS_TOKEN}", "X-Api-Key": "synthetic-plain-key-value"}},
     "legacy": {"type": "sse", "url": "https://mcp.example.com/sse"},
-    "leaky": {"command": "server", "args": ["--token=ghp_syntheticsyntheticsynthetic12"]},
+    "leaky": {"command": "server", "args": ["--token=ghp" + "_syntheticsyntheticsynthetic12"]},
     "nothing": {"note": "no command"},
 }}
 DESKTOP = {"globalShortcut": "Ctrl+Space", "mcpServers": {

@@ -31,7 +31,7 @@ from .context import (
     build_condense_messages, build_handoff_messages, build_summary_messages, compaction_output_allowance,
     condense_output_tokens, context_breakdown, effective_input_budget, estimate_prior, estimate_scale,
     estimate_tokens, handoff_output_tokens, handoff_with_contents, has_earlier_turn, last_request_report,
-    model_context_window, next_request_estimate, prepare_context, scaled_estimate, summary_byte_limit,
+    model_context_window, next_request_estimate, prepare_context, request_size, scaled_estimate, summary_byte_limit,
     summary_output_tokens, verify_declined_message, anchor_candidate, double_counted, reported_input,
 )
 from .tools import LIMIT as FILE_LIMIT
@@ -99,7 +99,7 @@ from .composer_api import (MAX_QUEUED, MAX_QUEUED_CHARS, SHELL_ONE_LINE, SIDE_QU
 import math
 import random
 from . import request_limits
-from .request_limits import STREAM_READ_TIMEOUT, PayloadTooLarge, check_payload, encode_payload
+from .request_limits import STREAM_READ_TIMEOUT, PayloadTooLarge, check_payload, encode_payload, request_bytes_over
 from .rate_limits import (ITPM, OTPM, CompactionOverOtpm, RATE_LIMIT_WAIT_CAP, RateLimitGate, describe, otpm_too_low,
                           parse_rate_limit, request_info_fields)
 from .context import in_turn_bytes_fit, in_turn_tokens
@@ -117,9 +117,12 @@ SECRET_KEY = re.compile(r"(?i)token|secret|passw|key|credential|auth|cookie")
 SHAPE_REDACTED_TOOLS = frozenset({"run_command", "get_job_output", "wait_job", "stop_job", "list_jobs", "get_tool_output"})
 # Databricks accepts at most this many functions in one request (built-in and MCP tools together).
 MAX_REQUEST_TOOLS = 32
-# The built-in tool kinds Plan mode always refuses (permissions.tool_decision), left out of its requests. Plan's tool
-# list already differs (submit_plan), so this costs no extra prompt-cache write.
-PLAN_REFUSED_KINDS = frozenset({"edit", "memory", "job_stop"})
+# The tool kinds Plan mode always refuses (permissions.tool_decision), left out of its requests: the file-changing
+# tools, remember, stop_job and MCP tools. Plan's tool list already differs (submit_plan), so this costs no extra
+# prompt-cache write.
+PLAN_REFUSED_KINDS = frozenset({"edit", "memory", "job_stop", "mcp"})
+# The feature tools a turn can add to its own tool list (AgentManager.joinable_helpers).
+JOINING_HELPERS = ("get_tool_output", "get_subagent_result", FINDINGS_TOOL)
 # A turn's MCP server status as a chat keeps it (Agent tools → Extensions): these fields only.
 MCP_STATUS_FIELDS = ("id", "name", "status", "error", "stderr_tail", "server_info", "retry_seconds")
 MESSAGE_SKILL_CHARS = 60_000  # The skill text one message may add, with its $ARGUMENTS filled in.
@@ -638,6 +641,21 @@ def step_note(history, notice):
             or not isinstance(last.get("content"), str) or not last["content"]):
         return ""
     return STEP_NOTE.format(notice=notice)
+
+
+def replay_within_bytes(messages, history, wire, model, definitions):
+    """reasoning_replay.apply, kept under the request byte target too (request_limits.PAYLOAD_TARGET_BYTES): images
+    count in bytes, hardly in tokens, so a replay within the input budget can still take a request with images
+    over 4 MB. Then only the newest replies that fit the room the request leaves go back, else none."""
+    target = request_limits.PAYLOAD_TARGET_BYTES
+    sent, replayed = reasoning_replay.apply(messages, history, wire, model)
+    if replayed and request_bytes_over(sent, definitions, estimate_tokens(sent, definitions), target):
+        room = min(reasoning_replay.MAX_REPLAY_BYTES, target - request_size(messages, definitions))
+        sent, replayed = (reasoning_replay.apply(messages, history, wire, model, limit=room, banded=False) if room > 0
+                          else (messages, 0))
+        if replayed and request_bytes_over(sent, definitions, estimate_tokens(sent, definitions), target):
+            sent, replayed = messages, 0
+    return sent, replayed
 
 
 def output_limit_text(max_output_tokens, thinking=False):
@@ -1238,6 +1256,12 @@ class AgentManager(LifecycleHooks):
         except (ValueError, OSError):
             tokens = []
         return tokens + self.extensions.secret_values() + self.credential_file_values()
+
+    def redact_sent(self, text):
+        """Text the app adds to a request or saves itself (an @ snapshot, an attached document's text, a memory
+        note, usage.csv), redacted like tool results and command output: the Databricks token, the other
+        redaction_tokens (MCP secret references, the credential file's values) and common secret shapes."""
+        return self.settings.redact(redact_value(redact_secrets(text), self.redaction_tokens()))
 
     def credential_file_values(self):
         """The credential file's secret-looking values of 8 characters or more (cached by size and time)."""
@@ -2556,11 +2580,13 @@ class AgentManager(LifecycleHooks):
         tools, without turned-off tools, tools an unconditional deny rule covers, submit_plan outside Plan, and
         in Plan the tools it always refuses: PLAN_REFUSED_KINDS) and the names of the MCP tools left out because
         Databricks accepts at most MAX_REQUEST_TOOLS functions per request: the built-in tools first, then MCP
-        tools in server order."""
+        tools in server order. While MCP tools are offered, each helper that can still join the chat mid-turn
+        (joinable_helpers) keeps a slot, so one joining never pushes out an MCP tool the turn already offered."""
         definitions = filter_tools(session, [*TOOL_DEFINITIONS, *self.feature_definitions(session), *external_tools])
         saved = self.rules.rules(session["workspace"])
         names = [item["function"]["name"] for item in definitions]
-        denied = denied_tools(session.get("allow_rules") or [], saved["project"], saved["user"], names)
+        helpers = [name for name in JOINING_HELPERS if name not in names and tool_allowed(session, name)]
+        denied = denied_tools(session.get("allow_rules") or [], saved["project"], saved["user"], [*names, *helpers])
         plan = session.get("permission_mode", "manual") == "plan"
         offer_plan = plan and not session.get("is_subagent")
         definitions = [item for item in definitions if item["function"]["name"] not in denied
@@ -2573,8 +2599,19 @@ class AgentManager(LifecycleHooks):
                 session[flag] = True
         builtin = [item for item in definitions if not item["function"]["name"].startswith("mcp__")]
         external = [item for item in definitions if item["function"]["name"].startswith("mcp__")]
-        room = max(0, MAX_REQUEST_TOOLS - len(builtin))
+        pending = self.joinable_helpers(session, names, set(helpers) - denied) if external else []
+        room = max(0, MAX_REQUEST_TOOLS - len(builtin) - len(pending))
         return [*builtin, *external[:room]], [item["function"]["name"] for item in external[room:]]
+
+    @staticmethod
+    def joinable_helpers(session, names, allowed):
+        """The helper tools of allowed (not offered yet, not turned off or denied) that this chat can be offered
+        mid-turn (feature_definitions), given the offered names: get_tool_output after a long MCP or web_fetch
+        result, get_subagent_result after a background delegate_task, report_findings after use_skill selects
+        a skill that names it (the app's review skills do)."""
+        triggers = {"get_tool_output": True, FINDINGS_TOOL: "use_skill" in names,
+                    "get_subagent_result": not session.get("is_subagent") and "delegate_task" in names}
+        return [name for name in JOINING_HELPERS if name in allowed and triggers[name]]
 
     def step_definitions(self, session, external_tools):
         """The tool definitions offered in the next model request (offered_tools)."""
@@ -3479,7 +3516,7 @@ class AgentManager(LifecycleHooks):
                     await self.update_event(session, event, state="rejected", output=output)
                     return output
                 # The card shows the note as it would be saved; a secret or a full memory fails before any card.
-                arguments = {**arguments, "text": project_memory.check_note(arguments["text"], self.settings.redact)}
+                arguments = {**arguments, "text": project_memory.check_note(arguments["text"], self.redact_sent)}
                 self.memory.room_for(session["workspace"], arguments["text"])
                 await self.update_event(session, event, input=arguments, preview=self.memory_preview(session, arguments))
                 if verdict.decision == "ask":
@@ -3726,7 +3763,7 @@ class AgentManager(LifecycleHooks):
             elif name == "remember":
                 if self.settings.values.get("project_memory", True) is not True:
                     raise ValueError("Project memory was turned off in Settings before the note was saved; nothing was saved.")
-                note = self.memory.add(session["workspace"], arguments["text"], self.settings.redact)
+                note = self.memory.add(session["workspace"], arguments["text"], self.redact_sent)
                 result = {"saved": note["text"], "message": "Saved to project memory. Later chats in this project see "
                           "it in their system message; the user can edit or delete it in Agent tools → Memory."}
             elif name == "submit_report":
@@ -3983,7 +4020,7 @@ class AgentManager(LifecycleHooks):
             if name == "run_command":
                 validate_command_options(new["command"], new.get("timeout_seconds", 60), new.get("max_output_bytes", 80000))
             elif name == "remember":
-                new = {**new, "text": project_memory.check_note(new["text"], self.settings.redact)}
+                new = {**new, "text": project_memory.check_note(new["text"], self.redact_sent)}
                 self.memory.room_for(session["workspace"], new["text"])
             verdict = self.permission(session, tools, name, new)
             if verdict.decision == "deny":
@@ -4183,12 +4220,19 @@ class AgentManager(LifecycleHooks):
         listed = session.get("agent_tools")
         servers = session.get("agent_mcp_servers")  # A custom agent's mcp_servers: only these start.
         if session.get("tool_profile", "inherit") != "inherit" or (
-                isinstance(listed, list) and not any(name.startswith("mcp__") for name in listed)) or servers == []:
-            # Restricted children must not start external servers during discovery.
+                isinstance(listed, list) and not any(name.startswith("mcp__") for name in listed)) or servers == [] or (
+                session.get("permission_mode", "manual") == "plan"):
+            # Restricted children must not start external servers during discovery, and Plan refuses every MCP
+            # call (PLAN_REFUSED_KINDS): a turn that starts in Plan starts none.
             return await self._run_databricks(session, prompt, [], **({"content": content} if content is not None else {}))
-        off = off_servers(session.get("disabled_tools"))
+        # A custom agent's subagent starts only the servers whose tools it may use: not those its disallowed_tools
+        # take away whole (mcp__<id>__*), its mcp_servers leave out, or its tools list names no tool of.
+        off = [*off_servers(session.get("disabled_tools")), *off_servers(session.get("agent_denied_tools"))]
         if isinstance(servers, list):
             off = [*off, *(server for server in self.mcp_server_ids() if server not in servers)]
+        if isinstance(listed, list):
+            off = [*off, *(server for server in self.mcp_server_ids()
+                           if not any(name.startswith(f"mcp__{server}__") for name in listed))]
         # Servers this chat turned off never start; a server that fails is skipped and the others work.
         async with self.extensions.turn(off=off) as connection:
             definitions = await connection.discover()
@@ -5753,10 +5797,11 @@ class AgentManager(LifecycleHooks):
                 # Read at each step, so an effort chosen while the turn runs applies from this request.
                 effort = self.reasoning_request(session, max_output_tokens)
                 # Settings → Reasoning → Send earlier thinking back: this turn's replies carry their signed reasoning,
-                # counted in the estimate and the meter; a request it would push over the input budget goes without.
+                # counted in the estimate and the meter; a request it would push over the input budget goes without,
+                # and over the byte target with only what fits (replay_within_bytes).
                 sent, replayed = messages, 0
                 if (replay := self.replay_model(session)) is not None:
-                    sent, replayed = reasoning_replay.apply(messages, history, wire, replay)
+                    sent, replayed = replay_within_bytes(messages, history, wire, replay, definitions)
                     tokens = scaled_estimate(sent, definitions, scale) if replayed else 0
                     if tokens > input_budget:
                         sent, replayed = messages, 0
@@ -5823,8 +5868,12 @@ class AgentManager(LifecycleHooks):
                         except InferenceError as exc:
                             if fallback is not None:
                                 raise  # One fallback attempt: its own failure ends the request.
+                            # A 400 that names the cache markers or the signed reasoning sent back (both are content
+                            # parts too) goes to their ladders first; this branch runs if it continues without them.
                             if (exc.http_status == 400 and getattr(exc, "images_named", False)
-                                    and attached.IMAGE_PART in body):
+                                    and attached.IMAGE_PART in body
+                                    and not (cache_sent not in (None, "off") and getattr(exc, "cache_named", False))
+                                    and not (replayed and getattr(exc, "replay_named", False))):
                                 # The endpoint does not take the image parts after all: its requests carry notes
                                 # instead (cache_body reads supports), so later messages of the chat still work.
                                 self.vision_rejections.add(session["model"])

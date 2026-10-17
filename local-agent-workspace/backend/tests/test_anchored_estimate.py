@@ -330,5 +330,7 @@ async def test_the_meter_groups_tools_by_the_configured_server_ids(runtime, monk
     external = [{"type": "function", "function": {"name": f"mcp__{server}__search", "description": "Search.",
                                                   "parameters": {"type": "object", "properties": {}}}}
                 for server in ("team", "team__a")]
+    # Turned off, the helpers that can join mid-turn keep no place (joinable_helpers): both MCP tools fit.
+    session["disabled_tools"] = ["get_tool_output", "report_findings", "get_subagent_result"]
     await manager._run_databricks(session, "Hello", external)
     assert list(session["context_info"]["tool_groups"]) == ["Built-in tools", "MCP team", "MCP team__a"]

@@ -147,6 +147,24 @@ def test_secrets_in_attached_files_are_redacted(runtime):
     assert "1: KEY = '[REDACTED]'" in content and "2: GH = '[REDACTED]'" in content
 
 
+def test_credential_file_values_are_redacted_in_snapshots_and_attached_documents(runtime, tmp_path):
+    """As in read_file and command output: a value of the credential file (redaction_tokens) is redacted whatever
+    its shape, in an @ snapshot and in an attached document's text."""
+    manager, session, project = runtime
+    value = "Qw3rtyOpaq" + "ue9Lk2Zx"  # No token shape, and not after a name the generic pattern knows.
+    (tmp_path / "creds.env").write_text(f"DATABRICKS_HOST=https://gateway.example\nMY_SERVICE_TOKEN={value}\n")
+    manager.settings.values["env_file"] = str(tmp_path / "creds.env")
+    text = f"The service key is {value} for now.\nservice:\n  key: {value}\n"
+    (project / "notes.txt").write_text(text)
+    assert value in manager.redaction_tokens()
+    content, attachments, _ = expand(manager, session, "See @notes.txt")
+    assert attachments[0]["kind"] == "file" and value not in content
+    assert "1: The service key is [REDACTED] for now." in content and "3:   key: [REDACTED]" in content
+    record = manager.uploads.save(session["id"], "notes.txt", text.encode())
+    content, attachments, _ = expand(manager, session, "Summarize", uploads=[{"id": record["id"]}])
+    assert attachments[0]["kind"] == "document" and value not in content and "key: [REDACTED]" in content
+
+
 def test_a_secret_across_the_8000_character_cut_is_redacted_whole(runtime):
     """Redaction runs before the snapshot is shortened, so no part of a configured token is attached."""
     manager, session, project = runtime

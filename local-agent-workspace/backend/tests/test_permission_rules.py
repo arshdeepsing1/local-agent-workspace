@@ -139,6 +139,8 @@ async def test_deny_rules_block_paths_and_mcp_tools_in_bypass(runtime, tmp_path)
 def test_unconditional_deny_rules_remove_tools_from_the_definitions(runtime):
     manager, session, _, _ = runtime
     _, external = connection(manager, session)
+    # Turned off, the helpers that can join mid-turn keep no place: all three MCP tools fit (joinable_helpers).
+    session["disabled_tools"] = ["get_tool_output", "report_findings", "get_subagent_result"]
     offered = names(manager.step_definitions(session, external))
     assert {"run_command", "mcp__docs__search", "mcp__docs__fetch", "mcp__other__echo"} <= offered
     manager.rules.add("user", session["workspace"], {"behavior": "deny", "tool": "mcp__docs__*"})
@@ -544,7 +546,9 @@ def test_mode_prompts_are_exact():
         "needs their approval. A command that names a credential-looking file always shows a card.")
     assert mode_prompt("bypassPermissions") == (
         "Bypass permissions mode: actions run without approval cards, except commands that name credential-looking "
-        "files. Deny and ask rules the user saved and file-tool credential exclusions still apply.")
+        "files, calls a hook asks about and a subagent's change to a file another running subagent changed. remember "
+        "saves a note only when a rule the user saved allows it. Deny and ask rules the user saved and file-tool "
+        "credential exclusions still apply.")
     assert mode_prompt("manual") == "Manual mode: reads run directly; file changes and commands require an approval card."
     assert mode_prompt("acceptEdits") == "Accept edits mode: file edits run directly; commands require an approval card."
 

@@ -496,7 +496,8 @@ when opening a conversation or performing restart recovery.
   message with an error, as does a PDF, Word, Excel or PowerPoint file: attach it with **Attach
   files** instead, or ask the agent to read it (`read_file` reads its text). Missing paths,
   folders and words such as `@dist` stay plain text, and so do tokens inside code: a fenced block, or a code span on one line (a run of backticks closes
-  only at the next run of the same length, as in the quoted lines of review comments). Secrets in snapshots are redacted like command output, before a snapshot is
+  only at the next run of the same length, as in the quoted lines of review comments). Secrets in snapshots are redacted like command output (common secret shapes, and the credential file's
+  secret-looking values and MCP servers' secret references whatever their shape), before a snapshot is
   shortened to 8,000 characters. An attached file counts as read, so the agent may
   edit it without reading it again. Only your typed text selects skills (not an attached file or a
   custom command's text).
@@ -545,7 +546,9 @@ when opening a conversation or performing restart recovery.
   endpoint without it, or when its file is gone, an image becomes a note in its message, such as
   `[Image shot.png, 1280×720: not sent, databricks-gpt-oss-120b does not take images.]`. If an
   endpoint answers the images with an HTTP 400 that names them, the app sends the request again
-  with notes, says so, and sends that endpoint no images until it restarts or Settings are saved.
+  with notes, says so, and sends that endpoint no images until it restarts or Settings are saved. A 400
+  that also names the prompt-cache markers or the thinking sent back (content-part fields too) first
+  goes down those fallbacks; the images are replaced only if the request still fails without them.
 - **Shell commands (`!`)**: a message starting with `!` runs the rest as one shell command in the
   project folder, like **Workspace → Terminal** Run, when the chat is idle, for at most 60 seconds
   (use **Workspace → Terminal** for longer commands). It is an explicit user action, so it runs in
@@ -1522,8 +1525,11 @@ and tool calls, as Anthropic's API expects with thinking on. Only replies the re
 endpoint wrote are sent back (a fallback endpoint or a model change never gets another endpoint's
 thinking), only within the current turn (a new message removes the earlier turn's thinking from the
 file, so it keeps at most one turn's), at most 64 KB per reply and 256 KB per request, newest
-first. The thinking counts in the context meter and the estimate (and costs input tokens), and a
-request it would push over the input budget goes without it. Compaction summaries, `/btw` side
+first. Past 256 KB the oldest replies' thinking is left out in steps of 128 KB, not one more reply at every
+step, so most requests still extend the previous one and read it from the prompt cache. The thinking
+counts in the context meter and the estimate (and costs input tokens); a request it would push over the
+input budget goes without it, and one it would push over the 3.8 MB request target (attached images count
+in bytes) goes with only the newest thinking that fits, or none. Compaction summaries, `/btw` side
 questions and titles never see it. Databricks does not document this on the chat-completions route,
 so when a request with it gets HTTP 400 the app sends it again once without it; a 400 that names
 the thinking or a signature, or a resend that is then accepted, makes requests to that endpoint
@@ -2245,7 +2251,8 @@ worth keeping (or ask it to remember), and each note shows an approval card with
 rule) approves the next ones. Manual, Accept edits and Auto always ask; Plan mode never saves a
 note; Bypass permissions and Don't ask save one only when an allow rule for `remember` exists,
 since they show no cards. A note is one line of up to 500 characters; text that looks like a
-secret (a token, password or key, or your Databricks token) is refused. A project holds at most
+secret (a token, password or key, your Databricks token, or a secret-looking value of your credential file or an
+MCP server's secret reference) is refused. A project holds at most
 50 notes and 4,000 bytes.
 
 Every conversation in the project, subagents included, gets the notes in its system message as
@@ -2438,13 +2445,17 @@ never starts in that chat.
 Databricks accepts at most 32 tools per request, built-in and MCP tools together. Built-in
 tools come first (28 in a new chat with the default Settings; up to 32 once `get_tool_output`, `web_search`,
 `report_findings` and `get_subagent_result` are offered too, which leaves no room for MCP tools; Plan mode adds
-`submit_plan` and leaves out the tools it always refuses: the file-changing tools, `remember` and `stop_job`), then MCP
-tools in server order; the MCP tools that do not fit are named once
+`submit_plan` and leaves out the tools it always refuses: the file-changing tools, `remember`, `stop_job` and MCP
+tools), then MCP tools in server order. `get_tool_output`, `report_findings` and `get_subagent_result` join a chat
+mid-turn (after a long result, a review skill, a background subagent), so while MCP tools are offered each of them
+that can still join keeps its place, and one joining never pushes out an MCP tool the turn already offered (with the
+default Settings that leaves room for one MCP tool until they have joined; turning a helper off frees its place). The MCP tools that do not fit are named once
 in a notice and in **Extensions**, and a call to one is refused. Turn off tools or servers a
 chat does not need to make room.
 
 The model sees names such as `mcp__example__tool`, so a new server ID cannot contain `__`. MCP calls require their own
-approval in Manual, Auto, and Accept edits; Plan blocks them, Don't ask blocks them unless a
+approval in Manual, Auto, and Accept edits; Plan leaves them out (a turn that starts in Plan starts no MCP server, so
+after a plan is approved they are offered from your next message on), Don't ask blocks them unless a
 rule allows them, and Bypass permits them unless a deny or ask rule covers them. **Allow this
 tool in this chat** approves one exact tool name for the rest of the chat; a saved rule for the
 project or all projects can allow one tool or all tools of a server (see **Permission rules**). MCP servers and hook commands have the user's OS/network access, not the
@@ -2978,13 +2989,13 @@ Report each finding with path:line, its severity and a suggested fix.
 | --- | --- |
 | `name` | A lowercase letter, then up to 39 lowercase letters, digits or `-` (default: the file name); not `explore`, `general` or `editor`. |
 | `description` | Required: one line of at most 300 characters, which the model reads to choose the agent. |
-| `tools` | Optional: the only tools the agent may use (`[a, b]`, `- item` lines, or `a, b`). Names this app does not have are ignored with a note, `delegate_task` never applies, and tools outside the profile are dropped. Left out: every tool of the profile. |
+| `tools` | Optional: the only tools the agent may use (`[a, b]`, `- item` lines, or `a, b`). Names this app does not have are ignored with a note, `delegate_task` never applies, and tools outside the profile are dropped; `get_tool_output` and `report_findings` follow the chat's rules, like `submit_report` (they are offered once a long result is kept or a review skill is selected), and only the MCP servers whose tools the list names start for the agent. Left out: every tool of the profile. |
 | `profile` | `read_only` (the default), `file_editor` or `inherit`, as for `tool_profile`. |
 | `model` | Optional Databricks serving endpoint name, only one you already use: the Settings model, a **Settings → Subagents** model or the model of one of your chats (not a subagent chat). Any other endpoint runs on the chat's model, with a note in Agent types and on the approval card. Left out (or `inherit`): the chat's model. |
 | `effort` | Optional `default`, `low` (Fast), `medium`, `high`, `xhigh` or `max`; left out: the chat's effort. |
 | `skills` | Optional: up to three skill IDs loaded into the subagent like selected skills; one that does not load, or whose frontmatter sets `disable-model-invocation: true` (the model chooses when an agent runs), is left out with a note in its first prompt. A `/skill` word in the instructions or the task loads no other skill. |
 | `max_steps` | Optional 1–24: the subagent's steps when the call gives no `max_steps` (a call's own value wins). |
-| `disallowed_tools` | Optional: tools the agent may not use, taken away from `tools` or from its profile (its MCP tools by name, or every tool of a server as `mcp__<server>__*`; a tool that covers another, such as `read_file` for `outline_file`, takes that one too). A list that takes away every tool is refused. |
+| `disallowed_tools` | Optional: tools the agent may not use, taken away from `tools` or from its profile (its MCP tools by name, or every tool of a server as `mcp__<server>__*`, which then does not start for the agent; a tool that covers another, such as `read_file` for `outline_file`, takes that one too). A list that takes away every tool is refused. |
 | `permission_mode` | Optional `plan`, `dontAsk`, `manual` (Claude Code's `default`), `auto`, `acceptEdits` or `bypassPermissions`; left out (or `inherit`): the chat's. It applies only when it is narrower than the chat's mode, also after you change the chat's mode while the subagent runs: Plan < Don't ask < Manual < Auto or Accept edits < Bypass permissions, and where Auto and Accept edits meet, Manual. The chat's mode still decides where it is stricter: a Plan subagent of a Manual or Accept edits chat asks before a read-only command (unless a rule allows it), and one of a Don't ask chat is refused it. |
 | `mcp_servers` | Optional: the IDs of the MCP servers (as **Settings → MCP** names them) whose tools the agent may use; only those start for it, and `[]` starts none. Left out: every configured server. Server definitions in the file are not supported; an ID that is not configured is left out with a note. |
 | `memory` | Optional `project` (the default: the subagent reads the project memory, as every chat does) or `none` (without it). `user` and `local` are not supported and read as `project`, with a note. |
@@ -3235,8 +3246,8 @@ waits (see **Mode changes while the agent works** below).
 | Auto | Accept file edits, run read-only commands (the fixed list and the commands the app checks, below), stop jobs and start subagents; ask for other commands and actions. |
 | Accept edits | Accept file edits and start subagents; ask before commands and other actions. |
 | Don't ask | Run only what the mode's reads or a saved rule allows; block everything else without an approval card, except a command that names a credential-looking file, which shows its card. |
-| Plan | Read/search approved folders, run read-only commands (the fixed list and the commands the app checks), and describe a plan; block file changes and other commands (the agent is not offered the file-changing tools, `remember` or `stop_job` in Plan). Subagents still need a card. |
-| Bypass permissions | Run actions and access external folders without approval cards, except a command that names a credential-looking file. Deny and ask rules still apply, and credential/generated-file exclusions still apply to file tools. |
+| Plan | Read/search approved folders, run read-only commands (the fixed list and the commands the app checks), and describe a plan; block file changes, other commands and MCP tools (the agent is not offered the file-changing tools, `remember`, `stop_job` or MCP tools in Plan). Subagents still need a card. |
+| Bypass permissions | Run actions and access external folders without approval cards, except a command that names a credential-looking file, a call a before-tool hook asks about, and a subagent's change to a file another running subagent changed. A project memory note is saved only with an allow rule for `remember`. Deny and ask rules still apply, and credential/generated-file exclusions still apply to file tools. |
 
 Reading, listing and searching files, reading job output, waiting for a job, skills,
 structured tasks and reporting review findings (`report_findings`) are available in every mode
@@ -3387,9 +3398,11 @@ spelling, what a glob in the command matches, and the name patterns in **Setting
 files → Secret file names for commands** (`*.tfvars`). A relative name counts in the folder the
 command reads it from, its `cwd` or a `cd <folder>` in it (`cat config` in `~/.kube`), and a link
 counts as the file it points at. The check reads the command's words, so a program that finds such
-a file itself is not caught: recursive `grep` and `rg` that the app checks skip them (a name
-without an extension only when it ends in the word, such as `db_token`, not `secret_key`), and
-output redaction stays. Command and MCP results are redacted before the agent sees them: the
+a file itself is not caught: recursive `grep` and `rg` that the app checks skip them whatever the
+case of their names (`.ENV`, `SERVER.PEM`; a name without an extension only when it ends in the word,
+such as `db_token`, not `secret_key`), and output redaction stays. A recursive `grep` asks instead when a
+Secret file names pattern cannot be written for every case (a letter outside ASCII, a backslash, a bracket
+other than letters, digits and ranges); `rg` handles those. Command and MCP results are redacted before the agent sees them: the
 Databricks token, the credential file's values for keys that name a token, secret, password, key,
 credential, auth or cookie (8 characters or more), MCP secret references, and GitHub, Databricks
 and AWS access-key shapes, long Bearer tokens and passwords in URLs. Six more names joined the file

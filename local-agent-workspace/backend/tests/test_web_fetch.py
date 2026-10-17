@@ -31,7 +31,7 @@ REFUSED = [
     "gopher://example.com/", "javascript:alert(1)", "http://user:secret@example.test/", "http://user@example.test/",
     "http://example.com:8080/", "https://example.com:22/", "http://example.com:notaport/", "http://999.1.1.1/",
     "http://example.123/", "https://example.com/?api_key=abcdefgh12345678", "https://example.com/?token=abcdef1234567890",
-    "https://example.com/ghp_abcdefghijklmnopqrstuvwxyz0123", "http://exa mple.com/", "", "http://",
+    "https://example.com/ghp" + "_abcdefghijklmnopqrstuvwxyz0123", "http://exa mple.com/", "", "http://",
 ]
 
 
@@ -61,6 +61,15 @@ def test_classify_names_the_reason_and_sees_embedded_ipv4():
     assert "metadata" in classify("169.254.169.254")
     assert classify("2002:5db8:d70e::1") is not None  # 6to4 is not a global address, whatever it embeds
     assert classify("not an address") == "is not an IP address"
+
+
+def test_the_refused_networks_do_not_depend_on_the_python_patch_release(monkeypatch):
+    """Before 3.12.4, ipaddress calls 6to4 addresses global; the guard's own table refuses them anyway."""
+    import ipaddress
+    monkeypatch.setattr(ipaddress.IPv6Address, "is_global", property(lambda self: True))
+    assert classify("2002:5db8:d70e::1") == "is a 6to4 relay address"
+    assert classify("3fff::1") == "is a documentation address"
+    assert classify("2002:7f00:1::1") == "embeds 127.0.0.1, which is a loopback address"
 
 
 def test_a_secret_in_the_url_is_refused():

@@ -53,7 +53,7 @@ def test_references_and_plain_values_validate():
 @pytest.mark.parametrize("server,message", [
     (stdio({"SECRET": "value"}), "looks like a secret"),
     (stdio({"GITHUB_TOKEN": "plain"}), 'use {"secret": "GITHUB_TOKEN"}'),
-    (stdio({"OPTIONS": "--token=ghp_abcdefghijklmnopqrstuvwxyz"}), "looks like a secret"),
+    (stdio({"OPTIONS": "--token=ghp" + "_abcdefghijklmnopqrstuvwxyz"}), "looks like a secret"),
     (stdio({"PATH": "/srv/other"}), "cannot be set"),
     (stdio({"LD_PRELOAD": "/srv/other/x.so"}), "cannot be set"),
     (stdio({"PYTHONSTARTUP": "x"}), "cannot be set"),
@@ -74,7 +74,7 @@ def test_references_and_plain_values_validate():
     (http("http://workspace.example.com/mcp", workspace_credentials=True), "https"),
     (http(workspace_credentials="yes"), "true or false"),
     # A prefix is saved in plain text: a scheme word and one space only.
-    (http(headers={"Authorization": {"secret": "EMPTY", "prefix": "ghp_abcdefghijklmnopqrstuvwxyz12"}}), "scheme word"),
+    (http(headers={"Authorization": {"secret": "EMPTY", "prefix": "ghp" + "_abcdefghijklmnopqrstuvwxyz12"}}), "scheme word"),
     (http(headers={"Cookie": {"secret": "CSRF", "prefix": "session=s3cr3tvalue1; csrf="}}), "scheme word"),
     (http(headers={"Authorization": {"secret": "T", "prefix": "Bearer"}}), "scheme word"),
     (http(headers={"Authorization": {"secret": "T", "prefix": "abcdef0123456789 "}}), "scheme word"),

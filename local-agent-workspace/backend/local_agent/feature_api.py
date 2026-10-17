@@ -261,13 +261,13 @@ def register_features(app, manager, settings, store, session_or_404, workspace_t
     @app.post("/api/memory")
     async def add_memory_note(body: MemoryNote, session_id: str | None = None):
         workspace = workspace_tools(session_id).root
-        manager.memory.add(workspace, body.text, settings.redact)
+        manager.memory.add(workspace, body.text, manager.redact_sent)
         return memory_listing(workspace)
 
     @app.patch("/api/memory/{entry}")
     async def edit_memory_note(entry: str, body: MemoryNote, session_id: str | None = None):
         workspace = workspace_tools(session_id).root
-        memory_change(lambda: manager.memory.edit(workspace, note_id(entry), body.text, settings.redact))
+        memory_change(lambda: manager.memory.edit(workspace, note_id(entry), body.text, manager.redact_sent))
         return memory_listing(workspace)
 
     @app.delete("/api/memory/{entry}")

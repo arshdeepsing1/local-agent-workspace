@@ -109,6 +109,59 @@ def test_newer_replies_go_first_within_the_byte_limit():
     assert reasoning_replay.prune(wire) == 3 and reasoning_replay.pending_bytes(wire, OPUS) == 0
 
 
+def long_tool_turn(steps, image_bytes=0, thinking=60_000):
+    """A turn whose user message carries an image of image_bytes, then steps tool calls with thinking bytes each."""
+    wire = [{"role": "user", "content": "Look.", **({"images": [{"kind": "image", "bytes": image_bytes}]} if image_bytes else {})}]
+    for step in range(steps):
+        call = {"id": f"call_{step}", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+        wire += [{"role": "assistant", "content": None, "tool_calls": [call],
+                  "reasoning": sidecar(OPUS, [signed_item("t" * thinking, f"sig-{step}")])},
+                 {"role": "tool", "tool_call_id": f"call_{step}", "content": "contents"}]
+    return wire
+
+
+def test_past_the_byte_limit_the_cut_moves_in_bands_so_most_requests_extend_the_previous_one():
+    """Each step adds 60 KB of thinking: past MAX_REPLAY_BYTES the oldest replies are left out in bands of half the
+    limit, not one more at every step (each such cut rewrites the prompt cache after it)."""
+    previous, breaks = None, []
+    for steps in range(1, 13):
+        wire = long_tool_turn(steps)
+        messages, history = prepared(wire)
+        sent, count = apply(messages, history, wire, OPUS)
+        replayed = [isinstance(message["content"], list) for message in sent if message["role"] == "assistant"]
+        assert replayed[-1] and sum(reasoning_replay._size(wire[2 * step + 1]["reasoning"]["items"])
+                                    for step, kept in enumerate(replayed) if kept) <= reasoning_replay.MAX_REPLAY_BYTES
+        assert replayed == sorted(replayed)  # The newest replies go back, the oldest are left out.
+        if previous is not None and sent[:len(previous)] != previous:
+            breaks.append(steps)
+        previous = sent
+    # 720 KB of thinking in all: the cut moved 4 times (at every step from the 5th without bands).
+    assert breaks == [5, 7, 9, 11]
+    # banded=False keeps the newest replies that fit.
+    assert apply(messages, history, wire, OPUS, banded=False)[1] == 4 > count == 3
+
+
+def test_the_replay_stays_under_the_request_byte_target_with_the_newest_replies_that_fit():
+    """Images count in bytes, hardly in tokens: thinking within the input budget can still take a request with images
+    over 4 MB (replay_within_bytes)."""
+    from local_agent.agents import replay_within_bytes
+    from local_agent.context import request_size
+    from local_agent.request_limits import PAYLOAD_TARGET_BYTES, image_bytes
+    wire = long_tool_turn(3)
+    messages, history = prepared(wire)
+    assert replay_within_bytes(messages, history, wire, OPUS, [])[1] == 3  # Far from the target: as apply.
+    base = request_size(messages)
+    for room, expected in ((150_000, 2), (70_000, 1), (40_000, 0)):
+        image = 3 * (PAYLOAD_TARGET_BYTES - room - base) // 4
+        wire = long_tool_turn(3, image)
+        messages, history = prepared(wire)
+        sent, count = replay_within_bytes(messages, history, wire, OPUS, [])
+        assert count == expected and (count or sent is messages)
+        assert request_size(sent) <= PAYLOAD_TARGET_BYTES and image_bytes(sent) > PAYLOAD_TARGET_BYTES - room - base
+        assert [isinstance(message.get("content"), list) for message in sent if message["role"] == "assistant"] == [
+            index >= 3 - expected for index in range(3)]  # The newest replies.
+
+
 # The conversation file and bundles
 
 def test_old_files_load_and_bundles_keep_reasoning_only_when_asked(tmp_path):
@@ -196,6 +249,33 @@ async def test_a_step_note_does_not_stop_the_reasoning_going_back(runtime, monke
     assert items_in(second) == [signed_item()]
     assert "Background jobs finished since your last step" in json.dumps(second["messages"][-1])
     assert "Background jobs finished" not in json.dumps(second["messages"][0])
+
+
+async def test_a_request_with_a_large_image_goes_without_the_replay_that_would_take_it_over_4_mb(runtime):
+    """A screenshot and padding put the turn's first request 20 KB under the byte target; four tool steps with 60 KB
+    of signed thinking each would add 240 KB (within the 1M window's input budget) and pass the 4 MB limit."""
+    import os
+    from local_agent import request_limits, uploads
+    from test_uploads import png
+    manager, _ = runtime
+    manager.settings.values["context_window"] = 1_000_000
+
+    async def chat(padding, steps):
+        session = manager.store.create(manager.settings.values)
+        session.update(title="Replay bytes", title_generated=True, permission_mode="bypassPermissions")
+        step = lambda n: [*reasoning_chunks(text="t" * 60_000, signature=f"sig-{n}"), *sse_chunks(
+            "Reading.", "tool_calls", tool_calls=[{"id": f"call_{n}", "name": "read_file", "arguments": {"path": "README.md"}}])]
+        manager.serving = ReplayClient(manager.settings, [*(agent(step(n)) for n in range(steps)), agent(sse_chunks("Done."))])
+        record = manager.uploads.save(session["id"], "shot.png", png(64, 32) + os.urandom(2_400_000))
+        await manager.run(session, "Look at the screenshot. " + padding, attachments=[{"kind": "image", **uploads.image_ref(record)}])
+        sizes = [len(request_limits.encode_payload(body)) for body in manager.serving.transport.bodies(OPUS)]
+        return session, sizes
+    _, sizes = await chat("", 0)
+    pad = request_limits.PAYLOAD_TARGET_BYTES - 20_000 - sizes[-1]
+    session, sizes = await chat(("context " * (pad // 8 + 1))[:pad], 4)
+    assert not [event for event in session["events"] if event["type"] == "error"]
+    assert len(sizes) == 5 and max(sizes) <= request_limits.PAYLOAD_TARGET_BYTES
+    assert [call.get("reasoning_replayed") for call in session["inference_calls"] if call["purpose"] == "agent"][-1] in (None, 0)
 
 
 async def test_with_the_setting_off_nothing_is_kept_or_sent(runtime):

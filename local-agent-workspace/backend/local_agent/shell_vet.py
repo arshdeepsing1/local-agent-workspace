@@ -566,6 +566,40 @@ def _generic(program, words, cwd, ctx):
     return _with_operands(program, options, operands, end=program not in NO_END)
 
 
+SIMPLE_BRACKET = re.compile(r"\[(!?)((?:[A-Za-z0-9](?:-[A-Za-z0-9])?)+)\]")
+BRACKET_ITEM = re.compile(r"([A-Za-z0-9])(?:-([A-Za-z0-9]))?")
+
+
+def any_case_glob(pattern):
+    """pattern for grep's --exclude and --exclude-dir, which compare names case-sensitively (GNU and BSD alike),
+    matching every case of what it matches casefolded, as secret_paths and the file tools compare: each ASCII
+    letter becomes a bracket expression of both cases (.env: .[eE][nN][vV]), and a bracket expression of letters,
+    digits and ranges gets the other case too. None when that cannot be written (a cased letter outside ASCII,
+    a backslash, another bracket form): the search is then not vetted."""
+    out, index = [], 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "[":
+            match = SIMPLE_BRACKET.match(pattern, index)
+            if not match:
+                return None
+            other = []
+            for low, high in BRACKET_ITEM.findall(match.group(2)):
+                if high and not (low <= high and ((low + high).isdigit() or (low + high).islower()
+                                                  or (low + high).isupper())):
+                    return None  # A range across digits and letters or cases, or backwards.
+                if low.isalpha():
+                    other.append(low.swapcase() + (f"-{high.swapcase()}" if high else ""))
+            out.append(f"[{match.group(1)}{match.group(2)}{''.join(other)}]")
+            index = match.end()
+            continue
+        if char == "\\" or (not char.isascii() and char.lower() != char.upper()):
+            return None
+        out.append(f"[{char.lower()}{char.upper()}]" if char.isascii() and char.isalpha() else char)
+        index += 1
+    return "".join(out)
+
+
 def _grep(program, words, cwd, ctx):
     options, operands, seen = parse_options(program, words, SPECS[program], cwd, ctx)
     given = any(key in seen for key in ("e", "f", "regexp", "file"))
@@ -585,7 +619,12 @@ def _grep(program, words, cwd, ctx):
         if recursive:
             if not operands:
                 operands = ["."]  # GNU grep -r searches the folder; BSD grep would read stdin.
-            excludes = [*(f"--exclude={name}" for name in names), *(f"--exclude-dir={name}" for name in folders)]
+            # rg's --iglob ignores case; grep's --exclude does not, so the names go in every case.
+            globs = [any_case_glob(name) for name in [*names, *folders]]
+            if None in globs:
+                raise Refused("grep -r cannot skip a secret file name pattern in every case; use rg")
+            excludes = [*(f"--exclude={glob}" for glob in globs[:len(names)]),
+                        *(f"--exclude-dir={glob}" for glob in globs[len(names):])]
         tail = [*options, *excludes]
     else:
         # rg searches folders by default; --no-config: no RIPGREP_CONFIG_PATH file adds options (such as --pre).

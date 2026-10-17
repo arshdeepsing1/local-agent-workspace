@@ -322,6 +322,7 @@ def mode_prompt(mode: str, subagent: bool = False, reports: bool = True) -> str:
                     "tell the user what needs their approval. A command that names a credential-looking file always "
                     "shows a card."),
         "bypassPermissions": ("Bypass permissions mode: actions run without approval cards, except commands that name "
-                              "credential-looking files. Deny and ask rules the user saved and file-tool credential "
-                              "exclusions still apply."),
+                              "credential-looking files, calls a hook asks about and a subagent's change to a file another "
+                              "running subagent changed. remember saves a note only when a rule the user saved allows it. "
+                              "Deny and ask rules the user saved and file-tool credential exclusions still apply."),
     }.get(mode, "Manual mode: ask before changes and commands.")

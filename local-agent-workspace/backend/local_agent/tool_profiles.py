@@ -12,6 +12,11 @@ FILE_TOOLS = READ_TOOLS | {"write_file", "edit_file", "insert_activity_log", "mo
 # lists file names and sizes.
 COVERED_BY = {"outline_file": ("read_file",), "project_overview": ("list_files", "find_files")}
 
+# Helpers the app offers once a chat needs them (AgentManager.feature_definitions): get_tool_output after a long
+# result was kept, report_findings once a skill that names it was selected. An agent file's tools list does not
+# take them away; its disallowed_tools does.
+FOLLOW_UP_TOOLS = frozenset({"get_tool_output", "report_findings"})
+
 
 def covering_tool(name, names):
     """The first tool in names that covers name (COVERED_BY), else None."""
@@ -48,9 +53,10 @@ def child_profile(parent, requested=None):
 
 def agent_refusal(session, name):
     """Why a custom agent's subagent (custom_agents.py) may not use name, else None: its file's tools list
-    does not include it, its disallowed_tools take it away, or its mcp_servers leave out the tool's server."""
+    does not include it (FOLLOW_UP_TOOLS aside), its disallowed_tools take it away, or its mcp_servers leave out
+    the tool's server."""
     agent_tools = session.get("agent_tools")
-    if isinstance(agent_tools, list) and name not in agent_tools:
+    if isinstance(agent_tools, list) and name not in agent_tools and name not in FOLLOW_UP_TOOLS:
         return "tools"
     denied = session.get("agent_denied_tools")
     if isinstance(denied, list) and (name in denied or covering_tool(name, denied) or server_off(name, denied)):
