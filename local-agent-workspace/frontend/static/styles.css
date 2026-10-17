@@ -773,3 +773,7 @@ code.finding-location{color:#55564f;text-decoration:none}
 .project-trust-file dl{margin:0;display:grid;gap:4px}.project-trust-file dl>div{display:flex;justify-content:space-between;gap:12px;font-size:12px}
 .project-trust-file dt{color:var(--muted)}.project-trust-file dd{margin:0;font-weight:500;text-align:right;overflow-wrap:anywhere;min-width:0}
 .project-trust-dialog .dialog-content>.field-help{margin:0}.project-trust-dialog footer{margin-top:4px}
+/* 2026-10-16 fix-ui: a queued message's tags (command, plain text, attached files, Paused) on a row of their own under its text, a long file name shortened there; the note above a PDF preview. */
+.queue-item{flex-wrap:wrap;row-gap:3px}.queue-text{flex:1 1 calc(100% - 66px)}.queue-item .icon-button{flex:none}
+.queue-tag,.queue-paused{order:1;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.file-preview-pdf{display:flex;flex-direction:column;overflow:hidden}.file-preview-pdf>.file-preview-note{padding:6px 12px;border-bottom:1px solid #e3dfd5}

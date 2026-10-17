@@ -39,7 +39,7 @@ export default function QueueBar({ session, onRemove, onEdit, onSend, onError })
       <span class="queue-text" title=${item.text}>${clipped(item.text)}</span>
       ${item.command?.name ? html`<small class="queue-tag" title=${item.command.path || ''}>Command /${item.command.name}</small>` : null}
       ${item.verbatim ? html`<small class="queue-tag">Plain text</small>` : null}
-      ${(item.uploads || []).map(ref => html`<small class="queue-tag" key=${ref.id} title="Attached file">${ref.name || 'Attached file'}</small>`)}
+      ${(item.uploads || []).map(ref => html`<small class="queue-tag" key=${ref.id} title=${ref.name ? `Attached file: ${ref.name}` : 'Attached file'}>${ref.name || 'Attached file'}</small>`)}
       ${item.paused ? html`<small class="queue-paused">Paused</small>` : null}
       <button class="icon-button" aria-label=${`Edit queued message: ${name}`} title="Edit queued message" disabled=${working} onClick=${() => void act(() => onEdit(item), messageBox)}><${Pencil} size=${14} /></button>
       <button class="icon-button queue-remove" aria-label=${`Remove queued message: ${name}`} title="Remove queued message" disabled=${working} onClick=${() => void act(() => onRemove(item.id), nextRemove(index))}><${X} size=${14} /></button>

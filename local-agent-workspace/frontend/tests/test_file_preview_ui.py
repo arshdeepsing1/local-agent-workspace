@@ -5,7 +5,10 @@ import json
 import struct
 import zlib
 
+import pytest
 from playwright.sync_api import expect
+
+from conftest import ORIGIN
 
 
 def png(width, height):
@@ -17,39 +20,51 @@ def png(width, height):
 
 
 PNG = png(2, 1)
-FILES = [{"path": name, "name": name, "directory": False}
-         for name in ("logo.png", "logo.svg", "paper.pdf", "README.md", "page.html", "data.bin")]
+NAMES = ("logo.png", "logo.svg", "paper.pdf", "README.md", "page.html", "data.bin", "big.md", "big.html")
+FILES = [{"path": name, "name": name, "directory": False} for name in NAMES]
 SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="4" height="3"><rect width="4" height="3" fill="teal"/></svg>'
 TEXT = {"README.md": "# Guide\n\nSee ![logo](logo.png), ![diagram](logo.svg) and ![remote](https://example.com/track.png).\n\n"
                      "[Notes](docs/notes.md) · [Site](https://example.com/)\n",
         "page.html": "<!doctype html><title>x</title><p id=t>Static page</p><script>document.getElementById('t').textContent='Ran'</script>",
         "docs/notes.md": "# Notes\n"}
-SETUP = f"""
+TOO_LARGE = "File is too large for the text editor (80 KB limit)."
+
+
+def setup(texts=None, opened=None, extra=""):
+    """The fake server: FILES listed, TEXT (and texts) as text files, big.* over the editor's limit, other files not
+    text; opened maps a requested path to the one the server finds (sent back as X-Opened-Path, like the server)."""
+    return f"""
 const png = Uint8Array.from(atob({json.dumps(base64.b64encode(PNG).decode())}), c => c.charCodeAt(0))
 const svg = new TextEncoder().encode({json.dumps(SVG)})
-const texts = {json.dumps(TEXT)}
+const texts = {json.dumps({**TEXT, **(texts or {})})}
+const opened = {json.dumps(opened or {})}
 fake.captureDownloads()
 fake.override = path => {{
   const params = new URLSearchParams(path.split('?')[1] || '')
+  const name = opened[params.get('path')] || params.get('path')
   if (path.startsWith('/api/files?')) return fake.json({json.dumps(FILES)})
   if (path.startsWith('/api/file/raw?')) {{
-    const name = params.get('path')
     if (name === 'missing.png') return fake.json({{ detail: 'missing.png does not exist in /project.' }}, 400)
     const body = name.endsWith('.png') ? png : name.endsWith('.svg') ? svg : name.endsWith('.pdf') ? new TextEncoder().encode('%PDF-1.4\\n%%EOF\\n') : new Uint8Array([1, 2, 3])
-    return new Response(body, {{ headers: {{ 'Content-Type': params.get('download') ? 'application/octet-stream' : 'image/png' }} }})
+    return new Response(body, {{ headers: {{ 'Content-Type': params.get('download') ? 'application/octet-stream' : 'image/png',
+      'X-Opened-Path': encodeURIComponent(name).replaceAll('%2F', '/') }} }})
   }}
   if (path.startsWith('/api/file?')) {{
-    const name = params.get('path')
-    if (name in texts) return fake.json({{ path: name, content: texts[name], absolute: `/project/${{name}}` }})
+    if (name in texts) return fake.json({{ path: name, content: texts[name], absolute: name.startsWith('/') ? name : `/project/${{name}}` }})
+    if (name.startsWith('big.')) return fake.json({{ detail: {{ message: {json.dumps(TOO_LARGE)}, code: 'not_text' }} }}, 400)
     return fake.json({{ detail: {{ message: 'This file is not UTF-8 text, so the text editor cannot open it.', code: 'not_text' }} }}, 400)
   }}
 }}
+{extra}
 """
 
 
-def start(ui, page):
-    ui.app(session="a", scenario="workspace", setup=SETUP)
-    ui.show_session("a")
+SETUP = setup()
+
+
+def start(ui, page, setup=SETUP, session="a"):
+    ui.app(session=session, scenario="workspace", setup=setup)
+    ui.show_session(session)
     page.get_by_role("button", name="Workspace", exact=True).click()
     expect(page.locator(".file-row", has_text="logo.png")).to_be_visible()
 
@@ -112,6 +127,9 @@ def test_a_pdf_shows_in_a_frame_from_a_typed_blob(ui, page):
     expect(frame).to_be_attached()
     assert frame.get_attribute("src").startswith("blob:")
     assert frame.get_attribute("title") == "Preview of paper.pdf"
+    # A browser's viewer can name a blob by its ID, and nothing can rename it: the note says how to save it by its name.
+    expect(panel(page).locator(".file-preview-pdf .file-preview-note")).to_have_text(
+        "15 bytes · The viewer may name the file by an ID: Download above saves it as paper.pdf.")
 
 
 def test_markdown_previews_project_images_but_nothing_from_the_web(ui, page):
@@ -182,3 +200,101 @@ def test_a_file_that_is_not_text_offers_download(ui, page):
     panel(page).locator(".file-preview-none").get_by_role("button", name="Download").click()
     ui.wait("fake.downloads.length === 1")
     assert ui.js("fake.downloads[0].download") == "data.bin"
+
+
+def test_markdown_and_html_too_large_for_the_editor_say_why_and_offer_download(ui, page):
+    start(ui, page)
+    for name in ("big.md", "big.html"):
+        page.locator(".file-row", has_text=name).click()
+        expect(panel(page).get_by_text(TOO_LARGE)).to_be_visible()
+        expect(panel(page).locator(".file-preview-markdown, iframe")).to_have_count(0)
+        expect(panel(page).get_by_role("button", name="Preview", exact=True)).to_have_count(0)
+        panel(page).locator(".file-preview-none").get_by_role("button", name="Download").click()
+        ui.wait("fake.downloads.length === 1")
+        assert ui.js("fake.downloads.pop().download") == name
+        panel(page).get_by_role("button", name="Back to files").click()
+
+
+# What an HTML file can start with: its frame's policy must be in the head whatever comes first. A browser ignores a
+# policy in the body, and the parser opens the body on any character HTML does not count as whitespace, such as a
+# no-break space before the doctype.
+STARTS = {"doctype": "<!doctype html>", "no doctype": "", "whitespace": " \n\t<!doctype html>", "bom": "\ufeff<!doctype html>",
+          "no-break space": "\u00a0<!doctype html>", "line tab": "\u000b<!doctype html>",
+          "ideographic space": "\u3000<!doctype html>", "line separator": "\u2028<!doctype html>",
+          "comment": "<!-- generated --><!doctype html>"}
+
+
+@pytest.mark.parametrize("start_with", STARTS.values(), ids=STARTS.keys())
+def test_the_html_preview_loads_nothing_whatever_the_file_starts_with(ui, page, start_with):
+    hits = []
+    page.route(f"{ORIGIN}/tracker/**", lambda route: (hits.append(route.request.url), route.fulfill(status=404, body="")))
+    # With scripts on, the page reports once its stylesheet, its image and its fetch have finished, loaded or refused.
+    text = (f"{start_with}<title>x</title><script>const sheet = new Promise(done => {{ window.sheetDone = done }})</script>"
+            f'<link rel="stylesheet" href="{ORIGIN}/tracker/sheet.css" onload="sheetDone()" onerror="sheetDone()">'
+            f'<img src="{ORIGIN}/tracker/pixel.png" alt="probe"><p id=t>Static page</p>'
+            "<script>const image = document.querySelector('img')\n"
+            "Promise.all([sheet, new Promise(done => { if (image.complete) done(); else image.onload = image.onerror = done }),"
+            f"fetch('{ORIGIN}/tracker/fetch').catch(() => {{}})]).then(() => {{ document.getElementById('t').textContent = 'Ran' }})</script>")
+    start(ui, page, setup(texts={"page.html": text}))
+    page.locator(".file-row", has_text="page.html").click()
+    panel(page).get_by_role("button", name="Preview", exact=True).click()
+    expect(page.frame_locator(".file-preview-frame").get_by_text("Static page")).to_be_visible()
+    srcdoc = panel(page).locator("iframe.file-preview-frame").get_attribute("srcdoc")
+    assert ui.js(f"""(() => {{ const head = new DOMParser().parseFromString({json.dumps(srcdoc)}, 'text/html').head
+      return head.firstElementChild?.outerHTML.startsWith('<meta http-equiv="Content-Security-Policy"') }})()"""), srcdoc[:80]
+    panel(page).get_by_role("button", name="Run scripts").click()
+    expect(page.frame_locator(".file-preview-frame").get_by_text("Ran")).to_be_visible()
+    assert hits == []
+
+
+def test_a_markdown_file_outside_the_project_shows_its_own_images_and_opens_its_links(ui, page):
+    # A folder added to Files (or granted, or the default code folder) is listed by absolute paths.
+    notes = {"/srv/notes/README.md": "# Notes\n\n![diagram](logo.png) ![up](../../../up.png) ![remote](https://example.com/t.png)\n\n"
+                                     "[Other](other.md)\n",
+             "/srv/notes/other.md": "# Other\n"}
+    reply = """fake.sessions.get('a').events = [{ id: 'r1', type: 'assistant', text: 'See `/srv/notes/README.md`.', created: 2 }]"""
+    start(ui, page, setup(texts=notes, extra=reply))
+    page.get_by_role("link", name="/srv/notes/README.md").click()
+    panel(page).get_by_role("button", name="Preview", exact=True).click()
+    preview = panel(page).locator(".file-preview-markdown")
+    ui.wait("document.querySelector('.file-preview-markdown img[alt=diagram]')?.src.startsWith('blob:')")
+    assert len(ui.requests("/api/file/raw?path=%2Fsrv%2Fnotes%2Flogo.png&session_id=a")) == 1
+    # Above the root is not a path; only an address on the web is called one.
+    expect(preview.get_by_text("Image not loaded: up")).to_be_visible()
+    expect(preview.get_by_text("Image from the web, not loaded: remote")).to_be_visible()
+    preview.get_by_role("link", name="Other").click()
+    expect(panel(page).get_by_role("textbox", name="Edit /srv/notes/other.md")).to_have_value("# Other\n")
+
+
+def test_an_image_or_pdf_the_server_finds_elsewhere_is_named_by_the_file_opened(ui, page):
+    # A worktree chat: the reply names files by the source project's paths; the server reads the worktree's copies.
+    chat = """fake.sessions.set('w', { ...makeSession('w', 'Worktree chat'), workspace: '/state/worktrees/0b1c',
+      worktree: { branch: 'chat/x', source_workspace: '/code/shop' },
+      events: [{ id: 'r', type: 'assistant', text: 'See `/code/shop/img/logo.png` and `/code/shop/docs/paper.pdf`.' }] })"""
+    start(ui, page, setup(opened={"/code/shop/img/logo.png": "img/logo.png", "/code/shop/docs/paper.pdf": "docs/paper.pdf"},
+                          extra=chat), session="w")
+    for named, opened in (("/code/shop/img/logo.png", "img/logo.png"), ("/code/shop/docs/paper.pdf", "docs/paper.pdf")):
+        page.get_by_role("link", name=named).click()
+        toolbar = panel(page).locator(".editor-toolbar")
+        expect(toolbar.get_by_title(opened, exact=True)).to_have_text(opened)
+        expect(toolbar.get_by_role("link", name="Open in VS Code")).to_have_attribute("href", f"vscode://file/state/worktrees/0b1c/{opened}:1")
+        expect(panel(page).locator(".editor-note")).to_have_text(f"Opened {opened}: the reply named it {named}.")
+        # Read once, by the path the reply named.
+        asked = ui.js("fake.calls.filter(call => call.path.startsWith('/api/file/raw?'))"
+                      ".map(call => new URLSearchParams(call.path.split('?')[1]).get('path'))")
+        assert asked.count(named) == 1 and opened not in asked
+        panel(page).get_by_role("button", name="Back to files").click()
+    page.get_by_role("link", name="/code/shop/docs/paper.pdf").click()
+    expect(panel(page).locator(".editor-note")).to_be_visible()
+    panel(page).get_by_role("button", name="Add this file to chat").click()
+    expect(page.get_by_role("textbox", name="Message")).to_have_value("Please read the project file: docs/paper.pdf")
+
+
+def test_an_image_preview_has_no_add_to_chat_since_the_agent_reads_only_text(ui, page):
+    # read_file cannot read a PNG: an image reaches the agent only attached to a message.
+    start(ui, page)
+    for name, offered in (("logo.png", 0), ("logo.svg", 1), ("paper.pdf", 1), ("README.md", 1), ("data.bin", 1)):
+        page.locator(".file-row", has_text=name).click()
+        expect(panel(page).locator(".editor-toolbar").get_by_title(name, exact=True)).to_be_visible()
+        expect(panel(page).get_by_role("button", name="Add this file to chat")).to_have_count(offered)
+        panel(page).get_by_role("button", name="Back to files").click()

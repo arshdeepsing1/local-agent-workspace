@@ -229,3 +229,50 @@ def test_long_file_names_fit_a_phone(coarse_ui, coarse_page):
     assert button["width"] >= 23.5 and button["height"] >= 23.5
     attach = page.get_by_role("button", name="Attach files").bounding_box()
     assert attach["width"] >= 23.5 and attach["height"] >= 23.5
+
+
+QUEUE_TEXT = "Then update the summary table with the numbers from these files and explain the differences"
+# Each queued row's text width, whether the row overflows, and whether its Edit and Remove fit inside the bar.
+QUEUE_LAYOUT = """[...document.querySelectorAll('.queue-item')].map(item => {
+  const bar = document.querySelector('.queue-bar').getBoundingClientRect()
+  return { text: item.querySelector('.queue-text').getBoundingClientRect().width, overflows: item.scrollWidth > item.clientWidth,
+           buttons: [...item.querySelectorAll('button')].every(button => button.getBoundingClientRect().right <= bar.right + 0.5) }
+})"""
+
+
+def show_queue(ui, page, items):
+    setup = FILES + f"\nfake.sessions.set('a', {{ ...makeSession('a', 'Files'), queued_messages: {json.dumps(items)} }})"
+    ui.app(session="a", scenario="workspace", setup=setup)
+    ui.show_session("a")
+    expect(page.get_by_role("group", name="Queued messages").locator(".queue-item")).to_have_count(len(items))
+
+
+def queued_with_files(item_id, names, **extra):
+    return {"id": item_id, "text": QUEUE_TEXT, "created": 1, "paused": True, **extra,
+            "uploads": [{"id": f"{item_id}{index}".zfill(64), "name": name, "kind": "document"} for index, name in enumerate(names)]}
+
+
+def test_queued_file_names_leave_room_for_the_text_on_a_phone(coarse_ui, coarse_page):
+    # Tags go on a row of their own under the text, and a long file name is shortened there.
+    ui, page = coarse_ui, coarse_page
+    long_name = "a-very-long-quarterly-report-name-for-the-board-meeting-in-march.pdf"
+    show_queue(ui, page, [
+        queued_with_files("1", ["report-q3.pdf", "screenshot.png"], command={"name": "review", "path": ".agent/commands/review.md"}),
+        queued_with_files("2", [long_name])])
+    rows = ui.js(QUEUE_LAYOUT)
+    assert all(row["text"] > 120 and not row["overflows"] and row["buttons"] for row in rows), rows
+    assert not ui.js("document.querySelector('.queue-bar').scrollWidth > document.querySelector('.queue-bar').clientWidth")
+    tag = page.get_by_role("group", name="Queued messages").locator(".queue-tag", has_text=long_name)
+    expect(tag).to_have_attribute("title", f"Attached file: {long_name}")
+    assert tag.evaluate("tag => tag.scrollWidth > tag.clientWidth")
+
+
+def test_queued_file_names_leave_room_for_the_text_beside_the_workspace_panel(ui, page):
+    page.set_viewport_size({"width": 1280, "height": 844})
+    show_queue(ui, page, [queued_with_files("1", ["Q3-financial-report.pdf", "dashboard-screenshot.png"],
+                                            command={"name": "review", "path": ".agent/commands/review.md"})])
+    page.get_by_role("button", name="Workspace", exact=True).click()
+    expect(page.get_by_role("complementary", name="Workspace panel")).to_be_visible()
+    ui.wait("document.querySelector('.queue-item .queue-text').getBoundingClientRect().width > 300")
+    rows = ui.js(QUEUE_LAYOUT)
+    assert all(not row["overflows"] and row["buttons"] for row in rows), rows

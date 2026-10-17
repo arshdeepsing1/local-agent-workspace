@@ -60,6 +60,7 @@ def test_open_starts_the_wait_only_for_a_free_port(run_script, monkeypatch):
     started, served = [], []
     monkeypatch.setattr(serve, "run", lambda app, port, reload=False: served.append((app, port, reload)))
     monkeypatch.setattr(run_script, "open_when_ready", lambda port: started.append(port))
+    monkeypatch.setattr(run_script, "desktop_browser", lambda: True)
     port = free_port()
     run_script.main(["--port", str(port), "--open"])
     run_script.main(["--port", str(port)])
@@ -73,3 +74,24 @@ def test_open_starts_the_wait_only_for_a_free_port(run_script, monkeypatch):
     assert started == [port]
     assert [entry[1] for entry in served] == [port, port, served[2][1]]
     assert all(entry[0] == "local_agent.api:create_app" and entry[2] is False for entry in served)
+
+
+@pytest.mark.parametrize(("platform", "environ", "desktop"), [
+    ("linux", {"TERM": "xterm-256color"}, False), ("linux", {"DISPLAY": ":0"}, True),
+    ("linux", {"WAYLAND_DISPLAY": "wayland-0"}, True), ("linux", {"BROWSER": "firefox"}, True),
+    ("freebsd14", {}, False), ("darwin", {}, True), ("win32", {}, True)])
+def test_a_browser_opens_only_where_a_graphical_one_can(run_script, platform, environ, desktop):
+    # Without a display Python's webbrowser picks a text browser (w3m, lynx…), run in the server's own terminal.
+    assert run_script.desktop_browser(environ, platform) is desktop
+
+
+def test_open_without_a_desktop_says_where_the_app_is(run_script, monkeypatch, capsys):
+    from local_agent import serve
+    started = []
+    monkeypatch.setattr(serve, "run", lambda app, port, reload=False: None)
+    monkeypatch.setattr(run_script, "open_when_ready", lambda port: started.append(port))
+    monkeypatch.setattr(run_script, "desktop_browser", lambda: False)
+    port = free_port()
+    run_script.main(["--port", str(port), "--open"])
+    assert started == []
+    assert f"open http://127.0.0.1:{port}/ in your browser" in capsys.readouterr().out

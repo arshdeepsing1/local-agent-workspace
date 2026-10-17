@@ -98,7 +98,8 @@ cd local-agent-workspace
 
 Open http://127.0.0.1:8765, or start with `--open` (`.venv/bin/python run.py --open`) to have the
 app opened in your default browser once it is ready (within 10 seconds; not when the port is already
-in use). Use `--port 8766` if that port is occupied.
+in use). On a machine without a desktop (no display, such as over SSH) `--open` only prints the address,
+unless `BROWSER` names a browser to use. Use `--port 8766` if that port is occupied.
 Stop the local server with Ctrl+C. It must remain running for the UI and agents to work.
 
 The app can also run in its own window: in Chrome or Edge choose **Install app** (the icon at the end of
@@ -471,7 +472,8 @@ when opening a conversation or performing restart recovery.
 - **Messages while the agent works (queue and steering)**: while a reply, a compaction or a `!`
   command runs, the box keeps **Stop response** and adds **Queue message**; Enter queues too, and
   Esc in the box stops the reply. At most 3 messages (50,000 characters in total) can wait; they
-  are listed above the box, where **Edit** moves one back into the box and **Remove** drops it. At
+  are listed above the box, where **Edit** moves one back into the box (one queued as plain text
+  comes back with **Send as plain text** on) and **Remove** drops it. At
   the next step boundary, after every result of the agent's current tool calls, the waiting
   messages reach the agent as one message of the same turn, marked as sent while it was working
   ("steered"). A message queued during the final reply is sent as the next turn once the reply
@@ -585,7 +587,8 @@ when opening a conversation or performing restart recovery.
   are never replaced by automatic naming, including a title request already in flight.
 - **Workspace / Files**: browse a folder, edit UTF-8 text files up to the file write limit
   (Settings, 80 KB by default), or use the plus button to reference the file in chat ("Please read the project file: <path>", or
-  "Please read the file: <absolute path>" for a folder outside the project). On windows narrower
+  "Please read the file: <absolute path>" for a folder outside the project). An image other than SVG has no plus
+  button, since the agent reads files as text: attach it to a message with **Attach files** instead. On windows narrower
   than 1,024 px the Workspace panel opens over the chat (from 601 px it stops at the sidebar, which stays usable with the keyboard and the mouse and is not dimmed): focus moves into it, and
   **Close workspace**, Escape (in the panel or the sidebar) or a click on the dimmed chat closes it (that first
   click only closes the panel). An error that comes up while it is open shows at the bottom of the panel.
@@ -624,19 +627,22 @@ when opening a conversation or performing restart recovery.
   until the next save. Editor drafts are kept in the current page, not across reloads.
 - **Preview and download files**: in **Workspace / Files**, images (PNG, JPEG, GIF, WebP and SVG) and
   PDF files open in a preview instead of the editor: an image with its size in pixels and bytes, a PDF
-  in the browser's PDF viewer. An SVG is shown from a `data:` address, so opened in a tab of its own
+  in the browser's PDF viewer (which may name the file by an ID, also in its own download: **Download** in
+  the toolbar saves it by its name). An SVG is shown from a `data:` address, so opened in a tab of its own
   (**Open image in new tab**) its scripts run with an origin of their own, never as a page of the app.
   Markdown and HTML files open in the editor, with **Preview** beside it; the preview shows the
   editor's text, unsaved edits included, and **Edit** goes back. A Markdown preview is rendered like a
-  reply: images in the project are shown, images from the web are not loaded (a dashed note names
-  them), links to project files open them in the panel and web links open in a new tab. An HTML file
+  reply: images beside the file are shown (in the project, or in a folder outside it that Files shows),
+  images from the web are not loaded (a dashed note names them), links to files beside it open them in
+  the panel and web links open in a new tab. An HTML file
   previews in a sandboxed frame with an origin of its own, so it cannot reach the app, its token or
-  the API, and it loads nothing from any address (only what the file holds inline). Its scripts are
+  the API, and it loads nothing from any address (only what the file holds inline), whatever the file
+  starts with. Its scripts are
   off until you choose **Run scripts**, for that file until the page is reloaded (**Stop scripts**
   turns them off again). Running scripts still cannot make requests, but browsers let no page block
   WebRTC connections, so a script can send data to an address that way: run scripts only in files you
-  trust. A file that is not UTF-8 text, or is over the file write limit, says why and offers
-  **Download**. **Download** (in the editor toolbar, or the button on a file row, shown on hover or
+  trust. A file that is not UTF-8 text, or is over the file write limit (a Markdown or HTML file too,
+  which then has no preview), says why and offers **Download**. **Download** (in the editor toolbar, or the button on a file row, shown on hover or
   focus) saves any file of up to 20 MB as it is on disk. The checks of Files apply: credential files,
   the app's state folder and folders outside the project without folder access are refused. The server
   sends a file inline only when it is a PNG, JPEG, GIF, WebP or PDF file whose bytes start as that
@@ -1137,7 +1143,8 @@ when opening a conversation or performing restart recovery.
   are refused with the reason. **Open in VS Code** in the editor toolbar opens the file at
   that line through a `vscode://file/<absolute path>:<line>` link; nothing happens when VS
   Code is not installed. A path inside the project is opened by its project path; when a
-  reply names a file that does not exist as written, the editor opens the one project file
+  reply names a file that does not exist as written, the editor (or the preview of an image or
+  PDF, whose header, **Open in VS Code** and plus button then name that file) opens the one project file
   the name most likely means (a path starting with the project's own folder name, or the
   folders above it from the repository root; in a worktree chat, the worktree's copy of a
   file named by the source project's path, which is always preferred over the source

@@ -24,6 +24,15 @@ def accepting(port):
         return False
 
 
+def desktop_browser(environ=None, platform=None):
+    """Whether --open can start a graphical browser: on macOS and Windows, or with a display (X11 or Wayland) or a
+    browser named in BROWSER. Without them Python's webbrowser runs a text browser (w3m, lynx…) in this terminal,
+    which then fights the server's log output and waits until that browser is closed."""
+    environ = os.environ if environ is None else environ
+    platform = sys.platform if platform is None else platform
+    return platform in ("darwin", "win32") or any(environ.get(name) for name in ("DISPLAY", "WAYLAND_DISPLAY", "BROWSER"))
+
+
 def open_when_ready(port, timeout=OPEN_WAIT_SECONDS, opener=None):
     """--open: open the app in the default browser once 127.0.0.1:port accepts connections (checked every 0.1 s
     for at most timeout seconds). True when the browser was asked to open it."""
@@ -46,7 +55,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     # A port already in use is another program's (the start fails and says so): no browser is opened for it.
     if args.open and not accepting(args.port):
-        threading.Thread(target=open_when_ready, args=(args.port,), daemon=True).start()
+        if desktop_browser():
+            threading.Thread(target=open_when_ready, args=(args.port,), daemon=True).start()
+        else:
+            print(f"No desktop to open a browser on: open http://127.0.0.1:{args.port}/ in your browser.", flush=True)
     from local_agent import serve
     serve.run("local_agent.api:create_app", args.port, reload=args.reload)
 
