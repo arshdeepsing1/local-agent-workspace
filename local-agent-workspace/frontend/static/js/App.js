@@ -17,6 +17,7 @@ import PermissionRulesDialog from './components/PermissionRulesDialog.js'
 import ContextMeter from './components/ContextMeter.js'
 import ChangesBar, { plural } from './components/ChangesBar.js'
 import StorageNotice from './components/StorageNotice.js'
+import { ScheduleAlerts } from './components/SchedulesPanel.js'
 import { blockerOf, OpenBlockingChat } from './components/BlockingChat.js'
 import TaskChecklist from './components/TaskChecklist.js'
 import ContinueButton from './components/ContinueButton.js'
@@ -54,6 +55,8 @@ export default function App() {
   const [workspaceOpen, setWorkspaceOpen] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [foldersOpen, setFoldersOpen] = useState(false)
+  // The token expiry warning (Settings → Credentials → Token expires on) you dismissed in this page, until it changes.
+  const [tokenDismissed, setTokenDismissed] = useState(null)
   // The add-rule dialog: false, or { done } that returns focus when it closes.
   const [rulesOpen, setRulesOpen] = useState(false)
   // A changed file chosen in the changes bar, to open in the Workspace panel's review.
@@ -215,6 +218,10 @@ export default function App() {
       <${StorageNotice} problems=${app.storageProblems} />
       ${!app.online ? html`<div class="connection-banner" role="status">Reconnecting to your local server… Refresh if the server was restarted.</div>` : null}
       ${app.online && app.connection && !app.connection.connected ? html`<${ConnectionBanner} app=${app} onSettings=${() => setSettingsOpen(true)} onError=${showError} />` : null}
+      ${app.settings?.token_warning && tokenDismissed !== app.settings.token_warning ? html`<div class="connection-banner token-banner" role="status"><span class="banner-text">${app.settings.token_warning}</span>
+        <div class="banner-actions"><button onClick=${() => setSettingsOpen(true)}>Open settings</button><button onClick=${() => setTokenDismissed(app.settings.token_warning)}>Dismiss</button></div></div>` : null}
+      ${app.ready ? html`<${ScheduleAlerts} enabled=${app.settings?.schedules_enabled === true} notify=${attention.notifications.enabled}
+        onOpenChat=${id => { app.setActiveId(id); void app.refreshSessions().catch(e => showError(e.message)) }} onOpenSchedules=${() => setAgentToolsOpen('Schedules')} onError=${showError} />` : null}
       ${hasMessages && active ? html`<${Conversation} key=${active.id} session=${active} onError=${showError} onSelectSession=${app.setActiveId} onOpenPath=${openFileAt}
           roots=${standingPath ? [standingPath] : []} busy=${busy} onLoadEarlier=${app.loadEarlier} onPrefill=${text => { if (draft.trim()) return false; setDraft(text); return true }} />` :
         html`<div class="welcome"><div class="welcome-content">

@@ -75,11 +75,15 @@ frontend that runs without a build step.
   an earlier step is billed at the cache-read rate.
 - Endpoint checks: **Test model** and **Check endpoint capabilities…** send a few small requests,
   after you approve their estimated cost, and show what the endpoint accepts.
+- Scheduled runs: a prompt sent to a new chat of a project at set times (`every 2 hours` or a cron
+  line), with a fixed permission mode (never Bypass), an approval limit and token, time and spending
+  limits per run. Each run waits for your **Run** unless the schedule runs automatically; missed runs
+  are caught up once, and a rejected token pauses the schedule.
 - Collapsible activity.
 - Responsive desktop/mobile UI, bundled fonts, and no credential storage in the browser.
 
 This release does not include a browser automation engine, OS computer control,
-cloud sessions, a scheduler, a full PTY terminal, or an OS execution sandbox.
+cloud sessions, scheduled runs while the app is closed, a full PTY terminal, or an OS execution sandbox.
 
 ## Quick start
 
@@ -787,7 +791,8 @@ when opening a conversation or performing restart recovery.
   that you declined). The card shows when it expires (with the weekday when that is not today).
   0 waits until you answer or press **Stop**, like Claude desktop, but a waiting card keeps the
   chat busy, and a busy chat blocks Undo and Recovery restores in its project. Before this
-  setting existed, every card expired after five minutes. An action stopped without any card, for example by Plan mode or
+  setting existed, every card expired after five minutes. A scheduled run has its own approval limit
+  (1 to 60 minutes), after which the run stops (see **Scheduled runs**). An action stopped without any card, for example by Plan mode or
   because project instructions changed mid-turn, shows "Not run:" and the reason, not "declined".
   When a busy chat blocks an action, the error names that chat and why (for example
   "“Fix the parser” is waiting for your approval. Answer or stop it before undoing agent
@@ -3027,6 +3032,75 @@ is ignored. Thinking is not replayed as model history, and the app never fabrica
 hidden reasoning. Endpoint support varies; ordinary responses legitimately have no
 Thinking block.
 
+### Scheduled runs
+
+**Agent tools → Schedules** lists the schedules of the chat's project (a worktree chat's source
+project; the Settings project without a chat) and adds, edits, pauses, resumes and deletes them. A
+schedule sends its prompt, as if you typed it, to a **new chat** in that project at each of its times.
+The chat is named after the schedule and the time (no title request), is tagged `scheduled`, and gets
+the schedule's settings as its own:
+
+- **When it runs**: `every N minutes`, `hours` or `days`, counted from when you save that timing (an
+  edit that keeps it keeps the schedule's times, and its preview shows them; at most every
+  5 minutes, at least every 31 days), or a five-field cron line: minute, hour, day of month, month and
+  day of week (0 or 7 is Sunday), each `*`, a number, a range, a list or a step (`*/15`, `8-18/2`,
+  `1,15`), such as `0 9 * * 1-5` for 9:00 on weekdays. When both day fields are set, a day that matches
+  either one runs, as in cron. The form shows the next three times as you type. Times are read in the
+  schedule's **Time zone** (a name such as `Europe/Berlin`), or this computer's when it is empty. A time
+  that a clock change skips (02:30 on the night the clocks go forward) runs an hour later that day, and a
+  time that repeats (01:30 when they go back) runs once.
+- **Permission mode**: fixed for every run, any mode except Bypass permissions. Don't ask is the default:
+  it blocks what its rules do not allow instead of asking, so a run rarely waits for you.
+- **Approval limit (minutes)**, 1 to 60, required: a card of the run (an approval, a question or a plan,
+  its subagents' cards included) that waits this long without an answer ends the run. The action does
+  not run, later cards of the run do not wait, and the run stops before its next model request with a
+  notice ("Stopped at the approval limit" in notifications). Only the scheduled turn has this limit: a
+  message you send in that chat afterwards waits as **Settings → Approval wait** says.
+- **Token limit per run** and **Time limit per run (minutes)**, both required, and **Spending limit per
+  run** (DBU; 0 follows **Settings → Agent → Spending limit per conversation**): the new chat's own turn
+  limits and spending limit (see **Token and time limits per turn** and **Spending limit**), so a run
+  wraps up and ends at them, also on endpoints without price data. **Agent steps**, **Model endpoint**
+  and **Reasoning effort** follow Settings when left empty.
+- **Run policy**: **Ask before each run** (the default) or **Run automatically**.
+- **Missed runs**: **Run once when the app is back** (the default) or **Skip them**.
+
+Schedules run only while the app runs and **Settings → Agent → Scheduled runs at their times** is on
+(off by default; **Run now** works either way). The app then checks them every 30 seconds. With Ask, a
+due run waits for you: a banner above the chat says "Scheduled run ready: <name>" with **Run** (which
+starts it and opens its chat) and **Skip**, the schedule shows **Run** and **Skip** too, the server shows
+the same text as a desktop notification when **Settings → Desktop notification when no browser tab is
+open** is on and no page is open, and **Notify me** shows it while the page is hidden. Nothing is sent
+until you choose Run. A ready run nobody starts before the schedule's next time, or within 24 hours, is
+not run. With Run automatically, runs start at their times without a click, and each one makes model
+calls billed to your workspace.
+
+Before each run the app makes the free connection check (it lists the serving endpoints; no model
+call). When Databricks rejects the token (HTTP 401 or 403), the schedule is paused, a banner says
+"Scheduled runs paused: Databricks rejected the token" (and a desktop notification when no page is
+open); renew the token in your credential file, then **Resume** the schedule. Other problems (no
+network, a Databricks server error, a project folder that is gone, an @ file the prompt may not attach)
+skip that run with a note, as does a run the app stops before it starts (the app closing, or Scheduled
+runs turned off, during its connection check). A run is also skipped while the schedule's previous run
+still runs (its scheduled turn: a message you send in that run's chat later does not count), and when
+two scheduled runs already run. If runs were due while the app was closed (or asleep, or with scheduled
+runs off), the first check afterwards runs the schedule **once** for all of them when the latest was due
+within 24 hours ("Caught up once: 4 runs missed while the app was not running"), and otherwise skips them
+with a note. Times that pass while a schedule is paused are not caught up. Two app instances on one state
+folder never both run schedules: the first one holds the lock file `scheduler.lock` in the state folder,
+and the other says so in Schedules.
+
+Each schedule's **History** keeps its last 20 runs: when, how it started (Scheduled, Caught up, Run now
+or Run when ready) and how it ended (steps, time, tokens and estimated DBU), or why it did not run, with
+**Open chat**; a run that is still running keeps its entry however many notes follow it. **Run now**
+starts a run at once, whatever the run policy; it still checks the connection and the runs already
+running. Schedules are kept in `schedules.json` in the state folder, never in a project, and deleting one
+keeps its runs' chats. Each run checks the saved schedule again, so one changed outside the app (Bypass
+permissions, a missing limit) is paused with a note instead of run.
+
+**Settings → Credentials → Token expires on** (optional) is the day your Databricks personal access
+token expires. From 7 days before, and after it, a banner (with **Open settings** and **Dismiss**) and
+Agent tools → Schedules remind you to renew it. The app never reads the token's date from Databricks.
+
 ### Web fetch and search
 
 **Settings → Web access** controls the agent's two web tools. Both are tools of this app
@@ -3668,7 +3742,8 @@ echo "Review the diff" | python3 scripts/agent_run.py --output stream-json -
 - The result object has `terminal_reason`, `is_error`, `duration_s`, `steps`, `tool_calls`,
   `usage`, `tokens`, `estimated_dbu`, `unpriced_calls`, `subagents`, `changed_files`, `result`
   (the final reply), `exit_code` and `session_id`. Exit codes: 0 completed, 1 an error, 2 a limit
-  was reached (Agent steps, spending, or the turn's tokens or time), 3 stopped or interrupted.
+  was reached (Agent steps, spending, the turn's tokens or time, or a scheduled run's approval limit),
+  3 stopped or interrupted.
   Ctrl+C stops the turn and prints its result (none when the prompt had not started a turn yet).
   A token count no call reported is `null`, never 0.
 
@@ -3953,6 +4028,7 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `backend/local_agent/usage_export.py` / `scripts/usage_report.py`: usage rows and CSV correlated with conversation history.
 - `backend/local_agent/usage_overview.py`: usage across chats (`GET /api/usage`, `usage_report.py --all`) from each conversation's usage summary.
 - `backend/local_agent/turns.py`: each turn's result record and its token and time limits (the wrap-up request, `budget_limit`).
+- `backend/local_agent/schedules.py` / `schedules_api.py`: scheduled runs (cron lines and intervals, the scheduler loop and its lock file, catch-up, the connection check, the token expiry warning) and their routes.
 - `backend/local_agent/stream_api.py` / `client.py` / `scripts/agent_run.py`: the NDJSON stream of a chat, the stdlib Python client and the headless runner.
 - `backend/local_agent/serve.py`: the uvicorn server of `run.py` and the simulator, which ends the chats' streams before it waits for open responses at shutdown.
 - `backend/local_agent/instructions.py`: scoped project guidance loading (`.local` files, `@path` imports,

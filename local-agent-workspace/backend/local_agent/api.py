@@ -53,6 +53,8 @@ from .interactions import register_interactions
 from .projects import register_projects
 from .endpoint_checks_api import register_endpoint_checks
 from .stream_api import register_stream, stream_snapshot
+from .schedules import Scheduler
+from .schedules_api import register_schedules
 from .user_paths import checked_workspace
 
 
@@ -224,6 +226,9 @@ class SettingsEdit(BaseModel):
     web_search_provider: Literal["", "brave", "tavily", "searxng"] | None = None
     web_search_url: str | None = Field(default=None, max_length=2048, strict=True)
     web_search_key: str | None = Field(default=None, max_length=64, strict=True)
+    # Settings → Agent → Scheduled runs and Settings → Credentials → Token expires on ("" or YYYY-MM-DD): schedules.py.
+    schedules_enabled: bool | None = Field(default=None, strict=True)
+    token_expires_on: str | None = Field(default=None, max_length=10, strict=True)
 
 
 class GitStage(BaseModel):
@@ -300,12 +305,15 @@ def create_app(settings=None):
     settings = settings or Settings()
     store = Store(settings.state_dir / "conversations.sqlite3")
     manager = AgentManager(store, settings)
+    scheduler = manager.scheduler = Scheduler(manager, settings)
     local_token = secrets.token_urlsafe(32)
     deleting_sessions = set()
 
     @asynccontextmanager
     async def lifespan(app):
+        await scheduler.sync()  # Settings → Agent → Scheduled runs (off by default).
         yield
+        await scheduler.stop()  # No new scheduled run starts during the shutdown.
         manager.closing = True  # A Stop during shutdown records the reply as interrupted.
         await asyncio.gather(*(manager.stop(sid) for sid in list(manager.tasks)))
         await manager.endpoint_runner.stop()  # An endpoint check keeps what came back so far.
@@ -462,6 +470,7 @@ def create_app(settings=None):
                              "you use (the Settings model, Settings → Subagents or one of your chats). Requests carry "
                              "the conversation, so the app sends them only to endpoints you already chose.")
         result = settings.update(body.model_dump(exclude_none=True))
+        await scheduler.sync()  # Scheduled runs turned on or off.
         # A request format Databricks rejected, and cache markers and images it rejected, are tried again after any
         # Settings save.
         manager.reasoning_rejections.clear()
@@ -1134,6 +1143,7 @@ def create_app(settings=None):
     register_projects(app, manager, settings, workspace_tools)
     register_endpoint_checks(app, manager, settings)
     register_stream(app, manager, session_or_404)
+    register_schedules(app, manager, settings, session_or_404, workspace_tools)
     workspace_folders = register_workspace_folders(app, settings, session_or_404)
 
     # The browser loads the frontend source files directly; there is no build step.

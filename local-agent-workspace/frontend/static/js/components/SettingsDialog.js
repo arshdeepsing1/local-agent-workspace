@@ -435,7 +435,10 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         <p class="field-help">The agent can save short notes about a project, each with your approval, and later chats in that project see them. Review, edit and delete them in Agent tools → Memory.</p>
         <label class="settings-checkbox"><input type="checkbox" checked=${form.git_context !== false}
           onChange=${e => field('git_context', e.currentTarget.checked)} />Git status in messages</label>
-        <p class="field-help">The first message of each reply carries a short Git snapshot of the project (branch, upstream, change counts and the last five commits, at most 1,200 bytes), so the agent needs no command to find them; messages sent while the agent works carry none. Credential files are left out.</p>`)}
+        <p class="field-help">The first message of each reply carries a short Git snapshot of the project (branch, upstream, change counts and the last five commits, at most 1,200 bytes), so the agent needs no command to find them; messages sent while the agent works carry none. Credential files are left out.</p>
+        <label class="settings-checkbox"><input type="checkbox" checked=${form.schedules_enabled === true}
+          onChange=${e => field('schedules_enabled', e.currentTarget.checked)} />Scheduled runs at their times</label>
+        <p class="field-help">While the app is open it checks the schedules of Agent tools → Schedules every 30 seconds. A schedule that asks before each run waits for your Run; one set to run automatically starts on its own and makes model calls. Off (the default): schedules run only with Run now.</p>`)}
         ${group('subagents', html`
         <p class="field-help">The agent hands self-contained work to subagents of three built-in types. Each type can use its own endpoint and reasoning effort; Same as the chat follows the chat that starts it.</p>
         ${SUBAGENT_TYPES.map(([kind, label, help]) => html`<${SubagentDefaults} key=${kind} label=${label} help=${help}
@@ -480,7 +483,9 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         <${More} topic="desktop notifications">It uses notify-send on Linux and osascript on macOS, and names only the status and the conversation title.<//>`)}
         ${group('credentials', html`
         <label>Credential file<input value=${form.env_file} onInput=${e => field('env_file', e.currentTarget.value)} placeholder="/path/to/env_vars.txt" /></label>
-        <p class="field-help">Read on the server. Use DBRICKS_URL and DBRICKS_TOKEN assignments. Environment variables also work.</p>`)}
+        <p class="field-help">Read on the server. Use DBRICKS_URL and DBRICKS_TOKEN assignments. Environment variables also work.</p>
+        <label>Token expires on<input type="date" value=${form.token_expires_on || ''} onInput=${e => field('token_expires_on', e.currentTarget.value)} /></label>
+        <p class="field-help">Optional: the day your Databricks personal access token expires. From 7 days before, a banner and Agent tools → Schedules remind you to renew it. The app never reads the token's date from Databricks.</p>`)}
         <p class="settings-note">Project, model and effort changes apply to new conversations; each chat keeps its own model and effort. Use Folder access above the chat input to allow additional folders. Commands run according to your selected permission mode.</p>
         </div>
         </div>

@@ -44,7 +44,7 @@ NO_REVIEWER = ("Nobody can review plans in this scripted run. Do not make change
 CARD_GONE = ("This approval is no longer pending.", "This question is no longer waiting for an answer.",
              "This plan is no longer waiting for review.")
 SHUT_DOWN = "The app shut down before the turn ended (its shutdown stops running turns)."
-LIMIT_REASONS = ("step_limit", "spending_limit", "budget_limit")
+LIMIT_REASONS = ("step_limit", "spending_limit", "budget_limit", "approval_expired")
 STOP_REASONS = ("stopped", "interrupted")
 RECONNECTS = 3  # New streams query() opens after the app dropped one whose reader fell behind.
 

@@ -300,7 +300,7 @@ def test_focused_fields_stay_above_the_footer(ui, page, width, height):
     dialog = open_settings_at(ui, page, width, height)
     dialog.get_by_role("textbox", name="Project folder").focus()
     hidden = []
-    for _ in range(60):
+    for _ in range(120):  # Every focusable control of the dialog, then the footer.
         state = ui.js("""(a => ({ name: a.getAttribute('aria-label') || a.labels?.[0]?.textContent.trim().slice(0, 40) || a.textContent.trim(),
           inFooter: !!a.closest('form > footer'), top: a.getBoundingClientRect().top, bottom: a.getBoundingClientRect().bottom,
           height: a.getBoundingClientRect().height }))(document.activeElement)""")

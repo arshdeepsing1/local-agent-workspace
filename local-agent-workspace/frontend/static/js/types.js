@@ -40,7 +40,28 @@
 //   that holds the API key; '' = BRAVE_API_KEY or TAVILY_API_KEY), web_search_status: { provider, ready, problem?,
 //   key_name? } | null (never the key),
 //   git_context: boolean (each turn's first message carries a short Git snapshot: branch, upstream, change counts,
-//   recent commits; default true) }
+//   recent commits; default true), schedules_enabled: boolean (the scheduler runs Agent tools → Schedules at their
+//   times; default false), token_expires_on: '' | 'YYYY-MM-DD' (the Databricks token's expiry, typed by the user),
+//   token_warning: string | null (from 7 days before that day, and after it; backend schedules.token_warning) }
+// Schedules (backend schedules.py, schedules_api.py). GET /schedules?session_id= -> { enabled (Settings), running (this
+//   app runs them), problem (another app holds the state folder's lock, or schedules.json cannot be read; or null),
+//   project, schedules: Schedule[] (this project's), other_projects, token_warning, limits: { max_approval_minutes,
+//   max_turn_tokens, max_turn_minutes, min_interval_minutes, max_name, max_prompt, max_schedules, max_running, modes } }.
+//   POST /schedules { ScheduleFields } adds one for the chat's project, PUT /schedules/<id> edits, DELETE deletes,
+//   POST /schedules/<id>/pause|resume|skip; each returns the listing. POST /schedules/<id>/run (Run now, or Run on a
+//   waiting run) -> the listing and session_id (the run's new chat). POST /schedules/preview { spec, timezone,
+//   schedule_id? (the edited one: an unchanged timing keeps its saved times) } -> { text, zone, next_runs: [epoch seconds] }. GET /schedules/ready -> { ready: [{ id, name, workspace, due, note }],
+//   paused: [{ id, name, workspace }] (a rejected token) } over all projects.
+// ScheduleFields: { name, prompt, spec ('every N minutes|hours|days' or a five-field cron line), timezone ('' = this
+//   computer's), model ('' = Settings'), reasoning_effort ('' = Settings'), permission_mode (never 'bypassPermissions'),
+//   approval_timeout_minutes (1-60, required), turn_token_limit, turn_time_limit_minutes (required), spending_limit_dbu
+//   (0 = the Settings default), max_agent_steps (null = Settings'), run_policy: 'ask'|'auto', catch_up: 'once'|'skip' }.
+// Schedule: ScheduleFields and { id, workspace, enabled, paused_reason?: 'paused'|'token_rejected'|'invalid', created,
+//   anchor, next_run (epoch seconds or null), pending?: { due, created, trigger, note? } (waiting for Run), running,
+//   zone, mode_label, history: [{ id, at, due, trigger: 'scheduled'|'catch_up'|'run_now'|'ready', outcome:
+//   'started'|'not_run'|'skipped', note?, session_id?, started?, ended?, terminal_reason? ('deleted': its chat was
+//   deleted), estimated_dbu?, tokens?, duration_s?, steps? }] (the last 20) }. A run's chat has tags ['scheduled'] and
+//   schedule: { id, name, trigger, due? }.
 // GET /output-styles?session_id= -> { styles: [{ id, name, description, source: 'built-in'|'project'|'user', path? }],
 //   errors: [{ path, error }] } (backend output_styles.py; the chat's project, or the default one without a chat).
 // Memory (GET /memory?session_id=; POST { text } adds, PATCH /memory/<id> { text } edits, DELETE /memory/<id> deletes
@@ -95,7 +116,8 @@
 //   agent_type?: 'explore'|'general'|'editor' or a custom agent's name (a subagent), subagents?: SubagentEntry[] (a parent's index of its
 //   subagent chats; left out of GET /sessions list items),
 //   terminal_reason?: how the last turn ended: 'completed'|'stopped'|'error'|'inference_error'|
-//   'tool_error'|'step_limit'|'spending_limit'|'budget_limit' (the turn's token or time limit)|'interrupted'|
+//   'tool_error'|'step_limit'|'spending_limit'|'budget_limit' (the turn's token or time limit)|'approval_expired' (a
+//   scheduled run's card waited its approval limit)|'interrupted'|
 //   'hook_blocked' (a user_prompt hook blocked the message; also in the /api/sessions summaries),
 //   turn_ended?: epoch seconds when the last turn ended; null while a turn runs (also in summaries),
 //   turn_delegated?: true while the last turn is one a parent's delegate_task started (also in summaries),

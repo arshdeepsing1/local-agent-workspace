@@ -27,13 +27,14 @@ def test_legacy_settings_do_not_restore_removed_options(tmp_path, monkeypatch):
                 "thinking_summaries": True, "thinking_replay": False, "prompt_caching": "auto", "spending_limit_dbu": 0, "subagent_defaults": DEFAULT_SUBAGENT_DEFAULTS,
                 "background_subagent_wake": False, "fallback_model": "",
                 "turn_token_limit": 0, "turn_time_limit_minutes": 0, "slash_commands": True, "web_fetch": True,
-                "web_search_provider": "", "web_search_url": "", "web_search_key": "", "coding_dir": "", "python_venv": ""}
+                "web_search_provider": "", "web_search_url": "", "web_search_key": "", "schedules_enabled": False,
+                "token_expires_on": "", "coding_dir": "", "python_venv": ""}
     assert settings.values == expected
     with TestClient(create_app(settings)) as client:
         bootstrap = client.get("/api/bootstrap").json()
         assert set(bootstrap["settings"]) == {*expected, "host", "configured", "coding_dir_status",
                                               "python_venv_status", "default_model", "default_limits", "endpoint_profiles",
-                                              "web_search_status"}
+                                              "web_search_status", "token_warning"}
         assert bootstrap["settings"]["default_limits"] == {"context_window": 131072, "max_output_tokens": 8192}
         headers = {"X-Local-Token": bootstrap["token"]}
         # Old clients may still send these keys, but they cannot enable a mode.

@@ -5,6 +5,7 @@ import ConversationTransfer from './ConversationTransfer.js'
 import ExtensionsEditor from './ExtensionsEditor.js'
 import UsagePanel from './UsagePanel.js'
 import MemoryPanel from './MemoryPanel.js'
+import SchedulesPanel from './SchedulesPanel.js'
 import { blockerOf, OpenBlockingChat } from './BlockingChat.js'
 import { modeLabel } from './PermissionsMenu.js'
 import { agentLabel, agentSettingsText, elapsedText } from '../subagents.js'
@@ -23,7 +24,7 @@ const plural = (count, one, many = `${one}s`) => `${count.toLocaleString('en-US'
 // The sections, grouped in the navigation on the left (one scrolling row below 640 px).
 export const SECTIONS = [
   { group: 'This chat', tabs: ['Overview', 'Tasks', 'Subagents', 'Tools', 'Usage', 'Export'] },
-  { group: 'Project', tabs: ['Checkpoints', 'Verify', 'Memory', 'Worktrees', 'Extensions'] },
+  { group: 'Project', tabs: ['Checkpoints', 'Verify', 'Memory', 'Worktrees', 'Extensions', 'Schedules'] },
 ]
 const TABS = SECTIONS.flatMap(section => section.tabs)
 const TAB_KEY = 'agent-tools-tab'
@@ -94,6 +95,7 @@ function AgentToolsScope(props) {
     Memory: () => html`<${MemoryPanel} session=${props.session} onError=${props.onError} />`,
     Worktrees: () => html`<${Worktrees} ...${props} />`,
     Extensions: () => html`<${ExtensionsPanel} ...${props} />`,
+    Schedules: () => html`<${SchedulesPanel} session=${props.session} onError=${props.onError} onSelectSession=${id => { props.onSelectSession(id); props.onClose() }} />`,
   }
   return html`<dialog class="agent-tools-dialog" ref=${dialog} aria-label="Agent tools" onCancel=${props.onClose} onClick=${e => { if (e.target === dialog.current) props.onClose() }}>
     <div class="agent-tools-content">

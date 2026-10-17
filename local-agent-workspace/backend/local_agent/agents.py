@@ -38,7 +38,7 @@ from .tools import LIMIT as FILE_LIMIT
 from .tools import write_limit_setting
 from . import diagnostics, notebooks
 from .edits import clip_result, preview_diff, split_lines
-from .config import DEFAULT_APPROVAL_MINUTES, DEFAULT_MAX_AGENT_STEPS, follow_limits, read_env
+from .config import DEFAULT_MAX_AGENT_STEPS, follow_limits, read_env
 from .instructions import load_project_instructions, load_user_instructions, note_instruction_path, user_tools
 from . import memory as project_memory
 from .output_styles import style_block
@@ -57,7 +57,7 @@ from . import custom_agents
 from .context import estimate_text_tokens
 from .planning import (REPORT_SUBMITTED, REPORT_SUBMITTED_REPLY, CallAllowance, DelegateManager, DelegationGate, TaskManager,
                        retried_reports)
-from .interactions import InteractionManager
+from .interactions import InteractionManager, wait_seconds
 from .feature_tools import FEATURE_TOOLS, FINDINGS_TOOL
 from .tool_profiles import agent_refusal, tool_allowed, filter_tools, off_servers, server_off
 from .mcp_client import FULL_RESULT_CHARS, RETRY_SECONDS
@@ -810,6 +810,7 @@ def delegated_prompt(session):
 # The wire's answer to a prompt the spending limit stopped before any model request (spending_stop).
 SPENDING_STOP_REPLY = "[No reply: the spending limit stopped this turn before a model request.]"
 BUDGET_STOP_REPLY = "[No reply: the turn's token or time limit stopped it before a model request.]"
+APPROVAL_STOP_REPLY = "[No reply: this scheduled run stopped at its approval limit before a model request.]"
 
 
 def public_queue(queue):
@@ -852,6 +853,10 @@ class AgentManager(LifecycleHooks):
         # and the chats whose current request is a turn's wrap-up at its budget (their tool calls do not run).
         self.turns = {}
         self.budget_wrapups = set()
+        # {chat id: {schedule_id, approval_timeout_minutes}} of a scheduled run's chat until its turn starts (run
+        # moves it into the turn's state as "scheduled"; schedules.py), and the app's scheduler (api.create_app).
+        self.scheduled_turns = {}
+        self.scheduler = None
         self.side_questions = set()  # Chats with a /btw side question being answered.
         self.stop_requested = set()  # Tasks the user stopped: no queued follow-up, even if they ended normally.
         self.unsent_views = {}  # Session id -> @ file views recorded once the turn's message enters the wire.
@@ -1836,11 +1841,15 @@ class AgentManager(LifecycleHooks):
         {allowed: True, by: 'mode', mode} or {allowed: True, by: 'rule', scope} when a mode or
         rule change re-checked the card, or {allowed: False, blocked: text} when it now blocks it.
         """
+        run = self.scheduled_run(session)
+        if run is not None and run.get("expired"):
+            # A scheduled run that already reached its approval limit waits for no other card: it stops next.
+            await self.update_event(session, event, state="rejected", approval="expired")
+            return False
         future = asyncio.get_running_loop().create_future()
         key = (session["id"], event["id"])
         self.pending[key] = future
-        minutes = self.settings.values.get("approval_timeout_minutes", DEFAULT_APPROVAL_MINUTES)
-        seconds = minutes * 60 if type(minutes) is int and minutes > 0 else None  # None waits until answered or stopped.
+        seconds = self.approval_seconds(session)  # None waits until answered or stopped.
         try:
             await self.update_event(session, event, state="pending",
                                     **({"approval_expires": time.time() + seconds} if seconds else {}))
@@ -1851,6 +1860,7 @@ class AgentManager(LifecycleHooks):
             outcome = "approved" if allowed else "blocked" if answer.get("blocked") else "declined"
         except TimeoutError:
             allowed, outcome, answer = False, "expired", {}
+            self.approval_expired(session)
         finally:
             self.pending.pop(key, None)
         rule = answer.get("rule") if allowed else None
@@ -1870,6 +1880,41 @@ class AgentManager(LifecycleHooks):
             await self.publish_permissions(session)
         await self.status(session, "running")
         return allowed
+
+    def scheduled_run(self, session):
+        """The scheduled run (schedules.py) of the turn this chat's card belongs to (a subagent's: its parent's), as
+        {schedule_id, approval_timeout_minutes, expired?}, or None outside one."""
+        _, turn = turns.scope(self, session)
+        run = turn.get("scheduled") if isinstance(turn, dict) else None
+        return run if isinstance(run, dict) else None
+
+    def approval_seconds(self, session):
+        """How long a card of this chat waits (approval cards, questions and plans): a scheduled run's approval
+        limit, else Settings → Agent → Approval wait; None waits until answered or stopped."""
+        run = self.scheduled_run(session)
+        if run is None:
+            return wait_seconds(self.settings)
+        minutes = run.get("approval_timeout_minutes")  # schedules.py checked it; a scheduled card never waits forever.
+        return wait_seconds(self.settings, minutes if type(minutes) is int and minutes > 0 else 1)
+
+    def approval_expired(self, session):
+        """A card of a scheduled run waited its approval limit: the run stops before its next model request."""
+        run = self.scheduled_run(session)
+        if run is not None:
+            run["expired"] = True
+
+    async def approval_stop(self, session, wire, run):
+        """End a scheduled run whose card waited its approval limit (terminal_reason 'approval_expired'); a
+        subagent's stop is an error its parent's delegate_task result reports, and the parent stops next."""
+        if wire and wire[-1].get("role") == "user":
+            wire.append({"role": "assistant", "content": APPROVAL_STOP_REPLY})
+            self.store.save(session)
+        minutes = run.get("approval_timeout_minutes")
+        limit = f"{minutes} minute{'' if minutes == 1 else 's'}" if type(minutes) is int else "its limit"
+        await self.event(session, "error" if session.get("is_subagent") else "notice", terminal_reason="approval_expired",
+                         text=(f"A card waited {limit}, this scheduled run's approval limit, without an answer, so its "
+                               "action did not run and the run stopped. Review the chat, then send a message to "
+                               "continue it yourself."))
 
     def rule_context(self, tools):
         """What normalizing and matching rules needs from the conversation's file tools."""
@@ -2567,6 +2612,7 @@ class AgentManager(LifecycleHooks):
         await self.delegates.cancel_parent(session_id)
         if task and not task.done():
             await asyncio.gather(task, return_exceptions=True)
+        self.scheduled_turns.pop(session_id, None)  # A scheduled run stopped before its turn began.
         # A task cancelled before its first scheduling never enters run's finally.
         if task and task.cancelled() and self.tasks.get(session_id) is task:
             session = self.live.pop(session_id, None)
@@ -3023,6 +3069,8 @@ class AgentManager(LifecycleHooks):
         storage_error_reported = False
         turn_state = self.turns[session["id"]] = {"started": turns.clock(), "first_event": first_event,
                                                   "first_call": len(session.get("inference_calls") or [])}
+        if (scheduled := self.scheduled_turns.pop(session["id"], None)) is not None:
+            turn_state["scheduled"] = scheduled  # Only this turn is the scheduled run; later ones are the user's.
 
         async def report_storage_failure(exc):
             nonlocal storage_error_reported
@@ -5606,6 +5654,12 @@ class AgentManager(LifecycleHooks):
             system = None  # The latest request's system message (a spending stop after a step refreshes the meter with it).
             wrap_up = None  # The notice of the wrap-up request once the turn reached its token or time limit (turns.py).
             for step_index in range(steps):
+                # A scheduled run whose card waited its approval limit (schedules.py) ends here.
+                if (run := self.scheduled_run(session)) is not None and run.get("expired"):
+                    if step_index:
+                        await self.refresh_next_estimate(session, system, definitions, wire, context_state)
+                    await self.approval_stop(session, wire, run)
+                    return False
                 # Before any compaction is billed: the chat's spending limit (its subagents count
                 # for it) and a max_tokens above the output-tokens-per-minute limit Databricks
                 # reported for this endpoint, which can never be admitted.
@@ -5999,6 +6053,10 @@ class AgentManager(LifecycleHooks):
                         [*model_history(wire), message], context_state, system, definitions, input_budget))
             if steps > 0:
                 await self.refresh_next_estimate(session, system, definitions, wire, context_state)
+            # A card of the last step waited a scheduled run's approval limit: that, not the step limit, ended it.
+            if (run := self.scheduled_run(session)) is not None and run.get("expired"):
+                await self.approval_stop(session, wire, run)
+                return False
         # A chat a script created with its own Agent steps does not follow the Settings value.
         own_steps = not session.get("is_subagent") and type(session.get("max_agent_steps")) is int
         await self.event(session, "error" if session.get("is_subagent") else "notice",

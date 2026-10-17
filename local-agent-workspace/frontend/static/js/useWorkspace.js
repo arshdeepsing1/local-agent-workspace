@@ -360,7 +360,8 @@ export function useWorkspace() {
       coding_dir, python_venv, auto_compact_percent, reasoning_effort, reasoning_format, thinking_summaries, prompt_caching, subagent_defaults,
       background_subagent_wake,
       spending_limit_dbu, fallback_model, user_agents_file, user_claude_file, project_memory, output_style, slash_commands, thinking_replay,
-      web_fetch, web_search_provider, web_search_url, web_search_key, git_context, turn_token_limit, turn_time_limit_minutes } = next
+      web_fetch, web_search_provider, web_search_url, web_search_key, git_context, turn_token_limit, turn_time_limit_minutes,
+      schedules_enabled, token_expires_on } = next
     const saved = await api('/settings', 'PUT', {
       workspace, model, env_file, context_window, max_output_tokens, max_agent_steps,
       ...(typeof compaction_handoffs === 'boolean' ? { compaction_handoffs } : {}),
@@ -379,6 +380,8 @@ export function useWorkspace() {
       ...(Number.isFinite(spending_limit_dbu) ? { spending_limit_dbu } : {}),
       ...(Number.isInteger(turn_token_limit) ? { turn_token_limit } : {}),
       ...(Number.isInteger(turn_time_limit_minutes) ? { turn_time_limit_minutes } : {}),
+      ...(typeof schedules_enabled === 'boolean' ? { schedules_enabled } : {}),
+      ...(typeof token_expires_on === 'string' ? { token_expires_on } : {}),
       ...(typeof reasoning_format === 'string' ? { reasoning_format } : {}),
       ...(typeof thinking_summaries === 'boolean' ? { thinking_summaries } : {}),
       ...(typeof thinking_replay === 'boolean' ? { thinking_replay } : {}),
