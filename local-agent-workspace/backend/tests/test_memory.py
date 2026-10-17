@@ -209,6 +209,24 @@ async def test_a_value_of_the_credential_file_is_refused_like_a_secret(runtime, 
     assert notes(manager, project) == []
 
 
+async def test_a_sign_in_method_of_the_credential_file_is_no_secret(runtime, tmp_path):
+    """DATABRICKS_AUTH_TYPE names how to sign in: a note may mention it, and redaction leaves it, while the file's
+    token stays a secret."""
+    app, manager, session, project, tools = runtime
+    value = "Qw3rtyOpaq" + "ue9Lk2Zx"
+    (tmp_path / "creds.env").write_text(f"DATABRICKS_AUTH_TYPE=databricks-cli\nMY_SERVICE_TOKEN={value}\n")
+    manager.settings.values["env_file"] = str(tmp_path / "creds.env")
+    assert manager.redact_sent(f"Run databricks-cli auth login, not {value}.") == "Run databricks-cli auth login, not [REDACTED]."
+    async with REAL_CLIENT(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+        client.headers["X-Local-Token"] = (await client.get("/api/bootstrap")).json()["token"]
+        text = "Sign in to the workspace with databricks-cli before deploying."
+        response = await client.post("/api/memory", params={"session_id": session["id"]}, json={"text": text})
+        assert response.status_code == 200
+        response = await client.post("/api/memory", params={"session_id": session["id"]}, json={"text": f"Key: {value}"})
+        assert response.status_code == 400
+    assert notes(manager, project) == [text]
+
+
 def test_note_and_memory_caps(tmp_path):
     store = MemoryStore(tmp_path / "state")
     workspace = tmp_path / "project"

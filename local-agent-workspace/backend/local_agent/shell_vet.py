@@ -593,11 +593,17 @@ def any_case_glob(pattern):
             out.append(f"[{match.group(1)}{match.group(2)}{''.join(other)}]")
             index = match.end()
             continue
-        if char == "\\" or (not char.isascii() and char.lower() != char.upper()):
+        if char == "\\" or one_case_letters(char):
             return None
         out.append(f"[{char.lower()}{char.upper()}]" if char.isascii() and char.isalpha() else char)
         index += 1
     return "".join(out)
+
+
+def one_case_letters(name):
+    """Whether name has a cased letter outside ASCII (é, ß), which neither grep's --exclude nor rg's --iglob
+    (its case folding is ASCII only) skips in every case."""
+    return any(not char.isascii() and (char.lower() != char.upper() or char.casefold() != char) for char in name)
 
 
 def _grep(program, words, cwd, ctx):
@@ -612,19 +618,23 @@ def _grep(program, words, cwd, ctx):
     for item in operands:
         path_operand(item, cwd, ctx)
     names, folders = ctx.excludes
+    recursive = program == "rg" or ("r" in seen or "recursive" in seen or "recurse" in seen.get("d", [])
+                                    or "recurse" in seen.get("directories", []))
+    if recursive and any(one_case_letters(name) for name in names):
+        raise Refused(f"{program} cannot skip a secret file name pattern with a letter outside ASCII in every case")
     if program == "grep":
-        recursive = ("r" in seen or "recursive" in seen or "recurse" in seen.get("d", [])
-                     or "recurse" in seen.get("directories", []))
         excludes = []
         if recursive:
             if not operands:
                 operands = ["."]  # GNU grep -r searches the folder; BSD grep would read stdin.
-            # rg's --iglob ignores case; grep's --exclude does not, so the names go in every case.
-            globs = [any_case_glob(name) for name in [*names, *folders]]
+            # rg's --iglob ignores (ASCII) case; grep's --exclude does not, so the names go in every case. The
+            # folders are the credential folders (ASCII, always written), the generated folders and the app's state
+            # folder, which is enough by its name on disk when it cannot be written in every case.
+            globs = [any_case_glob(name) for name in names]
             if None in globs:
                 raise Refused("grep -r cannot skip a secret file name pattern in every case; use rg")
-            excludes = [*(f"--exclude={glob}" for glob in globs[:len(names)]),
-                        *(f"--exclude-dir={glob}" for glob in globs[len(names):])]
+            excludes = [*(f"--exclude={glob}" for glob in globs),
+                        *(f"--exclude-dir={any_case_glob(name) or name}" for name in folders)]
         tail = [*options, *excludes]
     else:
         # rg searches folders by default; --no-config: no RIPGREP_CONFIG_PATH file adds options (such as --pre).

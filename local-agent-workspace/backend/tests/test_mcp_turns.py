@@ -448,7 +448,8 @@ async def test_a_helper_joining_mid_turn_never_pushes_out_an_offered_mcp_tool(ru
     assert [name for name in second if name.startswith("mcp__")] == mcp and "get_tool_output" in second
     assert len(first) == MAX_REQUEST_TOOLS - 3 and len(second) == MAX_REQUEST_TOOLS - 2
     [notice] = notices(session)
-    assert notice.startswith("Databricks accepts at most 32 tools per request, so 3 MCP tools were not offered: ")
+    assert notice.startswith("Databricks accepts at most 32 tools per request, so 3 MCP tools were not offered "
+                             "(3 places are kept for tools this chat can add mid-turn): ")
     # Once every helper has joined, the slots they kept are theirs: the MCP room is the same.
     session.update(findings_tool=True, background_subagents_offered=True)
     definitions, capped = manager.offered_tools(session, Connection.definitions)
@@ -456,3 +457,19 @@ async def test_a_helper_joining_mid_turn_never_pushes_out_an_offered_mcp_tool(ru
     # A helper the chat turned off keeps no slot.
     session.update(findings_tool=False, disabled_tools=["report_findings"])
     assert len(manager.offered_tools(session, Connection.definitions)[1]) == 2
+
+
+def test_the_places_kept_for_helpers_in_a_new_chat(runtime):
+    """README: with the default Settings a new chat offers 28 built-in tools and keeps 3 places, so one MCP tool fits,
+    and none once a web search provider adds web_search; turning off use_skill frees report_findings' place."""
+    manager, session, _, _ = runtime
+
+    def counts():
+        definitions, capped = manager.offered_tools(session, mcp_tools(4))
+        mcp = [item for item in definitions if item["function"]["name"].startswith("mcp__")]
+        return len(definitions) - len(mcp), len(mcp), len(capped)
+    assert counts() == (28, 1, 3)
+    manager.settings.values.update(web_search_provider="searxng", web_search_url="http://127.0.0.1:8888")
+    assert counts() == (29, 0, 4)
+    session["disabled_tools"] = ["use_skill"]
+    assert counts() == (28, 2, 2)

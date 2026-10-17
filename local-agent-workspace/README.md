@@ -2448,9 +2448,11 @@ tools come first (28 in a new chat with the default Settings; up to 32 once `get
 `submit_plan` and leaves out the tools it always refuses: the file-changing tools, `remember`, `stop_job` and MCP
 tools), then MCP tools in server order. `get_tool_output`, `report_findings` and `get_subagent_result` join a chat
 mid-turn (after a long result, a review skill, a background subagent), so while MCP tools are offered each of them
-that can still join keeps its place, and one joining never pushes out an MCP tool the turn already offered (with the
-default Settings that leaves room for one MCP tool until they have joined; turning a helper off frees its place). The MCP tools that do not fit are named once
-in a notice and in **Extensions**, and a call to one is refused. Turn off tools or servers a
+that can still join keeps its place for the rest of the chat, and one joining never pushes out an MCP tool the turn
+already offered. With the default Settings a new chat therefore has room for one MCP tool, and for none once a web
+search provider is set; turning off one of these helpers, or `use_skill` or `delegate_task` (which `report_findings`
+and `get_subagent_result` follow), frees a place. The MCP tools that do not fit are named once
+in a notice (with the places kept) and in **Extensions**, and a call to one is refused. Turn off tools or servers a
 chat does not need to make room.
 
 The model sees names such as `mcp__example__tool`, so a new server ID cannot contain `__`. MCP calls require their own
@@ -3400,11 +3402,14 @@ command reads it from, its `cwd` or a `cd <folder>` in it (`cat config` in `~/.k
 counts as the file it points at. The check reads the command's words, so a program that finds such
 a file itself is not caught: recursive `grep` and `rg` that the app checks skip them whatever the
 case of their names (`.ENV`, `SERVER.PEM`; a name without an extension only when it ends in the word,
-such as `db_token`, not `secret_key`), and output redaction stays. A recursive `grep` asks instead when a
-Secret file names pattern cannot be written for every case (a letter outside ASCII, a backslash, a bracket
-other than letters, digits and ranges); `rg` handles those. Command and MCP results are redacted before the agent sees them: the
+such as `db_token`, not `secret_key`), and output redaction stays. When a Secret file names pattern has a
+letter outside ASCII (`é`, `ß`), a recursive `grep` or `rg` is not checked as read-only: it asks for
+approval (Plan and Don't ask block it). So is a recursive `grep` when a pattern has a backslash or a bracket other than
+letters, digits and ranges (use `rg`). Neither skips a name that matches only once its letters are folded
+(`ſecrets.yaml` with a long s, a Kelvin sign `K` or a ligature such as `ﬁ`), though a command that names such
+a file still counts it as one. Command and MCP results are redacted before the agent sees them: the
 Databricks token, the credential file's values for keys that name a token, secret, password, key,
-credential, auth or cookie (8 characters or more), MCP secret references, and GitHub, Databricks
+credential, auth or cookie (8 characters or more; not a sign-in method such as `DATABRICKS_AUTH_TYPE=databricks-cli`), MCP secret references, and GitHub, Databricks
 and AWS access-key shapes, long Bearer tokens and passwords in URLs. Six more names joined the file
 tools' exclusions and the diff exclusions: `.databrickscfg`, `.git-credentials`, `.pypirc`,
 `.pgpass`, `id_ecdsa` and `id_dsa`.

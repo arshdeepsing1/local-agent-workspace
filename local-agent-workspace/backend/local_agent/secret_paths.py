@@ -60,11 +60,12 @@ def check_patterns(value):
     return list(value)
 
 
-def patterns_setting(values):
-    """The valid patterns from Settings values (a hand-edited bad value means none)."""
+def patterns_setting(values, casefold=True):
+    """The valid patterns from Settings values (a hand-edited bad value means none), casefolded unless casefold
+    is False (a recursive search's exclusions: ß must not become an ASCII ss there)."""
     value = values.get("secret_file_patterns") if isinstance(values, dict) else None
     try:
-        return tuple(item.casefold() for item in check_patterns(value))
+        return tuple(item.casefold() if casefold else item for item in check_patterns(value))
     except ValueError:
         return ()
 

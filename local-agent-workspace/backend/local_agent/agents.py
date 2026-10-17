@@ -113,6 +113,8 @@ from .tool_profiles import covering_tool
 MAX_OUTPUT_LIMIT_RETRIES = 2
 # Credential-file assignments whose values are redacted from every tool result, by key name (M6j).
 SECRET_KEY = re.compile(r"(?i)token|secret|passw|key|credential|auth|cookie")
+# Keys that name a sign-in method, not a secret (DATABRICKS_AUTH_TYPE=databricks-cli): their values stay.
+METHOD_KEY = re.compile(r"(?i)auth_?(?:type|method)$")
 # Results that carry what a command or an MCP server printed: their secret shapes are redacted too.
 SHAPE_REDACTED_TOOLS = frozenset({"run_command", "get_job_output", "wait_job", "stop_job", "list_jobs", "get_tool_output"})
 # Databricks accepts at most this many functions in one request (built-in and MCP tools together).
@@ -1264,7 +1266,8 @@ class AgentManager(LifecycleHooks):
         return self.settings.redact(redact_value(redact_secrets(text), self.redaction_tokens()))
 
     def credential_file_values(self):
-        """The credential file's secret-looking values of 8 characters or more (cached by size and time)."""
+        """The credential file's secret-looking values of 8 characters or more, not those of a sign-in method
+        key (METHOD_KEY), cached by size and time."""
         path = self.settings.values.get("env_file") if isinstance(self.settings.values, dict) else ""
         if not path:
             return []
@@ -1275,7 +1278,8 @@ class AgentManager(LifecycleHooks):
             cached = self.__dict__.get("_credential_values")
             if cached and cached[0] == key:
                 return list(cached[1])
-            values = [value for name, value in read_env(target).items() if SECRET_KEY.search(name) and len(value) >= 8]
+            values = [value for name, value in read_env(target).items()
+                      if SECRET_KEY.search(name) and not METHOD_KEY.search(name) and len(value) >= 8]
         except (OSError, UnicodeError, ValueError):
             return []
         self.__dict__["_credential_values"] = (key, values)
@@ -2184,8 +2188,9 @@ class AgentManager(LifecycleHooks):
         return found
 
     def search_excludes(self, patterns):
-        """(names, folders) a vetted recursive search skips: credential-looking names, and the generated folders
-        and the app's state folder (by name), which file tools leave out too."""
+        """(names, folders) a vetted recursive search skips: credential-looking names (patterns: Settings → Secret
+        file names as typed, not casefolded), and the generated folders and the app's state folder (by name),
+        which file tools leave out too."""
         names, folders = secret_paths.grep_excludes(patterns)
         return names, sorted({*folders, *IGNORED, Path(self.settings.state_dir).name})
 
@@ -2213,7 +2218,8 @@ class AgentManager(LifecycleHooks):
                 check_path=lambda value: self.vetted_path(tools, roots, value),
                 find_program=lambda name: self.vetted_program(name, env, roots),
                 secret=lambda word: secret_paths.looks_secret(word, credential, patterns),
-                allow=allow, rule_program=rule_program, excludes=self.search_excludes(patterns))
+                allow=allow, rule_program=rule_program,
+                excludes=self.search_excludes(secret_paths.patterns_setting(self.settings.values, casefold=False)))
             return shell_vet.vet(arguments.get("command"), context), None
         except shell_vet.Refused as exc:
             return None, str(exc)
@@ -4330,15 +4336,18 @@ class AgentManager(LifecycleHooks):
         self.store.save(session)
         await self.broadcast(session["id"], {"type": "mcp_status", "mcp_status": kept})
 
-    async def capped_notice(self, session, capped):
-        """Name the MCP tools the 32-function limit leaves out, once for each new set (offered_tools)."""
+    async def capped_notice(self, session, capped, kept=0):
+        """Name the MCP tools the 32-function limit leaves out, once for each new set (offered_tools). kept: the
+        places left for the helper tools that can still join the chat mid-turn (joinable_helpers)."""
         if capped:
             session["mcp_capped"] = list(capped)
             shown = ", ".join(capped[:12]) + (f" and {len(capped) - 12} more" if len(capped) > 12 else "")
+            places = (f" ({kept} place{'s are' if kept != 1 else ' is'} kept for tools this chat can add mid-turn)"
+                      if kept > 0 else "")
             await self.event(session, "notice", text=(
                 f"Databricks accepts at most {MAX_REQUEST_TOOLS} tools per request, so {len(capped)} MCP "
-                f"tool{'s' if len(capped) != 1 else ''} {'were' if len(capped) != 1 else 'was'} not offered: {shown}. "
-                "Turn off tools or servers this chat does not need in Agent tools → Tools."))
+                f"tool{'s' if len(capped) != 1 else ''} {'were' if len(capped) != 1 else 'was'} not offered{places}: "
+                f"{shown}. Turn off tools or servers this chat does not need in Agent tools → Tools."))
         else:
             session.pop("mcp_capped", None)
         status = session.get("mcp_status")
@@ -5754,7 +5763,7 @@ class AgentManager(LifecycleHooks):
                 tools.unrestricted = mode == "bypassPermissions"
                 definitions, capped = self.offered_tools(session, external_tools)
                 if capped != (session.get("mcp_capped") or []):
-                    await self.capped_notice(session, capped)
+                    await self.capped_notice(session, capped, kept=MAX_REQUEST_TOOLS - len(definitions))
                 notice = "\n".join(text for text in (self.step_notices(session, tools), wrap_up) if text)
                 history = model_history(wire)
                 # At the full cache level the notices end the last message (STEP_NOTE), added to a copy after the
