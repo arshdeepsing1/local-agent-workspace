@@ -81,7 +81,15 @@ function SpendingLimit({ session, spending, onSaved }) {
   const [draft, setDraft] = useState(limit == null ? '0' : String(limit))
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
-  useEffect(() => { setDraft(limit == null ? '0' : String(limit)) }, [limit, spending.source])
+  // The draft follows a new server value, never just a first render: a value typed before the mount's effects ran
+  // (a slow page) would otherwise be replaced with the old one and saved.
+  const shown = useRef(`${limit}:${spending.source}`)
+  useEffect(() => {
+    const key = `${limit}:${spending.source}`
+    if (shown.current === key) return
+    shown.current = key
+    setDraft(limit == null ? '0' : String(limit))
+  }, [limit, spending.source])
   const own = spending.source === 'chat'
   const follows = spending.follows_parent ?? !!session.is_subagent
   const save = async value => {
@@ -139,7 +147,13 @@ function TurnLimits({ session, limits, onSaved }) {
   const [draft, setDraft] = useState({ tokens: String(tokens ?? 0), minutes: String(minutes ?? 0) })
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
-  useEffect(() => { setDraft({ tokens: String(tokens ?? 0), minutes: String(minutes ?? 0) }) }, [tokens, minutes, limits.token_source, limits.time_source])
+  const shown = useRef(`${tokens}:${minutes}:${limits.token_source}:${limits.time_source}`)  // As in SpendingLimit.
+  useEffect(() => {
+    const key = `${tokens}:${minutes}:${limits.token_source}:${limits.time_source}`
+    if (shown.current === key) return
+    shown.current = key
+    setDraft({ tokens: String(tokens ?? 0), minutes: String(minutes ?? 0) })
+  }, [tokens, minutes, limits.token_source, limits.time_source])
   const own = limits.token_source === 'chat' || limits.time_source === 'chat'
   const save = async body => {
     setSaving(true); setError('')

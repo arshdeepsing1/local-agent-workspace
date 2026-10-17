@@ -326,6 +326,7 @@ def test_the_slash_menu_offers_the_side_question_first(ui, page):
     expect(first).to_contain_text("/btw")
     expect(first).to_contain_text("Side question")
     expect(first).to_contain_text("Ask about this conversation without adding to it (one model request).")
+    expect(page.get_by_text("Loading skills…")).to_have_count(0)  # Enter does nothing until the list arrived.
     box.press("Enter")
     expect(box).to_have_value("/btw ")
 

@@ -37,7 +37,7 @@ def run(page, text, busy=False):
     box = message(page)
     box.fill(text)
     if not busy:
-        expect(page.get_by_role("combobox", name="Model")).to_be_enabled()
+        expect(page.get_by_role("combobox", name="Model")).to_be_enabled(timeout=10_000)
     box.press("Enter")
 
 
@@ -182,7 +182,7 @@ def test_a_command_that_opens_another_view_leaves_no_draft_behind(ui, page):
         expect(page.locator(".slash-menu")).to_be_visible()
         box.press("Escape")
         expect(page.locator(".slash-menu")).to_have_count(0)
-        expect(page.get_by_role("combobox", name="Model")).to_be_enabled()  # Enter is ignored until then.
+        expect(page.get_by_role("combobox", name="Model")).to_be_enabled(timeout=10_000)  # Enter is ignored until then.
         box.press("Enter")
         ui.wait(f"new URL(location.href).searchParams.get('session') {url}")
         ui.wait(f"{DRAFT} === null")

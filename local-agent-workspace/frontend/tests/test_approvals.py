@@ -484,9 +484,17 @@ def long_chat(ui, page):
     ui.emit("a", {"type": "status", "status": "running"})
 
 
+SETTLED = """e => new Promise(done => { let last = -1, still = 0
+  const check = () => { still = e.scrollTop === last ? still + 1 : 0; last = e.scrollTop
+    if (still >= 3) done(); else requestAnimationFrame(check) }
+  requestAnimationFrame(check) })"""
+
+
 def scroll_to_top(page):
     transcript = page.locator(".transcript")
+    transcript.evaluate(SETTLED)  # A smooth scroll still in flight would carry the view back down (slow machines).
     transcript.evaluate("e => { e.style.scrollBehavior = 'auto'; e.scrollTop = 0; e.dispatchEvent(new Event('scroll')) }")
+    transcript.evaluate(SETTLED)
     expect(page.get_by_text("Step 0", exact=True)).to_be_in_viewport()
 
 

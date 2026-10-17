@@ -121,6 +121,14 @@ def test_a_spending_limit_stops_the_chat_until_it_is_raised(app_page, stack):
     limit.get_by_role("spinbutton", name="Limit for this chat (DBU, 0 = none)").fill("100")
     limit.get_by_role("button", name="Save limit").click()
     expect(limit.get_by_text("This chat's own limit.")).to_be_visible()
+    # The server's chat (live or saved) has the new limit before Continue starts the next turn.
+    [header] = stack.manager.store.list()
+    for _ in range(100):
+        if (stack.manager.get(header["id"]) or {}).get("spending_limit_dbu") == 100:
+            break
+        page.wait_for_timeout(50)
+    else:
+        raise AssertionError(f"The chat's limit never reached the server: {stack.manager.get(header['id']).get('spending_limit_dbu')!r}")
     page.keyboard.press("Escape")
     expect(tools).to_have_count(0)
     stopped.get_by_role("button", name="Continue").click()
