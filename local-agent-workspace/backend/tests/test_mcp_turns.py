@@ -129,6 +129,33 @@ async def test_a_server_turned_off_in_the_chat_never_starts(runtime, local_serve
     assert card["state"] == "rejected" and "turned off" in card["output"]
 
 
+async def test_plan_mode_offers_no_mcp_tool_and_a_turn_that_starts_in_plan_starts_no_server(runtime, local_server,
+                                                                                             monkeypatch):
+    manager, session, tmp_path, _ = runtime
+    manager.extensions.update_config({"servers": [local_server]})
+    exactly_builtins(manager, session, 20)
+    session["permission_mode"] = "plan"  # Plan refuses every MCP call (permissions.tool_decision).
+    definitions, capped = manager.offered_tools(session, mcp_tools(3))
+    assert not any(item["function"]["name"].startswith("mcp__") for item in definitions) and capped == []
+    session["permission_mode"] = "manual"
+    assert [item["function"]["name"] for item in manager.offered_tools(session, mcp_tools(3))[0][-3:]] == [
+        f"mcp__many__tool{n:02d}" for n in range(3)]
+    session.update(permission_mode="plan", disabled_tools=[])
+    sent = []
+
+    async def handler(request):
+        sent.append([tool["function"]["name"] for tool in json.loads(request.content)["tools"]])
+        return stream("Done.")
+    gateway(monkeypatch, handler)
+    await manager.run(session, "Plan the change")
+    assert session["terminal_reason"] == "completed" and "submit_plan" in sent[0]
+    assert not any(name.startswith("mcp__") for name in sent[0]) and not (tmp_path / "local.started").exists()
+    # Out of Plan, the next turn starts the server and offers its tools.
+    session["permission_mode"] = "bypassPermissions"
+    await manager.run(session, "Now use it")
+    assert "mcp__local__echo" in sent[1] and (tmp_path / "local.started").exists()
+
+
 async def test_a_subagent_inherits_the_server_switch(runtime, local_server, monkeypatch):
     manager, session, tmp_path, _ = runtime
     manager.extensions.update_config({"servers": [local_server]})
@@ -143,14 +170,55 @@ async def test_a_subagent_inherits_the_server_switch(runtime, local_server, monk
     assert not (tmp_path / "local.started").exists()
 
 
+def big_server(tmp_path, count=32):
+    """A stdio server with count tools: alone it takes all the room of a turn's MCP discovery (MAX_TOOLS)."""
+    path = tmp_path / "big_server.py"
+    path.write_text(f'''import sys
+from pathlib import Path
+from mcp.server import MCPServer
+Path(sys.argv[1]).write_text("started")
+server = MCPServer("Big test", log_level="ERROR")
+for n in range({count}):
+    server.add_tool(lambda x: x, name=f"big{{n:02d}}", description="Echo.")
+server.run()
+''')
+    return {"id": "big", "name": "Big test", "transport": "stdio", "command": sys.executable,
+            "args": [str(path), str(tmp_path / "big.started")], "enabled": True}
+
+
+@pytest.mark.parametrize("narrowing", ["disallowed_tools: [mcp__big__*]", "tools: [read_file, mcp__local__echo]"])
+async def test_a_server_an_agent_may_use_no_tool_of_never_starts_in_its_subagent(runtime, local_server, monkeypatch,
+                                                                                 narrowing):
+    manager, session, tmp_path, _ = runtime
+    agents = tmp_path / "project" / ".agents" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "narrow.md").write_text(f"---\ndescription: Test agent.\nprofile: inherit\n{narrowing}\n---\nWork.\n")
+    manager.extensions.update_config({"servers": [big_server(tmp_path), local_server]})
+    sent = []
+
+    async def handler(request):
+        sent.append([tool["function"]["name"] for tool in json.loads(request.content)["tools"]])
+        return stream("Child report.")
+    gateway(monkeypatch, handler)
+    result = await manager.delegates.delegate(session, "Look around", agent_type="narrow")
+    assert result["status"] == "completed"
+    child = next(item for item in manager.store.list() if item.get("parent_session_id") == session["id"])
+    # The big server would have taken all the room and pushed the allowed one out (skipped).
+    assert not (tmp_path / "big.started").exists() and (tmp_path / "local.started").exists()
+    assert [(item["id"], item["status"]) for item in manager.get(child["id"])["mcp_status"]] == [
+        ("big", "off"), ("local", "connected")]
+    assert [name for name in sent[0] if name.startswith("mcp__")] == ["mcp__local__echo"]
+
+
 def mcp_tools(count):
     return [{"type": "function", "function": {"name": f"mcp__many__tool{n:02d}", "description": "External MCP tool",
                                               "parameters": {"type": "object", "properties": {}}}} for n in range(count)]
 
 
 def exactly_builtins(manager, session, count):
-    """Turn off built-in tools until exactly count are offered (more tools may be added later)."""
-    session["tool_output_offered"] = True
+    """Turn off built-in tools until exactly count are offered (more tools may be added later). The helpers that can
+    join mid-turn are offered already, so they keep no slot (joinable_helpers)."""
+    session.update(tool_output_offered=True, findings_tool=True, background_subagents_offered=True)
     names = [item["function"]["name"] for item in manager.step_definitions(session, [])]
     assert len(names) >= count
     session["disabled_tools"] = names[count:]
@@ -336,3 +404,72 @@ def test_api_routes_for_images_and_the_server_switch(tmp_path, monkeypatch):
         assert client.delete(f"/api/sessions/{sid}").status_code == 200
         assert manager.results.image(sid, image_id) is None
     assert not os.environ.get("NEVER_SET_BY_TESTS")
+
+
+async def test_a_helper_joining_mid_turn_never_pushes_out_an_offered_mcp_tool(runtime, monkeypatch):
+    """With the default Settings, get_tool_output, report_findings and get_subagent_result keep a slot while MCP
+    tools are offered: the long result that adds get_tool_output leaves the turn's MCP tools as they were."""
+    manager, session, _, _ = runtime
+    builtins = len(manager.step_definitions(session, []))
+    room = MAX_REQUEST_TOOLS - builtins - 3
+    assert room >= 1
+    whole = "".join(f"line {number:05d}\n" for number in range(2000))
+    results = manager.results.chat(session["id"])
+
+    class Connection:
+        definitions = mcp_tools(room + 3)
+        tool_names = {item["function"]["name"] for item in definitions}
+        status = [{"id": "many", "name": "Many", "status": "connected", "tools": sorted(tool_names)}]
+
+        async def discover(self):
+            return self.definitions
+
+        async def call(self, name, arguments):
+            return {"output": whole[:7000], "is_error": False, "truncated": True, "result_id": results.add(whole),
+                    "next_offset": 7000, "total_chars": len(whole)}
+
+    @asynccontextmanager
+    async def turn(**options):
+        yield Connection()
+    manager.extensions.turn = turn
+    requests = []
+
+    async def handler(request):
+        payload = json.loads(request.content)
+        requests.append([tool["function"]["name"] for tool in payload["tools"]])
+        if len(requests) == 1:
+            return stream(call={"name": f"mcp__many__tool{room - 1:02d}"})
+        return stream("Done.")
+    gateway(monkeypatch, handler)
+    await manager.run(session, "Use the last offered tool")
+    first, second = requests
+    mcp = [f"mcp__many__tool{n:02d}" for n in range(room)]
+    assert [name for name in first if name.startswith("mcp__")] == mcp and "get_tool_output" not in first
+    assert [name for name in second if name.startswith("mcp__")] == mcp and "get_tool_output" in second
+    assert len(first) == MAX_REQUEST_TOOLS - 3 and len(second) == MAX_REQUEST_TOOLS - 2
+    [notice] = notices(session)
+    assert notice.startswith("Databricks accepts at most 32 tools per request, so 3 MCP tools were not offered "
+                             "(3 places are kept for tools this chat can add mid-turn): ")
+    # Once every helper has joined, the slots they kept are theirs: the MCP room is the same.
+    session.update(findings_tool=True, background_subagents_offered=True)
+    definitions, capped = manager.offered_tools(session, Connection.definitions)
+    assert len(definitions) == MAX_REQUEST_TOOLS and [item["function"]["name"] for item in definitions[-room:]] == mcp
+    # A helper the chat turned off keeps no slot.
+    session.update(findings_tool=False, disabled_tools=["report_findings"])
+    assert len(manager.offered_tools(session, Connection.definitions)[1]) == 2
+
+
+def test_the_places_kept_for_helpers_in_a_new_chat(runtime):
+    """README: with the default Settings a new chat offers 28 built-in tools and keeps 3 places, so one MCP tool fits,
+    and none once a web search provider adds web_search; turning off use_skill frees report_findings' place."""
+    manager, session, _, _ = runtime
+
+    def counts():
+        definitions, capped = manager.offered_tools(session, mcp_tools(4))
+        mcp = [item for item in definitions if item["function"]["name"].startswith("mcp__")]
+        return len(definitions) - len(mcp), len(mcp), len(capped)
+    assert counts() == (28, 1, 3)
+    manager.settings.values.update(web_search_provider="searxng", web_search_url="http://127.0.0.1:8888")
+    assert counts() == (29, 0, 4)
+    session["disabled_tools"] = ["use_skill"]
+    assert counts() == (28, 2, 2)

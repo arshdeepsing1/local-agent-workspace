@@ -512,7 +512,7 @@ function ServerRow({ server, test }) {
   const hints = server.tool_annotations || {}
   return html`<div class="agent-tools-row" key=${server.id}><div><strong>${server.name}</strong><small>${serverLine(server, test)}</small>
     ${server.error ? html`<p class="form-error">${server.error}</p>` : null}
-    ${server.capped?.length ? html`<p>Not offered (Databricks takes at most 32 tools per request): ${server.capped.join(', ')}</p>` : null}
+    ${server.capped?.length ? html`<p>Not offered (Databricks takes at most 32 tools per request, and the tools a chat can add mid-turn keep their places): ${server.capped.join(', ')}</p>` : null}
     ${server.stderr_tail ? html`<details class="mcp-stderr"><summary>Server stderr (end)</summary><pre>${server.stderr_tail}</pre></details>` : null}
     ${server.instructions ? html`<details class="mcp-stderr"><summary>Server instructions (shown here only; never sent to the agent)</summary><pre>${server.instructions}</pre></details>` : null}
     ${test && server.tools?.length ? html`<ul class="mcp-tools">${server.tools.map(name => html`<li key=${name}><code>${name}</code>${hintText(hints[name]) ? html` <small>Server says: ${hintText(hints[name])}</small>` : null}</li>`)}</ul>` : null}

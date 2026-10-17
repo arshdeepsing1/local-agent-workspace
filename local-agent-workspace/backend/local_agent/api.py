@@ -42,7 +42,6 @@ from .telemetry import SUMMARY_VERSION, session_metrics, usage_summary
 from .usage_overview import MAX_DAYS, overview
 from . import spending, turns
 from .spending import MAX_LIMIT_DBU
-from .activity import redact_secrets
 from .usage_export import usage_csv, usage_rows
 from .transcript import transcript, transcript_file_name
 from .feature_api import register_features
@@ -808,7 +807,7 @@ def create_app(settings=None):
         """include_subagents adds the rows of the chat's subagent chats that still exist (conversation_id
         tells them apart), numbered on after the chat's own."""
         session = session_or_404(session_id)
-        redact = lambda value: settings.redact(redact_secrets(value))  # noqa: E731
+        redact = manager.redact_sent
         rows = usage_rows(session, redact=redact)
         if include_subagents:
             for entry in session.get("subagents") or []:

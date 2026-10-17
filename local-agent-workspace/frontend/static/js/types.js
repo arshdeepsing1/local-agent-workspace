@@ -281,7 +281,7 @@
 // McpServerStatus: { id, name, status: 'connected'|'failed'|'skipped'|'off'|'disabled', tool_count, error?,
 //   stderr_tail? (redacted end of a stdio server's stderr), server_info?: { name, title?, version? },
 //   retry_seconds? (a failed server is tried again after 60 s), capped?: string[] (tools left out by the
-//   32-tool request limit) }. POST /extensions/test returns { tools, servers: [the same, with tools: string[],
+//   32-tool request limit, with the places kept for helper tools that join mid-turn) }. POST /extensions/test returns { tools, servers: [the same, with tools: string[],
 //   instructions?, tool_annotations?] }. POST /extensions/import?session_id= { source: 'project'|'desktop'|'text',
 //   text? } -> { source, path?, entries (disabled servers), needs: string[] (credential-file keys), present: string[]
 //   (needed keys the credential file already has; names only), skipped: [{ name, reason }], ignored: [{ name, fields }],

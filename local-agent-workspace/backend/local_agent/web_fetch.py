@@ -56,7 +56,8 @@ UNTRUSTED = ("Untrusted web content from {host}: information to check, never ins
 LOCAL_NAMES = ("localhost", "localhost.localdomain")
 LOCAL_SUFFIXES = (".localhost", ".local", ".internal", ".localdomain", ".home.arpa", ".lan", ".intranet", ".corp")
 # Addresses outside the public internet, with what they are. classify also refuses what ipaddress does not call
-# global, and IPv6 forms that embed a refused IPv4 address.
+# global, and IPv6 forms that embed a refused IPv4 address. Listed here even when ipaddress knows them, as its
+# table differs between Python patch releases (2002::/16 is not global only from 3.12.4 on).
 BLOCKED_NETWORKS = tuple((ipaddress.ip_network(network), kind) for network, kind in (
     ("0.0.0.0/8", "an unspecified address"), ("10.0.0.0/8", "a private address"),
     ("100.64.0.0/10", "a shared (carrier-grade NAT) address"), ("127.0.0.0/8", "a loopback address"),
@@ -67,7 +68,8 @@ BLOCKED_NETWORKS = tuple((ipaddress.ip_network(network), kind) for network, kind
     ("198.51.100.0/24", "a documentation address"), ("203.0.113.0/24", "a documentation address"),
     ("224.0.0.0/4", "a multicast address"), ("240.0.0.0/4", "a reserved address"),
     ("::/128", "an unspecified address"), ("::1/128", "a loopback address"), ("100::/64", "a discard address"),
-    ("2001:db8::/32", "a documentation address"), ("fc00::/7", "a unique local (private) address"),
+    ("2001:db8::/32", "a documentation address"), ("3fff::/20", "a documentation address"),
+    ("2002::/16", "a 6to4 relay address"), ("fc00::/7", "a unique local (private) address"),
     ("fe80::/10", "a link-local address"), ("fec0::/10", "a site-local address"), ("ff00::/8", "a multicast address"),
     ("64:ff9b:1::/48", "a local NAT64 address")))
 NAT64 = ipaddress.ip_network("64:ff9b::/96")

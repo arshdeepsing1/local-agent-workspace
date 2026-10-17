@@ -495,7 +495,8 @@ def test_last_turn_mcp_status_in_extensions_and_overview(ui, page):
     overview_row(page, "MCP servers").get_by_role("button", name="Open Extensions").click()
     status = page.get_by_label("MCP servers in the last turn")
     expect(status.get_by_text("Connected · 3 tools · server: docs-mcp 2.0")).to_be_visible()
-    expect(status.get_by_text("Not offered (Databricks takes at most 32 tools per request): mcp__docs__extra")).to_be_visible()
+    expect(status.get_by_text("Not offered (Databricks takes at most 32 tools per request, and the tools a chat can add "
+                               "mid-turn keep their places): mcp__docs__extra")).to_be_visible()
     expect(status.get_by_text("Failed · tried again in about 42 s")).to_be_visible()
     expect(status.get_by_text("could not connect or list tools: No such file")).to_be_visible()
     expect(status.get_by_text("Turned off in this chat · not started")).to_be_visible()

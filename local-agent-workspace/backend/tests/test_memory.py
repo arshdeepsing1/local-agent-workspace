@@ -180,7 +180,7 @@ async def test_memory_off_hides_the_tool_and_block_but_a_chat_that_had_the_tool_
 # What a note may hold
 
 @pytest.mark.parametrize("text", ["Deploy with token dapi" + "0123456789abcdef" * 2, "The password=hunter2-fake",
-                                  "Use the key AKIAABCDEFGHIJKLMNOP", "The gateway accepts private-token"])
+                                  "Use the key AKIA" + "ABCDEFGHIJKLMNOP", "The gateway accepts private-token"])
 async def test_secret_shapes_and_the_configured_token_are_refused(runtime, monkeypatch, text):
     _, manager, session, project, tools = runtime
     approve = AsyncMock(return_value=True)
@@ -189,6 +189,42 @@ async def test_secret_shapes_and_the_configured_token_are_refused(runtime, monke
     assert "holds a secret" in result["message"]
     approve.assert_not_awaited()
     assert notes(manager, project) == []
+
+
+async def test_a_value_of_the_credential_file_is_refused_like_a_secret(runtime, monkeypatch, tmp_path):
+    """The credential file's secret-looking values (redaction_tokens) count, as in tool results, whatever their
+    shape: from the remember tool and from Agent tools → Memory."""
+    app, manager, session, project, tools = runtime
+    value = "Qw3rtyOpaq" + "ue9Lk2Zx"  # No token shape: only the credential file makes it a secret.
+    (tmp_path / "creds.env").write_text(f"MY_SERVICE_TOKEN={value}\n")
+    manager.settings.values["env_file"] = str(tmp_path / "creds.env")
+    monkeypatch.setattr(manager, "approve", AsyncMock(return_value=True))
+    result = json.loads(await remember(manager, session, tools, f"The service key is {value}"))
+    assert "holds a secret" in result["message"] and notes(manager, project) == []
+    async with REAL_CLIENT(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+        client.headers["X-Local-Token"] = (await client.get("/api/bootstrap")).json()["token"]
+        response = await client.post("/api/memory", params={"session_id": session["id"]},
+                                     json={"text": f"Key: {value}"})
+        assert response.status_code == 400 and "holds a secret" in response.json()["detail"]
+    assert notes(manager, project) == []
+
+
+async def test_a_sign_in_method_of_the_credential_file_is_no_secret(runtime, tmp_path):
+    """DATABRICKS_AUTH_TYPE names how to sign in: a note may mention it, and redaction leaves it, while the file's
+    token stays a secret."""
+    app, manager, session, project, tools = runtime
+    value = "Qw3rtyOpaq" + "ue9Lk2Zx"
+    (tmp_path / "creds.env").write_text(f"DATABRICKS_AUTH_TYPE=databricks-cli\nMY_SERVICE_TOKEN={value}\n")
+    manager.settings.values["env_file"] = str(tmp_path / "creds.env")
+    assert manager.redact_sent(f"Run databricks-cli auth login, not {value}.") == "Run databricks-cli auth login, not [REDACTED]."
+    async with REAL_CLIENT(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+        client.headers["X-Local-Token"] = (await client.get("/api/bootstrap")).json()["token"]
+        text = "Sign in to the workspace with databricks-cli before deploying."
+        response = await client.post("/api/memory", params={"session_id": session["id"]}, json={"text": text})
+        assert response.status_code == 200
+        response = await client.post("/api/memory", params={"session_id": session["id"]}, json={"text": f"Key: {value}"})
+        assert response.status_code == 400
+    assert notes(manager, project) == [text]
 
 
 def test_note_and_memory_caps(tmp_path):

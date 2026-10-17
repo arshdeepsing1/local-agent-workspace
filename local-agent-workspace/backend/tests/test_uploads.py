@@ -382,6 +382,33 @@ async def test_an_endpoint_that_rejects_image_parts_gets_notes_from_then_on(api,
     assert manager.supports(OPUS, "vision")
 
 
+@pytest.mark.parametrize("wording", ["cache_control is not supported for this content part.",
+                                     "Unsupported parameter: cache_control on image message content."])
+async def test_a_400_that_names_the_cache_markers_goes_down_the_cache_levels_and_keeps_the_images(api, monkeypatch,
+                                                                                                  wording):
+    """Cache markers are content-part fields too: a 400 naming them, worded with an image term, is a cache rejection
+    first. The images still go, and the endpoint still takes them afterwards."""
+    client, manager, settings = api
+    bodies = []
+
+    async def handle(request):
+        bodies.append(json.loads(request.content))
+        if b"cache_control" in request.content:  # Only the markers are refused.
+            return httpx.Response(400, json={"error_code": "BAD_REQUEST", "message": wording})
+        return sse()
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: REAL_CLIENT(**kwargs, transport=httpx.MockTransport(handle)))
+    session_id = await new_chat(client, manager, OPUS)
+    record = (await upload(client, session_id, "shot.png", png())).json()
+    await send(client, manager, session_id, "Describe", [{"id": record["id"]}])
+    session = manager.get(session_id)
+    assert not [event for event in session["events"] if event["type"] == "error"]
+    calls = [call.get("retry_reason") for call in session["inference_calls"] if call["purpose"] == "agent"]
+    assert calls == [None, "cache_rejected", "cache_rejected"]
+    assert all(attached.IMAGE_PART in json.dumps(body, separators=(",", ":")).encode() for body in bodies)
+    assert manager.supports(OPUS, "vision") and manager.cache_levels.get(OPUS) == "off"
+    assert not any("rejected the images" in event.get("text", "") for event in session["events"])
+
+
 async def test_image_limits_per_message(api, monkeypatch):
     client, manager, _ = api
     gateway(monkeypatch)

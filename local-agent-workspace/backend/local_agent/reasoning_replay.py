@@ -135,23 +135,38 @@ def _replayable(raw, sent, model):
             and sent.get("tool_calls") == raw.get("tool_calls"))
 
 
-def apply(messages, history, wire, model, limit=MAX_REPLAY_BYTES):
+def apply(messages, history, wire, model, limit=MAX_REPLAY_BYTES, banded=True):
     """(messages to send, how many replies carry their reasoning). messages is the prepared request
     (context.prepare_context, its tail the same objects as history, which is agents.model_history(wire));
     wire the chat's own history with the sidecars. Only replies after the last user message, written by
-    model, get their items back, newest first within limit bytes; anything else is sent as it is."""
-    start, result, count, size = turn_start(wire), list(messages), 0, 0
+    model, get their items back, the newest within limit bytes; anything else is sent as it is.
+
+    Past the limit, banded leaves out the oldest replies in whole bands of half the limit, counted from the
+    turn's first reply: the cut moves about once per band of new thinking instead of at every step, so the
+    requests in between still extend the previous one (its prompt cache). The newest reply goes back whenever
+    it fits. banded=False sends the newest replies that fit."""
+    start, result, matched = turn_start(wire), list(messages), []
     for back in range(1, len(wire) - start + 1):
         position = len(wire) - back
         if back >= len(result) or result[-back] is not history[position]:
             break  # Compacted away, or not this message: nothing earlier is matched either.
         raw, sent = wire[position], history[position]
-        if not _replayable(raw, sent, model):
-            continue
-        size += raw["reasoning"].get("bytes") if type(raw["reasoning"].get("bytes")) is int else _size(raw["reasoning"]["items"])
-        if size > limit:
+        if _replayable(raw, sent, model):
+            side = raw["reasoning"]
+            matched.append((back, side["bytes"] if type(side.get("bytes")) is int else _size(side["items"])))
+    total = sum(size for _, size in matched)
+    floor = total - limit  # A reply goes back when it starts at or after floor (counted from the oldest matched).
+    if banded and matched and limit >= 2 and total > limit:
+        band = limit // 2
+        floor = max(floor, min(-(-floor // band) * band, total - matched[0][1]))
+    count, offset = 0, total
+    for back, size in matched:  # Newest first.
+        offset -= size
+        if offset < floor:
             break
-        result[-back] = {**sent, "content": content(raw["reasoning"]["items"], sent.get("content"))}
+        position = len(wire) - back
+        result[-back] = {**history[position], "content": content(wire[position]["reasoning"]["items"],
+                                                                 history[position].get("content"))}
         count += 1
     return (result, count) if count else (messages, 0)
 
