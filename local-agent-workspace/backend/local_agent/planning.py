@@ -154,7 +154,7 @@ PENDING_TITLE = 200
 # offers no Allow, so the user reviews the subagent's card.
 PENDING_WARNINGS = (("secret_files", "names credential-looking files"), ("protected", "changes a protected file"),
                     ("sibling_change", "another subagent changed this file"), ("hook_ask", "a hook asked for it"),
-                    ("uncertain", "a rule may cover it"))
+                    ("hook_change", "a hook changed what the agent proposed"), ("uncertain", "a rule may cover it"))
 # A custom agent's first prompt (custom_agents.py): its instructions, then what its tools allow.
 AGENT_HEADER = "Custom agent: "
 CUSTOM_BRIEFS = {

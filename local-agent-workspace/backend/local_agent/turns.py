@@ -14,7 +14,9 @@ started, waits for your approvals included. Both are checked before each agent m
 reached the agent gets one more request, told to stop and report what is done and what remains (no tools
 run in it), and then the turn ends with terminal_reason 'budget_limit'. A subagent counts toward its parent's
 turn: its requests add to the parent's tokens and the parent's start time applies, and a subagent that
-reaches it wraps up and reports the stop as an error, as for the spending limit.
+reaches it wraps up and reports the stop as an error, as for the spending limit (in a delegated turn its
+submit_report is the one call that runs in the wrap-up, so its report reaches the parent). A /btw side
+question asked while the turn runs is not the turn's: it counts toward neither its limit nor its result.
 """
 import json
 import time
@@ -27,7 +29,7 @@ from .telemetry import USAGE_FIELDS, call_estimated_dbu, call_tokens, reported_t
 LIMIT_KEYS = TURN_LIMITS  # {Settings key: its maximum}
 CHANGED_FILES = 20  # Paths a result lists; changed_files_total counts them all.
 ERROR_REASONS = ("error", "inference_error")
-# What the wrap-up request's tool calls return: it is told not to call any.
+# What the wrap-up request's tool calls return: it is told not to call any (a delegated subagent: but submit_report).
 WRAP_UP_REFUSAL = "Not run: this turn reached its budget. Reply with a summary of what is done and what remains."
 clock = time.time  # Patched by tests of the time limit.
 
@@ -76,10 +78,15 @@ def status(manager, session):
             "time_source": values["turn_time_limit_minutes"][1], "follows_parent": root is not session}
 
 
+def turn_calls(calls):
+    """The ledger records that belong to a turn: not a /btw side question asked while it ran."""
+    return [call for call in calls if isinstance(call, dict) and call.get("purpose") != "side_question"]
+
+
 def own_tokens(session, first_call=0):
-    """The tokens of a chat's own ledger records from first_call on."""
+    """The tokens of a chat's own ledger records from first_call on (turn_calls)."""
     calls = session.get("inference_calls") if isinstance(session.get("inference_calls"), list) else []
-    return sum(call_tokens(call) for call in calls[first_call:])
+    return sum(call_tokens(call) for call in turn_calls(calls[first_call:]))
 
 
 def children(manager, root, turn):
@@ -102,8 +109,9 @@ def _child_usage(value):
     """(tokens or None when none were reported, estimated DBU, unpriced calls) of a live child (its ledger) or an
     index entry."""
     if isinstance(value.get("inference_calls"), list):
-        dbu, unpriced = _spend(value["inference_calls"])
-        return reported_tokens(value["inference_calls"]), dbu, unpriced
+        calls = turn_calls(value["inference_calls"])
+        dbu, unpriced = _spend(calls)
+        return reported_tokens(calls), dbu, unpriced
     tokens = value.get("tokens") if type(value.get("tokens")) is int else None
     dbu = value.get("estimated_dbu")
     dbu = dbu if isinstance(dbu, (int, float)) and not isinstance(dbu, bool) else 0.0
@@ -152,8 +160,13 @@ def reached(manager, session):
     return (" and ".join(reasons), root is not session) if reasons else None
 
 
-def wrap_up_notice(text):
-    """The step notice of the wrap-up request (the system message's changing part)."""
+def wrap_up_notice(text, report=False):
+    """The step notice of the wrap-up request (the system message's changing part). report: a subagent's
+    delegated turn, whose submit_report is the one call that runs in it (so its report reaches the parent)."""
+    if report:
+        return (f"This turn has used {text} per turn. Call no tool except submit_report and do not start new work: "
+                "send your report now with what is done, what remains and how to continue. This is the turn's last "
+                "request.")
     return (f"This turn has used {text} per turn. Do not call any tools and do not start new work: reply now with "
             "a short summary of what is done, what remains and how to continue. This is the turn's last request.")
 
@@ -198,7 +211,7 @@ def turn_result(manager, session, turn, terminal_reason, ended=None):
     tools named them, redacted)."""
     ended = clock() if ended is None else ended
     events = [event for event in session["events"][turn["first_event"]:] if isinstance(event, dict)]
-    calls = [call for call in (session.get("inference_calls") or [])[turn["first_call"]:] if isinstance(call, dict)]
+    calls = turn_calls((session.get("inference_calls") or [])[turn["first_call"]:])
     totals = usage_totals(calls)
     dbu, unpriced = _spend(calls)
     priced = any(call_estimated_dbu(call)[0] is not None for call in calls)

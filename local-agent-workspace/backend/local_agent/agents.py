@@ -2530,7 +2530,8 @@ class AgentManager(LifecycleHooks):
 
     def feature_definitions(self, session):
         """The feature tools a chat can be offered: no delegate_task or remember in a subagent, and submit_report
-        only there (get_subagent_result once the chat started a background subagent); remember while
+        only in a subagent's delegated turn, never in one the user continues (get_subagent_result once the chat
+        started a background subagent); remember while
         Settings → Project memory is on, or in a chat it was offered to before; get_tool_output once a long result
         of this chat was kept; web_fetch while Settings → Web access allows it and web_search while it names a
         search provider, or in a chat they were offered to before; report_findings once a skill that names it
@@ -2539,10 +2540,10 @@ class AgentManager(LifecycleHooks):
         subagent = bool(session.get("is_subagent"))
         memory = not subagent and (self.settings.values.get("project_memory", True) is True
                                    or session.get("memory_tool") is True)
-        # submit_report: a subagent's structured final report; get_subagent_result: once the chat started a
-        # background subagent.
+        # submit_report: a subagent's structured final report, while a parent waits for it; get_subagent_result:
+        # once the chat started a background subagent.
         offered = {"remember": memory, "get_tool_output": bool(session.get("tool_output_offered")),
-                   "submit_report": subagent,
+                   "submit_report": subagent and bool(session.get("turn_delegated")),
                    "get_subagent_result": not subagent and session.get("background_subagents_offered") is True,
                    "web_fetch": self.settings.values.get("web_fetch", True) is True or session.get("web_fetch_tool") is True,
                    "web_search": (web_fetch.search_setup(self.settings.values) is not None
@@ -3181,7 +3182,10 @@ class AgentManager(LifecycleHooks):
                     await report_storage_failure(storage_exc)
         finally:
             updates = []
+            stopped = asyncio.current_task().cancelling()
             for event in session["events"]:
+                if event.get("state") == "pending" and not stopped and self.card_waits(session, event):
+                    continue  # A card another task waits on (a background subagent's hook in this chat) stays.
                 if event.get("state") in ("running", "pending"):
                     event["state"] = "cancelled"
                     updates.append(event)
@@ -3230,8 +3234,15 @@ class AgentManager(LifecycleHooks):
             self.store.forget_encodings(session["id"])
             try:
                 await self.status(session, "idle", turn_ended=True, result=result)
+                if not stopped and any(self.card_waits(session, event) for event in session["events"]):
+                    await self.status(session, "awaiting_approval")  # That card still waits for its answer.
             except STORAGE_ERRORS as exc:
                 await report_storage_failure(exc)
+
+    def card_waits(self, session, event):
+        """Whether a card of this chat still waits for its answer (its wait in self.pending has not ended)."""
+        future = self.pending.get((session["id"], event.get("id")))
+        return future is not None and not future.done()
 
     async def run_delegations(self, session, tools, calls, values, allowance):
         """Consecutive delegate_task calls of one response, run in parallel; their outputs in call
@@ -3301,8 +3312,10 @@ class AgentManager(LifecycleHooks):
         invoked = False
         views_key = views_prev = None
         try:
-            if session["id"] in self.budget_wrapups:
-                # The turn's wrap-up request at its budget was told to call no tools (turns.py).
+            if session["id"] in self.budget_wrapups and not (
+                    name == "submit_report" and session.get("is_subagent") and session.get("turn_delegated")):
+                # The turn's wrap-up request at its budget was told to call no tools (turns.py); a delegated
+                # subagent's report is its answer, so it goes through and reaches the parent.
                 await self.update_event(session, event, state="rejected", output=turns.WRAP_UP_REFUSAL)
                 return turns.WRAP_UP_REFUSAL
             # The mode can change while a turn runs; folder checks follow the current one.
@@ -4879,6 +4892,14 @@ class AgentManager(LifecycleHooks):
 
     async def manual_compact(self, session, preservation_note=""):
         committed = False
+        first_event = len(session["events"])  # Its before_compaction hook cards come after this.
+
+        async def close_cards():
+            """A hook card a Stop or failure left running or pending shows cancelled, as at a turn's end (not a
+            card another task still waits on: a background subagent's hook in this chat)."""
+            for event in session["events"][first_event:]:
+                if event.get("state") in ("running", "pending") and not self.card_waits(session, event):
+                    await self.update_event(session, event, state="cancelled")
         try:
             self.compaction_trigger(session, "manual")
             await self.status(session, "compacting")
@@ -4927,11 +4948,13 @@ class AgentManager(LifecycleHooks):
             await self.broadcast(session["id"], {"type": "context", "context_info": session["context_info"]})
             await self.summary_adjustment_notice(session, info)
         except asyncio.CancelledError:
+            await close_cards()
             await self.event(session, "notice", text=("Context compaction completed. History is preserved." if committed
                              else "Context compaction stopped. The previous context and full history are preserved."))
         except Exception as exc:
             await self.event(session, "error", text=self.settings.redact(str(exc))[:1500])
         finally:
+            await close_cards()
             self.live.pop(session["id"], None)
             self.store.forget_encodings(session["id"])
             await self.status(session, "idle")
@@ -5697,7 +5720,8 @@ class AgentManager(LifecycleHooks):
                         await self.refresh_next_estimate(session, system, definitions, wire, context_state)
                         await self.budget_stop(session, wire, turns.stop_text(*budget, wrapped=True))
                         return False
-                    wrap_up = turns.wrap_up_notice(budget[0])
+                    wrap_up = turns.wrap_up_notice(budget[0], report=bool(session.get("is_subagent")
+                                                                          and session.get("turn_delegated")))
                     self.budget_wrapups.add(session["id"])
                 elif wrap_up is not None:
                     # The limit was raised or removed during the wrap-up request: the turn goes on as usual.
@@ -6063,6 +6087,12 @@ class AgentManager(LifecycleHooks):
                     # reads it), so no request follows for a closing reply. The history gets one, as a turn ends.
                     wire.append({"role": "assistant", "content": REPORT_SUBMITTED_REPLY})
                     self.store.save(session)
+                    if wrap_up is not None and (budget := turns.reached(self, session)) is not None:
+                        # The wrap-up's report ends the turn at the budget: no stop hook continues it, and the
+                        # parent gets the report with the budget stop.
+                        await self.refresh_next_estimate(session, system, definitions, wire, context_state)
+                        await self.budget_stop(session, wire, turns.stop_text(*budget, wrapped=True))
+                        return False
                     if await self.stop_hooks(session, wire, stop_state, step_index + 1 < steps) == "continue":
                         retry_reason = "stop_hook"
                         continue
@@ -6078,6 +6108,10 @@ class AgentManager(LifecycleHooks):
             # A card of the last step waited a scheduled run's approval limit: that, not the step limit, ended it.
             if (run := self.scheduled_run(session)) is not None and run.get("expired"):
                 await self.approval_stop(session, wire, run)
+                return False
+            if wrap_up is not None and (budget := turns.reached(self, session)) is not None:
+                # The last step was the wrap-up request and its reply still called tools: the budget ended the turn.
+                await self.budget_stop(session, wire, turns.stop_text(*budget, wrapped=True))
                 return False
         # A chat a script created with its own Agent steps, or one whose project's settings file sets them, does not
         # follow the Settings value.

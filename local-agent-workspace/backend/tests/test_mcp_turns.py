@@ -192,8 +192,9 @@ def test_the_largest_built_in_tool_set_fits_the_request_limit(runtime):
     # Without a background subagent (the usual case) one place stays free.
     session.pop("background_subagents_offered")
     assert len(manager.offered_tools(session, [])[0]) == MAX_REQUEST_TOOLS - 1
-    # A subagent gets submit_report but never delegate_task, remember, submit_plan or get_subagent_result.
-    session.update(is_subagent=True, background_subagents_offered=True)
+    # A subagent (in its delegated turn) gets submit_report but never delegate_task, remember, submit_plan or
+    # get_subagent_result.
+    session.update(is_subagent=True, turn_delegated=True, background_subagents_offered=True)
     names = {item["function"]["name"] for item in manager.offered_tools(session, [])[0]}
     assert "submit_report" in names and not names & {"delegate_task", "remember", "submit_plan", "get_subagent_result"}
 
