@@ -27,7 +27,9 @@ MODE_LABELS = {"manual": "Manual", "auto": "Auto", "acceptEdits": "Accept edits"
 TOOL_KINDS = {
     **dict.fromkeys(("list_files", "find_files", "read_file", "search_files", "list_jobs", "get_job_output", "wait_job",
                      "notebook_read", "outline_file", "project_overview", "get_tool_output"), "read"),
-    **dict.fromkeys(("list_skills", "use_skill", "list_tasks", "get_task", "create_task", "update_task"), "task"),
+    # report_findings only shows a card of the agent's review findings (no side effect), in every mode.
+    **dict.fromkeys(("list_skills", "use_skill", "list_tasks", "get_task", "create_task", "update_task",
+                     "report_findings"), "task"),
     "ask_user": "question",
     "submit_plan": "plan",
     **dict.fromkeys(("write_file", "edit_file", "insert_activity_log", "move_path", "delete_path", "notebook_edit"),

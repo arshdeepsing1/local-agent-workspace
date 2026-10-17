@@ -2,7 +2,8 @@
 
 PROFILES = ("read_only", "file_editor", "inherit")
 READ_TOOLS = frozenset({"list_files", "find_files", "read_file", "search_files", "list_skills", "use_skill", "list_tasks",
-                        "get_task", "notebook_read", "ask_user", "outline_file", "project_overview", "get_tool_output"})
+                        "get_task", "notebook_read", "ask_user", "outline_file", "project_overview", "get_tool_output",
+                        "report_findings"})
 FILE_TOOLS = READ_TOOLS | {"write_file", "edit_file", "insert_activity_log", "move_path", "delete_path", "notebook_edit"}
 
 

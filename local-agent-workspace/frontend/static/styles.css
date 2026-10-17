@@ -657,3 +657,34 @@ body.panel-resizing{cursor:col-resize;user-select:none}
 .hook-trust>span{flex:1 1 220px;min-width:0;font-size:12px;line-height:1.5;overflow-wrap:anywhere}
 .hook-trust .hook-trusted{color:#4f6b3f}
 .hook-trust .outline{font-size:12px;padding:6px 11px}
+/* 2026-10-16 git: review findings cards, Stage/Unstage and Commit in the Changes view, the pull request chip. */
+.findings-card{margin:10px 0;padding:12px 14px;border:1px solid var(--border);border-radius:12px;background:var(--surface);min-width:0}
+.findings-card header{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.findings-title{font-size:13px;font-weight:600;color:var(--ink)}
+.findings-counts{display:flex;gap:5px;flex-wrap:wrap;flex:1;min-width:0}
+.findings-summary{margin:8px 0 0;font-size:13px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere}
+.findings-list{list-style:none;margin:10px 0 0;padding:0}
+.finding{padding:9px 0;border-top:1px solid var(--border);min-width:0}
+.finding-head{display:flex;align-items:baseline;gap:7px;flex-wrap:wrap;min-width:0}
+.finding-severity{flex:none;font-size:11px;font-weight:600;line-height:18px;padding:0 7px;border-radius:9px;text-transform:capitalize}
+.finding-severity.high{background:#f6e4e1;color:#7a3b31}.finding-severity.medium{background:#f4ecdf;color:#6b4f2e}
+.finding-severity.low{background:#e6edf3;color:#2f4d66}.finding-severity.info{background:#efefec;color:#55564f}
+.finding-location{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--accent);padding:0;border:0;background:none;text-decoration:underline;text-underline-offset:2px;text-align:left;overflow-wrap:anywhere;min-width:0}
+button.finding-location:hover{color:var(--accent-hover);background:none}
+code.finding-location{color:#55564f;text-decoration:none}
+.finding-title{font-size:13px;font-weight:500;overflow-wrap:anywhere;min-width:0}
+.finding-detail,.finding-suggestion{margin:5px 0 0;font-size:12.5px;line-height:1.5;color:#45463f;white-space:pre-wrap;overflow-wrap:anywhere}
+.findings-empty{margin:8px 0 0;font-size:12px;color:var(--muted)}
+.git-group-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.git-group-action{font-size:11px;padding:2px 8px;margin:6px 4px 0;border-radius:5px;color:#625d52}
+.git-entry{display:flex;align-items:center;gap:2px;min-width:0}.git-entry>.git-row{flex:1}
+.git-stage{width:26px;height:26px;flex:none;color:#625d52}
+.git-commit{display:flex;flex-direction:column;gap:6px;margin:4px 4px 8px}
+.git-commit textarea{width:100%;min-height:44px;resize:vertical;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--ink);padding:6px 8px;font:inherit;font-size:12px;line-height:1.5}
+.git-commit button{align-self:flex-end;font-size:12px;padding:5px 11px}
+.git-pr{margin:0;padding:7px 10px 0;font-size:11px;min-width:0}
+.git-pr-chip{display:inline-block;max-width:100%;padding:2px 8px;border:1px solid var(--border);border-radius:10px;background:var(--surface);color:#3f403a;text-decoration:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;vertical-align:middle}
+.git-pr-chip.merged{color:#5b3e7a}.git-pr-chip.closed{color:#7a3b31}.git-pr-chip.failing{border-color:#e1b3aa}
+.git-pr-note{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.git-committed{margin:8px 10px 0;font-size:11px;color:#2b7350;overflow-wrap:anywhere}
+@media(pointer:coarse){.git-group-action,.finding-location{min-height:24px}}

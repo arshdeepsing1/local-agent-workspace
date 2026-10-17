@@ -34,7 +34,9 @@
 //   web_fetch: boolean (offer web_fetch; default true), web_search_provider: '' | 'brave' | 'tavily' | 'searxng' (default ''
 //   = no web_search), web_search_url: string (the SearXNG address), web_search_key: string (the credential-file entry
 //   that holds the API key; '' = BRAVE_API_KEY or TAVILY_API_KEY), web_search_status: { provider, ready, problem?,
-//   key_name? } | null (never the key) }
+//   key_name? } | null (never the key),
+//   git_context: boolean (each turn's first message carries a short Git snapshot: branch, upstream, change counts,
+//   recent commits; default true) }
 // GET /output-styles?session_id= -> { styles: [{ id, name, description, source: 'built-in'|'project'|'user', path? }],
 //   errors: [{ path, error }] } (backend output_styles.py; the chat's project, or the default one without a chat).
 // Memory (GET /memory?session_id=; POST { text } adds, PATCH /memory/<id> { text } edits, DELETE /memory/<id> deletes
@@ -193,9 +195,12 @@
 //   submit_plan events: { name: 'submit_plan', input: { plan, title? }, plan_outcome?: 'approved'|'keep_planning'|
 //   'expired'|'superseded', plan_mode?, feedback?, approval_expires? }; answered with
 //   POST /sessions/<id>/plans/<event id> { choice, feedback? }.
+//   report_findings events (a review skill's result, no card): { name: 'report_findings', input: { summary,
+//   findings: [{ path, line?, end_line?, severity: 'high'|'medium'|'low'|'info', title, detail?, suggestion? }] }
+//   (redacted by the app) }; completed ones render as the Review findings card.
 //   User events also carry in_wire? (true once the text reached the model history as its own message; false
 //   when the turn failed before that; absent on older events), steered? (true: sent while the agent was
-//   working) and attachments?: Attachment[]. The 'Stopped.' notice carries stop_phase?: 'streaming'|'tools'|'waiting'.
+//   working), git_context? (true: the app's Git snapshot went with it) and attachments?: Attachment[]. The 'Stopped.' notice carries stop_phase?: 'streaming'|'tools'|'waiting'.
 //   A rate-limit retry, automatic-continue or shared-wait notice carries details?: string ('HTTP 429 <code>: <message>
 //   · Retry-After: <n s | none>', the 429 behind it; a shared wait shows the other chat's), shown under Details.
 //   A compaction's notice carries compaction?: Compaction (one notice per compaction).
@@ -356,6 +361,14 @@
 // ChangeDiff (GET /sessions/<id>/changes/diff?path=): { path, status, added, removed,
 //   baseline_hash, current_hash, hunks: [{ index, line, added, removed }],
 //   lines: [{ kind: 'context'|'removed'|'added', text, old?, new?, hunk?, newline? }] }
+// Changes view actions (git_tools.py; 409 while a chat in the project replies or a command runs there):
+//   POST /git/stage?session_id= { paths: string[] (1..4,000, workspace-relative files), staged: boolean } -> the new
+//   GET /git/status answer (an entry with submodule: true is a submodule whose commit changed: it has no stage
+//   button); POST /git/commit?session_id= { message (1..10,000) } -> { commit: { hash, subject },
+//   status }. GET /git/pr?session_id=&branch=&refresh? -> { available: true, number, title, state:
+//   'open'|'closed'|'merged'|…, draft, url: string | null, review_decision: string | null, checks: { total, passed,
+//   failed, pending } } or { available: false, code: 'no_gh'|'refused'|'no_git'|'no_pr'|'not_signed_in'|'no_repo'|
+//   'no_branch'|'no_remote'|'timeout'|'error', reason }.
 // WorkspaceFolders (GET, POST { path } and DELETE { path } /workspace-folders?session_id=, the
 //   session optional): the project's folders added to Files, view only (the agent's access is
 //   unchanged). { workspace (absolute project path), folders: [{ path (absolute), missing: boolean }],

@@ -344,7 +344,7 @@ export function useWorkspace() {
       system_notifications, user_instructions, write_limit_kb, command_env, secret_file_patterns, rate_limit_auto_continue, auto_keep_changes,
       coding_dir, python_venv, auto_compact_percent, reasoning_effort, reasoning_format, thinking_summaries, prompt_caching, subagent_defaults,
       spending_limit_dbu, fallback_model, user_agents_file, user_claude_file, project_memory, output_style, slash_commands, thinking_replay,
-      web_fetch, web_search_provider, web_search_url, web_search_key } = next
+      web_fetch, web_search_provider, web_search_url, web_search_key, git_context } = next
     const saved = await api('/settings', 'PUT', {
       workspace, model, env_file, context_window, max_output_tokens, max_agent_steps,
       ...(typeof compaction_handoffs === 'boolean' ? { compaction_handoffs } : {}),
@@ -371,6 +371,7 @@ export function useWorkspace() {
       ...(typeof user_agents_file === 'boolean' ? { user_agents_file } : {}),
       ...(typeof user_claude_file === 'boolean' ? { user_claude_file } : {}),
       ...(typeof project_memory === 'boolean' ? { project_memory } : {}),
+      ...(typeof git_context === 'boolean' ? { git_context } : {}),
       ...(typeof output_style === 'string' && output_style ? { output_style } : {}),
       ...(typeof web_fetch === 'boolean' ? { web_fetch } : {}),
       ...(typeof web_search_provider === 'string' ? { web_search_provider } : {}),

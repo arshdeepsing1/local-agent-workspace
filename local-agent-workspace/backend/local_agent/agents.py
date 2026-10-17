@@ -57,7 +57,7 @@ from . import custom_agents
 from .context import estimate_text_tokens
 from .planning import CallAllowance, DelegateManager, DelegationGate, TaskManager
 from .interactions import InteractionManager
-from .feature_tools import FEATURE_TOOLS
+from .feature_tools import FEATURE_TOOLS, FINDINGS_TOOL
 from .tool_profiles import tool_allowed, filter_tools, off_servers, server_off
 from .mcp_client import FULL_RESULT_CHARS, RETRY_SECONDS
 from .result_store import ResultStore
@@ -80,7 +80,7 @@ from .store import UnreadableConversation
 from .approvals import MAX_ALLOW_RULES, busy_status, declined, rule_for
 from .notify import SystemNotifier, attention_message
 from .context import INCOMPLETE_RESPONSE_CONTINUATION, INVALID_ARGUMENTS_CONTINUATION, VERIFY_CONTINUATION_PREFIX
-from .context import HOOK_CONTINUATION_PREFIX, SKILL_MARKER, is_app_prompt, is_continuation
+from .context import ATTACHMENT_SEPARATOR, HOOK_CONTINUATION_PREFIX, SKILL_MARKER, is_app_prompt, is_continuation
 from .lifecycle_hooks import LifecycleHooks, ToolHookNotes, blocked_prompt_notice, hook_contexts, shown_arguments
 from .context import retained_request as context_retained
 from . import history
@@ -1016,10 +1016,35 @@ class AgentManager(LifecycleHooks):
             ids.append(skill_id)
         elif not enabled and skill_id in ids:
             ids.remove(skill_id)
-        self.skill_text(session, tools, ids)
+        text = self.skill_text(session, tools, ids)
         session["active_skills"] = ids
+        if FINDINGS_TOOL in text:
+            session["findings_tool"] = True  # feature_definitions: report_findings is offered from the next request.
         self.store.save(session)
         return {"active_skills": ids}
+
+    def skills_name_findings(self, tools, skill_ids):
+        """Whether one of these skills' instructions names report_findings (a review skill): the chat is then
+        offered that tool (feature_definitions)."""
+        try:
+            return FINDINGS_TOOL in self.skill_text({}, tools, list(skill_ids))
+        except (OSError, ValueError, UnicodeError):
+            return False
+
+    async def git_context_block(self, session, tools):
+        """The Git snapshot for a turn's first message (git_tools.git_context, after GIT_MARKER's separator), or
+        '' when Settings → Git status in messages is off, for a subagent (the parent's message had it and its
+        task says what matters) and outside a repository. In the message, not the system message, so the
+        cached system prefix and earlier messages stay the same; the app record leaves it out (GIT_MARKER)."""
+        if session.get("is_subagent") or self.settings.values.get("git_context", True) is not True:
+            return ""
+        credential = tools.credential_file
+        excludes = ([f":(exclude,literal){credential.relative_to(tools.root).as_posix()}"]
+                    if credential and credential.is_relative_to(tools.root) and credential != tools.root else [])
+        forbidden = [*tools.allowed_directories, *(Path(path) for path in self.standing_directories())]
+        text = await git_tools.git_context(tools.root, forbidden_roots=forbidden, excludes=excludes,
+                                           redact=lambda value: tools.redact(self.settings.redact(value)))
+        return ATTACHMENT_SEPARATOR + text if text else ""
 
     def requested_skills(self, tools, prompt, session=None, delegated=False):
         """The skills a message names: `/skill <id> …` at its start, or a listed
@@ -2321,15 +2346,17 @@ class AgentManager(LifecycleHooks):
         """The feature tools a chat can be offered: no delegate_task or remember in a subagent; remember while
         Settings → Project memory is on, or in a chat it was offered to before; get_tool_output once a long result
         of this chat was kept; web_fetch while Settings → Web access allows it and web_search while it names a
-        search provider, or in a chat they were offered to before. Once offered, a tool stays offered, so the
-        chat's tool list stays stable (a call to a tool Settings turned off is refused)."""
+        search provider, or in a chat they were offered to before; report_findings once a skill that names it
+        was selected (findings_tool). Once offered, a tool stays offered, so the chat's tool list stays stable
+        (a call to a tool Settings turned off is refused)."""
         subagent = bool(session.get("is_subagent"))
         memory = not subagent and (self.settings.values.get("project_memory", True) is True
                                    or session.get("memory_tool") is True)
         offered = {"remember": memory, "get_tool_output": bool(session.get("tool_output_offered")),
                    "web_fetch": self.settings.values.get("web_fetch", True) is True or session.get("web_fetch_tool") is True,
                    "web_search": (web_fetch.search_setup(self.settings.values) is not None
-                                  or session.get("web_search_tool") is True)}
+                                  or session.get("web_search_tool") is True),
+                   FINDINGS_TOOL: session.get("findings_tool") is True}
         return [tool for tool in FEATURE_TOOLS if not (subagent and tool["function"]["name"] == "delegate_task")
                 and offered.get(tool["function"]["name"], True)]
 
@@ -3423,6 +3450,19 @@ class AgentManager(LifecycleHooks):
                 await self.publish_tasks(session["id"])
             elif name in ("ask_user", "submit_plan"):
                 result = await self.interactions.handle(session, event, name, arguments)
+            elif name == FINDINGS_TOOL:
+                # No side effect: the card shows the findings (redacted), the transcript and exports keep them.
+                clean = lambda text: tools.redact(self.settings.redact(redact_secrets(text)))
+                report = {"summary": clean(arguments["summary"]),
+                          "findings": [{key: clean(value) if isinstance(value, str) else value for key, value in item.items()}
+                                       for item in arguments["findings"]]}
+                await self.update_event(session, event, input=report)
+                count = len(report["findings"])
+                # A subagent's parent gets them with its report (planning.reported_findings).
+                result = (f"Recorded {count} {'finding' if count == 1 else 'findings'}; "
+                          + ("the parent receives them with your report. " if session.get("is_subagent")
+                             else "the user sees them as a card. ")
+                          + "Do not repeat them in your reply; give a short overall verdict.")
             elif name == "remember":
                 if self.settings.values.get("project_memory", True) is not True:
                     raise ValueError("Project memory was turned off in Settings before the note was saved; nothing was saved.")
@@ -5265,11 +5305,17 @@ class AgentManager(LifecycleHooks):
             selected, skills = self.message_skills(session, tools, prompt, delegated=bool(session.get("turn_delegated")))
             if selected and turn is not None:
                 await self.update_event(session, turn, skills=selected)
+            if selected and not session.get("findings_tool") and self.skills_name_findings(tools, selected):
+                session["findings_tool"] = True  # Offered from this turn's first request on (offered_tools).
         # The meter lists the skills this message selected, each with what it adds to the message.
         blocks = skills.split(SKILL_MARKER)[1:]
         message_sources = [{"path": f"Skill /{skill_id}", "scope": "this message", "status": "loaded",
                             "estimated_tokens": estimate_text_tokens(SKILL_MARKER + block)}
                            for skill_id, block in zip(selected, blocks)] if len(blocks) == len(selected) else []
+        # Read once per turn, for its first message only (steered messages and later steps reuse it).
+        git_block = await self.git_context_block(session, tools)
+        if git_block and turn is not None:
+            await self.update_event(session, turn, git_context=True)
         # Complete interrupted tool exchanges before sending the next user turn.
         wire, context_state = repair_tool_history(session["wire"], session["events"], session.get("context_state", {}))
         # Keep the prefix boundary consistent even if context preparation fails.
@@ -5288,7 +5334,7 @@ class AgentManager(LifecycleHooks):
             self.store.save(session)
         # A new turn: no earlier reply's signed reasoning is sent back again, so the history keeps none of it.
         reasoning_replay.prune(wire)
-        wire.append({"role": "user", "content": (prompt if content is None else content) + skills})
+        wire.append({"role": "user", "content": (prompt if content is None else content) + git_block + skills})
         compactable = False
         if isinstance(meter := session.get("context_info"), dict) and meter.get("compactable") is False:
             # This turn's first request replaces the meter; a turn that ends before it leaves this one.

@@ -130,9 +130,10 @@ def test_credential_files_are_listed_hidden_and_their_diffs_refused(repository):
     (workspace / "keys/id_rsa").write_text("private-secret\n")
     response = client.get("/api/git/status")
     files = entries(response.json())
-    for key in (("unstaged", ".env"), ("untracked", "config/prod.ENV"), ("untracked", "config/.env.example"),
-                ("untracked", "keys/id_rsa")):
+    for key in (("unstaged", ".env"), ("untracked", "config/prod.ENV"), ("untracked", "keys/id_rsa")):
         assert files[key]["hidden"] == "credential" and files[key]["added"] is None
+    # .env.example is not a credential file (as for the file tools): listed and diffed like any file.
+    assert files[("untracked", "config/.env.example")]["hidden"] is None
     assert "secret" not in response.text
     for path, area in ((".env", "unstaged"), (".env", "staged"), ("config/prod.ENV", "untracked"),
                        ("keys/id_rsa", "untracked"), ("CONFIG/../.env", "unstaged")):

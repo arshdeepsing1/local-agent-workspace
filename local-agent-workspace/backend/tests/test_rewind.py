@@ -301,11 +301,11 @@ async def test_rewind_both_and_resend_sends_the_cut_history_plus_the_new_message
             **kwargs, transport=httpx.MockTransport(gateway)))
         response = await client.post(f"/api/sessions/{session['id']}/rewind", json={
             "before_event_id": "u2", "conversation": True, "code": True, "resend_text": "  Do it differently  "})
-        monkeypatch.undo()
         assert response.status_code == 200, response.text
         body = response.json()
         assert body["resent"] is True and body["backup_session_id"]
-        await manager.tasks[session["id"]]
+        await manager.tasks[session["id"]]  # The resent turn may await (the Git snapshot) before its request.
+        monkeypatch.undo()
     assert chat.files() == {"a.txt": "a1", "b.txt": None}
     assert len(requests) == 1
     assert requests[0]["messages"][1:] == [{"role": "user", "content": "Turn 1"}, {"role": "assistant", "content": "Done."},

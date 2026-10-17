@@ -1,5 +1,5 @@
 import { html, useCallback, useEffect, useRef, useState } from '../lib.js'
-import { ArrowLeft, ChevronRight, Code2, File, FileDiff, Folder, GitBranch, Maximize2, Minimize2, Pencil, Plus, RefreshCw, Save, Terminal, X } from '../icons.js'
+import { ArrowLeft, ChevronRight, Code2, File, FileDiff, Folder, GitBranch, Maximize2, Minimize2, Minus, Pencil, Plus, RefreshCw, Save, Terminal, X } from '../icons.js'
 import { api } from '../api.js'
 import FileRoots, { standingFolder, useWorkspaceFolders } from './FileRoots.js'
 import TerminalPanel from './TerminalPanel.js'
@@ -32,15 +32,47 @@ function changedLine(lines) {
   return (before?.kind === 'context' ? before.new : next?.new) || 1
 }
 
+// The pull request chip's text: "PR #12 · open · 3/4 checks" (GET /git/pr: git_tools.pr_status).
+export function prChipText(pr) {
+  const checks = pr.checks?.total ? ` · ${pr.checks.passed}/${pr.checks.total} checks${pr.checks.failed ? `, ${pr.checks.failed} failing` : ''}` : ''
+  return `PR #${pr.number} · ${pr.draft && pr.state === 'open' ? 'draft' : pr.state}${checks}`
+}
+const REVIEW_TEXT = { approved: 'approved', changes_requested: 'changes requested', review_required: 'review required' }
+// Reasons not worth a line under the branch: no gh, no repository or branch, no pull request.
+const QUIET_PR = new Set(['no_gh', 'no_git', 'no_repo', 'no_branch', 'no_remote', 'no_pr'])
+
+// The paths a Stage or Unstage button acts on: a rename stages or unstages both of its sides. A conflict, and a
+// folder Git lists whole (a nested repository), have no button: the server stages files only.
+const entryPaths = entry => entry.orig_path ? [entry.path, entry.orig_path] : [entry.path]
+// A submodule whose commit changed is listed, but the server stages files only.
+const stageable = entry => !entry.hidden && !entry.submodule && entry.status !== 'conflicted' && !entry.path.endsWith('/')
+
 // Git's view of the project (GET /git/status), grouped like an editor's source control
 // view, and a read-only diff of one file (GET /git/diff). Refreshes when shown, on
 // Refresh, and when a response ends. onOpenFile(path, line) opens the file in the editor.
+// Stage and Unstage (POST /git/stage) act on the files you choose; Commit (POST /git/commit)
+// commits what is staged with your message; the pull request chip comes from gh (GET /git/pr).
 function GitChanges({ query, workspace, busy, onOpenFile }) {
   const [status, setStatus] = useState(null)
   const [selected, setSelected] = useState(null)  // { entry, diff?, error? }
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
+  const [acting, setActing] = useState(false)  // a stage, unstage or commit request is running
+  const [message, setMessage] = useState('')
+  const [committed, setCommitted] = useState(null)  // { hash, subject } of the last commit made here
+  const [pr, setPr] = useState(null)
   const latest = useRef(0)
+  const prRequest = useRef(0)
+  const ids = useRef(`git-${Math.random().toString(36).slice(2, 10)}`).current  // Stage buttons name their row's path.
+  const withQuery = (path, extra = '') => `${path}${query || extra ? `?${[query, extra].filter(Boolean).join('&')}` : ''}`
+  const loadPr = async (result, force = false) => {
+    const request = ++prRequest.current
+    if (!result?.repository || !result.branch) { setPr(null); return }
+    try {
+      const answer = await api(withQuery('/git/pr', `branch=${encodeURIComponent(result.branch)}${force ? '&refresh=true' : ''}`))
+      if (request === prRequest.current) setPr(answer)
+    } catch { if (request === prRequest.current) setPr(null) }  // The chip is optional: no error for it.
+  }
   // Keyboard focus moves to Back when a diff opens, and to the row again on Back.
   const backButton = useRef(null)
   const list = useRef(null)
@@ -52,18 +84,36 @@ function GitChanges({ query, workspace, busy, onOpenFile }) {
     if (target) [...(list.current?.querySelectorAll('button.git-row') || [])]
       .find(row => row.dataset.area === target.area && row.dataset.path === target.path)?.focus()
   }, [selected?.entry])
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (force = false) => {
     const request = ++latest.current
     setLoading(true); setError('')
     try {
       const result = await api(`/git/status?${query}`)
-      if (request === latest.current) setStatus(result)
+      if (request === latest.current) { setStatus(result); void loadPr(result, force) }
     } catch (e) { if (request === latest.current) setError(e.message) }
     finally { if (request === latest.current) setLoading(false) }
   }, [query])
   useEffect(() => { void refresh() }, [refresh])
   const wasBusy = useRef(busy)
   useEffect(() => { if (wasBusy.current && !busy) void refresh(); wasBusy.current = busy }, [busy])
+  // Stage, unstage and commit answer with the new status; a newer refresh still wins.
+  const act = async (path, body) => {
+    const request = ++latest.current
+    setActing(true); setError('')
+    try {
+      const result = await api(withQuery(path), 'POST', body)
+      const next = result.status || result
+      if (request === latest.current) setStatus(next)
+      return result
+    } catch (e) { if (request === latest.current) setError(e.message); return null }
+    finally { setActing(false); if (request === latest.current) setLoading(false) }
+  }
+  const stageFiles = (paths, staged) => { setCommitted(null); return act('/git/stage', { paths, staged }) }
+  const commit = async event => {
+    event.preventDefault()
+    const result = await act('/git/commit', { message })
+    if (result?.commit) { setCommitted(result.commit); setMessage(''); void loadPr(result.status) }
+  }
   const showDiff = async entry => {
     returnTo.current = entry
     setSelected({ entry })
@@ -100,23 +150,47 @@ function GitChanges({ query, workspace, busy, onOpenFile }) {
     </div>`
   }
   const files = status?.files || []
+  const stagedCount = files.filter(entry => entry.area === 'staged').length
+  // While the agent works it may be changing the same files and index: the server refuses then, and so do the buttons.
+  const locked = acting || busy
+  const lockedTitle = busy ? 'Wait for the reply to finish' : undefined
   return html`<div class="changes-view">
     <div class="file-path"><${GitBranch} size=${14} /><span title=${status?.branch || ''}>${status?.repository === false ? 'Working tree' : status?.branch || (status ? 'Detached HEAD' : 'Working tree')}</span>
-      <button class="icon-button" aria-label="Refresh changes" disabled=${loading} onClick=${() => void refresh()}><${RefreshCw} size=${15} className=${loading ? 'spin' : ''} /></button></div>
+      <button class="icon-button" aria-label="Refresh changes" disabled=${loading} onClick=${() => void refresh(true)}><${RefreshCw} size=${15} className=${loading ? 'spin' : ''} /></button></div>
+    ${pr?.available ? html`<p class="git-pr"><a class=${`git-pr-chip ${pr.draft && pr.state === 'open' ? 'draft' : pr.state}${pr.checks?.failed ? ' failing' : ''}`}
+        href=${pr.url || undefined} target="_blank" rel="noopener noreferrer"
+        title=${[pr.title, REVIEW_TEXT[pr.review_decision]].filter(Boolean).join(' · ')}>${prChipText(pr)}</a></p>`
+      : pr && !QUIET_PR.has(pr.code) ? html`<p class="git-pr git-pr-note" title=${pr.reason}>${pr.reason}</p>` : null}
     ${error ? html`<div class="panel-error" role="alert">${error}</div>` : null}
+    ${committed ? html`<p class="git-committed" role="status">Committed ${committed.hash}: ${committed.subject}</p>` : null}
     <div class="git-groups" ref=${list}>
       ${status?.repository === false ? html`<p class="panel-empty">Not a Git repository.</p>`
         : status && !files.length ? html`<p class="panel-empty">Your working tree is clean.</p>`
         : GIT_GROUPS.map(([area, label]) => {
           const group = files.filter(entry => entry.area === area)
-          return group.length ? html`<section key=${area} class="git-group" aria-label=${label}><h3>${label} (${group.length})</h3>
-            ${group.map(entry => {
+          const staged = area === 'staged'
+          const usable = group.filter(stageable)
+          const verb = staged ? 'Unstage' : 'Stage'
+          return group.length ? html`<section key=${area} class="git-group" aria-label=${label}>
+            <div class="git-group-head"><h3>${label} (${group.length})</h3>
+              ${usable.length > 1 ? html`<button type="button" class="git-group-action" disabled=${locked} title=${lockedTitle}
+                onClick=${() => void stageFiles(usable.flatMap(entryPaths), !staged)}>${verb} all</button>` : null}</div>
+            ${staged ? html`<form class="git-commit" onSubmit=${commit}>
+              <textarea aria-label="Commit message" rows=${2} maxLength=${10000} spellcheck=${true} value=${message}
+                placeholder="Commit message" disabled=${acting} onInput=${e => setMessage(e.currentTarget.value)} />
+              <button type="submit" disabled=${locked || !message.trim()} title=${lockedTitle}>Commit ${stagedCount === 1 ? '1 file' : `${stagedCount} files`}</button>
+            </form>` : null}
+            ${group.map((entry, index) => {
               const [letter, name] = GIT_STATUS[entry.status] || ['?', entry.status]
+              const pathId = `${ids}-${area}-${index}`
               const content = html`<span class=${`git-letter ${entry.status}`} title=${name} aria-label=${name}>${letter}</span>
-                <span class="git-path" title=${entry.orig_path ? `${entry.orig_path} → ${entry.path}` : entry.path}>${entry.path}</span>`
+                <span class="git-path" id=${pathId} title=${entry.orig_path ? `${entry.orig_path} → ${entry.path}` : entry.path}>${entry.path}</span>`
               return entry.hidden ? html`<div key=${entry.path} class="git-row hidden" title=${HIDDEN_NOTES[entry.hidden]}>${content}<span class="git-hidden">${HIDDEN_NOTES[entry.hidden]}</span></div>`
-                : html`<button key=${entry.path} class="git-row" data-area=${entry.area} data-path=${entry.path} onClick=${() => void showDiff(entry)}>${content}
-                  ${Number.isInteger(entry.added) && Number.isInteger(entry.removed) ? html`<${DiffStat} added=${entry.added} removed=${entry.removed} />` : null}</button>`
+                : html`<div key=${entry.path} class="git-entry"><button class="git-row" data-area=${entry.area} data-path=${entry.path} onClick=${() => void showDiff(entry)}>${content}
+                  ${Number.isInteger(entry.added) && Number.isInteger(entry.removed) ? html`<${DiffStat} added=${entry.added} removed=${entry.removed} />` : null}</button>
+                  ${!stageable(entry) ? null : html`<button type="button" class="icon-button git-stage" aria-label=${verb} aria-describedby=${pathId}
+                    data-path=${entry.path} title=${lockedTitle || `${verb} ${entry.path}`} disabled=${locked}
+                    onClick=${() => void stageFiles(entryPaths(entry), !staged)}>${staged ? html`<${Minus} size=${14} />` : html`<${Plus} size=${14} />`}</button>`}</div>`
             })}</section>` : null
         })}
       ${status?.truncated ? html`<p class="panel-empty">Git lists more files than shown here.</p>` : null}

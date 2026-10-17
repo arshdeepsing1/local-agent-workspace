@@ -39,9 +39,13 @@ frontend that runs without a build step.
 - Project memory: short notes the agent saves with your approval (the `remember` tool) and every later
   chat in the project sees, kept in the app's state folder and reviewed in Agent tools → Memory.
 - Output styles (Default, Concise, Explanatory, or your own style files) and shipped skills for
-  handoffs, verifying and debugging a change, and drafting an `AGENTS.md` (`/init`).
+  handoffs, verifying and debugging a change, drafting an `AGENTS.md` (`/init`), committing, opening a
+  pull request, and code and security reviews whose findings show as a card.
+- A short Git snapshot (branch, upstream, change counts, recent commits) with the message that starts
+  each reply.
 - Workspace file explorer (the project, the conversation's granted folders and folders you add), text
-  editor with stale-file detection, Git status/diff, and a non-interactive command runner.
+  editor with stale-file detection, Git status/diff with Stage, Unstage, Commit and the branch's pull
+  request status, and a non-interactive command runner.
 - File checkpoints with reviewed, reversible restore and managed Git worktrees.
 - Review of the agent's file edits, as in an editor's chat: a "files changed" bar with
   Keep and Undo, dots on changed files in the file explorer, and an inline red/green
@@ -658,7 +662,37 @@ when opening a conversation or performing restart recovery.
   Click a row for a read-only diff with a separator per hunk: **Back to changes** returns,
   **Open file** opens the file in Files, and **Open in VS Code** opens it in VS Code. This
   is Git's view of the project, so it includes changes made by commands; it refreshes when
-  you open the tab, on Refresh, and when a response ends. There are no staging actions.
+  you open the tab, on Refresh, and when a response ends.
+  **Stage and commit.** The **+** button on a row of **Changes** or **Untracked** stages that file
+  (`git add`), and **−** on a row of **Staged changes** unstages it (`git restore --staged`); a
+  rename stages or unstages both of its paths. **Stage all** and **Unstage all** act on every row of
+  their group (not on credential files, generated folders, conflicts or a submodule whose commit
+  changed, which have no button).
+  Above the staged files, write a message and press **Commit N files** to commit what is staged;
+  the view then names the new commit. These are your own actions, so they show no approval card, but they wait while a
+  chat in the same project is replying or a command runs there (the buttons are disabled while
+  this chat replies, and the server answers "… is still running"). Only the files you choose are
+  staged, never a folder (no `git add -A`) and never an ignored file (Git refuses it without `-f`,
+  which the app never passes); credential files, generated folders and paths outside the project
+  are refused, at most 4,000 paths (100 KB) at a time. A file whose `.gitattributes` names a
+  filter (such as Git LFS) is not staged, since the app does not run the filter's program and Git
+  would otherwise stage the file unfiltered: stage it in a terminal. A commit is refused when
+  nothing is staged, when a staged file is a credential file or a rename or copy of one, or when a
+  staged file is outside the project folder (a project inside a larger repository commits only its
+  own files); a staged deletion of a credential file (`git rm --cached .env`, to stop tracking it)
+  may be committed. Commits run without hooks, without a
+  signing program and without automatic maintenance, and need your Git name and email (`git config
+  user.name` and `user.email`). Pushing is not here: ask the agent with `/pr` (below).
+  **Pull request.** When the GitHub CLI (`gh`) is installed and signed in, a chip under the branch
+  shows the branch's pull request, for example "PR #12 · open · 3/4 checks", and opens it on
+  GitHub; its tooltip has the title and the review state. The app runs `gh pr view` without a shell
+  in the project folder, with the commands' environment (never the Databricks credentials) plus
+  where `gh` keeps its sign-in (the desktop keyring's session bus and its configuration folder), the
+  hardened Git first on `PATH`, a 10-second limit, and at most once a minute per project and
+  branch (Refresh asks again after 5 seconds). It shows nothing when `gh` is missing, the
+  repository has no GitHub remote or the branch has no pull request, and a short note when `gh` is
+  not signed in or fails. A `gh` inside the project or a folder granted to the chat never runs.
+  `gh` calls GitHub, never Databricks. Checks are only shown, never re-run or fixed.
   The server runs Git directly (no shell) with the programs a repository's configuration
   can name switched off: `core.fsmonitor`, hooks, clean/smudge filters, external diff and
   text conversion. Git does not look inside submodule work trees, whose own configuration
@@ -668,7 +702,7 @@ when opening a conversation or performing restart recovery.
   up to 1 MB. A diff covers one file: a folder path is refused. Paths are literal, so a
   file named `*.py` shows only its own diff. A project
   folder inside a larger repository shows only its own files. Credential files at any
-  depth (`.env`, `.env.*` including `.env.example`, `*.env`, `env_vars.txt`, `.netrc`,
+  depth (`.env`, `.env.*` except `.env.example`, `*.env`, `env_vars.txt`, `.netrc`,
   `.npmrc`, `credentials`, `credentials.json`, `id_rsa`, `id_ed25519`, in any letter case,
   and the configured credential file) are listed as "Credential file: diff hidden",
   without line counts, and their diffs are refused, also when a rename or copy comes from
@@ -1933,6 +1967,23 @@ shapes replies: it never overrides your instructions, project guidance or permis
 style whose file is missing in a project falls back to Default there, and the context details say
 why.
 
+**Git status in messages.** With **Settings → Git status in messages** (on by default), the message
+that starts a reply carries a short Git snapshot of the project after your text, read when the reply
+starts (a message you send while the agent works carries none):
+the branch (or the detached commit), its upstream and how far ahead and behind it is (as of the last
+fetch: the app never fetches), how many files are staged, unstaged, untracked and conflicted with up
+to 8 of their paths, and the last five commit subjects. It is at most 1,200 bytes (about 300 tokens)
+and leaves out credential files (the names listed under **Workspace / Changes**, and the configured
+credential file); paths, branch names and commit subjects are redacted like file contents. Git runs
+as in the Changes view (no shell, no fsmonitor, hooks or filters, a Git inside the project never
+runs) with a 5-second limit; outside a repository nothing is sent, and when Git does not answer in
+time nothing is sent and the app does not ask again for 10 minutes. A project folder inside a
+larger repository counts only its own files. The snapshot is part of the message, not of the system
+message, so the cached start of the requests stays the same: the reply's later requests and later
+messages send it unchanged, and the message that starts the next reply carries its own.
+It is labelled as data, not instructions; a **Git status** chip under the message says it was sent,
+and summaries of earlier turns leave it out. Subagents get none: their task says what matters.
+
 At each model request the app rereads the project root's `AGENTS.md`, `AGENTS.local.md`,
 `CLAUDE.md` and `CLAUDE.local.md`, in that order. File tools also discover the same files in
 the target directory and its ancestors, from broader to more specific scopes. These encountered
@@ -2281,7 +2332,7 @@ a listed skill with `use_skill` when it fits the task. Skill descriptions from
 that workspace, with the same trust as `AGENTS.md`: review skills you did not write. The
 context details list the index as **Skill index · applies to this workspace**.
 
-The app also ships three short skills, available in every workspace and replaced the same way
+The app also ships seven short skills, available in every workspace and replaced the same way
 by a project's own copy:
 
 - `/verify` (`skills/verify/SKILL.md`): finds the project's own test, lint and build commands
@@ -2294,6 +2345,38 @@ by a project's own copy:
 - `/init` (`skills/init/SKILL.md`): drafts or updates the project's `AGENTS.md` (under 4 KB:
   overview, commands, layout, conventions, gotchas) from the README, manifests and CI files,
   keeping your own sections. `AGENTS.md` is a protected file, so the write shows an approval card.
+- `/commit` (`skills/commit/SKILL.md`): reads the status and the diff, stages only the files that
+  belong to the request by name (never `git add -A`, `git commit -a`, credential files or build
+  output), writes a message in the repository's style (Conventional Commits when it has none) and
+  commits. Each `git add` and `git commit` is a command with its approval card; it never skips hooks,
+  amends or pushes.
+- `/pr` (`skills/pr/SKILL.md`): checks that `gh` is installed and signed in, creates a branch when you
+  are on the base branch, commits as `/commit` does, pushes the branch (`git push -u origin HEAD`,
+  never `--force`) and opens the pull request with `gh pr create` and a Summary, Changes and Testing
+  body. Every push and `gh` command shows its card; it never merges, closes, approves or turns on
+  auto-merge unless you ask. The Changes view then shows the pull request's status.
+- `/review` (`skills/review/SKILL.md`): reviews the uncommitted changes, a branch or a pull request
+  read-only (reading the code around each change and its callers) for correctness, security,
+  regressions and missing tests, and reports with `report_findings`.
+- `/security-review` (`skills/security-review/SKILL.md`): traces untrusted input through the change
+  (injection, access checks, secrets, network, crypto, files, dependencies) and reports only issues
+  with an exploit path, with `report_findings`.
+
+**Review findings.** `report_findings` is offered to a chat once a skill whose instructions name it
+is selected (the two review skills, or your own skill that mentions it), and from then on in every
+request of that chat so its tool list stays stable; a subagent that uses such a skill (its agent
+file lists it, or its task names it) gets it too. It has no side effects, so it runs without a card
+in every mode, Plan included, and read-only subagents may use it; a deny rule still turns it off. The agent sends a summary (up to
+2,000 characters) and at most 30 findings, each with a path, an optional line or line range, a
+severity (high, medium, low or info), a title (120 characters), and a detail and suggestion (1,000
+characters each). The chat shows them as a **Review findings** card: counts by severity, each
+finding with its severity, a `path:line` button that opens the file at that line, its title, detail
+and suggestion, and **Copy findings as Markdown**. Text that looks like a secret is redacted on the
+card, in the transcript and in the export's card; the model's own saved history (which the export
+also holds) keeps the call as the model sent it. The transcript and the conversation export keep
+the findings in full. When a subagent reports findings, its card is in its own conversation, and
+the parent's agent gets them (one line each, at most 3,000 characters) at the top of the
+subagent's report.
 
 **Custom commands.** A command file is a Markdown file whose text goes with your message when the
 message starts with `/<name>`: `.agents/commands/<name>.md` in the project, then
@@ -2819,8 +2902,9 @@ waits (see **Mode changes while the agent works** below).
 | Plan | Read/search approved folders, run read-only commands (the fixed list and the commands the app checks), and describe a plan; block file changes and other commands. Subagents still need a card. |
 | Bypass permissions | Run actions and access external folders without approval cards, except a command that names a credential-looking file. Deny and ask rules still apply, and credential/generated-file exclusions still apply to file tools. |
 
-Reading, listing and searching files, reading job output, waiting for a job, skills and
-structured tasks are available in every mode without a card. Stopping a job is a command
+Reading, listing and searching files, reading job output, waiting for a job, skills,
+structured tasks and reporting review findings (`report_findings`) are available in every mode
+without a card. Stopping a job is a command
 action: it asks in Manual and Accept edits, is blocked in Don't ask unless a rule allows it, runs
 in Auto and Bypass, and is blocked in Plan. Starting a subagent (`delegate_task`) asks in Manual and
 Plan, runs in Accept edits, Auto and Bypass, and is blocked in Don't ask unless a rule allows
@@ -3562,7 +3646,7 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `backend/local_agent/activity.py`: app-generated activity log for handoffs (`insert_activity_log`).
 - `backend/local_agent/transcript.py` / `scripts/conversation_transcript.py`: Markdown transcripts of saved conversations (also `GET /api/sessions/<id>/transcript.md`).
 - `backend/local_agent/redaction.py`: common secret shapes replaced in logs, handoffs and transcripts, and the high-confidence ones in command and MCP results.
-- `skills/`: skills shipped with the app and offered in every workspace; `handoff/SKILL.md` is the detailed handoff skill. A workspace's `.agents/skills/<id>/` replaces the shipped skill with that ID.
+- `skills/`: skills shipped with the app and offered in every workspace; `handoff/SKILL.md` is the detailed handoff skill, and `commit`, `pr`, `review` and `security-review` are the Git skills. A workspace's `.agents/skills/<id>/` replaces the shipped skill with that ID.
 - `backend/local_agent/telemetry.py`: inference ledger, validated usage, DBU estimates, and failure categories.
 - `backend/local_agent/usage_export.py` / `scripts/usage_report.py`: usage rows and CSV correlated with conversation history.
 - `backend/local_agent/instructions.py`: scoped project guidance loading (`.local` files, `@path` imports,
@@ -3570,7 +3654,7 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `backend/local_agent/memory.py`: project memory notes in the state folder, keyed by the Git repository.
 - `backend/local_agent/output_styles.py`: Settings → Output style (built-in styles and style files).
 - `backend/local_agent/recovery.py` / `worktrees.py`: file recovery and Git worktrees.
-- `backend/local_agent/git_tools.py`: Git without a shell or repository-configured programs (worktrees, `/api/git`).
+- `backend/local_agent/git_tools.py`: Git without a shell or repository-configured programs (worktrees, `/api/git`, staging and commits from the Changes view, the Git snapshot in messages), and the pull request status from `gh`.
 - `backend/local_agent/notify.py`: optional desktop notifications (status and title only) when no page is open.
 - `backend/local_agent/changes.py`: the agent's file changes per conversation, their diffs, Keep and Undo.
 - `backend/local_agent/shell_changes.py`: the files a foreground `run_command` changed, from Git status before and after it.

@@ -583,7 +583,7 @@ const TOOL_GROUPS = [
   { name: 'Commands and jobs', tools: ['run_command', 'list_jobs', 'get_job_output', 'wait_job', 'stop_job'] },
   { name: 'Git', match: name => /^git_/.test(name) },
   { name: 'Tasks and subagents', tools: ['list_tasks', 'get_task', 'create_task', 'update_task', 'delegate_task'] },
-  { name: 'Skills', tools: ['list_skills', 'use_skill'] },
+  { name: 'Skills', tools: ['list_skills', 'use_skill', 'report_findings'] },
   { name: 'Memory', tools: ['remember'] },
   { name: 'MCP', tools: ['get_tool_output'] },
   { name: 'Web', tools: ['web_fetch', 'web_search'] },

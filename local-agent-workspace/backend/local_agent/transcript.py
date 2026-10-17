@@ -124,6 +124,32 @@ def _plan(event, arguments, state, output):
     return "\n".join(lines)
 
 
+def finding_location(item):
+    """path:line, path:line-end_line or path of one report_findings entry."""
+    where = str(item.get("path") or "")
+    line, end = item.get("line"), item.get("end_line")
+    if type(line) is int:
+        where += f":{line}" + (f"-{end}" if type(end) is int and end > line else "")
+    return where
+
+
+def _findings(arguments, state, output):
+    """report_findings: the summary, then each finding with its severity, location, title, detail and fix."""
+    findings = [item for item in arguments.get("findings") or [] if isinstance(item, dict)]
+    lines = [f"- Review findings ({len(findings)})" + (_failure(state, output) or ":")]
+    summary = " ".join(str(arguments.get("summary") or "").split())
+    if summary:
+        lines.append(_indent(summary))
+    for item in findings:
+        title = " ".join(str(item.get("title") or "").split())
+        lines.append(_indent(f"- **{item.get('severity') or 'info'}** {_code(finding_location(item))} {title}".rstrip()))
+        for key, label in (("detail", ""), ("suggestion", "Suggestion: ")):
+            text = " ".join(str(item.get(key) or "").split())
+            if text:
+                lines.append(_indent(_indent(label + text)))
+    return "\n".join(lines)
+
+
 def _tool(event, excerpt_chars):
     name = str(event.get("name") or "tool")
     arguments = event.get("input") if isinstance(event.get("input"), dict) else {}
@@ -135,6 +161,8 @@ def _tool(event, excerpt_chars):
         return _questions(event, arguments, state, output)
     if name == "submit_plan":
         return _plan(event, arguments, state, output)
+    if name == "report_findings":
+        return _findings(arguments, state, output)
     if name == "run_command" and state == "completed":
         status = str(result.get("state") or event.get("job_state") or state).replace("_", " ")
         if type(result.get("exit_code")) is int:
@@ -216,7 +244,8 @@ def transcript(session, *, excerpt_chars=EXCERPT_CHARS, redact=lambda text: text
              f"- Started {_when(session.get('created'))}; last updated {_when(session.get('updated'))}",
              "- Written by the app from the saved conversation file. Messages and replies are complete, with their "
              "headings moved two levels down; each tool call shows its main input, questions show the user's "
-             "answers, plans are shown in full with how they were reviewed, and command output is "
+             "answers, plans are shown in full with how they were reviewed, review findings are shown in full, and "
+             "command output is "
              f"shortened to {excerpt_chars:,} characters.", ""]
     tools, turn = [], 0
     for event in events:

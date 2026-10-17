@@ -38,6 +38,7 @@ export const ListPlus = icon('list-plus', '<path d="M11 12H3"/><path d="M16 6H3"
 export const LoaderCircle = icon('loader-circle', '<path d="M21 12a9 9 0 1 1-6.219-8.56"/>')
 export const MessageCircleQuestion = icon('message-circle-question', '<path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><path d="M12 17h.01"/>')
 export const Maximize2 = icon('maximize-2', '<path d="M15 3h6v6"/><path d="m21 3-7 7"/><path d="m3 21 7-7"/><path d="M9 21H3v-6"/>')
+export const Minus = icon('minus', '<path d="M5 12h14"/>')
 export const Menu = icon('menu', '<line x1="4" x2="20" y1="12" y2="12"/><line x1="4" x2="20" y1="6" y2="6"/><line x1="4" x2="20" y1="18" y2="18"/>')
 export const Minimize2 = icon('minimize-2', '<path d="m14 10 7-7"/><path d="M20 10h-6V4"/><path d="m3 21 7-7"/><path d="M4 14h6v6"/>')
 export const MessageSquarePlus = icon('message-square-plus', '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><path d="M12 7v6"/><path d="M9 10h6"/>')

@@ -76,6 +76,10 @@ function summarizeTools(events, shorten = path => path, projectName = '') {
     }
     if (event.name === 'remember') subject = shown = String(input.text ?? '')
     if (event.name === 'web_fetch') subject = shown = String(input.url ?? '')
+    if (event.name === 'report_findings') {
+      const count = Array.isArray(input.findings) ? input.findings.length : 0
+      subject = shown = `${count} ${count === 1 ? 'finding' : 'findings'}`
+    }
     if (event.name === 'wait_job') subject = shown = String(input.job_id ?? '').slice(0, 8) + (input.until_regex ? ` until /${input.until_regex}/` : '')
     if (event.name === 'outline_file') {
       suffix = (Number.isInteger(input.max_level) && input.max_level < 6 ? ` · to level ${input.max_level}` : '')
@@ -677,16 +681,67 @@ function Attachments({ items }) {
 }
 
 // What went to the agent with a user message besides its text: the command templates it ran (commands: [{ name,
-// path }], expanded after the text), the skills it selected for itself (skills: [id]), or verbatim (sent as plain text).
+// path }], expanded after the text), the skills it selected for itself (skills: [id]), verbatim (sent as plain text),
+// and git_context (the app's Git snapshot: Settings → Git status in messages).
 function SentWith({ event }) {
   const commands = Array.isArray(event.commands) ? event.commands : []
   const skills = Array.isArray(event.skills) ? event.skills : []
-  if (!commands.length && !skills.length && !event.verbatim) return null
+  if (!commands.length && !skills.length && !event.verbatim && !event.git_context) return null
   return html`<ul class="attachment-chips sent-with" aria-label="Sent with this message">
     ${commands.map(item => html`<li key=${`command-${item.name}`} class="attachment-chip" title=${`The agent got the text of ${item.path} after your message`}>Command /${item.name} · ${item.path}</li>`)}
     ${skills.map(id => html`<li key=${`skill-${id}`} class="attachment-chip" title="The skill's instructions went with this message only">Skill /${id}</li>`)}
     ${event.verbatim ? html`<li class="attachment-chip">Sent as plain text</li>` : null}
+    ${event.git_context ? html`<li class="attachment-chip" title="The branch, upstream, change counts and recent commits, read by the app when you sent this">Git status</li>` : null}
   </ul>`
+}
+
+// report_findings (a review skill's result): { summary, findings: [{ path, line?, end_line?, severity, title, detail?,
+// suggestion? }] }, as the app recorded it (redacted) in the tool event's input.
+const SEVERITIES = ['high', 'medium', 'low', 'info']
+const findingSeverity = item => SEVERITIES.includes(item?.severity) ? item.severity : 'info'
+export function findingLocation(item) {
+  const line = Number.isInteger(item?.line) && item.line > 0 ? item.line : null
+  const end = line && Number.isInteger(item.end_line) && item.end_line > line ? item.end_line : null
+  return `${String(item?.path || '')}${line ? `:${line}` : ''}${end ? `-${end}` : ''}`
+}
+export function findingsMarkdown(report) {
+  const findings = Array.isArray(report?.findings) ? report.findings : []
+  const lines = ['## Review findings', '']
+  if (report?.summary) lines.push(String(report.summary).trim(), '')
+  if (!findings.length) lines.push('No findings.')
+  findings.forEach((item, index) => {
+    lines.push(`${index + 1}. **${findingSeverity(item)}** \`${findingLocation(item)}\` ${String(item.title || '').trim()}`)
+    if (item.detail) lines.push(`   ${String(item.detail).trim().replace(/\n/g, '\n   ')}`)
+    if (item.suggestion) lines.push(`   Suggestion: ${String(item.suggestion).trim().replace(/\n/g, '\n   ')}`)
+  })
+  return lines.join('\n') + '\n'
+}
+
+// The card of a recorded report_findings call: counts by severity, each finding with its severity, a link that opens
+// the file at its line (onOpenPath), its title, detail and suggestion, and Copy as Markdown.
+function FindingsCard({ event, onOpenPath }) {
+  const report = event.input && typeof event.input === 'object' ? event.input : {}
+  const findings = (Array.isArray(report.findings) ? report.findings : []).filter(item => item && typeof item === 'object')
+  const counts = SEVERITIES.map(level => [level, findings.filter(item => findingSeverity(item) === level).length]).filter(([, count]) => count)
+  return html`<section class="findings-card" aria-label="Review findings">
+    <header><span class="findings-title">Review findings</span>
+      <span class="findings-counts">${counts.length ? counts.map(([level, count]) => html`<span key=${level} class=${`finding-severity ${level}`}>${count} ${level}</span>`) : html`<span class="finding-severity info">none</span>`}</span>
+      <${CopyAction} text=${findingsMarkdown({ ...report, findings })} label="Copy findings as Markdown" /></header>
+    ${report.summary ? html`<p class="findings-summary">${report.summary}</p>` : null}
+    ${findings.length ? html`<ol class="findings-list">${findings.map((item, index) => {
+      const level = findingSeverity(item)
+      const where = findingLocation(item)
+      const line = Number.isInteger(item.line) && item.line > 0 ? item.line : undefined
+      return html`<li key=${index} class=${`finding ${level}`}>
+        <div class="finding-head"><span class=${`finding-severity ${level}`}>${level}</span>
+          ${onOpenPath && item.path ? html`<button type="button" class="finding-location" title=${`Open ${where}`}
+            onClick=${() => onOpenPath(line ? { path: item.path, line } : { path: item.path })}>${where}</button>` : html`<code class="finding-location">${where}</code>`}
+          <span class="finding-title">${item.title}</span></div>
+        ${item.detail ? html`<p class="finding-detail">${item.detail}</p>` : null}
+        ${item.suggestion ? html`<p class="finding-suggestion"><strong>Suggestion:</strong> ${item.suggestion}</p>` : null}
+      </li>`
+    })}</ol>` : html`<p class="findings-empty">No findings.</p>`}
+  </section>`
 }
 
 // What user_prompt hooks did to a message (lifecycle_hooks.prompt_hooks): hook_blocked ({ hook_id, reason }: never
@@ -939,6 +994,7 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
       if (event.type === 'user') return html`<div class=${`user-message${event.steered ? ' steered' : ''}${event.hook_blocked ? ' hook-blocked' : ''}`} key=${event.id}>${event.steered ? html`<small class="steered-label">Sent while the agent was working</small>` : null}${event.origin?.kind === 'delegated' ? html`<small class="delegation-origin">Delegated by parent conversation</small>` : null}<${HookMessageLabel} event=${event} />${event.text}<${Attachments} items=${event.attachments} /><${SentWith} event=${event} /><${HookMessageDetails} event=${event} />${event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}${event.text || idle ? html`<div class="message-actions">${event.text ? html`<${CopyAction} text=${event.text} label="Copy message" />` : null}${idle ? html`<${ActionButton} label="Edit message" icon=${Pencil} target=${`edit:${event.id}`} onClick=${() => setEditing(event.id)} /><${ActionButton} label="Rewind to here" icon=${Undo2} onClick=${() => setRewinding(event)} />` : null}</div>` : null}</div>`
       if (event.type === 'tool' && event.name === 'ask_user') return html`<${QuestionCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
       if (event.type === 'tool' && event.name === 'submit_plan') return html`<${PlanCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
+      if (event.type === 'tool' && event.name === 'report_findings' && event.state === 'completed') return html`<${FindingsCard} key=${event.id} event=${event} onOpenPath=${onOpenPath} />`
       if (event.type === 'tool') return html`<${ToolCard} key=${event.id} event=${event} summary=${toolSummaries.get(event.id)} result=${toolStates.get(event.id).result} status=${toolStates.get(event.id).status} failure=${toolStates.get(event.id).failure} sessionId=${session.id} onError=${onError} onSelectSession=${onSelectSession} onOpenPath=${onOpenPath} />`
       if (event.type === 'assistant') return event.text || event.reasoning_summary || event.request_info || event.reasoning_started ? html`<${Reply} key=${event.id} text=${event.text || ''} reasoning=${event.reasoning_summary} truncated=${event.reasoning_truncated} started=${event.reasoning_started} seconds=${event.reasoning_seconds} wait=${event.reasoning_wait_seconds} requestInfo=${event.request_info} onOpenPath=${onOpenPath} actions=${event.text ? replyActions(event) : null} />` : null
       const marker = event.type !== 'error' && (!!event.stop_phase || event.text === STOPPED_TEXT)

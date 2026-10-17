@@ -174,6 +174,8 @@ ATTACHMENT_SEPARATOR = "\n\n---\n"
 # (commands.py) and the skills the message selected (AgentManager.message_skills). Never the user's words.
 COMMAND_MARKER = ATTACHMENT_SEPARATOR + "[Command /"
 SKILL_MARKER = ATTACHMENT_SEPARATOR + "[Skill /"
+# The Git snapshot the turn's first message carries (git_tools.CONTEXT_HEADER, AgentManager.git_context_block).
+GIT_MARKER = ATTACHMENT_SEPARATOR + "[Git status when this message was sent"
 
 
 def is_continuation(message):
@@ -585,10 +587,11 @@ def verify_note(message):
 
 def _attachment_start(content):
     """Where the part of a user message the app added starts, or -1: the @ file and ! output part
-    (mentions.expand_context), an expanded command (COMMAND_MARKER) or the skills it selected (SKILL_MARKER)."""
+    (mentions.expand_context), an expanded command (COMMAND_MARKER), the skills it selected (SKILL_MARKER)
+    or the Git snapshot (GIT_MARKER)."""
     from .mentions import HEADER  # Not at module level: mentions imports tools, which imports much more.
     found = [at for at in (content.find(ATTACHMENT_SEPARATOR + HEADER.split("{nonce}", 1)[0]),
-                           content.find(COMMAND_MARKER), content.find(SKILL_MARKER)) if at >= 0]
+                           content.find(COMMAND_MARKER), content.find(SKILL_MARKER), content.find(GIT_MARKER)) if at >= 0]
     return min(found, default=-1)
 
 

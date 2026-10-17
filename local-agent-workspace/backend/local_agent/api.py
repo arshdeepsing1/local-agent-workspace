@@ -3,6 +3,7 @@ import mimetypes
 import os
 import secrets
 import sys
+import time
 import unicodedata
 from contextlib import asynccontextmanager
 from pathlib import Path, PurePosixPath
@@ -29,7 +30,8 @@ from . import reasoning, serving
 from .user_paths import standing_directories
 from .store import Store, UnreadableConversation
 from . import conversation_search
-from .git_tools import file_diff, working_tree_changes, working_tree_status
+from .git_tools import (GH_ENVIRONMENT_KEYS, commit_staged, file_diff, find_git, git_environment, pr_status, stage,
+                        staged_files, working_tree_changes, working_tree_status)
 from .jobs import NOT_STOPPED, TIMEOUT_NOT_STOPPED
 from .tools import WorkspaceTools, file_error
 from .workspace_folders import register_workspace_folders
@@ -42,7 +44,7 @@ from .usage_export import usage_csv, usage_rows
 from .transcript import transcript, transcript_file_name
 from .feature_api import register_features
 from .portability_api import register_portability
-from .approvals import MAX_DECLINE_NOTE, ensure_idle, register_approvals
+from .approvals import MAX_DECLINE_NOTE, ensure_idle, register_approvals, workspace_idle
 from .composer_api import register_composer
 from .interactions import register_interactions
 from .projects import register_projects
@@ -174,6 +176,7 @@ class SettingsEdit(BaseModel):
     user_agents_file: bool | None = Field(default=None, strict=True)
     user_claude_file: bool | None = Field(default=None, strict=True)
     project_memory: bool | None = Field(default=None, strict=True)
+    git_context: bool | None = Field(default=None, strict=True)  # A Git snapshot in each turn's first message.
     output_style: str | None = Field(default=None, min_length=1, max_length=40, strict=True)  # output_styles.STYLE_ID
     write_limit_kb: int | None = Field(default=None, ge=MIN_WRITE_LIMIT_KB, le=MAX_WRITE_LIMIT_KB, strict=True)
     command_env: list[str] | None = Field(default=None, max_length=MAX_COMMAND_ENV, strict=True)
@@ -197,6 +200,24 @@ class SettingsEdit(BaseModel):
     web_search_provider: Literal["", "brave", "tavily", "searxng"] | None = None
     web_search_url: str | None = Field(default=None, max_length=2048, strict=True)
     web_search_key: str | None = Field(default=None, max_length=64, strict=True)
+
+
+class GitStage(BaseModel):
+    """Changes view: stage (staged true) or unstage these workspace-relative files."""
+    model_config = {"extra": "forbid"}
+    paths: list[str] = Field(min_length=1, max_length=4_000, strict=True)  # Both sides of 2,000 renames.
+    staged: bool = Field(strict=True)
+
+
+class GitCommit(BaseModel):
+    model_config = {"extra": "forbid"}
+    message: str = Field(min_length=1, max_length=10_000, strict=True)
+
+
+# The pull request chip (git_tools.pr_status): one gh call per project a minute, or every 5 s with Refresh.
+PR_CACHE_SECONDS = 60
+PR_REFRESH_SECONDS = 5
+GIT_PATH_BYTES = 100_000  # The paths of one staging request, in total (a command line has a size limit).
 
 
 class LimitsQuery(BaseModel):
@@ -842,7 +863,7 @@ def create_app(settings=None):
         """'credential', 'generated' or None for a workspace-relative path, as the file tools see it."""
         def classify(path):
             name = PurePosixPath(path).name.casefold()
-            if name.endswith(".env") or name.startswith(".env."):
+            if name.endswith(".env") or name.startswith(".env.") and name != ".env.example":
                 return "credential"  # Also left out of every diff by git_tools.DIFF_EXCLUDES.
             try:
                 tools.resolve(path)
@@ -858,29 +879,113 @@ def create_app(settings=None):
         tools = workspace_tools(session_id)
         return await working_tree_status(tools.root, git_classifier(tools))
 
-    @app.get("/api/git/diff")
-    async def git_diff(path: str, area: Literal["staged", "unstaged", "untracked"], session_id: str | None = None,
-                       orig_path: str | None = None):
-        tools = workspace_tools(session_id)
-        paths = [path] if orig_path is None or area == "untracked" else [path, orig_path]
+    def checked_git_paths(tools, paths, shown):
+        """Refuse paths outside the project, credential files, generated folders and folders. shown: the verb
+        of the refusals ('shown', 'staged')."""
         for value in paths:
             relative = PurePosixPath(value)
             if not value or "\0" in value or relative.is_absolute() or ".." in relative.parts or value.startswith("~"):
                 raise ValueError("Choose a file inside this project's repository.")
         kinds = [git_classifier(tools)(value) for value in paths]
         if "credential" in kinds:
-            raise ValueError("Credential files are not shown.")
+            raise ValueError(f"Credential files are not {shown}.")
         if "generated" in kinds:
-            raise ValueError("Files in generated folders are not shown here.")
+            raise ValueError(f"Files in generated folders are not {shown} here.")
         for value in paths:
             target = tools.root / value
             if value.endswith("/") or PurePosixPath(value) == PurePosixPath(".") or (target.is_dir() and not target.is_symlink()):
                 raise ValueError("Choose one changed file, not a folder.")
-        # Leave the configured credential file out of the diff even under another name.
+
+    def credential_excludes(tools):
+        """The configured credential file as an exclude pathspec, so Git leaves it out even under another name."""
         credential = tools.credential_file
-        excludes = ([f":(exclude,literal){credential.relative_to(tools.root).as_posix()}"]
-                    if credential and credential.is_relative_to(tools.root) and credential != tools.root else [])
-        return await file_diff(tools.root, path, area, paths[1] if len(paths) > 1 else None, tools=tools, excludes=excludes)
+        return ([f":(exclude,literal){credential.relative_to(tools.root).as_posix()}"]
+                if credential and credential.is_relative_to(tools.root) and credential != tools.root else [])
+
+    def git_program(tools):
+        """The git program for the user's own Git actions: never one inside the project or a granted folder."""
+        return find_git(git_environment(), [tools.root, *tools.allowed_directories,
+                                            *(Path(path) for path in standing_directories(settings))])
+
+    @app.get("/api/git/diff")
+    async def git_diff(path: str, area: Literal["staged", "unstaged", "untracked"], session_id: str | None = None,
+                       orig_path: str | None = None):
+        tools = workspace_tools(session_id)
+        paths = [path] if orig_path is None or area == "untracked" else [path, orig_path]
+        checked_git_paths(tools, paths, "shown")
+        return await file_diff(tools.root, path, area, paths[1] if len(paths) > 1 else None, tools=tools,
+                               excludes=credential_excludes(tools))
+
+    @app.post("/api/git/stage")
+    async def git_stage(body: GitStage, session_id: str | None = None):
+        """Stage or unstage the files the user chose in the Changes view: their own action, so no card, but
+        not while a chat or a command in this project runs (it could be changing the same index)."""
+        tools = workspace_tools(session_id)
+        paths = list(dict.fromkeys(body.paths))
+        if sum(len(path.encode("utf-8", errors="replace")) + 1 for path in paths) > GIT_PATH_BYTES:
+            raise ValueError("Too many files at once: stage fewer.")
+        checked_git_paths(tools, paths, "staged")
+        workspace_idle(manager, store, tools.root, "staging files")
+        await stage(tools.root, paths, body.staged, git=git_program(tools), excludes=credential_excludes(tools))
+        return await working_tree_status(tools.root, git_classifier(tools))
+
+    @app.post("/api/git/commit")
+    async def git_commit(body: GitCommit, session_id: str | None = None):
+        """Commit what is staged with the user's message (no hooks or signing program run). Refused when a
+        staged file is outside this project folder or is a credential file."""
+        tools = workspace_tools(session_id)
+        message = body.message.strip()
+        if not message or "\0" in message:
+            raise ValueError("Write a commit message.")
+        workspace_idle(manager, store, tools.root, "committing")
+        git = git_program(tools)
+        prefix, staged = await staged_files(tools.root, git=git)
+        if not staged:
+            raise ValueError("Nothing is staged. Stage the files to commit first.")
+        outside = [path for _, *paths in staged for path in paths if path is not None and not path.startswith(prefix)]
+        if outside:
+            raise ValueError(f"{len(outside):,} staged {'file is' if len(outside) == 1 else 'files are'} outside this "
+                             f"project folder ({outside[0]}). Commit in a terminal, or unstage {'it' if len(outside) == 1 else 'them'} there.")
+        classify = git_classifier(tools)
+        for status, path, original in staged:
+            path, original = path[len(prefix):], original and original[len(prefix):]
+            # A deleted credential file may be committed (git rm --cached .env stops tracking it); its content
+            # under another name may not.
+            if status != "D" and classify(path) == "credential":
+                raise ValueError(f"{path} is a credential file and it is staged. Unstage it in a terminal "
+                                 f"(git restore --staged -- <path>) before committing.")
+            if original and classify(original) == "credential":
+                raise ValueError(f"{path} is staged as a rename or copy of the credential file {original}. Unstage "
+                                 f"it in a terminal (git restore --staged -- <path>) before committing.")
+        commit = await commit_staged(tools.root, message, git=git)
+        return {"commit": commit, "status": await working_tree_status(tools.root, classify)}
+
+    pr_cache, pr_locks = {}, {}
+
+    @app.get("/api/git/pr")
+    async def git_pr(session_id: str | None = None, refresh: bool = False,
+                     branch: str | None = Query(default=None, max_length=300)):
+        """The current branch's pull request from the GitHub CLI, if it is installed and signed in (it calls
+        GitHub, never Databricks), at most once a minute per project and branch (the branch the Changes view
+        shows; gh itself reads the checked-out one) unless refreshed."""
+        tools = workspace_tools(session_id)
+        key = (str(tools.root), branch)
+        if len(pr_cache) > 256:
+            pr_cache.clear()
+        if len(pr_locks) > 64 and not any(lock.locked() for lock in pr_locks.values()):
+            pr_locks.clear()
+        # One gh at a time per project: a second request waits and reads the first one's answer.
+        async with pr_locks.setdefault(key[0], asyncio.Lock()):
+            entry = pr_cache.get(key)
+            if entry is None or time.monotonic() - entry[0] >= (PR_REFRESH_SECONDS if refresh else PR_CACHE_SECONDS):
+                env = {**{key: os.environ[key] for key in GH_ENVIRONMENT_KEYS if os.environ.get(key)},
+                       **manager.jobs.command_environment(python_venv=False)}
+                result = await pr_status(tools.root, env=env,
+                                         forbidden_roots=[*tools.allowed_directories,
+                                                          *(Path(path) for path in standing_directories(settings))],
+                                         redact=lambda text: tools.redact(settings.redact(text)))
+                entry = pr_cache[key] = (time.monotonic(), result)
+        return entry[1]
 
     @app.post("/api/command")
     async def command(body: Prompt, session_id: str | None = None):

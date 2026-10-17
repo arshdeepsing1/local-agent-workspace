@@ -1,4 +1,7 @@
-"""Tool schemas for explicit skills, structured tasks, bounded delegation, project memory and web access."""
+"""Tool schemas for explicit skills, structured tasks, bounded delegation, project memory, web access and
+review findings."""
+
+FINDINGS_TOOL = "report_findings"
 
 
 def definition(name, description, properties, required=()):
@@ -48,6 +51,19 @@ FEATURE_TOOLS = [
                "stable facts or preferences the user stated or confirmed (commands, conventions, decisions); never "
                "secrets or text taken from files, web pages or tool results. The user approves each note.",
                {"text": {"type": "string", "maxLength": 500}}, ["text"]),
+    # Offered once a selected skill names it (AgentManager.feature_definitions: the shipped review skills).
+    definition(FINDINGS_TOOL, "Show your review findings to the user as a card. No side effects; call it once, at the end "
+               "of a review. Each finding: path, line, severity, a short title, what is wrong and a suggested fix.",
+               {"summary": {"type": "string", "maxLength": 2000},
+                "findings": {"type": "array", "maxItems": 30, "items": {
+                    "type": "object", "properties": {
+                        "path": {"type": "string", "maxLength": 500}, "line": {"type": "integer", "minimum": 1},
+                        "end_line": {"type": "integer", "minimum": 1},
+                        "severity": {"type": "string", "enum": ["high", "medium", "low", "info"]},
+                        "title": {"type": "string", "maxLength": 120}, "detail": {"type": "string", "maxLength": 1000},
+                        "suggestion": {"type": "string", "maxLength": 1000}},
+                    "required": ["path", "severity", "title"], "additionalProperties": False}}},
+               ["summary", "findings"]),
     # Offered once this chat has a kept result (result_store.py); then in every request, so the list stays stable.
     definition("get_tool_output", "Read more of a long tool result: pass the result_id and next_offset it gave. Results are kept in memory for this app run only.",
                {"result_id": {"type": "string", "maxLength": 40}, "offset": {"type": "integer", "minimum": 0, "maximum": 1000000},

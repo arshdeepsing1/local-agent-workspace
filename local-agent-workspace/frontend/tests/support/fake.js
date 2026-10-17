@@ -10,6 +10,7 @@
 //   fake.reasoningPreview(body)  the answer to POST /api/settings/reasoning unless a test overrides it
 //                                (a small copy of backend reasoning.preview for the endpoints tests use)
 //   GET /api/endpoints/<model>/checks and /state answer "nothing saved" unless a test overrides them
+//   GET /api/git/pr answers "gh is not installed" unless a test overrides it
 (() => {
   const json = (body, status = 200) => new Response(JSON.stringify(body), {
     status, headers: { 'Content-Type': 'application/json' },
@@ -136,7 +137,10 @@
     : /^\/api\/memory(?:\?|$)/.test(path) && (options.method || 'GET') === 'GET' ? json(fake.memory)
     : /^\/api\/endpoints\/[^/]+\/checks$/.test(path) && (options.method || 'GET') === 'GET'
       ? json({ model: decodeURIComponent(path.split('/')[3]), saved: null, run: null, capabilities: [] })
-    : /^\/api\/endpoints\/[^/]+\/state$/.test(path) ? json({ ready: null, task: null, error: 'Not in tests.' }) : undefined
+    : /^\/api\/endpoints\/[^/]+\/state$/.test(path) ? json({ ready: null, task: null, error: 'Not in tests.' })
+    // The Changes view's pull request chip: gh is not installed unless a test says otherwise.
+    : /^\/api\/git\/pr(?:\?|$)/.test(path) ? json({ available: false, code: 'no_gh', reason: 'GitHub CLI (gh) is not installed or not on PATH.' })
+    : undefined
 
   window.fetch = async (input, options = {}) => {
     const path = String(input)

@@ -190,7 +190,7 @@ def test_the_app_ships_verify_debug_and_init_skills(tmp_path, skill_id, needle):
 def test_the_shipped_skills_fit_the_index_whole(tmp_path):
     manager = ExtensionManager(SimpleNamespace(state_dir=tmp_path, redact=lambda text: text), app_skills=APP_SKILLS)
     skills = manager.skills(WorkspaceTools(str(tmp_path)))
-    assert sorted(skill["id"] for skill in skills) == ["debug", "handoff", "init", "verify"]
+    assert sorted(skill["id"] for skill in skills) == ["commit", "debug", "handoff", "init", "pr", "review",
+                                                       "security-review", "verify"]
     index = skill_index(skills)
     assert "…" not in index and "- init: Use when the user asks to create or update AGENTS.md" in index
-    assert "review" not in {skill["id"] for skill in skills}  # Ships with the git package.

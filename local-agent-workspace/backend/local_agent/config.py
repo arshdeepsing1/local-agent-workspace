@@ -152,6 +152,8 @@ class Settings:
             "user_claude_file": False,
             "project_memory": True,
             "output_style": "default",
+            # Settings → Agent (git_tools.git_context): each turn's first message carries a short Git snapshot.
+            "git_context": True,
             "write_limit_kb": 80,
             "command_env": [],
             # Settings → Commands (secret_paths.py): file name patterns that count as credential files for commands.
@@ -330,7 +332,7 @@ class Settings:
         if not isinstance(instructions, str) or len(instructions) > MAX_USER_INSTRUCTIONS or "\x00" in instructions:
             raise ValueError(f"Custom instructions must be text of at most {MAX_USER_INSTRUCTIONS:,} characters.")
         for key, label in (("user_agents_file", "Load ~/.agents/AGENTS.md"), ("user_claude_file", "Load ~/.claude/CLAUDE.md"),
-                           ("project_memory", "Project memory")):
+                           ("project_memory", "Project memory"), ("git_context", "Git status in messages")):
             if type(candidate[key]) is not bool:
                 raise ValueError(f"{label} must be on or off.")
         if not isinstance(candidate["output_style"], str) or not STYLE_ID.match(candidate["output_style"]):

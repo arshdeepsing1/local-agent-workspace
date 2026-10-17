@@ -114,6 +114,7 @@ INDEX_ENTRIES = 200  # A parent's subagents index keeps its newest entries: the 
 TASK_CHARS = 200
 CHANGED_FILES = 20
 PATH_CHARS = 240
+FINDINGS_CHARS = 3000  # The child's report_findings, listed in the delegate_task report before its reply.
 CHANGE_TOOLS = ("write_file", "edit_file", "move_path", "delete_path", "notebook_edit", "insert_activity_log")
 TERMINAL_STATUS = {"completed": "completed", "stopped": "cancelled", "interrupted": "interrupted"}
 # The subagent's first prompt: what its tools allow (by its effective profile) and the report it ends with.
@@ -203,6 +204,34 @@ def subagent_index(sessions):
             task = re.split(r"\n\n(?:Parent-provided context:|" + re.escape(AGENT_HEADER) + ")", task, maxsplit=1)[0]
         index.setdefault(parent["id"], []).append(index_entry(child, task))
     return {key: value[-INDEX_ENTRIES:] for key, value in index.items()}
+
+
+def reported_findings(events, limit=FINDINGS_CHARS):
+    """The findings a subagent recorded with report_findings (redacted when recorded), one line each, for the
+    parent's model: the child's card is not part of its reply, and the parent sees only the report."""
+    findings = [item for event in events if event.get("type") == "tool" and event.get("name") == "report_findings"
+                and event.get("state") == "completed" and isinstance(event.get("input"), dict)
+                for item in event["input"].get("findings") or [] if isinstance(item, dict)]
+    if not findings:
+        return ""
+    lines = []
+    for item in findings:
+        line, end = item.get("line"), item.get("end_line")
+        where = str(item.get("path") or "")[:PATH_CHARS] + (
+            f":{line}" + (f"-{end}" if type(end) is int and end > line else "") if type(line) is int else "")
+        detail = " ".join(str(item.get("detail") or "").split())
+        detail = detail if len(detail) <= 160 else detail[:159] + "…"
+        lines.append(f"- {item.get('severity') or 'info'} {where}: " + " ".join(str(item.get("title") or "").split())
+                     + (f" ({detail})" if detail else ""))
+    shown, size = [], 0
+    for line in lines:
+        if size + len(line) + 1 > limit:
+            break
+        shown.append(line)
+        size += len(line) + 1
+    rest = len(lines) - len(shown)
+    return (f"Findings the subagent reported ({len(findings)}):\n" + "\n".join(shown)
+            + (f"\n- and {rest} more in its transcript" if rest else "") + "\n\n")
 
 
 def bounded_result(result, limit=RESULT_BYTES):
@@ -648,6 +677,8 @@ class DelegateManager:
                 child["agent_tools"] = agent_tools  # tool_profiles.tool_allowed: only these, within the profile.
             if skills:
                 child["active_skills"] = skills
+                if self.manager.skills_name_findings(self.manager.session_tools(parent), skills):
+                    child["findings_tool"] = True  # A review agent's skill reports with report_findings.
             if isinstance(parent.get("worktree"), dict):
                 # Display metadata only: the subagent of a worktree chat is listed under the same project.
                 child["worktree"] = dict(parent["worktree"])
@@ -721,7 +752,8 @@ class DelegateManager:
         reply = next((event.get("text", "") for event in reversed(events) if event.get("type") == "assistant" and event.get("text")), "")
         if reply and not cancelled and status == "completed":
             reply = self.manager.hook_report(saved, reply)  # A subagent_stop hook's replacement report, labelled.
-        output =("Errors:\n" + "\n".join(errors) + "\n\n" if errors else "") + (reply or "No final assistant reply was produced.")
+        output = ("Errors:\n" + "\n".join(errors) + "\n\n" if errors else "") + reported_findings(events) + (
+            reply or "No final assistant reply was produced.")
         paths = [self.manager.settings.redact(path)[:PATH_CHARS] for path in changed_paths(events)]
         steps = sum(event.get("type") == "assistant" for event in events)
         calls = sum(event.get("type") == "tool" for event in events)

@@ -254,6 +254,7 @@ class Event(Record):
     skills: list[SkillId] | None = Field(default=None, max_length=3)
     verbatim: bool | None = None
     queued: bool | None = None
+    git_context: bool | None = None  # User events: the app sent a Git snapshot with it (git_tools.git_context).
     attachments: list[Attachment] | None = Field(default=None, max_length=10)
     stop_phase: Literal["streaming", "tools", "waiting"] | None = None
     details: str | None = Field(default=None, max_length=1000)  # A rate-limit notice's Details (the 429).
