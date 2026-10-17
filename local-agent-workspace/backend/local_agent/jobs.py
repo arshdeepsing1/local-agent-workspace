@@ -664,8 +664,24 @@ class JobManager:
             raise ValueError("Command job not found.")
         task = self._tasks.get(job_id)
         if task is not None:
-            await asyncio.shield(task)
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # A stop that cancels the job's task before its first instruction (it never enters _run) cancels
+                # the job, not its waiter: a turn waiting for its command goes on, as after any stopped job.
+                if not task.cancelled() or asyncio.current_task().cancelling():
+                    raise
+                await self._cancel_unstarted(self._jobs[job_id])
         return self.get(job_id)
+
+    async def _cancel_unstarted(self, job):
+        """Mark a job whose task was cancelled before it entered _run (so _run never recorded the stop)."""
+        if job["state"] == "running":
+            job.update(state="cancelled", updated=time.time())
+            self._persist(job, mirror=True)
+            self._prune()
+            await self._changed()
+            await self._notify(job)
 
     async def stop(self, job_id):
         job = self._jobs.get(job_id)
@@ -678,12 +694,7 @@ class JobManager:
                     task.cancel()
                 await asyncio.shield(asyncio.gather(task, return_exceptions=True))
             # A task cancelled before its first instruction never enters _run.
-            if job["state"] == "running":
-                job.update(state="cancelled", updated=time.time())
-                self._persist(job, mirror=True)
-                self._prune()
-                await self._changed()
-                await self._notify(job)
+            await self._cancel_unstarted(job)
         return copy.deepcopy(job)
 
     def expected_seconds(self, job):

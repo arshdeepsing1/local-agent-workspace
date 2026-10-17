@@ -124,7 +124,8 @@ def test_a_spending_limit_stops_the_chat_until_it_is_raised(app_page, stack):
     page.keyboard.press("Escape")
     expect(tools).to_have_count(0)
     stopped.get_by_role("button", name="Continue").click()
-    expect(page.get_by_text("Continue from where you stopped.")).to_be_visible()
+    # Your message, not the reply quoting it (the simulated reply can already be there).
+    expect(page.locator(".user-message").filter(has_text="Continue from where you stopped.")).to_be_visible()
     expect(page.get_by_text("Simulated reply from")).to_be_visible(timeout=15_000)
     finished(page, 2)
     expect(page.get_by_role("status").filter(has_text="spending limit")).to_have_count(0)

@@ -30,10 +30,14 @@ def message(page):
     return page.get_by_role("textbox", name="Message")
 
 
-def run(page, text):
-    """Type a command after closing the / menu, as when it is typed with its arguments, and press Enter."""
+def run(page, text, busy=False):
+    """Type a command after closing the / menu, as when it is typed with its arguments, and press Enter once the
+    composer can run it (not while the previous command or a model save still finishes: Enter is ignored then;
+    the Model picker is disabled meanwhile, and also while the chat is busy)."""
     box = message(page)
     box.fill(text)
+    if not busy:
+        expect(page.get_by_role("combobox", name="Model")).to_be_enabled()
     box.press("Enter")
 
 
@@ -178,6 +182,7 @@ def test_a_command_that_opens_another_view_leaves_no_draft_behind(ui, page):
         expect(page.locator(".slash-menu")).to_be_visible()
         box.press("Escape")
         expect(page.locator(".slash-menu")).to_have_count(0)
+        expect(page.get_by_role("combobox", name="Model")).to_be_enabled()  # Enter is ignored until then.
         box.press("Enter")
         ui.wait(f"new URL(location.href).searchParams.get('session') {url}")
         ui.wait(f"{DRAFT} === null")
@@ -215,16 +220,16 @@ def test_clear_from_bypass_asks_before_the_new_chat_bypasses(ui, page):
 
 def test_paths_and_unknown_words_are_messages_and_commands_are_never_queued(ui, page):
     start_app(ui, page, status="running")
-    run(page, "/compact")
+    run(page, "/compact", busy=True)
     expect(error(page)).to_contain_text("Stop the response first: /compact runs when the conversation is idle.")
     expect(message(page)).to_have_value("/compact")
     # Allowed while busy: it runs at once.
-    run(page, "/rename Busy work")
+    run(page, "/rename Busy work", busy=True)
     ui.wait("fake.requests('/api/sessions/a/title', 'PUT').length === 1")
     no_messages(ui)
     # Each send must finish first: the composer ignores Enter while one is in flight.
     for count, text in enumerate(("/tmp/output.log is empty", "/unknown do it", "/help me with the parser"), start=1):
-        run(page, text)
+        run(page, text, busy=True)
         ui.wait(f"fake.requests('/api/sessions/a/messages', 'POST').length === {count}")
         expect(message(page)).to_have_value("")
     assert [body["text"] for body in ui.bodies("/api/sessions/a/messages", "POST")] == [
