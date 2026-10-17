@@ -8,6 +8,7 @@ import Composer from './components/Composer.js'
 import Conversation, { PENDING_CARDS, revealCard } from './components/Conversation.js'
 import AgentToolsDialog from './components/AgentToolsDialog.js'
 import SettingsDialog from './components/SettingsDialog.js'
+import ProjectTrustDialog, { useProjectLayers } from './components/ProjectTrustDialog.js'
 import WorkspacePanel from './components/WorkspacePanel.js'
 import FolderAccessDialog from './components/FolderAccessDialog.js'
 import { standingFolder } from './components/FileRoots.js'
@@ -68,6 +69,10 @@ export default function App() {
   const editorKey = JSON.stringify([app.viewKey, workspace])
   const [editorDrafts, setEditorDrafts] = useState({})
   const setEditorFile = value => setEditorDrafts(current => ({ ...current, [editorKey]: resolve(value, current[editorKey] || null) }))
+  // The trust prompt for the project of the chat shown (a worktree chat's source project), or of a new chat.
+  const projectFolder = active?.worktree?.source_workspace || workspace
+  const layers = useProjectLayers(active ? app.activeId : null, app.settings ? projectFolder : '', app.settings?.project_layers)
+  const projectDecided = report => { layers.setReport(report); void app.refreshSettings().catch(() => {}) }
   const hasMessages = !!active?.events.length
   const busy = !!active && active.status !== 'idle'
   // Below 1,024 px the Workspace panel is a drawer over the chat (and full width on phones): focus moves into it,
@@ -271,7 +276,10 @@ export default function App() {
       onAttach=${path => { setDraft(current => `${current}${current ? '\n' : ''}Please read the ${path.startsWith('/') ? 'file' : 'project file'}: ${path}`); setWorkspaceOpen(false) }} />` : null}
     ${agentToolsOpen && app.settings && (!app.activeId || active) ? html`<${AgentToolsDialog} key=${editorKey} session=${active} onSaveTools=${app.setDisabledTools}
       initialTab=${typeof agentToolsOpen === 'string' ? agentToolsOpen : undefined} workspace=${workspace} changedFiles=${active && app.changes ? changedFiles : null} onClose=${() => setAgentToolsOpen(false)} onError=${showError} onSelectSession=${id => { setAgentToolsOpen(false); app.setActiveId(id); void app.refreshSessions().catch(e => showError(e.message)) }} />` : null}
-    ${settingsOpen && app.settings ? html`<${SettingsDialog} settings=${app.settings} connection=${app.connection} onSave=${app.saveSettings} onClose=${() => setSettingsOpen(false)} />` : null}
+    ${settingsOpen && app.settings ? html`<${SettingsDialog} settings=${app.settings} connection=${app.connection} onSave=${app.saveSettings} onClose=${() => setSettingsOpen(false)}
+      onProjectDecided=${() => void app.refreshSettings().catch(() => {})} />` : null}
+    ${layers.asking && !settingsOpen ? html`<${ProjectTrustDialog} report=${layers.asking} sessionId=${active ? app.activeId : null}
+      onDecided=${projectDecided} onClose=${layers.dismiss} />` : null}
     ${foldersOpen && app.settings ? html`<${FolderAccessDialog} key=${app.viewKey} workspace=${active?.workspace || app.settings.workspace} folders=${active?.allowed_directories || []}
       codingDir=${app.settings.coding_dir_status}
       busy=${busy || (!!app.activeId && !active)} bypass=${app.permissionMode === 'bypassPermissions'} onAllow=${app.allowFolder} onRemove=${app.removeFolder} onClose=${() => setFoldersOpen(false)} />` : null}

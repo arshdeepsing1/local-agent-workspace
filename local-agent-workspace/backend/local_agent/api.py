@@ -9,7 +9,7 @@ import unicodedata
 from contextlib import asynccontextmanager
 from pathlib import Path, PurePosixPath
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
@@ -28,14 +28,14 @@ from .context import (
 )
 from .context import MAX_AUTO_COMPACT_PERCENT, MIN_AUTO_COMPACT_PERCENT
 from .model_profiles import default_limits, effective_limits, limit_warnings, limits_note, public_profile
-from . import reasoning, serving
+from . import reasoning, serving, settings_layers
 from .user_paths import standing_directories
 from .store import Store, UnreadableConversation
 from . import conversation_search
 from .git_tools import (GH_ENVIRONMENT_KEYS, commit_staged, file_diff, find_git, git_environment, pr_status, stage,
                         staged_files, working_tree_changes, working_tree_status)
 from .jobs import NOT_STOPPED, TIMEOUT_NOT_STOPPED
-from .tools import WorkspaceTools, file_error
+from .tools import NotText, WorkspaceTools, file_error
 from .workspace_folders import register_workspace_folders
 from .permissions import PermissionMode
 from .telemetry import SUMMARY_VERSION, session_metrics, usage_summary
@@ -63,6 +63,22 @@ USAGE_SCAN = 50  # Chats without a usage summary loaded per GET /api/usage (each
 # Browsers refuse ES modules served with a non-JavaScript type, and some systems
 # map .js to text/plain in their mimetypes registry.
 mimetypes.add_type("text/javascript", ".js")
+mimetypes.add_type("application/manifest+json", ".webmanifest")  # The web app manifest (Install app).
+
+
+# GET /api/file/raw serves these inline when a file's bytes start with the signature of its type (WebP: RIFF,
+# then WEBP at byte 8); every other file is a download.
+INLINE_TYPES = {"image/png": b"\x89PNG\r\n\x1a\n", "image/jpeg": b"\xff\xd8\xff", "image/gif": (b"GIF87a", b"GIF89a"),
+                "image/webp": b"RIFF", "application/pdf": b"%PDF-"}
+
+
+INDEX_POLICY = "frame-src blob:; frame-ancestors 'none'"
+
+
+def content_disposition(disposition, name):
+    """A Content-Disposition header for a file name: an ASCII fallback and the UTF-8 name (RFC 6266)."""
+    fallback = "".join(char if 32 <= ord(char) < 127 and char not in '"\\;%' else "_" for char in name) or "file"
+    return f'{disposition}; filename="{fallback}"; filename*=UTF-8\'\'{quote(name, safe="")}'
 
 
 class RevalidatedStaticFiles(StaticFiles):
@@ -229,6 +245,13 @@ class SettingsEdit(BaseModel):
     # Settings → Agent → Scheduled runs and Settings → Credentials → Token expires on ("" or YYYY-MM-DD): schedules.py.
     schedules_enabled: bool | None = Field(default=None, strict=True)
     token_expires_on: str | None = Field(default=None, max_length=10, strict=True)
+
+
+class ProjectTrust(BaseModel):
+    """Trust or Ignore a project's settings files (settings_layers.py), as reviewed: sha256 is the report's."""
+    model_config = {"extra": "forbid"}
+    decision: Literal["trust", "ignore"]
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$", strict=True)
 
 
 class GitStage(BaseModel):
@@ -477,7 +500,11 @@ def create_app(settings=None):
         manager.cache_levels.clear()
         manager.replay_rejections.clear()
         manager.vision_rejections.clear()
-        # Open chats' meters follow the new budgets and threshold; others follow when opened (stream).
+        await refresh_open_meters()
+        return result
+
+    async def refresh_open_meters():
+        """Open chats' meters follow new budgets and thresholds; others follow when opened (stream)."""
         for session_id in [key for key, sockets in manager.listeners.items() if sockets]:
             try:
                 session = manager.get(session_id)
@@ -485,7 +512,29 @@ def create_app(settings=None):
                 continue
             if session:
                 await manager.refresh_meter_limits(session)
-        return result
+
+    def layers_folder(session_id):
+        """The project whose settings files a chat (or, without one, a new chat in the Settings project) uses."""
+        return settings_layers.project_folder(session_or_404(session_id) if session_id else None, settings)
+
+    @app.get("/api/settings/project")
+    async def project_settings_files(session_id: str | None = None):
+        """The project's settings files (.agents/settings.json and .agents/settings.local.json): what they set and
+        whether they apply (settings_layers.ProjectLayers.report)."""
+        return settings.project_layers().report(layers_folder(session_id), fresh=True)
+
+    @app.post("/api/settings/project/trust")
+    async def trust_project_settings(body: ProjectTrust, session_id: str | None = None):
+        """Trust or Ignore the project's settings files as reviewed (body.sha256: the report's). HTTP 409 with the
+        new report when they changed meanwhile."""
+        folder = layers_folder(session_id)
+        try:
+            report = settings.project_layers().decide(folder, body.decision, body.sha256)
+        except settings_layers.ChangedFiles as exc:
+            raise HTTPException(409, {"message": str(exc),
+                                      "report": settings.project_layers().report(folder, fresh=True)}) from None
+        await refresh_open_meters()
+        return report
 
     @app.get("/api/settings")
     async def get_settings():
@@ -548,7 +597,8 @@ def create_app(settings=None):
         model = body.model.strip() if body and body.model else ""
         if body and body.model and not model:
             raise ValueError("Enter a model endpoint name.")
-        session = store.create({**settings.values, "workspace": workspace})
+        # The project's trusted settings files can set a new chat's model and effort (settings_layers.py).
+        session = store.create({**settings.effective(workspace), "workspace": workspace})
         session["permission_mode"] = body.permission_mode if body else "manual"
         if body and body.reasoning_effort:
             session["reasoning_effort"] = body.reasoning_effort
@@ -918,8 +968,9 @@ def create_app(settings=None):
     async def files(path: str = ".", session_id: str | None = None):
         return ui_tools(session_id).list_files(path)
 
-    @app.get("/api/file")
-    async def file(path: str, session_id: str | None = None):
+    def opened_file(path, session_id, read):
+        """(the path opened, read(tools, path)) for a file the Workspace panel opens by a path a reply, a tool card
+        or Files named."""
         tools = ui_tools(session_id)
         session = session_or_404(session_id) if session_id else {}
         worktree = session.get("worktree")
@@ -930,7 +981,7 @@ def create_app(settings=None):
             # so the editor never saves into the main checkout by mistake.
             path = locate_file(tools, path, worktree) or path
         try:
-            content = tools.read_file(path)
+            return tools, path, read(tools, path)
         except FileNotFoundError:
             # Replies and tool cards name files in other ways: from the project's own folder name
             # (demo/src/app.py), from the Git repository's root, or in a worktree chat by the source
@@ -939,9 +990,29 @@ def create_app(settings=None):
             if found is None:
                 raise ValueError(f"{path} does not exist in {tools.root}. It may have been moved or deleted, "
                                  "or it was named relative to another folder.") from None
-            path, content = found, tools.read_file(found)
+            return tools, found, read(tools, found)
+
+    @app.get("/api/file")
+    async def file(path: str, session_id: str | None = None):
+        try:
+            tools, path, content = opened_file(path, session_id, lambda tools, path: tools.read_file(path))
+        except NotText as exc:
+            raise HTTPException(400, {"message": settings.redact(str(exc)), "code": "not_text"}) from None
         # The absolute path lets the editor offer an "Open in VS Code" link.
         return {"path": path, "content": content, "absolute": str(tools.path(path))}
+
+    @app.get("/api/file/raw")
+    async def raw_file(path: str, session_id: str | None = None, download: bool = False):
+        """A file's bytes for the Workspace preview and Download (at most 20 MB). Only PNG, JPEG, GIF, WebP and
+        PDF files whose bytes start as that type says are served inline; everything else (HTML and SVG included)
+        is an attachment of type application/octet-stream. Neither ever runs as a page of this origin."""
+        tools, path, (target, data) = opened_file(path, session_id, lambda tools, path: tools.read_bytes(path))
+        kind = mimetypes.guess_type(target.name)[0]
+        inline = not download and kind in INLINE_TYPES and data.startswith(INLINE_TYPES[kind]) \
+            and (kind != "image/webp" or data[8:12] == b"WEBP")
+        return Response(data, media_type=kind if inline else "application/octet-stream", headers={
+            "Content-Disposition": content_disposition("inline" if inline else "attachment", target.name),
+            "Content-Security-Policy": "sandbox; default-src 'none'", "X-Opened-Path": quote(path)})
 
     @app.put("/api/file")
     async def save_file(body: FileEdit):
@@ -1154,7 +1225,10 @@ def create_app(settings=None):
     @app.get("/")
     async def index():
         if (frontend / "index.html").exists():
-            return FileResponse(frontend / "index.html", headers={"Cache-Control": "no-cache"})
+            # frame-src: the Workspace preview's frames (a PDF from a blob, an HTML file in a sandboxed srcdoc
+            # frame) cannot navigate to any address, so a previewed page reaches no network.
+            return FileResponse(frontend / "index.html", headers={"Cache-Control": "no-cache",
+                                                                  "Content-Security-Policy": INDEX_POLICY})
         return JSONResponse({"message": "The frontend folder is missing. See README.md."}, status_code=503)
 
     return app

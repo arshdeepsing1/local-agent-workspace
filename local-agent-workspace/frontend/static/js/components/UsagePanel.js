@@ -106,7 +106,8 @@ function SpendingLimit({ session, spending, onSaved }) {
   const details = [
     follows ? 'Follows its parent conversation\'s limit; the total includes the parent and its other subagents.'
       : limit == null ? (own ? 'No limit for this chat.' : 'No limit (Settings → Agent sets a default for every chat).')
-      : own ? 'This chat\'s own limit.' : 'The default from Settings → Agent.',
+      : own ? 'This chat\'s own limit.' : spending.source === 'project' ? 'The default from this project\'s settings file (lower than Settings → Agent).'
+      : 'The default from Settings → Agent.',
     spending.subagents_dbu > 0 ? `Includes ${formatDbu(spending.subagents_dbu)} DBU from subagents.` : '',
     spending.unpriced_calls ? `${spending.unpriced_calls === 1 ? '1 call' : `${spending.unpriced_calls} calls`} to endpoints without price data ${spending.unpriced_calls === 1 ? 'is' : 'are'} not counted.` : '',
   ].filter(Boolean)

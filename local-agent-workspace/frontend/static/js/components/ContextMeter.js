@@ -75,6 +75,9 @@ const ADJUSTMENTS = {
   condensed_trimmed: 'The condensed conversation summary was still over its size limit, so the app shortened its least important sections',
 }
 
+// The settings file that sets a chat's auto-compact threshold (auto_compact_source; settings_layers.py).
+const COMPACT_FILES = { project: '.agents/settings.json', local: '.agents/settings.local.json' }
+
 // openSignal: a number that /context increases to open the details (a change after mounting only).
 export default function ContextMeter({ info, model, busy = false, status, onCompact, openSignal = 0 }) {
   const [note, setNote] = useState('')
@@ -183,7 +186,7 @@ export default function ContextMeter({ info, model, busy = false, status, onComp
           <div><dt>Request overhead</dt><dd>~${info.breakdown.request_overhead.toLocaleString()} tokens</dd></div>
         </dl>` : null}
       <p>${typeof info.auto_compact_threshold === 'number'
-        ? `Automatic compaction at ${info.auto_compact_percent}% of the input budget: about ${info.auto_compact_threshold.toLocaleString()} input tokens (Settings → Auto-compact at).`
+        ? `Automatic compaction at ${info.auto_compact_percent}% of the input budget: about ${info.auto_compact_threshold.toLocaleString()} input tokens (${COMPACT_FILES[info.auto_compact_source] ? `set by this project's ${COMPACT_FILES[info.auto_compact_source]}` : 'Settings → Auto-compact at'}).`
         : `Automatic compaction threshold: approximately ${info.input_budget.toLocaleString()} input tokens.`}</p>
       <p>Of the ${info.context_window.toLocaleString()}-token context window, ${info.reply_reserve.toLocaleString()} tokens are reserved for the response and ${safetyReserve.toLocaleString()} for safety.</p>
       <p>The response limit is separate from the context window. Increasing the context budget does not increase the response limit.</p>

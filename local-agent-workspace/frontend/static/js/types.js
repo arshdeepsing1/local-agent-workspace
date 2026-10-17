@@ -42,7 +42,8 @@
 //   git_context: boolean (each turn's first message carries a short Git snapshot: branch, upstream, change counts,
 //   recent commits; default true), schedules_enabled: boolean (the scheduler runs Agent tools → Schedules at their
 //   times; default false), token_expires_on: '' | 'YYYY-MM-DD' (the Databricks token's expiry, typed by the user),
-//   token_warning: string | null (from 7 days before that day, and after it; backend schedules.token_warning) }
+//   token_warning: string | null (from 7 days before that day, and after it; backend schedules.token_warning),
+//   project_layers: ProjectLayers (the Settings project's settings files; never saved by PUT /settings) }
 // Schedules (backend schedules.py, schedules_api.py). GET /schedules?session_id= -> { enabled (Settings), running (this
 //   app runs them), problem (another app holds the state folder's lock, or schedules.json cannot be read; or null),
 //   project, schedules: Schedule[] (this project's), other_projects, token_warning, limits: { max_approval_minutes,
@@ -62,6 +63,15 @@
 //   'started'|'not_run'|'skipped', note?, session_id?, started?, ended?, terminal_reason? ('deleted': its chat was
 //   deleted), estimated_dbu?, tokens?, duration_s?, steps? }] (the last 20) }. A run's chat has tags ['scheduled'] and
 //   schedule: { id, name, trigger, due? }.
+// ProjectLayers (backend settings_layers.py; GET /settings/project?session_id= for a chat's project, or the Settings
+//   project): { workspace, status: 'none'|'pending'|'trusted'|'ignored', changed (pending because a file changed after a
+//   decision), decision: 'trust'|'ignore'|null, sha256 (of the files as read now), files: [{ layer: 'project'|'local',
+//   name ('.agents/settings.json' | '.agents/settings.local.json'), sha256, values ({ key: value } it may set and that
+//   pass the checks), problems: string[] (values not used, and why), ignored: string[] (keys a project cannot set) }],
+//   values and sources ({ key: value } and { key: 'project'|'local' } of what a trusted file sets for chats in the
+//   project), followed: string[] (budgets that follow the files' model), notes: string[] }.
+//   POST /settings/project/trust?session_id= { decision: 'trust'|'ignore', sha256 } -> ProjectLayers; HTTP 409
+//   { detail: { message, report } } when the files changed since that report.
 // GET /output-styles?session_id= -> { styles: [{ id, name, description, source: 'built-in'|'project'|'user', path? }],
 //   errors: [{ path, error }] } (backend output_styles.py; the chat's project, or the default one without a chat).
 // Memory (GET /memory?session_id=; POST { text } adds, PATCH /memory/<id> { text } edits, DELETE /memory/<id> deletes
@@ -342,7 +352,8 @@
 //   compactable? (false: Compact now has no earlier turn to summarize until the next user message; absent on
 //   older meters, which allow it),
 //   estimate_prior? (true: estimate_scale is the model's starting ratio, not yet from reported counts),
-//   auto_compact_threshold?, auto_compact_percent?, compaction_deferred? (over the threshold but within the input
+//   auto_compact_threshold?, auto_compact_percent?, auto_compact_source? ('project' or 'local': a trusted project
+//   settings file sets the percent), compaction_deferred? (over the threshold but within the input
 //   budget, and no cut brings it under the threshold: sent as it was), compaction?: Compaction (when this request compacted), last_request?: LastRequest,
 //   next_estimate?: { tokens, scale?, anchor? ({ model, reported, added, raw }: anchored like estimate_anchor),
 //   held_anchor? (the same, kept after a change to another model so a change back anchors again),

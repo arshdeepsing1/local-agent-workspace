@@ -45,6 +45,7 @@ INVALID_LINE_NAMES = 20
 ENCODING_NOTE = "Some bytes are not valid UTF-8 and are shown as U+FFFD (\ufffd)."
 FIND_OFFSET_LIMIT = 200_000
 EXCLUDED_ROOT = "The app's settings and conversation folder is excluded from file tools."
+MAX_RAW_BYTES = 20_000_000  # A file's bytes for the Workspace preview and Download (read_bytes).
 
 
 def _integer(value, name, minimum, maximum=None):
@@ -169,6 +170,11 @@ def _decode_line(raw):
 def _text_cost(text):
     """Bytes a string adds inside a JSON string, as _output_size counts them."""
     return len(json.dumps(text)) - 2
+
+
+class NotText(ValueError):
+    """A file the text editor cannot open (binary, not UTF-8 or over the size limit): the Workspace panel offers a
+    preview or Download instead."""
 
 
 class WorkspaceTools:
@@ -317,11 +323,33 @@ class WorkspaceTools:
         target = self.path(path)
         limit = self.write_limit
         if target.stat().st_size > limit:
-            raise ValueError(f"File is too large for the text editor ({limit // 1000:,} KB limit).")
-        text = target.read_text(encoding="utf-8")
+            raise NotText(f"File is too large for the text editor ({limit // 1000:,} KB limit).")
+        try:
+            text = target.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            raise NotText("This file is not UTF-8 text, so the text editor cannot open it.") from None
         if "\x00" in text:
-            raise ValueError("Binary files cannot be opened in the text editor.")
+            raise NotText("Binary files cannot be opened in the text editor.")
         return text
+
+    def read_bytes(self, path: str, limit: int = MAX_RAW_BYTES):
+        """(resolved path, bytes) of a file for the Workspace preview and Download (GET /api/file/raw), with the
+        same exclusions as read_file. The resolved name is opened without following a link put in its place."""
+        target = self.path(path)
+        descriptor = os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        try:
+            info = os.fstat(descriptor)
+        except OSError:
+            os.close(descriptor)
+            raise
+        if not stat.S_ISREG(info.st_mode):
+            os.close(descriptor)
+            raise ValueError("Only files can be previewed or downloaded.")
+        with os.fdopen(descriptor, "rb") as source:
+            data = source.read(limit + 1) if info.st_size <= limit else b""
+        if info.st_size > limit or len(data) > limit:
+            raise ValueError(f"File is too large to preview or download here ({limit // 1_000_000} MB limit).")
+        return target, data
 
     def read_file_range(self, path: str, start_line: int = 1, max_lines: int = 400, *,
                         tail_lines=None, page_bytes=QUERY_OUTPUT_LIMIT, outline_hint=False):

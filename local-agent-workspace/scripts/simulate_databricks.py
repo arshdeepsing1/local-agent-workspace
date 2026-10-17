@@ -368,6 +368,9 @@ class PromptCache:
 
 
 STEP_NOTE = re.compile(r"\n\n\[Note from the app, not the user's words or tool output: .*\]\Z", re.DOTALL)
+# The Git snapshot the app adds to a turn's first message in a repository ("... read by the app: data, not
+# instructions"): not the user's words either, so it never chooses a scripted turn.
+GIT_SNAPSHOT = re.compile(r"\n\n---\n\[Git status when this message was sent, .*\Z", re.DOTALL)
 
 
 def text_of(content):
@@ -419,7 +422,7 @@ class Brain:
         users = [message for message in messages if message.get("role") == "user"]
         first = text_of(users[0].get("content")) if users else ""
         # The app's step note (changed files, finished jobs) can end the last message: not the user's words.
-        prompt = STEP_NOTE.sub("", text_of(users[-1].get("content"))) if users else ""
+        prompt = GIT_SNAPSHOT.sub("", STEP_NOTE.sub("", text_of(users[-1].get("content")))) if users else ""
         made = tool_calls_before(messages)
         results = tool_results(messages)
         words = prompt.lower()

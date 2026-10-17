@@ -61,16 +61,24 @@ export async function apiText(path) {
   return (await apiFile(path)).text
 }
 // The same, with the file name from the response's Content-Disposition header (or null).
-export async function apiFile(path, retried = false) {
+export async function apiFile(path) {
+  const { response, name } = await download(path)
+  return { text: await response.text(), name }
+}
+// A file's bytes as a Blob (the Workspace preview and Download: GET /file/raw), with its file name or null.
+export async function apiBlob(path) {
+  const { response, name } = await download(path)
+  return { blob: await response.blob(), name }
+}
+async function download(path, retried = false) {
   const response = await fetch(`/api${path}`, { headers: { 'X-Local-Token': token } }).catch(offline)
   if (response.ok) {
-    const name = /filename="([^"]+)"/.exec(response.headers.get('Content-Disposition') || '')?.[1] || null
-    return { text: await response.text(), name }
+    return { response, name: /filename="([^"]+)"/.exec(response.headers.get('Content-Disposition') || '')?.[1] || null }
   }
   const data = await response.json().catch(() => ({}))
   if (response.status === 403 && data.code === 'reconnect_required' && !retried) {
     await refreshToken()
-    return apiFile(path, true)
+    return download(path, true)
   }
   throw errorFor(data, response.status, `Request failed with HTTP ${response.status}.`)
 }

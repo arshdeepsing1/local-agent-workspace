@@ -57,6 +57,55 @@ ENDPOINT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 EXPIRY_DATE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
 
 
+# Settings a project's settings files may set (settings_layers.py): what a chat in the project runs with. Each is
+# checked by check_setting, as a Settings save checks it.
+LAYERABLE = ("model", "reasoning_effort", "context_window", "max_output_tokens", "auto_compact_percent",
+             "max_agent_steps", "compaction_handoffs", "prompt_caching", "output_style", "auto_keep_changes",
+             "spending_limit_dbu")
+
+
+def check_setting(key, value):
+    """A LAYERABLE setting's value checked as a Settings save checks it: the value to use, or ValueError with the
+    save's message. The output limit is checked against the context budget by the caller."""
+    if key == "model":
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("Enter a model or model-service ID.")
+    elif key == "context_window":
+        if type(value) is not int or not MIN_CONTEXT_WINDOW <= value <= MAX_CONTEXT_WINDOW:
+            raise ValueError(f"Context budget must be an integer from {MIN_CONTEXT_WINDOW:,} to {MAX_CONTEXT_WINDOW:,} tokens.")
+    elif key == "max_output_tokens":
+        if type(value) is not int or not MIN_MAX_OUTPUT_TOKENS <= value <= MAX_MAX_OUTPUT_TOKENS:
+            raise ValueError(f"Output-token limit must be an integer from {MIN_MAX_OUTPUT_TOKENS:,} to {MAX_MAX_OUTPUT_TOKENS:,}.")
+    elif key == "max_agent_steps":
+        if type(value) is not int or not MIN_MAX_AGENT_STEPS <= value <= MAX_MAX_AGENT_STEPS:
+            raise ValueError(f"Agent step limit must be an integer from {MIN_MAX_AGENT_STEPS} to {MAX_MAX_AGENT_STEPS}.")
+    elif key == "compaction_handoffs":
+        if type(value) is not bool:
+            raise ValueError("Compaction handoffs must be on or off.")
+    elif key == "auto_compact_percent":
+        if type(value) is not int or not MIN_AUTO_COMPACT_PERCENT <= value <= MAX_AUTO_COMPACT_PERCENT:
+            raise ValueError(f"Auto-compact threshold must be an integer from {MIN_AUTO_COMPACT_PERCENT} to "
+                             f"{MAX_AUTO_COMPACT_PERCENT} percent.")
+    elif key == "output_style":
+        if not isinstance(value, str) or not STYLE_ID.match(value):
+            raise ValueError("Output style must be default, concise, explanatory or the name of a style file "
+                             "(1-40 lowercase letters, digits, - or _).")
+    elif key == "auto_keep_changes":
+        if type(value) is not bool:
+            raise ValueError("Automatic Keep must be on or off.")
+    elif key == "reasoning_effort":
+        if value not in EFFORT_LEVELS:
+            raise ValueError("Default reasoning effort must be one of: " + ", ".join(EFFORT_LEVELS) + ".")
+    elif key == "prompt_caching":
+        if value not in PROMPT_CACHING:
+            raise ValueError("Prompt caching must be one of: " + ", ".join(PROMPT_CACHING) + ".")
+    elif key == "spending_limit_dbu":
+        return validate_limit(value, "Default spending limit")
+    else:
+        raise ValueError(f"{key} is not a setting a project can set.")
+    return value
+
+
 def subagent_defaults(value, strict=True):
     """Settings → Subagents as {type: {model, effort}} for every built-in type. strict: a bad value is a
     ValueError (a save); otherwise it is the type's default (a settings.json written by hand)."""
@@ -284,12 +333,27 @@ class Settings:
         except (ValueError, OSError):
             host, configured = "", False
         return {**self.values, "host": host, "configured": configured, "web_search_status": self.web_search_status(),
+                # The Settings project's settings files: what they set and whether they apply (Settings shows the
+                # values and their sources; saving writes only these values, never a file's).
+                "project_layers": self.project_layers().report(self.values["workspace"]),
                 "coding_dir_status": user_paths.coding_dir_status(self),
                 "python_venv_status": user_paths.python_venv_status(self), "default_model": DEFAULT_MODEL,
                 "default_limits": dict(zip(LIMIT_KEYS, default_limits(self.values["model"]))),
                 "token_warning": token_warning(self.values["token_expires_on"]),
                 "endpoint_profiles": known_endpoints(),
                 **({"model_migrated_from": self.migrated_from} if self.migrated_from is not None else {})}
+
+    def project_layers(self):
+        """The project settings files of this state folder's projects (settings_layers.ProjectLayers)."""
+        if getattr(self, "_layers", None) is None:
+            from .settings_layers import ProjectLayers  # It imports this module.
+            self._layers = ProjectLayers(self)
+        return self._layers
+
+    def effective(self, workspace):
+        """Settings for chats in this project folder: these values with a trusted project file's over the keys it
+        sets (settings_layers.py)."""
+        return self.project_layers().effective(workspace)
 
     def credential_values(self, path=None):
         """The credential file's assignments (read as data), or {} without one. path: another file (a save's)."""
@@ -342,26 +406,12 @@ class Settings:
         workspace = Path(candidate["workspace"]).expanduser().resolve()
         if not workspace.is_dir():
             raise ValueError("Choose an existing project directory.")
-        if not candidate["model"].strip():
-            raise ValueError("Enter a model or model-service ID.")
-        budget = candidate["context_window"]
-        if type(budget) is not int or not MIN_CONTEXT_WINDOW <= budget <= MAX_CONTEXT_WINDOW:
-            raise ValueError(f"Context budget must be an integer from {MIN_CONTEXT_WINDOW:,} to {MAX_CONTEXT_WINDOW:,} tokens.")
-        output_tokens = candidate["max_output_tokens"]
-        if (type(output_tokens) is not int
-                or not MIN_MAX_OUTPUT_TOKENS <= output_tokens <= MAX_MAX_OUTPUT_TOKENS):
-            raise ValueError(f"Output-token limit must be an integer from {MIN_MAX_OUTPUT_TOKENS:,} to {MAX_MAX_OUTPUT_TOKENS:,}.")
-        if output_tokens >= budget - SAFETY_MARGIN:
+        for key in ("model", "context_window", "max_output_tokens"):
+            check_setting(key, candidate[key])
+        if candidate["max_output_tokens"] >= candidate["context_window"] - SAFETY_MARGIN:
             raise ValueError(f"Output-token limit must be below the context budget minus the {SAFETY_MARGIN:,}-token safety margin.")
-        max_steps = candidate["max_agent_steps"]
-        if type(max_steps) is not int or not MIN_MAX_AGENT_STEPS <= max_steps <= MAX_MAX_AGENT_STEPS:
-            raise ValueError(f"Agent step limit must be an integer from {MIN_MAX_AGENT_STEPS} to {MAX_MAX_AGENT_STEPS}.")
-        if type(candidate["compaction_handoffs"]) is not bool:
-            raise ValueError("Compaction handoffs must be on or off.")
-        percent = candidate["auto_compact_percent"]
-        if type(percent) is not int or not MIN_AUTO_COMPACT_PERCENT <= percent <= MAX_AUTO_COMPACT_PERCENT:
-            raise ValueError(f"Auto-compact threshold must be an integer from {MIN_AUTO_COMPACT_PERCENT} to "
-                             f"{MAX_AUTO_COMPACT_PERCENT} percent.")
+        for key in ("max_agent_steps", "compaction_handoffs", "auto_compact_percent"):
+            check_setting(key, candidate[key])
         minutes = candidate["approval_timeout_minutes"]
         if type(minutes) is not int or not 0 <= minutes <= MAX_APPROVAL_MINUTES:
             raise ValueError(f"Approval wait must be 0 (no limit) or 1 to {MAX_APPROVAL_MINUTES:,} minutes.")
@@ -374,9 +424,7 @@ class Settings:
                            ("project_memory", "Project memory"), ("git_context", "Git status in messages")):
             if type(candidate[key]) is not bool:
                 raise ValueError(f"{label} must be on or off.")
-        if not isinstance(candidate["output_style"], str) or not STYLE_ID.match(candidate["output_style"]):
-            raise ValueError("Output style must be default, concise, explanatory or the name of a style file "
-                             "(1-40 lowercase letters, digits, - or _).")
+        check_setting("output_style", candidate["output_style"])
         write_limit = candidate["write_limit_kb"]
         if type(write_limit) is not int or not MIN_WRITE_LIMIT_KB <= write_limit <= MAX_WRITE_LIMIT_KB:
             raise ValueError(f"File write limit must be an integer from {MIN_WRITE_LIMIT_KB} to {MAX_WRITE_LIMIT_KB:,} KB.")
@@ -393,20 +441,17 @@ class Settings:
         candidate["secret_file_patterns"] = check_patterns(candidate["secret_file_patterns"])
         if type(candidate["rate_limit_auto_continue"]) is not bool:
             raise ValueError("Continue after rate limits must be on or off.")
-        if type(candidate["auto_keep_changes"]) is not bool:
-            raise ValueError("Automatic Keep must be on or off.")
+        check_setting("auto_keep_changes", candidate["auto_keep_changes"])
         if type(candidate["background_subagent_wake"]) is not bool:
             raise ValueError("Continue the chat when a background subagent finishes must be on or off.")
-        if candidate["reasoning_effort"] not in EFFORT_LEVELS:
-            raise ValueError("Default reasoning effort must be one of: " + ", ".join(EFFORT_LEVELS) + ".")
+        check_setting("reasoning_effort", candidate["reasoning_effort"])
         if candidate["reasoning_format"] not in REQUEST_FORMATS:
             raise ValueError("Reasoning request format must be one of: " + ", ".join(REQUEST_FORMATS) + ".")
         if type(candidate["thinking_summaries"]) is not bool:
             raise ValueError("Show thinking summaries must be on or off.")
         if type(candidate["thinking_replay"]) is not bool:
             raise ValueError("Send earlier thinking back must be on or off.")
-        if candidate["prompt_caching"] not in PROMPT_CACHING:
-            raise ValueError("Prompt caching must be one of: " + ", ".join(PROMPT_CACHING) + ".")
+        check_setting("prompt_caching", candidate["prompt_caching"])
         if type(candidate["slash_commands"]) is not bool:
             raise ValueError("Slash commands must be on or off.")
         if type(candidate["schedules_enabled"]) is not bool:
@@ -416,7 +461,7 @@ class Settings:
         if not valid_expiry(expiry):
             raise ValueError("Token expires on must be empty or a date such as 2026-12-31.")
         self.check_web_settings(candidate)
-        candidate["spending_limit_dbu"] = validate_limit(candidate["spending_limit_dbu"], "Default spending limit")
+        candidate["spending_limit_dbu"] = check_setting("spending_limit_dbu", candidate["spending_limit_dbu"])
         for key, label, unit in (("turn_token_limit", "Token limit per turn", "tokens"),
                                  ("turn_time_limit_minutes", "Time limit per turn", "minutes")):
             if type(candidate[key]) is not int or not 0 <= candidate[key] <= TURN_LIMITS[key]:

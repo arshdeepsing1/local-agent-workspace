@@ -969,7 +969,7 @@ class DelegateManager:
                 agent_tools = self.agent_tools(parent, spec, profile)
             # The agent's effort, else the chat's now (a chat saved without one uses the Settings default).
             effort = spec["effort"] or (self.manager.get(parent["id"]) or parent).get("reasoning_effort")
-            labels["effort"] = effort or self.manager.settings.values.get("reasoning_effort") or "default"
+            labels["effort"] = effort or self.manager.chat_values(parent).get("reasoning_effort") or "default"
             child = self.manager.store.create({"workspace": parent["workspace"], "model": model})
             child.update(parent_session_id=parent["id"], is_subagent=True, max_steps=max_steps,
                          tool_profile=profile, agent_type=kind,
