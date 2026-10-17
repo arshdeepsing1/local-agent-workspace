@@ -2,6 +2,8 @@
 Settings → slash commands off (M5b). Commands run in the page: never queued, never sent to /messages."""
 import json
 
+import pytest
+
 from playwright.sync_api import expect
 
 REPLY = "The parser is fixed: **two** files changed."
@@ -169,27 +171,27 @@ def test_fork_new_and_clear(ui, page):
 DRAFT = "localStorage.getItem('local-workspace:draft:a')"
 
 
-def test_a_command_that_opens_another_view_leaves_no_draft_behind(ui, page):
+@pytest.mark.parametrize("command,url", [("/clear", "=== null"), ("/new", "=== null"), ("/fork", "=== 'forked'")])
+def test_a_command_that_opens_another_view_leaves_no_draft_behind(ui, page, command, url):
     """/clear, /new and /fork switch the view after the old chat's draft was saved (by the debounce, or
-    when the view switched): that saved command is removed, so the chat does not reopen with it in its box."""
+    when the view switched): that saved command is removed, so the chat does not reopen with it in its box.
+    One command per page: switching back between them left the composer waiting on CI runners."""
     start_app(ui, page)
-    for command, url in (("/clear", "=== null"), ("/new", "=== null"), ("/fork", "=== 'forked'")):
-        box = message(page)
-        box.fill(command)
-        if command == "/clear":
-            ui.wait(f"{DRAFT} === '/clear'")  # The paused-before-Enter case: the debounced save ran.
-        # Close the / menu once it is open (it opens after the skills load): Enter then runs the typed command.
-        expect(page.locator(".slash-menu")).to_be_visible()
-        box.press("Escape")
-        expect(page.locator(".slash-menu")).to_have_count(0)
-        expect(page.get_by_role("combobox", name="Model")).to_be_enabled(timeout=10_000)  # Enter is ignored until then.
-        box.press("Enter")
-        ui.wait(f"new URL(location.href).searchParams.get('session') {url}")
-        ui.wait(f"{DRAFT} === null")
-        page.get_by_role("button", name="Work").first.click()
-        ui.show_session("a")
-        expect(message(page)).to_have_value("")
-        assert ui.js(DRAFT) is None
+    box = message(page)
+    box.fill(command)
+    ui.wait(f"{DRAFT} === {command!r}")  # The paused-before-Enter case: the debounced save ran.
+    # Close the / menu once it is open (it opens after the skills load): Enter then runs the typed command.
+    expect(page.locator(".slash-menu")).to_be_visible()
+    box.press("Escape")
+    expect(page.locator(".slash-menu")).to_have_count(0)
+    expect(page.get_by_role("combobox", name="Model")).to_be_enabled(timeout=10_000)  # Enter is ignored until then.
+    box.press("Enter")
+    ui.wait(f"new URL(location.href).searchParams.get('session') {url}")
+    ui.wait(f"{DRAFT} === null")
+    page.get_by_role("button", name="Work").first.click()
+    ui.show_session("a")
+    expect(message(page)).to_have_value("")
+    assert ui.js(DRAFT) is None
     no_messages(ui)
 
 
@@ -229,7 +231,11 @@ def test_paths_and_unknown_words_are_messages_and_commands_are_never_queued(ui, 
     no_messages(ui)
     # Each send must finish first: the composer ignores Enter while one is in flight.
     for count, text in enumerate(("/tmp/output.log is empty", "/unknown do it", "/help me with the parser"), start=1):
-        run(page, text, busy=True)
+        box = message(page)
+        box.fill(text)
+        # The previous send must have finished: the composer ignores Enter (and disables Queue) until then.
+        expect(page.get_by_role("button", name="Queue message")).to_be_enabled(timeout=10_000)
+        box.press("Enter")
         ui.wait(f"fake.requests('/api/sessions/a/messages', 'POST').length === {count}")
         expect(message(page)).to_have_value("")
     assert [body["text"] for body in ui.bodies("/api/sessions/a/messages", "POST")] == [
