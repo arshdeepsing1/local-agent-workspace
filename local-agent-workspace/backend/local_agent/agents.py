@@ -949,15 +949,16 @@ class AgentManager(LifecycleHooks):
                 recovered.add(session["id"])
         self.delegates.recover(summaries, full_scan=full_scan, recovered=recovered)
 
-    @staticmethod
-    def mark_interrupted(session):
+    def mark_interrupted(self, session):
         """Close work that was running when the app last stopped; True if anything changed.
 
         run() keeps turn_running until the model loop ends. A title request (after the
         answer completed) or a manual compaction outside a turn is closed as interrupted
         but does not make the turn incomplete. Older records without the marker count as
-        cut short when an agent request or a tool was still running.
+        cut short when an agent request or a tool was still running. The turn it closes
+        gets its result record in the header (last_turn_result), which scripts read.
         """
+        now = time.time()
         cut_short = session.pop("turn_running", False) is True
         changed = cut_short
         for call in session.get("inference_calls", []):
@@ -992,12 +993,24 @@ class AgentManager(LifecycleHooks):
                     info.get("status"), info.get("error_kind")) == ("interrupted", "incomplete_response") else ""
                 history.close_stopped(session, session["events"],
                                       history.stopped_reply(partial, history.INTERRUPTED_MARKER), repair_tool_history)
-        if "turn_ended" in session and session["turn_ended"] is None:
+        turn_open = "turn_ended" in session and session["turn_ended"] is None
+        if turn_open:
             if not cut_short:
                 # Stopped while naming the chat: the answer itself had finished.
                 session["terminal_reason"] = "completed"
-            session["turn_ended"] = time.time()  # The turn ended when the server stopped.
+            session["turn_ended"] = now  # The turn ended when the server stopped.
             changed = True
+        if cut_short or turn_open:
+            # Not the previous turn's record: the turn from the newest user message, its calls and subagents since.
+            events, calls = session["events"], session.get("inference_calls") or []
+            first = next((index for index in range(len(events) - 1, -1, -1) if events[index].get("type") == "user"),
+                         len(events))
+            created = events[first].get("created") if first < len(events) else None
+            started = created if type(created) in (int, float) and created <= now else now
+            first_call = next((index for index, call in enumerate(calls) if isinstance(call, dict) and
+                               type(call.get("created")) in (int, float) and call["created"] >= started), len(calls))
+            session["last_turn_result"] = turns.turn_result(self, session, {
+                "started": started, "first_event": first, "first_call": first_call}, session["terminal_reason"], now)
         return changed
 
     def descendants(self, session_id):

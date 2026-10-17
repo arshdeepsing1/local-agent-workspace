@@ -186,6 +186,18 @@ def cut_session(session, before_event_id=None, *, keep_local=False):
         result["terminal_reason"] = reason
     else:
         result.pop("terminal_reason", None)
+    if event_cut < len(session["events"]):
+        # Scripts read the header's result record: the remaining last turn's (its last reply's footer), never a
+        # removed turn's.
+        reply = None
+        for event in reversed(result["events"]):
+            if event.get("type") == "user":
+                break
+            reply = reply or (event if event.get("type") == "assistant" else None)
+        if reply is not None and isinstance(reply.get("turn_result"), dict):
+            result["last_turn_result"] = reply["turn_result"]
+        else:
+            result.pop("last_turn_result", None)
     if keep_local and before_event_id is not None:
         restored = _carried_output(session, before_event_id)
         if restored:

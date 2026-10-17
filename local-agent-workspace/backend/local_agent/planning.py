@@ -828,7 +828,7 @@ class DelegateManager:
             return None, ""
         configured = set(getattr(self.manager, "mcp_server_ids", list)())
         missing = [server for server in servers if server not in configured]
-        note = (f"mcp_servers names {', '.join(missing)}, not configured in Settings → MCP; "
+        note = (f"mcp_servers names {', '.join(missing)}, not configured in Agent tools → Extensions; "
                 f"{'it is' if len(missing) == 1 else 'they are'} left out.") if missing else ""
         return [server for server in servers if server in configured], note
 

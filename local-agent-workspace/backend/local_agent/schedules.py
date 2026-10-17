@@ -332,11 +332,12 @@ def check_schedule(values):
     zone_of(zone_name)
     model = (values.get("model") or "").strip()
     if model and not ENDPOINT_NAME.match(model):
-        raise ValueError("The model must be empty (the Settings model) or an endpoint name of letters, digits, '.', "
-                         "'_' and '-'.")
+        raise ValueError("The model must be empty (the project's or Settings model) or an endpoint name of letters, "
+                         "digits, '.', '_' and '-'.")
     effort = values.get("reasoning_effort") or ""
     if effort and effort not in EFFORT_LEVELS:
-        raise ValueError("Reasoning effort must be empty (the Settings default) or one of: " + ", ".join(EFFORT_LEVELS) + ".")
+        raise ValueError("Reasoning effort must be empty (the project's or Settings default) or one of: "
+                         + ", ".join(EFFORT_LEVELS) + ".")
     mode = values.get("permission_mode") or "dontAsk"
     if mode == "bypassPermissions":
         raise ValueError("Scheduled runs never use Bypass permissions: choose Manual, Auto, Accept edits, Plan or "
@@ -490,11 +491,22 @@ class Scheduler:
                 log.exception("Scheduled runs: a check failed.")
             await asyncio.sleep(TICK_SECONDS)
 
-    def notify(self, text):
-        """A desktop notification (Settings → Notifications, no page open); an open page shows the banner."""
-        page_open = bool(self.manager.pages or any(self.manager.listeners.values()))
+    def notify(self, text, item, status):
+        """A desktop notification (Settings → Notifications, no page open; an open page shows the banner) and the
+        notification hooks (status 'scheduled_ready' or 'scheduled_paused'), also with a page open or desktop
+        notifications off, as for a chat's notifications."""
+        manager = self.manager
+        page_open = bool(manager.pages or any(manager.listeners.values()))
+        # No chat exists yet: the hooks, and the rules that let them run, are those of the schedule's project and mode.
+        owner = {"id": "", "title": str(item.get("name") or ""), "workspace": str(item.get("workspace") or ""),
+                 "permission_mode": item.get("permission_mode") or "dontAsk"}
+        try:
+            if manager.has_hooks(owner, "notification"):
+                manager.notification_hooks(owner, status, text, page_open, schedule_id=item["id"])
+        except (ValueError, OSError):
+            log.warning("Scheduled runs: the notification hooks could not run for a schedule's project.")
         if self.settings.values.get("system_notifications") is True and not page_open:
-            self.manager.notifier.send(text)
+            manager.notifier.send(text)
 
     def label(self, item):
         return short_title(self.manager.redact_title(str(item.get("name") or "")))
@@ -552,7 +564,7 @@ class Scheduler:
         if changed:
             self.store.write(items)
         for item in ready:
-            self.notify(f"Scheduled run ready: {self.label(item)}")
+            self.notify(f"Scheduled run ready: {self.label(item)}", item, "scheduled_ready")
         # next_run is already past these runs, so each one that does not start gets a note: one that fails does not
         # keep the others from starting, and a stop of the scheduler (the app closing, Scheduled runs turned off)
         # during a connection check notes it and the runs after it.
@@ -681,7 +693,8 @@ class Scheduler:
         status, text = await connection_status(self.manager)
         if status == "rejected":
             if not user:
-                self.notify(f"Scheduled runs paused: Databricks rejected the token ({self.label(item)})")
+                self.notify(f"Scheduled runs paused: Databricks rejected the token ({self.label(item)})", item,
+                            "scheduled_paused")
             return refuse(text, pause="token_rejected")
         if status != "ok":
             return refuse(text)
@@ -714,8 +727,9 @@ class Scheduler:
 
     def create_chat(self, item, workspace, trigger, due, now):
         """The run's chat: the schedule's mode, model, effort and limits as its own, tagged 'scheduled', and named
-        after the schedule (no title request)."""
-        store, values = self.manager.store, self.settings.values
+        after the schedule (no title request). A model or effort the schedule leaves empty is the project's trusted
+        settings files', else Settings', as for a new chat (settings_layers.py)."""
+        store, values = self.manager.store, self.settings.effective(workspace)
         session = store.create({**values, "workspace": workspace})
         stamp = datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M")
         session.update(title=f"{self.manager.redact_title(item['name'])[:MAX_NAME]} · {stamp}", title_generated=True,
@@ -723,7 +737,7 @@ class Scheduler:
                        turn_token_limit=item["turn_token_limit"], turn_time_limit_minutes=item["turn_time_limit_minutes"],
                        tags=[TAG], schedule={"id": item["id"], "name": item["name"], "trigger": trigger,
                                              **({"due": due} if due is not None else {})})
-        if item.get("spending_limit_dbu"):  # 0: the chat follows Settings → Spending limit per conversation.
+        if item.get("spending_limit_dbu"):  # 0: the chat follows the project's files, else Settings' limit.
             session["spending_limit_dbu"] = item["spending_limit_dbu"]
         if item.get("reasoning_effort"):
             session["reasoning_effort"] = item["reasoning_effort"]

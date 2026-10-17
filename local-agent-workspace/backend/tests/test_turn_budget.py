@@ -10,7 +10,7 @@ import pytest
 from local_agent import turns
 from local_agent.agents import AgentManager
 from local_agent.api import create_app
-from local_agent.config import Settings
+from local_agent.config import MAX_TURN_TOKENS, Settings
 from local_agent.prompt_cache import unmarked
 from local_agent.store import Store
 from local_agent.telemetry import reported_tokens
@@ -434,3 +434,38 @@ async def test_the_route_sets_clears_and_reports_a_chats_turn_limits(api):
     assert refused.status_code == 400 and "parent conversation's turn limits" in refused.json()["detail"]
     child_status = (await client.get(f"/api/sessions/{child['id']}/metrics")).json()["turn_limits"]
     assert child_status["follows_parent"] is True and child_status["turn_time_limit_minutes"] is None
+
+
+async def test_forks_exports_and_imports_keep_a_chats_own_turn_limits_and_steps(api):
+    client, manager, settings = api
+    settings.values.update(turn_token_limit=50_000, turn_time_limit_minutes=5)  # Its own 0 must stay none.
+    source, done = manager.store.create(settings.values), {"model": OPUS, "status": "completed"}
+    source.update(title="Capped", title_generated=True, terminal_reason="completed", spending_limit_dbu=2.5,
+                  turn_token_limit=200_000, turn_time_limit_minutes=0, max_agent_steps=5,
+                  events=[{"id": "u1", "type": "user", "text": "Hi", "in_wire": True},
+                          {"id": "a1", "type": "assistant", "text": "Hello", "request_info": done},
+                          {"id": "u2", "type": "user", "text": "Again", "in_wire": True},
+                          {"id": "a2", "type": "assistant", "text": "Hello again", "request_info": done}],
+                  wire=[{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello"},
+                        {"role": "user", "content": "Again"}, {"role": "assistant", "content": "Hello again"}])
+    manager.store.save(source)
+    own = ("spending_limit_dbu", "turn_token_limit", "turn_time_limit_minutes", "max_agent_steps")
+    whole = await client.post(f"/api/sessions/{source['id']}/fork")
+    here = await client.post(f"/api/sessions/{source['id']}/fork", json={"before_event_id": "u2"})
+    bundle = (await client.get(f"/api/sessions/{source['id']}/export")).json()
+    imported = await client.post("/api/sessions/import", params={"workspace": settings.values["workspace"]}, json=bundle)
+    assert (whole.status_code, here.status_code, imported.status_code) == (201, 201, 201), imported.text
+    for copy_id in (whole.json()["id"], here.json()["id"], imported.json()["session"]["id"]):
+        copied = manager.store.get(copy_id)
+        assert {key: copied.get(key) for key in own} == {key: source[key] for key in own}
+        status = (await client.get(f"/api/sessions/{copy_id}/metrics")).json()["turn_limits"]
+        assert (status["turn_token_limit"], status["token_source"], status["turn_time_limit_minutes"],
+                status["time_source"]) == (200_000, "chat", None, "chat")
+    assert len(manager.store.get(here.json()["id"])["wire"]) == 2
+    for key, value in (("turn_token_limit", -1), ("turn_token_limit", MAX_TURN_TOKENS + 1),
+                       ("turn_time_limit_minutes", True), ("max_agent_steps", 0), ("max_agent_steps", 65)):
+        edited = json.loads(json.dumps(bundle))
+        edited["sessions"][0][key] = value
+        refused = await client.post("/api/sessions/import", params={"workspace": settings.values["workspace"]},
+                                    json=edited)
+        assert refused.status_code == 400 and key in refused.json()["detail"], (key, value)

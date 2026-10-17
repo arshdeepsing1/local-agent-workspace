@@ -281,3 +281,31 @@ async def test_open_worktree_api_rejects_symlink_replacement(worktrees, tmp_path
         saved.rename(target)
         # The TestClient lifespan closed its database; Git cleanup is sufficient.
         git(repo, "worktree", "remove", str(target))
+
+
+def test_a_worktree_chat_from_a_worktree_chat_starts_with_the_trusted_projects_effort(worktrees, tmp_path, monkeypatch):
+    """New chat in worktree from a worktree chat: the worktree's source is the first worktree's folder, but the
+    root project's trusted settings files set the new chat's effort, as its worktree header and Settings say."""
+    _, repo, _ = worktrees
+    (repo / ".agents").mkdir()
+    (repo / ".agents" / "settings.json").write_text(json.dumps({"reasoning_effort": "max"}))
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "project settings")
+    monkeypatch.setattr("local_agent.config.APP_ROOT", tmp_path)
+    settings = Settings(tmp_path / "api-state")
+    settings.env = {}
+    settings.values.update(workspace=str(repo), env_file="", reasoning_effort="low")
+    settings.credentials = lambda: ("https://fake.example", "synthetic-test-token")
+    with TestClient(create_app(settings)) as client:
+        client.headers["X-Local-Token"] = client.get("/api/bootstrap").json()["token"]
+        report = client.get("/api/settings/project").json()
+        assert client.post("/api/settings/project/trust", json={"decision": "trust", "sha256": report["sha256"]}).json()[
+            "status"] == "trusted"
+        first = client.post("/api/worktrees", json={"branch": "one"}).json()
+        chat = client.post(f"/api/worktrees/{first['id']}/session").json()
+        scope = {"session_id": chat["id"]}
+        second = client.post("/api/worktrees", params=scope, json={"branch": "two"}).json()
+        nested = client.post(f"/api/worktrees/{second['id']}/session", params=scope).json()
+        assert second["source_workspace"] == first["path"]
+        assert nested["worktree"]["source_workspace"] == chat["worktree"]["source_workspace"] == str(repo.resolve())
+        assert (chat["reasoning_effort"], nested["reasoning_effort"]) == ("max", "max")

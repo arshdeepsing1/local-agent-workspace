@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 from local_agent.api import create_app
+from local_agent.client import result_record
 from local_agent.config import Settings
 
 
@@ -42,6 +43,39 @@ async def test_a_restart_marks_only_an_unfinished_answer_as_interrupted(tmp_path
         recovered = second.state.manager.store.get(session["id"])
         assert recovered["terminal_reason"] == reason
         assert recovered["turn_ended"] and "turn_running" not in recovered
+
+
+async def test_a_restart_gives_the_cut_short_turn_its_own_result_record(tmp_path, monkeypatch):
+    """Scripts read the header's last_turn_result (client.wait_result): after a restart it is the interrupted
+    turn's, counted from its user message, not the previous turn's."""
+    settings = settings_for(tmp_path, monkeypatch)
+    previous = {"terminal_reason": "completed", "is_error": False, "started": 100.0, "ended": 105.0}
+    first = create_app(settings)
+    async with first.router.lifespan_context(first):
+        store = first.state.manager.store
+        session = store.create(settings.values)
+        info = {"model": "test-model", "status": "completed", "finish_reason": "stop"}
+        session.update(terminal_reason="completed", turn_running=True, turn_ended=None, last_turn_result=previous,
+                       events=[{"id": "u1", "type": "user", "text": "First", "created": 100.0, "in_wire": True},
+                               {"id": "a1", "type": "assistant", "text": "One.", "created": 104.0, "request_info": info,
+                                "turn_result": previous},
+                               {"id": "u2", "type": "user", "text": "Second", "created": 200.0, "in_wire": True},
+                               {"id": "a2", "type": "assistant", "text": "Part", "created": 202.0,
+                                "request_info": {**info, "status": "running"}}],
+                       wire=[{"role": "user", "content": "First"}, {"role": "assistant", "content": "One."},
+                             {"role": "user", "content": "Second"}],
+                       inference_calls=[{"id": f"c{index}", "purpose": "agent", "model": "test-model", "created": created,
+                                         "status": "completed", "usage": {"input_tokens": tokens, "output_tokens": 10}}
+                                        for index, (created, tokens) in enumerate(((101.0, 1000), (201.0, 2000)))])
+        store.save(session)
+    second = create_app(settings)
+    async with second.router.lifespan_context(second):
+        recovered = second.state.manager.store.get(session["id"])
+    result = recovered["last_turn_result"]
+    assert (result["terminal_reason"], result["is_error"], result["started"]) == ("interrupted", False, 200.0)
+    assert result["ended"] == round(recovered["turn_ended"], 3) and recovered["terminal_reason"] == "interrupted"
+    assert (result["steps"], result["usage"]["calls"], result["tokens"]) == (1, 1, 2010)
+    assert result_record(session["id"], result)["exit_code"] == 3  # Not the previous turn's 0.
 
 
 async def test_a_page_never_sees_a_new_turn_end_while_the_chat_is_busy(tmp_path, monkeypatch):

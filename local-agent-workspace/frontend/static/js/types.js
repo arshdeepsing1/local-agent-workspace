@@ -135,7 +135,8 @@
 //   which use Settings.reasoning_effort; kept by forks and imports; also in summaries),
 //   spending_limit_dbu?: number (the chat's own spending limit; 0 = none; absent: Settings.spending_limit_dbu;
 //   kept by forks and imports), turn_token_limit?, turn_time_limit_minutes? (the chat's own turn limits; 0 = none;
-//   absent: Settings'), max_agent_steps? (a scripted chat's own Agent steps), last_turn_result?: TurnResult (the
+//   absent: Settings'; kept by forks and imports), max_agent_steps? (a scripted chat's own Agent steps; kept by forks
+//   and imports), last_turn_result?: TurnResult (the
 //   last turn's; GET /info and the snapshot, not the list) }
 // POST /sessions { permission_mode, reasoning_effort?, model?, workspace?, max_agent_steps? } creates a chat (Settings'
 //   effort and model when absent; /clear sends the replaced chat's; workspace: an existing absolute folder, never the

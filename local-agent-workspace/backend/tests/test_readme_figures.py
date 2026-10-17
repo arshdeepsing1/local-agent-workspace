@@ -1,5 +1,7 @@
 """The README's compaction and context-meter figures, recomputed from context.py at the default
-model and budgets (Claude Opus 5.5 at 200,000 and 16,384) and at the old 131,072 and 8,192."""
+model and budgets (Claude Opus 5.5 at 200,000 and 16,384) and at the old 131,072 and 8,192, and the lists the README
+keeps by hand of what the code does."""
+import re
 from pathlib import Path
 
 from local_agent import context
@@ -73,3 +75,19 @@ def test_the_readme_window_margin_figures_match_the_code():
     assert f"about 108,748 ({compaction_threshold(gpt, 90):,} on GPT OSS 120B, whose window those budgets fill)" in text
     window, output = default_limits(DEFAULT_MODEL)
     assert effective_input_budget(window, output, model_context_window(DEFAULT_MODEL)) == figures(window, output)["budget"]
+
+
+def test_the_readme_lists_match_the_code():
+    """The Changes view's credential names (tools.SECRET_NAMES), the endings the notification hook row names
+    (notify.attention_message and the scheduler's), and sentences the features made wrong."""
+    from local_agent.tools import SECRET_NAMES
+    text = readme()
+    start = text.index("Credential files at any depth")
+    assert SECRET_NAMES <= set(re.findall(r"`([^`]+)`", text[start:text.index("Credential file: diff hidden", start)]))
+    row = next(line for line in README.read_text(encoding="utf-8").splitlines() if line.startswith("| `notification` |"))
+    for ending in ("step limit", "spending limit", "token or time limit", "background subagent", "scheduled run"):
+        assert ending in row, ending
+    for stale in ("costs nothing today because the token estimate already bounds the size",
+                  "Thinking is not replayed as model history", "Six more names joined", "Settings → MCP",
+                  "Agent tools → Skills", "no view adds usage across chats", "follow Settings when left empty"):
+        assert stale not in text, stale

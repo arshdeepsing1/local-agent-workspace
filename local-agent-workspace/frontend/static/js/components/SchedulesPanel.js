@@ -191,14 +191,15 @@ function ScheduleForm({ editing, limits, busy, onCancel, onSave }) {
       <label>Time limit per run (minutes)<input type="number" min=${1} max=${limits.max_turn_minutes || 1440} step=${1} value=${Number.isFinite(form.turn_time_limit_minutes) ? form.turn_time_limit_minutes : ''} onInput=${whole('turn_time_limit_minutes')} /></label>
       <label>Spending limit per run (DBU)<input type="number" min=${0} step="any" inputmode="decimal" value=${Number.isFinite(form.spending_limit_dbu) ? form.spending_limit_dbu : ''}
         onInput=${e => { const text = e.currentTarget.value.trim(); field('spending_limit_dbu', text === '' ? NaN : Number(text)) }} /></label>
-      <label>Agent steps<input type="number" min=${1} max=${64} step=${1} value=${form.max_agent_steps ?? ''} placeholder="Settings" onInput=${whole('max_agent_steps')} /></label>
+      <label>Agent steps<input type="number" min=${1} max=${64} step=${1} value=${form.max_agent_steps ?? ''} placeholder="Project or Settings" onInput=${whole('max_agent_steps')} /></label>
     </div>
-    <p class="field-help">Required: the token and time limits end a run as a turn's limits do (Settings → Agent). The spending limit counts estimated DBU (0 follows Settings → Agent → Spending limit per conversation); endpoints without price data are capped by the token limit only.</p>
+    <p class="field-help">Required: the token and time limits end a run as a turn's limits do (Settings → Agent). The spending limit counts estimated DBU (0 follows the project's trusted settings files, else Settings → Agent → Spending limit per conversation); endpoints without price data are capped by the token limit only.</p>
     <div class="schedule-limits">
-      <label>Model endpoint<input spellcheck=${false} value=${form.model} onInput=${e => field('model', e.currentTarget.value)} placeholder="The Settings model" /></label>
+      <label>Model endpoint<input spellcheck=${false} value=${form.model} onInput=${e => field('model', e.currentTarget.value)} placeholder="The project's or Settings model" /></label>
       <label>Reasoning effort<select value=${form.reasoning_effort} onChange=${e => field('reasoning_effort', e.currentTarget.value)}>
-        <option value="">The Settings default</option>${Object.entries(EFFORT_LABELS).map(([value, label]) => html`<option key=${value} value=${value}>${label}</option>`)}</select></label>
+        <option value="">The project's or Settings default</option>${Object.entries(EFFORT_LABELS).map(([value, label]) => html`<option key=${value} value=${value}>${label}</option>`)}</select></label>
     </div>
+    <p class="field-help">Left empty, Agent steps, the model and the effort follow the project's trusted settings files (.agents/settings.json), else Settings, as a new chat there does.</p>
     <label>Run policy<select value=${form.run_policy} onChange=${e => field('run_policy', e.currentTarget.value)}>
       <option value="ask">Ask before each run (Run or Skip)</option><option value="auto">Run automatically</option></select></label>
     ${form.run_policy === 'auto' ? html`<p class="settings-note" role="status">Runs start at their times without a click, and each one makes model calls billed to your workspace.</p>`

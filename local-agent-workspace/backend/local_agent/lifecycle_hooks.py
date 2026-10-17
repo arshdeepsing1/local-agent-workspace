@@ -386,12 +386,13 @@ class LifecycleHooks:
             return note["text"]
         return before
 
-    def notification_hooks(self, session, status, message, page_open):
+    def notification_hooks(self, session, status, message, page_open, schedule_id=None):
         """Run the enabled notification hooks for one of the app's notifications (notify.attention_message) in
         the background. A hook runs only when it may run without a card (Bypass, or an allow rule such as
         Extensions' Run without asking): a card would itself notify. At most one run of a hook at a time (a
         notification while it runs is dropped); its output is ignored except for a log line when it fails.
-        stdin: the status, the message, the short redacted title and whether a page is open; never chat text."""
+        stdin: the status, the message, the short redacted title and whether a page is open; never chat text.
+        A scheduled run's notification (schedules.py) has no chat: session_id '' and its schedule_id."""
         hooks = self.matching_hooks(session, "notification")
         if not hooks:
             return
@@ -399,6 +400,8 @@ class LifecycleHooks:
         tools = self.session_tools(session)
         payload = {"event": "notification", "session_id": session["id"], "status": status, "message": message,
                    "title": short_title(self.redact_title(str(session.get("title") or ""))), "page_open": page_open}
+        if schedule_id is not None:
+            payload["schedule_id"] = schedule_id
         if session.get("is_subagent"):
             payload["agent"] = self.hook_agent(session)
         for hook, _ in hooks:

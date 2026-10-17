@@ -111,6 +111,9 @@ def test_a_new_schedule_needs_its_caps_and_never_offers_bypass(ui, page):
     modes = form.get_by_role("combobox", name="Permission mode").locator("option")
     expect(modes).to_have_text(["Don't ask (recommended)", "Plan", "Manual", "Accept edits", "Auto"])
     expect(form.get_by_role("combobox", name="Run policy")).to_have_value("ask")
+    # Left empty, the model and effort follow the project's trusted settings files, else Settings.
+    expect(form.get_by_role("textbox", name="Model endpoint")).to_have_attribute("placeholder", "The project's or Settings model")
+    expect(form.get_by_text(re.compile("follow the project's trusted settings files"))).to_be_visible()
     form.get_by_role("textbox", name="Name").fill("Morning summary")
     form.get_by_role("textbox", name="Prompt").fill("Summarize yesterday's commits.")
     form.get_by_role("textbox", name="When it runs").fill("* * * * *")
