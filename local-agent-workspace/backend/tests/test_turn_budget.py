@@ -319,6 +319,120 @@ async def test_a_subagent_counts_toward_its_parents_turn_and_reports_its_stop(ru
     assert session["last_turn_result"]["subagents"]["tokens"] == 33_000
 
 
+# A background subagent across its parent's turns: its requests count in the turn during which they were made.
+
+def gated_gateway(monkeypatch, parent, child):
+    """parent(n) and child(n), async: the SSE text of the chat's nth agent request and of its subagent's nth."""
+    requests, children = [], []
+
+    async def gateway(request):
+        body = json.loads(request.content)
+        if body.get("stream") is not True:
+            return httpx.Response(200, json={"choices": [{"message": {"content": "Title"}, "finish_reason": "stop"}]})
+        if is_child(body):
+            children.append(body)
+            return httpx.Response(200, text=await child(len(children)))
+        requests.append(body)
+        return httpx.Response(200, text=await parent(len(requests)))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: REAL_CLIENT(**kwargs, transport=httpx.MockTransport(gateway)))
+    return requests, children
+
+
+async def eventually(condition, timeout=5):
+    for _ in range(int(timeout * 100)):
+        if condition():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("condition not reached")
+
+
+def completed_calls(manager, child_id):
+    child = manager.get(child_id) or {}
+    return sum(call.get("status") == "completed" for call in child.get("inference_calls") or [])
+
+
+async def background_turn(manager, session, monkeypatch, turn_two, gates):
+    """Turn 1 starts a background subagent that makes one request in it and one more while the chat is idle;
+    its request n then waits for gates[n]. turn_two(n, child_id): the parent's nth request (from 3 on)."""
+    state, idle = {}, asyncio.Event()
+    gates = {2: idle, **gates}
+
+    async def child(count):
+        if count in gates:
+            await gates[count].wait()
+        return calls_reply((f"x{count}", "list_tasks", {})) if count < 4 else text_reply("## Report\nMapped.")
+
+    async def parent(count):
+        if count == 1:
+            return calls_reply(("d1", "delegate_task", {"task": "Map it", "agent_type": "explore", "background": True}))
+        if count == 2:  # The subagent's first request ends within turn 1.
+            state["child"] = manager.delegates.background[session["id"]][0]["child_session_id"]
+            await eventually(lambda: completed_calls(manager, state["child"]) == 1)
+            return text_reply("Started it.")
+        return await turn_two(count, state["child"])
+    requests, children = gated_gateway(monkeypatch, parent, child)
+    manager.store.save(session)
+    first = await started_turn(manager, session, "Map it in the background")
+    idle.set()
+    await eventually(lambda: completed_calls(manager, state["child"]) == 2)  # Its second, while the chat is idle.
+    return first, state["child"], requests
+
+
+async def test_a_background_subagent_counts_only_in_the_turn_during_which_it_made_its_requests(runtime, monkeypatch):
+    manager, session = runtime
+    gates = {3: asyncio.Event(), 4: asyncio.Event()}
+    seen = {}
+
+    async def turn_two(count, child_id):
+        if count == 3:
+            seen["used"] = turns.used(manager, manager.get(session["id"]))[2]
+            root, _, tokens, _ = turns.used(manager, manager.get(child_id))
+            seen["child_scope"] = (root["id"], tokens)
+            gates[3].set()  # The subagent's third request is made during turn 2.
+            await eventually(lambda: completed_calls(manager, child_id) == 3)
+            return calls_reply(("p3", "list_tasks", {}))
+        return text_reply("Done with turn two.")
+    first, child_id, requests = await background_turn(manager, session, monkeypatch, turn_two, gates)
+    one = first["last_turn_result"]
+    assert one["tokens"] == 33_000 and one["subagents"] == {"count": 1, "tokens": 11_000,
+                                                             "estimated_dbu": pytest.approx(PER_CALL)}
+    # Turn 2 has its own limit: its requests (22,000) and the subagent's one request in it (11,000) stay under it,
+    # though the subagent spent 22,000 more before the turn began.
+    manager.get(session["id"])["turn_token_limit"] = 40_000
+    second = await started_turn(manager, session, "Something else")
+    two = second["last_turn_result"]
+    assert seen["used"] == 0 and len(requests) == 4 and "per turn" not in system_text(requests[3])
+    assert two["terminal_reason"] == "completed" and two["tokens"] == 33_000
+    assert two["subagents"] == {"count": 1, "tokens": 11_000, "estimated_dbu": pytest.approx(PER_CALL)}
+    assert two["estimated_dbu"] == pytest.approx(3 * PER_CALL)
+    # The subagent started before turn 2 keeps its own budget: its whole run, not the parent's new turn.
+    assert seen["child_scope"] == (child_id, 22_000)
+    assert first["last_turn_result"] == one  # Turn 1's record is unchanged.
+    # A turn during which it makes no request does not count it.
+    third = await started_turn(manager, session, "And a third thing")
+    assert third["last_turn_result"]["subagents"] == {"count": 0, "tokens": 0, "estimated_dbu": 0.0}
+    gates[4].set()
+    await eventually(lambda: manager.delegates.background_running(session["id"]) == 0)
+
+
+async def test_a_background_subagent_that_ends_during_a_later_turn_counts_its_requests_in_it(runtime, monkeypatch):
+    manager, session = runtime
+    gates = {3: asyncio.Event(), 4: asyncio.Event()}
+
+    async def turn_two(count, child_id):
+        if count == 3:
+            gates[3].set()
+            gates[4].set()  # It makes its last two requests and ends while the parent waits for it.
+            return calls_reply(("g1", "get_subagent_result", {"subagent_id": child_id, "wait_seconds": 10}))
+        return text_reply("It is done.")
+    _, child_id, _ = await background_turn(manager, session, monkeypatch, turn_two, gates)
+    second = await started_turn(manager, session, "Wait for it")
+    assert manager.delegates.background_running(session["id"]) == 0
+    two = second["last_turn_result"]
+    assert two["subagents"] == {"count": 1, "tokens": 22_000, "estimated_dbu": pytest.approx(2 * PER_CALL)}
+    assert two["tokens"] == 44_000
+
+
 async def test_a_change_during_the_turn_applies_from_the_next_request(runtime, monkeypatch):
     manager, session = runtime
 

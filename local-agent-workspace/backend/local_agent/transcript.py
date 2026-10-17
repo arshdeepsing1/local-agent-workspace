@@ -329,8 +329,10 @@ def transcript(session, *, excerpt_chars=EXCERPT_CHARS, redact=lambda text: text
         if kind == "user":
             turn += 1
             delegated = (event.get("origin") or {}).get("kind") == "delegated"
-            lines += ["---", "", f"## Turn {turn} · {_when(event.get('created'))}", "",
-                      f"**User{' (delegated by the parent conversation)' if delegated else ''}:**", "",
+            # The app's message that continued the chat after a background subagent is not the user's.
+            who = ("User (delegated by the parent conversation)" if delegated else
+                   "App (sent when a background subagent finished)" if event.get("background_wake") is True else "User")
+            lines += ["---", "", f"## Turn {turn} · {_when(event.get('created'))}", "", f"**{who}:**", "",
                       _demote_headings(text) or "(empty message)", ""]
             lines += ["_Attached when sent: " + "; ".join(_attachment(item) for item in event["attachments"] if isinstance(item, dict)) + "_", ""] if isinstance(event.get("attachments"), list) and event["attachments"] else []
         elif kind == "assistant" and text:

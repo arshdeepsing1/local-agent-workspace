@@ -55,6 +55,17 @@ def test_transcript_keeps_messages_in_order_and_shortens_tool_results():
     assert transcript({"events": []}).startswith("# Transcript: Untitled conversation\n")
 
 
+def test_the_apps_message_after_a_background_subagent_is_not_labelled_as_yours():
+    from local_agent.planning import WAKE_TEXT
+    wake = WAKE_TEXT.format(id="1234abcd", kind="explore", ending="finished")
+    session = {"events": [{"id": "u1", "type": "user", "text": "Map it in the background"},
+                          {"id": "u2", "type": "user", "text": wake, "verbatim": True, "background_wake": True}]}
+    text = transcript(session)
+    first, second = text.split("## Turn 2", 1)
+    assert "**User:**" in first and "**User:**" not in second
+    assert "**App (sent when a background subagent finished):**" in second and "the background subagent 1234abcd" in second
+
+
 def test_configured_credentials_are_redacted_too():
     session = {"events": [{"type": "user", "text": "My token is private-value-123"}]}
     assert "private-value-123" not in transcript(session, redact=lambda text: text.replace("private-value-123", "[REDACTED]"))

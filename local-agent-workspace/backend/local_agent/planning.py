@@ -145,8 +145,13 @@ BACKGROUND_STARTED = ("Started in the background; this chat continues. A notice 
 BACKGROUND_QUEUED = ("Queued in the background: it starts when one of the three subagent slots frees; this chat continues. "
                      "get_subagent_result without subagent_id lists this chat's background subagents.")
 BACKGROUND_ENDINGS = {"completed": "finished", "failed": "failed", "cancelled": "was stopped", "interrupted": "was interrupted"}
+# A scheduled run's delegate_task asking for the background (runs_in_background): the card and its result say so.
+SCHEDULED_FOREGROUND = "background is ignored in a scheduled run, which waits for its subagents so its limits cover them."
 NOTICE_ENTRIES = 5
 LIST_ENTRIES = 20
+# How a turn ended when the chat may go on by itself (queued messages, the wake below); a limit, an error or a
+# stop waits for the user's Continue.
+CONTINUE_REASONS = ("completed", "tool_error")
 WAKE_TEXT = ("[Sent by the app: the background subagent {id} ({kind}) {ending}. Read its report with get_subagent_result "
              "and continue the task.]")
 PENDING_TITLE = 200
@@ -810,9 +815,15 @@ class DelegateManager:
 
     @staticmethod
     def background_call(arguments, spec):
-        """Whether a delegate_task call runs in the background: its background argument, else its agent's default."""
+        """Whether a delegate_task call asks to run in the background: its background argument, else its agent's
+        default."""
         value = arguments.get("background")
         return value if isinstance(value, bool) else spec.get("background") is True
+
+    def runs_in_background(self, parent, arguments, spec):
+        """Whether a delegate_task call runs in the background: as it asks (background_call), except in a scheduled
+        run, whose turn waits for its subagents so the run's limits and approval limit cover them."""
+        return self.background_call(arguments, spec) and self.manager.scheduled_run(parent) is None
 
     @staticmethod
     def agent_mode(parent, spec):
@@ -849,11 +860,13 @@ class DelegateManager:
         if spec["effort"]:
             parts.append(f"effort {EFFORT_LABELS[spec['effort']]}")
         steps = arguments.get("max_steps") or spec["max_steps"] or DEFAULT_STEPS
-        kind = "a background subagent" if self.background_call(arguments, spec) else "a subagent"
+        kind = "a background subagent" if self.runs_in_background(parent, arguments, spec) else "a subagent"
         text = (f"Start {kind} ({' · '.join(parts)}; separate paid model requests, at most {steps} steps)"
                 f"\n\nTask: {arguments['task']}"
                 + (f"\nContext: {arguments['context']}" if arguments.get("context") else "")
                 + (f"\nTool profile: {arguments['tool_profile']}" if arguments.get("tool_profile") else ""))
+        if self.background_call(arguments, spec) and kind == "a subagent":
+            text += f"\nRuns in the foreground: {SCHEDULED_FOREGROUND}"
         if spec["custom"]:
             text += f"\nAgent file: {spec['path']}"
             tools = self.agent_tools(parent, spec, profile)
@@ -1241,13 +1254,16 @@ class DelegateManager:
     async def maybe_wake(self, parent_id):
         """Settings → Subagents → Continue the chat when a background subagent finishes (off by default: it
         starts a paid turn): an idle chat whose model was not told of a finished background subagent gets an
-        app message that starts its next turn. Never raises."""
+        app message that starts its next turn. Not a chat whose last turn stopped at a limit, an error or a
+        stop (Continue is the user's choice), and never a scheduled run's chat, which nobody may be watching;
+        their notice waits for the next message. Never raises."""
         try:
             if (self.manager.settings.values.get("background_subagent_wake") is not True or self.manager.closing
                     or parent_id in self.stopping):
                 return
             parent = self.manager.get(parent_id)
-            if (not parent or parent.get("is_subagent") or self.manager.busy_task(parent_id)
+            if (not parent or parent.get("is_subagent") or isinstance(parent.get("schedule"), dict)
+                    or parent.get("terminal_reason") not in CONTINUE_REASONS or self.manager.busy_task(parent_id)
                     or self.manager.statuses.get(parent_id, "idle") != "idle" or not self.wake_due(parent)):
                 return
             if any(not item.get("paused") for item in self.manager.queue_of(parent)):

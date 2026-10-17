@@ -12,9 +12,12 @@ then change that chat). --output text prints the final reply (and a one-line sum
 result object, stream-json every message of the chat as one JSON line and then the result. Cards are
 declined by default (--approve deny: nothing waits for the approval timeout, and questions are skipped);
 --approve ask asks you in the terminal (a TTY only; control characters in what the agent wrote are shown
-as escapes). Bypass permissions, chosen with --mode or already set on the --session chat, needs
---confirm-bypass. Exit codes: 0 completed, 1 error, 2 a limit was reached (steps, spending or the turn's
-tokens or time), 3 stopped or interrupted (Ctrl+C stops the turn).
+as escapes), with the card's warnings (a secret file it reads, a protected file, a hook that asked). A
+turn that leaves background subagents working is reported once they ended, their cards answered the same
+way. Bypass permissions, chosen with --mode or already set on the --session chat, needs
+--confirm-bypass. Exit codes: 0 completed, 1 error, 2 a limit was reached (steps, spending or the
+turn's tokens or time), 3 stopped or interrupted (Ctrl+C stops the turn, or the background subagents
+it left working).
 
 The script talks to the app at --url (default http://127.0.0.1:8765) and never starts a server itself,
 so it cannot run a second app on the same state folder. Every model request is a paid call to your
@@ -61,8 +64,28 @@ def show(text):
     return escaped
 
 
+def card_warnings(context):
+    """The warnings of an approval card (client.CARD_WARNINGS), one line each, as the page shows them."""
+    lines = []
+    if isinstance(context.get("secret_files"), list) and context["secret_files"]:
+        lines.append("Reads a secret file: " + ", ".join(map(str, context["secret_files"]))
+                     + ". If you approve, its contents can reach the model.")
+    if context.get("protected"):
+        lines.append(f"Protected file: {context['protected']}. Edits to it always need your approval.")
+    if isinstance(context.get("hook_ask"), dict):
+        hook = context["hook_ask"]
+        lines.append(f"The hook {hook.get('hook_id')} asked for your approval" + (f": {hook['reason']}" if hook.get("reason") else "."))
+    if context.get("uncertain"):
+        lines.append("This command could not be checked exactly against your deny and ask rules.")
+    if isinstance(context.get("sibling_change"), dict):
+        sibling = context["sibling_change"]
+        lines.append(f"Another subagent of this chat ({sibling.get('agent_type') or 'general'}, "
+                     f"{str(sibling.get('subagent_id'))[:8]}) changed {sibling.get('path')} during its run.")
+    return lines
+
+
 def ask_tool(name, arguments, context):
-    """--approve ask: one approval in the terminal."""
+    """--approve ask: one approval in the terminal, with the card's warnings."""
     who = " (subagent)" if context.get("subagent") else ""
     if name == "submit_plan":
         print(f"\nPlan{who}:", file=sys.stderr)
@@ -72,7 +95,10 @@ def ask_tool(name, arguments, context):
         return Allow("acceptEdits") if answer == "a" else Allow("manual") if answer in ("m", "y", "yes") else Deny()
     preview = context.get("preview") or json.dumps(arguments, ensure_ascii=False)[:2000]
     print(f"\nApproval{who}: {shown(name)[0]}", file=sys.stderr)
-    if show(preview):
+    escaped = show(preview)
+    for line in card_warnings(context):
+        escaped = show(f"Warning: {line}") or escaped
+    if escaped:
         print(ESCAPED_NOTE, file=sys.stderr)
     if input("Allow it? [y/N] ").strip().lower() in ("y", "yes"):
         return Allow()
@@ -145,7 +171,7 @@ def main(argv=None):
         parser.error("--approve ask needs a terminal (and a prompt given as an argument)")
     interactive = args.approve == "ask"
     client = LocalAgentClient(args.url)
-    result, session_id, previous = None, args.session, None
+    result, session_id, previous, stopped = None, args.session, None, False
     try:
         if session_id is None:
             session_id = client.create_session(args.workspace, args.mode or "plan", args.model, args.effort,
@@ -172,6 +198,7 @@ def main(argv=None):
                 client.set_turn_limits(session_id, args.max_tokens, args.max_minutes)
         messages = client.query(prompt.strip(), session_id=session_id, can_use_tool=ask_tool if interactive else None,
                                 on_question=ask_questions if interactive else None)
+        waiting = False  # The turn ended; its background subagents still work.
         try:
             for message in messages:
                 if message["type"] == "result":
@@ -179,18 +206,26 @@ def main(argv=None):
                 elif message["type"] == "answer_refused":
                     print(f"agent_run: the app refused that answer ({shown(message['error'])[0]}): "
                           f"{FALLBACKS.get(message['answered'], 'it was declined')}.", file=sys.stderr)
+                elif message["type"] == "background_wait":
+                    waiting = True
+                    count = message["running"]
+                    print(f"agent_run: the turn ended; waiting for {count} background subagent{'' if count == 1 else 's'} "
+                          "(Ctrl+C stops them).", file=sys.stderr)
+                elif message["type"] == "status" and message.get("status") != "idle" and not message.get("subagent"):
+                    waiting = False  # The app continued the chat: a turn runs again.
                 if args.output == "stream-json":
                     print(json_text(message), flush=True)
         except KeyboardInterrupt:
-            print("\nStopping the turn…", file=sys.stderr)
+            print("\nStopping the background subagents…" if waiting else "\nStopping the turn…", file=sys.stderr)
             messages.close()  # Its streams end now.
-            client.interrupt(session_id)
+            client.interrupt(session_id)  # Stop also stops the chat's background subagents.
             result = client.wait_result(session_id, after=previous)  # The stopped turn's result.
             if result is None:
                 print("agent_run: stopped before the prompt started a turn.", file=sys.stderr)
                 return 3
             if args.output == "stream-json":
                 print(json_text(result), flush=True)
+            stopped = waiting  # Its turn had ended: you stopped what it left running.
     except LocalAgentError as exc:
         print(f"agent_run: {exc}", file=sys.stderr)
         return 1
@@ -204,7 +239,7 @@ def main(argv=None):
     elif args.output == "text":
         print(shown(result["result"])[0] if sys.stdout.isatty() else result["result"])
         print(summary_line(result), file=sys.stderr)
-    return result["exit_code"]
+    return 3 if stopped else result["exit_code"]
 
 
 if __name__ == "__main__":
