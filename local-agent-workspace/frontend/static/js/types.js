@@ -319,7 +319,8 @@
 //   compactable? (false: Compact now has no earlier turn to summarize until the next user message; absent on
 //   older meters, which allow it),
 //   estimate_prior? (true: estimate_scale is the model's starting ratio, not yet from reported counts),
-//   auto_compact_threshold?, auto_compact_percent?, compaction_deferred? (over the threshold but within the input
+//   auto_compact_threshold?, auto_compact_percent?, auto_compact_source? ('project' or 'local': a trusted project
+//   settings file sets the percent), compaction_deferred? (over the threshold but within the input
 //   budget, and no cut brings it under the threshold: sent as it was), compaction?: Compaction (when this request compacted), last_request?: LastRequest,
 //   next_estimate?: { tokens, scale?, anchor? ({ model, reported, added, raw }: anchored like estimate_anchor),
 //   held_anchor? (the same, kept after a change to another model so a change back anchors again),

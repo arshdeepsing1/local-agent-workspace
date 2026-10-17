@@ -87,6 +87,8 @@ def read_file(root, relative):
         if len(data) > MAX_FILE_BYTES:
             return b"", f"It is larger than {MAX_FILE_BYTES // 1024} KB, so it is not read."
         return data, None
+    except OSError as exc:  # A read that fails part way (a dropped network mount answers EIO).
+        return b"", f"It cannot be read ({exc.strerror or type(exc).__name__})."
     finally:
         os.close(descriptor)
 
@@ -231,11 +233,14 @@ class ProjectLayers:
         'project' or 'local'), followed (budgets that follow the files' model), notes}."""
         try:
             folder = Path(workspace).expanduser().resolve()
+            found = folder.is_dir()
         except (OSError, RuntimeError, ValueError):
-            folder = None
-        user = {key: self.settings.values.get(key) for key in LAYERABLE}
-        if folder is None or not folder.is_dir():
+            # A folder the app may not look at (no access, a dropped network mount): no files apply, and the page,
+            # which reports the Settings project's files, still loads.
+            found = False
+        if not found:
             return self._empty(str(workspace))
+        user = {key: self.settings.values.get(key) for key in LAYERABLE}
         cache_key = (str(folder), json.dumps(user, sort_keys=True, default=str),
                      tuple(signature(folder / name) for _, name in FILES), signature(folder / ".agents"),
                      signature(self.path))

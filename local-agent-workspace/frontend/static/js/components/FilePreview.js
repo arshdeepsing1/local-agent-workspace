@@ -3,13 +3,14 @@ import { apiBlob } from '../api.js'
 import { enhanceCodeBlocks, renderMarkdownPreview } from '../markdown.js'
 
 // The Workspace panel's file preview (M8g2). Nothing in it runs as a page of the app's origin:
-// - images (PNG, JPEG, GIF, WebP and SVG) show in an <img> from a blob, where an SVG's scripts never run;
+// - images (PNG, JPEG, GIF and WebP) show in an <img> from a blob; an SVG from a data: URL (see previewUrl);
 // - a PDF shows in the browser's viewer, from a blob typed application/pdf;
 // - Markdown is rendered and sanitized like a reply; images in the project are loaded from it, images from the web
 //   are not loaded, and web links open in a new tab;
 // - an HTML file shows in a sandboxed frame, which has an origin of its own (it cannot reach the app, its token or
 //   the API) and loads nothing (its policy, and the page's frame-src that keeps it from navigating). Its scripts
-//   run only after Run scripts, for that file until the page is reloaded.
+//   run only after Run scripts, for that file until the page is reloaded; they can still open WebRTC connections,
+//   which no policy or sandbox flag blocks, and the note says so.
 const KINDS = { png: 'image', jpg: 'image', jpeg: 'image', gif: 'image', webp: 'image', svg: 'image', pdf: 'pdf',
   md: 'markdown', markdown: 'markdown', html: 'html', htm: 'html' }
 const TYPES = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp',
@@ -31,19 +32,34 @@ export async function downloadFile(path, query) {
   try { link.click() } finally { link.remove(); URL.revokeObjectURL(url) }
 }
 
-// A blob URL of the file's bytes, typed by its extension (never by the server or the bytes), revoked when unused.
+// The URL a file's bytes are shown from, typed by its extension (never by the server or the bytes): a blob URL, or
+// a data: URL for an SVG. Opened on its own (Open image in new tab), a blob URL is a page of the app's origin, where
+// an SVG's scripts would run and could read the app's token; a data: URL is a page with an origin of its own.
+async function previewUrl(blob, path) {
+  const typed = new Blob([blob], { type: TYPES[extension(path)] || 'application/octet-stream' })
+  if (typed.type !== 'image/svg+xml') return URL.createObjectURL(typed)
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(reader.result)
+    reader.onerror = () => reject(reader.error)
+    reader.readAsDataURL(typed)
+  })
+}
+const revoke = url => { if (url?.startsWith('blob:')) URL.revokeObjectURL(url) }
+
+// The preview URL of a file, revoked when unused.
 function useFileUrl(path, query, version) {
   const [state, setState] = useState({ url: null, error: '', bytes: 0 })
   useEffect(() => {
     let active = true, url = null
     setState({ url: null, error: '', bytes: 0 })
-    apiBlob(rawPath(path, query)).then(({ blob }) => {
-      if (!active) return
-      const typed = new Blob([blob], { type: TYPES[extension(path)] || 'application/octet-stream' })
-      url = URL.createObjectURL(typed)
-      setState({ url, error: '', bytes: typed.size })
-    }, error => { if (active) setState({ url: null, error: error.message, bytes: 0 }) })
-    return () => { active = false; if (url) URL.revokeObjectURL(url) }
+    apiBlob(rawPath(path, query)).then(async ({ blob }) => {
+      const shown = await previewUrl(blob, path)
+      if (!active) return revoke(shown)
+      url = shown
+      setState({ url, error: '', bytes: blob.size })
+    }).catch(error => { if (active) setState({ url: null, error: error.message, bytes: 0 }) })
+    return () => { active = false; revoke(url) }
   }, [path, query, version])
   return state
 }
@@ -95,9 +111,8 @@ function MarkdownPreview({ path, content, query, onOpenPath }) {
       const local = path.startsWith('/') ? null : projectPath(address, path)
       if (/^data:image\/(?:png|jpeg|gif|webp);/i.test(address)) image.src = address
       else if (local && previewKind(local) === 'image') {
-        apiBlob(rawPath(local, query)).then(({ blob }) => {
-          if (!active) return
-          const url = URL.createObjectURL(new Blob([blob], { type: TYPES[extension(local)] }))
+        apiBlob(rawPath(local, query)).then(({ blob }) => previewUrl(blob, local)).then(url => {
+          if (!active) return revoke(url)
           urls.push(url)
           image.src = url
         }, () => { if (active) image.replaceWith(blocked(image, 'Image not found in the project')) })
@@ -109,7 +124,7 @@ function MarkdownPreview({ path, content, query, onOpenPath }) {
       if (local) { link.dataset.path = local; link.title = `Open ${local}` }
       else if (/^https?:/i.test(address)) { link.target = '_blank'; link.rel = 'noopener noreferrer' }
     }
-    return () => { active = false; urls.forEach(url => URL.revokeObjectURL(url)) }
+    return () => { active = false; urls.forEach(revoke) }
   }, [markup, path, query])
   const click = event => {
     const link = event.target.closest?.('a[href]')
@@ -150,7 +165,7 @@ function HtmlPreview({ path, content, query }) {
   }
   const page = useMemo(() => framedHtml(content), [content])
   return html`<div class="file-preview file-preview-html">
-    <p class="file-preview-note"><span>${scripts ? 'Scripts run in a sandbox, without network or access to the app.' : 'Scripts are off. Nothing is loaded from the network.'}</span>
+    <p class="file-preview-note"><span>${scripts ? 'Scripts run in a sandbox without access to the app. Requests are blocked, WebRTC connections are not: run scripts only in files you trust.' : 'Scripts are off. Nothing is loaded from the network.'}</span>
       <button type="button" class="outline" aria-pressed=${scripts} onClick=${toggle}>${scripts ? 'Stop scripts' : 'Run scripts'}</button></p>
     <iframe key=${scripts ? 'scripts' : 'static'} class="file-preview-frame" sandbox=${scripts ? 'allow-scripts' : ''}
       referrerpolicy="no-referrer" title=${`Preview of ${path}`} srcdoc=${page} /></div>`

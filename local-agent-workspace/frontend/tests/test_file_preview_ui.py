@@ -18,13 +18,15 @@ def png(width, height):
 
 PNG = png(2, 1)
 FILES = [{"path": name, "name": name, "directory": False}
-         for name in ("logo.png", "paper.pdf", "README.md", "page.html", "data.bin")]
-TEXT = {"README.md": "# Guide\n\nSee ![logo](logo.png) and ![remote](https://example.com/track.png).\n\n"
+         for name in ("logo.png", "logo.svg", "paper.pdf", "README.md", "page.html", "data.bin")]
+SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="4" height="3"><rect width="4" height="3" fill="teal"/></svg>'
+TEXT = {"README.md": "# Guide\n\nSee ![logo](logo.png), ![diagram](logo.svg) and ![remote](https://example.com/track.png).\n\n"
                      "[Notes](docs/notes.md) · [Site](https://example.com/)\n",
         "page.html": "<!doctype html><title>x</title><p id=t>Static page</p><script>document.getElementById('t').textContent='Ran'</script>",
         "docs/notes.md": "# Notes\n"}
 SETUP = f"""
 const png = Uint8Array.from(atob({json.dumps(base64.b64encode(PNG).decode())}), c => c.charCodeAt(0))
+const svg = new TextEncoder().encode({json.dumps(SVG)})
 const texts = {json.dumps(TEXT)}
 fake.captureDownloads()
 fake.override = path => {{
@@ -33,7 +35,7 @@ fake.override = path => {{
   if (path.startsWith('/api/file/raw?')) {{
     const name = params.get('path')
     if (name === 'missing.png') return fake.json({{ detail: 'missing.png does not exist in /project.' }}, 400)
-    const body = name.endsWith('.png') ? png : name.endsWith('.pdf') ? new TextEncoder().encode('%PDF-1.4\\n%%EOF\\n') : new Uint8Array([1, 2, 3])
+    const body = name.endsWith('.png') ? png : name.endsWith('.svg') ? svg : name.endsWith('.pdf') ? new TextEncoder().encode('%PDF-1.4\\n%%EOF\\n') : new Uint8Array([1, 2, 3])
     return new Response(body, {{ headers: {{ 'Content-Type': params.get('download') ? 'application/octet-stream' : 'image/png' }} }})
   }}
   if (path.startsWith('/api/file?')) {{
@@ -73,6 +75,22 @@ def test_an_image_opens_in_the_preview_and_downloads_as_a_file(ui, page):
     assert download["download"] == "logo.png" and download["size"] == len(PNG)
     assert download["connected"] and download["revoked"]
     assert len(ui.requests("/api/file/raw?path=logo.png&download=1&session_id=a")) == 1
+
+
+def test_an_svg_shows_from_a_data_url_never_from_a_blob_of_the_apps_origin(ui, page):
+    # Opened in a tab of its own, a blob: URL would be a page of the app's origin, where the SVG's scripts run.
+    start(ui, page)
+    page.locator(".file-row", has_text="logo.svg").click()
+    image = panel(page).get_by_role("img", name="logo.svg")
+    expect(image).to_be_visible()
+    assert image.get_attribute("src").startswith("data:image/svg+xml;base64,")
+    expect(panel(page).get_by_text(f"4 × 3 px · {len(SVG)} bytes")).to_be_visible()
+    # A project SVG in a Markdown preview too.
+    panel(page).get_by_role("button", name="Back to files").click()
+    page.locator(".file-row", has_text="README.md").click()
+    panel(page).get_by_role("button", name="Preview", exact=True).click()
+    ui.wait("document.querySelector('.file-preview-markdown img[alt=diagram]')?.getAttribute('src')")
+    assert panel(page).get_by_role("img", name="diagram").get_attribute("src").startswith("data:image/svg+xml;base64,")
 
 
 def test_each_file_row_has_a_download_button(ui, page):
@@ -141,6 +159,9 @@ def test_html_previews_in_a_sandbox_without_scripts_until_allowed(ui, page):
     panel(page).get_by_role("button", name="Run scripts").click()
     expect(panel(page).locator("iframe.file-preview-frame")).to_have_attribute("sandbox", "allow-scripts")
     expect(page.frame_locator(".file-preview-frame").get_by_text("Ran")).to_be_visible()
+    # No policy blocks WebRTC, and the note says so.
+    expect(panel(page).get_by_text("Scripts run in a sandbox without access to the app. Requests are blocked, "
+                                   "WebRTC connections are not: run scripts only in files you trust.")).to_be_visible()
     # The frame has an origin of its own: it cannot reach the app's page or storage.
     assert page.frame_locator(".file-preview-frame").locator("body").evaluate(
         "() => { try { return String(window.parent.document.title) } catch { return 'blocked' } }") == "blocked"

@@ -50,6 +50,8 @@ jobs:
         working-directory: local-agent-workspace/frontend
         run: python -m pytest -q --ignore=tests/e2e
       # The real page and app against the offline simulator (scripts/simulate_databricks.py): under a minute.
+      # It runs, and reports, also when an earlier test step failed.
       - name: End-to-end tests
+        if: ${{ !cancelled() }}
         working-directory: local-agent-workspace/frontend
         run: python -m pytest -q tests/e2e

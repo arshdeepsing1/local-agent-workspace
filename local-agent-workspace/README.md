@@ -620,20 +620,24 @@ when opening a conversation or performing restart recovery.
   until the next save. Editor drafts are kept in the current page, not across reloads.
 - **Preview and download files**: in **Workspace / Files**, images (PNG, JPEG, GIF, WebP and SVG) and
   PDF files open in a preview instead of the editor: an image with its size in pixels and bytes, a PDF
-  in the browser's PDF viewer. Markdown and HTML files open in the editor, with **Preview** beside it;
-  the preview shows the editor's text, unsaved edits included, and **Edit** goes back. A Markdown
-  preview is rendered like a reply: images in the project are shown, images from the web are not
-  loaded (a dashed note names them), links to project files open them in the panel and web links open
-  in a new tab. An HTML file previews in a sandboxed frame with an origin of its own, so it cannot
-  reach the app, its token or the API, and it loads nothing from any address (only what the file holds
-  inline). Its scripts are off until you choose **Run scripts**, for that file until the page is
-  reloaded (**Stop scripts** turns them off again). A file that is not UTF-8 text, or is over the file
-  write limit, says why and offers **Download**. **Download** (in the editor toolbar, or the button on
-  a file row, shown on hover or focus) saves any file of up to 20 MB as it is on disk. The checks of
-  Files apply: credential files, the app's state folder and folders outside the project without
-  folder access are refused. The server sends a file inline only when it is a PNG, JPEG, GIF, WebP or
-  PDF file whose bytes start as that type says; anything else, HTML and SVG included, is sent as a
-  download, and never as a page of the app.
+  in the browser's PDF viewer. An SVG is shown from a `data:` address, so opened in a tab of its own
+  (**Open image in new tab**) its scripts run with an origin of their own, never as a page of the app.
+  Markdown and HTML files open in the editor, with **Preview** beside it; the preview shows the
+  editor's text, unsaved edits included, and **Edit** goes back. A Markdown preview is rendered like a
+  reply: images in the project are shown, images from the web are not loaded (a dashed note names
+  them), links to project files open them in the panel and web links open in a new tab. An HTML file
+  previews in a sandboxed frame with an origin of its own, so it cannot reach the app, its token or
+  the API, and it loads nothing from any address (only what the file holds inline). Its scripts are
+  off until you choose **Run scripts**, for that file until the page is reloaded (**Stop scripts**
+  turns them off again). Running scripts still cannot make requests, but browsers let no page block
+  WebRTC connections, so a script can send data to an address that way: run scripts only in files you
+  trust. A file that is not UTF-8 text, or is over the file write limit, says why and offers
+  **Download**. **Download** (in the editor toolbar, or the button on a file row, shown on hover or
+  focus) saves any file of up to 20 MB as it is on disk. The checks of Files apply: credential files,
+  the app's state folder and folders outside the project without folder access are refused. The server
+  sends a file inline only when it is a PNG, JPEG, GIF, WebP or PDF file whose bytes start as that
+  type says; anything else, HTML and SVG included, is sent as a download, and never as a page of the
+  app.
 - **Review agent changes (Keep / Undo)**: files the agent creates or edits with its file
   tools are listed above the message box as **N files changed +added −removed**, and the
   **Workspace** button shows how many there are. Expand the bar to see each file and its
@@ -2106,7 +2110,9 @@ choose there applies to that chat only). Settings names each value a trusted fil
 (**In this project: 48 from .agents/settings.json.**), and **Settings → Project → Review settings
 files…** shows the files again and lets you change the decision. **Save settings** saves only your own
 values; the app never writes the files. **Agent tools → Usage** says when a chat's spending limit comes
-from the project's file.
+from the project's file, the step-limit notice when its Agent steps do, and the context meter when its
+auto-compact threshold does. A project folder the app cannot look at (no access, or a network folder
+that stopped answering) applies no files; the app still opens.
 
 **Settings → Custom instructions** (up to 8,000 characters) are your own instructions for
 every conversation in every project, subagents included. The system message places them
@@ -3309,7 +3315,8 @@ by folder path, so a worktree or a moved project starts without them.
 
 The server binds to `127.0.0.1`, checks Host/Origin, and uses a random local access
 token to protect its API/WebSocket. The page cannot be shown inside another site's frame, and
-its own frames (the Workspace preview) can load nothing but the preview itself. Databricks
+its own frames (the Workspace preview) can load nothing but the preview itself (the scripts of an
+HTML preview, once you choose **Run scripts**, can still open WebRTC connections). Databricks
 credentials stay server-side. File
 tools resolve paths and symlinks before checking the project and approved additional
 folders. Bypass mode skips that folder boundary; credential files and generated

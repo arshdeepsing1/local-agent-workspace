@@ -1,15 +1,19 @@
 """Project settings files (M5f3): .agents/settings.json and .agents/settings.local.json layered over Settings for a
 project's chats, only the allowed keys, only after Trust, and never once a file changed."""
+import errno
 import json
 import os
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from local_agent import settings_layers, spending
+from local_agent.agents import AgentManager
 from local_agent.api import create_app
 from local_agent.config import LAYERABLE, Settings
 from local_agent.settings_layers import ChangedFiles, ProjectLayers, merge
+from local_agent.store import Store
 
 OPUS = "databricks-claude-opus-5-5"
 
@@ -138,6 +142,17 @@ def test_unreadable_files_apply_nothing(settings, project, tmp_path):
     assert report["files"][0]["problems"] == ["Its folder is a link that leaves the project, so it is not read."]
 
 
+def test_a_settings_file_whose_read_fails_applies_nothing(settings, project, monkeypatch):
+    write(project, "settings.json", {"max_agent_steps": 3})
+
+    def read(descriptor, size):  # A dropped network mount.
+        raise OSError(errno.EIO, "Input/output error")
+    monkeypatch.setattr(os, "read", read)
+    result = settings_layers.read_file(project, ".agents/settings.json")
+    monkeypatch.undo()
+    assert result == (b"", "It cannot be read (Input/output error).")
+
+
 def test_a_project_model_must_be_an_endpoint_you_know_or_use(settings, project):
     write(project, "settings.json", {"model": "databricks-new-endpoint"})
     report = trust(settings.project_layers(), project)
@@ -255,3 +270,56 @@ def test_a_chat_runs_with_its_projects_values(client, settings, project):
     with TestClient(client.app) as other:
         other.headers["X-Local-Token"] = other.get("/api/bootstrap").json()["token"]
         assert other.post("/api/sessions", json={}).json()["model"] == OPUS
+
+
+def test_the_page_loads_when_the_settings_project_cannot_be_looked_at(client, settings, project, monkeypatch):
+    """macOS privacy protection answers EPERM, a folder without access EACCES and a dropped network mount EIO or
+    ENOTCONN: the project's files cannot apply, but bootstrap, Settings and the project's chats still work."""
+    write(project, "settings.json", {"max_agent_steps": 7})
+    trust(settings.project_layers(), project)
+    real_stat, blocked = os.stat, str(project.resolve())
+
+    def stat(path, *args, **kwargs):
+        if os.fspath(path) == blocked:
+            raise PermissionError(errno.EPERM, "Operation not permitted", blocked)
+        return real_stat(path, *args, **kwargs)
+    monkeypatch.setattr(os, "stat", stat)
+    response = client.get("/api/bootstrap")
+    assert response.status_code == 200 and response.json()["settings"]["project_layers"]["status"] == "none"
+    assert client.get("/api/settings").status_code == 200
+    assert client.manager.chat_values({"workspace": str(project)})["max_agent_steps"] == 32
+
+
+def sse(chunks):
+    return "".join("data: " + json.dumps(chunk) + "\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+
+
+async def test_the_step_limit_notice_names_the_file_that_sets_the_limit(settings, project, tmp_path, monkeypatch):
+    """Raising Agent steps in Settings changes nothing while a trusted file sets them, so the notice names the file."""
+    monkeypatch.setattr("local_agent.config.APP_ROOT", tmp_path)
+    settings.credentials = lambda: ("https://gateway.example", "private-token")
+    write(project, "settings.local.json", {"max_agent_steps": 1, "auto_compact_percent": 70})
+    trust(settings.project_layers(), project)
+    store = Store(tmp_path / "tests.sqlite3")
+    manager = AgentManager(store, settings)
+    session = store.create(settings.values)
+    session.update(title="Steps", title_generated=True, permission_mode="bypassPermissions")
+    real_client = httpx.AsyncClient
+
+    async def gateway(request):  # Every response asks for one more tool call.
+        return httpx.Response(200, text=sse([{"choices": [{"delta": {"tool_calls": [{
+            "index": 0, "id": "call-1", "type": "function", "function": {"name": "list_tasks", "arguments": "{}"}}]},
+            "finish_reason": "tool_calls"}]}]))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: real_client(**kwargs, transport=httpx.MockTransport(gateway)))
+    try:
+        await manager.run(session, "Go")
+    finally:
+        store.db.close()
+    assert session["terminal_reason"] == "step_limit"
+    notice = [event for event in session["events"] if event["type"] == "notice"][-1]["text"]
+    assert notice.startswith("Reached the 1-request agent limit.")
+    assert ("This project's .agents/settings.local.json sets this limit, not Settings: change it there or send a "
+            "message to continue.") in notice and "Increase Agent steps in Settings" not in notice
+    # The context meter names the file that sets the auto-compact threshold.
+    assert session["context_info"]["auto_compact_percent"] == 70
+    assert session["context_info"]["auto_compact_source"] == "local"

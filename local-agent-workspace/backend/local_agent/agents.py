@@ -4737,7 +4737,7 @@ class AgentManager(LifecycleHooks):
             views, updated = forget_summarized_reads(session.get("file_views") or {}, updated, holder["forgotten"])
             info = {**info, "instruction_files": guidance["files"], "instruction_sources": guidance["sources"],
                     "warnings": warnings, "prepared_for_next_turn": True, **last_request(session),
-                    **prior_flag(session)}
+                    **prior_flag(session), "auto_compact_source": self.chat_source(session, "auto_compact_percent")}
             summary = usage_summary(session)  # Its summary requests are in the ledger now.
             prepared = {**session, "context_state": updated, "context_info": info, "file_views": views,
                         "usage_summary": summary}
@@ -5260,7 +5260,8 @@ class AgentManager(LifecycleHooks):
             percent = auto_compact_percent(self.chat_values(session))
             threshold = compaction_threshold(budget, percent)
             updated = {**info, "context_window": context_window, "reply_reserve": reply_reserve, "input_budget": budget,
-                       "auto_compact_percent": percent, "auto_compact_threshold": threshold}
+                       "auto_compact_percent": percent, "auto_compact_threshold": threshold,
+                       "auto_compact_source": self.chat_source(session, "auto_compact_percent")}
             estimate = info.get("next_estimate")
             if isinstance(estimate, dict) and type(estimate.get("tokens")) is int:
                 tokens, scale = estimate["tokens"], estimate.get("scale")
@@ -5595,7 +5596,9 @@ class AgentManager(LifecycleHooks):
                                            "instruction_sources": [*guidance["sources"], *message_sources],
                                            "warnings": guidance["warnings"], **last_request(session),
                                            **prior_flag(session), "payload_bytes": len(body),
-                                           "payload_limit_bytes": request_limits.PAYLOAD_LIMIT_BYTES}
+                                           "payload_limit_bytes": request_limits.PAYLOAD_LIMIT_BYTES,
+                                           # 'project' or 'local' when a settings file sets the threshold.
+                                           "auto_compact_source": self.chat_source(session, "auto_compact_percent")}
                 self.store.save(session)
                 await self.broadcast(session["id"], {"type": "context", "context_info": session["context_info"]})
                 if len(body) > request_limits.PAYLOAD_LIMIT_BYTES:
@@ -5877,13 +5880,17 @@ class AgentManager(LifecycleHooks):
                         [*model_history(wire), message], context_state, system, definitions, input_budget))
             if steps > 0:
                 await self.refresh_next_estimate(session, system, definitions, wire, context_state)
-        # A chat a script created with its own Agent steps does not follow the Settings value.
+        # A chat a script created with its own Agent steps, or one whose project's settings file sets them, does not
+        # follow the Settings value.
         own_steps = not session.get("is_subagent") and type(session.get("max_agent_steps")) is int
+        source = None if session.get("is_subagent") or own_steps else self.chat_source(session, "max_agent_steps")
         await self.event(session, "error" if session.get("is_subagent") else "notice",
                          text=(f"Reached the {steps}-request agent limit. This counts model requests, not tool "
                                "calls. Completed actions were kept. "
                                + ("This chat's own limit was set when a script created it, not in Settings: send a "
                                   "message to continue." if own_steps else
+                                  f"This project's {settings_layers.LAYER_FILES[source]} sets this limit, not "
+                                  "Settings: change it there or send a message to continue." if source else
                                   "Increase Agent steps in Settings or send a message to continue.")
                                + self.turn_cost(session, *turn_start)),
                          terminal_reason="step_limit")

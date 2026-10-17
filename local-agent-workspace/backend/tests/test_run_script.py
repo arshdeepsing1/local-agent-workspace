@@ -1,6 +1,8 @@
 """run.py: --open opens the app in the browser once its port accepts connections (M8g1)."""
 import importlib.util
+import os
 import socket
+import sys
 import threading
 import time
 from pathlib import Path
@@ -11,7 +13,11 @@ RUN = Path(__file__).resolve().parents[2] / "run.py"
 
 
 @pytest.fixture
-def run_script():
+def run_script(monkeypatch):
+    # Loading run.py puts the backend first on sys.path and the interpreter's folder first on PATH: both are put
+    # back after the test, so later tests see the environment they started with.
+    monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
+    monkeypatch.setattr(sys, "path", list(sys.path))
     spec = importlib.util.spec_from_file_location("run_script", RUN)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

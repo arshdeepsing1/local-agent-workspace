@@ -255,6 +255,14 @@ def test_reported_input_is_shown_with_percentages_and_the_threshold_mark(ui, pag
                             "(Settings → Auto-compact at).")).to_be_visible()
 
 
+def test_a_threshold_set_by_a_project_settings_file_names_the_file(ui, page):
+    ui.mount("components/ContextMeter.js", f"{{ info: {{ ...{REPORTED}, auto_compact_percent: 70, auto_compact_source: 'local' }} }}")
+    page.get_by_text("Last model input · 10,000 tokens · 8.3%").click()
+    expect(page.get_by_text(re.compile(r"^Automatic compaction at 70% of the input budget: about 108,748 input tokens "
+                                       r"\(set by this project's \.agents/settings\.local\.json\)\.$"))).to_be_visible()
+    expect(page.get_by_text("Settings → Auto-compact at", exact=False)).to_have_count(0)
+
+
 def test_a_report_from_before_a_compaction_is_labelled_and_the_estimate_leads(ui, page):
     ui.mount("components/ContextMeter.js", f"{{ info: {{ ...{REPORTED}, compactions: 2, prepared_for_next_turn: true }} }}")
     summary = page.get_by_text("Context preview · ~7%")
