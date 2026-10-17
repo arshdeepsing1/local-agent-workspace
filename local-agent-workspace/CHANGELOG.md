@@ -177,6 +177,33 @@ Roadmap milestone M8 (agents, automation and delivery):
   closing, or Scheduled runs turned off, during its connection check), or that fails
   unexpectedly, gets a note in the history, and the other due runs still start.
 
+- Install the app in its own window: the page has a web app manifest and icons, so Chrome and
+  Edge offer **Install app** and Safari **Add to Dock**. The window is the same local page (the
+  server must be running); nothing is cached for offline use. `run.py --open` opens the app in
+  your browser once it is ready.
+- **Workspace / Files** previews files: images (PNG, JPEG, GIF, WebP, SVG) with their size, PDF
+  files in the browser's viewer, and Markdown and HTML files through **Preview** beside the
+  editor (unsaved edits included). A Markdown preview shows images from the project but loads
+  none from the web. An HTML preview runs in a sandboxed frame with an origin of its own that
+  cannot reach the app and loads nothing from any address; its scripts run only after **Run
+  scripts**, for that file until the page is reloaded (running scripts still cannot make
+  requests, but no browser lets a page block WebRTC connections, so run scripts only in files
+  you trust). An SVG is shown from a `data:` address, so one opened in a tab of its own cannot
+  read the app's access token.
+- **Download** in the editor toolbar and on each file row saves any file of up to 20 MB as it is
+  on disk, with the checks of Files (credential files, the state folder and folders without
+  access are refused). A binary or non-UTF-8 file now opens with Download instead of an error.
+  The server sends a file inline only when it is an image or PDF whose bytes match its type, and
+  never as a page of the app.
+- End-to-end tests drive the real page against the real app and the offline simulator (a reply
+  and its usage, an edit with Keep and Undo, parallel subagents, a question, a rate limit, a
+  spending-limit stop with Continue, compaction, the file preview and a trusted project settings
+  file). CI runs them on Ubuntu and macOS as their own step; they need no credentials and make
+  no network calls.
+- The simulator no longer picks a scripted turn from the Git status the app adds to a turn's
+  first message (it said "read by the app", so every first message in a Git project started the
+  read turn).
+
 Roadmap milestone M7 (endpoint-dependent model features):
 
 - Endpoint checks: **Settings → Model and context** has **Test model** (one short streamed
@@ -849,6 +876,18 @@ Default model, code folder, Python environment, large inputs and compaction:
   outline entry or search excerpt is shortened; hooks for `read_file`, `list_files` or
   `find_files` also run for `outline_file` and `project_overview`; long conversations save
   faster, and outlining a large Python file or starting a compaction pauses the app much less.
+
+- Project settings files: `.agents/settings.json` (shared with the project) and
+  `.agents/settings.local.json` (yours) can set a project's model, reasoning effort, context
+  budgets, auto-compact threshold, Agent steps, compaction handoffs, prompt caching, output
+  style, Automatic Keep and a lower spending limit; nothing else (never credentials,
+  permissions, commands, hooks or MCP servers). They apply only after you choose **Trust** in
+  the prompt shown the first time a project with such a file is opened, and stop applying when a
+  file changes until you decide again. Settings shows each value a file sets and where it comes
+  from; saving Settings changes only your own values. The step-limit notice and the context
+  meter name the file when one sets Agent steps or the auto-compact threshold. A project folder
+  the app cannot look at (no access, or a network folder that stopped answering) applies nothing
+  and does not stop the page from opening.
 
 Roadmap milestone M4 (conversation control and history):
 
