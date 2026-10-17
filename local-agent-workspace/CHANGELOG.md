@@ -6,6 +6,8 @@ Notable changes to Local Agent Workspace, newest first. Dates are UTC.
 
 Roadmap milestone M8 (agents, automation and delivery):
 
+- **Settings → Appearance → Text size** (90% to 150%) makes all text of the app larger or smaller at
+  once, kept in this browser; browser zoom still scales the whole page.
 - Background subagents: `delegate_task` with `background: true` returns at once (the child's ID
   and `running`, or `queued` while the three subagent slots are taken) and the chat goes on; its
   turn may end while the subagent works. A queued one starts within what the chat allows when

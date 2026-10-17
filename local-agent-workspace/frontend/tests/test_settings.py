@@ -265,11 +265,11 @@ def test_save_is_always_visible(ui, page, width, height):
     expect(dialog.get_by_role("group", name="Model and context").get_by_role("spinbutton", name="Context budget (tokens)")).to_be_visible()
     expect(dialog.get_by_role("group", name="Project").get_by_role("textbox", name="Project folder")).to_be_visible()
     groups = dialog.locator("fieldset.settings-group")
-    expect(groups).to_have_count(9)
-    assert [groups.nth(n).locator("legend").inner_text() for n in range(9)] == [
-        "Project", "Model and context", "Reasoning", "Agent", "Subagents", "Commands and files", "Web access", "Notifications",
-        "Credentials"]
-    for n in range(9):
+    expect(groups).to_have_count(10)
+    assert [groups.nth(n).locator("legend").inner_text() for n in range(10)] == [
+        "Project", "Model and context", "Reasoning", "Agent", "Subagents", "Commands and files", "Web access", "Appearance",
+        "Notifications", "Credentials"]
+    for n in range(10):
         expect(dialog.get_by_role("group", name=groups.nth(n).locator("legend").inner_text(), exact=True)).to_have_count(1)
     # The footer spans the dialog's padding without making it scroll sideways (phones have less padding).
     fits = ui.js("""(d => { const box = d.getBoundingClientRect(), footer = d.querySelector('form > footer').getBoundingClientRect()
@@ -408,3 +408,37 @@ def test_web_access_shows_what_the_saved_provider_still_needs(ui, page):
         "Add TAVILY_API_KEY=… to your credential file: web search with Tavily reads its API key there.")
     group.get_by_role("textbox", name="API key entry in your credential file").fill("MY_TAVILY")
     expect(group.get_by_role("status")).to_have_count(0)  # Checked again when saved.
+
+
+# Settings → Appearance → Text size (textSize.js): every font size at once, kept in this browser only.
+
+def test_text_size_scales_all_text_at_once_and_is_kept_in_this_browser(ui, page):
+    dialog = open_settings(ui, page)
+    size = dialog.get_by_role("group", name="Appearance").get_by_role("combobox", name="Text size")
+    expect(size).to_have_value("100")
+    legend = "parseFloat(getComputedStyle(document.querySelector('.settings-group legend')).fontSize)"
+    base = ui.js(legend)
+    size.select_option("125")
+    assert ui.js(legend) == pytest.approx(base * 1.25)
+    assert ui.js("localStorage.getItem('local.textSize')") == "125"
+    assert ui.js("document.documentElement.scrollWidth <= innerWidth")  # No sideways scroll.
+    ui.app(scenario="workspace")  # The page again: the size comes back from this browser's storage.
+    expect(page.get_by_role("combobox", name="Model")).to_have_value("test-model")
+    assert ui.js("getComputedStyle(document.documentElement).getPropertyValue('--text-scale').trim()") == "1.25"
+    page.get_by_role("button", name="Settings", exact=True).click()
+    size = page.get_by_role("dialog").get_by_role("combobox", name="Text size")
+    expect(size).to_have_value("125")
+    size.select_option("100")
+    assert ui.js(legend) == pytest.approx(base)
+    assert ui.js("localStorage.getItem('local.textSize')") is None
+    assert ui.bodies("/api/settings", "PUT") == []  # Never saved with Settings.
+
+
+@pytest.mark.parametrize("width,height", LAYOUT_VIEWPORTS)
+def test_the_largest_text_size_keeps_the_workspace_within_the_window(ui, page, width, height):
+    page.set_viewport_size({"width": width, "height": height})
+    ui.app(scenario="workspace", setup="localStorage.setItem('local.textSize', '150')")
+    expect(page.get_by_role("combobox", name="Model")).to_have_value("test-model")
+    assert ui.js("getComputedStyle(document.documentElement).getPropertyValue('--text-scale').trim()") == "1.5"
+    assert ui.js("document.documentElement.scrollWidth <= innerWidth")
+    expect(page.get_by_role("textbox", name="Message")).to_be_in_viewport()

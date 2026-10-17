@@ -29,6 +29,9 @@ import { RewindNotice } from './rewindNotice.js'
 import WorktreeChat from './components/WorktreeChat.js'
 import CommandHelp from './components/CommandHelp.js'
 import { runCommand } from './commands.js'
+import { applyTextSize, textSize } from './textSize.js'
+
+applyTextSize(textSize())  // Settings → Appearance → Text size, before the first render.
 
 export default function App() {
   const app = useWorkspace()

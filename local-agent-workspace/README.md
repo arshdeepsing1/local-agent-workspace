@@ -316,6 +316,10 @@ when opening a conversation or performing restart recovery.
 
 ## Working with the app
 
+- **Text size**: **Settings → Appearance → Text size** (90% to 150%, default 100%) makes all text of
+  the app larger or smaller at once; the layout keeps fitting the window. It applies as soon as you
+  choose it and is kept in this browser only (it is not part of Settings' saved values). Browser
+  zoom (Ctrl or Cmd and +) still enlarges the whole page instead.
 - **New conversation**: choose a model, then send a task. Enter sends; Shift+Enter adds a line.
   A message is limited to 50,000 characters. A longer one is not sent (it stays in the box)
   and the app advises saving long text such as a handoff as a file in the project and

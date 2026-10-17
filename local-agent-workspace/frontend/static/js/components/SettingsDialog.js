@@ -5,13 +5,14 @@ import { EFFORT_LABELS, modelLabel } from '../types.js'
 import { levelLabel, useReasoningPreview } from './EffortPicker.js'
 import EndpointChecksDialog, { testResultText } from './EndpointChecksDialog.js'
 import ProjectTrustDialog, { LAYER_FILES, layerValue } from './ProjectTrustDialog.js'
+import { TEXT_SIZES, applyTextSize, textSize } from '../textSize.js'
 
 const LIMIT_LEVELS = { error: 'form-error', warning: 'settings-note', note: 'field-help' }
 const inRange = (value, low, high) => Number.isInteger(value) && value >= low && value <= high
 const LIMIT_KEYS = ['context_window', 'max_output_tokens']
 // The dialog's sections, in order: [id, title]. On wide screens a list beside them jumps to each.
 const SECTIONS = [['project', 'Project'], ['model', 'Model and context'], ['reasoning', 'Reasoning'], ['agent', 'Agent'],
-  ['subagents', 'Subagents'], ['commands', 'Commands and files'], ['web', 'Web access'], ['notifications', 'Notifications'],
+  ['subagents', 'Subagents'], ['commands', 'Commands and files'], ['web', 'Web access'], ['appearance', 'Appearance'], ['notifications', 'Notifications'],
   ['credentials', 'Credentials']]
 // Settings → Web access: web_search providers (backend web_fetch.PROVIDERS) and the credential-file entry each reads
 // its API key from when Settings names none (web_fetch.DEFAULT_KEYS); SearXNG takes an address instead.
@@ -128,6 +129,7 @@ export default function SettingsDialog({ settings, connection, onSave, onClose, 
   const followed = useRef(null)
   const contextInput = useRef(null)
   const [saving, setSaving] = useState(false)
+  const [scale, setScale] = useState(textSize)
   const [error, setError] = useState('')
   // The variable names as typed; the form holds them as a list.
   const [envText, setEnvText] = useState((settings.command_env || []).join(' '))
@@ -510,6 +512,11 @@ export default function SettingsDialog({ settings, connection, onSave, onClose, 
           <p class="field-help">The name of the entry, for example ${form.web_search_key || SEARCH_KEYS[searchProvider]}=… in your credential file. The key itself stays there: it is read for each search and never saved in settings.</p>` : null}
         ${searchStatus ? html`<p class=${searchStatus.ready ? 'field-help' : 'settings-note'} role="status">${searchStatus.ready ? `${searchStatus.provider} is ready.` : searchStatus.problem}</p>` : null}
         <p class="field-help">With a provider, the agent gets a web_search tool. Each query goes to that provider, which may charge for it and sees what is searched; check your organization's rules first. The first search in each chat shows its query for your approval.</p>`)}
+        ${group('appearance', html`
+        <label>Text size<select value=${String(scale)} onChange=${e => setScale(applyTextSize(Number(e.currentTarget.value)))}>
+          ${TEXT_SIZES.map(size => html`<option value=${String(size)}>${size === 100 ? '100% (default)' : `${size}%`}</option>`)}
+        </select></label>
+        <p class="field-help">Changes the size of all text at once, in this browser only (not saved with Settings). Browser zoom (Ctrl or Cmd and +) enlarges the whole page instead.</p>`)}
         ${group('notifications', html`
         <label class="settings-checkbox"><input type="checkbox" checked=${form.system_notifications === true}
           onChange=${e => field('system_notifications', e.currentTarget.checked)} />Desktop notification when no browser tab is open</label>
