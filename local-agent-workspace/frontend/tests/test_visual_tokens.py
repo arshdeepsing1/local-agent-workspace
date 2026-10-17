@@ -358,7 +358,7 @@ def test_message_action_icons_have_three_to_one(ui, page):
 
 # V2, V3: the message box shows focus, and every focusable element gets the same 2 px accent ring
 
-ACCENT = "rgb(163, 90, 64)"
+ACCENT = "rgb(180, 85, 45)"
 
 
 def keyboard_focus(page, locator):

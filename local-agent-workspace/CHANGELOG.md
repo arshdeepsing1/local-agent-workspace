@@ -6,6 +6,8 @@ Notable changes to Local Agent Workspace, newest first. Dates are UTC.
 
 Roadmap milestone M8 (agents, automation and delivery):
 
+- A warmer palette: ivory backgrounds, warm grays and borders, and a brighter terracotta accent
+  (also in the app icon); text keeps at least 4.5:1 contrast and controls 3:1.
 - **Settings → Appearance → Text size** (90% to 150%) makes all text of the app larger or smaller at
   once, kept in this browser; browser zoom still scales the whole page.
 - Background subagents: `delegate_task` with `background: true` returns at once (the child's ID
