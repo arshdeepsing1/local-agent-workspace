@@ -92,8 +92,15 @@ cd local-agent-workspace
 .venv/bin/python run.py
 ```
 
-Open http://127.0.0.1:8765. Use `--port 8766` if that port is occupied.
+Open http://127.0.0.1:8765, or start with `--open` (`.venv/bin/python run.py --open`) to have the
+app opened in your default browser once it is ready (within 10 seconds; not when the port is already
+in use). Use `--port 8766` if that port is occupied.
 Stop the local server with Ctrl+C. It must remain running for the UI and agents to work.
+
+The app can also run in its own window: in Chrome or Edge choose **Install app** (the icon at the end of
+the address bar, or the menu → Cast, save, and share → Install page as app); in Safari on macOS choose
+File → Add to Dock. The window is the same local page (the server must still be running), with the app's
+name and icon. Nothing is cached for offline use: the app has no service worker.
 
 ## Install / move to another computer
 
@@ -103,8 +110,8 @@ system message names the one in use (in zsh an unquoted `$VAR` is not split into
 frontend is plain JavaScript loaded directly by the browser, so a fresh checkout
 needs no Node.js, pnpm, or frontend build to run or change. Native Windows is not
 supported by the POSIX filesystem/process handling; use a Linux environment such as WSL for that
-platform. The continuous-integration workflow (`.github/workflows/tests.yml`) runs the backend
-and UI test suites on Ubuntu and macOS; everyday use on Linux and WSL has not yet been checked
+platform. The continuous-integration workflow (`.github/workflows/tests.yml`) runs the backend,
+UI and end-to-end test suites on Ubuntu and macOS; everyday use on Linux and WSL has not yet been checked
 by hand.
 
 Clone the repository or copy the `local-agent-workspace` folder, including
@@ -611,6 +618,22 @@ when opening a conversation or performing restart recovery.
   Unsaved editor text stays with its conversation when closing the workspace panel,
   attaching a file, or switching chats. Text entered during a save remains unsaved
   until the next save. Editor drafts are kept in the current page, not across reloads.
+- **Preview and download files**: in **Workspace / Files**, images (PNG, JPEG, GIF, WebP and SVG) and
+  PDF files open in a preview instead of the editor: an image with its size in pixels and bytes, a PDF
+  in the browser's PDF viewer. Markdown and HTML files open in the editor, with **Preview** beside it;
+  the preview shows the editor's text, unsaved edits included, and **Edit** goes back. A Markdown
+  preview is rendered like a reply: images in the project are shown, images from the web are not
+  loaded (a dashed note names them), links to project files open them in the panel and web links open
+  in a new tab. An HTML file previews in a sandboxed frame with an origin of its own, so it cannot
+  reach the app, its token or the API, and it loads nothing from any address (only what the file holds
+  inline). Its scripts are off until you choose **Run scripts**, for that file until the page is
+  reloaded (**Stop scripts** turns them off again). A file that is not UTF-8 text, or is over the file
+  write limit, says why and offers **Download**. **Download** (in the editor toolbar, or the button on
+  a file row, shown on hover or focus) saves any file of up to 20 MB as it is on disk. The checks of
+  Files apply: credential files, the app's state folder and folders outside the project without
+  folder access are refused. The server sends a file inline only when it is a PNG, JPEG, GIF, WebP or
+  PDF file whose bytes start as that type says; anything else, HTML and SVG included, is sent as a
+  download, and never as a page of the app.
 - **Review agent changes (Keep / Undo)**: files the agent creates or edits with its file
   tools are listed above the message box as **N files changed +added −removed**, and the
   **Workspace** button shows how many there are. Expand the bar to see each file and its
@@ -2054,6 +2077,37 @@ group, takes a request the model endpoint failed before its reply started (see *
 **Save settings** stays at the
 bottom while you scroll, and a failed save shows its reason just above it.
 
+**Project settings files.** A project can set a few Settings for its own chats in
+`.agents/settings.json` (shared: commit it, and everyone with the project gets it) and
+`.agents/settings.local.json` (yours, for this copy: add it to `.gitignore`; the app never puts it in an
+export). Each holds one JSON object of at most 16 KB, for example
+`{"reasoning_effort": "high", "max_agent_steps": 48, "output_style": "concise"}`. The layers are your
+Settings, then the project file, then the local file; a later layer wins for the keys it sets. Only
+`model`, `reasoning_effort`, `context_window`, `max_output_tokens`, `auto_compact_percent`,
+`max_agent_steps`, `compaction_handoffs`, `prompt_caching`, `output_style`, `auto_keep_changes` and
+`spending_limit_dbu` are read. Every other key (credentials, the project folder, permission modes and
+rules, the commands' environment, hooks, MCP servers, custom instructions and the rest) is ignored and
+listed as ignored. Each value is checked as a Settings save checks it, and a value that fails is not used
+(the dialog below says why). Two more limits: the model must be an endpoint the app knows or one you
+already use (the Settings model, **Settings → Subagents** or one of your chats), and a spending limit can
+only lower yours, never raise or remove it. Budgets you left at your model's defaults follow a model the
+file sets, as they do when you change the model in Settings.
+
+The files apply only once you trust them. The first time you open a project that has one (the Settings
+project, or the project of the chat you open), **Project settings files** shows what each file would set,
+the values it cannot use and the keys it ignores, and asks **Trust** or **Ignore**. **Decide later** (×) or
+Escape decides nothing: the files stay unused, and the app asks again after a reload. The decision is
+remembered per project folder (by a hash of its path) in `trusted_projects.json` in the state folder,
+together with a hash of each file as you reviewed it. When a file changes (after a pull, by you, or by
+the agent, whose edits in `.agents/` always ask), it is not used until you decide again, and the dialog
+asks again. A worktree chat and its subagents use the source project's files and decision. A new chat in
+a trusted project starts with the files' model and effort (its model picker shows them; a model you
+choose there applies to that chat only). Settings names each value a trusted file sets under its field
+(**In this project: 48 from .agents/settings.json.**), and **Settings → Project → Review settings
+files…** shows the files again and lets you change the decision. **Save settings** saves only your own
+values; the app never writes the files. **Agent tools → Usage** says when a chat's spending limit comes
+from the project's file.
+
 **Settings → Custom instructions** (up to 8,000 characters) are your own instructions for
 every conversation in every project, subagents included. The system message places them
 right after the app's own instructions, before the permission-mode text and the project
@@ -3254,7 +3308,9 @@ by folder path, so a worktree or a moved project starts without them.
 ## Local access and limits
 
 The server binds to `127.0.0.1`, checks Host/Origin, and uses a random local access
-token to protect its API/WebSocket. Databricks credentials stay server-side. File
+token to protect its API/WebSocket. The page cannot be shown inside another site's frame, and
+its own frames (the Workspace preview) can load nothing but the preview itself. Databricks
+credentials stay server-side. File
 tools resolve paths and symlinks before checking the project and approved additional
 folders. Bypass mode skips that folder boundary; credential files and generated
 directories remain excluded. The app's state folder (settings, rules, extensions and
@@ -3682,7 +3738,9 @@ Thinking display, subagents, background jobs and change review before using a pa
   `wait_job`), `delegate` or `parallel` (one or two read-only subagents; `delegate custom` uses
   the first agent of the project's agent index, see **Custom agents**), `ask` (a question
   card), `task`, `read`, `rate limit` (one HTTP 429 with `Retry-After: 2`), `long`. Any other
-  message gets a reply that says which effort and fields the request carried.
+  message gets a reply that says which effort and fields the request carried. Only your own
+  words count: the Git status the app adds to a turn's first message and its notes to the model
+  never choose a turn.
 - Simulated chats and settings live in `.local/simulator/` (`--state-dir` to change), apart
   from your real conversations. Without `--workspace` a small demo Git project is created
   there. The app runs on port 8766, so the real app on 8765 can run at the same time.
@@ -3740,8 +3798,11 @@ picks up edits. `python run.py --reload` also restarts the backend on Python cha
 # One-time setup in the same Python environment:
 python -m pip install -c constraints.txt -e './backend[test,ui-test]'
 python -m playwright install chromium
-# Then:
+# Then (this also runs the end-to-end tests below):
 (cd frontend && python -m pytest -q)
+
+# End-to-end tests only: the real page and app against the offline simulator.
+(cd frontend && python -m pytest -q tests/e2e)
 
 # Static checks and the personal-data check (also run by CI):
 python -m pip install -c constraints.txt -e './backend[lint]'
@@ -3750,13 +3811,26 @@ python3 scripts/check_personal_data.py
 ```
 
 GitHub Actions (`.github/workflows/tests.yml` at the repository root) runs the personal-data
-check, the lint check and both test suites on Ubuntu and macOS for pull requests, pushes to
-`main`, and on demand. It uses no credentials and makes no model calls. Notable changes are
+check, the lint check and the backend, UI and end-to-end tests on Ubuntu and macOS for pull
+requests, pushes to `main`, and on demand. It uses no credentials and makes no model calls. Notable changes are
 listed in `CHANGELOG.md`.
 
 `python -m playwright install chromium` downloads Playwright's own Chromium; to use
 a browser that is already installed instead, set `UI_TEST_CHROMIUM` to its
 executable path. The frontend tests need no Node.js either.
+
+The end-to-end tests (`frontend/tests/e2e/`, marked `e2e`) drive the real page against the real app
+with nothing faked in between: each test starts the app on a free port of 127.0.0.1 with a fresh state
+folder and a small Git project, pointed at the simulated gateway of `scripts/simulate_databricks.py`
+(`start_gateway`, `patched_settings` and `start_app`, at speed 0), so they need no credentials and make
+no network or paid calls. They cover a streamed reply and its usage in the meter, an edit approved in
+Manual with Keep during the turn and Undo after it, two subagents in parallel with their reports,
+an `ask_user` question answered in its card, a rate limit waited out, a spending limit that stops a
+chat on Claude Opus 5.5 until **Agent tools → Usage** raises it and **Continue** finishes, compaction
+with its handoff file, the Workspace preview and Download under the server's real headers and the
+page's policy, and a trusted project settings file setting a chat's Agent steps. Each step waits for
+what the page shows next, never for a fixed time; `E2E_CPU_THROTTLE=4` runs the page on a CPU four
+times slower, as a busy machine might, to flush out races. They take under a minute.
 
 Tests cover all permission modes, approved/denied external CSV listings, persisted
 folder grants, shell classification, approval allow/deny,

@@ -35,6 +35,9 @@ export function useWorkspace() {
   const [draftEffort, setDraftEffort] = useState(null)
   // The model of a new conversation that /clear started from another chat (null: the Settings default).
   const [draftModel, setDraftModel] = useState(null)
+  // What the Settings project's trusted settings files set: a new conversation starts with their model and effort
+  // (backend settings_layers.py).
+  const projectValues = settings?.project_layers?.status === 'trusted' ? settings.project_layers.values || {} : {}
   // Unreviewed agent file changes of one conversation: { id, value: Changes }.
   const [changes, setChanges] = useState({ id: null, value: null })
   const changesPushed = useRef(0)
@@ -412,8 +415,9 @@ export function useWorkspace() {
     if (modelSaves.has(scope) || (!target.id && defaultModelSave.current) || !settings) return
     setModelSaves(current => new Set(current).add(scope))
     try {
-      // A new conversation /clear started keeps its own model; choosing another changes only that one.
-      if (!target.id && !creating && draftModel) { setDraftModel(model); return }
+      // A new conversation /clear started keeps its own model; choosing another changes only that one. So does
+      // one in a project whose trusted settings file sets the model (it would win over a Settings change).
+      if (!target.id && !creating && (draftModel || projectValues.model)) { setDraftModel(model); return }
       if (!target.id && !creating) {
         const saving = saveSettings({ ...settings, model })
         defaultModelSave.current = saving
@@ -652,12 +656,12 @@ export function useWorkspace() {
   return { settings, connection, connectionChecking, sessions, session: activeSession, activeId, viewKey: selection.key, error,
     online: online && reachable, offlineError: error === OFFLINE_MESSAGE, ready,
     setError: reportError, setActiveId: selectSession, newConversation, send, uploadFile, saveSettings, refreshSettings, deleteSession, renameSession, changeModel,
-    draftModel: activeId ? null : draftModel,
+    draftModel: activeId ? null : draftModel || projectValues.model || null,
     runShell, askSide, removeQueued, sendQueued, loadMentionFiles, sideAnswer: sideAnswer.key === selection.key ? sideAnswer.value : null, dismissSide,
     modelSaving: modelSaves.has(selection.key) || (!activeId && defaultModelSave.current !== null),
     checkConnection, refreshSessions, permissionMode: activeSession?.permission_mode || draftMode, setPermissionMode, allowFolder, removeFolder,
     // A chat saved without an effort, and a new conversation, use the Settings default.
-    reasoningEffort: (activeId ? activeSession?.reasoning_effort : draftEffort) || settings?.reasoning_effort || 'default',
+    reasoningEffort: (activeId ? activeSession?.reasoning_effort : draftEffort || projectValues.reasoning_effort) || settings?.reasoning_effort || 'default',
     changeEffort,
     loadEarlier, setMeta, searchConversations,
     rules: { chat: activeSession?.allow_rules || [], project: rulesHere?.project || [], user: rulesHere?.user || [],

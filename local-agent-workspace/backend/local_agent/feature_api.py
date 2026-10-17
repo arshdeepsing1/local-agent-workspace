@@ -143,7 +143,9 @@ def register_features(app, manager, settings, store, session_or_404, workspace_t
         record = manager.worktrees.validate(record["id"])
         manager.workspace_available(record["path"])
         parent = session_or_404(session_id) if session_id else {}
-        session = store.create({**settings.values, "workspace": record["path"], "model": parent.get("model", settings.values["model"])})
+        # The source project's settings files apply to its worktree chats (settings_layers.project_folder).
+        values = settings.effective(record["source_workspace"])
+        session = store.create({**values, "workspace": record["path"], "model": parent.get("model", values["model"])})
         # A new worktree chat starts with normal manual permissions and no inherited external grants.
         session["title"] = f"Worktree: {record['branch']}"[:100]
         # The root project, also when the worktree was made from a worktree chat (sidebar grouping).

@@ -38,7 +38,17 @@
 //   that holds the API key; '' = BRAVE_API_KEY or TAVILY_API_KEY), web_search_status: { provider, ready, problem?,
 //   key_name? } | null (never the key),
 //   git_context: boolean (each turn's first message carries a short Git snapshot: branch, upstream, change counts,
-//   recent commits; default true) }
+//   recent commits; default true),
+//   project_layers: ProjectLayers (the Settings project's settings files; never saved by PUT /settings) }
+// ProjectLayers (backend settings_layers.py; GET /settings/project?session_id= for a chat's project, or the Settings
+//   project): { workspace, status: 'none'|'pending'|'trusted'|'ignored', changed (pending because a file changed after a
+//   decision), decision: 'trust'|'ignore'|null, sha256 (of the files as read now), files: [{ layer: 'project'|'local',
+//   name ('.agents/settings.json' | '.agents/settings.local.json'), sha256, values ({ key: value } it may set and that
+//   pass the checks), problems: string[] (values not used, and why), ignored: string[] (keys a project cannot set) }],
+//   values and sources ({ key: value } and { key: 'project'|'local' } of what a trusted file sets for chats in the
+//   project), followed: string[] (budgets that follow the files' model), notes: string[] }.
+//   POST /settings/project/trust?session_id= { decision: 'trust'|'ignore', sha256 } -> ProjectLayers; HTTP 409
+//   { detail: { message, report } } when the files changed since that report.
 // GET /output-styles?session_id= -> { styles: [{ id, name, description, source: 'built-in'|'project'|'user', path? }],
 //   errors: [{ path, error }] } (backend output_styles.py; the chat's project, or the default one without a chat).
 // Memory (GET /memory?session_id=; POST { text } adds, PATCH /memory/<id> { text } edits, DELETE /memory/<id> deletes

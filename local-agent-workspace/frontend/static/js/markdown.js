@@ -11,6 +11,21 @@ export function renderMarkdown(text) {
   return DOMPurify.sanitize(marked.parse(text || ''))
 }
 
+// A Markdown file in the Workspace preview: rendered and sanitized like a reply, but each image's address is moved
+// to data-src before the HTML reaches the page, so nothing loads until the preview decides (FilePreview.js loads
+// images from the project and none from the web).
+const previewPurify = DOMPurify(window)
+previewPurify.addHook('afterSanitizeAttributes', node => {
+  if (node.nodeName !== 'IMG') return
+  const source = node.getAttribute('src')
+  node.removeAttribute('src')
+  node.removeAttribute('srcset')
+  if (source) node.setAttribute('data-src', source)
+})
+export function renderMarkdownPreview(text) {
+  return previewPurify.sanitize(marked.parse(text || ''))
+}
+
 // A block without a language tag is highlighted only up to this size:
 // guessing its language runs every grammar over the whole text.
 const AUTO_DETECT_LIMIT = 20 * 1024

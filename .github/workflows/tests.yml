@@ -48,4 +48,8 @@ jobs:
         run: python -m pytest -q
       - name: UI tests
         working-directory: local-agent-workspace/frontend
-        run: python -m pytest -q
+        run: python -m pytest -q --ignore=tests/e2e
+      # The real page and app against the offline simulator (scripts/simulate_databricks.py): under a minute.
+      - name: End-to-end tests
+        working-directory: local-agent-workspace/frontend
+        run: python -m pytest -q tests/e2e

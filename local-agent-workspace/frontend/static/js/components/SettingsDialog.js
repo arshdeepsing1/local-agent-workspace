@@ -4,6 +4,7 @@ import { api } from '../api.js'
 import { EFFORT_LABELS, modelLabel } from '../types.js'
 import { levelLabel, useReasoningPreview } from './EffortPicker.js'
 import EndpointChecksDialog, { testResultText } from './EndpointChecksDialog.js'
+import ProjectTrustDialog, { LAYER_FILES, layerValue } from './ProjectTrustDialog.js'
 
 const LIMIT_LEVELS = { error: 'form-error', warning: 'settings-note', note: 'field-help' }
 const inRange = (value, low, high) => Number.isInteger(value) && value >= low && value <= high
@@ -106,7 +107,17 @@ function fallbackChoices(settings, form, model) {
     .map(name => ({ value: name, label: `${labels.get(name) || modelLabel(name)} · ${name}` }))
 }
 
-export default function SettingsDialog({ settings, connection, onSave, onClose }) {
+// Settings → Project: the Settings project's settings files (backend settings_layers.py) and what you decided.
+function projectFilesText(layers) {
+  const names = layers.files.map(file => file.name).join(' and ')
+  if (layers.status === 'trusted') return `You trust ${names}: chats in this project use the values ${layers.files.length === 1 ? 'it sets' : 'they set'}, shown under each setting here. Saving changes only your own values.`
+  if (layers.status === 'ignored') return `You chose to ignore ${names}: chats in this project use your Settings.`
+  return layers.changed ? `${names} changed since you decided: ${layers.files.length === 1 ? 'it is' : 'they are'} not used until you choose again.`
+    : `This project has ${names}, not used until you choose Trust or Ignore.`
+}
+
+// onProjectDecided(report): a Trust or Ignore chosen from Settings → Project (the app reads Settings again).
+export default function SettingsDialog({ settings, connection, onSave, onClose, onProjectDecided }) {
   const dialog = useRef(null)
   const [form, setForm] = useState(settings)
   // Folder states checked again when the dialog opens (a first write creates the default code folder).
@@ -138,6 +149,15 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
   const [endpointChecks, setEndpointChecks] = useState(null)
   const sections = useRef({})
   const [activeSection, setActiveSection] = useState(SECTIONS[0][0])
+  // The Settings project's settings files: a value a trusted file sets is named under its field.
+  const layers = settings.project_layers
+  const [reviewingFiles, setReviewingFiles] = useState(false)
+  const fromProject = key => {
+    const source = layers?.status === 'trusted' ? layers.sources?.[key] : null
+    if (!source) return null
+    return html`<p class="settings-source">In this project: ${layerValue(layers.values[key])}${(layers.followed || []).includes(key)
+      ? `, the default of the endpoint ${LAYER_FILES[source]} sets` : ` from ${LAYER_FILES[source]}`}.</p>`
+  }
   const jumping = useRef(0)
   const instructions = form.user_instructions || ''
   const style = form.output_style || 'default'
@@ -304,7 +324,10 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
           onInput=${e => field('python_venv', e.currentTarget.value)} /></label>
         <p class="field-help">The agent's commands, Verify, hooks and the Terminal run with this environment active: VIRTUAL_ENV is set and its bin/ comes first on PATH.</p>
         <${More} topic="Python virtual environment">The read-only commands Auto runs without a card are unaffected, and agent edits inside the environment always ask. A value saved here overrides LOCAL_AGENT_PYTHON_VENV in .env; left unchanged, it follows .env.<//>
-        ${pathStatus(statuses.python_venv, settings.python_venv, form.python_venv)}`)}
+        ${pathStatus(statuses.python_venv, settings.python_venv, form.python_venv)}
+        ${layers && layers.status !== 'none' ? html`<div class="settings-project-files">
+          <p class=${layers.status === 'pending' ? 'settings-note' : 'field-help'}>${projectFilesText(layers)}</p>
+          <button type="button" class="outline" onClick=${() => setReviewingFiles(true)}>Review settings files…</button></div>` : null}`)}
         ${group('model', html`
         <label>Databricks model endpoint<select value=${otherEndpoint ? OTHER_ENDPOINT : form.model} onChange=${e => {
           const value = e.currentTarget.value
@@ -317,6 +340,7 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         </select></label>
         ${otherEndpoint ? html`<label>Endpoint name<input ref=${otherInput} required spellcheck=${false} value=${form.model}
           onInput=${e => field('model', e.currentTarget.value)} placeholder=${settings.default_model || 'databricks-claude-opus-5-5'} /></label>` : null}
+        ${fromProject('model')}
         <p class="field-help">Endpoints with built-in limits and the ones your Databricks workspace lists. Choose Other endpoint… to type a serving endpoint name.</p>
         <div class="settings-endpoint-checks">
           <button type="button" class="outline" disabled=${!model} onClick=${() => setChecking('test')}>Test model</button>
@@ -327,9 +351,11 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         ${settings.model_migrated_from ? html`<p class="settings-note" role="status">The default model changed from ${modelLabel(settings.model_migrated_from)} to ${modelLabel(settings.model)}, the app's new default. ${modelLabel(settings.model)} costs more per token. To switch back, choose ${settings.model_migrated_from} here and save, or in the model picker of a new conversation (in an open conversation the picker changes only that conversation).</p>` : null}
         <label>Context budget (tokens)<input ref=${contextInput} type="number" required min=${16384} max=${1048576} step=${1}
           value=${form.context_window || ''} onInput=${number('context_window')} /></label>
+        ${fromProject('context_window')}
         <p class="field-help">Set at or below your endpoint's total context limit, not your account usage quota. We reserve the output budget below plus 2,048 tokens for safety; the remainder is the estimated input budget.</p>
         <label>Max output tokens per request<input type="number" required min=${1024} max=${131072} step=${1}
           value=${form.max_output_tokens || ''} onInput=${number('max_output_tokens')} /></label>
+        ${fromProject('max_output_tokens')}
         <p class="field-help">Current estimated input budget: ${inputBudget.toLocaleString()} tokens${capped ? ` (${capped.toLocaleString()} for requests to this endpoint, ${cappedReason})` : ''}. The endpoint must support this value; a larger response budget leaves less room for input and can increase usage.</p>
         ${inputBudget < 16384 ? html`<p class="form-error" role="alert">This leaves too little room for a working conversation. Lower Max output tokens or increase the context budget; raising output does not fix a full context.</p>` : null}
         ${limits ? html`<div class="settings-limits">
@@ -342,14 +368,17 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         </div>` : null}
         <label>Auto-compact at (% of input budget)<input type="number" required min=${50} max=${100} step=${1}
           value=${form.auto_compact_percent === undefined ? 90 : form.auto_compact_percent || ''} onInput=${number('auto_compact_percent')} /></label>
+        ${fromProject('auto_compact_percent')}
         <p class="field-help">Earlier turns are summarized automatically when the next request's estimated input passes this share of the input budget (default 90). ${compactPercentValid ? `With these settings that is about ${Math.floor(inputBudget * compactPercent / 100).toLocaleString()} tokens${capped ? ` (${Math.floor(capped * compactPercent / 100).toLocaleString()} for requests to this endpoint)` : ''}.` : 'Enter a whole number from 50 to 100.'} Lower values compact sooner and keep requests smaller; 100 waits until the input budget is full.</p>
         <label class="settings-checkbox"><input type="checkbox" checked=${form.compaction_handoffs !== false}
           onChange=${e => field('compaction_handoffs', e.currentTarget.checked)} />Save a detailed handoff at each compaction</label>
+        ${fromProject('compaction_handoffs')}
         <p class="field-help">The model writes a detailed handoff (up to 16,000 output tokens, plus up to 8,192 for thinking on models that always think, such as Claude Opus 5.5) that the app saves to handoffs/auto/ in the project folder.</p>
         <${More} topic="compaction handoffs">The handoff includes an exact log of every command, and the model is told where to find it after compaction. Compaction then takes a few minutes longer and uses more output tokens.<//>
         <label>Prompt caching<select value=${form.prompt_caching || 'auto'} onChange=${e => field('prompt_caching', e.currentTarget.value)}>
           ${CACHING.map(([value, label]) => html`<option key=${value} value=${value}>${label}</option>`)}
         </select></label>
+        ${fromProject('prompt_caching')}
         <p class="field-help">Marks the stable start of each agent request so Databricks can bill repeated input at the cache-read rate (about 5% of the input price). Writes cost 25% more; entries expire after 5 minutes. Documented forms only marks just your last message or the last tool call.</p>
         <label>Fallback endpoint<select value=${otherFallback ? OTHER_ENDPOINT : fallback} onChange=${e => {
           const value = e.currentTarget.value
@@ -370,6 +399,7 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         <label>Default effort for new chats<select value=${effort} onChange=${e => field('reasoning_effort', e.currentTarget.value)}>
           ${levels.map(level => html`<option key=${level.value} value=${level.value}>${levelLabel(level)}</option>`)}
         </select></label>
+        ${fromProject('reasoning_effort')}
         <p class="field-help">Each chat can change its own effort beside the model picker. Default sends no effort field, so the endpoint uses its own; higher levels think longer and use more output tokens.</p>
         <label>Request format<select value=${form.reasoning_format || 'auto'} onChange=${e => field('reasoning_format', e.currentTarget.value)}>
           ${FORMATS.map(([value, label]) => html`<option key=${value} value=${value}>${label}</option>`)}
@@ -396,9 +426,11 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         ${group('agent', html`
         <label>Agent steps per message<input type="number" required min=${1} max=${64} step=${1}
           value=${form.max_agent_steps || ''} onInput=${number('max_agent_steps')} /></label>
+        ${fromProject('max_agent_steps')}
         <p class="field-help">Limits model round trips for one message, not individual tool calls. One model response can request several tools. The default is 32.</p>
         <label>Spending limit per conversation (DBU)<input type="number" required min=${0} max=${100000} step="any" inputmode="decimal"
           value=${spendingText} onInput=${e => { const text = e.currentTarget.value; setSpendingText(text); field('spending_limit_dbu', text.trim() === '' ? NaN : Number(text)) }} /></label>
+        ${fromProject('spending_limit_dbu')}
         <p class="field-help">The agent stops before its next model request once a conversation and its subagents have used this much (estimated from list prices, as in Agent tools → Usage), and warns at 80%. 0 means no limit. A chat can set its own limit in Usage.</p>
         <${More} topic="spending limit">It is a soft cap: one response can pass it before the next request is stopped. Calls to endpoints without price data are not counted, and title and compaction requests are not stopped.<//>
         <label>Token limit per turn<input type="number" required min=${0} max=${100000000} step=${1}
@@ -412,6 +444,7 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         <${More} topic="approval wait">A waiting card keeps the chat busy, which blocks Undo and Recovery in this project, so 0 can hold them up.<//>
         <label class="settings-checkbox"><input type="checkbox" checked=${form.auto_keep_changes === true}
           onChange=${e => field('auto_keep_changes', e.currentTarget.checked)} />Keep agent changes automatically when a reply finishes</label>
+        ${fromProject('auto_keep_changes')}
         <p class="field-help">The changes bar clears when a reply completes; a reply you stop, that fails or that reaches the step limit keeps its list.</p>
         <${More} topic="automatic Keep">Edits made with the agent's file tools can still be undone from Agent tools → Checkpoints; edits made by commands can no longer be undone from the app.<//>
         <label class="settings-checkbox"><input type="checkbox" checked=${form.rate_limit_auto_continue !== false}
@@ -429,6 +462,7 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
         <label>Output style<select value=${style} onChange=${e => field('output_style', e.currentTarget.value)}>
           ${styleChoices.map(item => html`<option key=${item.id} value=${item.id}>${item.name}</option>`)}
         </select></label>
+        ${fromProject('output_style')}
         <p class="field-help">How the agent writes its replies: Concise keeps them short, Explanatory explains the reasons behind its work. A project can add styles in .agents/output-styles/, and you in ~/.agents/output-styles/ (yours win for the same name).</p>
         <label class="settings-checkbox"><input type="checkbox" checked=${form.project_memory !== false}
           onChange=${e => field('project_memory', e.currentTarget.checked)} />Project memory</label>
@@ -485,5 +519,7 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
       </form>
     </div>
     ${checking ? html`<${EndpointChecksDialog} model=${model} mode=${checking} onClose=${() => setChecking(null)} />` : null}
+    ${reviewingFiles && layers?.files?.length ? html`<${ProjectTrustDialog} report=${layers} onDecided=${report => onProjectDecided?.(report)}
+      onClose=${() => setReviewingFiles(false)} />` : null}
   </dialog>`
 }

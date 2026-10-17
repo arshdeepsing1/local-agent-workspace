@@ -1,10 +1,11 @@
 import { html, useCallback, useEffect, useRef, useState } from '../lib.js'
-import { ArrowLeft, ChevronRight, Code2, File, FileDiff, Folder, GitBranch, Maximize2, Minimize2, Minus, Pencil, Plus, RefreshCw, Save, Terminal, X } from '../icons.js'
+import { ArrowLeft, ChevronRight, Code2, Download, Eye, File, FileDiff, Folder, GitBranch, Maximize2, Minimize2, Minus, Pencil, Plus, RefreshCw, Save, Terminal, X } from '../icons.js'
 import { api } from '../api.js'
 import FileRoots, { standingFolder, useWorkspaceFolders } from './FileRoots.js'
 import TerminalPanel from './TerminalPanel.js'
 import DiffReview, { DiffLine, UnsentComments } from './DiffReview.js'
 import { DiffStat } from './ChangesBar.js'
+import FilePreview, { downloadFile, opensInPreview, previewKind } from './FilePreview.js'
 
 // A link that opens an absolute path at a line in VS Code (vscode://file/<path>:<line>).
 // Each path segment is encoded, so "#" or "?" in a name cannot start a fragment or query.
@@ -271,7 +272,9 @@ function PanelResizer({ panel, width, limit, onWidth }) {
     onDblClick=${() => onWidth(null)} onKeyDown=${onKeyDown} />`
 }
 
-// file: { id, path, content, original, mode?: 'edit'|'review' } | null; setFile accepts a value or an updater.
+// file: { id, path, content, original, mode?: 'edit'|'review'|'preview', binary?, note?, version? } | null; setFile
+// accepts a value or an updater. A binary file (an image, a PDF, or a file that is not text: note says why) has no
+// text and only a preview or Download; Markdown and HTML files switch between the editor and a preview.
 // changes: the conversation's unreviewed agent changes (see ChangesBar); review: { path } opens
 // that file's changes once, then onReviewOpened() clears it; onReview(action, files) keeps or undoes;
 // onSelectSession(id) opens a chat that a review error names as blocking.
@@ -309,6 +312,7 @@ export default function WorkspacePanel({ sessionId, workspace, worktree = null, 
   const [loading, setLoading] = useState(false)
   const openRequest = useRef(0)
   useEffect(() => () => { openRequest.current++ }, [])
+  const rowIds = useRef(`files-${Math.random().toString(36).slice(2, 10)}`).current  // Download buttons name their row's file.
   const query = sessionId ? `session_id=${sessionId}` : ''
   const refresh = useCallback(async () => {
     setLoading(true); setError('')
@@ -340,6 +344,13 @@ export default function WorkspacePanel({ sessionId, workspace, worktree = null, 
     if (dirty && !confirm('Discard your unsaved edits?')) return
     const request = ++openRequest.current
     setError('')
+    // Images and PDF open in the preview, from their bytes; an agent's change to one opens its review.
+    if (mode !== 'review' && opensInPreview(path)) {
+      pendingLine.current = null
+      setLineMark(null)
+      setFile({ id: crypto.randomUUID(), path, content: '', original: '', mode: 'preview', binary: true })
+      return
+    }
     try {
       const result = await api(`/file?path=${encodeURIComponent(path)}&${query}`)
       if (request !== openRequest.current) return
@@ -355,19 +366,30 @@ export default function WorkspacePanel({ sessionId, workspace, worktree = null, 
       if (request !== openRequest.current) return
       // A file the agent deleted, or that a command made unreadable, still has a review.
       if (mode === 'review' || changed.has(path)) setFile({ id: crypto.randomUUID(), path, content: '', original: '', mode: 'review', missing: true })
+      // A file that is not text (binary, not UTF-8 or over the editor's limit) can still be downloaded.
+      else if (e.detail?.code === 'not_text') setFile({ id: crypto.randomUUID(), path, content: '', original: '', mode: 'preview', binary: true, note: e.message })
       else setError(e.message)
     }
   }
+  const download = async path => {
+    setError('')
+    try { await downloadFile(path, query) } catch (e) { setError(e.message) }
+  }
 
-  // Show the text editor again with the file as it is on disk, keeping an unsaved draft.
-  const editFile = async (quiet = false) => {
+  // Show the text editor (or a Markdown or HTML file's preview) again with the file as it is on disk, keeping an
+  // unsaved draft. An image or PDF shows its preview again, read anew.
+  const editFile = async (quiet = false, mode = 'edit') => {
     if (!file) return
-    if (dirty) { setFile({ ...file, mode: 'edit' }); return }
+    if (dirty) { setFile({ ...file, mode }); return }
     if (file.missing && quiet) { setFile(null); return }
+    if (file.binary || opensInPreview(file.path)) {
+      setFile(current => current?.id === file.id ? { ...current, mode: 'preview', binary: true, missing: false, version: (current.version || 0) + 1 } : current)
+      return
+    }
     const request = ++openRequest.current
     try {
       const result = await api(`/file?path=${encodeURIComponent(file.path)}&${query}`)
-      if (request === openRequest.current) setFile(current => current?.id === file.id ? { ...current, content: result.content, original: result.content, mode: 'edit', missing: false, absolute: result.absolute } : current)
+      if (request === openRequest.current) setFile(current => current?.id === file.id ? { ...current, content: result.content, original: result.content, mode, missing: false, absolute: result.absolute } : current)
     } catch (e) {
       if (request !== openRequest.current) return
       setFile(current => current?.id === file.id ? null : current)
@@ -415,7 +437,7 @@ export default function WorkspacePanel({ sessionId, workspace, worktree = null, 
     lastPending.current = { path: file?.path, hash: pendingHash, known: !!agentChanges }
     if (!file || dirty || !before.known || before.path !== file.path || before.hash === pendingHash || !pendingHash) return
     if (!before.hash && file.mode !== 'review') setFile({ ...file, mode: 'review' })
-    else if (file.mode === 'edit') void editFile(true)
+    else if (file.mode === 'edit' || file.mode === 'preview') void editFile(true, file.mode)
   }, [file?.path, pendingHash, !!agentChanges])
   // New or removed changed files can add or remove folders and files: list the folder again.
   const changedKey = [...changed.keys()].sort().join('\n')
@@ -443,6 +465,11 @@ export default function WorkspacePanel({ sessionId, workspace, worktree = null, 
   const project = (branch && typeof worktree.source_workspace === 'string' ? worktree.source_workspace : workspace)
     .split('/').filter(Boolean).pop() || workspace
   const expanded = sizing.width !== null && sizing.width >= sizing.limit
+  const kind = file ? previewKind(file.path) : null
+  // Markdown and HTML files switch between the editor and their preview (of the editor's text, unsaved edits included).
+  const textPreview = !!file && !file.binary && !file.missing && (kind === 'markdown' || kind === 'html')
+  const previewing = !!file && file.mode === 'preview' && !reviewing
+  const absolute = file?.absolute || (file?.binary ? (file.path.startsWith('/') ? file.path : `${workspace.replace(/\/+$/, '')}/${file.path}`) : null)
   return html`<aside class=${`workspace-panel ${sizing.width !== null ? 'sized' : ''}`} aria-label="Workspace panel" ref=${panel}
     style=${sizing.width !== null ? { '--panel-width': `${sizing.width}px` } : null}>
     <${PanelResizer} panel=${panel} width=${sizing.width} limit=${sizing.limit} onWidth=${sizing.set} />
@@ -461,12 +488,21 @@ export default function WorkspacePanel({ sessionId, workspace, worktree = null, 
           <span title=${file.path}>${file.path}${dirty ? ' •' : ''}</span>
           ${reviewing ? (file.missing ? null : html`<button class="editor-mode" onClick=${() => void editFile()}><${Pencil} size=${14} />Edit</button>`)
             : pending ? html`<button class="editor-mode pending" onClick=${() => setFile({ ...file, mode: 'review' })}><${FileDiff} size=${14} />Review changes</button>` : null}
-          <${VSCodeLink} absolute=${file.absolute} line=${markedLine?.line} />
+          ${textPreview && !reviewing ? (previewing
+            ? html`<button class="editor-mode" onClick=${() => setFile({ ...file, mode: 'edit' })}><${Pencil} size=${14} />Edit</button>`
+            : html`<button class="editor-mode" onClick=${() => setFile({ ...file, mode: 'preview' })}><${Eye} size=${14} />Preview</button>`) : null}
+          <${VSCodeLink} absolute=${absolute} line=${markedLine?.line} />
           <button class="icon-button" onClick=${() => onAttach(file.path)} aria-label="Add this file to chat"><${Plus} size=${16} /></button>
-          <button class="icon-button" onClick=${() => void save()} disabled=${!dirty || loading || reviewing} aria-label="Save file"><${Save} size=${16} /></button>
+          ${file.missing ? null : html`<button class="icon-button" onClick=${() => void download(file.path)} aria-label="Download file" title="Download"><${Download} size=${16} /></button>`}
+          ${file.binary ? null : html`<button class="icon-button" onClick=${() => void save()} disabled=${!dirty || loading || reviewing} aria-label="Save file"><${Save} size=${16} /></button>`}
         </div>
         ${reviewing ? html`<${DiffReview} key=${file.path} sessionId=${sessionId} path=${file.path} version=${pending.current_hash} busy=${busy} onAction=${onReview} onSelectSession=${onSelectSession}
-          onSendComments=${onSendComments} />` : html`
+          onSendComments=${onSendComments} />` : previewing ? (file.binary && !kind
+            ? html`<div class="file-preview-none"><p>${file.note || 'This file cannot be shown here.'}</p>
+              <button type="button" class="outline" onClick=${() => void download(file.path)}><${Download} size=${14} />Download</button></div>`
+            : html`<${FilePreview} key=${file.id} path=${file.path} kind=${kind} content=${file.content} query=${query} version=${file.version || 0}
+              onOpenPath=${path => void openFile(path)} />
+              ${textPreview ? html`<div class="editor-status"><span>Preview</span><span>${dirty ? 'Unsaved changes' : 'Saved on disk'}</span></div>` : null}`) : html`
         <textarea ref=${editor} class="code-editor" aria-label=${`Edit ${file.path}`} value=${file.content} spellcheck=${false}
           onMouseDown=${leaveLine} onKeyDown=${leaveLine} onInput=${e => { leaveLine(); setFile({ ...file, content: e.currentTarget.value }) }} />
         ${file.requested ? html`<p class="editor-note" role="status">Opened ${file.path}: the reply named it ${file.requested}.</p>` : null}
@@ -476,14 +512,15 @@ export default function WorkspacePanel({ sessionId, workspace, worktree = null, 
           onAdd=${added.add} onRemove=${added.remove} changed=${[...changed.keys()]} />
         <div class="file-path"><button class="icon-button" aria-label="Parent folder" disabled=${directory === root} onClick=${() => setDirectory(parentOf(directory))}><${ArrowLeft} size=${15} /></button><span title=${directory === '.' ? workspace : directory}>${directory === '.' ? 'Project files' : directory}</span>
           <button class="icon-button" aria-label="Refresh files" disabled=${loading} onClick=${() => void refresh()}><${RefreshCw} size=${14} className=${loading ? 'spin' : ''} /></button></div>
-        <div class="file-list">${files.map(entry => {
+        <div class="file-list">${files.map((entry, index) => {
           // Like an editor's explorer: a dot on files the agent changed, and on folders containing them.
           const dot = entry.directory ? [...changed.keys()].some(path => path.startsWith(`${entry.path}/`)) : changed.has(entry.path)
-          return html`<button key=${entry.path} class="file-row" onClick=${() => entry.directory ? setDirectory(entry.path) : void openFile(entry.path)}>
-          ${entry.directory ? html`<${Folder} size=${16} />` : html`<${File} size=${16} />`}<span title=${entry.name}>${entry.name}</span>
+          return html`<div key=${entry.path} class="file-entry"><button class="file-row" onClick=${() => entry.directory ? setDirectory(entry.path) : void openFile(entry.path)}>
+          ${entry.directory ? html`<${Folder} size=${16} />` : html`<${File} size=${16} />`}<span id=${`${rowIds}-${index}`} title=${entry.name}>${entry.name}</span>
           ${dot ? html`<span class="change-dot" role="img" aria-label=${entry.directory ? 'Contains changed files' : 'Changed by the agent'} title=${entry.directory ? 'Contains files the agent changed' : 'Changed by the agent: open it to review'} />` : null}
           ${entry.directory ? html`<${ChevronRight} size=${13} />` : null}
-        </button>`
+        </button>${entry.directory ? null : html`<button type="button" class="icon-button file-download" aria-label="Download"
+          aria-describedby=${`${rowIds}-${index}`} title=${`Download ${entry.name}`} onClick=${() => void download(entry.path)}><${Download} size=${14} /></button>`}</div>`
         })}${!loading && files.length === 0 ? html`<p class="panel-empty">This folder is empty.</p>` : null}</div>
         <p class="panel-footnote">Secret files and generated folders are excluded.</p>
       </div>`)

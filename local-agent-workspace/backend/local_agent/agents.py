@@ -54,6 +54,7 @@ from .extensions import ExtensionManager
 from .extensions import RESERVED_COMMANDS, skill_index
 from . import commands as command_templates
 from . import custom_agents
+from . import settings_layers
 from .context import estimate_text_tokens
 from .planning import CallAllowance, DelegateManager, DelegationGate, TaskManager
 from .interactions import InteractionManager
@@ -860,6 +861,9 @@ class AgentManager(LifecycleHooks):
         self.extensions = ExtensionManager(settings)
         self.task_board = TaskManager(store)
         self.projects = ProjectSettings(settings.state_dir)
+        # A model a project's settings files name must be one the user already uses (settings_layers.py).
+        if hasattr(settings, "project_layers"):
+            settings.project_layers().model_allowed = self.fallback_allowed
         self.memory = project_memory.MemoryStore(settings.state_dir)
         # In memory only: {chat id: its project memory block}, read when a turn starts (run_databricks), so a
         # note saved mid-turn changes the cached system prefix from the next turn on.
@@ -1387,12 +1391,27 @@ class AgentManager(LifecycleHooks):
         """Folders every conversation may use without a folder grant: the default code folder."""
         return user_paths.standing_directories(self.settings)
 
+    def chat_values(self, session):
+        """Settings for this chat: the user's, with its project's trusted settings files over the keys they set
+        (settings_layers.py; a worktree chat reads its source project's). Every per-chat read of those keys uses it,
+        so the meter, the requests and the notices agree."""
+        if not hasattr(self.settings, "effective"):
+            return self.settings.values
+        return self.settings.effective(settings_layers.project_folder(session, self.settings))
+
+    def chat_source(self, session, key):
+        """'project' or 'local' when this chat's value of key comes from its project's settings files, else None."""
+        if not hasattr(self.settings, "project_layers"):
+            return None
+        folder = settings_layers.project_folder(session, self.settings)
+        return self.settings.project_layers().report(folder)["sources"].get(key)
+
     def request_limits(self, session):
         """(context window, max output tokens) for this chat's requests. Budgets left at the Settings
         model's defaults follow the chat's own endpoint; customised budgets stay. Both are capped at
         the endpoint's maxima (model_profiles.effective_limits)."""
         context_window, max_output_tokens = self.base_limits(session)
-        limits = effective_limits(session.get("model") or self.settings.values["model"], context_window,
+        limits = effective_limits(session.get("model") or self.chat_values(session)["model"], context_window,
                                   max_output_tokens)
         return limits["context_window"], limits["max_output_tokens"]
 
@@ -1400,7 +1419,7 @@ class AgentManager(LifecycleHooks):
         """The Settings budgets, with those left at the Settings model's defaults following the chat's
         endpoint (before the endpoint's maxima apply). A followed value that would not fit with the
         other budget keeps the Settings value (config.follow_limits)."""
-        values = self.settings.values
+        values = self.chat_values(session)
         defaults = default_limits(values["model"])
         current = (values["context_window"], values["max_output_tokens"])
         follow = [current[0] == defaults[0], current[1] == defaults[1]]
@@ -1641,7 +1660,7 @@ class AgentManager(LifecycleHooks):
         self.notify_status(session, previous, status, turn_ended)
         await self.delegates.progress(session, status=status)
         if status == "idle":
-            if (turn_ended and self.settings.values.get("auto_keep_changes") is True
+            if (turn_ended and self.chat_values(session).get("auto_keep_changes") is True
                     and session.get("terminal_reason") in ("completed", "tool_error")):
                 # Automatic Keep: this chat's list clears when its reply finishes (a subagent's end
                 # leaves its parent's rolled-up rows alone). The empty list is pushed. A reply that
@@ -2321,7 +2340,7 @@ class AgentManager(LifecycleHooks):
         (the request's; default the chat's limit) caps a thinking budget."""
         values = self.settings.values
         effort = reasoning.valid_effort(session.get("reasoning_effort")) or reasoning.valid_effort(
-            values.get("reasoning_effort")) or reasoning.DEFAULT_EFFORT
+            self.chat_values(session).get("reasoning_effort")) or reasoning.DEFAULT_EFFORT
         setting = values.get("reasoning_format")
         setting = setting if setting in reasoning.REQUEST_FORMATS else reasoning.DEFAULT_FORMAT
         setting, rejected, _ = self.reasoning_ladder(session["model"], setting)
@@ -2366,7 +2385,7 @@ class AgentManager(LifecycleHooks):
         this endpoint to (cache_levels) and the level an endpoint check found accepted."""
         if not prompt_caching(session["model"]):
             return None
-        chosen = {"auto": "full", "messages": "messages"}.get(self.settings.values.get("prompt_caching", "auto"), "off")
+        chosen = {"auto": "full", "messages": "messages"}.get(self.chat_values(session).get("prompt_caching", "auto"), "off")
         remembered = self.cache_levels.get(session["model"], "full")
         # An endpoint check that found the markers rejected starts the ladder at the level it found accepted.
         probed = self.endpoint_checks.cache_level(session["model"]) or "full"
@@ -4126,7 +4145,7 @@ class AgentManager(LifecycleHooks):
         home = self.home_tools()
         user_block, sources, warnings = self.user_instructions_block(home)
         guidance["sources"].extend(sources)
-        style_text, style_source = style_block(self.settings.values.get("output_style", "default"), tools, home)
+        style_text, style_source = style_block(self.chat_values(session).get("output_style", "default"), tools, home)
         if style_source:
             guidance["sources"].append(style_source)
         # Read when the turn started: a note saved during the turn changes the cached prefix from the next one.
@@ -4547,7 +4566,7 @@ class AgentManager(LifecycleHooks):
 
     def handoff_plan(self, session, context_window):
         """Where the next compaction saves its handoff, or None when disabled."""
-        if not self.settings.values.get("compaction_handoffs", True) or session.get("is_subagent"):
+        if not self.chat_values(session).get("compaction_handoffs", True) or session.get("is_subagent"):
             return None
         state = session.get("context_state") or {}
         slug = re.sub(r"[^a-z0-9]+", "-", str(session.get("title") or "").lower()).strip("-")[:60].strip("-") or "chat"
@@ -4710,7 +4729,7 @@ class AgentManager(LifecycleHooks):
                     force_compact=True, preservation_note=preservation_note, condense=condense,
                     scale=estimate_scale(session.get("inference_calls"), session["model"]),
                     handoff_path=plan and plan["path"], save_handoff=plan and self.handoff_saver(session, plan),
-                    auto_compact_percent=auto_compact_percent(self.settings.values), record_requests=True,
+                    auto_compact_percent=auto_compact_percent(self.chat_values(session)), record_requests=True,
                     app_record=record, output_allowance=allowance, completed_calls=completed_call_ids(session),
                     model_window=model_context_window(session["model"]), anchor=self.estimate_anchor(session),
                     on_compaction=self.compaction_trigger(session), tool_servers=self.mcp_server_ids(),
@@ -5105,7 +5124,7 @@ class AgentManager(LifecycleHooks):
         target = {**session, "model": fallback}  # Read by the request helpers only, never saved.
         context_window, max_tokens = self.request_limits(target)
         if (model_context_window(fallback) is None
-                and fallback.lower() != str(self.settings.values.get("model") or "").strip().lower()):
+                and fallback.lower() != str(self.chat_values(session).get("model") or "").strip().lower()):
             # No known window (GPT OSS 20B, Opus 4.8, a typed endpoint): budgets customised for another endpoint
             # count only up to this one's defaults, as for a subagent on its own endpoint (base_limits).
             own = default_limits(fallback)
@@ -5237,8 +5256,8 @@ class AgentManager(LifecycleHooks):
                 return
             context_window, reply_reserve = self.request_limits(session)
             budget = effective_input_budget(context_window, reply_reserve, model_context_window(
-                session.get("model") or self.settings.values["model"]))
-            percent = auto_compact_percent(self.settings.values)
+                session.get("model") or self.chat_values(session)["model"]))
+            percent = auto_compact_percent(self.chat_values(session))
             threshold = compaction_threshold(budget, percent)
             updated = {**info, "context_window": context_window, "reply_reserve": reply_reserve, "input_budget": budget,
                        "auto_compact_percent": percent, "auto_compact_threshold": threshold}
@@ -5460,7 +5479,7 @@ class AgentManager(LifecycleHooks):
             # A chat a script created may have its own Agent steps (POST /api/sessions max_agent_steps).
             steps = (session.get("max_steps", 6) if session.get("is_subagent")
                      else session["max_agent_steps"] if type(session.get("max_agent_steps")) is int
-                     else self.settings.values.get("max_agent_steps", DEFAULT_MAX_AGENT_STEPS))
+                     else self.chat_values(session).get("max_agent_steps", DEFAULT_MAX_AGENT_STEPS))
             # What the chat had spent and how many calls it had before this turn (the step-limit notice).
             turn_start = (self.spent_so_far(session), len(session.get("inference_calls") or []))
             # Hidden repairs, auto-continue waits after rate limits, the reason the next
@@ -5528,7 +5547,7 @@ class AgentManager(LifecycleHooks):
                     reply_reserve=max_output_tokens, condense=condense, default_reply_reserve=default_reply_reserve,
                     scale=scale,
                     handoff_path=plan and plan["path"], save_handoff=plan and self.handoff_saver(session, plan),
-                    auto_compact_percent=auto_compact_percent(self.settings.values), record_requests=True,
+                    auto_compact_percent=auto_compact_percent(self.chat_values(session)), record_requests=True,
                     app_record=record, output_allowance=allowance, completed_calls=completed_call_ids(session),
                     model_window=model_context_window(session["model"]), anchor=self.estimate_anchor(session),
                     on_compaction=self.compaction_trigger(session), tool_servers=self.mcp_server_ids(),
