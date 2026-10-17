@@ -47,8 +47,8 @@
 //   max_turn_tokens, max_turn_minutes, min_interval_minutes, max_name, max_prompt, max_schedules, max_running, modes } }.
 //   POST /schedules { ScheduleFields } adds one for the chat's project, PUT /schedules/<id> edits, DELETE deletes,
 //   POST /schedules/<id>/pause|resume|skip; each returns the listing. POST /schedules/<id>/run (Run now, or Run on a
-//   waiting run) -> the listing and session_id (the run's new chat). POST /schedules/preview { spec, timezone } ->
-//   { text, zone, next_runs: [epoch seconds] }. GET /schedules/ready -> { ready: [{ id, name, workspace, due, note }],
+//   waiting run) -> the listing and session_id (the run's new chat). POST /schedules/preview { spec, timezone,
+//   schedule_id? (the edited one: an unchanged timing keeps its saved times) } -> { text, zone, next_runs: [epoch seconds] }. GET /schedules/ready -> { ready: [{ id, name, workspace, due, note }],
 //   paused: [{ id, name, workspace }] (a rejected token) } over all projects.
 // ScheduleFields: { name, prompt, spec ('every N minutes|hours|days' or a five-field cron line), timezone ('' = this
 //   computer's), model ('' = Settings'), reasoning_effort ('' = Settings'), permission_mode (never 'bypassPermissions'),

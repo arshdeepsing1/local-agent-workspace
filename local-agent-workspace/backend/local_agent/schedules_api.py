@@ -34,6 +34,7 @@ class SchedulePreview(BaseModel):
     model_config = {"extra": "forbid"}
     spec: str = Field(max_length=200, strict=True)
     timezone: str = Field(default="", max_length=64, strict=True)
+    schedule_id: str = Field(default="", max_length=64, strict=True)  # The schedule the form edits ("" for a new one).
 
 
 LIMITS = {"max_approval_minutes": schedules.MAX_APPROVAL_MINUTES, "max_turn_tokens": MAX_TURN_TOKENS,
@@ -80,7 +81,14 @@ def register_schedules(app, manager, settings, session_or_404, workspace_tools):
 
     @app.post("/api/schedules/preview")
     async def preview_schedule(body: SchedulePreview):
-        return schedules.preview(body.spec, body.timezone.strip())
+        """The next times of the typed schedule. An edit that keeps a schedule's timing keeps its anchor (Scheduler.edit),
+        so an interval's times still count from when the timing was saved."""
+        zone_name, anchor = body.timezone.strip(), None
+        item = scheduler.store.get(body.schedule_id) if body.schedule_id else None
+        if item is not None and isinstance(item.get("anchor"), (int, float)) and item.get("next_run") is not None \
+                and (schedules.parse_spec(body.spec).text, zone_name) == (item.get("spec"), item.get("timezone")):
+            anchor = item["anchor"]
+        return schedules.preview(body.spec, zone_name, anchor=anchor)
 
     @app.post("/api/schedules")
     async def create_schedule(body: ScheduleEdit, session_id: str | None = None):

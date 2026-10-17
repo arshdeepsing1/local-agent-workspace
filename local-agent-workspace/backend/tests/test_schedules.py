@@ -411,6 +411,120 @@ async def test_one_run_per_schedule_and_at_most_two_at_a_time(runtime, monkeypat
     assert scheduler.public(scheduler.store.get(items[0]["id"]))["running"] is False
 
 
+async def test_a_long_run_keeps_its_history_entry_and_its_schedule_never_runs_twice(runtime, monkeypatch):
+    manager, scheduler, project, now = runtime
+    release = asyncio.Event()
+
+    async def slow(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"endpoints": []})
+        await release.wait()
+        return httpx.Response(200, text=text_reply("Done."))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: REAL_CLIENT(**kwargs, transport=httpx.MockTransport(slow)))
+    item = make(scheduler, project, spec="every 5 minutes", run_policy="auto")
+    now[0] = T0 + 300
+    await scheduler.tick()
+    first = history(scheduler, item)[-1]["session_id"]
+    for step in range(2, 30):  # More "still running" notes than the history keeps.
+        now[0] = T0 + 300 * step
+        await scheduler.tick()
+    saved = history(scheduler, item)
+    assert len(saved) == schedules.HISTORY and saved[0]["session_id"] == first and "ended" not in saved[0]
+    assert all(entry["note"] == "Not run: the previous run of this schedule is still running." for entry in saved[1:])
+    assert [sid for sid in manager.tasks if manager.busy_task(sid)] == [first]
+    release.set()
+    await settled(manager)
+    assert history(scheduler, item)[0]["terminal_reason"] == "completed"
+
+
+def test_the_history_drops_ended_entries_before_a_running_one():
+    item = {"history": [{"id": "open", "outcome": "started", "session_id": "a"}]
+            + [{"id": f"n{index}", "outcome": "not_run"} for index in range(schedules.HISTORY - 1)]}
+    for index in range(5):
+        Scheduler.add_history(item, {"id": f"new{index}", "outcome": "not_run", "note": None})
+    ids = [entry["id"] for entry in item["history"]]
+    assert len(ids) == schedules.HISTORY and ids[0] == "open" and ids[-1] == "new4" and "n4" not in ids
+    assert "note" not in item["history"][-1]
+    # Entries that never ended (runs of a crashed app) cannot fill it beyond its size either.
+    item = {"history": [{"id": f"o{index}", "outcome": "started"} for index in range(schedules.HISTORY)]}
+    Scheduler.add_history(item, {"id": "last", "outcome": "not_run"})
+    assert len(item["history"]) == schedules.HISTORY and item["history"][0]["id"] == "o1"
+
+
+async def test_your_own_turn_in_a_runs_chat_does_not_block_the_next_run(runtime, monkeypatch):
+    manager, scheduler, project, now = runtime
+    release = asyncio.Event()
+    calls = []
+
+    async def answer(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"endpoints": []})
+        calls.append(1)
+        if len(calls) > 1:
+            await release.wait()
+        return httpx.Response(200, text=text_reply("Done."))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: REAL_CLIENT(**kwargs, transport=httpx.MockTransport(answer)))
+    item = make(scheduler, project, spec="every hour", run_policy="auto")
+    now[0] = T0 + 3600
+    await scheduler.tick()
+    await settled(manager)
+    session_id = history(scheduler, item)[-1]["session_id"]
+    manager.start(session_id, "A follow-up question of my own")  # You continue the run's chat.
+    await asyncio.sleep(0.05)
+    assert manager.busy_task(session_id) and scheduler.public(scheduler.store.get(item["id"]))["running"] is False
+    now[0] = T0 + 7200
+    await scheduler.tick()
+    entry = history(scheduler, item)[-1]
+    assert entry["outcome"] == "started" and entry["session_id"] != session_id
+    release.set()
+    await settled(manager)
+    assert history(scheduler, item)[-1]["terminal_reason"] == "completed"
+
+
+async def test_a_schedule_changed_outside_the_app_is_paused_instead_of_run(runtime, monkeypatch):
+    manager, scheduler, project, now = runtime
+    seen = gateway(monkeypatch)
+    path = manager.settings.state_dir / "schedules.json"
+
+    def tamper(index, **values):
+        data = json.loads(path.read_text())
+        data["schedules"][index].update(values)
+        path.write_text(json.dumps(data))
+    bypass = make(scheduler, project, name="Bypass", spec="every hour", run_policy="auto")
+    uncapped = make(scheduler, project, name="Uncapped", spec="every hour")
+    tamper(0, permission_mode="bypassPermissions")
+    tamper(1, approval_timeout_minutes=0, turn_token_limit=0)
+    with pytest.raises(ValueError, match="never use Bypass permissions"):
+        await scheduler.launch(bypass["id"], "run_now", user=True)
+    now[0] = T0 + 3600
+    await scheduler.tick()
+    for item, message in ((bypass, "never use Bypass permissions"), (uncapped, "need an approval limit")):
+        saved = scheduler.store.get(item["id"])
+        assert saved["enabled"] is False and saved["paused_reason"] == "invalid" and "pending" not in saved
+        assert saved["paused_note"].startswith("The saved schedule is not valid: ") and message in saved["paused_note"]
+        assert saved["history"][-1]["outcome"] == "not_run" and message in saved["history"][-1]["note"]
+    assert seen["checks"] == 0 and manager.store.list() == [] and scheduler.attention()["ready"] == []
+    # Changed while its connection check ran: the run checks the schedule again before its chat is made.
+    later = make(scheduler, project, name="Later", spec="every hour", run_policy="auto")
+
+    async def check_then_tamper(request):
+        tamper(2, turn_time_limit_minutes=0)
+        return httpx.Response(200, json={"endpoints": []})
+    monkeypatch.setattr(httpx, "AsyncClient",
+                        lambda **kwargs: REAL_CLIENT(**kwargs, transport=httpx.MockTransport(check_then_tamper)))
+    now[0] = T0 + 2 * 3600
+    await scheduler.tick()
+    saved = scheduler.store.get(later["id"])
+    assert saved["paused_reason"] == "invalid" and "a time limit per run" in saved["paused_note"]
+    assert manager.store.list() == [] and manager.scheduled_turns == {}
+    # A scheduled turn's approval limit is never "no limit", even when its value is damaged.
+    session = manager.store.create({**manager.settings.values, "workspace": str(project)})
+    manager.turns[session["id"]] = {"started": 0, "first_event": 0, "first_call": 0,
+                                    "scheduled": {"schedule_id": "x", "approval_timeout_minutes": 0}}
+    assert manager.approval_seconds(session) == interactions.MINUTE
+    manager.turns.pop(session["id"])
+
+
 async def test_a_card_nobody_answers_ends_the_run_at_its_approval_limit(runtime, monkeypatch):
     manager, scheduler, project, now = runtime
     monkeypatch.setattr(interactions, "MINUTE", 0.05)  # Each minute of the approval limit lasts 50 ms.
@@ -432,6 +546,20 @@ async def test_a_card_nobody_answers_ends_the_run_at_its_approval_limit(runtime,
     manager.turns[session_id] = {"started": 0, "first_event": 0, "first_call": 0}
     assert manager.approval_seconds(chat) == 60 * 0.05  # Settings → Approval wait: 60 minutes.
     manager.turns.pop(session_id)
+
+
+async def test_a_card_of_the_last_step_ends_the_run_at_the_approval_limit_too(runtime, monkeypatch):
+    manager, scheduler, project, now = runtime
+    monkeypatch.setattr(interactions, "MINUTE", 0.05)
+    gateway(monkeypatch, lambda requests: call_reply("run_command", {"command": "touch ran.txt"}, f"c{len(requests)}"))
+    item = make(scheduler, project, permission_mode="manual", approval_timeout_minutes=1, max_agent_steps=1)
+    session_id = await scheduler.launch(item["id"], "run_now", user=True)
+    await settled(manager)
+    chat = manager.store.get(session_id)
+    card = next(event for event in chat["events"] if event.get("name") == "run_command")
+    assert card["approval"] == "expired" and chat["terminal_reason"] == "approval_expired"
+    assert [event["terminal_reason"] for event in chat["events"] if event.get("terminal_reason")] == ["approval_expired"]
+    assert history(scheduler, item)[-1]["terminal_reason"] == "approval_expired"
 
 
 async def test_a_question_nobody_answers_ends_the_run_too(runtime, monkeypatch):
@@ -510,6 +638,46 @@ async def test_a_run_that_cannot_start_is_noted_and_leaves_no_chat(runtime, monk
     assert history(scheduler, gone)[-1]["note"] == "Not run: Choose an existing project directory."
 
 
+async def test_due_runs_a_stopped_or_failing_tick_does_not_start_get_a_note(runtime, monkeypatch):
+    manager, scheduler, project, now = runtime
+    hang = asyncio.Event()
+
+    async def answer(request):
+        if request.method == "GET":
+            await hang.wait()
+        return httpx.Response(200, json={"endpoints": []})
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: REAL_CLIENT(**kwargs, transport=httpx.MockTransport(answer)))
+    first = make(scheduler, project, name="First", spec="every hour", run_policy="auto")
+    second = make(scheduler, project, name="Second", spec="every hour", run_policy="auto")
+    now[0] = T0 + 3600 + 5
+    task = asyncio.create_task(scheduler.tick())
+    for _ in range(100):  # Until the first run's connection check waits.
+        await asyncio.sleep(0.01)
+        if scheduler.launching:
+            break
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    for item in (first, second):
+        entry = history(scheduler, item)[-1]
+        assert entry["outcome"] == "not_run" and entry["due"] == T0 + 3600
+        assert entry["note"].startswith("Not run: the scheduler stopped before the run started")
+    assert manager.store.list() == [] and not scheduler.launching
+    # One run that fails unexpectedly does not keep the next one from starting.
+    gateway(monkeypatch)
+    plain = scheduler.create_chat
+
+    def broken(item, *args):
+        if item["id"] == first["id"]:
+            raise RuntimeError("unexpected")
+        return plain(item, *args)
+    monkeypatch.setattr(scheduler, "create_chat", broken)
+    now[0] = T0 + 2 * 3600
+    await scheduler.tick()
+    await settled(manager)
+    assert history(scheduler, first)[-1]["note"].startswith("Not run: it could not be started because of an unexpected")
+    assert history(scheduler, second)[-1]["terminal_reason"] == "completed"
+
+
 async def test_a_deleted_or_restarted_run_gets_its_end_in_the_history(runtime, monkeypatch):
     manager, scheduler, project, now = runtime
     gateway(monkeypatch)
@@ -569,6 +737,43 @@ def test_the_scheduler_starts_only_when_scheduled_runs_are_on(tmp_path, monkeypa
     with TestClient(app):
         assert app.state.manager.scheduler.running
     assert not app.state.manager.scheduler.running and app.state.manager.scheduler.lock is None  # Stopped at shutdown.
+
+
+async def test_a_stop_and_a_start_that_overlap_keep_the_lock(runtime):
+    manager, scheduler, project, now = runtime
+    manager.settings.values["schedules_enabled"] = True
+    assert scheduler.start()
+    stopping = asyncio.create_task(scheduler.stop())
+    await asyncio.sleep(0)
+    assert scheduler.start()  # A second Settings save turns it on again while the first one's stop waits.
+    await stopping
+    other = Scheduler(manager, manager.settings)
+    assert scheduler.running and scheduler.lock is not None and other.acquire() is False
+    await scheduler.stop()
+    assert scheduler.lock is None and other.acquire() is True
+    other.release()
+
+
+def test_the_preview_of_an_edit_keeps_the_saved_interval_times(tmp_path, monkeypatch):
+    settings, project = client_for(tmp_path, monkeypatch)
+    now = [T0]
+    monkeypatch.setattr(schedules, "clock", lambda: now[0])
+    app = create_app(settings)
+    with TestClient(app) as client:
+        headers = {"X-Local-Token": client.get("/api/bootstrap").json()["token"]}
+        item = client.post("/api/schedules", headers=headers, json=good(spec="every 2 hours")).json()["schedules"][0]
+        now[0] = T0 + 5400  # 90 minutes later, Edit changes only the prompt.
+
+        def first_time(**body):
+            return client.post("/api/schedules/preview", headers=headers, json=body).json()["next_runs"][0]
+        assert first_time(spec="every 2 hours", schedule_id=item["id"]) == item["next_run"] == T0 + 7200
+        assert first_time(spec="Every  2 hours", timezone=" ", schedule_id=item["id"]) == T0 + 7200
+        assert first_time(spec="every 2 hours") == T0 + 5400 + 7200  # A new schedule counts from now.
+        assert first_time(spec="every 3 hours", schedule_id=item["id"]) == T0 + 5400 + 3 * 3600  # New timing: from now.
+        assert first_time(spec="every 2 hours", schedule_id="missing") == T0 + 5400 + 7200
+        saved = client.put(f"/api/schedules/{item['id']}", headers=headers,
+                           json=good(spec="every 2 hours", prompt="Another prompt")).json()["schedules"][0]
+        assert saved["next_run"] == T0 + 7200
 
 
 def test_the_schedule_routes(tmp_path, monkeypatch):

@@ -1857,7 +1857,10 @@ class AgentManager(LifecycleHooks):
         """How long a card of this chat waits (approval cards, questions and plans): a scheduled run's approval
         limit, else Settings → Agent → Approval wait; None waits until answered or stopped."""
         run = self.scheduled_run(session)
-        return wait_seconds(self.settings, run["approval_timeout_minutes"] if run else None)
+        if run is None:
+            return wait_seconds(self.settings)
+        minutes = run.get("approval_timeout_minutes")  # schedules.py checked it; a scheduled card never waits forever.
+        return wait_seconds(self.settings, minutes if type(minutes) is int and minutes > 0 else 1)
 
     def approval_expired(self, session):
         """A card of a scheduled run waited its approval limit: the run stops before its next model request."""
@@ -5909,6 +5912,10 @@ class AgentManager(LifecycleHooks):
                         [*model_history(wire), message], context_state, system, definitions, input_budget))
             if steps > 0:
                 await self.refresh_next_estimate(session, system, definitions, wire, context_state)
+            # A card of the last step waited a scheduled run's approval limit: that, not the step limit, ended it.
+            if (run := self.scheduled_run(session)) is not None and run.get("expired"):
+                await self.approval_stop(session, wire, run)
+                return False
         # A chat a script created with its own Agent steps does not follow the Settings value.
         own_steps = not session.get("is_subagent") and type(session.get("max_agent_steps")) is int
         await self.event(session, "error" if session.get("is_subagent") else "notice",

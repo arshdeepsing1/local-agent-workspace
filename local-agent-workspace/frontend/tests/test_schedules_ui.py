@@ -117,6 +117,7 @@ def test_a_new_schedule_needs_its_caps_and_never_offers_bypass(ui, page):
     expect(form.get_by_text("A schedule runs at most every 5 minutes.")).to_be_visible()
     form.get_by_role("textbox", name="When it runs").fill("0 9 * * 1-5")
     expect(form.get_by_role("status")).to_contain_text("Next runs (UTC): ")
+    assert ui.bodies("/api/schedules/preview", "POST")[-1] == {"spec": "0 9 * * 1-5", "timezone": ""}
     form.get_by_role("spinbutton", name="Token limit per run").fill("")
     form.get_by_role("button", name="Add schedule").click()
     expect(form.get_by_role("alert")).to_have_text("Set a token limit per run: scheduled runs need one.")
@@ -147,6 +148,9 @@ def test_edit_keeps_the_fields_and_a_server_refusal_shows(ui, page):
     form = region.get_by_role("form", name="Edit schedule")
     expect(form.get_by_role("textbox", name="Name")).to_have_value("Nightly tests")
     expect(form.get_by_role("spinbutton", name="Spending limit per run (DBU)")).to_have_value("2")
+    # The preview of an edit names the schedule, so an interval that keeps its timing shows its saved times.
+    expect(form.get_by_role("status")).to_contain_text("Next runs (UTC): ")
+    assert ui.bodies("/api/schedules/preview", "POST")[-1] == {"spec": "0 2 * * *", "timezone": "", "schedule_id": "s1"}
     form.get_by_role("button", name="Save schedule").click()
     expect(region.get_by_role("alert")).to_have_text("Scheduled runs need a time limit per run: a whole number of minutes from 1 to 1,440.")
     assert ui.bodies("/api/schedules/s1?session_id=a", "PUT")[0]["approval_timeout_minutes"] == 10

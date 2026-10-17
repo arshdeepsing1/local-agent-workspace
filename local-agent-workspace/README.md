@@ -791,8 +791,8 @@ when opening a conversation or performing restart recovery.
   that you declined). The card shows when it expires (with the weekday when that is not today).
   0 waits until you answer or press **Stop**, like Claude desktop, but a waiting card keeps the
   chat busy, and a busy chat blocks Undo and Recovery restores in its project. Before this
-  setting existed, every card expired after five minutes. A scheduled run has its own, shorter approval
-  limit, after which the run stops (see **Scheduled runs**). An action stopped without any card, for example by Plan mode or
+  setting existed, every card expired after five minutes. A scheduled run has its own approval limit
+  (1 to 60 minutes), after which the run stops (see **Scheduled runs**). An action stopped without any card, for example by Plan mode or
   because project instructions changed mid-turn, shows "Not run:" and the reason, not "declined".
   When a busy chat blocks an action, the error names that chat and why (for example
   "“Fix the parser” is waiting for your approval. Answer or stop it before undoing agent
@@ -2957,7 +2957,8 @@ schedule sends its prompt, as if you typed it, to a **new chat** in that project
 The chat is named after the schedule and the time (no title request), is tagged `scheduled`, and gets
 the schedule's settings as its own:
 
-- **When it runs**: `every N minutes`, `hours` or `days`, counted from when you save it (at most every
+- **When it runs**: `every N minutes`, `hours` or `days`, counted from when you save that timing (an
+  edit that keeps it keeps the schedule's times, and its preview shows them; at most every
   5 minutes, at least every 31 days), or a five-field cron line: minute, hour, day of month, month and
   day of week (0 or 7 is Sunday), each `*`, a number, a range, a list or a step (`*/15`, `8-18/2`,
   `1,15`), such as `0 9 * * 1-5` for 9:00 on weekdays. When both day fields are set, a day that matches
@@ -2984,18 +2985,20 @@ Schedules run only while the app runs and **Settings → Agent → Scheduled run
 (off by default; **Run now** works either way). The app then checks them every 30 seconds. With Ask, a
 due run waits for you: a banner above the chat says "Scheduled run ready: <name>" with **Run** (which
 starts it and opens its chat) and **Skip**, the schedule shows **Run** and **Skip** too, the server shows
-the same text as a desktop notification when **Settings → Desktop notification** is on and no page is
-open, and **Notify me** shows it while the page is hidden. Nothing is sent until you choose Run. A ready
-run nobody starts before the schedule's next time, or within 24 hours, is not run. With Run
-automatically, runs start at their times without a click, and each one makes model calls billed to your
-workspace.
+the same text as a desktop notification when **Settings → Desktop notification when no browser tab is
+open** is on and no page is open, and **Notify me** shows it while the page is hidden. Nothing is sent
+until you choose Run. A ready run nobody starts before the schedule's next time, or within 24 hours, is
+not run. With Run automatically, runs start at their times without a click, and each one makes model
+calls billed to your workspace.
 
 Before each run the app makes the free connection check (it lists the serving endpoints; no model
 call). When Databricks rejects the token (HTTP 401 or 403), the schedule is paused, a banner says
 "Scheduled runs paused: Databricks rejected the token" (and a desktop notification when no page is
 open); renew the token in your credential file, then **Resume** the schedule. Other problems (no
 network, a Databricks server error, a project folder that is gone, an @ file the prompt may not attach)
-skip that run with a note. A run is also skipped while the schedule's previous run still runs, and when
+skip that run with a note, as does a run the app stops before it starts (the app closing, or Scheduled
+runs turned off, during its connection check). A run is also skipped while the schedule's previous run
+still runs (its scheduled turn: a message you send in that run's chat later does not count), and when
 two scheduled runs already run. If runs were due while the app was closed (or asleep, or with scheduled
 runs off), the first check afterwards runs the schedule **once** for all of them when the latest was due
 within 24 hours ("Caught up once: 4 runs missed while the app was not running"), and otherwise skips them
@@ -3005,9 +3008,11 @@ and the other says so in Schedules.
 
 Each schedule's **History** keeps its last 20 runs: when, how it started (Scheduled, Caught up, Run now
 or Run when ready) and how it ended (steps, time, tokens and estimated DBU), or why it did not run, with
-**Open chat**. **Run now** starts a run at once, whatever the run policy; it still checks the connection
-and the runs already running. Schedules are kept in `schedules.json` in the state folder, never in a
-project, and deleting one keeps its runs' chats.
+**Open chat**; a run that is still running keeps its entry however many notes follow it. **Run now**
+starts a run at once, whatever the run policy; it still checks the connection and the runs already
+running. Schedules are kept in `schedules.json` in the state folder, never in a project, and deleting one
+keeps its runs' chats. Each run checks the saved schedule again, so one changed outside the app (Bypass
+permissions, a missing limit) is paused with a note instead of run.
 
 **Settings → Credentials → Token expires on** (optional) is the day your Databricks personal access
 token expires. From 7 days before, and after it, a banner (with **Open settings** and **Dismiss**) and

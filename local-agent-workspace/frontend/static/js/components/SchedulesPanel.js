@@ -19,7 +19,7 @@ const ENDS = { completed: 'Completed', tool_error: 'Completed with a failed tool
   spending_limit: 'Reached the spending limit', budget_limit: 'Reached its token or time limit',
   approval_expired: 'Stopped at the approval limit', stopped: 'Stopped', interrupted: 'Interrupted', error: 'Ended with an error',
   inference_error: 'Ended with an error', hook_blocked: 'Blocked by a hook', deleted: 'Its chat was deleted' }
-const PAUSED = { paused: 'Paused', token_rejected: 'Paused: Databricks rejected the token', invalid: 'Paused: its schedule cannot be read' }
+const PAUSED = { paused: 'Paused', token_rejected: 'Paused: Databricks rejected the token', invalid: 'Paused: its saved schedule is not valid' }
 const BLANK = { name: '', prompt: '', spec: '', timezone: '', model: '', reasoning_effort: '', permission_mode: 'dontAsk',
   approval_timeout_minutes: 10, turn_token_limit: 500000, turn_time_limit_minutes: 30, spending_limit_dbu: 0, max_agent_steps: null,
   run_policy: 'ask', catch_up: 'once' }
@@ -153,17 +153,18 @@ function ScheduleForm({ editing, limits, busy, onCancel, onSave }) {
   const whole = key => event => { const text = event.currentTarget.value.trim(); field(key, text === '' ? (key === 'max_agent_steps' ? null : NaN) : Number(text)) }
   const name = useRef(null)
   useEffect(() => { name.current?.focus() }, [])
-  // The next three times of the typed schedule, checked by the server as you type.
+  // The next three times of the typed schedule, checked by the server as you type (for an edit, from the saved
+  // schedule's start while its timing stays the same).
   useEffect(() => {
     const spec = form.spec.trim()
     if (!spec) { setPreview(null); return undefined }
     let alive = true
     const timer = setTimeout(() => {
-      api('/schedules/preview', 'POST', { spec, timezone: form.timezone.trim() })
+      api('/schedules/preview', 'POST', { spec, timezone: form.timezone.trim(), ...(editing.id ? { schedule_id: editing.id } : {}) })
         .then(value => { if (alive) setPreview(value) }, e => { if (alive) setPreview({ error: e.message }) })
     }, 300)
     return () => { alive = false; clearTimeout(timer) }
-  }, [form.spec, form.timezone])
+  }, [form.spec, form.timezone, editing.id])
   const submit = event => {
     event.preventDefault()
     const found = formProblem(form, limits)
@@ -177,7 +178,7 @@ function ScheduleForm({ editing, limits, busy, onCancel, onSave }) {
     <label>Prompt<textarea rows=${3} maxLength=${limits.max_prompt || 20000} value=${form.prompt} onInput=${e => field('prompt', e.currentTarget.value)}
       placeholder="Run the tests and summarize any failures." /></label>
     <label>When it runs<input spellcheck=${false} value=${form.spec} onInput=${e => field('spec', e.currentTarget.value)} placeholder="every 2 hours, or 0 9 * * 1-5" /></label>
-    <p class="field-help">every N minutes, hours or days (from when you save), or a cron line: minute hour day month weekday, such as 0 9 * * 1-5 for 9:00 on weekdays. At most every ${limits.min_interval_minutes || 5} minutes.</p>
+    <p class="field-help">every N minutes, hours or days (from when you save that timing), or a cron line: minute hour day month weekday, such as 0 9 * * 1-5 for 9:00 on weekdays. At most every ${limits.min_interval_minutes || 5} minutes.</p>
     ${preview?.error ? html`<p class="form-error">${preview.error}</p>` : preview?.next_runs ? html`<p class="field-help schedule-preview" role="status">Next runs (${preview.zone}): ${preview.next_runs.map(when).join(' · ')}</p>` : null}
     <label>Time zone<input spellcheck=${false} value=${form.timezone} onInput=${e => field('timezone', e.currentTarget.value)} placeholder="This computer's" /></label>
     <label>Permission mode<select value=${form.permission_mode} onChange=${e => field('permission_mode', e.currentTarget.value)}>

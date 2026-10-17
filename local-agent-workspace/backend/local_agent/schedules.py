@@ -11,7 +11,8 @@ off by default) and stops at shutdown. It ticks every TICK_SECONDS and holds a l
 two app instances on one state folder never both fire. A run first makes the free connection check (the endpoint
 listing of serving.endpoints_url, no model call): a rejected token (HTTP 401 or 403) pauses the schedule and says so.
 At most one run per schedule and MAX_RUNNING scheduled runs run at a time; a run that would pass that is skipped
-with a note in the schedule's history. Runs missed while the app was not running (or asleep, or with scheduled
+with a note in the schedule's history. Each run checks the saved schedule again (schedule_problem): one changed
+outside the app is paused instead of run. Runs missed while the app was not running (or asleep, or with scheduled
 runs off) are caught up once, not once per missed time, when the latest of them was due within MAX_AGE; older
 ones are skipped. Either way the history says how many were missed.
 
@@ -225,13 +226,14 @@ def next_fire(schedule, after):
     return spec.next_after(after, anchor, zone)
 
 
-def preview(spec, zone_name="", now=None, count=3):
-    """{text, zone, next_runs} of a schedule text before it is saved, or ValueError."""
+def preview(spec, zone_name="", now=None, count=3, anchor=None):
+    """{text, zone, next_runs} of a schedule text before it is saved, or ValueError. anchor: the saved schedule's,
+    when an edit keeps its timing (an interval then still counts from when it was saved), else now."""
     now = clock() if now is None else now
     parsed, zone = parse_spec(spec), zone_of(zone_name)
     runs, after = [], now
     for _ in range(count):
-        after = parsed.next_after(after, now, zone)
+        after = parsed.next_after(after, now if anchor is None else anchor, zone)
         if after is None:
             break
         runs.append(after)
@@ -366,6 +368,21 @@ def check_schedule(values):
             "max_agent_steps": steps, "run_policy": policy, "catch_up": catch_up}
 
 
+def schedule_problem(item):
+    """Why a saved schedule cannot run, or None. schedules.json is checked again at each run, as it may have been
+    changed outside the app: a run never uses Bypass permissions or goes without its caps and approval limit."""
+    try:
+        check_schedule(item)
+    except ValueError as exc:
+        return f"The saved schedule is not valid: {exc} Edit and save it, then resume it if it is paused."
+    return None
+
+
+def open_entry(entry):
+    """Whether a history entry is a started run whose end is not recorded yet."""
+    return isinstance(entry, dict) and entry.get("outcome") == "started" and "ended" not in entry
+
+
 async def connection_status(manager):
     """('ok' | 'rejected' | 'unavailable', why) from the free connection check (the serving endpoints listing)."""
     redact = manager.settings.redact
@@ -427,7 +444,8 @@ class Scheduler:
         if task is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-        self.release()
+        if self.task is None:  # A start() while the old loop ended runs a new loop, which keeps the lock.
+            self.release()
 
     def acquire(self):
         """Hold the state folder's lock file; False (and lock_problem says why) when another app holds it."""
@@ -504,11 +522,14 @@ class Scheduler:
             if isinstance(due, bool) or not isinstance(due, (int, float)) or due > now:
                 continue
             changed = True
-            try:
-                spec, zone = parse_spec(item.get("spec")), zone_of(item.get("timezone") or "")
-            except ValueError as exc:
-                item.update(enabled=False, paused_reason="invalid", paused_note=str(exc), next_run=None)
+            problem = schedule_problem(item)
+            if problem:
+                self.add_history(item, {**self.entry(due, "scheduled", now), "outcome": "not_run",
+                                        "note": f"Not run: {problem}"})
+                item.update(enabled=False, paused_reason="invalid", paused_note=problem, next_run=None)
+                item.pop("pending", None)
                 continue
+            spec, zone = parse_spec(item.get("spec")), zone_of(item.get("timezone") or "")
             count, latest = spec.due_times(due, now, item.get("anchor", due), zone)
             item["next_run"] = spec.next_after(now, item.get("anchor", now), zone)
             missed = count > 1 or now - latest > LATE_SECONDS
@@ -532,8 +553,23 @@ class Scheduler:
             self.store.write(items)
         for item in ready:
             self.notify(f"Scheduled run ready: {self.label(item)}")
-        for launch in launches:
-            await self.launch(*launch)
+        # next_run is already past these runs, so each one that does not start gets a note: one that fails does not
+        # keep the others from starting, and a stop of the scheduler (the app closing, Scheduled runs turned off)
+        # during a connection check notes it and the runs after it.
+        for index, (schedule_id, trigger, due, note) in enumerate(launches):
+            try:
+                await self.launch(schedule_id, trigger, due, note)
+            except asyncio.CancelledError:
+                for left_id, left_trigger, left_due, _ in launches[index:]:
+                    self.record(left_id, {**self.entry(left_due, left_trigger, clock()), "outcome": "not_run",
+                                          "note": "Not run: the scheduler stopped before the run started (the app "
+                                                  "closed or Scheduled runs were turned off)."})
+                raise
+            except Exception:  # noqa: BLE001 - the other due runs still start.
+                log.exception("Scheduled runs: a run could not be started.")
+                self.record(schedule_id, {**self.entry(due, trigger, clock()), "outcome": "not_run",
+                                          "note": "Not run: it could not be started because of an unexpected error "
+                                                  "(the app's log says more)."})
 
     @staticmethod
     def entry(due, trigger, now):
@@ -541,14 +577,19 @@ class Scheduler:
 
     @staticmethod
     def add_history(item, entry):
+        """Add an entry, keeping the last HISTORY: the oldest ended or not-run entries go first, so a run that is
+        still running keeps its entry (and gets its result) however many notes follow it."""
         history = item.get("history") if isinstance(item.get("history"), list) else []
-        item["history"] = [*history, {key: value for key, value in entry.items() if value is not None}][-HISTORY:]
+        history = [*history, {key: value for key, value in entry.items() if value is not None}]
+        while len(history) > HISTORY:
+            history.pop(next((index for index, old in enumerate(history[:-1]) if not open_entry(old)), 0))
+        item["history"] = history
 
     def reconcile(self, item, now):
         """Fill in the result of runs that ended (a run the app was restarted during, a deleted chat). True if changed."""
         changed = False
         for entry in item.get("history") or []:
-            if not isinstance(entry, dict) or entry.get("outcome") != "started" or "ended" in entry:
+            if not open_entry(entry):
                 continue
             session_id = entry.get("session_id")
             if session_id in self.manager.live or self.manager.busy_task(session_id) or session_id in self.runs:
@@ -585,14 +626,18 @@ class Scheduler:
         except (ValueError, OSError):
             log.warning("Scheduled runs: the result of a run could not be saved.")
 
+    def active(self, schedule_id=None):
+        """The chats of the runs (of this schedule) whose scheduled turn is running. finished() drops a run when its
+        turn ends, so a later turn of yours in its chat is not a run of the schedule."""
+        return [session_id for session_id, owner in self.runs.items()
+                if schedule_id in (None, owner) and self.manager.busy_task(session_id)]
+
     def busy(self, item):
         """Whether a run of this schedule is running."""
-        return any(isinstance(entry, dict) and self.manager.busy_task(entry.get("session_id"))
-                   for entry in item.get("history") or [])
+        return bool(self.active(item["id"]))
 
     def running_count(self, schedule_id):
-        busy = sum(self.manager.busy_task(session_id) for session_id in self.runs)
-        return busy + len(self.launching - {schedule_id})
+        return len(self.active()) + len(self.launching - {schedule_id})
 
     async def launch(self, schedule_id, trigger, due=None, note=None, *, user=False):
         """Start one run in a new chat: its id, or None when it did not start (the history says why). user: Run now
@@ -619,8 +664,11 @@ class Scheduler:
         def refuse(text, pause=None):
             if user:
                 raise ValueError(text)
-            self.record(schedule_id, {**entry, "outcome": "not_run", "note": f"Not run: {text}"}, pause=pause)
+            self.record(schedule_id, {**entry, "outcome": "not_run", "note": f"Not run: {text}"}, pause=pause,
+                        pause_note=text if pause == "invalid" else None)
             return None
+        if problem := schedule_problem(item):
+            return refuse(problem, pause="invalid")
         if self.busy(item):
             return refuse("the previous run of this schedule is still running.")
         if self.running_count(schedule_id) >= MAX_RUNNING:
@@ -642,6 +690,8 @@ class Scheduler:
             raise ValueError("This schedule no longer exists.")
         if item is None or (not user and item.get("enabled") is not True):
             return None
+        if problem := schedule_problem(item):
+            return refuse(problem, pause="invalid")
         session = self.create_chat(item, workspace, trigger, due, now)
         self.manager.scheduled_turns[session["id"]] = {
             "schedule_id": schedule_id, "approval_timeout_minutes": item["approval_timeout_minutes"]}
@@ -682,11 +732,11 @@ class Scheduler:
         store.save(session)
         return session
 
-    def record(self, schedule_id, entry, pause=None, clear_pending=False):
+    def record(self, schedule_id, entry, pause=None, clear_pending=False, pause_note=None):
         def change(item):
             self.add_history(item, entry)
             if pause:
-                item.update(enabled=False, paused_reason=pause)
+                item.update(enabled=False, paused_reason=pause, **({"paused_note": pause_note} if pause_note else {}))
             if clear_pending or pause:
                 item.pop("pending", None)
         try:
