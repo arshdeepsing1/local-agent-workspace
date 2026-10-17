@@ -139,6 +139,44 @@ Roadmap milestone M8 (agents, automation and delivery):
   kept there is found), within 10 seconds and at most once a minute per project and branch. A
   `gh` inside the project never runs.
 
+- Scheduled runs (**Agent tools → Schedules**): a schedule sends its prompt to a new chat of the
+  project at set times, `every N minutes|hours|days` or a five-field cron line (`*`, lists,
+  ranges and steps) in this computer's time zone or a named one, at most every 5 minutes. A time
+  that a clock change skips runs an hour later that day; a time that repeats runs once. The form
+  shows the next three times as you type. Each run's chat is named after the schedule (no title
+  request), tagged `scheduled`, and gets the schedule's permission mode (any mode but Bypass
+  permissions; Don't ask by default), model, effort, Agent steps, and its required token and
+  time limits and spending limit (0: the Settings default) as its own.
+- A scheduled run never waits forever: a card (approval, question or plan, its subagents'
+  included) that waits the schedule's **approval limit** (1 to 60 minutes, required) ends the
+  run with `terminal_reason` `approval_expired`, a notice and "Stopped at the approval limit" in
+  notifications; later cards of the run do not wait. Only the scheduled turn has this limit.
+- Run policy **Ask before each run** (the default): a due run waits for **Run** or **Skip** in a
+  banner above the chat ("Scheduled run ready: …"), in the schedule and as a desktop or browser
+  notification; nothing is sent before Run, and a ready run nobody starts before the next time
+  or within 24 hours is not run. **Run automatically** is an explicit choice per schedule. **Run
+  now** works at any time.
+- **Settings → Agent → Scheduled runs at their times** (off by default) starts the scheduler,
+  which checks every 30 seconds while the app runs and holds a lock file in the state folder, so
+  a second app on the same folder never runs the schedules too. Runs missed while the app was
+  closed or asleep are caught up once when the latest was due within 24 hours (the history says
+  how many were missed), else skipped; a schedule can skip missed runs instead. At most one run
+  per schedule and two scheduled runs run at a time; a run that would pass that is skipped with
+  a note.
+- Before each run the free connection check (no model call) runs: a token Databricks rejects
+  (HTTP 401 or 403) pauses the schedule, with a banner and a desktop notification. Each
+  schedule's history keeps its last 20 runs with how they ended (steps, time, tokens, estimated
+  DBU) or why they did not run, and **Open chat**. Schedules are kept in `schedules.json` in the
+  state folder.
+- **Settings → Credentials → Token expires on** (optional): from 7 days before the Databricks
+  token expires, and after it, a banner and Agent tools → Schedules remind you to renew it.
+- Each scheduled run checks its saved schedule again before it starts: one changed outside the
+  app (Bypass permissions, or a missing token, time or approval limit) is paused with a note
+  instead of run. A schedule never runs twice at once, and a message you send later in a run's
+  chat does not count as the schedule's run. A due run the app stops before it starts (the app
+  closing, or Scheduled runs turned off, during its connection check), or that fails
+  unexpectedly, gets a note in the history, and the other due runs still start.
+
 Roadmap milestone M7 (endpoint-dependent model features):
 
 - Endpoint checks: **Settings → Model and context** has **Test model** (one short streamed
