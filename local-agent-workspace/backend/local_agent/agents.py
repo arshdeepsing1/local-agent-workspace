@@ -56,8 +56,8 @@ from . import commands as command_templates
 from . import custom_agents
 from . import settings_layers
 from .context import estimate_text_tokens
-from .planning import (REPORT_SUBMITTED, REPORT_SUBMITTED_REPLY, CallAllowance, DelegateManager, DelegationGate, TaskManager,
-                       retried_reports)
+from .planning import (CONTINUE_REASONS, REPORT_SUBMITTED, REPORT_SUBMITTED_REPLY, SCHEDULED_FOREGROUND, CallAllowance,
+                       DelegateManager, DelegationGate, TaskManager, bounded_result, retried_reports)
 from .interactions import InteractionManager, wait_seconds
 from .feature_tools import FEATURE_TOOLS, FINDINGS_TOOL
 from .tool_profiles import agent_refusal, tool_allowed, filter_tools, off_servers, server_off
@@ -2836,7 +2836,8 @@ class AgentManager(LifecycleHooks):
 
     def _after_task(self, session_id, kind, task):
         """Done-callback of a turn, compaction or ! command: send the unpaused queued messages
-        as the next turn, unless the task was stopped or failed. Never raises."""
+        as the next turn, unless the task was stopped or failed; else a background subagent that finished
+        meanwhile may continue the chat (DelegateManager.maybe_wake). Never raises."""
         try:
             stopped = task in self.stop_requested
             self.stop_requested.discard(task)
@@ -2852,14 +2853,14 @@ class AgentManager(LifecycleHooks):
                 return
             if session is None:
                 return
-            if kind == "turn" and session.get("terminal_reason") not in ("completed", "tool_error"):
+            if kind == "turn" and session.get("terminal_reason") not in CONTINUE_REASONS:
                 return
             if kind == "compaction" and session["events"] and session["events"][-1].get("type") == "error":
                 return
             if not any(not item.get("paused") for item in self.queue_of(session)):
-                if (kind == "turn" and not session.get("is_subagent")
-                        and self.settings.values.get("background_subagent_wake") is True):
-                    # A background subagent that finished after this turn's last step may continue the chat.
+                if not session.get("is_subagent") and self.settings.values.get("background_subagent_wake") is True:
+                    # A background subagent that finished after this turn's last step, or while this ! command
+                    # or compaction ran, may continue the chat.
                     self._background(self.delegates.maybe_wake(session_id))
                 return
             self._background(self._send_after(session_id))
@@ -3086,8 +3087,10 @@ class AgentManager(LifecycleHooks):
         terminal_reason = "completed"
         first_event = len(session["events"])
         storage_error_reported = False
+        # carried: what the chat's background subagents still running from an earlier turn spent so far.
         turn_state = self.turns[session["id"]] = {"started": turns.clock(), "first_event": first_event,
-                                                  "first_call": len(session.get("inference_calls") or [])}
+                                                  "first_call": len(session.get("inference_calls") or []),
+                                                  "carried": turns.carried(self, session)}
         if (scheduled := self.scheduled_turns.pop(session["id"], None)) is not None:
             turn_state["scheduled"] = scheduled  # Only this turn is the scheduled run; later ones are the user's.
 
@@ -3755,7 +3758,8 @@ class AgentManager(LifecycleHooks):
 
                 # The agent its card showed, else the one the call names now (an unknown agent_type fails here).
                 spec = approved or self.delegates.agent_spec(session, arguments.get("agent_type"), arguments.get("tool_profile"))
-                background = self.delegates.background_call(arguments, spec)
+                background = self.delegates.runs_in_background(session, arguments, spec)
+                ignored = not background and self.delegates.background_call(arguments, spec)
                 call = {key: value for key, value in arguments.items() if key != "background"}
 
                 def start():
@@ -3775,6 +3779,8 @@ class AgentManager(LifecycleHooks):
                         result = await start()
                     finally:
                         await self.status(session, "running")
+                if ignored and isinstance(result, dict):
+                    result = bounded_result({**result, "note": f"Ran in the foreground: {SCHEDULED_FOREGROUND}"})
             elif name == "run_command":
                 if verdict.script is not None and verdict.decision == "allow":
                     result = await self.command_tool(session, event, arguments, script=verdict.script)

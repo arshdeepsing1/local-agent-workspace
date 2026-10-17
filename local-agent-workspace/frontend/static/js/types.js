@@ -153,7 +153,8 @@
 //   the idle status that ends the turn): { terminal_reason, is_error, started, ended (epoch seconds), duration_s,
 //   steps (agent replies), tool_calls, usage: { calls, input_tokens, output_tokens, cache_read_input_tokens,
 //   cache_creation_input_tokens, reasoning_tokens } (the turn's own calls; null = no call reported it), tokens: number |
-//   null (every processed token, its subagents' included; null: no call reported a count), estimated_dbu: number | null
+//   null (every processed token, its subagents' included, a background subagent's only for the requests it made
+//   during this turn; null: no call reported a count), estimated_dbu: number | null
 //   (no priced call), unpriced_calls, subagents: { count, tokens (null: none of them reported a count), estimated_dbu },
 //   changed_files: string[] (at most 20), changed_files_total? }.
 // GET /usage?days=1..90 (30) -> { days, since, until, totals: { calls, input_tokens, cache_read_input_tokens,
@@ -293,7 +294,8 @@
 //   { allowed } answers an approval) }. A finished delegate_task card's output is the JSON result { child_session_id, agent_type,
 //   tool_profile, status, terminal_reason, steps_used, tool_calls, changed_files, changed_files_total?, transcript,
 //   report?: { summary, findings?: [{ path?, line?, text }], files_changed?, next_steps?, findings_total?, ... } (its
-//   submit_report), output (its final reply, '' with a report) }. A background one's output is { child_session_id
+//   submit_report), output (its final reply, '' with a report), note? (a scheduled run's call that asked for the
+//   background: it ran in the foreground) }. A background one's output is { child_session_id
 //   (null while queued), agent_type, status: 'running'|'queued', background: true, transcript, message }; its result
 //   arrives later as the card's delegation_result, and the parent gets a notice { subagent_id, subagent_status }.
 //   A tool card a running sibling subagent's change made ask has sibling_change: { subagent_id, agent_type, path }.

@@ -355,6 +355,26 @@ async def test_a_message_sent_as_plain_text_is_resent_as_plain_text(runtime, mon
     assert user["verbatim"] is True and "skills" not in user and "attachments" not in user
 
 
+async def test_a_retry_of_the_apps_message_after_a_background_subagent_stays_the_apps(runtime, monkeypatch):
+    app, manager, session, project = runtime
+    standard(runtime)
+    third = next(event for event in session["events"] if event["id"] == "u3")
+    third.update(verbatim=True, background_wake=True)  # As DelegateManager.maybe_wake sends it.
+    manager.store.save(session)
+    requests = []
+    async with await client_for(app) as client:
+        gateway_for(monkeypatch, requests)
+        for text, wake in (("Turn 3", True), ("Turn 3, but check the tests too", None)):  # Retry, then an edit.
+            response = await client.post(f"/api/sessions/{session['id']}/rewind", json={
+                "before_event_id": [event for event in manager.get(session["id"])["events"] if event["type"] == "user"][-1]["id"],
+                "conversation": True, "resend_text": text, "resend_verbatim": True})
+            assert response.status_code == 200 and response.json()["resent"] is True, response.text
+            await idle(manager, session["id"])
+            user = [event for event in manager.store.get(session["id"])["events"] if event["type"] == "user"][-1]
+            assert user["text"] == text and user.get("background_wake") is wake
+        monkeypatch.undo()
+
+
 async def test_a_resend_with_a_refused_file_changes_nothing(runtime):
     """The resend's own checks run before the backup and the cut: a 400 leaves the chat as it was."""
     app, manager, session, project = runtime

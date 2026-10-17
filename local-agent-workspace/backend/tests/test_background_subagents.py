@@ -341,6 +341,70 @@ async def test_the_wake_option_continues_an_idle_chat_exactly_once(runtime, monk
         assert saved["terminal_reason"] == "completed"
 
 
+@pytest.mark.parametrize("stop", ["step_limit", "inference_error"])
+async def test_the_wake_option_never_continues_a_chat_stopped_at_a_limit_or_an_error(runtime, monkeypatch, stop):
+    manager, parent, _ = runtime
+    manager.settings.values["background_subagent_wake"] = True
+    if stop == "step_limit":
+        manager.settings.values["max_agent_steps"] = 2
+    gate = asyncio.Event()
+    second = (lambda: httpx.Response(400, json={"message": "Bad request."})) if stop == "inference_error" else (
+        lambda: calls_reply(("list_tasks", {}, "t1")))
+    gateway = Gateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)), second,
+                                    lambda: reply("Read it; all done.")], {"Survey": gated(gate)})
+    saved = await run_turn(manager, parent)
+    assert saved["terminal_reason"] == stop
+    gate.set()  # The subagent finishes after the turn stopped.
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+    await asyncio.sleep(0.3)
+    saved = manager.store.get(parent["id"])
+    assert len(gateway.requests["parent"]) == 2 and not manager.busy_task(parent["id"])
+    assert [event["type"] for event in saved["events"]].count("user") == 1
+    # Continue is yours: its first request names the subagent.
+    assert manager.delegates.wake_due(manager.get(parent["id"]))
+    await run_turn(manager, parent, "Continue")
+    assert "Background subagents ended since your last step" in json.dumps(gateway.requests["parent"][2]["messages"])
+
+
+@pytest.mark.parametrize("wake", [True, False])
+@pytest.mark.parametrize("task", ["command", "compaction"])
+async def test_a_wake_that_falls_during_a_command_or_a_compaction_comes_after_it(runtime, monkeypatch, task, wake):
+    manager, parent, _ = runtime
+    manager.settings.values["background_subagent_wake"] = wake
+    gate, hold = asyncio.Event(), asyncio.Event()
+    gateway = Gateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)),
+                                    lambda: reply("Going on."), lambda: reply("Read it; all done.")],
+                      {"Survey": gated(gate)})
+    await run_turn(manager, parent)
+    if task == "command":
+        manager.start_shell(parent["id"], "sleep 1")
+    else:
+        held = manager.get(parent["id"])  # An earlier turn to compact.
+        held["wire"] = [{"role": "user", "content": "First"}, {"role": "assistant", "content": "Done"}, *held["wire"]]
+        manager.store.save(held)
+        summarize = manager.summarize_context
+
+        async def held_summary(*args, **kwargs):
+            await hold.wait()
+            return await summarize(*args, **kwargs)
+        monkeypatch.setattr(manager, "summarize_context", held_summary)
+        manager.start_compaction(parent["id"])
+    gate.set()  # The subagent finishes while the command or the compaction runs.
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+    assert manager.busy_task(parent["id"]) and len(gateway.requests["parent"]) == 2
+    hold.set()
+    await asyncio.wait_for(manager.tasks[parent["id"]], 10)
+    if wake:
+        await eventually(lambda: len(gateway.requests["parent"]) == 3)
+    await asyncio.sleep(0.3)
+    await eventually(lambda: not manager.busy_task(parent["id"]))
+    saved = manager.store.get(parent["id"])
+    users = [event for event in saved["events"] if event["type"] == "user"]
+    assert len(gateway.requests["parent"]) == (3 if wake else 2) and len(users) == (2 if wake else 1)
+    if wake:
+        assert users[1]["background_wake"] is True
+
+
 async def test_a_running_turn_learns_of_a_background_subagent_at_its_next_step(runtime, monkeypatch):
     manager, parent, _ = runtime
     manager.settings.values["background_subagent_wake"] = True

@@ -15,7 +15,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from local_agent import interactions, schedules, spending, turns
+from local_agent import interactions, planning, schedules, spending, turns
 from local_agent.agents import AgentManager
 from local_agent.api import create_app
 from local_agent.config import Settings
@@ -602,6 +602,68 @@ async def test_a_subagents_card_ends_its_parents_run_too(runtime, monkeypatch):
     error = next(event for event in reversed(child_chat["events"]) if event.get("terminal_reason"))
     assert error["type"] == "error" and error["terminal_reason"] == "approval_expired"
     assert not (project / "ran.txt").exists()
+
+
+async def test_a_scheduled_runs_subagents_run_in_the_foreground_and_its_chat_is_never_woken(runtime, monkeypatch):
+    """background: true is ignored in a scheduled run: the run waits for its subagent, so the subagent's cards have
+    the run's approval limit, the next due run is skipped and the history counts the subagent's tokens."""
+    manager, scheduler, project, now = runtime
+    manager.settings.values["background_subagent_wake"] = True
+    gates, parent, child = [asyncio.Event(), asyncio.Event()], [], []
+
+    async def answer(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"endpoints": []})
+        body = json.loads(request.content)
+        first = next((m["content"] for m in body["messages"] if m["role"] == "user"), "")
+        if isinstance(first, str) and first.startswith("Delegated task:\n"):
+            child.append(body)
+            await gates[len(child) - 1].wait()
+            return httpx.Response(200, text=text_reply("## Report\nChecked."))
+        if body.get("stream") is not True:
+            return httpx.Response(200, json={"choices": [{"message": {"content": "Title"}, "finish_reason": "stop"}]})
+        parent.append(body)
+        return httpx.Response(200, text=call_reply("delegate_task", {"task": f"Check {len(parent)}", "background": True},
+                                                   f"d{len(parent)}") if len(parent) in (1, 3) else text_reply("Done."))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: REAL_CLIENT(**kwargs, transport=httpx.MockTransport(answer)))
+    item = make(scheduler, project, spec="every 30 minutes", run_policy="auto", permission_mode="acceptEdits",
+                approval_timeout_minutes=1)
+    now[0] = T0 + 1800
+    await scheduler.tick()
+    session_id = history(scheduler, item)[-1]["session_id"]
+    for _ in range(500):
+        if child:
+            break
+        await asyncio.sleep(0.01)
+    chat = manager.get(session_id)
+    assert manager.busy_task(session_id) and not manager.delegates.background.get(session_id)
+    assert manager.approval_seconds(manager.get(chat["subagents"][0]["id"])) == 60  # The run's 1 minute.
+    preview = manager.delegates.card_preview(chat, {"task": "Check it", "background": True})
+    assert preview.startswith("Start a subagent (") and f"Runs in the foreground: {planning.SCHEDULED_FOREGROUND}" in preview
+    now[0] = T0 + 3600
+    await scheduler.tick()
+    assert history(scheduler, item)[-1]["note"] == "Not run: the previous run of this schedule is still running."
+    gates[0].set()
+    await settled(manager)
+    chat = manager.store.get(session_id)
+    entry = next(entry for entry in history(scheduler, item) if entry.get("session_id") == session_id)
+    assert entry["terminal_reason"] == "completed" and entry["tokens"] == 3 * 1_100  # Its two requests and the subagent's.
+    result = json.loads(next(event for event in chat["events"] if event.get("name") == "delegate_task")["output"])
+    assert result["status"] == "completed" and result["note"] == f"Ran in the foreground: {planning.SCHEDULED_FOREGROUND}"
+    # A message of yours in the run's chat may start a background subagent; when it finishes, the wake option does
+    # not continue the run's chat (nobody may be watching it): its notice waits for your next message.
+    manager.start(session_id, "Check it again in the background")
+    await asyncio.wait_for(manager.tasks[session_id], 10)
+    assert manager.delegates.background_running(session_id) == 1
+    gates[1].set()
+    for _ in range(500):
+        if not manager.delegates.background_running(session_id):
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.3)
+    chat = manager.get(session_id)
+    assert len(parent) == 4 and not manager.busy_task(session_id) and manager.delegates.wake_due(chat)
+    assert not any(event.get("background_wake") for event in chat["events"])
 
 
 async def test_the_time_limit_stops_a_scheduled_run(runtime, monkeypatch):

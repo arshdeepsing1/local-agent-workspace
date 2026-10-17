@@ -258,6 +258,101 @@ def test_a_subagents_messages_and_cards_come_with_its_parents(served):
     assert messages[-1]["result"].startswith("Subagent reports received")
 
 
+def background_delegation(simulator, monkeypatch, child_call, pause=1):
+    """The simulator's delegate scenario starts a general subagent in the background, whose first step (after a
+    pause in which the parent's turn ends) makes child_call."""
+    def delegate(self, words, made, results, tools, system=""):
+        if made:
+            return "Started the work in the background; its report comes later.", []
+        return "Delegating in the background.", [simulator.call("delegate_task", task="Do a small change",
+                                                                agent_type="general", background=True)]
+
+    def subagent(self, prompt, made, results, tools):
+        if not made:
+            time.sleep(pause)
+            return "Doing it.", [child_call]
+        return "## Report\n\n- Summary: done.", []
+    respond = simulator.Brain.respond
+
+    def woken(self, body):  # The wake option's message (planning.WAKE_TEXT) gets a plain answer.
+        last = next((m.get("content") for m in reversed(body.get("messages") or []) if m.get("role") == "user"), "")
+        return ("Read its report: the change is done.", []) if "[Sent by the app:" in str(last) else respond(self, body)
+    monkeypatch.setattr(simulator.Brain, "respond", woken)
+    monkeypatch.setattr(simulator.Brain, "delegate", delegate)
+    monkeypatch.setattr(simulator.Brain, "subagent", subagent)
+
+
+def test_query_waits_for_the_chats_background_subagents_and_answers_their_cards(served, simulator, monkeypatch):
+    url, manager, workspace = served
+    background_delegation(simulator, monkeypatch, simulator.call("write_file", path="bg-note.txt", content="note\n"))
+    client = LocalAgentClient(url)
+    asked = []
+
+    def allow(name, arguments, context):
+        asked.append((name, context["subagent"]))
+        return Allow()
+    messages = list(client.query("delegate it", permission_mode="manual", can_use_tool=allow))
+    result = messages[-1]
+    assert asked == [("delegate_task", False), ("write_file", True)]  # The subagent's card came after the turn ended.
+    assert [message["running"] for message in messages if message["type"] == "background_wait"] == [1]
+    assert result["terminal_reason"] == "completed" and result["exit_code"] == 0
+    assert result["result"] == "Started the work in the background; its report comes later."
+    entry, = result["background_results"]
+    assert entry["task"] == "Do a small change" and entry["status"] == "completed" and entry["changed_files"] == ["bg-note.txt"]
+    assert (workspace / "bg-note.txt").read_text() == "note\n"
+    assert manager.delegates.background_running(result["session_id"]) == 0 and not manager.pending
+    plain = list(client.query("Hello"))[-1]
+    assert plain["background_results"] == []
+    # With Continue the chat when a background subagent finishes, the turn the app starts is followed too.
+    manager.settings.values["background_subagent_wake"] = True
+    result = list(client.query("delegate it", permission_mode="manual", can_use_tool=allow))[-1]
+    assert result["result"] == "Read its report: the change is done." and result["terminal_reason"] == "completed"
+    assert [entry["status"] for entry in result["background_results"]] == ["completed"]
+    assert client.info(result["session_id"])["status"] == "idle"
+
+
+def test_the_runner_declines_a_background_subagents_cards_and_waits_for_it(served, simulator, monkeypatch):
+    url, manager, workspace = served
+    background_delegation(simulator, monkeypatch, simulator.call("run_command", command="touch bg-cmd.txt"))
+    done = run(url, "--output", "json", "--mode", "acceptEdits", "delegate it")  # delegate_task needs no card here.
+    assert done.returncode == 0, done.stderr
+    assert "waiting for 1 background subagent (Ctrl+C stops them)" in done.stderr
+    result = json.loads(done.stdout)
+    entry, = result["background_results"]
+    assert entry["status"] == "completed" and not (workspace / "bg-cmd.txt").exists()
+    child = manager.store.get(entry["child_session_id"])
+    command = next(event for event in child["events"] if event.get("name") == "run_command")
+    assert command["approval"] == "declined" and command["decline_note"] == client_module.NO_APPROVER
+    assert manager.delegates.background_running(result["session_id"]) == 0 and not manager.pending
+
+
+def test_a_cards_warnings_reach_the_callback_and_the_terminal(monkeypatch, capsys):
+    client = LocalAgentClient()
+    monkeypatch.setattr(client, "_send_answer", lambda *args: None)
+    seen = []
+    warnings = {"secret_files": ["conf/db_password.txt"], "protected": "a CI workflow (.github/workflows)",
+                "hook_ask": {"hook_id": "guard", "reason": "Deploys need a person"}, "uncertain": True,
+                "sibling_change": {"subagent_id": "1234abcd-0000", "agent_type": "explore", "path": "src/app.py"}}
+    event = {"id": "e1", "type": "tool", "name": "run_command", "state": "pending", "input": {"command": "cat conf/*"},
+             "preview": "cat conf/*", "rememberable": [], **warnings}
+    client._answer("s1", False, event, lambda name, arguments, context: seen.append(context) or Allow(), None)
+    assert seen == [{"session_id": "s1", "event_id": "e1", "preview": "cat conf/*", "subagent": False, **warnings}]
+    plain = {key: value for key, value in event.items() if key not in warnings}
+    client._answer("s1", False, plain, lambda name, arguments, context: seen.append(context) or Allow(), None)
+    assert set(seen[-1]) == {"session_id", "event_id", "preview", "subagent"}
+    runner = load_runner()
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+    assert runner.ask_tool("run_command", event["input"], {**seen[0], "protected": "a file\x1b[2K"}) == Allow()
+    shown = capsys.readouterr().err
+    for line in ("Warning: Reads a secret file: conf/db_password.txt. If you approve, its contents can reach the model.",
+                 "Warning: The hook guard asked for your approval: Deploys need a person",
+                 "Warning: This command could not be checked exactly against your deny and ask rules.",
+                 "Warning: Another subagent of this chat (explore, 1234abcd) changed src/app.py during its run."):
+        assert line in shown
+    assert "Warning: Protected file: a file\\x1b[2K. Edits to it always need your approval." in shown
+    assert "\x1b" not in shown and runner.ESCAPED_NOTE in shown
+
+
 def test_without_a_callback_cards_are_declined_and_questions_skipped_at_once(served):
     url, manager, _ = served
     client = LocalAgentClient(url)
@@ -500,3 +595,21 @@ def test_ctrl_c_stops_the_turn_and_prints_its_result(served, simulator, monkeypa
     out, err = process.communicate(timeout=30)
     assert process.returncode == 3, err
     assert "Stopping the turn" in err and json.loads(out)["terminal_reason"] == "stopped"
+
+
+def test_ctrl_c_while_the_runner_waits_for_a_background_subagent_stops_it(served, simulator, monkeypatch):
+    url, manager, _ = served
+    background_delegation(simulator, monkeypatch, simulator.call("list_files", path="."), pause=30)
+    process = subprocess.Popen([sys.executable, str(RUNNER), "--url", url, "--output", "json", "--mode", "acceptEdits",
+                                "delegate it"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    deadline = time.time() + 20
+    while time.time() < deadline and not any(manager.delegates.background_running(sid) and not manager.busy_task(sid)
+                                             for sid in list(manager.delegates.background)):
+        time.sleep(0.05)
+    time.sleep(0.3)  # The runner has the turn's end.
+    process.send_signal(signal.SIGINT)
+    out, err = process.communicate(timeout=30)
+    assert process.returncode == 3, err
+    assert "Stopping the background subagents" in err
+    result = json.loads(out)
+    assert result["terminal_reason"] == "completed" and not manager.delegates.background

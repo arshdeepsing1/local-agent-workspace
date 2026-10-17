@@ -22,8 +22,18 @@ submit_plan) through can_use_tool("submit_plan", ...), where Allow(mode) approve
 given) and Deny keeps planning. Without a callback every approval is declined and questions are skipped at once:
 nothing waits for the approval timeout. An answer the app refuses (an option that is not listed, an Other answer
 over 1,000 characters) is replaced at once by that default and reported as an {"type": "answer_refused", ...}
-message. A subagent's cards are answered the same way (context["subagent"] is True). Every model request is a paid
-call to your Databricks workspace, made with the app's credentials.
+message. A subagent's cards are answered the same way (context["subagent"] is True). context also carries the
+card's warnings when it has them, as the page shows them: secret_files (the credential-looking files a command
+reads), protected (why the file is protected), hook_ask ({hook_id, reason}: a before-tool hook asked),
+uncertain (the command could not be checked exactly against the deny and ask rules) and sibling_change
+({subagent_id, agent_type, path}: another subagent of the chat changed the file).
+
+When the turn ends while background subagents of the chat (delegate_task background) still work, query() yields
+{"type": "background_wait", "running": n} and keeps following them, answering their cards the same way, until
+they end; the result's background_results lists each one's end (its delegate_task result, or its last status).
+A turn the app starts in the chat meanwhile (Settings → Subagents → Continue the chat when a background subagent
+finishes) is followed too, and the result is the last turn's. Every model request is a paid call to your
+Databricks workspace, made with the app's credentials.
 """
 import http.client
 import json
@@ -47,6 +57,8 @@ SHUT_DOWN = "The app shut down before the turn ended (its shutdown stops running
 LIMIT_REASONS = ("step_limit", "spending_limit", "budget_limit", "approval_expired")
 STOP_REASONS = ("stopped", "interrupted")
 RECONNECTS = 3  # New streams query() opens after the app dropped one whose reader fell behind.
+# A card's warnings that can_use_tool's context carries (agents.card_fields, the sibling and hook checks).
+CARD_WARNINGS = ("secret_files", "protected", "hook_ask", "uncertain", "sibling_change")
 
 
 class LocalAgentError(RuntimeError):
@@ -316,10 +328,10 @@ class LocalAgentClient:
               can_use_tool=None, on_question=None, verbatim=False):
         """Send prompt to a new chat (or the idle chat session_id, which keeps its own mode, endpoint, effort,
         folder and limits: the options of a new chat are not applied to it) and yield its messages (each with
-        session_id; a subagent's cards and messages also come, with subagent True) until the turn ends, then one
-        result record: {type: 'result', session_id, terminal_reason, is_error, exit_code, duration_s, steps,
-        tool_calls, usage, tokens, estimated_dbu, unpriced_calls, subagents, changed_files, result (the final
-        reply)}."""
+        session_id; a subagent's cards and messages also come, with subagent True) until the turn ends and the
+        chat's background subagents ended, then one result record: {type: 'result', session_id, terminal_reason,
+        is_error, exit_code, duration_s, steps, tool_calls, usage, tokens, estimated_dbu, unpriced_calls,
+        subagents, changed_files, result (the final reply), background_results}."""
         if session_id is None:
             session_id = self.create_session(workspace, permission_mode, model, effort, max_steps, spending_limit_dbu,
                                              turn_token_limit, turn_time_limit_minutes)["id"]
@@ -351,6 +363,9 @@ class LocalAgentClient:
 
         follow(session_id)
         answered, replies, sent, before = set(), {}, False, None
+        # The chat's background delegations seen running ({card id: its card}), followed until each ended; ended:
+        # the result of the turn that ended meanwhile; check: whether to see if all of them ended.
+        background, ended, check = {}, None, False
         try:
             while True:
                 chat_id, subagent, message = messages.get()
@@ -358,10 +373,13 @@ class LocalAgentClient:
                 if kind == "keep_alive":
                     continue
                 if kind in ("stream_error", "stream_ended") and chat_id == session_id:
+                    if ended is not None:  # The turn ended: what its background subagents did so far.
+                        yield result_record(session_id, ended, replies, list(background.values()))
+                        return
                     raise LocalAgentError(message.get("error") or "The app closed the chat's stream before the turn ended.")
                 if kind == "stream_ended":
                     continue
-                ended = None  # A new snapshot (after a reconnect) of the chat once its turn ended.
+                turn = None  # The result of a turn that just ended (also from a new snapshot after a reconnect).
                 if kind == "snapshot" and chat_id == session_id:
                     chat = message["session"]
                     last_turn = chat.get("last_turn_result") if isinstance(chat.get("last_turn_result"), dict) else None
@@ -372,11 +390,15 @@ class LocalAgentClient:
                         self.send(session_id, prompt, verbatim)
                         sent = True
                     elif chat.get("status") == "idle" and last_turn and last_turn.get("started") != before:
-                        ended = last_turn
+                        turn = last_turn
                 yield {**message, "session_id": chat_id, **({"subagent": True} if subagent else {})}
                 for event in _events_of(message):
                     if chat_id == session_id and event.get("type") == "assistant":
                         replies[event.get("id")] = dict(event)
+                    if chat_id == session_id and _background_card(event) and (
+                            event["id"] in background or not _ended(event) and not event["delegation"].get("terminal_reason")):
+                        check = check or (_ended(event) and not _ended(background.get(event["id"], event)))
+                        background[event["id"]] = dict(event)
                     if isinstance(event.get("child_session_id"), str):
                         follow(event["child_session_id"], True)
                     if event.get("type") == "tool" and event.get("state") == "pending" and (chat_id, event.get("id")) not in answered:
@@ -389,9 +411,18 @@ class LocalAgentClient:
                     reply["text"] = (reply.get("text") or "") + str(message.get("text") or "")
                 if (kind == "status" and chat_id == session_id and message.get("status") == "idle"
                         and isinstance(message.get("turn_result"), dict)):
-                    ended = message["turn_result"]
-                if ended is not None:
-                    yield result_record(session_id, ended, replies)
+                    turn = message["turn_result"]
+                if turn is not None:
+                    ended, check = turn, True
+                    running = sum(not _ended(card) for card in background.values())
+                    if running:
+                        yield {"type": "background_wait", "session_id": session_id, "running": running}
+                if ended is not None and check and all(_ended(card) for card in background.values()):
+                    check = False
+                    # The app may continue the chat once a background subagent finished: that turn is followed too.
+                    if background and self._busy(session_id):
+                        continue
+                    yield result_record(session_id, ended, replies, list(background.values()))
                     return
         finally:
             stop.set()
@@ -403,11 +434,19 @@ class LocalAgentClient:
                 except (AttributeError, OSError):
                     pass
 
+    def _busy(self, session_id):
+        """Whether the chat runs a turn (or anything else) now; a chat that is gone is not."""
+        try:
+            return self.info(session_id).get("status", "idle") != "idle"
+        except LocalAgentError:
+            return False
+
     def _answer(self, chat_id, subagent, event, can_use_tool, on_question):
         """Answer one waiting card. A callback that raises still answers it (declined, or questions skipped). An
         answer the app refuses is replaced by that default: returns the answer_refused message, else None."""
         name, arguments = event.get("name"), event.get("input") if isinstance(event.get("input"), dict) else {}
-        context = {"session_id": chat_id, "event_id": event["id"], "preview": event.get("preview"), "subagent": subagent}
+        context = {"session_id": chat_id, "event_id": event["id"], "preview": event.get("preview"), "subagent": subagent,
+                   **{key: event[key] for key in CARD_WARNINGS if event.get(key)}}
         verdict, answers, failure, refused = None, None, None, None
         try:
             if name == "ask_user":
@@ -461,10 +500,37 @@ def _events_of(message):
     return []
 
 
-def result_record(session_id, turn, replies=None):
-    """query()'s last message: the turn's result record (turns.turn_result) with the final reply's text."""
+def _background_card(event):
+    """Whether a chat's event is the card of a background delegation (delegate_task background)."""
+    return (event.get("type") == "tool" and event.get("name") == "delegate_task" and isinstance(event.get("id"), str)
+            and isinstance(event.get("delegation"), dict) and event["delegation"].get("background") is True)
+
+
+def _ended(card):
+    """Whether a background delegation ended: its result is on its card, or it was stopped while it waited for a
+    slot (it never had a subagent)."""
+    return isinstance(card.get("delegation_result"), dict) or bool(
+        card["delegation"].get("terminal_reason") and not card.get("child_session_id"))
+
+
+def background_result(card):
+    """A background subagent's entry in the result record: its delegate_task result (status, terminal_reason,
+    report or output, changed_files, ...) once it ended, else its last status."""
+    values = card.get("input") if isinstance(card.get("input"), dict) else {}
+    entry = {"task": values.get("task")}
+    if isinstance(card.get("delegation_result"), dict):
+        return {**entry, **card["delegation_result"]}
+    progress = card["delegation"]
+    return {**entry, "child_session_id": card.get("child_session_id"), "agent_type": progress.get("agent_type"),
+            "status": progress.get("status") or "running", "terminal_reason": progress.get("terminal_reason")}
+
+
+def result_record(session_id, turn, replies=None, background=None):
+    """query()'s last message: the turn's result record (turns.turn_result) with the final reply's text, and
+    (background: the chat's background delegation cards query() followed) background_results."""
     texts = [event.get("text") for event in (replies or {}).values()
              if isinstance(event.get("text"), str) and event["text"] and event.get("created", 0) >= turn.get("started", 0)]
     reason = turn.get("terminal_reason")
     return {"type": "result", "session_id": session_id, **{key: value for key, value in turn.items() if key not in ("started", "ended")},
-            "exit_code": exit_code(reason), "result": texts[-1] if texts else ""}
+            "exit_code": exit_code(reason), "result": texts[-1] if texts else "",
+            **({"background_results": [background_result(card) for card in background]} if background is not None else {})}

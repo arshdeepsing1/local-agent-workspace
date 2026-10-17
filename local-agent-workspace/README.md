@@ -402,7 +402,9 @@ when opening a conversation or performing restart recovery.
   such as GitHub tokens). Clicking it brings the window forward and opens that chat.
   Stopping a reply yourself, or a manual compaction, does not notify. A subagent's turn started
   by its parent notifies only when it needs approval (the parent's turn reports its end); a
-  subagent chat you continue yourself notifies like any other. A notification closes when it
+  background subagent that finishes or fails while its chat is idle notifies for that chat
+  ("Background subagent finished: Fix the parser"); a subagent chat you continue yourself notifies
+  like any other. A notification closes when it
   no longer applies (the approval was answered, the chat started another turn, or you opened
   the chat), so the next approval request alerts again. Each open tab notifies on its own; the browser replaces a
   notification with the same chat and status. If the browser blocks
@@ -1446,7 +1448,10 @@ the turn budget". Verify and stop hooks do not continue the turn past it, and me
 while it ran stay queued. If you raise or remove the limit while that last request runs, the turn
 goes on as usual from the next request (only that request's tool calls stay unrun). A subagent counts toward its parent's turn: its tokens add to the
 parent's and the parent's start time applies; a subagent that reaches the limit wraps up the same
-way and reports the stop as an error to its parent. The check runs between requests, so one
+way and reports the stop as an error to its parent. A background subagent's requests count in the turn during
+which they were made, never again in a later one: while it still works after its turn ended, your next
+message's turn counts only the requests it makes from then on, and it keeps its own turn's limits (the
+requests it made before count toward them). The check runs between requests, so one
 response can pass the limit; title and compaction requests count but are never stopped.
 
 ### Reasoning effort and thinking
@@ -2643,7 +2648,8 @@ python3 scripts/conversation_transcript.py .local/conversations/<id>.jsonl [more
 ```
 
 Each conversation becomes `<date>-<title>-<id>.md` (an existing file is never replaced):
-the messages and replies in full, one line per tool call with its main input, questions
+the messages and replies in full (a subagent's delegated prompt and the app's message after a
+background subagent are labelled as not yours), one line per tool call with its main input, questions
 with the user's answers, plans in full with their review outcome and feedback, and
 command output shortened to 600 characters (`--excerpt`). `--out all.md` joins them,
 oldest first. The script needs only Python 3 and replaces common secret shapes with
@@ -2906,12 +2912,18 @@ first 8 characters) its status and, once it ended, its whole result; without, th
 subagents and their status; `wait_seconds` (up to 300) waits for it, or for any of them, to end. A
 result it read is not named again. While no page is open, a desktop notification (Settings →
 Notifications) and the notification hooks report a background subagent that finished or failed while
-the chat was idle, and the sidebar marks the chat as changed. **Settings → Subagents →
+the chat was idle, and the sidebar marks the chat as changed; with a page open, **Notify me** reports it
+("Background subagent finished: <chat>"). **Settings → Subagents →
 Continue the chat when a background subagent finishes** (off by default: each such turn is a paid
 model request) sends an idle chat a short app message, labelled **Sent by the app when a background
 subagent finished**, so the agent reads the report and goes on; it starts one turn for what ended
 since the chat's last step, and a turn that was running when the subagent ended is told at its next
-step instead. **Stop** on the chat while it works and **Stop subagent** on a card stop background
+step instead. One that ended while a `!` command or a compaction ran continues the chat once it is
+done. It never continues a chat whose last turn stopped at a limit (Agent steps, the turn's tokens or
+time, spending), an error or Stop: that chat waits for **Continue** or your next message, whose first
+request names the subagent. Nor does it continue a scheduled run's chat. The app's message is not
+yours: it has no **Edit message**, **Retry** sends it again as the app's, rewinding to it leaves your
+message box empty, and transcripts label it **App (sent when a background subagent finished)**. **Stop** on the chat while it works and **Stop subagent** on a card stop background
 subagents too, and so does deleting the chat; a restart marks a running one interrupted
 and says so in the chat. While background subagents run, rewinding (also editing or retrying a
 message) and forking the chat are refused with a message naming how many run, because their
@@ -3056,8 +3068,8 @@ rules and permission mode apply as to any subagent, and subagents never delegate
 agent's list is refused like a turned-off one. In Manual mode the approval card names the agent
 and everything it sets, for example **Start a subagent (security-auditor · read-only · model
 Claude Sonnet 4.5 · effort Fast; separate paid model requests, at most 8 steps)** (**Start a
-background subagent** for one in the background, and **mode Plan** when its mode is narrower than the
-chat's), followed by the task, the agent file, its tools, disallowed tools, MCP servers, permission
+background subagent** for one in the background, except in a scheduled run, where the card says it runs
+in the foreground, and **mode Plan** when its mode is narrower than the chat's), followed by the task, the agent file, its tools, disallowed tools, MCP servers, permission
 mode, skills, whether it reads the project memory, its initial prompt, and the exact endpoint; the subagent that starts
 is the one the card showed, even if its file changes before you approve. Text the app shows or
 sends from agent files is redacted (the Databricks token and common secret shapes).
@@ -3128,6 +3140,11 @@ the schedule's settings as its own:
   limits and spending limit (see **Token and time limits per turn** and **Spending limit**), so a run
   wraps up and ends at them, also on endpoints without price data. **Agent steps**, **Model endpoint**
   and **Reasoning effort** follow Settings when left empty.
+- **Subagents** work in the foreground: `delegate_task`'s `background: true` (and an agent file's) is
+  ignored, as its card and result say, so the run waits for them, its approval limit, token and time
+  limits and history cover them, and the next run waits too. **Continue the chat when a background
+  subagent finishes** never continues a run's chat, not even for a background subagent that a message
+  of yours there started.
 - **Run policy**: **Ask before each run** (the default) or **Run automatically**.
 - **Missed runs**: **Run once when the app is back** (the default) or **Skip them**.
 
@@ -3808,10 +3825,19 @@ echo "Review the diff" | python3 scripts/agent_run.py --output stream-json -
   terminal, and `json` / `stream-json` write such characters as `\u` escapes (the parsed JSON is
   the same). An answer the app refuses (an Other answer over 1,000 characters, say) is replaced at
   once by the default (declined, questions skipped, or back to planning), with a message on stderr.
-  A subagent's cards are answered the same way.
+  A subagent's cards are answered the same way. `--approve ask` also prints the card's warnings
+  before you answer, as the page shows them: a secret file the command reads, a protected file, a
+  hook that asked, a command that could not be checked exactly against your rules, or a file another
+  subagent changed.
+- A turn that leaves background subagents working (`delegate_task` with `background: true`) is
+  reported once they ended: the script says on stderr that it waits, answers their cards the same
+  way, and the result's `background_results` lists each one's end (its `delegate_task` result:
+  `status`, `terminal_reason`, report or output, changed files). A turn that **Continue the chat
+  when a background subagent finishes** starts meanwhile is followed too, and the result is the last
+  turn's. Ctrl+C then stops them (as **Stop** does) and exits 3.
 - The result object has `terminal_reason`, `is_error`, `duration_s`, `steps`, `tool_calls`,
   `usage`, `tokens`, `estimated_dbu`, `unpriced_calls`, `subagents`, `changed_files`, `result`
-  (the final reply), `exit_code` and `session_id`. Exit codes: 0 completed, 1 an error, 2 a limit
+  (the final reply), `background_results`, `exit_code` and `session_id`. Exit codes: 0 completed, 1 an error, 2 a limit
   was reached (Agent steps, spending, the turn's tokens or time, or a scheduled run's approval limit),
   3 stopped or interrupted.
   Ctrl+C stops the turn and prints its result (none when the prompt had not started a turn yet).
@@ -3834,8 +3860,12 @@ for message in client.query("Fix the typo in README.md", permission_mode="manual
 ```
 
 `query()` yields the chat's messages (each with `session_id`; a subagent's also with
-`subagent: true`) and ends with the result object. `can_use_tool(name, input, context)` answers
-approval cards (`context` has `session_id`, `event_id`, `preview` and `subagent`) with `Allow()` or
+`subagent: true`) and ends with the result object; when the turn ends while background subagents
+work, it yields `{"type": "background_wait", "running": n}` and follows them first.
+`can_use_tool(name, input, context)` answers
+approval cards (`context` has `session_id`, `event_id`, `preview` and `subagent`, and the card's
+warnings when it has them: `secret_files`, `protected`, `hook_ask` with `hook_id` and `reason`,
+`uncertain`, and `sibling_change` with `subagent_id`, `agent_type` and `path`) with `Allow()` or
 `Deny(message)`; for a plan, `Allow("acceptEdits")` or `Allow("manual")` approves it into that mode.
 `on_question(questions, context)` answers `ask_user` questions with one
 `{"selected": [label], "other": None}` per question, or `None` to skip them. Without a callback every

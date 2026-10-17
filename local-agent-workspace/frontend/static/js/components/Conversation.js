@@ -738,16 +738,18 @@ function Attachments({ items }) {
 }
 
 // What went to the agent with a user message besides its text: the command templates it ran (commands: [{ name,
-// path }], expanded after the text), the skills it selected for itself (skills: [id]), verbatim (sent as plain text),
+// path }], expanded after the text), the skills it selected for itself (skills: [id]), verbatim (sent as plain text;
+// the app's own message after a background subagent always is, and says so above it instead),
 // and git_context (the app's Git snapshot: Settings → Git status in messages).
 function SentWith({ event }) {
   const commands = Array.isArray(event.commands) ? event.commands : []
   const skills = Array.isArray(event.skills) ? event.skills : []
-  if (!commands.length && !skills.length && !event.verbatim && !event.git_context) return null
+  const verbatim = event.verbatim && !event.background_wake
+  if (!commands.length && !skills.length && !verbatim && !event.git_context) return null
   return html`<ul class="attachment-chips sent-with" aria-label="Sent with this message">
     ${commands.map(item => html`<li key=${`command-${item.name}`} class="attachment-chip" title=${`The agent got the text of ${item.path} after your message`}>Command /${item.name} · ${item.path}</li>`)}
     ${skills.map(id => html`<li key=${`skill-${id}`} class="attachment-chip" title="The skill's instructions went with this message only">Skill /${id}</li>`)}
-    ${event.verbatim ? html`<li class="attachment-chip">Sent as plain text</li>` : null}
+    ${verbatim ? html`<li class="attachment-chip">Sent as plain text</li>` : null}
     ${event.git_context ? html`<li class="attachment-chip" title="The branch, upstream, change counts and recent commits, read by the app when you sent this">Git status</li>` : null}
   </ul>`
 }
@@ -1012,7 +1014,7 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
   const focusMessageBox = () => document.querySelector('textarea[aria-label="Message"]')?.focus()
   // After a conversation rewind whose resend failed, the text to send waits in the message box.
   const resent = (result, text) => {
-    const draftKept = result.resend_error && onPrefill ? onPrefill(text) === false : false
+    const draftKept = result.resend_error && onPrefill && text ? onPrefill(text) === false : false
     rewound({ backupId: result.backup_session_id }, draftKept)
     if (result.resend_error) onError(result.resend_error)
     focusMessageBox()
@@ -1025,7 +1027,8 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
         { before_event_id: cuts.latestUser.id, conversation: true, resend_text: cuts.latestUser.text,
           ...(cuts.latestUser.verbatim ? { resend_verbatim: true } : {}),
           ...(sentUploads(cuts.latestUser).length ? { resend_uploads: sentUploads(cuts.latestUser) } : {}) })
-      resent(result, cuts.latestUser.text)
+      // The server keeps the app's message after a background subagent the app's; it is never put in your message box.
+      resent(result, cuts.latestUser.background_wake ? '' : cuts.latestUser.text)
     } catch (e) { onError(e) }
     finally { setRetrying(false) }
   }
@@ -1058,7 +1061,7 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
           setEditing(null)
           resent(result, text)
         }} />`
-      if (event.type === 'user') return html`<div class=${`user-message${event.steered ? ' steered' : ''}${event.hook_blocked ? ' hook-blocked' : ''}`} key=${event.id}>${event.steered ? html`<small class="steered-label">Sent while the agent was working</small>` : null}${event.origin?.kind === 'delegated' ? html`<small class="delegation-origin">Delegated by parent conversation</small>` : null}${event.background_wake ? html`<small class="delegation-origin">Sent by the app when a background subagent finished</small>` : null}<${HookMessageLabel} event=${event} />${event.text}<${Attachments} items=${event.attachments} /><${SentWith} event=${event} /><${HookMessageDetails} event=${event} />${event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}${event.text || idle ? html`<div class="message-actions">${event.text ? html`<${CopyAction} text=${event.text} label="Copy message" />` : null}${idle ? html`<${ActionButton} label="Edit message" icon=${Pencil} target=${`edit:${event.id}`} onClick=${() => setEditing(event.id)} /><${ActionButton} label="Rewind to here" icon=${Undo2} onClick=${() => setRewinding(event)} />` : null}</div>` : null}</div>`
+      if (event.type === 'user') return html`<div class=${`user-message${event.steered ? ' steered' : ''}${event.hook_blocked ? ' hook-blocked' : ''}`} key=${event.id}>${event.steered ? html`<small class="steered-label">Sent while the agent was working</small>` : null}${event.origin?.kind === 'delegated' ? html`<small class="delegation-origin">Delegated by parent conversation</small>` : null}${event.background_wake ? html`<small class="delegation-origin">Sent by the app when a background subagent finished</small>` : null}<${HookMessageLabel} event=${event} />${event.text}<${Attachments} items=${event.attachments} /><${SentWith} event=${event} /><${HookMessageDetails} event=${event} />${event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}${event.text || idle ? html`<div class="message-actions">${event.text ? html`<${CopyAction} text=${event.text} label="Copy message" />` : null}${idle ? html`${event.background_wake ? null : html`<${ActionButton} label="Edit message" icon=${Pencil} target=${`edit:${event.id}`} onClick=${() => setEditing(event.id)} />`}<${ActionButton} label="Rewind to here" icon=${Undo2} onClick=${() => setRewinding(event)} />` : null}</div>` : null}</div>`
       if (event.type === 'tool' && event.name === 'ask_user') return html`<${QuestionCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
       if (event.type === 'tool' && event.name === 'submit_plan') return html`<${PlanCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
       if (event.type === 'tool' && event.name === 'report_findings' && event.state === 'completed') return html`<${FindingsCard} key=${event.id} event=${event} onOpenPath=${onOpenPath} />`
@@ -1078,7 +1081,8 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
       onSelectSession=${onSelectSession}
       onRewound=${result => {
         setRewinding(null)
-        rewound(result, result.conversation && onPrefill ? onPrefill(rewinding.text || '') === false : false)
+        // The app's message after a background subagent is not put in your message box as yours.
+        rewound(result, result.conversation && onPrefill && !rewinding.background_wake ? onPrefill(rewinding.text || '') === false : false)
         if (result.conversation) focusMessageBox()
       }} />` : null}
     ${forking !== undefined && onSelectSession ? html`<${ForkDialog} session=${session} beforeEventId=${forking.beforeEventId}

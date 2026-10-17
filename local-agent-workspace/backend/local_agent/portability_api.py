@@ -274,6 +274,10 @@ def register_portability(app, manager, settings, store, session_or_404):
                         manager.message_skills(remaining, resend_tools, text)
             except ValueError as exc:
                 raise HTTPException(400, settings.redact(str(exc))) from exc
+        # Retry of the app's message after a background subagent (the same text again) stays the app's message.
+        cut_event = session["events"][event_cut] if body.conversation and event_cut < len(session["events"]) else {}
+        app_message = (body.resend_text is not None and cut_event.get("background_wake") is True
+                       and body.resend_text.strip() == str(cut_event.get("text") or "").strip())
         files = []
         if body.code:
             plan = manager.checkpoints.rewind_plan(tools, session_id, turns)
@@ -323,7 +327,8 @@ def register_portability(app, manager, settings, store, session_or_404):
         result = {"backup_session_id": backup_id, "files": files, "resent": False}
         if body.resend_text is not None:
             try:
-                manager.start(session_id, body.resend_text.strip(), verbatim=body.resend_verbatim, uploads=resend_uploads)
+                manager.start(session_id, body.resend_text.strip(), verbatim=body.resend_verbatim, uploads=resend_uploads,
+                              extra={"background_wake": True} if app_message else None)
                 result["resent"] = True
             except ValueError as exc:
                 result["resend_error"] = settings.redact(str(exc))
