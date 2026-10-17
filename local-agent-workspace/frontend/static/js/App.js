@@ -47,6 +47,8 @@ export default function App() {
   // stay when another chat is opened meanwhile.
   const [attachedFiles, setAttachedFiles] = useState({})
   const filesFor = key => update => setAttachedFiles(current => ({ ...current, [key]: resolve(update, current[key] || []) }))
+  // The view whose message box turns Send as plain text on (Edit on a queued plain-text message), until it has.
+  const [plainFor, setPlainFor] = useState(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
   // false, true, or the section to open ('Usage' or 'Export' from /usage and /export).
   const [agentToolsOpen, setAgentToolsOpen] = useState(false)
@@ -197,6 +199,7 @@ export default function App() {
     reasoningFormat=${app.settings?.reasoning_format} thinkingSummaries=${app.settings?.thinking_summaries}
     onSend=${send} onError=${showError} onAttach=${() => setWorkspaceOpen(true)}
     attachments=${attachedFiles[app.viewKey] || []} setAttachments=${filesFor(app.viewKey)} onUpload=${app.uploadFile}
+    plainRequest=${plainFor === app.viewKey} onPlainShown=${() => setPlainFor(null)}
     onShell=${app.runShell} onSideQuestion=${app.askSide} loadFiles=${app.loadMentionFiles} pendingContext=${active?.pending_context}
     loadSkills=${() => api(`/skills${app.activeId ? `?session_id=${encodeURIComponent(app.activeId)}` : ''}`)}
     loadCommands=${() => api(`/commands${app.activeId ? `?session_id=${encodeURIComponent(app.activeId)}` : ''}`)}
@@ -244,6 +247,8 @@ export default function App() {
           onEdit=${async item => {
             await app.removeQueued(item.id)
             setDraft(current => current ? `${current}\n${item.text}` : item.text)
+            // Queued as plain text, it goes as plain text again: its ! or / is not run as a command.
+            if (item.verbatim) setPlainFor(app.viewKey)
             // Its attached files come back as chips too.
             const queued = (item.uploads || []).map(ref => ({ key: `queued-${item.id}-${ref.id}`, name: ref.name || 'Attached file',
               kind: ref.kind || 'document', record: { id: ref.id, name: ref.name, kind: ref.kind || 'document' }, asPath: !!ref.as_path }))

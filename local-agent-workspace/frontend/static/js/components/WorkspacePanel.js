@@ -466,6 +466,12 @@ export default function WorkspacePanel({ sessionId, workspace, worktree = null, 
     .split('/').filter(Boolean).pop() || workspace
   const expanded = sizing.width !== null && sizing.width >= sizing.limit
   const kind = file ? previewKind(file.path) : null
+  // An image other than SVG reaches the agent only attached to a message (read_file reads text): no Add to chat.
+  const raster = kind === 'image' && !/\.svg$/i.test(file.path)
+  // The server read an image or PDF by another path (a worktree's own copy, or a name from another folder): the
+  // panel names that file, as it does a text file the server found; the preview keeps reading the path it was given.
+  const previewOpened = opened => setFile(current => current?.id === file?.id && opened !== current.path
+    ? { ...current, path: opened, requested: current.requested || current.path } : current)
   // Markdown and HTML files switch between the editor and their preview (of the editor's text, unsaved edits included).
   const textPreview = !!file && !file.binary && !file.missing && (kind === 'markdown' || kind === 'html')
   const previewing = !!file && file.mode === 'preview' && !reviewing
@@ -492,16 +498,17 @@ export default function WorkspacePanel({ sessionId, workspace, worktree = null, 
             ? html`<button class="editor-mode" onClick=${() => setFile({ ...file, mode: 'edit' })}><${Pencil} size=${14} />Edit</button>`
             : html`<button class="editor-mode" onClick=${() => setFile({ ...file, mode: 'preview' })}><${Eye} size=${14} />Preview</button>`) : null}
           <${VSCodeLink} absolute=${absolute} line=${markedLine?.line} />
-          <button class="icon-button" onClick=${() => onAttach(file.path)} aria-label="Add this file to chat"><${Plus} size=${16} /></button>
+          ${raster ? null : html`<button class="icon-button" onClick=${() => onAttach(file.path)} aria-label="Add this file to chat"><${Plus} size=${16} /></button>`}
           ${file.missing ? null : html`<button class="icon-button" onClick=${() => void download(file.path)} aria-label="Download file" title="Download"><${Download} size=${16} /></button>`}
           ${file.binary ? null : html`<button class="icon-button" onClick=${() => void save()} disabled=${!dirty || loading || reviewing} aria-label="Save file"><${Save} size=${16} /></button>`}
         </div>
         ${reviewing ? html`<${DiffReview} key=${file.path} sessionId=${sessionId} path=${file.path} version=${pending.current_hash} busy=${busy} onAction=${onReview} onSelectSession=${onSelectSession}
-          onSendComments=${onSendComments} />` : previewing ? (file.binary && !kind
+          onSendComments=${onSendComments} />` : previewing ? (file.binary && !opensInPreview(file.path)
             ? html`<div class="file-preview-none"><p>${file.note || 'This file cannot be shown here.'}</p>
               <button type="button" class="outline" onClick=${() => void download(file.path)}><${Download} size=${14} />Download</button></div>`
-            : html`<${FilePreview} key=${file.id} path=${file.path} kind=${kind} content=${file.content} query=${query} version=${file.version || 0}
-              onOpenPath=${path => void openFile(path)} />
+            : html`<${FilePreview} key=${file.id} path=${file.path} source=${file.binary ? file.requested || file.path : undefined} kind=${kind}
+              content=${file.content} query=${query} version=${file.version || 0} onOpenPath=${path => void openFile(path)} onOpened=${previewOpened} />
+              ${file.requested ? html`<p class="editor-note" role="status">Opened ${file.path}: the reply named it ${file.requested}.</p>` : null}
               ${textPreview ? html`<div class="editor-status"><span>Preview</span><span>${dirty ? 'Unsaved changes' : 'Saved on disk'}</span></div>` : null}`) : html`
         <textarea ref=${editor} class="code-editor" aria-label=${`Edit ${file.path}`} value=${file.content} spellcheck=${false}
           onMouseDown=${leaveLine} onKeyDown=${leaveLine} onInput=${e => { leaveLine(); setFile({ ...file, content: e.currentTarget.value }) }} />

@@ -65,10 +65,13 @@ export async function apiFile(path) {
   const { response, name } = await download(path)
   return { text: await response.text(), name }
 }
-// A file's bytes as a Blob (the Workspace preview and Download: GET /file/raw), with its file name or null.
+// A file's bytes as a Blob (the Workspace preview and Download: GET /file/raw), with its file name or null, and
+// opened: the path the server read it by (X-Opened-Path, URL-encoded) or null.
 export async function apiBlob(path) {
   const { response, name } = await download(path)
-  return { blob: await response.blob(), name }
+  let opened = null
+  try { opened = decodeURIComponent(response.headers.get('X-Opened-Path') || '') || null } catch { /* not encoded as sent */ }
+  return { blob: await response.blob(), name, opened }
 }
 async function download(path, retried = false) {
   const response = await fetch(`/api${path}`, { headers: { 'X-Local-Token': token } }).catch(offline)

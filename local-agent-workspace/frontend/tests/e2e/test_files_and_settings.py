@@ -3,7 +3,9 @@ the server's own headers and the page's own Content-Security-Policy apply, which
 other UI tests cannot show."""
 import json
 import struct
+import threading
 import zlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 from playwright.sync_api import expect
@@ -93,6 +95,46 @@ def test_an_html_file_previews_in_a_sandbox_under_the_pages_policy(files, app_pa
     reached = page.frame_locator(".file-preview-frame").locator("body").evaluate(
         "() => { try { return window.parent.document.title } catch { return 'blocked' } }")
     assert reached == "blocked"
+
+
+@pytest.fixture
+def tracker():
+    """A server on 127.0.0.1 that records the paths asked of it: what a previewed file could reach."""
+    hits = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            hits.append(self.path)
+            self.send_response(404)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_address[1]}", hits
+    server.shutdown()
+    server.server_close()
+
+
+def test_an_html_file_that_starts_with_a_no_break_space_still_loads_nothing(files, tracker, app_page):
+    # Before its doctype, a character HTML does not count as whitespace opens the body: the frame's policy must still
+    # be in the head, where a browser applies it.
+    url, hits = tracker
+    (files / "nbsp.html").write_text(
+        f'\u00a0<!doctype html><title>x</title><link rel="stylesheet" href="{url}/sheet.css"><img src="{url}/pixel.png" alt="probe">'
+        "<p id=t>Static page</p><script>const image = document.querySelector('img')\n"
+        "Promise.all([new Promise(done => { if (image.complete) done(); else image.onload = image.onerror = done }),"
+        f"fetch('{url}/fetch').catch(() => {{}})]).then(() => {{ document.getElementById('t').textContent = 'Ran' }})</script>")
+    page = app_page
+    open_workspace(page)
+    panel(page).locator(".file-row", has_text="nbsp.html").click()
+    panel(page).get_by_role("button", name="Preview", exact=True).click()
+    expect(page.frame_locator(".file-preview-frame").get_by_text("Static page")).to_be_visible()
+    panel(page).get_by_role("button", name="Run scripts").click()
+    expect(page.frame_locator(".file-preview-frame").get_by_text("Ran")).to_be_visible()
+    assert hits == []
 
 
 @pytest.fixture

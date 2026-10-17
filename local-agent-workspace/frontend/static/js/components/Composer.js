@@ -41,12 +41,14 @@ function chipLabel(item) {
 // command; rejects with the error to show), loadCommands (command templates for the / menu),
 // slashCommands (Settings → slash commands), attachments and setAttachments(update) (the files attached to the next
 // message: [{ key, name, kind, model, record? (UploadRecord, once uploaded), asPath? }], kept by the page per view),
-// onUpload(file) -> Promise<UploadRecord> (paste, drop and Attach files; absent: no attaching)
+// onUpload(file) -> Promise<UploadRecord> (paste, drop and Attach files; absent: no attaching),
+// plainRequest (true turns Send as plain text on: a queued plain-text message is back in the box) and onPlainShown()
 export default function Composer(p) {
   const [sending, setSending] = useState(false)
   const [caret, setCaret] = useState(0)
   // Send as plain text: the next message goes as typed, without a command, skills, @ files or ! shell.
   const [plain, setPlain] = useState(false)
+  useEffect(() => { if (p.plainRequest) { setPlain(true); p.onPlainShown?.() } }, [p.plainRequest])
   // A built-in command chosen in the / menu: it runs while the box still starts with it (slash commands off).
   const [picked, setPicked] = useState(null)
   const input = useRef(null)
@@ -234,12 +236,12 @@ export default function Composer(p) {
         html`<button class="send-button" aria-label=${parsed ? 'Run command' : 'Send message'} disabled=${!text || sending || p.modelSaving || p.disabled || blocked} onClick=${() => void submit()}><${ArrowUp} size=${19} /></button>`}
     </div>
     ${hint ? html`<p class=${`composer-hint ${parsed || plain ? 'command-hint' : 'shell-hint'}`} role="status">${hint}</p>` : null}
+    ${p.onUpload ? html`<input ref=${picker} type="file" multiple accept=${ACCEPT} hidden onChange=${e => { attach(e.currentTarget.files); e.currentTarget.value = '' }} />` : null}
     <div class="composer-toolbar">
       <button class="attach-button icon-button" aria-label="Add project file" onClick=${p.onAttach}><${Plus} size=${19} /></button>
       ${p.onUpload ? html`<button class="attach-button icon-button attach-files" aria-label="Attach files" disabled=${p.disabled}
         title="Attach documents (PDF, Word, Excel, PowerPoint, CSV, text, Markdown) or images to your next message; you can also paste or drop them"
-        onClick=${() => picker.current?.click()}><${Paperclip} size=${16} /></button>
-      <input ref=${picker} type="file" multiple accept=${ACCEPT} hidden onChange=${e => { attach(e.currentTarget.files); e.currentTarget.value = '' }} />` : null}
+        onClick=${() => picker.current?.click()}><${Paperclip} size=${16} /></button>` : null}
       <button class=${`icon-button plain-toggle${plain ? ' active' : ''}`} aria-label="Send as plain text" aria-pressed=${plain}
         title="Send as plain text: exactly as typed, without commands, skills, @ files or ! shell (or press Shift+Alt+Enter)"
         onClick=${() => { setPlain(value => !value); input.current?.focus() }}><${Type} size=${17} /></button>
