@@ -58,7 +58,9 @@ FIELD_ALIASES = {"disallowedTools": "disallowed_tools", "permissionMode": "permi
 PERMISSION_MODES = ("plan", "dontAsk", "manual", "auto", "acceptEdits", "bypassPermissions")
 MODE_ALIASES = {"default": "manual"}
 # Narrowest first. Auto and Accept edits are not comparable (Auto runs read-only commands, Accept edits
-# asks for every command): where they meet, Manual applies (narrow_mode).
+# asks for every command): where they meet, Manual applies (narrow_mode). Plan is not narrower than Don't
+# ask, Manual or Accept edits for read-only commands, which it runs without a card: a subagent's verdict is
+# also the chat's mode's when that is stricter (AgentManager.permission, the child's mode_ceiling).
 MODE_RANK = {"plan": 0, "dontAsk": 1, "manual": 2, "auto": 3, "acceptEdits": 3, "bypassPermissions": 4}
 MAX_SERVERS = 20
 INITIAL_PROMPT_CHARS = 2_000
@@ -277,7 +279,7 @@ def _disallowed(value, notes):
 def narrow_mode(agent_mode, chat_mode):
     """The permission mode of an agent's subagent: the agent file's permission_mode when it is narrower
     than the chat's (MODE_RANK), else the chat's; between Auto and Accept edits, Manual. A file never
-    widens the chat's mode."""
+    widens the chat's mode: the chat's mode still decides where it is stricter (mode_ceiling)."""
     chat_mode = chat_mode if chat_mode in MODE_RANK else "manual"
     if agent_mode not in MODE_RANK or agent_mode == chat_mode:
         return chat_mode

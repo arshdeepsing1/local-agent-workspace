@@ -55,7 +55,8 @@ from .extensions import RESERVED_COMMANDS, skill_index
 from . import commands as command_templates
 from . import custom_agents
 from .context import estimate_text_tokens
-from .planning import REPORT_SUBMITTED, REPORT_SUBMITTED_REPLY, CallAllowance, DelegateManager, DelegationGate, TaskManager
+from .planning import (REPORT_SUBMITTED, REPORT_SUBMITTED_REPLY, CallAllowance, DelegateManager, DelegationGate, TaskManager,
+                       retried_reports)
 from .interactions import InteractionManager
 from .feature_tools import FEATURE_TOOLS
 from .tool_profiles import agent_refusal, tool_allowed, filter_tools, off_servers, server_off
@@ -1896,7 +1897,10 @@ class AgentManager(LifecycleHooks):
                                                "rules_problem": self.rules.problem})
 
     def permission(self, session, tools, name, arguments):
-        """The Verdict for one tool call in this conversation, with its chat, project and user rules."""
+        """The Verdict for one tool call in this conversation, with its chat, project and user rules. In a
+        delegated turn of a subagent whose agent file set its mode, the chat's mode (mode_ceiling) decides
+        too and the stricter verdict applies: Plan runs read-only commands that Manual and Accept edits ask
+        for and Don't ask refuses."""
         saved = self.rules.rules(session["workspace"])
 
         def protected(value):
@@ -1912,13 +1916,33 @@ class AgentManager(LifecycleHooks):
                 if _within(Path(os.path.abspath(requested)), folder) or _within(resolved, folder):
                     return f"the Python environment commands run with ({venv})"
             return reason
-        return evaluate(session.get("permission_mode", "manual"), name, arguments,
-                        chat_rules=session.get("allow_rules") or [], project_rules=saved["project"],
-                        user_rules=saved["user"], resolve_path=tools.resolve, protected=protected,
-                        disabled=set(session.get("disabled_tools") or []), subagent=bool(session.get("is_subagent")),
-                        credential_file=str(tools.credential_file) if tools.credential_file else None,
-                        vet=lambda values, allow: self.vet_command(tools, values, allow),
-                        secrets=lambda values: self.secret_words(tools, values))
+
+        def decide(mode):
+            return evaluate(mode, name, arguments,
+                            chat_rules=session.get("allow_rules") or [], project_rules=saved["project"],
+                            user_rules=saved["user"], resolve_path=tools.resolve, protected=protected,
+                            disabled=set(session.get("disabled_tools") or []), subagent=bool(session.get("is_subagent")),
+                            reports=bool(session.get("turn_delegated")),
+                            credential_file=str(tools.credential_file) if tools.credential_file else None,
+                            vet=lambda values, allow: self.vet_command(tools, values, allow),
+                            secrets=lambda values: self.secret_words(tools, values))
+        verdict = decide(session.get("permission_mode", "manual"))
+        if verdict.decision != "deny" and (ceiling := self.mode_ceiling(session)):
+            chat = decide(ceiling)
+            order = ("deny", "ask", "allow")
+            if order.index(chat.decision) < order.index(verdict.decision):
+                return chat
+        return verdict
+
+    @staticmethod
+    def mode_ceiling(session):
+        """The chat's mode, in a delegated turn of a subagent whose agent file set another mode (permission),
+        else None."""
+        ceiling = session.get("mode_ceiling")
+        if (ceiling in MODE_LABELS and ceiling != session.get("permission_mode", "manual") and session.get("is_subagent")
+                and session.get("turn_delegated")):
+            return ceiling
+        return None
 
     def command_start(self, tools, arguments):
         """The folder a command starts in: its resolved cwd, else the project (no access check here)."""
@@ -2227,7 +2251,13 @@ class AgentManager(LifecycleHooks):
         for child in self.active_children(session):
             # A custom agent's permission_mode stays when it is narrower than the chat's new mode.
             agent_mode = child.get("agent_permission_mode")
-            await self.change_mode(child, custom_agents.narrow_mode(agent_mode, mode) if agent_mode else mode, notice=notice)
+            narrowed = custom_agents.narrow_mode(agent_mode, mode) if agent_mode else mode
+            if agent_mode and child.get("mode_ceiling") != mode:
+                child["mode_ceiling"] = mode  # permission(): the chat's new mode decides where it is stricter.
+                if narrowed == child.get("permission_mode", "manual"):
+                    self.store.save(child)
+                    await self.recheck_pending(child, "mode")
+            await self.change_mode(child, narrowed, notice=notice)
 
     async def set_disabled_tools(self, session, names):
         """Turn tools off (or on again) for this conversation and a running subagent."""
@@ -2994,7 +3024,10 @@ class AgentManager(LifecycleHooks):
                 terminal_reason = next((item["terminal_reason"] for item in reversed(events) if item.get("terminal_reason")), "completed")
                 if terminal_reason == "completed" and any(item["type"] == "error" for item in events):
                     terminal_reason = "error"
-                if terminal_reason == "completed" and any(item.get("state") == "error" for item in events):
+                # A report the schema refused and the subagent then sent again is not a failed tool.
+                retried = retried_reports(events) if session.get("is_subagent") else set()
+                if terminal_reason == "completed" and any(item.get("state") == "error" and item.get("id") not in retried
+                                                          for item in events):
                     terminal_reason = "tool_error"
             for event in updates:
                 await self.broadcast(session["id"], {"type": "event", "event": event})
@@ -3894,7 +3927,7 @@ class AgentManager(LifecycleHooks):
         target = tools.resolve(value)  # Exclusions apply before any access prompt.
         if tools.permitted(target):
             return True
-        if session.get("permission_mode") == "dontAsk":
+        if "dontAsk" in (session.get("permission_mode"), self.mode_ceiling(session)):
             if outcome is not None:
                 outcome.update(approval="blocked", blocked_reason=DONT_ASK_ACCESS)
             return False
@@ -3908,10 +3941,10 @@ class AgentManager(LifecycleHooks):
                 verdict = self.permission(session, tools, *tool)
                 if verdict.decision == "deny" and verdict.source != "dont_ask":
                     return "deny", self.blocked_text(session, change, verdict.message)
+            if mode == "dontAsk" or self.mode_ceiling(session) == "dontAsk":
+                return "deny", DONT_ASK_ACCESS
             if mode == "bypassPermissions":
                 return "allow", {"by": "mode", "mode": mode}
-            if mode == "dontAsk":
-                return "deny", DONT_ASK_ACCESS
             return None
         key = (session["id"], event["id"])
         self.pending_checks[key] = recheck
@@ -4119,7 +4152,8 @@ class AgentManager(LifecycleHooks):
         # provider's prompt prefix caching can reuse the longest possible prefix. Agent
         # requests to Claude endpoints mark where the stable text ends (prompt_cache.py).
         warnings = guidance["warnings"] = [*guidance["warnings"], *warnings]
-        stable = (system_prompt() + "\n" + user_block + style_text + mode_prompt(mode, bool(session.get("is_subagent")))
+        stable = (system_prompt() + "\n" + user_block + style_text + mode_prompt(mode, bool(session.get("is_subagent")),
+                                                                                bool(session.get("turn_delegated")))
                   + (f"\nEnforced tool profile: {session['tool_profile']}. Commands, MCP tools and hooks are unavailable."
                      if session.get("tool_profile", "inherit") != "inherit" else "")
                   + "\nWorkspace: " + session["workspace"]

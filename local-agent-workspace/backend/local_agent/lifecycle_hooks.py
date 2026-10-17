@@ -312,13 +312,19 @@ class LifecycleHooks:
         """After a hook card in a chat that was not just running (a subagent's card in its delegating
         parent): approve() left it running, so put back its previous status, or awaiting_approval
         while another of its cards waits. A card a stopped subagent left waiting shows cancelled. An
-        idle parent (of a background subagent) becomes idle again."""
+        idle parent (of a background subagent) becomes idle again, or stays running when the user started
+        a turn there while the card waited."""
         if event.get("state") == "pending":
             await self.update_event(owner, event, state="cancelled")
         task = self.tasks.get(owner["id"])
         waiting = any(key[0] == owner["id"] and not future.done() for key, future in self.pending.items())
-        if previous == "idle" and (task is None or task.done()):
-            status = "awaiting_approval" if waiting else "idle"
+        if previous == "idle":
+            if task is None or task.done():
+                status = "awaiting_approval" if waiting else "idle"
+            elif task.cancelling():
+                return  # The new turn is stopping: its own end sets the status.
+            else:
+                status = "awaiting_approval" if waiting else "running"
             if self.statuses.get(owner["id"], "idle") != status:
                 await self.status(owner, status)
             return
@@ -421,7 +427,7 @@ class LifecycleHooks:
         verdict = self.permission(session, tools, name, arguments)
         if not forced or verdict.decision != "allow":
             return verdict
-        if session.get("permission_mode") == "dontAsk":
+        if "dontAsk" in (session.get("permission_mode"), self.mode_ceiling(session)):
             if forced.get("sibling"):
                 shared = forced["sibling"]
                 return Verdict("deny", "dont_ask", SIBLING_DONT_ASK.format(

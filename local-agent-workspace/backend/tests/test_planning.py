@@ -365,7 +365,7 @@ async def test_parent_progress_is_live_correlated_and_contains_no_child_payloads
     assert event["delegation"] == {"status": "awaiting_approval", "completed_tools": 0, "last_tool": "read_file",
                                    "agent_type": "general", "model": "synthetic-model", "effort": "default",
                                    "pending": {"event_id": child["events"][1]["id"], "name": "read_file",
-                                               "kind": "approval", "title": "read file"}}
+                                               "kind": "approval", "title": "read file", "review": True}}
     event["delegation"]["started"] = started
     assert "private child contents" not in json.dumps(saved)
     assert saved["wire"] == []

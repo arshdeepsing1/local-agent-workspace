@@ -2202,7 +2202,8 @@ never starts in that chat.
 
 Databricks accepts at most 32 tools per request, built-in and MCP tools together. Built-in
 tools come first (28 in a new chat with the default Settings; up to 31 once `get_tool_output`, `web_search` and Plan's
-`submit_plan` are offered too), then MCP tools in server order; the MCP tools that do not fit are named once
+`submit_plan` are offered too, and 32 with `get_subagent_result` once the chat started a background subagent, which
+leaves no room for MCP tools), then MCP tools in server order; the MCP tools that do not fit are named once
 in a notice and in **Extensions**, and a call to one is refused. Turn off tools or servers a
 chat does not need to make room.
 
@@ -2563,7 +2564,7 @@ prompt asks it to end with `submit_report`, a tool only subagents get: a structu
 `summary` (up to 2,000 characters), `findings` (up to 30, each with `text` and optionally `path` and
 `line`), `files_changed` (up to 20) and `next_steps` (up to 10; open questions and risks go there too).
 The tool checks the report against its schema, so an incomplete one is an error the model fixes and
-sends again, and a valid one ends the subagent's turn without another model request. A subagent that
+sends again (once a later report is accepted, the refused one does not count as a failure of the run), and a valid one ends the subagent's turn without another model request. A subagent that
 answers in plain text instead still reports that reply, as before. In a subagent chat you continue
 yourself, `submit_report` is refused: answer there in the reply.
 
@@ -2605,7 +2606,10 @@ subagent**, which stops only that one (its call returns as cancelled; the chat a
 subagents go on). While it waits for your approval, the card names what it waits on (for example
 **Waits for approval: run command · npm test**, or the file a file tool would change) with **Allow** and **Decline**, which answer that card in the
 subagent like its own buttons (to edit the action first or allow it for the chat, open the
-subagent); a question or a plan shows **Answer in subagent**. Stop on the parent stops all its
+subagent). **Allow** is there only when that line is the whole action: a one-line command (with its folder), or
+a move or delete. A command with more lines, a file's new content, another tool's arguments, or a card that
+warns (a credential-looking file, a protected file, another subagent's change to the file, a hook's ask; the
+card names the warning) shows **Review in subagent** instead, next to **Decline**. A question or a plan shows **Answer in subagent**. Stop on the parent stops all its
 subagents, also those still waiting for a slot and those in the background. The child's first prompt is labeled
 **Delegated by parent conversation** and retains the spawning action ID; later human
 messages are not labeled delegated. A subagent chat is named by its task until it gets a
@@ -2614,7 +2618,10 @@ title. Unfinished delegated runs are marked interrupted on restart rather than l
 **Background subagents.** With `background: true` (or an agent file's `background: true` when the
 call does not say), `delegate_task` returns at once with the child's ID, `status` (`running`, or
 `queued` while all three subagent slots are taken) and `background: true`, and the chat goes on; its
-turn may end while the subagent works. The card shows **Background** and its live progress. When the
+turn may end while the subagent works. A queued one starts within what the chat allows when its slot
+frees (its subagent tool ceiling, turned-off tools and mode at that time); one that then cannot start
+(for example `delegate_task` was turned off, or the chat's new mode needs approval for it) ends as
+failed, with a notice and result saying why. The card shows **Background** and its live progress. When the
 subagent ends, its result goes on its card (its **Report**), a notice in the chat says so (for example
 **Background subagent explore finished: Map the parser**, with **Open subagent**), and the next
 model request of the chat names it once: "Background subagents ended since your last step: …". The
@@ -2679,7 +2686,7 @@ explicit editor/terminal actions.
 only reads: `.agents/agents/<name>.md`, then `.claude/agents/<name>.md` (when both define a
 name, the `.agents` file is used and the other is noted), then the agents the app ships in its own
 `agents` folder. The app ships **plan**: it investigates the code (read-only commands too, in Plan
-mode, with no file edits and no MCP servers) and returns an implementation plan with goal, steps,
+mode, with no file edits and no MCP servers; its commands ask where the chat's mode asks) and returns an implementation plan with goal, steps,
 files, risks and tests, without changing anything. A project file named `plan.md` replaces it (Agent
 types notes that). Frontmatter between two `---` lines
 names the agent and its limits; the rest of the file is its instructions:
@@ -2710,7 +2717,7 @@ Report each finding with path:line, its severity and a suggested fix.
 | `skills` | Optional: up to three skill IDs loaded into the subagent like selected skills; one that does not load, or whose frontmatter sets `disable-model-invocation: true` (the model chooses when an agent runs), is left out with a note in its first prompt. A `/skill` word in the instructions or the task loads no other skill. |
 | `max_steps` | Optional 1–24: the subagent's steps when the call gives no `max_steps` (a call's own value wins). |
 | `disallowed_tools` | Optional: tools the agent may not use, taken away from `tools` or from its profile (its MCP tools by name, or every tool of a server as `mcp__<server>__*`; a tool that covers another, such as `read_file` for `outline_file`, takes that one too). A list that takes away every tool is refused. |
-| `permission_mode` | Optional `plan`, `dontAsk`, `manual` (Claude Code's `default`), `auto`, `acceptEdits` or `bypassPermissions`; left out (or `inherit`): the chat's. It applies only when it is narrower than the chat's mode, also after you change the chat's mode while the subagent runs: Plan < Don't ask < Manual < Auto or Accept edits < Bypass permissions, and where Auto and Accept edits meet, Manual. |
+| `permission_mode` | Optional `plan`, `dontAsk`, `manual` (Claude Code's `default`), `auto`, `acceptEdits` or `bypassPermissions`; left out (or `inherit`): the chat's. It applies only when it is narrower than the chat's mode, also after you change the chat's mode while the subagent runs: Plan < Don't ask < Manual < Auto or Accept edits < Bypass permissions, and where Auto and Accept edits meet, Manual. The chat's mode still decides where it is stricter: a Plan subagent of a Manual or Accept edits chat asks before a read-only command (unless a rule allows it), and one of a Don't ask chat is refused it. |
 | `mcp_servers` | Optional: the IDs of the MCP servers (as **Settings → MCP** names them) whose tools the agent may use; only those start for it, and `[]` starts none. Left out: every configured server. Server definitions in the file are not supported; an ID that is not configured is left out with a note. |
 | `memory` | Optional `project` (the default: the subagent reads the project memory, as every chat does) or `none` (without it). `user` and `local` are not supported and read as `project`, with a note. |
 | `initial_prompt` | Optional text of up to 2,000 characters (one line; a double-quoted value may use `\n`), added to the subagent's first prompt after the instructions under **Agent's initial prompt:**. |
@@ -2769,7 +2776,7 @@ endpoint you do not already use (see `model` above). Its profile is intersected 
 subagent tool ceiling and any requested `tool_profile` (the narrowest wins), its tools with that profile and without those the chat has
 turned off or an unconditional deny rule covers (a delegation with none of its tools left is
 refused, and the first prompt lists only the tools it has), `disallowed_tools` and `mcp_servers`
-only take tools away, `permission_mode` only narrows the chat's mode, the chat's turned-off tools,
+only take tools away, `permission_mode` only narrows the chat's mode (what the chat's mode asks for or refuses, the subagent does too), the chat's turned-off tools,
 rules and permission mode apply as to any subagent, and subagents never delegate. A tool outside the
 agent's list is refused like a turned-off one. In Manual mode the approval card names the agent
 and everything it sets, for example **Start a subagent (security-auditor · read-only · model

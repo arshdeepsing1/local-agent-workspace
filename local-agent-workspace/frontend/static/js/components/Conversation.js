@@ -505,7 +505,8 @@ function SubagentReport({ report, onOpenPath }) {
 }
 
 // Allow or Decline the card a subagent waits on, or open it to answer a question or plan (the child's own
-// approvals route, so its rules and checks apply), and Stop one running subagent.
+// approvals route, so its rules and checks apply), and Stop one running subagent. A card whose title does not
+// show the whole action, or that warns (pending.review), is reviewed in the subagent: no Allow here.
 function SubagentControls({ event, progress, onSelectSession, onError }) {
   const [acting, setActing] = useState('')
   const child = event.child_session_id
@@ -518,8 +519,10 @@ function SubagentControls({ event, progress, onSelectSession, onError }) {
   const decide = allowed => act(allowed ? 'allow' : 'decline', `/sessions/${encodeURIComponent(child)}/approvals/${encodeURIComponent(pending.event_id)}`, { allowed })
   return html`<div class="subagent-controls">
     ${pending ? html`<p class="subagent-pending" title=${pending.title}>${pending.kind === 'approval' ? `Waits for approval: ${String(pending.name || '').replace(/_/g, ' ')} · ` : pending.kind === 'question' ? 'Asks: ' : 'Plan to review: '}${pending.title}</p>` : null}
-    ${pending?.kind === 'approval' ? html`<button class="outline" disabled=${!!acting} onClick=${() => void decide(true)}>Allow</button>
-      <button class="outline" disabled=${!!acting} onClick=${() => void decide(false)}>Decline</button>` : null}
+    ${pending?.kind === 'approval' && Array.isArray(pending.warnings) && pending.warnings.length ? html`<p class="subagent-pending-warning">Its card warns: ${pending.warnings.join('; ')}.</p>` : null}
+    ${pending?.kind === 'approval' && !pending.review ? html`<button class="outline" disabled=${!!acting} onClick=${() => void decide(true)}>Allow</button>` : null}
+    ${pending?.kind === 'approval' && pending.review && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(child)}>Review in subagent</button>` : null}
+    ${pending?.kind === 'approval' ? html`<button class="outline" disabled=${!!acting} onClick=${() => void decide(false)}>Decline</button>` : null}
     ${pending && pending.kind !== 'approval' && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(child)}>Answer in subagent</button>` : null}
     <button class="outline danger" disabled=${!!acting} onClick=${() => void act('stop', `/sessions/${encodeURIComponent(child)}/stop`)}>${acting === 'stop' ? 'Stopping…' : 'Stop subagent'}</button>
   </div>`

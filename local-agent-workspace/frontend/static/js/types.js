@@ -225,9 +225,10 @@
 //   servers: [{ id, name, enabled }].
 // Delegation: { status: 'queued'|'running'|'awaiting_approval'|...|'completed'|'failed'|'cancelled'|'interrupted',
 //   completed_tools, last_tool?, terminal_reason?, agent_type?, started?, ended? (epoch seconds), background? (true:
-//   delegate_task background), pending?: { event_id, name, kind: 'approval'|'question'|'plan', title, expires? } (the
-//   child's waiting card while awaiting_approval: POST /sessions/<child>/approvals/<event_id> { allowed } answers an
-//   approval) }. A finished delegate_task card's output is the JSON result { child_session_id, agent_type,
+//   delegate_task background), pending?: { event_id, name, kind: 'approval'|'question'|'plan', title, warnings?:
+//   string[], review?: true (the title is not the whole action, or the card warns: no Allow on the parent's card),
+//   expires? } (the child's waiting card while awaiting_approval: POST /sessions/<child>/approvals/<event_id>
+//   { allowed } answers an approval) }. A finished delegate_task card's output is the JSON result { child_session_id, agent_type,
 //   tool_profile, status, terminal_reason, steps_used, tool_calls, changed_files, changed_files_total?, transcript,
 //   report?: { summary, findings?: [{ path?, line?, text }], files_changed?, next_steps?, findings_total?, ... } (its
 //   submit_report), output (its final reply, '' with a report) }. A background one's output is { child_session_id

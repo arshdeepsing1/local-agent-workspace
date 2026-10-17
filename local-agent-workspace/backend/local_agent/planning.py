@@ -149,6 +149,11 @@ LIST_ENTRIES = 20
 WAKE_TEXT = ("[Sent by the app: the background subagent {id} ({kind}) {ending}. Read its report with get_subagent_result "
              "and continue the task.]")
 PENDING_TITLE = 200
+# What a waiting card of a subagent warns about (its own card shows it); the parent's card names it and
+# offers no Allow, so the user reviews the subagent's card.
+PENDING_WARNINGS = (("secret_files", "names credential-looking files"), ("protected", "changes a protected file"),
+                    ("sibling_change", "another subagent changed this file"), ("hook_ask", "a hook asked for it"),
+                    ("uncertain", "a rule may cover it"))
 # A custom agent's first prompt (custom_agents.py): its instructions, then what its tools allow.
 AGENT_HEADER = "Custom agent: "
 CUSTOM_BRIEFS = {
@@ -242,6 +247,19 @@ def submitted_report(events):
                 and isinstance(event.get("input"), dict) and isinstance(event["input"].get("summary"), str)):
             return {key: event["input"][key] for key in REPORT_KEYS if key in event["input"]}
     return None
+
+
+def retried_reports(events):
+    """The IDs of submit_report calls that failed (the schema refused a report) before a later one was
+    accepted: the retry the tool invites, not a failure of the subagent's run."""
+    accepted, retried = False, set()
+    for event in reversed(events):
+        if event.get("type") == "tool" and event.get("name") == "submit_report":
+            if event.get("state") == "completed":
+                accepted = True
+            elif accepted and event.get("state") == "error":
+                retried.add(event.get("id"))
+    return retried
 
 
 def redacted_report(report, redact):
@@ -631,13 +649,16 @@ class DelegateManager:
 
     def pending_card(self, child):
         """What the child's newest waiting card asks, for its parent's card: {event_id, name, kind (approval,
-        question or plan), title (its first line, redacted), expires?}, or None."""
+        question or plan), title (its first line, redacted), warnings?, review?, expires?}, or None. review:
+        the title does not show the whole action (more lines, a file's new content, a tool's arguments) or the
+        card warns (warnings), so the parent's card offers no Allow and the user reviews the subagent's card."""
         event = next((item for item in reversed(child.get("events", [])) if item.get("state") == "pending"), None)
         if event is None:
             return None
         name = str(event.get("name") or "tool")
         kind = {"ask_user": "question", "submit_plan": "plan"}.get(name, "approval")
         values = event.get("input") if isinstance(event.get("input"), dict) else {}
+        whole = False  # Whether the title is the whole action.
         if kind == "question":
             questions = values.get("questions") if isinstance(values.get("questions"), list) else []
             title = next((item.get("question") for item in questions if isinstance(item, dict)), "") or "A question"
@@ -645,11 +666,22 @@ class DelegateManager:
             title = "A plan to review"
         elif isinstance(values.get("path"), str) and name in CHANGE_TOOLS:
             title = values["path"] + (f" → {values['destination']}" if isinstance(values.get("destination"), str) else "")
+            whole = name in ("move_path", "delete_path")  # The others change content the title does not show.
         else:  # A command's first line, or the first line of what the card shows.
             text = values.get("command") if name == "run_command" and isinstance(values.get("command"), str) else event.get("preview")
-            title = next((line.strip() for line in str(text or "").splitlines() if line.strip()), name.replace("_", " "))
-        pending = {"event_id": event["id"], "name": name[:120], "kind": kind,
-                   "title": self.manager.settings.redact(redact_secrets(str(title)))[:PENDING_TITLE]}
+            lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+            title = lines[0] if lines else name.replace("_", " ")
+            if name == "run_command" and isinstance(values.get("cwd"), str):
+                title += f" (in {values['cwd']})"
+            whole = name == "run_command" and len(lines) == 1
+        title = self.manager.settings.redact(redact_secrets(str(title)))
+        pending = {"event_id": event["id"], "name": name[:120], "kind": kind, "title": title[:PENDING_TITLE]}
+        if kind == "approval":
+            warnings = [label for key, label in PENDING_WARNINGS if event.get(key)]
+            if warnings:
+                pending["warnings"] = warnings
+            if warnings or not whole or len(title) > PENDING_TITLE:
+                pending["review"] = True
         if isinstance(event.get("approval_expires"), (int, float)):
             pending["expires"] = event["approval_expires"]
         return pending
@@ -802,9 +834,14 @@ class DelegateManager:
             servers, note = self.agent_servers(spec)
             if servers is not None:
                 text += "\nMCP servers: " + (", ".join(servers) or "none") + (f" ({note})" if note else "")
-            if mode != parent.get("permission_mode", "manual"):
+            chat_mode = parent.get("permission_mode", "manual")
+            if mode != chat_mode:
                 text += (f"\nPermission mode: {MODE_LABELS[mode]} (the agent file's {spec['permission_mode']}; this "
-                         f"chat is in {MODE_LABELS.get(parent.get('permission_mode', 'manual'), 'Manual')})")
+                         f"chat is in {MODE_LABELS.get(chat_mode, 'Manual')}"
+                         # AgentManager.permission: the chat's mode still decides where it is stricter.
+                         + ("; read-only commands still ask unless a rule allows them" if mode == "plan" and chat_mode
+                            in ("manual", "acceptEdits") else "; read-only commands that no rule allows are still "
+                            "refused" if mode == "plan" and chat_mode == "dontAsk" else "") + ")")
             if spec["skills"]:
                 text += "\nSkills: " + ", ".join(spec["skills"])
             if spec.get("memory") == "none":
@@ -894,7 +931,11 @@ class DelegateManager:
             raise ValueError(refusal)
         child = None
         try:
-            if entry.get("queued"):  # The chat may have turned the agent's tools off while it waited.
+            if entry.get("queued"):
+                # While it waited, the chat (idle after a background call) may have narrowed its subagent tool
+                # ceiling or turned the agent's tools off: the child starts within what the chat allows now.
+                parent = self.manager.get(parent["id"]) or parent
+                profile = child_profile(parent, spec["requested"])
                 agent_tools = self.agent_tools(parent, spec, profile)
             # The agent's effort, else the chat's now (a chat saved without one uses the Settings default).
             effort = spec["effort"] or (self.manager.get(parent["id"]) or parent).get("reasoning_effort")
@@ -923,6 +964,8 @@ class DelegateManager:
                 child["agent_mcp_servers"] = servers
             if spec.get("permission_mode"):
                 child["agent_permission_mode"] = spec["permission_mode"]
+                # The chat's mode, which still decides where it is stricter (AgentManager.permission).
+                child["mode_ceiling"] = parent.get("permission_mode", "manual")
             if spec.get("memory") == "none":
                 child["agent_memory"] = "none"  # AgentManager.memory_text: no project memory block.
             if skills:
@@ -999,8 +1042,9 @@ class DelegateManager:
         """The bounded result of a subagent's delegated turn (the parent's delegate_task result), with its
         submit_report report when it sent one; closes its progress and index entry."""
         events = saved.get("events", [])
-        errors = [event.get("text") or event.get("output") or "Child tool failed."
-                  for event in events if event.get("type") == "error" or event.get("state") == "error"]
+        retried = retried_reports(events)
+        errors = [event.get("text") or event.get("output") or "Child tool failed." for event in events
+                  if event.get("type") == "error" or (event.get("state") == "error" and event.get("id") not in retried)]
         if failure:
             errors.append(failure)
         cancelled = cancelled or any(event.get("state") == "cancelled" for event in events)
@@ -1049,8 +1093,18 @@ class DelegateManager:
 
         async def run():
             try:
-                result = await self.delegate(parent, **arguments, parent_event=parent_event, recheck=recheck, spec=spec,
-                                             background=record, started=started)
+                try:
+                    result = await self.delegate(parent, **arguments, parent_event=parent_event, recheck=recheck,
+                                                 spec=spec, background=record, started=started)
+                except Exception as exc:
+                    if not started.done():
+                        raise  # Refused before the call returned: its tool result says why.
+                    # Refused (or failed) after it queued, when a slot freed: the chat learns why it never ran.
+                    reason = self.manager.settings.redact(str(exc)) or type(exc).__name__
+                    result = {"child_session_id": record.get("child_session_id"),
+                              "agent_type": spec["name"] if spec else arguments.get("agent_type") or "general",
+                              "status": "failed", "terminal_reason": "error", "steps_used": 0, "tool_calls": 0,
+                              "changed_files": [], "transcript": None, "output": f"It did not start: {reason}"}
                 if started.done():
                     await self.finish_background(record, result)
                 return result
@@ -1101,13 +1155,20 @@ class DelegateManager:
         record["result"] = result
         parent = self.manager.get(record["parent_id"])
         child_id = result.get("child_session_id") or record.get("child_session_id")
-        if parent is None or not child_id:
-            return
+        if parent is None or not (child_id or result.get("status") == "failed"):
+            return  # Stopped while it waited for a slot: its card says so (_unqueue).
         event = next((item for item in parent.get("events", []) if item.get("id") == record.get("event_id")), None)
         if event is not None:
-            await self.manager.update_event(parent, event, delegation_result=result)
+            fields = {"delegation_result": result}
+            progress = event.get("delegation")
+            if not child_id and isinstance(progress, dict):  # It never started: the card shows why it failed.
+                fields["delegation"] = {**progress, "status": "failed", "terminal_reason": "error",
+                                        "ended": progress.get("ended") or time.time()}
+            await self.manager.update_event(parent, event, **fields)
         status = "interrupted" if self.manager.closing and result.get("status") == "cancelled" else result.get("status")
         notice = self.ending_notice({"id": child_id, "agent_type": result.get("agent_type")}, status, record.get("task"))
+        if not child_id:
+            notice["text"] += f" ({result.get('output', '')[:300]})"
         await self.manager.event(parent, "notice", **notice)
         if status in ("completed", "failed"):
             self.manager.notify_background(parent, f"Background subagent {BACKGROUND_ENDINGS[status]}")
@@ -1129,19 +1190,21 @@ class DelegateManager:
         notices = [event for event in notices if event.get("subagent_id") not in self.seen]
         if not notices:
             return ""
-        named = [f"{str(event['subagent_id'])[:8]} {event['text'].removeprefix('Background subagent ')}"
-                 for event in notices[:NOTICE_ENTRIES]]
+        named = [(f"{str(event['subagent_id'])[:8]} " if event.get("subagent_id") else "")
+                 + event["text"].removeprefix("Background subagent ") for event in notices[:NOTICE_ENTRIES]]
         more = f"; and {len(notices) - NOTICE_ENTRIES} more." if len(notices) > NOTICE_ENTRIES else "."
         return ("Background subagents ended since your last step: " + "; ".join(named) + more
                 + " Read their reports with get_subagent_result.")
 
     def wake_due(self, parent):
-        """Whether a background subagent of this chat finished (or failed) after the chat's last step."""
+        """Whether a background subagent of this chat finished (or failed) after the chat's last step; one that
+        never started has no report to read, and its notice waits for the chat's next step."""
         reported = parent.get("subagents_reported_through")
         reported = reported if type(reported) in (int, float) else 0
         return any(event.get("type") == "notice" and event.get("subagent_status") in ("completed", "failed")
                    and isinstance(event.get("created"), (int, float)) and event["created"] > reported
-                   and event.get("subagent_id") not in self.seen for event in parent.get("events", []))
+                   and event.get("subagent_id") and event["subagent_id"] not in self.seen
+                   for event in parent.get("events", []))
 
     async def maybe_wake(self, parent_id):
         """Settings → Subagents → Continue the chat when a background subagent finishes (off by default: it
@@ -1157,7 +1220,8 @@ class DelegateManager:
                 return
             if any(not item.get("paused") for item in self.manager.queue_of(parent)):
                 return  # Queued messages go first; their turn reads the notice.
-            notice = next(event for event in reversed(parent["events"]) if event.get("subagent_status"))
+            notice = next(event for event in reversed(parent["events"]) if event.get("subagent_id")
+                          and event.get("subagent_status"))
             text = WAKE_TEXT.format(id=str(notice["subagent_id"])[:8],
                                     kind=notice["text"].removeprefix("Background subagent ").split(" ", 1)[0],
                                     ending=BACKGROUND_ENDINGS.get(notice["subagent_status"], "ended"))

@@ -9,7 +9,7 @@ import time
 import httpx
 import pytest
 
-from local_agent import spending
+from local_agent import planning, spending
 from local_agent.agents import AgentManager
 from local_agent.api import create_app
 from local_agent.config import Settings
@@ -195,6 +195,71 @@ async def test_a_fourth_background_subagent_waits_for_a_slot_and_the_spend_count
     assert len([event for event in saved["events"] if event.get("subagent_status") == "completed"]) == 4
 
 
+def full_slots(monkeypatch):
+    """Every subagent slot taken until the returned dict's value is False (then the real count applies)."""
+    full = {"value": True}
+    original = planning.DelegateManager.running
+    monkeypatch.setattr(planning.DelegateManager, "running",
+                        lambda self: planning.MAX_RUNNING if full["value"] else original(self))
+    return full
+
+
+@pytest.mark.parametrize("change", ["tool_off", "auto_to_manual"])
+async def test_a_queued_background_subagent_refused_when_its_slot_frees_tells_the_chat_why(runtime, monkeypatch, change):
+    manager, parent, _ = runtime
+    parent["permission_mode"] = "auto"  # delegate_task runs without a card in Auto.
+    manager.store.save(parent)
+    manager.settings.values["background_subagent_wake"] = True
+    full = full_slots(monkeypatch)
+    Gateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)), lambda: reply("Going on.")],
+            {"Survey": lambda count, body: asyncio.sleep(0, reply("Done."))})
+    saved = await run_turn(manager, parent)
+    assert json.loads(card(saved, "a")["output"])["status"] == "queued"
+    held = manager.get(parent["id"])
+    if change == "tool_off":
+        held["disabled_tools"] = ["delegate_task"]
+    else:
+        held["permission_mode"] = "manual"
+    full["value"] = False
+    manager.delegates._wake()
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+    saved = manager.store.get(parent["id"])
+    reason = ("delegate_task was turned off in this chat while the subagent waited" if change == "tool_off"
+              else "starting it now needs approval")
+    result = card(saved, "a")["delegation_result"]
+    assert (result["status"], result["child_session_id"]) == ("failed", None) and reason in result["output"]
+    assert card(saved, "a")["delegation"]["status"] == "failed"
+    notice, = [event for event in saved["events"] if event.get("subagent_status")]
+    assert notice["subagent_status"] == "failed" and notice.get("subagent_id") is None
+    assert notice["text"].startswith("Background subagent general failed: Survey (It did not start: ")
+    assert reason in manager.delegates.background_notice(saved)
+    listing = await manager.delegates.subagent_result(saved)
+    assert listing["subagents"] == [{"subagent_id": None, "agent_type": "general", "status": "failed", "task": "Survey",
+                                     "has_result": True}]
+    assert not manager.busy_task(parent["id"])  # Nothing to read: the wake option does not start a turn for it.
+
+
+async def test_a_queued_background_subagent_starts_within_a_ceiling_narrowed_while_it_waited(runtime, monkeypatch):
+    manager, parent, _ = runtime
+    full = full_slots(monkeypatch)
+    gate = asyncio.Event()
+    gateway = Gateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)),
+                                    lambda: reply("Going on.")], {"Survey": gated(gate)})
+    saved = await run_turn(manager, parent)
+    assert json.loads(card(saved, "a")["output"])["status"] == "queued"
+    assert not manager.busy_task(parent["id"])  # Idle: Agent tools → Subagents may change the ceiling now.
+    manager.get(parent["id"])["subagent_tool_profile"] = "read_only"
+    full["value"] = False
+    manager.delegates._wake()
+    await asyncio.wait_for(gateway.child_started("Survey").wait(), 5)
+    child = manager.get(background_child(manager, parent))
+    offered = {tool["function"]["name"] for tool in gateway.requests["Survey"][0]["tools"]}
+    assert child["tool_profile"] == "read_only" and "run_command" not in offered and "read_file" in offered
+    gate.set()
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+    assert card(manager.store.get(parent["id"]), "a")["delegation_result"]["tool_profile"] == "read_only"
+
+
 async def test_subagent_stop_hooks_run_in_an_idle_parent_and_keep_its_newer_events(runtime, monkeypatch):
     manager, parent, _ = runtime
     manager.extensions.update_config({"hooks": [{
@@ -213,6 +278,39 @@ async def test_subagent_stop_hooks_run_in_an_idle_parent_and_keep_its_newer_even
     assert "Another question" in texts and "Second answer." in texts
     assert [event["state"] for event in saved["events"] if event.get("name") == "hook_subagent_stop"] == ["completed"]
     assert card(saved, "a")["delegation_result"]["output"].endswith("Checked by the hook.")
+    assert manager.statuses.get(parent["id"], "idle") == "idle"
+
+
+async def test_answering_a_hook_card_of_an_idle_parent_keeps_a_turn_started_meanwhile_running(runtime, monkeypatch):
+    manager, parent, _ = runtime
+    parent["permission_mode"] = "acceptEdits"  # delegate_task runs without a card; the hook asks for one.
+    manager.store.save(parent)
+    manager.extensions.update_config({"hooks": [{"id": "review", "event": "subagent_stop", "enabled": True,
+                                                 "timeout_seconds": 10, "command": "true"}]})
+    gate, hold = asyncio.Event(), asyncio.Event()
+    Gateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)), lambda: reply("Going on.")],
+            {"Survey": gated(gate)})
+    await run_turn(manager, parent)
+    gate.set()
+    await eventually(lambda: any(key[0] == parent["id"] for key in manager.pending))  # The hook card waits.
+    key = next(key for key in manager.pending if key[0] == parent["id"])
+    assert manager.statuses.get(parent["id"]) == "awaiting_approval"
+    original = Gateway.__call__
+
+    async def call(self, request):  # The new turn's model request waits for hold.
+        body = json.loads(request.content)
+        if body.get("stream") is True and any(item.get("content") == "Another question" for item in body["messages"]):
+            await hold.wait()
+            return reply("Second answer.")
+        return await original(self, request)
+    monkeypatch.setattr(Gateway, "__call__", call)
+    manager.start(parent["id"], "Another question")  # The user writes in the chat while the card waits.
+    await eventually(lambda: manager.statuses.get(parent["id"]) == "running")
+    manager.decide(parent["id"], key[1], True)
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+    assert manager.busy_task(parent["id"]) and manager.statuses.get(parent["id"]) == "running"
+    hold.set()
+    await asyncio.wait_for(manager.tasks[parent["id"]], 10)
     assert manager.statuses.get(parent["id"], "idle") == "idle"
 
 

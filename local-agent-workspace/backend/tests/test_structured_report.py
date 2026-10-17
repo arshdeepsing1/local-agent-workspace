@@ -10,7 +10,8 @@ from local_agent.feature_tools import FEATURE_TOOLS
 from local_agent.planning import (REPORT, REPORT_SUBMITTED, REPORT_SUBMITTED_REPLY, RESULT_BYTES, bounded_result,
                                   report_text)
 
-from test_parallel_subagents import Gateway, calls_reply, card, delegate, make_runtime, reply, run_turn, tool_messages
+from test_parallel_subagents import (Gateway, calls_reply, card, delegate, eventually, make_runtime, reply, run_turn,
+                                     tool_messages)
 
 REPORT_ARGUMENTS = {"summary": "Two call sites read the setting.",
                     "findings": [{"path": "a.txt", "line": 1, "text": "Reads it at start."}, {"text": "No tests cover it."}],
@@ -60,20 +61,31 @@ async def test_a_report_ends_the_subagents_turn_and_reaches_the_parent(runtime, 
                                              "- a.txt:1: Reads it at start.\n- No tests cover it.\nNext steps:\n- Add a test.")
 
 
-async def test_an_invalid_report_is_a_tool_error_and_the_model_retries(runtime, monkeypatch):
+@pytest.mark.parametrize("background", [False, True])
+async def test_an_invalid_report_is_a_tool_error_and_the_model_retries(runtime, monkeypatch, background):
     manager, parent, _ = runtime
     bad = {"findings": [{"path": "a.txt", "line": 0}]}  # No summary, a finding without text, line 0.
-    gateway = Gateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a")), lambda: reply("Parent done.")],
+    gateway = Gateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", **({"background": True} if background
+                                                                                    else {}))),
+                                    lambda: reply("Parent done.")],
                       {"Survey": child_steps(calls_reply(("submit_report", bad, "s1")),
                                              calls_reply(("submit_report", {"summary": "Fixed."}, "s2")))})
     saved = await run_turn(manager, parent)
+    if background:
+        await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+        saved = manager.store.get(parent["id"])
+        result = card(saved, "a")["delegation_result"]
+        assert saved["events"][-1]["text"] == "Background subagent general finished: Survey"
+    else:
+        result = json.loads(card(saved, "a")["output"])
     assert len(gateway.requests["Survey"]) == 2
-    child_id = json.loads(card(saved, "a")["output"])["child_session_id"]
-    first = dict(tool_messages(manager.store.get(child_id)["wire"]))["s1"]
+    child = manager.store.get(result["child_session_id"])
+    first = dict(tool_messages(child["wire"]))["s1"]
     assert '"error_kind": "invalid_arguments"' in first and REPORT_SUBMITTED not in first
-    result = json.loads(card(saved, "a")["output"])
-    # The failed call stays an error in the child (as any tool error does), listed before the report.
-    assert result["report"] == {"summary": "Fixed."} and result["output"].startswith("Errors:\nInvalid tool arguments")
+    # The refused call stays an error in the child's transcript, but the report it then sent completes the run.
+    assert [event["state"] for event in child["events"] if event.get("name") == "submit_report"] == ["error", "completed"]
+    assert (result["status"], result["terminal_reason"], child["terminal_reason"]) == ("completed", "completed", "completed")
+    assert result["report"] == {"summary": "Fixed."} and not result["output"].startswith("Errors:")
 
 
 async def test_a_subagent_without_a_report_still_reports_in_prose(runtime, monkeypatch):
@@ -94,6 +106,14 @@ async def test_submit_report_needs_a_delegated_turn_of_a_subagent(runtime):
     child.update(is_subagent=True, parent_session_id=parent["id"], turn_delegated=False)
     output = await manager.execute_tool(child, manager.session_tools(child), "submit_report", {"summary": "x"}, "s")
     assert "No parent chat waits for a report in this turn" in output
+    # Plan mode's texts name submit_report only while a parent waits for one.
+    child["permission_mode"] = "plan"
+    write = ("write_file", {"path": "b.txt", "content": "x"})
+    assert manager.permission(child, manager.session_tools(child), *write).message.endswith(
+        "Return the plan as your final reply.")
+    child["turn_delegated"] = True
+    assert manager.permission(child, manager.session_tools(child), *write).message.endswith(
+        "Return the plan in your report (submit_report).")
 
 
 async def test_a_report_is_redacted(runtime, monkeypatch):

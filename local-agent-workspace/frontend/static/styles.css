@@ -669,6 +669,7 @@ body.panel-resizing{cursor:col-resize;user-select:none}
 .subagent-finding-path{display:inline;padding:0;border:0;background:none;color:inherit;font:inherit;cursor:pointer;text-decoration:underline;text-decoration-color:#b9b2a3;text-underline-offset:2px}
 .subagent-finding-path:hover{color:var(--accent)}
 .tool-sibling{margin:0 13px 10px;font-size:11px;color:#87593b;overflow-wrap:anywhere}
+.subagent-controls .subagent-pending-warning{flex-basis:100%;margin:0;font-size:11px;color:#87593b;overflow-wrap:anywhere}
 .usage-subagents{margin-top:18px}.usage-subagents h3{margin-bottom:0}.usage-subagents .usage-cards{grid-template-columns:repeat(3,minmax(0,1fr))}
 .usage-subagent-list>summary{cursor:pointer;font-size:12px;width:fit-content;margin-bottom:8px}
 .usage-subagent-list table{width:100%;border-collapse:collapse;background:var(--surface);font-size:11px}

@@ -45,6 +45,17 @@ def test_the_card_a_subagent_waits_on_is_answered_from_the_parent(ui, page):
     progress.get_by_role("button", name="Decline").click()
     page.wait_for_function("fake.requests('/api/sessions/child-1/approvals/ev-1', 'POST').length === 2")
     assert ui.bodies("/api/sessions/child-1/approvals/ev-1", "POST") == [{"allowed": True}, {"allowed": False}]
+    # A card whose title is not the whole action, or that warns, is reviewed in the subagent (Decline stays).
+    ui.rerender(f"""{{ session: makeSession({json.dumps([delegation(status="awaiting_approval", pending={
+        "event_id": "ev-2", "name": "run_command", "kind": "approval", "title": "cat .netrc", "review": True,
+        "warnings": ["names credential-looking files"]})])}),
+      onError: fake.spy('onError'), onSelectSession: fake.spy('select') }}""")
+    expect(progress.locator(".subagent-pending-warning")).to_have_text("Its card warns: names credential-looking files.")
+    expect(progress.get_by_role("button", name="Allow")).to_have_count(0)
+    progress.get_by_role("button", name="Review in subagent").click()
+    assert ui.spy("select") == [["child-1"]]
+    progress.get_by_role("button", name="Decline").click()
+    page.wait_for_function("fake.requests('/api/sessions/child-1/approvals/ev-2', 'POST').length === 1")
     # A question (or a plan) is answered in the subagent itself.
     ui.rerender(f"""{{ session: makeSession({json.dumps([delegation(status="awaiting_approval",
         pending={"event_id": "q", "name": "ask_user", "kind": "question", "title": "Which folder?"})])}),

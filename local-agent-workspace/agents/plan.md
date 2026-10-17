@@ -1,7 +1,8 @@
 ---
 name: plan
 description: Plans a change without editing: investigates the code (read-only commands too) and returns a plan with steps, files, risks and tests.
-# Read-only: Plan mode lets only read-only commands run, the edit tools are not offered and no MCP server starts.
+# Read-only: Plan mode lets only read-only commands run (with a card where the chat's mode asks), the edit
+# tools are not offered and no MCP server starts.
 profile: inherit
 permission_mode: plan
 disallowed_tools: [write_file, edit_file, move_path, delete_path, notebook_edit, insert_activity_log]

@@ -85,6 +85,8 @@ class PendingCard(Record):
     name: str = Field(max_length=120)
     kind: Literal["approval", "question", "plan"]
     title: str = Field(max_length=200)
+    warnings: list[Annotated[str, Field(max_length=80)]] | None = Field(default=None, max_length=8)
+    review: bool | None = None  # The title is not the whole action, or the card warns: no Allow from the parent.
     expires: float | None = None
 
 

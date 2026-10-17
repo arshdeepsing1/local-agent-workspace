@@ -17,6 +17,7 @@ from local_agent.api import create_app
 from local_agent.config import DEFAULT_SUBAGENT_DEFAULTS, Settings, subagent_defaults
 from local_agent.custom_agents import (AGENT_ROOTS, FILE_BYTES, INDEX_BYTES, MAX_AGENTS, agent_index, discover,
                                        model_label, parse_agent, resolve)
+from local_agent.permissions import MODE_LABELS
 from local_agent.portability import export_bundle, fresh_copies
 from local_agent.store import Store
 from local_agent.tool_profiles import tool_allowed
@@ -1084,6 +1085,88 @@ async def test_a_parent_mode_change_keeps_the_agents_narrower_mode(runtime):
     release.set()
     await asyncio.wait_for(task, 10)
     assert modes == ["acceptEdits", "dontAsk"]
+
+
+@pytest.mark.parametrize("chat_mode", ["manual", "acceptEdits", "dontAsk", "auto", "bypassPermissions"])
+async def test_a_plan_agent_never_runs_a_command_its_chat_would_ask_for_or_refuse(runtime, chat_mode):
+    """Plan runs read-only commands and vetted pipelines without a card; Manual and Accept edits ask for
+    them and Don't ask refuses them. A Plan subagent of such a chat gets the chat's verdict for them."""
+    manager, parent, project = runtime
+    write_agent(project, "planner", agent_text(profile="inherit", permission_mode="plan"))
+    parent["permission_mode"] = chat_mode
+    manager.store.save(parent)
+    preview = manager.delegates.card_preview(parent, {"task": "Plan it", "agent_type": "planner"})
+    label = MODE_LABELS[chat_mode]
+    assert f"\nPermission mode: Plan (the agent file's plan; this chat is in {label}" + {
+        "manual": "; read-only commands still ask unless a rule allows them)",
+        "acceptEdits": "; read-only commands still ask unless a rule allows them)",
+        "dontAsk": "; read-only commands that no rule allows are still refused)"}.get(chat_mode, ")") in preview
+    manager.run_databricks = lambda child, prompt: manager.event(child, "assistant", text="Done.")
+    result = await manager.delegates.delegate(parent, "Plan it", agent_type="planner")
+    child = manager.store.get(result["child_session_id"])
+    assert (child["permission_mode"], child["mode_ceiling"]) == ("plan", chat_mode)
+    child["turn_delegated"] = True
+    tools = manager.session_tools(child)
+    for command in ("git log -1", "ls", "grep -n base a.txt | head -1"):
+        chat = manager.permission(parent, manager.session_tools(parent), "run_command", {"command": command})
+        sub = manager.permission(child, tools, "run_command", {"command": command})
+        if chat_mode in ("manual", "acceptEdits", "dontAsk"):
+            assert (sub.decision, sub.source) == (chat.decision, chat.source), command
+        else:
+            assert sub.decision == "allow" and sub.source in ("read_only_command", "read_only_pipeline"), command
+    # Plan still refuses what it refuses, whatever the chat's mode allows.
+    assert manager.permission(child, tools, "write_file", {"path": "b.txt", "content": "x"}).source == "plan"
+    assert manager.permission(child, tools, "run_command", {"command": "touch b.txt"}).decision == "deny"
+    # A rule the chat saved allows a read-only command again, as in the chat.
+    child["allow_rules"] = [{"tool": "run_command", "argv": ["ls"]}]
+    assert manager.permission(child, tools, "run_command", {"command": "ls"}).decision == "allow"
+    # A hook's ask shows a card, except where the chat's Don't ask shows none.
+    forced = manager.hooked_permission(child, tools, "run_command", {"command": "ls"}, {"hook_id": "guard"})
+    assert (forced.decision, forced.source) == (("deny", "dont_ask") if chat_mode == "dontAsk" else ("ask", "hook"))
+    if chat_mode == "dontAsk":  # Nor a folder-access card.
+        outside, outcome = project.parent / "other", {}
+        outside.mkdir()
+        assert not await manager.ensure_access(child, tools, str(outside), True, outcome)
+        assert outcome["approval"] == "blocked" and not manager.pending
+    # A chat the user continues is the user's own Plan chat: no ceiling.
+    child.update(turn_delegated=False, allow_rules=[])
+    assert manager.permission(child, tools, "run_command", {"command": "ls"}).decision == "allow"
+
+
+async def test_a_parent_mode_change_moves_a_plan_subagents_ceiling_and_rechecks_its_cards(runtime):
+    manager, parent, project = runtime
+    write_agent(project, "planner", agent_text(profile="inherit", permission_mode="plan"))
+    parent["permission_mode"] = "auto"
+    manager.store.save(parent)
+    release, seen = asyncio.Event(), []
+
+    async def worker(child, prompt):
+        tools = manager.session_tools(child)
+        seen.append(manager.permission(child, tools, "run_command", {"command": "ls"}).decision)
+        await release.wait()
+        seen.append(manager.permission(child, tools, "run_command", {"command": "ls"}).decision)
+        await manager.event(child, "assistant", text="Done.")
+    manager.run_databricks = worker
+    manager.live[parent["id"]] = parent
+    task = asyncio.create_task(manager.delegates.delegate(parent, "Plan", agent_type="planner"))
+    for _ in range(300):
+        if seen:
+            break
+        await asyncio.sleep(0.01)
+    child = manager.delegates.active_children(parent["id"])[0]
+    rechecked = []
+    original = manager.recheck_pending
+
+    async def recheck(session, change=None):
+        rechecked.append((session["id"], change))
+        await original(session, change)
+    manager.recheck_pending = recheck
+    await manager.change_mode(parent, "manual")
+    assert (child["permission_mode"], child["mode_ceiling"]) == ("plan", "manual")
+    assert (child["id"], "mode") in rechecked and manager.store.get(child["id"])["mode_ceiling"] == "manual"
+    release.set()
+    await asyncio.wait_for(task, 10)
+    assert seen == ["allow", "ask"]
 
 
 async def test_an_agent_with_background_true_runs_in_the_background_unless_the_call_says_otherwise(runtime, monkeypatch):
