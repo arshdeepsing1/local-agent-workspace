@@ -536,7 +536,9 @@ async def test_a_tools_list_keeps_get_tool_output_for_a_kept_result_and_disallow
     tools list names web_fetch can be read on; disallowed_tools still takes the helper away."""
     manager, parent, project = runtime
     child = manager.store.create({"workspace": str(project), "model": "test-model"})
-    child.update(is_subagent=True, tool_profile="inherit", agent_type="researcher", agent_tools=["read_file", "web_fetch"])
+    # turn_delegated: a delegated turn, which is offered submit_report.
+    child.update(is_subagent=True, turn_delegated=True, tool_profile="inherit", agent_type="researcher",
+                 agent_tools=["read_file", "web_fetch"])
     offered_now = lambda: [item["function"]["name"] for item in manager.offered_tools(child, [])[0]]
     assert offered_now() == ["read_file", "web_fetch", "submit_report"]
     result_id = manager.results.add(child["id"], "word " * 3000, "Untrusted web content")
