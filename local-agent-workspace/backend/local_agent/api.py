@@ -43,7 +43,7 @@ from .transcript import transcript, transcript_file_name
 from .feature_api import register_features
 from .portability_api import register_portability
 from .approvals import MAX_DECLINE_NOTE, ensure_idle, register_approvals
-from .composer_api import register_composer
+from .composer_api import UploadRef, register_composer, upload_refs, upload_refs_field
 from .interactions import register_interactions
 from .projects import register_projects
 from .endpoint_checks_api import register_endpoint_checks
@@ -67,6 +67,8 @@ class Prompt(BaseModel):
     text: str = Field(min_length=1, max_length=50000)
     # Sent as typed: no command template, no skill selected by /<id>, no @ file attached.
     verbatim: bool = Field(default=False, strict=True)
+    # Files attached from the composer (POST /api/sessions/{id}/uploads), also with plain text.
+    uploads: list[UploadRef] = upload_refs_field()
 
 
 class CompactionRequest(BaseModel):
@@ -679,6 +681,7 @@ def create_app(settings=None):
                 manager.checkpoints.delete_session(member)
                 manager.changes.delete_session(member)
                 manager.results.delete_session(member)
+                manager.uploads.delete_session(member)
                 store.delete(member)
                 manager.live.pop(member, None)
                 manager.statuses.pop(member, None)
@@ -711,7 +714,8 @@ def create_app(settings=None):
         if not body.text.strip():
             raise ValueError("Enter a message.")
         # Starts the message, or queues it while a turn, compaction or ! command runs.
-        return await manager.submit_message(session_id, body.text.strip(), verbatim=body.verbatim)
+        return await manager.submit_message(session_id, body.text.strip(), verbatim=body.verbatim,
+                                            uploads=upload_refs(body.uploads))
 
     @app.post("/api/sessions/{session_id}/stop")
     async def stop(session_id: str):

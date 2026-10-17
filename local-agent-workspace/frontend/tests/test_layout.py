@@ -371,3 +371,20 @@ def test_a_long_file_name_has_its_full_name_as_a_tooltip(ui, page):
     row = page.locator(".file-row", has_text=name).locator("span").first
     expect(row).to_have_attribute("title", name)
     assert row.evaluate("e => e.scrollWidth > e.clientWidth")
+
+
+TOOLBAR_VIEWPORTS = [(1280, 800), (1024, 768), (820, 1180), (390, 844), (360, 740)]
+
+
+@pytest.mark.parametrize("width,height", TOOLBAR_VIEWPORTS, ids=[f"{w}x{h}" for w, h in TOOLBAR_VIEWPORTS])
+def test_the_composer_toolbar_fits_with_attach_files(ui, page, width, height):
+    """Attach files sits between Add project file and Send as plain text, and the toolbar still fits its box."""
+    start(ui, page, width, height)
+    composer = box(ui, ".chat-composer .composer-block")
+    buttons = [page.get_by_role("button", name=name, exact=True).bounding_box()
+               for name in ("Add project file", "Attach files", "Send as plain text")]
+    model = page.get_by_role("combobox", name="Model").bounding_box()
+    for item in [*buttons, model]:
+        assert composer["left"] - 1 <= item["x"] and item["x"] + item["width"] <= composer["right"] + 1, (item, composer)
+    assert buttons[0]["x"] + buttons[0]["width"] <= buttons[1]["x"] and buttons[1]["x"] + buttons[1]["width"] <= buttons[2]["x"]
+    assert ui.js("document.documentElement.scrollWidth <= innerWidth")

@@ -22,15 +22,33 @@ def encode_payload(payload):
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
 
 
+# An image_url content part around its data URL: {"type":"image_url","image_url":{"url":"data:image/webp;base64,"}}.
+IMAGE_PART_BYTES = 80
+
+
+def image_bytes(messages):
+    """The bytes the image references of user messages ("images", uploads.py) add to the request body, where
+    each becomes an image_url part with a base64 data URL (uploads.expand_images)."""
+    total = 0
+    for message in messages:
+        refs = message.get("images") if isinstance(message, dict) else None
+        for ref in refs if isinstance(refs, list) else ():
+            size = ref.get("bytes") if isinstance(ref, dict) else None
+            if type(size) is int and size > 0:
+                total += 4 * -(-size // 3) + IMAGE_PART_BYTES
+    return total
+
+
 def request_bytes_over(messages, tools, raw_estimate, target):
-    """Whether the request body of messages and tools is over target bytes.
+    """Whether the request body of messages and tools is over target bytes, attached images included.
 
     raw_estimate is the UNSCALED context.estimate_tokens(messages, tools). The compact
     body is never longer than three bytes per estimated token, so a request whose
-    estimate is at most a third of target is not encoded at all."""
-    if 3 * raw_estimate <= target:
+    estimate is at most a third of target (less its images' bytes) is not encoded at all."""
+    images = image_bytes(messages)
+    if 3 * raw_estimate + images <= target:
         return False
-    return len(encode_payload({"messages": messages, "tools": list(tools)})) > target
+    return len(encode_payload({"messages": messages, "tools": list(tools)})) + images > target
 
 
 class PayloadTooLarge(InferenceError):

@@ -74,10 +74,16 @@ export async function apiFile(path, retried = false) {
   }
   throw errorFor(data, response.status, `Request failed with HTTP ${response.status}.`)
 }
+// Upload a file's bytes as the request body (a file attached in the composer), its name URL-encoded in
+// X-File-Name (header values cannot carry every character); answers the server's JSON.
+export async function apiUpload(path, file) {
+  return request(path, 'POST', file, false, { 'Content-Type': 'application/octet-stream',
+    'X-File-Name': encodeURIComponent(file.name || 'attachment') })
+}
 const UNREADABLE = Symbol('unreadable')  // a body that is not JSON (an HTML error page, an empty body)
-async function request(path, method, body, retried = false) {
+async function request(path, method, body, retried = false, headers = {}) {
   const response = await fetch(`/api${path}`, {
-    method, headers: { 'Content-Type': 'application/json', 'X-Local-Token': token },
+    method, headers: { 'Content-Type': 'application/json', 'X-Local-Token': token, ...headers },
     body,
   }).catch(offline)
   // A request that was sent and then lost is not sent again: it may have run.
@@ -87,7 +93,7 @@ async function request(path, method, body, retried = false) {
   // retry after replacing an expired local token cannot duplicate an action.
   if (response.status === 403 && data?.code === 'reconnect_required' && !retried) {
     await refreshToken()
-    return request(path, method, body, true)
+    return request(path, method, body, true, headers)
   }
   if (!response.ok) throw errorFor(data, response.status, JSON.stringify(data?.detail || data))
   return data

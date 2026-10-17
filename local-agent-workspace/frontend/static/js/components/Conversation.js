@@ -14,6 +14,7 @@ import { backupTitle, setRewindNotice } from '../rewindNotice.js'
 import { agentLabel, agentSettingsText, elapsedText } from '../subagents.js'
 import { pathShortener } from '../paths.js'
 import { hintText } from '../mcp.js'
+import { sentLabel, sentUploads } from '../attachments.js'
 
 // A long file is read in pages. Naming the lines each read covered keeps the
 // pages of one file from looking like the same read repeated.
@@ -661,8 +662,10 @@ function Markdown({ text, streaming = false, onOpenPath }) {
   return html`<div class="markdown" ref=${element} onClick=${open} dangerouslySetInnerHTML=${{ __html: markup }} />`
 }
 
-// Chips under a user message for its @ file snapshots and ! command outputs (metadata only).
+// Chips under a user message for its @ file snapshots, ! command outputs and attached documents and images
+// (metadata only).
 export function attachmentLabel(item) {
+  if (item?.kind === 'document' || item?.kind === 'image') return sentLabel(item)
   if (item?.kind === 'shell') {
     const command = String(item.command || '')
     return `! ${command.length > 60 ? `${command.slice(0, 59)}…` : command} · exit ${item.exit_code ?? '?'}`
@@ -902,7 +905,8 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
     try {
       const result = await api(`/sessions/${encodeURIComponent(session.id)}/rewind`, 'POST',
         { before_event_id: cuts.latestUser.id, conversation: true, resend_text: cuts.latestUser.text,
-          ...(cuts.latestUser.verbatim ? { resend_verbatim: true } : {}) })
+          ...(cuts.latestUser.verbatim ? { resend_verbatim: true } : {}),
+          ...(sentUploads(cuts.latestUser).length ? { resend_uploads: sentUploads(cuts.latestUser) } : {}) })
       resent(result, cuts.latestUser.text)
     } catch (e) { onError(e) }
     finally { setRetrying(false) }

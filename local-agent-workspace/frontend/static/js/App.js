@@ -41,6 +41,10 @@ export default function App() {
     catch (error) { restore?.(); throw error }
     forgetDraft(text, draftKey, id)
   }
+  // Files attached in the composer for the next message, per view (Composer's attachments; uploads.py), so they
+  // stay when another chat is opened meanwhile.
+  const [attachedFiles, setAttachedFiles] = useState({})
+  const filesFor = key => update => setAttachedFiles(current => ({ ...current, [key]: resolve(update, current[key] || []) }))
   const [settingsOpen, setSettingsOpen] = useState(false)
   // false, true, or the section to open ('Usage' or 'Export' from /usage and /export).
   const [agentToolsOpen, setAgentToolsOpen] = useState(false)
@@ -184,6 +188,7 @@ export default function App() {
     effort=${app.reasoningEffort} onEffort=${app.changeEffort}
     reasoningFormat=${app.settings?.reasoning_format} thinkingSummaries=${app.settings?.thinking_summaries}
     onSend=${send} onError=${showError} onAttach=${() => setWorkspaceOpen(true)}
+    attachments=${attachedFiles[app.viewKey] || []} setAttachments=${filesFor(app.viewKey)} onUpload=${app.uploadFile}
     onShell=${app.runShell} onSideQuestion=${app.askSide} loadFiles=${app.loadMentionFiles} pendingContext=${active?.pending_context}
     loadSkills=${() => api(`/skills${app.activeId ? `?session_id=${encodeURIComponent(app.activeId)}` : ''}`)}
     loadCommands=${() => api(`/commands${app.activeId ? `?session_id=${encodeURIComponent(app.activeId)}` : ''}`)}
@@ -224,7 +229,14 @@ export default function App() {
         <${TaskChecklist} key=${`tasks-${app.viewKey}`} tasks=${app.tasks} />
         <${ContinueButton} session=${active} disabled=${!app.ready || !app.online || app.modelSaving || !app.settings?.configured} onSend=${app.send} onError=${showError} />
         <${QueueBar} session=${active} onRemove=${app.removeQueued} onSend=${app.sendQueued} onError=${showError}
-          onEdit=${async item => { await app.removeQueued(item.id); setDraft(current => current ? `${current}\n${item.text}` : item.text) }} />
+          onEdit=${async item => {
+            await app.removeQueued(item.id)
+            setDraft(current => current ? `${current}\n${item.text}` : item.text)
+            // Its attached files come back as chips too.
+            const queued = (item.uploads || []).map(ref => ({ key: `queued-${item.id}-${ref.id}`, name: ref.name || 'Attached file',
+              kind: ref.kind || 'document', record: { id: ref.id, name: ref.name, kind: ref.kind || 'document' }, asPath: !!ref.as_path }))
+            if (queued.length) filesFor(app.viewKey)(current => [...current, ...queued.filter(item => !current.some(other => other.record?.id === item.record.id))])
+          }} />
         <${SideAnswer} side=${app.sideAnswer} onDismiss=${app.dismissSide} onError=${showError} />
         <${CommandHelp} notice=${commandNotice?.key === app.viewKey ? commandNotice : null} onDismiss=${() => setCommandNotice(null)} /></div>
         ${composer}

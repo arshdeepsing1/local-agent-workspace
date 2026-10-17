@@ -9,6 +9,7 @@ from pathlib import Path
 
 import regex as safe_regex
 
+from . import documents
 from .edits import plan_change, preview_diff
 from .jobs import bounded_regex, run_process
 
@@ -343,6 +344,9 @@ class WorkspaceTools:
             result["tail"] = True
         if _output_size(result) > limit:
             raise ValueError(f"Path or line offset exceeds the {size_name} ranged output limit.")
+        fmt = documents.document_format(target.name)
+        if fmt in documents.BINARY_FORMATS:
+            return self._read_document(target, fmt, start_line, max_lines, tail_lines, result, limit)
         deadline = time.monotonic() + QUERY_TIMEOUT
         if tail_lines is not None:
             return self._read_tail(target, info.st_size, tail_lines, result, limit, deadline)
@@ -624,6 +628,49 @@ class WorkspaceTools:
             result["files"].append(item)
         return result
 
+    def _read_document(self, target, fmt, start_line, max_lines, tail_lines, result, limit):
+        """read_file of a PDF, Word, Excel or PowerPoint file: its extracted text (documents.py), numbered and
+        paged like a text file's lines, with what it was extracted from ("--- Page N ---" lines mark pages,
+        sheets or slides)."""
+        try:
+            extracted = documents.read_file_text(target, fmt)
+        except documents.DocumentError as exc:
+            raise ValueError(str(exc)) from None
+        size_name = f"{limit // 1000} KB"
+        described = f"text extracted from this {documents.format_label(fmt)}"
+        if extracted["units"] and type(extracted["count"]) is int:
+            described += f" ({extracted['count']:,} {extracted['units']}{'s' if extracted['count'] != 1 else ''})"
+        result["extracted"] = described
+        if extracted["notes"]:
+            result["notes"] = extracted["notes"][:5]
+        lines = extracted["text"].split("\n") if extracted["text"] else []
+        total = len(lines)
+        if tail_lines is not None:
+            numbers = range(total, max(0, total - tail_lines), -1)
+        else:
+            numbers = range(start_line, min(total, start_line + max_lines - 1) + 1)
+        kept, cost = [], 0
+        for number in numbers:
+            entry = f"{number}: {lines[number - 1]}"
+            entry_cost = _text_cost(entry) + (2 if kept else 0)
+            first, last = (number, total) if tail_lines is not None else (start_line, number)
+            metadata = {**result, "start_line": first, "end_line": last, "truncated": False,
+                        "next_line": None if tail_lines is not None else max(1000, number + 1)}
+            if _output_size(metadata) + cost + entry_cost > limit:
+                if not kept:
+                    raise ValueError(f"Line {number} is too large for the {size_name} ranged output limit.")
+                result["truncated"] = True
+                if tail_lines is None:
+                    result["next_line"] = number
+                break
+            kept.append(entry)
+            cost += entry_cost
+            result.update(start_line=first, end_line=last)
+        if tail_lines is None and not result["truncated"] and result["end_line"] < total:
+            result.update(next_line=result["end_line"] + 1, truncated=True)
+        result["content"] = "\n".join(reversed(kept) if tail_lines is not None else kept)
+        return result
+
     def _read_tail(self, target, size, tail_lines, result, limit, deadline):
         """The last tail_lines lines of a regular file, read backwards from its end."""
         size_name = f"{limit // 1000} KB"
@@ -753,7 +800,7 @@ TOOL_DEFINITIONS = [
                 "include_ignored": {"type": "boolean", "default": False},
                 "offset": {"type": "integer", "minimum": 0, "maximum": 200000},
                 "max_results": {"type": "integer", "minimum": 1, "maximum": 500, "default": 200}}, ["pattern"]),
-    definition("read_file", "Read numbered lines from a regular text file: from start_line (default 1), or the last tail_lines lines, which suits logs. Pages are up to 8–128 KB depending on the context budget; max_lines defaults to 400, or more (up to 2,000) on large budgets; follow next_line. Bytes that are not valid UTF-8 are shown as � and listed in invalid_utf8_lines. Forward reads scan at most 8 MB from the start; tail_lines works on files up to 512 MB. External paths trigger folder access approval.",
+    definition("read_file", "Read numbered lines from a text file, or the text of a PDF, DOCX, XLSX or PPTX file: from start_line (default 1), or the last tail_lines lines, which suits logs. Pages are up to 8–128 KB depending on the context budget; max_lines defaults to 400, or up to 2,000 on large budgets; follow next_line. Invalid UTF-8 bytes show as � (listed in invalid_utf8_lines). Forward reads scan at most 8 MB; tail_lines works on files up to 512 MB. External paths trigger folder access approval.",
                {"path": STRING, "start_line": {"type": "integer", "minimum": 1},
                 "max_lines": {"type": "integer", "minimum": 1, "maximum": 2000},
                 "tail_lines": {"type": "integer", "minimum": 1, "maximum": 2000}}, ["path"]),

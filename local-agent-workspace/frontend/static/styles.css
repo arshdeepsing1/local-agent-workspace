@@ -657,3 +657,12 @@ body.panel-resizing{cursor:col-resize;user-select:none}
 .hook-trust>span{flex:1 1 220px;min-width:0;font-size:12px;line-height:1.5;overflow-wrap:anywhere}
 .hook-trust .hook-trusted{color:#4f6b3f}
 .hook-trust .outline{font-size:12px;padding:6px 11px}
+/* 2026-10-16 attachments: files attached to a message (chips with type, size and tokens; warnings; Attach files; the drop target). */
+.upload-chip{font-family:inherit;color:#4e4f49;gap:5px}.upload-chip>svg{flex-shrink:0;color:var(--muted)}.upload-chip.uploading{opacity:.75}
+.upload-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:3ch;flex:0 1 auto;max-width:32ch}
+.upload-detail{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 1000 auto;min-width:0}
+.attachment-warning,.attachment-note{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;margin:0 0 7px;font-size:12px;line-height:1.5;overflow-wrap:anywhere}
+.attachment-warning{color:#98492f}.attachment-note{color:var(--muted)}.attachment-warning .outline,.attachment-note .outline{font-size:12px;padding:4px 10px}
+.composer-block.dragging-files .composer{border-color:var(--accent);box-shadow:0 0 0 3px #a35a4026}
+.edit-message-files{overflow-wrap:anywhere}
+@media(max-width:600px){.upload-name{max-width:18ch}}

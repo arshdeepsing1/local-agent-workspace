@@ -1,18 +1,23 @@
-"""@ file snapshots and pending ! output in a user message.
+"""@ file snapshots, attached documents and images, and pending ! output in a user message.
 
-parse_mentions finds @path tokens the user typed; expand_context turns them, and
-any ! command output waiting for the next message, into the text the model receives:
-the message, then each attachment fenced between markers that carry a nonce new for
-each message, so file content cannot imitate the app's or the user's text. Only
-existing regular files attach; other tokens (missing paths, folders, prose such as
-@dist) stay plain text. find_files lists files for the composer's @ menu.
+parse_mentions finds @path tokens the user typed; expand_context turns them, the
+documents attached from the composer (uploads.py) and any ! command output waiting for
+the next message into the text the model receives: the message, then each attachment
+fenced between markers that carry a nonce new for each message, so file content cannot
+imitate the app's or the user's text. Only existing regular files attach; other tokens
+(missing paths, folders, prose such as @dist) stay plain text. Attached images are not
+text: they are listed in the attachments and go with the message as image parts.
+find_files lists files for the composer's @ menu.
 """
 import os
 import re
 import secrets
 from pathlib import Path
 
+from . import uploads as attached
 from .activity import redact_secrets
+from .documents import format_label
+from .model_profiles import profile_for
 from .tool_profiles import tool_allowed
 from .tools import IGNORED, MAX_PAGE_BYTES, file_error
 
@@ -39,6 +44,17 @@ TOO_LONG = "Attached files exceed 32,000 characters; attach smaller line ranges.
 ACCESS_HINT = " Use Folder access above the message box first."
 READ_DENIED = "reading this file is not allowed in this chat."
 READ_ASKS = "reading this file needs approval; ask the agent to read it instead."
+
+
+MIN_DOCUMENT_CHARS = 1_000  # Less room than this in a message's document allowance refuses the next document.
+TOO_MANY_FILES = "Attach at most {limit} files to one message."
+TOO_MANY_IMAGES = "Attach at most {limit} images to one message."
+IMAGES_TOO_LARGE = ("Images attached to one message can be at most {limit:g} MB together; send some of them in a later "
+                    "message.")
+DOCUMENTS_TOO_LONG = ("Attached documents can have at most {limit:,} characters of text in one message; send {name} in a "
+                      "later message.")
+AS_PATH_NOTE = ("text not read ({reason}). The file is saved at {path}; file tools cannot open that folder, but a "
+                "command can read it")
 
 
 class MentionError(ValueError):
@@ -154,15 +170,100 @@ def _fingerprint(path):
     return [info.st_size, info.st_mtime_ns]
 
 
-def expand_context(manager, session, tools, text, include_pending=True, on_error="raise", scan=None):
+def _uploaded(manager, session, uploads, notes, on_error):
+    """The items of the files attached from the composer (uploads: [{id, as_path?}]): documents with their
+    redacted text, shortened to the per-document and per-message allowances, and images. A file that is
+    gone, an image for an endpoint without image input, or a PDF the app cannot read (unless it goes as a
+    path) is refused: an error, or with on_error='inline' a note. The message limits always apply."""
+    refs = list({ref["id"]: ref for ref in uploads or () if isinstance(ref, dict) and isinstance(ref.get("id"), str)}.values())
+    if len(refs) > attached.MAX_MESSAGE_FILES:
+        raise ValueError(TOO_MANY_FILES.format(limit=attached.MAX_MESSAGE_FILES))
+    model = session.get("model") or ""
+    vision = manager.supports(model, "vision") if refs else False
+    items, images, image_bytes, room = [], 0, 0, attached.DOCUMENTS_CHARS
+    for ref in refs:
+        record = manager.uploads.get(session["id"], ref["id"])
+        name = record["name"] if record else "An attached file"
+        try:
+            if record is None:
+                raise MentionError(name, "it is no longer available; attach it again.")
+            if record.get("kind") == "image":
+                if not vision:
+                    raise MentionError(name, attached.vision_refusal(model, (profile_for(model) or {}).get("label")))
+                images, image_bytes = images + 1, image_bytes + record["bytes"]
+                if images > attached.MAX_MESSAGE_IMAGES:
+                    raise ValueError(TOO_MANY_IMAGES.format(limit=attached.MAX_MESSAGE_IMAGES))
+                if image_bytes > attached.MAX_MESSAGE_IMAGE_BYTES:
+                    raise ValueError(IMAGES_TOO_LARGE.format(limit=attached.MAX_MESSAGE_IMAGE_BYTES / 1_000_000))
+                items.append({"kind": "image", "record": record, "text": "", "display": name})
+                continue
+            if ref.get("as_path") is True:
+                reason = ("the app's PDF reader is not installed" if record.get("unreadable")
+                          else "attached as a path")
+                items.append({"kind": "document", "record": record, "text": "", "display": name, "shortened": False,
+                              "path": str(manager.uploads.file(session["id"], record)), "reason": reason})
+                continue
+            if record.get("unreadable"):
+                raise MentionError(name, record["unreadable"] + " Or choose Attach as path on its chip: the agent "
+                                   "then gets where the file is saved, for its commands to read.")
+            content = manager.uploads.text(session["id"], record)
+            if content is None:
+                raise MentionError(name, "it is no longer available; attach it again.")
+            # Redacted before it is shortened, as an @ snapshot.
+            content = manager.settings.redact(redact_secrets(content))
+            limit = min(attached.DOCUMENT_CHARS, room)
+            if content and limit < min(MIN_DOCUMENT_CHARS, len(content)):
+                raise ValueError(DOCUMENTS_TOO_LONG.format(limit=attached.DOCUMENTS_CHARS, name=name))
+            shortened = len(content) > limit or bool(record.get("truncated"))
+            if len(content) > limit:
+                cut = content.rfind("\n", 0, limit + 1)
+                content = content[:cut] if cut > limit // 2 else content[:limit]
+            room -= len(content)
+            items.append({"kind": "document", "record": record, "text": content, "display": name,
+                          "shortened": shortened})
+        except MentionError as exc:
+            if on_error != "inline":
+                raise ValueError(f"{exc.token}: {exc.reason}") from None
+            notes.append(f"(Could not attach {exc.token}: {exc.reason})")
+    return items
+
+
+def _document_block(nonce, item):
+    record = item["record"]
+    described = format_label(record.get("format"))
+    if type(record.get("count")) is int and record.get("units"):
+        described += f", {record['count']:,} {record['units']}{'s' if record['count'] != 1 else ''}"
+    if "path" in item:
+        described += ", " + AS_PATH_NOTE.format(reason=item["reason"], path=item["path"])
+    elif item["shortened"]:
+        described += (f", shortened: the first {len(item['text']):,} of "
+                      f"{'more than ' if record.get('truncated') else ''}{record.get('chars', 0):,} characters; "
+                      "read_file reads all of it once the user saves the file in the project")
+    for note in record.get("notes") or ():
+        described += "; " + str(note)
+    return f"<<<ATTACHMENT {nonce} document {item['display']} ({described})>>>\n{item['text']}\n<<<END {nonce}>>>"
+
+
+def _document_attachment(item):
+    record = item["record"]
+    return {"kind": "document", "name": record["name"], "upload": record["id"], "format": record.get("format"),
+            "chars": len(item["text"]), "truncated": item["shortened"],
+            **({"units": record["units"], "count": record["count"]} if record.get("units") else {}),
+            **({"as_path": True} if "path" in item else {})}
+
+
+def expand_context(manager, session, tools, text, include_pending=True, on_error="raise", scan=None, uploads=()):
     """(content, attachments, views) for a user message.
 
-    content is what the model receives (text itself when nothing attaches);
-    attachments the event metadata ({kind: 'file', path, start_line, end_line, truncated}
-    or {kind: 'shell', command, exit_code}); views the (path, fingerprint) pairs the
-    caller records with remember_file once the message is sent. With on_error='inline' a
-    refused token becomes a '(Could not attach …)' line instead of an error; the
-    5-file and 32,000-character limits always apply to the files that attached.
+    content is what the model receives (text itself when nothing attaches but images);
+    attachments the event metadata ({kind: 'file', path, start_line, end_line, truncated},
+    {kind: 'document', name, upload, format, chars, truncated, units?, count?, as_path?},
+    {kind: 'image', upload, name, media_type, width, height, bytes} or {kind: 'shell',
+    command, exit_code}); views the (path, fingerprint) pairs the caller records with
+    remember_file once the message is sent. uploads are the files attached from the
+    composer ([{id, as_path?}], uploads.py). With on_error='inline' a refused token or
+    attached file becomes a '(Could not attach …)' line instead of an error; the 5-file and
+    32,000-character @ limits and the attached files' limits always apply.
     scan is the text whose @ tokens attach, when it is not text: '' for a message sent as
     plain text (verbatim), or the typed message with its expanded command."""
     items, notes, total = [], [], 0
@@ -183,6 +284,8 @@ def expand_context(manager, session, tools, text, include_pending=True, on_error
         if total > TOTAL_CHARS:
             raise ValueError(TOO_LONG)
         items.append(item)
+    if uploads:
+        items.extend(_uploaded(manager, session, uploads, notes, on_error))
     if include_pending:
         for entry in (session.get("pending_context") or [])[-MAX_PENDING:]:
             if isinstance(entry, dict) and entry.get("kind") == "shell":
@@ -192,7 +295,7 @@ def expand_context(manager, session, tools, text, include_pending=True, on_error
         return text, [], []
     nonce = secrets.token_hex(6)
     while any(nonce in item["text"] or nonce in item.get("command", "") or nonce in item.get("display", "")
-              for item in items) or nonce in text or nonce in scan:
+              or nonce in item.get("path", "") for item in items) or nonce in text or nonce in scan:
         nonce = secrets.token_hex(6)
     blocks, attachments = [], []
     for item in items:
@@ -203,12 +306,19 @@ def expand_context(manager, session, tools, text, include_pending=True, on_error
                           f"<<<END {nonce}>>>")
             attachments.append({"kind": "file", "path": item["display"], "start_line": item["start"],
                                 "end_line": item["end"], "truncated": item["shortened"]})
+        elif item["kind"] == "document":
+            blocks.append(_document_block(nonce, item))
+            attachments.append(_document_attachment(item))
+        elif item["kind"] == "image":
+            attachments.append({"kind": "image", **attached.image_ref(item["record"])})
         else:
             code = item["exit_code"]
             blocks.append(f"<<<ATTACHMENT {nonce} command run by the user with ! (exit "
                           f"{code if code is not None else 'unknown'})>>>\n$ {item['command']}\n{item['text']}\n"
                           f"<<<END {nonce}>>>")
             attachments.append({"kind": "shell", "command": item["command"][:2000], "exit_code": code})
+    if not blocks and not notes:
+        return text, attachments, []  # Images only: the text goes as it is, the images as parts.
     content = text + "\n\n---\n" + HEADER.format(nonce=nonce) + "".join(note + "\n" for note in notes)
     if blocks:
         content += "\n" + "\n\n".join(blocks)

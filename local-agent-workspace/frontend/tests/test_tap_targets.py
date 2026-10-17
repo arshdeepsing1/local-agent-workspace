@@ -54,6 +54,13 @@ def test_every_control_is_touch_sized_on_a_phone(coarse_ui, coarse_page):
     page.get_by_text("Request details · completed").click()
     page.get_by_role("textbox", name="Message").fill("Read @src/parser.py and @README.md")
     expect(page.locator(".mention-chip")).to_have_count(2)
+    # An attached PDF whose text is not read: its chip and the Attach as path button.
+    ui.run("const record = fake.uploadRecord; fake.uploadRecord = (name, file) => ({ ...record(name, file), unreadable: 'Needs the documents extra.' })")
+    with page.expect_file_chooser() as chooser:
+        page.get_by_role("button", name="Attach files").click()
+    chooser.value.set_files([{"name": "paper.pdf", "mimeType": "application/pdf", "buffer": b"%PDF"}])
+    expect(page.get_by_role("button", name="Attach as path")).to_be_visible()
+    expect(page.locator(".mention-chip")).to_have_count(3)
     expect(page.locator(".code-copy")).to_be_visible()
     assert small_controls(page, ".main-area") == []
     assert no_page_scroll(ui)
