@@ -13,17 +13,28 @@ Roadmap milestone M8 (agents, automation and delivery):
   chat's mode now needs approval for it) ends as failed, with a notice and result that say why.
   The card shows **Background** and live progress. When the subagent ends, its result appears on
   the card's **Report**, a notice says so (**Background subagent explore finished: …**, with
-  **Open subagent**) and the chat's next model request names it once.
+  **Open subagent**) and the chat's next model request names it once. Except in a scheduled run,
+  where `background: true` (and an agent file's) is ignored: the run waits for its subagents, so
+  its approval limit, token and time limits and history cover them and the next run waits too.
+  The approval card says "Runs in the foreground" and the call's result has a note.
 - The new `get_subagent_result` tool (offered once the chat started a background subagent)
   returns one subagent's status and result, or lists them, and can wait up to 300 seconds. Stop
   on the chat, **Stop subagent** on a card and deleting the chat stop background subagents. A
   restart marks a running one interrupted and says so in the chat, and the spending limit counts
   them. Rewinding, editing, retrying and forking the chat are refused while they run. A desktop
   notification and the notification hooks (status `background_subagent`) report one that
-  finished or failed while the chat was idle.
+  finished or failed while the chat was idle. With a page open, **Notify me** now reports a
+  background subagent that finished or failed while its chat was idle ("Background subagent
+  finished: …").
 - **Settings → Subagents → Continue the chat when a background subagent finishes** (off by
   default: each such turn is a paid request) sends an idle chat a short app message, so the
-  agent reads the report and goes on, once for what ended since its last step.
+  agent reads the report and goes on, once for what ended since its last step. It never
+  continues a chat whose last turn stopped at a limit, an error or Stop (Continue stays yours),
+  nor a scheduled run's chat. One that ends while a `!` command or a manual compaction runs
+  continues the chat once it is done instead of never. The app's message shows no "Sent as plain
+  text" chip and no **Edit message**, **Retry** sends it again as the app's message, rewinding
+  to it leaves your message box empty, and transcripts label it **App (sent when a background
+  subagent finished)** instead of **User**.
 - Subagent cards: **Stop subagent** stops only that subagent (its call returns as cancelled; the
   chat and its other subagents go on). While a subagent waits for approval, its card names the
   action (**Waits for approval: run command · npm test**) with **Allow** and **Decline**, which
@@ -41,7 +52,10 @@ Roadmap milestone M8 (agents, automation and delivery):
   `background`, and Claude Code's names `disallowedTools`, `permissionMode`, `mcpServers`,
   `initialPrompt` and `maxTurns`. The approval card and Agent types show them. The app ships a
   **plan** agent (Plan mode, no edits, no MCP servers) that returns an implementation plan; a
-  project's `plan.md` replaces it.
+  project's `plan.md` replaces it. An MCP server that the agent may use no tool of no longer
+  starts for its subagent. This covers a server that `disallowed_tools` takes away whole
+  (`mcp__<server>__*`) and one whose tools a `tools` list never names. Its tools no longer count
+  against the turn's MCP limits either, so they cannot push out a server the agent may use.
 - A custom agent's `permission_mode` applies only when it is narrower than the chat's mode, also
   after a mode change while the subagent runs, so it never runs more than the chat allows: a
   Plan subagent of a Manual or Accept edits chat asks before read-only commands (unless a rule
@@ -52,18 +66,31 @@ Roadmap milestone M8 (agents, automation and delivery):
   subagent's entry in its parent's index keeps its token totals, also after it is deleted.
 - Hook input names the agent: tool events (and any event of a subagent chat) carry `agent` with
   the session, whether it is a subagent, its type, its parent chat and its custom agent file.
-- Turn summary: under the last reply of each turn a muted line sums it up, for example
-  `8 steps · 14 tools · 2 min 10 s · 182k in (160k cached) / 3.1k out · ~1.4 DBU` (no DBU part
-  without price data). Opened, it says how the turn ended, the tokens it processed with its
-  subagents, calls without price data and the files it changed. A count no call reported shows
-  `—`, never 0. The same result record is kept with the chat, ends the turn for scripts and is a
-  `_Turn: …_` line in transcripts; exports, forks and imports leave it out.
+- Turn summary: under the last reply of each turn a muted line sums it up, for example `8 steps
+  · 14 tools · 2 min 10 s · 182k in (160k cached) / 3.1k out · ~1.4 DBU` (no DBU part without
+  price data). Opened, it says how the turn ended, the tokens it processed with its subagents,
+  calls without price data and the files it changed. A count no call reported shows `—`, never
+  0. The same result record is kept with the chat, ends the turn for scripts and is a `_Turn:
+  …_` line in transcripts; exports, forks and imports leave it out. The result record a chat
+  keeps for scripts (`wait_result`) is now always its latest turn's: after a restart that cut a
+  turn short it is that turn's (`interrupted`, exit code 3), and after a rewind in place it is
+  the last kept turn's, never an earlier or a removed turn's. (adds to the bullet above) The
+  record a restart gives a cut-short turn counts the turn from its own message (a queued message
+  sent into it mid-turn is part of it), with its model requests, tokens and estimated DBU, and
+  its duration ends at the turn's last recorded step, not at the restart, so a scheduled run's
+  history no longer shows the time the app was down.
 - Token and time limits per turn: **Settings → Agent → Token limit per turn** and **Time limit
   per turn (minutes)** (0, the default, means none), and a chat's own in **Agent tools → Usage →
   Turn limits**. The token limit counts every token the turn processed, cache reads and its
   subagents' included, so it also caps endpoints without price data. The time limit is the
   wall-clock time since the turn started, waits for your approvals included. A subagent counts
-  toward its parent's turn.
+  toward its parent's turn. A background subagent's requests count in the turn during which they
+  were made, never again in a later one. A turn that starts while one still works counts only
+  the requests it makes from then on (the turn's tokens, estimated DBU and subagents in its
+  result, and the token limit), and the subagent keeps its own turn's limits. Before, every
+  later turn counted its whole spend again, so a turn limit could stop the chat at its first
+  request. Forks (also **Fork from here**), exports and imports keep a chat's own turn limits,
+  as they keep its spending limit; a chat a script created keeps its own Agent steps too.
 - At a turn limit the agent gets one more request, which tells it to call no tools and to reply
   with what is done and what remains (a tool call in that reply does not run). That instruction
   travels like the other step notices: at the full prompt-caching level it ends the request's
@@ -90,17 +117,26 @@ Roadmap milestone M8 (agents, automation and delivery):
   sequences, carriage returns, bidirectional overrides) as visible escapes, so a command cannot
   hide behind them. Bypass permissions needs `--confirm-bypass`. An answer the app refuses falls
   back at once to declining (or skipping the questions), so no card is left waiting. Ctrl+C
-  stops the turn, and before a turn started it exits without waiting.
+  stops the turn, and before a turn started it exits without waiting. Prompt"`": a turn that
+  leaves background subagents working is reported once they ended (stderr says it waits), their
+  cards answered with the same `--approve` policy, and the result lists each one's end in
+  `background_results`; Ctrl+C then stops them and exits 3. `--approve ask` prints a card's
+  warnings (a secret file it reads, a protected file, a hook that asked, a command that could
+  not be checked exactly, a file another subagent changed) before you answer.
 - `agent_run.py` options set the chat's model, effort, mode, Agent steps, spending limit and
   turn limits. `--session` sends the prompt to an existing idle chat instead: `--mode`,
   `--model` and `--effort` then change that chat, the new-chat-only `--workspace` and
   `--max-steps` are refused, and a chat already in Bypass permissions needs `--confirm-bypass`.
 - `backend/local_agent/client.py` is the standard-library Python client behind the script:
   `query(prompt, can_use_tool=..., on_question=...)` yields the chat's messages and ends with
-  the turn's result. The app serves a chat's live messages as newline-delimited JSON
-  (`GET /api/sessions/<id>/stream.ndjson`). A new chat can name its project folder and Agent
-  steps, and its step-limit notice then says the chat has its own. Stopping the app (Ctrl+C on
-  `run.py`) ends these streams at once and stops running turns as usual.
+  the turn's result. The app serves a chat's live messages as newline-delimited JSON (`GET
+  /api/sessions/<id>/stream.ndjson`). A new chat can name its project folder and Agent steps,
+  and its step-limit notice then says the chat has its own. Stopping the app (Ctrl+C on
+  `run.py`) ends these streams at once and stops running turns as usual. `query()` follows the
+  chat's background subagents (and a turn the wake option starts) before its result, yields a
+  `background_wait` message meanwhile, and the result has `background_results`. The
+  `can_use_tool` context carries the card's warnings: `secret_files`, `protected`, `hook_ask`,
+  `uncertain` and `sibling_change`.
 - Simulator: `start_gateway()`, `patched_settings()` and `start_app()` can be imported by tests
   and other launchers.
 - **Settings → Agent → Git status in messages** (on by default): the message that starts each
@@ -146,7 +182,9 @@ Roadmap milestone M8 (agents, automation and delivery):
   shows the next three times as you type. Each run's chat is named after the schedule (no title
   request), tagged `scheduled`, and gets the schedule's permission mode (any mode but Bypass
   permissions; Don't ask by default), model, effort, Agent steps, and its required token and
-  time limits and spending limit (0: the Settings default) as its own.
+  time limits and spending limit (0: the Settings default) as its own. A model, effort or Agent
+  steps the schedule leaves empty, and a spending limit of 0, follow the project's trusted
+  settings files, else Settings, as in a new chat there; the form says so.
 - A scheduled run never waits forever: a card (approval, question or plan, its subagents'
   included) that waits the schedule's **approval limit** (1 to 60 minutes, required) ends the
   run with `terminal_reason` `approval_expired`, a notice and "Stopped at the approval limit" in
@@ -155,7 +193,9 @@ Roadmap milestone M8 (agents, automation and delivery):
   banner above the chat ("Scheduled run ready: …"), in the schedule and as a desktop or browser
   notification; nothing is sent before Run, and a ready run nobody starts before the next time
   or within 24 hours is not run. **Run automatically** is an explicit choice per schedule. **Run
-  now** works at any time.
+  now** works at any time. "Scheduled run ready" also goes to notification hooks (status
+  `scheduled_ready`, with the schedule's `schedule_id` and an empty `session_id`), also while a
+  page is open or desktop notifications are off.
 - **Settings → Agent → Scheduled runs at their times** (off by default) starts the scheduler,
   which checks every 30 seconds while the app runs and holds a lock file in the state folder, so
   a second app on the same folder never runs the schedules too. Runs missed while the app was
@@ -167,7 +207,8 @@ Roadmap milestone M8 (agents, automation and delivery):
   (HTTP 401 or 403) pauses the schedule, with a banner and a desktop notification. Each
   schedule's history keeps its last 20 runs with how they ended (steps, time, tokens, estimated
   DBU) or why they did not run, and **Open chat**. Schedules are kept in `schedules.json` in the
-  state folder.
+  state folder. The pause after a rejected token also goes to notification hooks (status
+  `scheduled_paused`).
 - **Settings → Credentials → Token expires on** (optional): from 7 days before the Databricks
   token expires, and after it, a banner and Agent tools → Schedules remind you to renew it.
 - Each scheduled run checks its saved schedule again before it starts: one changed outside the
@@ -180,7 +221,9 @@ Roadmap milestone M8 (agents, automation and delivery):
 - Install the app in its own window: the page has a web app manifest and icons, so Chrome and
   Edge offer **Install app** and Safari **Add to Dock**. The window is the same local page (the
   server must be running); nothing is cached for offline use. `run.py --open` opens the app in
-  your browser once it is ready.
+  your browser once it is ready. On a machine without a desktop (no display, such as over SSH)
+  `run.py --open` now prints the app's address instead of starting a text browser in the
+  server's own terminal and waiting for it; a browser named in `BROWSER` is still used.
 - **Workspace / Files** previews files: images (PNG, JPEG, GIF, WebP, SVG) with their size, PDF
   files in the browser's viewer, and Markdown and HTML files through **Preview** beside the
   editor (unsaved edits included). A Markdown preview shows images from the project but loads
@@ -189,12 +232,26 @@ Roadmap milestone M8 (agents, automation and delivery):
   scripts**, for that file until the page is reloaded (running scripts still cannot make
   requests, but no browser lets a page block WebRTC connections, so run scripts only in files
   you trust). An SVG is shown from a `data:` address, so one opened in a tab of its own cannot
-  read the app's access token.
+  read the app's access token. An HTML preview loads nothing from any address whatever the file
+  starts with; a file that started with a no-break space (or another character HTML does not
+  count as whitespace) before its doctype could load images and stylesheets from the network,
+  and with **Run scripts** send requests to any address. A Markdown preview of a file in a
+  folder outside the project (added to Files, granted to the chat, or the default code folder)
+  shows the images beside it and opens its relative links; only an image whose address is on the
+  web is labeled "from the web". An image or PDF that the server finds by another path (a
+  worktree chat's own copy of a file named by the source project's path, or a name that starts
+  with the project's folder name) is named by the file opened, in the header, **Open in VS
+  Code** and the plus button, with the same "Opened …: the reply named it …" note as a text
+  file. An image preview other than SVG has no plus button (the agent reads files as text;
+  attach an image to a message with **Attach files**), and a PDF preview says that the browser's
+  viewer may name the file by an ID, also in its own download, while **Download** in the toolbar
+  saves it by its name.
 - **Download** in the editor toolbar and on each file row saves any file of up to 20 MB as it is
   on disk, with the checks of Files (credential files, the state folder and folders without
   access are refused). A binary or non-UTF-8 file now opens with Download instead of an error.
   The server sends a file inline only when it is an image or PDF whose bytes match its type, and
-  never as a page of the app.
+  never as a page of the app. A Markdown or HTML file over the file write limit, or not UTF-8,
+  now says why and offers Download like any other file, instead of opening as an empty preview.
 - End-to-end tests drive the real page against the real app and the offline simulator (a reply
   and its usage, an edit with Keep and Undo, parallel subagents, a question, a rate limit, a
   spending-limit stop with Continue, compaction, the file preview and a trusted project settings
@@ -234,7 +291,11 @@ Roadmap milestone M7 (endpoint-dependent model features):
   an HTTP 400 the app sends it once more without the thinking; a 400 that names the thinking or
   a signature, or a resend that is then accepted, makes the endpoint skip it until a restart or
   a Settings save. **Export with reasoning** keeps the thinking in a conversation file; a plain
-  export leaves it out.
+  export leaves it out. Past 256 KB, the oldest replies' thinking is now left out in steps of
+  128 KB rather than one more reply at every step, so most requests still read the previous one
+  from the prompt cache. A request that the thinking would push over the 3.8 MB request target
+  (attached images count in bytes) goes with only the newest thinking that fits, or none,
+  instead of failing at the 4 MB limit.
 - **Settings → Reasoning → Request format** adds **Anthropic thinking budget**
   (`thinking.budget_tokens`, 1,024 at Fast up to 32,768 at Max, below Max output tokens) for
   older Claude endpoints. When Databricks rejects the adaptive Anthropic fields for an endpoint
@@ -250,7 +311,10 @@ Roadmap milestone M7 (endpoint-dependent model features):
   text. The message waits until its files have uploaded. Queued messages, **Edit message**,
   **Retry response** and editing a queued message keep the files, and **Edit message** can leave
   one out (**Do not send … again**). Deleting a chat deletes its files; forks and rewind backups
-  get their own copies.
+  get their own copies. A queued message's tags (its command, Plain text, its attached files and
+  Paused) sit on a row of their own under its text, and a long file name is shortened there (its
+  full name on hover), so the text stays readable and Edit and Remove stay inside the bar on a
+  phone or beside the Workspace panel.
 - Documents reach the agent as their extracted text, fenced as data after the message like an
   `@` snapshot and redacted like command output: at most 50,000 characters per document and
   100,000 per message, with a note when one was shortened. Word, Excel and PowerPoint text is
@@ -262,7 +326,13 @@ Roadmap milestone M7 (endpoint-dependent model features):
   CPU for minutes or take gigabytes of memory. PDF text needs the new optional documents extra
   (`./backend[documents]`, the `pypdf` package); without it the app says so, and **Attach as
   path** sends where the file is saved instead. A document's extracted text is kept beside the
-  file (`.extracted.txt`), so the path names the file as it was attached.
+  file (`.extracted.txt`), so the path names the file as it was attached. Attached documents,
+  `@` snapshots and project memory notes now get the same redaction as command and MCP results.
+  That covers the credential file's secret-looking values and MCP servers' secret references
+  whatever their shape, so a note holding one is refused. usage.csv excerpts are redacted the
+  same way. A sign-in method in the credential file (`DATABRICKS_AUTH_TYPE=databricks-cli`, any
+  key ending in `AUTH_TYPE` or `AUTH_METHOD`) is no longer taken for a secret, in tool results
+  either, so a note may mention it.
 - `read_file` reads `.pdf`, `.docx`, `.xlsx` and `.pptx` project files as their extracted text,
   in numbered lines wrapped at 500 characters, with what it was extracted from (`extracted`) and
   notes; the last 4 documents read stay extracted in memory, and its tool description says so.
@@ -283,7 +353,10 @@ Roadmap milestone M7 (endpoint-dependent model features):
   or when its file is gone, an image becomes a note in its message; a compaction summary request
   gets a note naming each image instead of the image. An endpoint that answers image parts with
   an HTTP 400 naming them gets the request again with notes in place of the images, with a
-  notice, and no images until the app restarts or Settings are saved.
+  notice, and no images until the app restarts or Settings are saved. An HTTP 400 that names the
+  prompt-cache markers or the thinking sent back, worded with an image term ("content part"),
+  goes down the cache levels or drops the thinking first. Images are replaced by notes, and
+  turned off for the endpoint, only if the request still fails without them.
 - A queued message steered into a running turn must also keep the request under the 4 MB limit
   (attached images count in full); otherwise it waits and goes as the next message. A compaction
   that only the 4 MB limit called for says so in its notice instead of naming a token threshold.
@@ -355,11 +428,19 @@ Roadmap milestone M6 (MCP, hooks and web):
   (`get_tool_output`, `web_search`, `report_findings` and `get_subagent_result` on top of the
   defaults), which leaves no room for MCP tools. MCP tools follow in server order; those that do
   not fit are named once in a notice and in Extensions, and a call to one is refused. Turn off
-  tools or servers a chat does not need to make room.
+  tools or servers a chat does not need to make room. `get_tool_output`, `report_findings` and
+  `get_subagent_result` join a chat mid-turn. While MCP tools are offered, each of them that can
+  still join keeps its place for the rest of the chat, so one joining never pushes out an MCP
+  tool the turn already offered. With the default Settings a new chat therefore has room for one
+  MCP tool, and for none once a web search provider is set. Turning off one of these helpers, or
+  `use_skill` or `delegate_task` (which `report_findings` and `get_subagent_result` follow),
+  frees a place. The notice and Extensions say that places are kept for them.
 - In Plan mode the agent is no longer offered the tools Plan always refuses: the file-changing
   tools (`write_file`, `edit_file`, `move_path`, `delete_path`, `notebook_edit`,
   `insert_activity_log`), `remember` and `stop_job`. It still gets `submit_plan`, so a chat in
-  Plan sends fewer tool definitions and leaves more room for MCP tools.
+  Plan sends fewer tool definitions. MCP tools are left out too, and a turn that starts in Plan
+  starts no MCP server. After a plan is approved, the MCP tools are offered from the next
+  message on.
 - Secret references for MCP servers: a stdio server's `env` and an HTTP server's `headers` take
   text or `{"secret": "NAME"}`, read from your credential file each time the server starts. A
   header can add a `"prefix"`, which must be a scheme word and one space (such as `"Bearer "`),
@@ -420,7 +501,9 @@ Roadmap milestone M6 (MCP, hooks and web):
   passwords in the URL, and URLs that carry a secret. Nothing is looked up before the approval.
   Each connection resolves the name itself, refuses it when any address is private and connects
   to the checked address, on every redirect too (at most 5, same host; another host comes back
-  for a new call). No proxy, cookies or credentials are sent.
+  for a new call). No proxy, cookies or credentials are sent. 6to4 addresses (`2002::/16`) and
+  the `3fff::/20` documentation range are refused on every Python 3.12 patch release, not only
+  from 3.12.4 on.
 - A fetch card asks per domain: **Allow once**, **Allow *domain* in this chat**, or **Always
   allow…** for the project or all projects. New domain rules
   (`{"tool": "web_fetch", "domain": …}`): allow names one host exactly, deny and Always ask also
@@ -484,7 +567,14 @@ Roadmap milestone M6 (MCP, hooks and web):
   exact or prefix allow rule allows can join such a command in the project folder when no pipe
   feeds it (`python -m pytest -q 2>&1 | tail -20`). Deny and ask rules are matched part by part.
   Anything else asks as before, and in Plan the refusal says what the check refused. Cards read
-  "Ran as a read-only command (checked by the app)".
+  "Ran as a read-only command (checked by the app)". A recursive `grep` the app checks now skips
+  them whatever the case of their names (`.ENV`, `SERVER.PEM`, `API_TOKEN.TXT`, a `PROD.TFVARS`
+  that a Secret file names pattern covers), as `rg` already did. When a Secret file names
+  pattern has a letter outside ASCII (`é`, `ß`), a recursive `grep` or `rg` is not checked as
+  read-only (it asks for approval; Plan and Don't ask block it); so is a recursive `grep` when a
+  pattern has a backslash or a bracket other than letters, digits and ranges (use `rg`). Neither
+  skips a name that matches only once its letters are folded (`ſecrets.yaml` with a long s),
+  though a command that names it still counts it as a credential file.
 
 Roadmap milestone M5 (context, instructions, memory, skills and commands):
 
@@ -525,7 +615,8 @@ Roadmap milestone M5 (context, instructions, memory, skills and commands):
   and Edit send such a message the same way again, also in a fork or an imported copy of the
   conversation. With **Settings → Commands and files → Run commands typed with /** (on by
   default) turned off, typed `/` text is sent as it is in every message; built-in commands then
-  run only when chosen in the `/` menu.
+  run only when chosen in the `/` menu. **Edit** on a queued plain-text message brings it back
+  with **Send as plain text** on, so its `!` or `/` is not run as a shell command or a command.
 - Your own instruction files: **Settings → Agent → Load my instructions file
   ~/.agents/AGENTS.md** (on by default) and **Also load ~/.claude/CLAUDE.md** (off by default)
   add them after Custom instructions, with the same precedence (8,000 bytes each, with their
@@ -556,7 +647,10 @@ Roadmap milestone M5 (context, instructions, memory, skills and commands):
   kept in the app's state folder per Git repository (worktrees share them), never in the
   repository or an export. They reach every chat's system message as data, read when a reply
   starts so the cached prefix stays the same within a reply. **Agent tools → Memory** lists,
-  adds, edits and deletes them.
+  adds, edits and deletes them. The Bypass permissions row of the mode table and the model's
+  Bypass mode text now say that `remember` needs an allow rule there. They also say that a
+  before-tool hook's ask and another running subagent's change to the same file still show a
+  card.
 - **Settings → Agent → Output style**: Default, Concise or Explanatory, or a style file from the
   project's `.agents/output-styles/` or your `~/.agents/output-styles/` (yours wins over a
   project file of the same name). Its text (a style file's headed with the file it came from)
@@ -724,8 +818,10 @@ Follow-up of 2026-10-15:
 - A custom agent never widens what its chat allows: its tools stay within the subagent tool
   ceiling, turned-off tools, rules and mode, and Manual mode's approval card names the agent,
   its tools, model and effort before it starts. Its `model` must be an endpoint you already use
-  (the Settings model, Settings → Subagents or one of your chats); any other runs on the
-  chat's model, with a note.
+  (the Settings model, Settings → Subagents or one of your chats); any other runs on the chat's
+  model, with a note. An agent file's `tools` list no longer takes away `get_tool_output` and
+  `report_findings`. Like `submit_report`, they follow the chat's rules and are offered once a
+  long result is kept or a review skill is selected. `disallowed_tools` still takes them away.
 - Spending limit per conversation: a soft cap on the estimated DBU of a chat and its
   subagents, checked before each agent model request. **Settings → Agent** sets the default
   (0 = none), **Agent tools → Usage** shows the spend against the limit and sets a chat's own.
