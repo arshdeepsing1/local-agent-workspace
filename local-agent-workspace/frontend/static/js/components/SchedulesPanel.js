@@ -52,7 +52,7 @@ function formProblem(form, limits) {
   if (!whole(form.approval_timeout_minutes, 1, limits.max_approval_minutes || 60)) return `Set an approval limit of 1 to ${limits.max_approval_minutes || 60} minutes.`
   if (!whole(form.turn_token_limit, 1, limits.max_turn_tokens || 1e8)) return 'Set a token limit per run: scheduled runs need one.'
   if (!whole(form.turn_time_limit_minutes, 1, limits.max_turn_minutes || 1440)) return 'Set a time limit per run: scheduled runs need one.'
-  if (!Number.isFinite(form.spending_limit_dbu) || form.spending_limit_dbu < 0) return 'Set a spending limit of 0 (the Settings default) or more DBU.'
+  if (!Number.isFinite(form.spending_limit_dbu) || form.spending_limit_dbu < 0) return 'Set a spending limit of 0 (the project\'s or Settings default) or more DBU.'
   if (form.max_agent_steps !== null && !whole(form.max_agent_steps, 1, 64)) return 'Agent steps must be empty or 1 to 64.'
   return ''
 }

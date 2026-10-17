@@ -958,12 +958,13 @@ class AgentManager(LifecycleHooks):
         cut short when an agent request or a tool was still running. The turn it closes
         gets its result record in the header (last_turn_result), which scripts read.
         """
-        now = time.time()
+        now, closed = time.time(), []
         cut_short = session.pop("turn_running", False) is True
         changed = cut_short
         for call in session.get("inference_calls", []):
             if isinstance(call, dict) and call.get("status") == "running":
                 finish_inference_call(call, {"status": "interrupted", "error_kind": "incomplete_response"})
+                closed.append(call)
                 changed = True
                 cut_short |= call.get("purpose") == "agent"
         for event in session["events"]:
@@ -1001,16 +1002,9 @@ class AgentManager(LifecycleHooks):
             session["turn_ended"] = now  # The turn ended when the server stopped.
             changed = True
         if cut_short or turn_open:
-            # Not the previous turn's record: the turn from the newest user message, its calls and subagents since.
-            events, calls = session["events"], session.get("inference_calls") or []
-            first = next((index for index in range(len(events) - 1, -1, -1) if events[index].get("type") == "user"),
-                         len(events))
-            created = events[first].get("created") if first < len(events) else None
-            started = created if type(created) in (int, float) and created <= now else now
-            first_call = next((index for index, call in enumerate(calls) if isinstance(call, dict) and
-                               type(call.get("created")) in (int, float) and call["created"] >= started), len(calls))
-            session["last_turn_result"] = turns.turn_result(self, session, {
-                "started": started, "first_event": first, "first_call": first_call}, session["terminal_reason"], now)
+            # Not the previous turn's record: the turn from its own user message, its calls and subagents since.
+            turn, ended = turns.recovered_turn(session, now, closed)
+            session["last_turn_result"] = turns.turn_result(self, session, turn, session["terminal_reason"], ended)
         return changed
 
     def descendants(self, session_id):

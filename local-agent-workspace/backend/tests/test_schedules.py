@@ -440,6 +440,30 @@ async def test_notification_hooks_get_the_ready_and_paused_notifications(runtime
     assert sent == []  # A page is open: the banner says it, no desktop notification.
 
 
+async def test_a_notification_hook_that_fails_keeps_the_due_runs_and_the_desktop_notification(runtime, monkeypatch):
+    """Any error of the hooks part (an unreadable project folder, say) is logged: the tick still starts the other
+    schedules' due runs, which next_run is already past."""
+    manager, scheduler, project, now = runtime
+    gateway(monkeypatch)
+    has_hooks = manager.has_hooks
+
+    def failing(session, event):
+        if session["id"] == "":  # The scheduler's notification, not the run's chat.
+            raise RuntimeError("Symlink loop from a project folder")
+        return has_hooks(session, event)
+    monkeypatch.setattr(manager, "has_hooks", failing)
+    sent = []
+    manager.notifier.send = sent.append
+    manager.settings.values["system_notifications"] = True
+    ask = make(scheduler, project, name="Ask me", spec="every hour")
+    auto = make(scheduler, project, name="Auto", spec="every hour", run_policy="auto")
+    now[0] = T0 + 3600
+    await scheduler.tick()
+    await settled(manager)
+    assert isinstance(scheduler.store.get(ask["id"])["pending"], dict) and sent[0] == "Scheduled run ready: Ask me"
+    assert [entry["outcome"] for entry in history(scheduler, auto)] == ["started"]
+
+
 async def test_one_run_per_schedule_and_at_most_two_at_a_time(runtime, monkeypatch):
     manager, scheduler, project, now = runtime
     release = asyncio.Event()

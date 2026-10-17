@@ -3,8 +3,9 @@
 Schedules are kept in the state folder (schedules.json, 0600, atomic writes). Each one has a fixed permission
 mode (never Bypass permissions), a per-run approval limit (a card that waits that long ends the run with
 terminal_reason 'approval_expired': AgentManager.approve), a token limit and a time limit per run (turns.py) and a
-spending limit (spending.py; 0 follows the Settings default), which the new chat gets as its own. Its run policy is 'ask' by default: each run
-waits for Run (or Skip) in the app; 'auto' starts runs without a click, as an explicit choice per schedule.
+spending limit (spending.py; 0 follows the project's trusted settings files, else the Settings default), which the
+new chat gets as its own. Its run policy is 'ask' by default: each run waits for Run (or Skip) in the app; 'auto'
+starts runs without a click, as an explicit choice per schedule.
 
 The scheduler is an asyncio task the app starts when Settings → Agent → Scheduled runs is on (schedules_enabled,
 off by default) and stops at shutdown. It ticks every TICK_SECONDS and holds a lock file in the state folder, so
@@ -357,7 +358,8 @@ def check_schedule(values):
     spending = validate_limit(spending if spending is not None else 0, "Spending limit per run")
     steps = values.get("max_agent_steps")
     if steps is not None and (type(steps) is not int or not MIN_MAX_AGENT_STEPS <= steps <= MAX_MAX_AGENT_STEPS):
-        raise ValueError(f"Agent steps must be empty (the Settings value) or {MIN_MAX_AGENT_STEPS} to {MAX_MAX_AGENT_STEPS}.")
+        raise ValueError(f"Agent steps must be empty (the project's or Settings value) or {MIN_MAX_AGENT_STEPS} to "
+                         f"{MAX_MAX_AGENT_STEPS}.")
     policy = values.get("run_policy") or "ask"
     if policy not in POLICIES:
         raise ValueError("Run policy must be ask (each run waits for Run) or auto.")
@@ -503,8 +505,9 @@ class Scheduler:
         try:
             if manager.has_hooks(owner, "notification"):
                 manager.notification_hooks(owner, status, text, page_open, schedule_id=item["id"])
-        except (ValueError, OSError):
-            log.warning("Scheduled runs: the notification hooks could not run for a schedule's project.")
+        except Exception as exc:  # noqa: BLE001 - a notification hook never affects a run (tick starts the due ones).
+            log.warning("Scheduled runs: the notification hooks could not run for a schedule's project: %s",
+                        type(exc).__name__)
         if self.settings.values.get("system_notifications") is True and not page_open:
             manager.notifier.send(text)
 

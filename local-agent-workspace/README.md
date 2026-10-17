@@ -12,8 +12,8 @@ frontend that runs without a build step.
 - Attached documents and images: paste, drop or attach PDF, Word, Excel, PowerPoint, text and image
   files; the agent gets a document's text as data, and images go to endpoints that take image input.
 - Unsent message drafts kept in the browser across reloads, and a Continue button after a
-  turn stopped at the step, output or spending limit, at its token or time limit, by Stop, or by
-  a server restart.
+  turn stopped at the step, output or spending limit, at its token or time limit, at a scheduled
+  run's approval limit, by Stop, or by a server restart.
 - Databricks model selection, numbered line-range reads, paginated regex/literal
   search, file creation and exact edits, and shell commands with live output.
 - An optional fallback endpoint that takes one request the chat's endpoint failed before its reply
@@ -405,7 +405,8 @@ when opening a conversation or performing restart recovery.
   **Off**. You are notified when a chat starts waiting for approval, finishes a reply,
   reaches the **Agent steps** limit ("Reached the step limit: …", so you can Continue it), its
   spending limit ("Reached the spending limit: …") or the turn's token or time limit ("Reached
-  the turn budget: …"), or stops with an error (also during an automatic compaction, or because the
+  the turn budget: …"), stops at a scheduled run's approval limit ("Stopped at the approval
+  limit: …"), or stops with an error (also during an automatic compaction, or because the
   server stopped during the reply), if this page is hidden or that chat is not the one open. A
   notification reads, for example, "Needs your approval: Fix the parser": it contains only a status
   and the chat title, cut to 60 characters, never other conversation text. Until the chat is named,
@@ -2709,7 +2710,7 @@ within 32 KB). Each one has an `event`:
 | `subagent_start` | Before a subagent's first model request | `context` |
 | `subagent_stop` | When a subagent would end with its final reply | `decision` (`"block"` with `reason`), `report` |
 | `before_compaction` | Once per compaction (automatic, or **Compact now**), before its first summary request | `context` (it cannot stop a compaction) |
-| `notification` | When the app notifies: a chat needs your approval, finished, stopped with an error, or reached the step limit, the spending limit or the turn's token or time limit, a background subagent of an idle chat finished or failed, or a scheduled run is ready or a rejected token paused a schedule; only without asking | none: output is ignored |
+| `notification` | When the app notifies: a chat needs your approval, finished, stopped with an error or at a scheduled run's approval limit, or reached the step limit, the spending limit or the turn's token or time limit, a background subagent of an idle chat finished or failed, or a scheduled run is ready or a rejected token paused a schedule; only without asking | none: output is ignored |
 
 **Input.** Each hook gets one JSON object on stdin with `event` and the conversation's
 `session_id`. Tool events add `tool`, `arguments`, a stable `call_id`, `result` (after
@@ -3866,8 +3867,9 @@ card is declined at once. An answer the app refuses is replaced by that default 
 `{"type": "answer_refused", "name", "error", "answered"}` message. The client also has `create_session`, `send`, `interrupt`,
 `set_permission_mode` (Bypass needs `confirm=True`), `set_model`, `set_effort`,
 `set_spending_limit`, `set_turn_limits`, `fork`, `rewind`, `events` and `wait_result` (`None` for
-an idle chat without a turn newer than `after`; a turn a restart cut short reads as `interrupted`, and
-after a rewind in place it is the last kept turn's result).
+an idle chat without a turn newer than `after`; a turn a restart cut short reads as `interrupted`, its
+duration up to its last recorded step, not the time the app was down, and after a rewind in place it is
+the last kept turn's result).
 
 The client talks to the app on this computer only (`127.0.0.1`, `localhost` or `::1`). It reads
 the local token from `/api/bootstrap` as the page does, and again after the app restarted. A

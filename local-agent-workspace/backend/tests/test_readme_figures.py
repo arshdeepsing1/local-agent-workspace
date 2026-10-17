@@ -78,15 +78,22 @@ def test_the_readme_window_margin_figures_match_the_code():
 
 
 def test_the_readme_lists_match_the_code():
-    """The Changes view's credential names (tools.SECRET_NAMES), the endings the notification hook row names
-    (notify.attention_message and the scheduler's), and sentences the features made wrong."""
+    """The Changes view's credential names (tools.SECRET_NAMES), the endings the notification hook row and the
+    Notifications bullet name (notify.attention_message and the scheduler's), and sentences the features made wrong."""
+    from local_agent.notify import attention_message
     from local_agent.tools import SECRET_NAMES
     text = readme()
     start = text.index("Credential files at any depth")
     assert SECRET_NAMES <= set(re.findall(r"`([^`]+)`", text[start:text.index("Credential file: diff hidden", start)]))
     row = next(line for line in README.read_text(encoding="utf-8").splitlines() if line.startswith("| `notification` |"))
-    for ending in ("step limit", "spending limit", "token or time limit", "background subagent", "scheduled run"):
+    for ending in ("step limit", "spending limit", "token or time limit", "approval limit", "background subagent",
+                   "scheduled run"):
         assert ending in row, ending
+    start = text.index("- **Notifications**: click **Notify me**")
+    bullet = text[start:text.index(" - **", start + 1)]
+    for reason in ("step_limit", "spending_limit", "budget_limit", "approval_expired"):
+        message = attention_message({"title": "T", "terminal_reason": reason}, "running", "idle", turn_ended=True)
+        assert f'"{message.removesuffix("T")}…"' in bullet, message
     for stale in ("costs nothing today because the token estimate already bounds the size",
                   "Thinking is not replayed as model history", "Six more names joined", "Settings → MCP",
                   "Agent tools → Skills", "no view adds usage across chats", "follow Settings when left empty"):

@@ -3,6 +3,7 @@ reply, in the header and in the idle status; the wrap-up request at the limit, i
 budget_limit end; subagents counting toward their parent's turn; the Settings default and the chat's own."""
 import asyncio
 import json
+import time
 
 import httpx
 import pytest
@@ -222,6 +223,43 @@ async def test_a_count_no_call_reported_is_none_not_zero(runtime, monkeypatch):
     assert result["subagents"]["count"] == 1 and result["subagents"]["tokens"] is None
     assert session["subagents"][0]["tokens"] is None  # The subagents index tells it apart from 0 too.
     assert "— in / — out" in turn_summary_text(result)
+
+
+async def test_a_restart_counts_the_cut_short_turns_own_requests(runtime, monkeypatch, tmp_path):
+    """The ledger as a real turn writes it: a turn cut short after a finished tool step keeps that step's tokens and
+    DBU in the record a restart gives it (what scripts and a scheduled run's history read), ended before the
+    restart."""
+    manager, session = runtime
+    (tmp_path / "a.txt").write_text("hi")
+    never, requests = asyncio.Event(), []
+
+    async def gateway(request):
+        body = json.loads(request.content)
+        if body.get("stream") is not True:
+            return httpx.Response(200, json={"choices": [{"message": {"content": "Title"}, "finish_reason": "stop"}]})
+        requests.append(body)
+        if len(requests) == 1:
+            return httpx.Response(200, text=calls_reply(("c1", "read_file", {"path": "a.txt"})))
+        await never.wait()  # The second request is still running when the app stops.
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: REAL_CLIENT(**kwargs, transport=httpx.MockTransport(gateway)))
+    manager.start(session["id"], "Read a.txt")
+    for _ in range(500):
+        await asyncio.sleep(0.01)
+        if len(requests) == 2 and manager.store.get(session["id"])["inference_calls"][-1]["status"] == "running":
+            break
+    else:
+        raise AssertionError("The second request did not start.")
+    before = time.time()
+    restarted = AgentManager(Store(tmp_path / "tests.sqlite3"), manager.settings)
+    try:
+        result = restarted.store.get(session["id"])["last_turn_result"]
+        assert (result["terminal_reason"], result["steps"], result["tool_calls"]) == ("interrupted", 2, 1)
+        assert (result["usage"]["calls"], result["tokens"]) == (2, 11_000)
+        assert result["estimated_dbu"] == pytest.approx(PER_CALL) and result["ended"] <= round(before, 3)
+    finally:
+        manager.tasks[session["id"]].cancel()
+        await asyncio.gather(manager.tasks[session["id"]], return_exceptions=True)
+        restarted.store.db.close()
 
 
 def test_reported_tokens_tells_an_unreported_count_from_zero():
