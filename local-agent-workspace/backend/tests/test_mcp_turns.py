@@ -174,13 +174,28 @@ def test_the_largest_built_in_tool_set_fits_the_request_limit(runtime):
     from local_agent.agents import TOOL_DEFINITIONS
     from local_agent.feature_tools import FEATURE_TOOLS
     manager, session, _, _ = runtime
-    # Every built-in tool at once (Plan mode, get_tool_output and report_findings offered, a search provider set, nothing turned off)
-    # leaves room for MCP tools.
-    assert len(TOOL_DEFINITIONS) + len(FEATURE_TOOLS) <= MAX_REQUEST_TOOLS
+    # Every built-in tool a chat can get at once (get_tool_output, report_findings and get_subagent_result offered, a
+    # search provider set, nothing turned off) fits; submit_report is for subagents only, submit_plan for Plan. Only
+    # then is there no room left for MCP tools (they are capped with a notice).
     manager.settings.values.update(web_search_provider="searxng", web_search_url="http://127.0.0.1:8888")
-    session.update(permission_mode="plan", tool_output_offered=True, findings_tool=True, disabled_tools=[])
+    session.update(tool_output_offered=True, findings_tool=True, background_subagents_offered=True, disabled_tools=[])
     definitions, capped = manager.offered_tools(session, [])
-    assert len(definitions) == len(TOOL_DEFINITIONS) + len(FEATURE_TOOLS) and capped == []
+    assert len(definitions) == len(TOOL_DEFINITIONS) + len(FEATURE_TOOLS) - 2 == MAX_REQUEST_TOOLS and capped == []
+    assert not {"submit_report", "submit_plan"} & {item["function"]["name"] for item in definitions}
+    # Plan mode adds submit_plan and leaves out the tools it always refuses (edits, remember, stop_job).
+    session["permission_mode"] = "plan"
+    names = {item["function"]["name"] for item in manager.offered_tools(session, [])[0]}
+    left_out = {"write_file", "edit_file", "insert_activity_log", "move_path", "delete_path", "notebook_edit",
+                "remember", "stop_job"}
+    assert "submit_plan" in names and not names & left_out and len(names) == MAX_REQUEST_TOOLS - len(left_out) + 1
+    session["permission_mode"] = "manual"
+    # Without a background subagent (the usual case) one place stays free.
+    session.pop("background_subagents_offered")
+    assert len(manager.offered_tools(session, [])[0]) == MAX_REQUEST_TOOLS - 1
+    # A subagent gets submit_report but never delegate_task, remember, submit_plan or get_subagent_result.
+    session.update(is_subagent=True, background_subagents_offered=True)
+    names = {item["function"]["name"] for item in manager.offered_tools(session, [])[0]}
+    assert "submit_report" in names and not names & {"delegate_task", "remember", "submit_plan", "get_subagent_result"}
 
 
 async def test_a_shortened_mcp_result_can_be_read_from_the_start(runtime):

@@ -182,6 +182,9 @@ class Settings:
             "turn_token_limit": 0,
             "turn_time_limit_minutes": 0,
             "subagent_defaults": subagent_defaults(None),
+            # Settings → Subagents (planning.DelegateManager.maybe_wake): an idle chat continues by itself when a
+            # background subagent finishes. Off by default: it starts a paid turn.
+            "background_subagent_wake": False,
             # Settings → Model and context (AgentManager.fallback_endpoint): the endpoint an agent or subagent
             # request goes to once when its own failed before the reply started; "" = none.
             "fallback_model": "",
@@ -366,6 +369,8 @@ class Settings:
             raise ValueError("Continue after rate limits must be on or off.")
         if type(candidate["auto_keep_changes"]) is not bool:
             raise ValueError("Automatic Keep must be on or off.")
+        if type(candidate["background_subagent_wake"]) is not bool:
+            raise ValueError("Continue the chat when a background subagent finishes must be on or off.")
         if candidate["reasoning_effort"] not in EFFORT_LEVELS:
             raise ValueError("Default reasoning effort must be one of: " + ", ".join(EFFORT_LEVELS) + ".")
         if candidate["reasoning_format"] not in REQUEST_FORMATS:

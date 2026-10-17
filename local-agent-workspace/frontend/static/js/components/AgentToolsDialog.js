@@ -85,7 +85,8 @@ function AgentToolsScope(props) {
     Tasks: () => html`<${Tasks} ...${props} />`,
     Subagents: () => html`<${Subagents} ...${props} />`,
     Tools: () => html`<${ToolsPanel} ...${props} />`,
-    Usage: () => html`<${UsagePanel} session=${props.session} onError=${props.onError} />`,
+    Usage: () => html`<${UsagePanel} session=${props.session} onError=${props.onError}
+      onSelectSession=${id => { props.onSelectSession(id); props.onClose() }} />`,
     Export: () => html`<${ConversationTransfer} sessionId=${props.session?.id} workspace=${props.session?.workspace || props.workspace || ''}
       busy=${!!props.session && props.session.status !== 'idle'} onError=${props.onError} onSelectSession=${id => { props.onSelectSession(id); props.onClose() }} />`,
     Checkpoints: () => html`<${Checkpoints} ...${props} />`,
@@ -382,6 +383,19 @@ function SessionSubagents({ session, onError, onSelectSession, onClose }) {
   </section>`
 }
 
+// What an agent file narrows or adds beyond its tools (custom_agents.parse_agent): its permission mode (only when
+// narrower than the chat's), disallowed tools, MCP servers, memory, initial prompt and background default.
+const MODE_NAMES = { plan: 'Plan', dontAsk: "Don't ask", manual: 'Manual', auto: 'Auto', acceptEdits: 'Accept edits',
+  bypassPermissions: 'Bypass permissions' }
+function agentLimits(agent) {
+  return [agent.permission_mode ? `Mode: ${MODE_NAMES[agent.permission_mode] || agent.permission_mode} at most` : '',
+    agent.disallowed_tools?.length ? `Not: ${agent.disallowed_tools.join(', ')}` : '',
+    Array.isArray(agent.mcp_servers) ? `MCP servers: ${agent.mcp_servers.join(', ') || 'none'}` : '',
+    agent.memory === 'none' ? 'Without project memory' : '',
+    agent.initial_prompt_chars ? `Initial prompt (${agent.initial_prompt_chars.toLocaleString('en-US')} characters)` : '',
+    agent.background ? 'Runs in the background' : ''].filter(Boolean).join(' · ')
+}
+
 // The agent types delegate_task offers in this chat's project (GET /agents): the built-in ones with their
 // Settings → Subagents defaults, the project's custom agent files, and the files that cannot be used.
 function AgentTypes({ session, onError }) {
@@ -397,7 +411,7 @@ function AgentTypes({ session, onError }) {
   const errors = agents?.errors || []
   return html`<div class="agent-types">
     <div class="agent-tools-section-heading"><h3>Agent types</h3><button class="outline" disabled=${busy} onClick=${() => void refresh()}>Refresh agent types</button></div>
-    <p>The agent chooses a type for each subagent. Set the built-in types' model and effort in Settings → Subagents. Custom agents are Markdown files in this project's <code>.agents/agents</code> or <code>.claude/agents</code> folder; their tools never go beyond this chat's tool ceiling.</p>
+    <p>The agent chooses a type for each subagent. Set the built-in types' model and effort in Settings → Subagents. Custom agents are Markdown files in this project's <code>.agents/agents</code> or <code>.claude/agents</code> folder (the app ships a plan agent, which a project file of the same name replaces); their tools and mode never go beyond this chat's.</p>
     ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
     ${agents ? html`<ul class="agent-types-list" aria-label="Agent types">
       ${builtIn.map(agent => html`<li key=${agent.name} class="agent-type-row">
@@ -411,7 +425,8 @@ function AgentTypes({ session, onError }) {
         <small>${[profileLabels[agent.profile], Array.isArray(agent.tools) ? `Tools: ${agent.tools.join(', ')}` : 'Every tool of its profile',
           effort(agent.effort), model(agent.model), Number.isInteger(agent.max_steps) ? `${agent.max_steps} steps by default` : '',
           agent.skills?.length ? `Skills: ${agent.skills.join(', ')}` : ''].filter(Boolean).join(' · ')}</small>
-        <small class="agent-type-file">File: <code>${agent.path}</code></small>
+        ${agentLimits(agent) ? html`<small class="agent-type-limits">${agentLimits(agent)}</small>` : null}
+        <small class="agent-type-file">${agent.shipped ? 'Shipped with the app: ' : 'File: '}<code>${agent.path}</code></small>
         ${(agent.notes || []).map((note, index) => html`<small key=${index} class="agent-type-note">${note}</small>`)}
       </li>`)}
       ${errors.map(item => html`<li key=${item.path} class="agent-type-row agent-type-error">

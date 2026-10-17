@@ -398,6 +398,26 @@ def _totals(calls):
     return totals
 
 
+USAGE_TOTAL_FIELDS = ("calls", "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+
+
+def usage_counts(records):
+    """A conversation's call count and token sums (_totals: None for a field that is unknown), from its ledger
+    records: what a subagent's entry in its parent's index keeps for the parent's Usage."""
+    totals = _totals([_public_call(record) for record in records if isinstance(record, dict)])
+    return {field: totals[field] for field in USAGE_TOTAL_FIELDS}
+
+
+def sum_usage(items):
+    """The field sums of usage_counts dicts: None for a field one of them does not know."""
+    total = {field: 0 for field in USAGE_TOTAL_FIELDS}
+    for item in items:
+        for field in USAGE_TOTAL_FIELDS:
+            value = item.get(field) if isinstance(item, dict) else None
+            total[field] = None if total[field] is None or type(value) is not int else total[field] + value
+    return total
+
+
 def session_metrics(session):
     """Build a JSON-safe, TypeScript-friendly metrics view for one session."""
     calls, event_ids, complete = [], set(), session.get("inference_ledger_version") == LEDGER_VERSION

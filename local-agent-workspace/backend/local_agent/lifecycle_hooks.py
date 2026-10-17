@@ -32,6 +32,7 @@ from .approvals import declined
 from .context import HOOK_CONTINUATION_PREFIX
 from .extensions import TOOL_HOOK_EVENTS
 from .permissions import Verdict
+from .planning import report_text, submitted_report
 from .result_budget import cap_text
 from .notify import short_title
 from .tool_profiles import COVERED_BY
@@ -58,6 +59,10 @@ WARNING_TAILS = {
 }
 HOOK_ASK_DONT_ASK = ("Not run: a before-tool hook ({hook}) asked for your approval, which Don't ask mode does not show. "
                      "Continue without it and tell the user which action needs their approval.")
+# A subagent's change to a file a running sibling changed (AgentManager._execute_tool, DelegateManager.sibling_claim).
+SIBLING_DONT_ASK = ("Not run: another subagent of this chat ({subagent}, {kind}) changed {path} during this run, and such "
+                    "a change needs an approval card, which Don't ask mode does not show. Leave the file to that "
+                    "subagent and say so in your report.")
 PAYLOAD_TEXT_BYTES = 48_000  # a prompt, reply or task in a hook's stdin (run_hook refuses more than 128 KB)
 NOTE_CHARS = 4_000  # all hook context added to one tool result or one message
 SHOWN_ARGUMENTS_BYTES = 16_000  # arguments a card keeps for its before/after view
@@ -306,13 +311,25 @@ class LifecycleHooks:
     async def after_hook_card(self, owner, event, previous):
         """After a hook card in a chat that was not just running (a subagent's card in its delegating
         parent): approve() left it running, so put back its previous status, or awaiting_approval
-        while another of its cards waits. A card a stopped subagent left waiting shows cancelled."""
+        while another of its cards waits. A card a stopped subagent left waiting shows cancelled. An
+        idle parent (of a background subagent) becomes idle again, or stays running when the user started
+        a turn there while the card waited."""
         if event.get("state") == "pending":
             await self.update_event(owner, event, state="cancelled")
         task = self.tasks.get(owner["id"])
+        waiting = any(key[0] == owner["id"] and not future.done() for key, future in self.pending.items())
+        if previous == "idle":
+            if task is None or task.done():
+                status = "awaiting_approval" if waiting else "idle"
+            elif task.cancelling():
+                return  # The new turn is stopping: its own end sets the status.
+            else:
+                status = "awaiting_approval" if waiting else "running"
+            if self.statuses.get(owner["id"], "idle") != status:
+                await self.status(owner, status)
+            return
         if previous is None or task is None or task.done() or task.cancelling():
             return  # The owner's turn is over or stopping: its own end sets its status.
-        waiting = any(key[0] == owner["id"] and not future.done() for key, future in self.pending.items())
         # Another card's own wait ended meanwhile: the chat was delegating under it.
         status = "awaiting_approval" if waiting else "delegating" if previous == "awaiting_approval" else previous
         if self.statuses.get(owner["id"]) != status:
@@ -404,14 +421,19 @@ class LifecycleHooks:
     # Tool calls ------------------------------------------------------------------------------
 
     def hooked_permission(self, session, tools, name, arguments, forced=None):
-        """The tool's Verdict; forced (a before-tool hook's ask) turns an allow into a card, never the
-        other way. In Don't ask such a call is refused: that mode never shows a card."""
+        """The tool's Verdict; forced (a before-tool hook's ask, or {sibling}: a running sibling subagent
+        changed the file) turns an allow into a card, never the other way. In Don't ask such a call is
+        refused: that mode never shows a card."""
         verdict = self.permission(session, tools, name, arguments)
         if not forced or verdict.decision != "allow":
             return verdict
-        if session.get("permission_mode") == "dontAsk":
+        if "dontAsk" in (session.get("permission_mode"), self.mode_ceiling(session)):
+            if forced.get("sibling"):
+                shared = forced["sibling"]
+                return Verdict("deny", "dont_ask", SIBLING_DONT_ASK.format(
+                    subagent=str(shared["subagent_id"])[:8], kind=shared["agent_type"], path=shared["path"]))
             return Verdict("deny", "dont_ask", HOOK_ASK_DONT_ASK.format(hook=forced["hook_id"]))
-        return Verdict("ask", "hook", protected=verdict.protected)
+        return Verdict("ask", "sibling" if forced.get("sibling") else "hook", protected=verdict.protected)
 
     async def before_tool_hooks(self, session, name, arguments, definition, call_id, *, fixed=False):
         """Run one call's before-tool hooks. Returns {arguments, forced, contexts, refusal, changed_by}.
@@ -567,14 +589,18 @@ class LifecycleHooks:
         no delegation to report to: its turns are the user's own and run agent_stop in that chat."""
         subagent = bool(session.get("is_subagent") and session.get("turn_delegated"))
         phase = "subagent_stop" if subagent else "agent_stop"
-        # The parent waits on this delegation, so it is live: never a stored copy that a card's answer
-        # would save over the parent's newer state.
-        owner = self.live.get(session.get("parent_session_id")) if subagent else session
+        # The parent waits on this delegation, so it is live, or it went on without it (a background
+        # subagent) and is held in memory while it is idle: never a stored copy that a card's answer would
+        # save over the parent's newer state.
+        parent_id = session.get("parent_session_id")
+        owner = (self.live.get(parent_id) or self.delegates.held_session(parent_id)) if subagent else session
         if owner is None or not self.has_hooks(owner, phase):
             session.pop("hook_report", None)
             return "done"
         reply = next((item.get("text") for item in reversed(session["events"])
                       if item.get("type") == "assistant" and item.get("text")), "")
+        if subagent and (report := submitted_report(session["events"])) is not None:
+            reply = report_text(report)  # Its submit_report report is what the parent receives.
         reply, shortened = fit_text(reply)
         payload = {"session_id": owner["id"], "reply": reply, "reply_shortened": shortened,
                    "continuations": state["blocks"], "workspace": session["workspace"], "model": session["model"],

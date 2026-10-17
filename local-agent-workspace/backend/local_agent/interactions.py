@@ -143,7 +143,7 @@ class InteractionManager:
             raise InteractionError("submit_plan is only available in Plan mode. Describe the plan in your reply instead.",
                                    "unavailable_tool")
         if session.get("is_subagent"):
-            raise InteractionError("Subagents cannot submit plans; return the plan as your final reply.", "unavailable_tool")
+            raise InteractionError("Subagents cannot submit plans; return the plan in your report (submit_report).", "unavailable_tool")
         require_last_call(session, event, "submit_plan")
         answer = await self.wait(session, event, "plan")
         update = self.manager.update_event

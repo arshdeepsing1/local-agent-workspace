@@ -247,8 +247,10 @@ async def test_get_task_is_in_every_tool_profile(runtime, monkeypatch, profile):
     await manager.run_databricks(session, "Which task is next?")
     assert "get_task" in seen[0]
     # get_tool_output is offered only once a long MCP or web_fetch result of the chat was kept, and web_search only
-    # once Settings → Web access names a provider, report_findings once a skill that names it was selected.
-    assert len([*TOOL_DEFINITIONS, *FEATURE_TOOLS]) == 32 and "get_tool_output" not in seen[0]
+    # once Settings → Web access names a provider, report_findings once a skill that names it was selected,
+    # submit_report only in a subagent, get_subagent_result once the chat started a background subagent.
+    assert len([*TOOL_DEFINITIONS, *FEATURE_TOOLS]) == 34 and "get_tool_output" not in seen[0]
+    assert "submit_report" not in seen[0] and "get_subagent_result" not in seen[0]
     assert "web_search" not in seen[0] and ("web_fetch" in seen[0]) == (profile == "inherit")
     assert "report_findings" not in seen[0]
 

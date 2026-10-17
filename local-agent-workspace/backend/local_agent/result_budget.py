@@ -28,9 +28,10 @@ COMMAND_SHORTENED_HINT = SHORTENED_HINT + " Read the rest of the output with get
 MCP_SHORTENED_HINT = SHORTENED_HINT + " The whole result is kept: read it with get_tool_output, its result_id and next_offset."
 JOB_TOOLS = ("wait_job", "get_job_output", "list_jobs")
 # Tools whose results are always sent in full and charged: a job page (job_seen() has
-# advanced), and the user's own answers and plan feedback, which are short and bounded
-# (interactions.MAX_OTHER, MAX_FEEDBACK) and exist nowhere else.
-FULL_RESULT_TOOLS = (*JOB_TOOLS, "ask_user", "submit_plan")
+# advanced), the user's own answers and plan feedback, which are short and bounded
+# (interactions.MAX_OTHER, MAX_FEEDBACK) and exist nowhere else, and a background subagent's
+# bounded result (planning.RESULT_BYTES), which its notice no longer repeats once returned.
+FULL_RESULT_TOOLS = (*JOB_TOOLS, "ask_user", "submit_plan", "get_subagent_result")
 
 
 def _bytes(text):

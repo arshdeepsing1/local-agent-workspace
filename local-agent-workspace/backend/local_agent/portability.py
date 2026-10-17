@@ -80,6 +80,17 @@ class RequestInfo(Record):
     reasoning_replayed: int | None = Field(default=None, ge=0)
 
 
+class PendingCard(Record):
+    """The card a running subagent waits on (planning.DelegateManager.pending_card)."""
+    event_id: str = Field(min_length=1, max_length=512)
+    name: str = Field(max_length=120)
+    kind: Literal["approval", "question", "plan"]
+    title: str = Field(max_length=200)
+    warnings: list[Annotated[str, Field(max_length=80)]] | None = Field(default=None, max_length=8)
+    review: bool | None = None  # The title is not the whole action, or the card warns: no Allow from the parent.
+    expires: float | None = None
+
+
 class Progress(Record):
     status: str
     completed_tools: int = Field(ge=0)
@@ -90,6 +101,15 @@ class Progress(Record):
     effort: Effort | None = None
     started: float | None = None
     ended: float | None = None
+    background: bool | None = None  # delegate_task background: the parent went on while it worked.
+    pending: PendingCard | None = None
+
+
+class SiblingChange(Record):
+    """sibling_change: another running subagent of the chat changed this file during its run (its card asked)."""
+    subagent_id: str = Field(min_length=1, max_length=512)
+    agent_type: AgentName
+    path: str = Field(max_length=4096)
 
 
 class Origin(Record):
@@ -253,6 +273,12 @@ class Event(Record):
     child_session_id: str | None = None
     origin: Origin | None = None
     delegation: Progress | None = None
+    # A background delegation's final result (its card's Report), and the parent's notice when it ended.
+    delegation_result: dict[str, Any] | None = None
+    subagent_id: str | None = Field(default=None, max_length=512)
+    subagent_status: Literal["completed", "failed", "cancelled", "interrupted"] | None = None
+    sibling_change: SiblingChange | None = None
+    background_wake: bool | None = None  # The app's message that continued a chat after a background subagent.
     terminal_reason: str | None = None
     error_kind: str | None = None
     http_status: int | None = Field(default=None, ge=100, le=599)
@@ -409,6 +435,12 @@ class Conversation(Record):
     agent_file: str | None = Field(default=None, max_length=300)
     agent_model: str | None = Field(default=None, max_length=256)
     agent_effort: Effort | None = None
+    # What its agent file took away or narrowed: disallowed_tools, mcp_servers, permission_mode, memory: none.
+    agent_denied_tools: list[Annotated[str, Field(min_length=1, max_length=300)]] | None = Field(default=None, max_length=64)
+    agent_mcp_servers: list[Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,19}$")]] | None = Field(default=None,
+                                                                                                    max_length=20)
+    agent_permission_mode: Literal["manual", "auto", "acceptEdits", "plan", "bypassPermissions", "dontAsk"] | None = None
+    agent_memory: Literal["none"] | None = None
     # The user's labels. Pinned and archived are view state of this app and are not exported.
     tags: list[Annotated[str, Field(min_length=1, max_length=32)]] | None = Field(default=None, max_length=10)
 
@@ -690,6 +722,7 @@ def fresh_copies(bundle, workspace, *, kind="import"):
                 source["parent_call_id"] = remapped_call
         if source.get("delegation") and not source["delegation"].get("terminal_reason"):
             source["delegation"].update(status="interrupted", terminal_reason="interrupted")
+            source["delegation"].pop("pending", None)
         if kind != "fork":
             # An imported image has no file in this app: a note says what it was.
             source["wire"] = [attached.images_as_notes(message, attached.NOT_EXPORTED) for message in source["wire"]]
@@ -704,6 +737,9 @@ def fresh_copies(bundle, workspace, *, kind="import"):
             child = event.pop("child_session_id", None)
             if child in ids:
                 event["child_session_id"] = ids[child]
+            subagent = event.pop("subagent_id", None)  # A background subagent's notice: the copy, or none.
+            if subagent in ids:
+                event["subagent_id"] = ids[subagent]
             if str(event.get("name")).startswith("hook_subagent_") and isinstance(event.get("input"), dict):
                 # A subagent event's hook card names its subagent: the copy, or none outside the bundle.
                 subagent = event["input"].pop("subagent_session_id", None)
@@ -724,6 +760,7 @@ def fresh_copies(bundle, workspace, *, kind="import"):
                 source["terminal_reason"] = "interrupted"
             if event.get("delegation") and not event["delegation"].get("terminal_reason"):
                 event["delegation"].update(status="interrupted", terminal_reason="interrupted")
+                event["delegation"].pop("pending", None)
     # The subagents index of each copied parent lists its copied children (a bundle does not carry it).
     by_id = {source["id"]: source for source in sessions}
     for parent_id, index in subagent_index(sessions).items():

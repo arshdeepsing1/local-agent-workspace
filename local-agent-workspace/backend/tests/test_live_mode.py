@@ -255,7 +255,7 @@ async def test_a_running_subagent_follows_the_parents_mode(live):
     await asyncio.wait_for(delegate, 5)
     assert child["permission_mode"] == "plan" and manager.store.get(child_id)["permission_mode"] == "plan"
     assert seen["output"].startswith(SWITCHED.format("Plan") + "Plan mode is read-only.")
-    assert seen["output"].endswith("Return the plan as your final reply.")
+    assert seen["output"].endswith("Return the plan in your report (submit_report).")
     assert "Permission mode changed to Plan." in [item.get("text") for item in child["events"]]
 
 

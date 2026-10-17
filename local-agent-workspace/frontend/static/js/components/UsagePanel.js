@@ -1,6 +1,7 @@
 import { html, useCallback, useEffect, useMemo, useRef, useState } from '../lib.js'
 import { api, apiText } from '../api.js'
 import { EFFORT_LABELS } from '../types.js'
+import { agentLabel } from '../subagents.js'
 
 const integer = new Intl.NumberFormat()
 const dbu = new Intl.NumberFormat(undefined, { maximumFractionDigits: 4 })
@@ -178,17 +179,51 @@ function TurnLimits({ session, limits, onSaved }) {
   </div>`
 }
 
+// The chat's subagents (metrics.subagents, backend planning.usage_rollup): the chat and its subagents together,
+// then each subagent with its own calls, tokens and estimated DBU, and Open.
+function SubagentUsage({ metrics, onSelectSession }) {
+  const rollup = metrics.subagents
+  const children = Array.isArray(rollup?.children) ? rollup.children : []
+  if (!children.length) return null
+  const own = metrics.totals
+  const both = key => own[key] == null || rollup.totals[key] == null ? null : own[key] + rollup.totals[key]
+  const spent = metrics.spending?.spent_dbu
+  const cell = (usage, key) => formatCallTokens(usage ? usage[key] : null)
+  return html`<div class="usage-subagents" role="group" aria-label="This chat and its subagents">
+    <h3>This chat and its subagents</h3>
+    <div class="usage-cards">
+      <div><small>Model calls</small><strong>${integer.format(both('calls') ?? own.calls)}</strong></div>
+      <div><small>Uncached input</small><strong>${formatTokens(both('input_tokens'))}</strong></div>
+      <div><small>Cache read</small><strong>${formatTokens(both('cache_read_input_tokens'))}</strong></div>
+      <div><small>Cache write</small><strong>${formatTokens(both('cache_creation_input_tokens'))}</strong></div>
+      <div><small>Output tokens</small><strong>${formatTokens(both('output_tokens'))}</strong></div>
+      <div><small>Estimated cost</small><strong>${typeof spent === 'number' ? `${formatDbu(spent)} DBU` : 'Unavailable'}</strong></div>
+    </div>
+    ${rollup.without_usage ? html`<p class="field-help">${rollup.without_usage === 1 ? '1 subagent' : `${rollup.without_usage} subagents`} from before this app kept subagent usage ${rollup.without_usage === 1 ? 'is' : 'are'} not in these totals.</p>` : null}
+    <details class="usage-subagent-list"><summary>${children.length === 1 ? '1 subagent' : `${children.length} subagents`}</summary>
+      <div class="usage-table-scroll"><table><caption class="sr-only">Usage of each subagent</caption><thead><tr><th>Subagent</th><th>Status</th><th>Calls</th><th>Uncached input</th><th>Cache read</th><th>Cache write</th><th>Output</th><th>Est. DBU</th><th><span class="sr-only">Open</span></th></tr></thead><tbody>
+        ${children.map(child => html`<tr key=${child.id}><td><strong>${agentLabel(child.agent_type || 'general')}</strong> <small>${child.task}</small></td>
+          <td>${child.deleted ? 'deleted' : String(child.status || '').replace(/_/g, ' ')}</td><td>${cell(child.usage, 'calls')}</td>
+          <td>${cell(child.usage, 'input_tokens')}</td><td>${cell(child.usage, 'cache_read_input_tokens')}</td>
+          <td>${cell(child.usage, 'cache_creation_input_tokens')}</td><td>${cell(child.usage, 'output_tokens')}</td>
+          <td>${child.estimated_dbu == null ? '—' : formatDbu(child.estimated_dbu)}</td>
+          <td>${child.deleted || !onSelectSession ? null : html`<button class="outline" aria-label=${`Open subagent: ${child.task}`} onClick=${() => onSelectSession(child.id)}>Open</button>`}</td></tr>`)}
+      </tbody></table></div>
+    </details>
+  </div>`
+}
+
 // Agent tools → Usage: this chat's calls, or every chat's (All chats, GET /api/usage).
-export default function UsagePanel({ session, onError }) {
+export default function UsagePanel({ session, onError, onSelectSession }) {
   const [scope, setScope] = useState('chat')
   const switcher = html`<div class="usage-scope" role="group" aria-label="Usage of">
     <button aria-pressed=${scope === 'chat'} onClick=${() => setScope('chat')}>This chat</button>
     <button aria-pressed=${scope === 'all'} onClick=${() => setScope('all')}>All chats</button></div>`
   return scope === 'all' ? html`<${AllUsage} onError=${onError} switcher=${switcher} />`
-    : html`<${ChatUsage} session=${session} onError=${onError} switcher=${switcher} />`
+    : html`<${ChatUsage} session=${session} onError=${onError} onSelectSession=${onSelectSession} switcher=${switcher} />`
 }
 
-function ChatUsage({ session, onError, switcher }) {
+function ChatUsage({ session, onError, onSelectSession, switcher }) {
   const sessionId = session?.id
   const [metrics, setMetrics] = useState(null)
   const [loading, setLoading] = useState(false)
@@ -216,15 +251,16 @@ function ChatUsage({ session, onError, switcher }) {
   const firstLimit = useRef(true)
   useEffect(() => { if (firstLimit.current) { firstLimit.current = false; return } void refresh() }, [pushedLimit, pushedTurnLimits])
   const [exporting, setExporting] = useState(false)
-  const exportCsv = async () => {
+  // withSubagents: the subagent chats' rows too (conversation_id tells them apart).
+  const exportCsv = async (withSubagents = false) => {
     if (!sessionId) return
     setExporting(true); setError('')
     try {
-      const text = await apiText(`/sessions/${encodeURIComponent(sessionId)}/usage.csv`)
+      const text = await apiText(`/sessions/${encodeURIComponent(sessionId)}/usage.csv${withSubagents ? '?include_subagents=true' : ''}`)
       const url = URL.createObjectURL(new Blob([text], { type: 'text/csv;charset=utf-8' }))
       const link = document.createElement('a')
       link.href = url
-      link.download = `usage-${sessionId.slice(0, 8)}.csv`
+      link.download = `usage-${sessionId.slice(0, 8)}${withSubagents ? '-with-subagents' : ''}.csv`
       document.body.appendChild(link)
       link.click()
       link.remove()
@@ -236,7 +272,7 @@ function ChatUsage({ session, onError, switcher }) {
 
   if (!session) return html`<section class="agent-tools-section" aria-label="Usage">${switcher}<h3>Usage and cost</h3><p>Start a conversation to track its model usage.</p></section>`
   return html`<section class="agent-tools-section usage-panel" aria-label="Usage">${switcher}
-    <div class="agent-tools-section-heading"><div><h3>Usage and cost</h3><p>Provider-reported model calls for this conversation. Export CSV adds the reply and tools behind each call and the IDs sent to Databricks as request tags.</p></div><div class="agent-tools-actions"><button class="outline" disabled=${exporting} onClick=${() => void exportCsv()}>${exporting ? 'Exporting…' : 'Export CSV'}</button><button class="outline" disabled=${loading} onClick=${() => void refresh()}>${loading ? 'Refreshing…' : 'Refresh usage'}</button></div></div>
+    <div class="agent-tools-section-heading"><div><h3>Usage and cost</h3><p>Provider-reported model calls for this conversation. Export CSV adds the reply and tools behind each call and the IDs sent to Databricks as request tags.</p></div><div class="agent-tools-actions"><button class="outline" disabled=${exporting} onClick=${() => void exportCsv()}>${exporting ? 'Exporting…' : 'Export CSV'}</button>${metrics?.subagents?.children?.length ? html`<button class="outline" disabled=${exporting} onClick=${() => void exportCsv(true)}>Export with subagents</button>` : null}<button class="outline" disabled=${loading} onClick=${() => void refresh()}>${loading ? 'Refreshing…' : 'Refresh usage'}</button></div></div>
     ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
     ${!metrics && loading ? html`<p role="status">Loading usage…</p>` : null}
     ${metrics ? html`
@@ -253,6 +289,7 @@ function ChatUsage({ session, onError, switcher }) {
         <div><small>Automatic retries</small><strong>${integer.format(metrics.totals.retries ?? 0)}</strong></div>
         <div><small>Estimated cost</small><strong>${metrics.totals.estimated_dbu == null ? 'Unavailable' : `${formatDbu(metrics.totals.estimated_dbu)} DBU`}</strong></div>
       </div>
+      <${SubagentUsage} metrics=${metrics} onSelectSession=${onSelectSession} />
       ${!metrics.complete ? html`<p class="usage-warning" role="status">This older conversation has no complete inference ledger. Totals include visible agent calls only; title, compaction, and retry attempts may be missing.</p>` : null}
       ${metrics.calls.length ? html`<${TokenChart} calls=${metrics.calls} />` : html`<p class="muted">No model calls have been recorded for this conversation.</p>`}
       <div class="usage-breakdown">

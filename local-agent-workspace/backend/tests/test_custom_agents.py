@@ -17,6 +17,7 @@ from local_agent.api import create_app
 from local_agent.config import DEFAULT_SUBAGENT_DEFAULTS, Settings, subagent_defaults
 from local_agent.custom_agents import (AGENT_ROOTS, FILE_BYTES, INDEX_BYTES, MAX_AGENTS, agent_index, discover,
                                        model_label, parse_agent, resolve)
+from local_agent.permissions import MODE_LABELS
 from local_agent.portability import export_bundle, fresh_copies
 from local_agent.store import Store
 from local_agent.tool_profiles import tool_allowed
@@ -40,6 +41,12 @@ max_steps: 7
 Check every changed file for hard-coded secrets.
 Report each finding with path:line.
 """
+
+
+@pytest.fixture(autouse=True)
+def no_shipped_agents(tmp_path_factory, monkeypatch):
+    """Without the agents the app ships (agents/plan.md); the shipped-agent tests read the real folder."""
+    monkeypatch.setattr("local_agent.config.APP_ROOT", tmp_path_factory.mktemp("app"))
 
 
 def write_agent(project, name, text, root=AGENT_ROOTS[0]):
@@ -72,7 +79,9 @@ def test_a_full_agent_file_parses_with_its_notes():
 def test_defaults_are_the_file_name_read_only_and_the_chats_model_and_effort():
     agent = parse_agent("---\ndescription: 'Maps a module, it''s quick'\n# A comment\n\n---\n", "mapper")
     assert agent == {"name": "mapper", "description": "Maps a module, it's quick", "profile": "read_only", "tools": None,
-                     "model": None, "effort": None, "skills": [], "max_steps": None, "instructions": "", "notes": []}
+                     "model": None, "effort": None, "skills": [], "max_steps": None, "instructions": "", "notes": [],
+                     "disallowed_tools": [], "permission_mode": None, "mcp_servers": None, "memory": None,
+                     "initial_prompt": "", "background": False}
     claude = parse_agent('---\nname: reviewer\ndescription: "Reviews \\"diffs\\""\ntools: Read, Grep, Glob, WebFetch\n'
                          "model: sonnet\ncolor: blue\n---\nBody", "other")
     assert claude["tools"] == ["read_file", "search_files", "find_files"] and claude["model"] is None
@@ -425,7 +434,7 @@ async def test_a_custom_agent_gets_its_model_effort_tools_skills_instructions_an
     (endpoint, body), = gateway.requests["child"]
     assert endpoint == GPT and body["reasoning_effort"] == "high"
     # The file's tools within the read_only ceiling: run_command is not offered.
-    assert offered(body) == ["read_file", "search_files"]
+    assert offered(body) == ["read_file", "search_files", "submit_report"]
     system, first = body["messages"][0]["content"], body["messages"][1]["content"]
     assert "Workspace skill: review\n---\nname: Review" in system and "Custom subagents:" not in system
     assert first.startswith("Delegated task:\nAudit the repo\n\nCustom agent: security-auditor (from "
@@ -554,7 +563,7 @@ async def test_agent_tools_the_chat_turned_off_or_denies_are_left_out(runtime, m
     saved = await run_turn(manager, parent)
     assert card(saved, "a")["state"] == "error" and "child_session_id" not in card(saved, "a")
     (_, body), = gateway.requests["child"]  # No paid requests without a tool.
-    assert offered(body) == ["search_files"]
+    assert offered(body) == ["search_files", "submit_report"]
     assert "Your tools: search_files." in body["messages"][1]["content"]
     assert manager.store.get(card(saved, "b")["child_session_id"])["agent_tools"] == ["search_files"]
 
@@ -918,3 +927,296 @@ async def test_the_agents_route_marks_an_endpoint_you_do_not_use(api):
     use_endpoints(manager, GPT)
     agent = (await client.get("/api/agents")).json()["custom"][0]
     assert agent["model"] == GPT and "unused_model" not in agent
+
+
+# The remaining agent fields (M8a): disallowed_tools, permission_mode, mcp_servers, memory, initial_prompt,
+# background, and Claude Code's names for them; the plan agent the app ships.
+
+PLANNER = """---
+name: planner
+description: Plans changes.
+profile: inherit
+disallowedTools: [Write, edit_file, mcp__docs__*]
+permissionMode: plan
+mcpServers: [docs, docs, missing]
+initialPrompt: "Start with the README.\\nThen the tests."
+maxTurns: 40
+memory: none
+---
+Plan carefully.
+"""
+
+
+def test_the_remaining_fields_and_claude_code_names_parse():
+    agent = parse_agent(PLANNER, "planner")
+    assert {key: agent[key] for key in ("disallowed_tools", "permission_mode", "mcp_servers", "initial_prompt", "max_steps",
+                                        "memory", "background")} == {
+        "disallowed_tools": ["write_file", "edit_file", "mcp__docs__*"], "permission_mode": "plan",
+        "mcp_servers": ["docs", "missing"], "initial_prompt": "Start with the README.\nThen the tests.", "max_steps": 24,
+        "memory": "none", "background": False}
+    assert ("Claude Code field names used as this app's: disallowedTools → disallowed_tools, permissionMode → "
+            "permission_mode, mcpServers → mcp_servers, initialPrompt → initial_prompt, maxTurns → max_steps.") in agent["notes"]
+    assert "maxTurns 40 is more than this app's 24 model requests per subagent; 24 is used." in agent["notes"]
+    assert "Claude Code tool names used as this app's in disallowed_tools: Write → write_file." in agent["notes"]
+    defaults = parse_agent(agent_text(permission_mode="default", memory="user", background="true"), "x")
+    assert (defaults["permission_mode"], defaults["memory"], defaults["background"]) == ("manual", None, True)
+    assert any(note.startswith("memory user is not supported") for note in defaults["notes"])
+    assert parse_agent(agent_text(permission_mode="inherit", memory="project"), "x")["permission_mode"] is None
+    # The tools a list names lose the disallowed ones; the public listing leaves the initial prompt's text out.
+    listed = parse_agent(agent_text(tools="[read_file, search_files]", disallowed_tools="[Grep]"), "x")
+    assert listed["tools"] == ["read_file"]
+    public = custom_agents.public_agent({**agent, "path": "p", "root": "r"})
+    assert "initial_prompt" not in public and public["initial_prompt_chars"] == len(agent["initial_prompt"])
+
+
+@pytest.mark.parametrize("text,reason", [
+    (agent_text(permissionMode="plan", permission_mode="auto"), "permissionMode and permission_mode set the same field"),
+    (agent_text(permission_mode="sometimes"), "permission_mode must be plan, dontAsk, manual"),
+    (agent_text(mcp_servers="[Bad Name]"), "mcp_servers must list at most 20 MCP server IDs"),
+    (agent_text(mcp_servers="[1, 2]"), "mcp_servers must list"),
+    (agent_text(background="maybe"), "background must be true or false"),
+    (agent_text(memory="forever"), "memory must be project"),
+    (agent_text(initial_prompt="'" + "x" * 2001 + "'"), "initial_prompt has 2,001 characters"),
+    (agent_text(tools="[read_file]", disallowed_tools="[Read]"), "disallowed_tools takes away every tool that tools lists"),
+    (agent_text(disallowed_tools="[read_file, find_files, search_files, list_files, list_skills, use_skill, list_tasks, "
+                                 "get_task, notebook_read, ask_user, project_overview, get_tool_output, report_findings]"),
+     "disallowed_tools takes away every tool of the read_only profile"),
+])
+def test_bad_values_of_the_remaining_fields_are_refused(text, reason):
+    with pytest.raises(ValueError, match=reason):
+        parse_agent(text, "x")
+
+
+@pytest.mark.parametrize("chat,agent,expected", [
+    ("bypassPermissions", "plan", "plan"), ("plan", "acceptEdits", "plan"), ("auto", "acceptEdits", "manual"),
+    ("acceptEdits", "auto", "manual"), ("dontAsk", "manual", "dontAsk"), ("manual", "bypassPermissions", "manual"),
+    ("bypassPermissions", "acceptEdits", "acceptEdits"), ("manual", "dontAsk", "dontAsk"), ("auto", "auto", "auto"),
+    ("acceptEdits", "manual", "manual"), ("plan", "bypassPermissions", "plan"),
+])
+def test_an_agents_permission_mode_only_narrows_the_chats(chat, agent, expected):
+    assert custom_agents.narrow_mode(agent, chat) == expected
+
+
+async def test_a_custom_agent_narrows_its_mode_tools_servers_and_memory_and_gets_its_initial_prompt(runtime, monkeypatch):
+    manager, parent, project = runtime
+    write_agent(project, "planner", PLANNER)
+    manager.memory.add(parent["workspace"], "The project uses tabs.", manager.settings.redact)
+    manager.mcp_server_ids = lambda: ["docs", "other"]
+    preview = manager.delegates.card_preview(parent, {"task": "Plan it", "agent_type": "planner"})
+    assert preview.startswith("Start a subagent (planner · chat's tools · mode Plan; separate paid model requests, "
+                              "at most 24 steps)")
+    for line in ("Disallowed tools: write_file, edit_file, mcp__docs__*",
+                 "MCP servers: docs (mcp_servers names missing, not configured in Settings → MCP; it is left out.)",
+                 "Permission mode: Plan (the agent file's plan; this chat is in Bypass permissions)",
+                 "Project memory: not loaded (memory: none)", "Initial prompt: Start with the README.\nThen the tests."):
+        assert line in preview
+    gateway = Gateway(monkeypatch, [lambda: calls_reply(("delegate_task", {"task": "Plan it", "agent_type": "planner"}, "a")),
+                                    lambda: reply("Parent done.")])
+    saved = await run_turn(manager, parent)
+    child = manager.store.get(card(saved, "a")["child_session_id"])
+    assert {key: child[key] for key in ("permission_mode", "agent_permission_mode", "agent_denied_tools",
+                                        "agent_mcp_servers", "agent_memory")} == {
+        "permission_mode": "plan", "agent_permission_mode": "plan",
+        "agent_denied_tools": ["write_file", "edit_file", "mcp__docs__*"], "agent_mcp_servers": ["docs"],
+        "agent_memory": "none"}
+    (_, body), = gateway.requests["child"]
+    assert not {"write_file", "edit_file"} & set(offered(body)) and "read_file" in offered(body)
+    first = body["messages"][1]["content"]
+    assert "Plan carefully.\n\nAgent's initial prompt:\nStart with the README.\nThen the tests.\n\nNote: mcp_servers names missing" in first
+    assert "Project memory" not in body["messages"][0]["content"]
+    assert "The project uses tabs." in gateway.requests["parent"][0][1]["messages"][0]["content"]
+    # A disallowed tool, or one of a server the file leaves out, is refused like a turned-off one.
+    assert not tool_allowed(child, "write_file") and not tool_allowed(child, "mcp__docs__search")
+    assert not tool_allowed(child, "mcp__other__x") and tool_allowed({**child, "agent_denied_tools": []}, "mcp__docs__x")
+    child.update(turn_delegated=False, permission_mode="bypassPermissions")
+    output = await manager.execute_tool(child, manager.session_tools(child), "write_file",
+                                        {"path": "b.txt", "content": "x"}, "w")
+    assert output == "The planner agent's file disallows write_file (disallowed_tools). Use only the available tools."
+
+
+async def test_only_the_agents_mcp_servers_start(runtime):
+    manager, parent, _ = runtime
+    manager.mcp_server_ids = lambda: ["docs", "other", "third"]
+    seen = []
+
+    class Stop(Exception):
+        pass
+
+    def turn(off=()):
+        seen.append(list(off))
+        raise Stop()
+    manager.extensions.turn = turn
+    child = {**parent, "is_subagent": True, "tool_profile": "inherit", "agent_mcp_servers": ["docs"],
+             "disabled_tools": ["mcp__third__*"]}
+    with pytest.raises(Stop):
+        await manager._run_turn(child, "x")
+    assert seen == [["third", "other", "third"]]
+    ran = []
+
+    async def without_servers(session, prompt, external, **extra):
+        ran.append(external)
+    manager._run_databricks = without_servers
+    await manager._run_turn({**child, "agent_mcp_servers": []}, "x")  # mcp_servers: [] starts none.
+    assert ran == [[]] and len(seen) == 1
+
+
+async def test_a_parent_mode_change_keeps_the_agents_narrower_mode(runtime):
+    manager, parent, project = runtime
+    write_agent(project, "careful", agent_text(profile="inherit", permission_mode="acceptEdits"))
+    release, modes = asyncio.Event(), []
+
+    async def worker(child, prompt):
+        modes.append(child["permission_mode"])
+        await release.wait()
+        modes.append(child["permission_mode"])
+        await manager.event(child, "assistant", text="Done.")
+    manager.run_databricks = worker
+    manager.live[parent["id"]] = parent
+    task = asyncio.create_task(manager.delegates.delegate(parent, "Edit", agent_type="careful"))
+    for _ in range(300):
+        if modes:
+            break
+        await asyncio.sleep(0.01)
+    child = manager.delegates.active_children(parent["id"])[0]
+    for mode, expected in (("auto", "manual"), ("plan", "plan"), ("bypassPermissions", "acceptEdits"),
+                           ("dontAsk", "dontAsk")):
+        await manager.change_mode(parent, mode)
+        assert child["permission_mode"] == expected, mode
+    release.set()
+    await asyncio.wait_for(task, 10)
+    assert modes == ["acceptEdits", "dontAsk"]
+
+
+@pytest.mark.parametrize("chat_mode", ["manual", "acceptEdits", "dontAsk", "auto", "bypassPermissions"])
+async def test_a_plan_agent_never_runs_a_command_its_chat_would_ask_for_or_refuse(runtime, chat_mode):
+    """Plan runs read-only commands and vetted pipelines without a card; Manual and Accept edits ask for
+    them and Don't ask refuses them. A Plan subagent of such a chat gets the chat's verdict for them."""
+    manager, parent, project = runtime
+    write_agent(project, "planner", agent_text(profile="inherit", permission_mode="plan"))
+    parent["permission_mode"] = chat_mode
+    manager.store.save(parent)
+    preview = manager.delegates.card_preview(parent, {"task": "Plan it", "agent_type": "planner"})
+    label = MODE_LABELS[chat_mode]
+    assert f"\nPermission mode: Plan (the agent file's plan; this chat is in {label}" + {
+        "manual": "; read-only commands still ask unless a rule allows them)",
+        "acceptEdits": "; read-only commands still ask unless a rule allows them)",
+        "dontAsk": "; read-only commands that no rule allows are still refused)"}.get(chat_mode, ")") in preview
+    manager.run_databricks = lambda child, prompt: manager.event(child, "assistant", text="Done.")
+    result = await manager.delegates.delegate(parent, "Plan it", agent_type="planner")
+    child = manager.store.get(result["child_session_id"])
+    assert (child["permission_mode"], child["mode_ceiling"]) == ("plan", chat_mode)
+    child["turn_delegated"] = True
+    tools = manager.session_tools(child)
+    for command in ("git log -1", "ls", "grep -n base a.txt | head -1"):
+        chat = manager.permission(parent, manager.session_tools(parent), "run_command", {"command": command})
+        sub = manager.permission(child, tools, "run_command", {"command": command})
+        if chat_mode in ("manual", "acceptEdits", "dontAsk"):
+            assert (sub.decision, sub.source) == (chat.decision, chat.source), command
+        else:
+            assert sub.decision == "allow" and sub.source in ("read_only_command", "read_only_pipeline"), command
+    # Plan still refuses what it refuses, whatever the chat's mode allows.
+    assert manager.permission(child, tools, "write_file", {"path": "b.txt", "content": "x"}).source == "plan"
+    assert manager.permission(child, tools, "run_command", {"command": "touch b.txt"}).decision == "deny"
+    # A rule the chat saved allows a read-only command again, as in the chat.
+    child["allow_rules"] = [{"tool": "run_command", "argv": ["ls"]}]
+    assert manager.permission(child, tools, "run_command", {"command": "ls"}).decision == "allow"
+    # A hook's ask shows a card, except where the chat's Don't ask shows none.
+    forced = manager.hooked_permission(child, tools, "run_command", {"command": "ls"}, {"hook_id": "guard"})
+    assert (forced.decision, forced.source) == (("deny", "dont_ask") if chat_mode == "dontAsk" else ("ask", "hook"))
+    if chat_mode == "dontAsk":  # Nor a folder-access card.
+        outside, outcome = project.parent / "other", {}
+        outside.mkdir()
+        assert not await manager.ensure_access(child, tools, str(outside), True, outcome)
+        assert outcome["approval"] == "blocked" and not manager.pending
+    # A chat the user continues is the user's own Plan chat: no ceiling.
+    child.update(turn_delegated=False, allow_rules=[])
+    assert manager.permission(child, tools, "run_command", {"command": "ls"}).decision == "allow"
+
+
+async def test_a_parent_mode_change_moves_a_plan_subagents_ceiling_and_rechecks_its_cards(runtime):
+    manager, parent, project = runtime
+    write_agent(project, "planner", agent_text(profile="inherit", permission_mode="plan"))
+    parent["permission_mode"] = "auto"
+    manager.store.save(parent)
+    release, seen = asyncio.Event(), []
+
+    async def worker(child, prompt):
+        tools = manager.session_tools(child)
+        seen.append(manager.permission(child, tools, "run_command", {"command": "ls"}).decision)
+        await release.wait()
+        seen.append(manager.permission(child, tools, "run_command", {"command": "ls"}).decision)
+        await manager.event(child, "assistant", text="Done.")
+    manager.run_databricks = worker
+    manager.live[parent["id"]] = parent
+    task = asyncio.create_task(manager.delegates.delegate(parent, "Plan", agent_type="planner"))
+    for _ in range(300):
+        if seen:
+            break
+        await asyncio.sleep(0.01)
+    child = manager.delegates.active_children(parent["id"])[0]
+    rechecked = []
+    original = manager.recheck_pending
+
+    async def recheck(session, change=None):
+        rechecked.append((session["id"], change))
+        await original(session, change)
+    manager.recheck_pending = recheck
+    await manager.change_mode(parent, "manual")
+    assert (child["permission_mode"], child["mode_ceiling"]) == ("plan", "manual")
+    assert (child["id"], "mode") in rechecked and manager.store.get(child["id"])["mode_ceiling"] == "manual"
+    release.set()
+    await asyncio.wait_for(task, 10)
+    assert seen == ["allow", "ask"]
+
+
+async def test_an_agent_with_background_true_runs_in_the_background_unless_the_call_says_otherwise(runtime, monkeypatch):
+    manager, parent, project = runtime
+    write_agent(project, "watcher", agent_text(background="true"))
+    Gateway(monkeypatch, [lambda: calls_reply(("delegate_task", {"task": "Watch", "agent_type": "watcher"}, "a"),
+                                              ("delegate_task", {"task": "Now", "agent_type": "watcher",
+                                                                 "background": False}, "b")),
+                          lambda: reply("Parent done.")])
+    saved = await run_turn(manager, parent)
+    first, second = (json.loads(card(saved, call_id)["output"]) for call_id in ("a", "b"))
+    assert first["background"] is True and first["status"] == "running"
+    assert "background" not in second and second["status"] == "completed"
+    for _ in range(300):
+        if not manager.delegates.background_running(parent["id"]):
+            break
+        await asyncio.sleep(0.01)
+    assert card(manager.store.get(parent["id"]), "a")["delegation_result"]["status"] == "completed"
+
+
+def test_the_app_ships_a_plan_agent_that_a_project_file_replaces(tmp_path, monkeypatch):
+    from pathlib import Path
+    import local_agent
+    monkeypatch.setattr("local_agent.config.APP_ROOT", Path(local_agent.__file__).resolve().parents[2])
+    project = tmp_path / "project"
+    project.mkdir()
+    plan, = discover(project)["agents"]
+    assert (plan["name"], plan["path"], plan["shipped"], plan["profile"], plan["permission_mode"]) == (
+        "plan", "agents/plan.md", True, "inherit", "plan")
+    assert plan["mcp_servers"] == [] and "write_file" in plan["disallowed_tools"] and plan["notes"] == []
+    assert "Steps" in plan["instructions"] and "Risks" in plan["instructions"] and "Tests" in plan["instructions"]
+    write_agent(project, "plan", agent_text("Our own planner."))
+    own, = discover(project)["agents"]
+    assert own["path"] == ".agents/agents/plan.md" and "shipped" not in own
+    assert own["notes"] == ["Used instead of the agent the app ships with this name (agents/plan.md)."]
+
+
+async def test_copies_of_a_subagent_keep_what_its_agent_file_took_away(runtime):
+    manager, parent, project = runtime
+    write_agent(project, "planner", PLANNER)
+    manager.mcp_server_ids = lambda: ["docs"]
+
+    async def worker(child, prompt):
+        await manager.event(child, "assistant", text="Report.")
+    manager.run_databricks = worker
+    result = await manager.delegates.delegate(parent, "Plan", agent_type="planner")
+    child = manager.store.get(result["child_session_id"])
+    copies, root = fresh_copies(export_bundle([manager.store.get(parent["id"]), child], parent["id"]), str(project))
+    copied = next(session for session in copies if session["id"] != root)
+    assert {key: copied[key] for key in ("agent_denied_tools", "agent_mcp_servers", "agent_permission_mode",
+                                         "agent_memory")} == {
+        "agent_denied_tools": ["write_file", "edit_file", "mcp__docs__*"], "agent_mcp_servers": ["docs"],
+        "agent_permission_mode": "plan", "agent_memory": "none"}

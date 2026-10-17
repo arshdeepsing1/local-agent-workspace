@@ -26,10 +26,11 @@ MODE_LABELS = {"manual": "Manual", "auto": "Auto", "acceptEdits": "Accept edits"
 
 TOOL_KINDS = {
     **dict.fromkeys(("list_files", "find_files", "read_file", "search_files", "list_jobs", "get_job_output", "wait_job",
-                     "notebook_read", "outline_file", "project_overview", "get_tool_output"), "read"),
-    # report_findings only shows a card of the agent's review findings (no side effect), in every mode.
+                     "notebook_read", "outline_file", "project_overview", "get_tool_output", "get_subagent_result"), "read"),
+    # report_findings only shows a card of the agent's review findings (no side effect), in every mode;
+    # submit_report: a subagent's final report to its parent (planning.py), never a card.
     **dict.fromkeys(("list_skills", "use_skill", "list_tasks", "get_task", "create_task", "update_task",
-                     "report_findings"), "task"),
+                     "report_findings", "submit_report"), "task"),
     "ask_user": "question",
     "submit_plan": "plan",
     **dict.fromkeys(("write_file", "edit_file", "insert_activity_log", "move_path", "delete_path", "notebook_edit"),
@@ -56,7 +57,8 @@ READ_ONLY_SUMMARY = ("pwd, ls, read-only git status/diff/log/show/branch, and co
                      "paths in approved folders")
 PLAN_HEAD = f"Plan mode is read-only. Only read-only commands run in Plan mode: {READ_ONLY_SUMMARY}."
 PLAN_TAIL = " Describe the plan, or call submit_plan when it is ready."
-PLAN_TAIL_SUBAGENT = " Return the plan as your final reply."
+PLAN_TAIL_SUBAGENT = " Return the plan in your report (submit_report)."
+PLAN_TAIL_CONTINUED = " Return the plan as your final reply."  # A subagent chat the user continues: no parent waits.
 PLAN_DENIED = PLAN_HEAD + PLAN_TAIL
 PLAN_DENIED_SUBAGENT = PLAN_HEAD + PLAN_TAIL_SUBAGENT
 # The modes in which shell text is vetted (shell_vet); every other mode decides on it as before.
@@ -139,8 +141,9 @@ def _scoped(chat_rules, project_rules, user_rules):
 
 
 def evaluate(mode, name, arguments, *, chat_rules=(), project_rules=(), user_rules=(), resolve_path=None,
-             protected=None, disabled=(), subagent=False, credential_file=None, vet=None, secrets=None):
-    """The decision for one tool call. See the module docstring for the fixed order.
+             protected=None, disabled=(), subagent=False, credential_file=None, vet=None, secrets=None, reports=True):
+    """The decision for one tool call. See the module docstring for the fixed order. subagent: the call is a
+    subagent's, and reports: in a turn its parent delegated (Plan's refusal names submit_report then).
 
     vet(arguments, allow) -> (shell_vet.Plan or None, reason) checks shell text in Auto and Plan; allow(argv)
     is (rule, scope) for an argv or prefix allow rule matching one stage (None in Plan). secrets(arguments)
@@ -216,7 +219,8 @@ def evaluate(mode, name, arguments, *, chat_rules=(), project_rules=(), user_rul
     # (2) Plan mode: nothing outside its read-only set, whatever a rule says.
     if mode == "plan" and baseline == "deny":
         reason = f" This command was not checked as read-only: {vet_reason}." if vet_reason else ""
-        return Verdict("deny", "plan", PLAN_HEAD + reason + (PLAN_TAIL_SUBAGENT if subagent else PLAN_TAIL))
+        tail = (PLAN_TAIL_SUBAGENT if reports else PLAN_TAIL_CONTINUED) if subagent else PLAN_TAIL
+        return Verdict("deny", "plan", PLAN_HEAD + reason + tail)
     reason = None
     if kind == "edit" and protected is not None:
         reason = next(filter(None, (protected(arguments[key]) for key in EDIT_TOOL_PATHS.get(name, ())
@@ -298,10 +302,12 @@ PLAN_PROMPT = ("Plan mode: inspect files and describe a concrete plan with the p
                f"commands: {READ_ONLY_SUMMARY}.")
 
 
-def mode_prompt(mode: str, subagent: bool = False) -> str:
+def mode_prompt(mode: str, subagent: bool = False, reports: bool = True) -> str:
+    """The system message's mode text; subagent and reports as for evaluate."""
     if mode == "plan":
         if subagent:
-            return PLAN_PROMPT + " Use ask_user only when a decision blocks you. Return the finished plan as your final reply."
+            return PLAN_PROMPT + " Use ask_user only when a decision blocks you. Return the finished plan " + (
+                "with submit_report." if reports else "as your final reply.")
         return (PLAN_PROMPT + " Use ask_user for clarifying questions. When the plan is complete, call submit_plan with "
                 "the full plan: the user can approve it and switch modes, and you then implement it in this same turn. "
                 "Do not invent mode names.")

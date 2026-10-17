@@ -142,6 +142,7 @@ def register_portability(app, manager, settings, store, session_or_404):
 
     @app.post("/api/sessions/{session_id}/fork", status_code=201)
     async def fork(session_id: str, body: ForkRequest | None = None):
+        approvals.ensure_no_background(manager, session_or_404(session_id), "forking this conversation")
         if body is None:
             source = idle(session_id)
             completed_for_fork(source)
@@ -245,6 +246,7 @@ def register_portability(app, manager, settings, store, session_or_404):
             raise HTTPException(400, "Enter a message.")
         session = session_or_404(session_id)
         ensure_idle(manager, session, "rewinding this conversation")
+        approvals.ensure_no_background(manager, session, "rewinding this conversation")
         resend_uploads = upload_refs(body.resend_uploads)
         try:
             if body.conversation:

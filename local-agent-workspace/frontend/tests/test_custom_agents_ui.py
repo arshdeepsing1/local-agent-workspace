@@ -139,3 +139,28 @@ def test_settings_without_saved_defaults_show_explore_at_fast_and_send_nothing_u
     dialog.get_by_role("button", name="Save settings").click()
     expect(page.get_by_role("dialog")).to_have_count(0)
     assert "subagent_defaults" not in ui.bodies("/api/settings", "PUT")[0]
+
+
+def test_agent_types_show_what_an_agent_file_narrows_and_the_shipped_plan_agent(ui, page):
+    section = open_subagents(ui, page, """window.agentTypes = { ...agentTypes, errors: [], custom: [{ name: 'plan',
+      built_in: false, shipped: true, description: 'Plans a change without editing.', path: 'agents/plan.md',
+      profile: 'inherit', tools: null, model: null, effort: null, skills: [], max_steps: 12, notes: [],
+      instructions_chars: 900, disallowed_tools: ['write_file', 'edit_file'], permission_mode: 'plan', mcp_servers: [],
+      memory: 'none', initial_prompt_chars: 1200, background: true }] }""")
+    row = section.get_by_role("list", name="Agent types").get_by_role("listitem").nth(3)
+    expect(row.locator(".agent-type-limits")).to_have_text(
+        "Mode: Plan at most · Not: write_file, edit_file · MCP servers: none · Without project memory · "
+        "Initial prompt (1,200 characters) · Runs in the background")
+    expect(row.locator(".agent-type-file")).to_have_text("Shipped with the app: agents/plan.md")
+
+
+def test_settings_subagents_can_continue_a_chat_after_a_background_subagent(ui, page):
+    dialog = open_settings(ui, page)
+    group = dialog.get_by_role("group", name="Subagents", exact=True)
+    toggle = group.get_by_role("checkbox", name="Continue the chat when a background subagent finishes")
+    expect(toggle).not_to_be_checked()
+    expect(group.get_by_text(re.compile("Off by default: each such turn is a paid model request"))).to_be_visible()
+    toggle.click()
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    assert ui.bodies("/api/settings", "PUT")[0]["background_subagent_wake"] is True
