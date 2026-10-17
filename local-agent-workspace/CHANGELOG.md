@@ -16,7 +16,10 @@ Roadmap milestone M8 (agents, automation and delivery):
   **Open subagent**) and the chat's next model request names it once. Except in a scheduled run,
   where `background: true` (and an agent file's) is ignored: the run waits for its subagents, so
   its approval limit, token and time limits and history cover them and the next run waits too.
-  The approval card says "Runs in the foreground" and the call's result has a note.
+  The approval card says "Runs in the foreground" and the call's result has a note. A background
+  subagent's hook card (`subagent_start` or `subagent_stop`) that waits in the chat stays
+  answerable when a turn of the chat ends meanwhile, and the chat shows it waits for approval
+  until you answer it; Stop in the idle chat cancels the card.
 - The new `get_subagent_result` tool (offered once the chat started a background subagent)
   returns one subagent's status and result, or lists them, and can wait up to 300 seconds. Stop
   on the chat, **Stop subagent** on a card and deleting the chat stop background subagents. A
@@ -43,6 +46,8 @@ Roadmap milestone M8 (agents, automation and delivery):
   new content, another tool's arguments, or a card that warns (credential-looking or protected
   files, another subagent's change, a hook's ask; the parent's card names the warning) shows
   **Review in subagent** next to **Decline**. A question or a plan shows **Answer in subagent**.
+  A hook's change to the action is also a warning, so such a card shows **Review in subagent**
+  instead of **Allow**.
 - Two running subagents of one chat changing the same file: the second one's change shows an
   approval card naming the other subagent, in every mode (Don't ask refuses it). The files of a
   subagent whose run ended are free again, and the chat's own edits never ask. A command that
@@ -78,7 +83,8 @@ Roadmap milestone M8 (agents, automation and delivery):
   record a restart gives a cut-short turn counts the turn from its own message (a queued message
   sent into it mid-turn is part of it), with its model requests, tokens and estimated DBU, and
   its duration ends at the turn's last recorded step, not at the restart, so a scheduled run's
-  history no longer shows the time the app was down.
+  history no longer shows the time the app was down. A `/btw` side question asked while the turn
+  runs is not part of the turn's tokens, calls or DBU.
 - Token and time limits per turn: **Settings → Agent → Token limit per turn** and **Time limit
   per turn (minutes)** (0, the default, means none), and a chat's own in **Agent tools → Usage →
   Turn limits**. The token limit counts every token the turn processed, cache reads and its
@@ -90,13 +96,18 @@ Roadmap milestone M8 (agents, automation and delivery):
   result, and the token limit), and the subagent keeps its own turn's limits. Before, every
   later turn counted its whole spend again, so a turn limit could stop the chat at its first
   request. Forks (also **Fork from here**), exports and imports keep a chat's own turn limits,
-  as they keep its spending limit; a chat a script created keeps its own Agent steps too.
+  as they keep its spending limit; a chat a script created keeps its own Agent steps too. A
+  `/btw` side question asked while the turn runs does not count toward the turn's limits.
 - At a turn limit the agent gets one more request, which tells it to call no tools and to reply
   with what is done and what remains (a tool call in that reply does not run). That instruction
   travels like the other step notices: at the full prompt-caching level it ends the request's
   last message, otherwise the system message. Then the turn ends with a notice, desktop
   notifications say "Reached the turn budget", and **Continue** starts a new turn with a new
-  budget. Raising or removing the limit during that last request lets the turn go on as usual.
+  budget. Raising or removing the limit during that last request lets the turn go on as usual. A
+  subagent's last request asks for its report with `submit_report`, the one tool call that runs
+  then (any other call still does not run), so its parent gets the report with the budget error.
+  When that last request is also the turn's last Agent step and its reply still calls tools, the
+  turn ends with the budget notice, not the Agent steps one.
 - **Agent tools → Usage → All chats**: every conversation's model calls over the last 7, 30 or
   90 days, by day (cache reads, uncached input and output), endpoint, purpose and project, with
   the estimated DBU. It reads a small usage summary each conversation keeps in its file's first
@@ -389,7 +400,8 @@ Roadmap milestone M7 (endpoint-dependent model features):
   The parent's result carries it as `report` (redacted, bounded with the rest of the 6,000-byte
   result). The card's **Report** shows the summary, findings as `path:line` links that open the
   file, and next steps. A subagent that answers in prose still reports its reply, and in a
-  subagent chat you continue yourself the agent answers in its reply instead.
+  subagent chat you continue yourself the agent answers in its reply instead. In a subagent chat
+  you continue yourself, `submit_report` is not offered.
 - Endpoint profiles gain capability flags: `vision` (image input, documented for the
   Databricks-hosted Claude models and not for GPT OSS; attached images use it) and
   `structured_output` (not confirmed for any endpoint yet, so off). `POST /api/settings/limits`
@@ -522,7 +534,9 @@ Roadmap milestone M6 (MCP, hooks and web):
   (its `context` joins the preservation note; it cannot stop a compaction, and a `decision` is
   ignored and listed on its card), and `notification` runs for each of the app's own
   notifications (approval needed, finished, stopped with an error, a limit reached), also with a
-  page open, only when it may run without a card; its output is ignored.
+  page open, only when it may run without a card; its output is ignored. Stop during a manual
+  compaction's `before_compaction` hook shows its card cancelled, and the chat can be forked
+  again.
 - Hook `tools` lists take patterns with `*` and `?` (`mcp__github__*`, `*_file`) as well as
   exact names.
 - **Agent tools → Extensions**: **Run without asking (all projects)** under a saved hook saves

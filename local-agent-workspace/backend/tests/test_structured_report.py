@@ -106,6 +106,12 @@ async def test_submit_report_needs_a_delegated_turn_of_a_subagent(runtime):
     child.update(is_subagent=True, parent_session_id=parent["id"], turn_delegated=False)
     output = await manager.execute_tool(child, manager.session_tools(child), "submit_report", {"summary": "x"}, "s")
     assert "No parent chat waits for a report in this turn" in output
+    # A subagent chat the user continues is not offered it; its parent's delegated turn is.
+    names = lambda: {item["function"]["name"] for item in manager.offered_tools(child, [])[0]}  # noqa: E731
+    assert "submit_report" not in names()
+    child["turn_delegated"] = True
+    assert "submit_report" in names()
+    child["turn_delegated"] = False
     # Plan mode's texts name submit_report only while a parent waits for one.
     child["permission_mode"] = "plan"
     write = ("write_file", {"path": "b.txt", "content": "x"})

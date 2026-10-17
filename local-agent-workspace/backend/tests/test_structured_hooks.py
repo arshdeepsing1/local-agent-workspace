@@ -929,6 +929,30 @@ async def test_a_before_compaction_hook_cannot_block_a_compaction(rt, monkeypatc
     assert not [event for event in rt.session["events"][shown:] if event["type"] in ("notice", "error")]
 
 
+@pytest.mark.parametrize("mode", ["bypassPermissions", "manual"])
+async def test_stop_during_a_manual_compactions_hook_cancels_its_card(rt, monkeypatch, mode):
+    from local_agent.portability import completed_for_fork
+    compactable(rt)
+    rt.session.update(permission_mode=mode, terminal_reason="completed")
+    rt.manager.store.save(rt.session)
+    rt.manager.live.pop(rt.session["id"], None)
+    configure(rt, hook("slow", "before_compaction", "sleep 5; printf '{}'"))
+    summary_gateway(monkeypatch)
+    rt.manager.start_compaction(rt.session["id"])
+    # Bypass runs the hook (its card running); Manual first asks (its card pending).
+    waiting = "running" if mode == "bypassPermissions" else "pending"
+    for _ in range(500):
+        if any(event["state"] == waiting for event in cards(rt.manager.get(rt.session["id"]), "hook_before_compaction")):
+            break
+        await asyncio.sleep(0.01)
+    await rt.manager.stop(rt.session["id"])
+    saved = rt.manager.store.get(rt.session["id"])
+    assert [event["state"] for event in cards(saved, "hook_before_compaction")] == ["cancelled"]
+    assert saved["events"][-1]["text"].startswith("Context compaction stopped.")
+    assert rt.manager.statuses.get(rt.session["id"], "idle") == "idle" and not rt.manager.pending
+    completed_for_fork(saved)  # Forkable again, as before the compaction.
+
+
 async def test_prepare_context_runs_the_before_compaction_callback_once_when_it_compacts():
     from local_agent.context import prepare_context
     calls = []

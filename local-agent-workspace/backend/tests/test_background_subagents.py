@@ -314,6 +314,57 @@ async def test_answering_a_hook_card_of_an_idle_parent_keeps_a_turn_started_mean
     assert manager.statuses.get(parent["id"], "idle") == "idle"
 
 
+class HeldGateway(Gateway):
+    """A Gateway whose parent responses may be coroutines (a response that waits)."""
+
+    async def __call__(self, request):
+        response = await super().__call__(request)
+        return await response if asyncio.iscoroutine(response) else response
+
+
+@pytest.mark.parametrize("asked", ["while_idle", "during_the_turn"])
+async def test_a_turn_that_ends_while_a_hook_card_waits_leaves_that_card_waiting(runtime, monkeypatch, asked):
+    """The hook card of a background subagent waits in the parent while a turn of the parent ends (one the user
+    started while the card waited, or the turn that was running when it asked): the card stays answerable and
+    the chat says it waits, and its answer makes the chat idle."""
+    manager, parent, _ = runtime
+    parent["permission_mode"] = "acceptEdits"  # delegate_task runs without a card; the hook asks for one.
+    manager.store.save(parent)
+    manager.extensions.update_config({"hooks": [{"id": "review", "event": "subagent_stop", "enabled": True,
+                                                 "timeout_seconds": 10, "command": "true"}]})
+    gate, hold = asyncio.Event(), asyncio.Event()
+
+    async def held():  # The parent's second request waits until the card asks.
+        await hold.wait()
+        return reply("Going on.")
+    if asked == "while_idle":
+        HeldGateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)), lambda: reply("Going on."),
+                                  lambda: reply("Second answer.")], {"Survey": gated(gate)})
+        await run_turn(manager, parent)
+        gate.set()
+    else:
+        HeldGateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)), held],
+                    {"Survey": gated(gate)})
+        manager.start(parent["id"], "Delegate the work")
+        gate.set()
+    await eventually(lambda: any(key[0] == parent["id"] for key in manager.pending))  # The hook card waits.
+    key = next(key for key in manager.pending if key[0] == parent["id"])
+    if asked == "while_idle":
+        await manager.submit_message(parent["id"], "Another question")  # As the message route starts a turn.
+    hold.set()
+    await asyncio.wait_for(manager.tasks[parent["id"]], 10)
+    hook_card = next(event for event in manager.get(parent["id"])["events"] if event["id"] == key[1])
+    assert hook_card["state"] == "pending" and not manager.pending[key].done()
+    assert manager.statuses.get(parent["id"]) == "awaiting_approval"
+    manager.decide(parent["id"], key[1], True)
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+    await eventually(lambda: manager.statuses.get(parent["id"], "idle") == "idle")
+    saved = manager.store.get(parent["id"])
+    hook_card = next(event for event in saved["events"] if event["id"] == key[1])
+    assert (hook_card["state"], hook_card["approval"]) == ("completed", "approved")
+    assert card(saved, "a")["delegation_result"]["status"] == "completed"
+
+
 @pytest.mark.parametrize("wake", [True, False])
 async def test_the_wake_option_continues_an_idle_chat_exactly_once(runtime, monkeypatch, wake):
     manager, parent, _ = runtime
@@ -517,3 +568,24 @@ async def test_stop_ends_a_background_subagent_still_waiting_for_its_start_hook_
     assert card(saved, "a")["delegation"]["terminal_reason"] == "stopped"
     assert [event["state"] for event in saved["events"] if event.get("name") == "hook_subagent_start"] == ["cancelled"]
     assert manager.delegates.held_session(parent["id"]) is None
+
+
+async def test_stop_in_an_idle_parent_cancels_the_start_hook_card_of_its_queued_subagent(runtime, monkeypatch):
+    manager, parent, _ = runtime
+    parent["permission_mode"] = "acceptEdits"  # delegate_task runs without a card; the hook asks for one.
+    manager.store.save(parent)
+    manager.extensions.update_config({"hooks": [{"id": "brief", "event": "subagent_start", "enabled": True,
+                                                 "timeout_seconds": 10, "command": "true"}]})
+    full = full_slots(monkeypatch)
+    Gateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)), lambda: reply("Going on.")],
+            {"Survey": forever})
+    await run_turn(manager, parent)  # Queued: the turn ends while it waits for a slot.
+    full["value"] = False
+    manager.delegates._wake()
+    await eventually(lambda: any(key[0] == parent["id"] for key in manager.pending))  # Its start hook asks.
+    assert manager.statuses.get(parent["id"]) == "awaiting_approval"
+    await asyncio.wait_for(manager.stop(parent["id"]), 5)
+    assert manager.delegates.background_running(parent["id"]) == 0 and not manager.pending
+    saved = manager.store.get(parent["id"])
+    assert [event["state"] for event in saved["events"] if event.get("name") == "hook_subagent_start"] == ["cancelled"]
+    assert manager.statuses.get(parent["id"], "idle") == "idle"

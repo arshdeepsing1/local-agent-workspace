@@ -17,6 +17,8 @@ from local_agent.store import Store
 from local_agent.telemetry import reported_tokens
 from local_agent.transcript import turn_summary_text
 
+from test_parallel_subagents import eventually
+
 OPUS = "databricks-claude-opus-5-5"
 REAL_CLIENT = httpx.AsyncClient
 # 10,000 input and 1,000 output tokens per response: 11,000 tokens and 0.857144 DBU on Opus 5.5.
@@ -376,14 +378,6 @@ def gated_gateway(monkeypatch, parent, child):
     return requests, children
 
 
-async def eventually(condition, timeout=5):
-    for _ in range(int(timeout * 100)):
-        if condition():
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError("condition not reached")
-
-
 def completed_calls(manager, child_id):
     child = manager.get(child_id) or {}
     return sum(call.get("status") == "completed" for call in child.get("inference_calls") or [])
@@ -469,6 +463,85 @@ async def test_a_background_subagent_that_ends_during_a_later_turn_counts_its_re
     two = second["last_turn_result"]
     assert two["subagents"] == {"count": 1, "tokens": 22_000, "estimated_dbu": pytest.approx(2 * PER_CALL)}
     assert two["tokens"] == 44_000
+
+
+async def test_a_subagents_wrap_up_runs_only_its_report_which_reaches_the_parent(runtime, monkeypatch):
+    manager, session = runtime
+    session["turn_token_limit"] = 30_000
+    summary = "Mapped the parser: three modules; the tokenizer remains."
+    parent_replies = [calls_reply(delegation()), text_reply("The subagent reported at the budget.")]
+
+    def child(children):
+        if len(children) < 3:
+            return calls_reply((f"x{len(children)}", "list_tasks", {}))
+        # The wrap-up request: another call (refused) and the report (the one call that runs).
+        return calls_reply(("x3", "list_tasks", {}), ("r1", "submit_report", {"summary": summary}))
+    requests, children = scripted(monkeypatch, lambda requests: parent_replies[min(len(requests), 2) - 1], child)
+    manager.store.save(session)
+    session = await started_turn(manager, session, "Delegate")
+    # Its wrap-up request still offers submit_report and says to send the report with it.
+    assert len(children) == 3 and "submit_report" in {tool["function"]["name"] for tool in children[2]["tools"]}
+    assert "Call no tool except submit_report" in system_text(children[2])
+    assert "Do not call any tools" not in system_text(children[2])
+    child_session = manager.store.get(session["subagents"][0]["id"])
+    tools = [event for event in child_session["events"] if event["type"] == "tool"]
+    assert [(event["name"], event["state"]) for event in tools][-2:] == [("list_tasks", "rejected"),
+                                                                        ("submit_report", "completed")]
+    assert tools[-2]["output"] == turns.WRAP_UP_REFUSAL
+    # The report ends the child's turn at the budget: no request follows it, and the parent gets both.
+    assert child_session["terminal_reason"] == "budget_limit"
+    delegated = next(event for event in session["events"] if event.get("name") == "delegate_task")
+    result = json.loads(delegated["output"])
+    assert result["report"] == {"summary": summary}
+    assert (result["status"], result["terminal_reason"]) == ("failed", "budget_limit")
+    assert result["output"].startswith("Errors:\nIts parent conversation's turn has used")
+    assert "No final assistant reply" not in result["output"]
+    assert manager.budget_wrapups == set()
+
+
+async def test_a_wrap_up_on_the_last_agent_step_ends_the_turn_at_the_budget(runtime, monkeypatch):
+    manager, session = runtime
+    manager.settings.values["max_agent_steps"] = 3
+    session["turn_token_limit"] = 20_000  # 22,000 after two responses: the third and last request is the wrap-up.
+    requests, _ = scripted(monkeypatch, lambda requests: calls_reply((f"c{len(requests)}", "list_tasks", {})))
+    await manager.run(session, "Work")
+    assert len(requests) == 3 and "Do not call any tools" in system_text(requests[2])
+    assert [event["state"] for event in session["events"] if event["type"] == "tool"][-1] == "rejected"
+    stop = notices(session)[-1]
+    assert stop["terminal_reason"] == "budget_limit" == session["last_turn_result"]["terminal_reason"]
+    assert stop["text"].startswith("This turn has used about 33,000 of its 20,000-token limit per turn. The agent "
+                                   "wrapped up instead of continuing.")
+    assert not any("Increase Agent steps" in event["text"] for event in notices(session))
+
+
+async def test_a_side_question_during_a_turn_counts_toward_neither_its_limit_nor_its_result(runtime, monkeypatch):
+    manager, session = runtime
+    session["turn_token_limit"] = 30_000  # The turn's own two requests use 22,000; the side question 25,100.
+    manager.store.save(session)
+    hold, agent = asyncio.Event(), []
+
+    async def gateway(request):
+        body = json.loads(request.content)
+        if body.get("stream") is not True:  # The side question.
+            return httpx.Response(200, json={"choices": [{"message": {"content": "Side answer."}, "finish_reason": "stop"}],
+                                             "usage": {"prompt_tokens": 25_000, "completion_tokens": 100}})
+        agent.append(body)
+        if len(agent) == 1:
+            await hold.wait()
+            return httpx.Response(200, text=calls_reply(("c1", "list_tasks", {})))
+        return httpx.Response(200, text=text_reply("Done."))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: REAL_CLIENT(**kwargs, transport=httpx.MockTransport(gateway)))
+    manager.start(session["id"], "Work")
+    await eventually(lambda: agent)  # The side question is asked while the turn's first request runs.
+    assert (await manager.side_question(session["id"], "What is this about?"))["answer"] == "Side answer."
+    hold.set()
+    await manager.tasks[session["id"]]
+    saved = manager.store.get(session["id"])
+    assert [call["purpose"] for call in saved["inference_calls"]] == ["agent", "side_question", "agent"]
+    assert len(agent) == 2 and "Do not call any tools" not in system_text(agent[1])  # No wrap-up request.
+    result = saved["last_turn_result"]
+    assert (result["terminal_reason"], result["tokens"], result["usage"]["calls"]) == ("completed", 22_000, 2)
+    assert result["estimated_dbu"] == pytest.approx(2 * PER_CALL)
 
 
 async def test_a_change_during_the_turn_applies_from_the_next_request(runtime, monkeypatch):

@@ -1305,7 +1305,8 @@ Databricks responses may omit usage.
 **Turn summary.** Under the last reply of each turn a muted line sums the turn up, for example
 `8 steps · 14 tools · 2 min 10 s · 182k in (160k cached) / 3.1k out · ~1.4 DBU`: the agent's model
 requests (steps), its tool calls, the wall-clock time, the input (cache included, with the cache
-reads in brackets) and output tokens of the turn's own calls (title and compaction included), the
+reads in brackets) and output tokens of the turn's own calls (title and compaction included, not a
+`/btw` side question asked while it ran), the
 estimated DBU with its subagents', and how many subagents it started. A count no call reported
 shows `—`, never 0, and there is no DBU part without price data. Open it for how the turn ended,
 the tokens it processed with its subagents, calls without price data and the files its tools and
@@ -1465,17 +1466,20 @@ time limit is the wall-clock time since the turn started, waits for your approva
 
 Both are checked before each agent model request. Once one is reached, the agent gets one more
 request, told to call no tools and to reply with what is done, what remains and how to continue (a
-tool call in that reply does not run). Then the turn ends with a notice, the chat offers
-**Continue** (which starts a new turn with a new budget), and desktop notifications say "Reached
-the turn budget". Verify and stop hooks do not continue the turn past it, and messages queued
-while it ran stay queued. If you raise or remove the limit while that last request runs, the turn
+tool call in that reply does not run). Then the turn ends with a notice (also when that request was
+its last Agent step), the chat offers **Continue** (which starts a new turn with a new budget), and
+desktop notifications say "Reached the turn budget". Verify and stop hooks do not continue the turn
+past it, and messages queued while it ran stay queued. If you raise or remove the limit while that last request runs, the turn
 goes on as usual from the next request (only that request's tool calls stay unrun). A subagent counts toward its parent's turn: its tokens add to the
 parent's and the parent's start time applies; a subagent that reaches the limit wraps up the same
-way and reports the stop as an error to its parent. A background subagent's requests count in the turn during
-which they were made, never again in a later one: while it still works after its turn ended, your next
-message's turn counts only the requests it makes from then on, and it keeps its own turn's limits (the
-requests it made before count toward them). The check runs between requests, so one
-response can pass the limit; title and compaction requests count but are never stopped.
+way and reports the stop as an error to its parent. Its last request asks for its report with
+`submit_report`, the one tool call that runs then, so its parent gets that report with the error. A
+background subagent's requests count in the turn during which they were made, never again in a later
+one: while it still works after its turn ended, your next message's turn counts only the requests it
+makes from then on, and it keeps its own turn's limits (the requests it made before count toward
+them). The check runs between requests, so one response can pass the limit; title and compaction
+requests count but are never stopped, and a `/btw` side question asked while the turn runs does not
+count.
 
 ### Reasoning effort and thinking
 
@@ -2885,7 +2889,7 @@ prompt asks it to end with `submit_report`, a tool only subagents get: a structu
 The tool checks the report against its schema, so an incomplete one is an error the model fixes and
 sends again (once a later report is accepted, the refused one does not count as a failure of the run), and a valid one ends the subagent's turn without another model request. A subagent that
 answers in plain text instead still reports that reply, as before. In a subagent chat you continue
-yourself, `submit_report` is refused: answer there in the reply.
+yourself, `submit_report` is not offered (and refused if called): the agent answers there in its reply.
 
 Several `delegate_task` calls next to each other in one model response run in parallel.
 Their approval cards (Manual and Plan ask) come one at a time, in call order, and none of
@@ -2927,8 +2931,8 @@ subagents go on). While it waits for your approval, the card names what it waits
 subagent like its own buttons (to edit the action first or allow it for the chat, open the
 subagent). **Allow** is there only when that line is the whole action: a one-line command (with its folder), or
 a move or delete. A command with more lines, a file's new content, another tool's arguments, or a card that
-warns (a credential-looking file, a protected file, another subagent's change to the file, a hook's ask; the
-card names the warning) shows **Review in subagent** instead, next to **Decline**. A question or a plan shows **Answer in subagent**. Stop on the parent stops all its
+warns (a credential-looking file, a protected file, another subagent's change to the file, a hook's ask, a
+hook's change to the action; the card names the warning) shows **Review in subagent** instead, next to **Decline**. A question or a plan shows **Answer in subagent**. Stop on the parent stops all its
 subagents, also those still waiting for a slot and those in the background. The child's first prompt is labeled
 **Delegated by parent conversation** and retains the spawning action ID; later human
 messages are not labeled delegated. A subagent chat is named by its task until it gets a
@@ -2967,7 +2971,9 @@ and says so in the chat. While background subagents run, rewinding (also editing
 message) and forking the chat are refused with a message naming how many run, because their
 progress and results still go to it. The chat's spending limit counts them while they run. A chat
 with background subagents running stays in memory while it is idle, so their reports, hooks and
-your next message all change the same copy.
+your next message all change the same copy. A background subagent's hook card (`subagent_start` or
+`subagent_stop`) that waits in the chat outlasts a turn of the chat that ends meanwhile: it stays
+answerable, and the chat shows it waits for approval until you answer it.
 
 **Linked transcripts.** Every subagent is a conversation of its own:
 `conversations/<id>.jsonl` in the state folder, like any chat. Its header (the first line)
