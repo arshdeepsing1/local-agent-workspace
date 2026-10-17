@@ -216,6 +216,53 @@ def _tool(event, excerpt_chars):
     return line
 
 
+def _tokens(value):
+    """'182k', '3.1k', '950' or '—' for a count no call reported."""
+    if type(value) is not int:
+        return "—"
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 10_000:
+        return f"{round(value / 1000)}k"
+    return f"{value / 1000:.1f}k" if value >= 1000 else str(value)
+
+
+def _duration(seconds):
+    seconds = int(round(seconds)) if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) else 0
+    if seconds < 60:
+        return f"{seconds} s"
+    if seconds < 3600:
+        return f"{seconds // 60} min {seconds % 60} s" if seconds % 60 else f"{seconds // 60} min"
+    return f"{seconds // 3600} h {seconds % 3600 // 60} min" if seconds % 3600 // 60 else f"{seconds // 3600} h"
+
+
+def turn_summary_text(result):
+    """One line for a turn's result record (turns.turn_result), as the footer under its last reply shows it:
+    '8 steps · 14 tools · 2 min 10 s · 182k in (160k cached) / 3.1k out · ~1.4 DBU'. A token count no call
+    reported is '—'; no DBU without price data."""
+    if not isinstance(result, dict):
+        return ""
+    def count(value, word):
+        value = value if type(value) is int else 0
+        return f"{value:,} {word}{'' if value == 1 else 's'}"
+    usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+    uncached = usage.get("input_tokens")
+    total_in = None if type(uncached) is not int else uncached + sum(
+        usage.get(key) or 0 for key in ("cache_read_input_tokens", "cache_creation_input_tokens"))
+    cached = usage.get("cache_read_input_tokens")
+    tokens = f"{_tokens(total_in)} in" + (f" ({_tokens(cached)} cached)" if type(cached) is int and cached else "") \
+        + f" / {_tokens(usage.get('output_tokens'))} out"
+    parts = [count(result.get("steps"), "step"), count(result.get("tool_calls"), "tool"), _duration(result.get("duration_s")),
+             tokens]
+    dbu = result.get("estimated_dbu")
+    if isinstance(dbu, (int, float)) and not isinstance(dbu, bool):
+        parts.append(f"~{dbu:,.1f} DBU" if dbu >= 1 else f"~{dbu:.3f} DBU")
+    agents = (result.get("subagents") or {}).get("count") if isinstance(result.get("subagents"), dict) else 0
+    if type(agents) is int and agents:
+        parts.append(count(agents, "subagent"))
+    return " · ".join(parts)
+
+
 def transcript_file_stem(session, *, redact=lambda text: text):
     """<date>-<title>-<id>, the name the transcript script and the app's export give a transcript.
     The title is redacted like the transcript itself, so a secret becomes "-redacted-"."""
@@ -247,7 +294,7 @@ def transcript(session, *, excerpt_chars=EXCERPT_CHARS, redact=lambda text: text
              "answers, plans are shown in full with how they were reviewed, review findings are shown in full, and "
              "command output is "
              f"shortened to {excerpt_chars:,} characters.", ""]
-    tools, turn = [], 0
+    tools, turn, summary = [], 0, ""
     for event in events:
         kind = event.get("type")
         if kind == "tool":
@@ -257,6 +304,11 @@ def transcript(session, *, excerpt_chars=EXCERPT_CHARS, redact=lambda text: text
             lines += [*tools, ""]
             tools = []
         text = str(event.get("text") or "").strip()
+        if kind == "user" and summary:
+            lines += [f"_Turn: {summary}_", ""]  # The previous turn's result, after its last tool call.
+            summary = ""
+        if kind == "assistant" and isinstance(event.get("turn_result"), dict):
+            summary = turn_summary_text(event["turn_result"])
         if kind == "user":
             turn += 1
             delegated = (event.get("origin") or {}).get("kind") == "delegated"
@@ -269,4 +321,5 @@ def transcript(session, *, excerpt_chars=EXCERPT_CHARS, redact=lambda text: text
         elif kind in ("notice", "error") and text:
             lines += [f"> **{kind.title()}:** " + text.replace("\n", "\n> "), ""]
     lines += [*tools, ""] if tools else []
+    lines += [f"_Turn: {summary}_", ""] if summary else []
     return redact(redact_secrets("\n".join(lines).rstrip() + "\n"))

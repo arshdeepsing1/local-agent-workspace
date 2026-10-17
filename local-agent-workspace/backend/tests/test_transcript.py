@@ -142,3 +142,24 @@ def test_outline_and_overview_lines():
     text = transcript({"id": "c1", "title": "Outline", "events": events})
     assert "- Outlined `docs/h.md` to level 2\n" in text and "- Project overview of `.`\n" in text
     assert "- Outlined `a.py`\n" in text
+
+
+def test_each_turn_ends_with_its_result_line():
+    from local_agent.transcript import turn_summary_text
+    result = {"terminal_reason": "completed", "steps": 8, "tool_calls": 14, "duration_s": 130.4, "estimated_dbu": 1.42,
+              "usage": {"calls": 9, "input_tokens": 22_000, "cache_read_input_tokens": 160_000, "cache_creation_input_tokens": 0,
+                        "output_tokens": 3_100, "reasoning_tokens": None},
+              "subagents": {"count": 2}}
+    assert turn_summary_text(result) == "8 steps · 14 tools · 2 min 10 s · 182k in (160k cached) / 3.1k out · ~1.4 DBU · 2 subagents"
+    # A count no call reported is '—', never 0; no DBU part without price data.
+    unreported = {"steps": 1, "tool_calls": 0, "duration_s": 4, "estimated_dbu": None, "usage": {"input_tokens": None,
+                                                                                                   "output_tokens": 12}}
+    assert turn_summary_text(unreported) == "1 step · 0 tools · 4 s · — in / 12 out"
+    assert turn_summary_text(None) == ""
+    session = recorded()
+    session["events"][5]["turn_result"] = result  # a2, the first turn's last reply.
+    session["events"].append({"id": "a3", "type": "assistant", "text": "Reviewed.", "turn_result": unreported})
+    text = transcript({"id": "c0ffee00-1111", **session})
+    first, rest = text.split("_Turn: 8 steps", 1)
+    assert "The pod IP changed" in first and "Review it" in rest and "Review it" not in first
+    assert text.rstrip().endswith("_Turn: 1 step · 0 tools · 4 s · — in / 12 out_")

@@ -271,7 +271,8 @@ def plan(model, probes=None):
             tokens = input_tokens(model, sent, request_id, prior)
             cost = None
             if rates is not None:
-                input_rate = rates["cache_creation_input_tokens"] if request_id in CACHE_REQUESTS else rates["input_tokens"]
+                input_rate = (rates.get("cache_creation_input_tokens", rates["input_tokens"]) if request_id in CACHE_REQUESTS
+                              else rates["input_tokens"])
                 cost = round((tokens * input_rate + sent["max_tokens"] * rates["output_tokens"]) / 1_000_000, 6)
             entry = {"id": request_id, "label": label, "estimated_input_tokens": tokens, "max_tokens": sent["max_tokens"],
                      "estimated_dbu": cost}

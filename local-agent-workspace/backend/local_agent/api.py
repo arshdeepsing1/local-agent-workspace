@@ -2,6 +2,7 @@ import asyncio
 import mimetypes
 import os
 import secrets
+import sqlite3
 import sys
 import time
 import unicodedata
@@ -20,6 +21,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .agents import AgentManager, public_session
 from .config import APP_ROOT, ENDPOINT_NAME, MAX_APPROVAL_MINUTES, MAX_MAX_AGENT_STEPS, MIN_MAX_AGENT_STEPS, Settings
 from .config import MAX_COMMAND_ENV, MAX_USER_INSTRUCTIONS, MAX_WRITE_LIMIT_KB, MIN_WRITE_LIMIT_KB
+from .config import MAX_TURN_MINUTES, MAX_TURN_TOKENS
 from .context import (
     MAX_CONTEXT_WINDOW, MAX_MAX_OUTPUT_TOKENS, MIN_CONTEXT_WINDOW, MIN_MAX_OUTPUT_TOKENS, SAFETY_MARGIN,
     effective_input_budget, model_context_window,
@@ -36,8 +38,9 @@ from .jobs import NOT_STOPPED, TIMEOUT_NOT_STOPPED
 from .tools import WorkspaceTools, file_error
 from .workspace_folders import register_workspace_folders
 from .permissions import PermissionMode
-from .telemetry import session_metrics
-from . import spending
+from .telemetry import SUMMARY_VERSION, session_metrics, usage_summary
+from .usage_overview import MAX_DAYS, overview
+from . import spending, turns
 from .spending import MAX_LIMIT_DBU
 from .activity import redact_secrets
 from .usage_export import usage_csv, usage_rows
@@ -49,7 +52,11 @@ from .composer_api import register_composer
 from .interactions import register_interactions
 from .projects import register_projects
 from .endpoint_checks_api import register_endpoint_checks
+from .stream_api import register_stream, stream_snapshot
+from .user_paths import checked_workspace
 
+
+USAGE_SCAN = 50  # Chats without a usage summary loaded per GET /api/usage (each once: its summary is saved).
 
 # Browsers refuse ES modules served with a non-JavaScript type, and some systems
 # map .js to text/plain in their mimetypes registry.
@@ -91,6 +98,10 @@ class SessionPermissions(BaseModel):
     permission_mode: PermissionMode = "manual"
     reasoning_effort: Effort | None = None  # A new chat's effort; Settings' default when absent.
     model: str | None = Field(default=None, min_length=1, max_length=256, strict=True)  # /clear: the old chat's model.
+    # Scripts (client.py): the chat's project folder, checked like Settings' (the Settings workspace when absent),
+    # and its own Agent steps per message (Settings' when absent).
+    workspace: str | None = Field(default=None, min_length=1, max_length=4096, strict=True)
+    max_agent_steps: int | None = Field(default=None, ge=MIN_MAX_AGENT_STEPS, le=MAX_MAX_AGENT_STEPS, strict=True)
 
 
 class SessionEffort(BaseModel):
@@ -102,6 +113,14 @@ class SessionSpendingLimit(BaseModel):
     """The chat's own limit in DBU (0 = none), or null to follow the Settings default."""
     model_config = {"extra": "forbid"}
     spending_limit_dbu: float | None = Field(ge=0, le=MAX_LIMIT_DBU, allow_inf_nan=False, strict=True)
+
+
+class SessionTurnLimits(BaseModel):
+    """The chat's own turn limits (whole tokens or minutes, 0 = none), or null to follow the Settings default.
+    A field left out keeps its value."""
+    model_config = {"extra": "forbid"}
+    turn_token_limit: int | None = Field(default=None, ge=0, le=MAX_TURN_TOKENS, strict=True)
+    turn_time_limit_minutes: int | None = Field(default=None, ge=0, le=MAX_TURN_MINUTES, strict=True)
 
 
 class ReasoningQuery(BaseModel):
@@ -189,6 +208,8 @@ class SettingsEdit(BaseModel):
     prompt_caching: Literal["auto", "messages", "off"] | None = None  # config.PROMPT_CACHING
     slash_commands: bool | None = Field(default=None, strict=True)
     spending_limit_dbu: float | None = Field(default=None, ge=0, le=MAX_LIMIT_DBU, allow_inf_nan=False, strict=True)
+    turn_token_limit: int | None = Field(default=None, ge=0, le=MAX_TURN_TOKENS, strict=True)  # turns.py; 0 = none
+    turn_time_limit_minutes: int | None = Field(default=None, ge=0, le=MAX_TURN_MINUTES, strict=True)
     coding_dir: str | None = Field(default=None, max_length=4096, strict=True)
     python_venv: str | None = Field(default=None, max_length=4096, strict=True)
     # Settings → Subagents: {explore|general|editor: {model, effort}}; config.subagent_defaults checks it.
@@ -496,23 +517,29 @@ def create_app(settings=None):
     async def list_sessions():
         counts = manager.changes.counts()
         # A parent's subagents index (up to 200 entries) is left out: the list is fetched often while
-        # subagents work, and /sessions/<id>/children lists them. So is the last turn's MCP server status
-        # (errors and stderr tails), which the open chat has.
-        return [{**{k: v for k, v in s.items() if k not in ("subagents", "mcp_status")},
+        # subagents work, and /sessions/<id>/children lists them. So are the last turn's MCP server status
+        # (errors and stderr tails), which the open chat has, its result record (/info has it) and the usage
+        # summary (GET /api/usage).
+        return [{**{k: v for k, v in s.items() if k not in ("subagents", "mcp_status", "usage_summary", "last_turn_result")},
                  "status": manager.statuses.get(s["id"], "idle"),
                  "unreviewed_changes": counts.get(s["id"], 0)}
                 for s in store.list()]
 
     @app.post("/api/sessions")
     async def create_session(body: SessionPermissions | None = None):
-        manager.workspace_available(settings.values["workspace"])
+        workspace = settings.values["workspace"]
+        if body and body.workspace is not None:
+            workspace = str(checked_workspace(body.workspace, settings))
+        manager.workspace_available(workspace)
         model = body.model.strip() if body and body.model else ""
         if body and body.model and not model:
             raise ValueError("Enter a model endpoint name.")
-        session = store.create(settings.values)
+        session = store.create({**settings.values, "workspace": workspace})
         session["permission_mode"] = body.permission_mode if body else "manual"
         if body and body.reasoning_effort:
             session["reasoning_effort"] = body.reasoning_effort
+        if body and body.max_agent_steps is not None:
+            session["max_agent_steps"] = body.max_agent_steps
         if model:
             session["model"] = model
         store.save(session)
@@ -556,6 +583,17 @@ def create_app(settings=None):
         from .approvals import busy_status
         session = session_or_404(session_id)
         await manager.change_spending_limit(session, body.spending_limit_dbu)
+        return public_session(session, busy_status(manager, session_id))
+
+    @app.put("/api/sessions/{session_id}/turn-limits")
+    async def change_turn_limits(session_id: str, body: SessionTurnLimits):
+        # Allowed while a turn runs: the agent's next model request checks them (and a running subagent's).
+        from .approvals import busy_status
+        session = session_or_404(session_id)
+        changes = {key: getattr(body, key) for key in body.model_fields_set}
+        if not changes:
+            raise HTTPException(400, "Send turn_token_limit or turn_time_limit_minutes.")
+        await manager.change_turn_limits(session, changes)
         return public_session(session, busy_status(manager, session_id))
 
     @app.put("/api/sessions/{session_id}/title")
@@ -662,7 +700,40 @@ def create_app(settings=None):
     @app.get("/api/sessions/{session_id}/metrics")
     async def get_session_metrics(session_id: str):
         session = session_or_404(session_id)
-        return {**session_metrics(session), "spending": spending.status(manager, session)}
+        return {**session_metrics(session), "spending": spending.status(manager, session),
+                "turn_limits": turns.status(manager, session)}
+
+    @app.get("/api/usage")
+    async def usage_across_chats(days: int = Query(default=30, ge=1, le=MAX_DAYS)):
+        """Every chat's model calls in the last `days` local days (Agent tools → Usage → All chats), from the usage
+        summaries in their headers. A chat saved before summaries existed is loaded once and its summary saved, at
+        most USAGE_SCAN of them per request; pending_chats counts those left for the next one."""
+        chats, scanned, pending = [], 0, 0
+        for header in store.list():
+            if header["id"] in deleting_sessions:
+                continue
+            if header["id"] in manager.live:  # A running turn: its ledger is newer than its header.
+                chats.append((header, usage_summary(manager.live[header["id"]])))
+                continue
+            summary = header.get("usage_summary")
+            if not isinstance(summary, dict) or summary.get("version") != SUMMARY_VERSION:
+                if scanned >= USAGE_SCAN:
+                    pending += 1
+                    continue
+                scanned += 1
+                try:
+                    full = store.get(header["id"])
+                except (ValueError, OSError):
+                    continue  # Unreadable: reported by the store, not counted.
+                if not full:
+                    continue
+                summary = full["usage_summary"] = usage_summary(full)
+                try:
+                    store.save(full, touch=False)
+                except (OSError, sqlite3.Error):
+                    pass  # Counted now and computed again next time.
+            chats.append((header, summary))
+        return {**overview(chats, days), "pending_chats": pending}
 
     @app.get("/api/sessions/{session_id}/usage.csv")
     async def export_session_usage(session_id: str):
@@ -776,13 +847,7 @@ def create_app(settings=None):
         try:
             # The first snapshot carries the latest 200 events, extended to the whole latest turn
             # (at most 1,000); the page loads earlier ones from /events. Later snapshots are complete.
-            snapshot = public_session(session, manager.statuses.get(session_id, "idle"), manager.compaction_view(session_id))
-            events, total = snapshot["events"], len(snapshot["events"])
-            start = max(0, total - 200)
-            latest_user = next((index for index in range(total - 1, -1, -1) if events[index].get("type") == "user"), None)
-            if latest_user is not None and latest_user < start:
-                start = max(latest_user, total - 1000)
-            snapshot.update(events=events[start:], events_start=start, events_total=total)
+            snapshot = stream_snapshot(session, manager.statuses.get(session_id, "idle"), manager.compaction_view(session_id))
             await socket.send_json({"type": "snapshot", "session": snapshot})
             await manager.publish_changes(session)
             try:
@@ -1043,6 +1108,7 @@ def create_app(settings=None):
     register_interactions(app, manager, session_or_404)
     register_projects(app, manager, settings, workspace_tools)
     register_endpoint_checks(app, manager, settings)
+    register_stream(app, manager, session_or_404)
     workspace_folders = register_workspace_folders(app, settings, session_or_404)
 
     # The browser loads the frontend source files directly; there is no build step.

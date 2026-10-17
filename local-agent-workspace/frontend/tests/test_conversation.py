@@ -787,3 +787,33 @@ def test_a_question_or_plan_that_starts_waiting_comes_into_view(ui, page):
     answered = {**question, "state": "completed", "question_outcome": "skipped"}
     ui.rerender(props.format(json.dumps(history + [answered, plan])))
     expect(page.locator(".plan-card.needs-answer")).to_be_in_viewport()
+
+
+def test_a_turns_last_reply_shows_its_result_summary(ui, page):
+    result = """{ terminal_reason: 'budget_limit', is_error: false, started: 1, ended: 131.4, duration_s: 130.4, steps: 8, tool_calls: 14,
+      usage: { calls: 9, input_tokens: 22000, output_tokens: 3100, cache_read_input_tokens: 160000, cache_creation_input_tokens: 0,
+        reasoning_tokens: null },
+      tokens: 191000, estimated_dbu: 1.42, unpriced_calls: 1, subagents: { count: 2, tokens: 6000, estimated_dbu: 0.2 },
+      changed_files: ['src/app.py', 'README.md'], changed_files_total: 5 }"""
+    unreported = """{ terminal_reason: 'completed', steps: 1, tool_calls: 0, duration_s: 4, estimated_dbu: null, unpriced_calls: 0,
+      usage: { calls: 1, input_tokens: null, output_tokens: 12, cache_read_input_tokens: null }, subagents: { count: 0 }, changed_files: [] }"""
+    show(ui, f"""[{{ id: 'u1', type: 'user', text: 'Work' }},
+      {{ id: 'a1', type: 'assistant', text: 'Working.', request_info: {{ model: 'm', status: 'completed' }} }},
+      {{ id: 'a2', type: 'assistant', text: 'Summary: done and remaining.', request_info: {{ model: 'm', status: 'completed' }},
+        turn_result: {result} }},
+      {{ id: 'u2', type: 'user', text: 'Again' }},
+      {{ id: 'a3', type: 'assistant', text: 'Hi.', request_info: {{ model: 'm', status: 'completed' }}, turn_result: {unreported} }},
+      {{ id: 'a4', type: 'assistant', text: 'Still streaming', request_info: {{ model: 'm', status: 'running' }},
+        turn_result: {unreported} }}]""")
+    footers = page.locator(".turn-summary")
+    expect(footers).to_have_count(2)  # Only replies with a result, and none while one streams.
+    first = footers.first
+    expect(first.locator("summary")).to_have_text(
+        "Turn summary: 8 steps · 14 tools · 2 min 10 s · 182k in (160k cached) / 3.1k out · ~1.4 DBU · 2 subagents")
+    expect(first.locator("p")).to_be_hidden()
+    first.locator("summary").click()
+    expect(first.locator("p")).to_have_text(
+        "This turn reached the turn's token or time limit. 191,000 tokens processed, its subagents included. "
+        "1 call without price data not in the DBU estimate. Changed: src/app.py, README.md and 3 more.")
+    # A count no call reported shows '—', never 0; no DBU part without price data.
+    expect(footers.nth(1).locator("summary")).to_have_text("Turn summary: 1 step · 0 tools · 4 s · — in / 12 out")

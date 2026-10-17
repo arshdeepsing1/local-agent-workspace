@@ -65,7 +65,8 @@ from . import web_fetch
 from . import prompt_cache, reasoning, reasoning_replay
 from .reasoning import reasoning_delta, reasoning_shape
 from .endpoint_probes import CheckStore
-from . import spending
+from . import spending, turns
+from .telemetry import usage_summary
 from .titles import fallback_title, generate_title, needs_title
 from .telemetry import (
     InferenceError, begin_inference_call, call_estimated_dbu, finish_inference_call, http_error_kind,
@@ -803,6 +804,7 @@ def delegated_prompt(session):
 
 # The wire's answer to a prompt the spending limit stopped before any model request (spending_stop).
 SPENDING_STOP_REPLY = "[No reply: the spending limit stopped this turn before a model request.]"
+BUDGET_STOP_REPLY = "[No reply: the turn's token or time limit stopped it before a model request.]"
 
 
 def public_queue(queue):
@@ -818,7 +820,8 @@ def public_session(session, status="idle", compaction=None):
     return {"permission_mode": "manual", "allowed_directories": [], "allow_rules": [], "disabled_tools": [],
             **{k: v for k, v in session.items()
                if k not in ("wire", "context_state", "instruction_directories", "instruction_paths", "inference_calls",
-                            "command_jobs", "file_views", "turn_running", "jobs_reported_through", "pending_context")},
+                            "command_jobs", "file_views", "turn_running", "jobs_reported_through", "pending_context",
+                            "usage_summary")},
             **({"pending_context": pending} if pending else {}),
             **({"queued_messages": public_queue(queue)} if isinstance(queue, list) else {}),
             **({"compaction_progress": compaction} if compaction else {}),
@@ -840,6 +843,10 @@ class AgentManager(LifecycleHooks):
         self.pending_checks = {}  # (session id, event id) -> recheck(change) of a waiting card
         self.card_revisers = {}  # (session id, event id) -> async reviser(changes) for Edit before approving
         self.statuses = {}
+        # {chat id: {started, first_call, first_event}} while a turn runs (turns.py: its result record and budget),
+        # and the chats whose current request is a turn's wrap-up at its budget (their tool calls do not run).
+        self.turns = {}
+        self.budget_wrapups = set()
         self.side_questions = set()  # Chats with a /btw side question being answered.
         self.stop_requested = set()  # Tasks the user stopped: no queued follow-up, even if they ended normally.
         self.unsent_views = {}  # Session id -> @ file views recorded once the turn's message enters the wire.
@@ -1598,8 +1605,9 @@ class AgentManager(LifecycleHooks):
         self.closing_sockets.add(task)
         task.add_done_callback(self.closing_sockets.discard)
 
-    async def status(self, session, status, turn_ended=False):
-        """turn_ended: this idle status ends a turn (not a manual compaction)."""
+    async def status(self, session, status, turn_ended=False, result=None):
+        """turn_ended: this idle status ends a turn (not a manual compaction); result: that turn's result record
+        (turns.turn_result), which the message carries, so a script reads the end of its turn from it."""
         previous = self.statuses.get(session["id"], "idle")
         self.statuses[session["id"]] = status
         if status != "compacting":
@@ -1609,6 +1617,8 @@ class AgentManager(LifecycleHooks):
             # How and when the last turn ended, for notifications and the Continue button.
             message.update({key: session[key] for key in ("terminal_reason", "turn_ended", "turn_delegated")
                             if session.get(key)})
+            if turn_ended and result is not None:
+                message["turn_result"] = result
         await self.broadcast(session["id"], message)
         self.notify_status(session, previous, status, turn_ended)
         await self.delegates.progress(session, status=status)
@@ -2249,6 +2259,30 @@ class AgentManager(LifecycleHooks):
         await self.event(session, "error" if session.get("is_subagent") else "notice", text=text,
                          terminal_reason="spending_limit")
 
+    async def budget_stop(self, session, wire, text):
+        """End the turn at its token or time limit (turns.py), with a Continue button like the spending limit's; a
+        subagent's stop is an error its parent's delegate_task result reports."""
+        self.budget_wrapups.discard(session["id"])
+        if wire and wire[-1].get("role") == "user":
+            wire.append({"role": "assistant", "content": BUDGET_STOP_REPLY})
+            self.store.save(session)
+        await self.event(session, "error" if session.get("is_subagent") else "notice", text=text,
+                         terminal_reason="budget_limit")
+
+    async def change_turn_limits(self, session, values):
+        """Set the chat's own turn limits ({turn_token_limit, turn_time_limit_minutes}: whole tokens or minutes,
+        0 = none, None = follow the Settings default); keys left out keep their values. Its next model request,
+        and its running subagents', check them."""
+        if spending.root_of(self, session) is not session:
+            raise ValueError("A subagent follows its parent conversation's turn limits; change them there.")
+        for key, value in values.items():
+            if value is None:
+                session.pop(key, None)
+            else:
+                session[key] = turns.validate_limit(key, value)
+        self.store.save(session, touch=False)
+        await self.broadcast(session["id"], {"type": "turn_limits", **{key: session.get(key) for key in turns.LIMIT_KEYS}})
+
     async def change_spending_limit(self, session, limit):
         """Set the chat's spending limit in DBU (0 = none; None = follow the Settings default). Its next
         model request, and its running subagents', check the new limit."""
@@ -2439,10 +2473,13 @@ class AgentManager(LifecycleHooks):
             session = self.live.pop(session_id, None)
             self.store.forget_encodings(session_id)
             if session is not None:
-                session.update(terminal_reason="stopped", turn_ended=time.time())
+                now = time.time()
+                result = turns.turn_result(self, session, {"started": now, "first_call": len(session.get("inference_calls") or []),
+                                                           "first_event": len(session["events"])}, "stopped", now)
+                session.update(terminal_reason="stopped", turn_ended=now, last_turn_result=result)
                 self.store.save(session)
                 await self.delegates.progress(session, terminal_reason="stopped")
-                await self.status(session, "idle", turn_ended=True)
+                await self.status(session, "idle", turn_ended=True, result=result)
 
     def busy_task(self, session_id):
         task = self.tasks.get(session_id)
@@ -2860,6 +2897,7 @@ class AgentManager(LifecycleHooks):
             if current is not None:
                 current.setdefault("inference_calls", []).append(call)
                 current["inference_ledger_version"] = scratch["inference_ledger_version"]
+                current["usage_summary"] = usage_summary(current)
                 self.store.save(current)
 
     async def run(self, session, prompt, content=None, attachments=None, fields=None):
@@ -2867,6 +2905,8 @@ class AgentManager(LifecycleHooks):
         terminal_reason = "completed"
         first_event = len(session["events"])
         storage_error_reported = False
+        turn_state = self.turns[session["id"]] = {"started": turns.clock(), "first_event": first_event,
+                                                  "first_call": len(session.get("inference_calls") or [])}
 
         async def report_storage_failure(exc):
             nonlocal storage_error_reported
@@ -2975,23 +3015,35 @@ class AgentManager(LifecycleHooks):
                     terminal_reason = "error"
                 if terminal_reason == "completed" and any(item.get("state") == "error" for item in events):
                     terminal_reason = "tool_error"
+            # The turn's result record goes on its last reply (the footer under it), the header and the idle status.
+            ended = time.time()
+            result = turns.turn_result(self, session, turn_state, terminal_reason, ended)
+            reply = next((item for item in reversed(events) if item.get("type") == "assistant"), None)
+            if reply is not None:
+                reply["turn_result"] = result
+                if not any(item is reply for item in updates):
+                    updates.append(reply)
             for event in updates:
                 await self.broadcast(session["id"], {"type": "event", "event": event})
             # Set and saved right before the idle status, with no await in between on success,
             # so a sessions poll never sees a new turn_ended while the chat still looks busy.
-            session.update(terminal_reason=terminal_reason, turn_ended=time.time())
+            session.update(terminal_reason=terminal_reason, turn_ended=ended, last_turn_result=result,
+                           usage_summary=usage_summary(session))
             session.pop("turn_running", None)
+            self.turns.pop(session["id"], None)
+            self.budget_wrapups.discard(session["id"])
             try:
                 self.store.save(session)
             except STORAGE_ERRORS as exc:
                 session["terminal_reason"] = "error"
+                result.update(terminal_reason="error", is_error=True)
                 await report_storage_failure(exc)
             # Before it leaves the live chats, so no spending check of its parent misses this turn.
             self.delegates.record_spend(session)
             self.live.pop(session["id"], None)
             self.store.forget_encodings(session["id"])
             try:
-                await self.status(session, "idle", turn_ended=True)
+                await self.status(session, "idle", turn_ended=True, result=result)
             except STORAGE_ERRORS as exc:
                 await report_storage_failure(exc)
 
@@ -3063,6 +3115,10 @@ class AgentManager(LifecycleHooks):
         invoked = False
         views_key = views_prev = None
         try:
+            if session["id"] in self.budget_wrapups:
+                # The turn's wrap-up request at its budget was told to call no tools (turns.py).
+                await self.update_event(session, event, state="rejected", output=turns.WRAP_UP_REFUSAL)
+                return turns.WRAP_UP_REFUSAL
             # The mode can change while a turn runs; folder checks follow the current one.
             tools.unrestricted = session.get("permission_mode", "manual") == "bypassPermissions"
             if not tool_allowed(session, name):
@@ -4623,9 +4679,12 @@ class AgentManager(LifecycleHooks):
             info = {**info, "instruction_files": guidance["files"], "instruction_sources": guidance["sources"],
                     "warnings": warnings, "prepared_for_next_turn": True, **last_request(session),
                     **prior_flag(session)}
-            prepared = {**session, "context_state": updated, "context_info": info, "file_views": views}
+            summary = usage_summary(session)  # Its summary requests are in the ledger now.
+            prepared = {**session, "context_state": updated, "context_info": info, "file_views": views,
+                        "usage_summary": summary}
             self.store.save(prepared)
-            session.update(context_state=updated, context_info=info, file_views=views, updated=prepared["updated"])
+            session.update(context_state=updated, context_info=info, file_views=views, updated=prepared["updated"],
+                           usage_summary=summary)
             committed = True
             await self.broadcast(session["id"], {"type": "context", "context_info": session["context_info"]})
             await self.summary_adjustment_notice(session, info)
@@ -5352,7 +5411,9 @@ class AgentManager(LifecycleHooks):
         headers = serving.request_headers(token)
         # A prefill of a large context with adaptive thinking can stay silent for minutes.
         async with self.serving.client(serving.stream_timeout(STREAM_READ_TIMEOUT)) as client:
+            # A chat a script created may have its own Agent steps (POST /api/sessions max_agent_steps).
             steps = (session.get("max_steps", 6) if session.get("is_subagent")
+                     else session["max_agent_steps"] if type(session.get("max_agent_steps")) is int
                      else self.settings.values.get("max_agent_steps", DEFAULT_MAX_AGENT_STEPS))
             # What the chat had spent and how many calls it had before this turn (the step-limit notice).
             turn_start = (self.spent_so_far(session), len(session.get("inference_calls") or []))
@@ -5366,6 +5427,7 @@ class AgentManager(LifecycleHooks):
             consecutive_output_retries = 0
             execution_noticed = False
             system = None  # The latest request's system message (a spending stop after a step refreshes the meter with it).
+            wrap_up = None  # The notice of the wrap-up request once the turn reached its token or time limit (turns.py).
             for step_index in range(steps):
                 # Before any compaction is billed: the chat's spending limit (its subagents count
                 # for it) and a max_tokens above the output-tokens-per-minute limit Databricks
@@ -5378,6 +5440,18 @@ class AgentManager(LifecycleHooks):
                     return False
                 if verdict == "warn":
                     await self.event(session, "notice", text=text)
+                # The turn's token or time limit: one more request to wrap up (its tool calls do not run), then the end.
+                if (budget := turns.reached(self, session)) is not None:
+                    if wrap_up is not None:
+                        await self.refresh_next_estimate(session, system, definitions, wire, context_state)
+                        await self.budget_stop(session, wire, turns.stop_text(*budget, wrapped=True))
+                        return False
+                    wrap_up = turns.wrap_up_notice(budget[0])
+                    self.budget_wrapups.add(session["id"])
+                elif wrap_up is not None:
+                    # The limit was raised or removed during the wrap-up request: the turn goes on as usual.
+                    wrap_up = None
+                    self.budget_wrapups.discard(session["id"])
                 if (refusal := self.otpm_preflight(session, max_output_tokens)) is not None:
                     raise refusal
                 # The mode, rules and turned-off tools can change while a turn runs; each step follows them.
@@ -5386,7 +5460,8 @@ class AgentManager(LifecycleHooks):
                 definitions, capped = self.offered_tools(session, external_tools)
                 if capped != (session.get("mcp_capped") or []):
                     await self.capped_notice(session, capped)
-                notice, history = self.step_notices(session, tools), model_history(wire)
+                notice = "\n".join(text for text in (self.step_notices(session, tools), wrap_up) if text)
+                history = model_history(wire)
                 # At the full cache level the notices end the last message (STEP_NOTE), added to a copy after the
                 # context is prepared (compaction sees the history as it is), for this request only. Otherwise (and
                 # when that message cannot carry one) they end the system message.
@@ -5656,6 +5731,15 @@ class AgentManager(LifecycleHooks):
                         "in Settings if your endpoint supports it, or send a message to continue.",
                         "output_limit", exc.http_status) from exc
                 if not ordered_calls:
+                    if wrap_up is not None and (budget := turns.reached(self, session)) is not None:
+                        # The wrap-up reply ends the turn: no Verify round or stop hook continues it.
+                        await self.refresh_next_estimate(session, system, definitions, wire, context_state)
+                        await self.budget_stop(session, wire, turns.stop_text(*budget, wrapped=True))
+                        return False
+                    if wrap_up is not None:
+                        # The limit was raised during the wrap-up request: its reply ends the turn as any other.
+                        wrap_up = None
+                        self.budget_wrapups.discard(session["id"])
                     if spending.reached(self, session):
                         # Verify and stop hooks could only continue with a request the limit refuses. A
                         # subagent's final reply is still its report; a chat says why the turn ends here.
@@ -5707,16 +5791,21 @@ class AgentManager(LifecycleHooks):
                             # message from it if the app stops before the next save. Each save rewrites
                             # the whole conversation file.
                             self.store.save(session)
-                if step_index + 1 < steps and not spending.reached(self, session):
+                if step_index + 1 < steps and wrap_up is None and not spending.reached(self, session):
                     await self.drain_queue(session, wire, tools, fits=lambda message: in_turn_tokens(
                         [*model_history(wire), message], context_state, system, definitions, input_budget,
                         scale) <= input_budget)
             if steps > 0:
                 await self.refresh_next_estimate(session, system, definitions, wire, context_state)
+        # A chat a script created with its own Agent steps does not follow the Settings value.
+        own_steps = not session.get("is_subagent") and type(session.get("max_agent_steps")) is int
         await self.event(session, "error" if session.get("is_subagent") else "notice",
                          text=(f"Reached the {steps}-request agent limit. This counts model requests, not tool "
-                               "calls. Completed actions were kept. Increase Agent steps in Settings or send a "
-                               "message to continue." + self.turn_cost(session, *turn_start)),
+                               "calls. Completed actions were kept. "
+                               + ("This chat's own limit was set when a script created it, not in Settings: send a "
+                                  "message to continue." if own_steps else
+                                  "Increase Agent steps in Settings or send a message to continue.")
+                               + self.turn_cost(session, *turn_start)),
                          terminal_reason="step_limit")
 
     def spent_so_far(self, session):

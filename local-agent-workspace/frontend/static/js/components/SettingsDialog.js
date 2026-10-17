@@ -401,6 +401,11 @@ export default function SettingsDialog({ settings, connection, onSave, onClose }
           value=${spendingText} onInput=${e => { const text = e.currentTarget.value; setSpendingText(text); field('spending_limit_dbu', text.trim() === '' ? NaN : Number(text)) }} /></label>
         <p class="field-help">The agent stops before its next model request once a conversation and its subagents have used this much (estimated from list prices, as in Agent tools → Usage), and warns at 80%. 0 means no limit. A chat can set its own limit in Usage.</p>
         <${More} topic="spending limit">It is a soft cap: one response can pass it before the next request is stopped. Calls to endpoints without price data are not counted, and title and compaction requests are not stopped.<//>
+        <label>Token limit per turn<input type="number" required min=${0} max=${100000000} step=${1}
+          value=${form.turn_token_limit ?? 0} onInput=${number('turn_token_limit')} /></label>
+        <label>Time limit per turn (minutes)<input type="number" required min=${0} max=${1440} step=${1}
+          value=${form.turn_time_limit_minutes ?? 0} onInput=${number('turn_time_limit_minutes')} /></label>
+        <p class="field-help">Once one message's turn has processed this many tokens (cache reads included, its subagents' too) or run this long, the agent gets one last request to summarize what is done and what remains, then the turn ends; Continue starts a new one. 0 means no limit. A chat can set its own in Usage.</p>
         <label>Approval wait (minutes)<input type="number" required min=${0} max=${1440} step=${1}
           value=${form.approval_timeout_minutes ?? 60} onInput=${number('approval_timeout_minutes')} /></label>
         <p class="field-help">How long an approval card waits for your answer (default 60); after that the action does not run and the agent is told nobody answered. 0 waits until you answer or press Stop.</p>

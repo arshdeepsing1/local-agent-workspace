@@ -36,12 +36,12 @@ class RewindRequest(BaseModel):
     resend_verbatim: bool = Field(default=False, strict=True)  # Resent as plain text, as the message was sent.
 
 
-# Never copied into a rewind backup: the usage ledger and jobs stay with the live chat, and authority,
+# Never copied into a rewind backup: the usage ledger (and its summary) and jobs stay with the live chat, and authority,
 # links and local state are not carried (its subagents stay linked to the live chat, so the backup has
 # no subagents index). The worktree header stays: it is display metadata (grouping under the project).
 BACKUP_DROPPED = ("pinned", "inference_calls", "command_jobs", "context_info", "file_views", "instruction_directories",
                   "instruction_paths", "turn_running", "queued_messages", "pending_context", "parent_session_id",
-                  "parent_event_id", "parent_call_id", "delegation", "subagents")
+                  "parent_event_id", "parent_call_id", "delegation", "subagents", "usage_summary", "last_turn_result")
 
 
 def backup_copy(session):
