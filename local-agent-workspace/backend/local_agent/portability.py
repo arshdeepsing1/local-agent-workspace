@@ -10,6 +10,7 @@ from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationErr
 
 from . import uploads as attached
 from .composer_api import MAX_QUEUED
+from .config import MAX_MAX_AGENT_STEPS, MAX_TURN_MINUTES, MAX_TURN_TOKENS, MIN_MAX_AGENT_STEPS
 from .context import LARGE_SUMMARY_MAX_BYTES, MAX_ESTIMATE_SCALE, context_boundary
 from .extensions import HOOK_CONTEXT_CHARS, HOOK_EVENTS, HOOK_REPORT_CHARS, MAX_HOOKS
 from .lifecycle_hooks import SHOWN_ARGUMENTS_BYTES
@@ -426,6 +427,10 @@ class Conversation(Record):
     subagent_tool_profile: Profile = "inherit"
     reasoning_effort: Effort | None = None  # Kept by forks and imports, like the model.
     spending_limit_dbu: float | None = Field(default=None, ge=0, le=MAX_LIMIT_DBU)  # Kept too (not the spend).
+    # Kept too, like the spending limit: the chat's own turn limits (0 = none) and a script's Agent steps.
+    turn_token_limit: int | None = Field(default=None, ge=0, le=MAX_TURN_TOKENS)
+    turn_time_limit_minutes: int | None = Field(default=None, ge=0, le=MAX_TURN_MINUTES)
+    max_agent_steps: int | None = Field(default=None, ge=MIN_MAX_AGENT_STEPS, le=MAX_MAX_AGENT_STEPS)
     max_steps: int | None = Field(default=None, ge=1, le=MAX_STEPS)
     agent_type: AgentName | None = None
     # Kept by forks and imports, like tool_profile: a copy never gets more tools than its source.

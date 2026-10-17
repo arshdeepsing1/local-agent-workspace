@@ -1006,7 +1006,7 @@ async def test_a_custom_agent_narrows_its_mode_tools_servers_and_memory_and_gets
     assert preview.startswith("Start a subagent (planner · chat's tools · mode Plan; separate paid model requests, "
                               "at most 24 steps)")
     for line in ("Disallowed tools: write_file, edit_file, mcp__docs__*",
-                 "MCP servers: docs (mcp_servers names missing, not configured in Settings → MCP; it is left out.)",
+                 "MCP servers: docs (mcp_servers names missing, not configured in Agent tools → Extensions; it is left out.)",
                  "Permission mode: Plan (the agent file's plan; this chat is in Bypass permissions)",
                  "Project memory: not loaded (memory: none)", "Initial prompt: Start with the README.\nThen the tests."):
         assert line in preview

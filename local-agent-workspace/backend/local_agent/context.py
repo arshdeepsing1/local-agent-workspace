@@ -1364,7 +1364,8 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
     in_turn = deferred = byte_fallback = False
     # The 4 MB Databricks request limit: compaction also runs when the request body would
     # pass the app's byte target (request_limits). Within the token budget this only
-    # happens when the estimator undercounts bytes, so the check usually costs nothing.
+    # happens when the estimator undercounts bytes, or attached images (which count in full)
+    # add them.
     # It takes the unscaled estimate: an anchored one can be lower and is no bound on the bytes.
     over_bytes = request_bytes_over(messages, tools, raw, request_limits.PAYLOAD_TARGET_BYTES)
     # A compaction only the bytes call for (images count in full but in few tokens) says so in its notice.

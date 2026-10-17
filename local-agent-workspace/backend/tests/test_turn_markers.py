@@ -4,12 +4,19 @@ turn_running (internal) tells restart recovery that the answer itself was cut sh
 turn_ended is None while a turn runs and records when it ended, for notifications.
 """
 import asyncio
+from datetime import datetime, timezone
 
 import httpx
 import pytest
 
 from local_agent.api import create_app
+from local_agent.client import result_record
 from local_agent.config import Settings
+
+
+def iso(stamp):
+    """A ledger time as telemetry writes it."""
+    return datetime.fromtimestamp(stamp, timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def settings_for(tmp_path, monkeypatch):
@@ -42,6 +49,53 @@ async def test_a_restart_marks_only_an_unfinished_answer_as_interrupted(tmp_path
         recovered = second.state.manager.store.get(session["id"])
         assert recovered["terminal_reason"] == reason
         assert recovered["turn_ended"] and "turn_running" not in recovered
+
+
+async def test_a_restart_gives_the_cut_short_turn_its_own_result_record(tmp_path, monkeypatch):
+    """Scripts read the header's last_turn_result (client.wait_result): after a restart it is the interrupted
+    turn's, counted from its own user message (not a queued message steered into it, not the previous turn's), with
+    its ledger records (ISO times, as telemetry writes them), and ending at its last recorded step, not at the
+    restart."""
+    settings = settings_for(tmp_path, monkeypatch)
+    previous = {"terminal_reason": "completed", "is_error": False, "started": 100.0, "ended": 105.0}
+    first = create_app(settings)
+    async with first.router.lifespan_context(first):
+        store = first.state.manager.store
+        session = store.create(settings.values)
+        info = {"model": "test-model", "status": "completed", "finish_reason": "stop"}
+        session.update(terminal_reason="completed", turn_running=True, turn_ended=None, last_turn_result=previous,
+                       events=[{"id": "u1", "type": "user", "text": "First", "created": 100.0, "in_wire": True},
+                               {"id": "a1", "type": "assistant", "text": "One.", "created": 104.0, "request_info": info,
+                                "turn_result": previous},
+                               {"id": "u2", "type": "user", "text": "Second", "created": 200.0, "in_wire": True},
+                               {"id": "a2", "type": "assistant", "text": "", "created": 201.0,
+                                "request_info": {**info, "finish_reason": "tool_calls"}},
+                               {"id": "t2", "type": "tool", "name": "read_file", "state": "done", "created": 202.0,
+                                "input": {"path": "a.txt"}},
+                               {"id": "u3", "type": "user", "text": "Also b.txt", "created": 210.0, "in_wire": True,
+                                "steered": True},
+                               {"id": "a3", "type": "assistant", "text": "Part", "created": 211.0,
+                                "request_info": {**info, "status": "running"}}],
+                       wire=[{"role": "user", "content": "First"}, {"role": "assistant", "content": "One."},
+                             {"role": "user", "content": "Second"}],
+                       inference_calls=[{"id": "c0", "purpose": "agent", "model": "test-model", "created": iso(101.0),
+                                         "finished": iso(103.0), "status": "completed",
+                                         "usage": {"input_tokens": 1000, "output_tokens": 10}},
+                                        {"id": "c1", "purpose": "agent", "model": "test-model", "created": iso(201.0),
+                                         "finished": iso(201.5), "status": "completed",
+                                         "usage": {"input_tokens": 2000, "output_tokens": 10}},
+                                        {"id": "c2", "purpose": "agent", "model": "test-model", "created": iso(211.0),
+                                         "status": "running"}])
+        store.save(session)
+    second = create_app(settings)
+    async with second.router.lifespan_context(second):
+        recovered = second.state.manager.store.get(session["id"])
+    result = recovered["last_turn_result"]
+    assert (result["terminal_reason"], result["is_error"], result["started"]) == ("interrupted", False, 200.0)
+    assert recovered["terminal_reason"] == "interrupted" and recovered["turn_ended"] > 1_000_000_000
+    assert (result["ended"], result["duration_s"]) == (211.0, 11.0)  # The in-flight request's start, not the restart.
+    assert (result["steps"], result["tool_calls"], result["usage"]["calls"], result["tokens"]) == (2, 1, 2, 2010)
+    assert result_record(session["id"], result)["exit_code"] == 3  # Not the previous turn's 0.
 
 
 async def test_a_page_never_sees_a_new_turn_end_while_the_chat_is_busy(tmp_path, monkeypatch):

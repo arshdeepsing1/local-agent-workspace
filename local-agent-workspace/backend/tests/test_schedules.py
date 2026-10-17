@@ -6,6 +6,7 @@ calls (httpx MockTransport or the simulator)."""
 import asyncio
 import importlib.util
 import json
+import shlex
 import time
 from datetime import date, datetime
 from pathlib import Path
@@ -26,6 +27,7 @@ REAL_CLIENT = httpx.AsyncClient
 APP = Path(__file__).resolve().parents[2]
 SIMULATOR = APP / "scripts" / "simulate_databricks.py"
 T0 = 1_800_000_000.0  # 2027-01-15 08:00 UTC
+OPUS = "databricks-claude-opus-5-5"
 
 
 def zone(name):
@@ -276,6 +278,24 @@ async def test_a_schedule_without_a_spending_limit_keeps_the_settings_default(ru
     assert "spending_limit_dbu" not in chat and spending.limit_for(manager, chat) == (4.0, "settings")
 
 
+async def test_an_empty_model_and_effort_follow_the_projects_trusted_files(runtime, monkeypatch):
+    """As in a new chat there: a schedule's empty model and effort are the trusted project file's, else Settings'."""
+    manager, scheduler, project, now = runtime
+    seen = gateway(monkeypatch)
+    (project / ".agents").mkdir()
+    (project / ".agents" / "settings.json").write_text(json.dumps({"model": OPUS, "reasoning_effort": "high"}))
+    layers = manager.settings.project_layers()
+    layers.decide(str(project), "trust", layers.report(str(project), fresh=True)["sha256"])
+    follows = await scheduler.launch(make(scheduler, project)["id"], "run_now", user=True)
+    await settled(manager)
+    own = await scheduler.launch(make(scheduler, project, name="Own", model="test-endpoint", reasoning_effort="low")["id"],
+                                 "run_now", user=True)
+    await settled(manager)
+    chats = [manager.store.get(session_id) for session_id in (follows, own)]
+    assert [(chat["model"], chat["reasoning_effort"]) for chat in chats] == [(OPUS, "high"), ("test-endpoint", "low")]
+    assert seen["requests"][0]["output_config"] == {"effort": "high"}
+
+
 async def test_missed_runs_are_caught_up_once_or_skipped_when_too_old(runtime, monkeypatch):
     manager, scheduler, project, now = runtime
     seen = gateway(monkeypatch)
@@ -381,6 +401,67 @@ async def test_a_rejected_token_pauses_the_schedule_without_a_model_call(runtime
     await scheduler.tick()
     saved = scheduler.store.get(item["id"])
     assert saved["enabled"] and saved["history"][-1]["note"] == "Not run: Databricks answered the connection check with HTTP 503."
+
+
+async def test_notification_hooks_get_the_ready_and_paused_notifications(runtime, monkeypatch, tmp_path):
+    """As for a chat's notifications: also with a page open and desktop notifications off, and only with a rule
+    that lets the hook run without a card (a schedule has no chat: its project's rules)."""
+    manager, scheduler, project, now = runtime
+    record = tmp_path / "hook.jsonl"
+    command = f"cat >> {shlex.quote(str(record))}; echo >> {shlex.quote(str(record))}"
+    manager.extensions.update_config({"hooks": [{"id": "fwd", "event": "notification", "enabled": True,
+                                                 "timeout_seconds": 10, "command": command}]})
+    sent, payloads = [], lambda: [json.loads(line) for line in record.read_text().splitlines() if line.strip()]
+    manager.notifier.send = sent.append
+    manager.pages.add("page")
+    ask = make(scheduler, project, name="Ask me", spec="every hour")
+    now[0] = T0 + 3600
+    await scheduler.tick()
+    await asyncio.sleep(0.05)
+    assert isinstance(scheduler.store.get(ask["id"])["pending"], dict) and not record.exists()  # No rule: skipped.
+    manager.rules.add("user", str(project), {"behavior": "allow", "tool": "hook", "hook": "fwd"})
+    scheduler.skip(ask["id"])
+    now[0] = T0 + 7200
+    await scheduler.tick()
+    await asyncio.gather(*manager._notification_runs.values())
+    assert payloads() == [{"event": "notification", "session_id": "", "status": "scheduled_ready",
+                           "message": "Scheduled run ready: Ask me", "title": "Ask me", "page_open": True,
+                           "schedule_id": ask["id"]}]
+    scheduler.delete(ask["id"])
+    gateway(monkeypatch, check=401)
+    auto = make(scheduler, project, name="Auto", spec="every hour", run_policy="auto")
+    now[0] = T0 + 3 * 3600
+    await scheduler.tick()
+    await asyncio.gather(*manager._notification_runs.values())
+    assert scheduler.store.get(auto["id"])["paused_reason"] == "token_rejected"
+    assert payloads()[1:] == [{"event": "notification", "session_id": "", "status": "scheduled_paused",
+                               "message": "Scheduled runs paused: Databricks rejected the token (Auto)",
+                               "title": "Auto", "page_open": True, "schedule_id": auto["id"]}]
+    assert sent == []  # A page is open: the banner says it, no desktop notification.
+
+
+async def test_a_notification_hook_that_fails_keeps_the_due_runs_and_the_desktop_notification(runtime, monkeypatch):
+    """Any error of the hooks part (an unreadable project folder, say) is logged: the tick still starts the other
+    schedules' due runs, which next_run is already past."""
+    manager, scheduler, project, now = runtime
+    gateway(monkeypatch)
+    has_hooks = manager.has_hooks
+
+    def failing(session, event):
+        if session["id"] == "":  # The scheduler's notification, not the run's chat.
+            raise RuntimeError("Symlink loop from a project folder")
+        return has_hooks(session, event)
+    monkeypatch.setattr(manager, "has_hooks", failing)
+    sent = []
+    manager.notifier.send = sent.append
+    manager.settings.values["system_notifications"] = True
+    ask = make(scheduler, project, name="Ask me", spec="every hour")
+    auto = make(scheduler, project, name="Auto", spec="every hour", run_policy="auto")
+    now[0] = T0 + 3600
+    await scheduler.tick()
+    await settled(manager)
+    assert isinstance(scheduler.store.get(ask["id"])["pending"], dict) and sent[0] == "Scheduled run ready: Ask me"
+    assert [entry["outcome"] for entry in history(scheduler, auto)] == ["started"]
 
 
 async def test_one_run_per_schedule_and_at_most_two_at_a_time(runtime, monkeypatch):

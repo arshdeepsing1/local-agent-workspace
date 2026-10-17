@@ -9,10 +9,15 @@ frontend that runs without a build step.
 
 - Streamed Markdown chat and multiple persistent conversations, with highlighted code
   blocks that each have a Copy code button.
+- Attached documents and images: paste, drop or attach PDF, Word, Excel, PowerPoint, text and image
+  files; the agent gets a document's text as data, and images go to endpoints that take image input.
 - Unsent message drafts kept in the browser across reloads, and a Continue button after a
-  turn stopped at the step or output limit, by Stop, or by a server restart.
+  turn stopped at the step, output or spending limit, at its token or time limit, at a scheduled
+  run's approval limit, by Stop, or by a server restart.
 - Databricks model selection, numbered line-range reads, paginated regex/literal
   search, file creation and exact edits, and shell commands with live output.
+- An optional fallback endpoint that takes one request the chat's endpoint failed before its reply
+  started (no connection, HTTP 502, 503 or 504, or a rate limit, once the retries are used up).
 - Approval cards with proposed edits and command text, which you can edit before approving.
   A declined action does not run. Decline with a note the agent reads, or allow the action
   for the rest of a chat, for the project or for all projects.
@@ -65,12 +70,15 @@ frontend that runs without a build step.
 - Persistent tasks with dependencies, shown as a live checklist above the message box,
   and subagents the model starts on its own (explore, general, editor, or a custom agent
   defined in the project's `.agents/agents` files; several in parallel), each in its own
-  conversation file linked from its parent's, with a model and effort per agent type.
+  conversation file linked from its parent's, with a model and effort per agent type. A background
+  subagent works while the chat goes on, and its report reaches the chat when it ends.
 - Markdown transcripts of a conversation: download or copy one from the app, or write
   them for many saved conversations with a script.
 - A reasoning effort per conversation (Default, Fast, Medium, High, Extra high, Max) sent in the
   fields each endpoint takes, and a collapsible Thinking block with the endpoint's thinking
   summary and how long it thought.
+- Token and time limits per turn and a spending limit per conversation (Settings defaults, or a
+  chat's own), and usage across all chats by day, endpoint, purpose and project.
 - Prompt caching on Claude endpoints: agent requests mark their stable start, so input that repeats
   an earlier step is billed at the cache-read rate.
 - Endpoint checks: **Test model** and **Check endpoint capabilities…** send a few small requests,
@@ -79,6 +87,9 @@ frontend that runs without a build step.
   line), with a fixed permission mode (never Bypass), an approval limit and token, time and spending
   limits per run. Each run waits for your **Run** unless the schedule runs automatically; missed runs
   are caught up once, and a rejected token pauses the schedule.
+- Scripting the running app: `scripts/agent_run.py` runs one prompt and prints the reply or a JSON
+  result with an exit code, and the standard-library Python client streams a chat's messages and
+  answers its cards.
 - Collapsible activity.
 - Responsive desktop/mobile UI, bundled fonts, and no credential storage in the browser.
 
@@ -286,10 +297,10 @@ conversation as an archived copy titled `<title> (before rewind)`. The copy keep
 messages, replies, tool results and summary, starts in Manual with no grants, rules or
 active skills, and does not copy the usage ledger, jobs, queued messages or waiting
 command output. Its own **Usage** view still shows the token counts recorded on its
-replies, as historical calls marked incomplete (like a fork); no view adds usage across
-chats. A worktree chat's copy keeps its `worktree` header, so it is listed with its
-project. Archived copies can be opened from the rewind notice and deleted like any
-conversation.
+replies, as historical calls marked incomplete (like a fork); it has no usage ledger, so **Agent
+tools → Usage → All chats** does not count those calls again. A worktree chat's copy keeps its
+`worktree` header, so it is listed with its project. Archived copies can be opened from the rewind
+notice and deleted like any conversation.
 
 Each user message records whether its text reached the model history (`in_wire`), so
 a cut before any message maps exactly onto the model history; app-generated prompts
@@ -393,13 +404,16 @@ when opening a conversation or performing restart recovery.
 - **Notifications**: click **Notify me** at the bottom of the sidebar to turn on browser
   notifications; the browser asks for permission only then. The switch shows **On** or
   **Off**. You are notified when a chat starts waiting for approval, finishes a reply,
-  reaches the **Agent steps** limit ("Reached the step limit: …", so you can Continue it), or
-  stops with an error (also during an automatic compaction, or because the server stopped
-  during the reply), if this page is hidden or that chat is not the one open. A notification reads, for example,
-  "Needs your approval: Fix the parser": it contains only a status and the chat title, cut to
-  60 characters, never other conversation text. Until the chat is named, its title is the start
-  of the first message with credentials redacted (the configured token and common secret shapes
-  such as GitHub tokens). Clicking it brings the window forward and opens that chat.
+  reaches the **Agent steps** limit ("Reached the step limit: …", so you can Continue it), its
+  spending limit ("Reached the spending limit: …") or the turn's token or time limit ("Reached
+  the turn budget: …"), stops at a scheduled run's approval limit ("Stopped at the approval
+  limit: …"), or stops with an error (also during an automatic compaction, or because the
+  server stopped during the reply), if this page is hidden or that chat is not the one open. A
+  notification reads, for example, "Needs your approval: Fix the parser": it contains only a status
+  and the chat title, cut to 60 characters, never other conversation text. Until the chat is named,
+  its title is the start of the first message with credentials redacted (the configured token and
+  common secret shapes such as GitHub tokens). Clicking it brings the window forward and opens that
+  chat.
   Stopping a reply yourself, or a manual compaction, does not notify. A subagent's turn started
   by its parent notifies only when it needs approval (the parent's turn reports its end); a
   background subagent that finishes or fails while its chat is idle notifies for that chat
@@ -800,7 +814,8 @@ when opening a conversation or performing restart recovery.
   file named `*.py` shows only its own diff. A project
   folder inside a larger repository shows only its own files. Credential files at any
   depth (`.env`, `.env.*` except `.env.example`, `*.env`, `env_vars.txt`, `.netrc`,
-  `.npmrc`, `credentials`, `credentials.json`, `id_rsa`, `id_ed25519`, in any letter case,
+  `.npmrc`, `.pgpass`, `.pypirc`, `.git-credentials`, `.databrickscfg`, `credentials`,
+  `credentials.json`, `id_rsa`, `id_ed25519`, `id_ecdsa`, `id_dsa`, in any letter case,
   and the configured credential file) are listed as "Credential file: diff hidden",
   without line counts, and their diffs are refused, also when a rename or copy comes from
   such a file. Files in generated folders (`node_modules`, `dist`, `.venv` and the like)
@@ -843,16 +858,18 @@ when opening a conversation or performing restart recovery.
   command in this chat** (commands), **Allow edits in this chat** (`write_file`, `edit_file`,
   `insert_activity_log`, `move_path`, `delete_path`, `notebook_edit`), **Allow this tool in
   this chat** (one MCP tool), **Allow this hook in this chat**, **Allow subagents in this
-  chat** (`delegate_task`), **Allow stopping jobs in this chat** (`stop_job`) or **Allow saving
-  memory in this chat** (`remember`, see **Project memory**). A card raised
+  chat** (`delegate_task`), **Allow stopping jobs in this chat** (`stop_job`), **Allow saving
+  memory in this chat** (`remember`, see **Project memory**) or **Allow *domain* in this chat**
+  (`web_fetch`, see **Web fetch and search**). A card raised
   by an Always ask rule, an uncertain command or a protected file, or a command that names a
   credential file or contains your token, has no such button. It approves the card and stores
   a rule for this conversation. Rules match
   exactly: the same command text (only leading and trailing whitespace is ignored; never a
-  prefix), the same MCP tool name, the same hook ID. A later matching action runs without a
-  card in Manual, Auto, Accept edits and Don't ask, and its card says "Allowed by a rule for this chat".
-  Plan still blocks it, Bypass is unchanged, and credential exclusions, folder-access cards,
-  protected files, project-guidance checks and the changed-file check still apply. A command
+  prefix), the same MCP tool name, the same hook ID, the same host. A later matching action runs
+  without a card in Manual, Auto, Accept edits and Don't ask, and its card says "Allowed by a rule
+  for this chat". Plan still blocks it, Bypass is unchanged, and credential exclusions,
+  folder-access cards, protected files, project-guidance checks and the changed-file check still
+  apply. A command
   allowed by its exact text runs through the shell exactly as approved. Folder-access cards have no
   such button: a folder grant already lasts for the chat. Rules are saved with the chat (at most
   100), listed in the permissions menu (commands with their exact spacing), where each can be
@@ -1024,9 +1041,11 @@ when opening a conversation or performing restart recovery.
   them as chats of their own (the API default, `DELETE /api/sessions/<id>?children=keep`);
   a subagent turn the deletion stopped is recorded as stopped.
 - **Continue**: when the latest turn of an idle conversation stopped before it finished —
-  at the **Agent steps** limit, at the output-token limit after the automatic retries,
-  by **Stop**, or because the server restarted before its answer finished (not while it
-  was only naming the chat or during a manual compaction) — a **Continue** button above
+  at the **Agent steps** limit, at the output-token limit after the automatic retries, at
+  the chat's spending limit, at the turn's token or time limit (see **Token and time limits
+  per turn**), at a scheduled run's approval limit, by **Stop**, or because the server
+  restarted before its answer finished (not while it was only naming the chat or during a
+  manual compaction) — a **Continue** button above
   the message box sends `Continue from where you stopped.` as an ordinary message. It
   is not shown while the conversation is busy, after a completed turn, or after other
   errors. Your draft is left as it is, and keyboard focus moves to the message box.
@@ -1435,7 +1454,8 @@ continued by you (subagents that ended before this existed are not counted). The
 (one message and the agent's work on it) of chats without limits of their own; 0, the default,
 means none. **Agent tools → Usage → Turn limits** sets a chat's own (0 = none for this chat) or
 returns it to the Settings defaults. A change applies from the agent's next model request, also
-while a turn runs. The token limit counts every token the turn's requests processed as Databricks
+while a turn runs. Forks and imports keep a chat's own limits, as they keep its spending limit.
+The token limit counts every token the turn's requests processed as Databricks
 reported them: uncached input, cache reads and writes, and output, its subagents' included. So it
 also caps endpoints without price data, and cache reads count in full although they cost less. The
 time limit is the wall-clock time since the turn started, waits for your approvals included.
@@ -1787,11 +1807,11 @@ none, the scaled estimate). The automatic compaction threshold, the budget check
 compaction considers and the 4 MB check keep the heuristic estimate.
 Expanded context details attribute that same estimate to system/project
 instructions (including skills selected for the chat), tool definitions (split per MCP server,
-for example "Built-in tools · ~5,900 tokens" and "MCP docs · ~640 tokens", when an MCP server's
+for example "Built-in tools · ~9,000 tokens" and "MCP docs · ~640 tokens", when an MCP server's
 tools are offered), conversation messages and tool results, the retained summary, and request
 framing/rounding overhead. The categories add up to the displayed estimate; they are not
 tokenizer-derived measurements. **Loaded instructions** lists each selected skill with its cost:
-`Skill /<id>` applies to this chat (selected in **Agent tools → Skills**, in the system message)
+`Skill /<id>` applies to this chat (selected in **Agent tools → Extensions**, in the system message)
 or to this message (selected with `/<id>`, sent with that message, so it counts in messages).
 `GET /api/sessions/<id>/context` returns the same meter as JSON (`{status, context_info}`, plus
 `compaction_progress` while the chat compacts) without building a request.
@@ -1987,9 +2007,11 @@ context budget for multi-step work.
 **Request size.** Databricks accepts at most 4 MB per request. The app encodes each
 request body itself (compact UTF-8 JSON) and sends exactly those bytes, so it knows the
 size it sends; the context details show "Request size: 245 KB of Databricks' 4 MB limit."
-for the latest request. Compaction also runs when a request would pass 3.8 MB, a check
-that costs nothing today because the token estimate already bounds the size (at most three
-bytes per estimated token, about 3.1 MB at the 1,048,576-token maximum). When no
+for the latest request. Compaction also runs when a request would pass 3.8 MB. Text alone
+stays under about three bytes per estimated token (about 3.1 MB at the 1,048,576-token
+maximum), so for text the token threshold comes first; attached images count by their base64
+bytes (see **Images**), so this check compacts a chat with a few large images at a few thousand
+estimated tokens, and its notice gives the request size instead of the token threshold. When no
 compaction brings such a request under 3.8 MB, the app still compacts at the latest point
 that fits when that makes the request smaller. A request still over 4 MB is not sent: the turn ends with a `payload_too_large` error that suggests smaller
 steps or a lower context budget, without a **Continue** button; a compaction or `/btw`
@@ -2131,9 +2153,10 @@ together with a hash of each file as you reviewed it. When a file changes (after
 the agent, whose edits in `.agents/` always ask), it is not used until you decide again, and the dialog
 asks again. A worktree chat and its subagents use the source project's files and decision. A new chat in
 a trusted project starts with the files' model and effort (its model picker shows them; a model you
-choose there applies to that chat only). Settings names each value a trusted file sets under its field
-(**In this project: 48 from .agents/settings.json.**), and **Settings → Project → Review settings
-files…** shows the files again and lets you change the decision. **Save settings** saves only your own
+choose there applies to that chat only), and so does a scheduled run's chat unless its schedule sets
+them. Settings names each value a trusted file sets under its field (**In this project: 48 from
+.agents/settings.json.**), and **Settings → Project → Review settings files…** shows the files again
+and lets you change the decision. **Save settings** saves only your own
 values; the app never writes the files. **Agent tools → Usage** says when a chat's spending limit comes
 from the project's file, the step-limit notice when its Agent steps do, and the context meter when its
 auto-compact threshold does. A project folder the app cannot look at (no access, or a network folder
@@ -2700,7 +2723,7 @@ within 32 KB). Each one has an `event`:
 | `subagent_start` | Before a subagent's first model request | `context` |
 | `subagent_stop` | When a subagent would end with its final reply | `decision` (`"block"` with `reason`), `report` |
 | `before_compaction` | Once per compaction (automatic, or **Compact now**), before its first summary request | `context` (it cannot stop a compaction) |
-| `notification` | When the app notifies: a chat needs your approval, finished, stopped with an error, or reached the step or spending limit, or a background subagent of an idle chat finished or failed; only without asking | none: output is ignored |
+| `notification` | When the app notifies: a chat needs your approval, finished, stopped with an error or at a scheduled run's approval limit, or reached the step limit, the spending limit or the turn's token or time limit, a background subagent of an idle chat finished or failed, or a scheduled run is ready or a rejected token paused a schedule; only without asking | none: output is ignored |
 
 **Input.** Each hook gets one JSON object on stdin with `event` and the conversation's
 `session_id`. Tool events add `tool`, `arguments`, a stable `call_id`, `result` (after
@@ -2716,8 +2739,10 @@ reply), `continuations` (how often hooks continued this turn), `workspace`, `mod
 (`subagent_start`) or `reply` and `continuations` (`subagent_stop`). `before_compaction` adds
 `trigger` (`auto` or `manual`), `preservation_note` (your note for **Compact now**),
 `estimated_input_tokens`, `threshold`, `input_budget`, `workspace`, `model` and
-`permission_mode`; `notification` adds `status` (`background_subagent` for a background subagent), `message` (the notification's text), `title`
-(the chat's title, redacted and shortened) and `page_open`, never transcript text. Tool events
+`permission_mode`; `notification` adds `status` (`background_subagent` for a background subagent,
+`scheduled_ready` and `scheduled_paused` for a schedule, whose `session_id` is empty and which adds its
+`schedule_id`), `message` (the notification's text), `title` (the chat's or schedule's name, redacted and
+shortened) and `page_open`, never transcript text. Tool events
 also add `agent`, the chat or subagent that made the call: `{"session_id", "is_subagent",
 "agent_type", "parent_session_id", "agent_file"}` (the subagent's type, such as `explore` or a
 custom agent's name, its parent chat and its custom agent file; `null` for a chat's own call).
@@ -3005,7 +3030,7 @@ Report each finding with path:line, its severity and a suggested fix.
 | `max_steps` | Optional 1–24: the subagent's steps when the call gives no `max_steps` (a call's own value wins). |
 | `disallowed_tools` | Optional: tools the agent may not use, taken away from `tools` or from its profile (its MCP tools by name, or every tool of a server as `mcp__<server>__*`; a tool that covers another, such as `read_file` for `outline_file`, takes that one too). A list that takes away every tool is refused. |
 | `permission_mode` | Optional `plan`, `dontAsk`, `manual` (Claude Code's `default`), `auto`, `acceptEdits` or `bypassPermissions`; left out (or `inherit`): the chat's. It applies only when it is narrower than the chat's mode, also after you change the chat's mode while the subagent runs: Plan < Don't ask < Manual < Auto or Accept edits < Bypass permissions, and where Auto and Accept edits meet, Manual. The chat's mode still decides where it is stricter: a Plan subagent of a Manual or Accept edits chat asks before a read-only command (unless a rule allows it), and one of a Don't ask chat is refused it. |
-| `mcp_servers` | Optional: the IDs of the MCP servers (as **Settings → MCP** names them) whose tools the agent may use; only those start for it, and `[]` starts none. Left out: every configured server. Server definitions in the file are not supported; an ID that is not configured is left out with a note. |
+| `mcp_servers` | Optional: the IDs of the MCP servers (as **Agent tools → Extensions** names them) whose tools the agent may use; only those start for it, and `[]` starts none. Left out: every configured server. Server definitions in the file are not supported; an ID that is not configured is left out with a note. |
 | `memory` | Optional `project` (the default: the subagent reads the project memory, as every chat does) or `none` (without it). `user` and `local` are not supported and read as `project`, with a note. |
 | `initial_prompt` | Optional text of up to 2,000 characters (one line; a double-quoted value may use `\n`), added to the subagent's first prompt after the instructions under **Agent's initial prompt:**. |
 | `background` | Optional `true`: the agent runs in the background when the call does not set `background` (see **Background subagents** above). |
@@ -3107,9 +3132,11 @@ the Databricks stream supplies thinking: `reasoning` content blocks with `summar
 entries, `thinking` blocks, or `reasoning_content` / `reasoning` delta fields (see
 **Reasoning effort and thinking**). The text persists with the conversation, displays
 separately from the answer, and has a 12,000-character limit. Opaque/encrypted reasoning
-is ignored. Thinking is not replayed as model history, and the app never fabricates
-hidden reasoning. Endpoint support varies; ordinary responses legitimately have no
-Thinking block.
+is never shown. Thinking is not sent back as model history unless **Settings → Reasoning →
+Send earlier thinking back** is on (see **Reasoning effort and thinking**): then this turn's
+signed thinking, redacted thinking and encrypted summaries go back, as they came, to the
+endpoint that wrote them. The app never fabricates hidden reasoning. Endpoint support varies;
+ordinary responses legitimately have no Thinking block.
 
 ### Scheduled runs
 
@@ -3136,10 +3163,11 @@ the schedule's settings as its own:
   notice ("Stopped at the approval limit" in notifications). Only the scheduled turn has this limit: a
   message you send in that chat afterwards waits as **Settings → Approval wait** says.
 - **Token limit per run** and **Time limit per run (minutes)**, both required, and **Spending limit per
-  run** (DBU; 0 follows **Settings → Agent → Spending limit per conversation**): the new chat's own turn
-  limits and spending limit (see **Token and time limits per turn** and **Spending limit**), so a run
-  wraps up and ends at them, also on endpoints without price data. **Agent steps**, **Model endpoint**
-  and **Reasoning effort** follow Settings when left empty.
+  run** (DBU; 0 follows the project's trusted settings files, else **Settings → Agent → Spending limit
+  per conversation**): the new chat's own turn limits and spending limit (see **Token and time limits
+  per turn** and **Spending limit**), so a run wraps up and ends at them, also on endpoints without price
+  data. **Agent steps**, **Model endpoint** and **Reasoning effort** left empty follow the project's
+  trusted settings files (see **Project settings files**), else Settings, as a new chat there does.
 - **Subagents** work in the foreground: `delegate_task`'s `background: true` (and an agent file's) is
   ignored, as its card and result say, so the run waits for them, its approval limit, token and time
   limits and history cover them, and the next run waits too. **Continue the chat when a background
@@ -3153,7 +3181,8 @@ Schedules run only while the app runs and **Settings → Agent → Scheduled run
 due run waits for you: a banner above the chat says "Scheduled run ready: <name>" with **Run** (which
 starts it and opens its chat) and **Skip**, the schedule shows **Run** and **Skip** too, the server shows
 the same text as a desktop notification when **Settings → Desktop notification when no browser tab is
-open** is on and no page is open, and **Notify me** shows it while the page is hidden. Nothing is sent
+open** is on and no page is open, **Notify me** shows it while the page is hidden, and notification hooks
+get it (status `scheduled_ready`; see **Agent tools: MCP, skills, and hooks**). Nothing is sent
 until you choose Run. A ready run nobody starts before the schedule's next time, or within 24 hours, is
 not run. With Run automatically, runs start at their times without a click, and each one makes model
 calls billed to your workspace.
@@ -3161,8 +3190,9 @@ calls billed to your workspace.
 Before each run the app makes the free connection check (it lists the serving endpoints; no model
 call). When Databricks rejects the token (HTTP 401 or 403), the schedule is paused, a banner says
 "Scheduled runs paused: Databricks rejected the token" (and a desktop notification when no page is
-open); renew the token in your credential file, then **Resume** the schedule. Other problems (no
-network, a Databricks server error, a project folder that is gone, an @ file the prompt may not attach)
+open, and notification hooks with status `scheduled_paused`); renew the token in your credential
+file, then **Resume** the schedule. Other problems (no network, a Databricks server error, a project
+folder that is gone, an @ file the prompt may not attach)
 skip that run with a note, as does a run the app stops before it starts (the app closing, or Scheduled
 runs turned off, during its connection check). A run is also skipped while the schedule's previous run
 still runs (its scheduled turn: a message you send in that run's chat later does not count), and when
@@ -3323,8 +3353,10 @@ Rule kinds:
 
 When rules disagree, **deny beats ask, and ask beats allow**, whatever their scope. The fixed
 order is: turned-off tools, deny rules (in every mode, Bypass included), Plan's read-only limit,
-ask rules, protected files, the mode itself, allow rules (never in Plan), Don't ask (and Bypass for
-a memory note), and finally a card. A tool that a deny rule without conditions covers is not offered to the agent at all.
+ask rules and uncertain commands, commands that name a credential-looking file (a card in every
+mode, see **Credential-looking files**), protected files, the mode itself, allow rules (never in
+Plan), Don't ask (and Bypass for a memory note), and finally a card. A tool that a deny rule
+without conditions covers is not offered to the agent at all.
 
 Rules never override credential and generated-file exclusions, the state-folder exclusion,
 folder-access cards (only Don't ask, which blocks them, and Bypass, which needs none, differ),
@@ -3400,10 +3432,10 @@ remembered, and a mode or rule change never approves it. Such names are `.env`, 
 `.env.*`, `.env-*`, `.env_*` (`.env.local`, `.env-prod`; not `.env.example`, an `.envs` folder or
 `.environment`), the file tools' other credential names
 (`.netrc`, `.npmrc`, `.pgpass`, `.pypirc`, `.git-credentials`, `.databrickscfg`, `credentials`,
-`id_rsa`, `id_ed25519`, `id_ecdsa`, `id_dsa`, `env_vars.txt`), other private keys and key stores
-(`id_rsa*` but not `*.pub`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`), files in `.ssh` (except
-public keys, `known_hosts`, `authorized_keys` and `config`) and `.gnupg`, `.aws/credentials` and
-`.aws/config`, `.kube/config` and other kube configs, `.docker/config.json`,
+`credentials.json`, `id_rsa`, `id_ed25519`, `id_ecdsa`, `id_dsa`, `env_vars.txt`), other private
+keys and key stores (`id_rsa*` but not `*.pub`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`), files
+in `.ssh` (except public keys, `known_hosts`, `authorized_keys` and `config`) and `.gnupg`,
+`.aws/credentials` and `.aws/config`, `.kube/config` and other kube configs, `.docker/config.json`,
 `.config/gh/hosts.yml`, `.my.cnf`, `.vault-token`, data files whose name contains token, secret,
 password, credential or apikey (`api_token.txt`, `secrets.yaml`, `secrets/db_token`; not
 `tokenizer.py`, `tokenizer.json` or `secret_santa.md`), the configured credential file under any
@@ -3416,9 +3448,8 @@ without an extension only when it ends in the word, such as `db_token`, not `sec
 output redaction stays. Command and MCP results are redacted before the agent sees them: the
 Databricks token, the credential file's values for keys that name a token, secret, password, key,
 credential, auth or cookie (8 characters or more), MCP secret references, and GitHub, Databricks
-and AWS access-key shapes, long Bearer tokens and passwords in URLs. Six more names joined the file
-tools' exclusions and the diff exclusions: `.databrickscfg`, `.git-credentials`, `.pypirc`,
-`.pgpass`, `id_ecdsa` and `id_dsa`.
+and AWS access-key shapes, long Bearer tokens and passwords in URLs. The file tools and the Changes
+view hide the same credential names (see **Workspace / Changes**).
 
 **Protected files.** Edits always show a card, in every mode except Bypass and even with an allow
 rule, when a path (requested or resolved, inside or outside the project) is in `.vscode`, `.idea`,
@@ -3873,7 +3904,9 @@ card is declined at once. An answer the app refuses is replaced by that default 
 `{"type": "answer_refused", "name", "error", "answered"}` message. The client also has `create_session`, `send`, `interrupt`,
 `set_permission_mode` (Bypass needs `confirm=True`), `set_model`, `set_effort`,
 `set_spending_limit`, `set_turn_limits`, `fork`, `rewind`, `events` and `wait_result` (`None` for
-an idle chat without a turn newer than `after`).
+an idle chat without a turn newer than `after`; a turn a restart cut short reads as `interrupted`, its
+duration up to its last recorded step, not the time the app was down, and after a rewind in place it is
+the last kept turn's result).
 
 The client talks to the app on this computer only (`127.0.0.1`, `localhost` or `::1`). It reads
 the local token from `/api/bootstrap` as the page does, and again after the app restarted. A
@@ -3885,7 +3918,8 @@ record (`turn_result`). A reader that falls 1,000 messages behind is dropped, as
 shows a turn that ended meanwhile. When the app shuts down (Ctrl+C on `run.py`), every stream
 ends at once with `stream_closed` reason `shutdown` and the app stops the running turns, so a
 connected script never holds up the shutdown. `POST /api/sessions` takes `workspace` and
-`max_agent_steps` for scripts, and `PUT /api/sessions/<id>/turn-limits` sets a chat's turn limits.
+`max_agent_steps` for scripts, and `PUT /api/sessions/<id>/turn-limits` sets a chat's turn limits;
+forks and imports keep both.
 
 ## Trying the app offline (simulator)
 
@@ -4121,6 +4155,7 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `backend/local_agent/permissions.py`: the permission modes, the one decision every tool call and waiting card goes through (turned-off tools, rules, protected files, Don't ask), and model instructions.
 - `backend/local_agent/approvals.py`: rules from cards and the Permissions menu (chat, project and all-project routes, reset), edit before approving, turned-off tools and the tool list, decline-note wording, and 409 details naming a busy chat.
 - `backend/local_agent/interactions.py`: `ask_user` questions and `submit_plan` reviews that wait for the user inside a turn.
+- `backend/local_agent/commands.py`: custom command files (`.agents/commands/<name>.md`, `$ARGUMENTS`) run with `/<name>`, and the names the app's own `/` commands reserve.
 - `backend/local_agent/store.py`: per-conversation JSONL storage, unreadable-file reports, and legacy migration.
 - `backend/local_agent/drafts.py`: bounded periodic streamed-reply checkpoints.
 - `backend/local_agent/portability.py` / `portability_api.py`: validated conversation copies.
@@ -4140,7 +4175,7 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `backend/local_agent/activity.py`: app-generated activity log for handoffs (`insert_activity_log`).
 - `backend/local_agent/transcript.py` / `scripts/conversation_transcript.py`: Markdown transcripts of saved conversations (also `GET /api/sessions/<id>/transcript.md`).
 - `backend/local_agent/redaction.py`: common secret shapes replaced in logs, handoffs and transcripts, and the high-confidence ones in command and MCP results.
-- `skills/`: skills shipped with the app and offered in every workspace; `handoff/SKILL.md` is the detailed handoff skill, and `commit`, `pr`, `review` and `security-review` are the Git skills. A workspace's `.agents/skills/<id>/` replaces the shipped skill with that ID.
+- `skills/`: skills shipped with the app and offered in every workspace; `handoff/SKILL.md` is the detailed handoff skill, `verify`, `debug` and `init` run a project's checks, debug a reported failure and draft its `AGENTS.md`, and `commit`, `pr`, `review` and `security-review` are the Git skills. A workspace's `.agents/skills/<id>/` replaces the shipped skill with that ID.
 - `agents/`: agent files shipped with the app (`plan.md`); a project's `.agents/agents/<name>.md` or `.claude/agents/<name>.md` of the same name replaces one.
 - `backend/local_agent/telemetry.py`: inference ledger, validated usage, DBU estimates, and failure categories.
 - `backend/local_agent/usage_export.py` / `scripts/usage_report.py`: usage rows and CSV correlated with conversation history.

@@ -19,7 +19,9 @@ requests count in the parent's turn during which they were made: one still runni
 counts only what it spends from the new turn's start (carried) and keeps its own turn's budget.
 """
 import json
+import math
 import time
+from datetime import datetime
 
 from .config import TURN_LIMITS
 from .planning import changed_paths
@@ -220,6 +222,37 @@ def _delegated_files(events):
         files = result.get("changed_files") if isinstance(result, dict) else None
         paths += [path for path in files or [] if isinstance(path, str)]
     return paths
+
+
+def moment(value):
+    """A recorded time as epoch seconds (an event's number, a ledger record's ISO 'created' or 'finished'), or None."""
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except (ValueError, OverflowError, OSError):
+            return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        return float(value)
+    return None
+
+
+def recovered_turn(session, now, closed=()):
+    """(turn state, ended) of the turn a restart closed (AgentManager.mark_interrupted): from its own user message (a
+    queued message steered into it is part of it), with the ledger records made since, ended at its newest recorded
+    time, not at the restart (the app was down in between). closed: the ledger records the restart itself finished."""
+    events, calls = session["events"], session.get("inference_calls") or []
+    first = next((index for index in range(len(events) - 1, -1, -1) if events[index].get("type") == "user"
+                  and not events[index].get("steered")), len(events))
+    started = moment(events[first].get("created")) if first < len(events) else None
+    started = started if started is not None and started <= now else now
+    first_call = next((index for index, call in enumerate(calls) if isinstance(call, dict)
+                       and (moment(call.get("created")) or 0.0) >= started), len(calls))
+    closed = {id(call) for call in closed}
+    times = [moment(event.get("created")) for event in events[first:] if isinstance(event, dict)]
+    times += [moment(call.get(key)) for call in calls[first_call:] if isinstance(call, dict)
+              for key in ("created", "finished") if key == "created" or id(call) not in closed]
+    ended = max([started, *(value for value in times if value is not None and value <= now)])
+    return {"started": started, "first_event": first, "first_call": first_call}, ended
 
 
 def turn_result(manager, session, turn, terminal_reason, ended=None):

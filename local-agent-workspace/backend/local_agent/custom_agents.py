@@ -352,8 +352,9 @@ def parse_agent(text, stem):
         servers = [item.strip() for item in servers.split(",") if item.strip()] if isinstance(servers, str) else servers
         if (not isinstance(servers, list) or len(servers) > MAX_SERVERS
                 or any(not isinstance(item, str) or not SERVER_ID.fullmatch(item) for item in servers)):
-            raise ValueError(f"mcp_servers must list at most {MAX_SERVERS} MCP server IDs as Settings → MCP names them, "
-                             "such as [docs] ([] for none); server definitions in an agent file are not supported.")
+            raise ValueError(f"mcp_servers must list at most {MAX_SERVERS} MCP server IDs as Agent tools → Extensions "
+                             "names them, such as [docs] ([] for none); server definitions in an agent file are not "
+                             "supported.")
         servers = list(dict.fromkeys(servers))
     memory = fields.get("memory")
     if memory is not None:
