@@ -14,6 +14,7 @@ import { backupTitle, setRewindNotice } from '../rewindNotice.js'
 import { agentLabel, agentSettingsText, elapsedText } from '../subagents.js'
 import { pathShortener } from '../paths.js'
 import { hintText } from '../mcp.js'
+import { turnSummary } from '../turnResult.js'
 
 // A long file is read in pages. Naming the lines each read covered keeps the
 // pages of one file from looking like the same read repeated.
@@ -726,13 +727,22 @@ function Thinking({ text, truncated, started, seconds, streaming, answering, rea
   </details>`
 }
 
-function Reply({ text, reasoning, truncated, started, seconds, wait, requestInfo, onOpenPath, actions = null }) {
+// The turn's result under its last reply (turnResult.js): steps, tools, time, tokens and DBU; opened, how it ended.
+function TurnFooter({ result }) {
+  const summary = turnSummary(result)
+  if (!summary) return null
+  return html`<details class="turn-summary"><summary><span class="sr-only">Turn summary: </span>${summary.text}</summary>
+    <p>${summary.details}</p></details>`
+}
+
+function Reply({ text, reasoning, truncated, started, seconds, wait, requestInfo, onOpenPath, actions = null, turnResult = null }) {
   const streaming = requestInfo?.status === 'running'
   return html`<div class="assistant-reply"><${Brand} small=${true} />
     <div class="reply-content"><${Thinking} text=${reasoning} truncated=${truncated} started=${started} seconds=${seconds}
       streaming=${streaming} answering=${!!text} reasoningTokens=${requestInfo?.usage?.reasoning_tokens} /><${Markdown} text=${text} streaming=${streaming} onOpenPath=${onOpenPath} />
       ${text || actions ? html`<div class="message-actions">${text ? html`<${CopyAction} text=${text} label="Copy response" />` : null}${actions}</div>` : null}
       ${requestInfo ? html`<${RequestDetails} info=${requestInfo} reasoningWait=${wait} reasoningText=${!!reasoning} />` : null}
+      ${turnResult && !streaming ? html`<${TurnFooter} result=${turnResult} />` : null}
     </div></div>`
 }
 
@@ -923,7 +933,7 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
       if (event.type === 'tool' && event.name === 'ask_user') return html`<${QuestionCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
       if (event.type === 'tool' && event.name === 'submit_plan') return html`<${PlanCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
       if (event.type === 'tool') return html`<${ToolCard} key=${event.id} event=${event} summary=${toolSummaries.get(event.id)} result=${toolStates.get(event.id).result} status=${toolStates.get(event.id).status} failure=${toolStates.get(event.id).failure} sessionId=${session.id} onError=${onError} onSelectSession=${onSelectSession} onOpenPath=${onOpenPath} />`
-      if (event.type === 'assistant') return event.text || event.reasoning_summary || event.request_info || event.reasoning_started ? html`<${Reply} key=${event.id} text=${event.text || ''} reasoning=${event.reasoning_summary} truncated=${event.reasoning_truncated} started=${event.reasoning_started} seconds=${event.reasoning_seconds} wait=${event.reasoning_wait_seconds} requestInfo=${event.request_info} onOpenPath=${onOpenPath} actions=${event.text ? replyActions(event) : null} />` : null
+      if (event.type === 'assistant') return event.text || event.reasoning_summary || event.request_info || event.reasoning_started ? html`<${Reply} key=${event.id} text=${event.text || ''} reasoning=${event.reasoning_summary} truncated=${event.reasoning_truncated} started=${event.reasoning_started} seconds=${event.reasoning_seconds} wait=${event.reasoning_wait_seconds} requestInfo=${event.request_info} onOpenPath=${onOpenPath} actions=${event.text ? replyActions(event) : null} turnResult=${event.turn_result} />` : null
       const marker = event.type !== 'error' && (!!event.stop_phase || event.text === STOPPED_TEXT)
       const classes = ['conversation-notice', event.type === 'error' && 'error', marker && 'stop-marker', event.compaction && 'compaction'].filter(Boolean).join(' ')
       if (marker) return html`<div class=${classes} key=${event.id} title=${event.text}>${STOP_TEXT[event.stop_phase] || 'Stopped'}</div>`

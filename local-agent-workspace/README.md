@@ -1099,10 +1099,17 @@ received before an interruption may be partial, not a final count.
 
 For recognized standard pay-per-token endpoints, the Usage section calculates an
 estimated DBU cost from published input, output, cache-read, and cache-write rates.
-The rates are those of 2026-10-13: Claude Opus 5.5 at 57.143 DBU per million input tokens,
-285.714 output, 2.857 cache read and 71.429 cache write (the 5-minute rate; 1-hour cache writes
-at 114.286 cannot be told apart in the usage), and Claude Opus 4.8 at 71.429, 357.143, 7.143 and
-89.286.
+The rates are the Standard pay-per-token list prices of 2026-10-16 from the Databricks pricing
+pages for [proprietary](https://www.databricks.com/product/pricing/proprietary-foundation-model-serving)
+and [open](https://www.databricks.com/product/pricing/foundation-model-serving) models, for example
+Claude Opus 5.5 at 57.143 DBU per million input tokens, 285.714 output, 2.857 cache read and 71.429
+cache write (the 5-minute rate; 1-hour cache writes at 114.286 cannot be told apart in the usage),
+Claude Opus 4.8 at 71.429, 357.143, 7.143 and 89.286, and GPT OSS 120B at 2.143 input and 8.571
+output. The other Claude Opus and Sonnet endpoints and Haiku 4.5, GPT-5, 5.1, 5.2, 5 Mini and
+5 Nano, GPT OSS 20B, Llama 4 Maverick, Llama 3.3 70B, Llama 3.1 8B and Gemma 3 12B are priced too;
+**Agent tools → Usage → All chats → List prices** shows the whole table. Endpoints whose price
+depends on the context length are left out, and a cache rate the page does not list (open models,
+GPT cache writes) is priced at the input rate.
 It does not estimate missing token counts. This is not an account-wide report or an
 invoice: regional uplifts, provisioned endpoints, negotiated pricing, credits, and
 delayed billing adjustments can differ. Older chats that predate the ledger show
@@ -1110,6 +1117,30 @@ visible agent-call totals as incomplete because title, summary, and retry attemp
 cannot be reconstructed. A delegated child's requests stay in its own conversation's
 usage (its parent's spending limit counts them).
 Databricks responses may omit usage.
+
+**Turn summary.** Under the last reply of each turn a muted line sums the turn up, for example
+`8 steps · 14 tools · 2 min 10 s · 182k in (160k cached) / 3.1k out · ~1.4 DBU`: the agent's model
+requests (steps), its tool calls, the wall-clock time, the input (cache included, with the cache
+reads in brackets) and output tokens of the turn's own calls (title and compaction included), the
+estimated DBU with its subagents', and how many subagents it started. A count no call reported
+shows `—`, never 0, and there is no DBU part without price data. Open it for how the turn ended,
+the tokens it processed with its subagents, calls without price data and the files its tools and
+subagents changed. The same record ends the turn for scripts (see **Scripting the app**), is
+kept with the chat, and is a `_Turn: …_` line in transcripts; exports, forks and imports leave it
+out.
+
+**All chats.** **Agent tools → Usage → All chats** sums the model calls of every conversation over
+the last 7, 30 or 90 days (local calendar dates): totals (uncached input, cache reads and writes,
+output, estimated DBU and calls without price data), one bar per day split into cache reads,
+uncached input with cache writes, and output (also as a table), and tables by endpoint, by purpose
+(agent, title, compaction, side question) and by project (a worktree chat counts for its project;
+the 20 largest, then one row for the rest). Subagent chats count as chats of their own. It reads a
+small summary each conversation keeps in its file's first line (at most 90 days), so no
+conversation is loaded; a chat saved before this existed is read once and its summary saved, 50
+per refresh, and the view says how many are left. Endpoint checks are not chats and are not
+included. `python3 scripts/usage_report.py --all <state dir> [--days 30] [--json]` prints the same
+from the conversation files (Python 3 only; the state dir is `.local` by default).
+
 See the [Databricks API reference](https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/api-reference)
 for the provider's usage fields. The context meter below shows the input Databricks
 reported for the last request next to the app's own pre-request estimate, and
@@ -1235,6 +1266,27 @@ and compaction requests are counted but never stopped. A subagent follows its pa
 in the parent's subagents index after each of its turns, also when it is stopped, deleted or
 continued by you (subagents that ended before this existed are not counted). The offline simulator reports usage, so
 `databricks-claude-opus-5-5` there can be used to try a small limit.
+
+### Token and time limits per turn
+
+**Settings → Agent → Token limit per turn** and **Time limit per turn (minutes)** cap each turn
+(one message and the agent's work on it) of chats without limits of their own; 0, the default,
+means none. **Agent tools → Usage → Turn limits** sets a chat's own (0 = none for this chat) or
+returns it to the Settings defaults. A change applies from the agent's next model request, also
+while a turn runs. The token limit counts every token the turn's requests processed as Databricks
+reported them: uncached input, cache reads and writes, and output, its subagents' included. So it
+also caps endpoints without price data, and cache reads count in full although they cost less. The
+time limit is the wall-clock time since the turn started, waits for your approvals included.
+
+Both are checked before each agent model request. Once one is reached, the agent gets one more
+request, told to call no tools and to reply with what is done, what remains and how to continue (a
+tool call in that reply does not run). Then the turn ends with a notice, the chat offers
+**Continue** (which starts a new turn with a new budget), and desktop notifications say "Reached
+the turn budget". Verify and stop hooks do not continue the turn past it, and messages queued
+while it ran stay queued. A subagent counts toward its parent's turn: its tokens add to the
+parent's and the parent's start time applies; a subagent that reaches the limit wraps up the same
+way and reports the stop as an error to its parent. The check runs between requests, so one
+response can pass the limit; title and compaction requests count but are never stopped.
 
 ### Reasoning effort and thinking
 
@@ -1422,7 +1474,7 @@ endpoint…** takes a typed name; chats on the fallback endpoint itself have no 
 **Request details** show **Answered by** with the fallback (**Sent to** when it failed too) and
 **Fallback from** with the chat's endpoint and why it failed; **Agent tools → Usage** lists the call
 under the fallback endpoint, priced at that endpoint's rates (an endpoint without price data, such
-as GPT OSS, is not counted by the spending limit, as for any other call).
+as a custom serving endpoint, is not counted by the spending limit, as for any other call).
 
 ### Endpoint checks
 
@@ -1445,7 +1497,7 @@ prices (input at the app's estimate, at the cache-write rate for the cache reque
 token; the two requests that send the tool result back include room for the reply they repeat, and a
 run does not send one that would come out larger), and the total, for example at most about 7.1 DBU
 for all checks on Claude Opus 5.5 and 0.6 DBU for Test model (a run usually costs a fraction of
-that). An endpoint without price data, such as GPT OSS, shows its token caps instead. You can untick
+that). An endpoint without price data, such as a custom serving endpoint, shows its token caps instead. You can untick
 checks. Nothing is sent until you press **Run (about N DBU)**, and every run asks again: the server
 sends the requests only with the plan you saw (`plan_id`, computed again from the endpoint, the
 chosen checks and the price list) and its estimate, and refuses anything else without sending a
@@ -3192,6 +3244,77 @@ Automatic compaction adds bounded summary requests beyond the configured agent s
 Databricks inference is billed to your workspace. Endpoints must support streaming,
 function calling, and non-streamed text responses for summarization.
 
+### Scripting the app
+
+`scripts/agent_run.py` runs one prompt in the running app and prints the result;
+`backend/local_agent/client.py` is the Python client it uses. Both need only Python 3 (not the
+app's dependencies) and the app running (`python3 run.py`). Neither starts a server, so a second
+app never opens the same state folder. Every model request is billed to your Databricks workspace,
+like a message typed in the page.
+
+```
+python3 scripts/agent_run.py "Summarize the README"          # Plan mode: changes nothing
+python3 scripts/agent_run.py --output json --max-tokens 500000 "List the TODOs"
+python3 scripts/agent_run.py --mode manual --approve ask "Fix the failing test"
+echo "Review the diff" | python3 scripts/agent_run.py --output stream-json -
+```
+
+- The prompt runs in a new chat, listed in the sidebar like any other (`--session <id>` sends it
+  to an existing idle chat instead). `--workspace` chooses its project folder (an existing absolute
+  folder, never the app's state folder; default the Settings workspace), `--mode` its permission
+  mode (default **Plan**; **Bypass permissions** also needs `--confirm-bypass`), `--model` and
+  `--effort` its endpoint and effort, `--max-steps` its own Agent steps per message, `--max-dbu`
+  its spending limit and `--max-tokens` / `--max-minutes` its turn limits.
+- `--output text` (the default) prints the final reply, and a one-line summary on stderr; `json`
+  prints one result object; `stream-json` prints every message of the chat as one JSON line (what
+  the page gets: the snapshot, events, text deltas, status changes) and then the result.
+- Cards: `--approve deny` (the default) declines every approval card at once with a note that
+  nobody can approve in this run, skips questions, and keeps a plan in planning (the agent is told
+  to end its turn with the plan as its reply), so nothing waits for the approval timeout.
+  `--approve ask` asks you in the terminal (it needs one). A subagent's cards are answered the same
+  way.
+- The result object has `terminal_reason`, `is_error`, `duration_s`, `steps`, `tool_calls`,
+  `usage`, `tokens`, `estimated_dbu`, `unpriced_calls`, `subagents`, `changed_files`, `result`
+  (the final reply), `exit_code` and `session_id`. Exit codes: 0 completed, 1 an error, 2 a limit
+  was reached (Agent steps, spending, or the turn's tokens or time), 3 stopped or interrupted.
+  Ctrl+C stops the turn and prints its result.
+
+From Python:
+
+```python
+import sys
+sys.path.insert(0, "backend")  # From the local-agent-workspace folder.
+from local_agent.client import Allow, Deny, LocalAgentClient
+
+def can_use_tool(name, arguments, context):
+    return Allow() if name in ("write_file", "edit_file") else Deny("Only file edits in this run.")
+
+client = LocalAgentClient()  # http://127.0.0.1:8765
+for message in client.query("Fix the typo in README.md", permission_mode="manual", can_use_tool=can_use_tool):
+    if message["type"] == "result":
+        print(message["terminal_reason"], message["changed_files"], message["result"])
+```
+
+`query()` yields the chat's messages (each with `session_id`; a subagent's also with
+`subagent: true`) and ends with the result object. `can_use_tool(name, input, context)` answers
+approval cards (`context` has `session_id`, `event_id`, `preview` and `subagent`) with `Allow()` or
+`Deny(message)`; for a plan, `Allow("acceptEdits")` or `Allow("manual")` approves it into that mode.
+`on_question(questions, context)` answers `ask_user` questions with one
+`{"selected": [label], "other": None}` per question, or `None` to skip them. Without a callback every
+card is declined at once. The client also has `create_session`, `send`, `interrupt`,
+`set_permission_mode` (Bypass needs `confirm=True`), `set_model`, `set_effort`,
+`set_spending_limit`, `set_turn_limits`, `fork`, `rewind`, `events` and `wait_result`.
+
+The client talks to the app on this computer only (`127.0.0.1`, `localhost` or `::1`). It reads
+the local token from `/api/bootstrap` as the page does, and again after the app restarted. A
+chat's live messages come from `GET /api/sessions/<id>/stream.ndjson`, one JSON object per line:
+the snapshot first, then what the page's WebSocket gets, and a `keep_alive` line every 15 seconds
+while it is quiet. A turn ends with the idle `status` message, which carries the turn's result
+record (`turn_result`). A reader that falls 1,000 messages behind is dropped, as a stalled page is
+(its stream ends with a `stream_closed` line); the client then opens a new stream, whose snapshot
+shows a turn that ended meanwhile. `POST /api/sessions` takes `workspace` and `max_agent_steps`
+for scripts, and `PUT /api/sessions/<id>/turn-limits` sets a chat's turn limits.
+
 ## Trying the app offline (simulator)
 
 `scripts/simulate_databricks.py` starts the app against a simulated Databricks workspace on
@@ -3249,6 +3372,10 @@ Thinking display, subagents, background jobs and change review before using a pa
 - Simulated chats and settings live in `.local/simulator/` (`--state-dir` to change), apart
   from your real conversations. Without `--workspace` a small demo Git project is created
   there. The app runs on port 8766, so the real app on 8765 can run at the same time.
+- `scripts/agent_run.py --url http://127.0.0.1:8766 "edit a note"` scripts the simulated app
+  (see **Scripting the app**). Tests and other launchers import the start-up pieces:
+  `start_gateway()` runs the fake gateway in a thread, `patched_settings()` points an app made in
+  the same process at it, and `start_app()` runs that app on a free port.
 
 ## Development and checks
 
@@ -3424,6 +3551,9 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `skills/`: skills shipped with the app and offered in every workspace; `handoff/SKILL.md` is the detailed handoff skill. A workspace's `.agents/skills/<id>/` replaces the shipped skill with that ID.
 - `backend/local_agent/telemetry.py`: inference ledger, validated usage, DBU estimates, and failure categories.
 - `backend/local_agent/usage_export.py` / `scripts/usage_report.py`: usage rows and CSV correlated with conversation history.
+- `backend/local_agent/usage_overview.py`: usage across chats (`GET /api/usage`, `usage_report.py --all`) from each conversation's usage summary.
+- `backend/local_agent/turns.py`: each turn's result record and its token and time limits (the wrap-up request, `budget_limit`).
+- `backend/local_agent/stream_api.py` / `client.py` / `scripts/agent_run.py`: the NDJSON stream of a chat, the stdlib Python client and the headless runner.
 - `backend/local_agent/instructions.py`: scoped project guidance loading (`.local` files, `@path` imports,
   path-scoped project rules, the 24,000-byte budget) and the user's own instruction files.
 - `backend/local_agent/memory.py`: project memory notes in the state folder, keyed by the Git repository.

@@ -13,12 +13,24 @@ USAGE_FIELDS = (
     "cache_creation_input_tokens", "reasoning_tokens",
 )
 PRICING_SOURCE = "https://www.databricks.com/product/pricing/proprietary-foundation-model-serving"
-PRICING_EFFECTIVE_AT = "2026-10-13"
-# Versioned snapshot of the Databricks pay-per-token list rates. These are
-# estimates, not invoice records; account discounts and billing adjustments are
-# intentionally outside this local calculation. Regional processing adds a 10%
-# uplift that is not included. Cache writes use the 5-minute rate: the usage does
-# not tell 1-hour writes (114.286 DBU per million for Opus 5.5) apart.
+OPEN_PRICING_SOURCE = "https://www.databricks.com/product/pricing/foundation-model-serving"
+PRICING_EFFECTIVE_AT = "2026-10-16"
+# Versioned snapshot of the Databricks pay-per-token list rates (Standard, not Priority or Batch), copied
+# from the two pricing pages above on PRICING_EFFECTIVE_AT; only endpoints with one rate per token type are
+# listed (models whose rate depends on the context length are left out). These are estimates, not invoice
+# records; account discounts and billing adjustments are intentionally outside this local calculation.
+# Regional processing adds a 10% uplift that is not included. Cache writes use the 5-minute rate: the usage
+# does not tell 1-hour writes (114.286 DBU per million for Opus 5.5) apart. A model whose page lists no
+# cache rate has its cache tokens priced at its input rate (no discount is listed).
+_CLAUDE_OPUS_4_5 = {"input_tokens": 71.429, "output_tokens": 357.143, "cache_read_input_tokens": 7.143,
+                    "cache_creation_input_tokens": 89.286}
+_CLAUDE_OPUS_4 = {"input_tokens": 214.286, "output_tokens": 1071.43, "cache_read_input_tokens": 21.429,
+                  "cache_creation_input_tokens": 267.857}
+_CLAUDE_SONNET_5 = {"input_tokens": 28.571, "output_tokens": 142.857, "cache_read_input_tokens": 2.857,
+                    "cache_creation_input_tokens": 35.714}
+_CLAUDE_SONNET_4 = {"input_tokens": 42.857, "output_tokens": 214.286, "cache_read_input_tokens": 4.286,
+                    "cache_creation_input_tokens": 53.571}
+_GPT_5 = {"input_tokens": 17.857, "output_tokens": 142.857, "cache_read_input_tokens": 1.786}
 MODEL_DBU_PER_MILLION = {
     "databricks-claude-opus-5-5": {
         "input_tokens": 57.143,
@@ -26,13 +38,28 @@ MODEL_DBU_PER_MILLION = {
         "cache_read_input_tokens": 2.857,
         "cache_creation_input_tokens": 71.429,
     },
-    "databricks-claude-opus-4-8": {
-        "input_tokens": 71.429,
-        "output_tokens": 357.143,
-        "cache_read_input_tokens": 7.143,
-        "cache_creation_input_tokens": 89.286,
-    },
+    **{f"databricks-claude-opus-{version}": _CLAUDE_OPUS_4_5 for version in ("5", "4-8", "4-7", "4-6", "4-5")},
+    **{f"databricks-claude-opus-{version}": _CLAUDE_OPUS_4 for version in ("4-1", "4")},
+    **{f"databricks-claude-sonnet-{version}": _CLAUDE_SONNET_5 for version in ("5-5", "5")},
+    **{f"databricks-claude-sonnet-{version}": _CLAUDE_SONNET_4 for version in ("4-6", "4-5", "4")},
+    "databricks-claude-haiku-4-5": {"input_tokens": 14.286, "output_tokens": 71.429, "cache_read_input_tokens": 1.429,
+                                    "cache_creation_input_tokens": 17.857},
+    "databricks-gpt-5-2": {"input_tokens": 25.0, "output_tokens": 200.0, "cache_read_input_tokens": 2.5},
+    "databricks-gpt-5-1": _GPT_5,
+    "databricks-gpt-5": _GPT_5,
+    "databricks-gpt-5-mini": {"input_tokens": 3.571, "output_tokens": 28.571, "cache_read_input_tokens": 0.357},
+    "databricks-gpt-5-nano": {"input_tokens": 0.714, "output_tokens": 5.714, "cache_read_input_tokens": 0.071},
+    # Open models (OPEN_PRICING_SOURCE).
+    "databricks-gpt-oss-120b": {"input_tokens": 2.143, "output_tokens": 8.571},
+    "databricks-gpt-oss-20b": {"input_tokens": 1.0, "output_tokens": 4.286},
+    "databricks-llama-4-maverick": {"input_tokens": 7.143, "output_tokens": 21.429},
+    "databricks-meta-llama-3-3-70b-instruct": {"input_tokens": 7.143, "output_tokens": 21.429},
+    "databricks-meta-llama-3-1-8b-instruct": {"input_tokens": 2.143, "output_tokens": 6.429},
+    "databricks-gemma-3-12b": {"input_tokens": 2.143, "output_tokens": 7.143},
 }
+OPEN_MODELS = ("databricks-gpt-oss-120b", "databricks-gpt-oss-20b", "databricks-llama-4-maverick",
+               "databricks-meta-llama-3-3-70b-instruct", "databricks-meta-llama-3-1-8b-instruct", "databricks-gemma-3-12b")
+PRICED_FIELDS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
 # The raw usage object's key names kept per call (usage_keys): bounded, so a provider cannot write text into the ledger.
 USAGE_KEY_LIMIT = 16
 USAGE_KEY_PATTERN = re.compile(r"[a-z0-9_.]{1,64}\Z")
@@ -250,9 +277,16 @@ def estimated_dbu(model, usage):
         return None
     # Claude reports uncached input, cache reads, and cache writes as separate
     # billable buckets. Cache tokens must therefore be added, not subtracted
-    # from prompt_tokens/input_tokens.
-    value = sum(usage.get(field, 0) * rate for field, rate in rates.items()) / 1_000_000
+    # from prompt_tokens/input_tokens. A cache rate the price list leaves out is the input rate.
+    value = sum(usage.get(field, 0) * rates.get(field, rates["input_tokens"]) for field in PRICED_FIELDS) / 1_000_000
     return round(value, 9)
+
+
+def pricing_source(model):
+    """The pricing page a model's list rates come from, or None for a model without them."""
+    if not isinstance(model, str) or model.lower() not in MODEL_DBU_PER_MILLION:
+        return None
+    return OPEN_PRICING_SOURCE if model.lower() in OPEN_MODELS else PRICING_SOURCE
 
 
 def _explicit_rejection(call):
@@ -417,8 +451,82 @@ def session_metrics(session):
             "unit": "per_1m_tokens",
             "label": "Databricks pay-per-token list-price DBU estimate",
             "source_url": PRICING_SOURCE,
+            "open_source_url": OPEN_PRICING_SOURCE,  # The rates of OPEN_MODELS.
             "effective_at": PRICING_EFFECTIVE_AT,
             "estimated": True,
             "models": MODEL_DBU_PER_MILLION,
         },
     }
+
+
+TOKEN_FIELDS = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens")
+
+
+def call_tokens(call):
+    """Every token one ledger record reports it processed: uncached input, cache reads and writes, and output
+    (reasoning is part of output). 0 for a record without usage."""
+    usage = reported_usage(call.get("usage")) if isinstance(call, dict) else {}
+    return sum(usage.get(field, 0) for field in TOKEN_FIELDS)
+
+
+def usage_totals(records):
+    """The usage panel's totals (_totals) of these ledger records: counts, token sums (a field no call reported
+    is None) and the estimated DBU (None when a call has no estimate)."""
+    return _totals([_public_call(record) for record in records if isinstance(record, dict)])
+
+
+# The usage summary each conversation keeps in its header (usage_summary), so a view of every chat's usage reads
+# headers only: one row per local date, model and purpose, the newest SUMMARY_DAYS dates and SUMMARY_ROWS rows.
+SUMMARY_VERSION = 1
+SUMMARY_COLUMNS = ("date", "model", "purpose", "calls", *TOKEN_FIELDS, "estimated_dbu", "unpriced_calls")
+SUMMARY_DAYS = 90
+SUMMARY_ROWS = 120
+
+
+def local_date(value):
+    """The local calendar date (YYYY-MM-DD) of a ledger time, as the usage CSV shows it."""
+    try:
+        moment = datetime.fromisoformat(_iso_time(value).replace("Z", "+00:00"))
+        return moment.astimezone().date().isoformat()
+    except (ValueError, OverflowError, OSError):
+        return "1970-01-01"
+
+
+def usage_summary(session):
+    """{version, calls, rows: [[date, model, purpose, calls, input, cache read, cache write, output, estimated DBU,
+    unpriced calls]]} from the conversation's ledger. Tokens are those reported; DBU sums the priced calls, and
+    unpriced_calls counts calls that reported usage to an endpoint without list rates."""
+    groups = {}
+    records = session.get("inference_calls") if isinstance(session.get("inference_calls"), list) else []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        call = _public_call(record)
+        key = (local_date(call["created"]), call["model"][:128], call["purpose"])
+        row = groups.setdefault(key, [*key, 0, 0, 0, 0, 0, 0.0, 0])
+        row[3] += 1
+        usage = call.get("usage") or {}
+        for index, field in enumerate(TOKEN_FIELDS, start=4):
+            row[index] += usage.get(field, 0)
+        estimate, priced = call_estimated_dbu(record)
+        if estimate is not None:
+            row[8] = round(row[8] + estimate, 9)
+        elif not priced:
+            row[9] += 1
+    dates = sorted({key[0] for key in groups}, reverse=True)[:SUMMARY_DAYS]
+    rows = sorted((row for key, row in groups.items() if key[0] in dates), key=lambda row: (row[0], row[1], row[2]))
+    return {"version": SUMMARY_VERSION, "calls": len(records), "rows": rows[-SUMMARY_ROWS:]}
+
+
+def summary_rows(summary):
+    """The valid rows of a header's usage_summary as dicts (SUMMARY_COLUMNS); [] for a missing or damaged one."""
+    if not isinstance(summary, dict) or summary.get("version") != SUMMARY_VERSION or not isinstance(summary.get("rows"), list):
+        return []
+    rows = []
+    for row in summary["rows"][-SUMMARY_ROWS:]:
+        if (not isinstance(row, list) or len(row) != len(SUMMARY_COLUMNS) or not all(isinstance(item, str) for item in row[:3])
+                or not all(type(item) is int and item >= 0 for item in (*row[3:8], row[9]))
+                or isinstance(row[8], bool) or not isinstance(row[8], (int, float)) or not math.isfinite(row[8])):
+            continue
+        rows.append(dict(zip(SUMMARY_COLUMNS, row)))
+    return rows

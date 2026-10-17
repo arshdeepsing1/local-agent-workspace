@@ -27,6 +27,10 @@ MAX_USER_INSTRUCTIONS = 8_000
 MIN_WRITE_LIMIT_KB = 16
 MAX_WRITE_LIMIT_KB = 1000
 MAX_COMMAND_ENV = 32
+# Settings → Agent (turns.py): a turn's token limit (every token its requests processed) and wall-clock limit.
+MAX_TURN_TOKENS = 100_000_000
+MAX_TURN_MINUTES = 1_440
+TURN_LIMITS = {"turn_token_limit": MAX_TURN_TOKENS, "turn_time_limit_minutes": MAX_TURN_MINUTES}
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
 # Never passed to commands; equal to jobs.CREDENTIAL_ENV, DENIED_ENV and DENIED_ENV_PREFIXES.
 CREDENTIAL_ENV = {"DBRICKS_TOKEN", "DATABRICKS_TOKEN", "DBRICKS_URL", "DATABRICKS_HOST", "LOCAL_AGENT_ENV_FILE"}
@@ -172,6 +176,9 @@ class Settings:
             "prompt_caching": "auto",
             # Settings → Agent (spending.py): the soft cap in estimated DBU of chats without their own; 0 = none.
             "spending_limit_dbu": 0,
+            # Settings → Agent (turns.py): the token and time limits of each turn of chats without their own; 0 = none.
+            "turn_token_limit": 0,
+            "turn_time_limit_minutes": 0,
             "subagent_defaults": subagent_defaults(None),
             # Settings → Model and context (AgentManager.fallback_endpoint): the endpoint an agent or subagent
             # request goes to once when its own failed before the reply started; "" = none.
@@ -204,6 +211,9 @@ class Settings:
                 self.values["spending_limit_dbu"] = validate_limit(float(limit) if isinstance(limit, str) else limit)
             except ValueError:
                 self.values["spending_limit_dbu"] = 0
+            for key, maximum in TURN_LIMITS.items():  # A hand-edited limit that is not a whole number means none.
+                if type(self.values[key]) is not int or not 0 <= self.values[key] <= maximum:
+                    self.values[key] = 0
             fallback = self.values["fallback_model"]  # A hand-edited name that is not one means none.
             fallback = fallback.strip() if isinstance(fallback, str) else ""
             self.values["fallback_model"] = fallback if ENDPOINT_NAME.match(fallback) else ""
@@ -340,6 +350,10 @@ class Settings:
         if type(candidate["slash_commands"]) is not bool:
             raise ValueError("Slash commands must be on or off.")
         candidate["spending_limit_dbu"] = validate_limit(candidate["spending_limit_dbu"], "Default spending limit")
+        for key, label, unit in (("turn_token_limit", "Token limit per turn", "tokens"),
+                                 ("turn_time_limit_minutes", "Time limit per turn", "minutes")):
+            if type(candidate[key]) is not int or not 0 <= candidate[key] <= TURN_LIMITS[key]:
+                raise ValueError(f"{label} must be a whole number of {unit} from 0 (none) to {TURN_LIMITS[key]:,}.")
         sent = values.get("subagent_defaults")
         if isinstance(sent, dict):
             # Types and fields left out keep their current values.

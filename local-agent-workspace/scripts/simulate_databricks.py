@@ -59,8 +59,13 @@ anything else gets a short reply that says which effort and fields the request c
 
 Conversations and settings live in a separate state folder (default .local/simulator), so
 simulated chats never mix with real ones. Your credential file is never read.
+
+Tests and other launchers import the start-up pieces: start_gateway() runs the fake gateway in a
+thread, patched_settings() points an app made in the same process at it, and start_app() runs the
+app on a free port (scripts/agent_run.py and local_agent.client can then drive it).
 """
 import argparse
+import contextlib
 import copy
 import hashlib
 import hmac
@@ -774,6 +779,62 @@ def demo_workspace(state):
     return project
 
 
+def start_gateway(port=0, *, claude_fields="both", cache="accept", replay="accept", vision="accept",
+                  response_format="accept", speed=1.0):
+    """Start the fake gateway on 127.0.0.1:port (0: any free port) in a daemon thread, with a fresh prompt cache
+    and rate-limit marks: (server, its URL). server.shutdown() and server.server_close() stop it."""
+    Gateway.claude_fields, Gateway.cache_mode, Gateway.speed = claude_fields, cache, max(0.0, speed)
+    Gateway.replay_mode, Gateway.vision_mode, Gateway.response_format_mode = replay, vision, response_format
+    Gateway.prompt_cache, Gateway.brain = PromptCache(), Brain()
+    server = ThreadingHTTPServer(("127.0.0.1", port), Gateway)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+
+SIMULATED_ENV = ("LOCAL_AGENT_STATE_DIR", "LOCAL_AGENT_WORKSPACE", "LOCAL_AGENT_ENV_FILE")
+
+
+@contextlib.contextmanager
+def patched_settings(gateway, state, workspace):
+    """While open, an app created in this process (local_agent.api.create_app) runs against the gateway: its state
+    folder and project come from the process environment, which wins over .env and is read when the app makes its
+    Settings, and Settings.credentials answers the gateway with a fake token, so your credential file is never read.
+    Both are restored on exit."""
+    if str(APP / "backend") not in sys.path:
+        sys.path.insert(0, str(APP / "backend"))
+    from local_agent import config
+    saved_env = {name: os.environ.get(name) for name in SIMULATED_ENV}
+    saved_credentials = config.Settings.credentials
+    os.environ.update(LOCAL_AGENT_STATE_DIR=str(state), LOCAL_AGENT_WORKSPACE=str(workspace), LOCAL_AGENT_ENV_FILE="")
+    config.Settings.credentials = lambda self: (gateway, "simulated-token")
+    try:
+        yield
+    finally:
+        config.Settings.credentials = saved_credentials
+        for name, value in saved_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def start_app(port=0):
+    """Start the app on 127.0.0.1:port (0: any free port) in a thread, inside patched_settings: (server, thread,
+    its URL). Set server.should_exit = True and join the thread to stop it (the app's shutdown runs)."""
+    import uvicorn
+    from local_agent.api import create_app
+    server = uvicorn.Server(uvicorn.Config(create_app(), host="127.0.0.1", port=port, access_log=False, log_level="warning"))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    while not server.started:
+        if not thread.is_alive():
+            raise RuntimeError("The app did not start.")
+        time.sleep(0.02)
+    bound = server.servers[0].sockets[0].getsockname()[1]
+    return server, thread, f"http://127.0.0.1:{bound}"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--port", type=int, default=8766, help="app port (default 8766; the real app uses 8765)")
@@ -795,12 +856,8 @@ def main():
     parser.add_argument("--gateway-only", action="store_true", help="run only the fake gateway (for your own launcher)")
     args = parser.parse_args()
 
-    Gateway.claude_fields, Gateway.cache_mode, Gateway.speed = args.claude_fields, args.cache, max(0.0, args.speed)
-    Gateway.replay_mode, Gateway.vision_mode, Gateway.response_format_mode = args.replay, args.vision, args.response_format
-    server = ThreadingHTTPServer(("127.0.0.1", args.gateway_port), Gateway)
-    server.daemon_threads = True
-    gateway = f"http://127.0.0.1:{server.server_address[1]}"
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    _, gateway = start_gateway(args.gateway_port, claude_fields=args.claude_fields, cache=args.cache, replay=args.replay,
+                               vision=args.vision, response_format=args.response_format, speed=args.speed)
     log(f"fake Databricks gateway on {gateway} (Claude reasoning fields accepted: {args.claude_fields}; "
         f"cache markers: {args.cache}; thinking sent back: {args.replay}; images: {args.vision}; "
         f"response_format: {args.response_format})")
@@ -813,16 +870,12 @@ def main():
     state = Path(args.state_dir).expanduser().resolve()
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     workspace = Path(args.workspace).expanduser().resolve() if args.workspace else demo_workspace(state)
-    # Set before the app reads its settings; the process environment wins over .env.
-    os.environ.update(LOCAL_AGENT_STATE_DIR=str(state), LOCAL_AGENT_WORKSPACE=str(workspace), LOCAL_AGENT_ENV_FILE="")
-    sys.path.insert(0, str(APP / "backend"))
     os.environ["PATH"] = str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", "")
-    from local_agent import config
-    config.Settings.credentials = lambda self: (gateway, "simulated-token")
-    import uvicorn
-    log(f"app on http://127.0.0.1:{args.port}  workspace {workspace}  state {state}")
-    log(SCENARIO_HINT)
-    uvicorn.run("local_agent.api:create_app", factory=True, host="127.0.0.1", port=args.port, access_log=False)
+    with patched_settings(gateway, state, workspace):
+        import uvicorn
+        log(f"app on http://127.0.0.1:{args.port}  workspace {workspace}  state {state}")
+        log(SCENARIO_HINT)
+        uvicorn.run("local_agent.api:create_app", factory=True, host="127.0.0.1", port=args.port, access_log=False)
 
 
 if __name__ == "__main__":

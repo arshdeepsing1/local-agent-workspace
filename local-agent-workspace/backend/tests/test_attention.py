@@ -86,7 +86,9 @@ async def test_the_idle_status_message_carries_how_the_turn_ended(runtime):
     assert statuses[0] == {"type": "status", "status": "running"}
     ended = (await listed(client, session))["turn_ended"]
     assert isinstance(ended, float)
+    result = statuses[-1].pop("turn_result")  # The turn's result record (turns.py) ends it too.
     assert statuses[-1] == {"type": "status", "status": "idle", "terminal_reason": "error", "turn_ended": ended}
+    assert result["terminal_reason"] == "error" and result["is_error"] is True and result["ended"] == round(ended, 3)
 
 
 async def test_the_summary_marks_a_turn_in_progress_and_when_it_ended(runtime):
@@ -246,6 +248,7 @@ async def test_a_turn_cut_off_by_a_restart_is_marked_interrupted(tmp_path, monke
         assert {key: store.get(done["id"])[key] for key in ("terminal_reason", "turn_ended")} == {
             "terminal_reason": "completed", "turn_ended": 123.0}
     assert attention_message({"title": "T", "terminal_reason": "interrupted"}, "running", "idle", True) == "Stopped with an error: T"
+    assert attention_message({"title": "T", "terminal_reason": "budget_limit"}, "running", "idle", True) == "Reached the turn budget: T"
 
 
 async def test_notifier_failures_never_reach_the_conversation(runtime):

@@ -648,3 +648,19 @@ body.panel-resizing{cursor:col-resize;user-select:none}
 .capability-table tr[data-status=rejected] td:nth-child(2),.capability-table tr[data-status=error] td:nth-child(2){color:#98492f}
 .overview-capabilities{margin:-8px 0 20px;font-size:12px}.overview-capabilities>summary{cursor:pointer;color:var(--muted);padding:4px 0}
 @media(max-width:600px){.capability-table td:last-child{white-space:normal}.endpoint-requests li,.endpoint-progress li{flex-direction:column}}
+/* 2026-10-16 runner: the turn summary under a turn's last reply, turn limits and All chats in Agent tools → Usage. */
+.turn-summary{font-size:11px;color:var(--muted);margin:-8px 0 14px;overflow-wrap:anywhere}.turn-summary>summary{cursor:pointer;width:fit-content;max-width:100%;font-variant-numeric:tabular-nums}
+.turn-summary p{margin:6px 0 0;padding:9px 11px;border:1px solid var(--border);border-radius:8px;background:var(--surface);line-height:1.5}
+.usage-scope{display:inline-flex;gap:2px;padding:2px;margin:0 0 14px;border:1px solid var(--border);border-radius:8px;background:var(--surface)}
+.usage-scope button{border:0;background:none;padding:5px 11px;border-radius:6px;font-size:12px;color:var(--muted)}.usage-scope button[aria-pressed=true]{background:#f1efe9;color:var(--ink);font-weight:500}
+.usage-turn-limits{background:var(--surface);border:1px solid var(--border);border-radius:9px;padding:12px;margin:12px 0 0;min-width:0}.usage-turn-limits .field-help{margin:6px 0 0}
+.usage-period{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)}.usage-period select{font-size:12px}
+.usage-day-chart{position:relative}.usage-day-hit{fill:transparent}.usage-day-chart g:focus{outline:none}.usage-day-chart g:focus .usage-day-hit{fill:#f1efe9}
+.usage-day-cached{fill:#2a78d6;background:#2a78d6}.usage-day-uncached{fill:#1baf7a;background:#1baf7a}.usage-day-output{fill:#eb6834;background:#eb6834}
+.usage-day-chart svg{height:166px}.usage-day-axis{display:flex;justify-content:space-between;padding:4px 4px 0;font-size:11px;color:var(--muted)}
+.usage-day-tooltip{position:absolute;top:34px;display:grid;gap:3px;min-width:12rem;padding:8px 10px;border:1px solid var(--border);border-radius:8px;background:var(--surface);box-shadow:0 4px 14px rgba(41,41,35,.12);font-size:11px;color:var(--muted);pointer-events:none}
+.usage-day-tooltip strong{color:var(--ink);font-weight:500}.usage-day-tooltip b{color:var(--ink);font-weight:500;font-variant-numeric:tabular-nums}.usage-day-tooltip i{display:inline-block;width:10px;height:2px;margin-right:6px;vertical-align:middle}
+.usage-day-table,.usage-prices{margin:10px 0 0;font-size:12px}.usage-day-table>summary,.usage-prices>summary{cursor:pointer;color:var(--muted);padding:4px 0;width:fit-content}
+.usage-day-table table,.usage-prices table{width:100%;border-collapse:collapse;background:var(--surface);font-size:11px}.usage-day-table th,.usage-day-table td,.usage-prices th,.usage-prices td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--border);white-space:nowrap}
+.usage-day-table th,.usage-prices th{font-weight:500;color:var(--muted)}.usage-prices .field-help{margin-top:8px}
+@media(max-width:600px){.usage-day-tooltip{min-width:9rem}.usage-scope{display:flex}.usage-scope button{flex:1}.usage-day-chart svg{height:130px}}

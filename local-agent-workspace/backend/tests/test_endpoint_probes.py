@@ -4,7 +4,6 @@ it, and whole runs against a ReplayClient and the offline simulator. No request 
 import asyncio
 import importlib.util
 import json
-import math
 import stat
 import threading
 from http.server import ThreadingHTTPServer
@@ -18,7 +17,7 @@ from local_agent.api import create_app
 from local_agent.config import Settings
 from local_agent.endpoint_probes import CheckStore, capabilities, interpret, plan, prompt_counting, read_stream, sanitize
 from local_agent.serving import ReplayClient, ServingClient, sse_chunks
-from local_agent.telemetry import MODEL_DBU_PER_MILLION, REQUEST_TAGS_HEADER
+from local_agent.telemetry import MODEL_DBU_PER_MILLION, PRICING_EFFECTIVE_AT, REQUEST_TAGS_HEADER
 
 OPUS, OPUS_48, GPT = "databricks-claude-opus-5-5", "databricks-claude-opus-4-8", "databricks-gpt-oss-120b"
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "simulate_databricks.py"
@@ -44,15 +43,18 @@ def test_the_plan_prices_each_request_at_list_prices_and_names_the_worst_case():
     assert value["total_dbu"] < 7.5  # The whole suite, at most; Test model alone:
     test = plan(OPUS, ["basic"])
     assert test["total_dbu"] <= 0.65 and [request["id"] for request in test["probes"][0]["requests"]] == ["basic"]
-    assert value["pricing_effective_at"] == "2026-10-13"
+    assert value["pricing_effective_at"] == PRICING_EFFECTIVE_AT == "2026-10-16"
 
 
 def test_an_endpoint_without_prices_is_unpriced_and_checks_that_do_not_apply_are_left_out():
-    value = plan(GPT)
+    value = plan("team-gpt-oss-endpoint")  # Not in the list prices.
     assert value["priced"] is False and value["total_dbu"] is None
     assert all(request["estimated_dbu"] is None for probe in value["probes"] for request in probe["requests"])
     assert "cache" not in [probe["id"] for probe in value["probes"]]  # cache_control is for Claude endpoints only.
     assert value["max_output_tokens"] > 0
+    # GPT OSS 120B has list prices (input and output only): priced, without the Claude cache check.
+    gpt = plan(GPT)
+    assert gpt["priced"] is True and gpt["total_dbu"] > 0 and "cache" not in [probe["id"] for probe in gpt["probes"]]
     assert [probe["id"] for probe in plan("plain-endpoint")["probes"]] == ["basic", "tools", "response_format", "image"]
     with pytest.raises(ValueError, match="None of the chosen checks"):
         plan("plain-endpoint", ["reasoning"])
@@ -493,14 +495,14 @@ async def test_refusals_found_by_a_check_reach_only_their_hooks(api, gateway):
     assert limits["profile"]["vision"] is False
 
 
-async def test_a_gpt_oss_check_is_unpriced_and_has_no_signed_replay(api, gateway):
+async def test_a_gpt_oss_check_is_priced_at_its_list_rates_and_has_no_signed_replay(api, gateway):
     client, manager, _ = api
     manager.serving = GatewayClient(manager.settings, gateway[1])
     run = await run_all(client, manager, GPT)
-    assert run["status"] == "completed" and run["approved_dbu"] is None
+    assert run["status"] == "completed" and run["approved_dbu"] == plan(GPT)["total_dbu"]
     results = manager.endpoint_checks.get(GPT)["results"]
     assert results["tools"]["replay_signed"] == "skipped" and results["image"]["status"] == "rejected"
-    assert math.isclose(run["reported_dbu"], 0.0)
+    assert 0 < run["reported_dbu"] <= run["approved_dbu"]
 
 
 def test_the_readme_cost_figures_match_the_plan():

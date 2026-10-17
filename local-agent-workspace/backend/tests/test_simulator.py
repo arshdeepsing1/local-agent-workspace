@@ -1,8 +1,6 @@
 """scripts/simulate_databricks.py: the offline Databricks stand-in for trying the app without paid calls."""
 import importlib.util
 import json
-import threading
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import httpx
@@ -21,13 +19,8 @@ def simulator():
 
 @pytest.fixture
 def gateway(simulator):
-    simulator.Gateway.speed, simulator.Gateway.claude_fields, simulator.Gateway.cache_mode = 0.0, "both", "accept"
-    simulator.Gateway.replay_mode = simulator.Gateway.vision_mode = simulator.Gateway.response_format_mode = "accept"
-    simulator.Gateway.prompt_cache = simulator.PromptCache()
-    server = ThreadingHTTPServer(("127.0.0.1", 0), simulator.Gateway)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    yield f"http://127.0.0.1:{server.server_address[1]}"
+    server, url = simulator.start_gateway(speed=0.0)  # The defaults: both fields, cache markers, replay accepted.
+    yield url
     server.shutdown()
     server.server_close()
 

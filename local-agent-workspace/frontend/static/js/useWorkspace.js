@@ -250,6 +250,12 @@ export function useWorkspace() {
           const { spending_limit_dbu: _, ...rest } = current
           return typeof data.spending_limit_dbu === 'number' ? { ...rest, spending_limit_dbu: data.spending_limit_dbu } : rest
         })
+        if (data.type === 'turn_limits') setSession(current => {
+          if (current?.id !== activeId) return current
+          const { turn_token_limit: _tokens, turn_time_limit_minutes: _minutes, ...rest } = current
+          return { ...rest, ...Object.fromEntries(['turn_token_limit', 'turn_time_limit_minutes']
+            .filter(key => Number.isInteger(data[key])).map(key => [key, data[key]])) }
+        })
         if (data.type === 'meta') {
           const meta = { pinned: data.pinned, archived: data.archived, tags: data.tags }
           setSession(current => current?.id === activeId ? { ...current, ...meta } : current)
@@ -265,6 +271,7 @@ export function useWorkspace() {
           setSession(current => current?.id === activeId ? {
             ...current, status: data.status, ...('terminal_reason' in data ? { terminal_reason: data.terminal_reason } : {}),
             ...(data.turn_ended ? { turn_ended: data.turn_ended } : {}),
+            ...(data.turn_result ? { last_turn_result: data.turn_result } : {}),
           } : current)
           setSessions(current => current.map(item => item.id === activeId ? {
             ...item, status: data.status, ...(data.terminal_reason ? { terminal_reason: data.terminal_reason } : {}),
@@ -338,7 +345,8 @@ export function useWorkspace() {
     const { workspace, model, env_file, context_window, max_output_tokens, max_agent_steps, compaction_handoffs, approval_timeout_minutes,
       system_notifications, user_instructions, write_limit_kb, command_env, secret_file_patterns, rate_limit_auto_continue, auto_keep_changes,
       coding_dir, python_venv, auto_compact_percent, reasoning_effort, reasoning_format, thinking_summaries, prompt_caching, subagent_defaults,
-      spending_limit_dbu, fallback_model, user_agents_file, user_claude_file, project_memory, output_style, slash_commands, thinking_replay } = next
+      spending_limit_dbu, fallback_model, user_agents_file, user_claude_file, project_memory, output_style, slash_commands, thinking_replay,
+      turn_token_limit, turn_time_limit_minutes } = next
     const saved = await api('/settings', 'PUT', {
       workspace, model, env_file, context_window, max_output_tokens, max_agent_steps,
       ...(typeof compaction_handoffs === 'boolean' ? { compaction_handoffs } : {}),
@@ -355,6 +363,8 @@ export function useWorkspace() {
       ...(typeof python_venv === 'string' ? { python_venv } : {}),
       ...(typeof reasoning_effort === 'string' ? { reasoning_effort } : {}),
       ...(Number.isFinite(spending_limit_dbu) ? { spending_limit_dbu } : {}),
+      ...(Number.isInteger(turn_token_limit) ? { turn_token_limit } : {}),
+      ...(Number.isInteger(turn_time_limit_minutes) ? { turn_time_limit_minutes } : {}),
       ...(typeof reasoning_format === 'string' ? { reasoning_format } : {}),
       ...(typeof thinking_summaries === 'boolean' ? { thinking_summaries } : {}),
       ...(typeof thinking_replay === 'boolean' ? { thinking_replay } : {}),

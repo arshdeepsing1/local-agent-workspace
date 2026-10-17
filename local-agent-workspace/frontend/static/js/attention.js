@@ -54,6 +54,7 @@ export function attentionFor(before, session) {
   // Not finished: the chat offers Continue.
   if (session.terminal_reason === 'step_limit') return { state: 'step_limit', body: `Reached the step limit: ${title}` }
   if (session.terminal_reason === 'spending_limit') return { state: 'spending_limit', body: `Reached the spending limit: ${title}` }
+  if (session.terminal_reason === 'budget_limit') return { state: 'budget_limit', body: `Reached the turn budget: ${title}` }
   return { state: 'finished', body: `Finished: ${title}` }
 }
 

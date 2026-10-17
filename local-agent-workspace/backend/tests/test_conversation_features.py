@@ -22,9 +22,11 @@ from local_agent.transcript import transcript
 
 
 def ended(message):
-    """An idle status message without its turn_ended time (checked by the attention tests)."""
+    """An idle status message without its turn_ended time (checked by the attention tests) and the turn's result
+    record (test_turn_budget.py), which names the same terminal_reason."""
     assert message.get("turn_ended"), message
-    return {key: value for key, value in message.items() if key != "turn_ended"}
+    assert message["turn_result"]["terminal_reason"] == message.get("terminal_reason"), message
+    return {key: value for key, value in message.items() if key not in ("turn_ended", "turn_result")}
 
 class Socket:
     def __init__(self):

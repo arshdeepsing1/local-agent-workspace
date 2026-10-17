@@ -8,6 +8,8 @@
 //   secret_file_patterns? (at most 32 file name patterns, such as '*.tfvars': a command naming such a file
 //   always shows an approval card with a warning, like the built-in credential names; secret_paths.py),
 //   spending_limit_dbu? (0-100000, default 0 = none: the spending limit of chats without their own; spending.py),
+//   turn_token_limit?, turn_time_limit_minutes? (whole tokens 0-100,000,000 and minutes 0-1440, default 0 = none: the
+//   token and time limits of each turn of chats without their own; turns.py),
 //   coding_dir (default folder for new standalone code: the saved or .env value, '' = off),
 //   python_venv (virtual environment the agent's commands, Verify, hooks and the Terminal use, '' = off),
 //   coding_dir_status: { path, state: 'off'|'ready'|'missing'|'invalid', message, source: 'settings'|'env'|'none' }
@@ -85,20 +87,39 @@
 //   agent_type?: 'explore'|'general'|'editor' or a custom agent's name (a subagent), subagents?: SubagentEntry[] (a parent's index of its
 //   subagent chats; left out of GET /sessions list items),
 //   terminal_reason?: how the last turn ended: 'completed'|'stopped'|'error'|'inference_error'|
-//   'tool_error'|'step_limit'|'spending_limit'|'interrupted'|'hook_blocked' (a user_prompt hook blocked the
-//   message; also in the /api/sessions summaries),
+//   'tool_error'|'step_limit'|'spending_limit'|'budget_limit' (the turn's token or time limit)|'interrupted'|
+//   'hook_blocked' (a user_prompt hook blocked the message; also in the /api/sessions summaries),
 //   turn_ended?: epoch seconds when the last turn ended; null while a turn runs (also in summaries),
 //   turn_delegated?: true while the last turn is one a parent's delegate_task started (also in summaries),
 //   reasoning_effort?: Effort (the chat's own level, saved in its header; absent on chats saved before it existed,
 //   which use Settings.reasoning_effort; kept by forks and imports; also in summaries),
 //   spending_limit_dbu?: number (the chat's own spending limit; 0 = none; absent: Settings.spending_limit_dbu;
-//   kept by forks and imports) }
-// POST /sessions { permission_mode, reasoning_effort?, model? } creates a chat (Settings' effort and model when absent;
-//   /clear sends the replaced chat's).
+//   kept by forks and imports), turn_token_limit?, turn_time_limit_minutes? (the chat's own turn limits; 0 = none;
+//   absent: Settings'), max_agent_steps? (a scripted chat's own Agent steps), last_turn_result?: TurnResult (the
+//   last turn's; GET /info and the snapshot, not the list) }
+// POST /sessions { permission_mode, reasoning_effort?, model?, workspace?, max_agent_steps? } creates a chat (Settings'
+//   effort and model when absent; /clear sends the replaced chat's; workspace: an existing absolute folder, never the
+//   app's state folder, for scripts, default the Settings workspace).
 // PUT /sessions/<id>/reasoning-effort { reasoning_effort } -> Session, also while busy: the agent's next model request
 //   (and a running subagent's) uses it. Pushed as { type: 'reasoning_effort', reasoning_effort }.
 // PUT /sessions/<id>/spending-limit { spending_limit_dbu: number 0..100000 | null (follow Settings) } -> Session, also
 //   while busy (400 for a subagent). Pushed as { type: 'spending_limit', spending_limit_dbu, spending: Spending }.
+// PUT /sessions/<id>/turn-limits { turn_token_limit?, turn_time_limit_minutes?: whole number | null (follow Settings) }
+//   -> Session, also while busy (400 for a subagent or an empty body). Pushed as { type: 'turn_limits', turn_token_limit,
+//   turn_time_limit_minutes } (null: the Settings default). TurnLimits (GET /sessions/<id>/metrics → turn_limits):
+//   { turn_token_limit: number | null (none), token_source: 'chat'|'settings', turn_time_limit_minutes, time_source,
+//   follows_parent } — a subagent follows its parent's.
+// TurnResult (turns.turn_result; on the turn's last reply as turn_result, in the header as last_turn_result and in
+//   the idle status that ends the turn): { terminal_reason, is_error, started, ended (epoch seconds), duration_s,
+//   steps (agent replies), tool_calls, usage: { calls, input_tokens, output_tokens, cache_read_input_tokens,
+//   cache_creation_input_tokens, reasoning_tokens } (the turn's own calls; null = no call reported it), tokens (every
+//   processed token, its subagents' included), estimated_dbu: number | null (no priced call), unpriced_calls,
+//   subagents: { count, tokens, estimated_dbu }, changed_files: string[] (at most 20), changed_files_total? }.
+// GET /usage?days=1..90 (30) -> { days, since, until, totals: { calls, input_tokens, cache_read_input_tokens,
+//   cache_creation_input_tokens, output_tokens, estimated_dbu, unpriced_calls, chats }, by_day: [{ date, ... }] (every
+//   local date, oldest first), by_model: [{ key, priced, ... }], by_purpose: [{ key, label, ... }], by_project:
+//   [{ key, name, ... }] (at most 20, then one '' row), pricing: { effective_at, source_url, open_source_url, models },
+//   pending_chats (older chats not summarized yet) }: every chat's usage from the summaries in their headers.
 // Spending (GET /sessions/<id>/metrics → spending): { limit_dbu: number | null (none), source: 'chat'|'settings',
 //   spent_dbu, own_dbu, subagents_dbu, unpriced_calls, percent: number | null } — a subagent reports its parent's.
 //   GET /sessions list items omit events and allow_rules, and add unreviewed_changes (files with agent
@@ -145,14 +166,17 @@
 //   disabled_tools?, project_rules?: Rule[], user_rules?: Rule[], rules_problem?: string | null }
 // Status message: { type: 'status', status, terminal_reason?, turn_ended? (sent with 'idle'
 //   when a turn ended; a manual compaction leaves turn_ended unchanged), turn_delegated? (true, with
-//   turn_ended, when a parent's delegate_task started that turn) }
+//   turn_ended, when a parent's delegate_task started that turn), turn_result?: TurnResult (with turn_ended) }
+// GET /sessions/<id>/stream.ndjson: the WebSocket's messages for scripts, one JSON per line (snapshot first,
+//   keep_alive lines while quiet, stream_closed { reason } before the app ends it).
 // /api/presence: a WebSocket (same protocols as the stream) each page holds open; no messages.
 // AgentEvent: { id, type: 'user'|'assistant'|'tool'|'notice'|'error', text?,
 //   reasoning_summary? (the reply's thinking text the endpoint returned, redacted, at most 12,000 characters),
 //   reasoning_truncated?, reasoning_started? (epoch seconds when its thinking began), reasoning_seconds? (how long it
 //   thought: until answer text or a tool call began, or the response ended; also set when the endpoint reported
 //   reasoning tokens without text), reasoning_wait_seconds? (seconds from sending the request to its first thinking
-//   item; Request details show it), child_session_id?, request_info?,
+//   item; Request details show it), child_session_id?, request_info?, turn_result?: TurnResult (a turn's last reply:
+//   the footer under it; exports and forks leave it out),
 //   name?, input?, output?, preview?, state?, delegation?, origin?,
 //   (delegation: Delegation, on a delegate_task card or a notice with child_session_id),
 //   approval?: 'approved'|'declined'|'expired'|'blocked', approval_expires? (epoch seconds, only with a limit),
@@ -277,7 +301,7 @@
 //   treats it as current only while compactions and input_budget match the session's, and the model too once a
 //   request to another model has been prepared (estimated_tokens no longer the report's).
 // Metrics (GET /sessions/<id>/metrics): { scope, session_id, complete, totals, calls, by_purpose, by_model,
-//   pricing, last_input: LastRequest | null }. A call has effort?, effort_field? and reasoning_skipped? like
+//   pricing, last_input: LastRequest | null, spending: Spending, turn_limits: TurnLimits }. A call has effort?, effort_field? and reasoning_skipped? like
 //   RequestInfo.reasoning; retry_reason 'reasoning_rejected' marks the resend without reasoning fields, and
 //   'cache_rejected' the resend with fewer cache markers, 'fallback' a request to Settings → Fallback endpoint
 //   (its fallback_from names the chat's endpoint). Agent calls also have prompt_cache? ('full'|'messages'|'off':
