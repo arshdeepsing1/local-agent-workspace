@@ -606,8 +606,13 @@ async def test_restart_does_not_rewrite_already_mirrored_terminal_jobs(tmp_path,
     reopened.db.close()
 
 
+# The foreground child prints "started" itself, so it already exists when the group gets SIGTERM. A shell
+# signalled after its own printf but before it starts sleep defers the trap until sleep ends (POSIX).
+TRAPPED_COMMAND = "trap 'sleep 0.3; touch done.txt; exit 0' TERM; sh -c 'printf started; exec sleep 30'"
+
+
 async def test_sigterm_lets_a_command_clean_up_after_a_timeout(tmp_path, killpg_answer):
-    command = "trap 'sleep 0.3; touch done.txt; exit 0' TERM; printf started; sleep 30"
+    command = TRAPPED_COMMAND
     with pytest.raises(CommandTimeout) as caught:
         await asyncio.wait_for(run_process(command, tmp_path, timeout_seconds=1), 10)
     assert caught.value.result["output"].startswith("started")
@@ -616,8 +621,7 @@ async def test_sigterm_lets_a_command_clean_up_after_a_timeout(tmp_path, killpg_
 
 async def test_sigterm_lets_a_background_job_clean_up_when_stopped(store, tmp_path, killpg_answer):
     manager = JobManager(store, lambda text: text, None)
-    job = await manager.start("trap 'sleep 0.3; touch done.txt; exit 0' TERM; printf started; sleep 30", tmp_path,
-                              background=True)
+    job = await manager.start(TRAPPED_COMMAND, tmp_path, background=True)
     async with asyncio.timeout(5):
         while manager.get(job["id"])["output"] != "started":
             await asyncio.sleep(.01)
