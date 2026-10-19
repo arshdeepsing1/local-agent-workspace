@@ -412,6 +412,38 @@ async def test_batch_and_progress_fields_never_reach_the_model(runtime, monkeypa
             await manager.delegates.subagent_result(chat(), *arguments)
 
 
+async def test_a_running_subagents_card_counts_the_step_its_model_request_is_on_from_the_first_request(
+        runtime, monkeypatch):
+    """While a subagent waits on its model, its parent's card names that step: "Step 1 of 10" during the first
+    request, "Step 2 of 10" during the second, not the step before it (shown until the step's first tool card)."""
+    manager, parent, _ = runtime
+    release = {1: asyncio.Event(), 2: asyncio.Event()}
+
+    async def child(count, body):
+        await release[count].wait()
+        if count == 1:
+            return calls_reply(("read_file", {"path": "a.txt"}, "r"))
+        return reply("Read it.")
+    gateway = Gateway(monkeypatch, [lambda: calls_reply(delegate("One", "a")), lambda: reply("Done.")], {"One": child})
+    manager.start(parent["id"], "Delegate the work")
+    await asyncio.wait_for(gateway.child_started("One").wait(), 10)
+    live = manager.live[parent["id"]]
+    child_id = card(live, "a")["child_session_id"]
+
+    def during_request():
+        # The child's replies so far (each step's starts with its request), and the step its parent's card shows.
+        replies = sum(event["type"] == "assistant" for event in manager.live[child_id]["events"])
+        return replies, card(live, "a")["delegation"].get("steps")
+    seen = [during_request()]
+    release[1].set()
+    await eventually(lambda: len(gateway.requests.get("One", [])) == 2)
+    seen.append(during_request())
+    release[2].set()
+    await asyncio.wait_for(manager.tasks[parent["id"]], 10)
+    assert seen == [(1, 1), (2, 2)]
+    assert card(manager.store.get(parent["id"]), "a")["delegation"]["steps"] == 2
+
+
 async def test_delegations_beyond_the_limit_wait_for_a_slot_and_then_run(runtime, monkeypatch):
     manager, parent, _ = runtime
     releases = {task: asyncio.Event() for task in ("A", "B", "C", "D")}

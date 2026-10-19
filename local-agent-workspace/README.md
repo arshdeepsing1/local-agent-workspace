@@ -3849,7 +3849,8 @@ job. The job's
 exit code and state distinguish success, failure, timeout, and cancellation.
 Each job also records who started it: its `origin` is `agent` for `run_command` (Verify
 runs too) and `user` for the Terminal panel's Run, `!` commands and `/api/command`. The
-job list (`GET /api/jobs`) shows it; a job recorded before this existed reads as `user`.
+job list (`GET /api/jobs`) shows it; a job recorded before this existed is `agent` when its
+chat has the job's `run_command` card, else `user`.
 Only the configured prefix of output is retained; excess output is drained and
 reported as truncated. Foreground cancellation, timeouts, command completion,
 and normal app shutdown clean up the command's process group. A timeout, Stop, or

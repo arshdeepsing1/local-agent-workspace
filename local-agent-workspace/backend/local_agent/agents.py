@@ -1883,7 +1883,9 @@ class AgentManager(LifecycleHooks):
         session["events"].append(event)
         self.store.save(session)
         await self.broadcast(session["id"], {"type": "event", "event": event})
-        if kind == "tool":
+        # A subagent's parent card follows its tool cards and its steps: a step's reply event is created as its
+        # model request starts, so the card names that step while it waits (streamed text changes no count).
+        if kind in ("tool", "assistant"):
             await self.delegates.progress(session)
         return event
 

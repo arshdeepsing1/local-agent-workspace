@@ -492,7 +492,7 @@ async def test_a_timed_out_background_jobs_notice_says_so_without_an_exit_code(r
 
 async def test_run_command_jobs_are_the_agents_and_terminal_and_bang_commands_are_the_users(settings):
     """Job rows (GET /api/jobs) say who started each job, so the page can tell the agent's commands from the
-    user's; a job recorded before origin existed reads as the user's."""
+    user's; a job recorded before origin existed is the agent's when its chat has the job's run_command card."""
     import httpx
     app = create_app(settings)
     manager = app.state.manager
@@ -516,7 +516,11 @@ async def test_run_command_jobs_are_the_agents_and_terminal_and_bang_commands_ar
             rows = (await client.get("/api/jobs" + query)).json()
             assert {row["id"]: row["origin"] for row in rows} == {terminal["id"]: "user", agent["job_id"]: "agent",
                                                                   bang: "user"}
-            manager.jobs._jobs[agent["job_id"]].pop("origin")  # As a job recorded before origin existed.
+            for job_id in (agent["job_id"], terminal["id"]):
+                manager.jobs._jobs[job_id].pop("origin")  # As jobs recorded before origin existed.
+            # Such a job is the agent's when the chat has its run_command card, else the user's.
             rows = (await client.get("/api/jobs" + query)).json()
-            assert {row["id"]: row["origin"] for row in rows}[agent["job_id"]] == "user"
-            assert (await client.get(f"/api/jobs/{agent['job_id']}" + query)).json()["origin"] == "user"
+            assert {row["id"]: row["origin"] for row in rows} == {terminal["id"]: "user", agent["job_id"]: "agent",
+                                                                  bang: "user"}
+            assert (await client.get(f"/api/jobs/{agent['job_id']}" + query)).json()["origin"] == "agent"
+            assert (await client.get(f"/api/jobs/{terminal['id']}" + query)).json()["origin"] == "user"
