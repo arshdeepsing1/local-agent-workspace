@@ -2118,7 +2118,9 @@ since the compaction started, for example `Compacting context: condensing (reque
 the next request passed the auto-compact threshold, or this request's tool results did (a
 compaction inside one long request); **Compact now** gives no reason. The server sends these
 before each summary request and with the chat when it is opened, so a page opened or reloaded
-mid-compaction shows them too. Summary requests are not streamed, so a large one can take a few
+mid-compaction shows them too. While a card that asked meanwhile (a background subagent's hook card)
+waits, the chat shows that it waits for approval; once the card is answered, the hint shows the same
+request and time again. Summary requests are not streamed, so a large one can take a few
 minutes. Summaries persist across
 restarts, while the full display transcript and original model/tool history remain
 in that conversation's JSONL file. Summary requests are additional billed inference. A failed or stopped
@@ -2997,11 +2999,13 @@ that was stopped), and a turn that was running when the subagent ended is told a
 step instead. One that ended while a `!` command or a compaction ran continues the chat once it is
 done. It never continues a chat whose last turn stopped at a limit (Agent steps, the turn's tokens or
 time, spending), an error or Stop: that chat waits for **Continue** or your next message, whose first
-request names the subagent. Nor does it continue a scheduled run's chat. The app's message is not
-yours: it carries no `!` output (that waits for your next message), it has no **Edit message**,
-**Retry** sends it again as the app's, rewinding to it leaves your message box empty, and transcripts
-label it **App (sent when a background subagent ended)** and count it apart from your messages. A
-conversation rewind names again, at the next request, the subagents that only the removed turns were
+request names the subagent. **Stop** on the chat also holds, when a later `!` command, compaction or
+card's answer leaves it idle, for every subagent that ended until then: your next message (or
+**Continue**, when the chat offers it) names it. Nor does it continue a scheduled run's chat. The
+app's message is not yours: it carries no `!` output (that waits for your next message), it has no
+**Edit message**, **Retry** sends it again as the app's, rewinding to it leaves your message box
+empty, and transcripts label it **App (sent when a background subagent ended)** and count it apart
+from your messages. A conversation rewind names again, at the next request, the subagents that only the removed turns were
 told of or read the report of. A subagent whose card the rewind keeps keeps its notice too, also when
 it ended in a removed turn: the notice then follows the last kept reply. **Stop** on the chat while it works and **Stop subagent** on a card stop background
 subagents too, and so does deleting the chat; a restart marks a running one interrupted
@@ -3016,7 +3020,8 @@ ends. When such a task ends and when such a card is answered, the chat's status 
 waits for approval while any of its cards waits; else it is idle, or shows what its running task does
 now (working, delegating or compacting), also in a turn you started meanwhile. Once it is idle again,
 a background subagent that finished while the card waited continues the chat (with the option above on);
-**Stop** on the chat instead closes the card and continues nothing. **Stop subagent** on a subagent
+**Stop** on the chat instead closes the card and continues nothing, also not when a later `!` command or
+compaction ends. **Stop subagent** on a subagent
 that still waits for its `subagent_start` card cancels that card: the subagent never starts, and its
 call returns as cancelled. A restart closes a card that still waited without marking the chat's
 finished turn interrupted.

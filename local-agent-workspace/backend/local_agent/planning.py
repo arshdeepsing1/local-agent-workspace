@@ -1329,14 +1329,28 @@ class DelegateManager:
 
     def due_notice(self, parent):
         """The newest notice of a background subagent of this chat that finished (or failed) after the chat's last
-        step, or None; one that never started has no report to read, and its notice waits for the chat's next
-        step."""
-        reported = parent.get("subagents_reported_through")
-        reported = reported if type(reported) in (int, float) else 0
+        step and after the user's last Stop on the chat (stopped), or None; one that never started has no report to
+        read, and its notice waits for the chat's next step."""
+        reported = max((value for value in (parent.get("subagents_reported_through"), parent.get("stopped_through"))
+                        if type(value) in (int, float)), default=0)
         return next((event for event in reversed(parent.get("events", [])) if event.get("type") == "notice"
                      and event.get("subagent_status") in ("completed", "failed")
                      and isinstance(event.get("created"), (int, float)) and event["created"] > reported
                      and event.get("subagent_id") and event["subagent_id"] not in self.seen), None)
+
+    def stopped(self, parent_id):
+        """Stop on the chat ended (AgentManager.stop): Stop is the user's choice, like a limit, so a background
+        subagent that ended until now continues nothing (due_notice), also not when a later ! command, compaction
+        or card's answer leaves the chat idle. Its notice still waits for the chat's next step (background_notice,
+        which reads only subagents_reported_through). Saved with the chat, so a restart keeps it."""
+        try:
+            parent = self.manager.get(parent_id)
+        except (ValueError, OSError):  # An unreadable conversation: nothing can wake it.
+            return
+        if parent is None or parent.get("is_subagent") or self.due_notice(parent) is None:
+            return
+        parent["stopped_through"] = time.time()
+        self.manager.store.save(parent, touch=False)
 
     def wake_due(self, parent):
         """Whether a background subagent of this chat finished (or failed) after the chat's last step (due_notice)."""
@@ -1346,8 +1360,9 @@ class DelegateManager:
         """Settings → Subagents → Continue the chat when a background subagent finishes (off by default: it
         starts a paid turn): an idle chat whose model was not told of a finished background subagent gets an
         app message that starts its next turn. Not a chat whose last turn stopped at a limit, an error or a
-        stop (Continue is the user's choice), and never a scheduled run's chat, which nobody may be watching;
-        their notice waits for the next message. Never raises."""
+        stop (Continue is the user's choice), nor for a subagent that ended before the user's last Stop on the
+        chat (stopped), and never a scheduled run's chat, which nobody may be watching; their notice waits for
+        the next message. Never raises."""
         try:
             if (self.manager.settings.values.get("background_subagent_wake") is not True or self.manager.closing
                     or parent_id in self.stopping):
