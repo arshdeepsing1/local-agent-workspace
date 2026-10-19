@@ -334,7 +334,9 @@ when opening a conversation or performing restart recovery.
   URL, which preserves that selection on refresh and supports browser Back/Forward.
   The header shows a short session ID when there is room; hover the title for the full title
   and ID. The sidebar shows the ID after a title that several conversations share. In a narrow
-  window **Agent tools** and **Workspace** show only their icons.
+  window **Agent tools** and **Workspace** show only their icons. The Workspace panel's tabs do the
+  same while their labels do not fit the panel (a narrow panel, or a large text size); hover a tab to
+  see its name, which screen readers still hear.
   Drafts stay with their conversation while switching chats and are saved in this
   browser's `localStorage` about half a second after you stop typing (and when the page
   closes), so they survive a reload; the new-conversation view keeps its own draft, which
@@ -463,7 +465,7 @@ when opening a conversation or performing restart recovery.
       (`/model gpt oss 120b`); alone, it moves focus to the model list.
     - `/mode [mode]`: `manual`, `auto`, `accept-edits`, `plan`, `dont-ask` or `bypass` (which asks for
       confirmation first, as the permission menu does); alone, it opens the permission menu.
-    - `/context`: opens the context meter's details.
+    - `/context`: opens the context meter's details (**Workspace / Progress** summarises the same reading).
     - `/usage` and `/export`: open **Agent tools → Usage** or **Agent tools → Export**.
     - `/fork`: copies the completed conversation, as **Fork completed conversation**, and opens the copy.
     - `/rename <title>`: renames the conversation.
@@ -852,6 +854,26 @@ when opening a conversation or performing restart recovery.
   commands launched before creating a chat belong to the selected workspace.
   This remains a noninteractive command runner: stdin is closed, with no PTY.
   Closing the panel does not cancel a job. Errors pause polling until **Refresh jobs**.
+- **Workspace / Progress**: what the open chat is doing, in three sections. **Context** reads as the
+  context meter does (the same line and percentage, a "Context used" bar with the auto-compact mark,
+  compactions and warnings), adds the last turn's summary line and the loaded instruction files, and
+  **Context details** opens the meter's details (a panel that covers the chat closes first). **Tasks**
+  lists the chat's task list read-only, as the checklist above the message box does. **Background
+  tasks** lists, first, the chat's subagents that wait for your answer, run (those of the current turn
+  marked "In this turn") or wait for a free slot, and its running commands; then the 10 newest finished
+  background subagents and the 10 newest finished background commands the agent started, newest first
+  (the rest are in **Agent tools → Subagents** and Terminal). A subagent row shows its type, task,
+  status, actions, step ("Step 4 of 10"), current tool ("Now: run command · npm test") and time, with
+  **Open subagent**, **Show card** (its card in the transcript, when that page is loaded) and the card's
+  own **Allow**, **Decline**, **Review in subagent**, **Answer in subagent** and **Stop subagent**: they
+  answer the subagent's chat, so they work while its card is on an earlier page that is not loaded. A
+  command row says who started it (**Agent**, or **You** from Terminal or a `!` command), its state and
+  how long it ran, with **Stop job** and **View output** (Terminal, with that job selected). Scheduled
+  runs are not listed: each is a chat of its own (**Agent tools → Schedules**). The commands are read
+  only while the tab is shown and the page is visible (every second while one runs, else every 3 s);
+  after an error the tab tries again, waiting longer each time (up to 30 s), and offers **Retry**. A run
+  of subagents' **Show in panel** opens this tab. The panel opens on the tab you used last, in any chat
+  (kept in this browser).
 - **Approvals**: approve or decline model-proposed writes, commands, MCP calls, and hooks. An unanswered
   card waits **Settings → Approval wait (minutes)**, 60 by default (1–1,440); a browser refresh
   retains it while the server runs (a server restart cancels it). After that time the card shows
@@ -1052,7 +1074,7 @@ when opening a conversation or performing restart recovery.
   Beside it, **Local** (hidden when the chat column is narrow) says the conversation runs on
   this computer; hover it for the explanation.
 - **Stop**: cancel the current agent turn and its foreground command. Background
-  jobs continue; stop them individually in Terminal. Approved writes and completed
+  jobs continue; stop them individually in Terminal or **Workspace / Progress**. Approved writes and completed
   shell side effects are retained. Stop also cancels its subagents. Deleting a
   conversation removes its jobs, tasks, and file checkpoint copies; edited files stay
   on disk. Delete a chat with **More actions** → **Delete…**; one that has subagent chats asks first: **Delete with subagents**
@@ -1850,7 +1872,9 @@ tokenizer-derived measurements. **Loaded instructions** lists each selected skil
 `Skill /<id>` applies to this chat (selected in **Agent tools → Extensions**, in the system message)
 or to this message (selected with `/<id>`, sent with that message, so it counts in messages).
 `GET /api/sessions/<id>/context` returns the same meter as JSON (`{status, context_info}`, plus
-`compaction_progress` while the chat compacts) without building a request.
+`compaction_progress` while the chat compacts) without building a request. **Workspace / Progress**
+summarises the same reading beside the chat, with the last turn and the loaded instruction files; its
+**Context details** opens these details.
 
 **Settings → Auto-compact at (% of input budget)** (default 90, 50–100) sets when
 automatic compaction runs: when the next request's estimate passes that share of the
