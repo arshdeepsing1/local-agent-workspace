@@ -134,3 +134,26 @@ def test_a_tool_groups_head_and_a_runs_head_are_touch_sized_on_a_phone(coarse_ui
     for head in (group, run):
         box = head.bounding_box()
         assert box["width"] >= 24 and box["height"] >= 24, box
+
+
+def test_the_progress_tab_is_touch_sized_on_a_phone(coarse_ui, coarse_page):
+    # A waiting and a running subagent, a running and an ended command, the task list and the context.
+    ui, page = coarse_ui, coarse_page
+    pending = {"event_id": "p1", "name": "write_file", "kind": "approval", "title": "Write src/app.py"}
+    context = {"estimated_tokens": 6000, "input_budget": 120832, "context_window": 131072, "reply_reserve": 8192, "compactions": 0,
+               "summarized_messages": 0, "estimate_method": "weighted_utf8", "instruction_files": ["AGENTS.md"], "warnings": []}
+    children = "".join(f"""fake.sessions.set('{child}', {{ ...makeSession('{child}', '{title}'), parent_session_id: 'a', is_subagent: true,
+      delegation: {json.dumps({"status": status, "completed_tools": 2, "agent_type": "explore", "background": True, "started": 1,
+                               **({"pending": pending} if status == "awaiting_approval" else {})})} }})
+""" for child, title, status in [("k1", "Check the tests", "running"), ("k2", "Update the docs", "awaiting_approval")])
+    ui.app(session="a", scenario="workspace", setup=SETUP + children + f"""fake.sessions.get('a').context_info = {json.dumps(context)}
+fake.override = path => path.startsWith('/api/jobs?') ? fake.json([workspaceJob('dev', {{ command: 'npm run dev' }}),
+  workspaceJob('build', {{ command: 'make build', state: 'completed', exit_code: 0, updated: 150 }})]) : undefined""")
+    ui.show_session("a")
+    ui.emit("a", {"type": "tasks", "tasks": [{"id": "t1", "title": "Fix the exporter", "status": "in_progress"}]})
+    page.get_by_role("button", name=re.compile("^Workspace")).click()
+    page.get_by_role("button", name="Progress", exact=True).click()
+    expect(page.get_by_role("list", name="Background tasks").get_by_role("listitem")).to_have_count(4)
+    expect(page.get_by_role("button", name="Context details")).to_be_visible()
+    assert small_controls(page, ".workspace-panel") == []
+    assert no_page_scroll(ui)
