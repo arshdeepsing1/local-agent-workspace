@@ -3989,8 +3989,8 @@ running turn a queued prompt went into, one the app started for its background s
 announced as `{"type": "turn_start", "event_id": <its user event>, "background_wake": true?}`.
 `client_ref=` sets the token the prompt is sent with (default: a new one; letters, digits, `-`
 and `_`, at most 64). A prompt left in the chat's queue raises `LocalAgentError`
-(`client.NOT_SENT`), and the app's shutdown `client.SHUT_DOWN`, also while background subagents
-were awaited.
+(`client.NOT_SENT`), and the app's shutdown `client.SHUT_DOWN` (`client.BACKGROUND_SHUT_DOWN`
+while only background subagents were awaited: the shutdown stops them).
 `can_use_tool(name, input, context)` answers
 approval cards (`context` has `session_id`, `event_id`, `preview` and `subagent`, and the card's
 warnings when it has them: `secret_files`, `protected`, `hook_ask` with `hook_id` and `reason`,

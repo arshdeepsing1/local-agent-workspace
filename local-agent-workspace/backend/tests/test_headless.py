@@ -933,7 +933,7 @@ def test_a_shutdown_during_the_turn_the_app_continued_is_an_error_not_the_first_
 def test_a_shutdown_while_query_waits_for_a_background_subagent_is_an_error_not_a_success(simulator, tmp_path,
                                                                                          monkeypatch):
     """The shutdown stops the subagent the script waits for: no result with exit code 0 whose subagent still
-    reads as running."""
+    reads as running, and an error that says so (the turn had ended)."""
     gateway, gateway_url = simulator.start_gateway(speed=0.0)
     state, workspace = tmp_path / "state", tmp_path / "project"
     workspace.mkdir()
@@ -947,7 +947,7 @@ def test_a_shutdown_while_query_waits_for_a_background_subagent_is_an_error_not_
             server.should_exit = True  # Ctrl+C on run.py while the subagent works.
             thread.join(15)
             follower.join(10)
-            assert not follower.is_alive() and str(out["error"]) == client_module.SHUT_DOWN
+            assert not follower.is_alive() and str(out["error"]) == client_module.BACKGROUND_SHUT_DOWN
             assert not [message for message in out["messages"] if message["type"] == "result"]
     finally:
         gate.set()
@@ -1556,6 +1556,61 @@ def test_ctrl_c_during_the_wake_turn_a_new_streams_snapshot_shows_prints_that_st
     result = json.loads(output.out)
     assert (result["terminal_reason"], result["exit_code"]) == ("stopped", 3)
     assert [entry["status"] for entry in result["background_results"]] == ["completed"]
+
+
+def test_ctrl_c_during_the_wake_turn_a_new_snapshot_shows_while_another_subagent_works_says_it_stops_the_turn(
+        monkeypatch, capsys):
+    """As above, but the gap held the end of the script's turn too, and a second background subagent of that turn
+    still works. The new snapshot shows the app's wake turn for the first one running: query() announces that turn
+    and no background_wait for the end before it, so Ctrl+C says it stops the turn."""
+    runner = load_runner()
+    other = {**WORKING, "id": "c2", "child_session_id": "k2", "input": {"task": "The slow part"}, "created": 5.3}
+    cancelled = {**other, "delegation": {**other["delegation"], "status": "cancelled", "terminal_reason": "stopped"},
+                 "delegation_result": {"status": "cancelled", "terminal_reason": "stopped", "output": ""}}
+    stopped = {"started": 7.9, "ended": 8.6, "terminal_reason": "stopped", "steps": 0}
+    events = [PROMPT, FINISHED, other, {**STARTED, "turn_result": PROMPTED}, WAKE]
+    first = dropped_stream()
+    streams = [
+        # The stream drops before the turn's end: the gap holds it, the first subagent's end and the wake turn's start.
+        [*first[:-2], {"type": "event", "event": other}, *first[-2:]],
+        [{"type": "snapshot", "session": {"id": "s1", "status": "running", "turn_ended": None, "events": events,
+                                          "last_turn_result": PROMPTED}},
+         {"type": "delta", "id": "r2", "text": "Read"}],
+        # wait_result's stream after Stop: the wake turn and the second subagent were stopped.
+        [{"type": "snapshot", "session": {"id": "s1", "status": "idle", "turn_ended": 8.6,
+                                          "events": [*events[:2], cancelled, *events[3:]], "last_turn_result": stopped}}]]
+    refs, stops = [], []
+
+    def lines(self, chat_id, stop=None, opened=None):
+        if chat_id != "s1":  # A subagent's chat.
+            yield {"type": "snapshot", "session": {"id": chat_id, "status": "idle", "events": []}}
+            return
+        held = len(streams) == 2  # query()'s last stream stays open until it ends.
+        yield from streams.pop(0)
+        if held:
+            stop.wait(30)
+    header = {"id": "s1", "status": "idle", "permission_mode": "plan", "turn_ended": 2.0,
+              "last_turn_result": first[0]["session"]["last_turn_result"]}
+    monkeypatch.setattr(LocalAgentClient, "_lines", lines)
+    monkeypatch.setattr(LocalAgentClient, "send", lambda self, chat_id, text, verbatim=False, client_ref=None:
+                        refs.append(client_ref) or {"ok": True})
+    monkeypatch.setattr(LocalAgentClient, "info", lambda self, chat_id: header)
+    monkeypatch.setattr(LocalAgentClient, "session", lambda self, chat_id: {
+        **header, "turn_ended": 8.6, "last_turn_result": stopped,
+        "events": [{**PROMPT, "client_refs": refs[-1:]}, FINISHED, cancelled, *events[3:]]})
+    monkeypatch.setattr(LocalAgentClient, "request", lambda self, method, path, body=None: {"background_subagent_wake": True})
+    monkeypatch.setattr(LocalAgentClient, "interrupt", lambda self, chat_id: stops.append(chat_id))
+    seen = []
+    # Ctrl+C at the wake turn's first delta, after query() read the new snapshot.
+    interrupted_query(monkeypatch, lambda message: seen.append(message["type"]) or message["type"] == "delta")
+    code = runner.main(["--output", "json", "--session", "s1", "Go"])
+    output = capsys.readouterr()
+    assert stops == ["s1"] and code == 3
+    assert seen[len(seen) - 1 - seen[::-1].index("snapshot"):] == ["snapshot", "turn_start", "delta"]
+    assert "Stopping the turn" in output.err and "Stopping the background subagents" not in output.err, output.err
+    result = json.loads(output.out)
+    assert (result["terminal_reason"], result["exit_code"]) == ("stopped", 3)  # The wake turn was stopped.
+    assert [entry["status"] for entry in result["background_results"]] == ["completed", "cancelled"]
 
 
 @pytest.mark.parametrize("when", ["during the turn the app continued", "after it, while another subagent works"])

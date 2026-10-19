@@ -45,9 +45,9 @@ neither answers their cards nor reports them, and a ! command or a compaction is
 nothing of the prompt's runs in the chat any more (it is idle, or a card query() does not answer waits). A prompt
 sent just as something else started in the chat waits in its queue: query() follows the turn that sends it (or,
 from then on, the running turn it goes into), and raises LocalAgentError (NOT_SENT) when what ran ended without
-sending it. The app's shutdown raises LocalAgentError (SHUT_DOWN), also while query() waits for background
-subagents (it stops them). Every model request is a paid call to your Databricks workspace, made with the app's
-credentials.
+sending it. The app's shutdown raises LocalAgentError (SHUT_DOWN; BACKGROUND_SHUT_DOWN while query() waits only
+for background subagents, which it stops). Every model request is a paid call to your Databricks workspace, made
+with the app's credentials.
 """
 import http.client
 import json
@@ -71,6 +71,8 @@ CARD_GONE = ("This approval is no longer pending.", "This question is no longer 
              "This plan is no longer waiting for review.")
 SHUT_DOWN = "The app shut down before the turn ended (its shutdown stops running turns)."
 BACKGROUND_CUT = "The app closed the chat's stream before the background subagents of the prompt's turns ended."
+BACKGROUND_SHUT_DOWN = ("The app shut down before the background subagents of the prompt's turns ended (its shutdown "
+                        "stops them).")
 NOT_SENT = ("The prompt was not sent: the chat got busy as it was sent, so it waited in the chat's queue, and what ran "
             "then ended without sending it (after a stop, an error or a limit, Send queued messages in the page sends "
             "it).")
@@ -475,7 +477,8 @@ class LocalAgentClient:
                                                 _next_start(owners.starts, ended))
                             return
                         # A shutdown stops them: no success while they still worked.
-                        raise LocalAgentError(message.get("error") or BACKGROUND_CUT)
+                        error = message.get("error")
+                        raise LocalAgentError(BACKGROUND_SHUT_DOWN if error == SHUT_DOWN else error or BACKGROUND_CUT)
                     raise LocalAgentError(message.get("error") or "The app closed the chat's stream before the turn ended.")
                 if kind == "stream_ended":
                     continue
@@ -564,7 +567,9 @@ class LocalAgentClient:
                     if own:
                         ended = own[-1]
                         running = sum(not _ended(card) for card in background.values())
-                        if running:
+                        # Not when a new snapshot shows a turn of the prompt's running after that end (the app's
+                        # wake turn, announced above): query() follows that turn, not only its subagents.
+                        if running and (chat is None or turn != "own"):
                             yield {"type": "background_wait", "session_id": session_id, "running": running,
                                    "turn_result": ended}
                     if chat is None:
