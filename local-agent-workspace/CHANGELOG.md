@@ -4,6 +4,34 @@ Notable changes to Local Agent Workspace, newest first. Dates are UTC.
 
 ## Unreleased
 
+Second reviews of the integration fixes (2026-10-19). The three integration-fix packages that
+had no second review (the composer and file preview; background subagents' accounting, wakes and
+the headless runner; turn endings) were reviewed again; every finding was reproduced with a failing
+test before it was fixed, and the bullets below in M5 to M8 describe the corrected behaviour:
+
+- **Send as plain text** stays with the message draft (switching chats, a new conversation, a
+  reload), and every way a sent message comes back into the box (queue **Edit**, **Rewind to
+  here**, a failed **Retry** or **Edit message**) brings back its own mode, so its `!` is not run as
+  a shell command.
+- Turn limits: a subagent chat you continue yourself keeps its own turn, also while its parent's
+  turn runs, and its parent's turn counts only its delegated run; a `/btw` in a subagent's chat
+  stays out of its parent's turns after the subagent ended too; a background subagent carried
+  over from an earlier turn counts in the turn result even when its requests reported no usage;
+  the step-limit notice's DBU matches the turn summary.
+- A background subagent's hook card that outlasts a turn, a compaction or a `!` command follows one
+  rule: the chat awaits approval while a card waits, a running hook's card stays running, Stop on
+  the chat settles it (and continues nothing), and a restart does not mark the finished turn
+  interrupted. **Stop subagent** works while a subagent waits for its `subagent_start` hook card.
+- The budget wrap-up: a reply that cannot be used ends the turn at the budget with no hidden retry
+  promised, and a subagent's report that did not go through reaches its parent as written.
+- The wake message no longer takes your pending `!` output, names the subagent the wake is for,
+  is labelled for a failed subagent too, and a rewind past it tells the next message again.
+  Background-subagent notifications also cover one that ended during a `!` command or a manual
+  compaction, and no longer close the chat's error or limit notification.
+- The scripting client and `agent_run.py` follow only their own turns, never wait forever (a
+  subagent that ended during a `!` command or compaction, one stopped during its start hook),
+  report a shutdown during a followed wake turn as an error, and show the `hook_change` warning.
+
 Roadmap milestone M8 (agents, automation and delivery):
 
 - A warmer palette: ivory backgrounds, warm grays and borders, and a brighter terracotta accent
@@ -258,7 +286,9 @@ Roadmap milestone M8 (agents, automation and delivery):
   server must be running); nothing is cached for offline use. `run.py --open` opens the app in
   your browser once it is ready. On a machine without a desktop (no display, such as over SSH)
   `run.py --open` now prints the app's address instead of starting a text browser in the
-  server's own terminal and waiting for it; a browser named in `BROWSER` is still used.
+  server's own terminal and waiting for it; a browser named in `BROWSER` is still used (only those
+  are tried, never a text browser Python finds itself), and when no browser opened the app the
+  address is printed.
 - **Workspace / Files** previews files: images (PNG, JPEG, GIF, WebP, SVG) with their size, PDF
   files in the browser's viewer, and Markdown and HTML files through **Preview** beside the
   editor (unsaved edits included). A Markdown preview shows images from the project but loads
@@ -276,8 +306,9 @@ Roadmap milestone M8 (agents, automation and delivery):
   web is labeled "from the web". An image or PDF that the server finds by another path (a
   worktree chat's own copy of a file named by the source project's path, or a name that starts
   with the project's folder name) is named by the file opened, in the header, **Open in VS
-  Code** and the plus button, with the same "Opened …: the reply named it …" note as a text
-  file. An image preview other than SVG has no plus button (the agent reads files as text;
+  Code** and (for an SVG or a PDF) the plus button, with the same "Opened …: the reply named it
+  …" note as a text file; so is a file the editor cannot show (too large, or not text) in its
+  Download view. An image preview other than SVG has no plus button (the agent reads files as text;
   attach an image to a message with **Attach files**), and a PDF preview says that the browser's
   viewer may name the file by an ID, also in its own download, while **Download** in the toolbar
   saves it by its name.
