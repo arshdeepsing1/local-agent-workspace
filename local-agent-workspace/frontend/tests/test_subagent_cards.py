@@ -245,6 +245,28 @@ def test_cards_still_being_prepared_and_cards_on_an_earlier_page(ui, page):
     expect(run_head(page).get_by_role("button", name="2 subagents", exact=True)).to_be_visible()
 
 
+def test_a_run_a_stopped_turn_left_short_is_not_preparing_again_while_a_later_turn_runs(ui, page):
+    # Turn 1, manual mode: the first card of a 2-call batch waited for approval and you pressed Stop, so the second
+    # card was never made (run_delegations prepares the cards one at a time).
+    stopped = {**member(0, 2, child=None), "state": "cancelled", "output": "Stopped"}
+    del stopped["delegation"]
+    first = [{"id": "u1", "type": "user", "text": "Split it"}, stopped,
+             {"id": "stop", "type": "notice", "text": "Stopped", "stop_phase": "approval"}]
+    show_run(ui, first, status="idle")
+    expect(run_head(page).locator(".run-note")).to_have_text("1 of 2 started")
+    # Turn 2: a new message keeps the chat busy, but nothing of that old run is being prepared.
+    later = [*first, {"id": "u2", "type": "user", "text": "Just list the files instead"},
+             {"id": "s", "type": "assistant", "text": "", "request_info": {"model": "m", "status": "running"}}]
+    for status in ("running", "delegating", "awaiting_approval"):
+        rerender_run(ui, later, status=status)
+        expect(run_head(page).locator(".run-note")).to_have_text("1 of 2 started")
+    # A message sent while the turn ran (steered) is part of that turn: its cards are still being prepared.
+    steered = [{"id": "u1", "type": "user", "text": "Split it"}, member(0, 2),
+               {"id": "u2", "type": "user", "text": "Also the tests", "steered": True}]
+    rerender_run(ui, steered, status="delegating")
+    expect(run_head(page).locator(".run-note")).to_have_text("Preparing 1 of 2")
+
+
 def test_a_card_waiting_for_approval_to_start_a_subagent_keeps_its_approval_in_the_run(ui, page):
     first = {**member(0), "state": "pending", "preview": "Task 0", "rememberable": ["chat"]}
     del first["delegation"]

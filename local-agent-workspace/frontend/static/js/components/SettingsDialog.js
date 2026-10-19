@@ -521,7 +521,7 @@ export default function SettingsDialog({ settings, connection, onSave, onClose, 
         <p class="field-help">Changes the size of all text at once, in this browser only (not saved with Settings). Browser zoom (Ctrl or Cmd and +) enlarges the whole page instead.</p>
         <label class="settings-checkbox"><input type="checkbox" checked=${grouping}
           onChange=${e => { setGroupToolCalls(e.currentTarget.checked); setGrouping(e.currentTarget.checked) }} />Group tool calls in the transcript</label>
-        <p class="field-help">Two or more finished read-only actions in a row (commands, file reads, searches, job checks, web lookups) fold under one line such as "Ran 3 commands"; click it to see them. Approvals, questions, running or failed actions, edits and subagents always show. In this browser only (not saved with Settings).</p>`)}
+        <p class="field-help">Two or more finished read-only actions in a row (commands, file reads, searches, job checks, web lookups) fold under one line such as "Ran 3 commands"; click it to see them. Approvals, questions, running or failed actions and edits never fold. The subagents of a multi-agent run share one head that folds them (a run that ended before you opened the chat starts folded); one that waits for you, failed, was stopped or was not run stays shown. Turned off, every card shows on its own, without these lines and heads. In this browser only (not saved with Settings).</p>`)}
         ${group('notifications', html`
         <label class="settings-checkbox"><input type="checkbox" checked=${form.system_notifications === true}
           onChange=${e => field('system_notifications', e.currentTarget.checked)} />Desktop notification when no browser tab is open</label>

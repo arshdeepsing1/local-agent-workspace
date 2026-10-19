@@ -177,6 +177,23 @@ def test_what_never_folds_and_what_ends_a_group(ui, page):
     assert order(page) == ["user-message", "assistant-reply", "head:Ran 2 commands", "assistant-reply", "assistant-reply"]
 
 
+def test_a_reply_that_shows_only_a_thought_line_ends_a_group(ui, page):
+    # An endpoint that reports reasoning tokens or a thinking time but streams no summary: the reply shows
+    # "Thought · the endpoint did not return a summary", which is thinking of its own, so it is not folded away.
+    by_tokens = {**quiet("t"), "request_info": {**quiet("t")["request_info"], "usage": {"reasoning_tokens": 512}}}
+    show(ui, [user("u"), command("a"), by_tokens, command("b")])
+    expect(page.get_by_text("Thought · the endpoint did not return a summary")).to_be_visible()
+    expect(page.locator(".tool-group")).to_have_count(0)
+    expect(page.locator(".tool-card")).to_have_count(2)
+    rerender(ui, [user("u"), command("a"), {**quiet("t"), "reasoning_seconds": 4.2}, command("b")])
+    expect(page.get_by_text("Thought for 4 s · the endpoint did not return a summary")).to_be_visible()
+    expect(page.locator(".tool-group")).to_have_count(0)
+    # Without either, the response only called tools and still folds with the cards around it.
+    rerender(ui, [user("u"), command("a"), quiet("t"), command("b")])
+    expect(head(page, "Ran 2 commands")).to_be_visible()
+    expect(page.locator(".tool-card")).to_have_count(0)
+
+
 LAYOUT = """async events => {
   const { layoutTranscript } = await import('/static/js/transcriptGroups.js')
   const { toolStatesFor } = await import('/static/js/components/Conversation.js')
@@ -285,6 +302,29 @@ def test_the_appearance_setting_folds_and_unfolds_the_open_chat_at_once(ui, page
     assert ui.js("localStorage.getItem('group-tool-calls')") is None
     dialog.get_by_role("button", name="Cancel").click()
     assert ui.bodies("/api/settings", "PUT") == []  # Kept in this browser, never saved with Settings.
+
+
+def test_a_long_group_phrase_wraps_on_a_phone_at_150_percent_text_and_keeps_the_subject(ui, page):
+    page.set_viewport_size({"width": 360, "height": 740})
+    folds = [command("c1"), command("c2"), read("r"), tool("l", "list_files", path="src"), tool("v", "project_overview"),
+             tool("j", "list_jobs"), tool("f", "find_files", pattern="docs/**/*.md")]
+    events = [user("u", "Check it"), *folds, reply("t", "Now the docs.")]
+    ui.app(session="a", scenario="workspace", setup=f"""localStorage.setItem('local.textSize', '150')
+      fake.sessions.set('a', {{ ...makeSession('a', 'Docs'), events: {json.dumps(events)} }})""")
+    ui.show_session("a")
+    group = page.locator(".tool-group-head")
+    expect(group).to_have_accessible_name("Ran 2 commands, read 1 file, listed 2 folders and 2 more docs/**/*.md")
+    group.scroll_into_view_if_needed()
+    # The whole phrase can be read (it wraps rather than ending in "…"), and the subject keeps room beside it.
+    sizes = group.evaluate("""el => {
+      const phrase = el.querySelector('.tool-group-phrase'), subject = el.querySelector('.tool-group-subject')
+      const text = document.createRange()
+      text.selectNodeContents(phrase)
+      return { cut: phrase.scrollWidth > phrase.clientWidth, lines: new Set([...text.getClientRects()].map(box => Math.round(box.top))).size,
+        subject: subject.getBoundingClientRect().width, inside: el.getBoundingClientRect().right <= document.documentElement.clientWidth }
+    }""")
+    assert not sizes["cut"] and sizes["lines"] >= 2 and sizes["subject"] >= 40 and sizes["inside"], sizes
+    assert ui.js("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
 
 
 def test_twenty_thousand_events_lay_out_in_under_a_second_and_closed_groups_leave_no_cards(ui, page):

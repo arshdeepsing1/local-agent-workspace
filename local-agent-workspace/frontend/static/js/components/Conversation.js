@@ -977,8 +977,8 @@ const keptRow = (event, status) => ['pending', 'error', 'rejected', 'cancelled']
 // The head of a multi-agent run (the delegate_task cards of one response): how many, their statuses (a polite live
 // region that changes only when a status does), how many finished, the time from the first start to the last end
 // (or to now, counted here each second while one runs), Background, the cards still being prepared, the ones on an
-// earlier page, and Show in panel (onShowProgress, when given).
-function RunHead({ run, members, open, rows, onToggle, status, eventsStart, onShowProgress }) {
+// earlier page, and Show in panel (onShowProgress, when given). making: the turn that makes its cards still runs.
+function RunHead({ run, members, open, rows, onToggle, making, eventsStart, onShowProgress }) {
   const states = members.map(memberState)
   const live = states.some(state => !state.finished)
   const starts = members.map(event => event.delegation?.started).filter(value => typeof value === 'number')
@@ -999,8 +999,8 @@ function RunHead({ run, members, open, rows, onToggle, status, eventsStart, onSh
   const indexes = members.map(event => event.delegation_batch?.index).filter(Number.isInteger)
   const earlier = batch && eventsStart > 0 && indexes.length && Math.min(...indexes) > 0 ? Math.min(...indexes) : 0
   const known = members.length + earlier
-  // A turn stopped while it prepared the cards leaves fewer than the batch asked for.
-  const preparing = batch && known < batch.size ? status !== 'idle' ? `Preparing ${known} of ${batch.size}` : `${known} of ${batch.size} started` : ''
+  // A turn stopped while it prepared the cards leaves fewer than the batch asked for, also while a later turn runs.
+  const preparing = batch && known < batch.size ? making ? `Preparing ${known} of ${batch.size}` : `${known} of ${batch.size} started` : ''
   const background = members.some(event => event.delegation?.background)
   return html`<div class=${`run-head${rows ? ' has-rows' : ''}`}>
     <button class="run-toggle" aria-expanded=${open} aria-controls=${members.map(event => `tool-${event.id}`).join(' ')} onClick=${onToggle}>
@@ -1167,7 +1167,7 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
     // Retry resends the latest message, so it is offered only on a reply to that message: after a turn
     // that failed or was stopped before any reply, the last reply belongs to an earlier turn.
     const retry = latestUserIndex >= 0 && turnStart >= 0 && !steered && lastReplyIndex > latestUserIndex
-    return { nextUser, turnEnds, lastReply: events[lastReplyIndex], latestUser: events[latestUserIndex], retry }
+    return { nextUser, turnEnds, lastReply: events[lastReplyIndex], latestUser: events[latestUserIndex], retry, turnStart }
   }, [session.events])
   const rewound = (result, draftKept = false) => {
     if (result.backupId) setRewindNotice(session.id, { title: backupTitle(session.title), backupId: result.backupId, draftKept })
@@ -1229,12 +1229,16 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
   }
   // Which groups are open, and for each run whether it is open and the class of each row it shows: a closed run still
   // shows the rows that wait for you or went wrong (keptRow), and the hook cards between them that did something.
+  // A run is in the running turn when it starts after that turn's message (the layout keeps every event in order).
   const groupOpen = new Map()
   const runs = new Map()
+  let at = 0  // the index in session.events of the next event item
   for (const item of layout) {
     if (item.kind === 'group') groupOpen.set(item.key, item.members.some(id => view.open.has(id) || view.pinned.has(id)))
-    else if (item.kind === 'run') runs.set(item.key, { rows: [], members: [] })
-    else if (item.role) {
+    else if (item.kind === 'run') runs.set(item.key, { rows: [], members: [], thisTurn: at > cuts.turnStart })
+    else {
+      at++
+      if (!item.role) continue
       const run = runs.get(item.run)
       run.rows.push(item)
       if (item.role === 'member') run.members.push(item.event)
@@ -1270,7 +1274,8 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
     if (item.kind === 'run') {
       const run = runs.get(item.key)
       return html`<${RunHead} key=${item.key} run=${item} members=${run.members} open=${run.open} rows=${run.classes.size > 0}
-        onToggle=${() => toggleRun(item.key, run.open)} status=${session.status} eventsStart=${session.events_start || 0} onShowProgress=${onShowProgress} />`
+        onToggle=${() => toggleRun(item.key, run.open)} making=${run.thisTurn && session.status !== 'idle'}
+        eventsStart=${session.events_start || 0} onShowProgress=${onShowProgress} />`
     }
     // A closed group's cards are not rendered at all, so a long chat keeps only their heads on the page.
     if (item.group) return groupOpen.get(item.group) ? renderEvent(item.event, 'grouped') : null

@@ -52,9 +52,12 @@ const DISTINCT = {
 
 const isHookCard = event => event.type === 'tool' && String(event.name || '').startsWith('hook_')
 
-// A reply that shows nothing of its own: no text, thinking or turn footer, and not streaming. Between two members it
-// folds with them; before the first or after the last it stays, since it belongs to that step or the next.
+// A reply that shows nothing of its own: no text, thinking or turn footer, and not streaming. Thinking includes the
+// "Thought" line of an endpoint that reports a thinking time or reasoning tokens without a summary (Conversation.js
+// Thinking). Between two members it folds with them; before the first or after the last it stays, since it belongs
+// to that step or the next.
 const quietReply = event => !event.text && !event.reasoning_summary && event.reasoning_started == null
+  && typeof event.reasoning_seconds !== 'number' && !(event.request_info?.usage?.reasoning_tokens > 0)
   && !event.turn_result && event.request_info?.status !== 'running'
 
 // What an event is for the layout. state: its Conversation toolState ({ result, status, hooked }).
