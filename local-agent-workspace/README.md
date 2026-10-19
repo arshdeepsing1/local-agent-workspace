@@ -2998,9 +2998,10 @@ since the chat's last step (the message names the latest subagent that finished 
 that was stopped), and a turn that was running when the subagent ended is told at its next
 step instead. One that ended while a `!` command or a compaction ran continues the chat once it is
 done. It never continues a chat whose last turn stopped at a limit (Agent steps, the turn's tokens or
-time, spending), an error or Stop, and **Stop** on the chat also holds for every subagent that ended
-until then when a later `!` command or compaction ends: that chat waits for **Continue** or your next
-message, whose first request names the subagent. Nor does it continue a scheduled run's chat. The
+time, spending), an error or Stop: that chat waits for **Continue** or your next message, whose first
+request names the subagent. **Stop** on the chat also holds, when a later `!` command, compaction or
+card's answer leaves it idle, for every subagent that ended until then: your next message (or
+**Continue**, when the chat offers it) names it. Nor does it continue a scheduled run's chat. The
 app's message is not yours: it carries no `!` output (that waits for your next message), it has no
 **Edit message**, **Retry** sends it again as the app's, rewinding to it leaves your message box
 empty, and transcripts label it **App (sent when a background subagent ended)** and count it apart
