@@ -95,6 +95,9 @@ class Prompt(BaseModel):
     verbatim: bool = Field(default=False, strict=True)
     # Files attached from the composer (POST /api/sessions/{id}/uploads), also with plain text.
     uploads: list[UploadRef] = upload_refs_field()
+    # A script's token for this message, kept on the user event that sends it (client_refs): its client tells its
+    # own turns from others by it. Never sent to the model.
+    client_ref: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{1,64}$", strict=True)
 
 
 class CompactionRequest(BaseModel):
@@ -887,7 +890,7 @@ def create_app(settings=None):
             raise ValueError("Enter a message.")
         # Starts the message, or queues it while a turn, compaction or ! command runs.
         return await manager.submit_message(session_id, body.text.strip(), verbatim=body.verbatim,
-                                            uploads=upload_refs(body.uploads))
+                                            uploads=upload_refs(body.uploads), client_ref=body.client_ref)
 
     @app.post("/api/sessions/{session_id}/stop")
     async def stop(session_id: str):

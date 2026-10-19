@@ -1231,7 +1231,8 @@ class AgentManager(LifecycleHooks):
     def message_parts(items):
         """(scan, blocks, fields) for prepared messages sent as one: scan the text whose @ tokens attach
         (a plain-text message's are left out), blocks the expanded commands as the model gets them after the
-        typed text and its attachments, fields the user event's extras (commands, verbatim)."""
+        typed text and its attachments, fields the user event's extras (commands, verbatim, client_refs: the
+        scripts' tokens of the messages, POST /messages client_ref)."""
         scan = "\n\n".join("" if item.get("verbatim") else item["text"] + (
             "\n\n" + item["command"]["expanded"] if isinstance(item.get("command"), dict) else "") for item in items)
         commands = [item["command"] for item in items if isinstance(item.get("command"), dict)]
@@ -1241,6 +1242,9 @@ class AgentManager(LifecycleHooks):
             fields["commands"] = [{"name": command["name"], "path": command["path"]} for command in commands]
         if items and all(item.get("verbatim") for item in items):
             fields["verbatim"] = True
+        refs = [item["client_ref"] for item in items if isinstance(item.get("client_ref"), str)]
+        if refs:
+            fields["client_refs"] = refs
         return scan, blocks, fields
 
     @staticmethod
@@ -2649,14 +2653,16 @@ class AgentManager(LifecycleHooks):
         """The tool definitions offered in the next model request (offered_tools)."""
         return self.offered_tools(session, external_tools)[0]
 
-    def start(self, session_id, prompt, *, from_queue=False, verbatim=False, items=None, uploads=(), extra=None):
+    def start(self, session_id, prompt, *, from_queue=False, verbatim=False, items=None, uploads=(), extra=None,
+              client_ref=None):
         """Start a turn. @ files, attached files (uploads: [{id, as_path?}]) and pending ! output are attached
         now, and a command template is expanded, so a refused file or a broken command is an error before
         anything runs (from_queue: queued messages, given as items, whose commands were expanded when they were
         queued; refused files become a note). verbatim: sent as plain text, without a command, skills or @ files.
         extra: fields of the user event (background_wake: the app's message after a background subagent, which
-        leaves the waiting ! output for your next message). Queued messages still waiting are leftovers of a stop
-        or failure: they are paused."""
+        leaves the waiting ! output for your next message; wake_for: the subagents it reports). client_ref: a
+        script's token for the message (its user event's client_refs). Queued messages still waiting are leftovers
+        of a stop or failure: they are paused."""
         if session_id in self.tasks and not self.tasks[session_id].done():
             raise ValueError("A response is already running in this conversation.")
         session = self.get(session_id)
@@ -2668,7 +2674,8 @@ class AgentManager(LifecycleHooks):
         content, attachments, views, fields = None, None, [], {}
         if not delegated_prompt(session):
             tools = self.session_tools(session)
-            prepared = items if items is not None else [self.prepared_message(tools, prompt, verbatim, uploads)]
+            prepared = items if items is not None else [{**self.prepared_message(tools, prompt, verbatim, uploads),
+                                                         **({"client_ref": client_ref} if client_ref else {})}]
             scan, blocks, fields = self.message_parts(prepared)
             expanded, attachments, views = mentions.expand_context(
                 self, session, tools, prompt, include_pending=not (extra or {}).get("background_wake"),
@@ -2720,13 +2727,13 @@ class AgentManager(LifecycleHooks):
         task = self.tasks.get(session_id)
         return task is not None and not task.done()
 
-    async def submit_message(self, session_id, text, verbatim=False, uploads=()):
+    async def submit_message(self, session_id, text, verbatim=False, uploads=(), client_ref=None):
         """Send a message: start it when the chat is idle, else queue it for the running task.
         verbatim: sent as plain text (no command, skill or @ file). uploads: files attached from the
-        composer ([{id, as_path?}])."""
+        composer ([{id, as_path?}]). client_ref: a script's token, kept on the user event that sends it."""
         if self.busy_task(session_id):
-            return await self.enqueue(session_id, text, verbatim, uploads)
-        self.start(session_id, text, verbatim=verbatim, uploads=uploads)
+            return await self.enqueue(session_id, text, verbatim, uploads, client_ref)
+        self.start(session_id, text, verbatim=verbatim, uploads=uploads, client_ref=client_ref)
         return {"ok": True}
 
     @staticmethod
@@ -2738,10 +2745,11 @@ class AgentManager(LifecycleHooks):
         await self.broadcast(session["id"], {"type": "queue", "queued_messages": public_queue(self.queue_of(session)),
                                              **({"error": error} if error else {})})
 
-    async def enqueue(self, session_id, text, verbatim=False, uploads=()):
+    async def enqueue(self, session_id, text, verbatim=False, uploads=(), client_ref=None):
         """Queue a message while a turn, compaction or ! command runs. @ tokens and attached files are
         checked now; their snapshot is taken when the message is sent. A command template is expanded now
-        (prepared_message), so its errors show at once."""
+        (prepared_message), so its errors show at once. client_ref: a script's token, kept on the queued message
+        and on the user event that sends it (as the next turn, or into the running one)."""
         session = self.get(session_id)
         if not session:
             raise ValueError("Conversation not found.")
@@ -2753,6 +2761,8 @@ class AgentManager(LifecycleHooks):
             raise ValueError("Queued messages can contain at most 50,000 characters in total.")
         tools = self.session_tools(session)
         prepared = self.prepared_message(tools, text, verbatim, uploads)
+        if client_ref:
+            prepared["client_ref"] = client_ref
         mentions.expand_context(self, session, tools, text, include_pending=False, scan=self.message_parts([prepared])[0],
                                 uploads=self.message_uploads([prepared]))
         if prepared.get("uploads"):
