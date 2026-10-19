@@ -952,13 +952,13 @@ when opening a conversation or performing restart recovery.
   plans), running, failed, declined and stopped actions, changes (`write_file`, `edit_file`,
   `move_path`, `delete_path`, `notebook_edit`, `insert_activity_log`), `create_task`, `update_task`,
   `remember`, `use_skill`, findings, subagents, background commands, `stop_job`, `!` commands, MCP
-  tools, and cards with a
-  note of their own (an edited command, a credential-looking file, a result shortened or not sent
-  to the agent, a hook's change, another subagent's change to the file). A hook card that decided
-  and changed nothing joins a group without counting toward the two. A model response that only
-  called tools folds with the cards around it; a reply with text or thinking, your message and a
-  notice end a group. **Settings → Appearance → Group tool calls in the transcript** turns
-  folding off.
+  tools, and cards with a note of their own (an edited command, a credential-looking file, a result
+  shortened or not sent to the agent, a hook's change, another subagent's change to the file). A
+  card that ran by a rule or as a checked read-only command folds; its line (**Allowed by a rule
+  for this chat**, ...) shows once the group is open. A hook card that decided and changed nothing
+  joins a group without counting toward the two. A model response that only called tools folds
+  with the cards around it; a reply with text or thinking, your message and a notice end a group.
+  **Settings → Appearance → Group tool calls in the transcript** turns folding off.
   **Read before overwriting:** the conversation remembers the size and modification time
   of each file the agent read (`read_file` any page, or `notebook_read`) or wrote, up to 500 files.
   `write_file` on an existing file is refused, before any approval card, unless the
