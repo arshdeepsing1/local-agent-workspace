@@ -50,7 +50,8 @@ frontend that runs without a build step.
   each reply.
 - Workspace file explorer (the project, the conversation's granted folders and folders you add), text
   editor with stale-file detection, Git status/diff with Stage, Unstage, Commit and the branch's pull
-  request status, and a non-interactive command runner.
+  request status, a non-interactive command runner, and a Progress tab (context, tasks, background
+  subagents and commands).
 - File checkpoints with reviewed, reversible restore and managed Git worktrees.
 - Review of the agent's file edits, as in an editor's chat: a "files changed" bar with
   Keep and Undo, dots on changed files in the file explorer, and an inline red/green
@@ -90,7 +91,10 @@ frontend that runs without a build step.
 - Scripting the running app: `scripts/agent_run.py` runs one prompt and prints the reply or a JSON
   result with an exit code, and the standard-library Python client streams a chat's messages and
   answers its cards.
-- Collapsible activity.
+- A workflow view of the agent's work: consecutive read-only steps fold into one line ("Ran 3 commands,
+  read 2 files"), subagents started together share a run card with each one's live step and current
+  action, and **Workspace / Progress** shows the chat's context, task list and background tasks; a
+  card that needs you is never folded away. The full list of actions stays under Activity.
 - Responsive desktop/mobile UI, bundled fonts, and no credential storage in the browser.
 
 This release does not include a browser automation engine, OS computer control,
