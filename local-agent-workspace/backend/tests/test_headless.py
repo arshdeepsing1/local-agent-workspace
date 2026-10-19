@@ -4,6 +4,7 @@ ports. No network beyond 127.0.0.1 and no paid calls."""
 import asyncio
 import importlib.util
 import json
+import shlex
 import signal
 import subprocess
 import sys
@@ -258,28 +259,65 @@ def test_a_subagents_messages_and_cards_come_with_its_parents(served):
     assert messages[-1]["result"].startswith("Subagent reports received")
 
 
-def background_delegation(simulator, monkeypatch, child_call, pause=1):
+FIRST_REPLY = "Started the work in the background; its report comes later."
+WAKE_REPLY = "Read its report: the change is done."
+
+
+def background_delegation(simulator, monkeypatch, child_call, pause=1, gate=None, last_step=None, wake_step=None):
     """The simulator's delegate scenario starts a general subagent in the background, whose first step (after a
-    pause in which the parent's turn ends) makes child_call."""
+    pause in which the parent's turn ends, or once gate is set) makes child_call. last_step() runs before the
+    parent's last reply and wake_step() before the answer to the app's wake message."""
     def delegate(self, words, made, results, tools, system=""):
         if made:
-            return "Started the work in the background; its report comes later.", []
+            if last_step is not None:
+                last_step()
+            return FIRST_REPLY, []
         return "Delegating in the background.", [simulator.call("delegate_task", task="Do a small change",
                                                                 agent_type="general", background=True)]
 
     def subagent(self, prompt, made, results, tools):
         if not made:
-            time.sleep(pause)
+            gate.wait(30) if gate is not None else time.sleep(pause)
             return "Doing it.", [child_call]
         return "## Report\n\n- Summary: done.", []
     respond = simulator.Brain.respond
 
     def woken(self, body):  # The wake option's message (planning.WAKE_TEXT) gets a plain answer.
         last = next((m.get("content") for m in reversed(body.get("messages") or []) if m.get("role") == "user"), "")
-        return ("Read its report: the change is done.", []) if "[Sent by the app:" in str(last) else respond(self, body)
+        if "[Sent by the app:" not in str(last):
+            return respond(self, body)
+        if wake_step is not None:
+            wake_step()
+        return WAKE_REPLY, []
     monkeypatch.setattr(simulator.Brain, "respond", woken)
     monkeypatch.setattr(simulator.Brain, "delegate", delegate)
     monkeypatch.setattr(simulator.Brain, "subagent", subagent)
+
+
+def wait_until(condition, timeout=20.0):
+    deadline = time.time() + timeout
+    while not condition():
+        assert time.time() < deadline, "timed out"
+        time.sleep(0.05)
+
+
+def in_thread(client, prompt, **options):
+    """query() in a thread, as a script's main loop: ({messages, error}, the thread)."""
+    out = {"messages": [], "error": None}
+
+    def target():
+        try:
+            for message in client.query(prompt, **options):
+                out["messages"].append(message)
+        except LocalAgentError as exc:
+            out["error"] = exc
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    return out, thread
+
+
+def user_events(manager, session_id):
+    return [event for event in manager.get(session_id)["events"] if event["type"] == "user"]
 
 
 def test_query_waits_for_the_chats_background_subagents_and_answers_their_cards(served, simulator, monkeypatch):
@@ -326,13 +364,244 @@ def test_the_runner_declines_a_background_subagents_cards_and_waits_for_it(serve
     assert manager.delegates.background_running(result["session_id"]) == 0 and not manager.pending
 
 
+@pytest.mark.parametrize("wake", [False, True])
+def test_a_background_subagent_that_ends_during_a_shell_command_is_reported_once_the_command_ended(
+        served, simulator, monkeypatch, wake):
+    url, manager, _ = served
+    manager.settings.values["background_subagent_wake"] = wake
+    gate = threading.Event()
+    background_delegation(simulator, monkeypatch, simulator.call("list_files", path="."), gate=gate)
+    client = LocalAgentClient(url)
+    out, thread = in_thread(client, "delegate it", permission_mode="acceptEdits")
+    wait_until(lambda: any(message["type"] == "background_wait" for message in out["messages"]))
+    session_id = out["messages"][0]["session_id"]
+    # The user runs a ! command in the page while the script waits (not a turn); the subagent ends during it.
+    client.request("POST", f"/api/sessions/{session_id}/shell", {"command": "sleep 3"})
+    gate.set()
+    wait_until(lambda: manager.delegates.background_running(session_id) == 0)
+    assert manager.busy_task(session_id)
+    thread.join(15)
+    assert not thread.is_alive() and not manager.busy_task(session_id)
+    result = out["messages"][-1]
+    # With the wake option, the app continues the chat once the command ended: that turn is followed.
+    assert result["type"] == "result" and result["result"] == (WAKE_REPLY if wake else FIRST_REPLY)
+    assert [entry["status"] for entry in result["background_results"]] == ["completed"]
+    assert len(user_events(manager, session_id)) == (2 if wake else 1)
+
+
+def test_query_follows_the_turn_the_app_starts_after_a_turn_in_which_a_background_subagent_finished(
+        served, simulator, monkeypatch):
+    url, manager, _ = served
+    manager.settings.values["background_subagent_wake"] = True
+    holder = {}
+    # The parent's last request waits until its subagent finished: the app continues the chat after that turn.
+    background_delegation(simulator, monkeypatch, simulator.call("list_files", path="."), pause=0,
+                          last_step=lambda: wait_until(lambda: manager.delegates.background_running(holder["id"]) == 0))
+    client = LocalAgentClient(url)
+    session = holder["id"] = client.create_session(permission_mode="acceptEdits")["id"]
+    messages = list(client.query("delegate it", session_id=session))
+    assert messages[-1]["result"] == WAKE_REPLY and len(user_events(manager, session)) == 2
+    assert not [message for message in messages if message["type"] == "background_wait"]
+
+
+def test_a_consumer_that_reads_late_still_gets_the_result_of_the_turn_the_app_continued(served, simulator, monkeypatch):
+    url, manager, _ = served
+    manager.settings.values["background_subagent_wake"] = True
+    background_delegation(simulator, monkeypatch, simulator.call("list_files", path="."))
+    messages = []
+    for message in LocalAgentClient(url).query("delegate it", permission_mode="acceptEdits"):
+        messages.append(message)
+        if message["type"] == "background_wait":
+            # A consumer that is slow for a moment (its pipe is full, say): meanwhile the subagent finishes and the
+            # turn the app starts for it runs to its end.
+            session_id = message["session_id"]
+            wait_until(lambda: len(user_events(manager, session_id)) == 2 and not manager.busy_task(session_id))
+    assert messages[-1]["result"] == WAKE_REPLY and messages[-1]["terminal_reason"] == "completed"
+
+
+def test_query_neither_answers_nor_reports_a_turn_the_user_queued_in_its_chat(served, simulator, monkeypatch):
+    url, manager, _ = served
+    last, release = threading.Event(), threading.Event()
+    background_delegation(simulator, monkeypatch, simulator.call("list_files", path="."), pause=0,
+                          last_step=lambda: last.set() or release.wait(30))
+    client = LocalAgentClient(url)
+    out, thread = in_thread(client, "delegate it", permission_mode="acceptEdits")
+    wait_until(last.is_set)
+    session_id = out["messages"][0]["session_id"]
+    wait_until(lambda: manager.delegates.background_running(session_id) == 0)
+    # The user queues a message in the page while the scripted turn runs: it starts the next turn.
+    assert client.send(session_id, "ask me something")["queued"] is True
+    release.set()
+    thread.join(15)
+    assert not thread.is_alive()
+    result = out["messages"][-1]
+    assert result["type"] == "result" and result["result"] == FIRST_REPLY
+    wait_until(lambda: any(event.get("name") == "ask_user" for event in manager.get(session_id)["events"]))
+    time.sleep(0.5)
+    question = next(event for event in manager.get(session_id)["events"] if event.get("name") == "ask_user")
+    assert question["state"] == "pending"  # Left for the user to answer in the page.
+    client.interrupt(session_id)
+
+
+def test_a_message_the_user_sends_while_query_waits_starts_a_turn_query_leaves_alone(served, simulator, monkeypatch):
+    url, manager, _ = served
+    gate = threading.Event()
+    background_delegation(simulator, monkeypatch, simulator.call("list_files", path="."), gate=gate)
+    client = LocalAgentClient(url)
+    out, thread = in_thread(client, "delegate it", permission_mode="acceptEdits")
+    wait_until(lambda: any(message["type"] == "background_wait" for message in out["messages"]))
+    session_id = out["messages"][0]["session_id"]
+    client.send(session_id, "ask me something")  # The chat is idle while the script waits: the user sends one.
+    wait_until(lambda: any(event.get("name") == "ask_user" for event in manager.get(session_id)["events"]))
+    time.sleep(0.5)
+    question = next(event for event in manager.get(session_id)["events"] if event.get("name") == "ask_user")
+    assert question["state"] == "pending"
+    client.answer_questions(session_id, question["id"], None)  # The user skips it in the page.
+    wait_until(lambda: not manager.busy_task(session_id))
+    gate.set()
+    thread.join(15)
+    assert not thread.is_alive()
+    result = out["messages"][-1]
+    assert result["type"] == "result" and result["result"] == FIRST_REPLY and result["terminal_reason"] == "completed"
+    assert [entry["status"] for entry in result["background_results"]] == ["completed"]
+
+
+def test_a_shutdown_during_the_turn_the_app_continued_is_an_error_not_the_first_turns_result(simulator, tmp_path,
+                                                                                              monkeypatch):
+    gateway, gateway_url = simulator.start_gateway(speed=0.0)
+    state, workspace = tmp_path / "state", tmp_path / "project"
+    workspace.mkdir()
+    waking = threading.Event()
+    background_delegation(simulator, monkeypatch, simulator.call("list_files", path="."),
+                          wake_step=lambda: waking.set() or time.sleep(3))  # The answer to the app's message is slow.
+    try:
+        with simulator.patched_settings(gateway_url, state, workspace):
+            server, thread, url = simulator.start_app()
+            server.config.app.state.manager.settings.values["background_subagent_wake"] = True
+            out, follower = in_thread(LocalAgentClient(url), "delegate it", permission_mode="acceptEdits")
+            wait_until(waking.is_set)
+            # query() follows the turn the app started: its user event came after the background_wait.
+            wait_until(lambda: any(message["type"] == "event" and message["event"].get("background_wake")
+                                   for message in out["messages"]))
+            assert follower.is_alive()
+            server.should_exit = True  # Ctrl+C on run.py while that turn runs.
+            thread.join(15)
+            follower.join(10)
+            assert not follower.is_alive() and str(out["error"]) == client_module.SHUT_DOWN
+            assert out["messages"][-1]["type"] != "result"
+    finally:
+        gateway.shutdown()
+        gateway.server_close()
+
+
+def test_a_hooks_change_of_the_action_reaches_the_callback_as_a_card_warning(served, simulator, monkeypatch):
+    url, _, _ = served
+    respond = simulator.Brain.respond
+
+    def probe(self, body):
+        users = [message for message in body.get("messages") or [] if message.get("role") == "user"]
+        if users and "run the probe" in simulator.text_of(users[-1].get("content")):
+            made = simulator.tool_calls_before(body.get("messages") or [])
+            return ("Done.", []) if made else ("Running it.", [simulator.call("run_command", command="echo agent")])
+        return respond(self, body)
+    monkeypatch.setattr(simulator.Brain, "respond", probe)
+    client = LocalAgentClient(url)
+    swap = "printf '%s' " + shlex.quote(json.dumps({"arguments": {"command": "echo from-hook"}}))
+    client.request("PUT", "/api/extensions", {"hooks": [{"id": "swap", "event": "before_tool", "command": swap,
+                                                          "enabled": True, "timeout_seconds": 10,
+                                                          "tools": ["run_command"]}]})
+    seen = {}
+
+    def answer(name, arguments, context):
+        seen[name] = (arguments, context)
+        return Deny("Not now.") if name == "run_command" else Allow()  # The hook's own card lets it run.
+    list(client.query("run the probe", permission_mode="manual", can_use_tool=answer))
+    arguments, context = seen["run_command"]
+    assert arguments == {"command": "echo from-hook"}  # What would run, and what the agent proposed:
+    assert context["hook_change"] == {"hooks": ["swap"], "original": {"command": "echo agent"}}
+
+
+def test_a_queued_background_subagent_refused_when_its_slot_frees_is_reported_as_failed(served, simulator, monkeypatch):
+    url, manager, _ = served
+    gate = threading.Event()
+
+    def delegate(self, words, made, results, tools, system=""):
+        if made:
+            return FIRST_REPLY, []
+        return "Delegating.", [simulator.call("delegate_task", task=f"Survey part {number}", agent_type="general",
+                                              background=True) for number in range(3 if "three" in words else 1)]
+
+    def subagent(self, prompt, made, results, tools):
+        if not made:
+            gate.wait(30)
+            return "Listing.", [simulator.call("list_files", path=".")]
+        return "## Report\n\n- Summary: done.", []
+    monkeypatch.setattr(simulator.Brain, "delegate", delegate)
+    monkeypatch.setattr(simulator.Brain, "subagent", subagent)
+    client = LocalAgentClient(url)
+    other = client.create_session(permission_mode="acceptEdits")
+    client.send(other["id"], "delegate three")  # Another chat's subagents take the three slots.
+    wait_until(lambda: manager.delegates.running() == 3)
+    out, thread = in_thread(client, "delegate it", permission_mode="acceptEdits")
+    wait_until(lambda: any(message["type"] == "background_wait" for message in out["messages"]))
+    session_id = out["messages"][0]["session_id"]
+    # While its delegation waits for a slot, the user turns delegate_task off in this chat.
+    client.request("PUT", f"/api/sessions/{session_id}/disabled-tools", {"tools": ["delegate_task"]})
+    gate.set()
+    thread.join(20)
+    assert not thread.is_alive()
+    entry, = out["messages"][-1]["background_results"]
+    assert (entry["status"], entry["terminal_reason"]) == ("failed", "error") and "It did not start" in entry["output"]
+    wait_until(lambda: not manager.delegates.background)
+
+
+def test_stop_during_a_background_subagents_start_hook_card_ends_query_with_the_stopped_turn(served, simulator,
+                                                                                            monkeypatch):
+    url, _, _ = served
+    background_delegation(simulator, monkeypatch, simulator.call("list_files", path="."))
+    client = LocalAgentClient(url)
+    client.request("PUT", "/api/extensions", {"hooks": [{"id": "brief", "event": "subagent_start", "command": "true",
+                                                          "enabled": True, "timeout_seconds": 10}]})
+
+    def stop_at_the_hook(name, arguments, context):
+        if name == "hook_subagent_start":
+            client.interrupt(context["session_id"])  # Stop while the hook's card waits in the chat.
+        return Allow()
+    out, thread = in_thread(client, "delegate it", permission_mode="manual", can_use_tool=stop_at_the_hook)
+    thread.join(20)
+    assert not thread.is_alive()
+    result = out["messages"][-1]
+    assert result["type"] == "result" and result["terminal_reason"] == "stopped" and result["exit_code"] == 3
+    assert [entry["status"] for entry in result["background_results"]] == ["cancelled"]
+
+
+def test_a_stop_from_the_page_while_a_background_subagents_start_hook_runs_ends_query(served, simulator, monkeypatch):
+    url, manager, _ = served
+    background_delegation(simulator, monkeypatch, simulator.call("list_files", path="."))
+    client = LocalAgentClient(url)
+    client.request("PUT", "/api/extensions", {"hooks": [{"id": "brief", "event": "subagent_start", "command": "sleep 3",
+                                                          "enabled": True, "timeout_seconds": 10}]})
+    out, thread = in_thread(client, "delegate it", permission_mode="acceptEdits",
+                            can_use_tool=lambda name, arguments, context: Allow())
+    wait_until(lambda: out["messages"])
+    session_id = out["messages"][0]["session_id"]
+    wait_until(lambda: any(event.get("name") == "hook_subagent_start" and event.get("state") == "running"
+                           and event.get("approval") for event in manager.get(session_id)["events"]))
+    LocalAgentClient(url).interrupt(session_id)  # Stop, as the page sends it, while the approved hook runs.
+    thread.join(15)
+    assert not thread.is_alive()
+    result = out["messages"][-1]
+    assert result["type"] == "result" and result["terminal_reason"] == "stopped" and result["exit_code"] == 3
+
+
 def test_a_cards_warnings_reach_the_callback_and_the_terminal(monkeypatch, capsys):
     client = LocalAgentClient()
     monkeypatch.setattr(client, "_send_answer", lambda *args: None)
     seen = []
     warnings = {"secret_files": ["conf/db_password.txt"], "protected": "a CI workflow (.github/workflows)",
                 "hook_ask": {"hook_id": "guard", "reason": "Deploys need a person"}, "uncertain": True,
-                "sibling_change": {"subagent_id": "1234abcd-0000", "agent_type": "explore", "path": "src/app.py"}}
+                "sibling_change": {"subagent_id": "1234abcd-0000", "agent_type": "explore", "path": "src/app.py"},
+                "hook_change": {"hooks": ["swap", "tidy"], "original": {"command": "cat notes/*"}}}
     event = {"id": "e1", "type": "tool", "name": "run_command", "state": "pending", "input": {"command": "cat conf/*"},
              "preview": "cat conf/*", "rememberable": [], **warnings}
     client._answer("s1", False, event, lambda name, arguments, context: seen.append(context) or Allow(), None)
@@ -347,7 +616,9 @@ def test_a_cards_warnings_reach_the_callback_and_the_terminal(monkeypatch, capsy
     for line in ("Warning: Reads a secret file: conf/db_password.txt. If you approve, its contents can reach the model.",
                  "Warning: The hook guard asked for your approval: Deploys need a person",
                  "Warning: This command could not be checked exactly against your deny and ask rules.",
-                 "Warning: Another subagent of this chat (explore, 1234abcd) changed src/app.py during its run."):
+                 "Warning: Another subagent of this chat (explore, 1234abcd) changed src/app.py during its run.",
+                 'Warning: The hooks swap, tidy changed what the agent proposed; this shows what would run. It '
+                 'proposed: {"command": "cat notes/*"}'):
         assert line in shown
     assert "Warning: Protected file: a file\\x1b[2K. Edits to it always need your approval." in shown
     assert "\x1b" not in shown and runner.ESCAPED_NOTE in shown
@@ -413,6 +684,51 @@ def test_interrupt_stops_the_turn(served):
     result = list(client.query("edit a note", permission_mode="manual", can_use_tool=stop))[-1]
     assert result["terminal_reason"] == "stopped" and result["exit_code"] == 3
     assert client.wait_result(holder["session"])["terminal_reason"] == "stopped"  # Its last turn, from the snapshot.
+
+
+SUBAGENT_STOP_CARD = {"hooks": [{"id": "review", "event": "subagent_stop", "command": "true", "enabled": True,
+                                 "timeout_seconds": 10}]}
+
+
+@pytest.mark.parametrize("asks", ["during the turn", "after the turn"])
+def test_wait_result_gives_the_ended_turn_while_a_background_subagents_hook_card_waits(served, simulator, monkeypatch,
+                                                                                      asks):
+    """The chat's turn ended while its background subagent's subagent_stop card waits in it (the chat shows that
+    it waits for approval): no turn runs, so wait_result gives that turn at once."""
+    url, manager, _ = served
+    manager.extensions.update_config(SUBAGENT_STOP_CARD)  # Its card asks in the parent, also in Accept edits.
+    client = LocalAgentClient(url)
+    session_id = client.create_session(permission_mode="acceptEdits")["id"]  # delegate_task needs no card.
+
+    def turn_ended():
+        return isinstance(client.info(session_id).get("last_turn_result"), dict) and not manager.busy_task(session_id)
+
+    def delegate(self, words, made, results, tools, system=""):
+        if made:
+            if asks == "during the turn":
+                wait_until(lambda: manager.pending)  # The last reply comes once the subagent's card asks.
+            return FIRST_REPLY, []
+        return "Delegating in the background.", [simulator.call("delegate_task", task="Do a small change",
+                                                                agent_type="general", background=True)]
+
+    def subagent(self, prompt, made, results, tools):
+        if asks == "after the turn":
+            wait_until(turn_ended)
+        return "## Report\n\n- Summary: done.", []
+    monkeypatch.setattr(simulator.Brain, "delegate", delegate)
+    monkeypatch.setattr(simulator.Brain, "subagent", subagent)
+    client.send(session_id, "delegate it")
+    wait_until(lambda: turn_ended() and client.info(session_id)["status"] == "awaiting_approval")
+    card = next(event for event in client.session(session_id)["events"] if event.get("name") == "hook_subagent_stop")
+    assert card["state"] == "pending"
+    outcome = {}
+    waiter = threading.Thread(target=lambda: outcome.update(result=client.wait_result(session_id)), daemon=True)
+    waiter.start()
+    waiter.join(10)
+    assert not waiter.is_alive()
+    assert outcome["result"]["terminal_reason"] == "completed" and outcome["result"]["result"] == FIRST_REPLY
+    client.answer_approval(session_id, card["id"], True)
+    wait_until(lambda: manager.delegates.background_running(session_id) == 0)
 
 
 def test_a_busy_chat_and_a_missing_app_are_errors(served):
@@ -613,3 +929,30 @@ def test_ctrl_c_while_the_runner_waits_for_a_background_subagent_stops_it(served
     assert "Stopping the background subagents" in err
     result = json.loads(out)
     assert result["terminal_reason"] == "completed" and not manager.delegates.background
+    # The result object lists what Stop ended, and its exit code is the runner's.
+    assert [entry["status"] for entry in result["background_results"]] == ["cancelled"] and result["exit_code"] == 3
+
+
+def test_ctrl_c_while_the_runner_waits_stops_the_background_subagents_also_after_a_shell_command(served, simulator,
+                                                                                                 monkeypatch):
+    url, manager, _ = served
+    gate = threading.Event()
+    background_delegation(simulator, monkeypatch, simulator.call("list_files", path="."), gate=gate)
+    process = subprocess.Popen([sys.executable, str(RUNNER), "--url", url, "--output", "json", "--mode", "acceptEdits",
+                                "delegate it"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        wait_until(lambda: any(manager.delegates.background_running(sid) and not manager.busy_task(sid)
+                               for sid in list(manager.delegates.background)))
+        session_id = next(iter(manager.delegates.background))
+        time.sleep(0.5)  # The runner has the turn's end.
+        # The user runs a ! command in the page; it ends while the subagent still works.
+        LocalAgentClient(url).request("POST", f"/api/sessions/{session_id}/shell", {"command": "true"})
+        wait_until(lambda: not manager.busy_task(session_id))
+        time.sleep(0.5)  # The runner has the command's end.
+        process.send_signal(signal.SIGINT)
+        out, err = process.communicate(timeout=30)
+    finally:
+        gate.set()
+        if process.poll() is None:
+            process.kill()
+    assert process.returncode == 3 and "Stopping the background subagents" in err, err

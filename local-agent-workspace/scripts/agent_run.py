@@ -12,9 +12,10 @@ then change that chat). --output text prints the final reply (and a one-line sum
 result object, stream-json every message of the chat as one JSON line and then the result. Cards are
 declined by default (--approve deny: nothing waits for the approval timeout, and questions are skipped);
 --approve ask asks you in the terminal (a TTY only; control characters in what the agent wrote are shown
-as escapes), with the card's warnings (a secret file it reads, a protected file, a hook that asked). A
-turn that leaves background subagents working is reported once they ended, their cards answered the same
-way. Bypass permissions, chosen with --mode or already set on the --session chat, needs
+as escapes), with the card's warnings (a secret file it reads, a protected file, a hook that asked or
+changed the action). A turn that leaves background subagents working is reported once they ended, their
+cards answered the same way; a turn you start in the page meanwhile is yours. Bypass permissions, chosen
+with --mode or already set on the --session chat, needs
 --confirm-bypass. Exit codes: 0 completed, 1 error, 2 a limit was reached (steps, spending or the
 turn's tokens or time), 3 stopped or interrupted (Ctrl+C stops the turn, or the background subagents
 it left working).
@@ -75,6 +76,11 @@ def card_warnings(context):
     if isinstance(context.get("hook_ask"), dict):
         hook = context["hook_ask"]
         lines.append(f"The hook {hook.get('hook_id')} asked for your approval" + (f": {hook['reason']}" if hook.get("reason") else "."))
+    if isinstance(context.get("hook_change"), dict):
+        hooks = [str(hook) for hook in context["hook_change"].get("hooks") or []]
+        original = json.dumps(context["hook_change"].get("original"), ensure_ascii=False)
+        lines.append(f"The hook{'s' if len(hooks) > 1 else ''} {', '.join(hooks)} changed what the agent proposed; "
+                     f"this shows what would run. It proposed: {original if len(original) <= 500 else original[:499] + '…'}")
     if context.get("uncertain"):
         lines.append("This command could not be checked exactly against your deny and ask rules.")
     if isinstance(context.get("sibling_change"), dict):
@@ -211,21 +217,25 @@ def main(argv=None):
                     count = message["running"]
                     print(f"agent_run: the turn ended; waiting for {count} background subagent{'' if count == 1 else 's'} "
                           "(Ctrl+C stops them).", file=sys.stderr)
-                elif message["type"] == "status" and message.get("status") != "idle" and not message.get("subagent"):
-                    waiting = False  # The app continued the chat: a turn runs again.
+                elif (message["type"] == "event" and not message.get("subagent") and message["event"].get("type") == "user"
+                      and message["event"].get("background_wake") is True):
+                    waiting = False  # The app continued the chat: query() follows that turn (not a ! command's run).
                 if args.output == "stream-json":
                     print(json_text(message), flush=True)
         except KeyboardInterrupt:
             print("\nStopping the background subagents…" if waiting else "\nStopping the turn…", file=sys.stderr)
             messages.close()  # Its streams end now.
             client.interrupt(session_id)  # Stop also stops the chat's background subagents.
-            result = client.wait_result(session_id, after=previous)  # The stopped turn's result.
+            # The stopped turn's result, with what Stop ended of its background subagents.
+            result = client.wait_result(session_id, after=previous, background=True)
             if result is None:
                 print("agent_run: stopped before the prompt started a turn.", file=sys.stderr)
                 return 3
+            stopped = waiting  # Its turn had ended: you stopped what it left running.
+            if stopped:
+                result["exit_code"] = 3  # The turn's own end stays in terminal_reason.
             if args.output == "stream-json":
                 print(json_text(result), flush=True)
-            stopped = waiting  # Its turn had ended: you stopped what it left running.
     except LocalAgentError as exc:
         print(f"agent_run: {exc}", file=sys.stderr)
         return 1
