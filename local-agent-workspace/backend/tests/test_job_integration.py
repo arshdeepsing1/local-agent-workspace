@@ -299,6 +299,7 @@ async def test_a_background_job_that_ends_after_the_turn_leaves_one_notice(runti
     assert [event["text"] for event in notices] == [
         "Background job failed (exit 2): sleep .3; printf finished; exit 2"]
     assert notices[0]["job_id"] == started["job_id"]
+    assert (notices[0]["job_state"], notices[0]["exit_code"]) == ("failed", 2)  # The job's card shows how it ended.
     assert [data["event"]["id"] for data in sent if data.get("event", {}).get("type") == "notice"] == [notices[0]["id"]]
     await manager.job_update(manager.jobs.get(started["job_id"]))  # A repeated update adds nothing.
     assert len([event for event in manager.store.get(session["id"])["events"] if event["type"] == "notice"]) == 1
@@ -454,8 +455,8 @@ async def test_a_job_ending_while_its_chat_is_live_leaves_one_notice(runtime):
     assert waited["reason"] == "exited"
     assert manager.live[session["id"]] is session  # Still live: the turn goes on.
     notices = [event for event in session["events"] if event["type"] == "notice"]
-    assert [(event["text"], event["job_id"]) for event in notices] == [
-        ("Background job completed (exit 0): sleep .2; printf ready", started["job_id"])]
+    assert [(event["text"], event["job_id"], event["job_state"], event["exit_code"]) for event in notices] == [
+        ("Background job completed (exit 0): sleep .2; printf ready", started["job_id"], "completed", 0)]
     stored = manager.store.get(session["id"])
     assert [event["id"] for event in stored["events"] if event["type"] == "notice"] == [notices[0]["id"]]
     assert [data["event"]["id"] for sid, data in sent
@@ -476,3 +477,50 @@ async def test_notices_redact_secret_shapes_in_the_command(runtime):
     assert texts == ["Background job completed (exit 0): sleep .2; printf ok # [REDACTED]"]
     report = manager.background_jobs_notice(stored)
     assert started["job_id"][:8] in report and "[REDACTED]" in report and secret not in report
+
+
+async def test_a_timed_out_background_jobs_notice_says_so_without_an_exit_code(runtime):
+    manager, session, _ = runtime
+    session["events"].append({"id": "card", "type": "tool", "name": "run_command", "job_id": "job-1",
+                              "state": "completed", "input": {"command": "sleep 99", "background": True}})
+    await manager.job_update({"id": "job-1", "session_id": session["id"], "background": True, "state": "timed_out",
+                              "exit_code": None, "command": "sleep 99", "output": ""})
+    notice = session["events"][-1]
+    assert (notice["text"], notice["job_id"], notice["job_state"], notice["exit_code"]) == (
+        "Background job timed out: sleep 99", "job-1", "timed_out", None)
+
+
+async def test_run_command_jobs_are_the_agents_and_terminal_and_bang_commands_are_the_users(settings):
+    """Job rows (GET /api/jobs) say who started each job, so the page can tell the agent's commands from the
+    user's; a job recorded before origin existed is the agent's when its chat has the job's run_command card."""
+    import httpx
+    app = create_app(settings)
+    manager = app.state.manager
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://localhost") as client:
+            client.headers["X-Local-Token"] = (await client.get("/api/bootstrap")).json()["token"]
+            session_id = (await client.post("/api/sessions")).json()["id"]
+            query = f"?session_id={session_id}"
+            terminal = (await client.post("/api/jobs" + query, json={"command": "printf terminal"})).json()
+            assert terminal["origin"] == "user"
+            await manager.jobs.wait(terminal["id"])
+            session = manager.get(session_id)
+            session["permission_mode"] = "bypassPermissions"
+            manager.live[session_id] = session
+            agent = json.loads(await manager.execute_tool(session, manager.session_tools(session), "run_command",
+                                                          {"command": "printf agent"}, "call-1"))
+            manager.live.pop(session_id)
+            manager.start_shell(session_id, "printf bang")
+            await asyncio.wait_for(manager.tasks[session_id], 10)
+            bang = next(event["job_id"] for event in manager.get(session_id)["events"] if event.get("name") == "user_command")
+            rows = (await client.get("/api/jobs" + query)).json()
+            assert {row["id"]: row["origin"] for row in rows} == {terminal["id"]: "user", agent["job_id"]: "agent",
+                                                                  bang: "user"}
+            for job_id in (agent["job_id"], terminal["id"]):
+                manager.jobs._jobs[job_id].pop("origin")  # As jobs recorded before origin existed.
+            # Such a job is the agent's when the chat has its run_command card, else the user's.
+            rows = (await client.get("/api/jobs" + query)).json()
+            assert {row["id"]: row["origin"] for row in rows} == {terminal["id"]: "user", agent["job_id"]: "agent",
+                                                                  bang: "user"}
+            assert (await client.get(f"/api/jobs/{agent['job_id']}" + query)).json()["origin"] == "agent"
+            assert (await client.get(f"/api/jobs/{terminal['id']}" + query)).json()["origin"] == "user"

@@ -2523,7 +2523,8 @@ With the default Settings a new chat therefore has room for one MCP tool, and fo
 is set; turning off one of these helpers, or `use_skill` or `delegate_task` (which `report_findings`
 and `get_subagent_result` follow), frees a place. The MCP tools that do not fit are named once
 in a notice (with the places kept) and in **Extensions**, and a call to one is refused. Turn off tools or servers a
-chat does not need to make room.
+chat does not need to make room. The workflow view (the subagent run card, grouped tool calls and
+**Workspace / Progress**) adds no tool; it reads fields the model never sees.
 
 The model sees names such as `mcp__example__tool`, so a new server ID cannot contain `__`. MCP calls require their own
 approval in Manual, Auto, and Accept edits; Plan leaves them out (a turn that starts in Plan starts no MCP server, so
@@ -3846,6 +3847,10 @@ Without `from_offset` it scans from the end of the last result the conversation 
 for that job, so a line printed in between still counts. Stop ends the wait, not the
 job. The job's
 exit code and state distinguish success, failure, timeout, and cancellation.
+Each job also records who started it: its `origin` is `agent` for `run_command` (Verify
+runs too) and `user` for the Terminal panel's Run, `!` commands and `/api/command`. The
+job list (`GET /api/jobs`) shows it; a job recorded before this existed is `agent` when its
+chat has the job's `run_command` card, else `user`.
 Only the configured prefix of output is retained; excess output is drained and
 reported as truncated. Foreground cancellation, timeouts, command completion,
 and normal app shutdown clean up the command's process group. A timeout, Stop, or
@@ -3889,7 +3894,9 @@ packages.
 When a background job that the agent started completes, fails, or times out, its
 conversation gets a notice, also when the chat is idle, and the agent's next model
 request names the job once, unless a `wait_job` or `get_job_output` result already
-showed that it ended. Nothing wakes an idle chat. Jobs started from the
+showed that it ended. The notice also carries how the job ended (its `job_state` and
+`exit_code`), which the page reads to show the outcome on the command's card. Nothing
+wakes an idle chat. Jobs started from the
 Terminal panel, and stopped or cancelled jobs, get no notice.
 Automatic compaction adds bounded summary requests beyond the configured agent steps.
 Databricks inference is billed to your workspace. Endpoints must support streaming,

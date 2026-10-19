@@ -33,6 +33,7 @@ DENIED_ENV_PREFIXES = ("LD_", "DYLD_")
 TERM_GRACE_SECONDS = 2
 ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
 JOB_NOTICE_STATES = {"completed", "failed", "timed_out"}  # Background jobs that get a finished notice.
+JOB_ORIGINS = ("agent", "user")  # Who started a job (GET /api/jobs fills it in for jobs recorded before it).
 HEAD_CHARS = 1_500  # A failed command's first result: up to this much of the start,
 TAIL_CHARS = 4_500  # and this much of the end,
 MIN_HEAD_CHARS = 200  # or at least this much of the start alone.
@@ -555,13 +556,17 @@ class JobManager:
         return env
 
     async def start(self, command, workspace, session_id=None, timeout_seconds=60,
-                    max_output_bytes=80_000, background=False, *, argv=None, env=None, cwd=None, script=None):
+                    max_output_bytes=80_000, background=False, *, argv=None, env=None, cwd=None, script=None,
+                    origin="user"):
         """Start a job. command is the shell text, or with argv (or script) its display text: argv
         then runs without a shell, script (a vetted command's, shell_vet) as SCRIPT_SHELL -c script,
         with env as the whole environment when given. cwd: the folder it runs in when it is not the
         workspace (run_command's cwd); the job still belongs to the workspace. argv, script and env
-        are never stored or published."""
+        are never stored or published. origin: who started it, "agent" (run_command) or "user" (Run in
+        Terminal, a ! command), which the page shows."""
         validate_command_options(command, timeout_seconds, max_output_bytes)
+        if origin not in JOB_ORIGINS:
+            raise ValueError("A job's origin must be agent or user.")
         if script is not None:
             if argv is not None:
                 raise ValueError("A job runs an argument vector or a script, not both.")
@@ -604,7 +609,7 @@ class JobManager:
         job = {"id": str(uuid.uuid4()), "session_id": session_id, "workspace": workspace,
                "command": sanitize(command), "state": "running", "created": now, "updated": now,
                "exit_code": None, "output": "", "truncated": False, "timeout_seconds": timeout_seconds,
-               "max_output_bytes": max_output_bytes, "background": bool(background)}
+               "max_output_bytes": max_output_bytes, "background": bool(background), "origin": origin}
         if cwd is not None and cwd != workspace:
             job["cwd"] = cwd
         if script is not None:

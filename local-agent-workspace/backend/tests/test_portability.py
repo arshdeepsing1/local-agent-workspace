@@ -131,6 +131,32 @@ async def test_included_children_remap_parent_event_call_and_origin_but_single_e
         assert copies[0]["is_subagent"] is True
 
 
+async def test_an_export_and_import_keep_a_runs_batch_and_its_subagents_progress(runtime):
+    """The workflow view's fields (delegation_batch, the progress counts and the newest tool's state and subject)
+    are part of the bundle; values the app never writes are refused."""
+    app, manager, source, destination = runtime
+    progress = {"status": "completed", "completed_tools": 2, "terminal_reason": "completed", "max_steps": 10,
+                "steps": 3, "tool_calls": 3, "failed_tools": 1, "last_tool_state": "error", "last_tool_subject": "npm test"}
+    batch = {"id": "0123456789ab", "index": 1, "size": 2}
+    source["events"][1].update(name="delegate_task", input={"task": "Build"}, delegation=progress, delegation_batch=batch)
+    manager.store.save(source)
+    bundle = export_bundle([source], source["id"])
+    assert (bundle["sessions"][0]["events"][1]["delegation"], bundle["sessions"][0]["events"][1]["delegation_batch"]) == (
+        progress, batch)
+    async with await client_for(app) as client:
+        response = await client.post("/api/sessions/import", params={"workspace": str(destination)}, json=bundle)
+        imported = manager.store.get(response.json()["session"]["id"])
+        assert (imported["events"][1]["delegation"], imported["events"][1]["delegation_batch"]) == (progress, batch)
+    for event in ({"delegation": {**progress, "last_tool_state": "done"}},
+                  {"delegation": {**progress, "last_tool_subject": "x" * 161}},
+                  {"delegation": {**progress, "max_steps": 0}},
+                  {"delegation_batch": {**batch, "size": 1}}, {"delegation_batch": {**batch, "label": "extra"}}):
+        changed = copy.deepcopy(bundle)
+        changed["sessions"][0]["events"][1].update(event)
+        with pytest.raises(ValueError, match="schema"):
+            parse_bundle(json.dumps(changed).encode())
+
+
 async def test_import_marks_pending_approval_and_partial_response_historical(runtime):
     app, manager, source, destination = runtime
     bundle = export_bundle([source], source["id"])

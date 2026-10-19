@@ -1333,11 +1333,12 @@ class AgentManager(LifecycleHooks):
                                 for event in stored["events"])):
                 notices.add(job["id"])
                 text = f"Background job {job_ending(job)}: {job_command(self.redact_title(job['command']), 80)}"
+                # How it ended, so the job's card can show it (the page reads the notice by job_id).
+                ending = {"job_id": job["id"], "job_state": job["state"], "exit_code": job.get("exit_code")}
                 if session is not None:
-                    await self.event(session, "notice", text=text, job_id=job["id"])
+                    await self.event(session, "notice", text=text, **ending)
                 else:
-                    notice = {"id": str(uuid.uuid4()), "type": "notice", "created": time.time(),
-                              "text": text, "job_id": job["id"]}
+                    notice = {"id": str(uuid.uuid4()), "type": "notice", "created": time.time(), "text": text, **ending}
                     stored["events"].append(notice)
                     try:
                         self.store.save(stored)
@@ -1659,7 +1660,7 @@ class AgentManager(LifecycleHooks):
         job = await self.jobs.start(command=arguments["command"], workspace=session["workspace"],
                                     session_id=session["id"], timeout_seconds=arguments.get("timeout_seconds", 60),
                                     max_output_bytes=arguments.get("max_output_bytes", 80000),
-                                    background=arguments.get("background", False), **options)
+                                    background=arguments.get("background", False), origin="agent", **options)
         try:
             # job_started: the card shows how long the command has run against its timeout.
             await self.update_event(session, event, job_id=job["id"], job_started=job["created"], output=job["output"],
@@ -1882,7 +1883,9 @@ class AgentManager(LifecycleHooks):
         session["events"].append(event)
         self.store.save(session)
         await self.broadcast(session["id"], {"type": "event", "event": event})
-        if kind == "tool":
+        # A subagent's parent card follows its tool cards and its steps: a step's reply event is created as its
+        # model request starts, so the card names that step while it waits (streamed text changes no count).
+        if kind in ("tool", "assistant"):
             await self.delegates.progress(session)
         return event
 
@@ -3362,9 +3365,11 @@ class AgentManager(LifecycleHooks):
         order. Each call is prepared in call order (checks, approval card, hooks), so cards come
         one at a time; then every prepared delegation starts together (DelegateManager still runs
         at most three subagents at once; the others wait for a slot). Results are finished one at
-        a time as the subagents end, each charged once to the response's allowance."""
+        a time as the subagents end, each charged once to the response's allowance. Each card carries
+        the batch's ID and its place in it (delegation_batch), so the page shows them as one run."""
         lock = asyncio.Lock()
-        gates = [DelegationGate(lock) for _ in calls]
+        batch = uuid.uuid4().hex[:12]
+        gates = [DelegationGate(lock, {"id": batch, "index": index, "size": len(calls)}) for index in range(len(calls))]
         shares = [CallAllowance(allowance) for _ in calls]
         tasks = []
         try:
@@ -3421,7 +3426,11 @@ class AgentManager(LifecycleHooks):
         event = notes.event = await self.event(session, "tool", name=name, input=arguments, call_id=call_id,
                                                state="running", output="",
                                                **({"verify": True} if origin == "verify" else {}),
-                                               **({"mcp_annotations": hints} if isinstance(hints, dict) else {}))
+                                               **({"mcp_annotations": hints} if isinstance(hints, dict) else {}),
+                                               # A parallel delegate_task call's place in its batch, from its first
+                                               # broadcast on (also when it is then refused or declined).
+                                               **({"delegation_batch": dict(gate.batch)} if gate is not None and gate.batch
+                                                  else {}))
         invoked = False
         views_key = views_prev = None
         try:
