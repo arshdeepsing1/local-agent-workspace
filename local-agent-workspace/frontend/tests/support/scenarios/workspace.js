@@ -67,8 +67,22 @@ fake.userRules = []
 fake.rulesProblem = null
 window.ruleSets = id => ({ chat: fake.sessions.get(id)?.allow_rules || [], project: fake.projectRules, user: fake.userRules,
   project_path: '/project', problem: fake.rulesProblem })
+// The chat's jobs (Workspace → Progress and Terminal): a list a test sets, [] when unset. A job reads as
+// GET /api/jobs/<id> (with output: '' unless it has some), and Stop job cancels it as the server does.
+window.workspaceJob = (id, overrides = {}) => ({
+  id, session_id: 'a', workspace: '/project', command: `command-${id}`, state: 'running', created: 100, updated: 100,
+  exit_code: null, truncated: false, timeout_seconds: 60, max_output_bytes: 80000, background: true, origin: 'agent', ...overrides,
+})
 fake.handle = (path, options) => {
   const body = () => JSON.parse(options.body)
+  if (path.startsWith('/api/jobs?') && (options.method || 'GET') === 'GET') return fake.json(fake.jobs || [])
+  const jobId = path.match(/^\/api\/jobs\/([^/?]+)(\/stop)?\?/)
+  const job = jobId && (fake.jobs || []).find(item => item.id === decodeURIComponent(jobId[1]))
+  if (job && jobId[2] && options.method === 'POST') {
+    Object.assign(job, { state: 'cancelled', exit_code: -15, updated: job.updated + 1 })
+    return fake.json(job)
+  }
+  if (job && (options.method || 'GET') === 'GET') return fake.json({ output: '', ...job })
   if (path.startsWith('/api/permission-rules') && (options.method || 'GET') === 'GET') {
     return fake.json(ruleSets(new URLSearchParams(path.split('?')[1] || '').get('session_id')))
   }

@@ -69,6 +69,9 @@ export default function App() {
   const [review, setReview] = useState(null)
   // A file a reply or tool card names, to open in the Workspace editor: { path, line?, viewKey }.
   const [openPath, setOpenPath] = useState(null)
+  // A Workspace tab to show once (a run's Show in panel), and a card Workspace → Progress shows in the transcript.
+  const [panelTab, setPanelTab] = useState(null)
+  const [cardShown, setCardShown] = useState(null)
   const active = app.session
   const workspace = active?.workspace || app.settings?.workspace || ''
   const editorKey = JSON.stringify([app.viewKey, workspace])
@@ -126,6 +129,13 @@ export default function App() {
     document.addEventListener('keydown', onKeyDown)
     return () => document.removeEventListener('keydown', onKeyDown)
   }, [drawerOpen])
+  // Workspace → Progress → Show card: once the drawer has closed (the chat column is no longer inert), the card
+  // comes into view with focus on its heading.
+  useEffect(() => {
+    if (!cardShown || drawerOpen) return
+    setCardShown(null)
+    revealCard(document.querySelector(`.transcript [data-event-id="${CSS.escape(cardShown)}"]`), true)
+  }, [cardShown, drawerOpen])
   // An error can name another chat that blocks the action: { message, session_id, title }.
   const [blocker, setBlocker] = useState(null)
   const showError = error => {
@@ -234,6 +244,7 @@ export default function App() {
       ${app.ready ? html`<${ScheduleAlerts} enabled=${app.settings?.schedules_enabled === true} notify=${attention.notifications.enabled}
         onOpenChat=${id => { app.setActiveId(id); void app.refreshSessions().catch(e => showError(e.message)) }} onOpenSchedules=${() => setAgentToolsOpen('Schedules')} onError=${showError} />` : null}
       ${hasMessages && active ? html`<${Conversation} key=${active.id} session=${active} onError=${showError} onSelectSession=${app.setActiveId} onOpenPath=${openFileAt}
+          onShowProgress=${() => { setWorkspaceOpen(true); setPanelTab({ tab: 'progress', viewKey: app.viewKey }) }}
           roots=${standingPath ? [standingPath] : []} busy=${busy} onLoadEarlier=${app.loadEarlier} onPrefill=${(text, verbatim) => { if (draft.trim()) return false; setDraft(text); setPlain(!!verbatim); return true }} />` :
         html`<div class="welcome"><div class="welcome-content">
           <div class="welcome-heading"><${Brand} /><h1>What’s up next?</h1></div>
@@ -282,6 +293,11 @@ export default function App() {
       changes=${app.changes} busy=${busy} review=${review?.viewKey === app.viewKey ? review : null} onReviewOpened=${() => setReview(null)} onReview=${app.reviewChanges} onSelectSession=${app.setActiveId}
       onSendComments=${text => app.send(text)}
       open=${openPath?.viewKey === app.viewKey ? openPath : null} onOpened=${() => setOpenPath(null)}
+      session=${active} sessions=${app.sessions} tasks=${app.tasks}
+      showTab=${panelTab?.viewKey === app.viewKey ? panelTab.tab : null} onTabShown=${() => setPanelTab(null)}
+      onOpenSubagent=${id => { if (drawerTier) setWorkspaceOpen(false); app.setActiveId(id) }}
+      onShowCard=${id => { if (drawerTier) setWorkspaceOpen(false); setCardShown(id) }}
+      onOpenContext=${() => { if (drawerTier) setWorkspaceOpen(false); setContextSignal(value => value + 1) }}
       onAttach=${path => { setDraft(current => `${current}${current ? '\n' : ''}Please read the ${path.startsWith('/') ? 'file' : 'project file'}: ${path}`); setWorkspaceOpen(false) }} />` : null}
     ${agentToolsOpen && app.settings && (!app.activeId || active) ? html`<${AgentToolsDialog} key=${editorKey} session=${active} onSaveTools=${app.setDisabledTools}
       initialTab=${typeof agentToolsOpen === 'string' ? agentToolsOpen : undefined} workspace=${workspace} changedFiles=${active && app.changes ? changedFiles : null} onClose=${() => setAgentToolsOpen(false)} onError=${showError} onSelectSession=${id => { setAgentToolsOpen(false); app.setActiveId(id); void app.refreshSessions().catch(e => showError(e.message)) }} />` : null}

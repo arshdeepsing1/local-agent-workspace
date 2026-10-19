@@ -1,8 +1,9 @@
-import { html, useCallback, useEffect, useRef, useState } from '../lib.js'
-import { ArrowLeft, ChevronRight, Code2, Download, Eye, File, FileDiff, Folder, GitBranch, Maximize2, Minimize2, Minus, Pencil, Plus, RefreshCw, Save, Terminal, X } from '../icons.js'
+import { html, useCallback, useEffect, useLayoutEffect, useRef, useState } from '../lib.js'
+import { Activity, ArrowLeft, ChevronRight, Code2, Download, Eye, File, FileDiff, Folder, GitBranch, Maximize2, Minimize2, Minus, Pencil, Plus, RefreshCw, Save, Terminal, X } from '../icons.js'
 import { api } from '../api.js'
 import FileRoots, { standingFolder, useWorkspaceFolders } from './FileRoots.js'
 import TerminalPanel from './TerminalPanel.js'
+import ProgressPanel from './ProgressPanel.js'
 import DiffReview, { DiffLine, UnsentComments } from './DiffReview.js'
 import { DiffStat } from './ChangesBar.js'
 import FilePreview, { downloadFile, opensInPreview, previewKind } from './FilePreview.js'
@@ -238,6 +239,42 @@ export function usePanelWidth() {
   return { width: width === null ? null : Math.min(width, limit), limit, set }
 }
 
+// The tab the panel shows, kept for this browser: the panel opens again (in any chat) on the tab last chosen.
+const PANEL_TAB_KEY = 'workspace-panel-tab'
+const PANEL_TABS = ['files', 'changes', 'terminal', 'progress']
+function savedTab() {
+  try {
+    const value = localStorage.getItem(PANEL_TAB_KEY)
+    return PANEL_TABS.includes(value) ? value : 'files'
+  } catch { return 'files' }
+}
+function saveTab(value) {
+  try { localStorage.setItem(PANEL_TAB_KEY, value) } catch {}
+}
+
+// The tabs show their icons only while their labels do not fit the panel (a narrow panel, or large text); each
+// label stays its button's name and tooltip. Measured again when the tabs, a tab or the text size changes.
+function useFittedTabs() {
+  const nav = useRef(null)
+  useLayoutEffect(() => {
+    const element = nav.current
+    if (!element || typeof ResizeObserver !== 'function') return undefined
+    const fit = () => {
+      element.classList.remove('icons-only')
+      element.classList.toggle('icons-only', element.scrollWidth > element.clientWidth + 1)
+    }
+    fit()
+    const sizes = new ResizeObserver(fit)
+    sizes.observe(element)
+    element.querySelectorAll('button').forEach(button => sizes.observe(button))
+    const scale = new MutationObserver(fit)  // Settings → Appearance → Text size (--text-scale on the root).
+    scale.observe(document.documentElement, { attributes: true, attributeFilter: ['style'] })
+    void document.fonts?.ready.then(() => { if (element.isConnected) fit() })
+    return () => { sizes.disconnect(); scale.disconnect() }
+  }, [])
+  return nav
+}
+
 function PanelResizer({ panel, width, limit, onWidth }) {
   const drag = useRef(null)
   const current = () => width ?? panel.current?.getBoundingClientRect().width ?? PANEL_MIN
@@ -284,8 +321,16 @@ function PanelResizer({ panel, width, limit, onWidth }) {
 // pythonVenv: Settings python_venv_status (named in the Terminal).
 // open: { path, line? } opens that file in the editor once, at that line, then onOpened() clears it.
 // worktree: the chat's worktree ({ branch, source_workspace }) or null; the header then names the project and branch.
-export default function WorkspacePanel({ sessionId, workspace, worktree = null, allowedDirectories = [], codingDir = null, pythonVenv = null, file, setFile, onClose, onAttach, changes: agentChanges, busy, review, onReviewOpened, onReview, onSelectSession, onSendComments, open, onOpened }) {
-  const [tab, setTab] = useState('files')
+// Progress (ProgressPanel): session (the open chat or null), sessions (app.sessions), tasks (the chat's task list);
+// onOpenSubagent(id) opens a subagent chat, onShowCard(eventId) shows a card in the transcript and onOpenContext()
+// the context meter's details. showTab: a tab name to show once, then onTabShown() clears it (Show in panel).
+export default function WorkspacePanel({ sessionId, workspace, worktree = null, allowedDirectories = [], codingDir = null, pythonVenv = null, file, setFile, onClose, onAttach, changes: agentChanges, busy, review, onReviewOpened, onReview, onSelectSession, onSendComments, open, onOpened,
+  session = null, sessions = [], tasks = [], onOpenSubagent, onShowCard, onOpenContext, showTab = null, onTabShown }) {
+  const [tab, shownTab] = useState(savedTab)
+  const setTab = name => { shownTab(name); saveTab(name) }
+  // Progress → View output: the job Terminal selects when it opens.
+  const [focusJob, setFocusJob] = useState(null)
+  const tabs = useFittedTabs()
   const panel = useRef(null)
   const sizing = usePanelWidth()
   // The drawer's error alert (outside the panel) is as wide as the panel.
@@ -408,6 +453,12 @@ export default function WorkspacePanel({ sessionId, workspace, worktree = null, 
     setTab('files')
     void openFile(review.path, 'review')
   }, [review])
+  // A run's Show in panel (and any other one-shot request for a tab).
+  useEffect(() => {
+    if (!showTab) return
+    onTabShown?.()
+    if (PANEL_TABS.includes(showTab)) setTab(showTab)
+  }, [showTab])
   // A file opened from a reply or a tool card, at a line when one is given.
   useEffect(() => {
     if (!open) return
@@ -465,7 +516,9 @@ export default function WorkspacePanel({ sessionId, workspace, worktree = null, 
     } catch (e) { setError(e.message) }
     finally { setLoading(false) }
   }
-  const tabButton = (name, Icon, label) => html`<button class=${tab === name ? 'active' : ''} onClick=${() => setTab(name)}><${Icon} size=${15} />${label}</button>`
+  // While the labels do not fit, the tabs show their icons only (useFittedTabs).
+  const tabButton = (name, Icon, label) => html`<button class=${tab === name ? 'active' : ''} aria-pressed=${tab === name} title=${label}
+    onClick=${() => setTab(name)}><${Icon} size=${15} /><span class="tab-label">${label}</span></button>`
   const branch = typeof worktree?.branch === 'string' ? worktree.branch : ''
   const project = (branch && typeof worktree.source_workspace === 'string' ? worktree.source_workspace : workspace)
     .split('/').filter(Boolean).pop() || workspace
@@ -491,8 +544,8 @@ export default function WorkspacePanel({ sessionId, workspace, worktree = null, 
         <button class="icon-button panel-expand" aria-label=${expanded ? 'Restore workspace width' : 'Expand workspace'} title=${expanded ? 'Restore the default width' : 'Make the panel as wide as possible'}
           onClick=${() => sizing.set(expanded ? null : sizing.limit)}>${expanded ? html`<${Minimize2} size=${16} />` : html`<${Maximize2} size=${16} />`}</button>
         <button class="icon-button" aria-label="Close workspace" onClick=${onClose}><${X} size=${19} /></button></div></header>
-    <nav class="workspace-tabs" aria-label="Workspace views">
-      ${tabButton('files', Folder, 'Files')}${tabButton('changes', GitBranch, 'Changes')}${tabButton('terminal', Terminal, 'Terminal')}
+    <nav class="workspace-tabs" aria-label="Workspace views" ref=${tabs}>
+      ${tabButton('files', Folder, 'Files')}${tabButton('changes', GitBranch, 'Changes')}${tabButton('terminal', Terminal, 'Terminal')}${tabButton('progress', Activity, 'Progress')}
     </nav>
     ${error ? html`<div class="panel-error" role="alert">${error}</div>` : null}
     ${tab === 'files' ? (file ? html`<div class="file-editor">
@@ -540,7 +593,10 @@ export default function WorkspacePanel({ sessionId, workspace, worktree = null, 
       </div>`)
     : tab === 'changes' ? html`<${GitChanges} query=${query} workspace=${workspace} busy=${busy}
       onOpenFile=${(path, line) => { setTab('files'); void openFile(path, 'edit', line) }} />`
-    : html`<${TerminalPanel} sessionId=${sessionId} workspace=${workspace} pythonVenv=${pythonVenv} />`}
+    : tab === 'progress' ? html`<${ProgressPanel} session=${session} sessions=${sessions} tasks=${tasks} onSelectSession=${onOpenSubagent}
+      onShowCard=${onShowCard} onOpenContext=${onOpenContext} onError=${setError}
+      onViewOutput=${id => { setFocusJob(id); setTab('terminal') }} />`
+    : html`<${TerminalPanel} sessionId=${sessionId} workspace=${workspace} pythonVenv=${pythonVenv} focusJob=${focusJob} onFocused=${() => setFocusJob(null)} />`}
     ${sessionId && !(tab === 'files' && reviewing) ? html`<${UnsentComments} sessionId=${sessionId} busy=${busy} onSendComments=${onSendComments} />` : null}
   </aside>`
 }
