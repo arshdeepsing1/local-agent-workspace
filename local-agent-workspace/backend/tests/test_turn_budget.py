@@ -528,8 +528,8 @@ def broken_call(call_id, name, arguments):
 
 async def test_a_subagents_wrap_up_report_the_schema_refuses_still_reaches_the_parent_as_text(runtime, monkeypatch):
     """Outside the wrap-up a report the schema refuses is an error the model fixes and sends again; the wrap-up is
-    the turn's last request, so no request follows, and the parent gets the refused report's text (redacted) with
-    the error, not an earlier step's narration."""
+    the turn's last request, so no request follows, and the parent gets the refused report as written (redacted)
+    with the error, not an earlier step's narration."""
     manager, session = runtime
     session["turn_token_limit"] = 30_000
     summary = "Mapped the parser: three modules; the tokenizer remains."
@@ -558,8 +558,45 @@ async def test_a_subagents_wrap_up_report_the_schema_refuses_still_reaches_the_p
     output = result["output"]
     assert output.startswith("Errors:\nInvalid tool arguments at findings.0")
     assert "Looking at the parser" not in output and "No final assistant reply" not in output, output
-    assert output.endswith(planning.REFUSED_REPORT + f"Summary: {summary}\nFindings:\n- parser.py:3: Entry point.\n"
-                           "Next steps:\n- Map the tokenizer with the key [REDACTED]."), output
+    written = json.dumps(refused).replace("private-token", "[REDACTED]")
+    assert output.endswith(planning.REFUSED_REPORT + written) and '"severity": "info"' in output, output
+
+
+REMAINING = "The tokenizer remains: map tokenizer.py next."
+# Wrap-up reports the schema refuses, each with what remains in the part it refused: the wrap-up asks for what is
+# done, what remains and how to continue, which invites these shapes.
+REFUSED_SHAPES = {
+    "summary_object": {"summary": {"done": "Mapped the parser: three modules.", "remaining": REMAINING}},
+    "extra_top_level_key": {"summary": "Mapped the parser: three modules.", "remaining": REMAINING},
+    "string_findings": {"summary": "Mapped the parser: three modules.", "findings": [f"parser.py:3: {REMAINING}"]},
+}
+
+
+@pytest.mark.parametrize("shape", list(REFUSED_SHAPES))
+async def test_a_refused_wrap_up_report_reaches_the_parent_with_the_part_the_schema_refused(runtime, monkeypatch,
+                                                                                            shape):
+    """A summary that is not text, a key the schema does not take or findings that are not objects: the parent gets
+    the refused report as the model wrote it, never an earlier step's narration nor the report without that part."""
+    manager, session = runtime
+    session["turn_token_limit"] = 30_000
+    parent_replies = [calls_reply(delegation()), text_reply("The subagent reported at the budget.")]
+
+    def child(children):
+        if len(children) < 3:
+            return narrated(f"x{len(children)}", "Looking at the parser next.")
+        return calls_reply(("r1", "submit_report", REFUSED_SHAPES[shape]))  # The wrap-up request's report.
+    requests, children = scripted(monkeypatch, lambda requests: parent_replies[min(len(requests), 2) - 1], child)
+    manager.store.save(session)
+    session = await started_turn(manager, session, "Delegate")
+    assert len(children) == 3 and "Call no tool except submit_report" in system_text(children[2])
+    child_session = manager.store.get(session["subagents"][0]["id"])
+    assert next(event for event in child_session["events"] if event.get("call_id") == "r1")["state"] == "error"
+    delegated = next(event for event in session["events"] if event.get("name") == "delegate_task")
+    result = json.loads(delegated["output"])
+    assert result["terminal_reason"] == "budget_limit" and "report" not in result
+    output = result["output"]
+    assert output.startswith("Errors:\nInvalid tool arguments") and "Looking at the parser" not in output, output
+    assert output.endswith(planning.REFUSED_REPORT + json.dumps(REFUSED_SHAPES[shape])), output
 
 
 async def test_a_subagents_wrap_up_report_with_broken_json_is_promised_no_retry_and_reaches_the_parent_as_written(

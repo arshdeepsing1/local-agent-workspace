@@ -1492,7 +1492,7 @@ parent's and the parent's start time applies; a subagent that reaches the limit 
 way and reports the stop as an error to its parent. Its last request asks for its report with
 `submit_report`, the one tool call that runs then, so its parent gets that report with the error. If
 the schema refuses that report, or its arguments cannot be read, no request follows to fix it: the
-parent's result has its text (redacted) after the error instead. A
+parent's result has it as the model wrote it (redacted) after the error instead. A
 background subagent's requests count in the turn during which they were made, never again in a later
 one: while it still works after its turn ended, your next message's turn counts only the requests it
 makes from then on, and it keeps its own turn's limits (the requests it made before count toward
@@ -2908,7 +2908,7 @@ prompt asks it to end with `submit_report`, a tool only subagents get: a structu
 `line`), `files_changed` (up to 20) and `next_steps` (up to 10; open questions and risks go there too).
 The tool checks the report against its schema, so an incomplete one is an error the model fixes and
 sends again (once a later report is accepted, the refused one does not count as a failure of the run;
-at a turn's token or time limit no request follows, so the parent gets the refused report as text), and a valid one ends the subagent's turn without another model request. A subagent that
+at a turn's token or time limit no request follows, so the parent gets the refused report as the model wrote it), and a valid one ends the subagent's turn without another model request. A subagent that
 answers in plain text instead still reports that reply, as before. In a subagent chat you continue
 yourself, `submit_report` is not offered (and refused if called): the agent answers there in its reply.
 
@@ -2938,7 +2938,7 @@ command changed are in the changes bar), `transcript`, `report` (its `submit_rep
 secrets redacted; when the result is too large its lists lose their last items first, with a
 `*_total` count) and `output` (its final reply: empty with a report, the whole report without one,
 after any errors; when its last response's `submit_report` report did not go through, refused by the
-schema or with arguments that could not be read, that report follows as labelled text; a
+schema or with arguments that could not be read, that report follows as the model wrote it, labelled; a
 `subagent_stop` hook's replacement report replaces both).
 Each subagent has its own card: its type, the effort and model it started with (for example
 **Fast · Claude Opus 5.5**), live status (running, waiting for approval,

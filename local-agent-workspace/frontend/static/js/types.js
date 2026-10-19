@@ -297,7 +297,7 @@
 //   tool_profile, status, terminal_reason, steps_used, tool_calls, changed_files, changed_files_total?, transcript,
 //   report?: { summary, findings?: [{ path?, line?, text }], files_changed?, next_steps?, findings_total?, ... } (its
 //   submit_report), output (its final reply, '' with a report; a last report that did not go through follows as
-//   text), note? (a scheduled run's call that asked for the
+//   the model wrote it), note? (a scheduled run's call that asked for the
 //   background: it ran in the foreground) }. A background one's output is { child_session_id
 //   (null while queued), agent_type, status: 'running'|'queued', background: true, transcript, message }; its result
 //   arrives later as the card's delegation_result, and the parent gets a notice { subagent_id, subagent_status }.

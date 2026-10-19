@@ -139,7 +139,7 @@ REPORT_SUBMITTED = "Report sent to the parent chat. Your turn ends here."
 # A report of the subagent's last response that did not go through (unaccepted_report): how the parent's result
 # labels its text. The arguments of an unusable reply's call are kept up to UNSENT_REPORT_CHARS (the result holds
 # no more).
-REFUSED_REPORT = "Its last report, which the submit_report schema refused (see the error), as text:\n"
+REFUSED_REPORT = "Its last report, which the submit_report schema refused (see the error), as the model wrote it:\n"
 UNSENT_REPORT = "Its last report, whose submit_report arguments could not be read, as the model wrote them:\n"
 UNSENT_REPORT_CHARS = RESULT_BYTES
 # The model history's reply after submit_report ended a subagent's turn (a turn ends with a reply).
@@ -292,22 +292,19 @@ def submitted_report(events):
 
 def unaccepted_report(events):
     """The report a subagent's last response sent that did not go through, as labelled text, or None: a
-    submit_report call the schema refused (its known keys, as report_text writes them) or one in a reply that could
-    not be used (its arguments as written, kept on the reply as unsent_report). The wrap-up at a turn's limit sends
-    no request to fix it, so the parent gets it this way."""
+    submit_report call the schema refused or one in a reply that could not be used (kept on the reply as
+    unsent_report), its arguments as the model wrote them either way. The wrap-up at a turn's limit sends no request
+    to fix it, so the parent gets it this way."""
     start = next((index for index in range(len(events) - 1, -1, -1) if events[index].get("type") == "assistant"), None)
     if start is None:
         return None
     for event in reversed(events[start + 1:]):
         values = event.get("input")
         if (event.get("type") == "tool" and event.get("name") == "submit_report" and event.get("state") == "error"
-                and isinstance(values, dict) and isinstance(values.get("summary"), str)):
-            # Only the shapes report_text reads: the schema refused these values.
-            report = {"summary": values["summary"]}
-            for key, kind in (("findings", dict), ("files_changed", str), ("next_steps", str)):
-                if isinstance(values.get(key), list):
-                    report[key] = [item for item in values[key] if isinstance(item, kind)]
-            return REFUSED_REPORT + report_text(report)
+                and isinstance(values, dict)):
+            # As written, not as report_text: the part the schema refused (a summary that is not text, a key it does
+            # not take) is the part report_text would leave out, and often holds what remains.
+            return REFUSED_REPORT + json.dumps(values, ensure_ascii=False)
     unsent = events[start].get("unsent_report")
     return UNSENT_REPORT + unsent if isinstance(unsent, str) and unsent else None
 
