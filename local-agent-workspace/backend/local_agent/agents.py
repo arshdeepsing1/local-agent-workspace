@@ -869,7 +869,12 @@ class AgentManager(LifecycleHooks):
         self.rules = RuleStore(settings.state_dir)
         self.pending_checks = {}  # (session id, event id) -> recheck(change) of a waiting card
         self.card_revisers = {}  # (session id, event id) -> async reviser(changes) for Edit before approving
+        # (session id, event id) of hook cards another task than the chat's own runs (a background subagent's hook
+        # in its parent), while they wait or run: the end of the chat's turn or compaction leaves them alone.
+        self.foreign_cards = set()
         self.statuses = {}
+        # Chats whose turn, compaction or ! command is setting its last status (settle): it counts as over.
+        self.settling = set()
         # {chat id: {started, first_call, first_event}} while a turn runs (turns.py: its result record and budget),
         # and the chats whose current request is a turn's wrap-up at its budget (their tool calls do not run).
         self.turns = {}
@@ -974,12 +979,16 @@ class AgentManager(LifecycleHooks):
 
         run() keeps turn_running until the model loop ends. A title request (after the
         answer completed) or a manual compaction outside a turn is closed as interrupted
-        but does not make the turn incomplete. Older records without the marker count as
-        cut short when an agent request or a tool was still running. The turn it closes
-        gets its result record in the header (last_turn_result), which scripts read.
+        but does not make the turn incomplete, nor does a card still open after the turn
+        ended (a background subagent's hook card, which outlasts it). Older records without
+        the markers count as cut short when an agent request or a tool was still running.
+        The turn it closes gets its result record in the header (last_turn_result), which
+        scripts read.
         """
         now, closed = time.time(), []
         cut_short = session.pop("turn_running", False) is True
+        # The turn's end was saved, so a card still open is not the turn's.
+        turn_closed = not cut_short and type(session.get("turn_ended")) in (int, float)
         changed = cut_short
         for call in session.get("inference_calls", []):
             if isinstance(call, dict) and call.get("status") == "running":
@@ -992,7 +1001,7 @@ class AgentManager(LifecycleHooks):
                 event["state"] = "cancelled"
                 changed = True
                 # A ! command is the user's own action, not an agent turn: nothing to continue.
-                if not (event.get("type") == "tool" and event.get("name") == "user_command"):
+                if not (turn_closed or event.get("type") == "tool" and event.get("name") == "user_command"):
                     cut_short = True
             if event.get("request_info", {}).get("status") == "running":
                 event["request_info"].update(status="interrupted", error_kind="incomplete_response")
@@ -2680,6 +2689,7 @@ class AgentManager(LifecycleHooks):
             if not task.cancelling():
                 task.cancel()
         await self.delegates.cancel_parent(session_id)
+        await self.delegates.cancel_start(session_id)  # A subagent whose start hooks (perhaps a card) still run.
         if task and not task.done():
             await asyncio.gather(task, return_exceptions=True)
         self.scheduled_turns.pop(session_id, None)  # A scheduled run stopped before its turn began.
@@ -2997,7 +3007,7 @@ class AgentManager(LifecycleHooks):
             self.store.forget_encodings(session["id"])
             if noted:  # The composer shows the output waiting for the next message.
                 await self.publish_pending(session)
-            await self.status(session, "idle")
+            await self.settle(session, asyncio.current_task().cancelling())
 
     async def side_question(self, session_id, question):
         """/btw: answer a question from the conversation so far in one non-streamed request.
@@ -3237,8 +3247,8 @@ class AgentManager(LifecycleHooks):
             updates = []
             stopped = asyncio.current_task().cancelling()
             for event in session["events"]:
-                if event.get("state") == "pending" and not stopped and self.card_waits(session, event):
-                    continue  # A card another task waits on (a background subagent's hook in this chat) stays.
+                if not stopped and self.card_elsewhere(session, event):
+                    continue  # Another task's card (a background subagent's hook in this chat) waits or runs on.
                 if event.get("state") in ("running", "pending"):
                     event["state"] = "cancelled"
                     updates.append(event)
@@ -3286,16 +3296,32 @@ class AgentManager(LifecycleHooks):
             self.live.pop(session["id"], None)
             self.store.forget_encodings(session["id"])
             try:
-                await self.status(session, "idle", turn_ended=True, result=result)
-                if not stopped and any(self.card_waits(session, event) for event in session["events"]):
-                    await self.status(session, "awaiting_approval")  # That card still waits for its answer.
+                await self.settle(session, stopped, turn_ended=True, result=result)
             except STORAGE_ERRORS as exc:
                 await report_storage_failure(exc)
 
-    def card_waits(self, session, event):
+    def cards_wait(self, session_id):
         """Whether a card of this chat still waits for its answer (its wait in self.pending has not ended)."""
-        future = self.pending.get((session["id"], event.get("id")))
-        return future is not None and not future.done()
+        return any(key[0] == session_id and not future.done() for key, future in self.pending.items())
+
+    def card_elsewhere(self, session, event):
+        """Whether another task than the chat's own still waits on or runs this card (a background subagent's hook
+        in this chat): the chat's turn or compaction that ends meanwhile leaves it as it is."""
+        return (session["id"], event.get("id")) in self.foreign_cards
+
+    async def settle(self, session, stopped=False, turn_ended=False, result=None):
+        """The status a turn, manual compaction or ! command leaves when it ends, by the rule a hook card's answer
+        follows too (after_hook_card): idle, or awaiting_approval while a card of the chat still waits (a background
+        subagent's hook card outlasts the task; after a Stop, which ends those, it stays idle). A card answered
+        meanwhile, whose approve() sets the chat running, finds the task over (settling), so the chat is never
+        left running without a task. turn_ended and result: as for status()."""
+        self.settling.add(session["id"])
+        try:
+            await self.status(session, "idle", turn_ended=turn_ended, result=result)
+            if not stopped and self.cards_wait(session["id"]):
+                await self.status(session, "awaiting_approval")  # That card still waits for its answer.
+        finally:
+            self.settling.discard(session["id"])
 
     async def run_delegations(self, session, tools, calls, values, allowance):
         """Consecutive delegate_task calls of one response, run in parallel; their outputs in call
@@ -4961,10 +4987,11 @@ class AgentManager(LifecycleHooks):
         first_event = len(session["events"])  # Its before_compaction hook cards come after this.
 
         async def close_cards():
-            """A hook card a Stop or failure left running or pending shows cancelled, as at a turn's end (not a
-            card another task still waits on: a background subagent's hook in this chat)."""
+            """A hook card a Stop or failure left running or pending shows cancelled, as at a turn's end (unless
+            stopped, not a card another task still waits on or runs: a background subagent's hook in this chat)."""
+            stopped = asyncio.current_task().cancelling()
             for event in session["events"][first_event:]:
-                if event.get("state") in ("running", "pending") and not self.card_waits(session, event):
+                if event.get("state") in ("running", "pending") and (stopped or not self.card_elsewhere(session, event)):
                     await self.update_event(session, event, state="cancelled")
         try:
             self.compaction_trigger(session, "manual")
@@ -5023,7 +5050,7 @@ class AgentManager(LifecycleHooks):
             await close_cards()
             self.live.pop(session["id"], None)
             self.store.forget_encodings(session["id"])
-            await self.status(session, "idle")
+            await self.settle(session, asyncio.current_task().cancelling())
 
     async def model_response(self, session, event, client, url, headers, payload, retry_reason=None, body=None,
                              effort=None, cache=None, accepted=None, fallback=None, replayed=0):
