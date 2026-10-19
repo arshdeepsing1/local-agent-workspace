@@ -1020,7 +1020,8 @@ when opening a conversation or performing restart recovery.
   When a reply's tool calls had invalid or
   incomplete arguments, or the reply ended without a finish reason, none of its tools
   run, and the app asks the model in a hidden message to issue them again or to
-  continue: up to twice in a row, with a notice each time. A reply stopped by the
+  continue: up to twice in a row, with a notice each time (not after the wrap-up request at a turn's token
+  or time limit, which ends the turn; see **Token and time limits per turn**). A reply stopped by the
   provider's content filter, an empty reply and a stream cut off mid-message are not
   retried; the turn ends with the error. A content filter stop says so, and no
   **Continue** button is offered for it.
@@ -1482,13 +1483,16 @@ time limit is the wall-clock time since the turn started, waits for your approva
 Both are checked before each agent model request. Once one is reached, the agent gets one more
 request, told to call no tools and to reply with what is done, what remains and how to continue (a
 tool call in that reply does not run). Then the turn ends with a notice (also when that request was
-its last Agent step), the chat offers **Continue** (which starts a new turn with a new budget), and
+its last Agent step, and when its reply reached the output limit, had broken tool arguments or ended
+early: no hidden retry follows it), the chat offers **Continue** (which starts a new turn with a new budget), and
 desktop notifications say "Reached the turn budget". Verify and stop hooks do not continue the turn
 past it, and messages queued while it ran stay queued. If you raise or remove the limit while that last request runs, the turn
 goes on as usual from the next request (only that request's tool calls stay unrun). A subagent counts toward its parent's turn: its tokens add to the
 parent's and the parent's start time applies; a subagent that reaches the limit wraps up the same
 way and reports the stop as an error to its parent. Its last request asks for its report with
-`submit_report`, the one tool call that runs then, so its parent gets that report with the error. A
+`submit_report`, the one tool call that runs then, so its parent gets that report with the error. If
+the schema refuses that report, or its arguments cannot be read, no request follows to fix it: the
+parent's result has its text (redacted) after the error instead. A
 background subagent's requests count in the turn during which they were made, never again in a later
 one: while it still works after its turn ended, your next message's turn counts only the requests it
 makes from then on, and it keeps its own turn's limits (the requests it made before count toward
@@ -1882,7 +1886,8 @@ The output-token limit is separate from the configurable total context capacity
 and the resulting input budget. Raising it reduces the available input budget and
 works only when the selected endpoint supports the requested value. If a response
 ends at that limit, none of that response's tool calls run. When another configured
-agent step is available, the app automatically retries in smaller steps up to twice;
+agent step is available, the app automatically retries in smaller steps up to twice (not after the
+wrap-up request at a turn's token or time limit: that turn ends at the limit);
 requests recovered this way are recorded as interrupted rather than terminal errors.
 The full partial response remains in the visible event, while model history keeps a
 small omission marker and a hidden app-generated user continuation so role ordering
@@ -2902,7 +2907,8 @@ prompt asks it to end with `submit_report`, a tool only subagents get: a structu
 `summary` (up to 2,000 characters), `findings` (up to 30, each with `text` and optionally `path` and
 `line`), `files_changed` (up to 20) and `next_steps` (up to 10; open questions and risks go there too).
 The tool checks the report against its schema, so an incomplete one is an error the model fixes and
-sends again (once a later report is accepted, the refused one does not count as a failure of the run), and a valid one ends the subagent's turn without another model request. A subagent that
+sends again (once a later report is accepted, the refused one does not count as a failure of the run;
+at a turn's token or time limit no request follows, so the parent gets the refused report as text), and a valid one ends the subagent's turn without another model request. A subagent that
 answers in plain text instead still reports that reply, as before. In a subagent chat you continue
 yourself, `submit_report` is not offered (and refused if called): the agent answers there in its reply.
 
@@ -2931,7 +2937,9 @@ its file tools changed, at most 20; `changed_files_total` when there were more; 
 command changed are in the changes bar), `transcript`, `report` (its `submit_report` report, with
 secrets redacted; when the result is too large its lists lose their last items first, with a
 `*_total` count) and `output` (its final reply: empty with a report, the whole report without one,
-after any errors; a `subagent_stop` hook's replacement report replaces both).
+after any errors; when its last response's `submit_report` report did not go through, refused by the
+schema or with arguments that could not be read, that report follows as labelled text; a
+`subagent_stop` hook's replacement report replaces both).
 Each subagent has its own card: its type, the effort and model it started with (for example
 **Fast · Claude Opus 5.5**), live status (running, waiting for approval,
 waiting for a free slot, completed, failed, cancelled), completed actions, last tool, how

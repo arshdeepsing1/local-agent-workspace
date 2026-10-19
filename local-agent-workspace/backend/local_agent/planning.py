@@ -136,6 +136,12 @@ LEGACY_REPORT = ("Work on your own: the parent sees only your final reply, never
                  "report: summary; key findings with path:line references; files changed (or none); open questions or risks.")
 REPORT_KEYS = ("summary", "findings", "files_changed", "next_steps")
 REPORT_SUBMITTED = "Report sent to the parent chat. Your turn ends here."
+# A report of the subagent's last response that did not go through (unaccepted_report): how the parent's result
+# labels its text. The arguments of an unusable reply's call are kept up to UNSENT_REPORT_CHARS (the result holds
+# no more).
+REFUSED_REPORT = "Its last report, which the submit_report schema refused (see the error), as text:\n"
+UNSENT_REPORT = "Its last report, whose submit_report arguments could not be read, as the model wrote them:\n"
+UNSENT_REPORT_CHARS = RESULT_BYTES
 # The model history's reply after submit_report ended a subagent's turn (a turn ends with a reply).
 REPORT_SUBMITTED_REPLY = "[Report submitted to the parent chat with submit_report.]"
 INITIAL_PROMPT_LABEL = "Agent's initial prompt:"
@@ -282,6 +288,28 @@ def submitted_report(events):
                 and isinstance(event.get("input"), dict) and isinstance(event["input"].get("summary"), str)):
             return {key: event["input"][key] for key in REPORT_KEYS if key in event["input"]}
     return None
+
+
+def unaccepted_report(events):
+    """The report a subagent's last response sent that did not go through, as labelled text, or None: a
+    submit_report call the schema refused (its known keys, as report_text writes them) or one in a reply that could
+    not be used (its arguments as written, kept on the reply as unsent_report). The wrap-up at a turn's limit sends
+    no request to fix it, so the parent gets it this way."""
+    start = next((index for index in range(len(events) - 1, -1, -1) if events[index].get("type") == "assistant"), None)
+    if start is None:
+        return None
+    for event in reversed(events[start + 1:]):
+        values = event.get("input")
+        if (event.get("type") == "tool" and event.get("name") == "submit_report" and event.get("state") == "error"
+                and isinstance(values, dict) and isinstance(values.get("summary"), str)):
+            # Only the shapes report_text reads: the schema refused these values.
+            report = {"summary": values["summary"]}
+            for key, kind in (("findings", dict), ("files_changed", str), ("next_steps", str)):
+                if isinstance(values.get(key), list):
+                    report[key] = [item for item in values[key] if isinstance(item, kind)]
+            return REFUSED_REPORT + report_text(report)
+    unsent = events[start].get("unsent_report")
+    return UNSENT_REPORT + unsent if isinstance(unsent, str) and unsent else None
 
 
 def retried_reports(events):
@@ -1085,7 +1113,8 @@ class DelegateManager:
 
     async def child_result(self, parent, saved, kind, profile, cancelled=False, failure=""):
         """The bounded result of a subagent's delegated turn (the parent's delegate_task result), with its
-        submit_report report when it sent one; closes its progress and index entry."""
+        submit_report report when it sent one (as text in the output when its last response's report did not go
+        through); closes its progress and index entry."""
         events = saved.get("events", [])
         retried = retried_reports(events)
         errors = [event.get("text") or event.get("output") or "Child tool failed." for event in events
@@ -1097,9 +1126,12 @@ class DelegateManager:
         status = "cancelled" if cancelled or reason == "stopped" else "failed" if errors or reason != "completed" else "completed"
         await self.progress(saved, terminal_reason=reason)
         report = None if cancelled else submitted_report(events)
-        if report is not None:
+        unaccepted = None if cancelled or report is not None else unaccepted_report(events)
+        if report is not None or unaccepted:
             # Only text of the response that sent the report goes with it, never an earlier step's narration.
             reply = next((event.get("text") or "" for event in reversed(events) if event.get("type") == "assistant"), "")
+            if unaccepted:
+                reply = (reply + "\n\n" if reply else "") + self.manager.settings.redact(redact_secrets(unaccepted))
         else:
             reply = next((event.get("text", "") for event in reversed(events) if event.get("type") == "assistant" and event.get("text")), "")
         if (reply or report) and not cancelled and status == "completed":
