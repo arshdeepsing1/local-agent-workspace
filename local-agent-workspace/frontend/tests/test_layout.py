@@ -302,6 +302,45 @@ def test_short_welcome_scrolls_from_the_top(ui, page, height):
     expect(explore).to_be_in_viewport(ratio=1)
 
 
+# L13: the Workspace panel's four tabs fit it: labelled while the labels fit, icons only otherwise (a phone at
+# large text, or a docked panel at 125% and up); each icon-only tab keeps its label as its name and tooltip
+
+TAB_VIEWPORTS = [(1280, 900, 100, False), (1280, 900, 150, True), (1100, 800, 100, None), (820, 1180, 150, False),
+                 (390, 844, 100, False), (360, 740, 100, None), (360, 740, 150, True)]
+
+
+@pytest.mark.parametrize("width,height,scale,icons", TAB_VIEWPORTS, ids=[f"{w}x{h}-{s}%" for w, h, s, _ in TAB_VIEWPORTS])
+def test_the_four_workspace_tabs_fit_the_panel_with_labels_or_icons(ui, page, width, height, scale, icons):
+    page.set_viewport_size({"width": width, "height": height})
+    ui.app(session="a", scenario="workspace", setup=CHAT % "" + f"; localStorage.setItem('local.textSize', '{scale}')")
+    ui.show_session("a")
+    open_panel(page)
+    nav = panel(page).get_by_role("navigation", name="Workspace views")
+    tabs = nav.get_by_role("button")
+    expect(tabs).to_have_text(["Files", "Changes", "Terminal", "Progress"])
+    tabs.last.click()
+    expect(tabs.last).to_have_attribute("aria-pressed", "true")
+    fit = nav.evaluate("""nav => ({ icons: nav.classList.contains('icons-only'), overflow: nav.scrollWidth - nav.clientWidth,
+      clipped: [...nav.querySelectorAll('.tab-label')].filter(label => label.scrollWidth > label.clientWidth + 0.5).length,
+      hit: [...nav.querySelectorAll('button')].every(b => { const r = b.getBoundingClientRect()
+        return b.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2)) }) })""")
+    assert fit["overflow"] <= 1 and fit["hit"], fit
+    if icons is not None:  # None: either, at the edge of fitting
+        assert fit["icons"] == icons, fit
+    if fit["icons"]:
+        for tab, label in zip(tabs.all(), ["Files", "Changes", "Terminal", "Progress"]):
+            expect(tab).to_have_attribute("title", label)
+            assert tab.locator(".tab-label").evaluate("e => e.getBoundingClientRect().width") <= 1
+    else:
+        assert fit["clipped"] == 0, fit
+    assert ui.js("document.documentElement.scrollWidth <= innerWidth")
+    assert ui.js("(e => e.scrollWidth <= e.clientWidth)(document.querySelector('.progress-panel'))")
+    main = box(ui, ".main-area")
+    assert main["width"] >= 360, main
+    if width >= 1024:
+        assert main["width"] >= 420, main
+
+
 # L6: the context details open as a popover above the meter
 
 POPOVER = [(390, 664), (390, 844), (844, 390), (667, 375), (1440, 900), (360, 740)]

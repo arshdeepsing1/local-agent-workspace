@@ -225,6 +225,35 @@ def test_the_workspace_review_and_its_active_tab_are_readable(ui, page):
     assert failures(page, ".workspace-panel") == []
 
 
+PROGRESS = """
+for (const [child, title, status, extra] of [['k1', 'Check the tests', 'running', { steps: 2, max_steps: 10, last_tool: 'run_command',
+    last_tool_state: 'running', last_tool_subject: 'npm test' }],
+  ['k2', 'Update the docs', 'awaiting_approval', { pending: { event_id: 'p1', name: 'write_file', kind: 'approval', title: 'Write src/app.py' } }],
+  ['k3', 'Old survey', 'completed', { terminal_reason: 'completed', ended: 9 }]]) {
+  fake.sessions.set(child, { ...makeSession(child, title), parent_session_id: 'a', is_subagent: true,
+    delegation: { status, completed_tools: 2, agent_type: 'explore', background: true, started: 1, ...extra } })
+}
+window.answer = path => path.startsWith('/api/jobs?') ? fake.json([workspaceJob('dev', { command: 'npm run dev' }),
+  workspaceJob('build', { command: 'make build', state: 'failed', exit_code: 2, updated: 150 })]) : undefined
+"""
+
+
+@pytest.mark.parametrize("scale", [100, 150])
+def test_the_progress_tab_and_its_icon_only_tabs_are_readable(ui, page, scale):
+    # Its rows, chips, notes and waiting row, at 4.5:1 and at least 11 px; at 150% the tabs show their icons only.
+    start_chat(ui, page, setup=PROGRESS + f"""fake.sessions.get('a').context_info = {json.dumps(CONTEXT_INFO)}
+      localStorage.setItem('local.textSize', '{scale}')""")
+    ui.emit("a", {"type": "tasks", "tasks": [{"id": "t1", "title": "Fix the exporter", "status": "in_progress"},
+                                             {"id": "t2", "title": "Old plan", "status": "cancelled"}]})
+    page.get_by_role("button", name=re.compile("^Workspace")).click()
+    page.get_by_role("button", name="Progress", exact=True).click()
+    expect(page.get_by_role("list", name="Background tasks").get_by_role("listitem")).to_have_count(5)
+    expect(page.locator(".workspace-tabs.icons-only")).to_have_count(1 if scale == 150 else 0)
+    page.mouse.move(0, 0)
+    assert failures(page, ".workspace-panel") == []
+    assert small_text(page, ".workspace-panel") == []
+
+
 def test_settings_and_folder_access_notes_are_readable(ui, page):
     start_chat(ui, page, setup=SETTINGS_WITH_NOTES)
     page.get_by_role("button", name="Settings", exact=True).click()
