@@ -428,9 +428,9 @@ when opening a conversation or performing restart recovery.
   background subagent that finishes or fails while its chat runs no turn notifies for that chat
   ("Background subagent finished: Fix the parser"), once the chat is idle when it ended during a
   `!` command or a manual compaction, and beside the chat's error or limit notification, which
-  still waits for you; a subagent chat you continue yourself notifies like any other. A notification closes when it
-  no longer applies (the approval was answered, the chat started another turn, or you opened
-  the chat), so the next approval request alerts again. Each open tab notifies on its own; the browser replaces a
+  still waits for you; a subagent chat you continue yourself notifies like any other. A
+  notification closes when it no longer applies (the approval was answered, the chat started
+  another turn, or you opened the chat), so the next approval request alerts again. Each open tab notifies on its own; the browser replaces a
   notification with the same chat and status. If the browser blocks
   notifications for the page, the sidebar says so; allow them in the browser's site settings.
   For when no tab is open, see **Settings → Desktop notification when no browser tab is open**:
@@ -2504,8 +2504,10 @@ tools come first (28 in a new chat with the default Settings; up to 32 once `get
 tools), then MCP tools in server order. `get_tool_output`, `report_findings` and `get_subagent_result` join a chat
 mid-turn (after a long result, a review skill, a background subagent), so while MCP tools are offered each of them
 that can still join keeps its place for the rest of the chat, and one joining never pushes out an MCP tool the turn
-already offered. With the default Settings a new chat therefore has room for one MCP tool, and for none once a web
-search provider is set; turning off one of these helpers, or `use_skill` or `delegate_task` (which `report_findings`
+already offered. A scheduled run's chat keeps the place of `get_subagent_result` too: the run's own subagents run
+in the foreground, but your later messages there can start background ones, and its tool list stays the same.
+With the default Settings a new chat therefore has room for one MCP tool, and for none once a web search provider
+is set; turning off one of these helpers, or `use_skill` or `delegate_task` (which `report_findings`
 and `get_subagent_result` follow), frees a place. The MCP tools that do not fit are named once
 in a notice (with the places kept) and in **Extensions**, and a call to one is refused. Turn off tools or servers a
 chat does not need to make room.
