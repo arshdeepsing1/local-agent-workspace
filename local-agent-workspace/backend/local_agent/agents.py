@@ -849,7 +849,7 @@ def public_session(session, status="idle", compaction=None):
             **{k: v for k, v in session.items()
                if k not in ("wire", "context_state", "instruction_directories", "instruction_paths", "inference_calls",
                             "command_jobs", "file_views", "turn_running", "jobs_reported_through", "pending_context",
-                            "usage_summary", "subagents_reported_through")},
+                            "usage_summary", "subagents_reported_through", "stopped_through")},
             **({"pending_context": pending} if pending else {}),
             **({"queued_messages": public_queue(queue)} if isinstance(queue, list) else {}),
             **({"compaction_progress": compaction} if compaction else {}),
@@ -941,7 +941,7 @@ class AgentManager(LifecycleHooks):
         self.estimate_anchors = {}
         self.anchor_candidates = {}
         # In memory only: {chat id: progress} of the compaction running in each chat (compaction_progress),
-        # until the chat's status leaves "compacting".
+        # until the chat's own work leaves "compacting" (a card's wait meanwhile keeps it).
         self.compactions = {}
         # The lifespan writes the marker after every task and job stopped. It is removed before
         # anything else, so a crash during this run gives a full scan next time. Without it (a
@@ -984,16 +984,19 @@ class AgentManager(LifecycleHooks):
 
         run() keeps turn_running until the model loop ends. A title request (after the
         answer completed) or a manual compaction outside a turn is closed as interrupted
-        but does not make the turn incomplete, nor does a card still open after the turn
-        ended (a background subagent's hook card, which outlasts it). Older records without
-        the markers count as cut short when an agent request or a tool was still running.
-        The turn it closes gets its result record in the header (last_turn_result), which
-        scripts read.
+        but does not make the turn incomplete, nor does a card still open once the
+        turn's answer finished (a background subagent's hook card, which outlasts it),
+        also while the chat was being named. Older records without the markers count as cut
+        short when an agent request or a tool was still running. The turn it closes gets
+        its result record in the header (last_turn_result), which scripts read.
         """
         now, closed = time.time(), []
         cut_short = session.pop("turn_running", False) is True
-        # The turn's end was saved, so a card still open is not the turn's.
-        turn_closed = not cut_short and type(session.get("turn_ended")) in (int, float)
+        # The turn's end was saved, or its answer finished and only naming the chat ran (turn_ended is None until
+        # naming ends, turn_running is already gone), so a card still open is not the turn's.
+        saved_end = session.get("turn_ended")
+        turn_closed = not cut_short and ("turn_ended" in session and saved_end is None
+                                         or type(saved_end) in (int, float))
         changed = cut_short
         for call in session.get("inference_calls", []):
             if isinstance(call, dict) and call.get("status") == "running":
@@ -1706,13 +1709,14 @@ class AgentManager(LifecycleHooks):
     async def status(self, session, status, turn_ended=False, result=None, card=False):
         """turn_ended: this idle status ends a turn (not a manual compaction); result: that turn's result record
         (turns.turn_result), which the message carries, so a script reads the end of its turn from it. card: the
-        status of a card's wait or answer, not of the chat's own work (work_statuses)."""
+        status of a card's wait or answer, not of the chat's own work (work_statuses): it leaves a running
+        compaction's progress, which shows again once the chat compacts again."""
         previous = self.statuses.get(session["id"], "idle")
         self.statuses[session["id"]] = status
         if not card:
             self.work_statuses[session["id"]] = status
-        if status != "compacting":
-            self.compactions.pop(session["id"], None)
+            if status != "compacting":
+                self.compactions.pop(session["id"], None)
         message = {"type": "status", "status": status}
         if status == "idle":
             # How and when the last turn ended, for notifications and the Continue button.
@@ -1721,6 +1725,9 @@ class AgentManager(LifecycleHooks):
             if turn_ended and result is not None:
                 message["turn_result"] = result
         await self.broadcast(session["id"], message)
+        if card and status == "compacting" and (record := self.compactions.get(session["id"])):
+            # A card's answer during a compaction: the page dropped its progress at the card's status.
+            await self.broadcast(session["id"], {"type": "compaction", "progress": dict(record)})
         self.notify_status(session, previous, status, turn_ended)
         await self.delegates.progress(session, status=status)
         if status == "idle":
@@ -2715,6 +2722,8 @@ class AgentManager(LifecycleHooks):
                 self.store.save(session)
                 await self.delegates.progress(session, terminal_reason="stopped")
                 await self.status(session, "idle", turn_ended=True, result=result)
+        if not self.closing:
+            self.delegates.stopped(session_id)  # What its background subagents reported until now wakes nothing.
 
     def busy_task(self, session_id):
         task = self.tasks.get(session_id)
@@ -3159,6 +3168,9 @@ class AgentManager(LifecycleHooks):
         terminal_reason = "completed"
         first_event = len(session["events"])
         storage_error_reported = False
+        # The answer completed and the chat is being named: a Stop then cancels only the title request. Not read from
+        # the status shown, which a background subagent's card waiting in the chat replaces.
+        naming = False
         # carried: what the chat's background subagents still running from an earlier turn spent so far.
         turn_state = self.turns[session["id"]] = {"started": turns.clock(), "first_event": first_event,
                                                   "first_call": len(session.get("inference_calls") or []),
@@ -3210,6 +3222,7 @@ class AgentManager(LifecycleHooks):
             session.pop("turn_running", None)  # The answer is finished; naming is not part of it.
             if completed and needs_title(session, self.redact_title):
                 previous_title = session["title"]
+                naming = True
                 await self.status(session, "naming")
                 title = await generate_title(self.serving, session, self.store.save)
                 if title and needs_title(session, self.redact_title) and session["title"] == previous_title:
@@ -3217,7 +3230,7 @@ class AgentManager(LifecycleHooks):
                     self.store.save(session)
                     await self.broadcast(session["id"], {"type": "title", "title": title})
         except asyncio.CancelledError:
-            if self.statuses.get(session["id"]) == "naming":
+            if naming:
                 # The answer completed; cancelling its title is not cancelled work.
                 asyncio.current_task().uncancel()
             else:

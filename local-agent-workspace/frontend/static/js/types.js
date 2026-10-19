@@ -218,7 +218,8 @@
 //   request of a compaction. CompactionProgress: { phase: 'handoff'|'summary'|'condense', request (from 1; a retry
 //   keeps the number), started and request_started (server time, epoch seconds), trigger: 'manual'|'in_turn'|'auto'
 //   |null }. The session (snapshot, GET /sessions/<id>) carries it as compaction_progress? while its status is
-//   'compacting'; a status other than 'compacting' ends it.
+//   'compacting'; a status other than 'compacting' ends it on the page. A card's wait and answer during the
+//   compaction keep it on the server: when the chat is 'compacting' again, the same progress is sent again.
 // GET /sessions/<id>/context -> { status, context_info: ContextInfo | null, compaction_progress? }: the meter as
 //   last prepared, without building a request.
 // GET /sessions/<id>/stream.ndjson: the WebSocket's messages for scripts, one JSON per line (snapshot first,
