@@ -458,7 +458,8 @@ class DelegateManager:
     def __init__(self, agent_manager):
         self.manager = agent_manager
         # {parent id: [entry]}: one entry per delegation of that chat, from its start (waiting for a
-        # slot while entry["waiting"]) to its end. entry: {child_session_id, cancelled, waiting}.
+        # slot while entry["waiting"]) to its end. entry: {child_session_id, cancelled, waiting, starting (the task of
+        # its subagent_start hooks, once its child exists)}.
         self.active = {}
         self.waiters = []  # Futures of delegations waiting for a free slot.
         # {parent id: [record]}: the chat's background delegations (start_background) of this app run.
@@ -469,7 +470,9 @@ class DelegateManager:
         self.held = {}
         # Background subagents whose final result get_subagent_result already returned: no notice repeats it.
         self.seen = set()
-        self.stopping = set()  # Chats whose subagents cancel_parent is stopping: nothing wakes them meanwhile.
+        # {chat id: how many cancel_parent calls stop its subagents now}: nothing wakes it meanwhile (maybe_wake), also
+        # not a subagent's card those stops close.
+        self.stopping = {}
         # {parent id: {resolved path: {child id}}}: the files each running subagent of the chat changed, so a
         # sibling's change to the same file asks first (sibling_claim).
         self.claims = {}
@@ -753,7 +756,19 @@ class DelegateManager:
 
     async def cancel_parent(self, parent_id):
         """Stop every subagent of this chat, also those still waiting for a slot and those in the background
-        (whose end it waits for, so nothing reports to the chat after this returns)."""
+        (whose end it waits for, so nothing reports to the chat after this returns). The chat counts as stopping
+        throughout (stopping): a subagent's card in it that these stops close may leave it idle, and Stop on the
+        chat must not continue it then (maybe_wake)."""
+        self.stopping[parent_id] = self.stopping.get(parent_id, 0) + 1
+        try:
+            await self._cancel_parent(parent_id)
+        finally:
+            self.stopping[parent_id] -= 1
+            if not self.stopping[parent_id]:
+                del self.stopping[parent_id]
+
+    async def _cancel_parent(self, parent_id):
+        """cancel_parent's stops, while the chat counts as stopping."""
         entries = list(self.active.get(parent_id, ()))
         for entry in entries:
             entry["cancelled"] = True
@@ -775,11 +790,20 @@ class DelegateManager:
                 # nothing would end that wait, so the delegation itself is cancelled.
                 record["worker"].cancel()
         if records:
-            self.stopping.add(parent_id)
-            try:
-                await asyncio.wait([record["worker"] for record in records])  # Not gather: a Stop of this wait
-            finally:                                                        # must not cancel their reports.
-                self.stopping.discard(parent_id)
+            await asyncio.wait([record["worker"] for record in records])  # Not gather: a Stop of this wait must not
+                                                                          # cancel their reports.
+
+    async def cancel_start(self, child_id):
+        """Stop subagent on a subagent that has not started yet: the subagent_start hooks of its delegation (their
+        card may wait in the parent chat) are cancelled, and it never starts; its call returns as cancelled."""
+        entry = next((entry for entries in self.active.values() for entry in entries
+                      if entry.get("child_session_id") == child_id), None)
+        starting = (entry or {}).get("starting")
+        if starting is None or starting.done() or entry["cancelled"]:
+            return  # Started, or its delegation is already being stopped.
+        entry["cancelled"] = True
+        starting.cancel()
+        await asyncio.wait([starting])  # Its card is closed when Stop returns.
 
     async def _slot(self, entry, parent, parent_event, labels, started=None):
         """Wait until fewer than MAX_RUNNING subagents run (over all chats); the card says queued.
@@ -1086,19 +1110,28 @@ class DelegateManager:
                 prompt += "".join(f"\n\nNote: {note}" for note in notes) + f"\n\n{brief} {REPORT}"
             else:
                 prompt += f"\n\n{BRIEFS[profile]} {REPORT}"
-            # subagent_start hooks (in this parent chat): their context reaches the child's first request.
-            await self.manager.subagent_start_hooks(parent, child, task=task, context=context, max_steps=max_steps)
-            self.manager.start(child["id"], prompt)
-            worker = self.manager.tasks[child["id"]]
-            if started is not None and not started.done():
-                started.set_result({"status": "running", "child_session_id": child["id"]})
-            try:
-                await asyncio.shield(worker)
-            except asyncio.CancelledError:
-                if asyncio.current_task().cancelling():
-                    raise
-                entry["cancelled"] = True
-                await self.manager.stop(child["id"])
+            # subagent_start hooks (in this parent chat): their context reaches the child's first request. They run in
+            # a task of their own, which Stop subagent cancels (cancel_start): the child then never starts.
+            if self.manager.has_hooks(parent, "subagent_start"):
+                starting = entry["starting"] = asyncio.create_task(self.manager.subagent_start_hooks(
+                    parent, child, task=task, context=context, max_steps=max_steps))
+                try:
+                    await starting
+                except asyncio.CancelledError:
+                    if asyncio.current_task().cancelling() or not entry["cancelled"]:
+                        raise
+            if not entry["cancelled"]:
+                self.manager.start(child["id"], prompt)
+                worker = self.manager.tasks[child["id"]]
+                if started is not None and not started.done():
+                    started.set_result({"status": "running", "child_session_id": child["id"]})
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    if asyncio.current_task().cancelling():
+                        raise
+                    entry["cancelled"] = True
+                    await self.manager.stop(child["id"])
         except asyncio.CancelledError:
             entry["cancelled"] = True
             await self.manager.stop(child["id"])

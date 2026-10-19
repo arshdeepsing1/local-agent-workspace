@@ -3010,8 +3010,16 @@ message) and forking the chat are refused with a message naming how many run, be
 progress and results still go to it. The chat's spending limit counts them while they run. A chat
 with background subagents running stays in memory while it is idle, so their reports, hooks and
 your next message all change the same copy. A background subagent's hook card (`subagent_start` or
-`subagent_stop`) that waits in the chat outlasts a turn of the chat that ends meanwhile: it stays
-answerable, and the chat shows it waits for approval until you answer it.
+`subagent_stop`) in the chat outlasts a turn, a compaction or a `!` command of the chat that ends
+meanwhile: a card that waits stays answerable, and one whose hook runs stays running until the hook
+ends. When such a task ends and when such a card is answered, the chat's status follows one rule: it
+waits for approval while any of its cards waits; else it is idle, or shows what its running task does
+now (working, delegating or compacting), also in a turn you started meanwhile. Once it is idle again,
+a background subagent that finished while the card waited continues the chat (with the option above on);
+**Stop** on the chat instead closes the card and continues nothing. **Stop subagent** on a subagent
+that still waits for its `subagent_start` card cancels that card: the subagent never starts, and its
+call returns as cancelled. A restart closes a card that still waited without marking the chat's
+finished turn interrupted.
 
 **Linked transcripts.** Every subagent is a conversation of its own:
 `conversations/<id>.jsonl` in the state folder, like any chat. Its header (the first line)

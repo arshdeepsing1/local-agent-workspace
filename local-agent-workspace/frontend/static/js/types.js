@@ -211,7 +211,9 @@
 //   disabled_tools?, project_rules?: Rule[], user_rules?: Rule[], rules_problem?: string | null }
 // Status message: { type: 'status', status, terminal_reason?, turn_ended? (sent with 'idle'
 //   when a turn ended; a manual compaction leaves turn_ended unchanged), turn_delegated? (true, with
-//   turn_ended, when a parent's delegate_task started that turn), turn_result?: TurnResult (with turn_ended) }
+//   turn_ended, when a parent's delegate_task started that turn), turn_result?: TurnResult (with turn_ended) }.
+//   When a turn, compaction or ! command ends while a card of the chat still waits (a background subagent's hook
+//   card), 'awaiting_approval' follows its 'idle' until the card is answered.
 // Compaction message: { type: 'compaction', progress: CompactionProgress }, sent before each summary or condensing
 //   request of a compaction. CompactionProgress: { phase: 'handoff'|'summary'|'condense', request (from 1; a retry
 //   keeps the number), started and request_started (server time, epoch seconds), trigger: 'manual'|'in_turn'|'auto'
