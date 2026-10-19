@@ -253,14 +253,17 @@ def test_subagents_whose_cards_are_not_loaded_are_listed_from_their_chats_and_an
              + subagent("k3", "Old survey", parent_event="d3", status="completed", terminal_reason="completed", ended=1300)
              + subagent("k4", "Foreground helper", parent_event="d4", background=False, status="completed",
                         terminal_reason="completed", ended=1400)
+             + subagent("k5", "Look up the API", parent_event="d5", background=False, started=1060)
              + subagent("q1", "Not a child", parent_event="x").replace("parent_session_id: 'a'", "parent_session_id: 'z'")
              + "Date.now = () => 1065000")
     start(ui, page, setup)
     open_progress(page)
     rows = background(page)
-    # Waiting first, then running, then ended background ones; an ended foreground subagent is its turn's card.
-    expect(rows).to_have_count(3)
-    expect(rows.locator(".progress-item-title")).to_have_text(["Update the docs", "Check the tests", "Old survey"])
+    # Waiting first, then running (oldest first), then ended background ones; an ended foreground subagent is its
+    # turn's card, a running one is marked as part of the turn.
+    expect(rows).to_have_count(4)
+    expect(rows.locator(".progress-item-title")).to_have_text(["Update the docs", "Check the tests", "Look up the API", "Old survey"])
+    expect(rows.nth(2).locator(".progress-chip")).to_have_text(["Explore", "In this turn"])
     expect(rows.nth(0).locator(".progress-status")).to_have_text("Waiting for approval")
     expect(rows.nth(0).locator(".subagent-pending")).to_have_text("Waits for approval: write file · Write src/app.py")
     running = rows.nth(1)
@@ -269,7 +272,7 @@ def test_subagents_whose_cards_are_not_loaded_are_listed_from_their_chats_and_an
     expect(running).to_contain_text("Step 4 of 10")
     expect(running.locator(".progress-tool")).to_have_text("Now: run command · npm test")
     expect(running.locator(".progress-elapsed")).to_have_text("1 min 05 s")
-    expect(rows.nth(2)).to_contain_text("Reason: completed")
+    expect(rows.nth(3)).to_contain_text("Reason: completed")
     # Their cards are on a page that is not loaded: no Show card, but the child chat answers.
     expect(panel(page).get_by_role("button", name="Show card")).to_have_count(0)
     rows.nth(0).get_by_role("button", name="Allow").click()
@@ -277,7 +280,7 @@ def test_subagents_whose_cards_are_not_loaded_are_listed_from_their_chats_and_an
     assert ui.bodies("/api/sessions/k2/approvals/p1", "POST") == [{"allowed": True}]
     running.get_by_role("button", name="Stop subagent").click()
     page.wait_for_function("fake.requests('/api/sessions/k1/stop', 'POST').length === 1")
-    expect(rows.nth(2).get_by_role("button", name="Stop subagent")).to_have_count(0)
+    expect(rows.nth(3).get_by_role("button", name="Stop subagent")).to_have_count(0)
     running.get_by_role("button", name="Open subagent").click()
     ui.wait("location.search === '?session=k1'")
     ui.show_session("k1")
