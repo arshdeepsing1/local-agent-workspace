@@ -766,6 +766,17 @@ def test_a_prompt_queued_behind_a_wake_turn_that_started_as_it_was_sent_is_still
     client.send(session_id, "delegate it")
     wait_until(lambda: manager.delegates.background_running(session_id) == 1 and not manager.busy_task(session_id))
 
+    respond, held = simulator.Brain.respond, []
+
+    def hold_the_wake(self, body):
+        # The app's turn for the subagent waits at its first request until the prompt waits in the queue, so it is
+        # still running when finish() looks and when the prompt is sent (a fast reply could end it between polls).
+        if not held and user_events(manager, session_id)[-1].get("background_wake") is True:
+            held.append(True)
+            wait_until(lambda: manager.get(session_id).get("queued_messages"))
+        return respond(self, body)
+    monkeypatch.setattr(simulator.Brain, "respond", hold_the_wake)
+
     def finish(chat_id):
         gate.set()
         wait_until(lambda: len(user_events(manager, chat_id)) == 2 and manager.busy_task(chat_id))
