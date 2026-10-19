@@ -50,11 +50,14 @@ def validate_limit(key, value):
 
 def scope(manager, session):
     """(the chat whose turn the budget counts, that turn's state or None): a subagent's running parent turn when
-    the subagent started during it, else the chat's own turn (a background subagent from an earlier turn of its
-    parent, and a subagent chat the user continues on its own)."""
+    the subagent runs as one of that parent's delegations and started during the turn, else the chat's own turn (a
+    background subagent from an earlier turn of its parent, and a subagent chat the user continues on its own, also
+    while its parent's turn runs)."""
     parent_id = session.get("parent_session_id") if session.get("is_subagent") else None
     own = manager.turns.get(session["id"])
-    if isinstance(parent_id, str) and parent_id in manager.turns and parent_id in manager.live:
+    if isinstance(parent_id, str) and parent_id in manager.turns and parent_id in manager.live and any(
+            entry.get("child_session_id") == session["id"]
+            for entry in getattr(manager.delegates, "active", {}).get(parent_id, ())):
         if own is None or own["started"] >= manager.turns[parent_id]["started"]:
             return manager.live[parent_id], manager.turns[parent_id]
     return session, own

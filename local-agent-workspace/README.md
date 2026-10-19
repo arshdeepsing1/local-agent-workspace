@@ -1489,6 +1489,8 @@ goes on as usual from the next request (only that request's tool calls stay unru
 parent's and the parent's start time applies; a subagent that reaches the limit wraps up the same
 way and reports the stop as an error to its parent. Its last request asks for its report with
 `submit_report`, the one tool call that runs then, so its parent gets that report with the error. A
+subagent chat you continue yourself has turns of its own, with its parent's limits, also while the
+parent's turn runs. A
 background subagent's requests count in the turn during which they were made, never again in a later
 one: while it still works after its turn ended, your next message's turn counts only the requests it
 makes from then on, and it keeps its own turn's limits (the requests it made before count toward

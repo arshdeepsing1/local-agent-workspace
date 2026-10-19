@@ -465,6 +465,43 @@ async def test_a_background_subagent_that_ends_during_a_later_turn_counts_its_re
     assert two["tokens"] == 44_000
 
 
+async def test_a_subagent_chat_the_user_continues_while_its_parents_turn_runs_keeps_its_own_budget(runtime, monkeypatch):
+    manager, session = runtime
+    hold = asyncio.Event()
+
+    async def parent(count):
+        if count == 1:
+            return calls_reply(("d1", "delegate_task", {"task": "Map it", "agent_type": "explore", "max_steps": 8}))
+        if count == 3:  # Turn 2's first request: it runs while the user continues the subagent chat.
+            await hold.wait()
+        return text_reply("Done.")
+
+    async def child(count):
+        # Its delegated turn reports at once; the turn the user continues keeps calling tools.
+        return text_reply("## Report\nMapped.") if count == 1 else calls_reply((f"x{count}", "list_tasks", {}))
+    requests, children = gated_gateway(monkeypatch, parent, child)
+    manager.store.save(session)
+    first = await started_turn(manager, session, "Delegate")
+    child_id = first["subagents"][0]["id"]
+    first["turn_token_limit"] = 30_000  # The subagent chat follows its parent's limits.
+    manager.store.save(first)
+    manager.start(session["id"], "Something else")
+    await eventually(lambda: len(requests) == 3)  # The parent's turn 2 runs.
+    manager.start(child_id, "Go on mapping the rest")  # The user continues the subagent chat on its own.
+    await asyncio.wait_for(manager.tasks[child_id], 10)
+    hold.set()
+    await asyncio.wait_for(manager.tasks[session["id"]], 10)
+    # Its own turn: three requests (33,000 tokens) reach the 30,000-token limit, so the fourth is its wrap-up.
+    continued = children[1:]
+    child_session = manager.store.get(child_id)
+    assert len(continued) == 4 and "per turn" in system_text(continued[3]), child_session["terminal_reason"]
+    assert child_session["terminal_reason"] == "budget_limit"
+    assert notices(child_session)[-1]["text"].startswith("This turn has used about 44,000 of its 30,000-token limit")
+    # Nor is it part of the parent's turn 2.
+    two = manager.store.get(session["id"])["last_turn_result"]
+    assert two["subagents"]["count"] == 0 and two["tokens"] == 11_000
+
+
 async def test_a_subagents_wrap_up_runs_only_its_report_which_reaches_the_parent(runtime, monkeypatch):
     manager, session = runtime
     session["turn_token_limit"] = 30_000
