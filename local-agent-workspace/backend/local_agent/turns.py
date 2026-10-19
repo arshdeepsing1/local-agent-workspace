@@ -17,8 +17,11 @@ turn: its requests add to the parent's tokens and the parent's start time applie
 reaches it wraps up and reports the stop as an error, as for the spending limit (in a delegated turn its
 submit_report is the one call that runs in the wrap-up, so its report reaches the parent). A background subagent's
 requests count in the parent's turn during which they were made: one still running from an earlier turn
-counts only what it spends from the new turn's start (carried) and keeps its own turn's budget. A /btw side
-question asked while the turn runs is not the turn's: it counts toward neither its limit nor its result.
+counts only what it spends from the new turn's start (carried) and keeps its own turn's budget. A subagent
+counts in its parent's turns for its delegated run only: a turn you continue its chat in is its own (scope), also
+while the turn that delegated it runs. A /btw side question asked while the turn runs is not the turn's: it counts
+toward neither its limit nor its result, nor does one asked in a subagent's chat count in its parent's turn (the
+subagents index keeps a turn_spend without them); the spending limit counts them, as they are billed.
 """
 import json
 import math
@@ -50,11 +53,14 @@ def validate_limit(key, value):
 
 def scope(manager, session):
     """(the chat whose turn the budget counts, that turn's state or None): a subagent's running parent turn when
-    the subagent started during it, else the chat's own turn (a background subagent from an earlier turn of its
-    parent, and a subagent chat the user continues on its own)."""
+    the subagent runs as one of that parent's delegations and started during the turn, else the chat's own turn (a
+    background subagent from an earlier turn of its parent, and a subagent chat the user continues on its own, also
+    while its parent's turn runs)."""
     parent_id = session.get("parent_session_id") if session.get("is_subagent") else None
     own = manager.turns.get(session["id"])
-    if isinstance(parent_id, str) and parent_id in manager.turns and parent_id in manager.live:
+    if isinstance(parent_id, str) and parent_id in manager.turns and parent_id in manager.live and any(
+            entry.get("child_session_id") == session["id"]
+            for entry in getattr(manager.delegates, "active", {}).get(parent_id, ())):
         if own is None or own["started"] >= manager.turns[parent_id]["started"]:
             return manager.live[parent_id], manager.turns[parent_id]
     return session, own
@@ -96,9 +102,21 @@ def own_tokens(session, first_call=0):
     return sum(call_tokens(call) for call in turn_calls(calls[first_call:]))
 
 
+def turn_spend(calls):
+    """What a subagent's ledger records count in its parent's turns (turn_calls), as its entry in the parent's
+    subagents index keeps it (planning.index_entry: up to the end of its delegated run, not a turn you continued its
+    chat in): {tokens (None when none were reported), estimated_dbu, unpriced_calls, finished_calls (those that
+    ended: a request is in the ledger from its start), reported_calls (those that reported a token count)}."""
+    calls = turn_calls(calls)
+    dbu, unpriced = _spend(calls)
+    return {"tokens": reported_tokens(calls), "estimated_dbu": round(dbu, 6), "unpriced_calls": unpriced,
+            "finished_calls": sum(call.get("status") != "running" for call in calls),
+            "reported_calls": sum(reported_tokens([call]) is not None for call in calls)}
+
+
 def carried(manager, root):
-    """{child id: (tokens or None, estimated DBU, unpriced calls)} that the chat's subagents still running as its
-    turn starts (background ones from an earlier turn) spent so far: the turn counts only what they spend after."""
+    """{child id: _child_usage} of the chat's subagents still running as its turn starts (background ones from an
+    earlier turn): what they spent so far, of which the turn counts only what they spend after."""
     index = {entry.get("id"): entry for entry in root.get("subagents") or [] if isinstance(entry, dict)}
     spent = {}
     for entry in getattr(manager.delegates, "active", {}).get(root["id"], []):
@@ -109,47 +127,52 @@ def carried(manager, root):
 
 
 def children(manager, root, turn):
-    """{child id: (tokens or None, estimated DBU, unpriced calls)} of the subagents that worked in this turn: those
-    the chat started in it in full (a running one read live, an ended one from the chat's subagents index, which
-    keeps its tokens and DBU), and one it carried over from an earlier turn (turn['carried']) for what it spent
-    since the turn started, when it spent anything."""
+    """{child id: _child_usage} of the subagents that worked in this turn: those the chat started in it, for their
+    delegated run in full (a running one read live, an ended one from the chat's subagents index, whose turn_spend
+    leaves out a turn you continued its chat in), and one it carried over from an earlier turn (turn['carried']) for
+    its requests that ended since the turn started, when any did (tokens None when none of them reported a count)."""
     found = {}
     base = turn.get("carried") or {}
+    running = {entry.get("child_session_id") for entry in getattr(manager.delegates, "active", {}).get(root["id"], [])}
     for entry in root.get("subagents") or []:
         started = entry.get("created") if isinstance(entry, dict) else None
         if not isinstance(entry, dict) or entry.get("id") not in base and (
                 isinstance(started, bool) or not isinstance(started, (int, float)) or started < turn["started"]):
             continue
-        found[entry.get("id")] = _child_usage(manager.live.get(entry.get("id")) or entry)
+        # An ended one's live ledger may have a turn you continued its chat in: its entry keeps the delegated run.
+        live = manager.live.get(entry.get("id")) if entry.get("id") in running else None
+        found[entry.get("id")] = _child_usage(live or entry)
     for entry in getattr(manager.delegates, "active", {}).get(root["id"], []):
         child_id = entry.get("child_session_id")
         if child_id and child_id not in found and child_id in manager.live:
             found[child_id] = _child_usage(manager.live[child_id])
-    for child_id, (tokens, dbu, unpriced) in base.items():
+    for child_id, before in base.items():
         if child_id not in found:
             continue
         now = found[child_id]
-        since = (None if now[0] is None else max(0, now[0] - (tokens or 0)), max(0.0, round(now[1] - dbu, 6)),
-                 max(0, now[2] - unpriced))
-        if since[0] or since[1] or since[2]:
-            found[child_id] = since
-        else:
-            del found[child_id]  # It made no request during this turn.
+        if now[3] <= before[3]:
+            del found[child_id]  # No request of it ended during this turn.
+            continue
+        found[child_id] = (None if now[4] <= before[4] else max(0, (now[0] or 0) - (before[0] or 0)),
+                           max(0.0, round(now[1] - before[1], 6)), max(0, now[2] - before[2]), now[3] - before[3],
+                           now[4] - before[4])
     return found
 
 
 def _child_usage(value):
-    """(tokens or None when none were reported, estimated DBU, unpriced calls) of a live child (its ledger) or an
-    index entry."""
+    """(tokens or None when none were reported, estimated DBU, unpriced calls, finished calls, calls that reported a
+    token count) that a live child (its ledger) or an index entry (its turn_spend) counts in its parent's turns. An
+    entry from before turn_spend has its whole spend, /btw side questions included, and no call counts."""
     if isinstance(value.get("inference_calls"), list):
-        calls = turn_calls(value["inference_calls"])
-        dbu, unpriced = _spend(calls)
-        return reported_tokens(calls), dbu, unpriced
+        value = turn_spend(value["inference_calls"])
+    elif isinstance(value.get("turn_spend"), dict):
+        value = value["turn_spend"]
     tokens = value.get("tokens") if type(value.get("tokens")) is int else None
     dbu = value.get("estimated_dbu")
     dbu = dbu if isinstance(dbu, (int, float)) and not isinstance(dbu, bool) else 0.0
-    unpriced = value.get("unpriced_calls") if type(value.get("unpriced_calls")) is int else 0
-    return tokens, dbu, unpriced
+    unpriced, finished, reported = (value.get(key) if type(value.get(key)) is int else 0
+                                    for key in ("unpriced_calls", "finished_calls", "reported_calls"))
+    return tokens, dbu, unpriced, finished, reported
 
 
 def _spend(calls):
@@ -281,7 +304,7 @@ def turn_result(manager, session, turn, terminal_reason, ended=None):
     priced = any(call_estimated_dbu(call)[0] is not None for call in calls)
     child_tokens, child_dbu, child_unpriced = None, 0.0, 0
     found = children(manager, session, turn) if not session.get("is_subagent") else {}
-    for tokens, estimate, missing in found.values():
+    for tokens, estimate, missing, *_ in found.values():
         if tokens is not None:
             child_tokens = (child_tokens or 0) + tokens
         child_dbu, child_unpriced = child_dbu + estimate, child_unpriced + missing

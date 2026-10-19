@@ -1323,7 +1323,8 @@ Databricks responses may omit usage.
 requests (steps), its tool calls, the wall-clock time, the input (cache included, with the cache
 reads in brackets) and output tokens of the turn's own calls (title and compaction included, not a
 `/btw` side question asked while it ran), the
-estimated DBU with its subagents', and how many subagents it started. A count no call reported
+estimated DBU with its subagents', and how many subagents worked in it (a background subagent from
+an earlier turn counts for its requests that ended during this turn). A count no call reported
 shows `—`, never 0, and there is no DBU part without price data. Open it for how the turn ended,
 the tokens it processed with its subagents, calls without price data and the files its tools and
 subagents changed. The same record ends the turn for scripts (see **Scripting the app**), is
@@ -1461,8 +1462,9 @@ continue. A reply that arrives over the limit ends the turn the same way, withou
 hooks (they could only continue with a refused request; a subagent's final reply still reaches
 its parent), and messages queued while it ran stay queued. It is a soft cap: one response can pass it before the next request is stopped.
 Cache reads and writes count at their own rates (see **Prompt caching**).
-Calls to endpoints without price data count as nothing and are listed as not counted; title
-and compaction requests are counted but never stopped. A subagent follows its parent's limit
+Calls to endpoints without price data count as nothing and are listed as not counted; title,
+compaction and `/btw` side question requests (also those in a subagent's chat) are counted but
+never stopped. A subagent follows its parent's limit
 (a subagent chat without its parent, such as a copy of one, has its own), and its spend is kept
 in the parent's subagents index after each of its turns, also when it is stopped, deleted or
 continued by you (subagents that ended before this existed are not counted). The offline simulator reports usage, so
@@ -1493,12 +1495,16 @@ way and reports the stop as an error to its parent. Its last request asks for it
 `submit_report`, the one tool call that runs then, so its parent gets that report with the error. If
 the schema refuses that report, or its arguments cannot be read, no request follows to fix it: the
 parent's result has it as the model wrote it (redacted) after the error instead. A
+subagent chat you continue yourself has turns of its own, with its parent's limits, also while the
+parent's turn runs: what it spends in them counts toward none of its parent's turns (the parent's
+turn that delegated it counts only its delegated run). A
 background subagent's requests count in the turn during which they were made, never again in a later
 one: while it still works after its turn ended, your next message's turn counts only the requests it
 makes from then on, and it keeps its own turn's limits (the requests it made before count toward
 them). The check runs between requests, so one response can pass the limit; title and compaction
-requests count but are never stopped, and a `/btw` side question asked while the turn runs does not
-count.
+requests count but are never stopped, and a `/btw` side question does not count: neither one asked
+while the turn runs nor one asked in a subagent's chat counts toward a turn (the spending limit
+counts them, as they are billed).
 
 ### Reasoning effort and thinking
 
@@ -3620,8 +3626,9 @@ and never blocks saving other settings. Files shows the folder as soon as the ag
 1–64. This is a model-request ceiling, not a tool-call count: one model response can
 request several tools. Reaching the ceiling preserves completed actions and stops
 until the user continues or raises the setting; the notice adds what the turn cost, for
-example "This turn used about 42.5 DBU (estimate)." (the chat and its subagents, from list
-prices; left out for an endpoint without price data). Each step resends the whole
+example "This turn used about 42.5 DBU (estimate)." (the turn's estimate as its turn summary
+shows it: from list prices, its subagents included, not a `/btw` side question; left out for an
+endpoint without price data). Each step resends the whole
 conversation, so a long turn on a large context costs far more than a short one, and with no
 spending limit set (the default) the step limit is the only brake: if you raise Agent steps,
 also set a per-chat **spending limit** (see **Spending limit**). **Max output tokens** defaults to

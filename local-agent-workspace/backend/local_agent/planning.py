@@ -10,7 +10,7 @@ from .permissions import MODE_LABELS, denied_tools
 from .reasoning import EFFORT_LABELS
 from .redaction import redact_secrets
 from .spending import own_spend
-from .telemetry import reported_tokens, sum_usage, usage_counts
+from .telemetry import sum_usage, usage_counts
 from .tool_profiles import PROFILES, child_profile, covering_tool, server_off, validate_profile
 
 log = logging.getLogger(__name__)
@@ -216,11 +216,13 @@ def index_entry(child, task):
     if progress.get("background") is True:
         entry["background"] = True  # delegate_task background: the parent went on while it worked.
     if isinstance(child.get("inference_calls"), list):
-        # What it spent so far, for its parent's spending limit (spending.py), turn budget (turns.py) and Usage
-        # (usage_rollup); a header has no ledger.
+        from .turns import turn_spend  # turns.py imports this module.
+        # What it spent so far, for its parent's spending limit (spending.py) and Usage (usage_rollup), and what of
+        # it counts in its parent's turns (turns.py: not its /btw side questions, nor a turn you continue its chat
+        # in, as _record keeps it from the end of its delegated run); a header has no ledger.
         entry["estimated_dbu"], entry["unpriced_calls"] = own_spend(child)
-        entry["tokens"] = reported_tokens(child["inference_calls"])  # None: no call reported a count.
         entry["usage"] = usage_counts(child["inference_calls"])
+        entry["turn_spend"] = turn_spend(child["inference_calls"])
     return entry
 
 
@@ -582,6 +584,9 @@ class DelegateManager:
         if current is not None and current.get("deleted"):
             return False  # Deleted while it ran: the entry keeps no transcript.
         updated = {**(current or {}), **index_entry(child, current.get("task", "") if task is None else task), **extra}
+        if current is not None and current.get("status") != "running" and isinstance(current.get("turn_spend"), dict):
+            # Its delegated run ended: a turn you continue its chat in is its own, not one of its parent's.
+            updated["turn_spend"] = current["turn_spend"]
         if updated == current:
             return False
         if current is None:
