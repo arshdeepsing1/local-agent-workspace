@@ -125,10 +125,11 @@ function JobRow({ job, agent, now, stopping, onStop, onViewOutput }) {
   </li>`
 }
 
-// Workspace → Progress: the chat's context, its task list (as the checklist above the message box shows it) and
-// its background tasks. session: the open chat (null: none); sessions: app.sessions (the subagent chats' summaries,
-// which outlast paging and reconnects); tasks: the chat's tasks. onSelectSession(id) opens a subagent;
-// onShowCard(eventId) shows its card in the transcript; onOpenContext() opens the meter's details;
+// Workspace → Progress: the chat's context, its task list (as the checklist above the message box shows it; its
+// region is named "Task list", since the checklist is the page's region named "Tasks") and its background tasks.
+// session: the open chat (null: none); sessions: app.sessions (the subagent chats' summaries, which outlast paging
+// and reconnects); tasks: the chat's tasks. onSelectSession(id) opens a subagent; onShowCard(eventId) shows its
+// card in the transcript (opening a run or group that folds it); onOpenContext() opens the meter's details;
 // onViewOutput(jobId) shows a job in Terminal; onError(message) reports a failed action.
 export default function ProgressPanel({ session, sessions = [], tasks = [], onSelectSession, onShowCard, onOpenContext, onViewOutput, onError }) {
   const ids = useRef(`progress-${Math.random().toString(36).slice(2, 10)}`).current
@@ -179,8 +180,8 @@ export default function ProgressPanel({ session, sessions = [], tasks = [], onSe
       <h3 id=${`${ids}-context`}>Context</h3>
       <${ContextSection} session=${session} onOpenContext=${onOpenContext} />
     </section>
-    <section class="progress-section" aria-labelledby=${`${ids}-tasks`}>
-      <h3 id=${`${ids}-tasks`}>Tasks</h3>
+    <section class="progress-section" aria-label="Task list">
+      <h3>Tasks</h3>
       ${tasks.length ? html`<p class="progress-note">${progress.done}/${progress.counted} done${progress.current ? ` · now: ${progress.current.title}` : ''}</p>
         <div class="progress-tasks"><${TaskList} tasks=${tasks} /></div>`
         : html`<p class="progress-empty">No tasks in this chat. When the agent plans its work as tasks, its checklist shows here and above the message box.</p>`}

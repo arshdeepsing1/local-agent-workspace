@@ -859,12 +859,13 @@ when opening a conversation or performing restart recovery.
   compactions and warnings), adds the last turn's summary line and the loaded instruction files, and
   **Context details** opens the meter's details (a panel that covers the chat closes first). **Tasks**
   lists the chat's task list read-only, as the checklist above the message box does. **Background
-  tasks** lists, first, the chat's subagents that wait for your answer, run (those of the current turn
-  marked "In this turn") or wait for a free slot, and its running commands; then the 10 newest finished
-  background subagents and the 10 newest finished background commands the agent started, newest first
-  (the rest are in **Agent tools → Subagents** and Terminal). A subagent row shows its type, task,
-  status, actions, step ("Step 4 of 10"), current tool ("Now: run command · npm test") and time, with
-  **Open subagent**, **Show card** (its card in the transcript, when that page is loaded) and the card's
+  tasks** lists first what waits for your answer, then what runs (subagents, those of the current turn
+  marked "In this turn", and commands, oldest first), then subagents waiting for a free slot; after them
+  the 10 newest finished background subagents and the 10 newest finished background commands the agent
+  started, newest first (the rest are in **Agent tools → Subagents** and Terminal). A subagent row shows
+  its type, task, status, actions, step ("Step 4 of 10"), current tool ("Now: run command · npm test")
+  and time, with **Open subagent**, **Show card** (its card in the transcript, when that page is loaded;
+  a folded run or group of cards opens to show it) and the card's
   own **Allow**, **Decline**, **Review in subagent**, **Answer in subagent** and **Stop subagent**: they
   answer the subagent's chat, so they work while its card is on an earlier page that is not loaded. A
   command row says who started it (**Agent**, or **You** from Terminal or a `!` command), its state and
@@ -873,7 +874,7 @@ when opening a conversation or performing restart recovery.
   only while the tab is shown and the page is visible (every second while one runs, else every 3 s);
   after an error the tab tries again, waiting longer each time (up to 30 s), and offers **Retry**. A run
   of subagents' **Show in panel** opens this tab. The panel opens on the tab you used last, in any chat
-  (kept in this browser).
+  (kept in this browser); the message box's **Add project file** (+) opens it on **Files**.
 - **Approvals**: approve or decline model-proposed writes, commands, MCP calls, and hooks. An unanswered
   card waits **Settings → Approval wait (minutes)**, 60 by default (1–1,440); a browser refresh
   retains it while the server runs (a server restart cancels it). After that time the card shows

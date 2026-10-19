@@ -69,7 +69,8 @@ export default function App() {
   const [review, setReview] = useState(null)
   // A file a reply or tool card names, to open in the Workspace editor: { path, line?, viewKey }.
   const [openPath, setOpenPath] = useState(null)
-  // A Workspace tab to show once (a run's Show in panel), and a card Workspace → Progress shows in the transcript.
+  // A Workspace tab to show once (a run's Show in panel, and Files for the message box's Add project file), and a
+  // card Workspace → Progress shows in the transcript.
   const [panelTab, setPanelTab] = useState(null)
   const [cardShown, setCardShown] = useState(null)
   const active = app.session
@@ -130,11 +131,20 @@ export default function App() {
     return () => document.removeEventListener('keydown', onKeyDown)
   }, [drawerOpen])
   // Workspace → Progress → Show card: once the drawer has closed (the chat column is no longer inert), the card
-  // comes into view with focus on its heading.
+  // comes into view with focus on its heading. A card folded away (a closed run or group of cards) is opened first
+  // with the closed head whose aria-controls names it, and shown once it has rendered (a few frames at most).
   useEffect(() => {
     if (!cardShown || drawerOpen) return
     setCardShown(null)
-    revealCard(document.querySelector(`.transcript [data-event-id="${CSS.escape(cardShown)}"]`), true)
+    const card = () => document.querySelector(`.transcript [data-event-id="${CSS.escape(cardShown)}"]`)
+    if (!card()) document.querySelector(`.transcript [aria-expanded="false"][aria-controls~="${CSS.escape(`tool-${cardShown}`)}"]`)?.click()
+    let frames = 0
+    const show = () => {
+      const found = card()
+      if (found) revealCard(found, true)
+      else if (++frames < 30) requestAnimationFrame(show)
+    }
+    show()
   }, [cardShown, drawerOpen])
   // An error can name another chat that blocks the action: { message, session_id, title }.
   const [blocker, setBlocker] = useState(null)
@@ -210,7 +220,7 @@ export default function App() {
     onModel=${app.changeModel}
     effort=${app.reasoningEffort} onEffort=${app.changeEffort}
     reasoningFormat=${app.settings?.reasoning_format} thinkingSummaries=${app.settings?.thinking_summaries}
-    onSend=${send} onError=${showError} onAttach=${() => setWorkspaceOpen(true)}
+    onSend=${send} onError=${showError} onAttach=${() => { setWorkspaceOpen(true); setPanelTab({ tab: 'files', viewKey: app.viewKey }) }}
     attachments=${attachedFiles[app.viewKey] || []} setAttachments=${filesFor(app.viewKey)} onUpload=${app.uploadFile}
     plain=${plain} setPlain=${setPlain}
     onShell=${app.runShell} onSideQuestion=${app.askSide} loadFiles=${app.loadMentionFiles} pendingContext=${active?.pending_context}

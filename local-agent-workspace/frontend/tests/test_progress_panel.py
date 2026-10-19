@@ -137,9 +137,13 @@ TASKS = [{"id": "t1", "title": "Read the failing test", "status": "completed"},
 def test_the_tasks_section_lists_the_chats_checklist_read_only_with_its_own_empty_text(ui, page):
     start(ui, page, chat())
     open_progress(page)
-    tasks = section(page, "Tasks")
+    tasks = section(page, "Task list")
+    expect(tasks.get_by_role("heading", name="Tasks")).to_be_visible()
     expect(tasks).to_contain_text("No tasks in this chat. When the agent plans its work as tasks, its checklist shows here")
     ui.emit("a", {"type": "tasks", "tasks": TASKS})
+    # The checklist above the message box is the page's one region named "Tasks"; this one has a name of its own.
+    expect(page.get_by_role("region", name="Tasks", exact=True)).to_have_count(1)
+    expect(page.locator(".chat-composer").get_by_role("region", name="Tasks", exact=True)).to_have_count(1)
     # The same counts and rows as the checklist above the message box (cancelled tasks are listed, not counted).
     expect(tasks.locator(".progress-note")).to_have_text("1/3 done · now: Fix the parser")
     rows = tasks.get_by_role("listitem")
@@ -289,6 +293,18 @@ def test_subagents_whose_cards_are_not_loaded_are_listed_from_their_chats_and_an
     expect(section(page, "Background tasks")).to_contain_text("Nothing runs in the background in this chat.")
 
 
+def test_a_waiting_subagents_answer_buttons_read_like_its_other_actions_and_only_stop_is_red(ui, page):
+    pending = {"event_id": "p1", "name": "write_file", "kind": "approval", "title": "Write src/app.py"}
+    start(ui, page, chat() + subagent("k2", "Update the docs", status="awaiting_approval", pending=pending))
+    open_progress(page)
+    row = background(page).first
+    def color(name):
+        return row.get_by_role("button", name=name, exact=True).evaluate("e => getComputedStyle(e).color")
+    open_color = color("Open subagent")
+    assert [color("Allow"), color("Decline")] == [open_color, open_color]
+    assert color("Stop subagent") != open_color
+
+
 def test_a_loaded_card_updates_its_row_live_and_a_queued_one_is_listed_without_actions(ui, page):
     events = CHAT + [card("d1", "k1", "Survey the parser"),
                      {**card("d2", None, "Wait for a slot", status="queued"), "child_session_id": None}]
@@ -355,6 +371,27 @@ def test_the_panel_remembers_its_tab_across_chats_and_reloads(ui, page):
     expect(panel(page).get_by_role("textbox", name="Shell command")).to_be_visible()
 
 
+@pytest.mark.parametrize("last", ["Progress", "Terminal"])
+def test_add_project_file_opens_the_panel_on_files_whatever_tab_was_used_last(ui, page, last):
+    # The message box's + is for picking a project file, so it opens Files, not the remembered tab.
+    start(ui, page, chat())
+    page.get_by_role("button", name=re.compile(r"^Workspace( \(|$)")).click()
+    panel(page).get_by_role("button", name=last, exact=True).click()
+    expect(panel(page).get_by_role("button", name=last, exact=True)).to_have_attribute("aria-pressed", "true")
+    page.get_by_role("button", name="Close workspace").click()
+    expect(panel(page)).to_have_count(0)
+    page.get_by_role("button", name="Add project file").click()
+    files = panel(page).get_by_role("button", name="Files", exact=True)
+    expect(files).to_have_attribute("aria-pressed", "true")
+    expect(panel(page).get_by_role("button", name="note.txt")).to_be_visible()
+    # Also while the docked panel is open on another tab.
+    panel(page).get_by_role("button", name=last, exact=True).click()
+    expect(files).to_have_attribute("aria-pressed", "false")
+    page.get_by_role("button", name="Add project file").click()
+    expect(files).to_have_attribute("aria-pressed", "true")
+    expect(panel(page).get_by_role("button", name="note.txt")).to_be_visible()
+
+
 def test_a_one_shot_tab_request_shows_that_tab_once(ui, page):
     ui.mount("components/WorkspacePanel.js", """{ sessionId: 'a', workspace: '/project', file: null, setFile: () => {},
       session: null, showTab: 'progress', onTabShown: fake.spy('shown') }""", scenario="workspace")
@@ -376,3 +413,29 @@ def test_show_in_panel_on_a_runs_head_opens_the_progress_tab(ui, page):
     page.get_by_role("button", name="Show in panel").click()
     expect(panel(page).get_by_role("button", name="Progress", exact=True)).to_have_attribute("aria-pressed", "true")
     expect(background(page)).to_have_count(2)
+
+
+@pytest.mark.skipif(not (FRONTEND / "static" / "js" / "transcriptGroups.js").exists(),
+                    reason="folded runs come with the transcript package")
+@pytest.mark.parametrize("width,height", [(1280, 900), (820, 1180)], ids=["docked", "drawer"])
+def test_show_card_on_a_subagent_whose_run_is_folded_opens_the_run_and_focuses_its_card(ui, page, width, height):
+    # A run that had ended when the chat opened starts folded, so its cards are not rendered: Show card opens the
+    # run (the closed head whose aria-controls names the card), then shows the card with focus on its heading.
+    def ended(n):
+        return {"status": "completed", "terminal_reason": "completed", "started": 1000, "ended": 1100 + n}
+    batch = [{**card(f"d{n}", f"k{n}", f"Task {n}", **ended(n)), "delegation_batch": {"id": "b1", "index": n, "size": 2}}
+             for n in range(2)]
+    start(ui, page, chat(CHAT + batch) + subagent("k0", "Task 0", parent_event="d0", **ended(0))
+          + subagent("k1", "Task 1", parent_event="d1", **ended(1)), width=width, height=height)
+    head = page.locator(".transcript [aria-expanded][aria-controls~='tool-d1']")
+    expect(head).to_have_attribute("aria-expanded", "false")
+    expect(page.locator("#tool-d1")).to_have_count(0)
+    open_progress(page)
+    rows = background(page)
+    expect(rows.locator(".progress-item-title")).to_have_text(["Task 1", "Task 0"])
+    rows.nth(0).get_by_role("button", name="Show card").click()
+    expect(page.locator("#tool-d1 .tool-heading")).to_be_focused()
+    expect(page.locator("#tool-d1 .tool-heading")).to_be_in_viewport()
+    expect(head).to_have_attribute("aria-expanded", "true")
+    if width < 1024:
+        expect(panel(page)).to_have_count(0)
