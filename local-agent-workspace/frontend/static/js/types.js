@@ -227,7 +227,8 @@
 //   thought: until answer text or a tool call began, or the response ended; also set when the endpoint reported
 //   reasoning tokens without text), reasoning_wait_seconds? (seconds from sending the request to its first thinking
 //   item; Request details show it), child_session_id?, request_info?, turn_result?: TurnResult (a turn's last reply:
-//   the footer under it; exports and forks leave it out),
+//   the footer under it; exports and forks leave it out), unsent_report? (a delegated subagent's reply that could
+//   not be used: its submit_report arguments as written, redacted, which its parent's result carries as text),
 //   name?, input?, output?, preview?, state?, delegation?, origin?,
 //   (delegation: Delegation, on a delegate_task card or a notice with child_session_id),
 //   approval?: 'approved'|'declined'|'expired'|'blocked', approval_expires? (epoch seconds, only with a limit),
@@ -295,7 +296,8 @@
 //   { allowed } answers an approval) }. A finished delegate_task card's output is the JSON result { child_session_id, agent_type,
 //   tool_profile, status, terminal_reason, steps_used, tool_calls, changed_files, changed_files_total?, transcript,
 //   report?: { summary, findings?: [{ path?, line?, text }], files_changed?, next_steps?, findings_total?, ... } (its
-//   submit_report), output (its final reply, '' with a report), note? (a scheduled run's call that asked for the
+//   submit_report), output (its final reply, '' with a report; a last report that did not go through follows as
+//   the model wrote it), note? (a scheduled run's call that asked for the
 //   background: it ran in the foreground) }. A background one's output is { child_session_id
 //   (null while queued), agent_type, status: 'running'|'queued', background: true, transcript, message }; its result
 //   arrives later as the card's delegation_result, and the parent gets a notice { subagent_id, subagent_status }.

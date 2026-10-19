@@ -56,8 +56,9 @@ from . import commands as command_templates
 from . import custom_agents
 from . import settings_layers
 from .context import estimate_text_tokens
-from .planning import (CONTINUE_REASONS, REPORT_SUBMITTED, REPORT_SUBMITTED_REPLY, SCHEDULED_FOREGROUND, CallAllowance,
-                       DelegateManager, DelegationGate, TaskManager, bounded_result, retried_reports)
+from .planning import (CONTINUE_REASONS, REPORT_SUBMITTED, REPORT_SUBMITTED_REPLY, SCHEDULED_FOREGROUND,
+                       UNSENT_REPORT_CHARS, CallAllowance, DelegateManager, DelegationGate, TaskManager, bounded_result,
+                       retried_reports)
 from .interactions import InteractionManager, wait_seconds
 from .feature_tools import FEATURE_TOOLS, FINDINGS_TOOL
 from .tool_profiles import agent_refusal, tool_allowed, filter_tools, off_servers, server_off
@@ -5236,6 +5237,13 @@ class AgentManager(LifecycleHooks):
             if error:
                 if error.kind != "output_limit":
                     message["content"] = ((message["content"] or "") + "\n\n[" + str(error) + "]").strip()
+                unsent = [call["function"]["arguments"] for call in ordered_calls
+                          if call["function"]["name"] == "submit_report"]
+                if unsent and error.kind != "content_filter" and session.get("is_subagent") and session.get(
+                        "turn_delegated"):
+                    # A delegated subagent's report in a reply that cannot be used, as written (redacted): when no
+                    # request follows (the turn's wrap-up), its parent still gets it (planning.unaccepted_report).
+                    event["unsent_report"] = self.settings.redact(unsent[-1])[:UNSENT_REPORT_CHARS]
             else:
                 if calls:
                     message["tool_calls"] = ordered_calls
@@ -6051,6 +6059,13 @@ class AgentManager(LifecycleHooks):
                     continuation = REPAIR_CONTINUATIONS.get(exc.kind)
                     if event["request_info"].get("finish_reason") == "content_filter":
                         continuation = None  # A provider safety stop is shown, never re-prompted.
+                    if (continuation or exc.kind == "output_limit") and wrap_up is not None and (
+                            budget := turns.reached(self, session)) is not None:
+                        # The wrap-up was the turn's last request: a reply that cannot be used ends it at the budget
+                        # too (also on the last Agent step), with no hidden retry or continuation promised.
+                        await self.refresh_next_estimate(session, system, definitions, wire, context_state)
+                        await self.budget_stop(session, wire, turns.stop_text(*budget, wrapped=True))
+                        return False
                     if continuation and consecutive_repairs < MAX_REPAIR_RETRIES and has_another_step:
                         # The reply keeps its 'error' request details (not 'interrupted', which
                         # offers Continue); the model gets a hidden request to try again.

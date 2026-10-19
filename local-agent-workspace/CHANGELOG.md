@@ -111,7 +111,10 @@ Roadmap milestone M8 (agents, automation and delivery):
   subagent's last request asks for its report with `submit_report`, the one tool call that runs
   then (any other call still does not run), so its parent gets the report with the budget error.
   When that last request is also the turn's last Agent step and its reply still calls tools, the
-  turn ends with the budget notice, not the Agent steps one.
+  turn ends with the budget notice, not the Agent steps one. A reply to that request that reached
+  the output limit, had broken tool arguments or ended early ends the turn at the budget too (no
+  hidden retry follows it), and a subagent's report the schema refused there, or whose arguments
+  could not be read, reaches its parent after the error as the model wrote it (redacted).
 - **Agent tools → Usage → All chats**: every conversation's model calls over the last 7, 30 or
   90 days, by day (cache reads, uncached input and output), endpoint, purpose and project, with
   the estimated DBU. It reads a small usage summary each conversation keeps in its file's first

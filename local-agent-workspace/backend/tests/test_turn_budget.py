@@ -8,7 +8,7 @@ import time
 import httpx
 import pytest
 
-from local_agent import turns
+from local_agent import planning, turns
 from local_agent.agents import AgentManager
 from local_agent.api import create_app
 from local_agent.config import MAX_TURN_TOKENS, Settings
@@ -512,6 +512,180 @@ async def test_a_wrap_up_on_the_last_agent_step_ends_the_turn_at_the_budget(runt
     assert stop["text"].startswith("This turn has used about 33,000 of its 20,000-token limit per turn. The agent "
                                    "wrapped up instead of continuing.")
     assert not any("Increase Agent steps" in event["text"] for event in notices(session))
+
+
+def narrated(call_id, text):
+    """A response with narration text and one list_tasks call."""
+    return sse({"content": text, "tool_calls": [{"index": 0, "id": call_id, "type": "function",
+                                                  "function": {"name": "list_tasks", "arguments": "{}"}}]}, "tool_calls")
+
+
+def broken_call(call_id, name, arguments):
+    """A response whose one tool call has arguments that are not valid JSON."""
+    return sse({"tool_calls": [{"index": 0, "id": call_id, "type": "function",
+                                "function": {"name": name, "arguments": arguments}}]}, "tool_calls")
+
+
+async def test_a_subagents_wrap_up_report_the_schema_refuses_still_reaches_the_parent_as_text(runtime, monkeypatch):
+    """Outside the wrap-up a report the schema refuses is an error the model fixes and sends again; the wrap-up is
+    the turn's last request, so no request follows, and the parent gets the refused report as written (redacted)
+    with the error, not an earlier step's narration."""
+    manager, session = runtime
+    session["turn_token_limit"] = 30_000
+    summary = "Mapped the parser: three modules; the tokenizer remains."
+    # A realistic slip: a finding with a key the schema does not take (additionalProperties: false).
+    refused = {"summary": summary, "findings": [{"path": "parser.py", "line": 3, "text": "Entry point.",
+                                                 "severity": "info"}],
+               "next_steps": ["Map the tokenizer with the key private-token."]}
+    parent_replies = [calls_reply(delegation()), text_reply("The subagent reported at the budget.")]
+
+    def child(children):
+        if len(children) < 3:
+            return narrated(f"x{len(children)}", "Looking at the parser next.")
+        if len(children) == 3:  # The wrap-up request: the report, with one bad field.
+            return calls_reply(("r1", "submit_report", refused))
+        return calls_reply(("r2", "submit_report", {"summary": summary}))  # Never asked for.
+    requests, children = scripted(monkeypatch, lambda requests: parent_replies[min(len(requests), 2) - 1], child)
+    manager.store.save(session)
+    session = await started_turn(manager, session, "Delegate")
+    assert len(children) == 3 and "Call no tool except submit_report" in system_text(children[2])
+    child_session = manager.store.get(session["subagents"][0]["id"])
+    assert next(event for event in child_session["events"] if event.get("call_id") == "r1")["state"] == "error"
+    assert child_session["terminal_reason"] == "budget_limit"
+    delegated = next(event for event in session["events"] if event.get("name") == "delegate_task")
+    result = json.loads(delegated["output"])
+    assert (result["status"], result["terminal_reason"]) == ("failed", "budget_limit") and "report" not in result
+    output = result["output"]
+    assert output.startswith("Errors:\nInvalid tool arguments at findings.0")
+    assert "Looking at the parser" not in output and "No final assistant reply" not in output, output
+    written = json.dumps(refused).replace("private-token", "[REDACTED]")
+    assert output.endswith(planning.REFUSED_REPORT + written) and '"severity": "info"' in output, output
+
+
+REMAINING = "The tokenizer remains: map tokenizer.py next."
+# Wrap-up reports the schema refuses, each with what remains in the part it refused: the wrap-up asks for what is
+# done, what remains and how to continue, which invites these shapes.
+REFUSED_SHAPES = {
+    "summary_object": {"summary": {"done": "Mapped the parser: three modules.", "remaining": REMAINING}},
+    "extra_top_level_key": {"summary": "Mapped the parser: three modules.", "remaining": REMAINING},
+    "string_findings": {"summary": "Mapped the parser: three modules.", "findings": [f"parser.py:3: {REMAINING}"]},
+}
+
+
+@pytest.mark.parametrize("shape", list(REFUSED_SHAPES))
+async def test_a_refused_wrap_up_report_reaches_the_parent_with_the_part_the_schema_refused(runtime, monkeypatch,
+                                                                                            shape):
+    """A summary that is not text, a key the schema does not take or findings that are not objects: the parent gets
+    the refused report as the model wrote it, never an earlier step's narration nor the report without that part."""
+    manager, session = runtime
+    session["turn_token_limit"] = 30_000
+    parent_replies = [calls_reply(delegation()), text_reply("The subagent reported at the budget.")]
+
+    def child(children):
+        if len(children) < 3:
+            return narrated(f"x{len(children)}", "Looking at the parser next.")
+        return calls_reply(("r1", "submit_report", REFUSED_SHAPES[shape]))  # The wrap-up request's report.
+    requests, children = scripted(monkeypatch, lambda requests: parent_replies[min(len(requests), 2) - 1], child)
+    manager.store.save(session)
+    session = await started_turn(manager, session, "Delegate")
+    assert len(children) == 3 and "Call no tool except submit_report" in system_text(children[2])
+    child_session = manager.store.get(session["subagents"][0]["id"])
+    assert next(event for event in child_session["events"] if event.get("call_id") == "r1")["state"] == "error"
+    delegated = next(event for event in session["events"] if event.get("name") == "delegate_task")
+    result = json.loads(delegated["output"])
+    assert result["terminal_reason"] == "budget_limit" and "report" not in result
+    output = result["output"]
+    assert output.startswith("Errors:\nInvalid tool arguments") and "Looking at the parser" not in output, output
+    assert output.endswith(planning.REFUSED_REPORT + json.dumps(REFUSED_SHAPES[shape])), output
+
+
+async def test_a_subagents_wrap_up_report_with_broken_json_is_promised_no_retry_and_reaches_the_parent_as_written(
+        runtime, monkeypatch):
+    """Outside the wrap-up a hidden request asks the model to send broken tool arguments again; the wrap-up is the
+    turn's last request, so the chat promises no retry, and the parent gets the report's arguments as written
+    (redacted)."""
+    manager, session = runtime
+    session["turn_token_limit"] = 30_000
+    summary = "Mapped the parser with the key private-token: three modules; the tokenizer remains."
+    arguments = '{"summary": "' + summary + '", "findings": [{"path": "parser.py", "text": "Entry point."},]}'
+    parent_replies = [calls_reply(delegation()), text_reply("The subagent reported at the budget.")]
+
+    def child(children):
+        if len(children) < 3:
+            return calls_reply((f"x{len(children)}", "list_tasks", {}))
+        if len(children) == 3:  # The wrap-up request: a trailing comma breaks the report's JSON.
+            return broken_call("r1", "submit_report", arguments)
+        return calls_reply(("r2", "submit_report", {"summary": summary}))  # Never asked for.
+    requests, children = scripted(monkeypatch, lambda requests: parent_replies[min(len(requests), 2) - 1], child)
+    manager.store.save(session)
+    session = await started_turn(manager, session, "Delegate")
+    assert len(children) == 3 and "Call no tool except submit_report" in system_text(children[2])
+    child_session = manager.store.get(session["subagents"][0]["id"])
+    texts = [event["text"] for event in notices(child_session)]
+    assert not any("automatically" in text.lower() for text in texts), texts  # No hidden retry is promised.
+    assert texts[-1].startswith("Its parent conversation's turn has used about 44,000 of its 30,000-token limit")
+    assert child_session["terminal_reason"] == "budget_limit" and manager.budget_wrapups == set()
+    delegated = next(event for event in session["events"] if event.get("name") == "delegate_task")
+    result = json.loads(delegated["output"])
+    assert (result["status"], result["terminal_reason"]) == ("failed", "budget_limit") and "report" not in result
+    assert result["output"].startswith("Errors:\nIts parent conversation's turn has used")
+    assert result["output"].endswith(planning.UNSENT_REPORT + arguments.replace("private-token", "[REDACTED]"))
+    assert "private-token" not in json.dumps(child_session["events"])  # Kept on its reply, redacted.
+
+
+@pytest.mark.parametrize("failure", ["output_limit", "incomplete_response"])
+async def test_a_wrap_up_summary_that_ends_early_is_promised_no_continuation(runtime, monkeypatch, failure):
+    """A plain chat's wrap-up summary cut at the output limit (or ended without a finish reason): an earlier step
+    would continue in a hidden request, but the wrap-up is the turn's last request, so the budget ends the turn
+    with the partial summary kept and no continuation promised."""
+    manager, session = runtime
+    session["turn_token_limit"] = 20_000  # 22,000 after two responses: the third request wraps up.
+
+    def replies(requests):
+        if len(requests) < 3:
+            return calls_reply((f"c{len(requests)}", "list_tasks", {}))
+        if len(requests) == 3:
+            return sse({"content": "Summary: two steps done; "}, "length" if failure == "output_limit" else None)
+        return text_reply("Summary: two steps done, the rest remains.")  # Never asked for.
+    requests, _ = scripted(monkeypatch, replies)
+    await manager.run(session, "Work")
+    assert len(requests) == 3 and "Do not call any tools" in system_text(requests[2])
+    texts = [event["text"] for event in notices(session)]
+    assert not any("automatically" in text.lower() for text in texts), texts  # No hidden retry is promised.
+    stop = notices(session)[-1]
+    assert stop["terminal_reason"] == "budget_limit" == session["last_turn_result"]["terminal_reason"]
+    assert stop["text"].startswith("This turn has used about 33,000 of its 20,000-token limit per turn. The agent "
+                                   "wrapped up instead of continuing.")
+    reply = [event for event in session["events"] if event["type"] == "assistant"][-1]
+    assert reply["text"] == "Summary: two steps done; "
+    assert session["wire"][-1]["role"] == "assistant" and manager.budget_wrapups == set()
+
+
+@pytest.mark.parametrize("failure", ["output_limit", "invalid_tool_arguments"])
+async def test_a_wrap_up_reply_on_the_last_agent_step_that_cannot_be_used_still_ends_at_the_budget(runtime, monkeypatch,
+                                                                                                  failure):
+    """The wrap-up is the third and last request, and its reply is cut at the output limit or has broken tool JSON:
+    the turn ends at the budget, as the same reply on an earlier step does, not with an inference error that
+    advises more Agent steps."""
+    manager, session = runtime
+    manager.settings.values["max_agent_steps"] = 3
+    session["turn_token_limit"] = 20_000  # 22,000 after two responses: the third and last request is the wrap-up.
+
+    def replies(requests):
+        if len(requests) < 3:
+            return calls_reply((f"c{len(requests)}", "list_tasks", {}))
+        if failure == "output_limit":
+            return sse({"content": "Done so far: the parser. Remaining: the tok"}, "length")
+        return broken_call("c3", "list_tasks", '{"oops')
+    requests, _ = scripted(monkeypatch, replies)
+    await manager.run(session, "Work")
+    assert len(requests) == 3 and "Do not call any tools" in system_text(requests[2])
+    stop = notices(session)[-1]
+    assert (session["terminal_reason"], stop.get("terminal_reason")) == ("budget_limit", "budget_limit"), stop["text"]
+    assert session["last_turn_result"]["terminal_reason"] == "budget_limit"
+    assert stop["text"].startswith("This turn has used about 33,000 of its 20,000-token limit per turn. The agent "
+                                   "wrapped up instead of continuing.")
+    assert not any(event["type"] == "error" for event in session["events"]) and manager.budget_wrapups == set()
 
 
 async def test_a_side_question_during_a_turn_counts_toward_neither_its_limit_nor_its_result(runtime, monkeypatch):
