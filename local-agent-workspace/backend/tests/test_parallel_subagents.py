@@ -2,11 +2,12 @@
 subagents index in the parent's header, and the bounded report the parent receives."""
 import asyncio
 import json
+import re
 
 import httpx
 import pytest
 
-from local_agent.agents import AgentManager
+from local_agent.agents import AgentManager, repair_tool_history
 from local_agent.config import Settings
 from local_agent.feature_tools import FEATURE_TOOLS
 from local_agent.planning import DEFAULT_STEPS, MAX_RUNNING, MAX_STEPS, REPORT, bounded_result
@@ -328,6 +329,87 @@ async def test_manual_mode_asks_for_each_delegation_in_order_before_any_starts(r
     assert messages[1][1].startswith("User declined this action.")
     assert json.loads(messages[2][1])["output"] == "Third report."
     assert "Second" not in gateway.requests
+    # Each card carries its place in the batch, also the declined one: the page shows the three as one run.
+    batches = [card(saved, call_id)["delegation_batch"] for call_id in ("call-1", "call-2", "call-3")]
+    assert [(item["index"], item["size"]) for item in batches] == [(0, 3), (1, 3), (2, 3)]
+    assert len({item["id"] for item in batches}) == 1 and card(saved, "call-2")["state"] == "rejected"
+
+
+async def test_the_cards_of_one_response_share_a_batch_from_their_first_broadcast_and_a_lone_one_has_none(
+        runtime, monkeypatch):
+    manager, parent, _ = runtime
+    sent = []
+    broadcast = manager.broadcast
+
+    async def record(session_id, data):
+        sent.append((session_id, json.loads(json.dumps(data))))
+        await broadcast(session_id, data)
+    monkeypatch.setattr(manager, "broadcast", record)
+    Gateway(monkeypatch, [lambda: calls_reply(delegate("One", "a"), delegate("Two", "b"),
+                                              delegate("Refused", "c", agent_type="planner")),
+                          lambda: calls_reply(delegate("Alone", "d")),
+                          lambda: reply("Done.")],
+            {task: (lambda count, body, task=task: asyncio.sleep(0, reply(f"{task} report.")))
+             for task in ("One", "Two", "Alone")})
+    saved = await run_turn(manager, parent)
+    batches = [card(saved, call_id).get("delegation_batch") for call_id in ("a", "b", "c", "d")]
+    assert re.fullmatch(r"[0-9a-f]{12}", batches[0]["id"])
+    assert batches[:3] == [{"id": batches[0]["id"], "index": index, "size": 3} for index in range(3)]
+    # The refused call (an unknown agent type) is a row of the run too; a delegation alone in its response is no run.
+    assert card(saved, "c")["state"] == "error" and batches[3] is None
+    first = {}
+    for session_id, data in sent:
+        event = data.get("event") or {}
+        if session_id == parent["id"] and event.get("name") == "delegate_task":
+            first.setdefault(event["call_id"], event)
+    assert [first[call_id].get("delegation_batch") for call_id in ("a", "b", "c", "d")] == batches
+    assert first["a"]["state"] == "running" and "delegation" not in first["a"]
+    # Each finished card's progress: its steps, one reply, no tools.
+    progress = card(saved, "a")["delegation"]
+    assert (progress["max_steps"], progress["steps"], progress["tool_calls"], progress["failed_tools"]) == (
+        DEFAULT_STEPS, 1, 0, 0)
+
+
+async def test_batch_and_progress_fields_never_reach_the_model(runtime, monkeypatch):
+    """delegation_batch and the progress fields are for the page only: no request carries them, the history rebuilt
+    from the cards is the same without them, and get_subagent_result reads none of them."""
+    manager, parent, _ = runtime
+
+    async def child(count, body):
+        if count == 1:
+            return calls_reply(("run_command", {"command": "printf subject-marker"}, "x"))
+        return reply("Ran it.")
+    gateway = Gateway(monkeypatch, [lambda: calls_reply(delegate("One", "a"), delegate("Two", "b")),
+                                    lambda: reply("Done.")], {"One": child, "Two": child})
+    saved = await run_turn(manager, parent)
+    progress, batch = card(saved, "a")["delegation"], card(saved, "a")["delegation_batch"]
+    assert (progress["last_tool_subject"], progress["last_tool_state"], progress["tool_calls"]) == (
+        "printf subject-marker", "completed", 1)
+    sent = json.dumps(gateway.requests["parent"])
+    for text in (batch["id"], "delegation_batch", "subject-marker", "last_tool_state", "failed_tools"):
+        assert text not in sent
+    # The tool messages rebuilt from the cards (an app stop before the save) are the same with or without the fields.
+    added = ("max_steps", "steps", "tool_calls", "failed_tools", "last_tool_state", "last_tool_subject")
+    plain = [{key: value for key, value in event.items() if key != "delegation_batch"} for event in saved["events"]]
+    for event in plain:
+        if isinstance(event.get("delegation"), dict):
+            event["delegation"] = {key: value for key, value in event["delegation"].items() if key not in added}
+    calls_only = [message for message in saved["wire"] if message["role"] != "tool"]
+    rebuilt = repair_tool_history(calls_only, saved["events"], {})
+    assert rebuilt == repair_tool_history(calls_only, plain, {}) and rebuilt[0] == saved["wire"]
+    # get_subagent_result reads its own keys of a background card, with an ID and without.
+    child_id = "c" * 36
+    fields = {"max_steps": 10, "steps": 2, "tool_calls": 3, "failed_tools": 1, "last_tool_state": "running",
+              "last_tool_subject": "npm test"}
+
+    def chat(extra=None, **more):
+        progress = {"status": "running", "completed_tools": 1, "last_tool": "run_command", "agent_type": "general",
+                    "background": True, **(extra or {})}
+        return {"id": parent["id"], "events": [{"id": "e", "type": "tool", "name": "delegate_task", "input": {
+            "task": "Build"}, "child_session_id": child_id, "delegation": progress, **more}]}
+    for arguments in ((), (child_id,)):
+        assert await manager.delegates.subagent_result(chat(fields, delegation_batch=batch), *arguments) == \
+            await manager.delegates.subagent_result(chat(), *arguments)
 
 
 async def test_delegations_beyond_the_limit_wait_for_a_slot_and_then_run(runtime, monkeypatch):
