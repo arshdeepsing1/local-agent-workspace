@@ -300,10 +300,13 @@ def transcript(session, *, excerpt_chars=EXCERPT_CHARS, redact=lambda text: text
     """Markdown for one conversation. Common secret shapes and anything redact
     replaces (the app's configured credentials) are replaced with [REDACTED]."""
     events = [event for event in session.get("events", []) if isinstance(event, dict)]
-    users = sum(event.get("type") == "user" for event in events)
+    # The app's messages after a background subagent are counted apart: they are not the user's.
+    apps = sum(event.get("type") == "user" and event.get("background_wake") is True for event in events)
+    users = sum(event.get("type") == "user" for event in events) - apps
     lines = [f"# Transcript: {session.get('title') or 'Untitled conversation'}", "",
              f"- Conversation `{session.get('id', 'unknown')}`, model `{session.get('model', 'unknown')}`, "
-             f"{users} user {'message' if users == 1 else 'messages'}",
+             f"{users} user {'message' if users == 1 else 'messages'}"
+             + (f", {apps} app {'message' if apps == 1 else 'messages'}" if apps else ""),
              f"- Workspace: `{session.get('workspace', 'unknown')}`",
              f"- Started {_when(session.get('created'))}; last updated {_when(session.get('updated'))}",
              "- Written by the app from the saved conversation file. Messages and replies are complete, with their "
@@ -331,7 +334,7 @@ def transcript(session, *, excerpt_chars=EXCERPT_CHARS, redact=lambda text: text
             delegated = (event.get("origin") or {}).get("kind") == "delegated"
             # The app's message that continued the chat after a background subagent is not the user's.
             who = ("User (delegated by the parent conversation)" if delegated else
-                   "App (sent when a background subagent finished)" if event.get("background_wake") is True else "User")
+                   "App (sent when a background subagent ended)" if event.get("background_wake") is True else "User")
             lines += ["---", "", f"## Turn {turn} · {_when(event.get('created'))}", "", f"**{who}:**", "",
                       _demote_headings(text) or "(empty message)", ""]
             lines += ["_Attached when sent: " + "; ".join(_attachment(item) for item in event["attachments"] if isinstance(item, dict)) + "_", ""] if isinstance(event.get("attachments"), list) and event["attachments"] else []

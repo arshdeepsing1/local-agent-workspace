@@ -300,7 +300,7 @@
 //   (null while queued), agent_type, status: 'running'|'queued', background: true, transcript, message }; its result
 //   arrives later as the card's delegation_result, and the parent gets a notice { subagent_id, subagent_status }.
 //   A tool card a running sibling subagent's change made ask has sibling_change: { subagent_id, agent_type, path }.
-//   A user message the app sent after a background subagent finished has background_wake: true.
+//   A user message the app sent after a background subagent finished or failed has background_wake: true.
 // SubagentEntry: { id, task (200 characters), agent_type, status, created, ended, transcript ('conversations/<id>.jsonl'
 //   in the state folder, null once deleted), steps_used?, tool_calls?, deleted? }.
 // GET /sessions/<id>/children -> list items of its subagent chats, each with status, transcript and subagent?: SubagentEntry.

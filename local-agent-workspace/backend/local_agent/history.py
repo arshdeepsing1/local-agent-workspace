@@ -181,6 +181,13 @@ def cut_session(session, before_event_id=None, *, keep_local=False):
         result.pop(key, None)
     # The read-before-write guard must not trust reads the model no longer remembers.
     result["file_views"] = {}
+    # Nor do background subagents' ends that only removed requests named count as told: the next step names those
+    # after the last kept reply again (the step that sent it named the earlier ones).
+    reported = result.get("subagents_reported_through")
+    if type(reported) in (int, float) and event_cut < len(session["events"]):
+        replies = [event["created"] for event in result["events"] if event.get("type") == "assistant"
+                   and isinstance(event.get("created"), (int, float))]
+        result["subagents_reported_through"] = min(reported, max(replies, default=0))
     reason = turn_end(result["events"])
     if reason:
         result["terminal_reason"] = reason

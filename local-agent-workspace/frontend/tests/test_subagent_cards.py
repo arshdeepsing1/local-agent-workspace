@@ -117,7 +117,7 @@ def test_a_siblings_change_and_the_apps_wake_message_are_labelled(ui, page):
                    "subagent_id": "abcdef1234567890", "agent_type": "editor", "path": "shared.txt"}}]
     show(ui, json.dumps(events))
     expect(page.locator(".user-message .delegation-origin")).to_have_text(
-        "Sent by the app when a background subagent finished")
+        "Sent by the app when a background subagent ended")
     expect(page.locator(".tool-sibling")).to_have_text(
         "Another subagent of this chat (Editor, abcdef12) changed shared.txt during its run, so this change asks first. "
         "Approve it only if both changes should stay.")

@@ -14,6 +14,7 @@ from local_agent.agents import AgentManager
 from local_agent.api import create_app
 from local_agent.config import Settings
 from local_agent.planning import BACKGROUND_QUEUED, BACKGROUND_STARTED, WAKE_TEXT
+from local_agent.transcript import transcript
 
 from test_parallel_subagents import (Gateway, calls_reply, card, delegate, eventually, make_runtime, reply, run_turn,
                                      tool_messages)
@@ -456,6 +457,91 @@ async def test_a_wake_that_falls_during_a_command_or_a_compaction_comes_after_it
         assert users[1]["background_wake"] is True
 
 
+@pytest.mark.parametrize("ends", ["during", "after"])
+async def test_the_wake_leaves_your_command_output_for_your_next_message(runtime, monkeypatch, ends):
+    """A ! command's output is attached to your next message: the app's message after a background subagent that
+    ends during the command, or while its output waits, does not take it."""
+    manager, parent, _ = runtime
+    manager.settings.values["background_subagent_wake"] = True
+    command = "echo output-for-your-next-message" + ("; sleep 1" if ends == "during" else "")
+    gate = asyncio.Event()
+    gateway = Gateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)),
+                                    lambda: reply("Going on."), lambda: reply("Read it; all done."),
+                                    lambda: reply("It printed the line.")], {"Survey": gated(gate)})
+    await run_turn(manager, parent)
+    manager.start_shell(parent["id"], command)
+    shell = manager.tasks[parent["id"]]
+    if ends == "after":
+        await asyncio.wait_for(shell, 10)
+    gate.set()
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+    await asyncio.wait_for(shell, 10)
+    await eventually(lambda: len(gateway.requests["parent"]) == 3)
+    await eventually(lambda: not manager.busy_task(parent["id"]))
+    saved = manager.store.get(parent["id"])
+    wake = [event for event in saved["events"] if event["type"] == "user"][-1]
+    assert wake["background_wake"] is True and not wake.get("attachments")
+    assert "output-for-your-next-message" not in json.dumps(gateway.requests["parent"][2]["messages"])
+    # The output still waits (its chip above the box), and your next message carries it.
+    assert [item.get("command") for item in saved.get("pending_context") or []] == [command]
+    saved = await run_turn(manager, parent, "What did it print?")
+    assert "output-for-your-next-message" in json.dumps(gateway.requests["parent"][3]["messages"][-1])
+    assert not saved.get("pending_context")
+
+
+async def test_the_wake_message_names_the_subagent_that_finished_not_one_stopped_later(runtime, monkeypatch):
+    """While a ! command runs, Survey finishes and you stop another background subagent (Stop subagent): the wake
+    after the command is for Survey's report, so its message names Survey."""
+    manager, parent, _ = runtime
+    manager.settings.values["background_subagent_wake"] = True
+    gate = asyncio.Event()
+    gateway = Gateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True),
+                                                        delegate("Forever", "b", background=True)),
+                                    lambda: reply("Going on."), lambda: reply("Read it; all done.")],
+                      {"Survey": gated(gate), "Forever": forever})
+    await run_turn(manager, parent)
+    await asyncio.wait_for(gateway.child_started("Forever").wait(), 5)
+    ids = {record["task"]: record["child_session_id"] for record in manager.delegates.background[parent["id"]]}
+    manager.start_shell(parent["id"], "sleep 2")
+    gate.set()  # Survey finishes while the command runs...
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 1)
+    await manager.stop(ids["Forever"])  # ...and then the other one is stopped.
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+    assert manager.busy_task(parent["id"])  # Both ended during the command.
+    await asyncio.wait_for(manager.tasks[parent["id"]], 10)
+    await eventually(lambda: len(gateway.requests["parent"]) == 3)
+    await eventually(lambda: not manager.busy_task(parent["id"]))
+    wake = [event for event in manager.store.get(parent["id"])["events"] if event["type"] == "user"][-1]
+    assert wake["background_wake"] is True
+    assert wake["text"] == WAKE_TEXT.format(id=ids["Survey"][:8], kind="general", ending="finished")
+
+
+async def test_the_wake_after_a_failed_subagent_says_it_failed_and_its_label_fits(runtime, monkeypatch):
+    """The wake option also continues the chat after a background subagent that failed: its message says so, and
+    the transcript's label of the app's message does not call it finished."""
+    manager, parent, _ = runtime
+    manager.settings.values["background_subagent_wake"] = True
+    gate = asyncio.Event()
+
+    async def failing(count, body):
+        await gate.wait()
+        return httpx.Response(400, json={"error": {"message": "Bad request"}})
+    gateway = Gateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)),
+                                    lambda: reply("Going on."), lambda: reply("It failed; I will do it myself.")],
+                      {"Survey": failing})
+    await run_turn(manager, parent)
+    child_id = background_child(manager, parent)
+    gate.set()
+    await eventually(lambda: len(gateway.requests["parent"]) == 3)
+    await eventually(lambda: not manager.busy_task(parent["id"]))
+    saved = manager.store.get(parent["id"])
+    wake = [event for event in saved["events"] if event["type"] == "user"][-1]
+    assert wake["background_wake"] is True
+    assert wake["text"] == WAKE_TEXT.format(id=child_id[:8], kind="general", ending="failed")
+    second = transcript(saved).split("## Turn 2", 1)[1]
+    assert "**App (sent when a background subagent ended):**" in second and "(general) failed." in second
+
+
 async def test_a_running_turn_learns_of_a_background_subagent_at_its_next_step(runtime, monkeypatch):
     manager, parent, _ = runtime
     manager.settings.values["background_subagent_wake"] = True
@@ -527,6 +613,40 @@ async def test_rewind_and_fork_wait_for_background_subagents(api, monkeypatch):
     response = await client.post(f"/api/sessions/{parent['id']}/rewind",
                                  json={"before_event_id": first["id"], "conversation": True})
     assert response.status_code == 200, response.text
+
+
+@pytest.mark.parametrize("read", [False, True])
+async def test_after_a_rewind_to_the_wake_message_your_next_message_learns_of_the_subagent(api, monkeypatch, read):
+    """The app's wake turn told the model a background subagent finished (and may have read its report). Rewinding
+    to that message removes the turn, so your next message's first request names the subagent again."""
+    client, manager = api
+    manager.settings.values["background_subagent_wake"] = True
+    parent = manager.store.create(manager.settings.values)
+    parent.update(title="Parent", title_generated=True, permission_mode="bypassPermissions")
+    manager.store.save(parent)
+    gate = asyncio.Event()
+    ids = {}
+    woken = [lambda: calls_reply(("get_subagent_result", {"subagent_id": ids["Survey"]}, "r1"))] if read else []
+    gateway = Gateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)),
+                                    lambda: reply("Going on."), *woken, lambda: reply("Read it; all done."),
+                                    lambda: reply("Answer.")], {"Survey": gated(gate)})
+    await run_turn(manager, parent)
+    ids["Survey"] = background_child(manager, parent)
+    gate.set()
+    await eventually(lambda: len(gateway.requests["parent"]) == 3 + read)
+    assert "Background subagents ended since your last step" in json.dumps(gateway.requests["parent"][2]["messages"])
+    if read:
+        assert "Found it at a.txt:1." in json.dumps(gateway.requests["parent"][3]["messages"])
+    await eventually(lambda: not manager.busy_task(parent["id"]))
+    wake = [event for event in manager.get(parent["id"])["events"] if event["type"] == "user"][-1]
+    assert wake["background_wake"] is True
+    response = await client.post(f"/api/sessions/{parent['id']}/rewind",
+                                 json={"before_event_id": wake["id"], "conversation": True})
+    assert response.status_code == 200, response.text
+    assert "Found it at a.txt:1." not in json.dumps(manager.get(parent["id"])["wire"])
+    await run_turn(manager, parent, "What next?")
+    assert len(gateway.requests["parent"]) == 4 + read
+    assert "Background subagents ended since your last step" in json.dumps(gateway.requests["parent"][-1]["messages"])
 
 
 async def test_exports_keep_a_background_subagents_card_result_and_notice(runtime, monkeypatch):

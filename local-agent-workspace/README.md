@@ -2973,14 +2973,18 @@ the chat was idle, and the sidebar marks the chat as changed; with a page open, 
 ("Background subagent finished: <chat>"). **Settings → Subagents →
 Continue the chat when a background subagent finishes** (off by default: each such turn is a paid
 model request) sends an idle chat a short app message, labelled **Sent by the app when a background
-subagent finished**, so the agent reads the report and goes on; it starts one turn for what ended
-since the chat's last step, and a turn that was running when the subagent ended is told at its next
+subagent ended**, so the agent reads the report and goes on; it starts one turn for what ended
+since the chat's last step (the message names the latest subagent that finished or failed, never one
+that was stopped), and a turn that was running when the subagent ended is told at its next
 step instead. One that ended while a `!` command or a compaction ran continues the chat once it is
 done. It never continues a chat whose last turn stopped at a limit (Agent steps, the turn's tokens or
 time, spending), an error or Stop: that chat waits for **Continue** or your next message, whose first
 request names the subagent. Nor does it continue a scheduled run's chat. The app's message is not
-yours: it has no **Edit message**, **Retry** sends it again as the app's, rewinding to it leaves your
-message box empty, and transcripts label it **App (sent when a background subagent finished)**. **Stop** on the chat while it works and **Stop subagent** on a card stop background
+yours: it carries no `!` output (that waits for your next message), it has no **Edit message**,
+**Retry** sends it again as the app's, rewinding to it leaves your message box empty, and transcripts
+label it **App (sent when a background subagent ended)** and count it apart from your messages. A
+conversation rewind names again, at the next request, the subagents that only the removed turns were
+told of or read the report of. **Stop** on the chat while it works and **Stop subagent** on a card stop background
 subagents too, and so does deleting the chat; a restart marks a running one interrupted
 and says so in the chat. While background subagents run, rewinding (also editing or retrying a
 message) and forking the chat are refused with a message naming how many run, because their
