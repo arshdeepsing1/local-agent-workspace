@@ -141,12 +141,18 @@ Roadmap milestone M8 (agents, automation and delivery):
   sequences, carriage returns, bidirectional overrides) as visible escapes, so a command cannot
   hide behind them. Bypass permissions needs `--confirm-bypass`. An answer the app refuses falls
   back at once to declining (or skipping the questions), so no card is left waiting. Ctrl+C
-  stops the turn, and before a turn started it exits without waiting. Prompt"`": a turn that
-  leaves background subagents working is reported once they ended (stderr says it waits), their
-  cards answered with the same `--approve` policy, and the result lists each one's end in
-  `background_results`; Ctrl+C then stops them and exits 3. `--approve ask` prints a card's
-  warnings (a secret file it reads, a protected file, a hook that asked, a command that could
-  not be checked exactly, a file another subagent changed) before you answer.
+  stops the turn, and before a turn started it exits without waiting. A turn that leaves
+  background subagents working is reported once they ended (a stopped one, also before it
+  started, has ended; stderr says it waits), their cards answered with the same `--approve`
+  policy, and the result lists each one's end in `background_results`. A turn you start in the
+  page meanwhile, also in the chat of a subagent whose delegation ended, is yours: the script
+  neither answers its cards nor reports it. Ctrl+C while it waits stops them (and a turn of yours
+  running in the chat: Stop applies to the whole chat), exits 3 and prints the script's turn with
+  them as stopped and `exit_code` 3. A prompt queued because something started in the chat as it
+  was sent is followed from the turn that sends it; when nothing sends it, the script says so and
+  exits 1. `--approve ask` prints a card's warnings (a secret file it reads, a protected file, a
+  hook that asked or changed the action, a command that could not be checked exactly, a file
+  another subagent changed) before you answer.
 - `agent_run.py` options set the chat's model, effort, mode, Agent steps, spending limit and
   turn limits. `--session` sends the prompt to an existing idle chat instead: `--mode`,
   `--model` and `--effort` then change that chat, the new-chat-only `--workspace` and
@@ -158,9 +164,14 @@ Roadmap milestone M8 (agents, automation and delivery):
   and its step-limit notice then says the chat has its own. Stopping the app (Ctrl+C on
   `run.py`) ends these streams at once and stops running turns as usual. `query()` follows the
   chat's background subagents (and a turn the wake option starts) before its result, yields a
-  `background_wait` message meanwhile, and the result has `background_results`. The
-  `can_use_tool` context carries the card's warnings: `secret_files`, `protected`, `hook_ask`,
-  `uncertain` and `sibling_change`.
+  `background_wait` message with the ended turn's `turn_result` meanwhile, and the result has
+  `background_results`; it follows only the prompt's turn and those the app starts, so the cards
+  of a turn the user or another script starts are left to them. A prompt that waits in the chat's
+  queue is followed from the turn that sends it, and one never sent raises `LocalAgentError`
+  (`NOT_SENT`). `wait_result` returns at once while no turn runs (also while a background
+  subagent's hook card waits); `background=True` adds `background_results`, and `turn=` gives an
+  ended turn's record. The `can_use_tool` context carries the card's warnings: `secret_files`,
+  `protected`, `hook_ask`, `hook_change`, `uncertain` and `sibling_change`.
 - Simulator: `start_gateway()`, `patched_settings()` and `start_app()` can be imported by tests
   and other launchers.
 - **Settings → Agent → Git status in messages** (on by default): the message that starts each

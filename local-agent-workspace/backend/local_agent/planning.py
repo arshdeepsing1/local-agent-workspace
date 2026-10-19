@@ -1024,7 +1024,8 @@ class DelegateManager:
         refusal = recheck() if recheck is not None and entry.get("queued") else None
         if refusal:
             self._release(parent["id"], entry)
-            await self._unqueue(parent, parent_event)
+            if background is None:  # A background one's card goes from queued to failed, with its result.
+                await self._unqueue(parent, parent_event)
             raise ValueError(refusal)
         child = None
         try:
@@ -1076,7 +1077,7 @@ class DelegateManager:
             child.update(parent_event_id=event_id, parent_call_id=(parent_event or {}).get("call_id"),
                          delegation={"status": "running", "completed_tools": 0, **labels, "started": time.time()})
             self.manager.store.save(child)
-        except BaseException:
+        except BaseException as exc:
             # A failed write (a full disk) must not keep the slot: other delegations would wait forever.
             if child is not None:
                 try:
@@ -1084,7 +1085,8 @@ class DelegateManager:
                 except OSError:
                     pass
             self._release(parent["id"], entry)
-            await self._unqueue(parent, parent_event)
+            if background is None or not isinstance(exc, Exception):  # As a refusal above; a stop is cancelled.
+                await self._unqueue(parent, parent_event)
             raise
         entry["child_session_id"] = child["id"]
         if background is not None:
