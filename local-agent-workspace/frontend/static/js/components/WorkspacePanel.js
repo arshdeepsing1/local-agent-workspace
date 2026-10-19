@@ -253,7 +253,9 @@ function saveTab(value) {
 }
 
 // The tabs show their icons only while their labels do not fit the panel (a narrow panel, or large text); each
-// label stays its button's name and tooltip. Measured again when the tabs, a tab or the text size changes.
+// label stays its button's name and tooltip. Measured again when the panel's size, the text size or the font
+// changes. The panel is observed rather than the tabs, whose height changes with the labels: observing them would
+// make each fit start another round of size notifications.
 function useFittedTabs() {
   const nav = useRef(null)
   useLayoutEffect(() => {
@@ -265,8 +267,7 @@ function useFittedTabs() {
     }
     fit()
     const sizes = new ResizeObserver(fit)
-    sizes.observe(element)
-    element.querySelectorAll('button').forEach(button => sizes.observe(button))
+    sizes.observe(element.parentElement)
     const scale = new MutationObserver(fit)  // Settings → Appearance → Text size (--text-scale on the root).
     scale.observe(document.documentElement, { attributes: true, attributeFilter: ['style'] })
     void document.fonts?.ready.then(() => { if (element.isConnected) fit() })

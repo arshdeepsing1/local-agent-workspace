@@ -341,6 +341,26 @@ def test_the_four_workspace_tabs_fit_the_panel_with_labels_or_icons(ui, page, wi
         assert main["width"] >= 420, main
 
 
+def test_resizing_the_panel_switches_the_tabs_between_labels_and_icons_without_a_resize_loop(ui, page):
+    # The fit watches the panel, not the tabs (whose height changes with their labels). Mutation: observe the tab bar
+    # (the browser then reports a ResizeObserver loop).
+    page.set_viewport_size({"width": 1280, "height": 900})
+    ui.app(session="a", scenario="workspace", setup=CHAT % "" + "; window.pageErrors = []; addEventListener('error', e => pageErrors.push(e.message))")
+    ui.show_session("a")
+    open_panel(page)
+    nav = page.locator(".workspace-tabs")
+    resizer = page.get_by_role("separator", name="Resize workspace panel")
+    resizer.focus()
+    for key, icons in [("Home", True), ("End", False), ("Home", True), ("Enter", False)]:
+        page.keyboard.press(key)
+        expect(nav).to_have_class(re.compile(r"\bicons-only\b") if icons else re.compile(r"^workspace-tabs$"))
+    page.set_viewport_size({"width": 390, "height": 844})
+    expect(nav).to_have_class(re.compile(r"^workspace-tabs$"))
+    ui.run("document.documentElement.style.setProperty('--text-scale', '1.5')")  # Settings → Appearance → Text size
+    expect(nav).to_have_class(re.compile(r"\bicons-only\b"))
+    assert ui.js("pageErrors") == []
+
+
 # L6: the context details open as a popover above the meter
 
 POPOVER = [(390, 664), (390, 844), (844, 390), (667, 375), (1440, 900), (360, 740)]
