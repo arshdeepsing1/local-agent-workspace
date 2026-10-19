@@ -2,9 +2,11 @@
 import importlib.util
 import os
 import socket
+import stat
 import sys
 import threading
 import time
+import webbrowser
 from pathlib import Path
 
 import pytest
@@ -59,7 +61,7 @@ def test_open_starts_the_wait_only_for_a_free_port(run_script, monkeypatch):
     from local_agent import serve
     started, served = [], []
     monkeypatch.setattr(serve, "run", lambda app, port, reload=False: served.append((app, port, reload)))
-    monkeypatch.setattr(run_script, "open_when_ready", lambda port: started.append(port))
+    monkeypatch.setattr(run_script, "open_when_ready", lambda port: started.append(port) or True)
     monkeypatch.setattr(run_script, "desktop_browser", lambda: True)
     port = free_port()
     run_script.main(["--port", str(port), "--open"])
@@ -94,4 +96,71 @@ def test_open_without_a_desktop_says_where_the_app_is(run_script, monkeypatch, c
     port = free_port()
     run_script.main(["--port", str(port), "--open"])
     assert started == []
+    assert f"open http://127.0.0.1:{port}/ in your browser" in capsys.readouterr().out
+
+
+def test_with_a_display_the_default_browser_opens_the_app(run_script, monkeypatch):
+    opened = []
+    monkeypatch.setattr(webbrowser, "open", lambda url: opened.append(url) or True)
+    for platform, environ in (("linux", {"DISPLAY": ":0"}), ("linux", {"WAYLAND_DISPLAY": "wayland-0"}),
+                              ("darwin", {}), ("win32", {})):
+        assert run_script.open_browser("http://127.0.0.1:8765/", environ, platform) is True
+    assert len(opened) == 4
+    # Without one, and with nothing in BROWSER, no browser is tried.
+    assert run_script.open_browser("http://127.0.0.1:8765/", {"TERM": "xterm-256color"}, "linux") is False
+    assert len(opened) == 4
+
+
+@pytest.fixture
+def no_display(monkeypatch, tmp_path):
+    """A Linux machine reached over SSH: a terminal (TERM), no display, and on PATH only the programs a test puts in
+    the folder returned. Python's webbrowser keeps the browsers it found on first use, so it looks again here."""
+    folder = tmp_path / "bin"
+    folder.mkdir()
+    monkeypatch.setenv("PATH", str(folder))
+    monkeypatch.setenv("TERM", "xterm-256color")
+    for name in ("DISPLAY", "WAYLAND_DISPLAY", "BROWSER"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(webbrowser, "_tryorder", None)
+    monkeypatch.setattr(webbrowser, "_browsers", {})
+    monkeypatch.setattr(webbrowser, "_os_preferred_browser", None)
+    return folder
+
+
+def fake_program(folder, name, body):
+    path = folder / name
+    path.write_text(f"#!/bin/sh\n{body}\n")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def serve_until_opened(monkeypatch):
+    """serve.run as a server that listens on its port until --open's wait (its own thread) has finished."""
+    from local_agent import serve
+    before = set(threading.enumerate())
+
+    def run(app, port, reload=False):
+        with socket.socket() as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", port))
+            listener.listen()
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and any(thread.is_alive() for thread in set(threading.enumerate()) - before):
+                time.sleep(0.05)
+    monkeypatch.setattr(serve, "run", run)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="a Linux machine reached over SSH")
+def test_a_browser_named_in_browser_that_cannot_start_runs_no_text_browser_and_the_address_is_printed(
+        run_script, no_display, monkeypatch, tmp_path, capsys):
+    # The profile exports BROWSER=firefox, as on the desktop; over SSH firefox cannot start without a display.
+    # Python's webbrowser would then go on to the text browsers it found (w3m here), run in the server's terminal.
+    tried, ran = tmp_path / "firefox-tried", tmp_path / "w3m-ran"
+    fake_program(no_display, "firefox", f'echo "$@" >> "{tried}"\necho "Error: no DISPLAY environment variable specified" >&2\nexit 1')
+    fake_program(no_display, "w3m", f'echo "$@" >> "{ran}"')
+    monkeypatch.setenv("BROWSER", "firefox")
+    serve_until_opened(monkeypatch)
+    port = free_port()
+    run_script.main(["--port", str(port), "--open"])
+    assert tried.read_text() == f"http://127.0.0.1:{port}/\n"  # The browser named in BROWSER is tried.
+    assert not ran.exists(), f"a text browser ran in the server's terminal: w3m {ran.read_text().strip()}"
     assert f"open http://127.0.0.1:{port}/ in your browser" in capsys.readouterr().out

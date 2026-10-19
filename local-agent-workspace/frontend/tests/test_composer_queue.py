@@ -15,6 +15,20 @@ ROUTES = """fake.override = (path, options) => {
   if (path === '/api/sessions/a/side-question') return fake.sideAnswer ? fake.sideAnswer.promise
     : fake.json({ answer: 'It changed **two** files.', request_info: { status: 'completed', finish_reason: 'stop' } })
 }"""
+# DELETE /queue/<id> removes that message from the chat and answers with the rest, like the server.
+REMOVE_QUEUED = """
+const queueOverride = fake.override
+fake.override = (path, options) => {
+  if (path.startsWith('/api/sessions/a/queue/') && options.method === 'DELETE') {
+    const left = fake.sessions.get('a').queued_messages.filter(item => item.id !== path.split('/').pop())
+    fake.sessions.set('a', { ...fake.sessions.get('a'), queued_messages: left })
+    return fake.json({ queued_messages: left })
+  }
+  return queueOverride(path, options)
+}"""
+PLAIN_STATUS = {"id": "q1", "text": "!git status", "created": 1, "paused": True, "verbatim": True}
+REVIEW_COMMAND = {"id": "q2", "text": "/review src/app.py", "created": 2, "paused": True,
+                  "command": {"name": "review", "path": ".agent/commands/review.md"}}
 
 
 def start_app(ui, page, session="a", status="idle", setup="", **fields):
@@ -140,16 +154,7 @@ def test_editing_a_queued_plain_text_message_keeps_it_plain_text(ui, page):
     queued = [{"id": "q1", "text": "!git status", "created": 1, "paused": True, "verbatim": True},
               {"id": "q2", "text": "/rename Shipping notes", "created": 2, "paused": True, "verbatim": True},
               {"id": "q3", "text": "!ls", "created": 3, "paused": True}]
-    start_app(ui, page, queued_messages=queued, setup="""
-const queueOverride = fake.override
-fake.override = (path, options) => {
-  if (path.startsWith('/api/sessions/a/queue/') && options.method === 'DELETE') {
-    const left = fake.sessions.get('a').queued_messages.filter(item => item.id !== path.split('/').pop())
-    fake.sessions.set('a', { ...fake.sessions.get('a'), queued_messages: left })
-    return fake.json({ queued_messages: left })
-  }
-  return queueOverride(path, options)
-}""")
+    start_app(ui, page, queued_messages=queued, setup=REMOVE_QUEUED)
     bar = queue_bar(page)
     toggle = page.get_by_role("button", name="Send as plain text")
     expect(bar.locator(".queue-tag", has_text="Plain text")).to_have_count(2)
@@ -170,6 +175,65 @@ fake.override = (path, options) => {
     expect(message(page)).to_have_value("!ls")
     expect(toggle).to_have_attribute("aria-pressed", "false")
     expect(page.get_by_role("status").filter(has_text="Shell command: Enter runs it")).to_be_visible()
+
+
+def edit_queued(page, text):
+    queue_bar(page).get_by_role("button", name=f"Edit queued message: {text}", exact=True).click()
+
+
+def test_send_as_plain_text_stays_with_its_chats_draft_while_another_chat_is_open(ui, page):
+    # The draft comes back when the chat is opened again, and Send as plain text with it: Enter must not run
+    # 'git status' in the project.
+    start_app(ui, page, queued_messages=[PLAIN_STATUS], setup=REMOVE_QUEUED)
+    toggle = page.get_by_role("button", name="Send as plain text")
+    edit_queued(page, "!git status")
+    expect(message(page)).to_have_value("!git status")
+    expect(toggle).to_have_attribute("aria-pressed", "true")
+    page.get_by_role("button", name="New conversation").click()
+    expect(message(page)).to_have_value("")
+    expect(toggle).to_have_attribute("aria-pressed", "false")  # The new conversation has its own.
+    page.get_by_role("button", name="Work", exact=True).click()
+    ui.show_session("a", count=2)
+    expect(message(page)).to_have_value("!git status")
+    expect(toggle).to_have_attribute("aria-pressed", "true")
+    message(page).press("Enter")
+    ui.wait("fake.requests('/api/sessions/a/messages', 'POST').length + fake.requests('/api/sessions/a/shell').length === 1")
+    assert ui.requests("/api/sessions/a/shell") == []
+    assert ui.bodies("/api/sessions/a/messages", "POST") == [{"text": "!git status", "verbatim": True}]
+
+
+def test_a_queued_message_edited_into_an_empty_box_brings_its_own_mode_not_the_last_ones(ui, page):
+    # The plain-text '!git status' is edited back and then cleared from the box. The queued command that is edited
+    # next goes as it was queued: Send as plain text is off, so the server expands its template again.
+    start_app(ui, page, queued_messages=[PLAIN_STATUS, REVIEW_COMMAND], setup=REMOVE_QUEUED)
+    toggle = page.get_by_role("button", name="Send as plain text")
+    edit_queued(page, "!git status")
+    expect(toggle).to_have_attribute("aria-pressed", "true")
+    message(page).fill("")
+    edit_queued(page, "/review src/app.py")
+    expect(message(page)).to_have_value("/review src/app.py")
+    expect(toggle).to_have_attribute("aria-pressed", "false")
+    message(page).press("Enter")
+    ui.wait("fake.requests('/api/sessions/a/messages', 'POST').length === 1")
+    assert ui.bodies("/api/sessions/a/messages", "POST") == [{"text": "/review src/app.py"}]
+
+
+def test_a_queued_message_edited_below_a_draft_leaves_plain_text_on_when_either_was_plain(ui, page):
+    # The box has one mode for the merged text, and plain text wins: it sends less and runs nothing, where the other
+    # way the plain-text message's @ files or /skill would be attached after all.
+    start_app(ui, page, queued_messages=[PLAIN_STATUS, REVIEW_COMMAND], setup=REMOVE_QUEUED)
+    toggle = page.get_by_role("button", name="Send as plain text")
+    message(page).fill("Summarize the changes")
+    edit_queued(page, "!git status")
+    expect(message(page)).to_have_value("Summarize the changes\n!git status")
+    expect(toggle).to_have_attribute("aria-pressed", "true")
+    edit_queued(page, "/review src/app.py")
+    expect(message(page)).to_have_value("Summarize the changes\n!git status\n/review src/app.py")
+    expect(toggle).to_have_attribute("aria-pressed", "true")
+    message(page).press("Enter")
+    ui.wait("fake.requests('/api/sessions/a/messages', 'POST').length === 1")
+    assert ui.bodies("/api/sessions/a/messages", "POST") == [
+        {"text": "Summarize the changes\n!git status\n/review src/app.py", "verbatim": True}]
 
 
 def test_escape_in_the_message_box_stops_a_busy_chat(ui, page):

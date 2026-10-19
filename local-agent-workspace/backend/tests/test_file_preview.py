@@ -163,14 +163,45 @@ def test_a_worktree_chat_reads_its_own_copy(tmp_path, project, mode):
 def test_the_text_route_says_when_a_file_is_not_text(client, project):
     (project / "latin1.txt").write_bytes("caf\xe9\n".encode("latin-1"))
     (project / "nul.txt").write_bytes(b"a\x00b")
-    for path, message in (("archive.zip", "This file is not UTF-8 text, so the text editor cannot open it."),
-                          ("latin1.txt", "This file is not UTF-8 text, so the text editor cannot open it."),
-                          ("nul.txt", "Binary files cannot be opened in the text editor.")):
-        response = client.get("/api/file", params={"path": path})
+    # The answer names the file opened, like a text file's: demo/archive.zip, as a reply names it, is archive.zip.
+    for named, path, message in (
+            ("archive.zip", "archive.zip", "This file is not UTF-8 text, so the text editor cannot open it."),
+            ("demo/archive.zip", "archive.zip", "This file is not UTF-8 text, so the text editor cannot open it."),
+            ("latin1.txt", "latin1.txt", "This file is not UTF-8 text, so the text editor cannot open it."),
+            ("nul.txt", "nul.txt", "Binary files cannot be opened in the text editor.")):
+        response = client.get("/api/file", params={"path": named})
         assert response.status_code == 400
-        assert response.json()["detail"] == {"message": message, "code": "not_text"}
+        assert response.json()["detail"] == {"message": message, "code": "not_text", "path": path,
+                                             "absolute": str((project / path).resolve())}
     assert issubclass(NotText, ValueError)  # Callers that catch ValueError keep working.
     assert client.get("/api/file", params={"path": "notes.md"}).json()["content"] == "# Notes\n"
+
+
+def test_a_worktree_chat_is_told_which_of_its_files_is_not_text(tmp_path, project):
+    # A reply names a Markdown file by the source project's path; the worktree's own copy, which is opened, is over
+    # the editor's limit. The answer names that copy, so Open in VS Code never edits the main checkout's.
+    (project / "big.md").write_text("# Main checkout\n" + "x" * 90_000)
+    worktree = tmp_path / "state" / "worktrees" / "1234"
+    worktree.mkdir(parents=True)
+    (worktree / "big.md").write_text("# Worktree\n" + "y" * 90_000)
+    settings = Settings(tmp_path / "state")
+    settings.values.update(workspace=str(project), env_file="")
+    app = create_app(settings)
+    with TestClient(app) as client:
+        client.headers["X-Local-Token"] = client.get("/api/bootstrap").json()["token"]
+        created = client.post("/api/sessions", json={}).json()
+        manager = app.state.manager
+        session = manager.get(created["id"])
+        session.update(workspace=str(worktree), worktree={"id": "1234", "branch": "chat/x", "source_workspace": str(project)})
+        manager.store.save(session)
+        response = client.get("/api/file", params={"path": str(project / "big.md"), "session_id": created["id"]})
+        assert response.status_code == 400
+        assert response.json()["detail"] == {"message": "File is too large for the text editor (80 KB limit).",
+                                             "code": "not_text", "path": "big.md",
+                                             "absolute": str((worktree / "big.md").resolve())}
+        # Download reads the same copy.
+        raw = client.get("/api/file/raw", params={"path": str(project / "big.md"), "session_id": created["id"]})
+        assert raw.content.startswith(b"# Worktree") and raw.headers["x-opened-path"] == "big.md"
 
 
 def test_the_page_lets_preview_frames_reach_no_address(client):

@@ -32,7 +32,8 @@ TOO_LARGE = "File is too large for the text editor (80 KB limit)."
 
 def setup(texts=None, opened=None, extra=""):
     """The fake server: FILES listed, TEXT (and texts) as text files, big.* over the editor's limit, other files not
-    text; opened maps a requested path to the one the server finds (sent back as X-Opened-Path, like the server)."""
+    text; opened maps a requested path to the one the server finds (sent back as X-Opened-Path, and in GET /api/file's
+    answer by its path and its absolute path in the chat's folder, like the server)."""
     return f"""
 const png = Uint8Array.from(atob({json.dumps(base64.b64encode(PNG).decode())}), c => c.charCodeAt(0))
 const svg = new TextEncoder().encode({json.dumps(SVG)})
@@ -50,9 +51,10 @@ fake.override = path => {{
       'X-Opened-Path': encodeURIComponent(name).replaceAll('%2F', '/') }} }})
   }}
   if (path.startsWith('/api/file?')) {{
-    if (name in texts) return fake.json({{ path: name, content: texts[name], absolute: name.startsWith('/') ? name : `/project/${{name}}` }})
-    if (name.startsWith('big.')) return fake.json({{ detail: {{ message: {json.dumps(TOO_LARGE)}, code: 'not_text' }} }}, 400)
-    return fake.json({{ detail: {{ message: 'This file is not UTF-8 text, so the text editor cannot open it.', code: 'not_text' }} }}, 400)
+    const absolute = name.startsWith('/') ? name : `${{fake.sessions.get(params.get('session_id'))?.workspace || '/project'}}/${{name}}`
+    if (name in texts) return fake.json({{ path: name, content: texts[name], absolute }})
+    const message = name.startsWith('big.') ? {json.dumps(TOO_LARGE)} : 'This file is not UTF-8 text, so the text editor cannot open it.'
+    return fake.json({{ detail: {{ message, code: 'not_text', path: name, absolute }} }}, 400)
   }}
 }}
 {extra}
@@ -215,6 +217,27 @@ def test_markdown_and_html_too_large_for_the_editor_say_why_and_offer_download(u
         panel(page).get_by_role("button", name="Back to files").click()
 
 
+def test_a_file_that_is_not_text_found_elsewhere_is_named_by_the_file_opened(ui, page):
+    # A worktree chat: the reply names big.md by the source project's path, and the server opens the worktree's copy,
+    # which is over the editor's limit. Like a text file, an image or a PDF found elsewhere, the panel names that copy;
+    # Open in VS Code must never let the user edit the main checkout's by mistake.
+    chat = """fake.sessions.set('w', { ...makeSession('w', 'Worktree chat'), workspace: '/state/worktrees/0b1c',
+      worktree: { branch: 'chat/x', source_workspace: '/code/shop' },
+      events: [{ id: 'r', type: 'assistant', text: 'See `/code/shop/big.md`.' }] })"""
+    start(ui, page, setup(opened={"/code/shop/big.md": "big.md"}, extra=chat), session="w")
+    ui.emit("w", {"type": "changes", "changes": {"files": [{"path": "big.md", "status": "modified", "added": 1, "removed": 1,
+                                                          "current_hash": "hash-big.md"}], "added": 1, "removed": 1}})
+    page.get_by_role("link", name="/code/shop/big.md").click()
+    expect(panel(page).get_by_text(TOO_LARGE)).to_be_visible()
+    toolbar = panel(page).locator(".editor-toolbar")
+    expect(toolbar.get_by_title("big.md", exact=True)).to_have_text("big.md")
+    expect(toolbar.get_by_role("link", name="Open in VS Code")).to_have_attribute("href", "vscode://file/state/worktrees/0b1c/big.md:1")
+    expect(toolbar.get_by_role("button", name="Review changes")).to_be_visible()  # The agent changed the worktree's copy.
+    expect(panel(page).locator(".editor-note")).to_have_text("Opened big.md: the reply named it /code/shop/big.md.")
+    panel(page).get_by_role("button", name="Add this file to chat").click()
+    expect(page.get_by_role("textbox", name="Message")).to_have_value("Please read the project file: big.md")
+
+
 # What an HTML file can start with: its frame's policy must be in the head whatever comes first. A browser ignores a
 # policy in the body, and the parser opens the body on any character HTML does not count as whitespace, such as a
 # no-break space before the doctype.
@@ -222,10 +245,12 @@ STARTS = {"doctype": "<!doctype html>", "no doctype": "", "whitespace": " \n\t<!
           "no-break space": "\u00a0<!doctype html>", "line tab": "\u000b<!doctype html>",
           "ideographic space": "\u3000<!doctype html>", "line separator": "\u2028<!doctype html>",
           "comment": "<!-- generated --><!doctype html>"}
+# The starts whose first character is text of the page: the frame's body begins with it, as a browser's would.
+TEXT_FIRST = {"no-break space", "line tab", "ideographic space", "line separator"}
 
 
-@pytest.mark.parametrize("start_with", STARTS.values(), ids=STARTS.keys())
-def test_the_html_preview_loads_nothing_whatever_the_file_starts_with(ui, page, start_with):
+@pytest.mark.parametrize(("name", "start_with"), STARTS.items(), ids=STARTS.keys())
+def test_the_html_preview_loads_nothing_whatever_the_file_starts_with(ui, page, name, start_with):
     hits = []
     page.route(f"{ORIGIN}/tracker/**", lambda route: (hits.append(route.request.url), route.fulfill(status=404, body="")))
     # With scripts on, the page reports once its stylesheet, its image and its fetch have finished, loaded or refused.
@@ -245,6 +270,11 @@ def test_the_html_preview_loads_nothing_whatever_the_file_starts_with(ui, page, 
     panel(page).get_by_role("button", name="Run scripts").click()
     expect(page.frame_locator(".file-preview-frame").get_by_text("Ran")).to_be_visible()
     assert hits == []
+    # The body begins with the page's first element, or with the text the file starts with: a byte order mark is
+    # dropped, as a browser drops it when it opens the file (kept, it would be a character in the body, a line above
+    # the page).
+    first = page.frame_locator(".file-preview-frame").locator("body").evaluate("body => body.firstChild.nodeName")
+    assert first == ("#text" if name in TEXT_FIRST else "IMG")
 
 
 def test_a_markdown_file_outside_the_project_shows_its_own_images_and_opens_its_links(ui, page):

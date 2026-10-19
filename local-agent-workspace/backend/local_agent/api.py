@@ -993,10 +993,14 @@ def create_app(settings=None):
 
     @app.get("/api/file")
     async def file(path: str, session_id: str | None = None):
-        try:
-            tools, path, content = opened_file(path, session_id, lambda tools, path: tools.read_file(path))
-        except NotText as exc:
-            raise HTTPException(400, {"message": settings.redact(str(exc)), "code": "not_text"}) from None
+        def read(tools, path):
+            try:
+                return tools.read_file(path)
+            except NotText as exc:
+                # Named by the file opened, like a text file, so the panel's Download view names that file.
+                raise HTTPException(400, {"message": settings.redact(str(exc)), "code": "not_text",
+                                          "path": path, "absolute": str(tools.path(path))}) from None
+        tools, path, content = opened_file(path, session_id, read)
         # The absolute path lets the editor offer an "Open in VS Code" link.
         return {"path": path, "content": content, "absolute": str(tools.path(path))}
 

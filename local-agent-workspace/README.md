@@ -109,8 +109,10 @@ cd local-agent-workspace
 
 Open http://127.0.0.1:8765, or start with `--open` (`.venv/bin/python run.py --open`) to have the
 app opened in your default browser once it is ready (within 10 seconds; not when the port is already
-in use). On a machine without a desktop (no display, such as over SSH) `--open` only prints the address,
-unless `BROWSER` names a browser to use. Use `--port 8766` if that port is occupied.
+in use). On a machine without a desktop (no display, such as over SSH) `--open` tries only the browsers
+`BROWSER` names, never a text browser in the server's terminal. When no browser opened the app (none was
+named or could start, or the app was not ready in time), it prints the address instead. Use `--port 8766`
+if that port is occupied.
 Stop the local server with Ctrl+C. It must remain running for the UI and agents to work.
 
 The app can also run in its own window: in Chrome or Edge choose **Install app** (the icon at the end of
@@ -486,7 +488,11 @@ when opening a conversation or performing restart recovery.
     message exactly as typed (the button turns off again after that message): no built-in or custom
     command, no skill, no `@` file snapshot and no `!` shell command (the `/` and `@` lists do not
     open). Output of an earlier `!` command that waits for your next message still goes with it. The message shows **Sent as plain text**,
-    and **Retry** and **Edit** send it the same way again. With **Settings → Commands and files →
+    and **Retry** and **Edit** send it the same way again. The button stays with the chat's draft while you open
+    other chats (not across a reload). A message put back into an empty box (**Edit** on a queued message,
+    **Rewind to here**, a failed **Retry response** or **Edit message**) sets it to that message's own mode: on
+    for one sent or queued as plain text, off for another. A queued message edited below a typed draft leaves it
+    on when either was plain text. With **Settings → Commands and files →
     Run commands typed with /** turned off (it is on by default), typed `/` text is sent as it is in
     every message; built-in commands then run only when chosen in the `/` menu.
 - **Messages while the agent works (queue and steering)**: while a reply, a compaction or a `!`
@@ -1172,12 +1178,13 @@ when opening a conversation or performing restart recovery.
   that line through a `vscode://file/<absolute path>:<line>` link; nothing happens when VS
   Code is not installed. A path inside the project is opened by its project path; when a
   reply names a file that does not exist as written, the editor (or the preview of an image or
-  PDF, whose header, **Open in VS Code** and plus button then name that file) opens the one project file
+  PDF, or the **Download** view of a file that is not text) opens the one project file
   the name most likely means (a path starting with the project's own folder name, or the
   folders above it from the repository root; in a worktree chat, the worktree's copy of a
   file named by the source project's path, which is always preferred over the source
-  project's own file) and says which file it opened. Otherwise it reports that the file does
-  not exist in the project folder. A file with unkept agent changes that cannot be read
+  project's own file) and says which file it opened; the header, **Open in VS Code** and the plus
+  button (which an image other than SVG does not have) then name that file. Otherwise it reports
+  that the file does not exist in the project folder. A file with unkept agent changes that cannot be read
   opens its review.
 - **Copy and export a conversation**: **Agent tools → Export → Export Markdown**
   downloads the conversation as a Markdown transcript (`<date>-<title>-<id>.md`; a secret
