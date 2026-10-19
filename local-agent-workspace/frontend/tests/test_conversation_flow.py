@@ -400,6 +400,57 @@ def test_a_first_message_that_fails_after_creation_stays_with_the_created_chat(u
     expect(message(page)).to_have_value("Hello there")
 
 
+def stored_plain(ui):
+    """The saved drafts marked to send as plain text."""
+    return ui.js("Object.keys(localStorage).filter(k => k.startsWith('local-workspace:draft-plain:')).map(k => k.slice(28)).sort()")
+
+
+def test_send_as_plain_text_is_saved_with_the_draft_across_a_reload(ui, page):
+    start_app(ui, page, session="a")
+    ui.show_session("a")
+    toggle = page.get_by_role("button", name="Send as plain text")
+    message(page).fill("!git status")
+    toggle.click()
+    ui.wait("localStorage.getItem('local-workspace:draft-plain:a') === '1'")
+    remount(ui, page)
+    ui.show_session("a")
+    expect(message(page)).to_have_value("!git status")
+    expect(toggle).to_have_attribute("aria-pressed", "true")
+    # Turned off, the mark goes; the draft stays.
+    toggle.click()
+    ui.wait("localStorage.getItem('local-workspace:draft-plain:a') === null")
+    assert stored(ui) == {"a": "!git status"}
+    toggle.click()
+    ui.wait("localStorage.getItem('local-workspace:draft-plain:a') === '1'")
+    page.get_by_role("button", name="Send message").click()
+    ui.wait("fake.requests('/api/sessions/a/messages', 'POST').length === 1")
+    assert ui.bodies("/api/sessions/a/messages", "POST") == [{"text": "!git status", "verbatim": True}]
+    expect(toggle).to_have_attribute("aria-pressed", "false")
+    page.wait_for_timeout(700)
+    assert stored(ui) == {} and stored_plain(ui) == []
+
+
+def test_a_failed_plain_text_first_message_comes_back_as_plain_text_in_a_new_view_opened_during_the_send(ui, page):
+    # The new view opened during the send starts empty and not as plain text; the failed message comes back into it
+    # in its own mode, so its '!' still does not run as a shell command.
+    start_app(ui, page, setup=DEFERRED_CREATION)
+    toggle = page.get_by_role("button", name="Send as plain text")
+    toggle.click()
+    message(page).fill("!git status")
+    ui.wait("localStorage.getItem('local-workspace:draft-plain:new') === '1'")
+    page.get_by_role("button", name="Send message").click()
+    ui.wait("fake.requests('/api/sessions', 'POST').length === 1")
+    assert stored(ui) == {} and stored_plain(ui) == []
+    page.get_by_role("button", name="New conversation").click()
+    expect(message(page)).to_have_value("")
+    expect(toggle).to_have_attribute("aria-pressed", "false")
+    ui.run("fake.deferreds.create.resolve(fake.json({ detail: 'Could not create the conversation.' }, 500))")
+    expect(message(page)).to_have_value("!git status")
+    expect(toggle).to_have_attribute("aria-pressed", "true")
+    ui.wait("localStorage.getItem('local-workspace:draft-plain:new') === '1'")
+    assert stored(ui) == {"new": "!git status"}
+
+
 def test_folder_access_creation_keeps_the_restored_draft_with_the_chat(ui, page):
     start_app(ui, page, setup="try { localStorage.setItem('local-workspace:draft:new', 'Restored idea') } catch {}")
     expect(message(page)).to_have_value("Restored idea")

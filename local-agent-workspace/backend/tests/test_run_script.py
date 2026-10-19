@@ -164,3 +164,24 @@ def test_a_browser_named_in_browser_that_cannot_start_runs_no_text_browser_and_t
     assert tried.read_text() == f"http://127.0.0.1:{port}/\n"  # The browser named in BROWSER is tried.
     assert not ran.exists(), f"a text browser ran in the server's terminal: w3m {ran.read_text().strip()}"
     assert f"open http://127.0.0.1:{port}/ in your browser" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="a Linux machine reached over SSH")
+def test_a_text_browser_named_in_browser_is_used_as_named_and_an_empty_browser_only_prints_the_address(
+        run_script, no_display, monkeypatch, tmp_path, capsys):
+    # BROWSER is your own choice of browser, as the README says: one that names w3m runs w3m, in the server's
+    # terminal. BROWSER= (empty) leaves --open to print the address.
+    ran = tmp_path / "w3m-ran"
+    fake_program(no_display, "w3m", f'echo "$@" >> "{ran}"')
+    monkeypatch.setenv("BROWSER", "w3m")
+    serve_until_opened(monkeypatch)
+    port = free_port()
+    run_script.main(["--port", str(port), "--open"])
+    assert ran.read_text() == f"http://127.0.0.1:{port}/\n"
+    assert "in your browser" not in capsys.readouterr().out
+    ran.unlink()
+    monkeypatch.setenv("BROWSER", "")
+    port = free_port()
+    run_script.main(["--port", str(port), "--open"])
+    assert not ran.exists()
+    assert f"open http://127.0.0.1:{port}/ in your browser" in capsys.readouterr().out

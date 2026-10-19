@@ -36,9 +36,11 @@ applyTextSize(textSize())  // Settings → Appearance → Text size, before the 
 export default function App() {
   const app = useWorkspace()
   const attention = useAttention({ sessions: app.sessions, activeId: app.activeId, ready: app.ready, onSelect: app.setActiveId })
-  // Message drafts are saved in localStorage per conversation ('new' before it exists).
+  // Message drafts are saved in localStorage per conversation ('new' before it exists), with their Send as plain
+  // text: it stays with the draft while another chat is open or the page is reloaded, and turns off once a message
+  // is sent. A message put back into the box sets it to that message's own mode.
   const draftKey = app.activeId || 'new'
-  const [draft, setDraft, forgetDraft, releaseDraft] = useSavedDrafts(app.viewKey, draftKey)
+  const { draft, setDraft, plain, setPlain, forget: forgetDraft, release: releaseDraft } = useSavedDrafts(app.viewKey, draftKey)
   const send = async (text, options) => {
     const restore = draftKey === 'new' ? releaseDraft('new') : null
     let id
@@ -50,10 +52,6 @@ export default function App() {
   // stay when another chat is opened meanwhile.
   const [attachedFiles, setAttachedFiles] = useState({})
   const filesFor = key => update => setAttachedFiles(current => ({ ...current, [key]: resolve(update, current[key] || []) }))
-  // Send as plain text, per view like the attached files: it stays with the draft while another chat is open and
-  // turns off once a message is sent. A message put back into the box sets it to that message's own mode.
-  const [plainViews, setPlainViews] = useState({})
-  const plainFor = key => update => setPlainViews(current => ({ ...current, [key]: resolve(update, !!current[key]) }))
   const [settingsOpen, setSettingsOpen] = useState(false)
   // false, true, or the section to open ('Usage' or 'Export' from /usage and /export).
   const [agentToolsOpen, setAgentToolsOpen] = useState(false)
@@ -204,7 +202,7 @@ export default function App() {
     reasoningFormat=${app.settings?.reasoning_format} thinkingSummaries=${app.settings?.thinking_summaries}
     onSend=${send} onError=${showError} onAttach=${() => setWorkspaceOpen(true)}
     attachments=${attachedFiles[app.viewKey] || []} setAttachments=${filesFor(app.viewKey)} onUpload=${app.uploadFile}
-    plain=${!!plainViews[app.viewKey]} setPlain=${plainFor(app.viewKey)}
+    plain=${plain} setPlain=${setPlain}
     onShell=${app.runShell} onSideQuestion=${app.askSide} loadFiles=${app.loadMentionFiles} pendingContext=${active?.pending_context}
     loadSkills=${() => api(`/skills${app.activeId ? `?session_id=${encodeURIComponent(app.activeId)}` : ''}`)}
     loadCommands=${() => api(`/commands${app.activeId ? `?session_id=${encodeURIComponent(app.activeId)}` : ''}`)}
@@ -236,7 +234,7 @@ export default function App() {
       ${app.ready ? html`<${ScheduleAlerts} enabled=${app.settings?.schedules_enabled === true} notify=${attention.notifications.enabled}
         onOpenChat=${id => { app.setActiveId(id); void app.refreshSessions().catch(e => showError(e.message)) }} onOpenSchedules=${() => setAgentToolsOpen('Schedules')} onError=${showError} />` : null}
       ${hasMessages && active ? html`<${Conversation} key=${active.id} session=${active} onError=${showError} onSelectSession=${app.setActiveId} onOpenPath=${openFileAt}
-          roots=${standingPath ? [standingPath] : []} busy=${busy} onLoadEarlier=${app.loadEarlier} onPrefill=${(text, verbatim) => { if (draft.trim()) return false; setDraft(text); plainFor(app.viewKey)(!!verbatim); return true }} />` :
+          roots=${standingPath ? [standingPath] : []} busy=${busy} onLoadEarlier=${app.loadEarlier} onPrefill=${(text, verbatim) => { if (draft.trim()) return false; setDraft(text); setPlain(!!verbatim); return true }} />` :
         html`<div class="welcome"><div class="welcome-content">
           <div class="welcome-heading"><${Brand} /><h1>What’s up next?</h1></div>
           <div class="suggestions"><button class="outline" onClick=${() => setDraft('Explore this project. Read the relevant files and explain its structure and how to run it.')}><${Folder} size=${16} />Explore this project</button>
@@ -254,7 +252,7 @@ export default function App() {
             setDraft(current => current ? `${current}\n${item.text}` : item.text)
             // It goes as it was queued: as plain text again, its ! or / is not run as a command. Below a typed draft
             // plain text wins, for either text: the merged message then sends less and runs nothing.
-            plainFor(app.viewKey)(plain => !!item.verbatim || (!!draft.trim() && plain))
+            setPlain(current => !!item.verbatim || (!!draft.trim() && current))
             // Its attached files come back as chips too.
             const queued = (item.uploads || []).map(ref => ({ key: `queued-${item.id}-${ref.id}`, name: ref.name || 'Attached file',
               kind: ref.kind || 'document', record: { id: ref.id, name: ref.name, kind: ref.kind || 'document' }, asPath: !!ref.as_path }))

@@ -42,8 +42,8 @@ function chipLabel(item) {
 // slashCommands (Settings → slash commands), attachments and setAttachments(update) (the files attached to the next
 // message: [{ key, name, kind, model, record? (UploadRecord, once uploaded), asPath? }], kept by the page per view),
 // onUpload(file) -> Promise<UploadRecord> (paste, drop and Attach files; absent: no attaching),
-// plain and setPlain(update) (Send as plain text, kept by the page per view: a message put back into the box sets it to
-// that message's own mode)
+// plain and setPlain(update) (Send as plain text, kept and saved by the page with the draft: a message put back into
+// the box sets it to that message's own mode)
 export default function Composer(p) {
   const [sending, setSending] = useState(false)
   const [caret, setCaret] = useState(0)

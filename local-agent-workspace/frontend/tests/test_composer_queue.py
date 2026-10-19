@@ -202,6 +202,29 @@ def test_send_as_plain_text_stays_with_its_chats_draft_while_another_chat_is_ope
     assert ui.bodies("/api/sessions/a/messages", "POST") == [{"text": "!git status", "verbatim": True}]
 
 
+def test_send_as_plain_text_comes_back_with_the_new_conversation_draft(ui, page):
+    # Every New conversation is a view of its own, and its draft comes back from the one saved for new conversations.
+    # Send as plain text must come back with it, or Enter runs 'git status' in the new chat's project.
+    start_app(ui, page)
+    toggle = page.get_by_role("button", name="Send as plain text")
+    page.get_by_role("button", name="New conversation").click()
+    expect(message(page)).to_have_value("")
+    toggle.click()
+    message(page).fill("!git status")
+    page.get_by_role("button", name="Work", exact=True).click()
+    ui.show_session("a", count=2)
+    expect(message(page)).to_have_value("")
+    expect(toggle).to_have_attribute("aria-pressed", "false")
+    page.get_by_role("button", name="New conversation").click()
+    expect(message(page)).to_have_value("!git status")
+    expect(toggle).to_have_attribute("aria-pressed", "true")
+    message(page).press("Enter")
+    ui.wait("fake.requests(/\\/messages$/, 'POST').length + fake.requests(/\\/shell$/, 'POST').length === 1")
+    assert ui.js("fake.requests(/\\/shell$/, 'POST')") == []
+    assert ui.bodies("/api/sessions/created/messages", "POST") == [{"text": "!git status", "verbatim": True}]
+    expect(toggle).to_have_attribute("aria-pressed", "false")
+
+
 def test_a_queued_message_edited_into_an_empty_box_brings_its_own_mode_not_the_last_ones(ui, page):
     # The plain-text '!git status' is edited back and then cleared from the box. The queued command that is edited
     # next goes as it was queued: Send as plain text is off, so the server expands its template again.

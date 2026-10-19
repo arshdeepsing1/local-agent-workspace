@@ -34,9 +34,10 @@ def desktop_browser(environ=None, platform=None):
 
 
 def open_browser(url, environ=None, platform=None):
-    """Open url in a graphical browser. Without a display only the browsers named in BROWSER are tried, in turn:
-    when they fail (a desktop browser cannot start over SSH), webbrowser.open would go on to the text browsers it
-    found and run one in this terminal. True when a browser was started."""
+    """Open url in a graphical browser. Without a display only the browsers named in BROWSER are tried, in turn, each
+    as named (a text browser named there is your choice, and runs in this terminal): when they fail (a desktop
+    browser cannot start over SSH), webbrowser.open would go on to the text browsers it found itself and run one in
+    this terminal. True when a browser was started."""
     environ = os.environ if environ is None else environ
     platform = sys.platform if platform is None else platform
     if platform in ("darwin", "win32") or any(environ.get(name) for name in ("DISPLAY", "WAYLAND_DISPLAY")):

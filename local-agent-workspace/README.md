@@ -110,9 +110,11 @@ cd local-agent-workspace
 Open http://127.0.0.1:8765, or start with `--open` (`.venv/bin/python run.py --open`) to have the
 app opened in your default browser once it is ready (within 10 seconds; not when the port is already
 in use). On a machine without a desktop (no display, such as over SSH) `--open` tries only the browsers
-`BROWSER` names, never a text browser in the server's terminal. When no browser opened the app (none was
-named or could start, or the app was not ready in time), it prints the address instead. Use `--port 8766`
-if that port is occupied.
+`BROWSER` names, never a text browser it finds itself. A browser `BROWSER` names is used as named: with
+`BROWSER=w3m` (or `lynx`) that text browser runs in the server's terminal until you close it (start with
+`BROWSER= .venv/bin/python run.py --open` to have only the address printed). When no browser opened the app
+(none was named or could start, or the app was not ready in time), it prints the address instead. Use
+`--port 8766` if that port is occupied.
 Stop the local server with Ctrl+C. It must remain running for the UI and agents to work.
 
 The app can also run in its own window: in Chrome or Edge choose **Install app** (the icon at the end of
@@ -336,7 +338,8 @@ when opening a conversation or performing restart recovery.
   Drafts stay with their conversation while switching chats and are saved in this
   browser's `localStorage` about half a second after you stop typing (and when the page
   closes), so they survive a reload; the new-conversation view keeps its own draft, which
-  moves to the conversation once it exists. A sent draft is removed (a new conversation's
+  moves to the conversation once it exists. A draft's **Send as plain text** is saved and
+  comes back with it. A sent draft is removed (a new conversation's
   first message as soon as you send it, so **New** during the send starts empty; if sending
   fails it comes back as the new-conversation draft, also in a new view opened during the
   send); text typed while it was sending is saved as the new draft. At most 50 drafts
@@ -488,8 +491,9 @@ when opening a conversation or performing restart recovery.
     message exactly as typed (the button turns off again after that message): no built-in or custom
     command, no skill, no `@` file snapshot and no `!` shell command (the `/` and `@` lists do not
     open). Output of an earlier `!` command that waits for your next message still goes with it. The message shows **Sent as plain text**,
-    and **Retry** and **Edit** send it the same way again. The button stays with the chat's draft while you open
-    other chats (not across a reload). A message put back into an empty box (**Edit** on a queued message,
+    and **Retry** and **Edit** send it the same way again. The button is kept with the draft: it stays while you
+    open other chats, and comes back with a typed draft after a reload and with the new-conversation draft in
+    a new **New conversation** view. A message put back into an empty box (**Edit** on a queued message,
     **Rewind to here**, a failed **Retry response** or **Edit message**) sets it to that message's own mode: on
     for one sent or queued as plain text, off for another. A queued message edited below a typed draft leaves it
     on when either was plain text. With **Settings → Commands and files →
@@ -4147,10 +4151,10 @@ and removes rules, that an error naming another chat offers to open it, and that
 badges, unread and Running filter, and the Files root switcher with change dots in granted
 folders work without `localStorage` too, that the Continue button appears only after a
 step-limit, output-limit, stopped or interrupted turn and sends its message, that the task
-checklist follows pushed tasks per conversation, that drafts survive a reload, are evicted oldest
-first, are removed when sent and keep text typed during the send, that code blocks are
-highlighted only when a reply is complete and copy their exact text, and that the Markdown
-transcript downloads and copies.
+checklist follows pushed tasks per conversation, that drafts survive a reload (with their Send
+as plain text), are evicted oldest first, are removed when sent and keep text typed during the
+send, that code blocks are highlighted only when a reply is complete and copy their exact
+text, and that the Markdown transcript downloads and copies.
 Permission-rule UI tests check the **Always allow…** form (only the scopes and prefixes the
 server offers), that cards offering nothing to remember have no chat button, Edit on a card
 (Save edit waits for a change), the Bypass confirmation, Don't ask, mode changes while the chat
