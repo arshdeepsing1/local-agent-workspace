@@ -308,7 +308,7 @@ def test_the_apps_message_after_a_background_subagent_is_not_yours_to_edit(ui, p
     start(ui, page, events=EVENTS + [WAKE, {"id": "a3", "type": "assistant", "text": "Read it; all done."}],
           extra="window.resendError = 'The project folder is gone.'")
     message = page.locator(".user-message").nth(2)
-    expect(message.locator(".delegation-origin")).to_have_text("Sent by the app when a background subagent finished")
+    expect(message.locator(".delegation-origin")).to_have_text("Sent by the app when a background subagent ended")
     expect(message.get_by_role("list", name="Sent with this message")).to_have_count(0)  # Not "Sent as plain text".
     expect(message.get_by_role("button", name="Edit message")).to_have_count(0)
     expect(page.get_by_role("button", name="Edit message")).to_have_count(2)
@@ -319,6 +319,14 @@ def test_the_apps_message_after_a_background_subagent_is_not_yours_to_edit(ui, p
                                  "resend_verbatim": True}]
     expect(page.locator(".app-error")).to_contain_text("The project folder is gone.")
     expect(message_box(page)).to_have_value("")
+
+
+def test_the_label_of_the_apps_message_after_a_failed_subagent_does_not_say_it_finished(ui, page):
+    failed = {**WAKE, "text": WAKE["text"].replace("(explore) finished.", "(explore) failed.")}
+    start(ui, page, events=EVENTS + [failed, {"id": "a3", "type": "assistant", "text": "It failed; retrying."}])
+    message = page.locator(".user-message").nth(2)
+    expect(message).to_contain_text("(explore) failed.")
+    expect(message.locator(".delegation-origin")).to_have_text("Sent by the app when a background subagent ended")
 
 
 def test_rewinding_to_the_apps_message_does_not_put_it_in_your_message_box(ui, page):

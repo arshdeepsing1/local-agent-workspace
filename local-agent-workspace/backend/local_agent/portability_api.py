@@ -313,6 +313,7 @@ def register_portability(app, manager, settings, store, session_or_404):
             cut, _ = cut_session(session, body.before_event_id, keep_local=True)
             session.clear()
             session.update(cut)
+            manager.delegates.forget_removed_reads(session)
             try:
                 store.save(session)
             except Exception as exc:

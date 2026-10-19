@@ -63,7 +63,20 @@ def test_the_apps_message_after_a_background_subagent_is_not_labelled_as_yours()
     text = transcript(session)
     first, second = text.split("## Turn 2", 1)
     assert "**User:**" in first and "**User:**" not in second
-    assert "**App (sent when a background subagent finished):**" in second and "the background subagent 1234abcd" in second
+    assert "**App (sent when a background subagent ended):**" in second and "the background subagent 1234abcd" in second
+
+
+def test_the_header_does_not_count_the_apps_message_as_yours():
+    from local_agent.planning import WAKE_TEXT
+    wake = WAKE_TEXT.format(id="1234abcd", kind="explore", ending="finished")
+    session = {"events": [{"id": "u1", "type": "user", "text": "Map it in the background"},
+                          {"id": "u2", "type": "user", "text": wake, "verbatim": True, "background_wake": True}]}
+    header = next(line for line in transcript(session).splitlines() if line.startswith("- Conversation "))
+    assert header.endswith(", 1 user message, 1 app message"), header
+    session["events"].append({"id": "u3", "type": "user", "text": "Thanks"})
+    header = next(line for line in transcript(session).splitlines() if line.startswith("- Conversation "))
+    assert header.endswith(", 2 user messages, 1 app message"), header
+    assert transcript({"events": session["events"][:1]}).splitlines()[2].endswith(", 1 user message")
 
 
 def test_configured_credentials_are_redacted_too():

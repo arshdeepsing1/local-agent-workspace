@@ -1742,9 +1742,10 @@ class AgentManager(LifecycleHooks):
 
     def notify_background(self, session, text):
         """A desktop notification (Settings → Notifications, while no page is open) and the notification hooks
-        when a background subagent of an idle chat ended: the text and the chat's title, never transcript text."""
-        if self.busy_task(session["id"]):
-            return  # The running turn reports it.
+        when a background subagent of a chat that runs no turn ended (it is idle, or runs a ! command or a manual
+        compaction): the text and the chat's title, never transcript text."""
+        if session["id"] in self.turns:
+            return  # The running turn learns of it at its next step, and its end notifies.
         page_open = bool(self.pages or any(self.listeners.values()))
         message = f"{text}: {short_title(self.redact_title(str(session.get('title') or '')))}"
         if self.has_hooks(session, "notification"):
@@ -2637,8 +2638,9 @@ class AgentManager(LifecycleHooks):
         now, and a command template is expanded, so a refused file or a broken command is an error before
         anything runs (from_queue: queued messages, given as items, whose commands were expanded when they were
         queued; refused files become a note). verbatim: sent as plain text, without a command, skills or @ files.
-        extra: fields of the user event (background_wake: the app's message after a background subagent).
-        Queued messages still waiting are leftovers of a stop or failure: they are paused."""
+        extra: fields of the user event (background_wake: the app's message after a background subagent, which
+        leaves the waiting ! output for your next message). Queued messages still waiting are leftovers of a stop
+        or failure: they are paused."""
         if session_id in self.tasks and not self.tasks[session_id].done():
             raise ValueError("A response is already running in this conversation.")
         session = self.get(session_id)
@@ -2653,8 +2655,8 @@ class AgentManager(LifecycleHooks):
             prepared = items if items is not None else [self.prepared_message(tools, prompt, verbatim, uploads)]
             scan, blocks, fields = self.message_parts(prepared)
             expanded, attachments, views = mentions.expand_context(
-                self, session, tools, prompt, on_error="inline" if from_queue else "raise", scan=scan,
-                uploads=self.message_uploads(prepared))
+                self, session, tools, prompt, include_pending=not (extra or {}).get("background_wake"),
+                on_error="inline" if from_queue else "raise", scan=scan, uploads=self.message_uploads(prepared))
             expanded += blocks
             content = expanded if expanded != prompt else None
             if from_queue:
@@ -2879,12 +2881,13 @@ class AgentManager(LifecycleHooks):
         if session.pop("pending_context", None):
             self._background(self.publish_pending(session))
 
-    def _content_sent(self, session):
+    def _content_sent(self, session, keep_pending=False):
         """A turn's message, with its attachments, is now in the wire: its @ files count as seen
-        (the read-before-overwrite guard) and its ! output no longer waits."""
+        (the read-before-overwrite guard) and its ! output no longer waits (keep_pending: it carried none)."""
         for target, seen in self.unsent_views.pop(session["id"], None) or []:
             self.remember_file(session, target, seen)
-        self._drop_pending(session)
+        if not keep_pending:
+            self._drop_pending(session)
 
     def _after_task(self, session_id, kind, task):
         """Done-callback of a turn, compaction or ! command: send the unpaused queued messages
@@ -5740,7 +5743,8 @@ class AgentManager(LifecycleHooks):
         if isinstance(meter := session.get("context_info"), dict) and meter.get("compactable") is False:
             # This turn's first request replaces the meter; a turn that ends before it leaves this one.
             meter["compactable"] = compactable = has_earlier_turn(wire, session.get("context_state"))
-        self._content_sent(session)  # Its @ files are now seen and its ! output no longer pending.
+        # Its @ files are now seen and its ! output no longer pending (the app's message carried none).
+        self._content_sent(session, keep_pending=bool(turn and turn.get("background_wake")))
         context_window, max_output_tokens = self.request_limits(session)
         self.mark_user_in_wire(session)  # No await since the prompt was appended above.
         if compactable:

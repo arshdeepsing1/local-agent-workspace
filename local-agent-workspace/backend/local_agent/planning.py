@@ -1275,15 +1275,37 @@ class DelegateManager:
         return ("Background subagents ended since your last step: " + "; ".join(named) + more
                 + " Read their reports with get_subagent_result.")
 
-    def wake_due(self, parent):
-        """Whether a background subagent of this chat finished (or failed) after the chat's last step; one that
-        never started has no report to read, and its notice waits for the chat's next step."""
+    def forget_removed_reads(self, session):
+        """After a conversation rewind: a background subagent of this chat whose result only removed turns read
+        (get_subagent_result) is unread again, so the next step names its end again."""
+        read = set()
+        for event in session.get("events", []):
+            if event.get("type") == "tool" and event.get("name") == "get_subagent_result":
+                try:
+                    output = json.loads(event.get("output") or "")
+                except ValueError:
+                    continue
+                if isinstance(output, dict) and isinstance(output.get("result"), dict):
+                    read.add(output.get("subagent_id"))
+        for event in session.get("events", []):
+            if event.get("type") == "tool" and event.get("name") == "delegate_task":
+                if event.get("child_session_id") not in read:
+                    self.seen.discard(event.get("child_session_id"))
+
+    def due_notice(self, parent):
+        """The newest notice of a background subagent of this chat that finished (or failed) after the chat's last
+        step, or None; one that never started has no report to read, and its notice waits for the chat's next
+        step."""
         reported = parent.get("subagents_reported_through")
         reported = reported if type(reported) in (int, float) else 0
-        return any(event.get("type") == "notice" and event.get("subagent_status") in ("completed", "failed")
-                   and isinstance(event.get("created"), (int, float)) and event["created"] > reported
-                   and event.get("subagent_id") and event["subagent_id"] not in self.seen
-                   for event in parent.get("events", []))
+        return next((event for event in reversed(parent.get("events", [])) if event.get("type") == "notice"
+                     and event.get("subagent_status") in ("completed", "failed")
+                     and isinstance(event.get("created"), (int, float)) and event["created"] > reported
+                     and event.get("subagent_id") and event["subagent_id"] not in self.seen), None)
+
+    def wake_due(self, parent):
+        """Whether a background subagent of this chat finished (or failed) after the chat's last step (due_notice)."""
+        return self.due_notice(parent) is not None
 
     async def maybe_wake(self, parent_id):
         """Settings → Subagents → Continue the chat when a background subagent finishes (off by default: it
@@ -1298,12 +1320,13 @@ class DelegateManager:
             parent = self.manager.get(parent_id)
             if (not parent or parent.get("is_subagent") or isinstance(parent.get("schedule"), dict)
                     or parent.get("terminal_reason") not in CONTINUE_REASONS or self.manager.busy_task(parent_id)
-                    or self.manager.statuses.get(parent_id, "idle") != "idle" or not self.wake_due(parent)):
+                    or self.manager.statuses.get(parent_id, "idle") != "idle"):
+                return
+            notice = self.due_notice(parent)  # The message names that subagent, not a later stopped one.
+            if notice is None:
                 return
             if any(not item.get("paused") for item in self.manager.queue_of(parent)):
                 return  # Queued messages go first; their turn reads the notice.
-            notice = next(event for event in reversed(parent["events"]) if event.get("subagent_id")
-                          and event.get("subagent_status"))
             text = WAKE_TEXT.format(id=str(notice["subagent_id"])[:8],
                                     kind=notice["text"].removeprefix("Background subagent ").split(" ", 1)[0],
                                     ending=BACKGROUND_ENDINGS.get(notice["subagent_status"], "ended"))
@@ -1312,7 +1335,7 @@ class DelegateManager:
             parent = self.manager.get(parent_id)
             if parent is not None:
                 await self.manager.event(parent, "notice", text="Could not continue the chat after a background "
-                                         f"subagent finished: {self.manager.settings.redact(str(exc))[:300]}")
+                                         f"subagent ended: {self.manager.settings.redact(str(exc))[:300]}")
 
     async def subagent_result(self, parent, subagent_id=None, wait_seconds=0):
         """get_subagent_result: one background subagent's status and, once it ended, its result (subagent_id:

@@ -425,11 +425,12 @@ when opening a conversation or performing restart recovery.
   chat.
   Stopping a reply yourself, or a manual compaction, does not notify. A subagent's turn started
   by its parent notifies only when it needs approval (the parent's turn reports its end); a
-  background subagent that finishes or fails while its chat is idle notifies for that chat
-  ("Background subagent finished: Fix the parser"); a subagent chat you continue yourself notifies
-  like any other. A notification closes when it
-  no longer applies (the approval was answered, the chat started another turn, or you opened
-  the chat), so the next approval request alerts again. Each open tab notifies on its own; the browser replaces a
+  background subagent that finishes or fails while its chat runs no turn notifies for that chat
+  ("Background subagent finished: Fix the parser"), once the chat is idle when it ended during a
+  `!` command or a manual compaction, and beside the chat's error or limit notification, which
+  still waits for you; a subagent chat you continue yourself notifies like any other. A
+  notification closes when it no longer applies (the approval was answered, the chat started
+  another turn, or you opened the chat), so the next approval request alerts again. Each open tab notifies on its own; the browser replaces a
   notification with the same chat and status. If the browser blocks
   notifications for the page, the sidebar says so; allow them in the browser's site settings.
   For when no tab is open, see **Settings → Desktop notification when no browser tab is open**:
@@ -2514,8 +2515,10 @@ tools come first (28 in a new chat with the default Settings; up to 32 once `get
 tools), then MCP tools in server order. `get_tool_output`, `report_findings` and `get_subagent_result` join a chat
 mid-turn (after a long result, a review skill, a background subagent), so while MCP tools are offered each of them
 that can still join keeps its place for the rest of the chat, and one joining never pushes out an MCP tool the turn
-already offered. With the default Settings a new chat therefore has room for one MCP tool, and for none once a web
-search provider is set; turning off one of these helpers, or `use_skill` or `delegate_task` (which `report_findings`
+already offered. A scheduled run's chat keeps the place of `get_subagent_result` too: the run's own subagents run
+in the foreground, but your later messages there can start background ones, and its tool list stays the same.
+With the default Settings a new chat therefore has room for one MCP tool, and for none once a web search provider
+is set; turning off one of these helpers, or `use_skill` or `delegate_task` (which `report_findings`
 and `get_subagent_result` follow), frees a place. The MCP tools that do not fit are named once
 in a notice (with the places kept) and in **Extensions**, and a call to one is refused. Turn off tools or servers a
 chat does not need to make room.
@@ -2766,7 +2769,7 @@ within 32 KB). Each one has an `event`:
 | `subagent_start` | Before a subagent's first model request | `context` |
 | `subagent_stop` | When a subagent would end with its final reply | `decision` (`"block"` with `reason`), `report` |
 | `before_compaction` | Once per compaction (automatic, or **Compact now**), before its first summary request | `context` (it cannot stop a compaction) |
-| `notification` | When the app notifies: a chat needs your approval, finished, stopped with an error or at a scheduled run's approval limit, or reached the step limit, the spending limit or the turn's token or time limit, a background subagent of an idle chat finished or failed, or a scheduled run is ready or a rejected token paused a schedule; only without asking | none: output is ignored |
+| `notification` | When the app notifies: a chat needs your approval, finished, stopped with an error or at a scheduled run's approval limit, or reached the step limit, the spending limit or the turn's token or time limit, a background subagent finished or failed while its chat ran no turn, or a scheduled run is ready or a rejected token paused a schedule; only without asking | none: output is ignored |
 
 **Input.** Each hook gets one JSON object on stdin with `event` and the conversation's
 `session_id`. Tool events add `tool`, `arguments`, a stable `call_id`, `result` (after
@@ -2983,18 +2986,24 @@ first 8 characters) its status and, once it ended, its whole result; without, th
 subagents and their status; `wait_seconds` (up to 300) waits for it, or for any of them, to end. A
 result it read is not named again. While no page is open, a desktop notification (Settings →
 Notifications) and the notification hooks report a background subagent that finished or failed while
-the chat was idle, and the sidebar marks the chat as changed; with a page open, **Notify me** reports it
-("Background subagent finished: <chat>"). **Settings → Subagents →
+the chat ran no turn (it was idle, or ran a `!` command or a manual compaction), and the sidebar marks
+the chat as changed; with a page open, **Notify me** reports it once the chat is idle ("Background
+subagent finished: <chat>"). **Settings → Subagents →
 Continue the chat when a background subagent finishes** (off by default: each such turn is a paid
 model request) sends an idle chat a short app message, labelled **Sent by the app when a background
-subagent finished**, so the agent reads the report and goes on; it starts one turn for what ended
-since the chat's last step, and a turn that was running when the subagent ended is told at its next
+subagent ended**, so the agent reads the report and goes on; it starts one turn for what ended
+since the chat's last step (the message names the latest subagent that finished or failed, never one
+that was stopped), and a turn that was running when the subagent ended is told at its next
 step instead. One that ended while a `!` command or a compaction ran continues the chat once it is
 done. It never continues a chat whose last turn stopped at a limit (Agent steps, the turn's tokens or
 time, spending), an error or Stop: that chat waits for **Continue** or your next message, whose first
 request names the subagent. Nor does it continue a scheduled run's chat. The app's message is not
-yours: it has no **Edit message**, **Retry** sends it again as the app's, rewinding to it leaves your
-message box empty, and transcripts label it **App (sent when a background subagent finished)**. **Stop** on the chat while it works and **Stop subagent** on a card stop background
+yours: it carries no `!` output (that waits for your next message), it has no **Edit message**,
+**Retry** sends it again as the app's, rewinding to it leaves your message box empty, and transcripts
+label it **App (sent when a background subagent ended)** and count it apart from your messages. A
+conversation rewind names again, at the next request, the subagents that only the removed turns were
+told of or read the report of. A subagent whose card the rewind keeps keeps its notice too, also when
+it ended in a removed turn: the notice then follows the last kept reply. **Stop** on the chat while it works and **Stop subagent** on a card stop background
 subagents too, and so does deleting the chat; a restart marks a running one interrupted
 and says so in the chat. While background subagents run, rewinding (also editing or retrying a
 message) and forking the chat are refused with a message naming how many run, because their
