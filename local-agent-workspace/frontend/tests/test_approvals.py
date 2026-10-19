@@ -61,6 +61,7 @@ def test_cards_ran_by_a_rule_say_so_without_expanding(ui, page):
     show(ui, """[{ id: 'ran', type: 'tool', name: 'run_command', state: 'completed', allowed_by_rule: true,
       input: { command: 'make test' }, output: '{}' }, { id: 'asked', type: 'tool', name: 'run_command',
       state: 'completed', approval: 'approved', input: { command: 'make lint' }, output: '{}' }]""")
+    page.get_by_role("button", name="Ran 2 commands make lint", exact=True).click()  # The two finished commands fold.
     expect(page.get_by_text("Allowed by a rule for this chat", exact=True)).to_have_count(1)
     card = page.locator(".tool-card").filter(has=page.get_by_text("Allowed by a rule for this chat"))
     expect(card.get_by_role("button", name="run command make test")).to_be_visible()
@@ -71,6 +72,7 @@ def test_a_checked_read_only_command_says_so(ui, page):
       input: { command: 'grep -n x a.py | head' }, output: '{}' }, { id: 'mixed', type: 'tool', name: 'run_command',
       state: 'completed', read_only_pipeline: true, allowed_by_rule: true, rule_scope: 'project',
       input: { command: 'make test 2>&1 | tail -5' }, output: '{}' }]""")
+    page.get_by_role("button", name="Ran 2 commands make test 2>&1 | tail -5", exact=True).click()  # The two finished commands fold.
     expect(page.get_by_text("Ran as a read-only command (checked by the app)", exact=True)).to_have_count(1)
     expect(page.get_by_text("Checked by the app: read-only commands and a rule for this project", exact=True)).to_have_count(1)
     expect(page.get_by_text("Allowed by a rule for this project", exact=True)).to_have_count(0)
