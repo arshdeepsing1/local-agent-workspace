@@ -17,10 +17,11 @@ turn: its requests add to the parent's tokens and the parent's start time applie
 reaches it wraps up and reports the stop as an error, as for the spending limit (in a delegated turn its
 submit_report is the one call that runs in the wrap-up, so its report reaches the parent). A background subagent's
 requests count in the parent's turn during which they were made: one still running from an earlier turn
-counts only what it spends from the new turn's start (carried) and keeps its own turn's budget. A /btw side
-question asked while the turn runs is not the turn's: it counts toward neither its limit nor its result, nor
-does one asked in a subagent's chat count in its parent's turn (the subagents index keeps a turn_spend without
-them); the spending limit counts them, as they are billed.
+counts only what it spends from the new turn's start (carried) and keeps its own turn's budget. A subagent
+counts in its parent's turns for its delegated run only: a turn you continue its chat in is its own (scope), also
+while the turn that delegated it runs. A /btw side question asked while the turn runs is not the turn's: it counts
+toward neither its limit nor its result, nor does one asked in a subagent's chat count in its parent's turn (the
+subagents index keeps a turn_spend without them); the spending limit counts them, as they are billed.
 """
 import json
 import math
@@ -103,9 +104,9 @@ def own_tokens(session, first_call=0):
 
 def turn_spend(calls):
     """What a subagent's ledger records count in its parent's turns (turn_calls), as its entry in the parent's
-    subagents index keeps it (planning.index_entry): {tokens (None when none were reported), estimated_dbu,
-    unpriced_calls, finished_calls (those that ended: a request is in the ledger from its start), reported_calls
-    (those that reported a token count)}."""
+    subagents index keeps it (planning.index_entry: up to the end of its delegated run, not a turn you continued its
+    chat in): {tokens (None when none were reported), estimated_dbu, unpriced_calls, finished_calls (those that
+    ended: a request is in the ledger from its start), reported_calls (those that reported a token count)}."""
     calls = turn_calls(calls)
     dbu, unpriced = _spend(calls)
     return {"tokens": reported_tokens(calls), "estimated_dbu": round(dbu, 6), "unpriced_calls": unpriced,
@@ -126,18 +127,21 @@ def carried(manager, root):
 
 
 def children(manager, root, turn):
-    """{child id: _child_usage} of the subagents that worked in this turn: those the chat started in it in full (a
-    running one read live, an ended one from the chat's subagents index, which keeps its turn_spend), and one it
-    carried over from an earlier turn (turn['carried']) for its requests that ended since the turn started, when
-    any did (tokens None when none of them reported a count)."""
+    """{child id: _child_usage} of the subagents that worked in this turn: those the chat started in it, for their
+    delegated run in full (a running one read live, an ended one from the chat's subagents index, whose turn_spend
+    leaves out a turn you continued its chat in), and one it carried over from an earlier turn (turn['carried']) for
+    its requests that ended since the turn started, when any did (tokens None when none of them reported a count)."""
     found = {}
     base = turn.get("carried") or {}
+    running = {entry.get("child_session_id") for entry in getattr(manager.delegates, "active", {}).get(root["id"], [])}
     for entry in root.get("subagents") or []:
         started = entry.get("created") if isinstance(entry, dict) else None
         if not isinstance(entry, dict) or entry.get("id") not in base and (
                 isinstance(started, bool) or not isinstance(started, (int, float)) or started < turn["started"]):
             continue
-        found[entry.get("id")] = _child_usage(manager.live.get(entry.get("id")) or entry)
+        # An ended one's live ledger may have a turn you continued its chat in: its entry keeps the delegated run.
+        live = manager.live.get(entry.get("id")) if entry.get("id") in running else None
+        found[entry.get("id")] = _child_usage(live or entry)
     for entry in getattr(manager.delegates, "active", {}).get(root["id"], []):
         child_id = entry.get("child_session_id")
         if child_id and child_id not in found and child_id in manager.live:

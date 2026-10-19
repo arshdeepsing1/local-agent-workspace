@@ -1323,7 +1323,7 @@ requests (steps), its tool calls, the wall-clock time, the input (cache included
 reads in brackets) and output tokens of the turn's own calls (title and compaction included, not a
 `/btw` side question asked while it ran), the
 estimated DBU with its subagents', and how many subagents worked in it (a background subagent from
-an earlier turn counts for the requests it made during this turn). A count no call reported
+an earlier turn counts for its requests that ended during this turn). A count no call reported
 shows `—`, never 0, and there is no DBU part without price data. Open it for how the turn ended,
 the tokens it processed with its subagents, calls without price data and the files its tools and
 subagents changed. The same record ends the turn for scripts (see **Scripting the app**), is
@@ -1492,7 +1492,8 @@ parent's and the parent's start time applies; a subagent that reaches the limit 
 way and reports the stop as an error to its parent. Its last request asks for its report with
 `submit_report`, the one tool call that runs then, so its parent gets that report with the error. A
 subagent chat you continue yourself has turns of its own, with its parent's limits, also while the
-parent's turn runs. A
+parent's turn runs: what it spends in them counts toward none of its parent's turns (the parent's
+turn that delegated it counts only its delegated run). A
 background subagent's requests count in the turn during which they were made, never again in a later
 one: while it still works after its turn ended, your next message's turn counts only the requests it
 makes from then on, and it keeps its own turn's limits (the requests it made before count toward

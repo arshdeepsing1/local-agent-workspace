@@ -575,6 +575,102 @@ async def test_a_subagent_chat_the_user_continues_while_its_parents_turn_runs_ke
     assert two["subagents"]["count"] == 0 and two["tokens"] == 11_000
 
 
+async def test_a_subagent_chat_continued_during_the_parent_turn_that_delegated_it_counts_there_only_its_delegated_run(
+        runtime, monkeypatch):
+    manager, session = runtime
+    # The parent's 33,000 and the subagent's delegated 11,000 stay under 50,000; with the 22,000 of the turn the
+    # user continued the subagent chat in, the parent's third request would be its wrap-up.
+    session["turn_token_limit"] = 50_000
+    hold, seen = asyncio.Event(), {}
+
+    async def parent(count):
+        if count == 1:
+            return calls_reply(("d1", "delegate_task", {"task": "Map it", "agent_type": "explore", "max_steps": 8}))
+        if count == 2:  # The subagent reported; while this request runs the user continues its chat.
+            await hold.wait()
+            return calls_reply(("p2", "list_tasks", {}))
+        return text_reply("Done.")
+
+    async def child(count):
+        if count == 3:  # The continued turn's second request: its first is in the live subagent's ledger.
+            seen["used"] = turns.used(manager, manager.get(session["id"]))[2]
+        if count == 1:
+            return text_reply("## Report\nMapped.")
+        return calls_reply(("x2", "list_tasks", {})) if count == 2 else text_reply("More mapped.")
+    requests, _ = gated_gateway(monkeypatch, parent, child)
+    manager.store.save(session)
+    manager.start(session["id"], "Delegate")
+    await eventually(lambda: len(requests) == 2)
+    child_id = manager.get(session["id"])["subagents"][0]["id"]
+    manager.start(child_id, "Go on mapping the rest")  # The user continues the subagent chat on its own.
+    await asyncio.wait_for(manager.tasks[child_id], 10)
+    assert manager.store.get(child_id)["last_turn_result"]["tokens"] == 22_000  # Its own turn.
+    hold.set()
+    await asyncio.wait_for(manager.tasks[session["id"]], 10)
+    saved = manager.store.get(session["id"])
+    result = saved["last_turn_result"]
+    # The parent's turn: its three requests and the subagent's delegated one, not the turn the user had with it,
+    # neither while that ran nor after.
+    assert seen["used"] == 22_000
+    assert len(requests) == 3 and "per turn" not in system_text(requests[2])
+    assert result["terminal_reason"] == "completed"
+    assert (result["subagents"]["tokens"], result["tokens"]) == (11_000, 44_000)
+    # The index keeps the delegated run for its parent's turns; its spend for the spending limit has every request.
+    entry = saved["subagents"][0]
+    assert entry["turn_spend"]["tokens"] == 11_000 and entry["estimated_dbu"] == pytest.approx(3 * PER_CALL)
+
+
+async def test_a_finished_subagent_the_user_continues_does_not_stop_its_running_sibling_at_the_parents_budget(
+        runtime, monkeypatch):
+    manager, session = runtime
+    # The parent's 22,000, Quick's 11,000 and Slow's 22,000 stay under 60,000; the user's own turn with Quick
+    # (33,000) is not the parent's.
+    session["turn_token_limit"] = 60_000
+    hold = asyncio.Event()
+    slow, continued = [], []
+
+    async def gateway(request):
+        body = json.loads(request.content)
+        if body.get("stream") is not True:
+            return httpx.Response(200, json={"choices": [{"message": {"content": "Title"}, "finish_reason": "stop"}]})
+        text = json.dumps(unmarked(body)["messages"])
+        if not is_child(body):
+            if "d1" not in text:
+                return httpx.Response(200, text=calls_reply(delegation("d1", "Quick"), delegation("d2", "Slow")))
+            return httpx.Response(200, text=text_reply("Done."))
+        if "Go on" in text:  # The user's own turn in Quick's chat: two tool rounds, then a reply.
+            continued.append(body)
+            return httpx.Response(200, text=calls_reply((f"q{len(continued)}", "list_tasks", {}))
+                                  if len(continued) < 3 else text_reply("More."))
+        if "Delegated task:\\nQuick" in text:
+            return httpx.Response(200, text=text_reply("## Report\nQuick done."))
+        slow.append(body)
+        if len(slow) == 1:
+            await hold.wait()  # Slow's first request runs while the user continues Quick.
+            return httpx.Response(200, text=calls_reply(("s1", "list_tasks", {})))
+        return httpx.Response(200, text=text_reply("## Report\nSlow done."))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: REAL_CLIENT(**kwargs, transport=httpx.MockTransport(gateway)))
+    manager.store.save(session)
+    manager.start(session["id"], "Delegate both")
+    await eventually(lambda: len(manager.get(session["id"]).get("subagents") or []) == 2 and slow)
+    quick = next(entry["id"] for entry in manager.get(session["id"])["subagents"] if entry["task"] == "Quick")
+    await eventually(lambda: not any(entry.get("child_session_id") == quick
+                                     for entry in manager.delegates.active.get(session["id"], ())))
+    manager.start(quick, "Go on")  # The user continues the finished subagent's chat on its own.
+    await asyncio.wait_for(manager.tasks[quick], 10)
+    assert manager.store.get(quick)["last_turn_result"]["tokens"] == 33_000
+    hold.set()
+    await asyncio.wait_for(manager.tasks[session["id"]], 10)
+    saved = manager.store.get(session["id"])
+    slow_id = next(entry["id"] for entry in saved["subagents"] if entry["task"] == "Slow")
+    # Slow's second request is an ordinary one: the parent's turn is at 33,000 then (its request, Quick's and Slow's
+    # first), not 66,000.
+    assert len(slow) == 2 and "per turn" not in system_text(slow[1])
+    assert manager.store.get(slow_id)["terminal_reason"] == "completed"
+    result = saved["last_turn_result"]
+    assert (result["terminal_reason"], result["subagents"]["tokens"], result["tokens"]) == ("completed", 33_000, 55_000)
+
+
 async def test_a_subagents_wrap_up_runs_only_its_report_which_reaches_the_parent(runtime, monkeypatch):
     manager, session = runtime
     session["turn_token_limit"] = 30_000
