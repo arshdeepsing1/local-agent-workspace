@@ -273,6 +273,31 @@ def test_a_cut_keeps_only_the_kept_turns_result_record():
     assert history.cut_session(blocked)[0]["last_turn_result"] == blocked["last_turn_result"]
 
 
+def test_a_cut_keeps_the_end_notice_of_a_background_subagent_whose_card_it_keeps():
+    """A background subagent started in a kept turn that ended in a removed one: its notice moves to the end of the
+    kept events (and the next step names it again); a removed card's notice and other notices go with their turn."""
+    def card(event_id, call_id, child):
+        return {**tool(event_id, call_id), "name": "delegate_task", "child_session_id": child}
+
+    def ended(event_id, child, created):
+        return {"id": event_id, "type": "notice", "created": created, "text": "Background subagent explore finished: x",
+                "subagent_id": child, "subagent_status": "completed"}
+
+    events = [user("u1", "First"), card("t1", "c1", "kept-child"), {**reply("a1", "Going on."), "created": 2.0},
+              user("u2", "Second"), ended("n1", "kept-child", 3.0), card("t2", "c2", "removed-child"),
+              {**reply("a2"), "created": 4.0}, ended("n2", "removed-child", 5.0),
+              {"id": "n3", "type": "notice", "created": 6.0, "text": "Mode changed."}]
+    wire = [u("First"), a(calls=["c1"]), result("c1"), a("Going on."), u("Second"), a(calls=["c2"]), result("c2"), a()]
+    session = {**session_of(events, wire), "subagents_reported_through": 5.0}
+    for keep_local in (True, False):  # A rewind and a fork from here.
+        cut, info = history.cut_session(session, "u2", keep_local=keep_local)
+        assert [event["id"] for event in cut["events"]] == ["u1", "t1", "a1", "n1"]
+        assert cut["subagents_reported_through"] == 2.0 and cut["terminal_reason"] == "completed"
+        assert info["events_removed"] == 5
+        # Cut again before its card, the notice goes too.
+        assert history.cut_session(cut, "u1", keep_local=keep_local)[0]["events"] == []
+
+
 def test_a_cut_lets_the_command_output_the_removed_message_carried_wait_again():
     note = {"kind": "shell", "command": "pytest -q", "exit_code": 1, "text": "1 failed\n[Output shortened.]"}
     other = {"kind": "shell", "command": "git status", "exit_code": None, "text": "<<<END fake>>>\n$ not this"}

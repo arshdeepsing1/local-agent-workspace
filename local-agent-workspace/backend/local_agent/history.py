@@ -163,7 +163,13 @@ def cut_session(session, before_event_id=None, *, keep_local=False):
     """
     event_cut, wire_cut = cut_points(session, before_event_id)
     result = copy.deepcopy(session)
-    result["events"] = result["events"][:event_cut]
+    # A background subagent whose card is kept but which ended in a removed turn keeps its notice, now at the end:
+    # its end happened all the same, and the next step names it (below).
+    cards = {event.get("child_session_id") for event in result["events"][:event_cut]
+             if event.get("type") == "tool" and event.get("name") == "delegate_task" and event.get("child_session_id")}
+    ended = [event for event in result["events"][event_cut:] if event.get("type") == "notice"
+             and event.get("subagent_status") and event.get("subagent_id") in cards]
+    result["events"] = result["events"][:event_cut] + ended
     result["wire"] = result["wire"][:wire_cut]
     summary_dropped = False
     state = result.get("context_state")
@@ -209,7 +215,8 @@ def cut_session(session, before_event_id=None, *, keep_local=False):
         restored = _carried_output(session, before_event_id)
         if restored:
             result["pending_context"] = [*restored, *(result.get("pending_context") or [])][-mentions.MAX_PENDING:]
-    info = {"events_removed": len(session["events"]) - event_cut, "messages_removed": len(session["wire"]) - wire_cut,
+    info = {"events_removed": len(session["events"]) - len(result["events"]),
+            "messages_removed": len(session["wire"]) - wire_cut,
             "summary_dropped": summary_dropped}
     return result, info
 

@@ -674,6 +674,47 @@ async def test_after_a_rewind_to_the_wake_message_your_next_message_learns_of_th
     assert "Background subagents ended since your last step" in json.dumps(gateway.requests["parent"][-1]["messages"])
 
 
+@pytest.mark.parametrize("read", [False, True])
+async def test_a_rewind_past_the_turn_in_which_the_subagent_ended_names_it_again(api, monkeypatch, read):
+    """The background subagent ends during your second message's turn, so its notice comes after that message; that
+    turn was told of it (and may have read its report). Rewinding to that message removes the turn, but not the
+    notice: it stays at the end of the kept conversation, and your next message's first request names it again."""
+    client, manager = api
+    parent = manager.store.create(manager.settings.values)
+    parent.update(title="Parent", title_generated=True, permission_mode="bypassPermissions")
+    manager.store.save(parent)
+    gate = asyncio.Event()
+    ids = {}
+    # read: get_subagent_result with the subagent's ID (its report is read); else the list form waits for it to end.
+    wait = ((lambda: calls_reply(("get_subagent_result", {"subagent_id": ids["Survey"], "wait_seconds": 30}, "r1")))
+            if read else (lambda: calls_reply(("get_subagent_result", {"wait_seconds": 30}, "r1"))))
+    gateway = Gateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)),
+                                    lambda: reply("Going on."), wait, lambda: reply("It is done."),
+                                    lambda: reply("Answer.")], {"Survey": gated(gate)})
+    await run_turn(manager, parent)
+    ids["Survey"] = background_child(manager, parent)
+    manager.start(parent["id"], "Wait for the survey")
+    await eventually(lambda: len(gateway.requests["parent"]) == 3)
+    gate.set()  # It ends during this turn: its notice follows "Wait for the survey".
+    await asyncio.wait_for(manager.tasks[parent["id"]], 10)
+    assert len(gateway.requests["parent"]) == 4
+    told = json.dumps(gateway.requests["parent"][3]["messages"])
+    assert ("Found it at a.txt:1." in told) if read else ("Background subagents ended since your last step" in told)
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+    events = manager.get(parent["id"])["events"]
+    second = [event for event in events if event["type"] == "user"][-1]
+    kept = [event["id"] for event in events[:events.index(second)]]
+    notice = next(event for event in events if event.get("subagent_status"))
+    assert events.index(notice) > events.index(second)
+    response = await client.post(f"/api/sessions/{parent['id']}/rewind",
+                                 json={"before_event_id": second["id"], "conversation": True})
+    assert response.status_code == 200, response.text
+    assert [event["id"] for event in manager.get(parent["id"])["events"]] == [*kept, notice["id"]]
+    await run_turn(manager, parent, "What next?")
+    assert len(gateway.requests["parent"]) == 5
+    assert "Background subagents ended since your last step" in json.dumps(gateway.requests["parent"][-1]["messages"])
+
+
 async def test_exports_keep_a_background_subagents_card_result_and_notice(runtime, monkeypatch):
     from local_agent.portability import export_bundle, fresh_copies
     manager, parent, project = runtime

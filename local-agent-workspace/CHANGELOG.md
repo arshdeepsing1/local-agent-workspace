@@ -28,20 +28,26 @@ Roadmap milestone M8 (agents, automation and delivery):
   returns one subagent's status and result, or lists them, and can wait up to 300 seconds. Stop
   on the chat, **Stop subagent** on a card and deleting the chat stop background subagents. A
   restart marks a running one interrupted and says so in the chat, and the spending limit counts
-  them. Rewinding, editing, retrying and forking the chat are refused while they run. A desktop
+  them. Rewinding, editing, retrying and forking the chat are refused while they run. Then a
+  conversation rewind names again, at the next request, the subagents that only the removed
+  turns were told of or read the report of, and keeps the notice of one whose card it keeps
+  (after the last kept reply when it ended in a removed turn). A desktop
   notification and the notification hooks (status `background_subagent`) report one that
-  finished or failed while the chat was idle. With a page open, **Notify me** now reports a
-  background subagent that finished or failed while its chat was idle ("Background subagent
-  finished: …").
+  finished or failed while the chat ran no turn (it was idle, or ran a `!` command or a manual
+  compaction). With a page open, **Notify me** now reports it once the chat is idle
+  ("Background subagent finished: …"), beside the chat's error or limit notification, which
+  still waits for you.
 - **Settings → Subagents → Continue the chat when a background subagent finishes** (off by
   default: each such turn is a paid request) sends an idle chat a short app message, so the
   agent reads the report and goes on, once for what ended since its last step. It never
   continues a chat whose last turn stopped at a limit, an error or Stop (Continue stays yours),
   nor a scheduled run's chat. One that ends while a `!` command or a manual compaction runs
-  continues the chat once it is done instead of never. The app's message shows no "Sent as plain
-  text" chip and no **Edit message**, **Retry** sends it again as the app's message, rewinding
-  to it leaves your message box empty, and transcripts label it **App (sent when a background
-  subagent finished)** instead of **User**.
+  continues the chat once it is done instead of never. The app's message (**Sent by the app
+  when a background subagent ended**) names the latest subagent that finished or failed and
+  carries no `!` output, which waits for your next message. It shows no "Sent as plain text"
+  chip and no **Edit message**, **Retry** sends it again as the app's message, rewinding to it
+  leaves your message box empty, and transcripts label it **App (sent when a background
+  subagent ended)** instead of **User** and count it apart from your messages.
 - Subagent cards: **Stop subagent** stops only that subagent (its call returns as cancelled; the
   chat and its other subagents go on). While a subagent waits for approval, its card names the
   action (**Waits for approval: run command · npm test**) with **Allow** and **Decline**, which

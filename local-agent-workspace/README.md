@@ -2988,7 +2988,8 @@ yours: it carries no `!` output (that waits for your next message), it has no **
 **Retry** sends it again as the app's, rewinding to it leaves your message box empty, and transcripts
 label it **App (sent when a background subagent ended)** and count it apart from your messages. A
 conversation rewind names again, at the next request, the subagents that only the removed turns were
-told of or read the report of. **Stop** on the chat while it works and **Stop subagent** on a card stop background
+told of or read the report of. A subagent whose card the rewind keeps keeps its notice too, also when
+it ended in a removed turn: the notice then follows the last kept reply. **Stop** on the chat while it works and **Stop subagent** on a card stop background
 subagents too, and so does deleting the chat; a restart marks a running one interrupted
 and says so in the chat. While background subagents run, rewinding (also editing or retrying a
 message) and forking the chat are refused with a message naming how many run, because their
