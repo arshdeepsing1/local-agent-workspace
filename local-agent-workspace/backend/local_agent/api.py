@@ -856,6 +856,7 @@ def create_app(settings=None):
                 store.delete(member)
                 manager.live.pop(member, None)
                 manager.statuses.pop(member, None)
+                manager.work_statuses.pop(member, None)
                 for remembered in (manager.estimate_anchors, manager.anchor_candidates, manager.compactions):
                     remembered.pop(member, None)
         finally:

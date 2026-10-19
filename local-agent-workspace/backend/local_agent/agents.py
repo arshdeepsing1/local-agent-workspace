@@ -873,6 +873,10 @@ class AgentManager(LifecycleHooks):
         # in its parent), while they wait or run: the end of the chat's turn or compaction leaves them alone.
         self.foreign_cards = set()
         self.statuses = {}
+        # {chat id: the status its own work last set (a turn, compaction or ! command: running, delegating,
+        # compacting, naming, idle at its end), never a card's wait or answer}: the status the answer to a card that
+        # another task asked in the chat puts back while that work goes on (after_hook_card).
+        self.work_statuses = {}
         # Chats whose turn, compaction or ! command is setting its last status (settle): it counts as over.
         self.settling = set()
         # {chat id: {started, first_call, first_event}} while a turn runs (turns.py: its result record and budget),
@@ -1698,11 +1702,14 @@ class AgentManager(LifecycleHooks):
         self.closing_sockets.add(task)
         task.add_done_callback(self.closing_sockets.discard)
 
-    async def status(self, session, status, turn_ended=False, result=None):
+    async def status(self, session, status, turn_ended=False, result=None, card=False):
         """turn_ended: this idle status ends a turn (not a manual compaction); result: that turn's result record
-        (turns.turn_result), which the message carries, so a script reads the end of its turn from it."""
+        (turns.turn_result), which the message carries, so a script reads the end of its turn from it. card: the
+        status of a card's wait or answer, not of the chat's own work (work_statuses)."""
         previous = self.statuses.get(session["id"], "idle")
         self.statuses[session["id"]] = status
+        if not card:
+            self.work_statuses[session["id"]] = status
         if status != "compacting":
             self.compactions.pop(session["id"], None)
         message = {"type": "status", "status": status}
@@ -1916,7 +1923,7 @@ class AgentManager(LifecycleHooks):
         try:
             await self.update_event(session, event, state="pending",
                                     **({"approval_expires": time.time() + seconds} if seconds else {}))
-            await self.status(session, "awaiting_approval")
+            await self.status(session, "awaiting_approval", card=True)
             answer = await asyncio.wait_for(future, timeout=seconds)
             answer = answer if isinstance(answer, dict) else {"allowed": bool(answer)}
             allowed = answer["allowed"]
@@ -1941,7 +1948,7 @@ class AgentManager(LifecycleHooks):
         await self.update_event(session, event, state="running" if allowed else "rejected", approval=outcome, **details)
         if rule:
             await self.publish_permissions(session)
-        await self.status(session, "running")
+        await self.status(session, "running", card=True)
         return allowed
 
     def scheduled_run(self, session):
@@ -3319,7 +3326,7 @@ class AgentManager(LifecycleHooks):
         try:
             await self.status(session, "idle", turn_ended=turn_ended, result=result)
             if not stopped and self.cards_wait(session["id"]):
-                await self.status(session, "awaiting_approval")  # That card still waits for its answer.
+                await self.status(session, "awaiting_approval", card=True)  # That card still waits for its answer.
         finally:
             self.settling.discard(session["id"])
 

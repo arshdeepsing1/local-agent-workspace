@@ -265,7 +265,7 @@ class LifecycleHooks:
                     finally:
                         # The owner's own task's card leaves a running chat to that task, and a stopping one to its end.
                         if foreign or (status != "running" and not asyncio.current_task().cancelling()):
-                            await self.after_hook_card(owner, event, status)
+                            await self.after_hook_card(owner, event)
                     if not allowed:
                         approval = event.get("approval")
                         if approval is None:  # Denied by a fresh check just before the card.
@@ -328,30 +328,30 @@ class LifecycleHooks:
                 self.foreign_cards.discard(card)
         return outcomes
 
-    async def after_hook_card(self, owner, event, previous):
+    async def after_hook_card(self, owner, event):
         """After a hook card that ran outside the owner chat's own task (a subagent's card in its parent) or in a
         chat that was not just running: approve() left the chat running, so its status follows the rule of a
         task's end (AgentManager.settle). While another of its cards waits it is awaiting_approval. Else it is idle
         once its task is over (an idle parent of a background subagent, or its turn, compaction or ! command
         ended during the wait), and then a background subagent that finished meanwhile may continue it
-        (maybe_wake); it is running in a turn the user started while the card waited, or back at the status it
-        had when the card asked. A card a stopped subagent left waiting shows cancelled."""
+        (maybe_wake). While its task goes on, it shows what that task's own work last set (work_statuses: running,
+        delegating, compacting or naming), not the status it had when the card asked: the task may have moved on
+        since, or be a turn the user started meanwhile. A card a stopped subagent left waiting shows cancelled."""
         if event.get("state") == "pending":
             await self.update_event(owner, event, state="cancelled")
         task = self.tasks.get(owner["id"])
         over = task is None or task.done() or owner["id"] in self.settling
-        if not over and (previous is None or task.cancelling()):
+        if not over and task.cancelling():
             return  # The owner's task is stopping: its own end sets its status.
         if self.cards_wait(owner["id"]):
             status = "awaiting_approval"
         elif over:
             status = "idle"
-        elif previous == "idle":
-            status = "running"  # A turn the user started while the card waited.
-        else:  # Another card's own wait ended meanwhile: the chat was delegating under it.
-            status = "delegating" if previous == "awaiting_approval" else previous
+        else:  # A turn that has set no status yet (its work's last one is an earlier task's idle) is running.
+            status = self.work_statuses.get(owner["id"], "idle")
+            status = "running" if status == "idle" else status
         if self.statuses.get(owner["id"], "idle") != status:
-            await self.status(owner, status)
+            await self.status(owner, status, card=True)
         if status == "idle":
             self._background(self.delegates.maybe_wake(owner["id"]))
 

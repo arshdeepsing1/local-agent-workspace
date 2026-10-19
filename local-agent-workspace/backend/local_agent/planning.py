@@ -443,7 +443,9 @@ class DelegateManager:
         self.held = {}
         # Background subagents whose final result get_subagent_result already returned: no notice repeats it.
         self.seen = set()
-        self.stopping = set()  # Chats whose subagents cancel_parent is stopping: nothing wakes them meanwhile.
+        # {chat id: how many cancel_parent calls stop its subagents now}: nothing wakes it meanwhile (maybe_wake), also
+        # not a subagent's card those stops close.
+        self.stopping = {}
         # {parent id: {resolved path: {child id}}}: the files each running subagent of the chat changed, so a
         # sibling's change to the same file asks first (sibling_claim).
         self.claims = {}
@@ -724,7 +726,19 @@ class DelegateManager:
 
     async def cancel_parent(self, parent_id):
         """Stop every subagent of this chat, also those still waiting for a slot and those in the background
-        (whose end it waits for, so nothing reports to the chat after this returns)."""
+        (whose end it waits for, so nothing reports to the chat after this returns). The chat counts as stopping
+        throughout (stopping): a subagent's card in it that these stops close may leave it idle, and Stop on the
+        chat must not continue it then (maybe_wake)."""
+        self.stopping[parent_id] = self.stopping.get(parent_id, 0) + 1
+        try:
+            await self._cancel_parent(parent_id)
+        finally:
+            self.stopping[parent_id] -= 1
+            if not self.stopping[parent_id]:
+                del self.stopping[parent_id]
+
+    async def _cancel_parent(self, parent_id):
+        """cancel_parent's stops, while the chat counts as stopping."""
         entries = list(self.active.get(parent_id, ()))
         for entry in entries:
             entry["cancelled"] = True
@@ -746,11 +760,8 @@ class DelegateManager:
                 # nothing would end that wait, so the delegation itself is cancelled.
                 record["worker"].cancel()
         if records:
-            self.stopping.add(parent_id)
-            try:
-                await asyncio.wait([record["worker"] for record in records])  # Not gather: a Stop of this wait
-            finally:                                                        # must not cancel their reports.
-                self.stopping.discard(parent_id)
+            await asyncio.wait([record["worker"] for record in records])  # Not gather: a Stop of this wait must not
+                                                                          # cancel their reports.
 
     async def cancel_start(self, child_id):
         """Stop subagent on a subagent that has not started yet: the subagent_start hooks of its delegation (their
