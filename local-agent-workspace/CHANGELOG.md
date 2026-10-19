@@ -193,12 +193,18 @@ Roadmap milestone M8 (agents, automation and delivery):
   `run.py`) ends these streams at once and stops running turns as usual. `query()` follows the
   chat's background subagents (and a turn the wake option starts) before its result, yields a
   `background_wait` message with the ended turn's `turn_result` meanwhile, and the result has
-  `background_results`; it follows only the prompt's turn and those the app starts, so the cards
-  of a turn the user or another script starts are left to them. A prompt that waits in the chat's
-  queue is followed from the turn that sends it, and one never sent raises `LocalAgentError`
-  (`NOT_SENT`). `wait_result` returns at once while no turn runs (also while a background
-  subagent's hook card waits); `background=True` adds `background_results`, and `turn=` gives an
-  ended turn's record. The `can_use_tool` context carries the card's warnings: `secret_files`,
+  `background_results`. Which turns and subagents are the script's is data the app records, not
+  timing: the prompt is sent with a token (`client_ref`, kept on the user event that sends it, also
+  from the queue or steered into a running turn), each `delegate_task` card has
+  `delegation.turn_user_id` (the turn that delegated it), and the app's message after a background
+  subagent has `wake_for`. So `query()` follows only the prompt's turns, the background subagents
+  they started and the app's turns about those (each announced as `turn_start`); the cards of a turn
+  the user or another script starts, and their subagents, are left to them, also across a
+  reconnect. A prompt that waits in the chat's queue is followed from the turn that sends it, and
+  one never sent raises `LocalAgentError` (`NOT_SENT`); a shutdown while it waits for background
+  subagents raises too. `wait_result` returns at once while no turn runs (also while a background
+  subagent's hook card waits); `background=True` adds `background_results`, and `client_ref=`
+  gives the record of that prompt's turns. The `can_use_tool` context carries the card's warnings: `secret_files`,
   `protected`, `hook_ask`, `hook_change`, `uncertain` and `sibling_change`.
 - Simulator: `start_gateway()`, `patched_settings()` and `start_app()` can be imported by tests
   and other launchers.
