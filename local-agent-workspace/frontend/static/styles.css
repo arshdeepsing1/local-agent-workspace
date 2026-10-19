@@ -746,7 +746,7 @@ code.finding-location{color:#55564f;text-decoration:none}
 .run-show{margin-left:auto;padding:4px 10px;font-size:calc(11px*var(--text-scale))}
 .tool-card.run-member{margin-top:0;margin-bottom:0;border-radius:0;border-top-color:#e6e2d8}.tool-card.run-last{margin-bottom:9px;border-radius:0 0 9px 9px}
 .delegation-progress .delegation-tool{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.delegation-progress .delegation-failed{color:#98492f}
+.delegation-progress .delegation-failed-tools{color:#98492f}
 .delegation-progress.needs-answer{background:#faf3e9;border-top:1px solid #e8d2c2;color:#5f5d55}
 @media(max-width:600px){.tool-group,.run-head{margin-left:25px}.tool-card.grouped{margin-left:37px}.assistant-reply.grouped{margin-left:10px}}
 .usage-subagents{margin-top:18px}.usage-subagents h3{margin-bottom:0}.usage-subagents .usage-cards{grid-template-columns:repeat(3,minmax(0,1fr))}

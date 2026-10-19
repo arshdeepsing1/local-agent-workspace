@@ -97,3 +97,40 @@ def test_a_mouse_keeps_the_dense_desktop_sizes(ui, page):
     chip = page.locator(".sidebar .tag-chip").first
     expect(chip).to_be_visible()
     assert chip.bounding_box()["height"] <= 18
+
+
+JOB = json.dumps({"job_id": "0123456789abcdef", "state": "completed", "exit_code": 0, "output": "ok\n", "background": False})
+WAITS = {"event_id": "ev-1", "name": "run_command", "kind": "approval", "title": "npm test"}
+HEADS = [
+    {"id": "u", "type": "user", "text": "Check it and split the docs work"},
+    *({"id": f"c{n}", "type": "tool", "name": "run_command", "state": "completed", "input": {"command": f"make check-{n}"},
+       "output": JOB} for n in range(3)),
+    *({"id": f"d{n}", "type": "tool", "name": "delegate_task", "call_id": f"call-{n}", "input": {"task": f"Docs part {n}"},
+       "state": "running", "child_session_id": f"child-{n}", "delegation_batch": {"id": "b1", "index": n, "size": 2},
+       "delegation": {"status": "awaiting_approval", "pending": WAITS, "completed_tools": 1, "agent_type": "editor", "started": 1000.0}
+       if n else {"status": "running", "completed_tools": 3, "agent_type": "explore", "steps": 4, "max_steps": 10,
+                  "last_tool": "run_command", "last_tool_state": "running", "last_tool_subject": "npm test", "started": 1000.0}}
+      for n in range(2)),
+]
+
+
+def test_a_tool_groups_head_and_a_runs_head_are_touch_sized_on_a_phone(coarse_ui, coarse_page):
+    # The heads are buttons, so the coarse-pointer block sizes them like every other control.
+    ui, page = coarse_ui, coarse_page
+    ui.app(session="a", scenario="workspace", setup=f"""fake.sessions.set('a', {{ ...makeSession('a', 'Docs'), status: 'delegating',
+      events: {json.dumps(HEADS)} }})
+      fake.override = path => path.startsWith('/api/jobs') ? fake.json([]) : undefined""")
+    ui.show_session("a")
+    group = page.get_by_role("button", name="Ran 3 commands make check-2", exact=True)
+    run = page.locator(".run-head").get_by_role("button", name="2 subagents", exact=True)
+    expect(group).to_be_visible()
+    expect(run).to_have_attribute("aria-expanded", "true")
+    expect(page.locator(".composer-hint").get_by_role("button", name="Show", exact=True)).to_be_visible()
+    assert small_controls(page, ".main-area") == []
+    group.click()
+    expect(page.locator(".tool-card.grouped")).to_have_count(3)
+    assert small_controls(page, ".main-area") == []
+    assert no_page_scroll(ui)
+    for head in (group, run):
+        box = head.bounding_box()
+        assert box["width"] >= 24 and box["height"] >= 24, box

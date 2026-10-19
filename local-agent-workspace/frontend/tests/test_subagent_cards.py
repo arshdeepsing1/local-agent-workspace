@@ -337,16 +337,16 @@ def test_a_subagent_row_shows_its_step_its_current_tool_and_its_failed_actions(u
     expect(row.locator(".delegation-steps")).to_have_text("Step 4 of 10")
     expect(row.locator(".delegation-tool")).to_have_text("Now: run command · npm test")
     expect(row.locator(".delegation-tool")).to_have_attribute("title", "npm test")
-    expect(row.locator(".delegation-failed")).to_have_text("1 failed action")
+    expect(row.locator(".delegation-failed-tools")).to_have_text("1 failed action")
     rerender_run(ui, [{**live, "delegation": {**live["delegation"], "last_tool_state": "completed", "failed_tools": 2}},
                       member(1, 2, started=1000.0)])
     expect(row.locator(".delegation-tool")).to_have_text("Last tool: run command · npm test")
-    expect(row.locator(".delegation-failed")).to_have_text("2 failed actions")
+    expect(row.locator(".delegation-failed-tools")).to_have_text("2 failed actions")
     # A card from an older app shows what it showed before.
     rerender_run(ui, [member(0, 2, last_tool="read_file", started=1000.0), member(1, 2, started=1000.0)])
     expect(row.locator(".delegation-tool")).to_have_text("Last tool: read file")
     expect(row.locator(".delegation-steps")).to_have_count(0)
-    expect(row.locator(".delegation-failed")).to_have_count(0)
+    expect(row.locator(".delegation-failed-tools")).to_have_count(0)
     # The heading's icon is the subagent's (Bot), not a file.
     expect(page.locator("#tool-d0 .tool-heading svg.lucide-bot")).to_have_count(1)
 

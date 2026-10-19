@@ -608,7 +608,7 @@ function DelegationStatus({ event, onSelectSession, onOpenPath, onError }) {
     ${steps ? html`<span class="delegation-steps">${steps}</span>` : null}
     <span>${progress.completed_tools} completed ${progress.completed_tools === 1 ? 'action' : 'actions'}</span>
     ${lastTool ? html`<span class="delegation-tool" title=${subject || undefined}>${toolRunning ? 'Now' : 'Last tool'}: ${lastTool}</span>` : null}
-    ${failed ? html`<span class="delegation-failed">${failed} failed ${failed === 1 ? 'action' : 'actions'}</span>` : null}
+    ${failed ? html`<span class="delegation-failed-tools">${failed} failed ${failed === 1 ? 'action' : 'actions'}</span>` : null}
     ${elapsed != null ? html`<span class="delegation-elapsed" title=${progress.terminal_reason ? 'Time it ran' : 'Time running'}>${elapsedText(elapsed)}</span>` : null}
     ${progress.terminal_reason ? html`<span>Reason: ${progress.terminal_reason.replace(/_/g, ' ')}</span>` : null}
     ${event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}
