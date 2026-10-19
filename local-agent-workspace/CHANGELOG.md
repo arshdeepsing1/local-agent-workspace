@@ -4,6 +4,34 @@ Notable changes to Local Agent Workspace, newest first. Dates are UTC.
 
 ## Unreleased
 
+Second reviews of the integration fixes (2026-10-19). The three integration-fix packages that
+had no second review (the composer and file preview; background subagents' accounting, wakes and
+the headless runner; turn endings) were reviewed again; every finding was reproduced with a failing
+test before it was fixed, and the bullets below in M5 to M8 describe the corrected behaviour:
+
+- **Send as plain text** stays with the message draft (switching chats, a new conversation, a
+  reload), and every way a sent message comes back into the box (queue **Edit**, **Rewind to
+  here**, a failed **Retry** or **Edit message**) brings back its own mode, so its `!` is not run as
+  a shell command.
+- Turn limits: a subagent chat you continue yourself keeps its own turn, also while its parent's
+  turn runs, and its parent's turn counts only its delegated run; a `/btw` in a subagent's chat
+  stays out of its parent's turns after the subagent ended too; a background subagent carried
+  over from an earlier turn counts in the turn result even when its requests reported no usage;
+  the step-limit notice's DBU matches the turn summary.
+- A background subagent's hook card that outlasts a turn, a compaction or a `!` command follows one
+  rule: the chat awaits approval while a card waits, a running hook's card stays running, Stop on
+  the chat settles it (and continues nothing), and a restart does not mark the finished turn
+  interrupted. **Stop subagent** works while a subagent waits for its `subagent_start` hook card.
+- The budget wrap-up: a reply that cannot be used ends the turn at the budget with no hidden retry
+  promised, and a subagent's report that did not go through reaches its parent as written.
+- The wake message no longer takes your pending `!` output, names the subagent the wake is for,
+  is labelled for a failed subagent too, and a rewind past it tells the next message again.
+  Background-subagent notifications also cover one that ended during a `!` command or a manual
+  compaction, and no longer close the chat's error or limit notification.
+- The scripting client and `agent_run.py` follow only their own turns, never wait forever (a
+  subagent that ended during a `!` command or compaction, one stopped during its start hook),
+  report a shutdown during a followed wake turn as an error, and show the `hook_change` warning.
+
 Roadmap milestone M8 (agents, automation and delivery):
 
 - A warmer palette: ivory backgrounds, warm grays and borders, and a brighter terracotta accent
@@ -28,20 +56,26 @@ Roadmap milestone M8 (agents, automation and delivery):
   returns one subagent's status and result, or lists them, and can wait up to 300 seconds. Stop
   on the chat, **Stop subagent** on a card and deleting the chat stop background subagents. A
   restart marks a running one interrupted and says so in the chat, and the spending limit counts
-  them. Rewinding, editing, retrying and forking the chat are refused while they run. A desktop
+  them. Rewinding, editing, retrying and forking the chat are refused while they run. Then a
+  conversation rewind names again, at the next request, the subagents that only the removed
+  turns were told of or read the report of, and keeps the notice of one whose card it keeps
+  (after the last kept reply when it ended in a removed turn). A desktop
   notification and the notification hooks (status `background_subagent`) report one that
-  finished or failed while the chat was idle. With a page open, **Notify me** now reports a
-  background subagent that finished or failed while its chat was idle ("Background subagent
-  finished: …").
+  finished or failed while the chat ran no turn (it was idle, or ran a `!` command or a manual
+  compaction). With a page open, **Notify me** now reports it once the chat is idle
+  ("Background subagent finished: …"), beside the chat's error or limit notification, which
+  still waits for you.
 - **Settings → Subagents → Continue the chat when a background subagent finishes** (off by
   default: each such turn is a paid request) sends an idle chat a short app message, so the
   agent reads the report and goes on, once for what ended since its last step. It never
   continues a chat whose last turn stopped at a limit, an error or Stop (Continue stays yours),
   nor a scheduled run's chat. One that ends while a `!` command or a manual compaction runs
-  continues the chat once it is done instead of never. The app's message shows no "Sent as plain
-  text" chip and no **Edit message**, **Retry** sends it again as the app's message, rewinding
-  to it leaves your message box empty, and transcripts label it **App (sent when a background
-  subagent finished)** instead of **User**.
+  continues the chat once it is done instead of never. The app's message (**Sent by the app
+  when a background subagent ended**) names the latest subagent that finished or failed and
+  carries no `!` output, which waits for your next message. It shows no "Sent as plain text"
+  chip and no **Edit message**, **Retry** sends it again as the app's message, rewinding to it
+  leaves your message box empty, and transcripts label it **App (sent when a background
+  subagent ended)** instead of **User** and count it apart from your messages.
 - Subagent cards: **Stop subagent** stops only that subagent (its call returns as cancelled; the
   chat and its other subagents go on). While a subagent waits for approval, its card names the
   action (**Waits for approval: run command · npm test**) with **Allow** and **Decline**, which
@@ -111,7 +145,10 @@ Roadmap milestone M8 (agents, automation and delivery):
   subagent's last request asks for its report with `submit_report`, the one tool call that runs
   then (any other call still does not run), so its parent gets the report with the budget error.
   When that last request is also the turn's last Agent step and its reply still calls tools, the
-  turn ends with the budget notice, not the Agent steps one.
+  turn ends with the budget notice, not the Agent steps one. A reply to that request that reached
+  the output limit, had broken tool arguments or ended early ends the turn at the budget too (no
+  hidden retry follows it), and a subagent's report the schema refused there, or whose arguments
+  could not be read, reaches its parent after the error as the model wrote it (redacted).
 - **Agent tools → Usage → All chats**: every conversation's model calls over the last 7, 30 or
   90 days, by day (cache reads, uncached input and output), endpoint, purpose and project, with
   the estimated DBU. It reads a small usage summary each conversation keeps in its file's first
@@ -132,12 +169,18 @@ Roadmap milestone M8 (agents, automation and delivery):
   sequences, carriage returns, bidirectional overrides) as visible escapes, so a command cannot
   hide behind them. Bypass permissions needs `--confirm-bypass`. An answer the app refuses falls
   back at once to declining (or skipping the questions), so no card is left waiting. Ctrl+C
-  stops the turn, and before a turn started it exits without waiting. Prompt"`": a turn that
-  leaves background subagents working is reported once they ended (stderr says it waits), their
-  cards answered with the same `--approve` policy, and the result lists each one's end in
-  `background_results`; Ctrl+C then stops them and exits 3. `--approve ask` prints a card's
-  warnings (a secret file it reads, a protected file, a hook that asked, a command that could
-  not be checked exactly, a file another subagent changed) before you answer.
+  stops the turn, and before a turn started it exits without waiting. A turn that leaves
+  background subagents working is reported once they ended (a stopped one, also before it
+  started, has ended; stderr says it waits), their cards answered with the same `--approve`
+  policy, and the result lists each one's end in `background_results`. A turn you start in the
+  page meanwhile, also in the chat of a subagent whose delegation ended, is yours: the script
+  neither answers its cards nor reports it. Ctrl+C while it waits stops them (and a turn of yours
+  running in the chat: Stop applies to the whole chat), exits 3 and prints the script's turn with
+  them as stopped and `exit_code` 3. A prompt queued because something started in the chat as it
+  was sent is followed from the turn that sends it; when nothing sends it, the script says so and
+  exits 1. `--approve ask` prints a card's warnings (a secret file it reads, a protected file, a
+  hook that asked or changed the action, a command that could not be checked exactly, a file
+  another subagent changed) before you answer.
 - `agent_run.py` options set the chat's model, effort, mode, Agent steps, spending limit and
   turn limits. `--session` sends the prompt to an existing idle chat instead: `--mode`,
   `--model` and `--effort` then change that chat, the new-chat-only `--workspace` and
@@ -149,9 +192,20 @@ Roadmap milestone M8 (agents, automation and delivery):
   and its step-limit notice then says the chat has its own. Stopping the app (Ctrl+C on
   `run.py`) ends these streams at once and stops running turns as usual. `query()` follows the
   chat's background subagents (and a turn the wake option starts) before its result, yields a
-  `background_wait` message meanwhile, and the result has `background_results`. The
-  `can_use_tool` context carries the card's warnings: `secret_files`, `protected`, `hook_ask`,
-  `uncertain` and `sibling_change`.
+  `background_wait` message with the ended turn's `turn_result` meanwhile, and the result has
+  `background_results`. Which turns and subagents are the script's is data the app records, not
+  timing: the prompt is sent with a token (`client_ref`, kept on the user event that sends it, also
+  from the queue or steered into a running turn), each `delegate_task` card has
+  `delegation.turn_user_id` (the turn that delegated it), and the app's message after a background
+  subagent has `wake_for`. So `query()` follows only the prompt's turns, the background subagents
+  they started and the app's turns about those (each announced as `turn_start`); the cards of a turn
+  the user or another script starts, and their subagents, are left to them, also across a
+  reconnect. A prompt that waits in the chat's queue is followed from the turn that sends it, and
+  one never sent raises `LocalAgentError` (`NOT_SENT`); a shutdown while it waits for background
+  subagents raises too. `wait_result` returns at once while no turn runs (also while a background
+  subagent's hook card waits); `background=True` adds `background_results`, and `client_ref=`
+  gives the record of that prompt's turns. The `can_use_tool` context carries the card's warnings: `secret_files`,
+  `protected`, `hook_ask`, `hook_change`, `uncertain` and `sibling_change`.
 - Simulator: `start_gateway()`, `patched_settings()` and `start_app()` can be imported by tests
   and other launchers.
 - **Settings → Agent → Git status in messages** (on by default): the message that starts each
@@ -238,7 +292,9 @@ Roadmap milestone M8 (agents, automation and delivery):
   server must be running); nothing is cached for offline use. `run.py --open` opens the app in
   your browser once it is ready. On a machine without a desktop (no display, such as over SSH)
   `run.py --open` now prints the app's address instead of starting a text browser in the
-  server's own terminal and waiting for it; a browser named in `BROWSER` is still used.
+  server's own terminal and waiting for it; a browser named in `BROWSER` is still used (only those
+  are tried, never a text browser Python finds itself), and when no browser opened the app the
+  address is printed.
 - **Workspace / Files** previews files: images (PNG, JPEG, GIF, WebP, SVG) with their size, PDF
   files in the browser's viewer, and Markdown and HTML files through **Preview** beside the
   editor (unsaved edits included). A Markdown preview shows images from the project but loads
@@ -256,8 +312,9 @@ Roadmap milestone M8 (agents, automation and delivery):
   web is labeled "from the web". An image or PDF that the server finds by another path (a
   worktree chat's own copy of a file named by the source project's path, or a name that starts
   with the project's folder name) is named by the file opened, in the header, **Open in VS
-  Code** and the plus button, with the same "Opened …: the reply named it …" note as a text
-  file. An image preview other than SVG has no plus button (the agent reads files as text;
+  Code** and (for an SVG or a PDF) the plus button, with the same "Opened …: the reply named it
+  …" note as a text file; so is a file the editor cannot show (too large, or not text) in its
+  Download view. An image preview other than SVG has no plus button (the agent reads files as text;
   attach an image to a message with **Attach files**), and a PDF preview says that the browser's
   viewer may name the file by an ID, also in its own download, while **Download** in the toolbar
   saves it by its name.
@@ -635,6 +692,8 @@ Roadmap milestone M5 (context, instructions, memory, skills and commands):
   default) turned off, typed `/` text is sent as it is in every message; built-in commands then
   run only when chosen in the `/` menu. **Edit** on a queued plain-text message brings it back
   with **Send as plain text** on, so its `!` or `/` is not run as a shell command or a command.
+  **Send as plain text** is saved with the message draft, so it comes back with the draft in
+  another chat, a new-conversation view and after a reload.
 - Your own instruction files: **Settings → Agent → Load my instructions file
   ~/.agents/AGENTS.md** (on by default) and **Also load ~/.claude/CLAUDE.md** (off by default)
   add them after Custom instructions, with the same precedence (8,000 bytes each, with their

@@ -2,6 +2,7 @@
 import json
 import re
 
+import pytest
 from playwright.sync_api import expect
 
 # A recording Notification API and a controllable document.hidden.
@@ -199,6 +200,120 @@ def test_a_background_subagent_that_ends_while_its_chat_is_idle_notifies_for_tha
     ui.tick(1500)
     settle(ui)
     assert len(notes(ui)) == 1
+
+
+BACKGROUND = {"is_subagent": True, "parent_session_id": "p", "status": "running", "turn_delegated": True,
+              "delegation": {"status": "running", "background": True}}
+DONE = {"status": "idle", "terminal_reason": "completed", "turn_ended": 3, "updated": 3,
+        "delegation": {"status": "completed", "background": True, "terminal_reason": "completed"}}
+
+
+@pytest.mark.parametrize("busy", ["running", "compacting"])
+def test_a_background_subagent_that_ends_during_a_command_or_a_manual_compaction_notifies_once_it_is_done(
+        ui, page, busy):
+    """A ! command (running, with the same last turn) and a manual compaction are not turns, so none learns that the
+    subagent ended: it is reported once the chat is idle again, and only once."""
+    start(ui, page, setup=GRANTED + sessions(("p", "Parent chat", {"status": "idle", "turn_ended": 1}),
+                                             ("c", "Background survey", BACKGROUND)), clock=True)
+    ui.run("window.pageHidden = true")
+    ui.tick(1500)
+    update(ui, "p", status=busy, updated=2)
+    ui.tick(1500)
+    update(ui, "c", **DONE)
+    update(ui, "p", updated=3)
+    ui.tick(1500)
+    update(ui, "p", status="idle", updated=4)
+    ui.tick(1500)
+    ui.wait("notifications.length === 1")
+    ui.tick(10000)
+    settle(ui)
+    assert notes(ui) == [["Local", "Background subagent finished: Parent chat", "p:background"]]
+    assert ui.js("notifications[0].closed") is False
+
+
+def test_the_open_chat_in_a_hidden_page_notifies_a_background_end_after_its_command(ui, page):
+    """The open chat's ! command statuses come on its stream (idle again without a new turn_ended)."""
+    start(ui, page, "p", setup=GRANTED + sessions(("p", "Parent chat", {"status": "idle", "turn_ended": 1}),
+                                                  ("c", "Background survey", BACKGROUND)), clock=True)
+    ui.show_session("p")
+    ui.tick(1500)
+    ui.run("window.pageHidden = true")
+    update(ui, "p", status="running", updated=2)
+    ui.emit("p", {"type": "status", "status": "running"})
+    ui.tick(1500)
+    update(ui, "c", **DONE)
+    update(ui, "p", updated=3)
+    ui.tick(1500)
+    update(ui, "p", status="idle", updated=4)
+    ui.emit("p", {"type": "status", "status": "idle"})
+    ui.tick(1500)
+    ui.wait("notifications.length === 1")
+    ui.tick(10000)
+    settle(ui)
+    assert notes(ui) == [["Local", "Background subagent finished: Parent chat", "p:background"]]
+
+
+def test_a_background_subagent_that_ends_during_a_turn_is_left_to_that_turn(ui, page):
+    """The turn learns of it at its next step, and its own end notifies."""
+    start(ui, page, setup=GRANTED + sessions(("p", "Parent chat", {"status": "idle", "turn_ended": 1}),
+                                             ("c", "Background survey", BACKGROUND)), clock=True)
+    ui.run("window.pageHidden = true")
+    ui.tick(1500)
+    update(ui, "p", status="running", turn_ended=None, updated=2)
+    ui.tick(1500)
+    update(ui, "c", **DONE)
+    update(ui, "p", updated=3)
+    ui.tick(1500)
+    update(ui, "p", status="idle", terminal_reason="completed", turn_ended=4, updated=4)
+    ui.tick(1500)
+    ui.wait("notifications.length === 1")
+    ui.tick(10000)
+    settle(ui)
+    assert notes(ui) == [["Local", "Finished: Parent chat", "p:finished"]]
+
+
+def test_a_queued_background_subagent_that_starts_and_fails_between_two_polls_notifies(ui, page):
+    """The page first sees the subagent already failed (it got its slot and failed at once). Its chat was listed
+    before, so it is news; a chat that comes with its ended subagents (an import) is not."""
+    start(ui, page, setup=GRANTED + sessions(("p", "Parent chat", {"status": "idle", "turn_ended": 1}),
+                                             ("x", "Long survey", BACKGROUND)), clock=True)
+    ui.run("window.pageHidden = true")
+    ui.tick(1500)
+    failed = {"is_subagent": True, "parent_session_id": "p", "updated": 3, "turn_delegated": True, "turn_ended": 3,
+              "terminal_reason": "inference_error", "delegation": {"status": "failed", "background": True,
+                                                                   "terminal_reason": "inference_error"}}
+    ui.run(f"fake.sessions.set('n', {{ ...makeSession('n', 'Queued survey'), ...{json.dumps(failed)} }})")
+    ui.run("fake.sessions.set('q', makeSession('q', 'Imported chat'))")
+    ui.run(f"fake.sessions.set('m', {{ ...makeSession('m', 'Imported survey'), ...{json.dumps(failed)}, "
+           "parent_session_id: 'q' })")
+    update(ui, "p", updated=3)
+    ui.tick(1500)
+    ui.wait("notifications.length === 1")
+    ui.tick(10000)
+    settle(ui)
+    assert notes(ui) == [["Local", "Background subagent failed: Parent chat", "p:background"]]
+
+
+@pytest.mark.parametrize("reason, text", [("error", "Stopped with an error"), ("step_limit", "Reached the step limit")])
+def test_a_background_subagent_leaves_its_chats_error_or_limit_notification_open(ui, page, reason, text):
+    """That chat still waits for your Continue: the background subagent's notification comes beside it."""
+    start(ui, page, setup=GRANTED + sessions(("p", "Parent chat", {"status": "running", "turn_ended": None}),
+                                             ("c", "Background survey", BACKGROUND)), clock=True)
+    ui.run("window.pageHidden = true")
+    ui.tick(1500)
+    update(ui, "p", status="idle", terminal_reason=reason, turn_ended=2, updated=2)
+    ui.tick(1500)
+    ui.wait("notifications.length === 1")
+    update(ui, "c", **DONE)
+    update(ui, "p", updated=3)
+    ui.tick(1500)
+    ui.wait("notifications.length === 2")
+    assert notes(ui) == [["Local", f"{text}: Parent chat", f"p:{reason}"],
+                         ["Local", "Background subagent finished: Parent chat", "p:background"]]
+    assert ui.js("notifications.map(n => n.closed)") == [False, False]
+    # Opening the chat answers both.
+    row(page, "Parent chat").click()
+    ui.wait("notifications.every(n => n.closed)")
 
 
 def test_a_subagent_chat_open_in_a_hidden_tab_notifies_when_your_turn_ends(ui, page):

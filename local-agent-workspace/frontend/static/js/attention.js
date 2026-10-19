@@ -59,13 +59,13 @@ export function attentionFor(before, session) {
   return { state: 'finished', body: `Finished: ${title}` }
 }
 
-// A background subagent (delegate_task background) that finished or failed while its chat is idle: { state, body }
-// for that chat, or null. Its chat's turn already reported its own end, and a running turn learns of it itself.
-// `before` is the subagent's last known { delegation } status.
+// A background subagent (delegate_task background) that finished or failed: { state, body } for its chat, or
+// null. useAttention reports it once the chat is idle, unless a turn of the chat ended meanwhile: that turn
+// learned of it and its own end notified. `before` is the subagent's last known { delegation } status.
 export function backgroundEnd(before, session, parent) {
   const delegation = session.delegation
   if (!session.is_subagent || delegation?.background !== true || before.delegation === delegation.status) return null
-  if (!['completed', 'failed'].includes(delegation.status) || !parent || parent.status !== 'idle') return null
+  if (!['completed', 'failed'].includes(delegation.status) || !parent) return null
   return { state: 'background', body: `Background subagent ${delegation.status === 'completed' ? 'finished' : 'failed'}: ${shortTitle(parent.title)}` }
 }
 
@@ -95,8 +95,11 @@ export function useAttention({ sessions, activeId, ready, onSelect }) {
   const forgotten = useRef(new Set())
   const known = useRef(null)
   const previous = useRef(null)
-  // Conversation id -> the notification shown for it, closed when it no longer applies.
+  // Conversation id -> { state: the notification shown for it }, each closed when it no longer applies.
   const shown = useRef(new Map())
+  // Conversation id -> { note, turn_ended }: a background subagent of that chat ended while its last turn was
+  // turn_ended; reported once the chat is idle (after a ! command or a manual compaction, which no turn learns of).
+  const ended = useRef(new Map())
   const current = useRef({})
   current.current = { enabled, activeId, onSelect }
   const baseTitle = useRef(null)
@@ -147,10 +150,14 @@ export function useAttention({ sessions, activeId, ready, onSelect }) {
   }, [sessions])
   useEffect(() => () => { if (baseTitle.current !== null) document.title = baseTitle.current }, [])
 
-  const dismiss = id => {
-    const notification = shown.current.get(id)
-    shown.current.delete(id)
-    try { notification?.close() } catch { /* Already gone. */ }
+  // Closes the chat's notifications (only those of the given states).
+  const dismiss = (id, states) => {
+    const notes = shown.current.get(id) || {}
+    for (const state of states || Object.keys(notes)) {
+      try { notes[state]?.close() } catch { /* Already gone. */ }
+      delete notes[state]
+    }
+    if (!Object.keys(notes).length) shown.current.delete(id)
   }
   // Opening a chat answers its notification.
   useEffect(() => { if (activeId) dismiss(activeId) }, [activeId])
@@ -163,23 +170,26 @@ export function useAttention({ sessions, activeId, ready, onSelect }) {
       delegation: item.delegation?.status }]))
     if (!before) return
     for (const id of shown.current.keys()) if (!previous.current.has(id)) dismiss(id)
+    for (const id of ended.current.keys()) if (!previous.current.has(id)) ended.current.delete(id)
     const { enabled, activeId, onSelect } = current.current
     const allowed = enabled && notificationsSupported() && window.Notification.permission === 'granted'
     const notify = (id, note) => {
       try {
         const notification = new window.Notification('Local', { body: note.body, tag: `${id}:${note.state}` })
         notification.onclick = () => { window.focus(); onSelect(id); notification.close() }
-        shown.current.set(id, notification)
+        shown.current.set(id, { ...shown.current.get(id), [note.state]: notification })
       } catch { /* Some browsers allow notifications only from a service worker. */ }
     }
     for (const item of sessions) {
-      // A chat seen for the first time (created or imported elsewhere) has no finished turn to report.
-      const last = before.get(item.id) || { status: 'idle', turn_ended: item.turn_ended, delegation: item.delegation?.status }
       const parent = item.is_subagent ? sessions.find(other => other.id === item.parent_session_id) : null
-      const ended = backgroundEnd(last, item, parent)
-      if (ended && allowed && (document.hidden || parent.id !== activeId)) {
-        dismiss(parent.id)
-        notify(parent.id, ended)
+      // A chat seen for the first time (created or imported elsewhere) has no finished turn to report; a
+      // background subagent its listed chat started is news even when it already ended (between two polls).
+      const last = before.get(item.id) || { status: 'idle', turn_ended: item.turn_ended,
+        delegation: parent && before.has(parent.id) ? undefined : item.delegation?.status }
+      const end = backgroundEnd(last, item, parent)
+      if (end) {
+        const waiting = ended.current.get(parent.id)  // An earlier end not reported yet: its turn is the one.
+        ended.current.set(parent.id, { note: end, turn_ended: waiting ? waiting.turn_ended : parent.turn_ended })
       }
       if (last.status === item.status && last.turn_ended === item.turn_ended) continue
       // The previous notification no longer applies (an approval was answered, a new turn began).
@@ -188,6 +198,19 @@ export function useAttention({ sessions, activeId, ready, onSelect }) {
       if (!note || !allowed) continue
       if (!document.hidden && item.id === activeId) continue
       notify(item.id, note)
+    }
+    // Background subagents' ends, for chats that are idle now: reported when the chat's last turn is the same as
+    // then (it was idle, or ran a ! command or a manual compaction); a turn that ended since learned of them and
+    // notified itself.
+    for (const item of sessions) {
+      const waiting = ended.current.get(item.id)
+      if (!waiting || item.status !== 'idle') continue
+      ended.current.delete(item.id)
+      if (waiting.turn_ended !== item.turn_ended || !allowed || (!document.hidden && item.id === activeId)) continue
+      // It replaces the chat's Finished (or an earlier background) notification, never an approval, an error or
+      // a limit, which still waits for you.
+      dismiss(item.id, ['finished', 'background'])
+      notify(item.id, waiting.note)
     }
   }, [ready, sessions])
 

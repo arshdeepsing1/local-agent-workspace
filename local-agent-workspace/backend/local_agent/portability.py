@@ -103,6 +103,7 @@ class Progress(Record):
     started: float | None = None
     ended: float | None = None
     background: bool | None = None  # delegate_task background: the parent went on while it worked.
+    turn_user_id: str | None = Field(default=None, max_length=512)  # The user event of the turn that delegated it.
     pending: PendingCard | None = None
 
 
@@ -128,6 +129,7 @@ class Answer(Record):
 
 
 UploadId = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+ClientRef = Annotated[str, Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")]  # api.Prompt.client_ref
 ImageType = Literal["image/png", "image/jpeg", "image/gif", "image/webp"]  # uploads.IMAGE_EXTENSIONS
 Pixels = Annotated[int, Field(ge=1, le=100_000)]
 
@@ -301,6 +303,10 @@ class Event(Record):
     skills: list[SkillId] | None = Field(default=None, max_length=3)
     verbatim: bool | None = None
     queued: bool | None = None
+    # User events: the scripts' tokens of the messages it sent (POST /messages client_ref), and on the app's message
+    # after a background subagent the subagents it reports.
+    client_refs: list[ClientRef] | None = Field(default=None, max_length=MAX_QUEUED)
+    wake_for: list[Annotated[str, Field(min_length=1, max_length=512)]] | None = Field(default=None, max_length=8)
     git_context: bool | None = None  # User events: the app sent a Git snapshot with it (git_tools.git_context).
     # At most 5 @ files and 5 ! outputs (mentions.py) and 8 attached files (uploads.MAX_MESSAGE_FILES).
     attachments: list[Attachment] | None = Field(default=None, max_length=10 + attached.MAX_MESSAGE_FILES)

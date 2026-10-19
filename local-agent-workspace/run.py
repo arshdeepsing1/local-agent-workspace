@@ -33,6 +33,24 @@ def desktop_browser(environ=None, platform=None):
     return platform in ("darwin", "win32") or any(environ.get(name) for name in ("DISPLAY", "WAYLAND_DISPLAY", "BROWSER"))
 
 
+def open_browser(url, environ=None, platform=None):
+    """Open url in a graphical browser. Without a display only the browsers named in BROWSER are tried, in turn, each
+    as named (a text browser named there is your choice, and runs in this terminal): when they fail (a desktop
+    browser cannot start over SSH), webbrowser.open would go on to the text browsers it found itself and run one in
+    this terminal. True when a browser was started."""
+    environ = os.environ if environ is None else environ
+    platform = sys.platform if platform is None else platform
+    if platform in ("darwin", "win32") or any(environ.get(name) for name in ("DISPLAY", "WAYLAND_DISPLAY")):
+        return webbrowser.open(url)
+    for entry in filter(None, environ.get("BROWSER", "").split(os.pathsep)):
+        try:
+            if webbrowser.get(entry).open(url):
+                return True
+        except webbrowser.Error:
+            continue
+    return False
+
+
 def open_when_ready(port, timeout=OPEN_WAIT_SECONDS, opener=None):
     """--open: open the app in the default browser once 127.0.0.1:port accepts connections (checked every 0.1 s
     for at most timeout seconds). True when the browser was asked to open it."""
@@ -42,9 +60,16 @@ def open_when_ready(port, timeout=OPEN_WAIT_SECONDS, opener=None):
             return False
         time.sleep(0.1)
     try:
-        return bool((opener or webbrowser.open)(f"http://127.0.0.1:{port}/"))
+        return bool((opener or open_browser)(f"http://127.0.0.1:{port}/"))
     except webbrowser.Error:
         return False
+
+
+def open_or_print_address(port):
+    """--open's wait, in its own thread: when no browser opened the app (none started, or the app was not ready in
+    time), the address is printed instead."""
+    if not open_when_ready(port):
+        print(f"No browser was opened: open http://127.0.0.1:{port}/ in your browser.", flush=True)
 
 
 def main(argv=None):
@@ -56,7 +81,7 @@ def main(argv=None):
     # A port already in use is another program's (the start fails and says so): no browser is opened for it.
     if args.open and not accepting(args.port):
         if desktop_browser():
-            threading.Thread(target=open_when_ready, args=(args.port,), daemon=True).start()
+            threading.Thread(target=open_or_print_address, args=(args.port,), daemon=True).start()
         else:
             print(f"No desktop to open a browser on: open http://127.0.0.1:{args.port}/ in your browser.", flush=True)
     from local_agent import serve

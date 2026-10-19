@@ -23,6 +23,7 @@ window.rewindError = null
 window.resendError = null
 fake.override = (path, options) => {
   if (path.startsWith('/api/sessions/a/rewind-preview?')) return fake.json(window.preview)
+  if (path === '/api/sessions/a/shell') return fake.json({ ok: true }, 202)
   if (path === '/api/sessions/a/rewind' && options.method === 'POST') {
     if (window.rewindError) return fake.json(window.rewindError.body, window.rewindError.status)
     const body = JSON.parse(options.body)
@@ -224,6 +225,61 @@ def test_a_failed_resend_puts_the_text_in_the_message_box(ui, page):
     ui.run("window.resendError = null")
 
 
+# The latest message was sent as plain text: its '!' is part of the question, not a shell command.
+PLAIN = "!git push --force is what the guide says; is that safe here?"
+PLAIN_LATEST = [*EVENTS[:2], {**EVENTS[2], "text": PLAIN, "verbatim": True}, *EVENTS[3:]]
+
+
+def expect_back_as_plain_text(ui, page):
+    """The message is back in the box with Send as plain text on: Enter sends it as typed and runs no command."""
+    expect(message_box(page)).to_have_value(PLAIN)
+    expect(page.get_by_role("button", name="Send as plain text")).to_have_attribute("aria-pressed", "true")
+    message_box(page).press("Enter")
+    ui.wait("fake.requests('/api/sessions/a/messages', 'POST').length + fake.requests('/api/sessions/a/shell').length === 1")
+    assert ui.requests("/api/sessions/a/shell") == []
+    assert ui.bodies("/api/sessions/a/messages", "POST") == [{"text": PLAIN, "verbatim": True}]
+
+
+def test_a_failed_retry_of_a_plain_text_message_puts_it_back_as_plain_text(ui, page):
+    start(ui, page, events=PLAIN_LATEST, extra="window.resendError = 'The project folder is gone.'")
+    page.get_by_role("button", name="Retry response").click()
+    ui.wait("fake.requests('/api/sessions/a/rewind', 'POST').length === 1")
+    assert rewind_posts(ui)[0]["resend_verbatim"] is True
+    expect(page.locator(".app-error")).to_contain_text("The project folder is gone.")
+    expect_back_as_plain_text(ui, page)
+
+
+def test_a_failed_edit_of_a_plain_text_message_puts_it_back_as_plain_text(ui, page):
+    start(ui, page, events=PLAIN_LATEST, extra="window.resendError = 'The project folder is gone.'")
+    page.get_by_role("button", name="Edit message").nth(1).click()
+    expect(page.get_by_role("textbox", name="Edit message")).to_have_value(PLAIN)
+    page.get_by_role("button", name="Send edited message").click()
+    ui.wait("fake.requests('/api/sessions/a/rewind', 'POST').length === 1")
+    assert rewind_posts(ui)[0]["resend_verbatim"] is True
+    expect(page.locator(".app-error")).to_contain_text("The project folder is gone.")
+    expect_back_as_plain_text(ui, page)
+
+
+def test_rewinding_to_a_message_puts_it_in_the_box_with_its_own_send_as_plain_text(ui, page):
+    start(ui, page, events=PLAIN_LATEST)
+    toggle = page.get_by_role("button", name="Send as plain text")
+    page.locator(".user-message").nth(1).get_by_role("button", name="Rewind to here").click()
+    dialog = page.get_by_role("dialog", name="Rewind conversation")
+    dialog.get_by_role("radio", name="Conversation only").check()
+    dialog.get_by_role("button", name="Rewind").click()
+    expect(dialog).to_have_count(0)
+    expect(message_box(page)).to_have_value(PLAIN)
+    expect(toggle).to_have_attribute("aria-pressed", "true")
+    # One that was not sent as plain text comes back with Send as plain text off, so its command and @ files work.
+    message_box(page).fill("")
+    page.locator(".user-message").first.get_by_role("button", name="Rewind to here").click()
+    dialog.get_by_role("radio", name="Conversation only").check()
+    dialog.get_by_role("button", name="Rewind").click()
+    expect(dialog).to_have_count(0)
+    expect(message_box(page)).to_have_value("First task")
+    expect(toggle).to_have_attribute("aria-pressed", "false")
+
+
 def test_the_rewind_notice_is_in_view_after_a_retry_in_a_long_chat(ui, page):
     long = [event for number in range(1, 9) for event in (
         {"id": f"u{number}", "type": "user", "text": f"Task {number}", "in_wire": True},
@@ -252,7 +308,7 @@ def test_the_apps_message_after_a_background_subagent_is_not_yours_to_edit(ui, p
     start(ui, page, events=EVENTS + [WAKE, {"id": "a3", "type": "assistant", "text": "Read it; all done."}],
           extra="window.resendError = 'The project folder is gone.'")
     message = page.locator(".user-message").nth(2)
-    expect(message.locator(".delegation-origin")).to_have_text("Sent by the app when a background subagent finished")
+    expect(message.locator(".delegation-origin")).to_have_text("Sent by the app when a background subagent ended")
     expect(message.get_by_role("list", name="Sent with this message")).to_have_count(0)  # Not "Sent as plain text".
     expect(message.get_by_role("button", name="Edit message")).to_have_count(0)
     expect(page.get_by_role("button", name="Edit message")).to_have_count(2)
@@ -263,6 +319,14 @@ def test_the_apps_message_after_a_background_subagent_is_not_yours_to_edit(ui, p
                                  "resend_verbatim": True}]
     expect(page.locator(".app-error")).to_contain_text("The project folder is gone.")
     expect(message_box(page)).to_have_value("")
+
+
+def test_the_label_of_the_apps_message_after_a_failed_subagent_does_not_say_it_finished(ui, page):
+    failed = {**WAKE, "text": WAKE["text"].replace("(explore) finished.", "(explore) failed.")}
+    start(ui, page, events=EVENTS + [failed, {"id": "a3", "type": "assistant", "text": "It failed; retrying."}])
+    message = page.locator(".user-message").nth(2)
+    expect(message).to_contain_text("(explore) failed.")
+    expect(message.locator(".delegation-origin")).to_have_text("Sent by the app when a background subagent ended")
 
 
 def test_rewinding_to_the_apps_message_does_not_put_it_in_your_message_box(ui, page):

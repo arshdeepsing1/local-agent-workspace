@@ -59,6 +59,8 @@ def test_arrows_choose_and_enter_inserts_before_a_second_enter_sends(ui, page):
     box = message(page)
     box.press_sequentially("/")
     last = len(COMMANDS) + 1
+    # The skills join the built-in commands when they arrive: wrap to the last one only once it is listed.
+    expect(options(page)).to_have_count(len(COMMANDS) + 2)
     expect(options(page).nth(0)).to_have_attribute("aria-selected", "true")
     expect(box).to_have_attribute("aria-activedescendant", options(page).nth(0).get_attribute("id"))
     expect(box).to_have_attribute("aria-controls", skills(page).get_attribute("id"))

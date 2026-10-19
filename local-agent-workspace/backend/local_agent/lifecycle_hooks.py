@@ -27,6 +27,7 @@ import asyncio
 import fnmatch
 import json
 import logging
+import uuid
 
 from .approvals import declined
 from .context import HOOK_CONTINUATION_PREFIX
@@ -234,10 +235,22 @@ class LifecycleHooks:
                               **({"subagent_session_id": fields["subagent_session_id"]}
                                  if fields.get("subagent_session_id") else {})}
                 subject = f"Event: {phase}"
-            event = await self.event(owner, "tool", name=f"hook_{phase}", state="running", input=card_input,
-                                     preview=f"Hook: {hook['id']}\n{subject}\nCommand: {hook['command']}\n"
-                                             f"Timeout: {hook['timeout_seconds']} seconds", output="",
-                                     **(self.verdict_fields(verdict) if verdict.decision == "allow" else {}))
+            # foreign: the hook runs outside the owner chat's own task (a background subagent's hook in its parent):
+            # its card outlasts the end of that chat's turn or compaction (foreign_cards), and its answer settles the
+            # chat's status, whatever it was when the card asked (after_hook_card).
+            foreign = asyncio.current_task() is not self.tasks.get(owner["id"])
+            card = (owner["id"], str(uuid.uuid4()))
+            if foreign:
+                self.foreign_cards.add(card)
+            try:
+                event = await self.event(owner, "tool", id=card[1], name=f"hook_{phase}", state="running",
+                                         input=card_input,
+                                         preview=f"Hook: {hook['id']}\n{subject}\nCommand: {hook['command']}\n"
+                                                 f"Timeout: {hook['timeout_seconds']} seconds", output="",
+                                         **(self.verdict_fields(verdict) if verdict.decision == "allow" else {}))
+            except BaseException:
+                self.foreign_cards.discard(card)
+                raise
             try:
                 if verdict.decision == "deny":
                     # A deny rule, or Don't ask with no allow rule: the hook does not run.
@@ -250,13 +263,9 @@ class LifecycleHooks:
                         allowed, _ = await self.request_approval(owner, hook_tools, event, f"hook_{phase}",
                                                                  {"hook_id": hook["id"]})
                     finally:
-                        # ended: the owner has no running turn, so this hook runs in a background subagent's task
-                        # (its turn may have ended during the wait, after approve() set it running).
-                        turn = self.tasks.get(owner["id"])
-                        ended = turn is None or turn.done()
-                        if (status != "running" or ended) and (owner is not session or ended
-                                                               or not asyncio.current_task().cancelling()):
-                            await self.after_hook_card(owner, event, status)
+                        # The owner's own task's card leaves a running chat to that task, and a stopping one to its end.
+                        if foreign or (status != "running" and not asyncio.current_task().cancelling()):
+                            await self.after_hook_card(owner, event)
                     if not allowed:
                         approval = event.get("approval")
                         if approval is None:  # Denied by a fresh check just before the card.
@@ -301,6 +310,10 @@ class LifecycleHooks:
                     fields["prompt"] = parsed["prompt"]
                 if parsed.get("decision") in ("deny", "block"):
                     break
+            except asyncio.CancelledError:
+                if foreign and event["state"] == "running":
+                    await self.update_event(owner, event, state="cancelled")  # Its subagent was stopped.
+                raise
             except (ValueError, OSError, TimeoutError) as exc:
                 warning = self.settings.redact(str(exc))
                 await self.update_event(owner, event, state="rejected" if event["state"] == "rejected" else "error",
@@ -311,35 +324,36 @@ class LifecycleHooks:
                     continue  # Blocked by a rule or Don't ask: the hook card says so; no notice every time.
                 warning = warning.rstrip().removesuffix(".")
                 await self.event(owner, "notice", text=f"{WARNING_LABELS[phase]} warning: {warning}. {WARNING_TAILS[phase]}")
+            finally:
+                self.foreign_cards.discard(card)
         return outcomes
 
-    async def after_hook_card(self, owner, event, previous):
-        """After a hook card in a chat that was not just running (a subagent's card in its delegating
-        parent): approve() left it running, so put back its previous status, or awaiting_approval
-        while another of its cards waits. A card a stopped subagent left waiting shows cancelled. A
-        parent whose turn is over (an idle parent of a background subagent, or its turn ended while the card
-        waited) becomes idle again, and stays running when the user started a turn there while the card
-        waited."""
+    async def after_hook_card(self, owner, event):
+        """After a hook card that ran outside the owner chat's own task (a subagent's card in its parent) or in a
+        chat that was not just running: approve() left the chat running, so its status follows the rule of a
+        task's end (AgentManager.settle). While another of its cards waits it is awaiting_approval. Else it is idle
+        once its task is over (an idle parent of a background subagent, or its turn, compaction or ! command
+        ended during the wait), and then a background subagent that finished meanwhile may continue it
+        (maybe_wake). While its task goes on, it shows what that task's own work last set (work_statuses: running,
+        delegating, compacting or naming), not the status it had when the card asked: the task may have moved on
+        since, or be a turn the user started meanwhile. A card a stopped subagent left waiting shows cancelled."""
         if event.get("state") == "pending":
             await self.update_event(owner, event, state="cancelled")
         task = self.tasks.get(owner["id"])
-        waiting = any(key[0] == owner["id"] and not future.done() for key, future in self.pending.items())
-        if previous == "idle" or task is None or task.done():
-            if task is None or task.done():
-                status = "awaiting_approval" if waiting else "idle"
-            elif task.cancelling():
-                return  # The new turn is stopping: its own end sets the status.
-            else:
-                status = "awaiting_approval" if waiting else "running"
-            if self.statuses.get(owner["id"], "idle") != status:
-                await self.status(owner, status)
-            return
-        if previous is None or task.cancelling():
-            return  # The owner's turn is stopping: its own end sets its status.
-        # Another card's own wait ended meanwhile: the chat was delegating under it.
-        status = "awaiting_approval" if waiting else "delegating" if previous == "awaiting_approval" else previous
-        if self.statuses.get(owner["id"]) != status:
-            await self.status(owner, status)
+        over = task is None or task.done() or owner["id"] in self.settling
+        if not over and task.cancelling():
+            return  # The owner's task is stopping: its own end sets its status.
+        if self.cards_wait(owner["id"]):
+            status = "awaiting_approval"
+        elif over:
+            status = "idle"
+        else:  # A turn that has set no status yet (its work's last one is an earlier task's idle) is running.
+            status = self.work_statuses.get(owner["id"], "idle")
+            status = "running" if status == "idle" else status
+        if self.statuses.get(owner["id"], "idle") != status:
+            await self.status(owner, status, card=True)
+        if status == "idle":
+            self._background(self.delegates.maybe_wake(owner["id"]))
 
     @staticmethod
     def hook_agent(session):

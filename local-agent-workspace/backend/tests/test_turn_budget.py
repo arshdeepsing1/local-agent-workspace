@@ -8,9 +8,10 @@ import time
 import httpx
 import pytest
 
-from local_agent import turns
+from local_agent import planning, turns
 from local_agent.agents import AgentManager
 from local_agent.api import create_app
+from local_agent.composer_api import SIDE_QUESTION_PREFIX
 from local_agent.config import MAX_TURN_TOKENS, Settings
 from local_agent.prompt_cache import unmarked
 from local_agent.store import Store
@@ -210,7 +211,7 @@ async def test_subagents_count_in_the_parents_result(runtime, monkeypatch):
     assert result["tokens"] == 44_000 and result["estimated_dbu"] == pytest.approx(4 * PER_CALL)
     child = manager.store.get(session["subagents"][0]["id"])
     assert child["last_turn_result"]["tokens"] == 22_000 and child["last_turn_result"]["subagents"]["count"] == 0
-    assert session["subagents"][0]["tokens"] == 22_000  # The index keeps it for later turns' checks.
+    assert session["subagents"][0]["turn_spend"]["tokens"] == 22_000  # The index keeps it for later turns' checks.
 
 
 async def test_a_count_no_call_reported_is_none_not_zero(runtime, monkeypatch):
@@ -223,7 +224,7 @@ async def test_a_count_no_call_reported_is_none_not_zero(runtime, monkeypatch):
     result = session["last_turn_result"]
     assert result["usage"]["input_tokens"] is None and result["tokens"] is None
     assert result["subagents"]["count"] == 1 and result["subagents"]["tokens"] is None
-    assert session["subagents"][0]["tokens"] is None  # The subagents index tells it apart from 0 too.
+    assert session["subagents"][0]["turn_spend"]["tokens"] is None  # The subagents index tells it apart from 0 too.
     assert "— in / — out" in turn_summary_text(result)
 
 
@@ -268,6 +269,15 @@ def test_reported_tokens_tells_an_unreported_count_from_zero():
     assert reported_tokens([]) is None and reported_tokens([{"usage": {}}, "damaged", {"usage": None}]) is None
     assert reported_tokens([{"usage": {"prompt_tokens": 0, "completion_tokens": 0}}]) == 0
     assert reported_tokens([{"usage": {}}, {"usage": {"prompt_tokens": 5, "completion_tokens": 2}}]) == 7
+
+
+def test_an_index_entry_from_before_the_turn_spend_counts_its_whole_spend(runtime):
+    manager, session = runtime
+    # Its tokens and DBU as the index kept them then (/btw side questions included), so a turn still counts it.
+    session["subagents"] = [{"id": "older", "created": time.time(), "tokens": 11_000, "estimated_dbu": PER_CALL,
+                             "unpriced_calls": 1}]
+    found = turns.children(manager, session, {"started": time.time() - 60})
+    assert found["older"][:3] == (11_000, PER_CALL, 1)
 
 
 # The budget
@@ -361,17 +371,27 @@ async def test_a_subagent_counts_toward_its_parents_turn_and_reports_its_stop(ru
 
 # A background subagent across its parent's turns: its requests count in the turn during which they were made.
 
+# A /btw side question's usage: 25,100 tokens and 1.457146 DBU on Opus 5.5 (more than two agent responses).
+SIDE_USAGE = {"prompt_tokens": 25_000, "completion_tokens": 100}
+SIDE_DBU = 1.457146
+
+
 def gated_gateway(monkeypatch, parent, child):
-    """parent(n) and child(n), async: the SSE text of the chat's nth agent request and of its subagent's nth."""
+    """parent(n) and child(n), async: the SSE text of the chat's nth agent request and of its subagent's nth (or
+    the subagent's HTTP response). A /btw side question is answered with SIDE_USAGE."""
     requests, children = [], []
 
     async def gateway(request):
         body = json.loads(request.content)
         if body.get("stream") is not True:
+            if SIDE_QUESTION_PREFIX.split("\n")[0] in json.dumps(body):
+                return httpx.Response(200, json={"choices": [{"message": {"content": "Side answer."},
+                                                              "finish_reason": "stop"}], "usage": SIDE_USAGE})
             return httpx.Response(200, json={"choices": [{"message": {"content": "Title"}, "finish_reason": "stop"}]})
         if is_child(body):
             children.append(body)
-            return httpx.Response(200, text=await child(len(children)))
+            reply = await child(len(children))
+            return reply if isinstance(reply, httpx.Response) else httpx.Response(200, text=reply)
         requests.append(body)
         return httpx.Response(200, text=await parent(len(requests)))
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: REAL_CLIENT(**kwargs, transport=httpx.MockTransport(gateway)))
@@ -383,15 +403,18 @@ def completed_calls(manager, child_id):
     return sum(call.get("status") == "completed" for call in child.get("inference_calls") or [])
 
 
-async def background_turn(manager, session, monkeypatch, turn_two, gates):
+async def background_turn(manager, session, monkeypatch, turn_two, gates, replies=None):
     """Turn 1 starts a background subagent that makes one request in it and one more while the chat is idle;
-    its request n then waits for gates[n]. turn_two(n, child_id): the parent's nth request (from 3 on)."""
+    its request n then waits for gates[n] and gets replies[n] when given. turn_two(n, child_id): the parent's nth
+    request (from 3 on)."""
     state, idle = {}, asyncio.Event()
     gates = {2: idle, **gates}
 
     async def child(count):
         if count in gates:
             await gates[count].wait()
+        if count in (replies or {}):
+            return replies[count]
         return calls_reply((f"x{count}", "list_tasks", {})) if count < 4 else text_reply("## Report\nMapped.")
 
     async def parent(count):
@@ -465,6 +488,189 @@ async def test_a_background_subagent_that_ends_during_a_later_turn_counts_its_re
     assert two["tokens"] == 44_000
 
 
+async def test_a_carried_subagent_whose_request_in_the_turn_reported_no_count_still_counts_in_it(runtime, monkeypatch):
+    manager, session = runtime
+    gates = {3: asyncio.Event()}
+
+    async def turn_two(count, child_id):
+        if count == 3:
+            gates[3].set()  # The subagent's third request is made during turn 2.
+            await eventually(lambda: len((manager.get(child_id) or {}).get("inference_calls") or []) == 3)
+            return calls_reply(("p3", "list_tasks", {}))
+        return text_reply("Done with turn two.")
+    # Databricks answers it with an error and no usage, which ends it.
+    failed = httpx.Response(500, json={"error_code": "INTERNAL_ERROR", "message": "Server problem."})
+    _, child_id, _ = await background_turn(manager, session, monkeypatch, turn_two, gates, {3: failed})
+    second = await started_turn(manager, session, "Something else")
+    await eventually(lambda: manager.delegates.background_running(session["id"]) == 0)
+    assert [call["status"] for call in manager.store.get(child_id)["inference_calls"]] == ["completed", "completed",
+                                                                                          "error"]
+    # It worked in turn 2, and no request it made then reported a count: counted, its tokens None (not 0).
+    two = second["last_turn_result"]
+    assert two["subagents"] == {"count": 1, "tokens": None, "estimated_dbu": 0.0}
+    assert two["tokens"] == 22_000
+
+
+async def test_a_side_question_in_a_background_subagents_chat_does_not_count_in_the_turn_it_ends_in(runtime, monkeypatch):
+    manager, session = runtime
+    gates = {3: asyncio.Event(), 4: asyncio.Event()}
+
+    async def turn_two(count, child_id):
+        if count == 3:
+            gates[3].set()
+            gates[4].set()  # It makes its last two requests and ends while the parent waits for it.
+            return calls_reply(("g1", "get_subagent_result", {"subagent_id": child_id, "wait_seconds": 10}))
+        return text_reply("It is done.")
+    _, child_id, requests = await background_turn(manager, session, monkeypatch, turn_two, gates)
+    # While the chat is idle, the user asks the running subagent a side question in its chat (25,100 tokens).
+    assert (await manager.side_question(child_id, "Which file are you on?"))["answer"] == "Side answer."
+    # Turn 2's limit: its two requests (22,000) and the subagent's two in it (22,000) stay under it.
+    manager.get(session["id"])["turn_token_limit"] = 50_000
+    second = await started_turn(manager, session, "Wait for it")
+    assert manager.delegates.background_running(session["id"]) == 0
+    # Read from the subagents index once it ended, the subagent's requests in turn 2 count in its result and its
+    # limit, the side question asked before it does not.
+    two = second["last_turn_result"]
+    assert two["subagents"] == {"count": 1, "tokens": 22_000, "estimated_dbu": pytest.approx(2 * PER_CALL)}
+    assert (two["terminal_reason"], two["tokens"]) == ("completed", 44_000)
+    assert len(requests) == 4 and "per turn" not in system_text(requests[3])
+    # Its spend for the spending limit keeps the side question: it is billed.
+    assert second["subagents"][0]["estimated_dbu"] == pytest.approx(4 * PER_CALL + SIDE_DBU)
+
+
+async def test_a_subagent_chat_the_user_continues_while_its_parents_turn_runs_keeps_its_own_budget(runtime, monkeypatch):
+    manager, session = runtime
+    hold = asyncio.Event()
+
+    async def parent(count):
+        if count == 1:
+            return calls_reply(("d1", "delegate_task", {"task": "Map it", "agent_type": "explore", "max_steps": 8}))
+        if count == 3:  # Turn 2's first request: it runs while the user continues the subagent chat.
+            await hold.wait()
+        return text_reply("Done.")
+
+    async def child(count):
+        # Its delegated turn reports at once; the turn the user continues keeps calling tools.
+        return text_reply("## Report\nMapped.") if count == 1 else calls_reply((f"x{count}", "list_tasks", {}))
+    requests, children = gated_gateway(monkeypatch, parent, child)
+    manager.store.save(session)
+    first = await started_turn(manager, session, "Delegate")
+    child_id = first["subagents"][0]["id"]
+    first["turn_token_limit"] = 30_000  # The subagent chat follows its parent's limits.
+    manager.store.save(first)
+    manager.start(session["id"], "Something else")
+    await eventually(lambda: len(requests) == 3)  # The parent's turn 2 runs.
+    manager.start(child_id, "Go on mapping the rest")  # The user continues the subagent chat on its own.
+    await asyncio.wait_for(manager.tasks[child_id], 10)
+    hold.set()
+    await asyncio.wait_for(manager.tasks[session["id"]], 10)
+    # Its own turn: three requests (33,000 tokens) reach the 30,000-token limit, so the fourth is its wrap-up.
+    continued = children[1:]
+    child_session = manager.store.get(child_id)
+    assert len(continued) == 4 and "per turn" in system_text(continued[3]), child_session["terminal_reason"]
+    assert child_session["terminal_reason"] == "budget_limit"
+    assert notices(child_session)[-1]["text"].startswith("This turn has used about 44,000 of its 30,000-token limit")
+    # Nor is it part of the parent's turn 2.
+    two = manager.store.get(session["id"])["last_turn_result"]
+    assert two["subagents"]["count"] == 0 and two["tokens"] == 11_000
+
+
+async def test_a_subagent_chat_continued_during_the_parent_turn_that_delegated_it_counts_there_only_its_delegated_run(
+        runtime, monkeypatch):
+    manager, session = runtime
+    # The parent's 33,000 and the subagent's delegated 11,000 stay under 50,000; with the 22,000 of the turn the
+    # user continued the subagent chat in, the parent's third request would be its wrap-up.
+    session["turn_token_limit"] = 50_000
+    hold, seen = asyncio.Event(), {}
+
+    async def parent(count):
+        if count == 1:
+            return calls_reply(("d1", "delegate_task", {"task": "Map it", "agent_type": "explore", "max_steps": 8}))
+        if count == 2:  # The subagent reported; while this request runs the user continues its chat.
+            await hold.wait()
+            return calls_reply(("p2", "list_tasks", {}))
+        return text_reply("Done.")
+
+    async def child(count):
+        if count == 3:  # The continued turn's second request: its first is in the live subagent's ledger.
+            seen["used"] = turns.used(manager, manager.get(session["id"]))[2]
+        if count == 1:
+            return text_reply("## Report\nMapped.")
+        return calls_reply(("x2", "list_tasks", {})) if count == 2 else text_reply("More mapped.")
+    requests, _ = gated_gateway(monkeypatch, parent, child)
+    manager.store.save(session)
+    manager.start(session["id"], "Delegate")
+    await eventually(lambda: len(requests) == 2)
+    child_id = manager.get(session["id"])["subagents"][0]["id"]
+    manager.start(child_id, "Go on mapping the rest")  # The user continues the subagent chat on its own.
+    await asyncio.wait_for(manager.tasks[child_id], 10)
+    assert manager.store.get(child_id)["last_turn_result"]["tokens"] == 22_000  # Its own turn.
+    hold.set()
+    await asyncio.wait_for(manager.tasks[session["id"]], 10)
+    saved = manager.store.get(session["id"])
+    result = saved["last_turn_result"]
+    # The parent's turn: its three requests and the subagent's delegated one, not the turn the user had with it,
+    # neither while that ran nor after.
+    assert seen["used"] == 22_000
+    assert len(requests) == 3 and "per turn" not in system_text(requests[2])
+    assert result["terminal_reason"] == "completed"
+    assert (result["subagents"]["tokens"], result["tokens"]) == (11_000, 44_000)
+    # The index keeps the delegated run for its parent's turns; its spend for the spending limit has every request.
+    entry = saved["subagents"][0]
+    assert entry["turn_spend"]["tokens"] == 11_000 and entry["estimated_dbu"] == pytest.approx(3 * PER_CALL)
+
+
+async def test_a_finished_subagent_the_user_continues_does_not_stop_its_running_sibling_at_the_parents_budget(
+        runtime, monkeypatch):
+    manager, session = runtime
+    # The parent's 22,000, Quick's 11,000 and Slow's 22,000 stay under 60,000; the user's own turn with Quick
+    # (33,000) is not the parent's.
+    session["turn_token_limit"] = 60_000
+    hold = asyncio.Event()
+    slow, continued = [], []
+
+    async def gateway(request):
+        body = json.loads(request.content)
+        if body.get("stream") is not True:
+            return httpx.Response(200, json={"choices": [{"message": {"content": "Title"}, "finish_reason": "stop"}]})
+        text = json.dumps(unmarked(body)["messages"])
+        if not is_child(body):
+            if "d1" not in text:
+                return httpx.Response(200, text=calls_reply(delegation("d1", "Quick"), delegation("d2", "Slow")))
+            return httpx.Response(200, text=text_reply("Done."))
+        if "Go on" in text:  # The user's own turn in Quick's chat: two tool rounds, then a reply.
+            continued.append(body)
+            return httpx.Response(200, text=calls_reply((f"q{len(continued)}", "list_tasks", {}))
+                                  if len(continued) < 3 else text_reply("More."))
+        if "Delegated task:\\nQuick" in text:
+            return httpx.Response(200, text=text_reply("## Report\nQuick done."))
+        slow.append(body)
+        if len(slow) == 1:
+            await hold.wait()  # Slow's first request runs while the user continues Quick.
+            return httpx.Response(200, text=calls_reply(("s1", "list_tasks", {})))
+        return httpx.Response(200, text=text_reply("## Report\nSlow done."))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: REAL_CLIENT(**kwargs, transport=httpx.MockTransport(gateway)))
+    manager.store.save(session)
+    manager.start(session["id"], "Delegate both")
+    await eventually(lambda: len(manager.get(session["id"]).get("subagents") or []) == 2 and slow)
+    quick = next(entry["id"] for entry in manager.get(session["id"])["subagents"] if entry["task"] == "Quick")
+    await eventually(lambda: not any(entry.get("child_session_id") == quick
+                                     for entry in manager.delegates.active.get(session["id"], ())))
+    manager.start(quick, "Go on")  # The user continues the finished subagent's chat on its own.
+    await asyncio.wait_for(manager.tasks[quick], 10)
+    assert manager.store.get(quick)["last_turn_result"]["tokens"] == 33_000
+    hold.set()
+    await asyncio.wait_for(manager.tasks[session["id"]], 10)
+    saved = manager.store.get(session["id"])
+    slow_id = next(entry["id"] for entry in saved["subagents"] if entry["task"] == "Slow")
+    # Slow's second request is an ordinary one: the parent's turn is at 33,000 then (its request, Quick's and Slow's
+    # first), not 66,000.
+    assert len(slow) == 2 and "per turn" not in system_text(slow[1])
+    assert manager.store.get(slow_id)["terminal_reason"] == "completed"
+    result = saved["last_turn_result"]
+    assert (result["terminal_reason"], result["subagents"]["tokens"], result["tokens"]) == ("completed", 33_000, 55_000)
+
+
 async def test_a_subagents_wrap_up_runs_only_its_report_which_reaches_the_parent(runtime, monkeypatch):
     manager, session = runtime
     session["turn_token_limit"] = 30_000
@@ -514,6 +720,180 @@ async def test_a_wrap_up_on_the_last_agent_step_ends_the_turn_at_the_budget(runt
     assert not any("Increase Agent steps" in event["text"] for event in notices(session))
 
 
+def narrated(call_id, text):
+    """A response with narration text and one list_tasks call."""
+    return sse({"content": text, "tool_calls": [{"index": 0, "id": call_id, "type": "function",
+                                                  "function": {"name": "list_tasks", "arguments": "{}"}}]}, "tool_calls")
+
+
+def broken_call(call_id, name, arguments):
+    """A response whose one tool call has arguments that are not valid JSON."""
+    return sse({"tool_calls": [{"index": 0, "id": call_id, "type": "function",
+                                "function": {"name": name, "arguments": arguments}}]}, "tool_calls")
+
+
+async def test_a_subagents_wrap_up_report_the_schema_refuses_still_reaches_the_parent_as_text(runtime, monkeypatch):
+    """Outside the wrap-up a report the schema refuses is an error the model fixes and sends again; the wrap-up is
+    the turn's last request, so no request follows, and the parent gets the refused report as written (redacted)
+    with the error, not an earlier step's narration."""
+    manager, session = runtime
+    session["turn_token_limit"] = 30_000
+    summary = "Mapped the parser: three modules; the tokenizer remains."
+    # A realistic slip: a finding with a key the schema does not take (additionalProperties: false).
+    refused = {"summary": summary, "findings": [{"path": "parser.py", "line": 3, "text": "Entry point.",
+                                                 "severity": "info"}],
+               "next_steps": ["Map the tokenizer with the key private-token."]}
+    parent_replies = [calls_reply(delegation()), text_reply("The subagent reported at the budget.")]
+
+    def child(children):
+        if len(children) < 3:
+            return narrated(f"x{len(children)}", "Looking at the parser next.")
+        if len(children) == 3:  # The wrap-up request: the report, with one bad field.
+            return calls_reply(("r1", "submit_report", refused))
+        return calls_reply(("r2", "submit_report", {"summary": summary}))  # Never asked for.
+    requests, children = scripted(monkeypatch, lambda requests: parent_replies[min(len(requests), 2) - 1], child)
+    manager.store.save(session)
+    session = await started_turn(manager, session, "Delegate")
+    assert len(children) == 3 and "Call no tool except submit_report" in system_text(children[2])
+    child_session = manager.store.get(session["subagents"][0]["id"])
+    assert next(event for event in child_session["events"] if event.get("call_id") == "r1")["state"] == "error"
+    assert child_session["terminal_reason"] == "budget_limit"
+    delegated = next(event for event in session["events"] if event.get("name") == "delegate_task")
+    result = json.loads(delegated["output"])
+    assert (result["status"], result["terminal_reason"]) == ("failed", "budget_limit") and "report" not in result
+    output = result["output"]
+    assert output.startswith("Errors:\nInvalid tool arguments at findings.0")
+    assert "Looking at the parser" not in output and "No final assistant reply" not in output, output
+    written = json.dumps(refused).replace("private-token", "[REDACTED]")
+    assert output.endswith(planning.REFUSED_REPORT + written) and '"severity": "info"' in output, output
+
+
+REMAINING = "The tokenizer remains: map tokenizer.py next."
+# Wrap-up reports the schema refuses, each with what remains in the part it refused: the wrap-up asks for what is
+# done, what remains and how to continue, which invites these shapes.
+REFUSED_SHAPES = {
+    "summary_object": {"summary": {"done": "Mapped the parser: three modules.", "remaining": REMAINING}},
+    "extra_top_level_key": {"summary": "Mapped the parser: three modules.", "remaining": REMAINING},
+    "string_findings": {"summary": "Mapped the parser: three modules.", "findings": [f"parser.py:3: {REMAINING}"]},
+}
+
+
+@pytest.mark.parametrize("shape", list(REFUSED_SHAPES))
+async def test_a_refused_wrap_up_report_reaches_the_parent_with_the_part_the_schema_refused(runtime, monkeypatch,
+                                                                                            shape):
+    """A summary that is not text, a key the schema does not take or findings that are not objects: the parent gets
+    the refused report as the model wrote it, never an earlier step's narration nor the report without that part."""
+    manager, session = runtime
+    session["turn_token_limit"] = 30_000
+    parent_replies = [calls_reply(delegation()), text_reply("The subagent reported at the budget.")]
+
+    def child(children):
+        if len(children) < 3:
+            return narrated(f"x{len(children)}", "Looking at the parser next.")
+        return calls_reply(("r1", "submit_report", REFUSED_SHAPES[shape]))  # The wrap-up request's report.
+    requests, children = scripted(monkeypatch, lambda requests: parent_replies[min(len(requests), 2) - 1], child)
+    manager.store.save(session)
+    session = await started_turn(manager, session, "Delegate")
+    assert len(children) == 3 and "Call no tool except submit_report" in system_text(children[2])
+    child_session = manager.store.get(session["subagents"][0]["id"])
+    assert next(event for event in child_session["events"] if event.get("call_id") == "r1")["state"] == "error"
+    delegated = next(event for event in session["events"] if event.get("name") == "delegate_task")
+    result = json.loads(delegated["output"])
+    assert result["terminal_reason"] == "budget_limit" and "report" not in result
+    output = result["output"]
+    assert output.startswith("Errors:\nInvalid tool arguments") and "Looking at the parser" not in output, output
+    assert output.endswith(planning.REFUSED_REPORT + json.dumps(REFUSED_SHAPES[shape])), output
+
+
+async def test_a_subagents_wrap_up_report_with_broken_json_is_promised_no_retry_and_reaches_the_parent_as_written(
+        runtime, monkeypatch):
+    """Outside the wrap-up a hidden request asks the model to send broken tool arguments again; the wrap-up is the
+    turn's last request, so the chat promises no retry, and the parent gets the report's arguments as written
+    (redacted)."""
+    manager, session = runtime
+    session["turn_token_limit"] = 30_000
+    summary = "Mapped the parser with the key private-token: three modules; the tokenizer remains."
+    arguments = '{"summary": "' + summary + '", "findings": [{"path": "parser.py", "text": "Entry point."},]}'
+    parent_replies = [calls_reply(delegation()), text_reply("The subagent reported at the budget.")]
+
+    def child(children):
+        if len(children) < 3:
+            return calls_reply((f"x{len(children)}", "list_tasks", {}))
+        if len(children) == 3:  # The wrap-up request: a trailing comma breaks the report's JSON.
+            return broken_call("r1", "submit_report", arguments)
+        return calls_reply(("r2", "submit_report", {"summary": summary}))  # Never asked for.
+    requests, children = scripted(monkeypatch, lambda requests: parent_replies[min(len(requests), 2) - 1], child)
+    manager.store.save(session)
+    session = await started_turn(manager, session, "Delegate")
+    assert len(children) == 3 and "Call no tool except submit_report" in system_text(children[2])
+    child_session = manager.store.get(session["subagents"][0]["id"])
+    texts = [event["text"] for event in notices(child_session)]
+    assert not any("automatically" in text.lower() for text in texts), texts  # No hidden retry is promised.
+    assert texts[-1].startswith("Its parent conversation's turn has used about 44,000 of its 30,000-token limit")
+    assert child_session["terminal_reason"] == "budget_limit" and manager.budget_wrapups == set()
+    delegated = next(event for event in session["events"] if event.get("name") == "delegate_task")
+    result = json.loads(delegated["output"])
+    assert (result["status"], result["terminal_reason"]) == ("failed", "budget_limit") and "report" not in result
+    assert result["output"].startswith("Errors:\nIts parent conversation's turn has used")
+    assert result["output"].endswith(planning.UNSENT_REPORT + arguments.replace("private-token", "[REDACTED]"))
+    assert "private-token" not in json.dumps(child_session["events"])  # Kept on its reply, redacted.
+
+
+@pytest.mark.parametrize("failure", ["output_limit", "incomplete_response"])
+async def test_a_wrap_up_summary_that_ends_early_is_promised_no_continuation(runtime, monkeypatch, failure):
+    """A plain chat's wrap-up summary cut at the output limit (or ended without a finish reason): an earlier step
+    would continue in a hidden request, but the wrap-up is the turn's last request, so the budget ends the turn
+    with the partial summary kept and no continuation promised."""
+    manager, session = runtime
+    session["turn_token_limit"] = 20_000  # 22,000 after two responses: the third request wraps up.
+
+    def replies(requests):
+        if len(requests) < 3:
+            return calls_reply((f"c{len(requests)}", "list_tasks", {}))
+        if len(requests) == 3:
+            return sse({"content": "Summary: two steps done; "}, "length" if failure == "output_limit" else None)
+        return text_reply("Summary: two steps done, the rest remains.")  # Never asked for.
+    requests, _ = scripted(monkeypatch, replies)
+    await manager.run(session, "Work")
+    assert len(requests) == 3 and "Do not call any tools" in system_text(requests[2])
+    texts = [event["text"] for event in notices(session)]
+    assert not any("automatically" in text.lower() for text in texts), texts  # No hidden retry is promised.
+    stop = notices(session)[-1]
+    assert stop["terminal_reason"] == "budget_limit" == session["last_turn_result"]["terminal_reason"]
+    assert stop["text"].startswith("This turn has used about 33,000 of its 20,000-token limit per turn. The agent "
+                                   "wrapped up instead of continuing.")
+    reply = [event for event in session["events"] if event["type"] == "assistant"][-1]
+    assert reply["text"] == "Summary: two steps done; "
+    assert session["wire"][-1]["role"] == "assistant" and manager.budget_wrapups == set()
+
+
+@pytest.mark.parametrize("failure", ["output_limit", "invalid_tool_arguments"])
+async def test_a_wrap_up_reply_on_the_last_agent_step_that_cannot_be_used_still_ends_at_the_budget(runtime, monkeypatch,
+                                                                                                  failure):
+    """The wrap-up is the third and last request, and its reply is cut at the output limit or has broken tool JSON:
+    the turn ends at the budget, as the same reply on an earlier step does, not with an inference error that
+    advises more Agent steps."""
+    manager, session = runtime
+    manager.settings.values["max_agent_steps"] = 3
+    session["turn_token_limit"] = 20_000  # 22,000 after two responses: the third and last request is the wrap-up.
+
+    def replies(requests):
+        if len(requests) < 3:
+            return calls_reply((f"c{len(requests)}", "list_tasks", {}))
+        if failure == "output_limit":
+            return sse({"content": "Done so far: the parser. Remaining: the tok"}, "length")
+        return broken_call("c3", "list_tasks", '{"oops')
+    requests, _ = scripted(monkeypatch, replies)
+    await manager.run(session, "Work")
+    assert len(requests) == 3 and "Do not call any tools" in system_text(requests[2])
+    stop = notices(session)[-1]
+    assert (session["terminal_reason"], stop.get("terminal_reason")) == ("budget_limit", "budget_limit"), stop["text"]
+    assert session["last_turn_result"]["terminal_reason"] == "budget_limit"
+    assert stop["text"].startswith("This turn has used about 33,000 of its 20,000-token limit per turn. The agent "
+                                   "wrapped up instead of continuing.")
+    assert not any(event["type"] == "error" for event in session["events"]) and manager.budget_wrapups == set()
+
+
 async def test_a_side_question_during_a_turn_counts_toward_neither_its_limit_nor_its_result(runtime, monkeypatch):
     manager, session = runtime
     session["turn_token_limit"] = 30_000  # The turn's own two requests use 22,000; the side question 25,100.
@@ -542,6 +922,89 @@ async def test_a_side_question_during_a_turn_counts_toward_neither_its_limit_nor
     result = saved["last_turn_result"]
     assert (result["terminal_reason"], result["tokens"], result["usage"]["calls"]) == ("completed", 22_000, 2)
     assert result["estimated_dbu"] == pytest.approx(2 * PER_CALL)
+
+
+async def test_a_side_question_in_a_subagents_chat_counts_in_its_parents_turn_neither_while_it_runs_nor_after(
+        runtime, monkeypatch):
+    manager, session = runtime
+    # Parent 22,000 + subagent 22,000 stay under 50,000; with the side question's 25,100 the parent's second
+    # request would be its wrap-up.
+    session["turn_token_limit"] = 50_000
+    hold = asyncio.Event()
+
+    async def parent(count):
+        return calls_reply(delegation()) if count == 1 else text_reply("Done.")
+
+    async def child(count):
+        if count == 1:
+            await hold.wait()  # The user asks the subagent a side question while its first request runs.
+            return calls_reply(("x1", "list_tasks", {}))
+        return text_reply("## Report\nMapped.")
+    requests, children = gated_gateway(monkeypatch, parent, child)
+    manager.store.save(session)
+    manager.start(session["id"], "Delegate")
+    await eventually(lambda: children)
+    child_id = manager.delegates.active[session["id"]][0]["child_session_id"]
+    assert (await manager.side_question(child_id, "What are you doing?"))["answer"] == "Side answer."
+    assert turns.used(manager, manager.get(session["id"]))[2] == 11_000  # Read live while it runs.
+    hold.set()
+    await manager.tasks[session["id"]]
+    assert "side_question" in [call["purpose"] for call in manager.store.get(child_id)["inference_calls"]]
+    # Read from the subagents index once it ended: its two agent requests, not the side question.
+    assert len(requests) == 2 and "per turn" not in system_text(requests[1])
+    result = manager.store.get(session["id"])["last_turn_result"]
+    assert result["terminal_reason"] == "completed"
+    assert result["subagents"] == {"count": 1, "tokens": 22_000, "estimated_dbu": pytest.approx(2 * PER_CALL)}
+    assert result["tokens"] == 44_000 and result["estimated_dbu"] == pytest.approx(4 * PER_CALL)
+
+
+async def test_the_step_limit_notice_names_the_turns_dbu_without_a_side_question_asked_during_it(runtime, monkeypatch):
+    manager, session = runtime
+    manager.settings.values["max_agent_steps"] = 2
+    hold = asyncio.Event()
+
+    async def parent(count):
+        if count == 1:
+            await hold.wait()  # The side question is asked while the turn's first request runs.
+        return calls_reply((f"c{count}", "list_tasks", {}))
+    requests, _ = gated_gateway(monkeypatch, parent, None)
+    manager.store.save(session)
+    manager.start(session["id"], "Work")
+    await eventually(lambda: requests)
+    assert (await manager.side_question(session["id"], "What is this about?"))["answer"] == "Side answer."
+    hold.set()
+    await manager.tasks[session["id"]]
+    saved = manager.store.get(session["id"])
+    result = saved["last_turn_result"]
+    assert result["terminal_reason"] == "step_limit" and result["estimated_dbu"] == pytest.approx(2 * PER_CALL)
+    # The notice names the turn's cost as its record (the footer under the same reply) does: 1.714 DBU, not 3.2.
+    assert notices(saved)[-1]["text"].endswith(" This turn used about 1.7 DBU (estimate).")
+
+
+async def test_a_subagents_step_limit_error_names_its_turns_dbu_without_a_side_question_in_its_chat(
+        runtime, monkeypatch):
+    manager, session = runtime
+    hold = asyncio.Event()
+
+    async def parent(count):
+        return calls_reply(("d1", "delegate_task", {"task": "Map it", "agent_type": "explore", "max_steps": 2})) \
+            if count == 1 else text_reply("Done.")
+
+    async def child(count):
+        if count == 1:
+            await hold.wait()  # The user asks the subagent a side question while its first request runs.
+        return calls_reply((f"x{count}", "list_tasks", {}))
+    _, children = gated_gateway(monkeypatch, parent, child)
+    manager.store.save(session)
+    manager.start(session["id"], "Delegate")
+    await eventually(lambda: children)
+    child_id = manager.delegates.active[session["id"]][0]["child_session_id"]
+    assert (await manager.side_question(child_id, "What are you doing?"))["answer"] == "Side answer."
+    hold.set()
+    await manager.tasks[session["id"]]
+    child_session = manager.store.get(child_id)
+    assert child_session["terminal_reason"] == "step_limit"
+    assert notices(child_session)[-1]["text"].endswith(" This turn used about 1.7 DBU (estimate).")
 
 
 async def test_a_change_during_the_turn_applies_from_the_next_request(runtime, monkeypatch):

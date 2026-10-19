@@ -10,7 +10,7 @@ from .permissions import MODE_LABELS, denied_tools
 from .reasoning import EFFORT_LABELS
 from .redaction import redact_secrets
 from .spending import own_spend
-from .telemetry import reported_tokens, sum_usage, usage_counts
+from .telemetry import sum_usage, usage_counts
 from .tool_profiles import PROFILES, child_profile, covering_tool, server_off, validate_profile
 
 log = logging.getLogger(__name__)
@@ -136,6 +136,12 @@ LEGACY_REPORT = ("Work on your own: the parent sees only your final reply, never
                  "report: summary; key findings with path:line references; files changed (or none); open questions or risks.")
 REPORT_KEYS = ("summary", "findings", "files_changed", "next_steps")
 REPORT_SUBMITTED = "Report sent to the parent chat. Your turn ends here."
+# A report of the subagent's last response that did not go through (unaccepted_report): how the parent's result
+# labels its text. The arguments of an unusable reply's call are kept up to UNSENT_REPORT_CHARS (the result holds
+# no more).
+REFUSED_REPORT = "Its last report, which the submit_report schema refused (see the error), as the model wrote it:\n"
+UNSENT_REPORT = "Its last report, whose submit_report arguments could not be read, as the model wrote them:\n"
+UNSENT_REPORT_CHARS = RESULT_BYTES
 # The model history's reply after submit_report ended a subagent's turn (a turn ends with a reply).
 REPORT_SUBMITTED_REPLY = "[Report submitted to the parent chat with submit_report.]"
 INITIAL_PROMPT_LABEL = "Agent's initial prompt:"
@@ -210,11 +216,13 @@ def index_entry(child, task):
     if progress.get("background") is True:
         entry["background"] = True  # delegate_task background: the parent went on while it worked.
     if isinstance(child.get("inference_calls"), list):
-        # What it spent so far, for its parent's spending limit (spending.py), turn budget (turns.py) and Usage
-        # (usage_rollup); a header has no ledger.
+        from .turns import turn_spend  # turns.py imports this module.
+        # What it spent so far, for its parent's spending limit (spending.py) and Usage (usage_rollup), and what of
+        # it counts in its parent's turns (turns.py: not its /btw side questions, nor a turn you continue its chat
+        # in, as _record keeps it from the end of its delegated run); a header has no ledger.
         entry["estimated_dbu"], entry["unpriced_calls"] = own_spend(child)
-        entry["tokens"] = reported_tokens(child["inference_calls"])  # None: no call reported a count.
         entry["usage"] = usage_counts(child["inference_calls"])
+        entry["turn_spend"] = turn_spend(child["inference_calls"])
     return entry
 
 
@@ -282,6 +290,25 @@ def submitted_report(events):
                 and isinstance(event.get("input"), dict) and isinstance(event["input"].get("summary"), str)):
             return {key: event["input"][key] for key in REPORT_KEYS if key in event["input"]}
     return None
+
+
+def unaccepted_report(events):
+    """The report a subagent's last response sent that did not go through, as labelled text, or None: a
+    submit_report call the schema refused or one in a reply that could not be used (kept on the reply as
+    unsent_report), its arguments as the model wrote them either way. The wrap-up at a turn's limit sends no request
+    to fix it, so the parent gets it this way."""
+    start = next((index for index in range(len(events) - 1, -1, -1) if events[index].get("type") == "assistant"), None)
+    if start is None:
+        return None
+    for event in reversed(events[start + 1:]):
+        values = event.get("input")
+        if (event.get("type") == "tool" and event.get("name") == "submit_report" and event.get("state") == "error"
+                and isinstance(values, dict)):
+            # As written, not as report_text: the part the schema refused (a summary that is not text, a key it does
+            # not take) is the part report_text would leave out, and often holds what remains.
+            return REFUSED_REPORT + json.dumps(values, ensure_ascii=False)
+    unsent = events[start].get("unsent_report")
+    return UNSENT_REPORT + unsent if isinstance(unsent, str) and unsent else None
 
 
 def retried_reports(events):
@@ -431,7 +458,8 @@ class DelegateManager:
     def __init__(self, agent_manager):
         self.manager = agent_manager
         # {parent id: [entry]}: one entry per delegation of that chat, from its start (waiting for a
-        # slot while entry["waiting"]) to its end. entry: {child_session_id, cancelled, waiting}.
+        # slot while entry["waiting"]) to its end. entry: {child_session_id, cancelled, waiting, starting (the task of
+        # its subagent_start hooks, once its child exists)}.
         self.active = {}
         self.waiters = []  # Futures of delegations waiting for a free slot.
         # {parent id: [record]}: the chat's background delegations (start_background) of this app run.
@@ -442,7 +470,9 @@ class DelegateManager:
         self.held = {}
         # Background subagents whose final result get_subagent_result already returned: no notice repeats it.
         self.seen = set()
-        self.stopping = set()  # Chats whose subagents cancel_parent is stopping: nothing wakes them meanwhile.
+        # {chat id: how many cancel_parent calls stop its subagents now}: nothing wakes it meanwhile (maybe_wake), also
+        # not a subagent's card those stops close.
+        self.stopping = {}
         # {parent id: {resolved path: {child id}}}: the files each running subagent of the chat changed, so a
         # sibling's change to the same file asks first (sibling_claim).
         self.claims = {}
@@ -557,6 +587,9 @@ class DelegateManager:
         if current is not None and current.get("deleted"):
             return False  # Deleted while it ran: the entry keeps no transcript.
         updated = {**(current or {}), **index_entry(child, current.get("task", "") if task is None else task), **extra}
+        if current is not None and current.get("status") != "running" and isinstance(current.get("turn_spend"), dict):
+            # Its delegated run ended: a turn you continue its chat in is its own, not one of its parent's.
+            updated["turn_spend"] = current["turn_spend"]
         if updated == current:
             return False
         if current is None:
@@ -723,7 +756,19 @@ class DelegateManager:
 
     async def cancel_parent(self, parent_id):
         """Stop every subagent of this chat, also those still waiting for a slot and those in the background
-        (whose end it waits for, so nothing reports to the chat after this returns)."""
+        (whose end it waits for, so nothing reports to the chat after this returns). The chat counts as stopping
+        throughout (stopping): a subagent's card in it that these stops close may leave it idle, and Stop on the
+        chat must not continue it then (maybe_wake)."""
+        self.stopping[parent_id] = self.stopping.get(parent_id, 0) + 1
+        try:
+            await self._cancel_parent(parent_id)
+        finally:
+            self.stopping[parent_id] -= 1
+            if not self.stopping[parent_id]:
+                del self.stopping[parent_id]
+
+    async def _cancel_parent(self, parent_id):
+        """cancel_parent's stops, while the chat counts as stopping."""
         entries = list(self.active.get(parent_id, ()))
         for entry in entries:
             entry["cancelled"] = True
@@ -745,16 +790,25 @@ class DelegateManager:
                 # nothing would end that wait, so the delegation itself is cancelled.
                 record["worker"].cancel()
         if records:
-            self.stopping.add(parent_id)
-            try:
-                await asyncio.wait([record["worker"] for record in records])  # Not gather: a Stop of this wait
-            finally:                                                        # must not cancel their reports.
-                self.stopping.discard(parent_id)
+            await asyncio.wait([record["worker"] for record in records])  # Not gather: a Stop of this wait must not
+                                                                          # cancel their reports.
+
+    async def cancel_start(self, child_id):
+        """Stop subagent on a subagent that has not started yet: the subagent_start hooks of its delegation (their
+        card may wait in the parent chat) are cancelled, and it never starts; its call returns as cancelled."""
+        entry = next((entry for entries in self.active.values() for entry in entries
+                      if entry.get("child_session_id") == child_id), None)
+        starting = (entry or {}).get("starting")
+        if starting is None or starting.done() or entry["cancelled"]:
+            return  # Started, or its delegation is already being stopped.
+        entry["cancelled"] = True
+        starting.cancel()
+        await asyncio.wait([starting])  # Its card is closed when Stop returns.
 
     async def _slot(self, entry, parent, parent_event, labels, started=None):
         """Wait until fewer than MAX_RUNNING subagents run (over all chats); the card says queued.
-        labels: the agent's type, model and effort, as the card shows them. started (a background
-        delegation's future) learns that it is queued."""
+        labels: the agent's type, model and effort, as the card shows them, and the turn that delegated it
+        (turn_user_id). started (a background delegation's future) learns that it is queued."""
         noticed = parent_event is None
         while not entry["cancelled"] and self.running() >= MAX_RUNNING:
             entry["queued"] = True
@@ -946,8 +1000,12 @@ class DelegateManager:
         # The agent's model, else the chat's. A queued card shows only the agent's own effort: the chat's is
         # read when the child starts, since change_effort reaches running children only.
         model = spec["model"] or parent["model"]
+        # turn_user_id: the user event that started the turn delegating it (a script follows the delegations of
+        # its own turns by it, also once that turn ended).
+        turn = next((event["id"] for event in reversed(parent["events"]) if event.get("type") == "user"
+                     and not event.get("steered")), None)
         labels = {"agent_type": kind, "model": model, **({"effort": spec["effort"]} if spec["effort"] else {}),
-                  **({"background": True} if background is not None else {})}
+                  **({"background": True} if background is not None else {}), **({"turn_user_id": turn} if turn else {})}
         if parent_event is not None:
             parent_event = next((event for event in parent["events"] if event["id"] == parent_event["id"]), None)
             if parent_event is None:
@@ -970,7 +1028,8 @@ class DelegateManager:
         refusal = recheck() if recheck is not None and entry.get("queued") else None
         if refusal:
             self._release(parent["id"], entry)
-            await self._unqueue(parent, parent_event)
+            if background is None:  # A background one's card goes from queued to failed, with its result.
+                await self._unqueue(parent, parent_event)
             raise ValueError(refusal)
         child = None
         try:
@@ -1022,7 +1081,7 @@ class DelegateManager:
             child.update(parent_event_id=event_id, parent_call_id=(parent_event or {}).get("call_id"),
                          delegation={"status": "running", "completed_tools": 0, **labels, "started": time.time()})
             self.manager.store.save(child)
-        except BaseException:
+        except BaseException as exc:
             # A failed write (a full disk) must not keep the slot: other delegations would wait forever.
             if child is not None:
                 try:
@@ -1030,7 +1089,8 @@ class DelegateManager:
                 except OSError:
                     pass
             self._release(parent["id"], entry)
-            await self._unqueue(parent, parent_event)
+            if background is None or not isinstance(exc, Exception):  # As a refusal above; a stop is cancelled.
+                await self._unqueue(parent, parent_event)
             raise
         entry["child_session_id"] = child["id"]
         if background is not None:
@@ -1056,19 +1116,28 @@ class DelegateManager:
                 prompt += "".join(f"\n\nNote: {note}" for note in notes) + f"\n\n{brief} {REPORT}"
             else:
                 prompt += f"\n\n{BRIEFS[profile]} {REPORT}"
-            # subagent_start hooks (in this parent chat): their context reaches the child's first request.
-            await self.manager.subagent_start_hooks(parent, child, task=task, context=context, max_steps=max_steps)
-            self.manager.start(child["id"], prompt)
-            worker = self.manager.tasks[child["id"]]
-            if started is not None and not started.done():
-                started.set_result({"status": "running", "child_session_id": child["id"]})
-            try:
-                await asyncio.shield(worker)
-            except asyncio.CancelledError:
-                if asyncio.current_task().cancelling():
-                    raise
-                entry["cancelled"] = True
-                await self.manager.stop(child["id"])
+            # subagent_start hooks (in this parent chat): their context reaches the child's first request. They run in
+            # a task of their own, which Stop subagent cancels (cancel_start): the child then never starts.
+            if self.manager.has_hooks(parent, "subagent_start"):
+                starting = entry["starting"] = asyncio.create_task(self.manager.subagent_start_hooks(
+                    parent, child, task=task, context=context, max_steps=max_steps))
+                try:
+                    await starting
+                except asyncio.CancelledError:
+                    if asyncio.current_task().cancelling() or not entry["cancelled"]:
+                        raise
+            if not entry["cancelled"]:
+                self.manager.start(child["id"], prompt)
+                worker = self.manager.tasks[child["id"]]
+                if started is not None and not started.done():
+                    started.set_result({"status": "running", "child_session_id": child["id"]})
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    if asyncio.current_task().cancelling():
+                        raise
+                    entry["cancelled"] = True
+                    await self.manager.stop(child["id"])
         except asyncio.CancelledError:
             entry["cancelled"] = True
             await self.manager.stop(child["id"])
@@ -1085,7 +1154,8 @@ class DelegateManager:
 
     async def child_result(self, parent, saved, kind, profile, cancelled=False, failure=""):
         """The bounded result of a subagent's delegated turn (the parent's delegate_task result), with its
-        submit_report report when it sent one; closes its progress and index entry."""
+        submit_report report when it sent one (as text in the output when its last response's report did not go
+        through); closes its progress and index entry."""
         events = saved.get("events", [])
         retried = retried_reports(events)
         errors = [event.get("text") or event.get("output") or "Child tool failed." for event in events
@@ -1097,9 +1167,12 @@ class DelegateManager:
         status = "cancelled" if cancelled or reason == "stopped" else "failed" if errors or reason != "completed" else "completed"
         await self.progress(saved, terminal_reason=reason)
         report = None if cancelled else submitted_report(events)
-        if report is not None:
+        unaccepted = None if cancelled or report is not None else unaccepted_report(events)
+        if report is not None or unaccepted:
             # Only text of the response that sent the report goes with it, never an earlier step's narration.
             reply = next((event.get("text") or "" for event in reversed(events) if event.get("type") == "assistant"), "")
+            if unaccepted:
+                reply = (reply + "\n\n" if reply else "") + self.manager.settings.redact(redact_secrets(unaccepted))
         else:
             reply = next((event.get("text", "") for event in reversed(events) if event.get("type") == "assistant" and event.get("text")), "")
         if (reply or report) and not cancelled and status == "completed":
@@ -1241,22 +1314,59 @@ class DelegateManager:
         return ("Background subagents ended since your last step: " + "; ".join(named) + more
                 + " Read their reports with get_subagent_result.")
 
+    def forget_removed_reads(self, session):
+        """After a conversation rewind: a background subagent of this chat whose result only removed turns read
+        (get_subagent_result) is unread again, so the next step names its end again."""
+        read = set()
+        for event in session.get("events", []):
+            if event.get("type") == "tool" and event.get("name") == "get_subagent_result":
+                try:
+                    output = json.loads(event.get("output") or "")
+                except ValueError:
+                    continue
+                if isinstance(output, dict) and isinstance(output.get("result"), dict):
+                    read.add(output.get("subagent_id"))
+        for event in session.get("events", []):
+            if event.get("type") == "tool" and event.get("name") == "delegate_task":
+                if event.get("child_session_id") not in read:
+                    self.seen.discard(event.get("child_session_id"))
+
+    def due_notice(self, parent):
+        """The newest notice of a background subagent of this chat that finished (or failed) after the chat's last
+        step and after the user's last Stop on the chat (stopped), or None; one that never started has no report to
+        read, and its notice waits for the chat's next step."""
+        reported = max((value for value in (parent.get("subagents_reported_through"), parent.get("stopped_through"))
+                        if type(value) in (int, float)), default=0)
+        return next((event for event in reversed(parent.get("events", [])) if event.get("type") == "notice"
+                     and event.get("subagent_status") in ("completed", "failed")
+                     and isinstance(event.get("created"), (int, float)) and event["created"] > reported
+                     and event.get("subagent_id") and event["subagent_id"] not in self.seen), None)
+
+    def stopped(self, parent_id):
+        """Stop on the chat ended (AgentManager.stop): Stop is the user's choice, like a limit, so a background
+        subagent that ended until now continues nothing (due_notice), also not when a later ! command, compaction
+        or card's answer leaves the chat idle. Its notice still waits for the chat's next step (background_notice,
+        which reads only subagents_reported_through). Saved with the chat, so a restart keeps it."""
+        try:
+            parent = self.manager.get(parent_id)
+        except (ValueError, OSError):  # An unreadable conversation: nothing can wake it.
+            return
+        if parent is None or parent.get("is_subagent") or self.due_notice(parent) is None:
+            return
+        parent["stopped_through"] = time.time()
+        self.manager.store.save(parent, touch=False)
+
     def wake_due(self, parent):
-        """Whether a background subagent of this chat finished (or failed) after the chat's last step; one that
-        never started has no report to read, and its notice waits for the chat's next step."""
-        reported = parent.get("subagents_reported_through")
-        reported = reported if type(reported) in (int, float) else 0
-        return any(event.get("type") == "notice" and event.get("subagent_status") in ("completed", "failed")
-                   and isinstance(event.get("created"), (int, float)) and event["created"] > reported
-                   and event.get("subagent_id") and event["subagent_id"] not in self.seen
-                   for event in parent.get("events", []))
+        """Whether a background subagent of this chat finished (or failed) after the chat's last step (due_notice)."""
+        return self.due_notice(parent) is not None
 
     async def maybe_wake(self, parent_id):
         """Settings → Subagents → Continue the chat when a background subagent finishes (off by default: it
         starts a paid turn): an idle chat whose model was not told of a finished background subagent gets an
         app message that starts its next turn. Not a chat whose last turn stopped at a limit, an error or a
-        stop (Continue is the user's choice), and never a scheduled run's chat, which nobody may be watching;
-        their notice waits for the next message. Never raises."""
+        stop (Continue is the user's choice), nor for a subagent that ended before the user's last Stop on the
+        chat (stopped), and never a scheduled run's chat, which nobody may be watching; their notice waits for
+        the next message. Never raises."""
         try:
             if (self.manager.settings.values.get("background_subagent_wake") is not True or self.manager.closing
                     or parent_id in self.stopping):
@@ -1264,21 +1374,24 @@ class DelegateManager:
             parent = self.manager.get(parent_id)
             if (not parent or parent.get("is_subagent") or isinstance(parent.get("schedule"), dict)
                     or parent.get("terminal_reason") not in CONTINUE_REASONS or self.manager.busy_task(parent_id)
-                    or self.manager.statuses.get(parent_id, "idle") != "idle" or not self.wake_due(parent)):
+                    or self.manager.statuses.get(parent_id, "idle") != "idle"):
+                return
+            notice = self.due_notice(parent)  # The message names that subagent, not a later stopped one.
+            if notice is None:
                 return
             if any(not item.get("paused") for item in self.manager.queue_of(parent)):
                 return  # Queued messages go first; their turn reads the notice.
-            notice = next(event for event in reversed(parent["events"]) if event.get("subagent_id")
-                          and event.get("subagent_status"))
             text = WAKE_TEXT.format(id=str(notice["subagent_id"])[:8],
                                     kind=notice["text"].removeprefix("Background subagent ").split(" ", 1)[0],
                                     ending=BACKGROUND_ENDINGS.get(notice["subagent_status"], "ended"))
-            self.manager.start(parent_id, text, verbatim=True, extra={"background_wake": True})
+            # wake_for: the subagent it reports (a script follows this turn when that subagent is one of its own).
+            self.manager.start(parent_id, text, verbatim=True,
+                               extra={"background_wake": True, "wake_for": [notice["subagent_id"]]})
         except (ValueError, OSError) as exc:
             parent = self.manager.get(parent_id)
             if parent is not None:
                 await self.manager.event(parent, "notice", text="Could not continue the chat after a background "
-                                         f"subagent finished: {self.manager.settings.redact(str(exc))[:300]}")
+                                         f"subagent ended: {self.manager.settings.redact(str(exc))[:300]}")
 
     async def subagent_result(self, parent, subagent_id=None, wait_seconds=0):
         """get_subagent_result: one background subagent's status and, once it ended, its result (subagent_id:

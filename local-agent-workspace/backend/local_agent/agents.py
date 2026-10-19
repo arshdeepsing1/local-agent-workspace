@@ -56,8 +56,9 @@ from . import commands as command_templates
 from . import custom_agents
 from . import settings_layers
 from .context import estimate_text_tokens
-from .planning import (CONTINUE_REASONS, REPORT_SUBMITTED, REPORT_SUBMITTED_REPLY, SCHEDULED_FOREGROUND, CallAllowance,
-                       DelegateManager, DelegationGate, TaskManager, bounded_result, retried_reports)
+from .planning import (CONTINUE_REASONS, REPORT_SUBMITTED, REPORT_SUBMITTED_REPLY, SCHEDULED_FOREGROUND,
+                       UNSENT_REPORT_CHARS, CallAllowance, DelegateManager, DelegationGate, TaskManager, bounded_result,
+                       retried_reports)
 from .interactions import InteractionManager, wait_seconds
 from .feature_tools import FEATURE_TOOLS, FINDINGS_TOOL
 from .tool_profiles import agent_refusal, tool_allowed, filter_tools, off_servers, server_off
@@ -72,7 +73,7 @@ from . import spending, turns
 from .telemetry import usage_summary
 from .titles import fallback_title, generate_title, needs_title
 from .telemetry import (
-    InferenceError, begin_inference_call, call_estimated_dbu, finish_inference_call, http_error_kind,
+    InferenceError, begin_inference_call, finish_inference_call, http_error_kind,
     record_response_id, reported_usage, stream_error_kind, usage_keys,
 )
 from . import serving
@@ -848,7 +849,7 @@ def public_session(session, status="idle", compaction=None):
             **{k: v for k, v in session.items()
                if k not in ("wire", "context_state", "instruction_directories", "instruction_paths", "inference_calls",
                             "command_jobs", "file_views", "turn_running", "jobs_reported_through", "pending_context",
-                            "usage_summary", "subagents_reported_through")},
+                            "usage_summary", "subagents_reported_through", "stopped_through")},
             **({"pending_context": pending} if pending else {}),
             **({"queued_messages": public_queue(queue)} if isinstance(queue, list) else {}),
             **({"compaction_progress": compaction} if compaction else {}),
@@ -869,7 +870,16 @@ class AgentManager(LifecycleHooks):
         self.rules = RuleStore(settings.state_dir)
         self.pending_checks = {}  # (session id, event id) -> recheck(change) of a waiting card
         self.card_revisers = {}  # (session id, event id) -> async reviser(changes) for Edit before approving
+        # (session id, event id) of hook cards another task than the chat's own runs (a background subagent's hook
+        # in its parent), while they wait or run: the end of the chat's turn or compaction leaves them alone.
+        self.foreign_cards = set()
         self.statuses = {}
+        # {chat id: the status its own work last set (a turn, compaction or ! command: running, delegating,
+        # compacting, naming, idle at its end), never a card's wait or answer}: the status the answer to a card that
+        # another task asked in the chat puts back while that work goes on (after_hook_card).
+        self.work_statuses = {}
+        # Chats whose turn, compaction or ! command is setting its last status (settle): it counts as over.
+        self.settling = set()
         # {chat id: {started, first_call, first_event}} while a turn runs (turns.py: its result record and budget),
         # and the chats whose current request is a turn's wrap-up at its budget (their tool calls do not run).
         self.turns = {}
@@ -931,7 +941,7 @@ class AgentManager(LifecycleHooks):
         self.estimate_anchors = {}
         self.anchor_candidates = {}
         # In memory only: {chat id: progress} of the compaction running in each chat (compaction_progress),
-        # until the chat's status leaves "compacting".
+        # until the chat's own work leaves "compacting" (a card's wait meanwhile keeps it).
         self.compactions = {}
         # The lifespan writes the marker after every task and job stopped. It is removed before
         # anything else, so a crash during this run gives a full scan next time. Without it (a
@@ -974,12 +984,19 @@ class AgentManager(LifecycleHooks):
 
         run() keeps turn_running until the model loop ends. A title request (after the
         answer completed) or a manual compaction outside a turn is closed as interrupted
-        but does not make the turn incomplete. Older records without the marker count as
-        cut short when an agent request or a tool was still running. The turn it closes
-        gets its result record in the header (last_turn_result), which scripts read.
+        but does not make the turn incomplete, nor does a card still open once the
+        turn's answer finished (a background subagent's hook card, which outlasts it),
+        also while the chat was being named. Older records without the markers count as cut
+        short when an agent request or a tool was still running. The turn it closes gets
+        its result record in the header (last_turn_result), which scripts read.
         """
         now, closed = time.time(), []
         cut_short = session.pop("turn_running", False) is True
+        # The turn's end was saved, or its answer finished and only naming the chat ran (turn_ended is None until
+        # naming ends, turn_running is already gone), so a card still open is not the turn's.
+        saved_end = session.get("turn_ended")
+        turn_closed = not cut_short and ("turn_ended" in session and saved_end is None
+                                         or type(saved_end) in (int, float))
         changed = cut_short
         for call in session.get("inference_calls", []):
             if isinstance(call, dict) and call.get("status") == "running":
@@ -992,7 +1009,7 @@ class AgentManager(LifecycleHooks):
                 event["state"] = "cancelled"
                 changed = True
                 # A ! command is the user's own action, not an agent turn: nothing to continue.
-                if not (event.get("type") == "tool" and event.get("name") == "user_command"):
+                if not (turn_closed or event.get("type") == "tool" and event.get("name") == "user_command"):
                     cut_short = True
             if event.get("request_info", {}).get("status") == "running":
                 event["request_info"].update(status="interrupted", error_kind="incomplete_response")
@@ -1217,7 +1234,8 @@ class AgentManager(LifecycleHooks):
     def message_parts(items):
         """(scan, blocks, fields) for prepared messages sent as one: scan the text whose @ tokens attach
         (a plain-text message's are left out), blocks the expanded commands as the model gets them after the
-        typed text and its attachments, fields the user event's extras (commands, verbatim)."""
+        typed text and its attachments, fields the user event's extras (commands, verbatim, client_refs: the
+        scripts' tokens of the messages, POST /messages client_ref)."""
         scan = "\n\n".join("" if item.get("verbatim") else item["text"] + (
             "\n\n" + item["command"]["expanded"] if isinstance(item.get("command"), dict) else "") for item in items)
         commands = [item["command"] for item in items if isinstance(item.get("command"), dict)]
@@ -1227,6 +1245,9 @@ class AgentManager(LifecycleHooks):
             fields["commands"] = [{"name": command["name"], "path": command["path"]} for command in commands]
         if items and all(item.get("verbatim") for item in items):
             fields["verbatim"] = True
+        refs = [item["client_ref"] for item in items if isinstance(item.get("client_ref"), str)]
+        if refs:
+            fields["client_refs"] = refs
         return scan, blocks, fields
 
     @staticmethod
@@ -1689,13 +1710,17 @@ class AgentManager(LifecycleHooks):
         self.closing_sockets.add(task)
         task.add_done_callback(self.closing_sockets.discard)
 
-    async def status(self, session, status, turn_ended=False, result=None):
+    async def status(self, session, status, turn_ended=False, result=None, card=False):
         """turn_ended: this idle status ends a turn (not a manual compaction); result: that turn's result record
-        (turns.turn_result), which the message carries, so a script reads the end of its turn from it."""
+        (turns.turn_result), which the message carries, so a script reads the end of its turn from it. card: the
+        status of a card's wait or answer, not of the chat's own work (work_statuses): it leaves a running
+        compaction's progress, which shows again once the chat compacts again."""
         previous = self.statuses.get(session["id"], "idle")
         self.statuses[session["id"]] = status
-        if status != "compacting":
-            self.compactions.pop(session["id"], None)
+        if not card:
+            self.work_statuses[session["id"]] = status
+            if status != "compacting":
+                self.compactions.pop(session["id"], None)
         message = {"type": "status", "status": status}
         if status == "idle":
             # How and when the last turn ended, for notifications and the Continue button.
@@ -1704,6 +1729,9 @@ class AgentManager(LifecycleHooks):
             if turn_ended and result is not None:
                 message["turn_result"] = result
         await self.broadcast(session["id"], message)
+        if card and status == "compacting" and (record := self.compactions.get(session["id"])):
+            # A card's answer during a compaction: the page dropped its progress at the card's status.
+            await self.broadcast(session["id"], {"type": "compaction", "progress": dict(record)})
         self.notify_status(session, previous, status, turn_ended)
         await self.delegates.progress(session, status=status)
         if status == "idle":
@@ -1741,9 +1769,10 @@ class AgentManager(LifecycleHooks):
 
     def notify_background(self, session, text):
         """A desktop notification (Settings → Notifications, while no page is open) and the notification hooks
-        when a background subagent of an idle chat ended: the text and the chat's title, never transcript text."""
-        if self.busy_task(session["id"]):
-            return  # The running turn reports it.
+        when a background subagent of a chat that runs no turn ended (it is idle, or runs a ! command or a manual
+        compaction): the text and the chat's title, never transcript text."""
+        if session["id"] in self.turns:
+            return  # The running turn learns of it at its next step, and its end notifies.
         page_open = bool(self.pages or any(self.listeners.values()))
         message = f"{text}: {short_title(self.redact_title(str(session.get('title') or '')))}"
         if self.has_hooks(session, "notification"):
@@ -1907,7 +1936,7 @@ class AgentManager(LifecycleHooks):
         try:
             await self.update_event(session, event, state="pending",
                                     **({"approval_expires": time.time() + seconds} if seconds else {}))
-            await self.status(session, "awaiting_approval")
+            await self.status(session, "awaiting_approval", card=True)
             answer = await asyncio.wait_for(future, timeout=seconds)
             answer = answer if isinstance(answer, dict) else {"allowed": bool(answer)}
             allowed = answer["allowed"]
@@ -1932,7 +1961,7 @@ class AgentManager(LifecycleHooks):
         await self.update_event(session, event, state="running" if allowed else "rejected", approval=outcome, **details)
         if rule:
             await self.publish_permissions(session)
-        await self.status(session, "running")
+        await self.status(session, "running", card=True)
         return allowed
 
     def scheduled_run(self, session):
@@ -2631,13 +2660,16 @@ class AgentManager(LifecycleHooks):
         """The tool definitions offered in the next model request (offered_tools)."""
         return self.offered_tools(session, external_tools)[0]
 
-    def start(self, session_id, prompt, *, from_queue=False, verbatim=False, items=None, uploads=(), extra=None):
+    def start(self, session_id, prompt, *, from_queue=False, verbatim=False, items=None, uploads=(), extra=None,
+              client_ref=None):
         """Start a turn. @ files, attached files (uploads: [{id, as_path?}]) and pending ! output are attached
         now, and a command template is expanded, so a refused file or a broken command is an error before
         anything runs (from_queue: queued messages, given as items, whose commands were expanded when they were
         queued; refused files become a note). verbatim: sent as plain text, without a command, skills or @ files.
-        extra: fields of the user event (background_wake: the app's message after a background subagent).
-        Queued messages still waiting are leftovers of a stop or failure: they are paused."""
+        extra: fields of the user event (background_wake: the app's message after a background subagent, which
+        leaves the waiting ! output for your next message; wake_for: the subagents it reports). client_ref: a
+        script's token for the message (its user event's client_refs). Queued messages still waiting are leftovers
+        of a stop or failure: they are paused."""
         if session_id in self.tasks and not self.tasks[session_id].done():
             raise ValueError("A response is already running in this conversation.")
         session = self.get(session_id)
@@ -2649,11 +2681,12 @@ class AgentManager(LifecycleHooks):
         content, attachments, views, fields = None, None, [], {}
         if not delegated_prompt(session):
             tools = self.session_tools(session)
-            prepared = items if items is not None else [self.prepared_message(tools, prompt, verbatim, uploads)]
+            prepared = items if items is not None else [{**self.prepared_message(tools, prompt, verbatim, uploads),
+                                                         **({"client_ref": client_ref} if client_ref else {})}]
             scan, blocks, fields = self.message_parts(prepared)
             expanded, attachments, views = mentions.expand_context(
-                self, session, tools, prompt, on_error="inline" if from_queue else "raise", scan=scan,
-                uploads=self.message_uploads(prepared))
+                self, session, tools, prompt, include_pending=not (extra or {}).get("background_wake"),
+                on_error="inline" if from_queue else "raise", scan=scan, uploads=self.message_uploads(prepared))
             expanded += blocks
             content = expanded if expanded != prompt else None
             if from_queue:
@@ -2680,6 +2713,7 @@ class AgentManager(LifecycleHooks):
             if not task.cancelling():
                 task.cancel()
         await self.delegates.cancel_parent(session_id)
+        await self.delegates.cancel_start(session_id)  # A subagent whose start hooks (perhaps a card) still run.
         if task and not task.done():
             await asyncio.gather(task, return_exceptions=True)
         self.scheduled_turns.pop(session_id, None)  # A scheduled run stopped before its turn began.
@@ -2695,18 +2729,20 @@ class AgentManager(LifecycleHooks):
                 self.store.save(session)
                 await self.delegates.progress(session, terminal_reason="stopped")
                 await self.status(session, "idle", turn_ended=True, result=result)
+        if not self.closing:
+            self.delegates.stopped(session_id)  # What its background subagents reported until now wakes nothing.
 
     def busy_task(self, session_id):
         task = self.tasks.get(session_id)
         return task is not None and not task.done()
 
-    async def submit_message(self, session_id, text, verbatim=False, uploads=()):
+    async def submit_message(self, session_id, text, verbatim=False, uploads=(), client_ref=None):
         """Send a message: start it when the chat is idle, else queue it for the running task.
         verbatim: sent as plain text (no command, skill or @ file). uploads: files attached from the
-        composer ([{id, as_path?}])."""
+        composer ([{id, as_path?}]). client_ref: a script's token, kept on the user event that sends it."""
         if self.busy_task(session_id):
-            return await self.enqueue(session_id, text, verbatim, uploads)
-        self.start(session_id, text, verbatim=verbatim, uploads=uploads)
+            return await self.enqueue(session_id, text, verbatim, uploads, client_ref)
+        self.start(session_id, text, verbatim=verbatim, uploads=uploads, client_ref=client_ref)
         return {"ok": True}
 
     @staticmethod
@@ -2718,10 +2754,11 @@ class AgentManager(LifecycleHooks):
         await self.broadcast(session["id"], {"type": "queue", "queued_messages": public_queue(self.queue_of(session)),
                                              **({"error": error} if error else {})})
 
-    async def enqueue(self, session_id, text, verbatim=False, uploads=()):
+    async def enqueue(self, session_id, text, verbatim=False, uploads=(), client_ref=None):
         """Queue a message while a turn, compaction or ! command runs. @ tokens and attached files are
         checked now; their snapshot is taken when the message is sent. A command template is expanded now
-        (prepared_message), so its errors show at once."""
+        (prepared_message), so its errors show at once. client_ref: a script's token, kept on the queued message
+        and on the user event that sends it (as the next turn, or into the running one)."""
         session = self.get(session_id)
         if not session:
             raise ValueError("Conversation not found.")
@@ -2733,6 +2770,8 @@ class AgentManager(LifecycleHooks):
             raise ValueError("Queued messages can contain at most 50,000 characters in total.")
         tools = self.session_tools(session)
         prepared = self.prepared_message(tools, text, verbatim, uploads)
+        if client_ref:
+            prepared["client_ref"] = client_ref
         mentions.expand_context(self, session, tools, text, include_pending=False, scan=self.message_parts([prepared])[0],
                                 uploads=self.message_uploads([prepared]))
         if prepared.get("uploads"):
@@ -2878,12 +2917,13 @@ class AgentManager(LifecycleHooks):
         if session.pop("pending_context", None):
             self._background(self.publish_pending(session))
 
-    def _content_sent(self, session):
+    def _content_sent(self, session, keep_pending=False):
         """A turn's message, with its attachments, is now in the wire: its @ files count as seen
-        (the read-before-overwrite guard) and its ! output no longer waits."""
+        (the read-before-overwrite guard) and its ! output no longer waits (keep_pending: it carried none)."""
         for target, seen in self.unsent_views.pop(session["id"], None) or []:
             self.remember_file(session, target, seen)
-        self._drop_pending(session)
+        if not keep_pending:
+            self._drop_pending(session)
 
     def _after_task(self, session_id, kind, task):
         """Done-callback of a turn, compaction or ! command: send the unpaused queued messages
@@ -2997,7 +3037,7 @@ class AgentManager(LifecycleHooks):
             self.store.forget_encodings(session["id"])
             if noted:  # The composer shows the output waiting for the next message.
                 await self.publish_pending(session)
-            await self.status(session, "idle")
+            await self.settle(session, asyncio.current_task().cancelling())
 
     async def side_question(self, session_id, question):
         """/btw: answer a question from the conversation so far in one non-streamed request.
@@ -3138,6 +3178,9 @@ class AgentManager(LifecycleHooks):
         terminal_reason = "completed"
         first_event = len(session["events"])
         storage_error_reported = False
+        # The answer completed and the chat is being named: a Stop then cancels only the title request. Not read from
+        # the status shown, which a background subagent's card waiting in the chat replaces.
+        naming = False
         # carried: what the chat's background subagents still running from an earlier turn spent so far.
         turn_state = self.turns[session["id"]] = {"started": turns.clock(), "first_event": first_event,
                                                   "first_call": len(session.get("inference_calls") or []),
@@ -3189,6 +3232,7 @@ class AgentManager(LifecycleHooks):
             session.pop("turn_running", None)  # The answer is finished; naming is not part of it.
             if completed and needs_title(session, self.redact_title):
                 previous_title = session["title"]
+                naming = True
                 await self.status(session, "naming")
                 title = await generate_title(self.serving, session, self.store.save)
                 if title and needs_title(session, self.redact_title) and session["title"] == previous_title:
@@ -3196,7 +3240,7 @@ class AgentManager(LifecycleHooks):
                     self.store.save(session)
                     await self.broadcast(session["id"], {"type": "title", "title": title})
         except asyncio.CancelledError:
-            if self.statuses.get(session["id"]) == "naming":
+            if naming:
                 # The answer completed; cancelling its title is not cancelled work.
                 asyncio.current_task().uncancel()
             else:
@@ -3237,8 +3281,8 @@ class AgentManager(LifecycleHooks):
             updates = []
             stopped = asyncio.current_task().cancelling()
             for event in session["events"]:
-                if event.get("state") == "pending" and not stopped and self.card_waits(session, event):
-                    continue  # A card another task waits on (a background subagent's hook in this chat) stays.
+                if not stopped and self.card_elsewhere(session, event):
+                    continue  # Another task's card (a background subagent's hook in this chat) waits or runs on.
                 if event.get("state") in ("running", "pending"):
                     event["state"] = "cancelled"
                     updates.append(event)
@@ -3286,16 +3330,32 @@ class AgentManager(LifecycleHooks):
             self.live.pop(session["id"], None)
             self.store.forget_encodings(session["id"])
             try:
-                await self.status(session, "idle", turn_ended=True, result=result)
-                if not stopped and any(self.card_waits(session, event) for event in session["events"]):
-                    await self.status(session, "awaiting_approval")  # That card still waits for its answer.
+                await self.settle(session, stopped, turn_ended=True, result=result)
             except STORAGE_ERRORS as exc:
                 await report_storage_failure(exc)
 
-    def card_waits(self, session, event):
+    def cards_wait(self, session_id):
         """Whether a card of this chat still waits for its answer (its wait in self.pending has not ended)."""
-        future = self.pending.get((session["id"], event.get("id")))
-        return future is not None and not future.done()
+        return any(key[0] == session_id and not future.done() for key, future in self.pending.items())
+
+    def card_elsewhere(self, session, event):
+        """Whether another task than the chat's own still waits on or runs this card (a background subagent's hook
+        in this chat): the chat's turn or compaction that ends meanwhile leaves it as it is."""
+        return (session["id"], event.get("id")) in self.foreign_cards
+
+    async def settle(self, session, stopped=False, turn_ended=False, result=None):
+        """The status a turn, manual compaction or ! command leaves when it ends, by the rule a hook card's answer
+        follows too (after_hook_card): idle, or awaiting_approval while a card of the chat still waits (a background
+        subagent's hook card outlasts the task; after a Stop, which ends those, it stays idle). A card answered
+        meanwhile, whose approve() sets the chat running, finds the task over (settling), so the chat is never
+        left running without a task. turn_ended and result: as for status()."""
+        self.settling.add(session["id"])
+        try:
+            await self.status(session, "idle", turn_ended=turn_ended, result=result)
+            if not stopped and self.cards_wait(session["id"]):
+                await self.status(session, "awaiting_approval", card=True)  # That card still waits for its answer.
+        finally:
+            self.settling.discard(session["id"])
 
     async def run_delegations(self, session, tools, calls, values, allowance):
         """Consecutive delegate_task calls of one response, run in parallel; their outputs in call
@@ -4961,10 +5021,11 @@ class AgentManager(LifecycleHooks):
         first_event = len(session["events"])  # Its before_compaction hook cards come after this.
 
         async def close_cards():
-            """A hook card a Stop or failure left running or pending shows cancelled, as at a turn's end (not a
-            card another task still waits on: a background subagent's hook in this chat)."""
+            """A hook card a Stop or failure left running or pending shows cancelled, as at a turn's end (unless
+            stopped, not a card another task still waits on or runs: a background subagent's hook in this chat)."""
+            stopped = asyncio.current_task().cancelling()
             for event in session["events"][first_event:]:
-                if event.get("state") in ("running", "pending") and not self.card_waits(session, event):
+                if event.get("state") in ("running", "pending") and (stopped or not self.card_elsewhere(session, event)):
                     await self.update_event(session, event, state="cancelled")
         try:
             self.compaction_trigger(session, "manual")
@@ -5023,7 +5084,7 @@ class AgentManager(LifecycleHooks):
             await close_cards()
             self.live.pop(session["id"], None)
             self.store.forget_encodings(session["id"])
-            await self.status(session, "idle")
+            await self.settle(session, asyncio.current_task().cancelling())
 
     async def model_response(self, session, event, client, url, headers, payload, retry_reason=None, body=None,
                              effort=None, cache=None, accepted=None, fallback=None, replayed=0):
@@ -5236,6 +5297,13 @@ class AgentManager(LifecycleHooks):
             if error:
                 if error.kind != "output_limit":
                     message["content"] = ((message["content"] or "") + "\n\n[" + str(error) + "]").strip()
+                unsent = [call["function"]["arguments"] for call in ordered_calls
+                          if call["function"]["name"] == "submit_report"]
+                if unsent and error.kind != "content_filter" and session.get("is_subagent") and session.get(
+                        "turn_delegated"):
+                    # A delegated subagent's report in a reply that cannot be used, as written (redacted): when no
+                    # request follows (the turn's wrap-up), its parent still gets it (planning.unaccepted_report).
+                    event["unsent_report"] = self.settings.redact(unsent[-1])[:UNSENT_REPORT_CHARS]
             else:
                 if calls:
                     message["tool_calls"] = ordered_calls
@@ -5732,7 +5800,8 @@ class AgentManager(LifecycleHooks):
         if isinstance(meter := session.get("context_info"), dict) and meter.get("compactable") is False:
             # This turn's first request replaces the meter; a turn that ends before it leaves this one.
             meter["compactable"] = compactable = has_earlier_turn(wire, session.get("context_state"))
-        self._content_sent(session)  # Its @ files are now seen and its ! output no longer pending.
+        # Its @ files are now seen and its ! output no longer pending (the app's message carried none).
+        self._content_sent(session, keep_pending=bool(turn and turn.get("background_wake")))
         context_window, max_output_tokens = self.request_limits(session)
         self.mark_user_in_wire(session)  # No await since the prompt was appended above.
         if compactable:
@@ -5749,8 +5818,6 @@ class AgentManager(LifecycleHooks):
             steps = (session.get("max_steps", 6) if session.get("is_subagent")
                      else session["max_agent_steps"] if type(session.get("max_agent_steps")) is int
                      else self.chat_values(session).get("max_agent_steps", DEFAULT_MAX_AGENT_STEPS))
-            # What the chat had spent and how many calls it had before this turn (the step-limit notice).
-            turn_start = (self.spent_so_far(session), len(session.get("inference_calls") or []))
             # Hidden repairs, auto-continue waits after rate limits, the reason the next
             # request is sent automatically (ledger), and the Verify loop's progress.
             consecutive_repairs, rate_limit_waits, retry_reason = 0, 0, None
@@ -6051,6 +6118,13 @@ class AgentManager(LifecycleHooks):
                     continuation = REPAIR_CONTINUATIONS.get(exc.kind)
                     if event["request_info"].get("finish_reason") == "content_filter":
                         continuation = None  # A provider safety stop is shown, never re-prompted.
+                    if (continuation or exc.kind == "output_limit") and wrap_up is not None and (
+                            budget := turns.reached(self, session)) is not None:
+                        # The wrap-up was the turn's last request: a reply that cannot be used ends it at the budget
+                        # too (also on the last Agent step), with no hidden retry or continuation promised.
+                        await self.refresh_next_estimate(session, system, definitions, wire, context_state)
+                        await self.budget_stop(session, wire, turns.stop_text(*budget, wrapped=True))
+                        return False
                     if continuation and consecutive_repairs < MAX_REPAIR_RETRIES and has_another_step:
                         # The reply keeps its 'error' request details (not 'interrupted', which
                         # offers Continue); the model gets a hidden request to try again.
@@ -6196,7 +6270,7 @@ class AgentManager(LifecycleHooks):
                                   f"This project's {settings_layers.LAYER_FILES[source]} sets this limit, not "
                                   "Settings: change it there or send a message to continue." if source else
                                   "Increase Agent steps in Settings or send a message to continue.")
-                               + self.turn_cost(session, *turn_start)),
+                               + self.turn_cost(session)),
                          terminal_reason="step_limit")
 
     @staticmethod
@@ -6212,21 +6286,14 @@ class AgentManager(LifecycleHooks):
         return any(item.get("type") == "tool" and item.get("name") == "submit_report" and item.get("call_id") in ids
                    and item.get("state") == "completed" for item in events[start:])
 
-    def spent_so_far(self, session):
-        """(estimated DBU, unpriced calls) of a chat and its subagents (spending.chat_spend); a subagent's own."""
-        if session.get("is_subagent"):
-            return spending.own_spend(session)
-        spend = spending.chat_spend(self, session)
-        return spend["spent_dbu"], spend["unpriced_calls"]
-
-    def turn_cost(self, session, before, first_call):
-        """' This turn used about N DBU (estimate).' since before (spent_so_far when the turn began), or ''
-        when a call of the turn has no price data or none of its own calls (from first_call on) was priced."""
-        spent, unpriced = self.spent_so_far(session)
-        calls = (session.get("inference_calls") or [])[first_call:]
-        if unpriced != before[1] or not any((call_estimated_dbu(call)[0] or 0) > 0 for call in calls
-                                            if isinstance(call, dict)):
+    def turn_cost(self, session):
+        """' This turn used about N DBU (estimate).': the estimate of the turn's result record (turns.turn_result: a
+        chat's with its subagents', not a /btw side question), so the footer under the reply gives the same, or ''
+        when a call of the turn has no price data or none was priced."""
+        turn = self.turns.get(session["id"])
+        result = turns.turn_result(self, session, turn, "step_limit") if turn is not None else {}
+        used = result.get("estimated_dbu")
+        if used is None or result.get("unpriced_calls"):
             return ""
-        used = max(0.0, spent - before[0])
         return f" This turn used about {used:,.1f} DBU (estimate)." if used >= 1 else \
             f" This turn used about {used:.3f} DBU (estimate)."

@@ -13,8 +13,11 @@ from local_agent import planning, spending
 from local_agent.agents import AgentManager
 from local_agent.api import create_app
 from local_agent.config import Settings
+from local_agent.notify import SystemNotifier
 from local_agent.planning import BACKGROUND_QUEUED, BACKGROUND_STARTED, WAKE_TEXT
+from local_agent.transcript import transcript
 
+from test_attention import Runner
 from test_parallel_subagents import (Gateway, calls_reply, card, delegate, eventually, make_runtime, reply, run_turn,
                                      tool_messages)
 
@@ -365,6 +368,584 @@ async def test_a_turn_that_ends_while_a_hook_card_waits_leaves_that_card_waiting
     assert card(saved, "a")["delegation_result"]["status"] == "completed"
 
 
+REVIEW_HOOK = {"id": "review", "event": "subagent_stop", "enabled": True, "timeout_seconds": 10, "command": "true"}
+
+
+def waiting_cards(manager, session_id):
+    """The keys of the chat's cards that still wait for their answer."""
+    return [key for key, future in manager.pending.items() if key[0] == session_id and not future.done()]
+
+
+def hold_compaction(manager, monkeypatch, parent, hold):
+    """Give the idle chat an earlier turn to compact, and make its summary request wait for hold."""
+    held = manager.get(parent["id"])
+    held["wire"] = [{"role": "user", "content": "First"}, {"role": "assistant", "content": "Done"}, *held["wire"]]
+    manager.store.save(held)
+    summarize = manager.summarize_context
+
+    async def held_summary(*args, **kwargs):
+        await hold.wait()
+        return await summarize(*args, **kwargs)
+    monkeypatch.setattr(manager, "summarize_context", held_summary)
+
+
+@pytest.mark.parametrize("task", ["compaction", "command"])
+async def test_a_compaction_or_a_command_that_ends_while_a_hook_card_waits_leaves_the_chat_awaiting_approval(
+        runtime, monkeypatch, task):
+    """A background subagent's subagent_stop card asks in the chat while a manual compaction or a ! command runs
+    there. The task's end leaves the card waiting, so the chat still shows it waits for approval, as at a turn's
+    end, until the card is answered."""
+    manager, parent, project = runtime
+    parent["permission_mode"] = "acceptEdits"  # delegate_task runs without a card; the hook asks for one.
+    manager.store.save(parent)
+    manager.extensions.update_config({"hooks": [REVIEW_HOOK]})
+    gate, hold = asyncio.Event(), asyncio.Event()
+    Gateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)), lambda: reply("Going on.")],
+            {"Survey": gated(gate)})
+    await run_turn(manager, parent)
+    if task == "command":  # It runs until the file go exists.
+        manager.start_shell(parent["id"], "while [ ! -f go ]; do sleep 0.05; done", timeout_seconds=30)
+    else:
+        hold_compaction(manager, monkeypatch, parent, hold)
+        manager.start_compaction(parent["id"])
+    gate.set()  # The subagent ends; its hook asks in the chat while the task runs.
+    await eventually(lambda: bool(waiting_cards(manager, parent["id"])))
+    key, = waiting_cards(manager, parent["id"])
+    hold.set()  # The compaction's summary request goes on ...
+    (project / "go").write_text("")  # ... or the command ends.
+    await asyncio.wait_for(manager.tasks[parent["id"]], 10)  # The task ended; the card still waits.
+    hook_card = next(event for event in manager.get(parent["id"])["events"] if event["id"] == key[1])
+    assert hook_card["state"] == "pending" and not manager.pending[key].done()
+    assert manager.statuses.get(parent["id"]) == "awaiting_approval"
+    manager.decide(parent["id"], key[1], True)
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+    await eventually(lambda: manager.statuses.get(parent["id"], "idle") == "idle")
+
+
+async def test_a_hook_card_answered_during_a_compaction_keeps_the_compactions_progress(runtime, monkeypatch):
+    """A manual compaction's summary request runs, with its progress shown, when a background subagent's
+    subagent_stop card asks in the chat; the user answers it while the compaction goes on. The chat compacts again
+    with the same progress (the snapshot and the context route read it), and the open page, which drops the
+    progress at the card's status, is sent it again."""
+    manager, parent, _ = runtime
+    parent["permission_mode"] = "acceptEdits"
+    manager.store.save(parent)
+    manager.extensions.update_config({"hooks": [REVIEW_HOOK]})
+    gate, hold = asyncio.Event(), asyncio.Event()
+    sent = []
+
+    class Page:  # The chat open in a browser: its status and compaction messages.
+        async def send_json(self, data):
+            if data.get("type") in ("status", "compaction"):
+                sent.append(data)
+    Gateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)), lambda: reply("Going on.")],
+            {"Survey": gated(gate)})
+    await run_turn(manager, parent)
+    hold_compaction(manager, monkeypatch, parent, hold)
+    manager.listeners[parent["id"]] = {Page()}
+    manager.start_compaction(parent["id"])
+    await eventually(lambda: (manager.compaction_view(parent["id"]) or {}).get("request") == 1)  # Its request runs.
+    before = manager.compaction_view(parent["id"])
+    gate.set()  # Survey ends: its card asks during the compaction.
+    await eventually(lambda: manager.statuses[parent["id"]] == "awaiting_approval")
+    key, = waiting_cards(manager, parent["id"])
+    assert manager.compaction_view(parent["id"]) is None  # Not while the card waits.
+    manager.decide(parent["id"], key[1], True)
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+    assert manager.busy_task(parent["id"]) and manager.statuses[parent["id"]] == "compacting"
+    assert manager.compaction_view(parent["id"]) == before
+    assert sent[-2:] == [{"type": "status", "status": "compacting"}, {"type": "compaction", "progress": before}]
+    hold.set()
+    await asyncio.wait_for(manager.tasks[parent["id"]], 10)
+    assert manager.compaction_view(parent["id"]) is None and parent["id"] not in manager.compactions
+
+
+@pytest.mark.parametrize("asked", ["in_an_earlier_turn", "in_the_same_turn"])
+async def test_answering_a_hook_card_while_the_turns_own_card_waits_keeps_the_chat_awaiting_approval(
+        runtime, monkeypatch, asked):
+    """A background subagent's hook card asked while a turn of the chat ran (the turn that ends before the next one
+    starts, or the same turn). The running turn then waits for its own run_command card. Answering the hook card
+    first leaves the chat awaiting approval, not running, since the turn's card still waits."""
+    manager, parent, _ = runtime
+    parent["permission_mode"] = "acceptEdits"  # delegate_task runs without a card; run_command asks.
+    manager.store.save(parent)
+    manager.extensions.update_config({"hooks": [REVIEW_HOOK]})
+    gate, hold = asyncio.Event(), asyncio.Event()
+
+    def check():  # The response whose run_command asks for the turn's own card.
+        return calls_reply(("run_command", {"command": "echo checking"}, "r"))
+
+    async def held():  # The turn's second request waits until the hook card asks.
+        await hold.wait()
+        return reply("Going on.") if asked == "in_an_earlier_turn" else check()
+    later = [check, lambda: reply("Ran it.")] if asked == "in_an_earlier_turn" else [lambda: reply("Ran it.")]
+    HeldGateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)), held, *later],
+                {"Survey": gated(gate)})
+    manager.start(parent["id"], "Delegate the work")
+    gate.set()
+    await eventually(lambda: bool(waiting_cards(manager, parent["id"])))  # The hook card waits while the turn runs.
+    hook_key, = waiting_cards(manager, parent["id"])
+    hold.set()
+    if asked == "in_an_earlier_turn":
+        await asyncio.wait_for(manager.tasks[parent["id"]], 10)  # That turn ends; the card stays waiting.
+        await manager.submit_message(parent["id"], "Run a check")
+    await eventually(lambda: len(waiting_cards(manager, parent["id"])) == 2)  # The turn's own card waits too.
+    own_key, = (key for key in waiting_cards(manager, parent["id"]) if key != hook_key)
+    manager.decide(parent["id"], hook_key[1], True)  # The user answers the hook card first.
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+    assert not manager.pending[own_key].done()
+    assert manager.statuses.get(parent["id"]) == "awaiting_approval"
+    manager.decide(parent["id"], own_key[1], True)
+    await asyncio.wait_for(manager.tasks[parent["id"]], 10)
+    assert manager.statuses.get(parent["id"], "idle") == "idle"
+
+
+async def test_a_hook_card_that_asked_while_the_turns_card_waited_answered_after_it_leaves_the_turn_running(
+        runtime, monkeypatch):
+    """The hook card asked while the turn waited on its own run_command card. The user allows the turn's card
+    first (its next request runs), then the hook card: the chat is running, not delegating."""
+    manager, parent, _ = runtime
+    parent["permission_mode"] = "acceptEdits"  # run_command asks.
+    manager.store.save(parent)
+    manager.extensions.update_config({"hooks": [REVIEW_HOOK]})
+    gate, later = asyncio.Event(), asyncio.Event()
+
+    async def held():
+        await later.wait()
+        return reply("Ran it.")
+    gateway = HeldGateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)),
+                                        lambda: calls_reply(("run_command", {"command": "echo checking"}, "r")), held],
+                          {"Survey": gated(gate)})
+    manager.start(parent["id"], "Delegate the work")
+    await eventually(lambda: len(waiting_cards(manager, parent["id"])) == 1)  # The turn's own card.
+    own_key, = waiting_cards(manager, parent["id"])
+    gate.set()  # Survey ends; its hook card asks while the turn's card waits.
+    await eventually(lambda: len(waiting_cards(manager, parent["id"])) == 2)
+    hook_key, = (key for key in waiting_cards(manager, parent["id"]) if key != own_key)
+    manager.decide(parent["id"], own_key[1], True)
+    await eventually(lambda: len(gateway.requests["parent"]) == 3)  # The command ran; the next request runs.
+    manager.decide(parent["id"], hook_key[1], True)
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+    await asyncio.sleep(0.1)
+    assert manager.statuses.get(parent["id"]) == "running"
+    later.set()
+    await asyncio.wait_for(manager.tasks[parent["id"]], 10)
+    assert manager.statuses.get(parent["id"], "idle") == "idle"
+
+
+async def test_a_hook_card_that_asked_during_a_compaction_answered_in_a_later_turn_leaves_that_turn_running(
+        runtime, monkeypatch):
+    """The card asked during a manual compaction, which ended; the user then sent a message. Answering the card
+    while that turn's request runs leaves the chat running, not compacting."""
+    manager, parent, _ = runtime
+    parent["permission_mode"] = "acceptEdits"
+    manager.store.save(parent)
+    manager.extensions.update_config({"hooks": [REVIEW_HOOK]})
+    gate, hold, later = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def held():
+        await later.wait()
+        return reply("Second answer.")
+    gateway = HeldGateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)),
+                                        lambda: reply("Going on."), held], {"Survey": gated(gate)})
+    await run_turn(manager, parent)
+    hold_compaction(manager, monkeypatch, parent, hold)
+    manager.start_compaction(parent["id"])
+    gate.set()  # Survey ends; its card asks during the compaction.
+    await eventually(lambda: bool(waiting_cards(manager, parent["id"])))
+    key, = waiting_cards(manager, parent["id"])
+    hold.set()
+    await asyncio.wait_for(manager.tasks[parent["id"]], 10)
+    assert manager.statuses.get(parent["id"]) == "awaiting_approval"
+    await manager.submit_message(parent["id"], "Go on")  # A turn the user starts while the card waits.
+    await eventually(lambda: len(gateway.requests["parent"]) == 3)  # Its request runs.
+    manager.decide(parent["id"], key[1], True)
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+    await asyncio.sleep(0.1)
+    assert manager.statuses.get(parent["id"]) == "running"
+    later.set()
+    await asyncio.wait_for(manager.tasks[parent["id"]], 10)
+    assert manager.statuses.get(parent["id"], "idle") == "idle"
+
+
+async def test_a_hook_card_answered_while_a_turn_started_meanwhile_delegates_leaves_that_turn_delegating(
+        runtime, monkeypatch):
+    """The card asked in the idle chat; the user then sent a message whose turn delegates to a (foreground)
+    subagent. Answering the card while that subagent works leaves the chat delegating, not running."""
+    manager, parent, _ = runtime
+    parent["permission_mode"] = "acceptEdits"
+    manager.store.save(parent)
+    manager.extensions.update_config({"hooks": [REVIEW_HOOK]})
+    gate, check = asyncio.Event(), asyncio.Event()
+    gateway = Gateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)),
+                                    lambda: reply("Going on."), lambda: calls_reply(delegate("Check", "c")),
+                                    lambda: reply("Checked.")],
+                      {"Survey": gated(gate), "Check": gated(check, "Checked it.")})
+    await run_turn(manager, parent)
+    gate.set()  # Survey ends; its card asks in the idle chat.
+    await eventually(lambda: bool(waiting_cards(manager, parent["id"])))
+    key, = waiting_cards(manager, parent["id"])
+    await manager.submit_message(parent["id"], "Check it")  # Its turn delegates to Check, which waits.
+    await eventually(lambda: gateway.child_started("Check").is_set())
+    await eventually(lambda: manager.statuses.get(parent["id"]) == "delegating")
+    manager.decide(parent["id"], key[1], True)
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+    await asyncio.sleep(0.1)
+    assert manager.statuses.get(parent["id"]) == "delegating"
+    check.set()  # Check ends: its own subagent_stop card asks.
+    await eventually(lambda: bool(waiting_cards(manager, parent["id"])))
+    key, = waiting_cards(manager, parent["id"])
+    manager.decide(parent["id"], key[1], True)
+    await asyncio.wait_for(manager.tasks[parent["id"]], 10)
+    assert manager.statuses.get(parent["id"], "idle") == "idle"
+
+
+async def test_a_hook_card_answered_while_the_turn_ends_leaves_the_idle_chat_idle(runtime, monkeypatch):
+    """The chat is open in a page that is slow to take the turn's idle status, and the user answers the background
+    subagent's hook card right as the turn ends: once everything settled, no task runs and the chat is idle, not
+    stuck at running."""
+    manager, parent, _ = runtime
+    parent["permission_mode"] = "acceptEdits"
+    manager.store.save(parent)
+    manager.extensions.update_config({"hooks": [REVIEW_HOOK]})
+    gate, hold = asyncio.Event(), asyncio.Event()
+
+    class SlowPage:  # Slow to take the idle status, which widens the turn's end.
+        async def send_json(self, data):
+            await asyncio.sleep(0.5 if data.get("type") == "status" and data.get("status") == "idle" else 0.005)
+
+    async def held():
+        await hold.wait()
+        return reply("Going on.")
+    HeldGateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)), held],
+                {"Survey": gated(gate)})
+    manager.listeners[parent["id"]] = {SlowPage()}
+    manager.start(parent["id"], "Delegate the work")
+    gate.set()
+    await eventually(lambda: bool(waiting_cards(manager, parent["id"])))
+    key, = waiting_cards(manager, parent["id"])
+    hold.set()
+    await eventually(lambda: manager.statuses.get(parent["id"]) == "idle")  # The turn ends ...
+    manager.decide(parent["id"], key[1], True)  # ... and the user clicks Allow at that moment.
+    await asyncio.wait_for(manager.tasks[parent["id"]], 10)
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+    await asyncio.sleep(0.6)  # Every broadcast is over.
+    assert not manager.busy_task(parent["id"]) and not waiting_cards(manager, parent["id"])
+    assert manager.statuses.get(parent["id"], "idle") == "idle"
+
+
+@pytest.mark.parametrize("send_seconds", [0, 0.02])
+async def test_allow_on_a_hook_card_as_the_reply_footer_arrives_leaves_the_idle_chat_idle(
+        runtime, monkeypatch, send_seconds):
+    """The same with a page that takes every message equally fast: the turn wrote a file (its end also sends the
+    changes list), and the user allows the hook card as the reply's footer (its turn result) reaches the page."""
+    manager, parent, _ = runtime
+    parent["permission_mode"] = "acceptEdits"  # delegate_task and write_file run without a card; the hook asks.
+    manager.store.save(parent)
+    manager.extensions.update_config({"hooks": [REVIEW_HOOK]})
+    gate, hold = asyncio.Event(), asyncio.Event()
+    clicked = {}
+
+    class Page:
+        async def send_json(self, data):
+            event = data.get("event") or {}
+            if data.get("type") == "event" and event.get("turn_result") and "key" in clicked and not clicked.get("done"):
+                clicked["done"] = True
+                manager.decide(parent["id"], clicked["key"][1], True)
+            await asyncio.sleep(send_seconds)
+
+    async def held():
+        await hold.wait()
+        return calls_reply(("write_file", {"path": "new.txt", "content": "changed\n"}, "w"))
+    HeldGateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)), held,
+                              lambda: reply("Wrote new.txt.")], {"Survey": gated(gate)})
+    manager.listeners[parent["id"]] = {Page()}
+    manager.start(parent["id"], "Delegate the work")
+    gate.set()
+    await eventually(lambda: bool(waiting_cards(manager, parent["id"])))
+    clicked["key"], = waiting_cards(manager, parent["id"])
+    hold.set()
+    await asyncio.wait_for(manager.tasks[parent["id"]], 10)
+    assert clicked.get("done")
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+    await asyncio.sleep(0.3)  # Every broadcast is over.
+    assert not manager.busy_task(parent["id"]) and not waiting_cards(manager, parent["id"])
+    assert manager.statuses.get(parent["id"], "idle") == "idle"
+
+
+@pytest.mark.parametrize("task", ["turn", "compaction"])
+async def test_a_turns_or_a_compactions_end_leaves_a_running_background_hook_card_running(runtime, monkeypatch, task):
+    """In Bypass a background subagent's subagent_stop hook runs without a card's question, so its card in the chat
+    is running while the hook runs. A turn or a manual compaction of the chat that ends meanwhile does not show it
+    cancelled: the hook still runs, and its card completes when it ends."""
+    manager, parent, project = runtime  # Bypass permissions.
+    manager.extensions.update_config({"hooks": [{**REVIEW_HOOK, "command": "while [ ! -f done ]; do sleep 0.05; done"}]})
+    gate, hold = asyncio.Event(), asyncio.Event()
+    shown = []
+
+    class Page:  # The chat open in a browser: what its hook card shows.
+        async def send_json(self, data):
+            if data.get("type") == "event" and data["event"].get("name") == "hook_subagent_stop":
+                shown.append(data["event"]["state"])
+
+    async def held():
+        await hold.wait()
+        return reply("Going on.")
+    HeldGateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)),
+                              held if task == "turn" else lambda: reply("Going on.")], {"Survey": gated(gate)})
+    if task == "compaction":
+        await run_turn(manager, parent)
+        hold_compaction(manager, monkeypatch, parent, hold)
+        manager.start_compaction(parent["id"])
+    else:
+        manager.start(parent["id"], "Delegate the work")
+    manager.listeners[parent["id"]] = {Page()}
+    gate.set()  # The subagent ends; its hook runs while the turn or the compaction goes on.
+    await eventually(lambda: shown == ["running"])
+    hold.set()
+    await asyncio.wait_for(manager.tasks[parent["id"]], 10)  # It ended; the hook still runs.
+    hook_card = next(event for event in manager.get(parent["id"])["events"] if event.get("name") == "hook_subagent_stop")
+    saved = next(event for event in manager.store.get(parent["id"])["events"] if event["id"] == hook_card["id"])
+    assert manager.delegates.background_running(parent["id"]) == 1
+    assert (hook_card["state"], saved["state"], shown) == ("running", "running", ["running"])
+    (project / "done").write_text("")
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+    assert shown == ["running", "completed"]
+
+
+async def test_a_restart_after_a_turn_ended_while_a_hook_card_waited_keeps_that_turn_completed(runtime, monkeypatch):
+    """The turn completed while a background subagent's hook card waited in the chat, and the app was then killed.
+    The restart closes the card and says the subagent was interrupted, but the finished turn stays completed (no
+    Continue for an answer that completed)."""
+    manager, parent, _ = runtime
+    parent["permission_mode"] = "acceptEdits"
+    manager.store.save(parent)
+    manager.extensions.update_config({"hooks": [REVIEW_HOOK]})
+    gate, hold = asyncio.Event(), asyncio.Event()
+
+    async def held():
+        await hold.wait()
+        return reply("Going on.")
+    HeldGateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)), held],
+                {"Survey": gated(gate)})
+    manager.start(parent["id"], "Delegate the work")
+    gate.set()
+    await eventually(lambda: bool(waiting_cards(manager, parent["id"])))
+    key, = waiting_cards(manager, parent["id"])
+    hold.set()
+    await asyncio.wait_for(manager.tasks[parent["id"]], 10)
+    child_id = background_child(manager, parent)
+    snapshot = [manager.store.get(session_id) for session_id in (parent["id"], child_id)]  # As a crash leaves them.
+    assert snapshot[0]["terminal_reason"] == "completed"
+    assert next(event for event in snapshot[0]["events"] if event["id"] == key[1])["state"] == "pending"
+    await manager.stop(parent["id"])
+    for session in snapshot:
+        manager.store.save(session)
+    restarted = AgentManager(manager.store, manager.settings)
+    try:
+        saved = manager.store.get(parent["id"])
+        assert saved["terminal_reason"] == "completed"
+        assert saved["last_turn_result"]["terminal_reason"] == "completed"
+        assert next(event for event in saved["events"] if event["id"] == key[1])["state"] == "cancelled"
+        assert [event["text"] for event in saved["events"] if event.get("subagent_id") == child_id] == [
+            "Background subagent general was interrupted: Survey"]
+    finally:
+        await restarted.jobs.shutdown()
+
+
+def hold_the_title(monkeypatch, naming):
+    """The parent chat's title request (naming its first turn, after the answer completed) sets naming and never
+    answers."""
+    original = HeldGateway.__call__
+
+    async def call(self, request):
+        body = json.loads(request.content)
+        if body.get("stream") is not True and "Delegated task" not in json.dumps(body):
+            naming.set()
+            await asyncio.Event().wait()
+        return await original(self, request)
+    monkeypatch.setattr(HeldGateway, "__call__", call)
+
+
+async def test_a_restart_while_the_finished_turn_names_the_chat_keeps_it_completed_with_a_hook_card_open(
+        runtime, monkeypatch):
+    """The first turn's answer completed while a background subagent's hook card waited in the chat, and the app
+    was killed while the chat was being named: turn_running is gone, but the turn's end is saved only once naming
+    ends. The restart closes the card and says the subagent was interrupted, and the finished turn stays
+    completed, as after a restart while naming without such a card or after the turn's end with one."""
+    manager, parent, _ = runtime
+    parent.update(permission_mode="acceptEdits", title="New conversation", title_generated=False)
+    manager.store.save(parent)
+    manager.extensions.update_config({"hooks": [REVIEW_HOOK]})
+    gate, hold, naming = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def held():  # The parent's second request waits until the card asks.
+        await hold.wait()
+        return reply("Going on.")
+    HeldGateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)), held],
+                {"Survey": gated(gate)})
+    hold_the_title(monkeypatch, naming)
+    manager.start(parent["id"], "Delegate the work")
+    gate.set()
+    await eventually(lambda: bool(waiting_cards(manager, parent["id"])))  # Survey's card asks during the turn.
+    key, = waiting_cards(manager, parent["id"])
+    hold.set()
+    await asyncio.wait_for(naming.wait(), 10)  # The answer completed; the chat is being named.
+    child_id = background_child(manager, parent)
+    snapshot = [manager.store.get(session_id) for session_id in (parent["id"], child_id)]  # As a kill leaves them.
+    assert "turn_running" not in snapshot[0] and snapshot[0]["turn_ended"] is None
+    assert next(event for event in snapshot[0]["events"] if event["id"] == key[1])["state"] == "pending"
+    await manager.stop(parent["id"])
+    for session in snapshot:
+        manager.store.save(session)
+    restarted = AgentManager(manager.store, manager.settings)
+    try:
+        saved = manager.store.get(parent["id"])
+        assert next(event for event in saved["events"] if event["id"] == key[1])["state"] == "cancelled"
+        assert [event["text"] for event in saved["events"] if event.get("subagent_id") == child_id] == [
+            "Background subagent general was interrupted: Survey"]
+        # No Continue for an answer that completed; its record says so too.
+        assert (saved["terminal_reason"], saved["last_turn_result"]["terminal_reason"]) == ("completed", "completed")
+    finally:
+        await restarted.jobs.shutdown()
+
+
+async def test_stop_while_the_chat_is_named_and_a_hook_card_asks_keeps_the_finished_turn_completed(
+        runtime, monkeypatch):
+    """The answer of the chat's first turn completed and the chat is being named when a background subagent ends
+    and its subagent_stop card asks in the chat (the chat shows awaiting approval). Stop on the chat then cancels
+    only the title request, as without the card: the turn stays completed, with no Stopped notice."""
+    manager, parent, _ = runtime
+    parent.update(permission_mode="acceptEdits", title="New conversation", title_generated=False)
+    manager.store.save(parent)
+    manager.extensions.update_config({"hooks": [REVIEW_HOOK]})
+    gate, naming = asyncio.Event(), asyncio.Event()
+    HeldGateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)), lambda: reply("Going on.")],
+                {"Survey": gated(gate)})
+    hold_the_title(monkeypatch, naming)
+    manager.start(parent["id"], "Delegate the work")
+    await asyncio.wait_for(naming.wait(), 10)  # The answer completed; the chat is being named.
+    gate.set()  # Survey ends now: its card asks in the chat.
+    await eventually(lambda: manager.statuses[parent["id"]] == "awaiting_approval")
+    assert waiting_cards(manager, parent["id"]) and manager.work_statuses[parent["id"]] == "naming"
+    await manager.stop(parent["id"])
+    saved = manager.store.get(parent["id"])
+    notices = [event["text"] for event in saved["events"] if event["type"] == "notice"]
+    assert (saved["terminal_reason"], saved["last_turn_result"]["terminal_reason"]) == ("completed", "completed")
+    assert not any(text.startswith("Stopped.") for text in notices), notices
+
+
+async def test_a_subagent_that_finishes_while_a_hook_card_waits_continues_the_chat_once_the_card_is_answered(
+        runtime, monkeypatch):
+    """With the wake option on, Survey works in the background while the idle chat waits on the subagent_start card
+    of a queued background delegation (the chat awaits approval, so Survey's end cannot continue it then). Once the
+    card is answered the chat is idle again, and the app's message continues it for Survey."""
+    manager, parent, _ = runtime
+    parent["permission_mode"] = "acceptEdits"  # delegate_task runs without a card; the hook asks for one.
+    manager.store.save(parent)
+    manager.settings.values["background_subagent_wake"] = True
+    gate = asyncio.Event()
+    gateway = Gateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)),
+                                    lambda: reply("Going on."),
+                                    lambda: calls_reply(delegate("Review", "b", background=True)),
+                                    lambda: reply("Queued it."),
+                                    lambda: reply("Read it; all done.")],
+                      {"Survey": gated(gate), "Review": forever})
+    await run_turn(manager, parent)  # Survey runs in the background.
+    manager.extensions.update_config({"hooks": [{"id": "brief", "event": "subagent_start", "enabled": True,
+                                                 "timeout_seconds": 10, "command": "true"}]})
+    full = full_slots(monkeypatch)
+    saved = await run_turn(manager, parent, "Review it too")  # Review waits for a slot; the turn ends.
+    assert json.loads(card(saved, "b")["output"])["status"] == "queued"
+    full["value"] = False
+    manager.delegates._wake()  # A slot frees: Review's start hook asks in the idle chat.
+    await eventually(lambda: bool(waiting_cards(manager, parent["id"])))
+    key, = waiting_cards(manager, parent["id"])
+    assert manager.statuses.get(parent["id"]) == "awaiting_approval"
+    gate.set()  # Survey finishes while the card waits.
+    await eventually(lambda: isinstance(card(manager.get(parent["id"]), "a").get("delegation_result"), dict))
+    await asyncio.sleep(0.3)
+    assert len(gateway.requests["parent"]) == 4  # Not while the card waits.
+    manager.decide(parent["id"], key[1], True)  # Review starts; the chat is idle again.
+    for _ in range(300):  # The app's message, once its turn ended.
+        if len(gateway.requests["parent"]) == 5 and not manager.busy_task(parent["id"]):
+            break
+        await asyncio.sleep(0.01)
+    users = [event for event in manager.get(parent["id"])["events"] if event.get("type") == "user"]
+    assert [event.get("background_wake") for event in users] == [None, None, True]
+
+
+async def survey_finished_while_reviews_card_waits(manager, parent, monkeypatch):
+    """With the wake option on, Survey finished while Review's subagent_stop card waited in the idle chat (so no
+    wake then). Returns the Gateway (the parent's requests so far: 3)."""
+    parent["permission_mode"] = "acceptEdits"  # delegate_task runs without a card; the hook asks for one.
+    manager.store.save(parent)
+    manager.settings.values["background_subagent_wake"] = True
+    manager.extensions.update_config({"hooks": [REVIEW_HOOK]})
+    survey, review = asyncio.Event(), asyncio.Event()
+    gateway = Gateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)),
+                                    lambda: calls_reply(delegate("Review", "b", background=True)),
+                                    lambda: reply("Both run."), lambda: reply("Woken.")],
+                      {"Survey": gated(survey), "Review": gated(review)})
+    await run_turn(manager, parent)  # Both run in the background; the turn ended.
+    assert len(gateway.requests["parent"]) == 3
+    review.set()  # Review ends: its card asks in the idle chat.
+    await eventually(lambda: len(waiting_cards(manager, parent["id"])) == 1)
+    review_key, = waiting_cards(manager, parent["id"])
+    survey.set()  # Survey ends: its card asks too.
+    await eventually(lambda: len(waiting_cards(manager, parent["id"])) == 2)
+    survey_key, = (key for key in waiting_cards(manager, parent["id"]) if key != review_key)
+    manager.decide(parent["id"], survey_key[1], True)  # Survey finishes; Review's card still waits.
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 1)
+    await asyncio.sleep(0.2)
+    assert manager.statuses.get(parent["id"]) == "awaiting_approval" and len(gateway.requests["parent"]) == 3
+    return gateway
+
+
+@pytest.mark.parametrize("stopped", ["chat", "subagent"])
+async def test_stop_on_the_idle_chat_while_a_hook_card_waits_starts_no_wake_turn(runtime, monkeypatch, stopped):
+    """With the wake option on, Survey finished while Review's subagent_stop card waited in the idle chat (so no
+    wake then). The user presses Stop on the chat instead of answering: nothing continues the chat. Stop subagent
+    on Review alone closes its card, and then Survey's report continues the chat."""
+    manager, parent, _ = runtime
+    gateway = await survey_finished_while_reviews_card_waits(manager, parent, monkeypatch)
+    if stopped == "chat":
+        await manager.stop(parent["id"])  # Stop on the chat, not an answer.
+    else:
+        record, = (record for record in manager.delegates.background[parent["id"]] if record["task"] == "Review")
+        await manager.stop(record["child_session_id"])
+    await asyncio.sleep(0.5)
+    users = [event.get("background_wake") for event in manager.get(parent["id"])["events"] if event.get("type") == "user"]
+    expected = ([None], 3) if stopped == "chat" else ([None, True], 4)
+    assert (users, len(gateway.requests["parent"]), manager.busy_task(parent["id"])) == (*expected, False)
+
+
+@pytest.mark.parametrize("task", ["command", "compaction"])
+async def test_a_command_or_a_compaction_after_stop_on_the_chat_starts_no_wake_turn_for_what_ended_before(
+        runtime, monkeypatch, task):
+    """The same Stop on the chat while Review's card waits, then the user runs a ! command or a manual compaction.
+    Its end does not continue the chat for Survey, which finished before the Stop: Stop is the user's choice, like
+    a limit, and lasts past the Stop itself. The user's next message names Survey."""
+    manager, parent, _ = runtime
+    gateway = await survey_finished_while_reviews_card_waits(manager, parent, monkeypatch)
+    await manager.stop(parent["id"])  # Stop on the chat: nothing continues it.
+    await asyncio.sleep(0.3)
+    assert len(gateway.requests["parent"]) == 3 and not manager.busy_task(parent["id"])
+    if task == "command":
+        manager.start_shell(parent["id"], "true")  # The user's own ! command, a while later.
+    else:
+        hold = asyncio.Event()
+        hold.set()  # The summary request goes on at once.
+        hold_compaction(manager, monkeypatch, parent, hold)
+        manager.start_compaction(parent["id"])
+    await asyncio.wait_for(manager.tasks[parent["id"]], 10)
+    await asyncio.sleep(0.5)  # A wake turn would have started by now.
+    users = [event.get("background_wake") for event in manager.get(parent["id"])["events"] if event.get("type") == "user"]
+    assert (users, len(gateway.requests["parent"]), manager.busy_task(parent["id"])) == ([None], 3, False)
+    await run_turn(manager, parent, "Go on")
+    assert "general finished: Survey" in json.dumps(gateway.requests["parent"][3]["messages"])
+
+
 @pytest.mark.parametrize("wake", [True, False])
 async def test_the_wake_option_continues_an_idle_chat_exactly_once(runtime, monkeypatch, wake):
     manager, parent, _ = runtime
@@ -456,6 +1037,114 @@ async def test_a_wake_that_falls_during_a_command_or_a_compaction_comes_after_it
         assert users[1]["background_wake"] is True
 
 
+@pytest.mark.parametrize("ends", ["during", "after"])
+async def test_the_wake_leaves_your_command_output_for_your_next_message(runtime, monkeypatch, ends):
+    """A ! command's output is attached to your next message: the app's message after a background subagent that
+    ends during the command, or while its output waits, does not take it."""
+    manager, parent, _ = runtime
+    manager.settings.values["background_subagent_wake"] = True
+    command = "echo output-for-your-next-message" + ("; sleep 1" if ends == "during" else "")
+    gate = asyncio.Event()
+    gateway = Gateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)),
+                                    lambda: reply("Going on."), lambda: reply("Read it; all done."),
+                                    lambda: reply("It printed the line.")], {"Survey": gated(gate)})
+    await run_turn(manager, parent)
+    manager.start_shell(parent["id"], command)
+    shell = manager.tasks[parent["id"]]
+    if ends == "after":
+        await asyncio.wait_for(shell, 10)
+    gate.set()
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+    await asyncio.wait_for(shell, 10)
+    await eventually(lambda: len(gateway.requests["parent"]) == 3)
+    await eventually(lambda: not manager.busy_task(parent["id"]))
+    saved = manager.store.get(parent["id"])
+    wake = [event for event in saved["events"] if event["type"] == "user"][-1]
+    assert wake["background_wake"] is True and not wake.get("attachments")
+    assert "output-for-your-next-message" not in json.dumps(gateway.requests["parent"][2]["messages"])
+    # The output still waits (its chip above the box), and your next message carries it.
+    assert [item.get("command") for item in saved.get("pending_context") or []] == [command]
+    saved = await run_turn(manager, parent, "What did it print?")
+    assert "output-for-your-next-message" in json.dumps(gateway.requests["parent"][3]["messages"][-1])
+    assert not saved.get("pending_context")
+
+
+async def test_the_wake_message_names_the_subagent_that_finished_not_one_stopped_later(runtime, monkeypatch):
+    """While a ! command runs, Survey finishes and you stop another background subagent (Stop subagent): the wake
+    after the command is for Survey's report, so its message names Survey."""
+    manager, parent, _ = runtime
+    manager.settings.values["background_subagent_wake"] = True
+    gate = asyncio.Event()
+    gateway = Gateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True),
+                                                        delegate("Forever", "b", background=True)),
+                                    lambda: reply("Going on."), lambda: reply("Read it; all done.")],
+                      {"Survey": gated(gate), "Forever": forever})
+    await run_turn(manager, parent)
+    await asyncio.wait_for(gateway.child_started("Forever").wait(), 5)
+    ids = {record["task"]: record["child_session_id"] for record in manager.delegates.background[parent["id"]]}
+    manager.start_shell(parent["id"], "sleep 2")
+    gate.set()  # Survey finishes while the command runs...
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 1)
+    await manager.stop(ids["Forever"])  # ...and then the other one is stopped.
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+    assert manager.busy_task(parent["id"])  # Both ended during the command.
+    await asyncio.wait_for(manager.tasks[parent["id"]], 10)
+    await eventually(lambda: len(gateway.requests["parent"]) == 3)
+    await eventually(lambda: not manager.busy_task(parent["id"]))
+    wake = [event for event in manager.store.get(parent["id"])["events"] if event["type"] == "user"][-1]
+    assert wake["background_wake"] is True
+    assert wake["text"] == WAKE_TEXT.format(id=ids["Survey"][:8], kind="general", ending="finished")
+
+
+async def test_the_wake_after_a_failed_subagent_says_it_failed_and_its_label_fits(runtime, monkeypatch):
+    """The wake option also continues the chat after a background subagent that failed: its message says so, and
+    the transcript's label of the app's message does not call it finished."""
+    manager, parent, _ = runtime
+    manager.settings.values["background_subagent_wake"] = True
+    gate = asyncio.Event()
+
+    async def failing(count, body):
+        await gate.wait()
+        return httpx.Response(400, json={"error": {"message": "Bad request"}})
+    gateway = Gateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)),
+                                    lambda: reply("Going on."), lambda: reply("It failed; I will do it myself.")],
+                      {"Survey": failing})
+    await run_turn(manager, parent)
+    child_id = background_child(manager, parent)
+    gate.set()
+    await eventually(lambda: len(gateway.requests["parent"]) == 3)
+    await eventually(lambda: not manager.busy_task(parent["id"]))
+    saved = manager.store.get(parent["id"])
+    wake = [event for event in saved["events"] if event["type"] == "user"][-1]
+    assert wake["background_wake"] is True
+    assert wake["text"] == WAKE_TEXT.format(id=child_id[:8], kind="general", ending="failed")
+    second = transcript(saved).split("## Turn 2", 1)[1]
+    assert "**App (sent when a background subagent ended):**" in second and "(general) failed." in second
+
+
+async def test_a_background_subagent_that_ends_during_a_command_notifies_while_no_page_is_open(runtime, monkeypatch):
+    """A ! command is not a turn: no turn learns of the subagent's end or reports it, so the desktop notification
+    goes when it ends."""
+    manager, parent, _ = runtime
+    manager.settings.values["system_notifications"] = True
+    runner = Runner()
+    manager.notifier = SystemNotifier(runner=runner, platform="linux", which=lambda name: f"/usr/bin/{name}")
+    gate = asyncio.Event()
+    Gateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)), lambda: reply("Going on.")],
+            {"Survey": gated(gate)})
+    await run_turn(manager, parent)
+    runner.calls.clear()
+    manager.start_shell(parent["id"], "sleep 1")
+    gate.set()
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+    assert manager.busy_task(parent["id"])
+    await eventually(lambda: runner.calls)
+    assert runner.calls == [["/usr/bin/notify-send", "Local", "Background subagent finished: Parent"]]
+    await asyncio.wait_for(manager.tasks[parent["id"]], 10)
+    await asyncio.sleep(0.1)
+    assert len(runner.calls) == 1  # The command's end notifies nothing more.
+
+
 async def test_a_running_turn_learns_of_a_background_subagent_at_its_next_step(runtime, monkeypatch):
     manager, parent, _ = runtime
     manager.settings.values["background_subagent_wake"] = True
@@ -529,6 +1218,81 @@ async def test_rewind_and_fork_wait_for_background_subagents(api, monkeypatch):
     assert response.status_code == 200, response.text
 
 
+@pytest.mark.parametrize("read", [False, True])
+async def test_after_a_rewind_to_the_wake_message_your_next_message_learns_of_the_subagent(api, monkeypatch, read):
+    """The app's wake turn told the model a background subagent finished (and may have read its report). Rewinding
+    to that message removes the turn, so your next message's first request names the subagent again."""
+    client, manager = api
+    manager.settings.values["background_subagent_wake"] = True
+    parent = manager.store.create(manager.settings.values)
+    parent.update(title="Parent", title_generated=True, permission_mode="bypassPermissions")
+    manager.store.save(parent)
+    gate = asyncio.Event()
+    ids = {}
+    woken = [lambda: calls_reply(("get_subagent_result", {"subagent_id": ids["Survey"]}, "r1"))] if read else []
+    gateway = Gateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)),
+                                    lambda: reply("Going on."), *woken, lambda: reply("Read it; all done."),
+                                    lambda: reply("Answer.")], {"Survey": gated(gate)})
+    await run_turn(manager, parent)
+    ids["Survey"] = background_child(manager, parent)
+    gate.set()
+    await eventually(lambda: len(gateway.requests["parent"]) == 3 + read)
+    assert "Background subagents ended since your last step" in json.dumps(gateway.requests["parent"][2]["messages"])
+    if read:
+        assert "Found it at a.txt:1." in json.dumps(gateway.requests["parent"][3]["messages"])
+    await eventually(lambda: not manager.busy_task(parent["id"]))
+    wake = [event for event in manager.get(parent["id"])["events"] if event["type"] == "user"][-1]
+    assert wake["background_wake"] is True
+    response = await client.post(f"/api/sessions/{parent['id']}/rewind",
+                                 json={"before_event_id": wake["id"], "conversation": True})
+    assert response.status_code == 200, response.text
+    assert "Found it at a.txt:1." not in json.dumps(manager.get(parent["id"])["wire"])
+    await run_turn(manager, parent, "What next?")
+    assert len(gateway.requests["parent"]) == 4 + read
+    assert "Background subagents ended since your last step" in json.dumps(gateway.requests["parent"][-1]["messages"])
+
+
+@pytest.mark.parametrize("read", [False, True])
+async def test_a_rewind_past_the_turn_in_which_the_subagent_ended_names_it_again(api, monkeypatch, read):
+    """The background subagent ends during your second message's turn, so its notice comes after that message; that
+    turn was told of it (and may have read its report). Rewinding to that message removes the turn, but not the
+    notice: it stays at the end of the kept conversation, and your next message's first request names it again."""
+    client, manager = api
+    parent = manager.store.create(manager.settings.values)
+    parent.update(title="Parent", title_generated=True, permission_mode="bypassPermissions")
+    manager.store.save(parent)
+    gate = asyncio.Event()
+    ids = {}
+    # read: get_subagent_result with the subagent's ID (its report is read); else the list form waits for it to end.
+    wait = ((lambda: calls_reply(("get_subagent_result", {"subagent_id": ids["Survey"], "wait_seconds": 30}, "r1")))
+            if read else (lambda: calls_reply(("get_subagent_result", {"wait_seconds": 30}, "r1"))))
+    gateway = Gateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)),
+                                    lambda: reply("Going on."), wait, lambda: reply("It is done."),
+                                    lambda: reply("Answer.")], {"Survey": gated(gate)})
+    await run_turn(manager, parent)
+    ids["Survey"] = background_child(manager, parent)
+    manager.start(parent["id"], "Wait for the survey")
+    await eventually(lambda: len(gateway.requests["parent"]) == 3)
+    gate.set()  # It ends during this turn: its notice follows "Wait for the survey".
+    await asyncio.wait_for(manager.tasks[parent["id"]], 10)
+    assert len(gateway.requests["parent"]) == 4
+    told = json.dumps(gateway.requests["parent"][3]["messages"])
+    assert ("Found it at a.txt:1." in told) if read else ("Background subagents ended since your last step" in told)
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+    events = manager.get(parent["id"])["events"]
+    second = [event for event in events if event["type"] == "user"][-1]
+    kept = [event["id"] for event in events[:events.index(second)]]
+    notice = next(event for event in events if event.get("subagent_status"))
+    assert events.index(notice) > events.index(second)
+    response = await client.post(f"/api/sessions/{parent['id']}/rewind",
+                                 json={"before_event_id": second["id"], "conversation": True})
+    assert response.status_code == 200, response.text
+    assert [event["id"] for event in manager.get(parent["id"])["events"]] == [*kept, notice["id"]]
+    await run_turn(manager, parent, "What next?")
+    assert len(gateway.requests["parent"]) == 5
+    assert "Background subagents ended since your last step" in json.dumps(gateway.requests["parent"][-1]["messages"])
+
+
 async def test_exports_keep_a_background_subagents_card_result_and_notice(runtime, monkeypatch):
     from local_agent.portability import export_bundle, fresh_copies
     manager, parent, project = runtime
@@ -589,3 +1353,60 @@ async def test_stop_in_an_idle_parent_cancels_the_start_hook_card_of_its_queued_
     saved = manager.store.get(parent["id"])
     assert [event["state"] for event in saved["events"] if event.get("name") == "hook_subagent_start"] == ["cancelled"]
     assert manager.statuses.get(parent["id"], "idle") == "idle"
+
+
+async def test_stop_subagent_ends_a_queued_subagent_waiting_for_its_start_hook_card_in_the_idle_chat(
+        runtime, monkeypatch):
+    """Stop subagent on the card (POST /api/sessions/<child>/stop) while a queued background subagent, whose slot
+    freed after the turn, waits for its subagent_start card in the idle chat: the card shows cancelled, the subagent
+    never starts and its card says it was stopped, as Stop on the idle chat does."""
+    manager, parent, _ = runtime
+    parent["permission_mode"] = "acceptEdits"  # delegate_task runs without a card; the hook asks for one.
+    manager.store.save(parent)
+    manager.extensions.update_config({"hooks": [{"id": "brief", "event": "subagent_start", "enabled": True,
+                                                 "timeout_seconds": 10, "command": "true"}]})
+    full = full_slots(monkeypatch)
+    gateway = Gateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)),
+                                    lambda: reply("Going on.")], {"Survey": forever})
+    await run_turn(manager, parent)  # Queued: the turn ends while it waits for a slot.
+    full["value"] = False
+    manager.delegates._wake()
+    await eventually(lambda: bool(waiting_cards(manager, parent["id"])))  # Its start hook asks in the idle chat.
+    spawning = card(manager.get(parent["id"]), "a")
+    child_id = spawning["child_session_id"]  # The card shows Stop subagent for this child.
+    assert child_id and not spawning["delegation"].get("terminal_reason")
+    await asyncio.wait_for(manager.stop(child_id), 5)
+    assert not waiting_cards(manager, parent["id"])
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+    saved = manager.store.get(parent["id"])
+    assert [event["state"] for event in saved["events"] if event.get("name") == "hook_subagent_start"] == ["cancelled"]
+    assert card(saved, "a")["delegation_result"]["status"] == "cancelled"
+    assert saved["events"][-1]["text"] == "Background subagent general was stopped: Survey"
+    assert "Survey" not in gateway.requests and manager.statuses.get(parent["id"], "idle") == "idle"
+
+
+@pytest.mark.parametrize("background", [False, True])
+async def test_stop_subagent_ends_a_subagent_waiting_for_its_start_hook_card_in_a_running_chat(
+        runtime, monkeypatch, background):
+    """Stop subagent while a subagent (one the turn waits for, or a background one still starting) waits for its
+    subagent_start card in the running chat: the card shows cancelled, the subagent never sends a request, and its
+    call returns as cancelled while the chat's turn goes on."""
+    manager, parent, _ = runtime
+    parent["permission_mode"] = "acceptEdits"
+    manager.store.save(parent)
+    manager.extensions.update_config({"hooks": [{"id": "brief", "event": "subagent_start", "enabled": True,
+                                                 "timeout_seconds": 10, "command": "true"}]})
+    gateway = Gateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=background)),
+                                    lambda: reply("Going on.")], {"Survey": forever})
+    manager.start(parent["id"], "Delegate the work")
+    await eventually(lambda: bool(waiting_cards(manager, parent["id"])))  # The start hook card waits.
+    child_id = card(manager.get(parent["id"]), "a")["child_session_id"]
+    await asyncio.wait_for(manager.stop(child_id), 5)
+    assert not waiting_cards(manager, parent["id"])
+    await asyncio.wait_for(manager.tasks[parent["id"]], 10)
+    saved = manager.store.get(parent["id"])
+    assert [event["state"] for event in saved["events"] if event.get("name") == "hook_subagent_start"] == ["cancelled"]
+    assert json.loads(card(saved, "a")["output"])["status"] == "cancelled"
+    assert card(saved, "a")["delegation"]["terminal_reason"] == "stopped"
+    assert saved["terminal_reason"] == "completed" and len(gateway.requests["parent"]) == 2
+    assert "Survey" not in gateway.requests and manager.delegates.background_running(parent["id"]) == 0
