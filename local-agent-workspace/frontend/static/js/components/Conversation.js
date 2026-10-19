@@ -1,5 +1,5 @@
 import { html, useEffect, useLayoutEffect, useMemo, useRef, useState } from '../lib.js'
-import { Check, ChevronDown, ChevronRight, CircleAlert, Copy, FileText, GitBranch, LoaderCircle, Pencil, RefreshCw, Terminal, Undo2, X } from '../icons.js'
+import { Bot, Check, ChevronDown, ChevronRight, CircleAlert, Copy, FileText, GitBranch, LoaderCircle, Pencil, RefreshCw, Search, Terminal, Undo2, Workflow, X } from '../icons.js'
 import { api } from '../api.js'
 import { enhanceCodeBlocks, linkPaths, renderMarkdown } from '../markdown.js'
 import QuestionCard from './QuestionCard.js'
@@ -16,6 +16,8 @@ import { pathShortener } from '../paths.js'
 import { hintText } from '../mcp.js'
 import { turnSummary } from '../turnResult.js'
 import { sentLabel, sentUploads } from '../attachments.js'
+import { layoutTranscript } from '../transcriptGroups.js'
+import { useViewPrefs } from '../viewPrefs.js'
 
 // A long file is read in pages. Naming the lines each read covered keeps the
 // pages of one file from looking like the same read repeated.
@@ -159,7 +161,7 @@ export function resultOf(event) {
     // A long MCP result: the rest is kept in memory for get_tool_output (result_store.py).
     kept: typeof page.result_id === 'string' && Number.isInteger(page.total_chars)
       ? { shown: Number(page.next_offset) || page.output.length, total: page.total_chars, restNotKept: page.rest_not_kept === true } : null,
-    job: 'state' in page ? { state: String(page.state), exitCode: page.exit_code, background: !!page.background,
+    job: 'state' in page ? { id: typeof page.job_id === 'string' ? page.job_id : null, state: String(page.state), exitCode: page.exit_code, background: !!page.background,
       total: page.total_chars, truncated: page.truncated === true, shown: shownPart(page),
       // wait_job: why the wait ended ('matched', 'timeout', 'idle' or 'exited') and the line that matched.
       wait: typeof page.reason === 'string' ? page.reason : null, match: typeof page.match?.line === 'string' ? page.match.line : null } : null }
@@ -227,16 +229,45 @@ export function toolStatus(event, result) {
 // The Action word: a command that ran and then failed says 'ran', not 'completed' beside its failed state.
 const actionText = (event, status) => event.state === 'completed' && status?.tone === 'warn' ? 'ran' : event.state
 
-// Parsed results, statuses and errors are cached per event object: an updated event is a new object.
+// Parsed results, statuses, errors and hook lines are cached per event object: an updated event is a new object.
 const statusCache = new WeakMap()
 function toolState(event) {
   let state = statusCache.get(event)
   if (!state) {
     const result = resultOf(event)
-    state = { result, status: toolStatus(event, result), failure: toolError(event) }
+    state = { result, status: toolStatus(event, result), failure: toolError(event), hooked: hookSummary(event) }
     statusCache.set(event, state)
   }
   return state
+}
+
+// A background command's status once its end notice came ({ type: 'notice', job_id, job_state, exit_code }; older
+// notices carry only the job id): 'background · exit 0', or a warning such as 'background · exit 1' whose collapsed
+// line is the notice.
+const BACKGROUND_ENDED = { failed: code => ['warn', `background · ${exitLabel(code)}`, 'warn'], timed_out: () => ['warn', 'background · timed out', 'warn'],
+  interrupted: () => ['warn', 'background · interrupted', 'warn'], cancelled: () => ['neutral', 'background · stopped', 'neutral'] }
+function backgroundEnded(notice) {
+  const state = notice.job_state
+  const code = Number.isInteger(notice.exit_code) ? notice.exit_code : null
+  if (state === 'completed' || (state == null && code === 0)) return { tone: 'ok', label: `background · exit ${code ?? 0}`, labelTone: 'neutral' }
+  const [tone, label, labelTone] = BACKGROUND_ENDED[state]?.(code) || ['neutral', 'background · ended', 'neutral']
+  return { tone, label, labelTone, ...(tone === 'warn' ? { outcome: clip(notice.text) } : {}) }
+}
+
+// Map<event id, { result, status, failure, hooked }> for the tool events: each parsed once (toolState), and a
+// background command whose end notice is loaded gets that outcome (a new status: the cached one stays as it was).
+export function toolStatesFor(events) {
+  const ended = new Map()
+  for (const event of events) if (event.type === 'notice' && typeof event.job_id === 'string' && event.job_id) ended.set(event.job_id, event)
+  const states = new Map()
+  for (const event of events) {
+    if (event.type !== 'tool') continue
+    const state = toolState(event)
+    const notice = ended.size && event.name === 'run_command' && state.status.label === 'started in background'
+      ? ended.get(event.job_id || state.result?.job?.id) : null
+    states.set(event.id, notice ? { ...state, status: backgroundEnded(notice) } : state)
+  }
+  return states
 }
 
 // The State line of an expanded command or job card.
@@ -491,6 +522,13 @@ function delegationResult(event) {
 
 export const DELEGATION_STATUS = { awaiting_approval: 'Waiting for approval', queued: 'waiting for a free slot' }
 
+// A subagent whose card waits for you (an approval, a question or a plan), answered from its row in the parent.
+export const subagentWaits = progress => !!progress && typeof progress === 'object' && !progress.terminal_reason
+  && progress.status === 'awaiting_approval' && !!progress.pending
+// Its row (the hint under the message box shows it). Not one of PENDING_CARDS: those match the chat's own waiting
+// tool events one to one, in order.
+export const WAITING_SUBAGENTS = '.delegation-progress.needs-answer'
+
 // A subagent's submit_report report: its summary, findings (path:line opens the file), files and next steps.
 function SubagentReport({ report, onOpenPath }) {
   const findings = Array.isArray(report.findings) ? report.findings.filter(item => item && typeof item === 'object') : []
@@ -555,13 +593,22 @@ function DelegationStatus({ event, onSelectSession, onOpenPath, onError }) {
   const result = delegationResult(event)
   const files = Array.isArray(result?.changed_files) ? result.changed_files : []
   const report = result?.report && typeof result.report === 'object' ? result.report : null
-  return html`<div class=${`delegation-progress ${progress.terminal_reason ? `delegation-${progress.status}` : 'delegation-live'}`} aria-label="Subagent progress">
+  // Live progress from newer apps (each part only when its field is there): its step, the tool it runs now or ran
+  // last with that tool's short redacted subject, and its failed actions.
+  const steps = Number.isInteger(progress.steps) ? `Step ${progress.steps}${Number.isInteger(progress.max_steps) ? ` of ${progress.max_steps}` : ''}` : ''
+  const subject = typeof progress.last_tool_subject === 'string' ? progress.last_tool_subject.trim() : ''
+  const lastTool = progress.last_tool ? `${progress.last_tool.replace(/_/g, ' ')}${subject ? ` · ${subject}` : ''}` : ''
+  const toolRunning = !progress.terminal_reason && progress.last_tool_state === 'running'
+  const failed = Number.isInteger(progress.failed_tools) && progress.failed_tools > 0 ? progress.failed_tools : 0
+  return html`<div class=${`delegation-progress ${progress.terminal_reason ? `delegation-${progress.status}` : 'delegation-live'}${subagentWaits(progress) ? ' needs-answer' : ''}`} aria-label="Subagent progress">
     <span class="delegation-status">Subagent: ${status}</span>
     ${kind ? html`<span class="delegation-type">${agentLabel(kind)}</span>` : null}
     ${progress.background ? html`<span class="delegation-background" title="The chat went on while it works; a notice says when it ends.">Background</span>` : null}
     ${settings ? html`<span class="delegation-agent" title=${progress.model ? `Effort and model (${progress.model})` : 'Effort'}>${settings}</span>` : null}
+    ${steps ? html`<span class="delegation-steps">${steps}</span>` : null}
     <span>${progress.completed_tools} completed ${progress.completed_tools === 1 ? 'action' : 'actions'}</span>
-    ${progress.last_tool ? html`<span>Last tool: ${progress.last_tool.replace(/_/g, ' ')}</span>` : null}
+    ${lastTool ? html`<span class="delegation-tool" title=${subject || undefined}>${toolRunning ? 'Now' : 'Last tool'}: ${lastTool}</span>` : null}
+    ${failed ? html`<span class="delegation-failed">${failed} failed ${failed === 1 ? 'action' : 'actions'}</span>` : null}
     ${elapsed != null ? html`<span class="delegation-elapsed" title=${progress.terminal_reason ? 'Time it ran' : 'Time running'}>${elapsedText(elapsed)}</span>` : null}
     ${progress.terminal_reason ? html`<span>Reason: ${progress.terminal_reason.replace(/_/g, ' ')}</span>` : null}
     ${event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}
@@ -625,7 +672,9 @@ function CommandClock({ started, limit }) {
 // The newest non-empty line of a running command's output (a progress line ended by a carriage return counts).
 const latestLine = output => clip(String(output || '').slice(-4000).split(/\r\n|\r|\n/).map(line => line.trim()).filter(Boolean).at(-1) || '')
 
-function ToolCard({ event, summary, result, status, failure = null, sessionId, onError, onSelectSession, onOpenPath }) {
+// className: its place in a group or run ('grouped', 'run-member', ...). onTouch(id): called when you click or focus
+// the card, so a card you used never folds away when it finishes (its group stays open).
+function ToolCard({ event, summary, result, status, failure = null, sessionId, onError, onSelectSession, onOpenPath, className = '', onTouch }) {
   const [expanded, setExpanded] = useState(false)
   const filePath = event.input?.[FILE_INPUTS[event.name]]
   const startLine = Number.isInteger(event.input?.start_line) && event.input.start_line > 0 ? event.input.start_line : undefined
@@ -652,10 +701,12 @@ function ToolCard({ event, summary, result, status, failure = null, sessionId, o
     finally { setDeciding(false) }
   }
   // id and data-event-id let other views (a run's head, Workspace → Progress) find and reveal this card.
-  return html`<div id=${`tool-${event.id}`} data-event-id=${event.id} class=${`tool-card ${isTask ? 'tool-task' : ''} ${pending ? 'needs-approval' : ''}`}>
+  const touch = onTouch ? () => onTouch(event.id) : undefined
+  return html`<div id=${`tool-${event.id}`} data-event-id=${event.id} class=${`tool-card ${isTask ? 'tool-task' : ''} ${pending ? 'needs-approval' : ''}${className ? ` ${className}` : ''}`}
+    onClick=${touch} onFocusIn=${touch}>
     <button class="tool-heading" onClick=${() => setExpanded(v => !v)} aria-expanded=${expanded || pending}
       aria-label=${[title, summary.subject, summary.taskStatus ? `Task: ${summary.taskStatus}` : '', status.label].filter(Boolean).join(' ')}>
-      ${event.name?.toLowerCase().includes('command') || event.name === 'Bash' ? html`<${Terminal} size=${16} />` : html`<${FileText} size=${16} />`}
+      ${event.name === 'delegate_task' ? html`<${Bot} size=${16} />` : event.name?.toLowerCase().includes('command') || event.name === 'Bash' ? html`<${Terminal} size=${16} />` : html`<${FileText} size=${16} />`}
       <span class="tool-name">${title}</span><span class="tool-subject" title=${summary.subject}>${summary.shown ?? summary.subject}</span>
       ${summary.taskStatus ? html`<span class="tool-task-status">Task: ${summary.taskStatus}</span>` : null}
       ${status.tone === 'running' ? html`<${LoaderCircle} size=${14} className="spin" />` : status.tone === 'ok' ? html`<${Check} size=${14} className="success-icon" />`
@@ -687,7 +738,7 @@ function ToolCard({ event, summary, result, status, failure = null, sessionId, o
             onClick=${() => onOpenPath(startLine ? { path: filePath, line: startLine } : { path: filePath })}><${FileText} size=${14} />Open file</button>` : null}`}
     </div>` : null}
     ${!expanded && (event.state === 'rejected' || event.state === 'cancelled' || event.state === 'error' || status.tone === 'warn')
-      ? html`<p class="tool-outcome">${(result && failureOutcome(event, result, status)) || toolOutcome(event)}</p>` : null}
+      ? html`<p class="tool-outcome">${status.outcome || (result && failureOutcome(event, result, status)) || toolOutcome(event)}</p>` : null}
     ${!expanded && event.state === 'completed' && allowanceNote(event) ? html`<p class="tool-outcome">${allowanceNote(event)}</p>` : null}
   </div>`
 }
@@ -866,9 +917,9 @@ function TurnFooter({ result }) {
     <p>${summary.details}</p></details>`
 }
 
-function Reply({ text, reasoning, truncated, started, seconds, wait, requestInfo, onOpenPath, actions = null, turnResult = null }) {
+function Reply({ text, reasoning, truncated, started, seconds, wait, requestInfo, onOpenPath, actions = null, turnResult = null, className = '' }) {
   const streaming = requestInfo?.status === 'running'
-  return html`<div class="assistant-reply"><${Brand} small=${true} />
+  return html`<div class=${`assistant-reply${className ? ` ${className}` : ''}`}><${Brand} small=${true} />
     <div class="reply-content"><${Thinking} text=${reasoning} truncated=${truncated} started=${started} seconds=${seconds}
       streaming=${streaming} answering=${!!text} reasoningTokens=${requestInfo?.usage?.reasoning_tokens} /><${Markdown} text=${text} streaming=${streaming} onOpenPath=${onOpenPath} />
       ${text || actions ? html`<div class="message-actions">${text ? html`<${CopyAction} text=${text} label="Copy response" />` : null}${actions}</div>` : null}
@@ -877,11 +928,101 @@ function Reply({ text, reasoning, truncated, started, seconds, wait, requestInfo
     </div></div>`
 }
 
+// The head of folded tool cards (transcriptGroups.js): what they did ("Ran 3 commands, read 2 files"), the last
+// card's subject and, when they span several model responses, how many. Opened, the cards show in place, indented.
+function ToolGroupHead({ group, open, summary, onToggle }) {
+  const subject = summary?.subject || ''
+  const shown = summary?.shown ?? subject
+  const Icon = group.commands ? Terminal : Search
+  return html`<div class="tool-group">
+    <button class="tool-group-head" aria-expanded=${open} aria-controls=${group.members.map(id => `tool-${id}`).join(' ')}
+      aria-label=${[group.phrase, subject].filter(Boolean).join(' ')} onClick=${onToggle}>
+      <${Icon} size=${15} /><span class="tool-group-phrase">${group.phrase}</span>
+      ${shown ? html`<span class="tool-group-subject" title=${subject}>${shown}</span>` : null}
+      ${group.steps > 1 ? html`<span class="tool-group-steps">· ${group.steps} steps</span>` : null}
+      ${open ? html`<${ChevronDown} size=${14} />` : html`<${ChevronRight} size=${14} />`}
+    </button></div>`
+}
+
+// One subagent of a run as its head counts it: a status label (the card's own words, lowercase) and whether it ended.
+// A card without progress yet waits for your approval, is being prepared, or ended before its subagent started.
+const MEMBER_STATES = { pending: 'needs approval', running: 'starting', rejected: 'not run', cancelled: 'cancelled', error: 'failed' }
+function memberState(event) {
+  const progress = event.delegation
+  if (progress && typeof progress === 'object') {
+    return { label: (DELEGATION_STATUS[progress.status] || String(progress.status || 'running').replace(/_/g, ' ')).toLowerCase(),
+      finished: !!progress.terminal_reason }
+  }
+  return { label: MEMBER_STATES[event.state] || 'completed', finished: event.state !== 'pending' && event.state !== 'running' }
+}
+// Live statuses first, then how they ended; others after the live ones in the order seen.
+const STATE_ORDER = ['needs approval', 'running', 'waiting for approval', 'starting', 'waiting for a free slot',
+  'completed', 'failed', 'cancelled', 'interrupted', 'not run']
+function runAggregate(states) {
+  const counts = new Map()
+  for (const state of states) {
+    const entry = counts.get(state.label) || { count: 0, finished: state.finished }
+    entry.count++
+    counts.set(state.label, entry)
+  }
+  const rank = ([label, entry]) => STATE_ORDER.includes(label) ? STATE_ORDER.indexOf(label) : entry.finished ? 50 : 4.5
+  return [...counts].sort((a, b) => rank(a) - rank(b)).map(([label, entry]) => `${entry.count} ${label}`).join(' · ')
+}
+// Rows a closed run still shows: a card that waits for you, a subagent that waits for you, failed, was interrupted or
+// stopped, and a card that ended in an error or was not run.
+const KEPT_ROWS = new Set(['awaiting_approval', 'failed', 'interrupted', 'cancelled'])
+const keptRow = (event, status) => ['pending', 'error', 'rejected', 'cancelled'].includes(event.state) || status?.tone === 'warn'
+  || KEPT_ROWS.has(event.delegation?.status)
+
+// The head of a multi-agent run (the delegate_task cards of one response): how many, their statuses (a polite live
+// region that changes only when a status does), how many finished, the time from the first start to the last end
+// (or to now, counted here each second while one runs), Background, the cards still being prepared, the ones on an
+// earlier page, and Show in panel (onShowProgress, when given).
+function RunHead({ run, members, open, rows, onToggle, status, eventsStart, onShowProgress }) {
+  const states = members.map(memberState)
+  const live = states.some(state => !state.finished)
+  const starts = members.map(event => event.delegation?.started).filter(value => typeof value === 'number')
+  const ends = members.map(event => event.delegation?.ended).filter(value => typeof value === 'number')
+  const ticking = live && starts.length > 0
+  const [now, setNow] = useState(() => Date.now() / 1000)
+  useEffect(() => {
+    if (!ticking) return undefined
+    setNow(Date.now() / 1000)
+    const timer = setInterval(() => setNow(Date.now() / 1000), 1000)
+    return () => clearInterval(timer)
+  }, [ticking])
+  const first = starts.length ? Math.min(...starts) : null
+  // Ended without end times (a restart interrupted them): no duration, as on the rows.
+  const elapsed = first == null ? null : live ? Math.max(now, first) - first : ends.length ? Math.max(...ends) - first : null
+  const finished = states.filter(state => state.finished).length
+  const batch = run.batch
+  const indexes = members.map(event => event.delegation_batch?.index).filter(Number.isInteger)
+  const earlier = batch && eventsStart > 0 && indexes.length && Math.min(...indexes) > 0 ? Math.min(...indexes) : 0
+  const known = members.length + earlier
+  // A turn stopped while it prepared the cards leaves fewer than the batch asked for.
+  const preparing = batch && known < batch.size ? status !== 'idle' ? `Preparing ${known} of ${batch.size}` : `${known} of ${batch.size} started` : ''
+  const background = members.some(event => event.delegation?.background)
+  return html`<div class=${`run-head${rows ? ' has-rows' : ''}`}>
+    <button class="run-toggle" aria-expanded=${open} aria-controls=${members.map(event => `tool-${event.id}`).join(' ')} onClick=${onToggle}>
+      <${Workflow} size=${16} /><span class="run-count">${members.length} ${members.length === 1 ? 'subagent' : 'subagents'}</span>
+      ${open ? html`<${ChevronDown} size=${14} />` : html`<${ChevronRight} size=${14} />`}
+    </button>
+    <span class="run-aggregate" role="status">${runAggregate(states)}</span>
+    <progress aria-label="Subagents finished" value=${finished} max=${members.length} />
+    ${elapsed != null ? html`<span class="run-elapsed" title=${live ? 'Time since the first one started' : 'Time from the first start to the last end'}>${elapsedText(elapsed)}</span>` : null}
+    ${background ? html`<span class="run-chip" title="The chat goes on while they work; a notice says when each ends.">Background</span>` : null}
+    ${preparing ? html`<span class="run-note">${preparing}</span>` : null}
+    ${earlier ? html`<span class="run-note">${earlier} earlier, not loaded</span>` : null}
+    ${onShowProgress ? html`<button class="outline run-show" onClick=${() => onShowProgress()}>Show in panel</button>` : null}
+  </div>`
+}
+
 // The cards waiting for your answer (an approval, a question, a plan): one per pending tool event, in transcript order.
 export const PENDING_CARDS = '.tool-card.needs-approval, .question-card.needs-answer, .plan-card.needs-answer'
 
 // Scrolls a waiting card into view and, with focus, moves keyboard focus to where answering starts: a tool card's
-// heading (it names the action; Tab reaches the buttons), a question's first option, a plan's first review button.
+// heading (it names the action; Tab reaches the buttons), a question's first option, a plan's first review button,
+// a waiting subagent's first control (WAITING_SUBAGENTS: Allow, or Review or Answer in subagent).
 // A card taller than the transcript cannot be shown whole; the view then keeps in sight the focused control (a long
 // plan's review buttons on a phone, where they are not sticky), or without focus an approval card's end with its
 // buttons.
@@ -890,6 +1031,7 @@ export function revealCard(card, focus = false) {
   if (!box) return
   const tool = card.matches('.tool-card')
   const target = !focus ? null : tool ? card.querySelector('.tool-heading')
+    : card.matches(WAITING_SUBAGENTS) ? card.querySelector('.subagent-controls button:not(:disabled)')
     : card.querySelector('input:not(:disabled)') || card.querySelector(':is(.plan-actions, .approval-buttons) button:not(:disabled)')
   // Where the view ends up is found with instant scrolls (the browser's own 'nearest', scroll-padding included) and
   // then reached with the transcript's smooth scroll from where it was.
@@ -905,6 +1047,9 @@ export function revealCard(card, focus = false) {
   target?.focus({ preventScroll: true })
 }
 
+// The fold state of a chat's transcript: nothing opened, pinned or closed yet.
+const freshFolds = id => ({ id, open: new Set(), pinned: new Set(), closed: new Set() })
+
 // onOpenPath({ path, line? }) opens a file named in a reply or a tool card in the Workspace panel.
 // onLoadEarlier() -> Promise loads the page of messages before the first loaded one (session.events_start > 0).
 // busy: the chat is not idle (message actions other than Copy are hidden).
@@ -912,7 +1057,8 @@ export function revealCard(card, focus = false) {
 // (verbatim), and returns false when a typed draft was kept.
 // roots: absolute folders besides the chat's allowed folders (the default code folder) whose files tool cards name
 // as "<folder name>/rest".
-export default function Conversation({ session, onError, onSelectSession, onOpenPath, busy = false, onPrefill, onLoadEarlier, roots = [] }) {
+// onShowProgress(): a run head's Show in panel (Workspace → Progress); without it the head has no such button.
+export default function Conversation({ session, onError, onSelectSession, onOpenPath, busy = false, onPrefill, onLoadEarlier, roots = [], onShowProgress }) {
   const container = useRef(null)
   const bottom = useRef(null)
   const follow = useRef(true)
@@ -937,8 +1083,22 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
   const shorten = useMemo(() => pathShortener(session.workspace, JSON.parse(rootsKey)), [session.workspace, rootsKey])
   const projectName = String(session.workspace || '').split('/').filter(Boolean).at(-1) || ''
   const toolSummaries = useMemo(() => summarizeTools(session.events, shorten, projectName), [session.events, shorten, projectName])
-  // Map<event id, { result, status }>: parsed once per event (see toolState).
-  const toolStates = useMemo(() => new Map(session.events.filter(event => event.type === 'tool').map(event => [event.id, toolState(event)])), [session.events])
+  // Map<event id, { result, status, failure, hooked }>: parsed once per event (see toolState).
+  const toolStates = useMemo(() => toolStatesFor(session.events), [session.events])
+  // Folded tool cards and multi-agent runs (transcriptGroups.js; Settings → Appearance → Group tool calls).
+  const prefs = useViewPrefs()
+  const layout = useMemo(() => layoutTranscript(session.events, toolStates, { group: prefs.group }), [session.events, toolStates, prefs.group])
+  // What you opened and closed, by event id, so it outlasts a group growing, Load earlier and a reconnect's fresh
+  // events: open (members of groups you opened, runs you opened), pinned (cards you clicked or focused: their group
+  // stays open until you close it) and closed (runs you closed). A chat of its own starts afresh.
+  const [folds, setFolds] = useState(() => freshFolds(session.id))
+  const view = folds.id === session.id ? folds : freshFolds(session.id)
+  const changeFolds = change => setFolds(current => change(current.id === session.id ? current : freshFolds(session.id)))
+  // Runs seen with a subagent still going start open (and stay open when it ends, so the page does not jump); runs
+  // first seen finished start closed.
+  const runsSeen = useRef(null)
+  if (runsSeen.current?.id !== session.id) runsSeen.current = { id: session.id, live: new Map() }
+  const touch = id => changeFolds(current => current.pinned.has(id) ? current : { ...current, pinned: new Set(current.pinned).add(id) })
   const last = session.events[session.events.length - 1]
   useEffect(() => { if (follow.current) bottom.current?.scrollIntoView({ block: 'end' }) }, [last?.id, last?.text, last?.state])
   useEffect(() => { follow.current = true; bottom.current?.scrollIntoView({ block: 'end' }) }, [session.id])
@@ -1043,6 +1203,83 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
         onClick=${() => setForking({ beforeEventId: next >= 0 ? session.events[next].id : null })} />` : null}
       ${canRetry ? html`<${ActionButton} label="Retry response" icon=${RefreshCw} disabled=${retrying} onClick=${() => void retry()} />` : null}`
   }
+  // One event as the transcript shows it. className: a card's or reply's place in an open group or a run.
+  const renderEvent = (event, className = '') => {
+    if (event.type === 'user' && editing === event.id && idle) return html`<${EditMessage} key=${event.id} sessionId=${session.id} event=${event}
+      onSelectSession=${onSelectSession}
+      onCancel=${() => { editReturn.current = event.id; setEditing(null) }} onSent=${(result, text) => {
+        setEditing(null)
+        resent(result, text, event.verbatim)
+      }} />`
+    if (event.type === 'user') return html`<div class=${`user-message${event.steered ? ' steered' : ''}${event.hook_blocked ? ' hook-blocked' : ''}`} key=${event.id}>${event.steered ? html`<small class="steered-label">Sent while the agent was working</small>` : null}${event.origin?.kind === 'delegated' ? html`<small class="delegation-origin">Delegated by parent conversation</small>` : null}${event.background_wake ? html`<small class="delegation-origin">Sent by the app when a background subagent ended</small>` : null}<${HookMessageLabel} event=${event} />${event.text}<${Attachments} items=${event.attachments} /><${SentWith} event=${event} /><${HookMessageDetails} event=${event} />${event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}${event.text || idle ? html`<div class="message-actions">${event.text ? html`<${CopyAction} text=${event.text} label="Copy message" />` : null}${idle ? html`${event.background_wake ? null : html`<${ActionButton} label="Edit message" icon=${Pencil} target=${`edit:${event.id}`} onClick=${() => setEditing(event.id)} />`}<${ActionButton} label="Rewind to here" icon=${Undo2} onClick=${() => setRewinding(event)} />` : null}</div>` : null}</div>`
+    if (event.type === 'tool' && event.name === 'ask_user') return html`<${QuestionCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
+    if (event.type === 'tool' && event.name === 'submit_plan') return html`<${PlanCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
+    if (event.type === 'tool' && event.name === 'report_findings' && event.state === 'completed') return html`<${FindingsCard} key=${event.id} event=${event} onOpenPath=${onOpenPath} />`
+    if (event.type === 'tool') return html`<${ToolCard} key=${event.id} event=${event} summary=${toolSummaries.get(event.id)} result=${toolStates.get(event.id).result} status=${toolStates.get(event.id).status} failure=${toolStates.get(event.id).failure} sessionId=${session.id} onError=${onError} onSelectSession=${onSelectSession} onOpenPath=${onOpenPath}
+      className=${className} onTouch=${touch} />`
+    if (event.type === 'assistant') return event.text || event.reasoning_summary || event.request_info || event.reasoning_started ? html`<${Reply} key=${event.id} text=${event.text || ''} reasoning=${event.reasoning_summary} truncated=${event.reasoning_truncated} started=${event.reasoning_started} seconds=${event.reasoning_seconds} wait=${event.reasoning_wait_seconds} requestInfo=${event.request_info} onOpenPath=${onOpenPath} actions=${event.text ? replyActions(event) : null} turnResult=${event.turn_result} className=${className} />` : null
+    const marker = event.type !== 'error' && (!!event.stop_phase || event.text === STOPPED_TEXT)
+    const classes = ['conversation-notice', event.type === 'error' && 'error', marker && 'stop-marker', event.compaction && 'compaction'].filter(Boolean).join(' ')
+    if (marker) return html`<div class=${classes} key=${event.id} title=${event.text}>${STOP_TEXT[event.stop_phase] || 'Stopped'}</div>`
+    const error = event.type === 'error' ? noticeError(event) : null
+    // A rate-limit notice's Details: the 429's code, message and Retry-After (AgentEvent.details).
+    const details = error ? error.details : typeof event.details === 'string' && event.details ? event.details : null
+    return html`<div class=${classes} key=${event.id} role=${error ? 'note' : undefined}>${error ? html`<p class="notice-summary">${error.summary}</p>` : idle ? idleNotice(event.text) : event.text}${details
+        ? html`<details class="notice-details"><summary>Details</summary><pre>${details}</pre></details>` : null}<${DelegationStatus} event=${event} onSelectSession=${onSelectSession} onError=${onError} />${!event.delegation && (event.child_session_id || event.subagent_id) && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id || event.subagent_id)}>Open subagent</button>` : null}</div>`
+  }
+  // Which groups are open, and for each run whether it is open and the class of each row it shows: a closed run still
+  // shows the rows that wait for you or went wrong (keptRow), and the hook cards between them that did something.
+  const groupOpen = new Map()
+  const runs = new Map()
+  for (const item of layout) {
+    if (item.kind === 'group') groupOpen.set(item.key, item.members.some(id => view.open.has(id) || view.pinned.has(id)))
+    else if (item.kind === 'run') runs.set(item.key, { rows: [], members: [] })
+    else if (item.role) {
+      const run = runs.get(item.run)
+      run.rows.push(item)
+      if (item.role === 'member') run.members.push(item.event)
+    }
+  }
+  for (const [key, run] of runs) {
+    if (run.members.some(event => !memberState(event).finished)) runsSeen.current.live.set(key, true)
+    run.open = view.closed.has(key) ? false : view.open.has(key) || runsSeen.current.live.has(key)
+    const shown = run.open ? run.rows : run.rows.filter(row => row.role === 'member' ? keptRow(row.event, toolStates.get(row.event.id)?.status) : !row.quiet)
+    run.classes = new Map(shown.map((row, index) => [row.event.id,
+      [row.cls, index === 0 && 'run-first', index === shown.length - 1 && 'run-last'].filter(Boolean).join(' ')]))
+  }
+  // Opening a group opens it by its cards' ids; closing it also forgets the cards you used in it.
+  const toggleGroup = (members, open) => changeFolds(current => {
+    const next = { ...current, open: new Set(current.open), pinned: new Set(current.pinned) }
+    for (const id of members) {
+      if (!open) next.open.add(id)
+      else { next.open.delete(id); next.pinned.delete(id) }
+    }
+    return next
+  })
+  const toggleRun = (key, open) => changeFolds(current => {
+    const next = { ...current, open: new Set(current.open), closed: new Set(current.closed) }
+    if (open) { next.open.delete(key); next.closed.add(key) }
+    else { next.closed.delete(key); next.open.add(key) }
+    return next
+  })
+  const renderItem = item => {
+    if (item.kind === 'group') {
+      const open = groupOpen.get(item.key)
+      return html`<${ToolGroupHead} key=${item.key} group=${item} open=${open} summary=${toolSummaries.get(item.lastId)} onToggle=${() => toggleGroup(item.members, open)} />`
+    }
+    if (item.kind === 'run') {
+      const run = runs.get(item.key)
+      return html`<${RunHead} key=${item.key} run=${item} members=${run.members} open=${run.open} rows=${run.classes.size > 0}
+        onToggle=${() => toggleRun(item.key, run.open)} status=${session.status} eventsStart=${session.events_start || 0} onShowProgress=${onShowProgress} />`
+    }
+    // A closed group's cards are not rendered at all, so a long chat keeps only their heads on the page.
+    if (item.group) return groupOpen.get(item.group) ? renderEvent(item.event, 'grouped') : null
+    if (item.role) {
+      const className = runs.get(item.run).classes.get(item.event.id)
+      return className ? renderEvent(item.event, className) : null
+    }
+    return renderEvent(item.event)
+  }
   return html`<div class="transcript" ref=${container} tabIndex=${-1} onScroll=${() => {
     const el = container.current
     if (el) follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120
@@ -1056,28 +1293,7 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
       })}</ol>
     </details>` : null}
     ${session.parent_session_id && onSelectSession ? html`<button class="outline parent-conversation" onClick=${() => onSelectSession(session.parent_session_id)}>Back to parent conversation</button>` : null}
-    ${session.events.map(event => {
-      if (event.type === 'user' && editing === event.id && idle) return html`<${EditMessage} key=${event.id} sessionId=${session.id} event=${event}
-        onSelectSession=${onSelectSession}
-        onCancel=${() => { editReturn.current = event.id; setEditing(null) }} onSent=${(result, text) => {
-          setEditing(null)
-          resent(result, text, event.verbatim)
-        }} />`
-      if (event.type === 'user') return html`<div class=${`user-message${event.steered ? ' steered' : ''}${event.hook_blocked ? ' hook-blocked' : ''}`} key=${event.id}>${event.steered ? html`<small class="steered-label">Sent while the agent was working</small>` : null}${event.origin?.kind === 'delegated' ? html`<small class="delegation-origin">Delegated by parent conversation</small>` : null}${event.background_wake ? html`<small class="delegation-origin">Sent by the app when a background subagent ended</small>` : null}<${HookMessageLabel} event=${event} />${event.text}<${Attachments} items=${event.attachments} /><${SentWith} event=${event} /><${HookMessageDetails} event=${event} />${event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}${event.text || idle ? html`<div class="message-actions">${event.text ? html`<${CopyAction} text=${event.text} label="Copy message" />` : null}${idle ? html`${event.background_wake ? null : html`<${ActionButton} label="Edit message" icon=${Pencil} target=${`edit:${event.id}`} onClick=${() => setEditing(event.id)} />`}<${ActionButton} label="Rewind to here" icon=${Undo2} onClick=${() => setRewinding(event)} />` : null}</div>` : null}</div>`
-      if (event.type === 'tool' && event.name === 'ask_user') return html`<${QuestionCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
-      if (event.type === 'tool' && event.name === 'submit_plan') return html`<${PlanCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
-      if (event.type === 'tool' && event.name === 'report_findings' && event.state === 'completed') return html`<${FindingsCard} key=${event.id} event=${event} onOpenPath=${onOpenPath} />`
-      if (event.type === 'tool') return html`<${ToolCard} key=${event.id} event=${event} summary=${toolSummaries.get(event.id)} result=${toolStates.get(event.id).result} status=${toolStates.get(event.id).status} failure=${toolStates.get(event.id).failure} sessionId=${session.id} onError=${onError} onSelectSession=${onSelectSession} onOpenPath=${onOpenPath} />`
-      if (event.type === 'assistant') return event.text || event.reasoning_summary || event.request_info || event.reasoning_started ? html`<${Reply} key=${event.id} text=${event.text || ''} reasoning=${event.reasoning_summary} truncated=${event.reasoning_truncated} started=${event.reasoning_started} seconds=${event.reasoning_seconds} wait=${event.reasoning_wait_seconds} requestInfo=${event.request_info} onOpenPath=${onOpenPath} actions=${event.text ? replyActions(event) : null} turnResult=${event.turn_result} />` : null
-      const marker = event.type !== 'error' && (!!event.stop_phase || event.text === STOPPED_TEXT)
-      const classes = ['conversation-notice', event.type === 'error' && 'error', marker && 'stop-marker', event.compaction && 'compaction'].filter(Boolean).join(' ')
-      if (marker) return html`<div class=${classes} key=${event.id} title=${event.text}>${STOP_TEXT[event.stop_phase] || 'Stopped'}</div>`
-      const error = event.type === 'error' ? noticeError(event) : null
-      // A rate-limit notice's Details: the 429's code, message and Retry-After (AgentEvent.details).
-      const details = error ? error.details : typeof event.details === 'string' && event.details ? event.details : null
-      return html`<div class=${classes} key=${event.id} role=${error ? 'note' : undefined}>${error ? html`<p class="notice-summary">${error.summary}</p>` : idle ? idleNotice(event.text) : event.text}${details
-          ? html`<details class="notice-details"><summary>Details</summary><pre>${details}</pre></details>` : null}<${DelegationStatus} event=${event} onSelectSession=${onSelectSession} onError=${onError} />${!event.delegation && (event.child_session_id || event.subagent_id) && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id || event.subagent_id)}>Open subagent</button>` : null}</div>`
-    })}
+    ${layout.map(renderItem)}
     ${['running', 'delegating'].includes(session.status) ? html`<div class="working-indicator"><span /><span /><span /><span class="sr-only">Working</span></div>` : null}
     ${rewinding && idle ? html`<${RewindDialog} session=${session} event=${rewinding} onClose=${() => setRewinding(null)}
       onSelectSession=${onSelectSession}

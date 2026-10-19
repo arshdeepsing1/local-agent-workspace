@@ -726,6 +726,29 @@ code.finding-location{color:#55564f;text-decoration:none}
 .subagent-finding-path:hover{color:var(--accent)}
 .tool-sibling{margin:0 13px 10px;font-size:calc(11px*var(--text-scale));color:#87593b;overflow-wrap:anywhere}
 .subagent-controls .subagent-pending-warning{flex-basis:100%;margin:0;font-size:calc(11px*var(--text-scale));color:#87593b;overflow-wrap:anywhere}
+/* Task B transcript: folded tool calls (one head, "Ran 3 commands"), a multi-agent run's head over its rows drawn as one card, a subagent's live step and current tool, and a subagent waiting for your answer. */
+.tool-group{margin:9px 0 9px 33px;min-width:0}
+.tool-group-head{width:100%;min-width:0;justify-content:flex-start;gap:8px;padding:7px 11px;border:1px solid transparent;border-radius:8px;font-size:calc(12px*var(--text-scale));color:var(--ink);text-align:left}
+.tool-group-head:hover,.tool-group-head[aria-expanded=true]{background:#f1efe9;border-color:#e5e1d7}
+.tool-group-head>svg{flex-shrink:0;color:var(--muted)}
+.tool-group-phrase{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tool-group-subject{flex:1 1 0;min-width:0;color:var(--muted);font:calc(11px*var(--text-scale)) ui-monospace,SFMono-Regular,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tool-group-steps{flex-shrink:0;color:var(--muted);font-size:calc(11px*var(--text-scale));white-space:nowrap}
+.tool-card.grouped{margin-left:47px;border-left:3px solid #d8d2c5}.assistant-reply.grouped{margin-left:14px}
+.run-head{display:flex;flex-wrap:wrap;align-items:center;gap:4px 10px;margin:9px 0 9px 33px;padding:5px 12px;border:1px solid #dedad1;border-radius:9px;background:#efece5;color:var(--muted);font-size:calc(12px*var(--text-scale));min-width:0;overflow-wrap:anywhere}
+.run-head.has-rows{margin-bottom:0;border-bottom:0;border-radius:9px 9px 0 0}
+.run-toggle{gap:7px;margin-left:-7px;padding:5px 7px;border-radius:6px;color:var(--ink);font-size:calc(12px*var(--text-scale));font-weight:500;white-space:nowrap}.run-toggle:hover{background:#e6e2d8}
+.run-toggle>svg{flex-shrink:0}.run-aggregate{min-width:0}
+.run-head progress{width:64px;height:5px;accent-color:var(--accent);flex-shrink:0}
+.run-elapsed{font-variant-numeric:tabular-nums;white-space:nowrap}
+.run-chip{border:1px dashed #a9a191;border-radius:10px;padding:0 7px;font-size:calc(11px*var(--text-scale));color:var(--ink)}
+.run-note{font-size:calc(11px*var(--text-scale))}
+.run-show{margin-left:auto;padding:4px 10px;font-size:calc(11px*var(--text-scale))}
+.tool-card.run-member{margin-top:0;margin-bottom:0;border-radius:0;border-top-color:#e6e2d8}.tool-card.run-last{margin-bottom:9px;border-radius:0 0 9px 9px}
+.delegation-progress .delegation-tool{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.delegation-progress .delegation-failed{color:#98492f}
+.delegation-progress.needs-answer{background:#faf3e9;border-top:1px solid #e8d2c2;color:#5f5d55}
+@media(max-width:600px){.tool-group,.run-head{margin-left:25px}.tool-card.grouped{margin-left:37px}.assistant-reply.grouped{margin-left:10px}}
 .usage-subagents{margin-top:18px}.usage-subagents h3{margin-bottom:0}.usage-subagents .usage-cards{grid-template-columns:repeat(3,minmax(0,1fr))}
 .usage-subagent-list>summary{cursor:pointer;font-size:calc(12px*var(--text-scale));width:fit-content;margin-bottom:8px}
 .usage-subagent-list table{width:100%;border-collapse:collapse;background:var(--surface);font-size:calc(11px*var(--text-scale))}
