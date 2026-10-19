@@ -1322,7 +1322,8 @@ Databricks responses may omit usage.
 requests (steps), its tool calls, the wall-clock time, the input (cache included, with the cache
 reads in brackets) and output tokens of the turn's own calls (title and compaction included, not a
 `/btw` side question asked while it ran), the
-estimated DBU with its subagents', and how many subagents it started. A count no call reported
+estimated DBU with its subagents', and how many subagents worked in it (a background subagent from
+an earlier turn counts for the requests it made during this turn). A count no call reported
 shows `—`, never 0, and there is no DBU part without price data. Open it for how the turn ended,
 the tokens it processed with its subagents, calls without price data and the files its tools and
 subagents changed. The same record ends the turn for scripts (see **Scripting the app**), is
@@ -3616,8 +3617,9 @@ and never blocks saving other settings. Files shows the folder as soon as the ag
 1–64. This is a model-request ceiling, not a tool-call count: one model response can
 request several tools. Reaching the ceiling preserves completed actions and stops
 until the user continues or raises the setting; the notice adds what the turn cost, for
-example "This turn used about 42.5 DBU (estimate)." (the chat and its subagents, from list
-prices; left out for an endpoint without price data). Each step resends the whole
+example "This turn used about 42.5 DBU (estimate)." (the turn's estimate as its turn summary
+shows it: from list prices, its subagents included, not a `/btw` side question; left out for an
+endpoint without price data). Each step resends the whole
 conversation, so a long turn on a large context costs far more than a short one, and with no
 spending limit set (the default) the step limit is the only brake: if you raise Agent steps,
 also set a per-chat **spending limit** (see **Spending limit**). **Max output tokens** defaults to

@@ -688,6 +688,55 @@ async def test_a_side_question_in_a_subagents_chat_counts_in_its_parents_turn_ne
     assert result["tokens"] == 44_000 and result["estimated_dbu"] == pytest.approx(4 * PER_CALL)
 
 
+async def test_the_step_limit_notice_names_the_turns_dbu_without_a_side_question_asked_during_it(runtime, monkeypatch):
+    manager, session = runtime
+    manager.settings.values["max_agent_steps"] = 2
+    hold = asyncio.Event()
+
+    async def parent(count):
+        if count == 1:
+            await hold.wait()  # The side question is asked while the turn's first request runs.
+        return calls_reply((f"c{count}", "list_tasks", {}))
+    requests, _ = gated_gateway(monkeypatch, parent, None)
+    manager.store.save(session)
+    manager.start(session["id"], "Work")
+    await eventually(lambda: requests)
+    assert (await manager.side_question(session["id"], "What is this about?"))["answer"] == "Side answer."
+    hold.set()
+    await manager.tasks[session["id"]]
+    saved = manager.store.get(session["id"])
+    result = saved["last_turn_result"]
+    assert result["terminal_reason"] == "step_limit" and result["estimated_dbu"] == pytest.approx(2 * PER_CALL)
+    # The notice names the turn's cost as its record (the footer under the same reply) does: 1.714 DBU, not 3.2.
+    assert notices(saved)[-1]["text"].endswith(" This turn used about 1.7 DBU (estimate).")
+
+
+async def test_a_subagents_step_limit_error_names_its_turns_dbu_without_a_side_question_in_its_chat(
+        runtime, monkeypatch):
+    manager, session = runtime
+    hold = asyncio.Event()
+
+    async def parent(count):
+        return calls_reply(("d1", "delegate_task", {"task": "Map it", "agent_type": "explore", "max_steps": 2})) \
+            if count == 1 else text_reply("Done.")
+
+    async def child(count):
+        if count == 1:
+            await hold.wait()  # The user asks the subagent a side question while its first request runs.
+        return calls_reply((f"x{count}", "list_tasks", {}))
+    _, children = gated_gateway(monkeypatch, parent, child)
+    manager.store.save(session)
+    manager.start(session["id"], "Delegate")
+    await eventually(lambda: children)
+    child_id = manager.delegates.active[session["id"]][0]["child_session_id"]
+    assert (await manager.side_question(child_id, "What are you doing?"))["answer"] == "Side answer."
+    hold.set()
+    await manager.tasks[session["id"]]
+    child_session = manager.store.get(child_id)
+    assert child_session["terminal_reason"] == "step_limit"
+    assert notices(child_session)[-1]["text"].endswith(" This turn used about 1.7 DBU (estimate).")
+
+
 async def test_a_change_during_the_turn_applies_from_the_next_request(runtime, monkeypatch):
     manager, session = runtime
 

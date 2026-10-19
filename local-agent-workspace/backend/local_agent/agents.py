@@ -72,7 +72,7 @@ from . import spending, turns
 from .telemetry import usage_summary
 from .titles import fallback_title, generate_title, needs_title
 from .telemetry import (
-    InferenceError, begin_inference_call, call_estimated_dbu, finish_inference_call, http_error_kind,
+    InferenceError, begin_inference_call, finish_inference_call, http_error_kind,
     record_response_id, reported_usage, stream_error_kind, usage_keys,
 )
 from . import serving
@@ -5749,8 +5749,6 @@ class AgentManager(LifecycleHooks):
             steps = (session.get("max_steps", 6) if session.get("is_subagent")
                      else session["max_agent_steps"] if type(session.get("max_agent_steps")) is int
                      else self.chat_values(session).get("max_agent_steps", DEFAULT_MAX_AGENT_STEPS))
-            # What the chat had spent and how many calls it had before this turn (the step-limit notice).
-            turn_start = (self.spent_so_far(session), len(session.get("inference_calls") or []))
             # Hidden repairs, auto-continue waits after rate limits, the reason the next
             # request is sent automatically (ledger), and the Verify loop's progress.
             consecutive_repairs, rate_limit_waits, retry_reason = 0, 0, None
@@ -6196,7 +6194,7 @@ class AgentManager(LifecycleHooks):
                                   f"This project's {settings_layers.LAYER_FILES[source]} sets this limit, not "
                                   "Settings: change it there or send a message to continue." if source else
                                   "Increase Agent steps in Settings or send a message to continue.")
-                               + self.turn_cost(session, *turn_start)),
+                               + self.turn_cost(session)),
                          terminal_reason="step_limit")
 
     @staticmethod
@@ -6212,21 +6210,14 @@ class AgentManager(LifecycleHooks):
         return any(item.get("type") == "tool" and item.get("name") == "submit_report" and item.get("call_id") in ids
                    and item.get("state") == "completed" for item in events[start:])
 
-    def spent_so_far(self, session):
-        """(estimated DBU, unpriced calls) of a chat and its subagents (spending.chat_spend); a subagent's own."""
-        if session.get("is_subagent"):
-            return spending.own_spend(session)
-        spend = spending.chat_spend(self, session)
-        return spend["spent_dbu"], spend["unpriced_calls"]
-
-    def turn_cost(self, session, before, first_call):
-        """' This turn used about N DBU (estimate).' since before (spent_so_far when the turn began), or ''
-        when a call of the turn has no price data or none of its own calls (from first_call on) was priced."""
-        spent, unpriced = self.spent_so_far(session)
-        calls = (session.get("inference_calls") or [])[first_call:]
-        if unpriced != before[1] or not any((call_estimated_dbu(call)[0] or 0) > 0 for call in calls
-                                            if isinstance(call, dict)):
+    def turn_cost(self, session):
+        """' This turn used about N DBU (estimate).': the estimate of the turn's result record (turns.turn_result: a
+        chat's with its subagents', not a /btw side question), so the footer under the reply gives the same, or ''
+        when a call of the turn has no price data or none was priced."""
+        turn = self.turns.get(session["id"])
+        result = turns.turn_result(self, session, turn, "step_limit") if turn is not None else {}
+        used = result.get("estimated_dbu")
+        if used is None or result.get("unpriced_calls"):
             return ""
-        used = max(0.0, spent - before[0])
         return f" This turn used about {used:,.1f} DBU (estimate)." if used >= 1 else \
             f" This turn used about {used:.3f} DBU (estimate)."

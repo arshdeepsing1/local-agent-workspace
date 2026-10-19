@@ -156,7 +156,8 @@
 //   cache_creation_input_tokens, reasoning_tokens } (the turn's own calls; null = no call reported it), tokens: number |
 //   null (every processed token, its subagents' included, a background subagent's only for the requests it made
 //   during this turn; null: no call reported a count), estimated_dbu: number | null
-//   (no priced call), unpriced_calls, subagents: { count, tokens (null: none of them reported a count), estimated_dbu },
+//   (no priced call), unpriced_calls, subagents: { count (those that worked in this turn: a background one from an
+//   earlier turn when a request of it ended during it), tokens (null: none of them reported a count), estimated_dbu },
 //   changed_files: string[] (at most 20), changed_files_total? }.
 // GET /usage?days=1..90 (30) -> { days, since, until, totals: { calls, input_tokens, cache_read_input_tokens,
 //   cache_creation_input_tokens, output_tokens, estimated_dbu, unpriced_calls, chats }, by_day: [{ date, ... }] (every
