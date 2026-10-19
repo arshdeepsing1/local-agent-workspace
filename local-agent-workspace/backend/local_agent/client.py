@@ -30,15 +30,18 @@ uncertain (the command could not be checked exactly against the deny and ask rul
 ({subagent_id, agent_type, path}: another subagent of the chat changed the file).
 
 When the turn ends while background subagents of the chat (delegate_task background) still work, query() yields
-{"type": "background_wait", "running": n} and keeps following them, answering their cards (theirs, and their
-subagent_start and subagent_stop hooks' in the chat) the same way, until they end: a delegation result on the
-card, or a stop. The result's background_results lists each one's end (its delegate_task result, or its last
-status). A turn the app starts in the chat meanwhile (Settings → Subagents → Continue the chat when a background
-subagent finishes) is followed too, and the result is the last turn's. A turn the user or another script starts
-in the chat is theirs: query() neither answers its cards nor reports it, and a ! command or a compaction is no
-turn. The result comes once nothing runs in the chat any more (it is idle, or a card of a background subagent
-query() does not follow waits). Every model request is a paid call to your Databricks workspace, made with the
-app's credentials.
+{"type": "background_wait", "running": n, "turn_result": the ended turn's result} and keeps following them,
+answering their cards (theirs, and their subagent_start and subagent_stop hooks' in the chat) the same way, until
+they end: a delegation result on the card, or a stop. The result's background_results lists each one's end (its
+delegate_task result, or its last status). A turn the app starts in the chat meanwhile (Settings → Subagents →
+Continue the chat when a background subagent finishes) is followed too, and the result is the last turn's. A turn
+the user or another script starts in the chat is theirs, as is one the user starts in a subagent's chat after its
+delegation ended: query() neither answers its cards nor reports it, and a ! command or a compaction is no turn.
+The result comes once nothing runs in the chat any more (it is idle, or a card of a background subagent query()
+does not follow waits). A prompt sent just as something else started in the chat waits in its queue: query()
+follows the turn that sends it (or, from then on, the running turn it goes into), and raises LocalAgentError
+(NOT_SENT) when what ran ended without sending it. Every model request is a paid call to your Databricks
+workspace, made with the app's credentials.
 """
 import http.client
 import json
@@ -60,6 +63,9 @@ NO_REVIEWER = ("Nobody can review plans in this scripted run. Do not make change
 CARD_GONE = ("This approval is no longer pending.", "This question is no longer waiting for an answer.",
              "This plan is no longer waiting for review.")
 SHUT_DOWN = "The app shut down before the turn ended (its shutdown stops running turns)."
+NOT_SENT = ("The prompt was not sent: the chat got busy as it was sent, so it waited in the chat's queue, and what ran "
+            "then ended without sending it (after a stop, an error or a limit, Send queued messages in the page sends "
+            "it).")
 LIMIT_REASONS = ("step_limit", "spending_limit", "budget_limit", "approval_expired")
 STOP_REASONS = ("stopped", "interrupted")
 RECONNECTS = 3  # New streams query() opens after the app dropped one whose reader fell behind.
@@ -308,13 +314,15 @@ class LocalAgentClient:
         finally:
             connection.close()
 
-    def wait_result(self, session_id, after=None, background=False):
+    def wait_result(self, session_id, after=None, background=False, turn=None):
         """The result record of the chat's running turn once it ends, or of its last turn when no turn runs (it is
         idle, or a background subagent's card waits; a ! command or a compaction is waited for); None when it had
         no turn, or none that started after `after` (the started time of an earlier turn's result: a message that
         never started a turn). background: the record also has background_results, the background subagents of
-        that turn (those it started, and those still working when it started) as they are then."""
-        replies, cards, runs, last = {}, {}, False, None
+        that turn (those it started, and those still working when it started) as they are then. turn: an ended
+        turn's result (turn_result, as background_wait carries it), whose record is given instead, also once
+        nothing runs."""
+        replies, cards, starts, runs, last = {}, {}, [], False, None
         for message in self.events(session_id):
             kind, status = message.get("type"), message.get("status")
             for event in _events_of(message):
@@ -322,8 +330,9 @@ class LocalAgentClient:
                     replies[event.get("id")] = dict(event)
                 elif _background_card(event):
                     cards[event["id"]] = dict(event)
-                elif kind == "event" and event.get("type") == "user" and not event.get("steered"):
-                    runs = True  # A turn starts.
+                elif event.get("type") == "user" and not event.get("steered"):  # A turn starts.
+                    starts.append((event.get("created", 0), None))
+                    runs = runs or kind == "event"
             if kind == "snapshot":
                 chat = message.get("session") or {}
                 last = chat.get("last_turn_result") if isinstance(chat.get("last_turn_result"), dict) else None
@@ -338,6 +347,9 @@ class LocalAgentClient:
             else:
                 done = False
             if done:
+                if turn is not None:
+                    return result_record(session_id, turn, replies, _turn_cards(cards, turn) if background else None,
+                                         _next_start(starts, turn))
                 if last is None or (after is not None and last.get("started") == after):
                     return None
                 return result_record(session_id, last, replies, _turn_cards(cards, last) if background else None)
@@ -354,7 +366,9 @@ class LocalAgentClient:
         chat's background subagents ended (and a turn the app started for them), then one result record: {type:
         'result', session_id, terminal_reason, is_error, exit_code, duration_s, steps, tool_calls, usage, tokens,
         estimated_dbu, unpriced_calls, subagents, changed_files, result (the final reply), background_results}.
-        Cards of a turn the user or another script starts in the chat meanwhile are left to them."""
+        Cards of a turn the user or another script starts in the chat meanwhile (or the user in a subagent's chat
+        after its delegation ended) are left to them. A prompt that waits in the chat's queue (something started
+        there as it was sent) is followed from the turn that sends it."""
         if session_id is None:
             session_id = self.create_session(workspace, permission_mode, model, effort, max_steps, spending_limit_dbu,
                                              turn_token_limit, turn_time_limit_minutes)["id"]
@@ -389,18 +403,23 @@ class LocalAgentClient:
         # The chat's turns after the prompt: starts holds (created, whose) per turn start, "own" (the prompt's turn,
         # or one the app started when a background subagent finished: followed) or "other" (one the user or another
         # script started: neither answered nor reported); turn is whose turn runs now (None: none), ended the
-        # result of the last own turn and latest the started time of the last turn end read. background: the
-        # chat's background delegations followed ({card id: its card}) until each ended; check: whether to see if
-        # query() is done; due: one finished since the last turn started, so the app may still continue the chat
-        # (grace: until when query() waits for that turn).
-        known, starts, turn, ended, latest = set(), [], None, None, None
+        # result of the last own turn and latest the started time of the last turn end read. waits: the prompt
+        # waits in the chat's queue, as something started there as it was sent; the turn that sends it is the
+        # prompt's. delegated: per subagent chat followed, whether its last turn is its delegated one (False: one
+        # the user started there after its delegation ended, theirs). background: the chat's background delegations
+        # followed ({card id: its card}) until each ended; check: whether to see if query() is done; due: one
+        # finished since the last turn started, so the app may still continue the chat (grace: until when query()
+        # waits for that turn, or for the queued prompt's).
+        known, starts, turn, ended, latest, waits, delegated = set(), [], None, None, None, False, {}
         background, check, due, grace = {}, False, False, None
         try:
             while True:
                 try:
                     chat_id, subagent, message = messages.get(
                         timeout=None if grace is None else max(0.0, grace - time.monotonic()))
-                except queue.Empty:  # The app did not continue the chat.
+                except queue.Empty:  # The app did not continue the chat (or send the queued prompt).
+                    if waits:
+                        raise LocalAgentError(NOT_SENT) from None
                     yield result_record(session_id, ended, replies, self._background_ends(session_id, background),
                                         _next_start(starts, ended))
                     return
@@ -423,19 +442,33 @@ class LocalAgentClient:
                             raise LocalAgentError("This chat is busy: wait for its turn to end, or use another chat.")
                         latest = last_turn and last_turn.get("started")
                         known.update(event.get("id") for event in _events_of(message) if event.get("type") == "user")
-                        self.send(session_id, prompt, verbatim)
-                        sent = True
+                        answer = self.send(session_id, prompt, verbatim)
+                        sent, waits = True, isinstance(answer, dict) and answer.get("queued") is True
                     else:  # A new stream after the app dropped a slow reader: what happened meanwhile.
                         reconnected = check = True
                         if last_turn and last_turn.get("started") != latest:
                             finished = last_turn
                 yield {**message, "session_id": chat_id, **({"subagent": True} if subagent else {})}
                 for event in _events_of(message):
-                    if parent and event.get("type") == "user" and not event.get("steered") and event.get("id") not in known:
-                        known.add(event.get("id"))  # A turn starts.
-                        whose = "own" if not starts or event.get("background_wake") is True and ended is not None else "other"
-                        starts.append((event.get("created", 0), whose))
-                        turn, check, due, grace = whose, True, False, None
+                    if parent and event.get("type") == "user" and event.get("id") not in known:
+                        known.add(event.get("id"))
+                        if not event.get("steered"):  # A turn starts.
+                            if waits:  # The queue's turn is the prompt's; one before it is the app's or the user's.
+                                whose = "own" if event.get("queued") is True else "other"
+                            else:  # The prompt's, or one the app starts for a background subagent (only while no
+                                # turn runs, so after the prompt's start).
+                                whose = "own" if not starts or event.get("background_wake") is True else "other"
+                            waits = waits and whose == "other"
+                            starts.append((event.get("created", 0), whose))
+                            turn, check, due, grace = whose, True, False, None
+                        elif waits:  # The queued prompt went into the running turn (steering): it is the prompt's now.
+                            waits, turn = False, "own"
+                            if starts:
+                                starts[-1] = (starts[-1][0], "own")
+                    if not parent and event.get("type") == "user" and not event.get("steered"):
+                        origin = event.get("origin")
+                        delegated[chat_id] = isinstance(origin, dict) and origin.get("kind") == "delegated"
+                    ours = turn == "own" if parent else delegated.get(chat_id, True)
                     if parent and event.get("type") == "assistant":
                         replies[event.get("id")] = dict(event)
                     if parent and _background_card(event):
@@ -447,10 +480,10 @@ class LocalAgentClient:
                             result = event.get("delegation_result")
                             check, due = True, due or isinstance(result, dict) and result.get("status") in ("completed", "failed")
                     child = event.get("child_session_id")
-                    if isinstance(child, str) and (not parent or turn == "own" or event.get("id") in background):
+                    if isinstance(child, str) and (ours or parent and event.get("id") in background):
                         follow(child, True)
                     if (event.get("type") == "tool" and event.get("state") == "pending" and (chat_id, event.get("id")) not in answered
-                            and (not parent or turn == "own" or _hook_of(event, background))):
+                            and (ours or parent and _hook_of(event, background))):
                         answered.add((chat_id, event["id"]))
                         refused = self._answer(chat_id, subagent, event, can_use_tool, on_question)
                         if refused is not None:
@@ -464,14 +497,21 @@ class LocalAgentClient:
                     check = check or message.get("status") in ("idle", "awaiting_approval")
                 if finished is not None:
                     latest = finished.get("started")
-                    if _whose(starts, finished) == "own":
+                    if not waits and _whose(starts, finished) == "own":
                         ended = finished
                         running = sum(not _ended(card) for card in background.values())
                         if running:
-                            yield {"type": "background_wait", "session_id": session_id, "running": running}
+                            yield {"type": "background_wait", "session_id": session_id, "running": running,
+                                   "turn_result": ended}
                     turn, check = None, True
                 if reconnected:
                     turn = starts[-1][1] if starts and _turn_runs(chat) else None
+                if check and waits and turn is None:
+                    check = False
+                    # Nothing runs and the prompt still waits: the app sends it in a moment, or what ran ended
+                    # without sending it.
+                    if self._settled(session_id, latest):
+                        grace = grace or time.monotonic() + WAKE_GRACE
                 if check and ended is not None and turn != "own" and all(_ended(card) for card in background.values()):
                     check = False
                     # Done once nothing runs in the chat (a turn the user or another script runs is theirs) and the

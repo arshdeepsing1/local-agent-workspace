@@ -3906,11 +3906,18 @@ echo "Review the diff" | python3 scripts/agent_run.py --output stream-json -
   in the chat) the same way, and the result's `background_results` lists each one's end (its
   `delegate_task` result: `status`, `terminal_reason`, report or output, changed files). A turn that
   **Continue the chat when a background subagent finishes** starts meanwhile is followed too, and
-  the result is the last turn's. A message you send in the page meanwhile starts a turn of yours: the
-  script neither answers its cards nor reports it, and a `!` command or a compaction there is no
-  turn either. The result comes once nothing runs in the chat (it is idle, or a card it does not
-  follow waits). Ctrl+C while it waits stops them (as **Stop** does) and exits 3; the result object
-  then lists them as stopped and has `exit_code` 3, its `terminal_reason` the turn's own.
+  the result is the last turn's. A message you send in the page meanwhile starts a turn of yours
+  (also in the chat of a subagent whose delegation ended): the script neither answers its cards nor
+  reports it, and a `!` command or a compaction there is no turn either. The result comes once
+  nothing runs in the chat (it is idle, or a card it does not follow waits). Ctrl+C while it waits
+  stops them (as **Stop** does, which also stops a turn of yours that runs in the chat then) and
+  exits 3; the result object is still the script's turn: it lists them as stopped and has
+  `exit_code` 3, its `terminal_reason` the turn's own.
+- A prompt sent just as something else started in the chat (a turn of yours, one the app started
+  for a background subagent, a `!` command) waits in the chat's queue: the script follows the turn
+  that sends it, or the running turn it goes into at that turn's next step. When what ran ends
+  without sending it (a stop, an error or a limit leaves the queue for **Send queued messages**),
+  the script says so and exits 1.
 - The result object has `terminal_reason`, `is_error`, `duration_s`, `steps`, `tool_calls`,
   `usage`, `tokens`, `estimated_dbu`, `unpriced_calls`, `subagents`, `changed_files`, `result`
   (the final reply), `background_results`, `exit_code` and `session_id`. Exit codes: 0 completed, 1 an error, 2 a limit
@@ -3937,8 +3944,10 @@ for message in client.query("Fix the typo in README.md", permission_mode="manual
 
 `query()` yields the chat's messages (each with `session_id`; a subagent's also with
 `subagent: true`) and ends with the result object; when the turn ends while background subagents
-work, it yields `{"type": "background_wait", "running": n}` and follows them first, as the runner
-does (a turn the user or another script starts in the chat is left to them).
+work, it yields `{"type": "background_wait", "running": n, "turn_result": {...}}` (the ended
+turn's result record) and follows them first, as the runner does (a turn the user or another
+script starts in the chat is left to them). A prompt left in the chat's queue raises
+`LocalAgentError` (`client.NOT_SENT`).
 `can_use_tool(name, input, context)` answers
 approval cards (`context` has `session_id`, `event_id`, `preview` and `subagent`, and the card's
 warnings when it has them: `secret_files`, `protected`, `hook_ask` with `hook_id` and `reason`,
@@ -3953,7 +3962,8 @@ card is declined at once. An answer the app refuses is replaced by that default 
 `set_spending_limit`, `set_turn_limits`, `fork`, `rewind`, `events` and `wait_result` (the running
 turn's result once it ends, else the last turn's at once, also while a background subagent's card
 waits in the chat, which then shows that it waits for approval; `None` for a chat without a turn newer
-than `after`; `background=True` adds the turn's `background_results`; a turn a restart cut short reads
+than `after`; `background=True` adds the turn's `background_results`; `turn=` a `turn_result` from
+`background_wait` gives that turn's record instead, once nothing runs; a turn a restart cut short reads
 as `interrupted`, its duration up to its last recorded step, not the time the app was down, and after a
 rewind in place it is the last kept turn's result).
 

@@ -14,11 +14,11 @@ declined by default (--approve deny: nothing waits for the approval timeout, and
 --approve ask asks you in the terminal (a TTY only; control characters in what the agent wrote are shown
 as escapes), with the card's warnings (a secret file it reads, a protected file, a hook that asked or
 changed the action). A turn that leaves background subagents working is reported once they ended, their
-cards answered the same way; a turn you start in the page meanwhile is yours. Bypass permissions, chosen
-with --mode or already set on the --session chat, needs
+cards answered the same way; a turn you start in the page meanwhile (also in a subagent's chat) is yours.
+Bypass permissions, chosen with --mode or already set on the --session chat, needs
 --confirm-bypass. Exit codes: 0 completed, 1 error, 2 a limit was reached (steps, spending or the
 turn's tokens or time), 3 stopped or interrupted (Ctrl+C stops the turn, or the background subagents
-it left working).
+it left working, and then also a turn you run in the chat: Stop applies to the whole chat).
 
 The script talks to the app at --url (default http://127.0.0.1:8765) and never starts a server itself,
 so it cannot run a second app on the same state folder. Every model request is a paid call to your
@@ -204,7 +204,7 @@ def main(argv=None):
                 client.set_turn_limits(session_id, args.max_tokens, args.max_minutes)
         messages = client.query(prompt.strip(), session_id=session_id, can_use_tool=ask_tool if interactive else None,
                                 on_question=ask_questions if interactive else None)
-        waiting = False  # The turn ended; its background subagents still work.
+        waiting = None  # The turn's result once it ended while its background subagents still work.
         try:
             for message in messages:
                 if message["type"] == "result":
@@ -213,25 +213,28 @@ def main(argv=None):
                     print(f"agent_run: the app refused that answer ({shown(message['error'])[0]}): "
                           f"{FALLBACKS.get(message['answered'], 'it was declined')}.", file=sys.stderr)
                 elif message["type"] == "background_wait":
-                    waiting = True
+                    waiting = message["turn_result"]
                     count = message["running"]
                     print(f"agent_run: the turn ended; waiting for {count} background subagent{'' if count == 1 else 's'} "
                           "(Ctrl+C stops them).", file=sys.stderr)
                 elif (message["type"] == "event" and not message.get("subagent") and message["event"].get("type") == "user"
                       and message["event"].get("background_wake") is True):
-                    waiting = False  # The app continued the chat: query() follows that turn (not a ! command's run).
+                    waiting = None  # The app continued the chat: query() follows that turn (not a ! command's run).
                 if args.output == "stream-json":
                     print(json_text(message), flush=True)
         except KeyboardInterrupt:
-            print("\nStopping the background subagents…" if waiting else "\nStopping the turn…", file=sys.stderr)
+            print("\nStopping the background subagents…" if waiting is not None else "\nStopping the turn…",
+                  file=sys.stderr)
             messages.close()  # Its streams end now.
-            client.interrupt(session_id)  # Stop also stops the chat's background subagents.
-            # The stopped turn's result, with what Stop ended of its background subagents.
-            result = client.wait_result(session_id, after=previous, background=True)
+            # Stop also stops the chat's background subagents (and a turn you started in the chat meanwhile).
+            client.interrupt(session_id)
+            # The stopped turn's result, or the one that had ended (not a turn of yours that ran meanwhile), with
+            # what Stop ended of its background subagents.
+            result = client.wait_result(session_id, after=previous, background=True, turn=waiting)
             if result is None:
                 print("agent_run: stopped before the prompt started a turn.", file=sys.stderr)
                 return 3
-            stopped = waiting  # Its turn had ended: you stopped what it left running.
+            stopped = waiting is not None  # Its turn had ended: you stopped what it left running.
             if stopped:
                 result["exit_code"] = 3  # The turn's own end stays in terminal_reason.
             if args.output == "stream-json":
