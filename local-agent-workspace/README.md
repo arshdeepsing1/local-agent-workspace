@@ -425,9 +425,10 @@ when opening a conversation or performing restart recovery.
   chat.
   Stopping a reply yourself, or a manual compaction, does not notify. A subagent's turn started
   by its parent notifies only when it needs approval (the parent's turn reports its end); a
-  background subagent that finishes or fails while its chat is idle notifies for that chat
-  ("Background subagent finished: Fix the parser"); a subagent chat you continue yourself notifies
-  like any other. A notification closes when it
+  background subagent that finishes or fails while its chat runs no turn notifies for that chat
+  ("Background subagent finished: Fix the parser"), once the chat is idle when it ended during a
+  `!` command or a manual compaction, and beside the chat's error or limit notification, which
+  still waits for you; a subagent chat you continue yourself notifies like any other. A notification closes when it
   no longer applies (the approval was answered, the chat started another turn, or you opened
   the chat), so the next approval request alerts again. Each open tab notifies on its own; the browser replaces a
   notification with the same chat and status. If the browser blocks
@@ -2755,7 +2756,7 @@ within 32 KB). Each one has an `event`:
 | `subagent_start` | Before a subagent's first model request | `context` |
 | `subagent_stop` | When a subagent would end with its final reply | `decision` (`"block"` with `reason`), `report` |
 | `before_compaction` | Once per compaction (automatic, or **Compact now**), before its first summary request | `context` (it cannot stop a compaction) |
-| `notification` | When the app notifies: a chat needs your approval, finished, stopped with an error or at a scheduled run's approval limit, or reached the step limit, the spending limit or the turn's token or time limit, a background subagent of an idle chat finished or failed, or a scheduled run is ready or a rejected token paused a schedule; only without asking | none: output is ignored |
+| `notification` | When the app notifies: a chat needs your approval, finished, stopped with an error or at a scheduled run's approval limit, or reached the step limit, the spending limit or the turn's token or time limit, a background subagent finished or failed while its chat ran no turn, or a scheduled run is ready or a rejected token paused a schedule; only without asking | none: output is ignored |
 
 **Input.** Each hook gets one JSON object on stdin with `event` and the conversation's
 `session_id`. Tool events add `tool`, `arguments`, a stable `call_id`, `result` (after
@@ -2969,8 +2970,9 @@ first 8 characters) its status and, once it ended, its whole result; without, th
 subagents and their status; `wait_seconds` (up to 300) waits for it, or for any of them, to end. A
 result it read is not named again. While no page is open, a desktop notification (Settings →
 Notifications) and the notification hooks report a background subagent that finished or failed while
-the chat was idle, and the sidebar marks the chat as changed; with a page open, **Notify me** reports it
-("Background subagent finished: <chat>"). **Settings → Subagents →
+the chat ran no turn (it was idle, or ran a `!` command or a manual compaction), and the sidebar marks
+the chat as changed; with a page open, **Notify me** reports it once the chat is idle ("Background
+subagent finished: <chat>"). **Settings → Subagents →
 Continue the chat when a background subagent finishes** (off by default: each such turn is a paid
 model request) sends an idle chat a short app message, labelled **Sent by the app when a background
 subagent ended**, so the agent reads the report and goes on; it starts one turn for what ended

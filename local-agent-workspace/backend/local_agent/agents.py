@@ -1741,9 +1741,10 @@ class AgentManager(LifecycleHooks):
 
     def notify_background(self, session, text):
         """A desktop notification (Settings → Notifications, while no page is open) and the notification hooks
-        when a background subagent of an idle chat ended: the text and the chat's title, never transcript text."""
-        if self.busy_task(session["id"]):
-            return  # The running turn reports it.
+        when a background subagent of a chat that runs no turn ended (it is idle, or runs a ! command or a manual
+        compaction): the text and the chat's title, never transcript text."""
+        if session["id"] in self.turns:
+            return  # The running turn learns of it at its next step, and its end notifies.
         page_open = bool(self.pages or any(self.listeners.values()))
         message = f"{text}: {short_title(self.redact_title(str(session.get('title') or '')))}"
         if self.has_hooks(session, "notification"):

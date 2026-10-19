@@ -13,9 +13,11 @@ from local_agent import planning, spending
 from local_agent.agents import AgentManager
 from local_agent.api import create_app
 from local_agent.config import Settings
+from local_agent.notify import SystemNotifier
 from local_agent.planning import BACKGROUND_QUEUED, BACKGROUND_STARTED, WAKE_TEXT
 from local_agent.transcript import transcript
 
+from test_attention import Runner
 from test_parallel_subagents import (Gateway, calls_reply, card, delegate, eventually, make_runtime, reply, run_turn,
                                      tool_messages)
 
@@ -540,6 +542,29 @@ async def test_the_wake_after_a_failed_subagent_says_it_failed_and_its_label_fit
     assert wake["text"] == WAKE_TEXT.format(id=child_id[:8], kind="general", ending="failed")
     second = transcript(saved).split("## Turn 2", 1)[1]
     assert "**App (sent when a background subagent ended):**" in second and "(general) failed." in second
+
+
+async def test_a_background_subagent_that_ends_during_a_command_notifies_while_no_page_is_open(runtime, monkeypatch):
+    """A ! command is not a turn: no turn learns of the subagent's end or reports it, so the desktop notification
+    goes when it ends."""
+    manager, parent, _ = runtime
+    manager.settings.values["system_notifications"] = True
+    runner = Runner()
+    manager.notifier = SystemNotifier(runner=runner, platform="linux", which=lambda name: f"/usr/bin/{name}")
+    gate = asyncio.Event()
+    Gateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)), lambda: reply("Going on.")],
+            {"Survey": gated(gate)})
+    await run_turn(manager, parent)
+    runner.calls.clear()
+    manager.start_shell(parent["id"], "sleep 1")
+    gate.set()
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+    assert manager.busy_task(parent["id"])
+    await eventually(lambda: runner.calls)
+    assert runner.calls == [["/usr/bin/notify-send", "Local", "Background subagent finished: Parent"]]
+    await asyncio.wait_for(manager.tasks[parent["id"]], 10)
+    await asyncio.sleep(0.1)
+    assert len(runner.calls) == 1  # The command's end notifies nothing more.
 
 
 async def test_a_running_turn_learns_of_a_background_subagent_at_its_next_step(runtime, monkeypatch):
