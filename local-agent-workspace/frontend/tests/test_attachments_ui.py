@@ -147,6 +147,8 @@ def test_a_new_conversation_is_created_for_its_first_attached_file(ui, page):
     expect(page.get_by_role("combobox", name="Model")).to_have_value("test-model")
     choose(page, ("notes.txt", "text/plain", b"notes"))
     expect(chips(page)).to_contain_text("notes.txt")
+    # The chip shows at once; the upload follows once the conversation exists.
+    ui.wait("fake.requests('/api/sessions/created/uploads', 'POST').length > 0")
     assert len(ui.requests("/api/sessions", "POST")) == 1
     assert [call["path"] for call in ui.requests("/api/sessions/created/uploads", "POST")] == ["/api/sessions/created/uploads"]
 
