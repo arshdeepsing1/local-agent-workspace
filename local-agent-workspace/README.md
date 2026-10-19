@@ -1460,8 +1460,9 @@ continue. A reply that arrives over the limit ends the turn the same way, withou
 hooks (they could only continue with a refused request; a subagent's final reply still reaches
 its parent), and messages queued while it ran stay queued. It is a soft cap: one response can pass it before the next request is stopped.
 Cache reads and writes count at their own rates (see **Prompt caching**).
-Calls to endpoints without price data count as nothing and are listed as not counted; title
-and compaction requests are counted but never stopped. A subagent follows its parent's limit
+Calls to endpoints without price data count as nothing and are listed as not counted; title,
+compaction and `/btw` side question requests (also those in a subagent's chat) are counted but
+never stopped. A subagent follows its parent's limit
 (a subagent chat without its parent, such as a copy of one, has its own), and its spend is kept
 in the parent's subagents index after each of its turns, also when it is stopped, deleted or
 continued by you (subagents that ended before this existed are not counted). The offline simulator reports usage, so
@@ -1495,8 +1496,9 @@ background subagent's requests count in the turn during which they were made, ne
 one: while it still works after its turn ended, your next message's turn counts only the requests it
 makes from then on, and it keeps its own turn's limits (the requests it made before count toward
 them). The check runs between requests, so one response can pass the limit; title and compaction
-requests count but are never stopped, and a `/btw` side question asked while the turn runs does not
-count.
+requests count but are never stopped, and a `/btw` side question does not count: neither one asked
+while the turn runs nor one asked in a subagent's chat counts toward a turn (the spending limit
+counts them, as they are billed).
 
 ### Reasoning effort and thinking
 
