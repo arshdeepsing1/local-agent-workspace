@@ -907,7 +907,8 @@ export function revealCard(card, focus = false) {
 // onOpenPath({ path, line? }) opens a file named in a reply or a tool card in the Workspace panel.
 // onLoadEarlier() -> Promise loads the page of messages before the first loaded one (session.events_start > 0).
 // busy: the chat is not idle (message actions other than Copy are hidden).
-// onPrefill(text) puts text in an empty composer and returns false when a typed draft was kept.
+// onPrefill(text, verbatim) puts text in an empty composer, with Send as plain text on when it was sent as plain text
+// (verbatim), and returns false when a typed draft was kept.
 // roots: absolute folders besides the chat's allowed folders (the default code folder) whose files tool cards name
 // as "<folder name>/rest".
 export default function Conversation({ session, onError, onSelectSession, onOpenPath, busy = false, onPrefill, onLoadEarlier, roots = [] }) {
@@ -1013,8 +1014,8 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
   // The rewound message is gone from the transcript (and its control with it): the message box is where to go on.
   const focusMessageBox = () => document.querySelector('textarea[aria-label="Message"]')?.focus()
   // After a conversation rewind whose resend failed, the text to send waits in the message box.
-  const resent = (result, text) => {
-    const draftKept = result.resend_error && onPrefill && text ? onPrefill(text) === false : false
+  const resent = (result, text, verbatim) => {
+    const draftKept = result.resend_error && onPrefill && text ? onPrefill(text, verbatim) === false : false
     rewound({ backupId: result.backup_session_id }, draftKept)
     if (result.resend_error) onError(result.resend_error)
     focusMessageBox()
@@ -1028,7 +1029,7 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
           ...(cuts.latestUser.verbatim ? { resend_verbatim: true } : {}),
           ...(sentUploads(cuts.latestUser).length ? { resend_uploads: sentUploads(cuts.latestUser) } : {}) })
       // The server keeps the app's message after a background subagent the app's; it is never put in your message box.
-      resent(result, cuts.latestUser.background_wake ? '' : cuts.latestUser.text)
+      resent(result, cuts.latestUser.background_wake ? '' : cuts.latestUser.text, cuts.latestUser.verbatim)
     } catch (e) { onError(e) }
     finally { setRetrying(false) }
   }
@@ -1059,7 +1060,7 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
         onSelectSession=${onSelectSession}
         onCancel=${() => { editReturn.current = event.id; setEditing(null) }} onSent=${(result, text) => {
           setEditing(null)
-          resent(result, text)
+          resent(result, text, event.verbatim)
         }} />`
       if (event.type === 'user') return html`<div class=${`user-message${event.steered ? ' steered' : ''}${event.hook_blocked ? ' hook-blocked' : ''}`} key=${event.id}>${event.steered ? html`<small class="steered-label">Sent while the agent was working</small>` : null}${event.origin?.kind === 'delegated' ? html`<small class="delegation-origin">Delegated by parent conversation</small>` : null}${event.background_wake ? html`<small class="delegation-origin">Sent by the app when a background subagent finished</small>` : null}<${HookMessageLabel} event=${event} />${event.text}<${Attachments} items=${event.attachments} /><${SentWith} event=${event} /><${HookMessageDetails} event=${event} />${event.child_session_id && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(event.child_session_id)}>Open subagent</button>` : null}${event.text || idle ? html`<div class="message-actions">${event.text ? html`<${CopyAction} text=${event.text} label="Copy message" />` : null}${idle ? html`${event.background_wake ? null : html`<${ActionButton} label="Edit message" icon=${Pencil} target=${`edit:${event.id}`} onClick=${() => setEditing(event.id)} />`}<${ActionButton} label="Rewind to here" icon=${Undo2} onClick=${() => setRewinding(event)} />` : null}</div>` : null}</div>`
       if (event.type === 'tool' && event.name === 'ask_user') return html`<${QuestionCard} key=${event.id} event=${event} sessionId=${session.id} onError=${onError} />`
@@ -1082,7 +1083,7 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
       onRewound=${result => {
         setRewinding(null)
         // The app's message after a background subagent is not put in your message box as yours.
-        rewound(result, result.conversation && onPrefill && !rewinding.background_wake ? onPrefill(rewinding.text || '') === false : false)
+        rewound(result, result.conversation && onPrefill && !rewinding.background_wake ? onPrefill(rewinding.text || '', rewinding.verbatim) === false : false)
         if (result.conversation) focusMessageBox()
       }} />` : null}
     ${forking !== undefined && onSelectSession ? html`<${ForkDialog} session=${session} beforeEventId=${forking.beforeEventId}

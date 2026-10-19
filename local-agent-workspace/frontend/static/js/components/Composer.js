@@ -42,13 +42,14 @@ function chipLabel(item) {
 // slashCommands (Settings → slash commands), attachments and setAttachments(update) (the files attached to the next
 // message: [{ key, name, kind, model, record? (UploadRecord, once uploaded), asPath? }], kept by the page per view),
 // onUpload(file) -> Promise<UploadRecord> (paste, drop and Attach files; absent: no attaching),
-// plainRequest (true turns Send as plain text on: a queued plain-text message is back in the box) and onPlainShown()
+// plain and setPlain(update) (Send as plain text, kept and saved by the page with the draft: a message put back into
+// the box sets it to that message's own mode)
 export default function Composer(p) {
   const [sending, setSending] = useState(false)
   const [caret, setCaret] = useState(0)
   // Send as plain text: the next message goes as typed, without a command, skills, @ files or ! shell.
-  const [plain, setPlain] = useState(false)
-  useEffect(() => { if (p.plainRequest) { setPlain(true); p.onPlainShown?.() } }, [p.plainRequest])
+  const plain = !!p.plain
+  const setPlain = p.setPlain || (() => {})
   // A built-in command chosen in the / menu: it runs while the box still starts with it (slash commands off).
   const [picked, setPicked] = useState(null)
   const input = useRef(null)

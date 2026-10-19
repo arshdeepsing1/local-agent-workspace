@@ -366,8 +366,13 @@ export default function WorkspacePanel({ sessionId, workspace, worktree = null, 
       if (request !== openRequest.current) return
       // A file the agent deleted, or that a command made unreadable, still has a review.
       if (mode === 'review' || changed.has(path)) setFile({ id: crypto.randomUUID(), path, content: '', original: '', mode: 'review', missing: true })
-      // A file that is not text (binary, not UTF-8 or over the editor's limit) can still be downloaded.
-      else if (e.detail?.code === 'not_text') setFile({ id: crypto.randomUUID(), path, content: '', original: '', mode: 'preview', binary: true, note: e.message })
+      // A file that is not text (binary, not UTF-8 or over the editor's limit) can still be downloaded. The server
+      // names the file it opened, as for a text file.
+      else if (e.detail?.code === 'not_text') {
+        const opened = typeof e.detail.path === 'string' && e.detail.path ? e.detail.path : path
+        setFile({ id: crypto.randomUUID(), path: opened, content: '', original: '', mode: 'preview', binary: true, note: e.message,
+          ...(typeof e.detail.absolute === 'string' ? { absolute: e.detail.absolute } : {}), ...(opened !== path ? { requested: path } : {}) })
+      }
       else setError(e.message)
     }
   }
@@ -476,6 +481,7 @@ export default function WorkspacePanel({ sessionId, workspace, worktree = null, 
   const textPreview = !!file && !file.binary && !file.missing && (kind === 'markdown' || kind === 'html')
   const previewing = !!file && file.mode === 'preview' && !reviewing
   const absolute = file?.absolute || (file?.binary ? (file.path.startsWith('/') ? file.path : `${workspace.replace(/\/+$/, '')}/${file.path}`) : null)
+  const openedNote = file?.requested ? html`<p class="editor-note" role="status">Opened ${file.path}: the reply named it ${file.requested}.</p>` : null
   return html`<aside class=${`workspace-panel ${sizing.width !== null ? 'sized' : ''}`} aria-label="Workspace panel" ref=${panel}
     style=${sizing.width !== null ? { '--panel-width': `${sizing.width}px` } : null}>
     <${PanelResizer} panel=${panel} width=${sizing.width} limit=${sizing.limit} onWidth=${sizing.set} />
@@ -505,14 +511,15 @@ export default function WorkspacePanel({ sessionId, workspace, worktree = null, 
         ${reviewing ? html`<${DiffReview} key=${file.path} sessionId=${sessionId} path=${file.path} version=${pending.current_hash} busy=${busy} onAction=${onReview} onSelectSession=${onSelectSession}
           onSendComments=${onSendComments} />` : previewing ? (file.binary && !opensInPreview(file.path)
             ? html`<div class="file-preview-none"><p>${file.note || 'This file cannot be shown here.'}</p>
-              <button type="button" class="outline" onClick=${() => void download(file.path)}><${Download} size=${14} />Download</button></div>`
+              <button type="button" class="outline" onClick=${() => void download(file.path)}><${Download} size=${14} />Download</button></div>
+              ${openedNote}`
             : html`<${FilePreview} key=${file.id} path=${file.path} source=${file.binary ? file.requested || file.path : undefined} kind=${kind}
               content=${file.content} query=${query} version=${file.version || 0} onOpenPath=${path => void openFile(path)} onOpened=${previewOpened} />
-              ${file.requested ? html`<p class="editor-note" role="status">Opened ${file.path}: the reply named it ${file.requested}.</p>` : null}
+              ${openedNote}
               ${textPreview ? html`<div class="editor-status"><span>Preview</span><span>${dirty ? 'Unsaved changes' : 'Saved on disk'}</span></div>` : null}`) : html`
         <textarea ref=${editor} class="code-editor" aria-label=${`Edit ${file.path}`} value=${file.content} spellcheck=${false}
           onMouseDown=${leaveLine} onKeyDown=${leaveLine} onInput=${e => { leaveLine(); setFile({ ...file, content: e.currentTarget.value }) }} />
-        ${file.requested ? html`<p class="editor-note" role="status">Opened ${file.path}: the reply named it ${file.requested}.</p>` : null}
+        ${openedNote}
         <div class="editor-status"><span>${file.content.split('\n').length} lines${markedLine?.selected ? ` · Line ${markedLine.line}` : ''}</span><span>${dirty ? 'Unsaved changes' : 'Saved on disk'}</span></div>`}
       </div>` : html`<div class="file-browser">
         <${FileRoots} workspace=${workspace} root=${root} onChoose=${chooseRoot} granted=${allowedDirectories} folders=${added.folders} codingDir=${codingDir}

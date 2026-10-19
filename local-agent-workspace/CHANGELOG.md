@@ -635,6 +635,8 @@ Roadmap milestone M5 (context, instructions, memory, skills and commands):
   default) turned off, typed `/` text is sent as it is in every message; built-in commands then
   run only when chosen in the `/` menu. **Edit** on a queued plain-text message brings it back
   with **Send as plain text** on, so its `!` or `/` is not run as a shell command or a command.
+  **Send as plain text** is saved with the message draft, so it comes back with the draft in
+  another chat, a new-conversation view and after a reload.
 - Your own instruction files: **Settings → Agent → Load my instructions file
   ~/.agents/AGENTS.md** (on by default) and **Also load ~/.claude/CLAUDE.md** (off by default)
   add them after Custom instructions, with the same precedence (8,000 bytes each, with their
