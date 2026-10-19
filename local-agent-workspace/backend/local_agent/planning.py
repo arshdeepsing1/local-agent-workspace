@@ -807,8 +807,8 @@ class DelegateManager:
 
     async def _slot(self, entry, parent, parent_event, labels, started=None):
         """Wait until fewer than MAX_RUNNING subagents run (over all chats); the card says queued.
-        labels: the agent's type, model and effort, as the card shows them. started (a background
-        delegation's future) learns that it is queued."""
+        labels: the agent's type, model and effort, as the card shows them, and the turn that delegated it
+        (turn_user_id). started (a background delegation's future) learns that it is queued."""
         noticed = parent_event is None
         while not entry["cancelled"] and self.running() >= MAX_RUNNING:
             entry["queued"] = True
@@ -1000,8 +1000,12 @@ class DelegateManager:
         # The agent's model, else the chat's. A queued card shows only the agent's own effort: the chat's is
         # read when the child starts, since change_effort reaches running children only.
         model = spec["model"] or parent["model"]
+        # turn_user_id: the user event that started the turn delegating it (a script follows the delegations of
+        # its own turns by it, also once that turn ended).
+        turn = next((event["id"] for event in reversed(parent["events"]) if event.get("type") == "user"
+                     and not event.get("steered")), None)
         labels = {"agent_type": kind, "model": model, **({"effort": spec["effort"]} if spec["effort"] else {}),
-                  **({"background": True} if background is not None else {})}
+                  **({"background": True} if background is not None else {}), **({"turn_user_id": turn} if turn else {})}
         if parent_event is not None:
             parent_event = next((event for event in parent["events"] if event["id"] == parent_event["id"]), None)
             if parent_event is None:
@@ -1380,7 +1384,9 @@ class DelegateManager:
             text = WAKE_TEXT.format(id=str(notice["subagent_id"])[:8],
                                     kind=notice["text"].removeprefix("Background subagent ").split(" ", 1)[0],
                                     ending=BACKGROUND_ENDINGS.get(notice["subagent_status"], "ended"))
-            self.manager.start(parent_id, text, verbatim=True, extra={"background_wake": True})
+            # wake_for: the subagent it reports (a script follows this turn when that subagent is one of its own).
+            self.manager.start(parent_id, text, verbatim=True,
+                               extra={"background_wake": True, "wake_for": [notice["subagent_id"]]})
         except (ValueError, OSError) as exc:
             parent = self.manager.get(parent_id)
             if parent is not None:

@@ -14,11 +14,12 @@ declined by default (--approve deny: nothing waits for the approval timeout, and
 --approve ask asks you in the terminal (a TTY only; control characters in what the agent wrote are shown
 as escapes), with the card's warnings (a secret file it reads, a protected file, a hook that asked or
 changed the action). A turn that leaves background subagents working is reported once they ended, their
-cards answered the same way; a turn you start in the page meanwhile (also in a subagent's chat) is yours.
-Bypass permissions, chosen with --mode or already set on the --session chat, needs
---confirm-bypass. Exit codes: 0 completed, 1 error, 2 a limit was reached (steps, spending or the
-turn's tokens or time), 3 stopped or interrupted (Ctrl+C stops the turn, or the background subagents
-it left working, and then also a turn you run in the chat: Stop applies to the whole chat).
+cards answered the same way; a turn you start in the page meanwhile (also in a subagent's chat) is yours,
+with the background subagents it starts. Bypass permissions, chosen with --mode or already set on the
+--session chat, needs --confirm-bypass. Exit codes: 0 completed, 1 error, 2 a limit was reached (steps,
+spending or the turn's tokens or time), 3 stopped or interrupted (Ctrl+C stops the turn, or the background
+subagents it left working, and then also a turn you run in the chat: Stop applies to the whole chat; before
+the prompt started a turn, it prints no result).
 
 The script talks to the app at --url (default http://127.0.0.1:8765) and never starts a server itself,
 so it cannot run a second app on the same state folder. Every model request is a paid call to your
@@ -28,11 +29,12 @@ import argparse
 import json
 import re
 import sys
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 
-from local_agent.client import DEFAULT_URL, Allow, Deny, LocalAgentClient, LocalAgentError  # noqa: E402
+from local_agent.client import DEFAULT_URL, STOP_REASONS, Allow, Deny, LocalAgentClient, LocalAgentError  # noqa: E402
 
 MODES = ("plan", "manual", "acceptEdits", "auto", "dontAsk", "bypassPermissions")
 EFFORTS = ("default", "low", "medium", "high", "xhigh", "max")
@@ -177,7 +179,8 @@ def main(argv=None):
         parser.error("--approve ask needs a terminal (and a prompt given as an argument)")
     interactive = args.approve == "ask"
     client = LocalAgentClient(args.url)
-    result, session_id, previous, stopped = None, args.session, None, False
+    # ref: the prompt's token, which the app keeps on its user event: the prompt's turns are told from others by it.
+    result, session_id, ref, stopped = None, args.session, uuid.uuid4().hex, False
     try:
         if session_id is None:
             session_id = client.create_session(args.workspace, args.mode or "plan", args.model, args.effort,
@@ -190,8 +193,6 @@ def main(argv=None):
                 print("agent_run: this chat is in Bypass permissions, which runs actions without approval cards: add "
                       "--confirm-bypass, or choose another --mode.", file=sys.stderr)
                 return 1
-            # The started time of its last turn: Ctrl+C before this prompt started a turn gives no result.
-            previous = chat["last_turn_result"].get("started") if isinstance(chat.get("last_turn_result"), dict) else None
             if args.mode is not None:
                 client.set_permission_mode(session_id, args.mode, confirm=args.mode == "bypassPermissions")
             if args.model is not None:
@@ -203,8 +204,8 @@ def main(argv=None):
             if args.max_tokens is not None or args.max_minutes is not None:
                 client.set_turn_limits(session_id, args.max_tokens, args.max_minutes)
         messages = client.query(prompt.strip(), session_id=session_id, can_use_tool=ask_tool if interactive else None,
-                                on_question=ask_questions if interactive else None)
-        waiting = None  # The turn's result once it ended while its background subagents still work.
+                                on_question=ask_questions if interactive else None, client_ref=ref)
+        waiting = False  # The prompt's last turn ended while background subagents of its turns still work.
         try:
             for message in messages:
                 if message["type"] == "result":
@@ -213,28 +214,32 @@ def main(argv=None):
                     print(f"agent_run: the app refused that answer ({shown(message['error'])[0]}): "
                           f"{FALLBACKS.get(message['answered'], 'it was declined')}.", file=sys.stderr)
                 elif message["type"] == "background_wait":
-                    waiting = message["turn_result"]
+                    waiting = True
                     count = message["running"]
                     print(f"agent_run: the turn ended; waiting for {count} background subagent{'' if count == 1 else 's'} "
                           "(Ctrl+C stops them).", file=sys.stderr)
-                elif (message["type"] == "event" and not message.get("subagent") and message["event"].get("type") == "user"
-                      and message["event"].get("background_wake") is True):
-                    waiting = None  # The app continued the chat: query() follows that turn (not a ! command's run).
+                elif message["type"] == "turn_start":
+                    waiting = False  # A turn of the prompt's runs (one the app started for its background subagents).
                 if args.output == "stream-json":
                     print(json_text(message), flush=True)
         except KeyboardInterrupt:
-            print("\nStopping the background subagents…" if waiting is not None else "\nStopping the turn…",
-                  file=sys.stderr)
+            print("\nStopping the background subagents…" if waiting else "\nStopping the turn…", file=sys.stderr)
             messages.close()  # Its streams end now.
             # Stop also stops the chat's background subagents (and a turn you started in the chat meanwhile).
             client.interrupt(session_id)
-            # The stopped turn's result, or the one that had ended (not a turn of yours that ran meanwhile), with
-            # what Stop ended of its background subagents.
-            result = client.wait_result(session_id, after=previous, background=True, turn=waiting)
+            # The prompt's last turn (the stopped one, or the one that had ended; never a turn of yours), with what
+            # Stop ended of the background subagents of its turns.
+            result = client.wait_result(session_id, background=True, client_ref=ref)
             if result is None:
-                print("agent_run: stopped before the prompt started a turn.", file=sys.stderr)
+                queued = any(isinstance(item, dict) and item.get("client_ref") == ref
+                             for item in client.session(session_id).get("queued_messages") or [])
+                print("agent_run: stopped before the prompt started a turn"
+                      + (" (it is still in the chat's queue: Send queued messages in the page sends it)." if queued
+                         else "."), file=sys.stderr)
                 return 3
-            stopped = waiting is not None  # Its turn had ended: you stopped what it left running.
+            # Its turn had ended: you stopped the background subagents it left working.
+            stopped = result["terminal_reason"] not in STOP_REASONS and any(
+                entry.get("terminal_reason") in STOP_REASONS for entry in result["background_results"])
             if stopped:
                 result["exit_code"] = 3  # The turn's own end stays in terminal_reason.
             if args.output == "stream-json":

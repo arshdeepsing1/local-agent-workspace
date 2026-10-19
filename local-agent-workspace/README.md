@@ -3942,19 +3942,25 @@ echo "Review the diff" | python3 scripts/agent_run.py --output stream-json -
   stderr that it waits, answers their cards (and their `subagent_start` / `subagent_stop` hook cards
   in the chat) the same way, and the result's `background_results` lists each one's end (its
   `delegate_task` result: `status`, `terminal_reason`, report or output, changed files). A turn that
-  **Continue the chat when a background subagent finishes** starts meanwhile is followed too, and
-  the result is the last turn's. A message you send in the page meanwhile starts a turn of yours
+  **Continue the chat when a background subagent finishes** starts for one of them is followed too,
+  and the result is the last turn's. A message you send in the page meanwhile starts a turn of yours
   (also in the chat of a subagent whose delegation ended): the script neither answers its cards nor
-  reports it, and a `!` command or a compaction there is no turn either. The result comes once
-  nothing runs in the chat (it is idle, or a card it does not follow waits). Ctrl+C while it waits
-  stops them (as **Stop** does, which also stops a turn of yours that runs in the chat then) and
-  exits 3; the result object is still the script's turn: it lists them as stopped and has
-  `exit_code` 3, its `terminal_reason` the turn's own.
+  reports it, nor the background subagents that turn starts or the turns the app starts for them,
+  and a `!` command or a compaction there is no turn either. The app records whose each turn is:
+  the script's prompt carries a token on its message, each `delegate_task` card names the turn that
+  delegated it, and the app's message after a background subagent names the subagent it reports.
+  The result comes once nothing of the script's runs in the chat (it is idle, or a card it does not
+  answer waits). Ctrl+C while it waits stops them (as **Stop** does, which also stops a turn of
+  yours that runs in the chat then) and exits 3; the result object is still the script's last turn
+  (also one the app started for its subagents): it lists them all, those Stop ended as stopped, and
+  has `exit_code` 3, its `terminal_reason` the turn's own. When the app shuts down while the script
+  waits, which stops them, the script says so and exits 1.
 - A prompt sent just as something else started in the chat (a turn of yours, one the app started
   for a background subagent, a `!` command) waits in the chat's queue: the script follows the turn
   that sends it, or the running turn it goes into at that turn's next step. When what ran ends
   without sending it (a stop, an error or a limit leaves the queue for **Send queued messages**),
-  the script says so and exits 1.
+  the script says so and exits 1. Ctrl+C while the prompt waits there stops what runs (Stop
+  applies to the whole chat) and prints no result: the script says the prompt is still queued.
 - The result object has `terminal_reason`, `is_error`, `duration_s`, `steps`, `tool_calls`,
   `usage`, `tokens`, `estimated_dbu`, `unpriced_calls`, `subagents`, `changed_files`, `result`
   (the final reply), `background_results`, `exit_code` and `session_id`. Exit codes: 0 completed, 1 an error, 2 a limit
@@ -3983,8 +3989,13 @@ for message in client.query("Fix the typo in README.md", permission_mode="manual
 `subagent: true`) and ends with the result object; when the turn ends while background subagents
 work, it yields `{"type": "background_wait", "running": n, "turn_result": {...}}` (the ended
 turn's result record) and follows them first, as the runner does (a turn the user or another
-script starts in the chat is left to them). A prompt left in the chat's queue raises
-`LocalAgentError` (`client.NOT_SENT`).
+script starts in the chat is left to them). Each turn of the prompt's that starts (its own, the
+running turn a queued prompt went into, one the app started for its background subagents) is
+announced as `{"type": "turn_start", "event_id": <its user event>, "background_wake": true?}`.
+`client_ref=` sets the token the prompt is sent with (default: a new one; letters, digits, `-`
+and `_`, at most 64). A prompt left in the chat's queue raises `LocalAgentError`
+(`client.NOT_SENT`), and the app's shutdown `client.SHUT_DOWN` (`client.BACKGROUND_SHUT_DOWN`
+while only background subagents were awaited: the shutdown stops them).
 `can_use_tool(name, input, context)` answers
 approval cards (`context` has `session_id`, `event_id`, `preview` and `subagent`, and the card's
 warnings when it has them: `secret_files`, `protected`, `hook_ask` with `hook_id` and `reason`,
@@ -4000,7 +4011,9 @@ card is declined at once. An answer the app refuses is replaced by that default 
 turn's result once it ends, else the last turn's at once, also while a background subagent's card
 waits in the chat, which then shows that it waits for approval; `None` for a chat without a turn newer
 than `after`; `background=True` adds the turn's `background_results`; `turn=` a `turn_result` from
-`background_wait` gives that turn's record instead, once nothing runs; a turn a restart cut short reads
+`background_wait` gives that turn's record instead, once nothing runs; `client_ref=` a prompt's token
+gives the record of that prompt's last turn, as `query()` follows them, with the background subagents
+of its turns, or `None` when it started no turn (it still waits in the queue); a turn a restart cut short reads
 as `interrupted`, its duration up to its last recorded step, not the time the app was down, and after a
 rewind in place it is the last kept turn's result).
 
@@ -4015,7 +4028,11 @@ shows a turn that ended meanwhile. When the app shuts down (Ctrl+C on `run.py`),
 ends at once with `stream_closed` reason `shutdown` and the app stops the running turns, so a
 connected script never holds up the shutdown. `POST /api/sessions` takes `workspace` and
 `max_agent_steps` for scripts, and `PUT /api/sessions/<id>/turn-limits` sets a chat's turn limits;
-forks and imports keep both.
+forks and imports keep both. `POST /api/sessions/<id>/messages` takes `client_ref`, a script's
+token for the message, which the app keeps on the user event that sends it (`client_refs`, also
+when it waited in the queue or went into a running turn) and never sends to the model; a
+`delegate_task` card's `delegation.turn_user_id` is the user event of the turn that delegated it,
+and the app's message after a background subagent has `wake_for` (the subagent it reports).
 
 ## Trying the app offline (simulator)
 

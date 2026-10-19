@@ -294,7 +294,8 @@
 //   servers: [{ id, name, enabled }].
 // Delegation: { status: 'queued'|'running'|'awaiting_approval'|...|'completed'|'failed'|'cancelled'|'interrupted',
 //   completed_tools, last_tool?, terminal_reason?, agent_type?, started?, ended? (epoch seconds), background? (true:
-//   delegate_task background), pending?: { event_id, name, kind: 'approval'|'question'|'plan', title, warnings?:
+//   delegate_task background), turn_user_id? (the user event of the turn that delegated it: a script follows the
+//   delegations of its own turns by it), pending?: { event_id, name, kind: 'approval'|'question'|'plan', title, warnings?:
 //   string[], review?: true (the title is not the whole action, or the card warns: no Allow on the parent's card),
 //   expires? } (the child's waiting card while awaiting_approval: POST /sessions/<child>/approvals/<event_id>
 //   { allowed } answers an approval) }. A finished delegate_task card's output is the JSON result { child_session_id, agent_type,
@@ -306,7 +307,8 @@
 //   (null while queued), agent_type, status: 'running'|'queued', background: true, transcript, message }; its result
 //   arrives later as the card's delegation_result, and the parent gets a notice { subagent_id, subagent_status }.
 //   A tool card a running sibling subagent's change made ask has sibling_change: { subagent_id, agent_type, path }.
-//   A user message the app sent after a background subagent finished or failed has background_wake: true.
+//   A user message the app sent after a background subagent finished or failed has background_wake: true and
+//   wake_for?: string[] (the subagent it reports, a child_session_id).
 // SubagentEntry: { id, task (200 characters), agent_type, status, created, ended, transcript ('conversations/<id>.jsonl'
 //   in the state folder, null once deleted), steps_used?, tool_calls?, deleted? }.
 // GET /sessions/<id>/children -> list items of its subagent chats, each with status, transcript and subagent?: SubagentEntry.
@@ -405,13 +407,15 @@
 // Composer (M4): Session.queued_messages?: QueuedMessage[]; Session.pending_context?: [{ kind: 'shell', command,
 //   exit_code }] (! output attached to the next message; its text stays on the server). Pushed as
 //   { type: 'pending_context', pending_context } when a command adds one and when a message takes them.
-// POST /sessions/<id>/messages { text, verbatim?, uploads?: [{ id, as_path? }] } (verbatim: sent as plain text: no command
-//   template, no skill, no @ file; uploads: files attached in the composer, at most 8, also with plain text).
+// POST /sessions/<id>/messages { text, verbatim?, uploads?: [{ id, as_path? }], client_ref? } (verbatim: sent as plain
+//   text: no command template, no skill, no @ file; uploads: files attached in the composer, at most 8, also with plain
+//   text; client_ref: a script's token, letters, digits, - and _, at most 64, kept on the queued message and the user
+//   event that sends it; never sent to the model).
 // POST /sessions/<id>/uploads (body: the file's bytes, header X-File-Name: its URL-encoded name) -> UploadRecord:
 //   { id (sha256), name, kind: 'document'|'image', format, media_type, bytes, estimated_tokens, a document's chars,
 //   truncated, notes, units?, count?, unreadable? (a PDF without the documents extra: send it with as_path), an image's
 //   width, height and vision_refusal? (the chat's endpoint does not take images) }; 400 or 413 with the reason.
-// QueuedMessage: { id, text, created, paused, verbatim?, uploads?: [{ id, as_path?, name, kind }], command?: { name, path } (a command template expanded when it
+// QueuedMessage: { id, text, created, paused, verbatim?, client_ref?, uploads?: [{ id, as_path?, name, kind }], command?: { name, path } (a command template expanded when it
 //   was queued; the server keeps the expanded text) } (paused: left over from a stop or failure; sent only by
 //   'Send queued messages'). POST /sessions/<id>/messages while busy -> { ok, queued: true, queued_messages };
 //   otherwise { ok: true }. 400 when 3 are waiting or their text would exceed 50,000 characters.
@@ -421,7 +425,8 @@
 // User AgentEvent extras: attachments?: [{ kind: 'file', path, start_line, end_line, truncated } |
 //   { kind: 'shell', command, exit_code }]; steered?, in_wire? (true: queued, sent mid-turn); queued? (sent from the
 //   queue as the next turn); commands?: [{ name, path }] (command templates whose text the agent got after the message);
-//   skills?: string[] (skills the message selected for itself with /<id>); verbatim? (sent as plain text).
+//   skills?: string[] (skills the message selected for itself with /<id>); verbatim? (sent as plain text);
+//   client_refs?: string[] (the client_ref of each message it sent, queued messages sent as one: a script's prompt).
 // POST /sessions/<id>/shell { command (one line, 1..2000), timeout_seconds?, max_output_bytes? } -> 202 { ok }
 //   (idle only; runs in every mode; shows a 'user_command' tool event).
 // POST /sessions/<id>/side-question { question (1..4000) } -> { answer, request_info: { status, finish_reason, usage? } };
