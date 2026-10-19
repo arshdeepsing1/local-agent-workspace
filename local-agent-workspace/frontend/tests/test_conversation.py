@@ -328,6 +328,8 @@ def test_find_files_and_wait_job_cards_name_their_pattern_and_job(ui, page):
       { id: 'wait', type: 'tool', name: 'wait_job', state: 'completed', input: { job_id: '0123456789abcdef', until_regex: 'ready on [0-9]+' } },
       { id: 'wait-exit', type: 'tool', name: 'wait_job', state: 'running', input: { job_id: 'fedcba9876543210' } },
     ]""")
+    # The finished searches and wait fold under one line; the running wait stays below it.
+    page.get_by_role("button", name="Searched 2 times, checked jobs once 01234567 until /ready on [0-9]+/", exact=True).click()
     expect(page.get_by_role("button", name="find files src/**/*.test.ts in web", exact=True)).to_be_visible()
     expect(page.get_by_role("button", name="find files *.py", exact=True)).to_be_visible()
     expect(page.get_by_role("button", name="wait job 01234567 until /ready on [0-9]+/", exact=True)).to_be_visible()
@@ -506,6 +508,8 @@ def test_pages_of_one_file_show_the_lines_each_read_covered(ui, page):
                 f"output: {json.dumps(output if output is not None else page_json)} }}")
     show(ui, "[" + ", ".join([read("p1", 1, 108), read("p2", 109, 243), read("p3", 244, state="running", output=""),
                                read("empty", 1, 0), read("failed", 500, state="error", output="Not a file.")]) + "]")
+    # The two finished pages fold under one line that counts one file; the running read ends that group.
+    page.get_by_role("button", name="Read 1 file notes/v7.md · lines 109–243", exact=True).click()
     for name in ("read file notes/v7.md · lines 1–108", "read file notes/v7.md · lines 109–243",
                  "read file notes/v7.md · from line 244", "read file notes/v7.md · from line 500 failed"):
         expect(page.get_by_role("button", name=name, exact=True)).to_be_visible()
@@ -631,6 +635,7 @@ def test_outline_and_overview_cards_name_their_subject(ui, page):
       { id: 'default', type: 'tool', name: 'project_overview', state: 'completed', output: '{}', input: {} },
       { id: 'backend', type: 'tool', name: 'project_overview', state: 'completed', output: '{}', input: { path: 'backend' } },
     ]""", ", onOpenPath: fake.spy('open')")
+    page.get_by_role("button", name="Read 2 files, listed 2 folders backend", exact=True).click()  # The five fold under one line.
     expect(page.get_by_role("button", name="outline file docs/handoff.md · to level 2", exact=True)).to_be_visible()
     expect(page.get_by_role("button", name="outline file src/app.py · from entry 120", exact=True)).to_be_visible()
     expect(page.get_by_role("button", name="project overview workspace", exact=True)).to_have_count(2)

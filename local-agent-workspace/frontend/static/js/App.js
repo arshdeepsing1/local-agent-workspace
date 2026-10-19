@@ -5,7 +5,7 @@ import { useWorkspace } from './useWorkspace.js'
 import { useAttention } from './attention.js'
 import Sidebar, { Brand } from './components/Sidebar.js'
 import Composer from './components/Composer.js'
-import Conversation, { PENDING_CARDS, revealCard } from './components/Conversation.js'
+import Conversation, { PENDING_CARDS, WAITING_SUBAGENTS, revealCard, subagentWaits } from './components/Conversation.js'
 import AgentToolsDialog from './components/AgentToolsDialog.js'
 import SettingsDialog from './components/SettingsDialog.js'
 import ProjectTrustDialog, { useProjectLayers } from './components/ProjectTrustDialog.js'
@@ -263,6 +263,8 @@ export default function App() {
         ${composer}
         ${active?.status === 'awaiting_approval' ? html`<p class="composer-hint"><span role="status">${(name => name === 'ask_user' ? 'The agent is waiting for your answer above.' : name === 'submit_plan' ? 'A plan is waiting for your review above.' : 'An action is waiting for your approval above.')(active.events?.findLast(event => event.state === 'pending')?.name)}</span>
           <button class="composer-hint-show" onClick=${showWaiting}>Show</button></p>` : null}
+        ${active && active.status !== 'awaiting_approval' && active.events?.some(event => subagentWaits(event.delegation)) ? html`<p class="composer-hint"><span role="status">A subagent is waiting for your answer above.</span>
+          <button class="composer-hint-show" onClick=${() => revealCard([...document.querySelectorAll(`.transcript ${WAITING_SUBAGENTS}`)].at(-1), true)}>Show</button></p>` : null}
         ${active?.status === 'compacting' ? html`<${CompactingHint} key=${active.id} since=${statusSeen.current.since}
           automatic=${statusSeen.current.before == null ? null : statusSeen.current.before !== 'idle'} percent=${active.context_info?.auto_compact_percent}
           progress=${active.compaction_progress} />` : null}

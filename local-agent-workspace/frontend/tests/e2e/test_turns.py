@@ -75,6 +75,10 @@ def test_parallel_subagents_run_and_report(app_page, stack):
         expect(card).to_be_visible()
     expect(page.get_by_role("button", name="Open subagent")).to_have_count(2)
     expect(page.get_by_text("Subagent: completed", exact=True)).to_have_count(2)
+    # The two cards of the one response share a run head, open since it was watched while it ran.
+    run = page.locator(".run-head")
+    expect(run.get_by_role("button", name="2 subagents", exact=True)).to_have_attribute("aria-expanded", "true")
+    expect(run.get_by_role("status")).to_have_text("2 completed")
     expect(summaries(page)).to_have_text(re.compile(r" · 2 subagents$"))
     children = [session for session in stack.manager.store.list() if session.get("is_subagent")]
     assert len(children) == 2 and all(child.get("terminal_reason") == "completed" for child in children)

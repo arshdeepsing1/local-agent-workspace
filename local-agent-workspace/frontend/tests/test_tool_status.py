@@ -413,6 +413,7 @@ def test_file_cards_name_paths_relative_to_the_project_or_their_folder(ui, page)
                  file_tool("o", "read_file", path="/elsewhere/notes.md"),
                  file_tool("l", "list_files", path="/srv/other")],
             extra=", roots: ['/srv/code']")
+    page.get_by_role("button", name="Read 1 file, listed 1 folder /srv/other", exact=True).click()  # The last two fold.
     subjects = page.locator(".tool-subject")
     expect(subjects).to_have_text(["other/tests/test_x.py", "src/app.py", "*.py in other/pkg", "code/new.py",
                                    "/elsewhere/notes.md", "other"])
@@ -429,6 +430,10 @@ def test_file_cards_name_paths_relative_to_the_project_or_their_folder(ui, page)
 def test_two_allowed_folders_with_the_same_name_stay_apart(ui, page):
     show_in(ui, [file_tool("a", "read_file", path="/srv/one/app/main.py"), file_tool("b", "read_file", path="/srv/two/app/main.py")],
             allowed=("/srv/one/app", "/srv/two/app"))
+    head = page.locator(".tool-group-head")
+    # The two reads fold under one line, which names the last one the same way.
+    expect(head.locator(".tool-group-subject")).to_have_text("two/app/main.py")
+    head.click()
     expect(page.locator(".tool-subject")).to_have_text(["one/app/main.py", "two/app/main.py"])
 
 
