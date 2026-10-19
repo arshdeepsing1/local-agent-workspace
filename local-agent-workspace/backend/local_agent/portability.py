@@ -14,7 +14,7 @@ from .config import MAX_MAX_AGENT_STEPS, MAX_TURN_MINUTES, MAX_TURN_TOKENS, MIN_
 from .context import LARGE_SUMMARY_MAX_BYTES, MAX_ESTIMATE_SCALE, context_boundary
 from .extensions import HOOK_CONTEXT_CHARS, HOOK_EVENTS, HOOK_REPORT_CHARS, MAX_HOOKS
 from .lifecycle_hooks import SHOWN_ARGUMENTS_BYTES
-from .planning import MAX_STEPS, subagent_index
+from .planning import MAX_STEPS, SUBJECT_CHARS, TOOL_STATES, subagent_index
 from .reasoning_replay import MAX_SIDECAR_BYTES, MAX_SIDECAR_ITEMS, REASONING_ITEMS
 from .spending import MAX_LIMIT_DBU
 
@@ -104,7 +104,22 @@ class Progress(Record):
     ended: float | None = None
     background: bool | None = None  # delegate_task background: the parent went on while it worked.
     turn_user_id: str | None = Field(default=None, max_length=512)  # The user event of the turn that delegated it.
+    # Its Agent steps, and (DelegateManager.progress) its replies and tool cards so far, those that failed, and its
+    # newest tool card's state and redacted subject.
+    max_steps: int | None = Field(default=None, ge=1, le=MAX_STEPS)
+    steps: int | None = Field(default=None, ge=0)
+    tool_calls: int | None = Field(default=None, ge=0)
+    failed_tools: int | None = Field(default=None, ge=0)
+    last_tool_state: Literal[TOOL_STATES] | None = None
+    last_tool_subject: str | None = Field(default=None, max_length=SUBJECT_CHARS)
     pending: PendingCard | None = None
+
+
+class DelegationBatch(Record):
+    """delegation_batch: a delegate_task call's place among the calls of one response that ran in parallel."""
+    id: str = Field(min_length=1, max_length=64)
+    index: int = Field(ge=0)
+    size: int = Field(ge=2)
 
 
 class SiblingChange(Record):
@@ -276,6 +291,7 @@ class Event(Record):
     child_session_id: str | None = None
     origin: Origin | None = None
     delegation: Progress | None = None
+    delegation_batch: DelegationBatch | None = None
     # A background delegation's final result (its card's Report), and the parent's notice when it ended.
     delegation_result: dict[str, Any] | None = None
     subagent_id: str | None = Field(default=None, max_length=512)

@@ -1193,7 +1193,8 @@ def create_app(settings=None):
     @app.get("/api/jobs")
     async def list_jobs(session_id: str | None = None):
         workspace = job_scope(session_id)
-        return [{key: value for key, value in job.items() if key != "output"}
+        # origin: who started it; a job recorded before origin existed reads as the user's.
+        return [{"origin": "user", **{key: value for key, value in job.items() if key != "output"}}
                 for job in manager.jobs.list(session_id=session_id, workspace=workspace)
                 if job["session_id"] == session_id]
 
@@ -1206,7 +1207,7 @@ def create_app(settings=None):
 
     @app.get("/api/jobs/{job_id}")
     async def get_job(job_id: str, session_id: str | None = None):
-        return scoped_job(job_id, session_id)
+        return {"origin": "user", **scoped_job(job_id, session_id)}
 
     @app.post("/api/jobs/{job_id}/stop")
     async def stop_job(job_id: str, session_id: str | None = None):
