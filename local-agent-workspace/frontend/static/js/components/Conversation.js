@@ -489,7 +489,7 @@ function delegationResult(event) {
   try { return usable(JSON.parse(event.output)) } catch { return null }
 }
 
-const DELEGATION_STATUS = { awaiting_approval: 'Waiting for approval', queued: 'waiting for a free slot' }
+export const DELEGATION_STATUS = { awaiting_approval: 'Waiting for approval', queued: 'waiting for a free slot' }
 
 // A subagent's submit_report report: its summary, findings (path:line opens the file), files and next steps.
 function SubagentReport({ report, onOpenPath }) {
@@ -513,7 +513,7 @@ function SubagentReport({ report, onOpenPath }) {
 // Allow or Decline the card a subagent waits on, or open it to answer a question or plan (the child's own
 // approvals route, so its rules and checks apply), and Stop one running subagent. A card whose title does not
 // show the whole action, or that warns (pending.review), is reviewed in the subagent: no Allow here.
-function SubagentControls({ event, progress, onSelectSession, onError }) {
+export function SubagentControls({ event, progress, onSelectSession, onError }) {
   const [acting, setActing] = useState('')
   const child = event.child_session_id
   const pending = progress.status === 'awaiting_approval' ? progress.pending : null
@@ -651,7 +651,8 @@ function ToolCard({ event, summary, result, status, failure = null, sessionId, o
     catch (e) { onError(e.message) }
     finally { setDeciding(false) }
   }
-  return html`<div class=${`tool-card ${isTask ? 'tool-task' : ''} ${pending ? 'needs-approval' : ''}`}>
+  // id and data-event-id let other views (a run's head, Workspace → Progress) find and reveal this card.
+  return html`<div id=${`tool-${event.id}`} data-event-id=${event.id} class=${`tool-card ${isTask ? 'tool-task' : ''} ${pending ? 'needs-approval' : ''}`}>
     <button class="tool-heading" onClick=${() => setExpanded(v => !v)} aria-expanded=${expanded || pending}
       aria-label=${[title, summary.subject, summary.taskStatus ? `Task: ${summary.taskStatus}` : '', status.label].filter(Boolean).join(' ')}>
       ${event.name?.toLowerCase().includes('command') || event.name === 'Bash' ? html`<${Terminal} size=${16} />` : html`<${FileText} size=${16} />`}

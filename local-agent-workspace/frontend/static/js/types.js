@@ -234,7 +234,8 @@
 //   the footer under it; exports and forks leave it out), unsent_report? (a delegated subagent's reply that could
 //   not be used: its submit_report arguments as written, redacted, which its parent's result carries as text),
 //   name?, input?, output?, preview?, state?, delegation?, origin?,
-//   (delegation: Delegation, on a delegate_task card or a notice with child_session_id),
+//   (delegation: Delegation, on a delegate_task card or a notice with child_session_id; a delegate_task card of a
+//   response that delegated two or more tasks at once also has delegation_batch: { id, index (call order from 0), size }),
 //   approval?: 'approved'|'declined'|'expired'|'blocked', approval_expires? (epoch seconds, only with a limit),
 //   decline_note? (the user's note sent with Decline), allowed_by_rule? (true: ran by a Rule, no card),
 //   rule_scope?: 'chat'|'project'|'user' (with allowed_by_rule), read_only_command? (true: ran from the fixed
@@ -295,7 +296,10 @@
 // Delegation: { status: 'queued'|'running'|'awaiting_approval'|...|'completed'|'failed'|'cancelled'|'interrupted',
 //   completed_tools, last_tool?, terminal_reason?, agent_type?, started?, ended? (epoch seconds), background? (true:
 //   delegate_task background), turn_user_id? (the user event of the turn that delegated it: a script follows the
-//   delegations of its own turns by it), pending?: { event_id, name, kind: 'approval'|'question'|'plan', title, warnings?:
+//   delegations of its own turns by it), max_steps? (its Agent steps), steps? (its replies so far), tool_calls? (its
+//   tool cards so far), failed_tools? (those in state 'error'), last_tool_state? (the newest tool card's state),
+//   last_tool_subject? (that card's path, command's first line or query, redacted, at most 160 characters; shown on
+//   the parent's card, never sent to the model), pending?: { event_id, name, kind: 'approval'|'question'|'plan', title, warnings?:
 //   string[], review?: true (the title is not the whole action, or the card warns: no Allow on the parent's card),
 //   expires? } (the child's waiting card while awaiting_approval: POST /sessions/<child>/approvals/<event_id>
 //   { allowed } answers an approval) }. A finished delegate_task card's output is the JSON result { child_session_id, agent_type,
@@ -403,7 +407,9 @@
 //   include_subagents=true adds the subagent chats' rows.
 // Job: { id, session_id, workspace, command, state, created, updated, exit_code,
 //   output?, truncated, timeout_seconds, max_output_bytes, background,
-//   without_shell? (true: ran from an argument vector without a shell) }
+//   without_shell? (true: ran from an argument vector without a shell), origin?: 'agent'|'user' (run_command, or Run in
+//   Terminal and ! commands; missing on older jobs: 'user') }. A background job's end notice ({ type: 'notice', job_id })
+//   also carries job_state (the job's state) and exit_code.
 // Composer (M4): Session.queued_messages?: QueuedMessage[]; Session.pending_context?: [{ kind: 'shell', command,
 //   exit_code }] (! output attached to the next message; its text stays on the server). Pushed as
 //   { type: 'pending_context', pending_context } when a command adds one and when a message takes them.
