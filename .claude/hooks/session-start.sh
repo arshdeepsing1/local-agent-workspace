@@ -1,7 +1,7 @@
 #!/bin/bash
-# SessionStart hook for Claude Code on the web. Installs the backend and its test
-# dependencies into .venv, so `python -m pytest` works without a manual setup. It does
-# nothing on a local machine, which keeps its own environment.
+# SessionStart hook for Claude Code on the web. Installs the app's backend and its test
+# dependencies into the app's .venv, so `python -m pytest` works without a manual setup.
+# It does nothing on a local machine, which keeps its own environment.
 set -euo pipefail
 
 if [ "${CLAUDE_CODE_REMOTE:-}" != "true" ]; then
@@ -9,7 +9,17 @@ if [ "${CLAUDE_CODE_REMOTE:-}" != "true" ]; then
 fi
 
 ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
-cd "$ROOT"
+
+# The app is in the local-agent-workspace folder of this repository. If it is moved to the root, use the root.
+APP="$ROOT/local-agent-workspace"
+if [ ! -f "$APP/backend/pyproject.toml" ]; then
+  APP="$ROOT"
+fi
+if [ ! -f "$APP/backend/pyproject.toml" ]; then
+  echo "session-start: backend/pyproject.toml not found under $ROOT" >&2
+  exit 1
+fi
+cd "$APP"
 
 # backend/pyproject.toml needs Python 3.12 or newer; the container's default python3 may be older.
 find_python() {
@@ -43,8 +53,8 @@ if [ -n "${CLAUDE_ENV_FILE:-}" ]; then
     grep -qxF -- "$1" "$CLAUDE_ENV_FILE" 2>/dev/null || printf '%s\n' "$1" >> "$CLAUDE_ENV_FILE"
   }
   # Make `python` and `pytest` in the session use this environment, as the README's commands expect.
-  persist "export VIRTUAL_ENV=\"$ROOT/.venv\""
-  persist "export PATH=\"$ROOT/.venv/bin:\$PATH\""
+  persist "export VIRTUAL_ENV=\"$APP/.venv\""
+  persist "export PATH=\"$APP/.venv/bin:\$PATH\""
   # The frontend tests use the Chromium that the web container provides, so nothing is downloaded.
   browser="${PLAYWRIGHT_BROWSERS_PATH:-/opt/pw-browsers}/chromium"
   if [ -x "$browser" ]; then
