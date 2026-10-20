@@ -5,6 +5,8 @@ import re
 import pytest
 from playwright.sync_api import expect
 
+from conftest import ORIGIN
+
 
 def open_settings(ui, page, setup=""):
     ui.app(scenario="workspace", setup=setup)
@@ -432,6 +434,60 @@ def test_text_size_scales_all_text_at_once_and_is_kept_in_this_browser(ui, page)
     assert ui.js(legend) == pytest.approx(base)
     assert ui.js("localStorage.getItem('local.textSize')") is None
     assert ui.bodies("/api/settings", "PUT") == []  # Never saved with Settings.
+
+
+# Settings → Appearance → Theme (theme.js): Light by default, Dark, or Match system; kept in this browser only.
+
+BODY_BACKGROUND = "getComputedStyle(document.body).backgroundColor"
+LIGHT_CANVAS, DARK_CANVAS = "rgb(250, 249, 245)", "rgb(38, 38, 36)"
+
+
+def test_the_theme_switches_to_dark_and_is_kept_in_this_browser(ui, page):
+    dialog = open_settings(ui, page)
+    theme = dialog.get_by_role("group", name="Appearance").get_by_role("combobox", name="Theme")
+    expect(theme).to_have_value("light")
+    expect(theme.locator("option")).to_have_text(["Light", "Dark", "Match system"])
+    assert ui.js("document.documentElement.dataset.theme") == "light"
+    assert ui.js(BODY_BACKGROUND) == LIGHT_CANVAS
+    theme.select_option("dark")
+    assert ui.js("document.documentElement.dataset.theme") == "dark"
+    assert ui.js("localStorage.getItem('local.theme')") == "dark"
+    assert ui.js(BODY_BACKGROUND) == DARK_CANVAS
+    assert ui.js("getComputedStyle(document.documentElement).colorScheme") == "dark"  # native controls and scrollbars too
+    ui.app(scenario="workspace")  # The page again: the theme comes back from this browser's storage.
+    expect(page.get_by_role("combobox", name="Model")).to_have_value("test-model")
+    assert ui.js("document.documentElement.dataset.theme") == "dark"
+    assert ui.js(BODY_BACKGROUND) == DARK_CANVAS
+    page.get_by_role("button", name="Settings", exact=True).click()
+    theme = page.get_by_role("dialog").get_by_role("combobox", name="Theme")
+    expect(theme).to_have_value("dark")
+    theme.select_option("light")
+    assert ui.js(BODY_BACKGROUND) == LIGHT_CANVAS
+    assert ui.js("localStorage.getItem('local.theme')") is None
+    assert ui.bodies("/api/settings", "PUT") == []  # Never saved with Settings.
+
+
+def test_match_system_follows_the_operating_system(ui, page):
+    page.emulate_media(color_scheme="dark")
+    dialog = open_settings(ui, page)
+    assert ui.js(BODY_BACKGROUND) == LIGHT_CANVAS  # Light by default, whatever the system uses.
+    dialog.get_by_role("combobox", name="Theme").select_option("system")
+    assert ui.js("document.documentElement.dataset.theme") == "system"
+    assert ui.js("localStorage.getItem('local.theme')") == "system"
+    assert ui.js(BODY_BACKGROUND) == DARK_CANVAS
+    page.emulate_media(color_scheme="light")
+    assert ui.js(BODY_BACKGROUND) == LIGHT_CANVAS
+
+
+def test_the_page_applies_a_stored_theme_before_its_script_runs(page):
+    # index.html sets data-theme from storage before the stylesheet, so a dark page never flashes light. The app's
+    # own script is left out here: the page alone must be dark.
+    page.route(f"{ORIGIN}/static/js/main.js", lambda route: route.fulfill(status=200, body="", content_type="text/javascript"))
+    page.add_init_script(script="localStorage.setItem('local.theme', 'dark')")
+    page.goto(f"{ORIGIN}/index.html")
+    assert page.evaluate("document.documentElement.dataset.theme") == "dark"
+    assert page.evaluate(BODY_BACKGROUND) == DARK_CANVAS
+    assert page.evaluate("document.querySelector('meta[name=theme-color]').content") == "#262624"
 
 
 @pytest.mark.parametrize("width,height", LAYOUT_VIEWPORTS)
