@@ -30,8 +30,10 @@ import WorktreeChat from './components/WorktreeChat.js'
 import CommandHelp from './components/CommandHelp.js'
 import { runCommand } from './commands.js'
 import { applyTextSize, textSize } from './textSize.js'
+import { applyTheme, theme } from './theme.js'
 
 applyTextSize(textSize())  // Settings → Appearance → Text size, before the first render.
+applyTheme(theme())  // Settings → Appearance → Theme (index.html already applied a stored one before the stylesheet).
 
 export default function App() {
   const app = useWorkspace()

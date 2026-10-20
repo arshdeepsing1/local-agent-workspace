@@ -32,6 +32,24 @@ Context accounting, file links and handoffs (2026-10-20):
 - New shipped skill **`/read-handoff`**: reads a handoff's Contents or headings, then only the
   sections that carry state, skipping command and activity logs, runbooks and resource lists.
 
+Claude-like theme (2026-10-20):
+
+- A new palette after Claude's apps: an ivory page and a slightly darker sidebar, white cards,
+  dialogs and message box, soft warm gray fills (your messages, hovered rows, code), translucent
+  warm borders, and a clay accent for the send button, the logo and links. Primary buttons (Save,
+  Keep, Allow) are near-black with ivory text; secondary buttons are white with a border; filter
+  pills such as **Tags (1)** and **Running** are tinted rather than filled. The message box is a white
+  rounded card whose border and shadow deepen while you type, and the send button stays a faded clay
+  square while the box is empty.
+- **Settings → Appearance → Theme**: **Light** (the default), **Dark** (Claude's dark colours) or
+  **Match system** (your computer's light or dark mode). It applies at once and is kept in this
+  browser only, like Text size; the page applies it before it is drawn, so a dark page never
+  flashes light, and native controls and scrollbars follow it.
+- Every colour comes from one set of named tokens (surfaces, text, borders, accent, status, code
+  and chart colours) with light and dark values. Text keeps at least 4.5:1 contrast in both themes,
+  icons, focus rings and form-field borders 3:1; keyboard focus shows a blue ring.
+- The app icon, tab icon and browser theme colour use the new clay and ivory.
+
 Workflow and progress view (2026-10-19):
 
 - Consecutive read-only steps fold into one line in the chat, such as **Ran 3 commands, read 2
