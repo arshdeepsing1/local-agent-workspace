@@ -157,6 +157,35 @@ async def test_an_export_and_import_keep_a_runs_batch_and_its_subagents_progress
             parse_bundle(json.dumps(changed).encode())
 
 
+async def test_an_export_import_and_fork_keep_how_a_background_job_ended_on_its_notice(runtime):
+    """A background job's end notice keeps job_id, job_state and exit_code, which its command's card reads in the
+    copy as in the source chat. A tool card's job_id stays out, like the job itself; values the app never writes
+    are refused."""
+    app, manager, source, destination = runtime
+    ended = {"job_id": "job-1", "job_state": "cancelled", "exit_code": -15}
+    source["events"].append({"id": "n1", "type": "notice", "text": "Background job stopped: npm run dev", **ended})
+    manager.store.save(source)
+    bundle = export_bundle([source], source["id"])
+    notice = bundle["sessions"][0]["events"][3]
+    assert {key: notice[key] for key in ended} == ended
+    assert "job_id" not in bundle["sessions"][0]["events"][1]
+    async with await client_for(app) as client:
+        response = await client.post("/api/sessions/import", params={"workspace": str(destination)}, json=bundle)
+        imported = manager.store.get(response.json()["session"]["id"])
+        assert {key: imported["events"][3][key] for key in ended} == ended
+        response = await client.post(f"/api/sessions/{source['id']}/fork")
+        assert response.status_code == 201, response.text
+        fork = manager.store.get(response.json()["id"])
+        assert {key: fork["events"][3][key] for key in ended} == ended
+        assert "job_id" not in fork["events"][1]
+    for index, event in ((3, {"job_state": "running"}), (3, {"job_state": "done"}), (3, {"exit_code": "0"}),
+                         (3, {"job_id": ""}), (1, {"job_id": "job-1"}), (1, {"exit_code": 0})):
+        changed = copy.deepcopy(bundle)
+        changed["sessions"][0]["events"][index].update(event)
+        with pytest.raises(ValueError, match="schema"):
+            parse_bundle(json.dumps(changed).encode())
+
+
 async def test_import_marks_pending_approval_and_partial_response_historical(runtime):
     app, manager, source, destination = runtime
     bundle = export_bundle([source], source["id"])
