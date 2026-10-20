@@ -26,19 +26,15 @@ Workflow and progress view (2026-10-19):
   running, waiting, queued and finished background subagents and background commands, with **Open
   subagent**, **Stop subagent**, **Allow**/**Decline**, **Show card**, **Stop job** and **View
   output**. The Workspace tabs show icons only when their labels do not fit, and the panel opens on
-  the tab used last (on Files for the message box's +, a review from the changes bar or a file
-  opened from a reply or a card).
-- A background command's card reads its outcome (**background · exit 0**, timed out, stopped,
-  interrupted) once the command ends, instead of "started in background", also when it was stopped
-  from Terminal or Progress, by the agent's `stop_job` or by the app's shutdown, or a restart
-  interrupted it.
+  the tab used last.
+- A background command's card reads its outcome (**background · exit 0**, timed out, stopped)
+  once the command ends, instead of "started in background".
 - For the page only (no new tool, route or socket message; nothing reaches the model, and the
   32-function guards are unchanged): `delegate_task` cards of one response carry `delegation_batch`
   `{id, index, size}`; a subagent's live `delegation` gains `max_steps`, `steps`, `tool_calls`,
   `failed_tools`, `last_tool_state` and `last_tool_subject`; jobs record `origin` (`agent` or `user`;
   older ones are read from their chat); a background job's end notice carries `job_state` and
-  `exit_code`, and a stopped or interrupted job gets one too (the agent's next request still names
-  only jobs that completed, failed or timed out). Exports, forks and imports keep the new fields.
+  `exit_code`. Exports, forks and imports keep the new fields.
 
 Second reviews of the integration fixes (2026-10-19). The three integration-fix packages that
 had no second review (the composer and file preview; background subagents' accounting, wakes and
