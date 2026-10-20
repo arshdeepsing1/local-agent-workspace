@@ -1,13 +1,29 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-style="claude" data-theme="light">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#faf9f6" />
+    <meta name="theme-color" content="#faf9f5" />
     <title>Local — Your agent workspace</title>
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 2 22 8 16 14 10 8ZM2 16 8 10 14 16 8 22ZM18 16 24 10 30 16 24 22ZM16 18 22 24 16 30 10 24Z' fill='none' stroke='%23b4552d' stroke-width='2'/%3E%3C/svg%3E" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 2 22 8 16 14 10 8ZM2 16 8 10 14 16 8 22ZM18 16 24 10 30 16 24 22ZM16 18 22 24 16 30 10 24Z' fill='none' stroke='%23d97757' stroke-width='2'/%3E%3C/svg%3E" />
     <link rel="manifest" href="/static/manifest.webmanifest" />
     <link rel="apple-touch-icon" href="/static/apple-touch-icon.png" />
+    <!-- Settings → Appearance → Style and Theme (static/js/theme.js), applied before the stylesheet so a dark page never
+         flashes light. Keep the keys and canvas colours in step with theme.js. -->
+    <script>
+      (function () {
+        try {
+          var style = localStorage.getItem('local.style') === 'vscode' ? 'vscode' : 'claude'
+          var theme = localStorage.getItem('local.theme')
+          if (theme !== 'dark' && theme !== 'system') theme = 'light'
+          var dark = theme === 'dark' || (theme === 'system' && matchMedia('(prefers-color-scheme: dark)').matches)
+          document.documentElement.dataset.style = style
+          document.documentElement.dataset.theme = theme
+          document.querySelector('meta[name="theme-color"]').content =
+            { claude: dark ? '#262624' : '#faf9f5', vscode: dark ? '#1f1f1f' : '#ffffff' }[style]
+        } catch (e) { /* Storage blocked: the defaults (Claude, Light). */ }
+      })()
+    </script>
     <link rel="stylesheet" href="/static/styles.css" />
     <script type="importmap">
       {

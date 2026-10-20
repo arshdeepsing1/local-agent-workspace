@@ -252,7 +252,7 @@ def test_settings_type_scale(ui, page):
     assert 20 <= float(sizes["title"][:-2]) <= 22 and 14 <= float(sizes["legend"][:-2]) <= 15, sizes
     assert 13 <= float(sizes["label"][:-2]) <= 14 and 13 <= float(sizes["input"][:-2]) <= 14, sizes
     assert 12 <= float(sizes["help"][:-2]) <= 13 and abs(float(sizes["helpLine"][:-2]) / float(sizes["help"][:-2]) - 1.45) < .06
-    assert sizes["helpColor"] == "rgb(102, 100, 92)"  # --muted
+    assert sizes["helpColor"] == "rgb(101, 100, 94)"  # --muted
     assert 760 <= sizes["width"] <= 880, sizes
 
 
@@ -353,7 +353,7 @@ def test_a_saved_reply_shows_how_long_it_thought(ui, page):
     # Thinking text is smaller and muted, the answer is not.
     styles = page.evaluate("""() => [document.querySelector('.thinking .markdown'), document.querySelector('.reply-content > .markdown')]
       .map(el => [getComputedStyle(el).fontSize, getComputedStyle(el).color])""")
-    assert styles[0] == ["13px", "rgb(102, 100, 92)"] and float(styles[1][0][:-2]) > 13, styles
+    assert styles[0] == ["13px", "rgb(101, 100, 94)"] and float(styles[1][0][:-2]) > 13, styles
 
 
 def test_thinking_without_a_summary_is_one_quiet_line(ui, page):

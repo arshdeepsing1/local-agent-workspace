@@ -44,8 +44,8 @@ frontend that runs without a build step.
 - Project memory: short notes the agent saves with your approval (the `remember` tool) and every later
   chat in the project sees, kept in the app's state folder and reviewed in Agent tools → Memory.
 - Output styles (Default, Concise, Explanatory, or your own style files) and shipped skills for
-  handoffs, verifying and debugging a change, drafting an `AGENTS.md` (`/init`), committing, opening a
-  pull request, and code and security reviews whose findings show as a card.
+  writing and reading handoffs, verifying and debugging a change, drafting an `AGENTS.md` (`/init`),
+  committing, opening a pull request, and code and security reviews whose findings show as a card.
 - A short Git snapshot (branch, upstream, change counts, recent commits) with the message that starts
   each reply.
 - Workspace file explorer (the project, the conversation's granted folders and folders you add), text
@@ -269,8 +269,7 @@ saved partial reply is shown as interrupted; the most recent uncheckpointed text
 may be lost. Incomplete streamed tool arguments are never persisted as executable
 requests or replayed. A local storage failure stops the response and reports that
 recent history may not have been saved. Back up the whole `conversations/` folder
-(the JSONL files and their `.state.json` files) and the separate operational SQLite
-database.
+(the JSONL files) and the separate operational SQLite database.
 
 **Agent tools → Export** exports a versioned JSON bundle, optionally with
 subagent conversations (32 total, 16 MiB maximum). Export requires idle chats. A reply's
@@ -324,6 +323,11 @@ when opening a conversation or performing restart recovery.
 
 ## Working with the app
 
+- **Style and theme**: **Settings → Appearance → Style** chooses **Claude** (the default: warm
+  ivory, clay and rounded cards) or **VS Code** (the editor's default colours, fonts and square
+  corners), and **Theme** chooses **Light** (the default), **Dark**, or **Match system**, which
+  follows your computer's light or dark mode and changes with it. Any style goes with any theme.
+  Both apply at once and are kept in this browser only (they are not part of Settings' saved values).
 - **Text size**: **Settings → Appearance → Text size** (90% to 150%, default 100%) makes all text of
   the app larger or smaller at once; the layout keeps fitting the window. It applies as soon as you
   choose it and is kept in this browser only (it is not part of Settings' saved values). Browser
@@ -526,7 +530,7 @@ when opening a conversation or performing restart recovery.
   remove them. Because queued messages are sent together, their `@` files must fit the limits of
   one message (see below) when you queue them. A message queued while a question or plan card
   waits stays queued; it never answers the card. Queued messages are saved with the chat (in its
-  `<id>.state.json`) and are not exported.
+  conversation file) and are not exported.
 - **Files in a message (`@`)**: type `@` to pick a project file (↑/↓, Enter or Tab inserts
   `@<path> `, Esc closes); `@src/app.py:10-40` or `@src/app.py#L10-L40` names lines. The menu
   leaves out files whose paths an `@` token cannot spell (spaces, quotes, `<>|@` or a backtick in
@@ -1248,7 +1252,9 @@ when opening a conversation or performing restart recovery.
   the name most likely means (a path starting with the project's own folder name, or the
   folders above it from the repository root; in a worktree chat, the worktree's copy of a
   file named by the source project's path, which is always preferred over the source
-  project's own file) and says which file it opened; the header, **Open in VS Code** and the plus
+  project's own file; or a relative path under a folder the chat worked in: where its commands
+  ran (`cwd`, or a leading `cd <folder> &&`), the folders its tools named or read files from,
+  its instruction folders, then their parent folders, the most recent first) and says which file it opened; the header, **Open in VS Code** and the plus
   button (which an image other than SVG does not have) then name that file. Otherwise it reports
   that the file does not exist in the project folder. A file with unkept agent changes that cannot be read
   opens its review.
@@ -1289,10 +1295,14 @@ workspace anyway, because commands run in the workspace can still reach it.
   files 0600. A chat keeps at most 100 attached files and 200 MB. Deleting the chat deletes its
   folder; a fork or rewind backup gets its own copies (hard links where possible). The folder is
   never exported, and an imported chat has no attached files: their chips keep the names.
-- `conversations/<conversation-id>.state.json`: the chat's "Allow for this chat" rules and
-  the size and modification time of the files the agent last read or wrote (paths only, no
-  contents). It sits beside the JSONL file so earlier versions of the app can still open the
-  chat; it is never exported, and a missing or unreadable one counts as empty.
+- The chat's "Allow for this chat" rules, queued messages, pending `!` output, the files whose
+  instructions it loaded, and the size and modification time of the files the agent last read or
+  wrote (paths only, no contents) are field records of the same JSONL file, never in its first
+  line and never exported. Earlier versions (up to 2026-10-20) kept them in
+  `conversations/<conversation-id>.state.json`: such a chat opens as before (that file wins over
+  field records, a missing or unreadable one counts as empty), and its next save moves the fields
+  into the JSONL file and removes it. Versions old enough to reject these field records cannot open a
+  chat saved since.
 - `conversations.sqlite3`: operational state only. Its `jobs` table stores command
   metadata, states, and bounded output for live control and restart recovery; terminal
   job snapshots are also mirrored into the owning chat JSONL. Chat messages, assistant
@@ -1415,11 +1425,18 @@ inside `prompt_tokens` (`prompt_tokens_details.cached_tokens`); the app then rec
 `prompt_tokens` minus the cached count as uncached input, so totals, the DBU estimate
 and the estimate scale do not count the cache twice (a cached count larger than
 `prompt_tokens` is left as reported). Claude endpoints on Databricks report the cache counts
-as top-level `cache_read_input_tokens` and `cache_creation_input_tokens`; that their
-`prompt_tokens` then excludes them, as the app assumes, is still to be confirmed by one cached
-request (see **Prompt caching**). Ledger records saved before
-this change keep the counts they were saved with; those that used OpenAI-style cached
-tokens stay double-counted, because they hold only the combined input count.
+as top-level `cache_read_input_tokens` and `cache_creation_input_tokens`, and their
+`prompt_tokens` includes them (seen on real cached requests: `prompt_tokens` was never below
+their sum, and `total_tokens` was `prompt_tokens` plus `completion_tokens`), so the app records
+`prompt_tokens` minus both as uncached input here too, when `total_tokens` is `prompt_tokens` plus
+`completion_tokens`; a `total_tokens` that counts them on top of `prompt_tokens`, or none, keeps them
+separate. Ledger records saved before this was known counted the cache
+twice: a chat's records are repaired when it is loaded (only records whose raw usage had
+`prompt_tokens` and a top-level cache count, and whose `total_tokens` is still input plus output),
+along with the meter's **Last request** report and the spend recorded for the chat's ended subagents
+(counted again from their repaired ledgers, once), and the usage across chats is counted again. Records
+that used OpenAI-style cached tokens before that split existed stay double-counted, because they
+hold only the combined input count.
 The Usage section starts with a **Last model input** row: the reported input tokens of
 the conversation's latest agent request (cache included), its share of the input
 budget and of the model's window when known, and the app's estimate for the same
@@ -1711,10 +1728,10 @@ cache reads that stay at about the size of the system message and the tool defin
 step, instead of covering the conversation before it: choose **Documented forms only** then. A rejection that lowered an endpoint
 to no markers still applies until a restart or a Settings save.
 
-How Databricks counts `prompt_tokens` while the cache is in use is still to be confirmed by one
-cached request: the context meter, the estimate scale and the DBU estimate assume it excludes the
-cache reads and writes, which Databricks reports as `cache_read_input_tokens` and
-`cache_creation_input_tokens`. To help check it, the ledger in the conversation file keeps, for
+Databricks' `prompt_tokens` includes the cache reads and writes it reports as
+`cache_read_input_tokens` and `cache_creation_input_tokens` (confirmed on real cached requests; see
+**Provider-reported usage**): the context meter, the estimate scale and the DBU estimate subtract them from it. To
+check the shape an endpoint sends, the ledger in the conversation file keeps, for
 each agent and subagent request (not titles, `/btw` side questions or compaction), the key names
 of the usage object Databricks sent (`usage_keys`, never values), the shape that carried the
 model's reasoning (`reasoning_shape`) and whether a reasoning signature came
@@ -1901,7 +1918,19 @@ that is partial, misses input tokens or looks counted twice, leaves the previous
 none, the scaled estimate). The automatic compaction threshold, the budget checks, side questions
 (`/btw`) and the meter use the anchored estimate; the usage ledger, the estimate scale, the cuts
 compaction considers and the 4 MB check keep the heuristic estimate.
-Expanded context details attribute that same estimate to system/project
+The open context details start with a usage card like Claude's context panel: "N% used" and the
+tokens used of the chat's context budget, a bar split by what the request holds, with the
+auto-compact threshold marked, and a legend with each part's tokens and share of the budget:
+messages and tool results, the conversation summary, system instructions, instruction files and
+memory (the loaded instruction sources, skill index and selected skills), built-in tools, MCP
+tools (with the number of servers), request overhead, then **Free space** up to the auto-compact
+threshold, the **Autocompact buffer** between it and the input budget, and what is **Reserved for
+the reply** (and safety). The parts add up to the context budget. When Databricks' count for the
+last request is current, the parts are the app's estimate scaled to it; a model whose window is
+larger than the budget says so. Warnings and **Compact now** follow, and the explanations below sit
+under a collapsed **Details** (it stays open or closed, for every chat, while the page is open).
+**Workspace → Progress** shows the same legend under its context line.
+The **Details** breakdown attributes that same estimate to system/project
 instructions (including skills selected for the chat), tool definitions (split per MCP server,
 for example "Built-in tools · ~9,000 tokens" and "MCP docs · ~640 tokens", when an MCP server's
 tools are offered), conversation messages and tool results, the retained summary, and request
@@ -2698,6 +2727,13 @@ by a project's own copy:
 - `/review` (`skills/review/SKILL.md`): reviews the uncommitted changes, a branch or a pull request
   read-only (reading the code around each change and its callers) for correctness, security,
   regressions and missing tests, and reports with `report_findings`.
+- `/read-handoff` (`skills/read-handoff/SKILL.md`): reads a handoff without filling the context:
+  its Contents list (or headings) first, then only the sections that carry state (status, open
+  items, next actions, requirements, decisions, errors and fixes, work done, file changes, key
+  facts), skipping the command and activity logs, the runbook and resource lists, which it searches
+  only for a detail the task needs; then replies with a short orientation. `/handoff` reads a
+  compacted chat's auto handoffs the same way, oldest first, so its handoff covers the chat from
+  its start.
 - `/security-review` (`skills/security-review/SKILL.md`): traces untrusted input through the change
   (injection, access checks, secrets, network, crypto, files, dependencies) and reports only issues
   with an exploit path, with `report_findings`.
@@ -4386,7 +4422,7 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `backend/local_agent/activity.py`: app-generated activity log for handoffs (`insert_activity_log`).
 - `backend/local_agent/transcript.py` / `scripts/conversation_transcript.py`: Markdown transcripts of saved conversations (also `GET /api/sessions/<id>/transcript.md`).
 - `backend/local_agent/redaction.py`: common secret shapes replaced in logs, handoffs and transcripts, and the high-confidence ones in command and MCP results.
-- `skills/`: skills shipped with the app and offered in every workspace; `handoff/SKILL.md` is the detailed handoff skill, `verify`, `debug` and `init` run a project's checks, debug a reported failure and draft its `AGENTS.md`, and `commit`, `pr`, `review` and `security-review` are the Git skills. A workspace's `.agents/skills/<id>/` replaces the shipped skill with that ID.
+- `skills/`: skills shipped with the app and offered in every workspace; `handoff/SKILL.md` is the detailed handoff skill and `read-handoff` reads one, `verify`, `debug` and `init` run a project's checks, debug a reported failure and draft its `AGENTS.md`, and `commit`, `pr`, `review` and `security-review` are the Git skills. A workspace's `.agents/skills/<id>/` replaces the shipped skill with that ID.
 - `agents/`: agent files shipped with the app (`plan.md`); a project's `.agents/agents/<name>.md` or `.claude/agents/<name>.md` of the same name replaces one.
 - `backend/local_agent/telemetry.py`: inference ledger, validated usage, DBU estimates, and failure categories.
 - `backend/local_agent/usage_export.py` / `scripts/usage_report.py`: usage rows and CSV correlated with conversation history.

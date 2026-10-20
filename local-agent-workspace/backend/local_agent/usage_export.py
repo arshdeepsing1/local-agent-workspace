@@ -12,6 +12,7 @@ import io
 import json
 from datetime import datetime
 
+from .context import repair_session_usage
 from .telemetry import session_metrics
 
 
@@ -51,6 +52,7 @@ def session_from_jsonl(path):
                 session["inference_calls"].append(data)
             elif kind == "field" and record.get("name") == "inference_calls" and data:
                 session["inference_calls"].extend(data)
+    repair_session_usage(session)  # Records saved while Databricks' cache counted twice (context.py).
     return session
 
 

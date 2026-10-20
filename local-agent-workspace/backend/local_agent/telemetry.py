@@ -149,15 +149,55 @@ def reported_usage(value):
     # cached_tokens), while Claude-style usage reports uncached input, cache reads and
     # cache writes as separate buckets. input_tokens is kept as the uncached part, so
     # the cache is not counted twice by totals, DBU estimates and the estimate scale.
-    # Top-level cache fields stay separate buckets. Checked 2026-10-16 on a live workspace:
-    # the Claude route returns top-level cache_read_input_tokens and
-    # cache_creation_input_tokens, 0 when nothing is cached; a request that hits the cache
-    # is still unchecked. Ledger records saved before this change keep their counts (they
-    # hold input_tokens only and cannot be re-split).
-    if (sources.get("input_tokens") == "prompt_tokens" and sources.get("cache_read_input_tokens") == "prompt_tokens_details"
-            and usage["cache_read_input_tokens"] <= usage["input_tokens"]):
+    split = (sources.get("input_tokens") == "prompt_tokens" and sources.get("cache_read_input_tokens") == "prompt_tokens_details"
+             and usage["cache_read_input_tokens"] <= usage["input_tokens"])
+    if split:
         usage["input_tokens"] -= usage["cache_read_input_tokens"]
+    # Databricks' Claude route sends prompt_tokens with top-level cache_read_input_tokens and
+    # cache_creation_input_tokens, and its prompt_tokens includes both (seen 2026-10-19 on 152 cached
+    # requests: prompt_tokens was never below their sum, and total_tokens was prompt_tokens plus
+    # completion_tokens). Only a report whose total_tokens says so is split: one whose total_tokens counts
+    # them on top of prompt_tokens, or that has none, keeps them as separate buckets.
+    if sources.get("input_tokens") == "prompt_tokens":
+        top = top_level_cache(usage, sources)
+        if inclusive_cache(usage, top, before=usage["cache_read_input_tokens"] if split else 0):
+            usage["input_tokens"] -= top
     return usage
+
+
+def top_level_cache(usage, sources):
+    """The cache read and write counts a usage reported as top-level fields (not in prompt_tokens_details)."""
+    return sum(usage.get(name, 0) for name in ("cache_read_input_tokens", "cache_creation_input_tokens")
+               if sources.get(name) == name)
+
+
+def inclusive_cache(usage, cached, before=0):
+    """True when a usage's input_tokens (Databricks' prompt_tokens, less before: what was already subtracted)
+    includes cached top-level cache tokens: some are cached, input_tokens is not below them, and total_tokens
+    is prompt_tokens plus output_tokens (it does not count them again)."""
+    total, output = usage.get("total_tokens"), usage.get("output_tokens", 0)
+    return 0 < cached <= usage["input_tokens"] and type(total) is int and total == usage["input_tokens"] + before + output
+
+
+def repair_counted_cache(call):
+    """Split the cache out of input_tokens in a ledger record saved before reported_usage did (for
+    Databricks' Claude route, whose prompt_tokens includes the cache counts). Only a record whose raw usage
+    had prompt_tokens and a top-level cache count, and whose total_tokens is still input_tokens plus
+    output_tokens (a repaired or newer record's is not), is changed. Returns True when it changed."""
+    usage = call.get("usage") if isinstance(call, dict) else None
+    keys = call.get("usage_keys") if isinstance(call, dict) else None
+    if (not isinstance(usage, dict) or not isinstance(keys, list) or "prompt_tokens" not in keys
+            or not {"cache_read_input_tokens", "cache_creation_input_tokens"} & set(keys)):
+        return False
+    counts = [usage.get(key, 0) for key in ("input_tokens", "output_tokens", "total_tokens",
+                                             "cache_read_input_tokens", "cache_creation_input_tokens")]
+    if any(type(count) is not int or count < 0 for count in counts) or "total_tokens" not in usage:
+        return False
+    uncached, output, total, read, write = counts
+    if total != uncached + output or not 0 < read + write <= uncached:
+        return False
+    usage["input_tokens"] = uncached - read - write
+    return True
 
 
 def usage_keys(value, seen=()):
@@ -508,7 +548,7 @@ def usage_totals(records):
 
 # The usage summary each conversation keeps in its header (usage_summary), so a view of every chat's usage reads
 # headers only: one row per local date, model and purpose, the newest SUMMARY_DAYS dates and SUMMARY_ROWS rows.
-SUMMARY_VERSION = 1
+SUMMARY_VERSION = 2  # 2: ledgers whose input counted Databricks' cache twice are repaired (repair_counted_cache).
 SUMMARY_COLUMNS = ("date", "model", "purpose", "calls", *TOKEN_FIELDS, "estimated_dbu", "unpriced_calls")
 SUMMARY_DAYS = 90
 SUMMARY_ROWS = 120

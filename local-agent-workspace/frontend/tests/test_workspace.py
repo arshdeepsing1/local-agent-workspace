@@ -130,8 +130,9 @@ def test_settings_edit_and_save_only_databricks_fields(ui, page):
     expect(dialog.get_by_label("Agent runtime")).to_have_count(0)
     # No agent runtime options: CLAUDE.md is named only as an instruction file (the project's, or the read-only
     # ~/.claude/CLAUDE.md). No Claude CLI runtime settings (a model name such as Claude Opus 5.5 in help text, or the
-    # Claude endpoints that Prompt caching applies to, is fine).
-    expect(dialog.get_by_text(re.compile(r"(?<!\.)Claude(?!\.md|\.local\.md| Opus|-opus| endpoints\))|MCP|skills", re.I))).to_have_count(0)
+    # Claude endpoints that Prompt caching applies to, is fine; so is Appearance → Style: Claude, "the Claude style").
+    expect(dialog.get_by_text(re.compile(r"(?<!\.)Claude(?!\.md|\.local\.md| Opus|-opus| endpoints\)| style|VS Code)(?!(?<=^Claude)$)|MCP|skills",
+                                         re.I))).to_have_count(0)
     expect(dialog.get_by_role("combobox", name="Prompt caching").locator("option").first).to_have_text(
         "Automatic (Claude endpoints)")
     checkboxes = dialog.get_by_role("checkbox")

@@ -74,3 +74,59 @@ def test_a_worktree_chat_opens_its_own_copy_of_a_source_project_path(tmp_path, p
         assert opened.status_code == 200, opened.json()
         assert opened.json()["path"] == "src/app.py" and opened.json()["content"] == "print('worktree')\n"
         assert opened.json()["absolute"] == str(worktree / "src" / "app.py")
+
+
+def test_a_path_named_relative_to_where_the_chat_worked_opens_that_file(tmp_path, project):
+    # A reply names template/pipeline.json after its commands ran in a repository below the project.
+    repository = project / "repos" / "pipeline"
+    (repository / "template").mkdir(parents=True)
+    (repository / "config").mkdir()
+    (repository / "template" / "pipeline.json").write_text("{}\n")
+    (project / "notes").mkdir()
+    (project / "notes" / "pipeline.json").write_text("[]\n")  # Older work: the latest folders come first.
+    settings = Settings(tmp_path / "state")
+    settings.values.update(workspace=str(project), env_file="")
+    app = create_app(settings)
+    with TestClient(app) as client:
+        headers = {"X-Local-Token": client.get("/api/bootstrap").json()["token"]}
+        created = client.post("/api/sessions", json={}, headers=headers).json()
+        manager = app.state.manager
+        session = manager.get(created["id"])
+
+        def opened(path):
+            return client.get("/api/file", params={"path": path, "session_id": created["id"]}, headers=headers)
+
+        assert opened("template/pipeline.json").status_code == 400  # Nothing done yet: not found.
+        session["events"] += [
+            {"id": "1", "type": "tool", "name": "read_file", "input": {"path": str(project / "notes" / "pipeline.json")}},
+            {"id": "2", "type": "tool", "name": "run_command", "input": {"command": f"cd {repository / 'config'} && ls"}},
+        ]
+        manager.store.save(session)
+        # The folder the command ran in, then its parent: the repository's own template folder.
+        found = opened("template/pipeline.json")
+        assert found.status_code == 200, found.json()
+        assert found.json()["path"] == "repos/pipeline/template/pipeline.json" and found.json()["content"] == "{}\n"
+        assert opened("pipeline.json").json()["path"] == "notes/pipeline.json"
+        assert opened("../pipeline/template/pipeline.json").status_code == 400  # Never outside a named folder.
+        assert opened("missing.json").json()["detail"].startswith("missing.json does not exist")
+
+
+def test_chat_folders_reads_commands_tools_and_instruction_folders_most_recent_first(tmp_path):
+    from local_agent.api import chat_folders
+    root = tmp_path / "project"
+    session = {"instruction_directories": ["docs", "a/b"], "events": [
+        {"type": "tool", "name": "read_file", "input": {"path": "a/b/c.py"}},
+        {"type": "tool", "name": "list_files", "input": {"path": "lib/sub"}},
+        {"type": "tool", "name": "run_command", "input": {"command": 'cd "x y/z"; make', "cwd": "w"}},
+        {"type": "tool", "name": "access_directory", "input": {"path": "granted"}},
+        {"type": "tool", "name": "run_command", "input": {"command": f"cd '{tmp_path}/elsewhere' && ls"}},  # Outside.
+        {"type": "tool", "name": "run_command", "input": {"command": "echo cd later && ls"}},  # Not leading.
+        {"type": "tool", "name": "read_file", "input": {"path": f"{root}/top.md"}},  # The project root.
+        {"type": "user", "text": "cd nowhere && ls"},
+    ]}
+    # A relative cd starts from the command's cwd; instruction folders come newest first.
+    assert chat_folders(session, root) == ["granted", "w/x y/z", "w", "lib/sub", "a/b", "docs", "w/x y", "lib", "a"]
+    # Only the latest events are read.
+    session["events"] = [{"type": "tool", "name": "read_file", "input": {"path": "old/f.py"}}] + [
+        {"type": "user", "text": "x"}] * 2000
+    assert chat_folders(session, root) == ["a/b", "docs", "a"]

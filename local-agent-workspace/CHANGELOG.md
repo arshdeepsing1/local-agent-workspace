@@ -4,6 +4,67 @@ Notable changes to Local Agent Workspace, newest first. Dates are UTC.
 
 ## Unreleased
 
+Context accounting, file links and handoffs (2026-10-20):
+
+- The context meter no longer counts Databricks' cached tokens twice. On Claude endpoints
+  `prompt_tokens` already includes `cache_read_input_tokens` and `cache_creation_input_tokens`
+  (seen on every cached request of a long real chat; `total_tokens` is `prompt_tokens` plus
+  `completion_tokens`), and the app added them on top: a chat at about 85% of its input budget
+  showed over 170%, before its first compaction. Reports were also left out of the estimate scale
+  as "counted twice", and DBU estimates billed cached tokens a second time. The cache counts are
+  now subtracted from `prompt_tokens` when `total_tokens` is `prompt_tokens` plus
+  `completion_tokens`; saved chats are repaired when they load (their usage records, the meter's
+  **Last request** and the spend their ended subagents' index entries recorded), as is the file
+  `scripts/usage_report.py` reads, and the usage across chats is counted again. The offline
+  simulator reports usage in the same shape, and the endpoint check's "prompt_tokens with a cache
+  read" row reads **Includes cached tokens** against it.
+- The open context details start with a usage card like Claude's context panel: **N% used**, the
+  tokens used of the context budget, a bar split by what the request holds with the auto-compact
+  mark, and a legend with tokens and share: messages and tool results, conversation summary,
+  system instructions, instruction files and memory, built-in tools, MCP tools, request overhead,
+  **Free space**, **Autocompact buffer** and **Reserved for the reply**. A model window larger than
+  the budget is named. Warnings and **Compact now** follow; the explanations sit under a collapsed
+  **Details**. **Workspace → Progress** shows the same legend.
+- A file a reply names relative to where the chat worked opens: the Workspace panel also looks
+  under the folders the chat's commands ran in (`cwd` or a leading `cd`), the folders its tools named
+  or read files from, its instruction folders and their parents, newest first. Before, a
+  `template/pipeline.json` named after commands ran in a repository below the project said it did
+  not exist.
+- `/handoff` in a compacted chat reads the handoffs the app saved at each compaction (oldest first,
+  only their state sections) and carries their facts in, so the handoff covers the chat from its
+  start. The summary says when older compaction handoffs exist than the five it lists.
+- A chat is one file again: its "Allow for this chat" rules, queued messages, pending `!` output,
+  instruction paths and file-read records are field records of `<id>.jsonl` instead of a separate
+  `<id>.state.json`. A chat saved with a `.state.json` opens as before, and its next save folds the
+  file in and removes it. App versions old enough to reject these field records cannot open a chat
+  saved since.
+- New shipped skill **`/read-handoff`**: reads a handoff's Contents or headings, then only the
+  sections that carry state, skipping command and activity logs, runbooks and resource lists.
+
+Claude and VS Code themes (2026-10-20):
+
+- A new palette after Claude's apps: an ivory page and a slightly darker sidebar, white cards,
+  dialogs and message box, soft warm gray fills (your messages, hovered rows, code), translucent
+  warm borders, and a clay accent for the send button, the logo and links. Primary buttons (Save,
+  Keep, Allow) are near-black with ivory text; secondary buttons are white with a border; filter
+  pills such as **Tags (1)** and **Running** are tinted rather than filled. The message box is a white
+  rounded card whose border and shadow deepen while you type, and the send button stays a faded clay
+  square while the box is empty.
+- **Settings → Appearance → Theme**: **Light** (the default), **Dark** (Claude's dark colours) or
+  **Match system** (your computer's light or dark mode). It applies at once and is kept in this
+  browser only, like Text size; the page applies it before it is drawn, so a dark page never
+  flashes light, and native controls and scrollbars follow it.
+- **Settings → Appearance → Style**: **Claude** (the default) or **VS Code**, with VS Code's Light
+  Modern and Dark Modern colours, its system UI and editor fonts, small corner radii, flat surfaces,
+  blue primary buttons and a blue focus border on the message box. Any style goes with any theme
+  (Match system included), kept in this browser like Theme.
+- Every colour comes from one set of named tokens (surfaces, text, borders, accent, status, code,
+  chart and context-usage colours) with values for each style and theme. Text keeps at least 4.5:1
+  contrast in all four, icons, focus rings and form-field borders 3:1; keyboard focus shows a blue
+  ring. Cards waiting for you are tinted clearly apart from errors and warnings, and transparent
+  images keep a light backing in dark.
+- The app icon, tab icon and browser theme colour use the new clay and ivory.
+
 Workflow and progress view (2026-10-19):
 
 - Consecutive read-only steps fold into one line in the chat, such as **Ran 3 commands, read 2

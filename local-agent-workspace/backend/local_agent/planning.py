@@ -245,7 +245,39 @@ def index_entry(child, task):
         entry["estimated_dbu"], entry["unpriced_calls"] = own_spend(child)
         entry["usage"] = usage_counts(child["inference_calls"])
         entry["turn_spend"] = turn_spend(child["inference_calls"])
+        entry["usage_version"] = INDEX_USAGE_VERSION
     return entry
+
+
+# 2: counted from ledgers whose input no longer counts Databricks' cache twice (telemetry.repair_counted_cache).
+INDEX_USAGE_VERSION = 2
+
+
+def repair_index_usage(parent, read_child):
+    """Count the spend of the parent's ended subagents again from their ledgers (read_child(id): the child chat,
+    repaired as it loads, or None) when their index entries were counted before INDEX_USAGE_VERSION. A turn_spend
+    keeps the calls it counted (those of the delegated run). True when an entry changed; never raises."""
+    from .turns import turn_calls, turn_spend  # turns.py imports this module.
+    changed = False
+    for entry in parent.get("subagents") or ():
+        try:
+            if (not isinstance(entry, dict) or entry.get("usage_version") == INDEX_USAGE_VERSION
+                    or entry.get("status") == "running" or entry.get("deleted") or not isinstance(entry.get("usage"), dict)):
+                continue
+            child = read_child(entry.get("id"))
+            calls = child.get("inference_calls") if isinstance(child, dict) else None
+            if not isinstance(calls, list):
+                continue
+            entry["estimated_dbu"], entry["unpriced_calls"] = own_spend(child)
+            entry["usage"] = usage_counts(calls)
+            counted = (entry.get("turn_spend") or {}).get("finished_calls")
+            if type(counted) is int:
+                entry["turn_spend"] = turn_spend(turn_calls(calls)[:counted])
+            entry["usage_version"] = INDEX_USAGE_VERSION
+            changed = True
+        except Exception:
+            continue
+    return changed
 
 
 def subagent_index(sessions):

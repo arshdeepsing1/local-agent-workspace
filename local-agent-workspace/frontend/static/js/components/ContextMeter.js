@@ -117,6 +117,90 @@ export function meterReading(info, model) {
   return { legacyEstimate, reportedIsCurrent, setupChanged, estimated, value, mark: info.auto_compact_percent, label, ariaValueText, report }
 }
 
+// Tokens as Claude shows them: 950, 12.3k, 1.2M.
+export function shortTokens(value) {
+  if (!Number.isFinite(value)) return '—'
+  const tokens = Math.round(value)
+  // Rounded first, so 999.6 reads 1.0k and 999,960 reads 1M.
+  const unit = (size, digits) => (tokens / size).toFixed(digits).replace(/\.0$/, digits && size > 1000 ? '' : '.0')
+  if (tokens < 1000) return String(tokens)
+  if (tokens < 99_950) return `${unit(1000, 1)}k`
+  if (tokens < 999_500) return `${unit(1000, 0)}k`
+  return `${unit(1_000_000, 1)}M`
+}
+
+const shareOf = (part, whole) => {
+  const percent = part / whole * 100
+  return `${percent > 0 && percent < 0.1 ? '<0.1' : percent.toFixed(1)}%`
+}
+
+// Where a chat's context window goes, like Claude's context panel: what the request holds (the app's breakdown,
+// scaled to the count Databricks reported when that report is current), then the free space up to the auto-compact
+// threshold, the buffer between it and the input budget, and what is kept for the reply and safety. The parts add up
+// to the context budget. Returns null without a breakdown (an older or byte-counted meter).
+export function contextUsage(info, reading) {
+  const breakdown = info.breakdown
+  if (!breakdown || reading.legacyEstimate || !(info.context_window > 0)) return null
+  const reported = reading.reportedIsCurrent ? reading.report.input_tokens : null
+  const used = reported ?? (reading.setupChanged ? info.next_estimate.tokens : info.estimated_tokens)
+  const estimated = Object.values(breakdown).reduce((sum, value) => sum + (value > 0 ? value : 0), 0)
+  const factor = estimated > 0 ? used / estimated : 0
+  // Instruction files, memory, custom instructions and skills are part of the system message (a skill the latest
+  // message selected counts in messages). Their costs are text-size estimates: scaled like the breakdown.
+  const scale = info.estimate_scale > 0 ? info.estimate_scale : 1
+  const loaded = (info.instruction_sources ?? []).filter(source => source.status !== 'omitted' && source.scope !== 'this message')
+  const instructions = Math.min(breakdown.system_instructions, Math.round(loaded.reduce((sum, source) => sum + (source.estimated_tokens || 0), 0) * scale))
+  const groups = Object.entries(info.tool_groups ?? {})
+  const builtIn = groups.length ? groups.filter(([name]) => name === 'Built-in tools').reduce((sum, [, tokens]) => sum + tokens, 0) : breakdown.tool_definitions
+  const parts = [
+    { key: 'messages', label: 'Messages and tool results', tokens: breakdown.messages_and_results },
+    { key: 'summary', label: 'Conversation summary', tokens: breakdown.summary },
+    { key: 'system', label: 'System instructions', tokens: breakdown.system_instructions - instructions },
+    { key: 'instructions', label: 'Instruction files and memory', tokens: instructions, items: loaded.length },
+    { key: 'tools', label: groups.some(([name]) => name !== 'Built-in tools') ? 'Built-in tools' : 'Tool definitions', tokens: builtIn },
+    { key: 'mcp', label: 'MCP tools', tokens: breakdown.tool_definitions - builtIn, items: groups.filter(([name]) => name !== 'Built-in tools').length },
+    { key: 'overhead', label: 'Request overhead', tokens: breakdown.request_overhead },
+  ].map(part => ({ ...part, tokens: Math.max(0, Math.round(part.tokens * factor)) })).filter(part => part.tokens > 0)
+  const window = info.context_window
+  const threshold = Math.min(info.auto_compact_threshold ?? info.input_budget, info.input_budget)
+  const room = [
+    { key: 'free', label: 'Free space', tokens: Math.max(0, threshold - used) },
+    { key: 'buffer', label: 'Autocompact buffer', tokens: Math.max(0, info.input_budget - Math.max(used, threshold)) },
+    { key: 'reserved', label: 'Reserved for the reply', tokens: Math.max(0, window - Math.max(used, info.input_budget)) },
+  ]
+  return { used, window, reported: reported !== null, parts, room, percent: used / window * 100,
+    budgetPercent: reading.reportedIsCurrent ? reading.report.percent_of_input_budget : reading.estimated,
+    mark: typeof info.auto_compact_threshold === 'number' ? info.auto_compact_threshold / window * 100 : null,
+    modelWindow: reading.reportedIsCurrent ? reading.report.model_window : null }
+}
+
+// The usage card at the top of the context details (and, without the bar, in Workspace → Progress).
+export function ContextUsage({ usage, autoCompact, bar = true }) {
+  if (!usage) return null
+  const { used, window, parts, room, percent, mark } = usage
+  const rows = [...parts, ...room.filter(part => part.key === 'free' || part.tokens > 0)]
+  const described = parts.map(part => `${part.label} ${shortTokens(part.tokens)}`).join(', ')
+  return html`<section class="context-usage" aria-label="Context usage">
+    <div class="context-usage-head">
+      <strong>${percent >= 10 ? Math.round(percent) : percent.toFixed(1)}% used</strong>
+      <span>${usage.reported ? '' : '~'}${shortTokens(used)} / ${shortTokens(window)}</span>
+    </div>
+    ${bar ? html`<div class="context-stack" role="img" aria-label=${`${shortTokens(used)} of the ${shortTokens(window)}-token context budget used: ${described}`}>
+      ${parts.map(part => html`<span key=${part.key} class=${`context-part context-${part.key}`} style=${`width:${Math.min(100, part.tokens / window * 100)}%`} />`)}
+      ${typeof mark === 'number' && mark < 100 ? html`<span class="context-stack-mark" aria-hidden="true" style=${`left:${mark}%`} />` : null}
+    </div>` : null}
+    <ul class="context-legend">${rows.map(part => html`<li key=${part.key}>
+      <span class=${`context-swatch context-${part.key}`} aria-hidden="true" />
+      <span class="context-legend-name">${part.label}${part.items ? html` <span class="context-legend-count">· ${part.items}</span>` : null}</span>
+      <span class="context-legend-tokens">${shortTokens(part.tokens)}</span>
+      <span class="context-legend-share">${shareOf(part.tokens, window)}</span>
+    </li>`)}</ul>
+    <p class="context-usage-note">${usage.reported ? 'Reported by Databricks for the last request' : 'Estimated by the app'}${typeof usage.budgetPercent === 'number'
+      ? ` · ${usage.budgetPercent}% of the input budget` : ''}${autoCompact ? ` · compacts at ${autoCompact}%` : ''}${usage.reported ? '; parts are the app\'s estimate' : ''}.${typeof usage.modelWindow === 'number' && usage.modelWindow > window
+      ? ` The model's window is ${shortTokens(usage.modelWindow)}; this chat uses a ${shortTokens(window)} context budget (Settings).` : ''}</p>
+  </section>`
+}
+
 // The instruction files and skills a chat's requests load, with their costs (the details' Loaded instructions).
 // note: false leaves out the line on how the costs are counted (it refers to the details' breakdown).
 export function LoadedInstructions({ info, note = true }) {
@@ -131,6 +215,9 @@ export function LoadedInstructions({ info, note = true }) {
 
 // The meter's text before a chat's first turn (Workspace → Progress shows it too).
 export const CONTEXT_EMPTY = 'Context usage is estimated after the first turn.'
+
+// Whether the details' Details section is open: kept while the page is open, for every chat's meter.
+let moreOpen = false
 
 // openSignal: a number that /context increases to open the details (a change after mounting only).
 export default function ContextMeter({ info, model, busy = false, status, onCompact, openSignal = 0 }) {
@@ -174,23 +261,26 @@ export default function ContextMeter({ info, model, busy = false, status, onComp
   const priorReplaced = reportedIsCurrent && typeof report.next_estimate_scale === 'number' && report.next_estimate_scale !== info.estimate_scale
   // Compact now has earlier turns to summarize (an older saved meter has no flag: allowed, as before).
   const compactable = info.compactable !== false
-  return html`<details class="context-meter" ref=${details} onToggle=${event => setOpen(event.currentTarget.open)}
-    onKeyDown=${event => {
-      if (event.key !== 'Escape' || event.isComposing || !details.current?.open) return
-      event.preventDefault()
-      details.current.open = false
-      details.current.querySelector('summary')?.focus()
-    }}>
-    <summary onClick=${() => setOpen(!details.current?.open)}>
-      <span>${label}</span>
-      ${!legacyEstimate ? html`<span class=${`context-bar${typeof mark === 'number' && value >= mark ? ' over' : ''}`}>${reportedIsCurrent
-        ? html`<progress aria-label="Reported model input usage" aria-valuetext=${ariaValueText} value=${Math.min(value, 100)} max=${100} />`
-        : html`<progress aria-label=${setupChanged ? 'Estimated next request input usage' : 'Estimated model input usage'} aria-valuetext=${ariaValueText} value=${Math.min(estimated, 100)} max=${100} />`}${typeof mark === 'number'
-        ? html`<span class="context-bar-mark" aria-hidden="true" style=${`left:${mark}%`} />` : null}</span>` : null}
-      ${info.compactions > 0 ? html`<span> · ${info.compactions} ${info.compactions === 1 ? 'compaction' : 'compactions'}</span>` : null}
-      ${info.warnings.length > 0 ? html`<span> · ${info.warnings.length} ${info.warnings.length === 1 ? 'warning' : 'warnings'}</span>` : null}
-    </summary>
-    <div class="context-details">
+  const usage = contextUsage(info, { legacyEstimate, reportedIsCurrent, setupChanged, estimated, report })
+  const warnings = info.warnings.length ? html`<p class="context-heading">Warnings</p><ul class="context-warnings">${info.warnings.map((warning, index) => html`<li key=${index}>${warning}</li>`)}</ul>` : null
+  const compactForm = onCompact ? html`<form class="context-compact" onSubmit=${event => {
+        event.preventDefault()
+        if (busy || submitting || !compactable) return
+        setSubmitting(true)
+        setError('')
+        void onCompact(note.trim()).catch(reason => setError(reason.message)).finally(() => setSubmitting(false))
+      }}>
+        <label>Preservation note (optional)<textarea value=${note} maxLength=${1000} disabled=${busy || submitting || !compactable}
+          onInput=${event => setNote(event.currentTarget.value)} placeholder="Decisions or details to preserve in the summary" /></label>
+        ${compactable ? html`<p>Summarizes earlier turns using your model and may add inference charges. Full history and the latest turn stay intact. Use Stop to cancel.</p>`
+          : html`<p id="context-compact-unavailable">${info.compactions > 0
+            ? 'Nothing to compact yet: earlier turns are already summarized and the latest turn is kept whole. Compact now is available again after your next message.'
+            : 'Nothing to compact yet: this conversation has one turn, and the latest turn is kept whole. Compact now is available after your next message.'}</p>`}
+        <button type="submit" class="outline" disabled=${busy || submitting || !compactable}
+          aria-describedby=${compactable ? undefined : 'context-compact-unavailable'}>${submitting ? 'Starting compaction…' : 'Compact now'}</button>
+        ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
+      </form>` : null
+  const explanation = html`
       ${report && typeof report.input_tokens === 'number' ? html`<${ReportedInput} report=${report} current=${reportedIsCurrent} heading=${reportHeading} />
         <p class="context-heading">App estimate</p>` : null}
       ${legacyEstimate ? html`<p>The saved meter counted bytes as tokens and can overstate context use. It will refresh on the next model request.</p>` : html`
@@ -223,25 +313,27 @@ export default function ContextMeter({ info, model, busy = false, status, onComp
       <p>Compactions: ${info.compactions}. Messages summarized: ${info.summarized_messages}.</p>
       ${Number.isInteger(info.payload_bytes) ? html`<p>Request size: ${requestSize(info.payload_bytes)} of Databricks' ${(info.payload_limit_bytes ?? 4_000_000) / 1e6} MB limit.</p>` : null}
       <p class="context-heading">Loaded instructions</p>
-      <${LoadedInstructions} info=${info} />
-      ${info.warnings.length ? html`<p class="context-heading">Warnings</p><ul class="context-warnings">${info.warnings.map((warning, index) => html`<li key=${index}>${warning}</li>`)}</ul>` : null}
-      ${onCompact ? html`<form class="context-compact" onSubmit=${event => {
-        event.preventDefault()
-        if (busy || submitting || !compactable) return
-        setSubmitting(true)
-        setError('')
-        void onCompact(note.trim()).catch(reason => setError(reason.message)).finally(() => setSubmitting(false))
-      }}>
-        <label>Preservation note (optional)<textarea value=${note} maxLength=${1000} disabled=${busy || submitting || !compactable}
-          onInput=${event => setNote(event.currentTarget.value)} placeholder="Decisions or details to preserve in the summary" /></label>
-        ${compactable ? html`<p>Summarizes earlier turns using your model and may add inference charges. Full history and the latest turn stay intact. Use Stop to cancel.</p>`
-          : html`<p id="context-compact-unavailable">${info.compactions > 0
-            ? 'Nothing to compact yet: earlier turns are already summarized and the latest turn is kept whole. Compact now is available again after your next message.'
-            : 'Nothing to compact yet: this conversation has one turn, and the latest turn is kept whole. Compact now is available after your next message.'}</p>`}
-        <button type="submit" class="outline" disabled=${busy || submitting || !compactable}
-          aria-describedby=${compactable ? undefined : 'context-compact-unavailable'}>${submitting ? 'Starting compaction…' : 'Compact now'}</button>
-        ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
-      </form>` : null}
+      <${LoadedInstructions} info=${info} />`
+  return html`<details class="context-meter" ref=${details} onToggle=${event => setOpen(event.currentTarget.open)}
+    onKeyDown=${event => {
+      if (event.key !== 'Escape' || event.isComposing || !details.current?.open) return
+      event.preventDefault()
+      details.current.open = false
+      details.current.querySelector('summary')?.focus()
+    }}>
+    <summary onClick=${() => setOpen(!details.current?.open)}>
+      <span>${label}</span>
+      ${!legacyEstimate ? html`<span class=${`context-bar${typeof mark === 'number' && value >= mark ? ' over' : ''}`}>${reportedIsCurrent
+        ? html`<progress aria-label="Reported model input usage" aria-valuetext=${ariaValueText} value=${Math.min(value, 100)} max=${100} />`
+        : html`<progress aria-label=${setupChanged ? 'Estimated next request input usage' : 'Estimated model input usage'} aria-valuetext=${ariaValueText} value=${Math.min(estimated, 100)} max=${100} />`}${typeof mark === 'number'
+        ? html`<span class="context-bar-mark" aria-hidden="true" style=${`left:${mark}%`} />` : null}</span>` : null}
+      ${info.compactions > 0 ? html`<span> · ${info.compactions} ${info.compactions === 1 ? 'compaction' : 'compactions'}</span>` : null}
+      ${info.warnings.length > 0 ? html`<span> · ${info.warnings.length} ${info.warnings.length === 1 ? 'warning' : 'warnings'}</span>` : null}
+    </summary>
+    <div class="context-details">
+      <${ContextUsage} usage=${usage} autoCompact=${info.auto_compact_percent} />
+      ${usage ? html`${warnings}${compactForm}<details class="context-more" open=${moreOpen} onToggle=${event => { moreOpen = event.currentTarget.open }}>
+        <summary>Details</summary>${explanation}</details>` : html`${explanation}${warnings}${compactForm}`}
     </div>
   </details>`
 }

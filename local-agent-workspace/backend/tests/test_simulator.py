@@ -194,8 +194,9 @@ def test_a_second_request_reads_the_first_ones_marked_prefix(gateway):
     changed["messages"][0]["content"][1]["text"] = "\nDate: tomorrow"
     tail = usage_of(gateway, changed)
     assert 0 < tail["cache_read_input_tokens"] < first["cache_creation_input_tokens"]
-    assert tail["total_tokens"] == (tail["prompt_tokens"] + tail["cache_read_input_tokens"]
-                                    + tail["cache_creation_input_tokens"] + tail["completion_tokens"])
+    # As on the real route: prompt_tokens is the whole input, the cache counts are parts of it.
+    assert tail["total_tokens"] == tail["prompt_tokens"] + tail["completion_tokens"]
+    assert tail["prompt_tokens"] >= tail["cache_read_input_tokens"] + tail["cache_creation_input_tokens"]
     # Another endpoint has its own cache, and an unmarked request uses none.
     assert usage_of(gateway, cached_request(), "databricks-claude-opus-4-8")["cache_read_input_tokens"] == 0
     plain = usage_of(gateway, {"messages": [{"role": "user", "content": "hello"}], "stream": True})
