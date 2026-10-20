@@ -36,7 +36,7 @@ Context accounting, file links and handoffs (2026-10-20):
 - New shipped skill **`/read-handoff`**: reads a handoff's Contents or headings, then only the
   sections that carry state, skipping command and activity logs, runbooks and resource lists.
 
-Claude-like theme (2026-10-20):
+Claude and VS Code themes (2026-10-20):
 
 - A new palette after Claude's apps: an ivory page and a slightly darker sidebar, white cards,
   dialogs and message box, soft warm gray fills (your messages, hovered rows, code), translucent
@@ -49,9 +49,15 @@ Claude-like theme (2026-10-20):
   **Match system** (your computer's light or dark mode). It applies at once and is kept in this
   browser only, like Text size; the page applies it before it is drawn, so a dark page never
   flashes light, and native controls and scrollbars follow it.
-- Every colour comes from one set of named tokens (surfaces, text, borders, accent, status, code
-  and chart colours) with light and dark values. Text keeps at least 4.5:1 contrast in both themes,
-  icons, focus rings and form-field borders 3:1; keyboard focus shows a blue ring.
+- **Settings → Appearance → Style**: **Claude** (the default) or **VS Code**, with VS Code's Light
+  Modern and Dark Modern colours, its system UI and editor fonts, small corner radii, flat surfaces,
+  blue primary buttons and a blue focus border on the message box. Any style goes with any theme
+  (Match system included), kept in this browser like Theme.
+- Every colour comes from one set of named tokens (surfaces, text, borders, accent, status, code,
+  chart and context-usage colours) with values for each style and theme. Text keeps at least 4.5:1
+  contrast in all four, icons, focus rings and form-field borders 3:1; keyboard focus shows a blue
+  ring. Cards waiting for you are tinted clearly apart from errors and warnings, and transparent
+  images keep a light backing in dark.
 - The app icon, tab icon and browser theme colour use the new clay and ivory.
 
 Workflow and progress view (2026-10-19):

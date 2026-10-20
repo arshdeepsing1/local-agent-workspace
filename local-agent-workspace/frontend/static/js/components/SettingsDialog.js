@@ -6,7 +6,7 @@ import { levelLabel, useReasoningPreview } from './EffortPicker.js'
 import EndpointChecksDialog, { testResultText } from './EndpointChecksDialog.js'
 import ProjectTrustDialog, { LAYER_FILES, layerValue } from './ProjectTrustDialog.js'
 import { TEXT_SIZES, applyTextSize, textSize } from '../textSize.js'
-import { THEMES, applyTheme, theme } from '../theme.js'
+import { STYLES, THEMES, applyStyle, applyTheme, style as appStyle, theme } from '../theme.js'
 import { groupToolCalls, setGroupToolCalls } from '../viewPrefs.js'
 
 const LIMIT_LEVELS = { error: 'form-error', warning: 'settings-note', note: 'field-help' }
@@ -132,7 +132,9 @@ export default function SettingsDialog({ settings, connection, onSave, onClose, 
   const contextInput = useRef(null)
   const [saving, setSaving] = useState(false)
   const [scale, setScale] = useState(textSize)
-  const [themeChoice, setThemeChoice] = useState(theme)
+  // What the page shows now (storage may be blocked, so a choice made earlier on this page is not stored).
+  const [themeChoice, setThemeChoice] = useState(() => document.documentElement.dataset.theme || theme())
+  const [styleChoice, setStyleChoice] = useState(() => document.documentElement.dataset.style || appStyle())
   const [grouping, setGrouping] = useState(groupToolCalls)
   const [error, setError] = useState('')
   // The variable names as typed; the form holds them as a list.
@@ -517,6 +519,10 @@ export default function SettingsDialog({ settings, connection, onSave, onClose, 
         ${searchStatus ? html`<p class=${searchStatus.ready ? 'field-help' : 'settings-note'} role="status">${searchStatus.ready ? `${searchStatus.provider} is ready.` : searchStatus.problem}</p>` : null}
         <p class="field-help">With a provider, the agent gets a web_search tool. Each query goes to that provider, which may charge for it and sees what is searched; check your organization's rules first. The first search in each chat shows its query for your approval.</p>`)}
         ${group('appearance', html`
+        <label>Style<select value=${styleChoice} onChange=${e => setStyleChoice(applyStyle(e.currentTarget.value))}>
+          ${STYLES.map(([value, label]) => html`<option key=${value} value=${value}>${label}</option>`)}
+        </select></label>
+        <p class="field-help">The Claude style has warm ivory, clay and rounded cards; the VS Code style has the editor's default colours, fonts and square corners. Either comes in light and dark (Theme below). In this browser only (not saved with Settings).</p>
         <label>Theme<select value=${themeChoice} onChange=${e => setThemeChoice(applyTheme(e.currentTarget.value))}>
           ${THEMES.map(([value, label]) => html`<option key=${value} value=${value}>${label}</option>`)}
         </select></label>
