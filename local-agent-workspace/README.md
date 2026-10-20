@@ -3977,10 +3977,12 @@ packages.
 When a background job that the agent started completes, fails, or times out, its
 conversation gets a notice, also when the chat is idle, and the agent's next model
 request names the job once, unless a `wait_job` or `get_job_output` result already
-showed that it ended. The notice also carries how the job ended (its `job_state` and
-`exit_code`), which the page reads to show the outcome on the command's card. Nothing
-wakes an idle chat. Jobs started from the
-Terminal panel, and stopped or cancelled jobs, get no notice.
+showed that it ended. A job that was stopped (**Stop job** in Terminal or **Workspace /
+Progress**, the agent's `stop_job`, or the app's shutdown) or that a restart interrupted gets
+a notice too, but no model request names it. The notice also carries how the job ended (its
+`job_state` and `exit_code`), which the page reads to show the outcome on the command's card;
+notices themselves are never sent to the model. Nothing wakes an idle chat. Jobs started from the Terminal panel get no notice, nor do
+the jobs that deleting a chat stops.
 Automatic compaction adds bounded summary requests beyond the configured agent steps.
 Databricks inference is billed to your workspace. Endpoints must support streaming,
 function calling, and non-streamed text responses for summarization.
