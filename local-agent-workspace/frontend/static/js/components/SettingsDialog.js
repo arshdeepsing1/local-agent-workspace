@@ -6,6 +6,7 @@ import { levelLabel, useReasoningPreview } from './EffortPicker.js'
 import EndpointChecksDialog, { testResultText } from './EndpointChecksDialog.js'
 import ProjectTrustDialog, { LAYER_FILES, layerValue } from './ProjectTrustDialog.js'
 import { TEXT_SIZES, applyTextSize, textSize } from '../textSize.js'
+import { THEMES, applyTheme, theme } from '../theme.js'
 import { groupToolCalls, setGroupToolCalls } from '../viewPrefs.js'
 
 const LIMIT_LEVELS = { error: 'form-error', warning: 'settings-note', note: 'field-help' }
@@ -131,6 +132,7 @@ export default function SettingsDialog({ settings, connection, onSave, onClose, 
   const contextInput = useRef(null)
   const [saving, setSaving] = useState(false)
   const [scale, setScale] = useState(textSize)
+  const [themeChoice, setThemeChoice] = useState(theme)
   const [grouping, setGrouping] = useState(groupToolCalls)
   const [error, setError] = useState('')
   // The variable names as typed; the form holds them as a list.
@@ -515,6 +517,10 @@ export default function SettingsDialog({ settings, connection, onSave, onClose, 
         ${searchStatus ? html`<p class=${searchStatus.ready ? 'field-help' : 'settings-note'} role="status">${searchStatus.ready ? `${searchStatus.provider} is ready.` : searchStatus.problem}</p>` : null}
         <p class="field-help">With a provider, the agent gets a web_search tool. Each query goes to that provider, which may charge for it and sees what is searched; check your organization's rules first. The first search in each chat shows its query for your approval.</p>`)}
         ${group('appearance', html`
+        <label>Theme<select value=${themeChoice} onChange=${e => setThemeChoice(applyTheme(e.currentTarget.value))}>
+          ${THEMES.map(([value, label]) => html`<option key=${value} value=${value}>${label}</option>`)}
+        </select></label>
+        <p class="field-help">Light or dark colours, or Match system to follow your computer's light or dark mode. In this browser only (not saved with Settings).</p>
         <label>Text size<select value=${String(scale)} onChange=${e => setScale(applyTextSize(Number(e.currentTarget.value)))}>
           ${TEXT_SIZES.map(size => html`<option value=${String(size)}>${size === 100 ? '100% (default)' : `${size}%`}</option>`)}
         </select></label>

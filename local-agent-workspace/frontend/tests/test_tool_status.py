@@ -504,7 +504,7 @@ def test_a_running_command_shows_its_time_against_its_limit_and_its_latest_line(
     expect(card.locator(".spin")).to_be_visible()
     live = card.locator(".tool-live")
     expect(live).to_have_text("step 2 of 9")
-    expect(live).to_have_css("color", "rgb(102, 100, 92)")  # --muted
+    expect(live).to_have_css("color", "rgb(101, 100, 94)")  # --muted
     # The accessible name does not change every second.
     expect(card.locator(".tool-heading")).to_have_accessible_name("run command python poll.py")
     card.locator(".tool-heading").click()

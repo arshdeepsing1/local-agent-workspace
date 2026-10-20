@@ -85,7 +85,20 @@ window.visual = (() => {
     .filter(el => ownText(el) && visible(el) && !el.closest('svg, .sr-only'))
     .filter(el => sizeOf(el) < minimum)
     .map(el => `${el.tagName.toLowerCase()}.${[...el.classList].join('.')} "${el.textContent.trim().slice(0, 30)}" ${sizeOf(el)}px`)
-  return { ratio, failures, iconFailures, smallText, background, parse }
+  // A CSS colour (such as 'var(--ink)') as the browser computes it, and the contrast of one over another.
+  const resolve = value => {
+    const probe = document.createElement('i')
+    probe.style.color = value
+    document.documentElement.append(probe)
+    const colour = getComputedStyle(probe).color
+    probe.remove()
+    return colour
+  }
+  const pair = (fg, bg) => {
+    const base = over(parse(resolve(bg)), [255, 255, 255, 1])
+    return Math.round(ratioOf(over(parse(resolve(fg)), base), base) * 100) / 100
+  }
+  return { ratio, failures, iconFailures, smallText, background, parse, resolve, pair }
 })()
 """
 
@@ -209,7 +222,7 @@ def test_the_workspace_review_and_its_active_tab_are_readable(ui, page):
     assert_readable(page, ".diff-review .line-number", ".diff-review .diff-line.hunk", ".workspace-tabs .active", ".review-bar .primary")
     assert failures(page, ".workspace-panel") == []
     page.locator(".workspace-tabs .active").hover()
-    expect(page.locator(".workspace-tabs .active")).to_have_css("background-color", "rgb(232, 229, 222)")
+    expect(page.locator(".workspace-tabs .active")).to_have_css("background-color", SURFACE_2)
     assert ratio(page, ".workspace-tabs .active") >= 4.5
     page.get_by_role("button", name="Changes", exact=True).click()
     # The Git file list (Mutations: .git-letter #8b6f2e, or .git-letter.deleted #a95640 on a hovered row).
@@ -218,7 +231,7 @@ def test_the_workspace_review_and_its_active_tab_are_readable(ui, page):
     assert failures(page, ".workspace-panel") == []
     deleted_row = page.get_by_role("button", name=re.compile("old.py")).first
     deleted_row.hover()
-    expect(deleted_row).to_have_css("background-color", "rgb(232, 229, 222)")
+    expect(deleted_row).to_have_css("background-color", SURFACE_2)
     assert ratio(page, ".git-letter.deleted") >= 4.5
     page.get_by_role("button", name=re.compile("app.py")).first.click()
     expect(page.locator(".git-diff-lines .diff-line.hunk")).to_be_visible()
@@ -299,7 +312,7 @@ def test_the_sticky_plan_actions_are_readable(ui, page):
           " list.scrollTop += card.getBoundingClientRect().top - list.getBoundingClientRect().top; return true })()")
     actions = page.locator(".plan-actions")
     expect(actions).to_have_css("position", "sticky")
-    assert actions.evaluate("e => getComputedStyle(e).backgroundColor") == "rgb(250, 243, 233)"  # #faf3e9
+    assert actions.evaluate("e => getComputedStyle(e).backgroundColor") == ACCENT_SOFT
     assert_readable(page, ".plan-actions .primary", ".plan-actions .outline", ".plan-card h3")
     assert failures(page, ".plan-card") == []
 
@@ -335,9 +348,10 @@ def test_status_labels_badges_and_outcome_lines_are_readable(ui, page):
                     ".project-badge")
     assert failures(page) == []
     # Touch keeps :hover on a tapped button, so the hovered toggles stay readable too.
-    for hovered, text in ((toggle, ".changes-toggle .diff-stat .removed"), (other, ".project-group-toggle:has-text('other') .project-group-name")):
+    for hovered, text, fill in ((toggle, ".changes-toggle .diff-stat .removed", SURFACE_2),
+                                (other, ".project-group-toggle:has-text('other') .project-group-name", SURFACE_3)):
         hovered.hover()
-        expect(hovered).to_have_css("background-color", "rgb(232, 229, 222)")
+        expect(hovered).to_have_css("background-color", fill)
         assert ratio(page, text) >= 4.5, text
 
 
@@ -387,7 +401,10 @@ def test_message_action_icons_have_three_to_one(ui, page):
 
 # V2, V3: the message box shows focus, and every focusable element gets the same 2 px accent ring
 
-ACCENT = "rgb(180, 85, 45)"
+FOCUS = "rgb(44, 132, 219)"  # --focus
+SURFACE_2 = "rgb(240, 238, 230)"  # --surface-2: hovered buttons
+SURFACE_3 = "rgb(232, 230, 220)"  # --surface-3: hovered sidebar rows
+ACCENT_SOFT = "rgb(246, 232, 224)"  # --accent-soft: cards waiting for you
 
 
 def keyboard_focus(page, locator):
@@ -398,7 +415,8 @@ def keyboard_focus(page, locator):
 
 
 def test_the_message_box_shows_keyboard_focus(ui, page):
-    # V-T4. Mutation: delete the .app-shell .composer:focus-within rule.
+    # V-T4. Mutation: delete the .app-shell .composer:focus-within rule. Focused, the card's subtle border turns to
+    # --border-strong (3:1 against the page) with a 1 px ring of the same colour, as in Claude's message box.
     start_chat(ui, page)
     composer = page.locator(".composer").first
     textbox = page.get_by_role("textbox", name="Message")
@@ -406,8 +424,9 @@ def test_the_message_box_shows_keyboard_focus(ui, page):
     blurred = composer.evaluate("e => [getComputedStyle(e).borderTopColor, getComputedStyle(e).boxShadow]")
     keyboard_focus(page, textbox)
     focused = composer.evaluate("e => [getComputedStyle(e).borderTopColor, getComputedStyle(e).boxShadow]")
-    assert focused[0] != blurred[0] and focused[0] == ACCENT, (blurred, focused)
-    assert ACCENT in focused[1], focused
+    assert focused[0] != blurred[0] and focused[0] == page.evaluate("visual.resolve('var(--border-strong)')"), (blurred, focused)
+    assert focused[0] in focused[1], focused
+    assert page.evaluate("visual.pair('var(--border-strong)', 'var(--canvas)')") >= 3
 
 
 def outline(locator):
@@ -429,13 +448,13 @@ def test_one_focus_ring_for_summaries_links_scrollers_and_the_review(ui, page):
     for target in targets:
         expect(target).to_be_visible()
         keyboard_focus(page, target)
-        assert outline(target) == ["solid", "2px", ACCENT], target
+        assert outline(target) == ["solid", "2px", FOCUS], target
     page.get_by_role("button", name="Changes", exact=True).click()
     page.get_by_role("button", name=re.compile("app.py")).first.click()
     for target in [page.get_by_role("link", name="Open in VS Code"), page.locator(".git-diff-lines")]:
         expect(target).to_be_visible()
         keyboard_focus(page, target)
-        assert outline(target) == ["solid", "2px", ACCENT], target
+        assert outline(target) == ["solid", "2px", FOCUS], target
 
 
 # The ring's rectangle (outline-offset plus outline-width around the border box) against the padding box of the
@@ -464,7 +483,7 @@ def test_rings_inside_clipped_cards_and_the_permission_menu_show(ui, page):
     for target in targets:
         expect(target).to_be_visible()
         keyboard_focus(page, target)
-        assert outline(target) == ["solid", "2px", ACCENT], target
+        assert outline(target) == ["solid", "2px", FOCUS], target
         assert target.evaluate(RING_INSIDE_CLIP), target
     page.locator(".permission-trigger").focus()
     page.keyboard.press("Enter")
@@ -473,11 +492,11 @@ def test_rings_inside_clipped_cards_and_the_permission_menu_show(ui, page):
     item = page.locator(".permissions-menu :focus")
     expect(item).to_have_count(1)
     assert item.evaluate("e => e.matches(':focus-visible')")
-    assert outline(item) == ["solid", "2px", ACCENT]
+    assert outline(item) == ["solid", "2px", FOCUS]
     assert item.evaluate(RING_INSIDE_CLIP)
     for target in (page.locator(".permissions-menu>.add-rule"), page.locator(".never-asks>summary")):
         keyboard_focus(page, target)
-        assert outline(target) == ["solid", "2px", ACCENT], target
+        assert outline(target) == ["solid", "2px", FOCUS], target
 
 
 # V9: an 11 px type floor, 12 px for phone banners
