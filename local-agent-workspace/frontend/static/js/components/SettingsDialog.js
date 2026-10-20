@@ -6,6 +6,7 @@ import { levelLabel, useReasoningPreview } from './EffortPicker.js'
 import EndpointChecksDialog, { testResultText } from './EndpointChecksDialog.js'
 import ProjectTrustDialog, { LAYER_FILES, layerValue } from './ProjectTrustDialog.js'
 import { TEXT_SIZES, applyTextSize, textSize } from '../textSize.js'
+import { groupToolCalls, setGroupToolCalls } from '../viewPrefs.js'
 
 const LIMIT_LEVELS = { error: 'form-error', warning: 'settings-note', note: 'field-help' }
 const inRange = (value, low, high) => Number.isInteger(value) && value >= low && value <= high
@@ -130,6 +131,7 @@ export default function SettingsDialog({ settings, connection, onSave, onClose, 
   const contextInput = useRef(null)
   const [saving, setSaving] = useState(false)
   const [scale, setScale] = useState(textSize)
+  const [grouping, setGrouping] = useState(groupToolCalls)
   const [error, setError] = useState('')
   // The variable names as typed; the form holds them as a list.
   const [envText, setEnvText] = useState((settings.command_env || []).join(' '))
@@ -516,7 +518,10 @@ export default function SettingsDialog({ settings, connection, onSave, onClose, 
         <label>Text size<select value=${String(scale)} onChange=${e => setScale(applyTextSize(Number(e.currentTarget.value)))}>
           ${TEXT_SIZES.map(size => html`<option value=${String(size)}>${size === 100 ? '100% (default)' : `${size}%`}</option>`)}
         </select></label>
-        <p class="field-help">Changes the size of all text at once, in this browser only (not saved with Settings). Browser zoom (Ctrl or Cmd and +) enlarges the whole page instead.</p>`)}
+        <p class="field-help">Changes the size of all text at once, in this browser only (not saved with Settings). Browser zoom (Ctrl or Cmd and +) enlarges the whole page instead.</p>
+        <label class="settings-checkbox"><input type="checkbox" checked=${grouping}
+          onChange=${e => { setGroupToolCalls(e.currentTarget.checked); setGrouping(e.currentTarget.checked) }} />Group tool calls in the transcript</label>
+        <p class="field-help">Two or more finished read-only actions in a row (commands, file reads, searches, job checks, web lookups) fold under one line such as "Ran 3 commands"; click it to see them. Approvals, questions, running or failed actions and edits never fold. The subagents of a multi-agent run share one head that folds them (a run that ended before you opened the chat starts folded); one that waits for you, failed, was stopped or was not run stays shown. Turned off, every card shows on its own, without these lines and heads. In this browser only (not saved with Settings).</p>`)}
         ${group('notifications', html`
         <label class="settings-checkbox"><input type="checkbox" checked=${form.system_notifications === true}
           onChange=${e => field('system_notifications', e.currentTarget.checked)} />Desktop notification when no browser tab is open</label>

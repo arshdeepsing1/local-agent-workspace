@@ -822,6 +822,8 @@ def test_outcome_lines_name_the_rule_mode_or_block(ui, page):
         """{ id: 'declined', type: 'tool', name: 'run_command', state: 'rejected', approval: 'declined', edited: true, input: { command: 'ls' } }""",
         """{ id: 'cancelled', type: 'tool', name: 'run_command', state: 'cancelled', edited: true, input: { command: 'ls' } }""",
     ]) + "]")
+    # The five finished commands before the edited one fold under one line; their lines show once it is open.
+    page.get_by_role("button", name="Ran 5 commands ls", exact=True).click()
     for text in ("Allowed by a rule for this chat", "Allowed by a rule for this project · ran without a shell",
                  "Allowed by a rule for all projects", "Ran as a read-only command · ran without a shell",
                  "Approved when you switched to Accept edits", "Edited by you before approval",

@@ -618,3 +618,47 @@ def test_store_is_reachable(tmp_path):
     finally:
         store.db.close()
     assert _snapshot(tmp_path / "missing")["exists"] is False
+
+
+async def test_a_rewind_or_fork_keeps_the_end_notice_of_a_background_command_whose_card_it_keeps(runtime):
+    """Turn 1 starts a background command; in turn 2 it is stopped (the agent's stop_job, or Stop job in Terminal or
+    Progress while turn 2 runs), so its end notice lands in turn 2. A conversation rewind to turn 2's message (also
+    Edit message and Retry response) and a fork from there keep the command's card, and the job stays stopped in
+    Workspace -> Progress: like a background subagent's notice, the job's end notice stays too, or the card would read
+    'started in background' again (the page reads the outcome from it), and no second notice ever comes."""
+    app, manager, session, project = runtime
+    chat = Chat(manager, session, project)
+    chat.turn(1)
+    job = await manager.jobs.start(command="sleep 30", workspace=str(project), session_id=session["id"],
+                                   background=True, origin="agent")
+    chat.session["events"].append({"id": "card", "type": "tool", "name": "run_command", "job_id": job["id"],
+                                   "state": "completed", "created": time.time(),
+                                   "input": {"command": "sleep 30", "background": True},
+                                   "output": json.dumps(manager.first_page(job), indent=2)})
+    manager.store.save(chat.session)
+    chat.turn(2)
+    await manager.jobs.stop(job["id"])
+
+    def ended(events):
+        return [event.get("job_state") for event in events if event["type"] == "notice" and event.get("job_id") == job["id"]]
+
+    stopped = manager.store.get(session["id"])
+    assert ended(stopped["events"]) == ["cancelled"]
+    ids = [event["id"] for event in stopped["events"]]
+    assert ids.index("u2") < next(index for index, event in enumerate(stopped["events"]) if event["type"] == "notice")
+    async with await client_for(app) as client:
+        response = await client.post(f"/api/sessions/{session['id']}/fork", json={"before_event_id": "u2"})
+        assert response.status_code == 201, response.text
+        fork = manager.store.get(response.json()["id"])
+        response = await client.post(f"/api/sessions/{session['id']}/rewind",
+                                     json={"before_event_id": "u2", "conversation": True})
+        assert response.status_code == 200, response.text
+    rewound = manager.store.get(session["id"])
+    assert [event["id"] for event in rewound["events"]][:3] == ["u1", "a1", "card"]  # The command's card is kept,
+    assert manager.jobs.get(job["id"])["state"] == "cancelled"  # Progress still lists the job as stopped,
+    assert ended(rewound["events"]) == ["cancelled"]  # and the card still reads so: the notice follows the kept reply.
+    assert rewound["events"][-1]["job_id"] == job["id"] and "u2" not in [event["id"] for event in rewound["events"]]
+    # The fork keeps the notice too; its card has no job_id (a bundle leaves it out), so the page and a later cut in
+    # the fork match the notice by the card's result (test_history_cut).
+    assert [event.get("job_id") for event in fork["events"] if event["type"] == "tool"] == [None]
+    assert ended(fork["events"]) == ["cancelled"]

@@ -97,3 +97,63 @@ def test_a_mouse_keeps_the_dense_desktop_sizes(ui, page):
     chip = page.locator(".sidebar .tag-chip").first
     expect(chip).to_be_visible()
     assert chip.bounding_box()["height"] <= 18
+
+
+JOB = json.dumps({"job_id": "0123456789abcdef", "state": "completed", "exit_code": 0, "output": "ok\n", "background": False})
+WAITS = {"event_id": "ev-1", "name": "run_command", "kind": "approval", "title": "npm test"}
+HEADS = [
+    {"id": "u", "type": "user", "text": "Check it and split the docs work"},
+    *({"id": f"c{n}", "type": "tool", "name": "run_command", "state": "completed", "input": {"command": f"make check-{n}"},
+       "output": JOB} for n in range(3)),
+    *({"id": f"d{n}", "type": "tool", "name": "delegate_task", "call_id": f"call-{n}", "input": {"task": f"Docs part {n}"},
+       "state": "running", "child_session_id": f"child-{n}", "delegation_batch": {"id": "b1", "index": n, "size": 2},
+       "delegation": {"status": "awaiting_approval", "pending": WAITS, "completed_tools": 1, "agent_type": "editor", "started": 1000.0}
+       if n else {"status": "running", "completed_tools": 3, "agent_type": "explore", "steps": 4, "max_steps": 10,
+                  "last_tool": "run_command", "last_tool_state": "running", "last_tool_subject": "npm test", "started": 1000.0}}
+      for n in range(2)),
+]
+
+
+def test_a_tool_groups_head_and_a_runs_head_are_touch_sized_on_a_phone(coarse_ui, coarse_page):
+    # The heads are buttons, so the coarse-pointer block sizes them like every other control.
+    ui, page = coarse_ui, coarse_page
+    ui.app(session="a", scenario="workspace", setup=f"""fake.sessions.set('a', {{ ...makeSession('a', 'Docs'), status: 'delegating',
+      events: {json.dumps(HEADS)} }})
+      fake.override = path => path.startsWith('/api/jobs') ? fake.json([]) : undefined""")
+    ui.show_session("a")
+    group = page.get_by_role("button", name="Ran 3 commands make check-2", exact=True)
+    run = page.locator(".run-head").get_by_role("button", name="2 subagents", exact=True)
+    expect(group).to_be_visible()
+    expect(run).to_have_attribute("aria-expanded", "true")
+    expect(page.locator(".composer-hint").get_by_role("button", name="Show", exact=True)).to_be_visible()
+    assert small_controls(page, ".main-area") == []
+    group.click()
+    expect(page.locator(".tool-card.grouped")).to_have_count(3)
+    assert small_controls(page, ".main-area") == []
+    assert no_page_scroll(ui)
+    for head in (group, run):
+        box = head.bounding_box()
+        assert box["width"] >= 24 and box["height"] >= 24, box
+
+
+def test_the_progress_tab_is_touch_sized_on_a_phone(coarse_ui, coarse_page):
+    # A waiting and a running subagent, a running and an ended command, the task list and the context.
+    ui, page = coarse_ui, coarse_page
+    pending = {"event_id": "p1", "name": "write_file", "kind": "approval", "title": "Write src/app.py"}
+    context = {"estimated_tokens": 6000, "input_budget": 120832, "context_window": 131072, "reply_reserve": 8192, "compactions": 0,
+               "summarized_messages": 0, "estimate_method": "weighted_utf8", "instruction_files": ["AGENTS.md"], "warnings": []}
+    children = "".join(f"""fake.sessions.set('{child}', {{ ...makeSession('{child}', '{title}'), parent_session_id: 'a', is_subagent: true,
+      delegation: {json.dumps({"status": status, "completed_tools": 2, "agent_type": "explore", "background": True, "started": 1,
+                               **({"pending": pending} if status == "awaiting_approval" else {})})} }})
+""" for child, title, status in [("k1", "Check the tests", "running"), ("k2", "Update the docs", "awaiting_approval")])
+    ui.app(session="a", scenario="workspace", setup=SETUP + children + f"""fake.sessions.get('a').context_info = {json.dumps(context)}
+fake.override = path => path.startsWith('/api/jobs?') ? fake.json([workspaceJob('dev', {{ command: 'npm run dev' }}),
+  workspaceJob('build', {{ command: 'make build', state: 'completed', exit_code: 0, updated: 150 }})]) : undefined""")
+    ui.show_session("a")
+    ui.emit("a", {"type": "tasks", "tasks": [{"id": "t1", "title": "Fix the exporter", "status": "in_progress"}]})
+    page.get_by_role("button", name=re.compile("^Workspace")).click()
+    page.get_by_role("button", name="Progress", exact=True).click()
+    expect(page.get_by_role("list", name="Background tasks").get_by_role("listitem")).to_have_count(4)
+    expect(page.get_by_role("button", name="Context details")).to_be_visible()
+    assert small_controls(page, ".workspace-panel") == []
+    assert no_page_scroll(ui)

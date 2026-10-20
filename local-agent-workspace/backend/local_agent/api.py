@@ -1190,12 +1190,20 @@ def create_app(settings=None):
             raise HTTPException(404, "Job not found in this conversation or workspace.")
         return job
 
+    def with_origin(jobs, session_id):
+        """The job rows with origin, who started each. A job recorded before origin existed is the agent's when
+        its chat has the job's run_command card (as for its end notice), else the user's."""
+        session = manager.get(session_id) if session_id and any(not job.get("origin") for job in jobs) else None
+        return [job if job.get("origin") else
+                {**job, "origin": "agent" if session and manager.agent_job(session, job["id"]) else "user"}
+                for job in jobs]
+
     @app.get("/api/jobs")
     async def list_jobs(session_id: str | None = None):
         workspace = job_scope(session_id)
-        return [{key: value for key, value in job.items() if key != "output"}
-                for job in manager.jobs.list(session_id=session_id, workspace=workspace)
-                if job["session_id"] == session_id]
+        return with_origin([{key: value for key, value in job.items() if key != "output"}
+                            for job in manager.jobs.list(session_id=session_id, workspace=workspace)
+                            if job["session_id"] == session_id], session_id)
 
     @app.post("/api/jobs")
     async def start_job(body: CommandRequest, session_id: str | None = None):
@@ -1206,7 +1214,7 @@ def create_app(settings=None):
 
     @app.get("/api/jobs/{job_id}")
     async def get_job(job_id: str, session_id: str | None = None):
-        return scoped_job(job_id, session_id)
+        return with_origin([scoped_job(job_id, session_id)], session_id)[0]
 
     @app.post("/api/jobs/{job_id}/stop")
     async def stop_job(job_id: str, session_id: str | None = None):

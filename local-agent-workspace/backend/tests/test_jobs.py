@@ -374,6 +374,21 @@ async def test_job_state_persistence_failures_and_defensive_copies(store, tmp_pa
     assert manager.get("missing") is None
 
 
+async def test_a_job_records_who_started_it_and_an_unknown_origin_starts_nothing(store, tmp_path):
+    manager = JobManager(store, lambda text: text, None)
+    users = await manager.start("true", tmp_path, session_id="session")
+    agents = await manager.start("true", tmp_path, session_id="session", origin="agent")
+    assert (users["origin"], agents["origin"]) == ("user", "agent")
+    with pytest.raises(ValueError, match="origin"):
+        await manager.start("true", tmp_path, session_id="session", origin="model")
+    assert len(manager.list(session_id="session")) == 2
+    for job in (users, agents):
+        await manager.wait(job["id"])
+    reloaded = JobManager(store, lambda text: text, None)
+    assert {job["id"]: job["origin"] for job in reloaded.list(session_id="session")} == {
+        users["id"]: "user", agents["id"]: "agent"}
+
+
 async def test_background_job_snapshots_are_kept_in_the_conversation_jsonl(store, tmp_path, monkeypatch):
     session = {"id": "chat", "title": "Command chat", "created": 1, "updated": 1,
                "workspace": str(tmp_path), "model": "model", "events": [], "wire": []}

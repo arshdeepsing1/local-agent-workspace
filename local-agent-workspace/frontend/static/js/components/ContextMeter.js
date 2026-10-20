@@ -78,6 +78,60 @@ const ADJUSTMENTS = {
 // The settings file that sets a chat's auto-compact threshold (auto_compact_source; settings_layers.py).
 const COMPACT_FILES = { project: '.agents/settings.json', local: '.agents/settings.local.json' }
 
+// What the collapsed meter shows for a chat's context info: the meter and Workspace → Progress both read it from
+// here, so the two can never disagree. model: the chat's model. Returns { legacyEstimate (a byte-counted saved meter:
+// no bar), reportedIsCurrent (Databricks' report describes the request the meter shows), setupChanged (the budgets or
+// model changed after it: the next request's estimate is shown), estimated (the app's estimate, % of the input budget),
+// value (the bar's %), mark (the auto-compact %), label (the one-line text), ariaValueText (the bar's spoken value),
+// report (info.last_request) }.
+export function meterReading(info, model) {
+  const legacyEstimate = info.estimate_method === 'conservative_utf8'
+  const percent = Math.round(info.estimated_tokens / info.input_budget * 100)
+  const report = info.last_request
+  // A report describes the request as sent; after a compaction, in a preview, or after
+  // the input budget changed it is history. Until the next request is prepared, the info and the
+  // report describe the same request (the model picker does not prepare one), so a model switch
+  // alone makes it history only once a request to the new model has been prepared.
+  const sameRequest = !!report && report.estimated_tokens === info.estimated_tokens
+  const sameSetup = !!report && report.input_budget === info.input_budget
+    && (sameRequest || !model || !report.model || report.model === model)
+  const reportedIsCurrent = !!report && !info.prepared_for_next_turn && report.compactions === info.compactions
+    && sameSetup && typeof report.input_tokens === 'number' && typeof report.percent_of_input_budget === 'number'
+  const next = info.next_estimate
+  // The report is history only because the budgets or the model changed after it (a model switch or
+  // a Settings save): the last request's estimate was scaled for the old model, so the collapsed meter
+  // shows the next request's estimate, already rescaled to the new model and budget.
+  const setupChanged = !reportedIsCurrent && sameRequest && !info.prepared_for_next_turn && report.compactions === info.compactions
+    && (report.input_budget !== info.input_budget || (!!model && !!report.model && report.model !== model))
+    && !!next && typeof next.tokens === 'number' && typeof next.percent_of_input_budget === 'number'
+  const estimated = setupChanged ? Math.round(next.percent_of_input_budget) : percent
+  const value = reportedIsCurrent ? report.percent_of_input_budget : estimated
+  const modelShare = reportedIsCurrent && typeof report.percent_of_model_window === 'number'
+    ? `; ${report.percent_of_model_window}% of the model's ${report.model_window.toLocaleString()}-token window` : ''
+  const label = reportedIsCurrent
+    ? `Last model input · ${report.input_tokens.toLocaleString()} tokens · ${report.percent_of_input_budget}%${report.partial ? ' (partial)' : ''}`
+    : `${info.prepared_for_next_turn ? 'Context preview' : setupChanged ? 'Next request' : 'Last model input'} · ${legacyEstimate ? 'estimate outdated' : `~${estimated}%`}`
+  const ariaValueText = reportedIsCurrent
+    ? `${report.percent_of_input_budget}% of input budget: ${report.input_tokens.toLocaleString()} of ${report.input_budget.toLocaleString()} tokens reported by Databricks${modelShare}`
+    : `Approximately ${estimated}% of input budget`
+  return { legacyEstimate, reportedIsCurrent, setupChanged, estimated, value, mark: info.auto_compact_percent, label, ariaValueText, report }
+}
+
+// The instruction files and skills a chat's requests load, with their costs (the details' Loaded instructions).
+// note: false leaves out the line on how the costs are counted (it refers to the details' breakdown).
+export function LoadedInstructions({ info, note = true }) {
+  return info.instruction_sources?.length ? html`
+    <ul>${info.instruction_sources.map(source => html`<li key=${source.path}>
+      ${sourceScope(source)} · ${sourceCost(source)}
+      ${source.reason ? html`<p>${source.reason}</p>` : null}
+    </li>`)}</ul>
+    ${note ? html`<p>File costs are estimates included in system instructions above; shared guidance and framing are counted separately.${info.instruction_sources.some(source => source.scope === 'this message') ? ' A skill your message selected counts in messages and tool results instead.' : ''}</p>` : null}`
+    : info.instruction_files?.length ? html`<ul>${info.instruction_files.map(file => html`<li key=${file}><code>${file}</code></li>`)}</ul>` : html`<p>No project instruction files loaded.</p>`
+}
+
+// The meter's text before a chat's first turn (Workspace → Progress shows it too).
+export const CONTEXT_EMPTY = 'Context usage is estimated after the first turn.'
+
 // openSignal: a number that /context increases to open the details (a change after mounting only).
 export default function ContextMeter({ info, model, busy = false, status, onCompact, openSignal = 0 }) {
   const [note, setNote] = useState('')
@@ -109,33 +163,11 @@ export default function ContextMeter({ info, model, busy = false, status, onComp
     setOpen(true)
     details.current.querySelector('summary')?.focus()
   }, [openSignal])
-  if (!info) return html`<p class="context-empty">Context usage is estimated after the first turn.</p>`
-  const legacyEstimate = info.estimate_method === 'conservative_utf8'
-  const percent = Math.round(info.estimated_tokens / info.input_budget * 100)
+  if (!info) return html`<p class="context-empty">${CONTEXT_EMPTY}</p>`
+  const { legacyEstimate, reportedIsCurrent, setupChanged, estimated, value, mark, label, ariaValueText, report } = meterReading(info, model)
   const safetyReserve = info.context_window - info.input_budget - info.reply_reserve
-  const report = info.last_request
-  // A report describes the request as sent; after a compaction, in a preview, or after
-  // the input budget changed it is history. Until the next request is prepared, the info and the
-  // report describe the same request (the model picker does not prepare one), so a model switch
-  // alone makes it history only once a request to the new model has been prepared.
-  const sameRequest = !!report && report.estimated_tokens === info.estimated_tokens
-  const sameSetup = !!report && report.input_budget === info.input_budget
-    && (sameRequest || !model || !report.model || report.model === model)
-  const reportedIsCurrent = !!report && !info.prepared_for_next_turn && report.compactions === info.compactions
-    && sameSetup && typeof report.input_tokens === 'number' && typeof report.percent_of_input_budget === 'number'
   const reportHeading = reportedIsCurrent ? 'Last request' : report && report.compactions !== info.compactions ? 'Before compaction' : 'Earlier request'
   const next = info.next_estimate
-  // The report is history only because the budgets or the model changed after it (a model switch or
-  // a Settings save): the last request's estimate was scaled for the old model, so the collapsed meter
-  // shows the next request's estimate, already rescaled to the new model and budget.
-  const setupChanged = !reportedIsCurrent && sameRequest && !info.prepared_for_next_turn && report.compactions === info.compactions
-    && (report.input_budget !== info.input_budget || (!!model && !!report.model && report.model !== model))
-    && !!next && typeof next.tokens === 'number' && typeof next.percent_of_input_budget === 'number'
-  const estimated = setupChanged ? Math.round(next.percent_of_input_budget) : percent
-  const value = reportedIsCurrent ? report.percent_of_input_budget : estimated
-  const mark = info.auto_compact_percent
-  const modelShare = reportedIsCurrent && typeof report.percent_of_model_window === 'number'
-    ? `; ${report.percent_of_model_window}% of the model's ${report.model_window.toLocaleString()}-token window` : ''
   const threshold = info.auto_compact_threshold ?? info.input_budget
   // A calibration report replaced the starting ratio the shown estimate used (a cancelled or partial
   // request, or a small one, does not).
@@ -150,12 +182,10 @@ export default function ContextMeter({ info, model, busy = false, status, onComp
       details.current.querySelector('summary')?.focus()
     }}>
     <summary onClick=${() => setOpen(!details.current?.open)}>
-      <span>${reportedIsCurrent
-        ? `Last model input · ${report.input_tokens.toLocaleString()} tokens · ${report.percent_of_input_budget}%${report.partial ? ' (partial)' : ''}`
-        : `${info.prepared_for_next_turn ? 'Context preview' : setupChanged ? 'Next request' : 'Last model input'} · ${legacyEstimate ? 'estimate outdated' : `~${estimated}%`}`}</span>
+      <span>${label}</span>
       ${!legacyEstimate ? html`<span class=${`context-bar${typeof mark === 'number' && value >= mark ? ' over' : ''}`}>${reportedIsCurrent
-        ? html`<progress aria-label="Reported model input usage" aria-valuetext=${`${report.percent_of_input_budget}% of input budget: ${report.input_tokens.toLocaleString()} of ${report.input_budget.toLocaleString()} tokens reported by Databricks${modelShare}`} value=${Math.min(value, 100)} max=${100} />`
-        : html`<progress aria-label=${setupChanged ? 'Estimated next request input usage' : 'Estimated model input usage'} aria-valuetext=${`Approximately ${estimated}% of input budget`} value=${Math.min(estimated, 100)} max=${100} />`}${typeof mark === 'number'
+        ? html`<progress aria-label="Reported model input usage" aria-valuetext=${ariaValueText} value=${Math.min(value, 100)} max=${100} />`
+        : html`<progress aria-label=${setupChanged ? 'Estimated next request input usage' : 'Estimated model input usage'} aria-valuetext=${ariaValueText} value=${Math.min(estimated, 100)} max=${100} />`}${typeof mark === 'number'
         ? html`<span class="context-bar-mark" aria-hidden="true" style=${`left:${mark}%`} />` : null}</span>` : null}
       ${info.compactions > 0 ? html`<span> · ${info.compactions} ${info.compactions === 1 ? 'compaction' : 'compactions'}</span>` : null}
       ${info.warnings.length > 0 ? html`<span> · ${info.warnings.length} ${info.warnings.length === 1 ? 'warning' : 'warnings'}</span>` : null}
@@ -193,13 +223,7 @@ export default function ContextMeter({ info, model, busy = false, status, onComp
       <p>Compactions: ${info.compactions}. Messages summarized: ${info.summarized_messages}.</p>
       ${Number.isInteger(info.payload_bytes) ? html`<p>Request size: ${requestSize(info.payload_bytes)} of Databricks' ${(info.payload_limit_bytes ?? 4_000_000) / 1e6} MB limit.</p>` : null}
       <p class="context-heading">Loaded instructions</p>
-      ${info.instruction_sources?.length ? html`
-        <ul>${info.instruction_sources.map(source => html`<li key=${source.path}>
-          ${sourceScope(source)} · ${sourceCost(source)}
-          ${source.reason ? html`<p>${source.reason}</p>` : null}
-        </li>`)}</ul>
-        <p>File costs are estimates included in system instructions above; shared guidance and framing are counted separately.${info.instruction_sources.some(source => source.scope === 'this message') ? ' A skill your message selected counts in messages and tool results instead.' : ''}</p>`
-        : info.instruction_files.length ? html`<ul>${info.instruction_files.map(file => html`<li key=${file}><code>${file}</code></li>`)}</ul>` : html`<p>No project instruction files loaded.</p>`}
+      <${LoadedInstructions} info=${info} />
       ${info.warnings.length ? html`<p class="context-heading">Warnings</p><ul class="context-warnings">${info.warnings.map((warning, index) => html`<li key=${index}>${warning}</li>`)}</ul>` : null}
       ${onCompact ? html`<form class="context-compact" onSubmit=${event => {
         event.preventDefault()

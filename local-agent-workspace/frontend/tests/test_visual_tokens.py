@@ -225,6 +225,35 @@ def test_the_workspace_review_and_its_active_tab_are_readable(ui, page):
     assert failures(page, ".workspace-panel") == []
 
 
+PROGRESS = """
+for (const [child, title, status, extra] of [['k1', 'Check the tests', 'running', { steps: 2, max_steps: 10, last_tool: 'run_command',
+    last_tool_state: 'running', last_tool_subject: 'npm test' }],
+  ['k2', 'Update the docs', 'awaiting_approval', { pending: { event_id: 'p1', name: 'write_file', kind: 'approval', title: 'Write src/app.py' } }],
+  ['k3', 'Old survey', 'completed', { terminal_reason: 'completed', ended: 9 }]]) {
+  fake.sessions.set(child, { ...makeSession(child, title), parent_session_id: 'a', is_subagent: true,
+    delegation: { status, completed_tools: 2, agent_type: 'explore', background: true, started: 1, ...extra } })
+}
+window.answer = path => path.startsWith('/api/jobs?') ? fake.json([workspaceJob('dev', { command: 'npm run dev' }),
+  workspaceJob('build', { command: 'make build', state: 'failed', exit_code: 2, updated: 150 })]) : undefined
+"""
+
+
+@pytest.mark.parametrize("scale", [100, 150])
+def test_the_progress_tab_and_its_icon_only_tabs_are_readable(ui, page, scale):
+    # Its rows, chips, notes and waiting row, at 4.5:1 and at least 11 px; at 150% the tabs show their icons only.
+    start_chat(ui, page, setup=PROGRESS + f"""fake.sessions.get('a').context_info = {json.dumps(CONTEXT_INFO)}
+      localStorage.setItem('local.textSize', '{scale}')""")
+    ui.emit("a", {"type": "tasks", "tasks": [{"id": "t1", "title": "Fix the exporter", "status": "in_progress"},
+                                             {"id": "t2", "title": "Old plan", "status": "cancelled"}]})
+    page.get_by_role("button", name=re.compile("^Workspace")).click()
+    page.get_by_role("button", name="Progress", exact=True).click()
+    expect(page.get_by_role("list", name="Background tasks").get_by_role("listitem")).to_have_count(5)
+    expect(page.locator(".workspace-tabs.icons-only")).to_have_count(1 if scale == 150 else 0)
+    page.mouse.move(0, 0)
+    assert failures(page, ".workspace-panel") == []
+    assert small_text(page, ".workspace-panel") == []
+
+
 def test_settings_and_folder_access_notes_are_readable(ui, page):
     start_chat(ui, page, setup=SETTINGS_WITH_NOTES)
     page.get_by_role("button", name="Settings", exact=True).click()
@@ -575,3 +604,62 @@ def test_a_two_digit_change_count_fits_its_badge(ui, page):
     expect(badge).to_contain_text("12")
     assert badge.evaluate("e => getComputedStyle(e).fontSize") == "11px"
     assert badge.evaluate("e => e.scrollWidth <= e.clientWidth && e.scrollHeight <= e.clientHeight")
+
+
+# Task B: a tool group's head and a multi-agent run's head with its rows
+
+COMMAND_DONE = json.dumps({"job_id": "0123456789abcdef", "state": "completed", "exit_code": 0, "output": "ok\n", "background": False})
+WAITS = {"event_id": "ev-1", "name": "run_command", "kind": "approval", "title": "npm test"}
+
+
+def subagent(n, size, batch, **progress):
+    return {"id": f"{batch}{n}", "type": "tool", "name": "delegate_task", "call_id": f"call-{batch}{n}", "input": {"task": f"Docs part {n}"},
+            "state": "completed" if progress.get("terminal_reason") else "running", "child_session_id": f"child-{batch}{n}",
+            "delegation_batch": {"id": batch, "index": n, "size": size},
+            "delegation": {"status": "running", "completed_tools": 2, "agent_type": "editor", "started": 1000.0, **progress}}
+
+
+RUNS = [
+    CHAT[0],
+    *({"id": f"c{n}", "type": "tool", "name": "run_command", "state": "completed", "input": {"command": f"make check-{n}"},
+       "output": COMMAND_DONE} for n in range(3)),
+    {"id": "r", "type": "assistant", "text": "Checks pass. Splitting the docs work."},
+    # A live run: one at work (its step, current tool and a failed action), one waiting for your answer, one queued.
+    subagent(0, 4, "a", steps=4, max_steps=10, last_tool="run_command", last_tool_state="running", last_tool_subject="npm test",
+             failed_tools=1),
+    subagent(1, 4, "a", status="awaiting_approval", pending=WAITS),
+    {**subagent(2, 4, "a", status="queued", completed_tools=0), "child_session_id": None},
+    {"id": "r2", "type": "assistant", "text": "Earlier run:"},
+    # An ended background run: folded, its failed row shown.
+    subagent(0, 2, "b", status="completed", terminal_reason="completed", ended=1060.0, background=True),
+    subagent(1, 2, "b", status="failed", terminal_reason="error", ended=1070.0, background=True),
+]
+
+
+@pytest.mark.parametrize("width,height", [(1280, 900), (390, 844)])
+def test_tool_group_and_run_heads_are_readable_and_at_least_eleven_pixels(ui, page, width, height):
+    start_chat(ui, page, width, height, events=RUNS, setup="fake.sessions.get('a').status = 'delegating'")
+    group = page.get_by_role("button", name="Ran 3 commands make check-2", exact=True)
+    expect(group).to_be_visible()
+    live, ended = page.locator(".run-head").nth(0), page.locator(".run-head").nth(1)
+    expect(live.get_by_role("status")).to_have_text("1 running · 1 waiting for approval · 1 waiting for a free slot")
+    expect(live.locator(".run-note")).to_have_text("Preparing 3 of 4")
+    expect(ended.get_by_role("button", name="2 subagents")).to_have_attribute("aria-expanded", "false")
+    expect(ended.locator(".run-chip")).to_have_text("Background")
+    expect(page.locator(".delegation-progress.needs-answer")).to_be_visible()
+    expect(page.locator(".delegation-failed-tools")).to_have_text("1 failed action")
+    page.add_style_tag(content="*{animation:none!important}")  # The running cards' spinners turn forever.
+    assert_readable(page, ".tool-group-phrase", ".tool-group-subject", ".run-count", ".run-aggregate", ".run-elapsed", ".run-chip",
+                    ".run-note", ".delegation-steps", ".delegation-tool", ".delegation-failed-tools",
+                    ".delegation-progress.needs-answer .delegation-status")
+    assert failures(page, ".transcript") == []
+    assert small_text(page, ".transcript") == []
+    # Open, hovered: the head's background and the grouped cards stay readable.
+    group.click()
+    expect(page.locator(".tool-card.grouped")).to_have_count(3)
+    group.hover()
+    assert_readable(page, ".tool-group-phrase", ".tool-group-subject", ".tool-card.grouped .tool-subject")
+    live.get_by_role("button", name="3 subagents").hover()
+    assert_readable(page, ".run-count")
+    assert failures(page, ".transcript") == []
+    assert small_text(page, ".transcript") == []

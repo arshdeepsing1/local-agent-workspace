@@ -6,15 +6,16 @@ import time
 import uuid
 from typing import Annotated, Any, Literal
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from . import uploads as attached
 from .composer_api import MAX_QUEUED
 from .config import MAX_MAX_AGENT_STEPS, MAX_TURN_MINUTES, MAX_TURN_TOKENS, MIN_MAX_AGENT_STEPS
 from .context import LARGE_SUMMARY_MAX_BYTES, MAX_ESTIMATE_SCALE, context_boundary
 from .extensions import HOOK_CONTEXT_CHARS, HOOK_EVENTS, HOOK_REPORT_CHARS, MAX_HOOKS
+from .jobs import JOB_END_STATES
 from .lifecycle_hooks import SHOWN_ARGUMENTS_BYTES
-from .planning import MAX_STEPS, subagent_index
+from .planning import MAX_STEPS, SUBJECT_CHARS, TOOL_STATES, subagent_index
 from .reasoning_replay import MAX_SIDECAR_BYTES, MAX_SIDECAR_ITEMS, REASONING_ITEMS
 from .spending import MAX_LIMIT_DBU
 
@@ -23,6 +24,9 @@ MAX_BUNDLE_BYTES = 16 * 1024 * 1024
 MAX_SESSIONS = 32
 FORMAT = "local-agent-workspace.conversations"
 Profile = Literal["inherit", "read_only", "file_editor"]
+# How a background job ended, on its end notice (the job's card reads it). A tool card's job_id stays out of a
+# bundle, like the job itself.
+NOTICE_JOB_FIELDS = ("job_id", "job_state", "exit_code")
 
 
 class Record(BaseModel):
@@ -104,7 +108,22 @@ class Progress(Record):
     ended: float | None = None
     background: bool | None = None  # delegate_task background: the parent went on while it worked.
     turn_user_id: str | None = Field(default=None, max_length=512)  # The user event of the turn that delegated it.
+    # Its Agent steps, and (DelegateManager.progress) its replies and tool cards so far, those that failed, and its
+    # newest tool card's state and redacted subject.
+    max_steps: int | None = Field(default=None, ge=1, le=MAX_STEPS)
+    steps: int | None = Field(default=None, ge=0)
+    tool_calls: int | None = Field(default=None, ge=0)
+    failed_tools: int | None = Field(default=None, ge=0)
+    last_tool_state: Literal[TOOL_STATES] | None = None
+    last_tool_subject: str | None = Field(default=None, max_length=SUBJECT_CHARS)
     pending: PendingCard | None = None
+
+
+class DelegationBatch(Record):
+    """delegation_batch: a delegate_task call's place among the calls of one response that ran in parallel."""
+    id: str = Field(min_length=1, max_length=64)
+    index: int = Field(ge=0)
+    size: int = Field(ge=2)
 
 
 class SiblingChange(Record):
@@ -276,6 +295,7 @@ class Event(Record):
     child_session_id: str | None = None
     origin: Origin | None = None
     delegation: Progress | None = None
+    delegation_batch: DelegationBatch | None = None
     # A background delegation's final result (its card's Report), and the parent's notice when it ended.
     delegation_result: dict[str, Any] | None = None
     subagent_id: str | None = Field(default=None, max_length=512)
@@ -312,6 +332,10 @@ class Event(Record):
     attachments: list[Attachment] | None = Field(default=None, max_length=10 + attached.MAX_MESSAGE_FILES)
     stop_phase: Literal["streaming", "tools", "waiting"] | None = None
     details: str | None = Field(default=None, max_length=1000)  # A rate-limit notice's Details (the 429).
+    # Notices: a background job's end (AgentManager.job_end_notice), matched to the job's card by job_id.
+    job_id: str | None = Field(default=None, min_length=1, max_length=512)
+    job_state: Literal[JOB_END_STATES] | None = None
+    exit_code: int | None = Field(default=None, ge=-2**31, le=2**32 - 1)
     # Hooks (lifecycle_hooks): a hook card's structured result; on a tool card, the arguments a
     # before-tool hook replaced, the card it asked for, or its deny; on a user message, a hook's
     # edit or block and the context hooks added for the model.
@@ -321,6 +345,12 @@ class Event(Record):
     hook_blocked: HookVerdict | None = None
     hook_edit: HookEdit | None = None
     hook_notes: list[HookNote] | None = Field(default=None, max_length=2 * MAX_HOOKS)
+
+    @model_validator(mode="after")
+    def _job_end_on_notices_only(self):
+        if self.type != "notice" and any(getattr(self, name) is not None for name in NOTICE_JOB_FIELDS):
+            raise ValueError("Only a notice says how a job ended.")
+        return self
 
 
 class Function(Record):
@@ -599,7 +629,8 @@ def export_bundle(sessions, root_id, with_reasoning=False, keep_images=False):
                               for message in record.get("wire", [])]
         if not keep_images:
             record["wire"] = [attached.images_as_notes(message, attached.NOT_EXPORTED) for message in record.get("wire", [])]
-        record["events"] = [{key: value for key, value in event.items() if key in Event.model_fields}
+        record["events"] = [{key: value for key, value in event.items() if key in Event.model_fields
+                             and (key not in NOTICE_JOB_FIELDS or event.get("type") == "notice")}
                             for event in record["events"]]
         # Keep only the fields a bundle defines; newer display details such as
         # a compaction's handoff path must not make the whole export invalid.

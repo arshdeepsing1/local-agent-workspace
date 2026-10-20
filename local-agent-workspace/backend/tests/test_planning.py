@@ -6,7 +6,7 @@ import pytest
 
 from local_agent.agents import AgentManager
 from local_agent.config import Settings
-from local_agent.planning import DelegateManager, TaskManager
+from local_agent.planning import DelegateManager, TaskManager, tool_subject
 from local_agent.store import Store
 
 
@@ -210,9 +210,9 @@ async def test_delegations_beyond_three_wait_for_a_free_slot(delegation):
         if spawning.get("delegation"):
             break
         await asyncio.sleep(0.01)
-    # No effort while queued: a general subagent takes the chat's when it starts.
+    # No effort while queued: a general subagent takes the chat's when it starts. Its steps are known already.
     assert spawning["delegation"] == {"status": "queued", "completed_tools": 0, "agent_type": "general",
-                                      "model": "synthetic-model"}
+                                      "model": "synthetic-model", "max_steps": 10}
     assert len(started) == 3 and helper.running() == 3 and len(helper.active[parent["id"]]) == 3
     releases[started[0]].set()
     for _ in range(100):
@@ -362,8 +362,11 @@ async def test_parent_progress_is_live_correlated_and_contains_no_child_payloads
                                             "parent_event_id": spawning["id"], "parent_call_id": "call-review"}
     started = event["delegation"].pop("started")
     # The card it waits on, so the parent's card can answer it; never the child's tool payloads.
+    # Its progress names what the waiting card acts on (its path), never what the card holds.
     assert event["delegation"] == {"status": "awaiting_approval", "completed_tools": 0, "last_tool": "read_file",
                                    "agent_type": "general", "model": "synthetic-model", "effort": "default",
+                                   "max_steps": 10, "steps": 0, "tool_calls": 1, "failed_tools": 0,
+                                   "last_tool_state": "pending", "last_tool_subject": "private.py",
                                    "pending": {"event_id": child["events"][1]["id"], "name": "read_file",
                                                "kind": "approval", "title": "read file", "review": True}}
     event["delegation"]["started"] = started
@@ -376,9 +379,96 @@ async def test_parent_progress_is_live_correlated_and_contains_no_child_payloads
     assert progress["started"] <= progress["ended"]
     assert {key: value for key, value in progress.items() if key not in ("started", "ended")} == {
         "status": "completed", "completed_tools": 1, "last_tool": "read_file", "terminal_reason": "completed",
-        "agent_type": "general", "model": "synthetic-model", "effort": "default"}
+        "agent_type": "general", "model": "synthetic-model", "effort": "default", "max_steps": 10, "steps": 1,
+        "tool_calls": 1, "failed_tools": 0, "last_tool_state": "completed", "last_tool_subject": "private.py"}
     await helper.progress(manager.store.get(child["id"]), status="running", terminal_reason="stopped")
     assert manager.store.get(parent["id"])["events"][0]["delegation"] == progress
+
+
+async def test_parent_progress_counts_steps_tools_and_failures_and_names_the_newest_tool_redacted(delegation, monkeypatch):
+    """The parent's card follows the child: its replies (steps of max_steps), its tool cards, those that failed, and
+    the newest one's state and subject (a command's first line, a path or a query), redacted and at most 160
+    characters. Streamed command output alone changes none of it, so it updates the parent's card no more."""
+    manager, helper, parent = delegation
+    manager.live[parent["id"]] = parent
+    spawning = await manager.event(parent, "tool", name="delegate_task", call_id="call-build", input={"task": "Build"},
+                                   output="", state="running")
+    secret = "ghp_" + "A1b2" * 6  # A token shape that redact_secrets replaces.
+    monkeypatch.setattr(manager.settings, "redact", lambda text: text.replace("synthetic-redacted", "[REDACTED]"))
+    sent, seen, streamed = [], [], []
+    broadcast = manager.broadcast
+
+    async def record(session_id, data):
+        sent.append(session_id)
+        await broadcast(session_id, data)
+    monkeypatch.setattr(manager, "broadcast", record)
+    keys = ("steps", "tool_calls", "failed_tools", "completed_tools", "last_tool", "last_tool_state", "last_tool_subject")
+
+    def snapshot():
+        seen.append(tuple(spawning["delegation"].get(key) for key in keys))
+
+    async def worker(child, prompt):
+        await manager.event(child, "assistant", text="")
+        command = await manager.event(child, "tool", name="run_command", input={"command": "\n  npm test\nnpm run lint"},
+                                      state="running", output="")
+        snapshot()
+        before = sent.count(parent["id"])
+        for output in ("one\n", "one\ntwo\n", "one\ntwo\nthree\n"):
+            await manager.update_event(child, command, output=output)
+        streamed.append(sent.count(parent["id"]) - before)
+        await manager.update_event(child, command, state="completed")
+        snapshot()
+        await manager.event(child, "assistant", text="")
+        await manager.event(child, "tool", name="read_file", input={"path": "missing.py"}, state="error", output="Not found")
+        snapshot()
+        await manager.event(child, "tool", name="search_files", state="completed", output="", input={
+            "query": f"synthetic-redacted {secret} " + "x" * 300, "path": "src"})
+        snapshot()
+        await manager.event(child, "assistant", text="Built.")
+    manager.run_databricks = worker
+    await helper.delegate(parent, "Build", max_steps=4, parent_event=spawning)
+    subject = "[REDACTED] [REDACTED] " + "x" * 138
+    assert seen == [(1, 1, 0, 0, "run_command", "running", "npm test"),
+                    (1, 1, 0, 1, "run_command", "completed", "npm test"),
+                    (2, 2, 1, 1, "read_file", "error", "missing.py"),
+                    (2, 3, 1, 2, "search_files", "completed", subject)]
+    assert len(subject) == 160 and streamed == [0]
+    final = manager.store.get(parent["id"])["events"][0]["delegation"]
+    assert (final["max_steps"], final["steps"], final["tool_calls"], final["failed_tools"]) == (4, 3, 3, 1)
+    assert final["last_tool_subject"] == subject and final["terminal_reason"]
+    saved = json.dumps(manager.store.get(parent["id"]))
+    assert secret not in saved and "synthetic-redacted" not in saved and "Not found" not in saved
+
+
+@pytest.mark.parametrize("event,subject", [
+    ({"name": "run_command", "input": {"command": "\n  npm test  \nnpm run lint", "cwd": "web"}}, "npm test"),
+    ({"name": "move_path", "input": {"path": "a.txt", "destination": "b.txt"}}, "a.txt → b.txt"),
+    ({"name": "search_files", "input": {"query": "parse(", "path": "src"}}, "parse("),
+    ({"name": "find_files", "input": {"pattern": "*.py", "path": "src"}}, "*.py"),
+    ({"name": "list_files", "input": {"path": "src"}}, "src"),
+    ({"name": "web_fetch", "input": {"url": "https://docs.example/start"}, "preview": "Fetch from docs.example:"},
+     "https://docs.example/start"),
+    ({"name": "ask_user", "input": {"questions": []}, "preview": "\n Which folder? \n"}, "Which folder?"),
+    ({"name": "wait_job", "input": {"job_id": "job-1"}}, ""),
+    ({"name": "list_jobs", "input": "not an object"}, ""),
+])
+def test_a_tool_cards_subject_is_its_command_query_pattern_path_or_url_else_its_first_shown_line(event, subject):
+    assert tool_subject({"type": "tool", **event}) == subject
+
+
+async def test_a_waiting_cards_title_keeps_its_own_rules_where_the_subject_differs(delegation):
+    """pending_card shares tool_subject but keeps its title's rules: a read or a search is titled by the first line
+    its card shows, a blank command by the tool's name, a change by its path."""
+    _, helper, _ = delegation
+
+    def title(**event):
+        return helper.pending_card({"events": [{"id": "e", "type": "tool", "state": "pending", **event}]})["title"]
+    assert title(name="web_search", input={"query": "parser docs"},
+                 preview="Search the web with Example:\nparser docs") == "Search the web with Example:"
+    assert title(name="read_file", input={"path": "../elsewhere/a.txt"},
+                 preview="Allow read_file outside the project?") == "Allow read_file outside the project?"
+    assert title(name="run_command", input={"command": "  \n "}, preview="Run: something") == "run command"
+    assert title(name="edit_file", input={"path": "a.txt", "old_text": "x", "new_text": "y"}, preview="--- a/a.txt") == "a.txt"
 
 
 async def test_delegation_provenance_is_only_on_initial_prompt_and_ids_do_not_cross(delegation):
@@ -438,7 +528,7 @@ async def test_child_cancelled_before_first_schedule_has_terminal_progress(deleg
     progress = manager.store.get(parent["id"])["events"][-1]["delegation"]
     assert {key: value for key, value in progress.items() if key not in ("started", "ended")} == {
         "status": "cancelled", "completed_tools": 0, "terminal_reason": "stopped", "agent_type": "general",
-        "model": "synthetic-model", "effort": "default"}
+        "model": "synthetic-model", "effort": "default", "max_steps": 10, "steps": 0, "tool_calls": 0, "failed_tools": 0}
     monkeypatch.setattr(manager, "start", original)
     manager.run_databricks = lambda session, prompt: asyncio.sleep(0)
     manager.start(result["child_session_id"], "Human follow-up after cancellation")

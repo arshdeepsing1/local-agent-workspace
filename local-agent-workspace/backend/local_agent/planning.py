@@ -161,6 +161,11 @@ CONTINUE_REASONS = ("completed", "tool_error")
 WAKE_TEXT = ("[Sent by the app: the background subagent {id} ({kind}) {ending}. Read its report with get_subagent_result "
              "and continue the task.]")
 PENDING_TITLE = 200
+# A running subagent's newest tool on its parent's card (progress: last_tool_subject): the input it acts on, in this
+# order (a search's query before the folder it searches), redacted and at most SUBJECT_CHARS.
+SUBJECT_KEYS = ("command", "query", "pattern", "path", "url")
+SUBJECT_CHARS = 160
+TOOL_STATES = ("pending", "running", "completed", "rejected", "cancelled", "error")  # A tool card's state.
 # What a waiting card of a subagent warns about (its own card shows it); the parent's card names it and
 # offers no Allow, so the user reviews the subagent's card.
 PENDING_WARNINGS = (("secret_files", "names credential-looking files"), ("protected", "changes a protected file"),
@@ -201,6 +206,23 @@ def changed_paths(events):
             if isinstance(values.get(key), str) and values[key] and values[key] not in paths:
                 paths.append(values[key])
     return paths
+
+
+def first_lines(text):
+    """The non-blank lines of text, stripped."""
+    return [line.strip() for line in str(text or "").splitlines() if line.strip()]
+
+
+def tool_subject(event, keys=SUBJECT_KEYS):
+    """What a tool card acts on, in one line and not yet redacted: the first of its input's keys that is text (a path,
+    with → destination for a move; else that value's first line), or else the first line of what the card shows
+    (its preview); "" without one. pending_card asks only for the keys its title uses."""
+    values = event.get("input") if isinstance(event.get("input"), dict) else {}
+    key = next((key for key in keys if isinstance(values.get(key), str)), None)
+    if key == "path":
+        return values["path"] + (f" → {values['destination']}" if isinstance(values.get("destination"), str) else "")
+    lines = first_lines(values[key] if key else event.get("preview"))
+    return lines[0] if lines else ""
 
 
 def index_entry(child, task):
@@ -400,11 +422,13 @@ class DelegationGate:
     done once it would start. The batch sets go when every call is prepared, so they all start
     together. A finished delegation then takes the batch's lock, which finished() releases once
     that call's execute_tool has returned: results are finished (charged, cards updated, hooks
-    run) one at a time, in the order the subagents end."""
+    run) one at a time, in the order the subagents end. batch: {id, index, size}, the call's place in
+    its batch, which its card carries (delegation_batch) so the page shows the batch as one run."""
 
-    def __init__(self, lock):
+    def __init__(self, lock, batch=None):
         self.ready = asyncio.get_running_loop().create_future()
         self.go, self.lock, self.holding = asyncio.Event(), lock, False
+        self.batch = batch
 
     async def run(self, start):
         if not self.ready.done():
@@ -683,9 +707,13 @@ class DelegateManager:
         if previous is None or previous.get("terminal_reason"):
             return
         tools = [event for event in child["events"] if event["type"] == "tool"]
-        progress = {**previous, "completed_tools": sum(event.get("state") == "completed" for event in tools)}
+        # Counted as its delegate_task result counts them (child_result): its replies so far and its tool cards.
+        progress = {**previous, "completed_tools": sum(event.get("state") == "completed" for event in tools),
+                    "steps": sum(event["type"] == "assistant" for event in child["events"]), "tool_calls": len(tools),
+                    "failed_tools": sum(event.get("state") == "error" for event in tools)}
         if tools:
             progress["last_tool"] = self.manager.settings.redact(str(tools[-1].get("name", "Tool")))[:160]
+            self._last_tool(progress, tools[-1])
         if terminal_reason:
             progress.update(terminal_reason=terminal_reason, status=TERMINAL_STATUS.get(terminal_reason, "failed"),
                             ended=time.time())
@@ -715,6 +743,20 @@ class DelegateManager:
         elif recorded:
             self.manager.store.save(parent)
 
+    def _last_tool(self, progress, event):
+        """The child's newest tool card on its parent's card: its state (last_tool_state) and what it acts on
+        (last_tool_subject, redacted: shown on the card, never sent to the model). A subject without a letter or
+        digit (an MCP tool's arguments start with "{") is left out."""
+        if event.get("state") in TOOL_STATES:
+            progress["last_tool_state"] = event["state"]
+        else:
+            progress.pop("last_tool_state", None)
+        subject = self.manager.settings.redact(redact_secrets(tool_subject(event)))[:SUBJECT_CHARS]
+        if re.search(r"\w", subject):
+            progress["last_tool_subject"] = subject
+        else:
+            progress.pop("last_tool_subject", None)
+
     def pending_card(self, child):
         """What the child's newest waiting card asks, for its parent's card: {event_id, name, kind (approval,
         question or plan), title (its first line, redacted), warnings?, review?, expires?}, or None. review:
@@ -733,15 +775,14 @@ class DelegateManager:
         elif kind == "plan":
             title = "A plan to review"
         elif isinstance(values.get("path"), str) and name in CHANGE_TOOLS:
-            title = values["path"] + (f" → {values['destination']}" if isinstance(values.get("destination"), str) else "")
+            title = tool_subject(event, ("path",))
             whole = name in ("move_path", "delete_path")  # The others change content the title does not show.
         else:  # A command's first line, or the first line of what the card shows.
-            text = values.get("command") if name == "run_command" and isinstance(values.get("command"), str) else event.get("preview")
-            lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
-            title = lines[0] if lines else name.replace("_", " ")
+            command = name == "run_command" and isinstance(values.get("command"), str)
+            title = tool_subject(event, ("command",) if command else ()) or name.replace("_", " ")
             if name == "run_command" and isinstance(values.get("cwd"), str):
                 title += f" (in {values['cwd']})"
-            whole = name == "run_command" and len(lines) == 1
+            whole = name == "run_command" and len(first_lines(values["command"] if command else event.get("preview"))) == 1
         title = self.manager.settings.redact(redact_secrets(str(title)))
         pending = {"event_id": event["id"], "name": name[:120], "kind": kind, "title": title[:PENDING_TITLE]}
         if kind == "approval":
@@ -807,8 +848,8 @@ class DelegateManager:
 
     async def _slot(self, entry, parent, parent_event, labels, started=None):
         """Wait until fewer than MAX_RUNNING subagents run (over all chats); the card says queued.
-        labels: the agent's type, model and effort, as the card shows them, and the turn that delegated it
-        (turn_user_id). started (a background delegation's future) learns that it is queued."""
+        labels: the agent's type, model, effort and steps (max_steps), as the card shows them, and the turn that
+        delegated it (turn_user_id). started (a background delegation's future) learns that it is queued."""
         noticed = parent_event is None
         while not entry["cancelled"] and self.running() >= MAX_RUNNING:
             entry["queued"] = True
@@ -1005,7 +1046,8 @@ class DelegateManager:
         turn = next((event["id"] for event in reversed(parent["events"]) if event.get("type") == "user"
                      and not event.get("steered")), None)
         labels = {"agent_type": kind, "model": model, **({"effort": spec["effort"]} if spec["effort"] else {}),
-                  **({"background": True} if background is not None else {}), **({"turn_user_id": turn} if turn else {})}
+                  **({"background": True} if background is not None else {}), **({"turn_user_id": turn} if turn else {}),
+                  "max_steps": max_steps}
         if parent_event is not None:
             parent_event = next((event for event in parent["events"] if event["id"] == parent_event["id"]), None)
             if parent_event is None:

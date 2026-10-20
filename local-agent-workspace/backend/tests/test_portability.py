@@ -131,6 +131,61 @@ async def test_included_children_remap_parent_event_call_and_origin_but_single_e
         assert copies[0]["is_subagent"] is True
 
 
+async def test_an_export_and_import_keep_a_runs_batch_and_its_subagents_progress(runtime):
+    """The workflow view's fields (delegation_batch, the progress counts and the newest tool's state and subject)
+    are part of the bundle; values the app never writes are refused."""
+    app, manager, source, destination = runtime
+    progress = {"status": "completed", "completed_tools": 2, "terminal_reason": "completed", "max_steps": 10,
+                "steps": 3, "tool_calls": 3, "failed_tools": 1, "last_tool_state": "error", "last_tool_subject": "npm test"}
+    batch = {"id": "0123456789ab", "index": 1, "size": 2}
+    source["events"][1].update(name="delegate_task", input={"task": "Build"}, delegation=progress, delegation_batch=batch)
+    manager.store.save(source)
+    bundle = export_bundle([source], source["id"])
+    assert (bundle["sessions"][0]["events"][1]["delegation"], bundle["sessions"][0]["events"][1]["delegation_batch"]) == (
+        progress, batch)
+    async with await client_for(app) as client:
+        response = await client.post("/api/sessions/import", params={"workspace": str(destination)}, json=bundle)
+        imported = manager.store.get(response.json()["session"]["id"])
+        assert (imported["events"][1]["delegation"], imported["events"][1]["delegation_batch"]) == (progress, batch)
+    for event in ({"delegation": {**progress, "last_tool_state": "done"}},
+                  {"delegation": {**progress, "last_tool_subject": "x" * 161}},
+                  {"delegation": {**progress, "max_steps": 0}},
+                  {"delegation_batch": {**batch, "size": 1}}, {"delegation_batch": {**batch, "label": "extra"}}):
+        changed = copy.deepcopy(bundle)
+        changed["sessions"][0]["events"][1].update(event)
+        with pytest.raises(ValueError, match="schema"):
+            parse_bundle(json.dumps(changed).encode())
+
+
+async def test_an_export_import_and_fork_keep_how_a_background_job_ended_on_its_notice(runtime):
+    """A background job's end notice keeps job_id, job_state and exit_code, which its command's card reads in the
+    copy as in the source chat. A tool card's job_id stays out, like the job itself; values the app never writes
+    are refused."""
+    app, manager, source, destination = runtime
+    ended = {"job_id": "job-1", "job_state": "cancelled", "exit_code": -15}
+    source["events"].append({"id": "n1", "type": "notice", "text": "Background job stopped: npm run dev", **ended})
+    manager.store.save(source)
+    bundle = export_bundle([source], source["id"])
+    notice = bundle["sessions"][0]["events"][3]
+    assert {key: notice[key] for key in ended} == ended
+    assert "job_id" not in bundle["sessions"][0]["events"][1]
+    async with await client_for(app) as client:
+        response = await client.post("/api/sessions/import", params={"workspace": str(destination)}, json=bundle)
+        imported = manager.store.get(response.json()["session"]["id"])
+        assert {key: imported["events"][3][key] for key in ended} == ended
+        response = await client.post(f"/api/sessions/{source['id']}/fork")
+        assert response.status_code == 201, response.text
+        fork = manager.store.get(response.json()["id"])
+        assert {key: fork["events"][3][key] for key in ended} == ended
+        assert "job_id" not in fork["events"][1]
+    for index, event in ((3, {"job_state": "running"}), (3, {"job_state": "done"}), (3, {"exit_code": "0"}),
+                         (3, {"job_id": ""}), (1, {"job_id": "job-1"}), (1, {"exit_code": 0})):
+        changed = copy.deepcopy(bundle)
+        changed["sessions"][0]["events"][index].update(event)
+        with pytest.raises(ValueError, match="schema"):
+            parse_bundle(json.dumps(changed).encode())
+
+
 async def test_import_marks_pending_approval_and_partial_response_historical(runtime):
     app, manager, source, destination = runtime
     bundle = export_bundle([source], source["id"])

@@ -4,6 +4,42 @@ Notable changes to Local Agent Workspace, newest first. Dates are UTC.
 
 ## Unreleased
 
+Workflow and progress view (2026-10-19):
+
+- Consecutive read-only steps fold into one line in the chat, such as **Ran 3 commands, read 2
+  files · app › npm test**: commands, file reads, searches, job checks and web lookups that finished,
+  succeeded and need nothing from you. Click it to open the cards. Approvals, questions, plans,
+  running or failed steps, edits, task updates, subagents, background starts, MCP cards and results
+  that were shortened or withheld never fold, and a running card stays visible below the line and
+  joins it when it ends. **Settings → Appearance → Group tool calls in the transcript** (on by
+  default, kept in this browser) turns folding off. Activity still lists every action.
+- Subagents started together (one response's `delegate_task` calls) share a run card: "3 subagents ·
+  1 running · 1 waiting for a free slot · 1 completed" with a bar of finished ones, the elapsed time,
+  **Preparing 2 of 3** while the turn still makes them, and **Show in panel**. Each row is the
+  subagent's card with its live **Step 4 of 10**, **Now: run command · npm test** (a short, redacted
+  subject shown on the card only and saved with the chat; never sent to the model) and failed
+  actions. A run that had already finished when the chat opened starts folded; rows that wait for
+  you, failed or were stopped always show. When a subagent waits for your answer, the message box
+  hint says so, with **Show**.
+- **Workspace → Progress**: the chat's context (the meter's reading, auto-compact point, last turn,
+  loaded instructions, **Context details**), its task list (read-only) and its background tasks:
+  running, waiting, queued and finished background subagents and background commands, with **Open
+  subagent**, **Stop subagent**, **Allow**/**Decline**, **Show card**, **Stop job** and **View
+  output**. The Workspace tabs show icons only when their labels do not fit, and the panel opens on
+  the tab used last (on Files for the message box's +, a review from the changes bar or a file
+  opened from a reply or a card).
+- A background command's card reads its outcome (**background · exit 0**, timed out, stopped,
+  interrupted) once the command ends, instead of "started in background", also when it was stopped
+  from Terminal or Progress, by the agent's `stop_job` or by the app's shutdown, or a restart
+  interrupted it, and after a rewind, **Retry response** or **Fork from here** that keeps the card.
+- For the page only (no new tool, route or socket message; nothing reaches the model, and the
+  32-function guards are unchanged): `delegate_task` cards of one response carry `delegation_batch`
+  `{id, index, size}`; a subagent's live `delegation` gains `max_steps`, `steps`, `tool_calls`,
+  `failed_tools`, `last_tool_state` and `last_tool_subject`; jobs record `origin` (`agent` or `user`;
+  older ones are read from their chat); a background job's end notice carries `job_state` and
+  `exit_code`, and a stopped or interrupted job gets one too (the agent's next request still names
+  only jobs that completed, failed or timed out). Exports, forks and imports keep the new fields.
+
 Second reviews of the integration fixes (2026-10-19). The three integration-fix packages that
 had no second review (the composer and file preview; background subagents' accounting, wakes and
 the headless runner; turn endings) were reviewed again; every finding was reproduced with a failing

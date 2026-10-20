@@ -50,7 +50,8 @@ frontend that runs without a build step.
   each reply.
 - Workspace file explorer (the project, the conversation's granted folders and folders you add), text
   editor with stale-file detection, Git status/diff with Stage, Unstage, Commit and the branch's pull
-  request status, and a non-interactive command runner.
+  request status, a non-interactive command runner, and a Progress tab (context, tasks, background
+  subagents and commands).
 - File checkpoints with reviewed, reversible restore and managed Git worktrees.
 - Review of the agent's file edits, as in an editor's chat: a "files changed" bar with
   Keep and Undo, dots on changed files in the file explorer, and an inline red/green
@@ -90,7 +91,10 @@ frontend that runs without a build step.
 - Scripting the running app: `scripts/agent_run.py` runs one prompt and prints the reply or a JSON
   result with an exit code, and the standard-library Python client streams a chat's messages and
   answers its cards.
-- Collapsible activity.
+- A workflow view of the agent's work: consecutive read-only steps fold into one line ("Ran 3 commands,
+  read 2 files"), subagents started together share a run card with each one's live step and current
+  action, and **Workspace / Progress** shows the chat's context, task list and background tasks; a
+  card that needs you is never folded away. The full list of actions stays under Activity.
 - Responsive desktop/mobile UI, bundled fonts, and no credential storage in the browser.
 
 This release does not include a browser automation engine, OS computer control,
@@ -324,6 +328,12 @@ when opening a conversation or performing restart recovery.
   the app larger or smaller at once; the layout keeps fitting the window. It applies as soon as you
   choose it and is kept in this browser only (it is not part of Settings' saved values). Browser
   zoom (Ctrl or Cmd and +) still enlarges the whole page instead.
+- **Group tool calls**: **Settings → Appearance → Group tool calls in the transcript** (on by
+  default) folds two or more finished read-only actions in a row under one line such as
+  **Ran 3 commands** (see **Tool details**), and shows the subagents of a multi-agent run under one
+  head that folds them (see **Agent tools: tasks, subagents, and activity**). Like Text size it
+  applies at once and is kept in this browser only; turned off, every tool card shows on its own, as
+  in earlier versions, without these lines and heads.
 - **New conversation**: choose a model, then send a task. Enter sends; Shift+Enter adds a line.
   A message is limited to 50,000 characters. A longer one is not sent (it stays in the box)
   and the app advises saving long text such as a handoff as a file in the project and
@@ -334,7 +344,9 @@ when opening a conversation or performing restart recovery.
   URL, which preserves that selection on refresh and supports browser Back/Forward.
   The header shows a short session ID when there is room; hover the title for the full title
   and ID. The sidebar shows the ID after a title that several conversations share. In a narrow
-  window **Agent tools** and **Workspace** show only their icons.
+  window **Agent tools** and **Workspace** show only their icons. The Workspace panel's tabs do the
+  same while their labels do not fit the panel (a narrow panel, or a large text size); hover a tab to
+  see its name, which screen readers still hear.
   Drafts stay with their conversation while switching chats and are saved in this
   browser's `localStorage` about half a second after you stop typing (and when the page
   closes), so they survive a reload; the new-conversation view keeps its own draft, which
@@ -463,7 +475,7 @@ when opening a conversation or performing restart recovery.
       (`/model gpt oss 120b`); alone, it moves focus to the model list.
     - `/mode [mode]`: `manual`, `auto`, `accept-edits`, `plan`, `dont-ask` or `bypass` (which asks for
       confirmation first, as the permission menu does); alone, it opens the permission menu.
-    - `/context`: opens the context meter's details.
+    - `/context`: opens the context meter's details (**Workspace / Progress** summarises the same reading).
     - `/usage` and `/export`: open **Agent tools → Usage** or **Agent tools → Export**.
     - `/fork`: copies the completed conversation, as **Fork completed conversation**, and opens the copy.
     - `/rename <title>`: renames the conversation.
@@ -852,6 +864,28 @@ when opening a conversation or performing restart recovery.
   commands launched before creating a chat belong to the selected workspace.
   This remains a noninteractive command runner: stdin is closed, with no PTY.
   Closing the panel does not cancel a job. Errors pause polling until **Refresh jobs**.
+- **Workspace / Progress**: what the open chat is doing, in three sections. **Context** reads as the
+  context meter does (the same line and percentage, a "Context used" bar with the auto-compact mark,
+  compactions and warnings), adds the last turn's summary line and the loaded instruction files, and
+  **Context details** opens the meter's details (a panel that covers the chat closes first). **Tasks**
+  lists the chat's task list read-only, as the checklist above the message box does. **Background
+  tasks** lists first what waits for your answer, then what runs (subagents, those of the current turn
+  marked "In this turn", and commands, oldest first), then subagents waiting for a free slot; after them
+  the 10 newest finished background subagents and the 10 newest finished background commands the agent
+  started, newest first (the rest are in **Agent tools → Subagents** and Terminal). A subagent row shows
+  its type, task, status, actions, step ("Step 4 of 10"), current tool ("Now: run command · npm test")
+  and time, with **Open subagent**, **Show card** (its card in the transcript, when that page is loaded;
+  a folded run or group of cards opens to show it) and the card's
+  own **Allow**, **Decline**, **Review in subagent**, **Answer in subagent** and **Stop subagent**: they
+  answer the subagent's chat, so they work while its card is on an earlier page that is not loaded. A
+  command row says who started it (**Agent**, or **You** from Terminal or a `!` command), its state and
+  how long it ran, with **Stop job** and **View output** (Terminal, with that job selected). Scheduled
+  runs are not listed: each is a chat of its own (**Agent tools → Schedules**). The commands are read
+  only while the tab is shown and the page is visible (every second while one runs, else every 3 s);
+  after an error the tab tries again, waiting longer each time (up to 30 s), and offers **Retry**. A run
+  of subagents' **Show in panel** opens this tab. The panel opens on the tab you used last, in any chat
+  (kept in this browser); the message box's **Add project file** (+), a review from the changes bar and
+  a file opened from a reply or a card open it on **Files** straight away.
 - **Approvals**: approve or decline model-proposed writes, commands, MCP calls, and hooks. An unanswered
   card waits **Settings → Approval wait (minutes)**, 60 by default (1–1,440); a browser refresh
   retains it while the server runs (a server restart cancels it). After that time the card shows
@@ -919,7 +953,11 @@ when opening a conversation or performing restart recovery.
   last output line under the collapsed card (`Exit 1 · …`; when output past `max_output_bytes`
   was not kept, it says so instead); its expanded card's **Action** line reads `ran · exit 1`,
   not `completed`. A command started with `background` is labelled
-  `started in background`. A failed tool shows its error category, and its expanded card shows
+  `started in background`; once the chat has the notice that it ended, the card reads the outcome
+  instead: `background · exit 0` with a tick, or a warning (`background · exit 1`,
+  `background · timed out`, `background · interrupted`) with the notice under the collapsed card,
+  `background · stopped` for one that was stopped, and `background · ended` in chats from earlier
+  versions, whose notices do not say how it ended. A failed tool shows its error category, and its expanded card shows
   **Error category** and the **Hint given to the agent**. Expanded command and job cards show the
   output as text, then a **State** line (state, exit code, size, and which part the result
   holds: the first part, the start and end, the latest output from a character, or a character
@@ -930,6 +968,28 @@ when opening a conversation or performing restart recovery.
   the tool worked; a muted label such as `job exit 1` reports the job itself. A `wait_job` card
   first says how the wait ended: `matched` (the **State** line quotes the matching line),
   `wait timed out` (no tick), `output quiet` or `job ended`.
+  **Grouped tool calls:** two or more finished read-only actions in a row fold under one line that
+  says what they did and then names the last one, for example **Ran 3 commands, read 2 files**
+  followed by `npm test` ("· 2 steps" when they span several model responses; on a narrow screen the
+  line wraps rather than being cut). These are commands, file reads and outlines, folder listings,
+  searches, job checks (`list_jobs`, `get_job_output`, `wait_job`), web fetches and searches, and
+  look-ups of tasks, skills, earlier results and subagent results; reads count distinct files, so
+  two pages of one file read one file. Click the line to show the cards in place, indented under it
+  (a closed group's cards are not on the page at all). A card you clicked or focused keeps its group
+  open until you close the group, and an open group stays open as it grows, after **Load earlier**
+  and after a reconnect. A card joins only once it finished and succeeded, so a running command
+  shows below the line and joins it when it ends. These never fold into such a line, and they end a
+  group: cards that wait for you (approvals, questions, plans), running, failed, declined and
+  stopped actions, changes (`write_file`, `edit_file`, `move_path`, `delete_path`, `notebook_edit`,
+  `insert_activity_log`), `create_task`, `update_task`, `remember`, `use_skill`, findings,
+  subagents, background commands, `stop_job`, `!` commands, MCP tools, and cards with a note of
+  their own (an edited command, a credential-looking file, a result shortened or not sent to the
+  agent, a hook's change, another subagent's change to the file). A card that ran by a rule or as a
+  checked read-only command folds; its line (**Allowed by a rule for this chat**, ...) shows once
+  the group is open. A hook card that decided and changed nothing joins a group without counting
+  toward the two. A model response that only called tools folds with the cards around it; a reply
+  with text or thinking (also only a **Thought** line), your message and a notice end a group.
+  **Settings → Appearance → Group tool calls in the transcript** turns folding off.
   **Read before overwriting:** the conversation remembers the size and modification time
   of each file the agent read (`read_file` any page, or `notebook_read`) or wrote, up to 500 files.
   `write_file` on an existing file is refused, before any approval card, unless the
@@ -1052,7 +1112,7 @@ when opening a conversation or performing restart recovery.
   Beside it, **Local** (hidden when the chat column is narrow) says the conversation runs on
   this computer; hover it for the explanation.
 - **Stop**: cancel the current agent turn and its foreground command. Background
-  jobs continue; stop them individually in Terminal. Approved writes and completed
+  jobs continue; stop them individually in Terminal or **Workspace / Progress**. Approved writes and completed
   shell side effects are retained. Stop also cancels its subagents. Deleting a
   conversation removes its jobs, tasks, and file checkpoint copies; edited files stay
   on disk. Delete a chat with **More actions** → **Delete…**; one that has subagent chats asks first: **Delete with subagents**
@@ -1850,7 +1910,9 @@ tokenizer-derived measurements. **Loaded instructions** lists each selected skil
 `Skill /<id>` applies to this chat (selected in **Agent tools → Extensions**, in the system message)
 or to this message (selected with `/<id>`, sent with that message, so it counts in messages).
 `GET /api/sessions/<id>/context` returns the same meter as JSON (`{status, context_info}`, plus
-`compaction_progress` while the chat compacts) without building a request.
+`compaction_progress` while the chat compacts) without building a request. **Workspace / Progress**
+summarises the same reading beside the chat, with the last turn and the loaded instruction files; its
+**Context details** opens these details.
 
 **Settings → Auto-compact at (% of input budget)** (default 90, 50–100) sets when
 automatic compaction runs: when the next request's estimate passes that share of the
@@ -2523,7 +2585,8 @@ With the default Settings a new chat therefore has room for one MCP tool, and fo
 is set; turning off one of these helpers, or `use_skill` or `delegate_task` (which `report_findings`
 and `get_subagent_result` follow), frees a place. The MCP tools that do not fit are named once
 in a notice (with the places kept) and in **Extensions**, and a call to one is refused. Turn off tools or servers a
-chat does not need to make room.
+chat does not need to make room. The workflow view (the subagent run card, grouped tool calls and
+**Workspace / Progress**) adds no tool; it reads fields the model never sees.
 
 The model sees names such as `mcp__example__tool`, so a new server ID cannot contain `__`. MCP calls require their own
 approval in Manual, Auto, and Accept edits; Plan leaves them out (a turn that starts in Plan starts no MCP server, so
@@ -2940,6 +3003,20 @@ chat's own edits never ask for this reason. A file a command changed is only kno
 ran, so a command that changes a file another running subagent changed adds a notice in the parent
 chat instead.
 
+The cards of such a run show as one card under a head: **3 subagents**, their statuses (for
+example `1 running · 1 waiting for a free slot · 1 completed`, read out when a status changes), a
+bar of how many finished, the time from the first start to the last end (counting while one runs),
+**Background** when they run in the background, **Preparing 2 of 3** while the turn that makes the
+cards still runs (**2 of 3 started** when a stopped turn made fewer, also while a later turn runs),
+**1 earlier, not loaded** when a card is on a page you have not loaded, and **Show in panel**, which
+opens **Workspace → Progress**.
+Click the head to fold the run's rows. A run you watched stays open when it ends, so the page does
+not jump; one that had ended before you opened the chat starts folded. A folded run still shows the
+rows that wait for you, failed, were stopped or were not run. In chats from earlier versions,
+`delegate_task` cards next to each other (with only hook cards or notices between them) form a run
+the same way. With **Settings → Appearance → Group tool calls in the transcript** turned off, the
+cards show on their own, without the head.
+
 The parent receives a bounded result (at most 6,000 bytes as JSON; the prose report is shortened
 first, then the file list, then a structured report): `child_session_id`, `agent_type`, `tool_profile`, `status`
 (completed/failed/cancelled), `terminal_reason` (completion, user Stop, step limit,
@@ -2953,11 +3030,15 @@ schema or with arguments that could not be read, that report follows as the mode
 `subagent_stop` hook's replacement report replaces both).
 Each subagent has its own card: its type, the effort and model it started with (for example
 **Fast · Claude Opus 5.5**), live status (running, waiting for approval,
-waiting for a free slot, completed, failed, cancelled), completed actions, last tool, how
-long it has run, **Open subagent** and, once it ended, a collapsible **Report** with the
-files it changed (a structured report shows its summary, its findings with `path:line` links that
-open the file, and its next steps). Progress metadata does not copy child tool payloads into the
-parent's context. **Open subagent** opens the child to review its work or approve actions;
+waiting for a free slot, completed, failed, cancelled), its step (**Step 4 of 10**), completed
+actions, the tool it runs now or ran last with a short subject (**Now: run command · npm test**:
+the path, the first line of the command, or the search; redacted like command output, at most 160
+characters), failed actions, how long it has run, **Open subagent** and, once it ended, a
+collapsible **Report** with the files it changed (a structured report shows its summary, its
+findings with `path:line` links that open the file, and its next steps). Cards from earlier
+versions show the last tool's name only. Progress never reaches the model: the parent's context
+gets only the result above, and the short subject is shown on the card only (it is saved with this
+chat's transcript). **Open subagent** opens the child to review its work or approve actions;
 **Back to parent conversation** returns to the parent. While a subagent runs, its card has **Stop
 subagent**, which stops only that one (its call returns as cancelled; the chat and its other
 subagents go on). While it waits for your approval, the card names what it waits on (for example
@@ -2966,7 +3047,10 @@ subagent like its own buttons (to edit the action first or allow it for the chat
 subagent). **Allow** is there only when that line is the whole action: a one-line command (with its folder), or
 a move or delete. A command with more lines, a file's new content, another tool's arguments, or a card that
 warns (a credential-looking file, a protected file, another subagent's change to the file, a hook's ask, a
-hook's change to the action; the card names the warning) shows **Review in subagent** instead, next to **Decline**. A question or a plan shows **Answer in subagent**. Stop on the parent stops all its
+hook's change to the action; the card names the warning) shows **Review in subagent** instead, next to **Decline**. A question or a plan shows **Answer in subagent**. Such a row is marked and
+stays visible, also in a folded run, and while the chat itself waits for no answer, **A subagent is
+waiting for your answer above.** shows under the message box: its **Show** brings the row into view
+and moves focus to its first button. Stop on the parent stops all its
 subagents, also those still waiting for a slot and those in the background. The child's first prompt is labeled
 **Delegated by parent conversation** and retains the spawning action ID; later human
 messages are not labeled delegated. A subagent chat is named by its task until it gets a
@@ -3197,7 +3281,8 @@ tells the model to ask before implementing it. The plan is not written to any fi
 stays in the conversation, and exports keep answers and review outcomes.
 
 **Activity** collapses a list of actual tool actions and their states; existing
-approval cards remain usable independently. A reply's **Thinking** block appears only when
+approval cards remain usable independently. It lists every action, also those the transcript folds
+under a line such as **Ran 3 commands** (see **Tool details**). A reply's **Thinking** block appears only when
 the Databricks stream supplies thinking: `reasoning` content blocks with `summary_text`
 entries, `thinking` blocks, or `reasoning_content` / `reasoning` delta fields (see
 **Reasoning effort and thinking**). The text persists with the conversation, displays
@@ -3846,6 +3931,10 @@ Without `from_offset` it scans from the end of the last result the conversation 
 for that job, so a line printed in between still counts. Stop ends the wait, not the
 job. The job's
 exit code and state distinguish success, failure, timeout, and cancellation.
+Each job also records who started it: its `origin` is `agent` for `run_command` (Verify
+runs too) and `user` for the Terminal panel's Run, `!` commands and `/api/command`. The
+job list (`GET /api/jobs`) shows it; a job recorded before this existed is `agent` when its
+chat has the job's `run_command` card, else `user`.
 Only the configured prefix of output is retained; excess output is drained and
 reported as truncated. Foreground cancellation, timeouts, command completion,
 and normal app shutdown clean up the command's process group. A timeout, Stop, or
@@ -3889,8 +3978,17 @@ packages.
 When a background job that the agent started completes, fails, or times out, its
 conversation gets a notice, also when the chat is idle, and the agent's next model
 request names the job once, unless a `wait_job` or `get_job_output` result already
-showed that it ended. Nothing wakes an idle chat. Jobs started from the
-Terminal panel, and stopped or cancelled jobs, get no notice.
+showed that it ended. A job that was stopped (**Stop job** in Terminal or **Workspace /
+Progress**, the agent's `stop_job`, or the app's shutdown) or that a restart interrupted gets
+a notice too; the agent's next request does not name it (the agent sees how it ended only when
+it checks the job, with `wait_job`, `get_job_output` or `list_jobs`). The notice also carries how
+the job ended (its `job_state` and `exit_code`), which the page reads to show the outcome on the
+command's card, also in a fork, an export or an import of the chat (a bundle keeps them on the
+notice, while the job itself is not transferred); notices themselves are never sent to the model.
+A rewind (also **Edit message** and **Retry response**) or **Fork from here** that keeps the
+command's card keeps its notice too, also when the job ended in a removed turn: the notice then
+follows the last kept reply. Nothing wakes an idle chat. Jobs started from the Terminal panel
+get no notice, nor do the jobs that deleting a chat stops.
 Automatic compaction adds bounded summary requests beyond the configured agent steps.
 Databricks inference is billed to your workspace. Endpoints must support streaming,
 function calling, and non-streamed text responses for summarization.

@@ -3,20 +3,23 @@ import { RefreshCw } from '../icons.js'
 import { api } from '../api.js'
 
 // pythonVenv: Settings python_venv_status, named under the command field.
-export default function TerminalPanel({ sessionId, workspace, pythonVenv = null }) {
-  return html`<${TerminalJobs} key=${JSON.stringify([sessionId, workspace])} sessionId=${sessionId} pythonVenv=${pythonVenv} />`
+// focusJob: a job id to select once (Workspace → Progress → View output); onFocused() is called once it is chosen.
+export default function TerminalPanel({ sessionId, workspace, pythonVenv = null, focusJob = null, onFocused }) {
+  return html`<${TerminalJobs} key=${JSON.stringify([sessionId, workspace])} sessionId=${sessionId} pythonVenv=${pythonVenv}
+    focusJob=${focusJob} onFocused=${onFocused} />`
 }
 
-const jobState = job => `${job.state.replace('_', ' ')}${job.exit_code === null ? '' : ` · exit ${job.exit_code}`}${job.background ? ' · background' : ''}${job.truncated ? ' · output truncated' : ''}`
+// "running · background", "failed · exit 1 · output truncated": a job's state line (also in Workspace → Progress).
+export const jobState = job => `${job.state.replace('_', ' ')}${job.exit_code === null ? '' : ` · exit ${job.exit_code}`}${job.background ? ' · background' : ''}${job.truncated ? ' · output truncated' : ''}`
 
-function TerminalJobs({ sessionId, pythonVenv }) {
+function TerminalJobs({ sessionId, pythonVenv, focusJob, onFocused }) {
   const query = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''
   const [command, setCommand] = useState('')
   const [timeout, setTimeoutSeconds] = useState(60)
   const [outputLimit, setOutputLimit] = useState(80000)
   const [background, setBackground] = useState(false)
   const [jobs, setJobs] = useState([])
-  const [selectedId, setSelectedId] = useState(null)
+  const [selectedId, setSelectedId] = useState(focusJob)
   const [detail, setDetail] = useState(null)
   const [refresh, setRefresh] = useState(0)
   const [launching, setLaunching] = useState(false)
@@ -25,6 +28,23 @@ function TerminalJobs({ sessionId, pythonVenv }) {
   const alive = useRef(false)
   const mutations = useRef(0)
   useEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
+  // The job to show once: it is selected, and its row takes focus when it is listed (the button that asked for it
+  // was in another tab).
+  const focusing = useRef(null)
+  useEffect(() => {
+    if (!focusJob) return
+    focusing.current = focusJob
+    setSelectedId(focusJob)
+    onFocused?.()
+  }, [focusJob])
+  const list = useRef(null)
+  useEffect(() => {
+    if (!focusing.current || !jobs.some(job => job.id === focusing.current)) return
+    const row = list.current?.querySelector(`[data-job-id="${CSS.escape(focusing.current)}"]`)
+    focusing.current = null
+    row?.scrollIntoView({ block: 'nearest' })
+    row?.focus({ preventScroll: true })
+  }, [jobs])
 
   useEffect(() => {
     let disposed = false
@@ -108,9 +128,9 @@ function TerminalJobs({ sessionId, pythonVenv }) {
       : pythonVenv?.state === 'invalid' ? html`<p class="field-help">The Python environment in Settings is not used: ${pythonVenv.message.replace(/^Not used: /, '')}</p>` : null}
     ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
     <div class="terminal-history-heading"><span>Job history</span><button class="icon-button" aria-label="Refresh jobs" onClick=${() => { setError(''); setRefresh(current => current + 1) }}><${RefreshCw} size=${14} /></button></div>
-    <div class="terminal-jobs" role="list" aria-label="Job history">
+    <div class="terminal-jobs" role="list" aria-label="Job history" ref=${list}>
       ${jobs.map(job => html`<div class="terminal-job" role="listitem" key=${job.id}>
-        <button class="terminal-job-select" aria-label=${`Show job ${job.command} · ${jobState(job)}`} aria-pressed=${job.id === selectedId} onClick=${() => setSelectedId(job.id)}><span title=${job.command}>${job.command}</span><small>${jobState(job)}</small></button>
+        <button class="terminal-job-select" data-job-id=${job.id} aria-label=${`Show job ${job.command} · ${jobState(job)}`} aria-pressed=${job.id === selectedId} onClick=${() => setSelectedId(job.id)}><span title=${job.command}>${job.command}</span><small>${jobState(job)}</small></button>
         ${job.state === 'running' ? html`<button class="outline terminal-stop" aria-label=${`Stop job ${job.command}`} disabled=${stopping.includes(job.id)} onClick=${() => void stop(job.id)}>${stopping.includes(job.id) ? 'Stopping…' : 'Stop job'}</button>` : null}
       </div>`)}
       ${!jobs.length ? html`<p>No jobs in this workspace scope yet.</p>` : null}
