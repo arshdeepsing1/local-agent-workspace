@@ -459,8 +459,14 @@ def handoff_pointer(files):
     files = [item for item in files or [] if isinstance(item, dict) and isinstance(item.get("path"), str)]
     if not files:
         return ""
+    listed = files[-HANDOFF_POINTER_FILES:]
+    oldest = listed[0].get("compaction")
+    # Only the newest are kept (context.compact): the older ones' files are still in that folder.
+    older = (f"\nThe handoffs of compactions 1-{oldest - 1} are older files in the same folder (names ending in "
+             "-compaction-<n>.md); a handoff of the whole conversation reads them too."
+             if type(oldest) is int and oldest > 1 and len(files) >= HANDOFF_POINTER_FILES else "")
     return HANDOFF_POINTER + "\n".join(f"- {item['path']} (compaction {item.get('compaction', '?')})"
-                                        for item in reversed(files[-HANDOFF_POINTER_FILES:]))
+                                        for item in reversed(listed)) + older
 
 
 def is_app_prompt(message):

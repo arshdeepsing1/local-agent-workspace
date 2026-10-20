@@ -51,6 +51,10 @@ def test_pointer_lists_newest_files_first_and_only_with_a_summary():
     listed = [line for line in pointer.splitlines() if line.startswith("- ")]
     assert listed[0] == "- handoffs/auto/h-7.md (compaction 7)"
     assert len(listed) == HANDOFF_POINTER_FILES and "h-2.md" not in pointer
+    # The older handoffs are named, so a handoff of the whole conversation can find them.
+    assert pointer.endswith("\nThe handoffs of compactions 1-2 are older files in the same folder (names ending in "
+                            "-compaction-<n>.md); a handoff of the whole conversation reads them too.")
+    assert "are older files" not in handoff_pointer(files[:5]) and "are older files" not in handoff_pointer(files[3:5])
     assert handoff_pointer([]) == handoff_pointer(None) == handoff_pointer([{"compaction": 1}]) == ""
     wire = [user("Current")]
     assert context_messages(wire, {"summary": "", "handoff_files": files}) == wire

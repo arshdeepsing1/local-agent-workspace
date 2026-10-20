@@ -44,8 +44,8 @@ frontend that runs without a build step.
 - Project memory: short notes the agent saves with your approval (the `remember` tool) and every later
   chat in the project sees, kept in the app's state folder and reviewed in Agent tools → Memory.
 - Output styles (Default, Concise, Explanatory, or your own style files) and shipped skills for
-  handoffs, verifying and debugging a change, drafting an `AGENTS.md` (`/init`), committing, opening a
-  pull request, and code and security reviews whose findings show as a card.
+  writing and reading handoffs, verifying and debugging a change, drafting an `AGENTS.md` (`/init`),
+  committing, opening a pull request, and code and security reviews whose findings show as a card.
 - A short Git snapshot (branch, upstream, change counts, recent commits) with the message that starts
   each reply.
 - Workspace file explorer (the project, the conversation's granted folders and folders you add), text
@@ -2717,6 +2717,13 @@ by a project's own copy:
 - `/review` (`skills/review/SKILL.md`): reviews the uncommitted changes, a branch or a pull request
   read-only (reading the code around each change and its callers) for correctness, security,
   regressions and missing tests, and reports with `report_findings`.
+- `/read-handoff` (`skills/read-handoff/SKILL.md`): reads a handoff without filling the context:
+  its Contents list (or headings) first, then only the sections that carry state (status, open
+  items, next actions, requirements, decisions, errors and fixes, work done, file changes, key
+  facts), skipping the command and activity logs, the runbook and resource lists, which it searches
+  only for a detail the task needs; then replies with a short orientation. `/handoff` reads a
+  compacted chat's auto handoffs the same way, oldest first, so its handoff covers the chat from
+  its start.
 - `/security-review` (`skills/security-review/SKILL.md`): traces untrusted input through the change
   (injection, access checks, secrets, network, crypto, files, dependencies) and reports only issues
   with an exploit path, with `report_findings`.
@@ -4405,7 +4412,7 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `backend/local_agent/activity.py`: app-generated activity log for handoffs (`insert_activity_log`).
 - `backend/local_agent/transcript.py` / `scripts/conversation_transcript.py`: Markdown transcripts of saved conversations (also `GET /api/sessions/<id>/transcript.md`).
 - `backend/local_agent/redaction.py`: common secret shapes replaced in logs, handoffs and transcripts, and the high-confidence ones in command and MCP results.
-- `skills/`: skills shipped with the app and offered in every workspace; `handoff/SKILL.md` is the detailed handoff skill, `verify`, `debug` and `init` run a project's checks, debug a reported failure and draft its `AGENTS.md`, and `commit`, `pr`, `review` and `security-review` are the Git skills. A workspace's `.agents/skills/<id>/` replaces the shipped skill with that ID.
+- `skills/`: skills shipped with the app and offered in every workspace; `handoff/SKILL.md` is the detailed handoff skill and `read-handoff` reads one, `verify`, `debug` and `init` run a project's checks, debug a reported failure and draft its `AGENTS.md`, and `commit`, `pr`, `review` and `security-review` are the Git skills. A workspace's `.agents/skills/<id>/` replaces the shipped skill with that ID.
 - `agents/`: agent files shipped with the app (`plan.md`); a project's `.agents/agents/<name>.md` or `.claude/agents/<name>.md` of the same name replaces one.
 - `backend/local_agent/telemetry.py`: inference ledger, validated usage, DBU estimates, and failure categories.
 - `backend/local_agent/usage_export.py` / `scripts/usage_report.py`: usage rows and CSV correlated with conversation history.
