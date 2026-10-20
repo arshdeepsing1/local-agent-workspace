@@ -34,8 +34,8 @@ TERM_GRACE_SECONDS = 2
 ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
 JOB_NOTICE_STATES = {"completed", "failed", "timed_out"}  # Background jobs the agent's next request names.
 # The agent's background jobs whose chat gets an end notice, which the page shows on the job's card: also stopped and
-# interrupted ones, which the agent's requests never name.
-JOB_END_STATES = ("completed", "failed", "timed_out", "cancelled", "interrupted")  # Also a bundle's notices (portability).
+# interrupted ones, which the agent's requests never name. A bundle's notices have these states too (portability).
+JOB_END_STATES = ("completed", "failed", "timed_out", "cancelled", "interrupted")
 KILLED_ENDINGS = {"timed_out": "timed out", "cancelled": "stopped", "interrupted": "interrupted"}
 JOB_ORIGINS = ("agent", "user")  # Who started a job (GET /api/jobs fills it in for jobs recorded before it).
 HEAD_CHARS = 1_500  # A failed command's first result: up to this much of the start,

@@ -16,8 +16,8 @@ import httpx
 
 from .tools import IGNORED, TOOL_DEFINITIONS, WorkspaceTools, file_error
 from .jobs import (CREDENTIAL_ENV, DENIED_ENV, DENIED_ENV_PREFIXES, ENVIRONMENT_KEYS, ENVIRONMENT_NAME, HEAD_CHARS,
-                   DEFAULT_WAIT_SECONDS, JOB_END_STATES, JOB_NOTICE_STATES, MIN_HEAD_CHARS, TAIL_CHARS, job_command, job_ending,
-                   job_runtime, suggested_wait, until_pattern, wait_page)
+                   DEFAULT_WAIT_SECONDS, JOB_END_STATES, JOB_NOTICE_STATES, MIN_HEAD_CHARS, TAIL_CHARS, job_command,
+                   job_ending, job_runtime, suggested_wait, until_pattern, wait_page)
 from .tools import read_page_bytes
 from .permissions import MODE_LABELS, SCOPE_NAMES, denied_tools, evaluate, log, mode_prompt
 from .rules import (APP_ROOT, RuleStore, card_rule_options, default_rule, normalize_rule, project_key, protected_reason,
