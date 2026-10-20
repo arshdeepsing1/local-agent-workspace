@@ -4,6 +4,34 @@ Notable changes to Local Agent Workspace, newest first. Dates are UTC.
 
 ## Unreleased
 
+Context accounting, file links and handoffs (2026-10-20):
+
+- The context meter no longer counts Databricks' cached tokens twice. On Claude endpoints
+  `prompt_tokens` already includes `cache_read_input_tokens` and `cache_creation_input_tokens`
+  (seen on every cached request of a long real chat; `total_tokens` is `prompt_tokens` plus
+  `completion_tokens`), and the app added them on top: a chat at about 85% of its input budget
+  showed over 170%, before its first compaction. Reports were also left out of the estimate scale
+  as "counted twice", and DBU estimates billed cached tokens a second time. The cache counts are
+  now subtracted from `prompt_tokens`; saved chats are repaired when they load (their usage
+  records and the meter's **Last request**), and the usage across chats is counted again.
+- The open context details start with a usage card like Claude's context panel: **N% used**, the
+  tokens used of the context budget, a bar split by what the request holds with the auto-compact
+  mark, and a legend with tokens and share: messages and tool results, conversation summary,
+  system instructions, instruction files and memory, built-in tools, MCP tools, request overhead,
+  **Free space**, **Autocompact buffer** and **Reserved for the reply**. A model window larger than
+  the budget is named. Warnings and **Compact now** follow; the explanations sit under a collapsed
+  **Details**. **Workspace → Progress** shows the same legend.
+- A file a reply names relative to where the chat worked opens: the Workspace panel also looks
+  under the folders the chat's commands ran in (`cwd` or a leading `cd`), the folders its tools named
+  or read files from, its instruction folders and their parents, newest first. Before, a
+  `template/pipeline.json` named after commands ran in a repository below the project said it did
+  not exist.
+- `/handoff` in a compacted chat reads the handoffs the app saved at each compaction (oldest first,
+  only their state sections) and carries their facts in, so the handoff covers the chat from its
+  start. The summary says when older compaction handoffs exist than the five it lists.
+- New shipped skill **`/read-handoff`**: reads a handoff's Contents or headings, then only the
+  sections that carry state, skipping command and activity logs, runbooks and resource lists.
+
 Workflow and progress view (2026-10-19):
 
 - Consecutive read-only steps fold into one line in the chat, such as **Ran 3 commands, read 2
