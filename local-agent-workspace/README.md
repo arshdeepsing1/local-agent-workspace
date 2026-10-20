@@ -1908,7 +1908,19 @@ that is partial, misses input tokens or looks counted twice, leaves the previous
 none, the scaled estimate). The automatic compaction threshold, the budget checks, side questions
 (`/btw`) and the meter use the anchored estimate; the usage ledger, the estimate scale, the cuts
 compaction considers and the 4 MB check keep the heuristic estimate.
-Expanded context details attribute that same estimate to system/project
+The open context details start with a usage card like Claude's context panel: "N% used" and the
+tokens used of the chat's context budget, a bar split by what the request holds, with the
+auto-compact threshold marked, and a legend with each part's tokens and share of the budget:
+messages and tool results, the conversation summary, system instructions, instruction files and
+memory (the loaded instruction sources, skill index and selected skills), built-in tools, MCP
+tools (with the number of servers), request overhead, then **Free space** up to the auto-compact
+threshold, the **Autocompact buffer** between it and the input budget, and what is **Reserved for
+the reply** (and safety). The parts add up to the context budget. When Databricks' count for the
+last request is current, the parts are the app's estimate scaled to it; a model whose window is
+larger than the budget says so. Warnings and **Compact now** follow, and the explanations below sit
+under a collapsed **Details** (it stays open or closed, for every chat, while the page is open).
+**Workspace → Progress** shows the same legend under its context line.
+The **Details** breakdown attributes that same estimate to system/project
 instructions (including skills selected for the chat), tool definitions (split per MCP server,
 for example "Built-in tools · ~9,000 tokens" and "MCP docs · ~640 tokens", when an MCP server's
 tools are offered), conversation messages and tool results, the retained summary, and request

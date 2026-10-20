@@ -4,7 +4,7 @@ import { api } from '../api.js'
 import { useJobs } from '../useJobs.js'
 import { agentLabel, elapsedText } from '../subagents.js'
 import { turnSummary } from '../turnResult.js'
-import { CONTEXT_EMPTY, LoadedInstructions, meterReading } from './ContextMeter.js'
+import { CONTEXT_EMPTY, ContextUsage, contextUsage, LoadedInstructions, meterReading } from './ContextMeter.js'
 import { DELEGATION_STATUS, SubagentControls } from './Conversation.js'
 import { TaskList, taskProgress } from './TaskChecklist.js'
 import { jobState } from './TerminalPanel.js'
@@ -64,6 +64,7 @@ function ContextSection({ session, onOpenContext }) {
     ${mark !== null ? html`<p class="progress-note">Compacts automatically at ${mark}% of the input budget.</p>` : null}
     ${counts ? html`<p class="progress-note">${counts}</p>` : null}
     ${summary ? html`<p class="progress-note" title=${summary.details}>Last turn: ${summary.text}</p>` : null}
+    <${ContextUsage} usage=${contextUsage(info, reading)} bar=${false} />
     <h4 class="progress-subheading">Loaded instructions</h4>
     <div class="progress-instructions"><${LoadedInstructions} info=${info} note=${false} /></div>
     ${onOpenContext ? html`<button class="outline" onClick=${onOpenContext}>Context details</button>` : null}`

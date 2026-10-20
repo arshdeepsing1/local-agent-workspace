@@ -13,12 +13,28 @@ def definition(scope, label):
     return scope.locator(f'xpath=.//dt[normalize-space()="{label}"]/following-sibling::dd[1]')
 
 
+def open_details(page):
+    """With a breakdown the usage card leads and the explanations sit under a collapsed Details."""
+    page.locator(".context-more > summary").click()
+    expect(page.locator(".context-more")).to_have_attribute("open", "")
+
+
+def legend(page):
+    """{label: (tokens, share)} of the usage card's legend."""
+    rows = page.locator(".context-legend li")
+    expect(rows.first).to_be_visible()
+    return {row.locator(".context-legend-name").inner_text().split(" · ")[0]:
+            (row.locator(".context-legend-tokens").inner_text(), row.locator(".context-legend-share").inner_text())
+            for row in rows.all()}
+
+
 def test_shows_breakdown_and_compaction_threshold(ui, page):
     ui.mount("components/ContextMeter.js", f"""{{ info: {{ ...{CONTEXT}, breakdown: {{
         system_instructions: 1000, tool_definitions: 2000, messages_and_results: 2500, summary: 400, request_overhead: 100 }} }} }}""")
     details = page.locator("details.context-meter")
     expect(details).not_to_have_attribute("open", "")
     page.get_by_text("Last model input · ~5%").click()
+    open_details(page)
     expect(page.get_by_text("Approximate input breakdown")).to_be_visible()
     for label, value in [("System instructions", "~1,000 tokens"), ("Tool definitions", "~2,000 tokens"),
                          ("Messages and tool results", "~2,500 tokens"), ("Conversation summary", "~400 tokens"),
@@ -39,7 +55,9 @@ def test_zero_summary_and_no_invented_breakdown(ui, page):
     ui.mount("components/ContextMeter.js", f"""{{ info: {{ ...{CONTEXT}, breakdown: {{
         system_instructions: 1000, tool_definitions: 2000, messages_and_results: 2900, summary: 0, request_overhead: 100 }} }} }}""")
     page.get_by_text("Last model input · ~5%").click()
+    open_details(page)
     expect(definition(page, "Conversation summary")).to_have_text("~0 tokens")
+    assert "Conversation summary" not in legend(page)  # Nothing summarized: no card row.
     ui.rerender(f"{{ info: {CONTEXT} }}")
     expect(page.get_by_text("Approximate input breakdown")).to_have_count(0)
     expect(page.get_by_text("Automatic compaction threshold: approximately 120,832 input tokens.")).to_be_visible()
@@ -499,6 +517,10 @@ def test_tool_definitions_are_split_per_mcp_server(ui, page):
     ui.mount("components/ContextMeter.js", f"""{{ info: {{ ...{CONTEXT}, {breakdown},
         tool_groups: {{ 'Built-in tools': 1400, 'MCP docs': 450, 'MCP git_hub': 150 }} }} }}""")
     page.get_by_text("Last model input · ~5%").click()
+    rows = legend(page)
+    assert rows["Built-in tools"][0] == "1.4k" and rows["MCP tools"][0] == "600" and "Tool definitions" not in rows
+    expect(page.locator(".context-legend li").filter(has_text="MCP tools")).to_contain_text("MCP tools · 2")
+    open_details(page)
     tools = definition(page, "Tool definitions")
     expect(tools).to_contain_text("~2,000 tokens")
     expect(tools.locator("li")).to_have_text(["Built-in tools · ~1,400 tokens", "MCP docs · ~450 tokens",
@@ -506,6 +528,7 @@ def test_tool_definitions_are_split_per_mcp_server(ui, page):
     # Only built-in tools: the total alone.
     ui.rerender(f"""{{ info: {{ ...{CONTEXT}, {breakdown}, tool_groups: {{ 'Built-in tools': 2000 }} }} }}""")
     expect(definition(page, "Tool definitions")).to_have_text("~2,000 tokens")
+    assert legend(page)["Tool definitions"][0] == "2.0k" and "MCP tools" not in legend(page)
 
 
 def test_selected_skills_are_listed_one_by_one(ui, page):
@@ -522,3 +545,64 @@ def test_selected_skills_are_listed_one_by_one(ui, page):
         re.compile(r"^\s*Skill /review · applies to this message · ~310 tokens\s*$"),
     ])
     expect(page.get_by_text(re.compile("A skill your message selected counts in messages and tool results instead."))).to_be_visible()
+
+
+def test_the_usage_card_shows_where_the_context_budget_goes(ui, page):
+    # Like Claude's context panel: what the request holds, then the free space up to the auto-compact threshold,
+    # the buffer up to the input budget and what is kept for the reply; the parts add up to the context budget.
+    info = """{ estimated_tokens: 60000, input_budget: 181568, context_window: 200000, reply_reserve: 16384,
+      auto_compact_threshold: 163411, auto_compact_percent: 90, estimate_scale: 1.0, compactions: 1, summarized_messages: 9,
+      estimate_method: 'weighted_utf8', instruction_files: ['AGENTS.md'], warnings: ['Large tool result trimmed.'],
+      breakdown: { system_instructions: 5000, tool_definitions: 8000, messages_and_results: 44000, summary: 2600, request_overhead: 400 },
+      tool_groups: { 'Built-in tools': 6000, 'MCP docs': 2000 },
+      instruction_sources: [{ path: 'AGENTS.md', scope: '.', status: 'loaded', estimated_tokens: 1500 },
+        { path: 'Project memory', scope: 'this project', status: 'loaded', estimated_tokens: 500 },
+        { path: 'Skill /review', scope: 'this message', status: 'loaded', estimated_tokens: 900 },
+        { path: 'big/AGENTS.md', scope: 'big', status: 'omitted', estimated_tokens: 0 }] }"""
+    ui.mount("components/ContextMeter.js", f"{{ info: {info}, onCompact: fake.spy('compact') }}")
+    page.get_by_text("Last model input · ~33%").click()
+    card = page.get_by_role("region", name="Context usage")
+    expect(card.locator(".context-usage-head")).to_have_text(re.compile(r"30% used\s*~60\.0k / 200k"))
+    assert legend(page) == {
+        "Messages and tool results": ("44.0k", "22.0%"), "Conversation summary": ("2.6k", "1.3%"),
+        "System instructions": ("3.0k", "1.5%"), "Instruction files and memory": ("2.0k", "1.0%"),
+        "Built-in tools": ("6.0k", "3.0%"), "MCP tools": ("2.0k", "1.0%"), "Request overhead": ("400", "0.2%"),
+        "Free space": ("103k", "51.7%"), "Autocompact buffer": ("18.2k", "9.1%"), "Reserved for the reply": ("18.4k", "9.2%")}
+    expect(card.locator(".context-legend li").filter(has_text="Instruction files")).to_contain_text("· 2")
+    expect(card.get_by_role("img")).to_have_attribute("aria-label", re.compile(r"^60\.0k of the 200k-token context budget used: "
+                                                                              r"Messages and tool results 44\.0k, "))
+    expect(card.locator(".context-stack-mark")).to_have_attribute("style", re.compile(r"left: ?81\.7"))
+    expect(card.locator(".context-usage-note")).to_have_text("Estimated by the app · 33% of the input budget · compacts at 90%.")
+    # Warnings and Compact now stay in view; the explanations wait under Details, which stays as it was left.
+    expect(page.get_by_text("Large tool result trimmed.")).to_be_visible()
+    expect(page.get_by_role("button", name="Compact now")).to_be_visible()
+    expect(page.get_by_text("Approximately 60,000 of 181,568 input tokens used.")).to_be_hidden()
+    open_details(page)
+    expect(page.get_by_text("Approximately 60,000 of 181,568 input tokens used.")).to_be_visible()
+    ui.rerender(f"{{ info: {{ ...{info}, estimated_tokens: 61000 }} }}")
+    expect(page.locator(".context-more")).to_have_attribute("open", "")
+
+
+def test_the_usage_card_follows_the_reported_count_and_names_the_model_window(ui, page):
+    # Databricks reported 170,000 for the request the app estimated at 100,000: the parts scale to the report, the
+    # threshold is passed (no free space), and the model's larger window is named next to the budget.
+    report = """{ call_id: 'c1', model: 'databricks-claude-opus-5-5', status: 'completed', finish_reason: 'stop', partial: false,
+      input_tokens: 170000, uncached_input_tokens: 2000, cache_read_input_tokens: 168000, cache_creation_input_tokens: 0,
+      context_window: 200000, input_budget: 181568, auto_compact_threshold: 163411, auto_compact_percent: 90, compactions: 0,
+      percent_of_input_budget: 93.6, percent_of_context_budget: 85, model_window: 1000000, percent_of_model_window: 17,
+      estimated_tokens: 100000, estimate_scale: 1.3 }"""
+    info = f"""{{ estimated_tokens: 100000, input_budget: 181568, context_window: 200000, reply_reserve: 16384,
+      auto_compact_threshold: 163411, auto_compact_percent: 90, compactions: 0, summarized_messages: 0,
+      estimate_method: 'weighted_utf8', instruction_files: [], warnings: [],
+      breakdown: {{ system_instructions: 10000, tool_definitions: 10000, messages_and_results: 80000, summary: 0, request_overhead: 0 }},
+      last_request: {report} }}"""
+    ui.mount("components/ContextMeter.js", f"{{ info: {info} }}")
+    page.get_by_text("Last model input · 170,000 tokens · 93.6%").click()
+    expect(page.locator(".context-usage-head")).to_have_text(re.compile(r"85% used\s*170k / 200k"))
+    rows = legend(page)
+    assert rows["Messages and tool results"] == ("136k", "68.0%") and rows["System instructions"] == ("17.0k", "8.5%")
+    assert rows["Free space"] == ("0", "0.0%") and rows["Autocompact buffer"] == ("11.6k", "5.8%")
+    assert rows["Reserved for the reply"] == ("18.4k", "9.2%")
+    expect(page.locator(".context-usage-note")).to_have_text(
+        "Reported by Databricks for the last request · 93.6% of the input budget · compacts at 90%; parts are the "
+        "app's estimate. The model's window is 1M; this chat uses a 200k context budget (Settings).")
