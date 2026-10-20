@@ -33,6 +33,11 @@ Context accounting, file links and handoffs (2026-10-20):
 - `/handoff` in a compacted chat reads the handoffs the app saved at each compaction (oldest first,
   only their state sections) and carries their facts in, so the handoff covers the chat from its
   start. The summary says when older compaction handoffs exist than the five it lists.
+- A chat is one file again: its "Allow for this chat" rules, queued messages, pending `!` output,
+  instruction paths and file-read records are field records of `<id>.jsonl` instead of a separate
+  `<id>.state.json`. A chat saved with a `.state.json` opens as before, and its next save folds the
+  file in and removes it. App versions old enough to reject these field records cannot open a chat
+  saved since.
 - New shipped skill **`/read-handoff`**: reads a handoff's Contents or headings, then only the
   sections that carry state, skipping command and activity logs, runbooks and resource lists.
 

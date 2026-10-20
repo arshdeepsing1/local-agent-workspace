@@ -19,9 +19,10 @@ _SEPARATE_FIELDS = ("context_state", "instruction_directories", "file_views", "a
                     "queued_messages", "pending_context", "instruction_paths")
 # Context meter fields left out of list summaries and headers (see Store.summary).
 _METER_FIELDS = ("last_request", "next_estimate")
-# Kept in <id>.state.json beside the conversation file, never in field records: versions
-# before these fields existed reject unknown field records but only read *.jsonl files.
-_SIDECAR_FIELDS = ("file_views", "allow_rules", "queued_messages", "pending_context", "instruction_paths")
+# Field records of the conversation file. Versions up to 2026-10-20 kept them in <id>.state.json
+# beside it (so versions before these fields existed could still open the chat): such a file is still read, wins
+# over field records (it was written later), and is folded into the conversation file by its next save.
+_STATE_FIELDS = ("file_views", "allow_rules", "queued_messages", "pending_context", "instruction_paths")
 
 
 # JSON encodings of strings this long are kept between saves of a running conversation
@@ -97,8 +98,8 @@ class Store:
         self.conversations.chmod(0o700)
         self._lock = threading.RLock()
         self._command_jobs = {}
-        # The sidecar state last written or read, as JSON text, per conversation ID.
-        self._sidecars = {}
+        # Conversation IDs whose <id>.state.json get() merged: their next save folds it in and removes it.
+        self._sidecars = set()
         # Per running conversation ID (keep_encodings), the long strings encoded at its last save:
         # {id(string): (string, JSON)}.
         self._encoded = {}
@@ -149,7 +150,7 @@ class Store:
         metadata = {key: value for key, value in session.items()
                     if key not in ("events", "wire", *_SEPARATE_FIELDS)}
         yield {"record": "session", "version": 1, "data": metadata}
-        for name in ("context_state", "instruction_directories"):
+        for name in ("context_state", "instruction_directories", *_STATE_FIELDS):
             if name in session:
                 yield {"record": "field", "name": name, "data": session[name]}
         if "inference_calls" in session:
@@ -216,37 +217,20 @@ class Store:
     def _state_path(self, session_id):
         return self._path(session_id).with_suffix(".state.json")
 
-    @staticmethod
-    def _sidecar_text(session):
-        state = {name: session[name] for name in _SIDECAR_FIELDS if name in session}
-        return json.dumps(state, ensure_ascii=False, separators=(",", ":"), sort_keys=True) if state else None
+    def _fold_sidecar(self, session):
+        """Before session is written: the fields of an older <id>.state.json it was not loaded with (get() merges
+        it), added for those session lacks. After the write, _drop_sidecar removes the file."""
+        if session["id"] in self._sidecars or not self._state_path(session["id"]).exists():
+            return session
+        return {**self._read_sidecar(session["id"]), **session}
 
-    def _write_sidecar(self, session_id, text):
-        """Replace (or with text None, remove) <id>.state.json atomically."""
-        target = self._state_path(session_id)
-        if text is None:
-            target.unlink(missing_ok=True)
-            return
-        temporary = self.conversations / f".{target.name}.{uuid.uuid4().hex}.tmp"
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-                output.write(text)
-                output.flush()
-                os.fsync(output.fileno())
-            os.replace(temporary, target)
-            target.chmod(0o600)
+    def _drop_sidecar(self, session_id):
+        """Remove an older <id>.state.json once the conversation file holds its fields."""
+        path = self._state_path(session_id)
+        if path.exists() or path.is_symlink():
+            path.unlink(missing_ok=True)
             self._sync_directory()
-        except BaseException:
-            temporary.unlink(missing_ok=True)
-            raise
-
-    def _save_sidecar(self, session):
-        """Write the sidecar when its fields changed since it was last written or read."""
-        text = self._sidecar_text(session)
-        if self._sidecars.get(session["id"], "") != text:
-            self._write_sidecar(session["id"], text)
-            self._sidecars[session["id"]] = text
+        self._sidecars.discard(session_id)
 
     def _read_sidecar(self, session_id):
         """The sidecar fields, or {} when the file is missing or unreadable (never fatal)."""
@@ -258,16 +242,12 @@ class Store:
             if not isinstance(state, dict):
                 raise ValueError("not an object")
         except FileNotFoundError:
-            self._sidecars[session_id] = None
             return {}
         except (OSError, ValueError, RecursionError) as exc:
-            # Rewritten on the next save; the conversation itself stays readable.
+            # Removed by the next save; the conversation itself stays readable.
             log.warning("Ignored unreadable conversation state file %s (%s).", path.name, type(exc).__name__)
-            self._sidecars.pop(session_id, None)
             return {}
-        state = {name: state[name] for name in _SIDECAR_FIELDS if name in state}
-        self._sidecars[session_id] = self._sidecar_text(state)
-        return state
+        return {name: state[name] for name in _STATE_FIELDS if name in state}
 
     def _write(self, session, *, insert_only=False):
         temporary, target = self._temporary(session)
@@ -392,8 +372,8 @@ class Store:
             merged = self._merge_jobs(jobs, prepared.get("command_jobs", []))
             if merged or "command_jobs" in prepared:
                 prepared["command_jobs"] = merged
-            self._write(prepared)
-            self._save_sidecar(prepared)
+            self._write(self._fold_sidecar(prepared))
+            self._drop_sidecar(session_id)
             self._command_jobs[session_id] = merged
         session["updated"] = prepared["updated"]
 
@@ -478,10 +458,10 @@ class Store:
                     return
             jobs = self._merge_jobs(session.get("command_jobs", []), jobs, [job])
             session["command_jobs"] = jobs
-            legacy = {name: session[name] for name in _SIDECAR_FIELDS if name in session}
-            if legacy:  # Older field records: move them first, as the rewrite drops them.
-                self._save_sidecar({"id": session_id, **legacy, **self._read_sidecar(session_id)})
+            # An older <id>.state.json is newer than the field records read with the file.
+            session.update(self._read_sidecar(session_id))
             self._write(session)
+            self._drop_sidecar(session_id)
             self._command_jobs[session_id] = jobs
 
     def insert_sessions(self, sessions):
@@ -509,8 +489,6 @@ class Store:
                     temporary.unlink()
                 for target in published:
                     target.chmod(0o600)
-                for session in prepared:
-                    self._save_sidecar(session)
                 self._sync_directory()
             except BaseException:
                 for temporary, _ in staged:
@@ -518,8 +496,6 @@ class Store:
                 for target in published:
                     target.unlink(missing_ok=True)
                 for session in prepared:
-                    self._state_path(session["id"]).unlink(missing_ok=True)
-                    self._sidecars.pop(session["id"], None)
                     self._encoded.pop(session["id"], None)
                 self._sync_directory()
                 raise
@@ -540,8 +516,10 @@ class Store:
             session = self._read_own(session_id)
             if session is None:
                 return None
-            # Older files keep these as field records; the sidecar is newer when both exist.
-            session.update(self._read_sidecar(session_id))
+            # An older <id>.state.json is newer than field records when both exist; the next save folds it in.
+            if self._state_path(session_id).exists():
+                session.update(self._read_sidecar(session_id))
+                self._sidecars.add(session_id)
             self._command_jobs[session_id] = self._merge_jobs(
                 self._command_jobs.get(session_id, []), session.get("command_jobs", []))
             return session
@@ -665,6 +643,6 @@ class Store:
             self._path(session_id).unlink(missing_ok=True)
             self._state_path(session_id).unlink(missing_ok=True)
             self._command_jobs.pop(session_id, None)
-            self._sidecars.pop(session_id, None)
+            self._sidecars.discard(session_id)
             self._encoded.pop(session_id, None)
             self._sync_directory()

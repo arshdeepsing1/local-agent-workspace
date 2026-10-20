@@ -354,6 +354,7 @@ def test_instruction_paths_stay_out_of_the_pages_exports_and_rewind_backups(agen
     assert manager.store.get(session["id"])["instruction_paths"] == ["src/app.py"]  # Kept beside the conversation.
     assert "instruction_paths" not in export_bundle([session], session["id"])["sessions"][0]
     assert "instruction_paths" not in backup_copy(session)
-    sidecar = manager.store._state_path(session["id"])
-    assert json.loads(sidecar.read_text())["instruction_paths"] == ["src/app.py"]
-    assert oct(os.stat(sidecar).st_mode & 0o777) == "0o600"
+    path = manager.store._path(session["id"])  # A field record of the private conversation file.
+    fields = {line["name"]: line["data"] for line in map(json.loads, path.read_text().splitlines()) if line["record"] == "field"}
+    assert fields["instruction_paths"] == ["src/app.py"] and "instruction_paths" not in json.loads(path.read_text().splitlines()[0])["data"]
+    assert oct(os.stat(path).st_mode & 0o777) == "0o600"

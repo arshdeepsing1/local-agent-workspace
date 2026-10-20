@@ -269,8 +269,7 @@ saved partial reply is shown as interrupted; the most recent uncheckpointed text
 may be lost. Incomplete streamed tool arguments are never persisted as executable
 requests or replayed. A local storage failure stops the response and reports that
 recent history may not have been saved. Back up the whole `conversations/` folder
-(the JSONL files and their `.state.json` files) and the separate operational SQLite
-database.
+(the JSONL files) and the separate operational SQLite database.
 
 **Agent tools → Export** exports a versioned JSON bundle, optionally with
 subagent conversations (32 total, 16 MiB maximum). Export requires idle chats. A reply's
@@ -531,7 +530,7 @@ when opening a conversation or performing restart recovery.
   remove them. Because queued messages are sent together, their `@` files must fit the limits of
   one message (see below) when you queue them. A message queued while a question or plan card
   waits stays queued; it never answers the card. Queued messages are saved with the chat (in its
-  `<id>.state.json`) and are not exported.
+  conversation file) and are not exported.
 - **Files in a message (`@`)**: type `@` to pick a project file (↑/↓, Enter or Tab inserts
   `@<path> `, Esc closes); `@src/app.py:10-40` or `@src/app.py#L10-L40` names lines. The menu
   leaves out files whose paths an `@` token cannot spell (spaces, quotes, `<>|@` or a backtick in
@@ -1296,10 +1295,14 @@ workspace anyway, because commands run in the workspace can still reach it.
   files 0600. A chat keeps at most 100 attached files and 200 MB. Deleting the chat deletes its
   folder; a fork or rewind backup gets its own copies (hard links where possible). The folder is
   never exported, and an imported chat has no attached files: their chips keep the names.
-- `conversations/<conversation-id>.state.json`: the chat's "Allow for this chat" rules and
-  the size and modification time of the files the agent last read or wrote (paths only, no
-  contents). It sits beside the JSONL file so earlier versions of the app can still open the
-  chat; it is never exported, and a missing or unreadable one counts as empty.
+- The chat's "Allow for this chat" rules, queued messages, pending `!` output, the files whose
+  instructions it loaded, and the size and modification time of the files the agent last read or
+  wrote (paths only, no contents) are field records of the same JSONL file, never in its first
+  line and never exported. Earlier versions (up to 2026-10-20) kept them in
+  `conversations/<conversation-id>.state.json`: such a chat opens as before (that file wins over
+  field records, a missing or unreadable one counts as empty), and its next save moves the fields
+  into the JSONL file and removes it. Versions old enough to reject these field records cannot open a
+  chat saved since.
 - `conversations.sqlite3`: operational state only. Its `jobs` table stores command
   metadata, states, and bounded output for live control and restart recovery; terminal
   job snapshots are also mirrored into the owning chat JSONL. Chat messages, assistant

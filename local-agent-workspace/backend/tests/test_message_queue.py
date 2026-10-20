@@ -435,7 +435,7 @@ async def test_a_queued_file_whose_grant_was_removed_is_sent_with_a_note(runtime
     assert "attachments" not in users(manager.get(sid))[-1]
 
 
-async def test_the_queue_survives_a_restart_in_the_sidecar_and_is_not_started(runtime):
+async def test_the_queue_survives_a_restart_in_the_conversation_file_and_is_not_started(runtime):
     manager, session, _ = runtime
     sid = session["id"]
     blocker = asyncio.Event()
@@ -449,10 +449,10 @@ async def test_the_queue_survives_a_restart_in_the_sidecar_and_is_not_started(ru
     await asyncio.sleep(0.05)
 
     lines = [json.loads(line) for line in manager.store._path(sid).read_text().splitlines()]
-    assert not any(line.get("name") in ("queued_messages", "pending_context") for line in lines)
+    state = {line["name"]: line["data"] for line in lines if line["record"] == "field"}
     assert "queued_messages" not in lines[0]["data"] and "pending_context" not in lines[0]["data"]
-    state = json.loads(manager.store._state_path(sid).read_text())
-    assert [item["text"] for item in state["queued_messages"]] == ["Survive a restart"]
+    assert [item["text"] for item in state["queued_messages"]] == ["Survive a restart"] and state["pending_context"]
+    assert not manager.store._state_path(sid).exists()
 
     store = Store(manager.settings.state_dir / "tests.sqlite3")
     try:
