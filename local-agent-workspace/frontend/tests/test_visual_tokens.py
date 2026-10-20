@@ -818,17 +818,25 @@ def test_other_looks_keep_a_chat_the_workspace_and_settings_readable(ui, page, s
     assert failures(page, "dialog[open]") == []
 
 
+def families(value):
+    """A computed font-family as a list of names. Chromium on macOS reports BlinkMacSystemFont as "system-ui"."""
+    names = [name.strip().strip('"') for name in value.split(",")]
+    return ["system-ui" if name == "BlinkMacSystemFont" else name for name in names]
+
+
 def test_the_vscode_style_changes_fonts_and_corners_but_claude_keeps_its_own(ui, page):
     start_chat(ui, page)
     look = """() => [getComputedStyle(document.body).fontFamily, getComputedStyle(document.querySelector('.app-shell .composer')).borderTopLeftRadius,
       getComputedStyle(document.querySelector('.markdown pre')).fontFamily]"""
     claude = page.evaluate(look)
-    assert claude == ['"DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif', "18px",
-                      "ui-monospace, SFMono-Regular, Menlo, monospace"], claude
+    assert [families(claude[0]), claude[1], families(claude[2])] == [
+        families('"DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'), "18px",
+        families("ui-monospace, SFMono-Regular, Menlo, monospace")], claude
     start_chat(ui, page, setup=choose("vscode", "light"))
     vscode = page.evaluate(look)
-    assert vscode == ['-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif', "5px",
-                      '"SF Mono", Menlo, Consolas, "Cascadia Mono", monospace'], vscode
+    assert [families(vscode[0]), vscode[1], families(vscode[2])] == [
+        families('-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif'), "5px",
+        families('"SF Mono", Menlo, Consolas, "Cascadia Mono", monospace')], vscode
 
 
 def lab(hex_colour):
