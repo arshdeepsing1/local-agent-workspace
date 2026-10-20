@@ -1248,7 +1248,9 @@ when opening a conversation or performing restart recovery.
   the name most likely means (a path starting with the project's own folder name, or the
   folders above it from the repository root; in a worktree chat, the worktree's copy of a
   file named by the source project's path, which is always preferred over the source
-  project's own file) and says which file it opened; the header, **Open in VS Code** and the plus
+  project's own file; or a relative path under a folder the chat worked in: where its commands
+  ran (`cwd`, or a leading `cd <folder> &&`), the folders its tools named or read files from,
+  its instruction folders, then their parent folders, the most recent first) and says which file it opened; the header, **Open in VS Code** and the plus
   button (which an image other than SVG does not have) then name that file. Otherwise it reports
   that the file does not exist in the project folder. A file with unkept agent changes that cannot be read
   opens its review.

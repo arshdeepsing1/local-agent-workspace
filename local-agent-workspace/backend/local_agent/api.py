@@ -1,6 +1,7 @@
 import asyncio
 import mimetypes
 import os
+import re
 import secrets
 import sqlite3
 import sys
@@ -295,11 +296,56 @@ class CommandRequest(BaseModel):
     background: bool = Field(default=False, strict=True)
 
 
-def locate_file(tools, path, worktree=None):
+# A command's leading `cd <folder> &&` (or `;`, or a new line): where the model ran it.
+LEADING_CD = re.compile(r"""\s*cd\s+(?:"([^"\n]+)"|'([^'\n]+)'|([^\s;&|'"]+))\s*(?:&&|;|\n)""")
+# Tools whose path argument names a folder; the others name a file.
+FOLDER_TOOLS = {"list_files", "search_files", "find_files"}
+CHAT_FOLDERS = 40
+
+
+def chat_folders(session, root):
+    """The folders a chat worked in, most recent first, as workspace paths: where its commands ran (cwd, or a
+    leading cd), the folders its tools named and those of the files they named, then its instruction folders,
+    and after all of them their parent folders. At most CHAT_FOLDERS before the parents; the project root and
+    folders outside it are left out."""
+    root, found = PurePosixPath(str(root)), []
+
+    def add(value, folder):
+        if not isinstance(value, str) or not value.strip() or "\x00" in value or len(found) >= CHAT_FOLDERS:
+            return
+        path = PurePosixPath(value.strip().replace("\\", "/"))
+        if path.is_absolute():
+            try:
+                path = path.relative_to(root)
+            except ValueError:
+                return
+        path = path if folder else path.parent
+        if ".." not in path.parts and str(path) != "." and str(path) not in found:
+            found.append(str(path))
+
+    for event in reversed(session.get("events") or []):
+        arguments = event.get("input") if isinstance(event, dict) and event.get("type") == "tool" else None
+        if len(found) >= CHAT_FOLDERS:
+            break
+        if not isinstance(arguments, dict):
+            continue
+        add(arguments.get("cwd"), True)
+        command = arguments.get("command")
+        if isinstance(command, str) and (match := LEADING_CD.match(command)):
+            add(next(group for group in match.groups() if group), True)
+        add(arguments.get("path"), event.get("name") in FOLDER_TOOLS)
+    for folder in session.get("instruction_directories") or ():
+        add(folder, True)
+    parents = dict.fromkeys(str(parent) for folder in found for parent in PurePosixPath(folder).parents)
+    return found + [parent for parent in parents if parent != "." and parent not in found]
+
+
+def locate_file(tools, path, worktree=None, folders=()):
     """The project file a not-found path most likely names, as a workspace path, or None: a path that
     starts with the project's own last folders (`<project>/src/app.py`, or `<sub>/src/app.py` from the
-    Git repository's root) without them, or in a worktree chat the same file under the worktree
-    instead of its source project (by absolute path or by the source folder's name)."""
+    Git repository's root) without them, in a worktree chat the same file under the worktree
+    instead of its source project (by absolute path or by the source folder's name), or a relative
+    path that names a file under one of folders (chat_folders: where the chat worked), the first first."""
     value = PurePosixPath(path.replace("\\", "/"))
     candidates = []
     source = worktree.get("source_workspace") if isinstance(worktree, dict) else None
@@ -315,6 +361,7 @@ def locate_file(tools, path, worktree=None):
         parts = tuple(part for part in value.parts if part != ".")
         candidates += ["/".join(parts[count:]) for root in roots for count in range(1, min(4, len(parts)))
                        if len(root) > count and parts[:count] == root[-count:]]
+        candidates += [f"{folder}/{'/'.join(parts)}" for folder in folders if parts]
     for candidate in candidates:
         if not candidate or ".." in PurePosixPath(candidate).parts:
             continue
@@ -989,7 +1036,7 @@ def create_app(settings=None):
             # Replies and tool cards name files in other ways: from the project's own folder name
             # (demo/src/app.py), from the Git repository's root, or in a worktree chat by the source
             # project's absolute path. Open the one existing file such a name means, else say so.
-            found = locate_file(tools, path, session.get("worktree"))
+            found = locate_file(tools, path, session.get("worktree"), chat_folders(session, tools.root) if session else ())
             if found is None:
                 raise ValueError(f"{path} does not exist in {tools.root}. It may have been moved or deleted, "
                                  "or it was named relative to another folder.") from None
