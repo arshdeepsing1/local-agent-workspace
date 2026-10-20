@@ -324,6 +324,9 @@ when opening a conversation or performing restart recovery.
 
 ## Working with the app
 
+- **Theme**: **Settings → Appearance → Theme** chooses **Light** (the default), **Dark**, or
+  **Match system**, which follows your computer's light or dark mode and changes with it. It applies
+  at once and is kept in this browser only (it is not part of Settings' saved values).
 - **Text size**: **Settings → Appearance → Text size** (90% to 150%, default 100%) makes all text of
   the app larger or smaller at once; the layout keeps fitting the window. It applies as soon as you
   choose it and is kept in this browser only (it is not part of Settings' saved values). Browser
