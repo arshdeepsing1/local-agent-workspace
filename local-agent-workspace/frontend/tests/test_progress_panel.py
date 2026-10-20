@@ -392,6 +392,30 @@ def test_add_project_file_opens_the_panel_on_files_whatever_tab_was_used_last(ui
     expect(panel(page).get_by_role("button", name="note.txt")).to_be_visible()
 
 
+@pytest.mark.parametrize("opened", ["review", "path link"])
+def test_a_review_or_a_file_opened_from_a_reply_opens_files_without_showing_or_polling_the_remembered_progress(
+        ui, page, opened):
+    # The panel opens on the tab used last (Progress here), but a review from the changes bar and a file opened
+    # from a reply (or a card) open it on Files from its first frame: Progress never mounts, so GET /api/jobs is
+    # not read, as the commands are read only while the tab is shown.
+    reply = [CHAT[0], {"id": "r1", "type": "assistant", "text": "I changed `note.txt`.", "created": 2}]
+    start(ui, page, chat(reply) + "localStorage.setItem('workspace-panel-tab', 'progress')")
+    expect(panel(page)).to_have_count(0)
+    ui.run("window.progressMounted = 0; new MutationObserver(() => { if (document.querySelector('.progress-panel')) "
+           "window.progressMounted++ }).observe(document.body, { childList: true, subtree: true })")
+    if opened == "review":
+        ui.emit("a", "{ type: 'changes', changes: makeChanges(changedFile('note.txt', 2, 1)) }")
+        page.get_by_role("region", name="Changed files").get_by_role("button", name=re.compile("^1 file changed")).click()
+        page.get_by_title("Review note.txt").click()
+        expect(page.get_by_role("region", name="Agent changes in note.txt")).to_be_visible()
+    else:
+        page.locator(".markdown a.path-link", has_text="note.txt").click()
+        expect(panel(page).get_by_role("textbox", name="Edit note.txt")).to_be_visible()
+    expect(panel(page).get_by_role("button", name="Files", exact=True)).to_have_attribute("aria-pressed", "true")
+    assert jobs_requests(ui) == 0
+    assert ui.js("window.progressMounted") == 0
+
+
 def test_a_one_shot_tab_request_shows_that_tab_once(ui, page):
     ui.mount("components/WorkspacePanel.js", """{ sessionId: 'a', workspace: '/project', file: null, setFile: () => {},
       session: null, showTab: 'progress', onTabShown: fake.spy('shown') }""", scenario="workspace")

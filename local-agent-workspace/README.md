@@ -884,7 +884,8 @@ when opening a conversation or performing restart recovery.
   only while the tab is shown and the page is visible (every second while one runs, else every 3 s);
   after an error the tab tries again, waiting longer each time (up to 30 s), and offers **Retry**. A run
   of subagents' **Show in panel** opens this tab. The panel opens on the tab you used last, in any chat
-  (kept in this browser); the message box's **Add project file** (+) opens it on **Files**.
+  (kept in this browser); the message box's **Add project file** (+), a review from the changes bar and
+  a file opened from a reply or a card open it on **Files** straight away.
 - **Approvals**: approve or decline model-proposed writes, commands, MCP calls, and hooks. An unanswered
   card waits **Settings → Approval wait (minutes)**, 60 by default (1–1,440); a browser refresh
   retains it while the server runs (a server restart cancels it). After that time the card shows

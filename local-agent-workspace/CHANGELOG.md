@@ -26,7 +26,8 @@ Workflow and progress view (2026-10-19):
   running, waiting, queued and finished background subagents and background commands, with **Open
   subagent**, **Stop subagent**, **Allow**/**Decline**, **Show card**, **Stop job** and **View
   output**. The Workspace tabs show icons only when their labels do not fit, and the panel opens on
-  the tab used last.
+  the tab used last (on Files for the message box's +, a review from the changes bar or a file
+  opened from a reply or a card).
 - A background command's card reads its outcome (**background · exit 0**, timed out, stopped,
   interrupted) once the command ends, instead of "started in background", also when it was stopped
   from Terminal or Progress, by the agent's `stop_job` or by the app's shutdown, or a restart
