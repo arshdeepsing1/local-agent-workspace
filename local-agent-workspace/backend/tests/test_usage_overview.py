@@ -16,8 +16,8 @@ from local_agent.api import create_app
 from local_agent.config import Settings
 from local_agent.store import Store
 from local_agent.telemetry import (
-    MODEL_DBU_PER_MILLION, OPEN_PRICING_SOURCE, PRICING_SOURCE, SUMMARY_DAYS, SUMMARY_ROWS, estimated_dbu,
-    pricing_source, summary_rows, usage_summary,
+    MODEL_DBU_PER_MILLION, OPEN_PRICING_SOURCE, PRICING_SOURCE, SUMMARY_DAYS, SUMMARY_ROWS, SUMMARY_VERSION,
+    estimated_dbu, pricing_source, summary_rows, usage_summary,
 )
 from local_agent.usage_overview import MAX_PROJECTS, overview
 
@@ -52,7 +52,7 @@ def test_the_summary_groups_calls_by_local_date_model_and_purpose():
         "not a record",
     ]}
     summary = usage_summary(session)
-    assert summary["version"] == 1 and summary["calls"] == 6
+    assert summary["version"] == SUMMARY_VERSION and summary["calls"] == 6
     rows = {(row["date"], row["model"], row["purpose"]): row for row in summary_rows(summary)}
     agent = rows[(today.isoformat(), OPUS, "agent")]
     assert (agent["calls"], agent["input_tokens"], agent["cache_read_input_tokens"], agent["output_tokens"]) == (2, 3000, 5000, 300)
@@ -80,13 +80,13 @@ def test_the_summary_is_bounded_and_damaged_rows_are_skipped():
                                    ["2026-01-01", "m", "agent", 1, 0, 0, 0, 0, float("nan"), 0],
                                    ["2026-01-01", "m", "agent", 1, 0, 0, 0, 0, True, 0], rows[0] and list(rows[0].values())]}
     assert [row["date"] for row in summary_rows(damaged)] == [rows[0]["date"]]
-    assert summary_rows({**summary, "version": 2}) == [] and summary_rows(None) == [] and summary_rows({"rows": "x"}) == []
+    assert summary_rows({**summary, "version": SUMMARY_VERSION + 1}) == [] and summary_rows(None) == [] and summary_rows({"rows": "x"}) == []
 
 
 def test_a_summary_row_whose_date_is_not_a_date_is_skipped():
     # '2026-10-15x' sorts inside the window as a string; '20261015' is ISO's basic form, not the one written.
     rows = [[day, "m", "agent", 1, 10, 0, 0, 5, 0.001, 0] for day in ("2026-10-15x", "20261015", "2026-02-30", "2026-10-15")]
-    summary = {"version": 1, "calls": 4, "rows": rows}
+    summary = {"version": SUMMARY_VERSION, "calls": 4, "rows": rows}
     assert [row["date"] for row in summary_rows(summary)] == ["2026-10-15"]
     value = overview([({"workspace": "/project"}, summary)], 7, today=date(2026, 10, 16))
     assert value["totals"]["calls"] == 1 and value["totals"]["chats"] == 1
@@ -221,7 +221,7 @@ async def test_get_usage_reads_headers_and_summarizes_older_chats_once(api, monk
     assert {row["key"] for row in first["by_project"]} <= {"/project/a", "/project/b", "/project/c"}
     second = (await client.get("/api/usage")).json()
     assert second["pending_chats"] == 0 and second["totals"]["chats"] == 3 and second["days"] == 30
-    assert manager.store.header(older["id"])["usage_summary"]["version"] == 1  # Saved: not loaded again.
+    assert manager.store.header(older["id"])["usage_summary"]["version"] == SUMMARY_VERSION  # Saved: not loaded again.
     by_model = {row["key"]: row for row in second["by_model"]}
     assert by_model[GPT_OSS]["estimated_dbu"] > 0 and second["totals"]["unpriced_calls"] == 0
     # The sessions list leaves summaries and result records out.

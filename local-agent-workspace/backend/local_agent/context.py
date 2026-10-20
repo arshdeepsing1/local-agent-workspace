@@ -14,6 +14,7 @@ import re
 
 from . import request_limits
 from .request_limits import encode_payload, image_bytes, request_bytes_over
+from .telemetry import repair_counted_cache
 
 
 DEFAULT_CONTEXT_WINDOW = 131072
@@ -1721,6 +1722,26 @@ def last_request_report(call, context_info, model_window=None):
         return report
     except Exception:
         return None
+
+
+def repair_session_usage(session):
+    """Repair a loaded chat's ledger records that counted Databricks' cache twice (telemetry.repair_counted_cache),
+    and the meter's last request report when it describes one of them. Never raises."""
+    try:
+        calls = session.get("inference_calls")
+        repaired = {call["id"]: call for call in calls if repair_counted_cache(call) and isinstance(call.get("id"), str)} \
+            if isinstance(calls, list) else {}
+        info = session.get("context_info")
+        report = info.get("last_request") if repaired and isinstance(info, dict) else None
+        if isinstance(report, dict) and report.get("call_id") in repaired:
+            call = repaired[report["call_id"]]
+            # The report keeps the budgets and estimate it was made with.
+            fixed = last_request_report(call, report, report.get("model_window"))
+            if fixed is not None:
+                fixed["next_estimate_scale"] = float(estimate_scale(calls, call.get("model")))
+                info["last_request"] = fixed
+    except Exception:
+        pass
 
 
 def in_turn_tokens(wire, state, system_message, tools, input_budget, scale=1.0, *, record=True):

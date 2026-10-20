@@ -8,6 +8,7 @@ import time
 import uuid
 from pathlib import Path
 
+from .context import repair_session_usage
 from .telemetry import LEDGER_VERSION
 
 log = logging.getLogger(__name__)
@@ -424,6 +425,7 @@ class Store:
             raise UnreadableConversation(path.name, f"it could not be opened ({exc.strerror or type(exc).__name__})") from None
         if session.get("id") != session_id:
             raise UnreadableConversation(path.name, "its conversation ID does not match the file name")
+        repair_session_usage(session)
         return session
 
     def _known_jobs(self, session_id):

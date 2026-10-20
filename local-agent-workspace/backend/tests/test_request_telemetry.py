@@ -56,14 +56,65 @@ def test_openai_style_cached_tokens_are_not_counted_twice():
     openai = reported_usage({"prompt_tokens": 1000, "completion_tokens": 5, "prompt_tokens_details": {"cached_tokens": 800}})
     assert openai == {"input_tokens": 200, "output_tokens": 5, "cache_read_input_tokens": 800}
     assert reported_usage(openai) == openai  # Stored records are not split again.
-    # Claude-style buckets are already separate.
-    assert reported_usage({"prompt_tokens": 1000, "cache_read_input_tokens": 800}) == {
+    # Claude-style buckets under input_tokens are already separate.
+    assert reported_usage({"input_tokens": 1000, "cache_read_input_tokens": 800}) == {
         "input_tokens": 1000, "cache_read_input_tokens": 800}
     assert reported_usage({"input_tokens": 1000, "prompt_tokens_details": {"cached_tokens": 800}}) == {
         "input_tokens": 1000, "cache_read_input_tokens": 800}
     # A cached count above the prompt count is not a subset of it: nothing is subtracted.
     assert reported_usage({"prompt_tokens": 100, "prompt_tokens_details": {"cached_tokens": 800}}) == {
         "input_tokens": 100, "cache_read_input_tokens": 800}
+
+
+def test_databricks_claude_prompt_tokens_include_the_top_level_cache_counts():
+    # Databricks' Claude route: prompt_tokens includes the cache read and write counts, and total_tokens is
+    # prompt_tokens plus completion_tokens. The cache counts stay separate buckets; input_tokens keeps the rest.
+    usage = reported_usage({"prompt_tokens": 165465, "completion_tokens": 670, "total_tokens": 166135,
+                            "cache_read_input_tokens": 158527, "cache_creation_input_tokens": 2196})
+    assert usage == {"input_tokens": 4742, "output_tokens": 670, "total_tokens": 166135,
+                     "cache_read_input_tokens": 158527, "cache_creation_input_tokens": 2196}
+    assert reported_usage(usage) == usage  # Stored records are not split again.
+    # A cache miss writes everything: the uncached part is what follows the marker.
+    assert reported_usage({"prompt_tokens": 154048, "cache_read_input_tokens": 0,
+                           "cache_creation_input_tokens": 154046})["input_tokens"] == 2
+    # Nothing cached, or cache counts above prompt_tokens (not a subset of it): nothing is subtracted.
+    assert reported_usage({"prompt_tokens": 1000, "cache_read_input_tokens": 0,
+                           "cache_creation_input_tokens": 0})["input_tokens"] == 1000
+    assert reported_usage({"prompt_tokens": 100, "cache_read_input_tokens": 800})["input_tokens"] == 100
+    # A total_tokens that counts the cache on top of prompt_tokens says the buckets are separate.
+    assert reported_usage({"prompt_tokens": 1000, "completion_tokens": 5, "total_tokens": 1805,
+                           "cache_read_input_tokens": 800})["input_tokens"] == 1000
+
+
+def test_ledger_records_that_counted_the_cache_twice_are_repaired_once_on_load(tmp_path):
+    keys = ["cache_creation_input_tokens", "cache_read_input_tokens", "completion_tokens", "prompt_tokens", "total_tokens"]
+    doubled = {"id": "a", "purpose": "agent", "model": "databricks-claude-opus-5-5", "status": "completed",
+               "estimated_input_tokens": 120000, "usage_keys": keys,
+               "usage": {"input_tokens": 154048, "output_tokens": 1582, "total_tokens": 155630,
+                         "cache_read_input_tokens": 0, "cache_creation_input_tokens": 154046}}
+    # Saved by this version (already split), or without the raw keys to tell: kept as they are.
+    split = {**doubled, "id": "b", "usage": {**doubled["usage"], "input_tokens": 2}}
+    unknown = {**doubled, "id": "c", "usage_keys": ["input_tokens", "cache_read_input_tokens"], "usage": dict(doubled["usage"])}
+    store = Store(tmp_path / "tests.sqlite3")
+    session = store.create({"workspace": str(tmp_path), "model": "databricks-claude-opus-5-5"})
+    session["inference_calls"] = [json.loads(json.dumps(call)) for call in (doubled, split, unknown)]
+    session["context_info"] = {"estimated_tokens": 130000, "input_budget": 181568, "context_window": 200000,
+                               "last_request": {"call_id": "a", "model": "databricks-claude-opus-5-5", "status": "completed",
+                                                "input_tokens": 308094, "context_window": 200000, "input_budget": 181568,
+                                                "auto_compact_threshold": 163411, "auto_compact_percent": 90,
+                                                "compactions": 1, "estimated_tokens": 132570, "estimate_scale": 1.16,
+                                                "model_window": 1000000, "percent_of_input_budget": 169.7}}
+    store.save(session)
+    loaded = Store(tmp_path / "tests.sqlite3").get(session["id"])
+    assert [call["usage"]["input_tokens"] for call in loaded["inference_calls"]] == [2, 2, 154048]
+    report = loaded["context_info"]["last_request"]
+    assert report["input_tokens"] == 154048 and report["uncached_input_tokens"] == 2
+    assert report["percent_of_input_budget"] == 84.8 and report["percent_of_model_window"] == 15.4
+    assert report["compactions"] == 1 and report["estimated_tokens"] == 132570 and report["next_estimate_scale"] > 1
+    store.save(loaded)  # Saved repaired, then loaded again: not split a second time.
+    again = Store(tmp_path / "tests.sqlite3").get(session["id"])
+    assert [call["usage"]["input_tokens"] for call in again["inference_calls"]] == [2, 2, 154048]
+    assert again["context_info"]["last_request"]["input_tokens"] == 154048
 
 
 def test_retry_after_accepts_seconds_http_date_and_nested_json_with_a_cap(monkeypatch):

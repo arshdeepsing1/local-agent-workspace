@@ -1415,11 +1415,16 @@ inside `prompt_tokens` (`prompt_tokens_details.cached_tokens`); the app then rec
 `prompt_tokens` minus the cached count as uncached input, so totals, the DBU estimate
 and the estimate scale do not count the cache twice (a cached count larger than
 `prompt_tokens` is left as reported). Claude endpoints on Databricks report the cache counts
-as top-level `cache_read_input_tokens` and `cache_creation_input_tokens`; that their
-`prompt_tokens` then excludes them, as the app assumes, is still to be confirmed by one cached
-request (see **Prompt caching**). Ledger records saved before
-this change keep the counts they were saved with; those that used OpenAI-style cached
-tokens stay double-counted, because they hold only the combined input count.
+as top-level `cache_read_input_tokens` and `cache_creation_input_tokens`, and their
+`prompt_tokens` includes them (seen on real cached requests: `prompt_tokens` was never below
+their sum, and `total_tokens` was `prompt_tokens` plus `completion_tokens`), so the app records
+`prompt_tokens` minus both as uncached input here too. A `total_tokens` that counts them on top of
+`prompt_tokens` keeps them separate. Ledger records saved before this was known counted the cache
+twice: a chat's records are repaired when it is loaded (only records whose raw usage had
+`prompt_tokens` and a top-level cache count, and whose `total_tokens` is still input plus output),
+along with the meter's **Last request** report, and the usage across chats is counted again. Records
+that used OpenAI-style cached tokens before that split existed stay double-counted, because they
+hold only the combined input count.
 The Usage section starts with a **Last model input** row: the reported input tokens of
 the conversation's latest agent request (cache included), its share of the input
 budget and of the model's window when known, and the app's estimate for the same
@@ -1711,10 +1716,10 @@ cache reads that stay at about the size of the system message and the tool defin
 step, instead of covering the conversation before it: choose **Documented forms only** then. A rejection that lowered an endpoint
 to no markers still applies until a restart or a Settings save.
 
-How Databricks counts `prompt_tokens` while the cache is in use is still to be confirmed by one
-cached request: the context meter, the estimate scale and the DBU estimate assume it excludes the
-cache reads and writes, which Databricks reports as `cache_read_input_tokens` and
-`cache_creation_input_tokens`. To help check it, the ledger in the conversation file keeps, for
+Databricks' `prompt_tokens` includes the cache reads and writes it reports as
+`cache_read_input_tokens` and `cache_creation_input_tokens` (confirmed on real cached requests; see
+**Provider-reported usage**): the context meter, the estimate scale and the DBU estimate subtract them from it. To
+check the shape an endpoint sends, the ledger in the conversation file keeps, for
 each agent and subagent request (not titles, `/btw` side questions or compaction), the key names
 of the usage object Databricks sent (`usage_keys`, never values), the shape that carried the
 model's reasoning (`reasoning_shape`) and whether a reasoning signature came
