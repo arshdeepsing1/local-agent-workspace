@@ -32,7 +32,11 @@ DENIED_ENV = {"BASH_ENV", "ENV", "ZDOTDIR", "PROMPT_COMMAND", "SHELLOPTS", "BASH
 DENIED_ENV_PREFIXES = ("LD_", "DYLD_")
 TERM_GRACE_SECONDS = 2
 ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
-JOB_NOTICE_STATES = {"completed", "failed", "timed_out"}  # Background jobs that get a finished notice.
+JOB_NOTICE_STATES = {"completed", "failed", "timed_out"}  # Background jobs the agent's next request names.
+# The agent's background jobs whose chat gets an end notice, which the page shows on the job's card: also stopped and
+# interrupted ones, which the agent's requests never name. A bundle's notices have these states too (portability).
+JOB_END_STATES = ("completed", "failed", "timed_out", "cancelled", "interrupted")
+KILLED_ENDINGS = {"timed_out": "timed out", "cancelled": "stopped", "interrupted": "interrupted"}
 JOB_ORIGINS = ("agent", "user")  # Who started a job (GET /api/jobs fills it in for jobs recorded before it).
 HEAD_CHARS = 1_500  # A failed command's first result: up to this much of the start,
 TAIL_CHARS = 4_500  # and this much of the end,
@@ -333,9 +337,10 @@ def job_command(command, limit):
 
 
 def job_ending(job):
-    """How a finished job ended, for notices: 'completed (exit 0)', 'failed (exit 2)' or 'timed out'."""
-    if job["state"] == "timed_out":
-        return "timed out"
+    """How a finished job ended, for notices: 'completed (exit 0)', 'failed (exit 2)', 'timed out', 'stopped' or
+    'interrupted'."""
+    if job["state"] in KILLED_ENDINGS:  # The app ended the process: its exit code says nothing more.
+        return KILLED_ENDINGS[job["state"]]
     exit_code = f" (exit {job['exit_code']})" if type(job.get("exit_code")) is int else ""
     return ("completed" if job["state"] == "completed" else "failed") + exit_code
 
@@ -481,6 +486,7 @@ class JobManager:
         self._jobs = {}
         self._removing_sessions = set()
         self._closed = False
+        self.interrupted = []  # Jobs this start marked interrupted, for their chats' end notices (AgentManager).
         store.db.execute("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, session_id TEXT, workspace TEXT, data TEXT)")
         store.db.commit()
         for (data,) in store.db.execute("SELECT data FROM jobs"):
@@ -489,6 +495,7 @@ class JobManager:
                 job.update(state="interrupted", updated=time.time(),
                            output=job["output"] + "\n[Server restarted; command outcome is unknown. The command was not restarted.]")
                 self._persist(job, mirror=True)
+                self.interrupted.append(copy.deepcopy(job))
             elif mirror_finished:
                 # Finished jobs were mirrored when they ended; after a clean shutdown that holds, and
                 # mirroring again would fully read each owning conversation (header-only startup).
@@ -765,6 +772,10 @@ class JobManager:
     async def shutdown(self):
         self._closed = True
         await asyncio.gather(*(self.stop(job["id"]) for job in list(self._jobs.values()) if job["state"] == "running"))
+
+    def removing(self, session_id):
+        """Whether this conversation's jobs are being stopped because the conversation is being deleted."""
+        return session_id in self._removing_sessions
 
     async def remove_session(self, session_id):
         self._removing_sessions.add(session_id)

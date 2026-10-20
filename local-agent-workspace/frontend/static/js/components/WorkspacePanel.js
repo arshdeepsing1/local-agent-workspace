@@ -327,8 +327,9 @@ function PanelResizer({ panel, width, limit, onWidth }) {
 // the context meter's details. showTab: a tab name to show once, then onTabShown() clears it (Show in panel).
 export default function WorkspacePanel({ sessionId, workspace, worktree = null, allowedDirectories = [], codingDir = null, pythonVenv = null, file, setFile, onClose, onAttach, changes: agentChanges, busy, review, onReviewOpened, onReview, onSelectSession, onSendComments, open, onOpened,
   session = null, sessions = [], tasks = [], onOpenSubagent, onShowCard, onOpenContext, showTab = null, onTabShown }) {
-  // A tab requested as the panel opens (showTab) is its first tab, so the remembered one never shows for a moment.
-  const [tab, shownTab] = useState(() => PANEL_TABS.includes(showTab) ? showTab : savedTab())
+  // A tab requested as the panel opens (showTab, or Files for a review or a file to open) is its first tab, so the
+  // remembered one never shows for a moment (nor reads what it shows, such as Progress's jobs).
+  const [tab, shownTab] = useState(() => PANEL_TABS.includes(showTab) ? showTab : (review || open) ? 'files' : savedTab())
   const setTab = name => { shownTab(name); saveTab(name) }
   // Progress → View output: the job Terminal selects when it opens.
   const [focusJob, setFocusJob] = useState(null)

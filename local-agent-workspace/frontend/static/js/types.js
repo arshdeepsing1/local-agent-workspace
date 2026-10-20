@@ -408,8 +408,8 @@
 // Job: { id, session_id, workspace, command, state, created, updated, exit_code,
 //   output?, truncated, timeout_seconds, max_output_bytes, background,
 //   without_shell? (true: ran from an argument vector without a shell), origin?: 'agent'|'user' (run_command, or Run in
-//   Terminal and ! commands; missing on older jobs: 'user') }. A background job's end notice ({ type: 'notice', job_id })
-//   also carries job_state (the job's state) and exit_code.
+//   Terminal and ! commands; missing on older jobs: 'user') }. A background job's end notice ({ type: 'notice', job_id },
+//   also for a job that was stopped or interrupted) also carries job_state (the job's state) and exit_code.
 // Composer (M4): Session.queued_messages?: QueuedMessage[]; Session.pending_context?: [{ kind: 'shell', command,
 //   exit_code }] (! output attached to the next message; its text stays on the server). Pushed as
 //   { type: 'pending_context', pending_context } when a command adds one and when a message takes them.

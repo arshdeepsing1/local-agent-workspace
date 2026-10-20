@@ -380,6 +380,14 @@ def test_a_background_commands_card_shows_how_it_ended_once_its_notice_came(ui, 
     expect(status).to_have_text("background · ended")
     rerender(ui, [started, {**done, "text": "Background job timed out: serve", "job_state": "timed_out", "exit_code": None}])
     expect(status).to_have_text("background · timed out")
+    # A job that was stopped (Stop job, stop_job, the app's shutdown) is neutral; one a restart interrupted warns.
+    rerender(ui, [started, {**done, "text": "Background job stopped: serve", "job_state": "cancelled", "exit_code": -15}])
+    expect(status).to_have_text("background · stopped")
+    expect(status).to_have_class("tool-status neutral")
+    expect(page.locator(".tool-card .tool-outcome")).to_have_count(0)
+    rerender(ui, [started, {**done, "text": "Background job interrupted: serve", "job_state": "interrupted", "exit_code": None}])
+    expect(status).to_have_text("background · interrupted")
+    expect(page.locator(".tool-card .tool-outcome")).to_have_text("Background job interrupted: serve")
     # It still never folds, also next to other commands.
     rerender(ui, [command("a"), started, command("b"), done])
     expect(page.locator(".tool-group")).to_have_count(0)

@@ -8,6 +8,7 @@ has in_wire true; one that failed before its prompt was appended has in_wire fal
 events saved before the flag existed have no key and are matched by exact text.
 """
 import copy
+import json
 
 from . import context, mentions, portability
 
@@ -164,11 +165,14 @@ def cut_session(session, before_event_id=None, *, keep_local=False):
     event_cut, wire_cut = cut_points(session, before_event_id)
     result = copy.deepcopy(session)
     # A background subagent whose card is kept but which ended in a removed turn keeps its notice, now at the end:
-    # its end happened all the same, and the next step names it (below).
+    # its end happened all the same, and the next step names it (below). So does a background command's end notice,
+    # which the page reads to show on the card how the job ended (the job itself stays ended).
     cards = {event.get("child_session_id") for event in result["events"][:event_cut]
              if event.get("type") == "tool" and event.get("name") == "delegate_task" and event.get("child_session_id")}
+    jobs = {_command_job(event) for event in result["events"][:event_cut]
+            if event.get("type") == "tool" and event.get("name") == "run_command"} - {None}
     ended = [event for event in result["events"][event_cut:] if event.get("type") == "notice"
-             and event.get("subagent_status") and event.get("subagent_id") in cards]
+             and ((event.get("subagent_status") and event.get("subagent_id") in cards) or event.get("job_id") in jobs)]
     result["events"] = result["events"][:event_cut] + ended
     result["wire"] = result["wire"][:wire_cut]
     summary_dropped = False
@@ -219,6 +223,24 @@ def cut_session(session, before_event_id=None, *, keep_local=False):
             "messages_removed": len(session["wire"]) - wire_cut,
             "summary_dropped": summary_dropped}
     return result, info
+
+
+def _command_job(event):
+    """The job a run_command card ran: its job_id or, in a fork or an import (a bundle leaves that out), the job_id
+    of its result page, after the edited-command note when there is one (as the page reads it); else None."""
+    if isinstance(event.get("job_id"), str) and event["job_id"]:
+        return event["job_id"]
+    text = event.get("output")
+    if not isinstance(text, str) or not text:
+        return None
+    if text.startswith("["):  # The note can quote '\n{'; the page's only line starting with '{' is its first.
+        text = text[text.rfind("\n{") + 1:] if "\n{" in text else ""
+    try:
+        page = json.loads(text)
+    except ValueError:
+        return None
+    job = page.get("job_id") if isinstance(page, dict) else None
+    return job if isinstance(job, str) and job else None
 
 
 def _carried_output(session, event_id):

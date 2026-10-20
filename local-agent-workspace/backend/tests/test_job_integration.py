@@ -195,6 +195,30 @@ def test_app_shutdown_stops_background_jobs(settings):
         assert restored["state"] == "cancelled"
 
 
+async def test_the_apps_shutdown_leaves_a_stopped_notice_for_the_agents_background_job(settings):
+    """The app's shutdown stops the agent's running background job: after the restart its chat has the end notice,
+    so the job's card reads that it was stopped, as Workspace → Progress does."""
+    import httpx
+    app = create_app(settings)
+    manager = app.state.manager
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://localhost") as client:
+            client.headers["X-Local-Token"] = (await client.get("/api/bootstrap")).json()["token"]
+            session_id = (await client.post("/api/sessions")).json()["id"]
+            session = manager.get(session_id)
+            session["permission_mode"] = "bypassPermissions"
+            started = json.loads(await manager.execute_tool(session, manager.session_tools(session), "run_command",
+                                                            {"command": "sleep 30", "background": True}, "call-1"))
+            await wait_for_turn_end(manager, session)
+    with TestClient(create_app(settings)) as restarted:
+        headers = {"X-Local-Token": restarted.get("/api/bootstrap").json()["token"]}
+        job = restarted.get(f"/api/jobs/{started['job_id']}?session_id={session_id}", headers=headers).json()
+        assert job["state"] == "cancelled"
+        events = restarted.get(f"/api/sessions/{session_id}", headers=headers).json()["events"]
+        assert [(event["text"], event["job_id"], event["job_state"]) for event in events if event["type"] == "notice"] == [
+            ("Background job stopped: sleep 30", started["job_id"], "cancelled")]
+
+
 async def test_a_failed_command_shows_the_start_and_the_end_of_its_output(runtime):
     manager, session, tools = runtime
     session["permission_mode"] = "bypassPermissions"
@@ -330,7 +354,7 @@ async def test_a_slow_page_does_not_lose_the_notice(runtime, monkeypatch):
         "Background job completed (exit 0): sleep .3; printf done"]
 
 
-async def test_terminal_and_cancelled_jobs_get_no_notice(runtime):
+async def test_terminal_jobs_get_no_notice_and_a_stopped_agent_job_gets_one_for_its_card_only(runtime):
     manager, session, tools = runtime
     session["permission_mode"] = "bypassPermissions"
     session["jobs_reported_through"] = 0.0
@@ -341,9 +365,89 @@ async def test_terminal_and_cancelled_jobs_get_no_notice(runtime):
     await manager.jobs.wait(terminal["id"])
     await manager.jobs.stop(stopped["job_id"])
     stored = manager.store.get(session["id"])
-    assert not [event for event in stored["events"] if event["type"] == "notice"]
+    notices = [event for event in stored["events"] if event["type"] == "notice"]
+    job = manager.jobs.get(stopped["job_id"])
+    assert [(event["text"], event["job_id"], event["job_state"], event["exit_code"]) for event in notices] == [
+        ("Background job stopped: sleep 30", stopped["job_id"], "cancelled", job["exit_code"])]
+    # The page shows it on the job's card; the agent's next request names only jobs that completed, failed or
+    # timed out.
     assert manager.background_jobs_notice(stored) == ""
     assert "printf mine" not in json.dumps(stored["events"])
+
+
+async def test_a_restart_leaves_an_interrupted_notice_for_the_agents_running_background_job(runtime):
+    manager, session, _ = runtime
+    session["events"].append({"id": "card", "type": "tool", "name": "run_command", "job_id": "job-1",
+                              "state": "completed", "input": {"command": "sleep 99", "background": True}})
+    session["jobs_reported_through"] = 0.0
+    await wait_for_turn_end(manager, session)
+    now = time.time()
+    # Still running when the app stopped without its clean shutdown.
+    running = {"id": "job-1", "session_id": session["id"], "workspace": session["workspace"], "command": "sleep 99",
+               "state": "running", "created": now, "updated": now, "exit_code": None, "output": "", "truncated": False,
+               "timeout_seconds": 60, "max_output_bytes": 80000, "background": True, "origin": "agent"}
+    manager.jobs._persist(dict(running))
+    restarted = AgentManager(manager.store, manager.settings)
+    try:
+        stored = manager.store.get(session["id"])
+        notices = [event for event in stored["events"] if event["type"] == "notice"]
+        assert [(event["text"], event["job_id"], event["job_state"], event["exit_code"]) for event in notices] == [
+            ("Background job interrupted: sleep 99", "job-1", "interrupted", None)]
+        assert restarted.background_jobs_notice(stored) == ""  # The agent is not told, as before.
+        # A second start that marks the job interrupted again (its record still read running) adds no second notice.
+        restarted.jobs._persist(dict(running))
+        again = AgentManager(manager.store, manager.settings)
+        await again.jobs.shutdown()
+        assert again.jobs.get("job-1")["state"] == "interrupted"
+        assert len([event for event in manager.store.get(session["id"])["events"] if event["type"] == "notice"]) == 1
+    finally:
+        await restarted.jobs.shutdown()
+
+
+async def test_a_stopped_jobs_notice_never_reaches_the_model(settings, monkeypatch):
+    """The end notice of a stopped job is for the page: the chat's history (the wire, which is also all that
+    compaction summarizes) is unchanged, and the agent's next request names no ended job and has no notice text."""
+    import httpx
+    store = Store(settings.state_dir / "stopped.sqlite3")
+    manager = AgentManager(store, settings)
+    session = store.create(settings.values)
+    session["permission_mode"] = "bypassPermissions"
+    requests = []
+    replies = [{"tool_calls": [{"index": 0, "id": "c1", "type": "function", "function": {
+                   "name": "run_command", "arguments": json.dumps({"command": "sleep 30", "background": True})}}]},
+               {"content": "Started."},
+               {"content": "It was stopped."}]
+
+    async def gateway(request):
+        payload = json.loads(request.content)
+        if "tools" not in payload:
+            return httpx.Response(200, text='data: {"choices": [{"delta": {"content": "Title"}, "finish_reason": "stop"}]}\n\ndata: [DONE]\n\n')
+        requests.append(payload)
+        delta = replies[len(requests) - 1]
+        chunk = {"choices": [{"delta": delta, "finish_reason": "tool_calls" if "tool_calls" in delta else "stop"}]}
+        return httpx.Response(200, text="data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n")
+
+    client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client(**kwargs, transport=httpx.MockTransport(gateway)))
+    try:
+        await manager.run(session, "Start a server")
+        job_id = next(event["job_id"] for event in session["events"] if event.get("name") == "run_command")
+        wire = json.loads(json.dumps(store.get(session["id"])["wire"]))
+        await manager.jobs.stop(job_id)
+        session = store.get(session["id"])  # As the app loads an idle conversation.
+        assert [(event["text"], event["job_state"]) for event in session["events"] if event["type"] == "notice"] == [
+            ("Background job stopped: sleep 30", "cancelled")]
+        assert session["wire"] == wire
+        await manager.run(session, "Is it up?")
+        assert len(requests) == 3
+        # The history it sends is the one before the stop, then the new message; the system message is the same.
+        assert requests[2]["messages"][1:] == [*requests[1]["messages"][1:], {"role": "assistant", "content": "Started."},
+                                               {"role": "user", "content": "Is it up?"}]
+        assert requests[2]["messages"][0] == requests[1]["messages"][0]
+        assert "Background job stopped" not in json.dumps(requests[2])
+    finally:
+        await manager.jobs.shutdown()
+        store.db.close()
 
 
 async def test_a_deleted_conversation_gets_no_notice_and_is_not_recreated(runtime):
@@ -353,6 +457,8 @@ async def test_a_deleted_conversation_gets_no_notice_and_is_not_recreated(runtim
         "command": "sleep 30", "background": True}, "bg"))
     await wait_for_turn_end(manager, session)
     await manager.jobs.remove_session(session["id"])
+    # Deleting the chat stopped its job: that stop is no end notice, not even in the chat about to be deleted.
+    assert not [event for event in manager.store.get(session["id"])["events"] if event["type"] == "notice"]
     manager.store.delete(session["id"])
     assert manager.jobs.get(started["job_id"]) is None
     assert manager.store.get(session["id"]) is None

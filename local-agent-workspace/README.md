@@ -884,7 +884,8 @@ when opening a conversation or performing restart recovery.
   only while the tab is shown and the page is visible (every second while one runs, else every 3 s);
   after an error the tab tries again, waiting longer each time (up to 30 s), and offers **Retry**. A run
   of subagents' **Show in panel** opens this tab. The panel opens on the tab you used last, in any chat
-  (kept in this browser); the message box's **Add project file** (+) opens it on **Files**.
+  (kept in this browser); the message box's **Add project file** (+), a review from the changes bar and
+  a file opened from a reply or a card open it on **Files** straight away.
 - **Approvals**: approve or decline model-proposed writes, commands, MCP calls, and hooks. An unanswered
   card waits **Settings → Approval wait (minutes)**, 60 by default (1–1,440); a browser refresh
   retains it while the server runs (a server restart cancels it). After that time the card shows
@@ -3977,10 +3978,17 @@ packages.
 When a background job that the agent started completes, fails, or times out, its
 conversation gets a notice, also when the chat is idle, and the agent's next model
 request names the job once, unless a `wait_job` or `get_job_output` result already
-showed that it ended. The notice also carries how the job ended (its `job_state` and
-`exit_code`), which the page reads to show the outcome on the command's card. Nothing
-wakes an idle chat. Jobs started from the
-Terminal panel, and stopped or cancelled jobs, get no notice.
+showed that it ended. A job that was stopped (**Stop job** in Terminal or **Workspace /
+Progress**, the agent's `stop_job`, or the app's shutdown) or that a restart interrupted gets
+a notice too; the agent's next request does not name it (the agent sees how it ended only when
+it checks the job, with `wait_job`, `get_job_output` or `list_jobs`). The notice also carries how
+the job ended (its `job_state` and `exit_code`), which the page reads to show the outcome on the
+command's card, also in a fork, an export or an import of the chat (a bundle keeps them on the
+notice, while the job itself is not transferred); notices themselves are never sent to the model.
+A rewind (also **Edit message** and **Retry response**) or **Fork from here** that keeps the
+command's card keeps its notice too, also when the job ended in a removed turn: the notice then
+follows the last kept reply. Nothing wakes an idle chat. Jobs started from the Terminal panel
+get no notice, nor do the jobs that deleting a chat stops.
 Automatic compaction adds bounded summary requests beyond the configured agent steps.
 Databricks inference is billed to your workspace. Endpoints must support streaming,
 function calling, and non-streamed text responses for summarization.

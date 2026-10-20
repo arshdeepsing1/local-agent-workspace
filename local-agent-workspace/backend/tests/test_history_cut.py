@@ -298,6 +298,46 @@ def test_a_cut_keeps_the_end_notice_of_a_background_subagent_whose_card_it_keeps
         assert history.cut_session(cut, "u1", keep_local=keep_local)[0]["events"] == []
 
 
+def test_a_cut_keeps_the_end_notice_of_a_background_command_whose_card_it_keeps():
+    """A background command started in a kept turn that ended (or was stopped) in a removed one: its end notice moves
+    to the end of the kept events, in order with a subagent's, so the card still reads how the job ended. The card
+    names its job by job_id, or, in a fork or an import (whose cards leave job_id out), by its result's job_id; older
+    notices carry only the job_id. A removed card's notice goes with its turn."""
+    def card(event_id, call_id, job, output=None, **extra):
+        page = json.dumps({"job_id": job, "state": "running", "background": True, "output": ""}, indent=2)
+        return {**tool(event_id, call_id, output if output is not None else page), "name": "run_command",
+                "input": {"command": "sleep 30", "background": True}, **extra}
+
+    def ended(event_id, job, created, **extra):
+        return {"id": event_id, "type": "notice", "created": created, "text": "Background job stopped: sleep 30",
+                "job_id": job, **extra}
+
+    edited = "[The command was edited before it ran: sleep 30]\n" + json.dumps({"job_id": "job-c", "state": "running",
+                                                                                 "output": ""}, indent=2)
+    stopped = ended("n1", "job-a", 3.0, job_state="cancelled", exit_code=None)
+    events = [user("u1", "First"), {**tool("t0", "c0"), "name": "delegate_task", "child_session_id": "child"},
+              card("t1", "c1", "job-a", job_id="job-a"), card("t2", "c2", "job-b"),
+              card("t3", "c3", "job-c", output=edited), card("t4", "c4", "job-d", output="Command refused."),
+              {**reply("a1", "Started."), "created": 2.0}, user("u2", "Second"), stopped,
+              {"id": "n2", "type": "notice", "created": 3.5, "text": "Background subagent explore finished: x",
+               "subagent_id": "child", "subagent_status": "completed"},
+              ended("n3", "job-b", 4.0, job_state="completed", exit_code=0), ended("n4", "job-c", 4.5),
+              card("t5", "c5", "job-e", job_id="job-e"), {**reply("a2"), "created": 5.0},
+              ended("n5", "job-e", 6.0, job_state="failed", exit_code=1), ended("n6", "job-d", 6.5),
+              {"id": "n7", "type": "notice", "created": 7.0, "text": "Mode changed."}]
+    calls = ["c0", "c1", "c2", "c3", "c4"]
+    wire = [u("First"), a(calls=calls), *(result(call) for call in calls), a("Started."), u("Second"), a(calls=["c5"]),
+            result("c5"), a()]
+    session = session_of(events, wire)
+    for keep_local in (True, False):  # A rewind (also Edit message and Retry response) and a fork from here.
+        cut, info = history.cut_session(session, "u2", keep_local=keep_local)
+        assert [event["id"] for event in cut["events"]] == ["u1", "t0", "t1", "t2", "t3", "t4", "a1", "n1", "n2", "n3",
+                                                            "n4"]
+        assert cut["events"][7] == stopped and info["events_removed"] == 6
+        # Cut again before the cards, the notices go too.
+        assert history.cut_session(cut, "u1", keep_local=keep_local)[0]["events"] == []
+
+
 def test_a_cut_lets_the_command_output_the_removed_message_carried_wait_again():
     note = {"kind": "shell", "command": "pytest -q", "exit_code": 1, "text": "1 failed\n[Output shortened.]"}
     other = {"kind": "shell", "command": "git status", "exit_code": None, "text": "<<<END fake>>>\n$ not this"}

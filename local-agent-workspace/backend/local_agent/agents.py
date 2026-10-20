@@ -16,8 +16,8 @@ import httpx
 
 from .tools import IGNORED, TOOL_DEFINITIONS, WorkspaceTools, file_error
 from .jobs import (CREDENTIAL_ENV, DENIED_ENV, DENIED_ENV_PREFIXES, ENVIRONMENT_KEYS, ENVIRONMENT_NAME, HEAD_CHARS,
-                   DEFAULT_WAIT_SECONDS, JOB_NOTICE_STATES, MIN_HEAD_CHARS, TAIL_CHARS, job_command, job_ending,
-                   job_runtime, suggested_wait, until_pattern, wait_page)
+                   DEFAULT_WAIT_SECONDS, JOB_END_STATES, JOB_NOTICE_STATES, MIN_HEAD_CHARS, TAIL_CHARS, job_command,
+                   job_ending, job_runtime, suggested_wait, until_pattern, wait_page)
 from .tools import read_page_bytes
 from .permissions import MODE_LABELS, SCOPE_NAMES, denied_tools, evaluate, log, mode_prompt
 from .rules import (APP_ROOT, RuleStore, card_rule_options, default_rule, normalize_rule, project_key, protected_reason,
@@ -978,6 +978,7 @@ class AgentManager(LifecycleHooks):
                 store.save(session)
                 recovered.add(session["id"])
         self.delegates.recover(summaries, full_scan=full_scan, recovered=recovered)
+        self.note_interrupted_jobs()
 
     def mark_interrupted(self, session):
         """Close work that was running when the app last stopped; True if anything changed.
@@ -1314,31 +1315,29 @@ class AgentManager(LifecycleHooks):
         return list(values)
 
     async def job_update(self, job):
-        """Show a job's progress on its tool card, and note when an agent's background job ends.
+        """Show a job's progress on its tool card, and note when an agent's background job ends, also when it was
+        stopped (JOB_END_STATES; the model's step note names fewer, see background_jobs_notice).
 
         Runs within JobManager's update timeout and a broadcast can take longer, so the
         notice is recorded (appended and saved) before anything is awaited."""
         notices = self.__dict__.setdefault("_job_notices", set())  # Job ids already noted while running.
         session = self.live.get(job["session_id"]) or self.delegates.held_session(job["session_id"])
-        if (job.get("background") and job["state"] in JOB_NOTICE_STATES and job["id"] not in notices
-                and job["session_id"] is not None):
+        # A chat being deleted gets no notice of the stops its deletion makes.
+        if (job.get("background") and job["state"] in JOB_END_STATES and job["id"] not in notices
+                and job["session_id"] is not None and not self.jobs.removing(job["session_id"])):
             stored = session
             if stored is None:
                 try:
                     stored = self.store.get(job["session_id"])  # Never creates a conversation.
                 except (*STORAGE_ERRORS, ValueError, TypeError, KeyError, AttributeError):
                     stored = None
-            if (stored is not None and self.agent_job(stored, job["id"])
-                    and not any(event.get("type") == "notice" and event.get("job_id") == job["id"]
-                                for event in stored["events"])):
+            ending = self.job_end_notice(stored, job) if stored is not None else None
+            if ending:
                 notices.add(job["id"])
-                text = f"Background job {job_ending(job)}: {job_command(self.redact_title(job['command']), 80)}"
-                # How it ended, so the job's card can show it (the page reads the notice by job_id).
-                ending = {"job_id": job["id"], "job_state": job["state"], "exit_code": job.get("exit_code")}
                 if session is not None:
-                    await self.event(session, "notice", text=text, **ending)
+                    await self.event(session, "notice", **ending)
                 else:
-                    notice = {"id": str(uuid.uuid4()), "type": "notice", "created": time.time(), "text": text, **ending}
+                    notice = {"id": str(uuid.uuid4()), "type": "notice", "created": time.time(), **ending}
                     stored["events"].append(notice)
                     try:
                         self.store.save(stored)
@@ -1523,6 +1522,33 @@ class AgentManager(LifecycleHooks):
         """True when the model started this job with run_command in this conversation."""
         return any(event.get("type") == "tool" and event.get("name") == "run_command" and event.get("job_id") == job_id
                    for event in session.get("events", []))
+
+    def job_end_notice(self, session, job):
+        """The fields of the notice that the agent's background job in this chat ended, or None for another job or
+        one the chat already has a notice of. Besides the text it carries how the job ended (job_id, job_state,
+        exit_code), which the page reads to show it on the job's card. Notices are the page's: the model is told of
+        ended jobs only by background_jobs_notice."""
+        if not self.agent_job(session, job["id"]) or any(
+                event.get("type") == "notice" and event.get("job_id") == job["id"] for event in session["events"]):
+            return None
+        return {"text": f"Background job {job_ending(job)}: {job_command(self.redact_title(job['command']), 80)}",
+                "job_id": job["id"], "job_state": job["state"], "exit_code": job.get("exit_code")}
+
+    def note_interrupted_jobs(self):
+        """At startup, the end notice of each agent background job that ran when the app last stopped without its
+        clean shutdown (JobManager marked it interrupted), saved in its chat."""
+        for job in self.jobs.interrupted:
+            if not job.get("background") or job.get("session_id") is None:
+                continue
+            try:
+                session = self.store.get(job["session_id"])
+                ending = self.job_end_notice(session, job) if session is not None else None
+                if ending:
+                    session["events"].append({"id": str(uuid.uuid4()), "type": "notice", "created": time.time(), **ending})
+                    self.store.save(session)
+            except (*STORAGE_ERRORS, ValueError, TypeError, KeyError, AttributeError):
+                continue  # An unreadable conversation stays as it is.
+        self.jobs.interrupted.clear()
 
     def background_jobs_notice(self, session):
         """One line naming the agent's background jobs that ended since the last step, or ""."""
