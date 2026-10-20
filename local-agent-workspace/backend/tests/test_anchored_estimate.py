@@ -210,8 +210,8 @@ async def test_a_report_that_cannot_anchor_leaves_the_scaled_estimate(runtime, m
     if kind == "partial":
         gateway(monkeypatch, finish=None)  # The stream ends without a finish reason.
     elif kind == "double_counted":
-        # Uncached input near the estimate and as much again from the cache: counted twice.
-        gateway(monkeypatch, lambda raw: {"prompt_tokens": raw, "cache_read_input_tokens": raw, "completion_tokens": 5})
+        # Uncached input (input_tokens: kept as reported) near the estimate and as much again from the cache.
+        gateway(monkeypatch, lambda raw: {"input_tokens": raw, "cache_read_input_tokens": raw, "completion_tokens": 5})
     else:
         gateway(monkeypatch, lambda raw: {"completion_tokens": 5})
     await manager.run(session, "Hello " * 100)
@@ -225,7 +225,7 @@ async def test_a_report_that_cannot_anchor_leaves_the_scaled_estimate(runtime, m
 async def test_a_report_that_cannot_anchor_keeps_the_previous_anchor(runtime, monkeypatch):
     manager, session, _ = runtime
     good = lambda raw: {"prompt_tokens": raw * 7 // 10, "completion_tokens": 5}
-    doubled = lambda raw: {"prompt_tokens": raw, "cache_read_input_tokens": raw, "completion_tokens": 5}
+    doubled = lambda raw: {"input_tokens": raw, "cache_read_input_tokens": raw, "completion_tokens": 5}
     usages = [good, doubled, good]
     gateway(monkeypatch, lambda raw: usages.pop(0)(raw))
     await manager.run(session, "Hello " * 100)
@@ -334,3 +334,17 @@ async def test_the_meter_groups_tools_by_the_configured_server_ids(runtime, monk
     session["disabled_tools"] = ["get_tool_output", "report_findings", "get_subagent_result"]
     await manager._run_databricks(session, "Hello", external)
     assert list(session["context_info"]["tool_groups"]) == ["Built-in tools", "MCP team", "MCP team__a"]
+
+
+async def test_a_databricks_report_whose_prompt_tokens_include_the_cache_anchors_on_prompt_tokens(runtime, monkeypatch):
+    # Databricks' Claude route counts the cache inside prompt_tokens: the whole input is prompt_tokens, not the sum
+    # (which looked counted twice and never anchored).
+    manager, session, _ = runtime
+    gateway(monkeypatch, lambda raw: {"prompt_tokens": raw * 13 // 10, "cache_read_input_tokens": raw,
+                                      "completion_tokens": 5, "total_tokens": raw * 13 // 10 + 5})
+    await manager.run(session, "Hello " * 100)
+    first = agent_calls(session)[-1]
+    assert first["usage"]["input_tokens"] == first["estimated_input_tokens"] * 13 // 10 - first["estimated_input_tokens"]
+    assert session["context_info"]["last_request"]["input_tokens"] == first["estimated_input_tokens"] * 13 // 10
+    await manager.run(session, "Again")
+    assert session["context_info"]["estimate_anchor"]["reported"] == first["estimated_input_tokens"] * 13 // 10
