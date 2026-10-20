@@ -149,27 +149,34 @@ def reported_usage(value):
     # cached_tokens), while Claude-style usage reports uncached input, cache reads and
     # cache writes as separate buckets. input_tokens is kept as the uncached part, so
     # the cache is not counted twice by totals, DBU estimates and the estimate scale.
-    if (sources.get("input_tokens") == "prompt_tokens" and sources.get("cache_read_input_tokens") == "prompt_tokens_details"
-            and usage["cache_read_input_tokens"] <= usage["input_tokens"]):
+    split = (sources.get("input_tokens") == "prompt_tokens" and sources.get("cache_read_input_tokens") == "prompt_tokens_details"
+             and usage["cache_read_input_tokens"] <= usage["input_tokens"])
+    if split:
         usage["input_tokens"] -= usage["cache_read_input_tokens"]
     # Databricks' Claude route sends prompt_tokens with top-level cache_read_input_tokens and
     # cache_creation_input_tokens, and its prompt_tokens includes both (seen 2026-10-19 on 152 cached
     # requests: prompt_tokens was never below their sum, and total_tokens was prompt_tokens plus
-    # completion_tokens). The cache markers sit on the last message, so an uncached part that excluded
-    # them would be a few tokens, never their size. A total_tokens that counts them on top of
-    # prompt_tokens says they are separate, and nothing is subtracted.
-    elif sources.get("input_tokens") == "prompt_tokens" and inclusive_cache(usage):
-        usage["input_tokens"] -= usage.get("cache_read_input_tokens", 0) + usage.get("cache_creation_input_tokens", 0)
+    # completion_tokens). Only a report whose total_tokens says so is split: one whose total_tokens counts
+    # them on top of prompt_tokens, or that has none, keeps them as separate buckets.
+    if sources.get("input_tokens") == "prompt_tokens":
+        top = top_level_cache(usage, sources)
+        if inclusive_cache(usage, top, before=usage["cache_read_input_tokens"] if split else 0):
+            usage["input_tokens"] -= top
     return usage
 
 
-def inclusive_cache(usage):
-    """True when a usage's input_tokens (Databricks' prompt_tokens) already includes its top-level cache
-    read and write counts: some are cached, input_tokens is not below their sum, and total_tokens, when
-    present, does not count them again on top of it."""
-    cached = usage.get("cache_read_input_tokens", 0) + usage.get("cache_creation_input_tokens", 0)
+def top_level_cache(usage, sources):
+    """The cache read and write counts a usage reported as top-level fields (not in prompt_tokens_details)."""
+    return sum(usage.get(name, 0) for name in ("cache_read_input_tokens", "cache_creation_input_tokens")
+               if sources.get(name) == name)
+
+
+def inclusive_cache(usage, cached, before=0):
+    """True when a usage's input_tokens (Databricks' prompt_tokens, less before: what was already subtracted)
+    includes cached top-level cache tokens: some are cached, input_tokens is not below them, and total_tokens
+    is prompt_tokens plus output_tokens (it does not count them again)."""
     total, output = usage.get("total_tokens"), usage.get("output_tokens", 0)
-    return 0 < cached <= usage["input_tokens"] and not (type(total) is int and total >= usage["input_tokens"] + cached + output)
+    return 0 < cached <= usage["input_tokens"] and type(total) is int and total == usage["input_tokens"] + before + output
 
 
 def repair_counted_cache(call):

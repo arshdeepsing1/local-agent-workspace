@@ -299,8 +299,10 @@ class CommandRequest(BaseModel):
 # A command's leading `cd <folder> &&` (or `;`, or a new line): where the model ran it.
 LEADING_CD = re.compile(r"""\s*cd\s+(?:"([^"\n]+)"|'([^'\n]+)'|([^\s;&|'"]+))\s*(?:&&|;|\n)""")
 # Tools whose path argument names a folder; the others name a file.
-FOLDER_TOOLS = {"list_files", "search_files", "find_files"}
+FOLDER_TOOLS = {"list_files", "search_files", "find_files", "access_directory"}
 CHAT_FOLDERS = 40
+# The latest events chat_folders reads: a long chat's oldest folders matter least.
+CHAT_FOLDER_EVENTS = 2000
 
 
 def chat_folders(session, root):
@@ -323,18 +325,21 @@ def chat_folders(session, root):
         if ".." not in path.parts and str(path) != "." and str(path) not in found:
             found.append(str(path))
 
-    for event in reversed(session.get("events") or []):
+    for event in reversed((session.get("events") or [])[-CHAT_FOLDER_EVENTS:]):
         arguments = event.get("input") if isinstance(event, dict) and event.get("type") == "tool" else None
         if len(found) >= CHAT_FOLDERS:
             break
         if not isinstance(arguments, dict):
             continue
-        add(arguments.get("cwd"), True)
+        cwd = arguments.get("cwd") if isinstance(arguments.get("cwd"), str) and arguments["cwd"].strip() else None
         command = arguments.get("command")
         if isinstance(command, str) and (match := LEADING_CD.match(command)):
-            add(next(group for group in match.groups() if group), True)
+            target = next(group for group in match.groups() if group)
+            # A relative cd starts from the command's cwd.
+            add(target if cwd is None or PurePosixPath(target).is_absolute() else f"{cwd.rstrip('/')}/{target}", True)
+        add(cwd, True)
         add(arguments.get("path"), event.get("name") in FOLDER_TOOLS)
-    for folder in session.get("instruction_directories") or ():
+    for folder in reversed(session.get("instruction_directories") or ()):  # Added as the chat reached them.
         add(folder, True)
     parents = dict.fromkeys(str(parent) for folder in found for parent in PurePosixPath(folder).parents)
     return found + [parent for parent in parents if parent != "." and parent not in found]

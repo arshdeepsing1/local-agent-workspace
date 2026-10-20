@@ -119,9 +119,14 @@ export function meterReading(info, model) {
 
 // Tokens as Claude shows them: 950, 12.3k, 1.2M.
 export function shortTokens(value) {
-  if (value < 1000) return String(Math.round(value))
-  if (value < 1_000_000) return `${(value / 1000).toFixed(value < 99_950 ? 1 : 0)}k`
-  return `${(value / 1_000_000).toFixed(value % 1_000_000 ? 1 : 0)}M`
+  if (!Number.isFinite(value)) return '—'
+  const tokens = Math.round(value)
+  // Rounded first, so 999.6 reads 1.0k and 999,960 reads 1M.
+  const unit = (size, digits) => (tokens / size).toFixed(digits).replace(/\.0$/, digits && size > 1000 ? '' : '.0')
+  if (tokens < 1000) return String(tokens)
+  if (tokens < 99_950) return `${unit(1000, 1)}k`
+  if (tokens < 999_500) return `${unit(1000, 0)}k`
+  return `${unit(1_000_000, 1)}M`
 }
 
 const shareOf = (part, whole) => {
@@ -152,8 +157,8 @@ export function contextUsage(info, reading) {
     { key: 'summary', label: 'Conversation summary', tokens: breakdown.summary },
     { key: 'system', label: 'System instructions', tokens: breakdown.system_instructions - instructions },
     { key: 'instructions', label: 'Instruction files and memory', tokens: instructions, items: loaded.length },
-    { key: 'tools', label: groups.length > 1 ? 'Built-in tools' : 'Tool definitions', tokens: builtIn },
-    { key: 'mcp', label: 'MCP tools', tokens: breakdown.tool_definitions - builtIn, items: Math.max(0, groups.length - 1) },
+    { key: 'tools', label: groups.some(([name]) => name !== 'Built-in tools') ? 'Built-in tools' : 'Tool definitions', tokens: builtIn },
+    { key: 'mcp', label: 'MCP tools', tokens: breakdown.tool_definitions - builtIn, items: groups.filter(([name]) => name !== 'Built-in tools').length },
     { key: 'overhead', label: 'Request overhead', tokens: breakdown.request_overhead },
   ].map(part => ({ ...part, tokens: Math.max(0, Math.round(part.tokens * factor)) })).filter(part => part.tokens > 0)
   const window = info.context_window

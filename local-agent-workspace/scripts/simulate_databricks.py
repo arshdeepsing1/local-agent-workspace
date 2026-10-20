@@ -28,8 +28,8 @@ for Claude endpoints (the real route is not verified yet): both (default), anthr
 
 Prompt caching: Claude endpoints take "cache_control": {"type": "ephemeral"} on content parts and
 assistant tool_calls (at most 4; other endpoints refuse it with HTTP 400) and report usage as the real
-route does: prompt_tokens (the uncached remainder), completion_tokens, total_tokens and top-level
-cache_read_input_tokens and cache_creation_input_tokens, with input counts about 1.1 times the app's
+route does: prompt_tokens (the whole input, cache included), completion_tokens, total_tokens (their sum)
+and top-level cache_read_input_tokens and cache_creation_input_tokens (parts of prompt_tokens), with input counts about 1.1 times the app's
 estimate, as the real route counts. A prefix cache in memory (per endpoint, 5 minutes, refreshed on each
 read) answers a request that repeats an earlier one's marked prefix.
 --cache chooses how the route treats the markers: accept (default), documented (refuses list content
@@ -752,11 +752,12 @@ class Gateway(BaseHTTPRequestHandler):
 
 def usage(prompt_tokens, completion, cache=None, reasoning_tokens=0):
     """The usage object. Claude endpoints (cache: (read, written, total) input tokens): prompt_tokens is the
-    uncached remainder, with the cache counts as top-level fields and no details objects or reasoning
-    tokens, as the real route reports them. Other endpoints: OpenAI-style, cached tokens inside prompt_tokens."""
+    whole input with the cache counts inside it, repeated as top-level fields, and no details objects or
+    reasoning tokens, as the real route reports them. Other endpoints: OpenAI-style, cached tokens inside
+    prompt_tokens."""
     if cache is not None:
         read, written, total = cache
-        return {"prompt_tokens": total - read - written, "completion_tokens": completion,
+        return {"prompt_tokens": total, "completion_tokens": completion,
                 "total_tokens": total + completion, "cache_read_input_tokens": read,
                 "cache_creation_input_tokens": written}
     return {"prompt_tokens": prompt_tokens, "completion_tokens": completion, "total_tokens": prompt_tokens + completion,

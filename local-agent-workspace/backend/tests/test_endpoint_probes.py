@@ -462,7 +462,7 @@ async def test_a_whole_check_runs_against_the_simulator(api, gateway):
         "basic": "accepted", "reasoning": "accepted", "cache": "accepted", "tools": "accepted",
         "response_format": "accepted", "image": "accepted"}
     assert results["reasoning"]["reasoning_shape"] == "content.reasoning" and results["reasoning"]["signature"] is True
-    assert results["cache"]["level"] == "full" and results["cache"]["prompt_counting"] == "separate"
+    assert results["cache"]["level"] == "full" and results["cache"]["prompt_counting"] == "included"
     assert results["cache"]["cache_read_tokens"] > 5_000
     assert (results["tools"]["replay_plain"], results["tools"]["replay_signed"]) == ("accepted", "accepted")
     assert results["basic"]["answer"] == "ready" and results["image"]["answer"] == "Red."

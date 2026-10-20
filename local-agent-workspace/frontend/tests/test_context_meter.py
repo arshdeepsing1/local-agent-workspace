@@ -606,3 +606,20 @@ def test_the_usage_card_follows_the_reported_count_and_names_the_model_window(ui
     expect(page.locator(".context-usage-note")).to_have_text(
         "Reported by Databricks for the last request · 93.6% of the input budget · compacts at 90%; parts are the "
         "app's estimate. The model's window is 1M; this chat uses a 200k context budget (Settings).")
+
+
+def test_short_token_counts_round_before_choosing_the_unit(ui, page):
+    ui.mount("components/ContextMeter.js", f"{{ info: {CONTEXT} }}")
+    shown = page.evaluate("""async () => [999, 999.6, 12345, 99949, 99950, 999499, 999960, 1000001, 1200000, NaN]
+                               .map((await import('/static/js/components/ContextMeter.js')).shortTokens)""")
+    assert shown == ["999", "1.0k", "12.3k", "99.9k", "100k", "999k", "1M", "1M", "1.2M", "—"]
+
+
+def test_mcp_servers_are_counted_without_a_built_in_group(ui, page):
+    breakdown = """breakdown: { system_instructions: 1000, tool_definitions: 2000, messages_and_results: 2500, summary: 0,
+        request_overhead: 500 }"""
+    ui.mount("components/ContextMeter.js", f"""{{ info: {{ ...{CONTEXT}, {breakdown},
+        tool_groups: {{ 'MCP docs': 1500, 'MCP git_hub': 500 }} }} }}""")
+    page.get_by_text("Last model input · ~5%").click()
+    expect(page.locator(".context-legend li").filter(has_text="MCP tools")).to_contain_text("MCP tools · 2")
+    assert legend(page)["MCP tools"][0] == "2.0k" and "Built-in tools" not in legend(page)

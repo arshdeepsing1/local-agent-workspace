@@ -462,9 +462,10 @@ def handoff_pointer(files):
     listed = files[-HANDOFF_POINTER_FILES:]
     oldest = listed[0].get("compaction")
     # Only the newest are kept (context.compact): the older ones' files are still in that folder.
-    older = (f"\nThe handoffs of compactions 1-{oldest - 1} are older files in the same folder (names ending in "
-             "-compaction-<n>.md); a handoff of the whole conversation reads them too."
-             if type(oldest) is int and oldest > 1 and len(files) >= HANDOFF_POINTER_FILES else "")
+    earlier = "compaction 1" if oldest == 2 else f"compactions 1-{oldest - 1}" if type(oldest) is int else ""
+    older = (f"\nThe handoffs of {earlier} are older files in the same folder (names ending in -compaction-<n>.md, "
+             "their first lines name this conversation); a handoff of the whole conversation reads them too."
+             if type(oldest) is int and oldest > 1 and len(files) >= HANDOFF_POINTER_FILES - 1 else "")
     return HANDOFF_POINTER + "\n".join(f"- {item['path']} (compaction {item.get('compaction', '?')})"
                                         for item in reversed(listed)) + older
 

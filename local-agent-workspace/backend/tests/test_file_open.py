@@ -118,9 +118,15 @@ def test_chat_folders_reads_commands_tools_and_instruction_folders_most_recent_f
         {"type": "tool", "name": "read_file", "input": {"path": "a/b/c.py"}},
         {"type": "tool", "name": "list_files", "input": {"path": "lib/sub"}},
         {"type": "tool", "name": "run_command", "input": {"command": 'cd "x y/z"; make', "cwd": "w"}},
+        {"type": "tool", "name": "access_directory", "input": {"path": "granted"}},
         {"type": "tool", "name": "run_command", "input": {"command": f"cd '{tmp_path}/elsewhere' && ls"}},  # Outside.
         {"type": "tool", "name": "run_command", "input": {"command": "echo cd later && ls"}},  # Not leading.
         {"type": "tool", "name": "read_file", "input": {"path": f"{root}/top.md"}},  # The project root.
         {"type": "user", "text": "cd nowhere && ls"},
     ]}
-    assert chat_folders(session, root) == ["w", "x y/z", "lib/sub", "a/b", "docs", "x y", "lib", "a"]
+    # A relative cd starts from the command's cwd; instruction folders come newest first.
+    assert chat_folders(session, root) == ["granted", "w/x y/z", "w", "lib/sub", "a/b", "docs", "w/x y", "lib", "a"]
+    # Only the latest events are read.
+    session["events"] = [{"type": "tool", "name": "read_file", "input": {"path": "old/f.py"}}] + [
+        {"type": "user", "text": "x"}] * 2000
+    assert chat_folders(session, root) == ["a/b", "docs", "a"]

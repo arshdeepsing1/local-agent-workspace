@@ -79,7 +79,7 @@ def long_history(count=4, size=45_000):
 
 
 # Databricks' Claude route: prompt_tokens includes the top-level cache counts (9,000 uncached + 1,000 cache read).
-USAGE = {"prompt_tokens": 10_000, "completion_tokens": 50, "cache_read_input_tokens": 1000}
+USAGE = {"prompt_tokens": 10_000, "completion_tokens": 50, "total_tokens": 10_050, "cache_read_input_tokens": 1000}
 
 
 def capture(manager):

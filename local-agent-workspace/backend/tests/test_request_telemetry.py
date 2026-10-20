@@ -75,15 +75,21 @@ def test_databricks_claude_prompt_tokens_include_the_top_level_cache_counts():
                      "cache_read_input_tokens": 158527, "cache_creation_input_tokens": 2196}
     assert reported_usage(usage) == usage  # Stored records are not split again.
     # A cache miss writes everything: the uncached part is what follows the marker.
-    assert reported_usage({"prompt_tokens": 154048, "cache_read_input_tokens": 0,
-                           "cache_creation_input_tokens": 154046})["input_tokens"] == 2
+    assert reported_usage({"prompt_tokens": 154048, "completion_tokens": 1582, "total_tokens": 155630,
+                           "cache_read_input_tokens": 0, "cache_creation_input_tokens": 154046})["input_tokens"] == 2
     # Nothing cached, or cache counts above prompt_tokens (not a subset of it): nothing is subtracted.
-    assert reported_usage({"prompt_tokens": 1000, "cache_read_input_tokens": 0,
+    assert reported_usage({"prompt_tokens": 1000, "total_tokens": 1000, "cache_read_input_tokens": 0,
                            "cache_creation_input_tokens": 0})["input_tokens"] == 1000
-    assert reported_usage({"prompt_tokens": 100, "cache_read_input_tokens": 800})["input_tokens"] == 100
-    # A total_tokens that counts the cache on top of prompt_tokens says the buckets are separate.
+    assert reported_usage({"prompt_tokens": 100, "total_tokens": 100, "cache_read_input_tokens": 800})["input_tokens"] == 100
+    # A total_tokens that counts the cache on top of prompt_tokens, or none, keeps the buckets separate.
     assert reported_usage({"prompt_tokens": 1000, "completion_tokens": 5, "total_tokens": 1805,
                            "cache_read_input_tokens": 800})["input_tokens"] == 1000
+    assert reported_usage({"prompt_tokens": 50000, "cache_creation_input_tokens": 10000})["input_tokens"] == 50000
+    # OpenAI-style cached tokens and a top-level cache write: each is taken out once.
+    mixed = {"prompt_tokens": 1000, "completion_tokens": 5, "total_tokens": 1005,
+             "prompt_tokens_details": {"cached_tokens": 300}, "cache_creation_input_tokens": 200}
+    assert reported_usage(mixed) == {"input_tokens": 500, "output_tokens": 5, "total_tokens": 1005,
+                                     "cache_read_input_tokens": 300, "cache_creation_input_tokens": 200}
 
 
 def test_ledger_records_that_counted_the_cache_twice_are_repaired_once_on_load(tmp_path):
@@ -480,3 +486,37 @@ def test_restart_marks_only_inflight_request_metadata_interrupted(runtime):
     assert events[1]["request_info"]["status"] == "completed"
     assert events[2]["request_info"] == {"model": "new", "status": "interrupted",
         "error_kind": "incomplete_response", "usage": {"input_tokens": 0}}
+
+
+def test_a_parents_subagent_index_and_the_cli_report_are_counted_again_once(tmp_path):
+    from local_agent.planning import INDEX_USAGE_VERSION
+    from local_agent.usage_export import session_from_jsonl, usage_rows
+    keys = ["cache_creation_input_tokens", "cache_read_input_tokens", "completion_tokens", "prompt_tokens", "total_tokens"]
+
+    def doubled(call_id, purpose="agent"):
+        return {"id": call_id, "purpose": purpose, "model": "databricks-claude-opus-5-5", "status": "completed",
+                "created": "2026-10-19T08:00:00Z", "usage_keys": keys,
+                "usage": {"input_tokens": 50000, "output_tokens": 100, "total_tokens": 50100,
+                          "cache_read_input_tokens": 45000, "cache_creation_input_tokens": 0}}
+
+    store = Store(tmp_path / "tests.sqlite3")
+    child = store.create({"workspace": str(tmp_path), "model": "databricks-claude-opus-5-5"})
+    # Two calls in the delegated run, then a turn the user continued the subagent's chat in.
+    child["inference_calls"] = [doubled("c1"), doubled("c2"), doubled("c3")]
+    store.save(child)
+    parent = store.create({"workspace": str(tmp_path), "model": "databricks-claude-opus-5-5"})
+    stale = {"input_tokens": 150000, "cache_read_input_tokens": 135000}
+    parent["subagents"] = [{"id": child["id"], "status": "completed", "estimated_dbu": 13.3, "unpriced_calls": 0,
+                            "usage": stale, "turn_spend": {"tokens": 100300, "estimated_dbu": 8.8, "unpriced_calls": 0,
+                                                           "finished_calls": 2, "reported_calls": 2}},
+                           {"id": "running-one", "status": "running", "usage": dict(stale)}]
+    store.save(parent)
+    loaded = Store(tmp_path / "tests.sqlite3").get(parent["id"])
+    entry, running = loaded["subagents"]
+    assert entry["usage_version"] == INDEX_USAGE_VERSION and entry["usage"]["input_tokens"] == 15000
+    assert entry["estimated_dbu"] < 13.3 / 2 and entry["turn_spend"]["finished_calls"] == 2
+    assert entry["turn_spend"]["tokens"] == 2 * (5000 + 45000 + 100)  # The delegated run's two calls only.
+    assert running["usage"] == stale and "usage_version" not in running  # Its live counts are kept until it ends.
+    # The CLI usage report repairs the file it reads, like the app.
+    path = tmp_path / "conversations" / f"{child['id']}.jsonl"
+    assert [row["input_tokens"] for row in usage_rows(session_from_jsonl(path))] == [5000, 5000, 5000]

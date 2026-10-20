@@ -12,8 +12,12 @@ Context accounting, file links and handoffs (2026-10-20):
   `completion_tokens`), and the app added them on top: a chat at about 85% of its input budget
   showed over 170%, before its first compaction. Reports were also left out of the estimate scale
   as "counted twice", and DBU estimates billed cached tokens a second time. The cache counts are
-  now subtracted from `prompt_tokens`; saved chats are repaired when they load (their usage
-  records and the meter's **Last request**), and the usage across chats is counted again.
+  now subtracted from `prompt_tokens` when `total_tokens` is `prompt_tokens` plus
+  `completion_tokens`; saved chats are repaired when they load (their usage records, the meter's
+  **Last request** and the spend their ended subagents' index entries recorded), as is the file
+  `scripts/usage_report.py` reads, and the usage across chats is counted again. The offline
+  simulator reports usage in the same shape, and the endpoint check's "prompt_tokens with a cache
+  read" row reads **Includes cached tokens** against it.
 - The open context details start with a usage card like Claude's context panel: **N% used**, the
   tokens used of the context budget, a bar split by what the request holds with the auto-compact
   mark, and a legend with tokens and share: messages and tool results, conversation summary,

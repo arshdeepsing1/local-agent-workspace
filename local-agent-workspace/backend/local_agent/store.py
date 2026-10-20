@@ -426,6 +426,16 @@ class Store:
         if session.get("id") != session_id:
             raise UnreadableConversation(path.name, "its conversation ID does not match the file name")
         repair_session_usage(session)
+        if session.get("subagents"):
+            from .planning import repair_index_usage  # planning imports this module's users.
+
+            def read_child(child_id):
+                try:
+                    return self._read_own(child_id) if self._valid_id(child_id) else None
+                except (UnreadableConversation, OSError):
+                    return None
+
+            repair_index_usage(session, read_child)
         return session
 
     def _known_jobs(self, session_id):

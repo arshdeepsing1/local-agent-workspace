@@ -53,7 +53,11 @@ def test_pointer_lists_newest_files_first_and_only_with_a_summary():
     assert len(listed) == HANDOFF_POINTER_FILES and "h-2.md" not in pointer
     # The older handoffs are named, so a handoff of the whole conversation can find them.
     assert pointer.endswith("\nThe handoffs of compactions 1-2 are older files in the same folder (names ending in "
-                            "-compaction-<n>.md); a handoff of the whole conversation reads them too.")
+                            "-compaction-<n>.md, their first lines name this conversation); a handoff of the whole "
+                            "conversation reads them too.")
+    assert "The handoffs of compaction 1 are older files" in handoff_pointer(files[1:6])
+    # Four left after a handoff that could not be saved was dropped: the older ones are still named.
+    assert "The handoffs of compaction 1 are older files" in handoff_pointer(files[1:5])
     assert "are older files" not in handoff_pointer(files[:5]) and "are older files" not in handoff_pointer(files[3:5])
     assert handoff_pointer([]) == handoff_pointer(None) == handoff_pointer([{"compaction": 1}]) == ""
     wire = [user("Current")]
