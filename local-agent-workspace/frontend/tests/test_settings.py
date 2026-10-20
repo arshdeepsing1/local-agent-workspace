@@ -479,15 +479,72 @@ def test_match_system_follows_the_operating_system(ui, page):
     assert ui.js(BODY_BACKGROUND) == LIGHT_CANVAS
 
 
-def test_the_page_applies_a_stored_theme_before_its_script_runs(page):
-    # index.html sets data-theme from storage before the stylesheet, so a dark page never flashes light. The app's
-    # own script is left out here: the page alone must be dark.
+BOOT = [  # stored style, stored theme, system dark → data-style, data-theme, body background, <meta name="theme-color">
+    (None, None, False, "claude", "light", LIGHT_CANVAS, "#faf9f5"),
+    (None, "dark", False, "claude", "dark", DARK_CANVAS, "#262624"),
+    (None, "system", True, "claude", "system", DARK_CANVAS, "#262624"),
+    ("vscode", None, True, "vscode", "light", "rgb(255, 255, 255)", "#ffffff"),
+    ("vscode", "dark", False, "vscode", "dark", "rgb(31, 31, 31)", "#1f1f1f"),
+    ("vscode", "system", True, "vscode", "system", "rgb(31, 31, 31)", "#1f1f1f"),
+    ("vscode", "system", False, "vscode", "system", "rgb(255, 255, 255)", "#ffffff"),
+    ("solarized", "sepia", True, "claude", "light", LIGHT_CANVAS, "#faf9f5"),  # unknown values: the defaults
+]
+
+
+@pytest.mark.parametrize("stored_style,stored_theme,system_dark,style,theme,background,meta", BOOT)
+def test_the_page_applies_the_stored_look_before_its_script_runs(page, stored_style, stored_theme, system_dark, style, theme,
+                                                                  background, meta):
+    # index.html sets data-style and data-theme from storage before the stylesheet, so a dark page never flashes light.
+    # The app's own script is left out here: the page alone must have the look.
+    page.emulate_media(color_scheme="dark" if system_dark else "light")
     page.route(f"{ORIGIN}/static/js/main.js", lambda route: route.fulfill(status=200, body="", content_type="text/javascript"))
-    page.add_init_script(script="localStorage.setItem('local.theme', 'dark')")
+    stored = {"local.style": stored_style, "local.theme": stored_theme}
+    page.add_init_script(script="".join(f"localStorage.setItem('{key}', '{value}');" for key, value in stored.items() if value))
     page.goto(f"{ORIGIN}/index.html")
-    assert page.evaluate("document.documentElement.dataset.theme") == "dark"
-    assert page.evaluate(BODY_BACKGROUND) == DARK_CANVAS
-    assert page.evaluate("document.querySelector('meta[name=theme-color]').content") == "#262624"
+    assert page.evaluate("[document.documentElement.dataset.style, document.documentElement.dataset.theme]") == [style, theme]
+    assert page.evaluate(BODY_BACKGROUND) == background
+    assert page.evaluate("document.querySelector('meta[name=theme-color]').content") == meta
+
+
+def test_the_vscode_style_is_kept_in_this_browser_and_goes_with_dark(ui, page):
+    dialog = open_settings(ui, page)
+    appearance = dialog.get_by_role("group", name="Appearance")
+    style = appearance.get_by_role("combobox", name="Style", exact=True)
+    expect(style).to_have_value("claude")
+    expect(style.locator("option")).to_have_text(["Claude", "VS Code"])
+    assert ui.js("document.documentElement.dataset.style") == "claude"
+    style.select_option("vscode")
+    appearance.get_by_role("combobox", name="Theme").select_option("dark")
+    assert ui.js("[document.documentElement.dataset.style, document.documentElement.dataset.theme]") == ["vscode", "dark"]
+    assert ui.js("[localStorage.getItem('local.style'), localStorage.getItem('local.theme')]") == ["vscode", "dark"]
+    assert ui.js(BODY_BACKGROUND) == "rgb(31, 31, 31)"
+    save = dialog.get_by_role("button", name="Save settings")
+    expect(save).to_have_css("background-color", "rgb(0, 120, 212)")  # a blue primary button
+    expect(save).to_have_css("color", "rgb(255, 255, 255)")
+    ui.app(scenario="workspace")  # The page again: both come back from this browser's storage.
+    expect(page.get_by_role("combobox", name="Model")).to_have_value("test-model")
+    assert ui.js("[document.documentElement.dataset.style, document.documentElement.dataset.theme]") == ["vscode", "dark"]
+    page.get_by_role("button", name="Settings", exact=True).click()
+    dialog = page.get_by_role("dialog")
+    expect(dialog.get_by_role("combobox", name="Style", exact=True)).to_have_value("vscode")
+    expect(dialog.get_by_role("combobox", name="Theme")).to_have_value("dark")
+    dialog.get_by_role("combobox", name="Style", exact=True).select_option("claude")
+    assert ui.js("localStorage.getItem('local.style')") is None
+    assert ui.js(BODY_BACKGROUND) == DARK_CANVAS  # Claude dark
+    assert ui.bodies("/api/settings", "PUT") == []  # Never saved with Settings.
+
+
+def test_the_selects_show_the_look_of_the_page_when_storage_is_blocked(ui, page):
+    # Storage that throws keeps a choice for this page only; reopening Settings still shows it.
+    dialog = open_settings(ui, page, setup="""Object.defineProperty(window, 'localStorage', { get() { throw new Error('blocked') } })""")
+    dialog.get_by_role("combobox", name="Theme").select_option("dark")
+    dialog.get_by_role("combobox", name="Style", exact=True).select_option("vscode")
+    dialog.get_by_role("button", name="Cancel").click()
+    page.get_by_role("button", name="Settings", exact=True).click()
+    dialog = page.get_by_role("dialog")
+    expect(dialog.get_by_role("combobox", name="Theme")).to_have_value("dark")
+    expect(dialog.get_by_role("combobox", name="Style", exact=True)).to_have_value("vscode")
+    assert ui.js(BODY_BACKGROUND) == "rgb(31, 31, 31)"
 
 
 @pytest.mark.parametrize("width,height", LAYOUT_VIEWPORTS)

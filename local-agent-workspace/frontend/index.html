@@ -11,16 +11,18 @@
     <!-- Settings → Appearance → Style and Theme (static/js/theme.js), applied before the stylesheet so a dark page never
          flashes light. Keep the keys and canvas colours in step with theme.js. -->
     <script>
-      try {
-        var style = localStorage.getItem('local.style') === 'vscode' ? 'vscode' : 'claude'
-        var theme = localStorage.getItem('local.theme')
-        if (theme !== 'dark' && theme !== 'system') theme = 'light'
-        var dark = theme === 'dark' || (theme === 'system' && matchMedia('(prefers-color-scheme: dark)').matches)
-        document.documentElement.dataset.style = style
-        document.documentElement.dataset.theme = theme
-        document.querySelector('meta[name="theme-color"]').content =
-          { claude: dark ? '#262624' : '#faf9f5', vscode: dark ? '#1f1f1f' : '#ffffff' }[style]
-      } catch (e) { /* Storage blocked: the defaults (Claude, Light). */ }
+      (function () {
+        try {
+          var style = localStorage.getItem('local.style') === 'vscode' ? 'vscode' : 'claude'
+          var theme = localStorage.getItem('local.theme')
+          if (theme !== 'dark' && theme !== 'system') theme = 'light'
+          var dark = theme === 'dark' || (theme === 'system' && matchMedia('(prefers-color-scheme: dark)').matches)
+          document.documentElement.dataset.style = style
+          document.documentElement.dataset.theme = theme
+          document.querySelector('meta[name="theme-color"]').content =
+            { claude: dark ? '#262624' : '#faf9f5', vscode: dark ? '#1f1f1f' : '#ffffff' }[style]
+        } catch (e) { /* Storage blocked: the defaults (Claude, Light). */ }
+      })()
     </script>
     <link rel="stylesheet" href="/static/styles.css" />
     <script type="importmap">

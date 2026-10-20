@@ -202,7 +202,7 @@ def assert_readable(page, *selectors, minimum=4.5):
 # V1, V10: text contrast (4.5:1) and icon contrast (3:1)
 
 def test_text_in_a_chat_and_the_sidebar_is_readable(ui, page):
-    # Mutations: restore --muted #858580 (fails most), or --accent #b66b50 (fails .primary).
+    # Mutations: restore --muted #858580 (fails most), or set --primary to #8a8a8a (fails .primary).
     start_chat(ui, page, events=CHAT, setup=f"fake.sessions.get('a').context_info = {json.dumps(CONTEXT_INFO)}")
     page.get_by_text("Activity · 2 actions").click()
     page.get_by_text("Request details · completed").click()
@@ -404,12 +404,12 @@ def test_message_action_icons_have_three_to_one(ui, page):
     assert len(values) >= 3 and min(values) >= 3, values
 
 
-# V2, V3: the message box shows focus, and every focusable element gets the same 2 px accent ring
+# V2, V3: the message box shows focus, and every focusable element gets the same 2 px --focus ring
 
 FOCUS = "rgb(44, 132, 219)"  # --focus
 SURFACE_2 = "rgb(240, 238, 230)"  # --surface-2: hovered buttons
 SURFACE_3 = "rgb(232, 230, 220)"  # --surface-3: hovered sidebar rows
-ACCENT_SOFT = "rgb(246, 232, 224)"  # --accent-soft: cards waiting for you
+ACCENT_SOFT = "rgb(245, 236, 224)"  # --accent-soft: cards waiting for you
 
 
 def keyboard_focus(page, locator):
@@ -419,19 +419,22 @@ def keyboard_focus(page, locator):
     assert locator.evaluate("e => document.activeElement === e && e.matches(':focus-visible')")
 
 
-def test_the_message_box_shows_keyboard_focus(ui, page):
-    # V-T4. Mutation: delete the .app-shell .composer:focus-within rule. Focused, the card's subtle border turns to
-    # --border-strong (3:1 against the page) and its shadow deepens, as in Claude's message box.
-    start_chat(ui, page)
+@pytest.mark.parametrize("style,theme", [("claude", "light"), ("claude", "dark"), ("vscode", "light"), ("vscode", "dark")])
+def test_the_message_box_shows_keyboard_focus(ui, page, style, theme):
+    # V-T4. Mutation: delete the .app-shell .composer:focus-within rule. Focused, the card's subtle border and a 1 px ring
+    # around it turn to --border-strong in Claude style (its shadow deepens too) and to --focus in VS Code style: 3:1
+    # against the page, and 2 px together.
+    start_chat(ui, page, setup=f"localStorage.setItem('local.style', '{style}'); localStorage.setItem('local.theme', '{theme}')")
     composer = page.locator(".composer").first
     textbox = page.get_by_role("textbox", name="Message")
     textbox.evaluate("e => e.blur()")
     blurred = composer.evaluate("e => [getComputedStyle(e).borderTopColor, getComputedStyle(e).boxShadow]")
     keyboard_focus(page, textbox)
     focused = composer.evaluate("e => [getComputedStyle(e).borderTopColor, getComputedStyle(e).boxShadow]")
-    assert focused[0] != blurred[0] and focused[0] == page.evaluate("visual.resolve('var(--border-strong)')"), (blurred, focused)
-    assert focused[1] != blurred[1], (blurred, focused)
-    assert page.evaluate("visual.pair('var(--border-strong)', 'var(--canvas)')") >= 3
+    cue = "var(--border-strong)" if style == "claude" else "var(--focus)"
+    assert focused[0] != blurred[0] and focused[0] == page.evaluate(f"visual.resolve('{cue}')"), (blurred, focused)
+    assert focused[1].startswith(f"{focused[0]} 0px 0px 0px 1px"), focused  # the ring outside the border
+    assert page.evaluate(f"visual.pair('{cue}', 'var(--canvas)')") >= 3
 
 
 def outline(locator):
@@ -702,6 +705,22 @@ REQUIRED_TOKENS = ["canvas", "sidebar", "surface", "surface-2", "surface-3", "in
                    "primary", "primary-hover", "on-primary",
                    *(f"ctx-{name}" for name in ("messages", "summary", "system", "instructions", "tools", "mcp", "overhead", "buffer",
                                                 "reserved", "free"))]
+NAMED_COLOURS = set((
+    "aliceblue antiquewhite aqua aquamarine azure beige bisque black blanchedalmond blue blueviolet brown burlywood cadetblue "
+    "chartreuse chocolate coral cornflowerblue cornsilk crimson cyan darkblue darkcyan darkgoldenrod darkgray darkgreen darkgrey "
+    "darkkhaki darkmagenta darkolivegreen darkorange darkorchid darkred darksalmon darkseagreen darkslateblue darkslategray "
+    "darkslategrey darkturquoise darkviolet deeppink deepskyblue dimgray dimgrey dodgerblue firebrick floralwhite forestgreen "
+    "fuchsia gainsboro ghostwhite gold goldenrod gray green greenyellow grey honeydew hotpink indianred indigo ivory khaki lavender "
+    "lavenderblush lawngreen lemonchiffon lightblue lightcoral lightcyan lightgoldenrodyellow lightgray lightgreen lightgrey "
+    "lightpink lightsalmon lightseagreen lightskyblue lightslategray lightslategrey lightsteelblue lightyellow lime limegreen linen "
+    "magenta maroon mediumaquamarine mediumblue mediumorchid mediumpurple mediumseagreen mediumslateblue mediumspringgreen "
+    "mediumturquoise mediumvioletred midnightblue mintcream mistyrose moccasin navajowhite navy oldlace olive olivedrab orange "
+    "orangered orchid palegoldenrod palegreen paleturquoise palevioletred papayawhip peachpuff peru pink plum powderblue purple "
+    "rebeccapurple red rosybrown royalblue saddlebrown salmon sandybrown seagreen seashell sienna silver skyblue slateblue slategray "
+    "slategrey snow springgreen steelblue tan teal thistle tomato turquoise violet wheat white whitesmoke yellow yellowgreen "
+    # CSS system colours
+    "accentcolor accentcolortext activetext buttonborder buttonface buttontext canvas canvastext field fieldtext graytext highlight "
+    "highlighttext linktext mark marktext selecteditem selecteditemtext visitedtext").split())
 TEXT = ["var(--ink)", "var(--ink-2)", "var(--muted)", "var(--accent-text)"]
 BACKGROUNDS = ["var(--canvas)", "var(--sidebar)", "var(--surface)", "var(--surface-2)"]
 # (foreground, background, minimum): text 4.5:1, icons, focus rings and form-field borders 3:1.
@@ -729,8 +748,14 @@ def test_the_stylesheet_takes_every_colour_from_a_token():
     blocks = TOKEN_BLOCK.findall(css)
     assert [block.split("{")[0] for block in blocks] == BLOCK_SELECTORS
     rest = TOKEN_BLOCK.sub("", css)
-    literal = r"#[0-9a-fA-F]{3,8}\b|\b(?:rgba?|hsla?|hwb|lab|lch|oklch|oklab|color)\(|(?<![-\w.'\"])(?:white|black|red|green|blue|gray|grey)(?![-\w])"
+    literal = r"#[0-9a-fA-F]{3,8}\b|\b(?:rgba?|hsla?|hwb|lab|lch|oklch|oklab|color|color-mix|light-dark)\("
     assert re.findall(r"[^{};]*(?:" + literal + r")[^;}]*", rest) == []
+    # Named and system colours (white, rebeccapurple, Canvas, ButtonText…) in any declaration outside the tokens.
+    named = [(prop.strip(), word) for prop, value in re.findall(r"([-\w]+)\s*:([^;{}]*)", rest)
+             if not prop.strip().startswith("--") and prop.strip() not in ("font", "font-family", "content", "grid-area", "animation")
+             for word in re.findall(r"(?<![-\w(.#'\"])[a-zA-Z]+(?![-\w(])", re.sub(r"var\([^)]*\)|'[^']*'|\"[^\"]*\"", "", value))
+             if word.lower() in NAMED_COLOURS]
+    assert named == []
     names = [{name for name in re.findall(r"--([\w-]+):", block) if name not in NOT_COLOURS} for block in blocks]
     assert set(REQUIRED_TOKENS) <= names[0], set(REQUIRED_TOKENS) - names[0]
     assert all(found == names[0] for found in names), [names[0] ^ found for found in names]  # every palette sets every token
@@ -804,3 +829,26 @@ def test_the_vscode_style_changes_fonts_and_corners_but_claude_keeps_its_own(ui,
     vscode = page.evaluate(look)
     assert vscode == ['-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif', "5px",
                       '"SF Mono", Menlo, Consolas, "Cascadia Mono", monospace'], vscode
+
+
+def lab(hex_colour):
+    """CIE L*a*b* (D65) of #rrggbb or #rgb."""
+    digits = hex_colour.lstrip("#")
+    digits = "".join(c * 2 for c in digits) if len(digits) == 3 else digits
+    rgb = [int(digits[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+    r, g, b = (c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in rgb)
+    xyz = ((r * .4124 + g * .3576 + b * .1805) / .95047, r * .2126 + g * .7152 + b * .0722, (r * .0193 + g * .1192 + b * .9505) / 1.08883)
+    fx, fy, fz = (t ** (1 / 3) if t > .008856 else 7.787 * t + 16 / 116 for t in xyz)
+    return 116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)
+
+
+def test_waiting_cards_do_not_look_like_errors_or_warnings():
+    # A card waiting for you (--accent-soft) must not read as an error (--danger-soft) or a warning (--warning-soft):
+    # at least 6 apart (CIE76 ΔE) in every palette. Mutation: --accent-soft #f6e8e0 with --danger-soft #f8e7e4 (2.8).
+    css = re.sub(r"/\*.*?\*/", "", STYLESHEET.read_text(), flags=re.S)
+    gaps = {}
+    for block in TOKEN_BLOCK.findall(css):
+        tokens = dict(re.findall(r"--([\w-]+):([^;}]+)", block))
+        for a, b in (("accent-soft", "danger-soft"), ("accent-soft", "warning-soft"), ("danger-soft", "warning-soft")):
+            gaps[(block.split("{")[0], a, b)] = round(sum((p - q) ** 2 for p, q in zip(lab(tokens[a]), lab(tokens[b]))) ** .5, 1)
+    assert len(gaps) == 18 and {key: gap for key, gap in gaps.items() if gap < 6} == {}
