@@ -689,13 +689,19 @@ def test_tool_group_and_run_heads_are_readable_and_at_least_eleven_pixels(ui, pa
     assert small_text(page, ".transcript") == []
 
 
-# Theme tokens (2026-10-20): one semantic colour set on :root, light by default and dark under data-theme.
+# Theme tokens (2026-10-20): one semantic colour set per style (Claude, VS Code) and theme (light, dark), on :root.
 
 STYLESHEET = Path(__file__).resolve().parents[1] / "static" / "styles.css"
-TOKEN_BLOCK = re.compile(r':root(?:\[data-theme="(?:dark|system)"\])?\{[^{}]*\}')
+TOKEN_BLOCK = re.compile(r':root(?:\[data-style="vscode"\])?(?:\[data-theme="(?:dark|system)"\])?\{[^{}]*\}')
+BLOCK_SELECTORS = [":root", ':root[data-theme="dark"]', ':root[data-theme="system"]', ':root[data-style="vscode"]',
+                   ':root[data-style="vscode"][data-theme="dark"]', ':root[data-style="vscode"][data-theme="system"]']
+NOT_COLOURS = ("text-scale", "serif", "font-ui", "font-mono")
 REQUIRED_TOKENS = ["canvas", "sidebar", "surface", "surface-2", "surface-3", "ink", "ink-2", "muted", "border", "border-strong",
                    "accent", "accent-hover", "accent-text", "accent-soft", "on-accent", "on-ink", "focus", "danger", "danger-soft",
-                   "success", "success-soft", "warning", "warning-soft", "info", "info-soft", "shadow", "overlay"]
+                   "success", "success-soft", "warning", "warning-soft", "info", "info-soft", "shadow", "overlay",
+                   "primary", "primary-hover", "on-primary",
+                   *(f"ctx-{name}" for name in ("messages", "summary", "system", "instructions", "tools", "mcp", "overhead", "buffer",
+                                                "reserved", "free"))]
 TEXT = ["var(--ink)", "var(--ink-2)", "var(--muted)", "var(--accent-text)"]
 BACKGROUNDS = ["var(--canvas)", "var(--sidebar)", "var(--surface)", "var(--surface-2)"]
 # (foreground, background, minimum): text 4.5:1, icons, focus rings and form-field borders 3:1.
@@ -704,44 +710,53 @@ PAIRS = ([(fg, bg, 4.5) for fg in TEXT for bg in BACKGROUNDS]
          + [(f"var(--{name})", bg, 4.5) for name in ("danger", "success", "warning", "info")
             for bg in ("var(--canvas)", "var(--surface)", "var(--surface-2)", f"var(--{name}-soft)")]
          + [(fg, "var(--accent-soft)", 4.5) for fg in ("var(--accent-text)", "var(--muted)", "var(--ink)")]
-         + [("var(--on-ink)", "var(--ink)", 4.5), ("var(--on-ink)", "var(--ink-2)", 4.5),  # primary buttons, also hovered
+         + [("var(--on-primary)", "var(--primary)", 4.5), ("var(--on-primary)", "var(--primary-hover)", 4.5),  # primary buttons
             ("var(--on-accent)", "var(--accent)", 3), ("var(--on-accent)", "var(--accent-hover)", 3),  # the send button's arrow
             ("var(--terminal-ink)", "var(--terminal-bg)", 4.5)]
          + [(f"var(--code-{name})", "var(--surface-2)", 4.5) for name in ("keyword", "string", "number", "title", "type", "attr")]
          + [(fg, bg, 3) for fg in ("var(--border-strong)", "var(--focus)", "var(--accent)") for bg in BACKGROUNDS])
+# Every style with every theme; Match system on a dark computer must equal Dark.
+LOOKS = [(style, theme) for style in ("claude", "vscode") for theme in ("light", "dark", "system")]
+
+
+def choose(style, theme):
+    return f"localStorage.setItem('local.style', '{style}'); localStorage.setItem('local.theme', '{theme}')"
 
 
 def test_the_stylesheet_takes_every_colour_from_a_token():
     # Mutation: write a colour such as #fff or rgba(0,0,0,.1) in any rule outside the token blocks.
     css = re.sub(r"/\*.*?\*/", "", STYLESHEET.read_text(), flags=re.S)
     blocks = TOKEN_BLOCK.findall(css)
-    assert [block.split("{")[0] for block in blocks] == [":root", ':root[data-theme="dark"]', ':root[data-theme="system"]']
+    assert [block.split("{")[0] for block in blocks] == BLOCK_SELECTORS
     rest = TOKEN_BLOCK.sub("", css)
     literal = r"#[0-9a-fA-F]{3,8}\b|\b(?:rgba?|hsla?|hwb|lab|lch|oklch|oklab|color)\(|(?<![-\w.'\"])(?:white|black|red|green|blue|gray|grey)(?![-\w])"
     assert re.findall(r"[^{};]*(?:" + literal + r")[^;}]*", rest) == []
-    light = dict(re.findall(r"--([\w-]+):([^;}]+)", blocks[0]))
-    assert set(REQUIRED_TOKENS) <= set(light), set(REQUIRED_TOKENS) - set(light)
-    dark, system = blocks[1], blocks[2]
-    assert dark.split("{", 1)[1] == system.split("{", 1)[1]  # Match system in dark mode is exactly Dark
-    assert set(re.findall(r"--([\w-]+):", dark)) == {name for name in light if name not in ("text-scale", "serif")}
-    assert "@media (prefers-color-scheme:dark){" + system + "}" in css
+    names = [{name for name in re.findall(r"--([\w-]+):", block) if name not in NOT_COLOURS} for block in blocks]
+    assert set(REQUIRED_TOKENS) <= names[0], set(REQUIRED_TOKENS) - names[0]
+    assert all(found == names[0] for found in names), [names[0] ^ found for found in names]  # every palette sets every token
+    for dark, system in ((blocks[1], blocks[2]), (blocks[4], blocks[5])):
+        assert dark.split("{", 1)[1] == system.split("{", 1)[1]  # Match system in dark mode is exactly Dark
+        assert "@media (prefers-color-scheme:dark){" + system + "}" in css
 
 
-@pytest.mark.parametrize("theme", ["light", "dark"])
-def test_the_theme_tokens_meet_their_contrast_pairs(ui, page, theme):
+@pytest.mark.parametrize("style,theme", LOOKS)
+def test_the_theme_tokens_meet_their_contrast_pairs(ui, page, style, theme):
+    page.emulate_media(color_scheme="dark")
     page.add_init_script(script=CONTRAST_JS)
-    ui.app(scenario="workspace", setup=f"localStorage.setItem('local.theme', '{theme}')")
+    ui.app(scenario="workspace", setup=choose(style, theme))
     expect(page.get_by_role("combobox", name="Model")).to_have_value("test-model")
-    assert ui.js("document.documentElement.dataset.theme") == theme
+    assert ui.js("[document.documentElement.dataset.style, document.documentElement.dataset.theme]") == [style, theme]
     values = page.evaluate("pairs => pairs.map(([fg, bg, min]) => [fg, bg, min, visual.pair(fg, bg)])", PAIRS)
     assert [value for value in values if value[3] < value[2]] == []
+    canvas = {"claude": ("rgb(250, 249, 245)", "rgb(38, 38, 36)"), "vscode": ("rgb(255, 255, 255)", "rgb(31, 31, 31)")}[style]
+    assert ui.js("getComputedStyle(document.body).backgroundColor") == canvas[theme != "light"]
 
 
-@pytest.mark.parametrize("theme", ["light", "dark"])
-def test_form_fields_have_three_to_one_borders(ui, page, theme):
+@pytest.mark.parametrize("style,theme", [look for look in LOOKS if look[1] != "system"])
+def test_form_fields_have_three_to_one_borders(ui, page, style, theme):
     # WCAG 1.4.11: a text field, select or text area is found by its border, so the border gets --border-strong.
     # Mutation: give .app-settings .dialog-content select border var(--border).
-    start_chat(ui, page, setup=f"localStorage.setItem('local.theme', '{theme}')")
+    start_chat(ui, page, setup=choose(style, theme))
     page.get_by_role("button", name="Settings", exact=True).click()
     fields = page.locator("dialog[open] :is(input:not([type=checkbox]):not([type=radio]), select, textarea)")
     expect(fields.first).to_be_visible()
@@ -753,15 +768,15 @@ def test_form_fields_have_three_to_one_borders(ui, page, theme):
     assert search.evaluate("e => visual.borderRatio(e)") >= 3, theme
 
 
-@pytest.mark.parametrize("theme", ["dark", "system"])
-def test_dark_text_in_a_chat_the_workspace_and_settings_is_readable(ui, page, theme):
-    # The page-wide checks of the light tests above, in dark (and in Match system on a dark computer).
+@pytest.mark.parametrize("style,theme", [("claude", "dark"), ("claude", "system"), ("vscode", "light"), ("vscode", "dark"),
+                                         ("vscode", "system")])
+def test_other_looks_keep_a_chat_the_workspace_and_settings_readable(ui, page, style, theme):
+    # The page-wide checks of the Claude light tests above, in the other looks (system on a dark computer).
     page.emulate_media(color_scheme="dark")
-    start_chat(ui, page, events=CHAT[:1] + [SPLIT_COMMAND], setup=f"localStorage.setItem('local.theme', '{theme}')")
+    start_chat(ui, page, events=CHAT[:1] + [SPLIT_COMMAND], setup=choose(style, theme))
     expect(page.locator(".split-button")).to_be_visible()  # an approval card (--accent-soft) and its buttons
     assert failures(page) == []
     start_chat(ui, page, setup=f"fake.sessions.get('a').context_info = {json.dumps(CONTEXT_INFO)}")
-    assert ui.js("getComputedStyle(document.body).backgroundColor") == "rgb(38, 38, 36)"
     page.get_by_text("Activity · 2 actions").click()
     page.get_by_text("Request details · completed").click()
     assert ratio(page, ".composer textarea", "::placeholder") >= 4.5
@@ -776,3 +791,16 @@ def test_dark_text_in_a_chat_the_workspace_and_settings_is_readable(ui, page, th
     page.get_by_role("button", name="Settings", exact=True).click()
     expect(page.get_by_role("dialog", name="Settings")).to_be_visible()
     assert failures(page, "dialog[open]") == []
+
+
+def test_the_vscode_style_changes_fonts_and_corners_but_claude_keeps_its_own(ui, page):
+    start_chat(ui, page)
+    look = """() => [getComputedStyle(document.body).fontFamily, getComputedStyle(document.querySelector('.app-shell .composer')).borderTopLeftRadius,
+      getComputedStyle(document.querySelector('.markdown pre')).fontFamily]"""
+    claude = page.evaluate(look)
+    assert claude == ['"DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif', "18px",
+                      "ui-monospace, SFMono-Regular, Menlo, monospace"], claude
+    start_chat(ui, page, setup=choose("vscode", "light"))
+    vscode = page.evaluate(look)
+    assert vscode == ['-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif', "5px",
+                      '"SF Mono", Menlo, Consolas, "Cascadia Mono", monospace'], vscode
