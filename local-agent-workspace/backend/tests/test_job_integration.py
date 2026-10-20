@@ -383,10 +383,10 @@ async def test_a_restart_leaves_an_interrupted_notice_for_the_agents_running_bac
     await wait_for_turn_end(manager, session)
     now = time.time()
     # Still running when the app stopped without its clean shutdown.
-    manager.jobs._persist({"id": "job-1", "session_id": session["id"], "workspace": session["workspace"],
-                           "command": "sleep 99", "state": "running", "created": now, "updated": now, "exit_code": None,
-                           "output": "", "truncated": False, "timeout_seconds": 60, "max_output_bytes": 80000,
-                           "background": True, "origin": "agent"})
+    running = {"id": "job-1", "session_id": session["id"], "workspace": session["workspace"], "command": "sleep 99",
+               "state": "running", "created": now, "updated": now, "exit_code": None, "output": "", "truncated": False,
+               "timeout_seconds": 60, "max_output_bytes": 80000, "background": True, "origin": "agent"}
+    manager.jobs._persist(dict(running))
     restarted = AgentManager(manager.store, manager.settings)
     try:
         stored = manager.store.get(session["id"])
@@ -394,9 +394,11 @@ async def test_a_restart_leaves_an_interrupted_notice_for_the_agents_running_bac
         assert [(event["text"], event["job_id"], event["job_state"], event["exit_code"]) for event in notices] == [
             ("Background job interrupted: sleep 99", "job-1", "interrupted", None)]
         assert restarted.background_jobs_notice(stored) == ""  # The agent is not told, as before.
-        # A second start adds no second notice.
+        # A second start that marks the job interrupted again (its record still read running) adds no second notice.
+        restarted.jobs._persist(dict(running))
         again = AgentManager(manager.store, manager.settings)
         await again.jobs.shutdown()
+        assert again.jobs.get("job-1")["state"] == "interrupted"
         assert len([event for event in manager.store.get(session["id"])["events"] if event["type"] == "notice"]) == 1
     finally:
         await restarted.jobs.shutdown()
