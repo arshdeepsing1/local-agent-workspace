@@ -5,6 +5,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -472,7 +473,8 @@ def test_awk_that_could_hide_a_write_or_a_program_is_not_vetted(world, text):
     assert reason, text
 
 
-@pytest.mark.skipif(not os.path.exists(AWK), reason="/usr/bin/awk is required")
+@pytest.mark.skipif(sys.platform != "darwin" or not os.path.exists(AWK),
+                    reason="these cases document the macOS /usr/bin/awk")
 @pytest.mark.parametrize("text", awk_cases([text for text in AWK_HIDDEN if text not in AWK_OTHER_AWK], "macos-awk"))
 def test_the_refused_awk_really_creates_a_file_with_the_local_awk(tmp_path, text):
     # Independent of the decision: the raw command, run in a scratch folder, does what the case documents.

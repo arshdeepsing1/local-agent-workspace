@@ -473,7 +473,9 @@ async def test_a_hook_that_asks_shows_its_own_card_after_the_batch_is_allowed(ru
     manager.start(parent["id"], "Delegate three")
     live = await waiting_batch(manager, parent)
     manager.decide(parent["id"], waiting(live)[0]["batch_approval"]["id"], True)
-    await eventually(lambda: card(live, "call-3")["state"] == "pending" and "batch_approval" not in card(live, "call-3"))
+    # The card's own wait must exist too: the card reads "pending" while the earlier calls' hooks still run.
+    await eventually(lambda: card(live, "call-3")["state"] == "pending" and "batch_approval" not in card(live, "call-3")
+                     and (parent["id"], card(live, "call-3")["id"]) in manager.pending)
     assert [item["call_id"] for item in waiting(live)] == ["call-3"] and started(gateway) == []
     manager.decide(parent["id"], card(live, "call-3")["id"], True)
     await asyncio.wait_for(manager.tasks[parent["id"]], 10)

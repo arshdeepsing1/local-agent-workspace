@@ -1107,6 +1107,9 @@ def _git(program, words, cwd, ctx):
             target = os.path.join(str(cwd), words[i + 1])
             if ctx.secret(words[i + 1]):
                 raise Refused(f"{words[i + 1]} looks like a credential folder")
+            # By name first, so the reason does not depend on whether the file system ignores case.
+            if credential_folder(words[i + 1], anywhere=True, root=ctx.root):
+                raise Refused(f"git -C {words[i + 1]} is a credential folder or inside one")
             cwd = ctx.check_path(target)
             if not cwd.is_dir():
                 raise Refused(f"git -C {words[i + 1]} is not a folder")

@@ -67,8 +67,9 @@ def ref(text, *needles):
 
 
 def browser_processes(marker):
-    done = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True)
-    return [line for line in done.stdout.splitlines() if marker in line and "ps -axo" not in line]
+    # -ww: without it, Linux ps cuts each line at 80 characters when its output is a pipe.
+    done = subprocess.run(["ps", "-A", "-ww", "-o", "pid=,command="], capture_output=True, text=True)
+    return [line for line in done.stdout.splitlines() if marker in line and "ps -A -ww" not in line]
 
 
 # No browser needed --------------------------------------------------------------------------------------------
