@@ -1341,12 +1341,21 @@ async def test_an_upstream_407_is_not_shown_to_the_browser_as_its_own_proxy_chal
     assert status(answer) == 502 and b"roxy-authenticate" not in answer
 
 
+async def extra_bytes(reader):
+    """Bytes that follow a forwarded request body on the upstream connection within 0.3 s: b"" when none came."""
+    try:
+        return await asyncio.wait_for(reader.read(65536), 0.3)
+    except asyncio.TimeoutError:
+        return b""
+
+
 async def test_the_request_body_is_forwarded_by_its_declared_length_and_nothing_after_it(rig):
     seen = []
 
     async def serve(reader, writer):
         seen.append(await reader.readuntil(b"\r\n\r\n"))
-        seen.append(await reader.read(65536))
+        seen.append(await reader.readexactly(5))  # The proxy can forward the body in several writes.
+        seen.append(await extra_bytes(reader))
         writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
         await writer.drain()
     server = await asyncio.start_server(serve, "127.0.0.1", 0)
@@ -1356,7 +1365,7 @@ async def test_the_request_body_is_forwarded_by_its_declared_length_and_nothing_
     head = b"POST http://shop.test/p HTTP/1.1\r\nHost: shop.test\r\nContent-Length: 5\r\n" + chat.header() + b"\r\n"
     answer = await rig.talk(head + b"12345" + b"GET http://10.1.2.3/secret HTTP/1.1\r\n\r\n")
     server.close()
-    assert b"ok" in answer and seen[1] == b"12345"
+    assert b"ok" in answer and seen[1] == b"12345" and seen[2] == b""
 
 
 async def test_a_chunked_request_body_is_forwarded_up_to_its_end(rig):
@@ -1364,7 +1373,8 @@ async def test_a_chunked_request_body_is_forwarded_up_to_its_end(rig):
 
     async def serve(reader, writer):
         seen.append(await reader.readuntil(b"\r\n\r\n"))
-        seen.append(await reader.read(65536))
+        seen.append(await reader.readuntil(b"0\r\n\r\n"))  # The proxy forwards one chunk at a time.
+        seen.append(await extra_bytes(reader))
         writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
         await writer.drain()
     server = await asyncio.start_server(serve, "127.0.0.1", 0)
@@ -1375,7 +1385,7 @@ async def test_a_chunked_request_body_is_forwarded_up_to_its_end(rig):
     body = b"3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n"
     answer = await rig.talk(head + body + b"GET http://10.1.2.3/secret HTTP/1.1\r\n\r\n")
     server.close()
-    assert b"ok" in answer and seen[1] == body
+    assert b"ok" in answer and seen[1] == body and seen[2] == b""
 
 
 @pytest.mark.parametrize("framing", [b"Content-Length: 3\r\nTransfer-Encoding: chunked\r\n", b"Content-Length: 3\r\nContent-Length: 4\r\n",
