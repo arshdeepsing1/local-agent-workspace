@@ -17,7 +17,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # macOS needs about 35 minutes since the browser, workflow and proxy tests were added.
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: local-agent-workspace
