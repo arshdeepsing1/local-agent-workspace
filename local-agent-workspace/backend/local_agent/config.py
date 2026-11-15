@@ -11,6 +11,7 @@ from .context import (
 )
 from .context import DEFAULT_AUTO_COMPACT_PERCENT, MAX_AUTO_COMPACT_PERCENT, MIN_AUTO_COMPACT_PERCENT
 from .model_profiles import DEFAULT_MODEL, LEGACY_DEFAULT_LIMITS, LEGACY_DEFAULT_MODEL, default_limits, known_endpoints
+from .model_profiles import set_subagents_running_max
 from .output_styles import STYLE_ID
 from .reasoning import DEFAULT_EFFORT, DEFAULT_FORMAT, EFFORT_LEVELS, REQUEST_FORMATS
 from .spending import validate_limit
@@ -32,6 +33,42 @@ MAX_COMMAND_ENV = 32
 MAX_TURN_TOKENS = 100_000_000
 MAX_TURN_MINUTES = 1_440
 TURN_LIMITS = {"turn_token_limit": MAX_TURN_TOKENS, "turn_time_limit_minutes": MAX_TURN_MINUTES}
+# Settings → Subagents (planning.DelegateManager): subagents running at once over all chats, and subagents one chat
+# may start in one turn. The first also sets each request's share of the endpoint's rate limit (model_profiles).
+SUBAGENT_LIMITS = {"subagents_running_max": (3, 1, 8, "Subagents at once"),
+                   "subagents_per_turn_max": (6, 1, 24, "Subagents per turn")}  # default, least, most, label
+# Settings -> Model and context (context.trim_pass): old tool results leave the request once it passes the start mark
+# (percent of the input budget, the base auto_compact_percent uses) and the pass trims down to the target mark.
+TRIM_START = (70, 40, 90)  # default, least, most
+# Settings → Browsing (browser_tool.py): the browser tool is off until chosen; "auto" opens a window when a display
+# exists, "window" always does and "headless" never does; an action stops after browser_action_timeout seconds.
+# browser_upstream_proxy is "auto" (the system's proxy), "none" or an address such as http://proxy.example:8080
+# (browser_proxy.py). A password in that address is shown as <redacted> in every text the app returns.
+BROWSER_HEADLESS = ("auto", "window", "headless")
+BROWSER_TIMEOUT = (30, 5, 120)  # default, least, most
+TRIM_TARGET_DEFAULT, TRIM_TARGET_LEAST, TRIM_GAP = 55, 20, 5  # The target is at most the start minus TRIM_GAP.
+
+
+def effective_trim_marks(values):
+    """(start, target) percentages of the input budget the live trim of a chat really runs at, or None when it does not
+    run. Settings saves each mark within its own range; the run fits them to the chat's auto-compact percentage (a
+    project's settings file can lower it): the start is at most 5 points below it (and at least 20), the target at most
+    5 points below the start (and at least 10). A start under 25 means no trim for the chat. A target saved above the
+    start is therefore run lower than saved; public() reports these marks so Settings can show what is in effect."""
+    if values.get("context_trim", True) is not True:
+        return None
+    start, target = values.get("context_trim_start_percent", 70), values.get("context_trim_target_percent", 55)
+    if type(start) is not int or type(target) is not int:
+        start, target = 70, 55
+    compact = values.get("auto_compact_percent", DEFAULT_AUTO_COMPACT_PERCENT)
+    if type(compact) is not int or not MIN_AUTO_COMPACT_PERCENT <= compact <= MAX_AUTO_COMPACT_PERCENT:
+        compact = DEFAULT_AUTO_COMPACT_PERCENT
+    start = max(20, min(start, compact - 5))
+    if start < 25:
+        return None
+    return start, max(10, min(target, start - 5))
+
+
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
 # Never passed to commands; equal to jobs.CREDENTIAL_ENV, DENIED_ENV and DENIED_ENV_PREFIXES.
 CREDENTIAL_ENV = {"DBRICKS_TOKEN", "DATABRICKS_TOKEN", "DBRICKS_URL", "DATABRICKS_HOST", "LOCAL_AGENT_ENV_FILE"}
@@ -212,6 +249,11 @@ class Settings:
             "max_agent_steps": DEFAULT_MAX_AGENT_STEPS,
             "compaction_handoffs": True,
             "auto_compact_percent": DEFAULT_AUTO_COMPACT_PERCENT,
+            "context_trim": True,
+            "context_trim_start_percent": TRIM_START[0],
+            "context_trim_target_percent": TRIM_TARGET_DEFAULT,
+            # Settings -> Model and context: ask before an automatic compaction at the start of a turn.
+            "compaction_ask": True,
             "approval_timeout_minutes": DEFAULT_APPROVAL_MINUTES,
             "system_notifications": False,
             "user_instructions": "",
@@ -250,6 +292,7 @@ class Settings:
             # Settings → Subagents (planning.DelegateManager.maybe_wake): an idle chat continues by itself when a
             # background subagent finishes. Off by default: it starts a paid turn.
             "background_subagent_wake": False,
+            **{key: limit[0] for key, limit in SUBAGENT_LIMITS.items()},
             # Settings → Model and context (AgentManager.fallback_endpoint): the endpoint an agent or subagent
             # request goes to once when its own failed before the reply started; "" = none.
             "fallback_model": "",
@@ -267,8 +310,15 @@ class Settings:
             # (off: they run only with Run now), and Settings → Credentials: the day the Databricks token expires.
             "schedules_enabled": False,
             "token_expires_on": "",
+            # Settings → Browsing (browser_tool.py, browser.py): the agent's browser tool, and how it runs. Not a
+            # project setting: a project file cannot turn a browser on.
+            "browser_tools": False,
+            "browser_headless": BROWSER_HEADLESS[0],
+            "browser_action_timeout": BROWSER_TIMEOUT[0],
+            "browser_upstream_proxy": "auto",
         }
         self.migrated_from = None
+        self.listeners = []  # Called without arguments after each saved change (update).
         if self.path.exists():
             saved = json.loads(self.path.read_text())
             keys = set(self.values) | set(LIMIT_KEYS)
@@ -295,6 +345,29 @@ class Settings:
             for key, maximum in TURN_LIMITS.items():  # A hand-edited limit that is not a whole number means none.
                 if type(self.values[key]) is not int or not 0 <= self.values[key] <= maximum:
                     self.values[key] = 0
+            for key, (default, least, most, _) in SUBAGENT_LIMITS.items():  # Hand-edited: out of range means the default.
+                if type(self.values[key]) is not int or not least <= self.values[key] <= most:
+                    self.values[key] = default
+            if type(self.values["context_trim"]) is not bool:  # Hand-edited: anything else is the default.
+                self.values["context_trim"] = True
+            if type(self.values["compaction_ask"]) is not bool:
+                self.values["compaction_ask"] = True
+            if type(self.values["browser_tools"]) is not bool:  # Hand-edited: anything but true is off.
+                self.values["browser_tools"] = False
+            if self.values["browser_headless"] not in BROWSER_HEADLESS:
+                self.values["browser_headless"] = BROWSER_HEADLESS[0]
+            seconds = self.values["browser_action_timeout"]
+            if type(seconds) is not int or not BROWSER_TIMEOUT[1] <= seconds <= BROWSER_TIMEOUT[2]:
+                self.values["browser_action_timeout"] = BROWSER_TIMEOUT[0]
+            try:  # Hand-edited: a proxy setting that is not valid means "auto".
+                from .browser_proxy import check_upstream_setting
+                self.values["browser_upstream_proxy"] = check_upstream_setting(self.values["browser_upstream_proxy"])
+            except ValueError:
+                self.values["browser_upstream_proxy"] = "auto"
+            try:
+                self.check_trim(self.values)
+            except ValueError:
+                self.values.update(context_trim_start_percent=TRIM_START[0], context_trim_target_percent=TRIM_TARGET_DEFAULT)
             if type(self.values["schedules_enabled"]) is not bool:  # Hand-edited: anything but true is off.
                 self.values["schedules_enabled"] = False
             if not valid_expiry(self.values["token_expires_on"]):
@@ -302,6 +375,7 @@ class Settings:
             fallback = self.values["fallback_model"]  # A hand-edited name that is not one means none.
             fallback = fallback.strip() if isinstance(fallback, str) else ""
             self.values["fallback_model"] = fallback if ENDPOINT_NAME.match(fallback) else ""
+        set_subagents_running_max(self.values["subagents_running_max"])
         # Budgets not saved follow the model's defaults; saved ones win.
         limits = dict(zip(LIMIT_KEYS, default_limits(self.values["model"])))
         ordered = {}
@@ -332,7 +406,9 @@ class Settings:
             configured = True
         except (ValueError, OSError):
             host, configured = "", False
-        return {**self.values, "host": host, "configured": configured, "web_search_status": self.web_search_status(),
+        from .browser_proxy import redact_url
+        return {**self.values, "browser_upstream_proxy": redact_url(self.values["browser_upstream_proxy"]),
+                "host": host, "configured": configured, "web_search_status": self.web_search_status(),
                 # The Settings project's settings files: what they set and whether they apply (Settings shows the
                 # values and their sources; saving writes only these values, never a file's).
                 "project_layers": self.project_layers().report(self.values["workspace"]),
@@ -340,8 +416,29 @@ class Settings:
                 "python_venv_status": user_paths.python_venv_status(self), "default_model": DEFAULT_MODEL,
                 "default_limits": dict(zip(LIMIT_KEYS, default_limits(self.values["model"]))),
                 "token_warning": token_warning(self.values["token_expires_on"]),
+                # The marks the live trim runs at (effective_trim_marks), which differ from the saved ones when the
+                # target is above the start or the auto-compact percentage is low; null when the trim does not run.
+                "context_trim_effective": (lambda marks: None if marks is None else {"start": marks[0], "target": marks[1]})(
+                    effective_trim_marks(self.values)),
                 "endpoint_profiles": known_endpoints(),
+                "browser_status": self.browser_status(),
                 **({"model_migrated_from": self.migrated_from} if self.migrated_from is not None else {})}
+
+    def browser_status(self):
+        """Settings → Browsing: {ready, problem?, proxy, proxy_problem?}, whether the browser tool can run here
+        (browser_tool.status) and how it connects: "direct", "system proxy host:port", "configured proxy host:port" or
+        "PAC file found: enter the proxy address" (then proxy_problem says what to do). While the setting is off it is
+        {"ready": false, "problem": "Browsing is off. ..."}: the tool cannot run, and the install problems (the
+        package, the browser) and the connection are named once the setting is on. Never starts a browser and never
+        holds a password."""
+        from .browser_tool import status
+        if self.values.get("browser_tools") is not True:
+            return {"ready": False, "problem": "Browsing is off. Turn it on in Settings → Browsing."}
+        from .browser_proxy import resolve_upstream
+        report = status(True)
+        choice = resolve_upstream(self.values.get("browser_upstream_proxy", "auto"))
+        return {**{key: report[key] for key in ("ready", "problem") if key in report}, "proxy": choice.mode,
+                **({"proxy_problem": choice.problem} if choice.problem else {})}
 
     def project_layers(self):
         """The project settings files of this state folder's projects (settings_layers.ProjectLayers)."""
@@ -412,6 +509,9 @@ class Settings:
             raise ValueError(f"Output-token limit must be below the context budget minus the {SAFETY_MARGIN:,}-token safety margin.")
         for key in ("max_agent_steps", "compaction_handoffs", "auto_compact_percent"):
             check_setting(key, candidate[key])
+        self.check_trim(candidate)
+        if type(candidate["compaction_ask"]) is not bool:
+            raise ValueError("Ask before compacting must be on or off.")
         minutes = candidate["approval_timeout_minutes"]
         if type(minutes) is not int or not 0 <= minutes <= MAX_APPROVAL_MINUTES:
             raise ValueError(f"Approval wait must be 0 (no limit) or 1 to {MAX_APPROVAL_MINUTES:,} minutes.")
@@ -461,11 +561,27 @@ class Settings:
         if not valid_expiry(expiry):
             raise ValueError("Token expires on must be empty or a date such as 2026-12-31.")
         self.check_web_settings(candidate)
+        if type(candidate["browser_tools"]) is not bool:
+            raise ValueError("Browsing must be on or off.")
+        if candidate["browser_headless"] not in BROWSER_HEADLESS:
+            raise ValueError("Browser window must be auto, window or headless.")
+        seconds = candidate["browser_action_timeout"]
+        if type(seconds) is not int or not BROWSER_TIMEOUT[1] <= seconds <= BROWSER_TIMEOUT[2]:
+            raise ValueError(f"Browser action timeout must be a whole number of seconds from {BROWSER_TIMEOUT[1]} to "
+                             f"{BROWSER_TIMEOUT[2]}.")
+        from .browser_proxy import check_upstream_setting, restore_password
+        proxy = candidate["browser_upstream_proxy"]
+        if isinstance(proxy, str):
+            proxy = restore_password(proxy, self.values["browser_upstream_proxy"])  # the dialog shows <redacted>
+        candidate["browser_upstream_proxy"] = check_upstream_setting(proxy)
         candidate["spending_limit_dbu"] = check_setting("spending_limit_dbu", candidate["spending_limit_dbu"])
         for key, label, unit in (("turn_token_limit", "Token limit per turn", "tokens"),
                                  ("turn_time_limit_minutes", "Time limit per turn", "minutes")):
             if type(candidate[key]) is not int or not 0 <= candidate[key] <= TURN_LIMITS[key]:
                 raise ValueError(f"{label} must be a whole number of {unit} from 0 (none) to {TURN_LIMITS[key]:,}.")
+        for key, (_, least, most, label) in SUBAGENT_LIMITS.items():
+            if type(candidate[key]) is not int or not least <= candidate[key] <= most:
+                raise ValueError(f"{label} must be a whole number from {least} to {most}.")
         sent = values.get("subagent_defaults")
         if isinstance(sent, dict):
             # Types and fields left out keep their current values.
@@ -500,12 +616,31 @@ class Settings:
         persisted = {key: value for key, value in candidate.items()
                      if key not in ENV_KEYS or not self.env_equivalent(key, value, candidate)}
         self.values = candidate
+        set_subagents_running_max(candidate["subagents_running_max"])
         temp = self.path.with_suffix(".tmp")
         temp.write_text(json.dumps({**persisted, "settings_version": SETTINGS_VERSION}, indent=2))
         temp.chmod(0o600)
         temp.replace(self.path)
         self.migrated_from = None
+        for listener in list(self.listeners):
+            listener()  # DelegateManager: a higher subagent limit wakes the delegations that wait for a slot.
         return self.public()
+
+    @staticmethod
+    def check_trim(candidate):
+        """Settings -> Model and context -> Trim old tool results, checked in candidate: on or off, a start mark of
+        40 to 90 percent and a target of 20 to 85 percent. Each is checked for its own range only; agents.trim_marks
+        fits them to Auto-compact at when a chat runs."""
+        if type(candidate["context_trim"]) is not bool:
+            raise ValueError("Trim old tool results must be on or off.")
+        start, target = candidate["context_trim_start_percent"], candidate["context_trim_target_percent"]
+        _, least, most = TRIM_START
+        if type(start) is not int or not least <= start <= most:
+            raise ValueError(f"Start trimming at must be a whole number from {least} to {most} percent of the input budget.")
+        top = TRIM_START[2] - TRIM_GAP
+        if type(target) is not int or not TRIM_TARGET_LEAST <= target <= top:
+            raise ValueError(f"Trim down to must be a whole number from {TRIM_TARGET_LEAST} to {top} percent of the "
+                             f"input budget.")
 
     def check_web_settings(self, candidate):
         """Settings → Web access, checked (and the address and key name tidied) in candidate."""

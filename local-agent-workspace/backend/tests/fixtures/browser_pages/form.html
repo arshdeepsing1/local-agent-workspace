@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Order form</title></head>
+<body>
+<h1>Order form</h1>
+<p>Fill in the form and send it.</p>
+<form action="result.html" method="get">
+  <label for="name">Name</label>
+  <input id="name" name="name" type="text" placeholder="Your name">
+  <label for="size">Size</label>
+  <select id="size" name="size">
+    <option value="s">Small</option>
+    <option value="m">Medium</option>
+    <option value="l">Large</option>
+  </select>
+  <label><input type="checkbox" name="gift" value="yes"> Gift wrap</label>
+  <button type="submit">Send order</button>
+</form>
+<p style="display:none">HIDDEN-FORM-NOTE do not show</p>
+</body></html>

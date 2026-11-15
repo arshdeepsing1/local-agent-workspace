@@ -105,7 +105,13 @@ async def test_small_context_requires_no_compaction_and_reports_estimated_budget
                     "breakdown": context_breakdown(messages, TOOLS),
                     "tool_groups": {"Built-in tools": context_breakdown(messages, TOOLS)["tool_definitions"]},
                     "auto_compact_threshold": DEFAULT_CONTEXT_WINDOW - REPLY_RESERVE - SAFETY_MARGIN,
-                    "auto_compact_percent": 100, "compactable": False}  # One turn: Compact now has nothing to do.
+                    "auto_compact_percent": 100, "compactable": False,  # One turn: Compact now has nothing to do.
+                    # The one reading: no provider report yet, so the estimate over the 131,072-token context
+                    # budget; compaction starts at the 120,832-token threshold, 92% of that budget.
+                    "percent_used": round(100 * estimate_tokens(messages, TOOLS) / 131072),
+                    "used_tokens": estimate_tokens(messages, TOOLS), "limit_tokens": 131072,
+                    "limit_name": "context budget", "is_estimate": True, "compact_at_percent": 92,
+                    "last_request_cached": 0, "warn": "none"}
 
 
 async def test_dynamic_reply_reserve_is_budgeted_without_mutating_wire():

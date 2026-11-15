@@ -500,3 +500,13 @@ def test_rules_saved_in_an_older_header_record_still_load(tmp_path):
         assert store.get(session["id"])["allow_rules"] == [{"tool": "edits"}]
     finally:
         store.db.close()
+
+
+def test_a_browser_card_is_remembered_by_its_host_key():
+    from local_agent.approvals import rule_for
+    assert rule_for("browser", {"action": "open", "url": "http://localhost:3000/a"}) == {
+        "tool": "browser", "domain": "localhost:3000"}
+    assert rule_for("browser", {"action": "click", "ref": "r1", "host": "docs.example.com"}) == {
+        "tool": "browser", "domain": "docs.example.com"}
+    assert rule_for("browser", {"action": "read"}) is None
+    assert rule_for("web_fetch", {"url": "https://docs.example.com/x"}) == {"tool": "web_fetch", "domain": "docs.example.com"}

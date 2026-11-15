@@ -336,3 +336,192 @@ def test_images_response_format_and_the_endpoint_state(gateway, simulator):
     assert state["state"]["ready"] == "READY" and state["task"] == "llm/v1/chat"
     assert httpx.get(f"{gateway}/api/2.0/serving-endpoints/unknown-endpoint").status_code == 404
 
+
+
+# --- The long_chat scenario ------------------------------------------------------------------------------------
+
+LONG_CHAT_TOOLS = [{"type": "function", "function": {"name": name, "parameters": {"type": "object", "properties": {}}}}
+                   for name in ("run_command", "read_file")]
+
+
+def long_chat_user_text(simulator, step):
+    """What the test sends at a step: the standing instruction itself at steps 4 and 8."""
+    return {4: simulator.LONG_CHAT_INSTRUCTIONS[0], 8: simulator.LONG_CHAT_INSTRUCTIONS[1]}.get(step, f"step {step}")
+
+
+def play_long_chat(simulator, steps, wire=None, system="You are a coding assistant."):
+    """Drive the scripted model through steps 1..steps as an app would, with tool results of the documented
+    sizes: (wire, [(tool name, arguments, result bytes) per step])."""
+    brain, wire, calls_by_step = simulator.Brain(), list(wire or []), []
+    for step in range(1, steps + 1):
+        wire.append({"role": "user", "content": long_chat_user_text(simulator, step)})
+        made = []
+        while True:
+            body = {"messages": [{"role": "system", "content": system}, *wire], "tools": LONG_CHAT_TOOLS}
+            text, calls = brain.respond(body)
+            message = {"role": "assistant", "content": text}
+            if not calls:
+                wire.append(message)
+                break
+            message["tool_calls"] = [{"id": f"call_{step}_{len(made) + index}", "type": "function",
+                                      "function": {"name": item["name"], "arguments": json.dumps(item["arguments"])}}
+                                     for index, item in enumerate(calls)]
+            wire.append(message)
+            for item, call in zip(calls, message["tool_calls"]):
+                size = simulator.long_chat_plan(step, simulator.Gateway.long_chat_scale)["bytes"]
+                wire.append({"role": "tool", "tool_call_id": call["id"], "content": "x" * size})
+                made.append((item["name"], item["arguments"], size))
+        calls_by_step.append(made)
+    return wire, calls_by_step
+
+
+def sent(simulator, wire, question, system="You are a coding assistant."):
+    """The scripted model's reply to a question, from the request made of this wire."""
+    body = {"messages": [{"role": "system", "content": system}, *wire, {"role": "user", "content": question}],
+            "tools": LONG_CHAT_TOOLS}
+    return simulator.Brain().respond(body)
+
+
+def test_long_chat_steps_call_the_documented_tools_and_state_the_facts(simulator):
+    wire, by_step = play_long_chat(simulator, 40)
+    assert [len(calls) for calls in by_step] == [1] * 40  # One tool call a step.
+    plans = {step: simulator.long_chat_plan(step) for step in range(1, 41)}
+    for step, calls in enumerate(by_step, start=1):
+        name, arguments, size = calls[0]
+        assert (name, arguments, size) == (plans[step]["tool"], plans[step]["arguments"], plans[step]["bytes"])
+    assert {step for step, plan in plans.items() if plan["tool"] == "read_file"} == {
+        1, 4, 6, 8, 10, 14, 15, 21, 25, 28, 30, 35, 40}
+    assert {plans[step]["arguments"]["path"] for step in (6, 10, 15, 25, 30, 35, 40)} == {"long-chat/shared.txt"}
+    assert [plans[step]["bytes"] for step in (2, 3, 5, 7, 9, 12, 18, 20)] == [6_000, 12_000, 24_000, 6_000, 12_000,
+                                                                          24_000, 12_000, 6_000]
+    assert sum(plan["bytes"] for plan in plans.values()) > 400_000  # The context grows quickly.
+    replies = {step: message["content"] for step, message in zip(
+        range(1, 41), [message for message in wire if message["role"] == "assistant" and "tool_calls" not in message])}
+    assert simulator.LONG_CHAT_GOAL in replies[1]
+    assert [simulator.LONG_CHAT_TASKS[index] in replies[step] for step, index in ((2, 0), (5, 1), (9, 2))] == [True] * 3
+    assert [simulator.LONG_CHAT_DECISIONS[index] in replies[step] for step, index in
+            ((3, 0), (7, 1), (12, 2), (18, 3))] == [True] * 4
+    assert all(f"Standing instruction: {text}" in replies[step] for step, text in
+               ((4, simulator.LONG_CHAT_INSTRUCTIONS[0]), (8, simulator.LONG_CHAT_INSTRUCTIONS[1])))
+    assert simulator.LONG_CHAT_CLOSED in replies[20]
+    assert all(replies[step].endswith(f"Step {step} done.") for step in range(1, 41))
+    assert len(simulator.LONG_CHAT_TASKS) == 3 and len(simulator.LONG_CHAT_DECISIONS) == 4
+
+
+def test_a_long_chat_command_prints_exactly_its_documented_bytes_and_the_files_exist(simulator, tmp_path):
+    import subprocess
+    for step, size in ((2, 6_000), (3, 12_000), (5, 24_000)):
+        command = simulator.long_chat_plan(step)["arguments"]["command"]
+        assert subprocess.run(command, shell=True, capture_output=True, check=True).stdout.__len__() == size
+    assert simulator.long_chat_plan(5, scale=0.25)["bytes"] == 6_000
+    shared, small = simulator.long_chat_files(tmp_path)
+    assert (shared.stat().st_size, small.stat().st_size) == (5_000, 200)
+    assert simulator.long_chat_files(tmp_path) == [shared, small]  # Same content each time.
+
+
+def test_long_chat_questions_are_answered_from_the_request_only(simulator):
+    wire, _ = play_long_chat(simulator, 40)
+    expected = {"goal": simulator.LONG_CHAT_GOAL, "open tasks": simulator.LONG_CHAT_OPEN_TASKS,
+                "decision 1": simulator.LONG_CHAT_DECISIONS[0], "decision 2": simulator.LONG_CHAT_DECISIONS[1],
+                "decision 3": simulator.LONG_CHAT_DECISIONS[2], "decision 4": simulator.LONG_CHAT_DECISIONS[3],
+                "instruction 1": simulator.LONG_CHAT_INSTRUCTIONS[0], "instruction 2": simulator.LONG_CHAT_INSTRUCTIONS[1],
+                "closed task": simulator.LONG_CHAT_CLOSED, "last step": "Last step: 40"}
+    assert set(expected) == set(simulator.LONG_CHAT_QUESTIONS) and len(expected) == 10
+    for topic, answer in expected.items():
+        assert sent(simulator, wire, f"question: {topic}") == (answer, [])
+    # Nothing is remembered between requests: the same question over a request without the text.
+    texts = {"goal": simulator.LONG_CHAT_GOAL, "decision 2": simulator.LONG_CHAT_DECISIONS[1],
+             "instruction 2": simulator.LONG_CHAT_INSTRUCTIONS[1], "closed task": simulator.LONG_CHAT_CLOSED}
+    for topic, text in texts.items():
+        stripped = [{**message, "content": message["content"].replace(text, "")} for message in wire]
+        assert sent(simulator, stripped, f"question: {topic}") == ("not in context", [])
+    without_task = [{**message, "content": message["content"].replace(simulator.LONG_CHAT_TASKS[2], "")}
+                    for message in wire]
+    assert sent(simulator, without_task, "question: open tasks") == ("not in context", [])
+    assert sent(simulator, [], "question: last step") == ("not in context", [])
+    assert sent(simulator, wire[:60], "question: last step")[0] in {f"Last step: {n}" for n in range(1, 41)}
+    # The question is not a step: no tool call, and a summary in place of the history still answers.
+    summary = {"role": "user", "content": "Summary:\n- " + simulator.LONG_CHAT_DECISIONS[3] + "\n- Step 17 done."}
+    assert sent(simulator, [summary], "question: decision 4") == (simulator.LONG_CHAT_DECISIONS[3], [])
+    assert sent(simulator, [summary], "question: last step") == ("Last step: 17", [])
+    assert sent(simulator, [summary], "question: decision 1") == ("not in context", [])
+
+
+def test_long_chat_summary_carries_the_fixed_texts_under_the_requested_headings(simulator, gateway):
+    from local_agent import context
+    wire, _ = play_long_chat(simulator, 21)
+    chunk = json.dumps(wire)
+    url = f"{gateway}/serving-endpoints/databricks-claude-opus-5-5/invocations"
+
+    def summary_of(messages):
+        reply = httpx.post(url, json={"messages": messages, "max_tokens": 2048}).json()
+        assert reply["choices"][0]["finish_reason"] == "stop"
+        text = reply["choices"][0]["message"]["content"]
+        sections = context.summary_sections(text)
+        return text, {name: text[start:end] for name, (start, end) in sections.items()}
+
+    text, sections = summary_of(context.build_summary_messages("", chunk))
+    assert list(sections) == list(context.SUMMARY_SECTIONS)  # The headings the app asked for, in its order.
+    assert simulator.LONG_CHAT_GOAL in sections["Goal and current status"]
+    assert simulator.LONG_CHAT_CLOSED in sections["Goal and current status"]
+    assert "Step 21 done." in sections["Goal and current status"]
+    open_tasks = sections["Open tasks and next steps"]
+    assert simulator.LONG_CHAT_TASKS[0] in open_tasks and simulator.LONG_CHAT_TASKS[2] in open_tasks
+    assert simulator.LONG_CHAT_TASKS[1] not in open_tasks  # Closed at step 20.
+    requirements = sections["User requirements, preferences and constraints"]
+    assert all(instruction in requirements for instruction in simulator.LONG_CHAT_INSTRUCTIONS)
+    assert all(decision in sections["Decisions and reasons"] for decision in simulator.LONG_CHAT_DECISIONS)
+    assert sections["Errors, causes and fixes"].strip().endswith("None.")
+    # The next compaction carries the previous summary forward, and the handoff and condense prompts get theirs.
+    _, carried = summary_of(context.build_summary_messages(text, json.dumps(wire[-3:])))
+    assert simulator.LONG_CHAT_INSTRUCTIONS[1] in carried["User requirements, preferences and constraints"]
+    _, handoff = summary_of(context.build_handoff_messages("", chunk))
+    assert list(handoff) == list(context.SUMMARY_SECTIONS + context.HANDOFF_EXTRA_SECTIONS)
+    _, condensed = summary_of(context.build_condense_messages(text, 3_500))
+    assert list(condensed) == list(context.SUMMARY_SECTIONS)
+    assert simulator.LONG_CHAT_DECISIONS[2] in condensed["Decisions and reasons"]
+    # A request that lost a text loses it from the summary: it is built from the request, not remembered.
+    lost = chunk.replace(simulator.LONG_CHAT_INSTRUCTIONS[0], "").replace(simulator.LONG_CHAT_DECISIONS[0], "")
+    _, partial = summary_of(context.build_summary_messages("", lost))
+    assert simulator.LONG_CHAT_INSTRUCTIONS[0] not in partial["User requirements, preferences and constraints"]
+    assert simulator.LONG_CHAT_DECISIONS[0] not in partial["Decisions and reasons"]
+    assert simulator.LONG_CHAT_INSTRUCTIONS[1] in partial["User requirements, preferences and constraints"]
+    # Other chats keep the old summary: a heading with filler text.
+    plain = httpx.post(url, json={"messages": context.build_summary_messages("", "nothing special")}).json()
+    assert "Simulated summary content" in plain["choices"][0]["message"]["content"]
+
+
+def test_long_chat_over_the_gateway_calls_a_tool_and_reports_growing_usage(gateway, simulator):
+    url = f"{gateway}/serving-endpoints/databricks-claude-opus-5-5/invocations"
+    first = {"messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "step 5"}],
+             "stream": True, "max_tokens": 1024, "tools": LONG_CHAT_TOOLS}
+    parts = chunks(httpx.post(url, json=first))
+    calls = [call for part in parts for call in part["choices"][0]["delta"].get("tool_calls") or []]
+    arguments = json.loads("".join(call["function"]["arguments"] for call in calls))
+    assert calls[0]["function"]["name"] == "run_command" and arguments["command"].endswith("head -c 24000")
+    wire, _ = play_long_chat(simulator, 6)
+    second = {**first, "messages": [{"role": "system", "content": "s"}, *wire, {"role": "user", "content": "step 7"}]}
+    usage = chunks(httpx.post(url, json=second))[-1]["usage"]
+    assert usage["prompt_tokens"] > parts[-1]["usage"]["prompt_tokens"] + 8_000
+    assert {"cache_read_input_tokens", "cache_creation_input_tokens"} <= set(usage)
+    assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
+
+
+@pytest.mark.parametrize("window, scale", [(65_536, 1.0), (32_768, 0.25)])
+def test_long_chat_passes_the_auto_compact_threshold_at_least_three_times(simulator, window, scale):
+    from local_agent import context, tools
+    budget = context.effective_input_budget(window, context.DEFAULT_MAX_OUTPUT_TOKENS)
+    threshold = context.compaction_threshold(budget, context.DEFAULT_AUTO_COMPACT_PERCENT)
+    system = {"role": "system", "content": "s" * 12_000}
+    wire, due = [], []
+    for step in range(1, 41):
+        plan = simulator.long_chat_plan(step, scale)
+        wire += [{"role": "user", "content": f"step {step}"},
+                 {"role": "assistant", "content": "", "tool_calls": [{"id": f"c{step}", "type": "function", "function": {
+                     "name": plan["tool"], "arguments": json.dumps(plan["arguments"])}}]},
+                 {"role": "tool", "tool_call_id": f"c{step}", "content": "x" * plan["bytes"]},
+                 {"role": "assistant", "content": f"Step {step} done."}]
+        if context.estimate_tokens([system, *wire], tools.TOOL_DEFINITIONS) > threshold:
+            due.append(step)
+            wire = [{"role": "user", "content": "S" * 3_000}, *wire[-4:]]  # A summary and the latest turn.
+    assert len(due) >= 3, due

@@ -272,6 +272,14 @@ class Uploads:
         _write(folder / f"{upload_id}.json", json.dumps(record, ensure_ascii=False).encode("utf-8"))
         return record
 
+    def save_tool_image(self, session_id, name, data):
+        """Keep an image a tool made (the browser's screenshot) as an ordinary upload of this conversation, under the
+        same limits as an attached image; returns its wire reference (image_ref). ValueError (shown in the tool's
+        result) when the bytes are not an image the app takes or a limit is passed."""
+        if not data or not documents.image_info(data):
+            raise ValueError(f"{clean_name(name)} is not an image the app takes (PNG, JPEG, GIF or WebP).")
+        return image_ref(self.save(session_id, name, data))
+
     def get(self, session_id, upload_id):
         """The record of an attached file of this conversation, or None."""
         if not isinstance(upload_id, str) or not UPLOAD_ID.match(upload_id):

@@ -18,6 +18,8 @@ from .redaction import redact_secrets
 EXCERPT_CHARS = 600
 COMMAND_CHARS = 2000
 DETAIL_CHARS = 300
+# A transcript with its subagents' transcripts (subagents=) is cut here, with a note: the limit of a conversation bundle.
+MAX_COMBINED_BYTES = 16 * 1024 * 1024
 PLAN_CHARS = 20000  # submit_plan's own limit: a plan is shown in full.
 PLAN_MODES = {"acceptEdits": "Accept edits", "manual": "Manual"}
 QUESTION_OUTCOMES = {"answered": "answered", "skipped": "skipped", "expired": "not answered in time"}
@@ -79,8 +81,8 @@ def _indent(text):
     return "\n".join("  " + line if line else line for line in text.splitlines())
 
 
-def _demote_headings(text):
-    """Put a reply's own headings below the transcript's turn headings. Lines
+def _demote_headings(text, by=2):
+    """Put a reply's own headings below the transcript's turn headings (by levels down). Lines
     inside fenced code, such as shell comments, stay as they are."""
     lines, fence = [], None
     for line in text.split("\n"):
@@ -96,7 +98,7 @@ def _demote_headings(text):
                 fence = None
         elif not indented and re.match(r"#{1,6}(?:[ \t]|$)", stripped):
             level = len(stripped) - len(stripped.lstrip("#"))
-            line = "#" * min(6, level + 2) + stripped[level:]
+            line = "#" * min(6, level + by) + stripped[level:]
         lines.append(line)
     return "\n".join(lines)
 
@@ -296,29 +298,60 @@ def transcript_file_name(session, *, redact=lambda text: text):
     return transcript_file_stem(session, redact=redact) + ".md"
 
 
-def transcript(session, *, excerpt_chars=EXCERPT_CHARS, redact=lambda text: text):
-    """Markdown for one conversation. Common secret shapes and anything redact
-    replaces (the app's configured credentials) are replaced with [REDACTED]."""
+def _first_line(text, limit=120):
+    for line in str(text or "").splitlines():
+        if line.strip():
+            return _clip(" ".join(line.split()), limit)
+    return ""
+
+
+def _subagent_section(card, child, level, excerpt_chars):
+    """A subagent's transcript under the delegate_task card that started it: a heading naming its agent type and the
+    task's first line, the child's own events (one section level down), and an end marker."""
+    arguments = card.get("input") if isinstance(card.get("input"), dict) else {}
+    task = _first_line(arguments.get("task")) or _first_line(
+        next((event.get("text") for event in child.get("events", []) if isinstance(event, dict)
+              and event.get("type") == "user"), "")).removeprefix("Delegated task:")
+    kind = child.get("agent_type") or arguments.get("agent_type") or "general"
+    lines = ["", "#" * level + f" Subagent: {kind}, {task or 'no task recorded'}", "",
+             *_render(child, excerpt_chars, None, level - 1, True)]
+    return "\n".join([*lines, f"_End of subagent conversation {str(child.get('id', 'unknown'))[:8]}._"])
+
+
+def _render(session, excerpt_chars, subagents, shift=0, nested=False):
+    """The transcript's lines. shift moves every heading down (a subagent inside its parent's turn); subagents (a
+    {conversation ID: conversation} map, or None for a plain transcript) puts each child under its card."""
     events = [event for event in session.get("events", []) if isinstance(event, dict)]
     # The app's messages after a background subagent are counted apart: they are not the user's.
     apps = sum(event.get("type") == "user" and event.get("background_wake") is True for event in events)
     users = sum(event.get("type") == "user" for event in events) - apps
-    lines = [f"# Transcript: {session.get('title') or 'Untitled conversation'}", "",
-             f"- Conversation `{session.get('id', 'unknown')}`, model `{session.get('model', 'unknown')}`, "
-             f"{users} user {'message' if users == 1 else 'messages'}"
-             + (f", {apps} app {'message' if apps == 1 else 'messages'}" if apps else ""),
-             f"- Workspace: `{session.get('workspace', 'unknown')}`",
-             f"- Started {_when(session.get('created'))}; last updated {_when(session.get('updated'))}",
-             "- Written by the app from the saved conversation file. Messages and replies are complete, with their "
-             "headings moved two levels down; each tool call shows its main input, questions show the user's "
-             "answers, plans are shown in full with how they were reviewed, review findings are shown in full, and "
-             "command output is "
-             f"shortened to {excerpt_chars:,} characters.", ""]
-    tools, turn, summary = [], 0, ""
+    lines = [] if nested else [f"# Transcript: {session.get('title') or 'Untitled conversation'}", ""]
+    lines += [f"- Conversation `{session.get('id', 'unknown')}`, model `{session.get('model', 'unknown')}`, "
+              f"{users} user {'message' if users == 1 else 'messages'}"
+              + (f", {apps} app {'message' if apps == 1 else 'messages'}" if apps else ""),
+              f"- Workspace: `{session.get('workspace', 'unknown')}`",
+              f"- Started {_when(session.get('created'))}; last updated {_when(session.get('updated'))}"]
+    if not nested:
+        lines += ["- Written by the app from the saved conversation file. Messages and replies are complete, with their "
+                  "headings moved two levels down; each tool call shows its main input, questions show the user's "
+                  "answers, plans are shown in full with how they were reviewed, review findings are shown in full, and "
+                  "command output is "
+                  f"shortened to {excerpt_chars:,} characters."]
+    lines.append("")
+    tools, turn, summary, shown = [], 0, "", set()
     for event in events:
         kind = event.get("type")
         if kind == "tool":
             tools.append(_tool(event, excerpt_chars))
+            child_id = event.get("child_session_id")
+            if subagents is not None and event.get("name") == "delegate_task" and isinstance(child_id, str):
+                if child_id in shown:
+                    tools.append(f"\n_Subagent conversation shown above: `{child_id}`._")
+                elif isinstance(subagents.get(child_id), dict):
+                    tools.append(_subagent_section(event, subagents[child_id], 3 if turn else 2, excerpt_chars))
+                else:
+                    tools.append(f"\n_Subagent conversation not found: `{child_id}`._")
+                shown.add(child_id)
             continue
         if tools:
             lines += [*tools, ""]
@@ -335,13 +368,44 @@ def transcript(session, *, excerpt_chars=EXCERPT_CHARS, redact=lambda text: text
             # The app's message that continued the chat after a background subagent is not the user's.
             who = ("User (delegated by the parent conversation)" if delegated else
                    "App (sent when a background subagent ended)" if event.get("background_wake") is True else "User")
-            lines += ["---", "", f"## Turn {turn} · {_when(event.get('created'))}", "", f"**{who}:**", "",
-                      _demote_headings(text) or "(empty message)", ""]
+            lines += ["---", "", "#" * (2 + shift) + f" Turn {turn} · {_when(event.get('created'))}", "", f"**{who}:**", "",
+                      _demote_headings(text, 2 + shift) or "(empty message)", ""]
             lines += ["_Attached when sent: " + "; ".join(_attachment(item) for item in event["attachments"] if isinstance(item, dict)) + "_", ""] if isinstance(event.get("attachments"), list) and event["attachments"] else []
         elif kind == "assistant" and text:
-            lines += ["**Assistant:**", "", _demote_headings(text), ""]
+            lines += ["**Assistant:**", "", _demote_headings(text, 2 + shift), ""]
         elif kind in ("notice", "error") and text:
             lines += [f"> **{kind.title()}:** " + text.replace("\n", "\n> "), ""]
     lines += [*tools, ""] if tools else []
     lines += [f"_Turn: {summary}_", ""] if summary else []
-    return redact(redact_secrets("\n".join(lines).rstrip() + "\n"))
+    if subagents is not None and not nested:
+        # Subagent chats linked to this chat by their header whose card is gone: after the last turn.
+        rest = [child for child_id, child in subagents.items() if child_id not in shown and isinstance(child, dict)]
+        if rest:
+            lines += ["---", "", "## Subagent conversations without a card", ""]
+            for child in rest:
+                lines += _subagent_section({}, child, 3, excerpt_chars).split("\n")
+    return lines
+
+
+def _cut(text, limit):
+    """text cut at a line end within limit bytes, with a note, when it is longer."""
+    if len(text.encode("utf-8")) <= limit:
+        return text
+    note = (f"\n\n_Transcript cut: the combined document passed {limit:,} bytes here. Export the conversations "
+            "that follow on their own._\n")
+    room = max(0, limit - len(note.encode("utf-8")))
+    head = text.encode("utf-8")[:room].decode("utf-8", "ignore")
+    return head[:head.rfind("\n")].rstrip() + note if "\n" in head else note.lstrip()
+
+
+def transcript(session, *, excerpt_chars=EXCERPT_CHARS, redact=lambda text: text, subagents=None,
+               max_bytes=MAX_COMBINED_BYTES):
+    """Markdown for one conversation. Common secret shapes and anything redact
+    replaces (the app's configured credentials) are replaced with [REDACTED].
+
+    subagents ({conversation ID: conversation}, the chat's subagent chats found by their header link) adds each
+    child's transcript under the delegate_task card that started it, as a section one heading level down with an
+    end marker, redacted like the rest; a card whose child is not in the map says so. The document is cut
+    with a note at max_bytes. Without it the transcript is the chat alone."""
+    text = redact(redact_secrets("\n".join(_render(session, excerpt_chars, subagents)).rstrip() + "\n"))
+    return text if subagents is None else _cut(text, max_bytes)

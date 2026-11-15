@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Upload</title></head>
+<body>
+<h1>Upload</h1>
+<label for="f">Attachment</label>
+<input id="f" name="f" type="file">
+<p id="out">no file</p>
+<script>
+document.getElementById('f').addEventListener('change', (e) => {
+  document.getElementById('out').textContent = 'file=' + e.target.files.length;
+});
+</script>
+</body></html>

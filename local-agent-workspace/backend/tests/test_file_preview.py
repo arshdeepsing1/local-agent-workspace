@@ -206,4 +206,13 @@ def test_a_worktree_chat_is_told_which_of_its_files_is_not_text(tmp_path, projec
 
 def test_the_page_lets_preview_frames_reach_no_address(client):
     page = client.get("/")
-    assert page.headers["content-security-policy"] == INDEX_POLICY == "frame-src blob:; frame-ancestors 'none'"
+    policy = page.headers["content-security-policy"]
+    assert policy == INDEX_POLICY
+    assert "frame-src blob:" in policy and "frame-ancestors 'none'" in policy
+
+
+def test_the_page_loads_images_and_media_only_from_itself_or_its_own_bytes(client):
+    policy = client.get("/").headers["content-security-policy"]
+    assert "img-src 'self' data: blob:" in policy
+    assert "media-src 'self' data: blob:" in policy
+    assert "frame-ancestors 'none'" in policy

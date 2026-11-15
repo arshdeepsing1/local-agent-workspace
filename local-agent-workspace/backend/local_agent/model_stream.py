@@ -1,4 +1,6 @@
 """Bound SSE events before decoding, and tool-call fragments before assembly."""
+import json
+
 from .telemetry import InferenceError
 
 
@@ -92,6 +94,63 @@ async def sse_data(response):
                              "invalid_response")
 
 
+def well_formed(text):
+    """text with each escaped pair of surrogate halves ("\\ud83d\\ude00" in the model's JSON) joined into its
+    real character and every lone surrogate replaced by U+FFFD: strict UTF-8 cannot hold one."""
+    try:
+        text.encode("utf-8")
+        return text
+    except UnicodeEncodeError:
+        return text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+
+
+def well_formed_json(value):
+    """value (parsed JSON) with well_formed applied to every string and every dict key inside it. Walks with its
+    own stack, never by recursion: arguments nested deeper than Python's recursion limit reach it (the tool
+    schema check refuses them later). Key and list order stay."""
+    if isinstance(value, str):
+        return well_formed(value)
+    if not isinstance(value, (list, dict)):
+        return value
+    root = [] if isinstance(value, list) else {}
+    stack = [(value, root)]
+    while stack:
+        source, target = stack.pop()
+        for key, item in enumerate(source) if isinstance(source, list) else source.items():
+            if isinstance(item, (list, dict)):
+                copied = [] if isinstance(item, list) else {}
+                stack.append((item, copied))
+            else:
+                copied = well_formed(item) if isinstance(item, str) else item
+            if isinstance(target, list):
+                target.append(copied)
+            else:
+                target[well_formed(key)] = copied
+    return root
+
+
+def well_formed_arguments(text):
+    """A call's JSON argument text that strict UTF-8 can hold, whose parsed value is the one the tool receives.
+    The text is parsed first and cleaned after: a real half next to an escaped half ("\\ude00") is one pair only
+    once the escape is decoded, so cleaning the raw text would turn the real half into U+FFFD first. Text that
+    parses to a string with a lone half, or that holds a real one, is written again from the cleaned value. Text
+    that is not valid JSON is cleaned as it is (the call is refused later)."""
+    try:
+        parsed = json.loads(text)
+        again = json.dumps(parsed, ensure_ascii=False)
+    except (ValueError, RecursionError):
+        return well_formed(text)
+    try:
+        again.encode("utf-8")
+    except UnicodeEncodeError:
+        return json.dumps(well_formed_json(parsed), ensure_ascii=False)
+    return well_formed(text)
+
+
+def is_high_surrogate(character):
+    return "\ud800" <= character <= "\udbff" and len(character) == 1
+
+
 class ToolCallBuffer:
     def __init__(self):
         self.calls = {}
@@ -108,7 +167,7 @@ class ToolCallBuffer:
             self.calls[index] = {"id": "", "type": "function", "function": {"name": [], "arguments": []}}
         call = self.calls[index]
         if part.get("id") not in (None, ""):
-            if not isinstance(part["id"], str) or len(part["id"].encode("utf-8")) > 256:
+            if not isinstance(part["id"], str) or len(part["id"].encode("utf-8", "surrogatepass")) > 256:
                 raise InferenceError("The model returned an invalid tool-call ID.", "invalid_tool_arguments")
             call["id"] = part["id"]
         for key in ("name", "arguments"):
@@ -117,14 +176,14 @@ class ToolCallBuffer:
                 fragment = ""
             if not isinstance(fragment, str):
                 raise InferenceError("The model returned an invalid tool-call fragment.", "invalid_tool_arguments")
-            size = len(fragment.encode("utf-8"))
+            size = len(fragment.encode("utf-8", "surrogatepass"))
             if key == "arguments":
                 if self.argument_bytes + size > MAX_TOOL_ARGUMENT_BYTES:
                     raise InferenceError(
                         "The model's tool arguments exceeded 512 KiB in one response. No tool calls ran. "
                         "Retry with smaller file edits.", "invalid_tool_arguments")
                 self.argument_bytes += size
-            elif sum(len(item.encode("utf-8")) for item in call["function"][key]) + size > 128:
+            elif sum(len(item.encode("utf-8", "surrogatepass")) for item in call["function"][key]) + size > 128:
                 raise InferenceError("The model returned an oversized tool name. No tool calls ran.", "invalid_tool_arguments")
             if fragment:
                 call["function"][key].append(fragment)
@@ -138,5 +197,9 @@ class ToolCallBuffer:
             # hold valid JSON because it is sent back to the endpoint.
             if not function["arguments"].strip():
                 function["arguments"] = "{}"
-            calls[index] = {**call, "function": function}
+            # A pair of escaped halves may be split across fragments: joined here, once all are present.
+            arguments = function.pop("arguments")
+            function = {key: well_formed(text) for key, text in function.items()}
+            function["arguments"] = well_formed_arguments(arguments)
+            calls[index] = {**call, "id": well_formed(call["id"]), "function": function}
         return calls

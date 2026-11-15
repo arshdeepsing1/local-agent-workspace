@@ -21,6 +21,7 @@ from pathlib import Path
 
 from .jobs import ENVIRONMENT_KEYS, discard_output, kill_group, settle
 from .redaction import redact_secrets
+from .secret_paths import FOLDER_FILES
 from .tools import IGNORED, SECRET_NAMES
 
 OUTPUT_LIMIT = 80_000
@@ -51,6 +52,29 @@ def _env_variants():
 DIFF_EXCLUDES = (":(exclude,glob,icase)**/*.env", *(f":(exclude,glob,icase){pattern}"
                                                      for name in [*sorted(SECRET_NAMES), *_env_variants()]
                                                      for pattern in (f"**/{name}", f"**/{name}/**")))
+
+
+def _folder_excludes():
+    """The credential folders of secret_paths.FOLDER_FILES for a vetted Git command, at any depth and in any letter
+    case. The glob `**/<folder>/**` covers a top-level folder too, because `**/` matches no folder at all.
+    .ssh and .gnupg: every file in them, public keys included (a stricter view than `cat`, which reads
+    known_hosts and *.pub: a folder such as `.ssh/keys.pub/` can hold anything). .aws, .kube and .docker: what
+    `cat` refuses (the credential names directly in them) and everything below their top level, which holds
+    token caches; an ordinary file directly in them, such as `.docker/compose.yml`, stays visible like it is for
+    `cat`."""
+    patterns = []
+    for folder, names in FOLDER_FILES.items():
+        if names is None:
+            patterns.append(f"**/{folder}/**")
+        else:
+            patterns.append(f"**/{folder}/*/**")
+            patterns.extend(f"**/{folder}/{name}" for name in sorted(names))
+    return tuple(f":(exclude,glob,icase){pattern}" for pattern in patterns)
+
+
+# What a vetted shell command (and the model's own read-only Git) leaves out: the user's list above and the
+# credential folders. The app's own Changes view, which the user reads, keeps DIFF_EXCLUDES.
+VETTED_EXCLUDES = (*DIFF_EXCLUDES, *_folder_excludes())
 CHANGES_TIMEOUT = 60
 
 
@@ -188,6 +212,23 @@ async def partial_clone(workspace, git):
     return any(names.split(b"\0"))
 
 
+async def _require_commits_and_trees(workspace, sub, operands, git, filters):
+    """git show and git diff print a blob's content, which no pathspec can leave out: a revision that is not a
+    commit, a tag of one, or a tree (a hash from `git diff --raw`, a tag on a blob) is refused. A range
+    (a..b, a...b, ^a) is checked one revision at a time."""
+    for item in operands:
+        if item.startswith("-"):
+            continue
+        for revision in re.split(r"\.\.\.?", item[1:] if item.startswith("^") else item):
+            if not revision:
+                continue  # 'a..' and '..b' stand for HEAD.
+            code, _, _ = await run_git(workspace, ["rev-parse", "--verify", "-q", f"{revision}^{{tree}}"],
+                                       filters=filters, git=git)
+            if revision.startswith("-") or code != 0:
+                raise ValueError(f"git {sub} {item}: only a commit, a tag of one or a tree is shown here, not a "
+                                 "file's contents.")
+
+
 async def hardened_git_command(workspace, args, forbidden_roots, env=None, pathspecs=()):
     """(argv, env) for a read-only Git command: status, diff, show, log, ls-files, branch
     or rev-parse, with the programs a repository's configuration can name switched off
@@ -212,7 +253,13 @@ async def hardened_git_command(workspace, args, forbidden_roots, env=None, paths
     if pathspecs and (sub not in ("status", "diff", "show", "log", "ls-files")
                       or any(not isinstance(item, str) or not item or item.startswith(":") for item in pathspecs)):
         raise ValueError("These Git paths are not allowed in a read-only command.")
-    paths = ["--", *(pathspecs or ["."]), *DIFF_EXCLUDES]
+    if any(".." in item.split("/") for item in pathspecs):
+        # A pathspec that climbs out of the folder no longer matches the exclude patterns (`**/.ssh/**` misses
+        # `../.ssh/key`).
+        raise ValueError("A Git path with '..' is not allowed in a read-only command.")
+    if sub in ("diff", "show"):
+        await _require_commits_and_trees(workspace, sub, rest, git, filters)
+    paths = ["--", *(pathspecs or ["."]), *VETTED_EXCLUDES]
     part = {
         "status": [sub, "--ignore-submodules=dirty", *rest, *paths],
         "diff": [sub, "--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty", *rest, *paths],

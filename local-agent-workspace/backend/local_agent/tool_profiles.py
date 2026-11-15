@@ -4,6 +4,9 @@ PROFILES = ("read_only", "file_editor", "inherit")
 READ_TOOLS = frozenset({"list_files", "find_files", "read_file", "search_files", "list_skills", "use_skill", "list_tasks",
                         "get_task", "notebook_read", "ask_user", "outline_file", "project_overview", "get_tool_output",
                         "report_findings"})
+# The browser tool is in neither set, as web_fetch is in neither: one tool call cannot be split by action, and a page
+# can be read, clicked and submitted with it. Only the inherit profile offers it (browser_tool.py; the permission
+# modes then decide each action).
 FILE_TOOLS = READ_TOOLS | {"write_file", "edit_file", "insert_activity_log", "move_path", "delete_path", "notebook_edit"}
 
 

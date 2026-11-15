@@ -1,5 +1,6 @@
 import asyncio
 import fnmatch
+import io
 import json
 import os
 import stat
@@ -20,6 +21,7 @@ LIMIT = 80_000
 DEFAULT_WRITE_LIMIT = 80_000
 MIN_WRITE_LIMIT = 16_000
 MAX_WRITE_LIMIT = 1_000_000
+_READ_CHUNK = 64 * 1024  # Bytes asked of the descriptor per read in read_file.
 QUERY_OUTPUT_LIMIT = 8_000
 READ_SCAN_LIMIT = 8_000_000
 READ_LINE_LIMIT = 128_000
@@ -322,12 +324,40 @@ class WorkspaceTools:
     def read_file(self, path: str):
         target = self.path(path)
         limit = self.write_limit
-        if target.stat().st_size > limit:
-            raise NotText(f"File is too large for the text editor ({limit // 1000:,} KB limit).")
+        # One open, then fstat on the descriptor: a path checked first could become a named pipe before the open.
+        # O_NONBLOCK makes opening a pipe for reading return at once, so nothing waits for a writer.
         try:
-            text = target.read_text(encoding="utf-8")
+            descriptor = os.open(target, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        except OSError:
+            try:
+                kind = os.stat(target).st_mode
+            except OSError:
+                kind = stat.S_IFREG
+            if not stat.S_ISREG(kind):
+                raise ValueError("Only regular UTF-8 files can be edited.") from None  # A socket cannot be opened.
+            raise
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("Only regular UTF-8 files can be edited.")
+            if info.st_size > limit:
+                raise NotText(f"File is too large for the text editor ({limit // 1000:,} KB limit).")
+            # The file may have grown since fstat: read at most limit + 1 bytes, so more than limit is seen and refused.
+            chunks, total = [], 0
+            while total <= limit:
+                chunk = os.read(descriptor, min(_READ_CHUNK, limit + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+            if total > limit:
+                raise NotText(f"File is too large for the text editor ({limit // 1000:,} KB limit).")
+            # Same decoding and universal newlines as the text-mode open this replaces.
+            text = io.TextIOWrapper(io.BytesIO(b"".join(chunks)), encoding="utf-8").read()
         except UnicodeDecodeError:
             raise NotText("This file is not UTF-8 text, so the text editor cannot open it.") from None
+        finally:
+            os.close(descriptor)
         if "\x00" in text:
             raise NotText("Binary files cannot be opened in the text editor.")
         return text

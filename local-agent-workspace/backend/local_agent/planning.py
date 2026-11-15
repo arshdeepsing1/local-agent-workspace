@@ -6,6 +6,7 @@ import time
 import uuid
 
 from . import custom_agents
+from .config import SUBAGENT_LIMITS
 from .permissions import MODE_LABELS, denied_tools
 from .reasoning import EFFORT_LABELS
 from .redaction import redact_secrets
@@ -111,7 +112,10 @@ class TaskManager:
 # context); the parent's model gets back only a bounded report.
 AGENT_TYPES = {"explore": "read_only", "general": "inherit", "editor": "file_editor"}
 PROFILE_TYPES = {profile: kind for kind, profile in AGENT_TYPES.items()}
-MAX_RUNNING = 3  # Subagents running at once over all chats; model_profiles.CONCURRENT_REQUESTS is a chat plus three.
+# Settings → Subagents: subagents running at once over all chats (default MAX_RUNNING; model_profiles divides an
+# endpoint's rate limits by this plus the chat) and subagents one chat may start in one turn (default TURN_MAX).
+MAX_RUNNING = SUBAGENT_LIMITS["subagents_running_max"][0]
+TURN_MAX = SUBAGENT_LIMITS["subagents_per_turn_max"][0]
 MAX_STEPS = 24
 DEFAULT_STEPS = 10
 RESULT_BYTES = 6000  # The delegate_task result as indented JSON; the report (output) is shortened first.
@@ -532,6 +536,57 @@ class DelegateManager:
         # {parent id: {resolved path: {child id}}}: the files each running subagent of the chat changed, so a
         # sibling's change to the same file asks first (sibling_claim).
         self.claims = {}
+        # {parent id: (the turn's user event ID, delegations this chat started in that turn)}: the newest turn only.
+        self.turn_starts = {}
+        # A saved change of the limits: a higher running limit lets waiting delegations start (_slot checks again).
+        listeners = getattr(agent_manager.settings, "listeners", None)
+        if isinstance(listeners, list):
+            listeners.append(self._wake)
+
+    def limit(self, key):
+        """The Settings value of subagents_running_max or subagents_per_turn_max (the default for a missing or
+        invalid one: a hand-edited file is checked when Settings loads)."""
+        default, least, most, _ = SUBAGENT_LIMITS[key]
+        value = getattr(self.manager.settings, "values", {}).get(key, default)
+        return value if type(value) is int and least <= value <= most else default
+
+    @staticmethod
+    def turn_of(parent):
+        """The user event that started the turn now running in this chat (a steering message does not start one)."""
+        return next((event["id"] for event in reversed(parent["events"]) if event.get("type") == "user"
+                     and not event.get("steered")), None)
+
+    @staticmethod
+    def allowance_turn(parent, turn):
+        """The user event whose allowance a turn spends: its own, except for a turn the app started when a background
+        subagent ended (background_wake, with nobody present). That turn carries on the allowance of the turn that
+        started the subagent it reports (wake_for, and the card's delegation.turn_user_id), so a chain of wake turns
+        shares one allowance until you send a message."""
+        events = parent["events"]
+        for _ in range(len(events)):
+            event = next((item for item in events if item.get("id") == turn), None)
+            if event is None or not event.get("background_wake"):
+                break
+            started = next((item["delegation"]["turn_user_id"] for item in events
+                            if item.get("child_session_id") in (event.get("wake_for") or ())
+                            and isinstance(item.get("delegation"), dict)
+                            and isinstance(item["delegation"].get("turn_user_id"), str)), None)
+            if started is None or started == turn:
+                break
+            turn = started
+        return turn
+
+    def count_start(self, parent, turn):
+        """Count one more delegation of this chat's turn; ValueError (a tool error that leaves the turn running)
+        when the turn already started Settings → Subagents → Subagents per turn."""
+        limit = self.limit("subagents_per_turn_max")
+        turn = self.allowance_turn(parent, turn)
+        seen, started = self.turn_starts.get(parent["id"], (None, 0))
+        started = started if seen == turn else 0
+        if started >= limit:
+            raise ValueError(f"This turn already started {limit} subagents, the limit in Settings (Subagents per "
+                             "turn). Continue with their results.")
+        self.turn_starts[parent["id"]] = (turn, started + 1)
 
     def held_session(self, session_id):
         item = self.held.get(session_id)
@@ -879,11 +934,12 @@ class DelegateManager:
         await asyncio.wait([starting])  # Its card is closed when Stop returns.
 
     async def _slot(self, entry, parent, parent_event, labels, started=None):
-        """Wait until fewer than MAX_RUNNING subagents run (over all chats); the card says queued.
+        """Wait until fewer than the running limit of Settings (3 by default) subagents run (over all chats); the
+        card says queued. Settings changes wake it: a lower limit lets no new subagent start until enough ended.
         labels: the agent's type, model, effort and steps (max_steps), as the card shows them, and the turn that
         delegated it (turn_user_id). started (a background delegation's future) learns that it is queued."""
         noticed = parent_event is None
-        while not entry["cancelled"] and self.running() >= MAX_RUNNING:
+        while not entry["cancelled"] and self.running() >= self.limit("subagents_running_max"):
             entry["queued"] = True
             if started is not None and not started.done():
                 started.set_result({"status": "queued"})
@@ -1063,6 +1119,7 @@ class DelegateManager:
         max_steps = (spec["max_steps"] or DEFAULT_STEPS) if max_steps is None else max_steps
         if type(max_steps) is not int or not 1 <= max_steps <= MAX_STEPS:
             raise ValueError(f"max_steps must be an integer from 1 to {MAX_STEPS}.")
+        self.count_start(parent, self.turn_of(parent))  # Refused over the turn limit: no card, no slot.
         profile = child_profile(parent, spec["requested"])
         kind = spec["name"]
         agent_tools = self.agent_tools(parent, spec, profile)
@@ -1075,8 +1132,7 @@ class DelegateManager:
         model = spec["model"] or parent["model"]
         # turn_user_id: the user event that started the turn delegating it (a script follows the delegations of
         # its own turns by it, also once that turn ended).
-        turn = next((event["id"] for event in reversed(parent["events"]) if event.get("type") == "user"
-                     and not event.get("steered")), None)
+        turn = self.turn_of(parent)
         labels = {"agent_type": kind, "model": model, **({"effort": spec["effort"]} if spec["effort"] else {}),
                   **({"background": True} if background is not None else {}), **({"turn_user_id": turn} if turn else {}),
                   "max_steps": max_steps}
@@ -1122,6 +1178,8 @@ class DelegateManager:
                          permission_mode=self.agent_mode(parent, spec),
                          allowed_directories=list(parent.get("allowed_directories", [])),
                          allow_rules=[dict(rule) for rule in parent.get("allow_rules", [])],
+                         inherited_allow_rules=[dict(rule) for rule in parent.get("allow_rules", [])
+                                                if rule.get("behavior", "allow") == "allow"],
                          disabled_tools=list(parent.get("disabled_tools", [])))
             if effort is not None:
                 child["reasoning_effort"] = effort  # The agent's, else the chat's model settings apply.

@@ -16,6 +16,8 @@ ui-test = ["pytest>=8,<10", "playwright>=1.50,<2"]
 lint = ["ruff>=0.16,<1"]
 # Optional: PDF text for attached documents and read_file (documents.py); without it a PDF's text is not read.
 documents = ["pypdf>=6,<7"]
+# Optional: the browser tool (browser.py). Also run once: python -m playwright install chromium (or use an installed Chrome).
+browser = ["playwright>=1.50,<2"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["local_agent"]

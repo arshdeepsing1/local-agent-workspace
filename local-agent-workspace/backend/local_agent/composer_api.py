@@ -5,6 +5,7 @@ Messages themselves still go through POST /api/sessions/{id}/messages (api.py), 
 starts them or, while the chat is busy, queues them (AgentManager.submit_message).
 """
 import asyncio
+import base64
 import copy
 from urllib.parse import unquote
 
@@ -152,6 +153,20 @@ def register_composer(app, manager, settings, store, session_or_404):
         model = session["model"]
         vision = manager.supports(model, "vision") if record["kind"] == "image" else None
         return attached.public_record(record, vision, model, (profile_for(model) or {}).get("label"))
+
+    @app.get("/api/sessions/{session_id}/uploads/{upload_id}/image")
+    async def upload_image(session_id: str, upload_id: str):
+        """An image of this chat's uploads ({mime_type, data} as base64): the thumbnail of a browser card's screenshot.
+        Documents are never served here."""
+        session_or_404(session_id)
+        record = manager.uploads.get(session_id, upload_id)
+        if record is None or record.get("kind") != "image":
+            raise HTTPException(404, "This image is no longer available.")
+        try:
+            data = await asyncio.to_thread(manager.uploads.file(session_id, record).read_bytes)
+        except OSError:
+            raise HTTPException(404, "This image is no longer available.") from None
+        return {"mime_type": record["media_type"], "data": base64.b64encode(data).decode("ascii")}
 
     @app.get("/api/sessions/{session_id}/mention-files")
     async def session_mention_files(session_id: str, q: str = Query(default="", max_length=200)):

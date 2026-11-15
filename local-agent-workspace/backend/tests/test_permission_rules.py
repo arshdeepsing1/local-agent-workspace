@@ -1,6 +1,7 @@
 """Permission rules in the app: precedence, the saved rule file, protected paths, turned-off tools and the routes."""
 import asyncio
 import json
+import os
 import stat
 from pathlib import Path
 
@@ -19,7 +20,7 @@ from local_agent.permissions import (EDIT_CONTENT_KEYS, EDIT_TOOL_PATHS, TOOL_KI
                                      tool_decision)
 from local_agent.planning import DelegateManager
 from local_agent.portability import export_bundle
-from local_agent.rules import RULE_FILE, RuleStore, protected_reason
+from local_agent.rules import RULE_FILE, RuleStore, normalize_rule, protected_reason
 from local_agent.store import Store
 from local_agent.tools import TOOL_DEFINITIONS, WorkspaceTools
 
@@ -951,3 +952,425 @@ def test_large_input_guidance_follows_the_offered_tools(tmp_path, monkeypatch):
         assert "call project_overview first" in system["content"]
     finally:
         store.db.close()
+
+
+# Folder rules and letter case: two spellings are one folder exactly when the disk says so.
+
+def _edit_verdict(mode, project, path, rules):
+    tools = WorkspaceTools(str(project))
+    return evaluate(mode, "write_file", {"path": path, "content": "x"}, chat_rules=rules, resolve_path=tools.resolve)
+
+
+def _folder_rule(project, folder, behavior="deny"):
+    tools = WorkspaceTools(str(project))
+    return normalize_rule({"tool": "edits", "behavior": behavior, "path": str(folder)}, resolve_path=tools.resolve)
+
+
+def _case_insensitive_project(tmp_path, name="Private"):
+    project = tmp_path / "project"
+    (project / name).mkdir(parents=True)
+    if not (project / name.swapcase()).exists():
+        pytest.skip(f"this disk is case-sensitive, so {name.swapcase()!r} is another folder")
+    return project
+
+
+@pytest.mark.parametrize("mode", ["bypassPermissions", "acceptEdits"])
+def test_deny_folder_rule_applies_to_a_case_variant_on_a_case_insensitive_disk(tmp_path, mode):
+    project = _case_insensitive_project(tmp_path)
+    deny = _folder_rule(project, project / "Private")
+    assert _edit_verdict(mode, project, "Private/a.txt", [deny]).decision == "deny"
+    for path in ("private/a.txt", "PRIVATE/a.txt"):
+        assert _edit_verdict(mode, project, path, [deny]).decision == "deny", path
+
+
+def test_ask_folder_rule_applies_to_a_case_variant_on_a_case_insensitive_disk(tmp_path):
+    project = _case_insensitive_project(tmp_path)
+    ask = _folder_rule(project, project / "Private", "ask")
+    assert _edit_verdict("acceptEdits", project, "Private/a.txt", [ask]).decision == "ask"
+    assert _edit_verdict("acceptEdits", project, "private/a.txt", [ask]).decision == "ask"
+
+
+def test_folder_rule_typed_in_another_case_than_the_real_folder_still_matches(tmp_path):
+    project = _case_insensitive_project(tmp_path)
+    deny = _folder_rule(project, project / "PRIVATE")
+    for path in ("Private/a.txt", "private/a.txt"):
+        assert _edit_verdict("bypassPermissions", project, path, [deny]).decision == "deny", path
+
+
+def test_folder_rule_matches_a_new_file_in_a_case_variant_folder(tmp_path):
+    project = _case_insensitive_project(tmp_path)
+    deny = _folder_rule(project, project / "Private")
+    assert not (project / "Private" / "new.txt").exists()
+    assert _edit_verdict("bypassPermissions", project, "PRIVATE/new.txt", [deny]).decision == "deny"
+    assert _edit_verdict("bypassPermissions", project, "PRIVATE/sub/deeper/new.txt", [deny]).decision == "deny"
+
+
+def test_folder_rule_for_a_folder_that_does_not_exist_yet_matches_by_its_existing_parent(tmp_path):
+    project = _case_insensitive_project(tmp_path, "Parent")
+    deny = _folder_rule(project, project / "parent" / "Later")
+    assert not (project / "Parent" / "Later").exists()
+    assert _edit_verdict("bypassPermissions", project, "Parent/Later/a.txt", [deny]).decision == "deny"
+    assert _edit_verdict("bypassPermissions", project, "PARENT/later/a.txt", [deny]).decision == "deny"
+    assert _edit_verdict("bypassPermissions", project, "PARENT/Latest/a.txt", [deny]).decision != "deny"
+
+
+@pytest.mark.parametrize("sibling", ["Private2", "Privateer", "Priv"])
+def test_folder_rule_does_not_match_a_sibling_with_a_longer_or_shorter_name(tmp_path, sibling):
+    project = _case_insensitive_project(tmp_path)
+    (project / sibling).mkdir(exist_ok=True)
+    deny = _folder_rule(project, project / "Private")
+    for path in (f"{sibling}/a.txt", f"{sibling.lower()}/a.txt"):
+        assert _edit_verdict("bypassPermissions", project, path, [deny]).decision == "allow", path
+
+
+def test_allow_folder_rule_matches_a_case_variant_of_the_same_folder_only(tmp_path):
+    project = _case_insensitive_project(tmp_path, "Src")
+    (project / "Other").mkdir()
+    allow = _folder_rule(project, project / "Src", "allow")
+    assert _edit_verdict("default", project, "Src/a.py", [allow]).decision == "allow"
+    assert _edit_verdict("default", project, "src/a.py", [allow]).decision == "allow"
+    assert _edit_verdict("default", project, "Other/a.py", [allow]).decision != "allow"
+    assert _edit_verdict("default", project, "Srcs/a.py", [allow]).decision != "allow"
+
+
+def test_folder_rule_with_exact_case_matches_and_other_folders_do_not(tmp_path):
+    project = tmp_path / "project"
+    (project / "Private").mkdir(parents=True)
+    (project / "Public").mkdir()
+    deny = _folder_rule(project, project / "Private")
+    assert _edit_verdict("bypassPermissions", project, "Private/a.txt", [deny]).decision == "deny"
+    assert _edit_verdict("bypassPermissions", project, "Public/a.txt", [deny]).decision == "allow"
+
+
+def test_folder_rule_matches_an_equivalent_unicode_spelling_of_the_folder_name(tmp_path):
+    import unicodedata
+    project = tmp_path / "project"
+    (project / unicodedata.normalize("NFC", "café")).mkdir(parents=True)
+    if not (project / unicodedata.normalize("NFD", "café")).exists():
+        pytest.skip("this disk treats composed and decomposed names as different folders")
+    deny = _folder_rule(project, project / unicodedata.normalize("NFC", "café"))
+    path = unicodedata.normalize("NFD", "café") + "/a.txt"
+    assert _edit_verdict("bypassPermissions", project, path, [deny]).decision == "deny"
+
+
+def test_missing_folder_rule_follows_the_volume_case_rule(tmp_path, monkeypatch):
+    # The folder and its parent's child do not exist, so only the volume's case rule can say.
+    from local_agent import rules as rules_module
+    project = tmp_path / "project"
+    project.mkdir()
+    deny = _folder_rule(project, project / "Later")
+    probe = {"path": "later/a.txt", "content": "x"}
+    tools = WorkspaceTools(str(project))
+    monkeypatch.setattr(rules_module, "_volume_ignores_case", lambda folder, **kw: True)
+    assert rules_module.rule_matches(deny, "write_file", probe, resolve_path=tools.resolve)
+    monkeypatch.setattr(rules_module, "_volume_ignores_case", lambda folder, **kw: False)
+    assert not rules_module.rule_matches(deny, "write_file", probe, resolve_path=tools.resolve)
+    assert rules_module.rule_matches(deny, "write_file", {"path": "Later/a.txt", "content": "x"}, resolve_path=tools.resolve)
+
+
+# A folder name without a cased letter (2024, 12345) cannot show whether the disk ignores case, so the probe
+# uses a name higher up. When nothing can be probed, deny and ask rules match the variant and allow rules do not.
+
+def _require_case_insensitive_disk(tmp_path):
+    (tmp_path / "CaseProbe").mkdir()
+    if not (tmp_path / "caseprobe").exists():
+        pytest.skip("this disk is case-sensitive, so a case variant is another folder")
+
+
+def _write_verdict(mode, project, path, rules):
+    return _edit_verdict(mode, project, path, rules).decision
+
+
+def test_deny_rule_for_a_missing_folder_under_a_digit_named_parent_matches_a_case_variant(tmp_path):
+    _require_case_insensitive_disk(tmp_path)
+    project = tmp_path / "project"
+    (project / "2024").mkdir(parents=True)
+    deny = _folder_rule(project, project / "2024" / "Private")
+    assert not (project / "2024" / "Private").exists()
+    for path in ("2024/Private/a.txt", "2024/private/a.txt", "2024/PRIVATE/a.txt"):
+        assert _write_verdict("bypassPermissions", project, path, [deny]) == "deny", path
+    assert _write_verdict("bypassPermissions", project, "2024/Public/a.txt", [deny]) == "allow"
+
+
+@pytest.mark.parametrize("project_name", ["12345", "数据"])
+def test_deny_rule_in_a_project_whose_name_has_no_cased_letter_matches_a_case_variant(tmp_path, project_name):
+    _require_case_insensitive_disk(tmp_path)
+    project = tmp_path / project_name
+    project.mkdir()
+    deny = _folder_rule(project, project / "Private")
+    for path in ("Private/a.txt", "private/a.txt", "PRIVATE/a.txt"):
+        assert _write_verdict("bypassPermissions", project, path, [deny]) == "deny", path
+    assert _write_verdict("bypassPermissions", project, "Privates/a.txt", [deny]) == "allow"
+
+
+def test_missing_composed_name_rule_matches_the_decomposed_path_in_a_digit_named_project(tmp_path):
+    import unicodedata
+    _require_case_insensitive_disk(tmp_path)
+    project = tmp_path / "777"
+    project.mkdir()
+    deny = _folder_rule(project, project / unicodedata.normalize("NFC", "café"))
+    path = unicodedata.normalize("NFD", "café") + "/a.txt"
+    assert _write_verdict("bypassPermissions", project, path, [deny]) == "deny"
+
+
+def test_ask_rule_for_a_missing_folder_under_a_digit_named_parent_matches_a_case_variant(tmp_path):
+    _require_case_insensitive_disk(tmp_path)
+    project = tmp_path / "project"
+    (project / "2024").mkdir(parents=True)
+    ask = _folder_rule(project, project / "2024" / "Private", "ask")
+    assert _write_verdict("acceptEdits", project, "2024/private/a.txt", [ask]) == "ask"
+    assert _write_verdict("acceptEdits", project, "2024/Other/a.txt", [ask]) == "allow"
+
+
+def test_allow_rule_under_a_digit_named_parent_does_not_over_match_a_sibling(tmp_path):
+    project = tmp_path / "project"
+    (project / "2024").mkdir(parents=True)
+    allow = _folder_rule(project, project / "2024" / "Src", "allow")
+    assert _write_verdict("default", project, "2024/Src/a.py", [allow]) == "allow"
+    for path in ("2024/Other/a.py", "2024/Srcs/a.py", "2025/Src/a.py"):
+        assert _write_verdict("default", project, path, [allow]) != "allow", path
+
+
+def test_allow_rule_under_a_digit_named_parent_matches_the_case_variant_only_on_a_case_insensitive_disk(tmp_path):
+    _require_case_insensitive_disk(tmp_path)
+    project = tmp_path / "project"
+    (project / "2024").mkdir(parents=True)
+    allow = _folder_rule(project, project / "2024" / "Src", "allow")
+    assert _write_verdict("default", project, "2024/src/a.py", [allow]) == "allow"
+
+
+def test_allow_rule_follows_the_probed_volume_case_rule(tmp_path, monkeypatch):
+    from local_agent import rules as rules_module
+    project = tmp_path / "project"
+    (project / "2024").mkdir(parents=True)
+    allow = _folder_rule(project, project / "2024" / "Src", "allow")
+    call = {"path": "2024/src/a.py", "content": "x"}
+    tools = WorkspaceTools(str(project))
+    monkeypatch.setattr(rules_module, "_volume_ignores_case", lambda folder, **kw: True)
+    assert rules_module.rule_matches(allow, "write_file", call, resolve_path=tools.resolve)
+    monkeypatch.setattr(rules_module, "_volume_ignores_case", lambda folder, **kw: False)
+    assert not rules_module.rule_matches(allow, "write_file", call, resolve_path=tools.resolve)
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root ignores folder modes")
+def test_rule_under_an_unreadable_parent_does_not_match_a_path_elsewhere(tmp_path):
+    project = tmp_path / "project"
+    locked = project / "Locked"
+    locked.mkdir(parents=True)
+    (project / "Other").mkdir()
+    deny = _folder_rule(project, locked / "In")
+    ask = _folder_rule(project, locked / "In", "ask")
+    locked.chmod(0)
+    try:
+        for rule, mode, expected in ((deny, "bypassPermissions", "deny"), (ask, "acceptEdits", "ask")):
+            assert _write_verdict(mode, project, "Other/a.txt", [rule]) != expected
+            assert _write_verdict(mode, project, "new/a.txt", [rule]) != expected
+            assert _write_verdict(mode, project, "Locked/In/a.txt", [rule]) == expected
+    finally:
+        locked.chmod(0o700)
+
+
+def test_unprobeable_volume_matches_the_variant_for_deny_and_ask_rules_only(tmp_path, monkeypatch):
+    from local_agent import rules as rules_module
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setattr(rules_module, "_CASE_BY_DEVICE", {})
+    monkeypatch.setattr(rules_module, "_probe_volume", lambda folder, device: None)
+    tools = WorkspaceTools(str(project))
+
+    def matches(behavior, path):
+        rule = _folder_rule(project, project / "Later", behavior)
+        return rules_module.rule_matches(rule, "write_file", {"path": path, "content": "x"}, resolve_path=tools.resolve)
+
+    for behavior in ("deny", "ask"):
+        assert matches(behavior, "later/a.txt"), behavior
+        assert matches(behavior, "LATER/a.txt"), behavior
+        assert matches(behavior, "Later/a.txt"), behavior
+        assert not matches(behavior, "Latest/a.txt"), behavior
+    assert not matches("allow", "later/a.txt")
+    assert matches("allow", "Later/a.txt")
+    assert rules_module._CASE_BY_DEVICE == {}, "a guess must not be kept as if it were a probe result"
+
+
+def test_the_volume_probe_runs_once_per_device(tmp_path, monkeypatch):
+    from local_agent import rules as rules_module
+    project = tmp_path / "project"
+    (project / "Folder").mkdir(parents=True)
+    calls = []
+    monkeypatch.setattr(rules_module, "_CASE_BY_DEVICE", {})
+    monkeypatch.setattr(rules_module, "_probe_volume", lambda folder, device: calls.append(device) or True)
+    assert rules_module._volume_ignores_case(project) is True
+    assert rules_module._volume_ignores_case(project / "Folder") is True
+    deny = _folder_rule(project, project / "Later")
+    tools = WorkspaceTools(str(project))
+    assert rules_module.rule_matches(deny, "write_file", {"path": "later/a.txt", "content": "x"}, resolve_path=tools.resolve)
+    assert len(calls) == 1
+
+
+def test_the_real_volume_probe_agrees_with_the_disk(tmp_path, monkeypatch):
+    from local_agent import rules as rules_module
+    monkeypatch.setattr(rules_module, "_CASE_BY_DEVICE", {})
+    (tmp_path / "ProbeDir").mkdir()
+    (tmp_path / "2024").mkdir()
+    (tmp_path / "2024" / "x").mkdir()
+    (tmp_path / "empty").mkdir()
+    truth = (tmp_path / "probedir").exists()  # Ground truth for this disk, computed without the code under test.
+    for folder in (tmp_path / "ProbeDir", tmp_path / "2024", tmp_path / "2024" / "x", tmp_path / "empty", tmp_path):
+        for default in (False, True):
+            assert rules_module._volume_ignores_case(folder, default) is truth, (folder, default)
+    for default in (False, True):  # A folder that does not exist cannot be probed: the default comes back.
+        assert rules_module._volume_ignores_case(tmp_path / "missing", default) is default
+
+
+def _answers(cache):
+    return [value[0] if isinstance(value, tuple) else value for value in cache.values()]
+
+
+def test_a_parent_with_a_letter_the_disk_does_not_fold_does_not_poison_the_volume_answer(tmp_path, monkeypatch):
+    from local_agent import rules as rules_module
+    _require_case_insensitive_disk(tmp_path)
+    monkeypatch.setattr(rules_module, "_CASE_BY_DEVICE", {})
+    project = tmp_path / "t"
+    (project / "yazılım").mkdir(parents=True)
+    (project / "Mixed2024").mkdir()
+    tools = WorkspaceTools(str(project))
+    first = _folder_rule(project, project / "yazılım" / "Private")
+    second = _folder_rule(project, project / "Mixed2024" / "Private")
+    assert rules_module.rule_matches(first, "write_file", {"path": "yazılım/private/a.txt", "content": "x"},
+                                     resolve_path=tools.resolve)
+    assert False not in _answers(rules_module._CASE_BY_DEVICE)
+    assert rules_module.rule_matches(second, "write_file", {"path": "Mixed2024/private/a.txt", "content": "x"},
+                                     resolve_path=tools.resolve)
+    assert False not in _answers(rules_module._CASE_BY_DEVICE)
+
+
+@pytest.mark.parametrize("parent", ["数据", "ελληνικά", "ı"])
+def test_a_parent_named_with_only_non_ascii_letters_falls_through_to_an_ancestor(tmp_path, monkeypatch, parent):
+    from local_agent import rules as rules_module
+    _require_case_insensitive_disk(tmp_path)
+    monkeypatch.setattr(rules_module, "_CASE_BY_DEVICE", {})
+    project = tmp_path / "Proj"
+    (project / parent).mkdir(parents=True)
+    deny = _folder_rule(project, project / parent / "Private")
+    for path in (f"{parent}/Private/a.txt", f"{parent}/private/a.txt", f"{parent}/PRIVATE/a.txt"):
+        assert _write_verdict("bypassPermissions", project, path, [deny]) == "deny", path
+    assert False not in _answers(rules_module._CASE_BY_DEVICE)
+
+
+def test_the_case_variant_swaps_ascii_letters_only():
+    from local_agent.rules import _case_variant
+    for name in ("ı", "İ", "ß", "ς", "ǅ", "数据", "ελληνικά", "123"):
+        assert _case_variant(name) is None, name
+    assert _case_variant("aB1") == "Ab1"
+    assert _case_variant("yazılım") == "YAZıLıM"
+    assert _case_variant("Straße") == "sTRAßE"
+
+
+def _fake_probes(monkeypatch, rules_module, answers):
+    queue = list(answers)
+    monkeypatch.setattr(rules_module, "_probe_name", lambda parent, name: queue.pop(0) if queue else None)
+
+
+def test_two_probes_that_disagree_mean_cannot_tell_and_nothing_is_cached(tmp_path, monkeypatch):
+    from local_agent import rules as rules_module
+    (tmp_path / "Sub").mkdir()
+    monkeypatch.setattr(rules_module, "_CASE_BY_DEVICE", {})
+    _fake_probes(monkeypatch, rules_module, [False, True])
+    assert rules_module._probe_volume(tmp_path / "Sub", os.stat(tmp_path).st_dev) is None
+    _fake_probes(monkeypatch, rules_module, [False, True])
+    assert rules_module._volume_ignores_case(tmp_path / "Sub", default=True) is True
+    assert rules_module._volume_ignores_case(tmp_path / "Sub", default=False) is False
+    assert rules_module._CASE_BY_DEVICE == {}
+
+
+def test_a_negative_probe_needs_no_second_probe_when_none_is_available_and_agreeing_probes_are_kept(tmp_path, monkeypatch):
+    from local_agent import rules as rules_module
+    (tmp_path / "Sub").mkdir()
+    device = os.stat(tmp_path).st_dev
+    _fake_probes(monkeypatch, rules_module, [False])
+    assert rules_module._probe_volume(tmp_path / "Sub", device) is False
+    _fake_probes(monkeypatch, rules_module, [False, False])
+    assert rules_module._probe_volume(tmp_path / "Sub", device) is False
+    _fake_probes(monkeypatch, rules_module, [True])
+    assert rules_module._probe_volume(tmp_path / "Sub", device) is True
+
+
+class _FakeEntry:
+    def __init__(self, name, is_dir):
+        self.name, self._is_dir = name, is_dir
+
+    def is_dir(self, follow_symlinks=True):
+        return self._is_dir
+
+
+class _FakeScan:
+    def __init__(self, entries):
+        self.entries = entries
+
+    def __enter__(self):
+        return iter(self.entries)
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_the_child_probe_ignores_entries_that_are_not_directories(tmp_path, monkeypatch):
+    from local_agent import rules as rules_module
+    # On a case-sensitive disk two hard links a and A share an inode. They are files, so they prove nothing.
+    monkeypatch.setattr(os, "scandir", lambda folder: _FakeScan([_FakeEntry("a", False), _FakeEntry("A", False)]))
+    monkeypatch.setattr(rules_module, "_same_entry", lambda first, second: True)
+    assert list(rules_module._child_results(tmp_path)) == []
+    (tmp_path / "Abc").write_text("x")  # A file by the name probe: no answer either, even where case is ignored.
+    assert rules_module._probe_name(tmp_path, "Abc") is None
+
+
+def test_the_cache_key_holds_more_than_the_device_and_expires(tmp_path, monkeypatch):
+    from local_agent import rules as rules_module
+    (tmp_path / "Sub").mkdir()
+    device = os.stat(tmp_path).st_dev
+    monkeypatch.setattr(rules_module, "_CASE_BY_DEVICE", {})
+    now = [1000.0]
+    monkeypatch.setattr(rules_module, "_clock", lambda: now[0])
+    calls = []
+    monkeypatch.setattr(rules_module, "_probe_volume", lambda folder, dev: calls.append(dev) or True)
+    assert rules_module._volume_ignores_case(tmp_path / "Sub") is True
+    (key,) = rules_module._CASE_BY_DEVICE
+    assert isinstance(key, tuple) and len(key) == 2 and key[0] == device
+    top = Path(tmp_path)
+    while top.parent != top and os.stat(top.parent).st_dev == device:
+        top = top.parent
+    assert key[1] == os.stat(top).st_ino
+    now[0] += 60
+    assert rules_module._volume_ignores_case(tmp_path / "Sub") is True
+    assert len(calls) == 1
+    now[0] += 3600
+    assert rules_module._volume_ignores_case(tmp_path / "Sub") is True
+    assert len(calls) == 2, "an old answer must be probed again"
+
+
+def test_an_exact_name_match_costs_no_stat(tmp_path, monkeypatch):
+    from local_agent import rules as rules_module
+    project = tmp_path / "project"
+    project.mkdir()
+    tools = WorkspaceTools(str(project))
+    exact = tools.resolve("Later/a.txt")
+    counted = []
+    real = os.stat
+    monkeypatch.setattr(os, "stat", lambda *args, **kw: counted.append(args[0]) or real(*args, **kw))
+    assert rules_module._inside_folder(exact, project / "Later")
+    assert counted == []
+
+
+def test_the_browser_kind_follows_its_own_step_and_leaves_the_other_kinds_alone():
+    allow = {"behavior": "allow", "tool": "browser", "domain": "docs.example.com"}
+    read = {"action": "read", "host": "docs.example.com", "submits": False}
+    # An allow rule works in Plan for a read (web_fetch's allow rules never do) and not for a click.
+    assert evaluate("plan", "browser", read, chat_rules=[allow]).decision == "allow"
+    assert evaluate("plan", "browser", {**read, "action": "click"}, chat_rules=[allow]).decision == "deny"
+    assert evaluate("plan", "web_fetch", {"url": "https://docs.example.com/"},
+                    chat_rules=[{"behavior": "allow", "tool": "web_fetch", "domain": "docs.example.com"}]).decision == "ask"
+    # Bypass skips cards, never a deny rule.
+    deny = {"behavior": "deny", "tool": "browser", "domain": "example.com"}
+    assert evaluate("bypassPermissions", "browser", read).decision == "allow"
+    assert evaluate("bypassPermissions", "browser", read, chat_rules=[deny]).decision == "deny"
+    assert tool_decision("manual", "web_fetch", {"url": "https://docs.example.com/"}) == "ask"

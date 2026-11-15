@@ -628,7 +628,7 @@ async def test_no_git_on_path_is_reported(tmp_path):
 
 @needs_git
 async def test_the_hardened_git_command_line(tmp_path, monkeypatch):
-    from local_agent.git_tools import DIFF_EXCLUDES, SAFE_OPTIONS, hardened_git_command
+    from local_agent.git_tools import SAFE_OPTIONS, VETTED_EXCLUDES, hardened_git_command
     # Only this repository's filters: a machine's global Git configuration (Git LFS on CI) adds its own.
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     git(tmp_path, "init", "-q")
@@ -637,7 +637,7 @@ async def test_the_hardened_git_command_line(tmp_path, monkeypatch):
     assert argv[0] == shutil.which("git", path=os.pathsep.join(absolute_path_entries(os.environ)))
     assert argv[1:] == [*SAFE_OPTIONS, "-c", "log.showSignature=false", "-c", "filter.x.clean=",
                         "--no-optional-locks", "diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty",
-                        "--stat", "--", ".", *DIFF_EXCLUDES]
+                        "--stat", "--", ".", *VETTED_EXCLUDES]
     assert env["GIT_OPTIONAL_LOCKS"] == "0" and env["GIT_CONFIG_NOSYSTEM"] == "1"
     assert env["GIT_CONFIG_KEY_0"] == "filter.x.clean" and env["GIT_CONFIG_VALUE_0"] == ""
     log, _ = await hardened_git_command(tmp_path, ["log", "--oneline"], [])
@@ -648,6 +648,88 @@ async def test_the_hardened_git_command_line(tmp_path, monkeypatch):
     show, _ = await hardened_git_command(tmp_path, ["show", "--stat"], [])
     assert show[show.index("show"):show.index("--")] == [
         "show", "--no-ext-diff", "--no-textconv", "--no-show-signature", "--sparse", "--stat"]
+
+
+CREDENTIAL_FOLDER_FILES = {
+    # Hidden from a vetted Git command: every file of .ssh and .gnupg, nested files of .aws, .kube and .docker, and
+    # the credential names directly in them (the rule `cat` follows), at any depth and in any letter case.
+    "hidden": [".ssh/keys.pub/deploy", ".ssh/known_hosts", ".ssh/id.pub", "sub/.ssh/deploy_key", "up/.SSH/upper",
+               "a/b/.Ssh/deep/x", ".gnupg/pubring.kbx", "sub/.GnuPG/x", ".aws/cli/cache/abc.json", ".aws/sso/x",
+               "sub/.AWS/Cli/x.json", ".aws/credentials", "y/.AWS/Config", ".kube/config", ".kube/cache/x",
+               ".docker/config.json", "sub/.docker/CONFIG.JSON", ".docker/cfg/x", "x/.kube/KUBE/y"],
+    # Still shown: ordinary files directly in .aws, .kube and .docker, as `cat` reads them.
+    "shown": [".docker/compose.yml", ".aws/plain.txt", ".kube/notes.txt", "sub/.docker/compose.yml", "src/app.py",
+              ".docker-compose.yml", "not.ssh/x", ".sshx/y"],
+}
+
+
+@needs_git
+def test_the_vetted_excludes_leave_credential_folders_out_but_the_users_own_view_keeps_them(tmp_path):
+    from local_agent.git_tools import DIFF_EXCLUDES, VETTED_EXCLUDES
+    git(tmp_path, "init", "-q")
+    names = [*CREDENTIAL_FOLDER_FILES["hidden"], *CREDENTIAL_FOLDER_FILES["shown"]]
+    for name in names:
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("base\n")
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-qm", "base")
+    for name in names:
+        (tmp_path / name).write_text("changed\n")
+
+    def listed(excludes, *base):
+        out = git(tmp_path, "diff", "--name-only", "--", *(base or ["."]), *excludes).stdout.decode().split()
+        return set(out)
+    vetted, user = listed(VETTED_EXCLUDES), listed(DIFF_EXCLUDES)
+    assert vetted == set(CREDENTIAL_FOLDER_FILES["shown"])
+    # The user's own Changes view hides what it hid before: no credential-folder entry was added to DIFF_EXCLUDES.
+    # (`credentials` is one of the file tools' secret names, so the user's view already left that one out.)
+    assert user == set(names) - {".aws/credentials"}
+    assert not any(".ssh" in item or ".aws" in item for item in DIFF_EXCLUDES)
+    assert set(DIFF_EXCLUDES) < set(VETTED_EXCLUDES)
+    # A checked pathspec from a sub folder keeps the excludes.
+    inside = git(tmp_path, "-C", "sub", "diff", "--name-only", "--", ".", *VETTED_EXCLUDES).stdout.decode().split()
+    assert inside == ["sub/.docker/compose.yml"], inside
+
+
+@needs_git
+async def test_the_users_own_changes_view_still_shows_credential_folder_changes(tmp_path):
+    from local_agent.git_tools import working_tree_changes
+    git(tmp_path, "init", "-q")
+    for name in (".aws/cli/cache/abc.json", ".docker/compose.yml", "src/app.py"):
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("base\n")
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-qm", "base")
+    for name in (".aws/cli/cache/abc.json", ".docker/compose.yml", "src/app.py"):
+        (tmp_path / name).write_text("changed-by-the-user\n")
+    result = await working_tree_changes(tmp_path)
+    assert ".aws/cli/cache/abc.json" in result["output"] and "changed-by-the-user" in result["output"]
+
+
+@needs_git
+async def test_a_vetted_diff_or_show_never_prints_a_blob_or_a_path_outside_its_pathspec(tmp_path):
+    from local_agent.git_tools import hardened_git_command
+    git(tmp_path, "init", "-q")
+    (tmp_path / "sub" / ".ssh").mkdir(parents=True)
+    (tmp_path / "sub" / ".ssh" / "deploy_key").write_text("PRIVATE-BLOB\n")
+    (tmp_path / "other.txt").write_text("other\n")
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-qm", "base")
+    blob = git(tmp_path, "rev-parse", "HEAD:sub/.ssh/deploy_key").stdout.decode().strip()
+    for args in (["show", blob], ["diff", blob, blob], ["show", blob[:8]], ["diff", f"{blob}..{blob}"], ["show", "HEAD", blob]):
+        with pytest.raises(ValueError):
+            await hardened_git_command(tmp_path, args, [])
+    for args in (["show", "HEAD"], ["show", "HEAD^{tree}"], ["diff", "HEAD"], ["diff", "HEAD..HEAD"], ["diff", "HEAD...HEAD"],
+                 ["show", "--stat", "HEAD"], ["show", "^HEAD"], ["diff", "--stat", "-U3"]):
+        argv, _ = await hardened_git_command(tmp_path, args, [])
+        assert argv[-1].startswith(":(exclude")
+    # '..' climbs out of the workspace folder, where the exclude patterns no longer match.
+    with pytest.raises(ValueError):
+        await hardened_git_command(tmp_path / "sub", ["diff"], [], pathspecs=[".."])
+    with pytest.raises(ValueError):
+        await hardened_git_command(tmp_path / "sub", ["diff"], [], pathspecs=["./../sub/.ssh"])
 
 
 @needs_git

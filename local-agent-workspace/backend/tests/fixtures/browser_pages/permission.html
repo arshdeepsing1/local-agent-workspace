@@ -1,0 +1,7 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Permission</title></head>
+<body>
+<h1>Permission</h1>
+<p id="out">pending</p>
+<button id="geo" onclick="navigator.geolocation.getCurrentPosition(() => { document.getElementById('out').textContent = 'PERM-DONE granted'; }, () => { document.getElementById('out').textContent = 'PERM-DONE denied'; })">Where am I</button>
+</body></html>

@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 
 from .context import repair_session_usage
+from .model_stream import well_formed
 from .telemetry import LEDGER_VERSION
 
 log = logging.getLogger(__name__)
@@ -33,7 +34,12 @@ CACHED_STRING_CHARS = 2048
 # arguments are the model's) cannot exhaust Python's recursion. Long strings sit far shallower:
 # record, data, content or tool_calls, block or call, function, arguments.
 WALKED_DEPTH = 8
-_encode_json = json.JSONEncoder(ensure_ascii=False, separators=(",", ":")).encode
+_json_text = json.JSONEncoder(ensure_ascii=False, separators=(",", ":")).encode
+
+
+def _encode_json(value):
+    """The record's JSON text. A lone surrogate (strict UTF-8 cannot write one) is written as U+FFFD, so no save raises."""
+    return well_formed(_json_text(value))
 
 
 def _holds_long(container, depth):

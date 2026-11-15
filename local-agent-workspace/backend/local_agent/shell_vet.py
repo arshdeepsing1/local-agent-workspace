@@ -32,6 +32,8 @@ import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .secret_paths import credential_depth, credential_folder
+
 
 class Refused(ValueError):
     """The command cannot be checked as read-only; the text says why (shown to the model in Plan)."""
@@ -339,15 +341,38 @@ def expand(word, cwd, ctx):
     return matches
 
 
-def path_operand(value, cwd, ctx, *, directory=False, file_only=False):
-    """A path operand checked (inside the approved folders, not excluded, not credential-looking)."""
+def _credential_path(text, ctx, *, names, is_dir):
+    """Whether a path (as written or resolved) is a credential folder, or sits in one, where a vetted command
+    must not go. Directly in a credential folder, only a file passes (secret_paths names the credential files
+    there). The folder itself passes only for a listing of names (`ls -la .docker`, names=True). Anything
+    deeper is a token cache or a key folder (.aws/cli/cache, .ssh/keys.pub/): `cd` there is refused, so is this."""
+    found = credential_depth(text, ctx.root)
+    if found is None:
+        return False
+    _, below, count = found
+    if below == 0:
+        return not (names and count == 1)
+    return below > 1 or count > 1 or is_dir
+
+
+def path_operand(value, cwd, ctx, *, directory=False, file_only=False, names=False):
+    """A path operand checked (inside the approved folders, not excluded, not credential-looking, not a
+    credential folder or inside one). names=True: the program only lists names (ls without -R, du -s), so the
+    top level of a credential folder may be named."""
     if value in ("-", "/dev/null", "/dev/stdin"):
         return value
     if not value:
         raise Refused("it has an empty path")
     if ctx.secret(value):
         raise Refused(f"{value} looks like a credential file")
+    # A credential folder (.ssh): a recursive read reaches every file in it, and BSD grep's --exclude-dir does
+    # not skip a folder named as an operand or the current folder.
+    if _credential_path(value, ctx, names=names, is_dir=False):
+        raise Refused(f"{value} is a credential folder or inside one")
     resolved = ctx.check_path(os.path.join(str(cwd), value))
+    folder = resolved.is_dir()
+    if any(_credential_path(text, ctx, names=names, is_dir=folder) for text in (str(resolved), value)):
+        raise Refused(f"{value} is a credential folder or inside one")
     if directory and not resolved.is_dir():
         raise Refused(f"{value} is not a folder")
     if file_only and resolved.is_dir():
@@ -546,8 +571,11 @@ PROGRAMS = frozenset({*SPECS, "grep", "rg", "find", "sed", "awk", "git", "echo",
 
 def _generic(program, words, cwd, ctx):
     spec = SPECS[program]
-    options, operands, _ = parse_options(program, words, spec, cwd, ctx)
+    options, operands, seen = parse_options(program, words, spec, cwd, ctx)
     kind = OPERANDS[program]
+    # Only names: ls without -R, and du -s (a total). They may name a credential folder itself (`ls -la .docker`).
+    names = (program == "ls" and not {"R", "recursive"} & seen.keys()) or (
+        program == "du" and bool({"s", "summarize"} & seen.keys()) and not {"a", "all", "d", "max-depth"} & seen.keys())
     limit = MAX_OPERANDS.get(program)
     if limit is not None and len(operands) > limit:
         raise Refused(f"{program} takes at most {limit} operand{'s' if limit > 1 else ''} here"
@@ -560,7 +588,7 @@ def _generic(program, words, cwd, ctx):
         raise Refused("date takes only a +FORMAT operand here (other operands set the clock)")
     for item in operands:
         if kind == "paths":
-            path_operand(item, cwd, ctx)
+            path_operand(item, cwd, ctx, names=names)
         elif kind == "files":
             path_operand(item, cwd, ctx, file_only=True)
     return _with_operands(program, options, operands, end=program not in NO_END)
@@ -793,22 +821,97 @@ def _sed(program, words, cwd, ctx):
     return [*run, *(["--"] if dashed else []), *operands]
 
 
+# Where a '/' is division and where it starts a regular expression. gawk starts a regex only where an operand is
+# expected, one-true-awk decides by its grammar, and mawk starts one unless the previous token is in a fixed set
+# (number, string, ')', name, regex, ']', field, getline, and in some versions '++' and '--'). The lexer knows only
+# two kinds of place, and refuses a '/' anywhere else, because a wrong guess hides code inside a fake string.
+#
+# Division: all three awk implementations agree here. A '/' is division directly after a number, a string, a ']',
+# a ')' that does not close the header of if, while or for, a plain name (also a builtin variable such as NR or NF,
+# and the name or number of a field reference: $1, $NF), and nothing else. The lexer sets the state "operand".
+#
+# Regex start: all three awk implementations agree here. A '/' starts a regex directly after one of these
+# characters (as a token or the last character of one: '&&', '==', '!=', '<=', '>=', '+=', '~', '!~'), a newline
+# and '}' (after a rule a division is a syntax error in all three), and at the start of the program, directly after
+# the words in AWK_REGEX_AFTER, and after the ')' that closes an if, while or for header. The state is "operator".
+#
+# Anything else is "unsure" and a '/' there is refused: '++' and '--' (mawk: a regex; gawk: division), '>' (a
+# redirect after print, a comparison elsewhere), '$', '[', a division sign, a regex literal (mawk and gawk divide,
+# the grammars of the others differ), a keyword or builtin function of any awk in any letter case (AWK_RESERVED).
 AWK_DENIED = frozenset({"system", "getline", "close", "ARGV", "ARGC", "PROCINFO", "SYMTAB", "FUNCTAB",
                         "ENVIRON"})
-AWK_KEYWORDS = frozenset({"print", "printf", "return", "if", "while", "for", "do", "else", "in", "delete", "exit",
-                          "next", "nextfile", "function", "func", "BEGIN", "END", "case", "default", "switch"})
-AWK_OPERATORS = frozenset("(,{};!~=&|?:+-*/%^<>[\n")  # '/' here is division: it follows an operand
+AWK_DENIED_FOLDED = frozenset(name.casefold() for name in AWK_DENIED)
+AWK_REGEX_AFTER = frozenset({"print", "printf", "return", "else"})
+AWK_REGEX_AFTER_CHARS = frozenset("(,{};!~=?:+-*%^<&\n")  # '|' counts only as '||', '>' never
+# Words that are a keyword or a builtin function in gawk, mawk or one-true-awk (and plain variables in another):
+# after them a '/' is refused. Compared in lower case: another letter case is another name in awk, but a check
+# that guesses is a check that fails.
+AWK_RESERVED = frozenset({
+    "print", "printf", "return", "else", "do", "exit", "if", "while", "for", "in", "delete", "next", "nextfile",
+    "function", "func", "begin", "end", "beginfile", "endfile", "case", "default", "switch", "break", "continue",
+    "length", "substr", "index", "split", "sub", "gsub", "gensub", "match", "sprintf", "sin", "cos", "atan2", "exp",
+    "log", "sqrt", "int", "rand", "srand", "tolower", "toupper", "fflush", "systime", "strftime", "mktime",
+    "strtonum", "and", "or", "xor", "lshift", "rshift", "compl", "asort", "asorti", "patsplit", "isarray", "typeof",
+    "mkbool"})
+AWK_HEADERS = frozenset({"if", "while", "for"})
+AWK_OPERATORS = frozenset("(,{};!~=&|?:+-*/%^<>[\n")
+AWK_NUMBER = re.compile(r"0[xX][0-9a-fA-F]+|(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+AWK_CONTINUES = ",&|?:"  # A newline after these goes on with the statement (gawk also after '?' and ':').
+
+
+def _awk_regex_end(source, i):
+    """The index after the regular expression that starts at the '/' at source[i]. Refused when a bracket
+    expression holds a '/' (gawk reads [/] as one character, one-true-awk ends the regex there), or a
+    [: :] class or a backslash before ']' or '/' in it, and at a line end."""
+    n, j = len(source), i + 1
+    while j < n:
+        c = source[j]
+        if c == "/":
+            return j + 1
+        if c == "\n":
+            break
+        if c == "\\":
+            if source[j + 1:j + 2] in ("", "\n"):
+                break
+            j += 2
+            continue
+        if c == "[":
+            k = j + 1
+            k += source[k:k + 1] == "^"
+            k += source[k:k + 1] == "]"
+            while k < n and source[k] != "]":
+                if source[k] in "/\n" or (source[k] == "[" and source[k + 1:k + 2] in (":", ".", "=")):
+                    raise Refused("its awk program has a regular expression whose '[...]' could end at a '/' "
+                                  "in one awk and not in another")
+                if source[k] == "\\":
+                    if source[k + 1:k + 2] in ("]", "/", "\n", ""):
+                        raise Refused("its awk program has a regular expression with a backslash in '[...]'")
+                    k += 1
+                k += 1
+            if k >= n:
+                break
+            j = k
+        j += 1
+    raise Refused("its awk program has an unterminated regular expression")
 
 
 def check_awk(source):
     """Refused unless an awk program cannot run commands, read other files or the environment, or write any:
     no system(), getline, close(), ARGV/ARGC, ENVIRON, @-directives or pipes, and no > or >> after print or
-    printf (a comparison inside parentheses is fine). A '/' starts a regular expression only after an
-    operator or a keyword."""
+    printf (a comparison inside parentheses is fine). The lexer never guesses. A '/' is division after a
+    number, a string, a name, a field, ']' and any ')' but the one that closes the header of if, while or for (the
+    statement starts there, so '/' begins a regex), and begins a regex after the characters in
+    AWK_REGEX_AFTER_CHARS, '}', print, printf, return and else. Anywhere else (after '++', '--', '>', '$', '[',
+    a regex, a division sign, a keyword or builtin function of any awk) a '/' is refused: see the comment above
+    AWK_DENIED for the two sets on which all three awk implementations agree. A number must not touch a name
+    (1system() is 1 and a call). A print statement goes on after any number of newlines, blanks and comments
+    that follow ',', '&&', '||', '?' or ':'."""
     i, n = 0, len(source)
-    depth = 0
+    stack = []  # one (character, whether it opens the header of if, while or for) per open '(' or '['
     printing = None  # the parenthesis depth of the print statement being read
-    previous = "operator"
+    previous = "operator"  # operator: a regex may start; operand: '/' divides; unsure: '/' is refused
+    last = ""  # the last token before a newline, apart from newlines, blanks and comments
+    word = None  # the name just before the token being read
     while i < n:
         c = source[i]
         if c in " \t":
@@ -817,15 +920,30 @@ def check_awk(source):
         if c == "\\" and i + 1 < n and source[i + 1] == "\n":
             i += 2
             continue
-        if c in "\n;{}":
-            printing = None
-            previous = "operator"
-            i += 1
-            continue
         if c == "#":
+            start = i
             while i < n and source[i] != "\n":
                 i += 1
+            if source[start:i].endswith("\\"):
+                raise Refused("its awk program has a comment that ends in a backslash")
             continue
+        name, word = word, None
+        depth = len(stack)
+        if c == "\n":
+            # awk goes on with a statement after a newline that follows ',', '&&' or '||': the print stays open,
+            # however many blank lines and comments come between (last is left as it was).
+            if printing is not None and (depth > printing or last in AWK_CONTINUES):
+                previous = "operator"
+                i += 1
+                continue
+            printing, last, previous = None, "\n", "operator"
+            i += 1
+            continue
+        if c in ";{}":
+            printing, last, previous = None, c, "operator"
+            i += 1
+            continue
+        last = c
         if c == '"':
             j = i + 1
             while j < n and source[j] != '"':
@@ -834,34 +952,42 @@ def check_awk(source):
                 raise Refused("its awk program has an unterminated string")
             i, previous = j + 1, "operand"
             continue
-        if c == "/" and previous == "operator":
-            j = i + 1
-            while j < n and source[j] != "/":
-                if source[j] == "\n":
-                    raise Refused("its awk program has an unterminated regular expression")
-                j += 2 if source[j] == "\\" else 1
-            if j >= n:
-                raise Refused("its awk program has an unterminated regular expression")
-            i, previous = j + 1, "operand"
+        if c == "/":
+            if previous == "unsure":
+                raise Refused("its awk program has a '/' where one awk divides and another starts a regular "
+                              "expression (after '++', '--', '>', '$', '[', a regular expression, a division "
+                              "sign, or a keyword or builtin function)")
+            if previous == "operator":
+                i, previous = _awk_regex_end(source, i), "unsure"  # a '/' right after a regex is unsure
+                continue
+            i, previous = i + 1, "unsure"  # division: a '/' right after it is unsure
             continue
-        if c.isalpha() or c == "_":
+        if (c.isascii() and c.isalpha()) or c == "_":
             j = i
-            while j < n and (source[j].isalnum() or source[j] == "_"):
+            while j < n and source[j].isascii() and (source[j].isalnum() or source[j] == "_"):
                 j += 1
-            name = source[i:j]
-            if name in AWK_DENIED:
-                raise Refused(f"its awk program uses {name}, which can run commands or read other files or the "
+            text = source[i:j]
+            if text in AWK_DENIED or text.casefold() in AWK_DENIED_FOLDED:
+                raise Refused(f"its awk program uses {text}, which can run commands or read other files or the "
                               "environment")
-            if name in ("print", "printf"):
+            if text in ("print", "printf"):
                 printing = depth
-            previous = "operator" if name in AWK_KEYWORDS else "operand"
+            if text in AWK_REGEX_AFTER:
+                previous = "operator"
+            elif text.casefold() in AWK_RESERVED:
+                previous = "unsure"
+            else:
+                previous = "operand"
+            word = text
             i = j
             continue
-        if c.isdigit() or c == ".":
-            j = i
-            while j < n and (source[j].isalnum() or source[j] == "."):
-                j += 1
-            i, previous = j, "operand"
+        if c in "0123456789.":
+            match = AWK_NUMBER.match(source, i)
+            if not match:
+                raise Refused(f"its awk program uses {c!r}")
+            i, previous = match.end(), "operand"
+            if i < n and (source[i].isascii() and source[i].isalnum() or source[i] == "_"):
+                raise Refused("its awk program has a number that touches a name (1system() is a number and a call)")
             continue
         if c == "|":
             if source.startswith("||", i):
@@ -871,32 +997,33 @@ def check_awk(source):
         if c == ">":
             if printing is not None and depth == printing:
                 raise Refused("its awk program redirects print output to a file")
-            i, previous = i + 1, "operator"
+            i, previous = i + 1, "unsure"  # a redirect after print, a comparison elsewhere
             continue
         if c in "([":
-            depth += 1
-            i, previous = i + 1, "operator"
+            stack.append((c, c == "(" and name in AWK_HEADERS))
+            i, previous = i + 1, "operator" if c == "(" else "unsure"
             continue
         if c in ")]":
-            depth -= 1
-            if depth < 0:
+            if not stack or stack[-1][0] != {")": "(", "]": "["}[c]:
                 raise Refused("its awk program has unbalanced parentheses")
-            i, previous = i + 1, "operand"
+            header = stack.pop()[1]
+            # The ')' that ends an if, while or for header starts a statement: a '/' there is a regex.
+            i, previous = i + 1, "operator" if header else "operand"
             continue
         if c == "$":
-            i, previous = i + 1, "operator"
+            i, previous = i + 1, "unsure"
             continue
         if c == "@":
             raise Refused("its awk program uses an @ directive")
         if c in "+-" and source.startswith(c * 2, i):
-            i += 2  # ++ and --: what follows decides; a '/' after them is division.
-            previous = "operand"
+            # ++ and --: gawk divides after them and mawk starts a regex, so a '/' there is refused.
+            i, previous = i + 2, "unsure"
             continue
         if c in AWK_OPERATORS:
-            i, previous = i + 1, "operator"
+            i, previous = i + 1, "operator" if c in AWK_REGEX_AFTER_CHARS else "unsure"
             continue
         raise Refused(f"its awk program uses {c!r}")
-    if depth:
+    if stack:
         raise Refused("its awk program has unbalanced parentheses")
 
 
@@ -983,6 +1110,8 @@ def _git(program, words, cwd, ctx):
             cwd = ctx.check_path(target)
             if not cwd.is_dir():
                 raise Refused(f"git -C {words[i + 1]} is not a folder")
+            if any(credential_folder(text, anywhere=True, root=ctx.root) for text in (words[i + 1], str(cwd))):
+                raise Refused(f"git -C {words[i + 1]} is a credential folder or inside one")
             i += 2
         else:
             raise Refused(f"git {words[i]} is not an option the app checks")
@@ -998,6 +1127,9 @@ def _git(program, words, cwd, ctx):
         for item in paths:
             if item.startswith(":"):
                 raise Refused("git pathspec magic (a path starting with ':') is not checked")
+            if ".." in item.split("/"):
+                # Climbing out of the folder Git runs in: the credential-folder excludes no longer match there.
+                raise Refused("a git path with '..' is not checked")
             path_operand(item, cwd, ctx)
     options, operands, seen = parse_options(f"git {sub}", rest, GIT_SPECS[sub], cwd, ctx)
     allowed = GIT_REVISION_COMMANDS[sub]
@@ -1024,6 +1156,8 @@ def vet(text, ctx):
     """The Plan for shell text whose every stage is read-only (or, with ctx.allow, allowed by a rule), else Refused."""
     stages, operators = split_stages(lex(text))
     cwd = Path(ctx.cwd)
+    if credential_folder(str(cwd), anywhere=True, root=ctx.root):
+        raise Refused(f"the working folder {cwd} is a credential folder or inside one")
     # A leading 'cd DIR &&' (or ';') is where the script starts: each DIR must be an approved folder.
     while len(stages) > 1 and stages[0][0][0].text == "cd" and not stages[0][0][0].quoted:
         words, redirects = stages[0]
@@ -1037,9 +1171,11 @@ def vet(text, ctx):
         folder = expand(target, cwd, ctx)[0]
         if folder in ("-", "") or folder.startswith("-"):
             raise Refused("cd - is not checked")
-        if ctx.secret(folder):
+        if ctx.secret(folder) or credential_folder(folder):
             raise Refused(f"{folder} looks like a credential folder")
         resolved = ctx.check_path(os.path.join(str(cwd), folder))
+        if credential_folder(str(resolved), anywhere=True, root=ctx.root):
+            raise Refused(f"{folder} is a credential folder or inside one")
         if not resolved.is_dir():
             raise Refused(f"cd {folder}: not a folder")
         cwd = resolved

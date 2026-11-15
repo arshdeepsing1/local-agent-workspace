@@ -16,6 +16,8 @@ removes the sidecars of earlier turns (prune), so a conversation file keeps at m
 import copy
 import json
 
+from .model_stream import well_formed
+
 REASONING_ITEMS = ("reasoning", "thinking", "redacted_thinking")
 MAX_SIDECAR_BYTES = 64_000  # One reply's items, as JSON; a reply with more keeps none.
 MAX_REPLAY_BYTES = 256_000  # Items sent back in one request, newest reply first.
@@ -29,7 +31,8 @@ def _key(model):
 
 
 def _size(items):
-    return len(json.dumps(items, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    # surrogatepass: a size only; a lone surrogate in streamed text is repaired when its block closes.
+    return len(json.dumps(items, ensure_ascii=False, separators=(",", ":")).encode("utf-8", "surrogatepass"))
 
 
 class Collector:
@@ -72,7 +75,7 @@ class Collector:
             self._close()
         if self.current is None:
             self.current = (kind, [])
-        if isinstance(text, str) and text and self._grow(len(text.encode("utf-8"))):
+        if isinstance(text, str) and text and self._grow(len(text.encode("utf-8", "surrogatepass"))):
             self.current[1].append(text)
         if isinstance(signature, str) and signature and self._grow(len(signature)):
             self._close(signature)
@@ -89,7 +92,7 @@ class Collector:
         self.current = None
         if not signature:
             return
-        text = "".join(parts)
+        text = well_formed("".join(parts))  # Joins a pair split across pieces; valid text is returned as it is.
         self.items.append({"type": "reasoning", "summary": [{"type": "summary_text", "text": text, "signature": signature}]}
                           if kind == "reasoning" else {"type": "thinking", "thinking": text, "signature": signature})
 

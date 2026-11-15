@@ -302,7 +302,7 @@ async def test_stop_during_a_parallel_run_stops_every_subagent(runtime, monkeypa
     assert [item["status"] for item in saved["subagents"]] == ["cancelled", "cancelled"]
 
 
-async def test_manual_mode_asks_for_each_delegation_in_order_before_any_starts(runtime, monkeypatch):
+async def test_manual_mode_asks_for_each_delegation_in_order_after_review_before_any_starts(runtime, monkeypatch):
     manager, parent, _ = runtime
     parent["permission_mode"] = "manual"
     manager.store.save(parent)
@@ -312,13 +312,22 @@ async def test_manual_mode_asks_for_each_delegation_in_order_before_any_starts(r
                       {task: (lambda count, body, task=task: asyncio.sleep(0, reply(f"{task} report.")))
                        for task in ("First", "Second", "Third")})
     manager.start(parent["id"], "Delegate three")
+    # Manual mode shows the three as one batch wait; Review one by one turns it into one card at a time.
+    await eventually(lambda: manager.live.get(parent["id"]) and any(
+        event.get("batch_approval") for event in manager.live[parent["id"]]["events"]))
+    batch_id = next(event["batch_approval"]["id"] for event in manager.live[parent["id"]]["events"] if event.get("batch_approval"))
+    assert [task for task in gateway.started if gateway.started[task].is_set()] == []
+    manager.review_batch(parent["id"], batch_id)
     live = None
     for call_id, allowed in (("call-1", True), ("call-2", False), ("call-3", True)):
         await eventually(lambda: manager.live.get(parent["id"]) and any(
-            event.get("call_id") == call_id and event.get("state") == "pending" for event in manager.live[parent["id"]]["events"]))
+            event.get("call_id") == call_id and event.get("state") == "pending" and "batch_approval" not in event
+            for event in manager.live[parent["id"]]["events"]))
         live = manager.live[parent["id"]]
-        # One card at a time, and nothing starts before every card is answered.
-        assert [event["call_id"] for event in live["events"] if event.get("state") == "pending"] == [call_id]
+        # One card asks at a time (the later ones wait their turn), and nothing starts before every card is answered.
+        assert [event["call_id"] for event in live["events"]
+                if event.get("state") == "pending" and "batch_approval" not in event] == [call_id]
+        assert [key[1] for key in manager.pending if key[0] == parent["id"]] == [card(live, call_id)["id"]]
         assert [task for task in gateway.started if gateway.started[task].is_set()] == []
         manager.decide(parent["id"], card(live, call_id)["id"], allowed)
     await asyncio.wait_for(manager.tasks[parent["id"]], 10)
@@ -333,6 +342,8 @@ async def test_manual_mode_asks_for_each_delegation_in_order_before_any_starts(r
     batches = [card(saved, call_id)["delegation_batch"] for call_id in ("call-1", "call-2", "call-3")]
     assert [(item["index"], item["size"]) for item in batches] == [(0, 3), (1, 3), (2, 3)]
     assert len({item["id"] for item in batches}) == 1 and card(saved, "call-2")["state"] == "rejected"
+    assert [card(saved, call_id)["delegation_batch"]["origin"] for call_id in ("call-1", "call-2", "call-3")] == ["agent"] * 3
+    assert [card(saved, call_id)["delegation_batch"]["approval"] for call_id in ("call-1", "call-2", "call-3")] == ["single"] * 3
 
 
 async def test_the_cards_of_one_response_share_a_batch_from_their_first_broadcast_and_a_lone_one_has_none(
@@ -354,7 +365,9 @@ async def test_the_cards_of_one_response_share_a_batch_from_their_first_broadcas
     saved = await run_turn(manager, parent)
     batches = [card(saved, call_id).get("delegation_batch") for call_id in ("a", "b", "c", "d")]
     assert re.fullmatch(r"[0-9a-f]{12}", batches[0]["id"])
-    assert batches[:3] == [{"id": batches[0]["id"], "index": index, "size": 3} for index in range(3)]
+    assert [{key: item[key] for key in ("id", "index", "size")} for item in batches[:3]] == [
+        {"id": batches[0]["id"], "index": index, "size": 3} for index in range(3)]
+    assert [item["origin"] for item in batches[:3]] == ["agent"] * 3 and [item["approval"] for item in batches[:3]] == ["none"] * 3
     # The refused call (an unknown agent type) is a row of the run too; a delegation alone in its response is no run.
     assert card(saved, "c")["state"] == "error" and batches[3] is None
     first = {}
@@ -362,7 +375,9 @@ async def test_the_cards_of_one_response_share_a_batch_from_their_first_broadcas
         event = data.get("event") or {}
         if session_id == parent["id"] and event.get("name") == "delegate_task":
             first.setdefault(event["call_id"], event)
-    assert [first[call_id].get("delegation_batch") for call_id in ("a", "b", "c", "d")] == batches
+    # The approval outcome is only known once decided, so the first broadcast carries the rest.
+    assert [first[call_id].get("delegation_batch") for call_id in ("a", "b", "c", "d")] == [
+        {key: value for key, value in item.items() if key != "approval"} if item else None for item in batches]
     assert first["a"]["state"] == "running" and "delegation" not in first["a"]
     # Each finished card's progress: its steps, one reply, no tools.
     progress = card(saved, "a")["delegation"]

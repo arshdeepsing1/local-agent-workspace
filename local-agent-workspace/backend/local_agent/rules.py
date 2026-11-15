@@ -18,13 +18,15 @@ import json
 import os
 import re
 import shlex
+import stat
 import time
+import unicodedata
 import uuid
 from pathlib import Path, PurePosixPath
 
 from .config import APP_ROOT  # noqa: F401  (agents.py checks protected paths against it)
 from .secret_paths import looks_secret
-from .tools import parts_below
+from .tools import _identity, parts_below
 
 MAX_COMMAND_TEXT = 50_000
 MAX_TOKENS = 64
@@ -216,6 +218,47 @@ def has_matcher(rule):
     return any(key in rule for key in ("command", "argv", "prefix", "flags", "path", "hook", "domain"))
 
 
+LOOPBACK_KEY = re.compile(r":\d{1,5}\Z")
+
+
+def is_loopback_key(key):
+    """True for a browser host key of this computer: it keeps its port (browser.host_key), a public host's key never does."""
+    return isinstance(key, str) and LOOPBACK_KEY.search(key) is not None
+
+
+def browser_host(arguments):
+    """The host key of a browser call: the app's own 'host' (browser_tool.decide sets it from the page), else the
+    key of an open call's URL, else None."""
+    arguments = arguments if isinstance(arguments, dict) else {}
+    host = arguments.get("host")
+    if isinstance(host, str) and host:
+        return host
+    if arguments.get("action") == "open" and isinstance(arguments.get("url"), str):
+        from .browser import AddressRefused, host_key
+        try:
+            return host_key(arguments["url"])
+        except AddressRefused:
+            return None
+    return None
+
+
+def normalize_browser_host(value):
+    """A browser rule's host key from what the user typed: docs.example.com, localhost:3000, or a URL. A loopback
+    address keeps its port. ValueError with a message for the user."""
+    from .browser import AddressRefused, parse_address
+    hint = "Enter a host such as docs.example.com or localhost:3000."
+    if not isinstance(value, str) or not value.strip() or len(value) > 253:
+        raise ValueError(hint)
+    text = value.strip()
+    try:
+        return parse_address(text if "://" in text else "http://" + text).key
+    except AddressRefused as exc:
+        if exc.reason != "private_address" or "://" in text or ":" in text:
+            raise ValueError(f"{hint} {exc}") from None
+    from .web_fetch import normalize_domain  # A private name: only a deny or ask rule can use it.
+    return normalize_domain(text)
+
+
 def rule_label(rule):
     """Short plain text for messages, for example 'git push (any options)'."""
     tool = rule.get("tool", "")
@@ -247,6 +290,11 @@ def rule_label(rule):
         return f"fetches from {rule['domain']}" + ("" if behavior_of(rule) == "allow" else " and its subdomains")
     if tool == "web_search":
         return "web searches"
+    if tool == "browser":
+        domain = rule.get("domain")
+        if not domain:
+            return "browsing"
+        return f"Browse {domain}" + ("" if behavior_of(rule) == "allow" or is_loopback_key(domain) else " and its subdomains")
     if tool.startswith("mcp__") and tool.endswith("__*"):
         return f"all tools of MCP server {tool[5:-3]}"
     return f"the tool {tool}"
@@ -394,6 +442,15 @@ def normalize_rule(draft, *, resolve_path, credential_file=None, credential_toke
             rule["domain"] = normalize_domain(draft["domain"])
         elif behavior == "allow":
             raise ValueError("An allow rule for web fetches must name one domain, such as docs.python.org.")
+    elif tool == "browser":
+        # Allow names one host key exactly; deny and ask cover a domain and its subdomains (a loopback key: that
+        # port only), or all browsing.
+        if is_draft or set(draft) - {"behavior", "tool", "domain"}:
+            raise ValueError("A browser rule can only name a host.")
+        if "domain" in draft:
+            rule["domain"] = normalize_browser_host(draft["domain"])
+        elif behavior == "allow":
+            raise ValueError("An allow rule for browsing must name one host, such as docs.python.org or localhost:3000.")
     elif tool == "hook":
         if set(draft) - {"behavior", "tool", "hook"}:
             raise ValueError("A hook rule can only name a hook.")
@@ -492,6 +549,185 @@ def stage_matches(rule, argv):
     return not words or _program_matches(words, list(argv))
 
 
+_CASE_BY_DEVICE = {}  # (st_dev, inode of the volume's top folder) -> (True when names ignore letter case, time kept).
+_CASE_KEEP_SECONDS = 600  # A removable volume can reuse a device number, so an old answer is probed again.
+_PROBE_CHILDREN = 8
+_ASCII_SWAP = str.maketrans("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
+                            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+
+
+def _clock():
+    return time.monotonic()
+
+
+def _case_variant(name):
+    """The name with every ASCII letter swapped, or None when it has none. Other letters stay as they are: a
+    disk may not fold them (APFS keeps the dotless i apart from I), and that must not read as 'case-sensitive'."""
+    variant = name.translate(_ASCII_SWAP)
+    return variant if variant != name else None
+
+
+def _same_entry(first, second):
+    """True or False when two names are or are not one file entry (lstat identity), None when it cannot be told."""
+    try:
+        one = os.lstat(first)
+    except OSError:
+        return None
+    try:
+        other = os.lstat(second)
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        return None
+    return os.path.samestat(one, other)
+
+
+def _probe_name(parent, name):
+    """Whether the volume of the folder 'parent' ignores case, judged by one existing folder name. None when the
+    name has no ASCII letter, is not a folder (a file can have two hard links), or the lookup failed. Only
+    reads: nothing is created."""
+    variant = _case_variant(name)
+    if variant is None:
+        return None
+    try:
+        if not stat.S_ISDIR(os.lstat(Path(parent) / name).st_mode):
+            return None
+    except (OSError, ValueError):
+        return None
+    return _same_entry(Path(parent) / name, Path(parent) / variant)
+
+
+def _child_results(folder):
+    """The probe answers of the first few sub-folders of folder. Files are skipped: two hard links to one file
+    look like one entry on a case-sensitive disk."""
+    try:
+        with os.scandir(folder) as entries:
+            for index, entry in enumerate(entries):
+                if index >= _PROBE_CHILDREN:
+                    break
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                result = _probe_name(folder, entry.name)
+                if result is not None:
+                    yield result
+    except (OSError, ValueError):
+        return
+
+
+def _probe_results(folder, device):
+    """The non-empty probe answers in order: the folder's own name, its ancestors on the same device (a name
+    without an ASCII letter, such as 2024, cannot tell), then a few children."""
+    folder = Path(folder)
+    for candidate in (folder, *folder.parents):
+        if candidate == candidate.parent:
+            break
+        try:
+            if os.stat(candidate.parent).st_dev != device:
+                break  # Another volume: its case rule says nothing about this one.
+        except (OSError, ValueError):
+            break
+        result = _probe_name(candidate.parent, candidate.name)
+        if result is not None:
+            yield result
+    yield from _child_results(folder)
+
+
+def _probe_volume(folder, device):
+    """True, False or None (cannot tell) for the volume holding folder's entries. 'Same file' is trusted at
+    once. 'Does not exist' needs a second probe to agree when there is one, and two probes that disagree
+    mean None."""
+    try:
+        results = _probe_results(folder, device)
+        first = next(results, None)
+        if first is not False:
+            return first
+        second = next(results, None)
+        return None if second is True else False
+    except (OSError, ValueError):
+        return None
+
+
+def _volume_key(folder, device):
+    """(device, inode of the highest folder above this one on the same device): the volume's mount root."""
+    path, top = Path(folder), None
+    while True:
+        info = os.stat(path)
+        if info.st_dev != device:
+            break
+        top = info.st_ino
+        if path.parent == path:
+            break
+        path = path.parent
+    return (device, top)
+
+
+def _volume_ignores_case(folder, default=False, device=None):
+    """True when names directly inside this existing folder match without regard to letter case. The answer is
+    kept per volume for ten minutes. When no probe can tell, the answer is `default`, which is never kept.
+    device is the folder's st_dev when the caller already has it."""
+    try:
+        if device is None:
+            device = os.stat(folder).st_dev
+        key = _volume_key(folder, device)
+        kept = _CASE_BY_DEVICE.get(key)
+        if kept is not None and _clock() - kept[1] < _CASE_KEEP_SECONDS:
+            return kept[0]
+        result = _probe_volume(folder, device)
+    except (OSError, ValueError):
+        return default
+    if result is None:
+        return default
+    _CASE_BY_DEVICE[key] = (result, _clock())
+    return result
+
+
+def _inside_folder(path, root, unknown_matches=False):
+    """True when path is root or inside it. resolve() keeps the spelling the caller typed, so the comparison
+    cannot be by name alone: on a case-insensitive disk 'private' and 'Private' are one folder, and on a
+    case-sensitive one they are two. An existing folder is settled by file identity (which also covers composed
+    and decomposed Unicode names). A folder that does not exist yet has no identity, so its nearest readable
+    existing parent is matched by identity and the missing names are compared exactly, or without letter case
+    when that parent's volume ignores it. unknown_matches says what to assume when the volume cannot be probed:
+    True for deny and ask rules (match the variant), False for allow rules. An unreadable folder counts as
+    missing, and a path that differs by name at every level never matches. An exact-name match costs no stat."""
+    path, root = Path(path), Path(root)
+    if path.is_relative_to(root):
+        return True
+    missing = []
+    anchor = root
+    target = _identity(anchor)
+    while target is None and anchor != anchor.parent:
+        missing.insert(0, anchor.name)
+        anchor = anchor.parent
+        target = _identity(anchor)
+    if target is None:
+        return False
+    below = None
+    if path.is_relative_to(anchor):
+        below = path.relative_to(anchor).parts
+    else:
+        for ancestor in (path, *path.parents):
+            if _identity(ancestor) == target:
+                below = path.relative_to(ancestor).parts
+                break
+    if below is None:
+        return False
+    if not missing:
+        return True
+    if len(below) < len(missing):
+        return False
+    wanted, got = list(missing), list(below[:len(missing)])
+    if wanted == got:
+        return True
+    if not _volume_ignores_case(anchor, default=unknown_matches, device=target[0]):
+        return False
+    fold = lambda parts: [unicodedata.normalize("NFC", part).casefold() for part in parts]
+    return fold(wanted) == fold(got)
+
+
 def rule_matches(rule, name, arguments, *, resolve_path, credential_file=None):
     """True when the rule applies to this tool call (allow narrowly, deny and ask broadly)."""
     from .permissions import EDIT_TOOL_PATHS, tool_kind
@@ -529,7 +765,7 @@ def rule_matches(rule, name, arguments, *, resolve_path, credential_file=None):
             if value is None:
                 continue
             try:
-                results.append(isinstance(value, str) and resolve_path(value).is_relative_to(root))
+                results.append(isinstance(value, str) and _inside_folder(resolve_path(value), root, behavior != "allow"))
             except (ValueError, OSError):
                 results.append(behavior != "allow")
         return bool(results) and (all(results) if behavior == "allow" else any(results))
@@ -546,6 +782,17 @@ def rule_matches(rule, name, arguments, *, resolve_path, credential_file=None):
         if host is None:
             return behavior != "allow"  # A URL that cannot be checked never matches an allow rule.
         return host == domain if behavior == "allow" else host == domain or host.endswith("." + domain)
+    if tool == "browser":
+        if name != "browser":
+            return False
+        domain, host = rule.get("domain"), browser_host(arguments)
+        if not domain:
+            return behavior != "allow"
+        if host is None:
+            return behavior != "allow"  # A page that cannot be named never matches an allow rule.
+        if behavior == "allow" or is_loopback_key(domain) or is_loopback_key(host):
+            return host == domain
+        return host == domain or host.endswith("." + domain)
     if isinstance(tool, str):
         wildcard = MCP_WILDCARD.match(tool)
         if wildcard:
@@ -594,6 +841,9 @@ def default_rule(name, arguments):
         from .web_fetch import domain_of
         domain = domain_of(arguments.get("url"))
         return {"behavior": "allow", "domain": domain, "tool": "web_fetch"} if domain else None
+    if name == "browser":
+        host = browser_host(arguments)
+        return {"behavior": "allow", "domain": host, "tool": "browser"} if host else None
     if kind == "hook":
         hook = arguments.get("hook_id")
         return {"behavior": "allow", "hook": hook, "tool": "hook"} if isinstance(hook, str) and hook else None
@@ -656,6 +906,8 @@ def card_rule_options(name, arguments, *, resolve_path=None, credential_file=Non
     if name == "web_fetch":
         from .web_fetch import domain_of
         return {"domain": domain_of(arguments.get("url"))}
+    if name == "browser":
+        return {"domain": browser_host(arguments)}
     return None
 
 

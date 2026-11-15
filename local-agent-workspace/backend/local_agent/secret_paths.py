@@ -116,6 +116,44 @@ def _parts(path):
     return [part.casefold() for part in PurePosixPath(path).parts if part != "/"]
 
 
+def _below(path, root):
+    """The casefolded parts of path, or only those below root when path lies in it: a project under
+    ~/.docker/work/ is an ordinary project, so only the names inside the project count."""
+    parts = _parts(path)
+    if root:
+        base = _parts(str(root))
+        if parts[:len(base)] == base:
+            return parts[len(base):]
+    return parts
+
+
+def credential_folder(path, anywhere=False, root=None):
+    """The credential folder (a FOLDER_FILES name, any letter case) that a path ends in, or with anywhere also
+    sits in, else None: `.ssh`, `~/.SSH/`, `.aws/`. looks_secret leaves such a folder itself alone (it names
+    the files inside), but a recursive read or a listing of it reaches them; a vetted command must not.
+    With root, the parts of an absolute path above the project folder are not looked at."""
+    if not isinstance(path, str):
+        return None
+    parts = _below(path, root)
+    for part in (parts if anywhere else parts[-1:]):
+        if part in FOLDER_FILES:
+            return part
+    return None
+
+
+def credential_depth(path, root=None):
+    """(folder, below, count) for the first credential folder in a path, or None when it has none: the folder's
+    name, how many parts follow it (0 for the folder itself, 1 for a file or folder directly in it) and how
+    many credential folder names the path has in all."""
+    if not isinstance(path, str):
+        return None
+    parts = _below(path, root)
+    names = [index for index, part in enumerate(parts) if part in FOLDER_FILES]
+    if not names:
+        return None
+    return parts[names[0]], len(parts) - 1 - names[0], len(names)
+
+
 def looks_secret(word, credential_file=None, patterns=()):
     """The matched part when a command word (or the value after its first '=') names a credential-looking
     file, else None. patterns are casefolded name patterns; credential_file is an absolute path."""

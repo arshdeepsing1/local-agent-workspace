@@ -178,7 +178,8 @@ APP_SKILLS = Path(__file__).resolve().parents[2] / "skills"
 
 @pytest.mark.parametrize("skill_id,needle", [("verify", "Never report something as checked unless a command checked it"),
                                              ("debug", "Reproduce"), ("init", "AGENTS.local.md"),
-                                             ("read-handoff", "Skip: \"Commands run\"")])
+                                             ("resume", "Start no work"),
+                                             ("migrate-handoffs", "SESSION INDEX")])
 def test_the_app_ships_verify_debug_and_init_skills(tmp_path, skill_id, needle):
     manager = ExtensionManager(SimpleNamespace(state_dir=tmp_path, redact=lambda text: text), app_skills=APP_SKILLS)
     tools = WorkspaceTools(str(tmp_path))
@@ -191,7 +192,9 @@ def test_the_app_ships_verify_debug_and_init_skills(tmp_path, skill_id, needle):
 def test_the_shipped_skills_fit_the_index_whole(tmp_path):
     manager = ExtensionManager(SimpleNamespace(state_dir=tmp_path, redact=lambda text: text), app_skills=APP_SKILLS)
     skills = manager.skills(WorkspaceTools(str(tmp_path)))
-    assert sorted(skill["id"] for skill in skills) == ["commit", "debug", "handoff", "init", "pr", "read-handoff",
-                                                       "review", "security-review", "verify"]
+    assert sorted(skill["id"] for skill in skills) == ["commit", "debug", "handoff", "init", "migrate-handoffs",
+                                                       "pr", "resume", "review", "security-review", "verify",
+                                                       "workflow"]
     index = skill_index(skills)
+    assert "workflow" not in index  # disable-model-invocation: only the user selects it.
     assert "…" not in index and "- init: Use when the user asks to create or update AGENTS.md" in index

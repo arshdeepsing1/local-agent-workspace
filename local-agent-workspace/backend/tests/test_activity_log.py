@@ -307,5 +307,5 @@ def test_shipped_handoff_skill_loads_within_limits_and_uses_the_activity_log(run
     assert ACTIVITY_MARKER in skill["text"] and "insert_activity_log" in skill["text"]
     # Part size follows the output limit stated in the system prompt, not a fixed size.
     assert "half the file text the system prompt says one response can hold" in skill["text"]
-    assert skill["text"].rstrip().endswith("Reply briefly with the path, the approximate size, and anything you could "
+    assert skill["text"].rstrip().endswith("Reply briefly with both paths, their approximate sizes, and anything you could "
                                            "not recover (for example compacted turns).")

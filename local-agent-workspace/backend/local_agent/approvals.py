@@ -24,8 +24,9 @@ def rule_for(name, arguments):
 
     Commands match by their exact text (only surrounding whitespace is removed; the
     caller adds the folder of a command run with cwd outside the project), MCP tools
-    by their exact name, hooks by their exact ID, and web fetches by their host
-    (web_fetch.domain_of). Folder access and every other card has no rule.
+    by their exact name, hooks by their exact ID, web fetches by their host
+    (web_fetch.domain_of) and browser pages by their host key (browser.host_key, which keeps a loopback port).
+    Folder access and every other card has no rule.
     """
     name = name if isinstance(name, str) else ""
     arguments = arguments if isinstance(arguments, dict) else {}
@@ -45,6 +46,10 @@ def rule_for(name, arguments):
         from .web_fetch import domain_of
         domain = domain_of(arguments.get("url"))
         return {"tool": "web_fetch", "domain": domain} if domain else None
+    if name == "browser":
+        from .rules import browser_host
+        host = browser_host(arguments)
+        return {"tool": "browser", "domain": host} if host else None
     return None
 
 
@@ -182,14 +187,14 @@ def workspace_idle(manager, store, root, action):
 
 
 def known_tool_names():
-    from .feature_tools import FEATURE_TOOLS
+    from .feature_tools import BROWSER_TOOL, FEATURE_TOOLS
     from .tools import TOOL_DEFINITIONS
-    return [item["function"]["name"] for item in [*TOOL_DEFINITIONS, *FEATURE_TOOLS]]
+    return [item["function"]["name"] for item in [*TOOL_DEFINITIONS, *FEATURE_TOOLS, BROWSER_TOOL]]
 
 
 def register_approvals(app, manager, store, session_or_404):
     from .agents import public_session  # agents.py imports this module.
-    from .feature_tools import FEATURE_TOOLS
+    from .feature_tools import BROWSER_TOOL, FEATURE_TOOLS
     from .rules import normalize_rule, project_key
     from .tools import TOOL_DEFINITIONS, WorkspaceTools
 
@@ -270,6 +275,14 @@ def register_approvals(app, manager, store, session_or_404):
         await manager.revise_card(session_id, event_id, body.input)
         return {"ok": True}
 
+    @app.post("/api/sessions/{session_id}/approvals/{batch_id}/review")
+    async def review_batch(session_id: str, batch_id: str):
+        """Review one by one: a waiting batch of subagents asks on one card per subagent, in order. Allow all and
+        Decline all are POST /approvals/{batch_id} with the batch's ID (batch_approval.id on its cards)."""
+        session_or_404(session_id)
+        manager.review_batch(session_id, batch_id)
+        return {"ok": True}
+
     @app.put("/api/sessions/{session_id}/disabled-tools")
     async def set_disabled_tools(session_id: str, body: DisabledTools):
         session = session_or_404(session_id)
@@ -287,7 +300,10 @@ def register_approvals(app, manager, store, session_or_404):
     async def list_tools(session_id: str | None = None):
         session = session_or_404(session_id) if session_id else None
         tools = [{"name": item["function"]["name"], "description": short_description(item["function"].get("description", ""))}
-                 for item in [*TOOL_DEFINITIONS, *FEATURE_TOOLS]]
+                 for item in [*TOOL_DEFINITIONS, *FEATURE_TOOLS,
+                              # While Settings → Browsing is on, or was when this chat was offered the tool.
+                              *([BROWSER_TOOL] if session is None and manager.settings.values.get("browser_tools") is True
+                                or session is not None and manager.browsing_offered(session) else [])]]
         # The configured MCP servers: a chat can turn each off (mcp__<id>__*), so its process never starts.
         servers = [{"id": item["id"], "name": manager.settings.redact(item["name"]), "enabled": item["enabled"]}
                    for item in manager.extensions.public_config()["servers"]]

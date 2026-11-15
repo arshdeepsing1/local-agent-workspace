@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -90,14 +91,14 @@ def test_configured_credential_alias_cannot_supply_instructions(tmp_path, alias)
 def test_unreadable_file_warns_and_remaining_guidance_loads(tmp_path, monkeypatch):
     blocked = write(tmp_path, "AGENTS.md", "unreadable")
     write(tmp_path, "CLAUDE.md", "readable guidance")
-    read_text = Path.read_text
+    real_open = os.open
 
-    def denied(self, *args, **kwargs):
-        if self == blocked:
-            raise PermissionError(13, "Permission denied", str(self))
-        return read_text(self, *args, **kwargs)
+    def denied(path, *args, **kwargs):  # read_file opens the file itself, so the refusal is made where it opens.
+        if Path(path) == blocked:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_text", denied)
+    monkeypatch.setattr(os, "open", denied)
     result = load_project_instructions(WorkspaceTools(str(tmp_path)))
     assert result["files"] == ["CLAUDE.md"]
     assert len(result["warnings"]) == 1

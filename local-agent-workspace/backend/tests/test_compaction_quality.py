@@ -21,6 +21,7 @@ from local_agent.context import (
 )
 from local_agent.mentions import HEADER
 from local_agent.tools import WorkspaceTools, read_page_bytes
+from test_compaction_retention import simulator, start  # noqa: F401  (both are fixtures)
 
 
 SYSTEM = {"role": "system", "content": "Follow the user's current request."}
@@ -787,3 +788,16 @@ async def test_an_older_compacted_state_labels_where_its_record_starts():
                                           force_compact=True)
     assert updated["requests_from"] == 3 and state == original
     assert "recorded since compaction 3" in render_app_record(updated)
+
+
+@pytest.mark.parametrize("compactions", [1, 2, 3], ids=["after-1st", "after-2nd", "after-3rd"])
+def test_the_long_chat_state_is_in_the_summary_and_record_after_each_compaction(start, compactions):  # noqa: F811  (start is the imported fixture)
+    """T004 scenario against the offline fake gateway: after one, two and three compactions the summary plus the app
+    record still give the goal, the open tasks, the four decisions and the two standing instructions (9 of 10)."""
+    chat = start()
+    chat.run_until_compactions(compactions)
+    correct, applicable, results = chat.score()
+    lost = [topic for topic, (_, _, ok) in results.items() if not ok]
+    message = f"{correct} of {applicable} kept after {compactions} compactions (during steps {chat.compaction_steps}), lost: {lost}"
+    assert correct >= min(9, applicable), message
+    assert not {"goal", "instruction 1", "instruction 2"} & set(lost), message

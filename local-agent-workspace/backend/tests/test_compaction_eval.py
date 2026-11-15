@@ -54,7 +54,8 @@ def workspace(tmp_path, monkeypatch):
         f"print({FAILED!r})\nsys.exit(1)\n")
     settings = Settings(tmp_path / "state")
     settings.values.update(workspace=str(project), env_file="", model=MODEL, context_window=65_536,
-                           auto_compact_percent=90, compaction_handoffs=True)
+                           auto_compact_percent=90, compaction_handoffs=True,
+                           context_trim=False)  # A no-trimming baseline: the trim moves when compactions happen.
     settings.credentials = lambda: ("https://gateway.example", "test-token")
     store = Store(settings.state_dir / "eval.sqlite3")
     manager = AgentManager(store, settings)

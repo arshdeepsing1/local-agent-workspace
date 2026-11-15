@@ -271,3 +271,53 @@ def test_browser_folder_grants_require_idle_session_and_local_auth(setup, tmp_pa
         app.state.manager.statuses[sid] = 'running'
         assert client.post(route, json={'path': str(tmp_path)}, headers=headers).status_code == 409
         assert client.request('DELETE', route, json={'path': str(tmp_path)}, headers=headers).status_code == 409
+
+
+def _grant_and_remove(setup, folder, spelling):
+    """(granted list after the grant, DELETE response, the chat's saved list after it) for one spelling."""
+    settings, _, _ = setup
+    with TestClient(create_app(settings)) as client:
+        headers = {'X-Local-Token': client.get('/api/bootstrap').json()['token']}
+        sid = client.post('/api/sessions', headers=headers).json()['id']
+        route = f'/api/sessions/{sid}/folders'
+        granted = client.post(route, json={'path': str(folder)}, headers=headers).json()['allowed_directories']
+        response = client.request('DELETE', route, json={'path': spelling}, headers=headers)
+        saved = client.get(f'/api/sessions/{sid}', headers=headers).json()['allowed_directories']
+        return granted, response, saved
+
+
+def test_removing_a_folder_by_a_case_variant_removes_the_stored_grant(setup, tmp_path):
+    folder = tmp_path / 'revoked'
+    folder.mkdir()
+    if not (tmp_path / 'REVOKED').exists():
+        pytest.skip("this disk is case-sensitive, so 'REVOKED' is another folder")
+    granted, response, saved = _grant_and_remove(setup, folder, str(tmp_path / 'REVOKED'))
+    assert granted == [str(folder)]
+    assert response.status_code == 200 and response.json()['allowed_directories'] == []
+    assert response.json()['removed'] == [str(folder)]
+    assert saved == []
+
+
+def test_removing_a_folder_that_was_never_granted_says_nothing_was_removed(setup, tmp_path):
+    folder = tmp_path / 'granted'
+    folder.mkdir()
+    (tmp_path / 'other').mkdir()
+    granted, response, saved = _grant_and_remove(setup, folder, str(tmp_path / 'other'))
+    assert response.status_code == 200
+    assert response.json()['removed'] == [] and response.json()['allowed_directories'] == [str(folder)]
+    assert saved == [str(folder)]
+    gone = _grant_and_remove(setup, folder, str(tmp_path / 'never-existed'))[1]  # Not on disk: names are compared.
+    assert gone.json()['removed'] == [] and gone.json()['allowed_directories'] == [str(folder)]
+
+
+@pytest.mark.parametrize('spelling', ['slash', 'dotdot', 'symlink'])
+def test_removing_a_folder_by_a_slash_dotdot_or_symlink_spelling_still_removes_it(setup, tmp_path, spelling):
+    folder = tmp_path / 'revoked'
+    folder.mkdir()
+    (tmp_path / 'sub').mkdir()
+    (tmp_path / 'link').symlink_to(folder)
+    path = {'slash': str(folder) + '/', 'dotdot': str(tmp_path / 'sub' / '..' / 'revoked'),
+            'symlink': str(tmp_path / 'link')}[spelling]
+    _, response, saved = _grant_and_remove(setup, folder, path)
+    assert response.status_code == 200 and response.json()['removed'] == [str(folder.resolve())]
+    assert saved == []

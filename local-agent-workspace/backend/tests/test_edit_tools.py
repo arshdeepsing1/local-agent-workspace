@@ -3,7 +3,9 @@ import difflib
 import json
 import os
 import random
+import socket
 import stat
+import threading
 import time
 
 import pytest
@@ -17,7 +19,7 @@ from local_agent.edits import line_opcodes, plan_change, preview_diff
 from local_agent.instructions import load_project_instructions
 from local_agent.recovery import CheckpointManager
 from local_agent.store import Store
-from local_agent.tools import WorkspaceTools, write_limit_setting
+from local_agent.tools import NotText, WorkspaceTools, write_limit_setting
 
 
 @pytest.fixture
@@ -160,6 +162,191 @@ def test_the_editor_follows_the_write_limit_setting(tmp_path, monkeypatch):
         refused = client.get("/api/file", params={"path": "mid.txt", "session_id": session_id})
         assert refused.status_code == 400 and "16 KB limit" in refused.json()["detail"]["message"]
     assert (workspace / "big.txt").read_text() == "y" * 115_000
+
+
+def run_unblocking(call, pipe, seconds=3):
+    """Run call() on a worker thread. If it blocks on the FIFO, open the write end so it finishes, then report
+    the block. A regression fails the test instead of hanging the test process."""
+    outcome = {}
+
+    def attempt():
+        try:
+            outcome["value"] = call()
+        except Exception as error:  # Any refusal is the correct behaviour.
+            outcome["error"] = error
+
+    worker = threading.Thread(target=attempt, daemon=True)
+    worker.start()
+    worker.join(seconds)
+    blocked = worker.is_alive()
+    if blocked:
+        try:
+            os.close(os.open(pipe, os.O_WRONLY | os.O_NONBLOCK))
+        except OSError:
+            pass
+        worker.join(5)
+    return blocked, outcome
+
+
+needs_fifo = pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="named pipes are not available here")
+
+
+@needs_fifo
+def test_read_file_refuses_a_named_pipe_instead_of_blocking(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    pipe = project / "events.pipe"
+    os.mkfifo(pipe)
+    tools = WorkspaceTools(str(project))
+
+    blocked, outcome = run_unblocking(lambda: tools.read_file("events.pipe"), pipe)
+
+    assert not blocked, "read_file blocked on a named pipe (it would freeze the server's event loop)"
+    assert isinstance(outcome.get("error"), ValueError), f"read_file should refuse a pipe, got {outcome}"
+
+
+def test_read_file_refuses_a_folder_and_a_unix_socket(tmp_path):
+    project = tmp_path / "project"
+    (project / "folder").mkdir(parents=True)
+    tools = WorkspaceTools(str(project))
+    with pytest.raises(ValueError, match="regular"):
+        tools.read_file("folder")
+    if not hasattr(socket, "AF_UNIX"):
+        return
+    # A short path: Unix socket names are limited to about 100 bytes, so bind from inside the folder.
+    listener = socket.socket(socket.AF_UNIX)
+    previous = os.getcwd()
+    try:
+        os.chdir(project)
+        listener.bind("s.sock")
+    except OSError:
+        pytest.skip("this system cannot bind a Unix socket here")
+    finally:
+        os.chdir(previous)
+    try:
+        with pytest.raises(ValueError, match="regular"):
+            tools.read_file("s.sock")
+    finally:
+        listener.close()
+
+
+def test_read_file_still_reads_normal_empty_and_linked_files(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "note.txt").write_text("hello\n")
+    (project / "empty.txt").write_text("")
+    (project / "link.txt").symlink_to("note.txt")
+    tools = WorkspaceTools(str(project))
+    assert tools.read_file("note.txt") == "hello\n"
+    assert tools.read_file("empty.txt") == ""
+    assert tools.read_file("link.txt") == "hello\n"
+
+
+@needs_fifo
+def test_read_file_does_not_block_when_the_file_becomes_a_pipe_after_the_check(tmp_path, monkeypatch):
+    # The race: a path check says "regular file", then the path is a named pipe by the time it is opened.
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "real.txt").write_text("hello\n")
+    pipe = project / "events.pipe"
+    os.mkfifo(pipe)
+    regular = os.stat(project / "real.txt")
+    real_stat = os.stat
+
+    def lying_stat(path, *args, **kwargs):
+        return regular if str(path).endswith("events.pipe") else real_stat(path, *args, **kwargs)
+
+    tools = WorkspaceTools(str(project))
+    monkeypatch.setattr(os, "stat", lying_stat)
+    monkeypatch.setattr("pathlib.Path.stat", lambda self, **kw: lying_stat(self))
+
+    blocked, outcome = run_unblocking(lambda: tools.read_file("events.pipe"), pipe)
+
+    assert not blocked, "read_file blocked on a pipe that replaced the file after the check"
+    assert isinstance(outcome.get("error"), ValueError) and "regular" in str(outcome["error"]), outcome
+
+
+@needs_fifo
+def test_read_file_refuses_a_link_to_a_named_pipe_instead_of_blocking(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    pipe = project / "events.pipe"
+    os.mkfifo(pipe)
+    (project / "link.pipe").symlink_to("events.pipe")
+    tools = WorkspaceTools(str(project))
+
+    blocked, outcome = run_unblocking(lambda: tools.read_file("link.pipe"), pipe)
+
+    assert not blocked, "read_file blocked on a link to a named pipe"
+    assert isinstance(outcome.get("error"), ValueError), outcome
+
+
+def test_read_file_keeps_its_errors_for_missing_large_binary_and_non_utf8_files(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "big.txt").write_text("y" * 20_000)
+    (project / "latin.txt").write_bytes(b"caf\xe9\n")
+    (project / "nul.txt").write_bytes(b"a\x00b")
+    (project / "crlf.txt").write_bytes(b"a\r\nb\r\n")
+    (project / "empty.txt").write_text("")
+    tools = WorkspaceTools(str(project), write_limit=16_000)
+    with pytest.raises(FileNotFoundError):
+        tools.read_file("missing.txt")
+    with pytest.raises(NotText, match="too large for the text editor \\(16 KB limit\\)"):
+        tools.read_file("big.txt")
+    with pytest.raises(NotText, match="not UTF-8 text"):
+        tools.read_file("latin.txt")
+    with pytest.raises(NotText, match="Binary files cannot be opened"):
+        tools.read_file("nul.txt")
+    assert tools.read_file("crlf.txt") == "a\nb\n"  # Universal newlines, as read_text gave.
+    assert tools.read_file("empty.txt") == ""
+    with pytest.raises(ValueError, match="regular"):
+        tools.read_file("")  # The project folder itself.
+
+
+@pytest.mark.skipif(not os.path.isdir("/dev/fd"), reason="needs /dev/fd to count open descriptors")
+def test_read_file_closes_its_descriptor_on_every_path(tmp_path):
+    project = tmp_path / "project"
+    (project / "folder").mkdir(parents=True)
+    (project / "ok.txt").write_text("x")
+    (project / "latin.txt").write_bytes(b"\xff")
+    (project / "big.txt").write_text("y" * 20_000)
+    tools = WorkspaceTools(str(project), write_limit=16_000)
+
+    def attempt(name):
+        try:
+            tools.read_file(name)
+        except (ValueError, OSError):
+            pass
+
+    for name in ("ok.txt", "folder", "latin.txt", "big.txt", "missing.txt"):
+        attempt(name)
+    before = len(os.listdir("/dev/fd"))
+    for _ in range(20):
+        for name in ("ok.txt", "folder", "latin.txt", "big.txt", "missing.txt"):
+            attempt(name)
+    assert len(os.listdir("/dev/fd")) == before
+
+
+@needs_fifo
+def test_the_files_routes_refuse_a_named_pipe_quickly(tmp_path, monkeypatch):
+    monkeypatch.setattr("local_agent.config.APP_ROOT", tmp_path)
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    settings = Settings(tmp_path / "state")
+    settings.env = {}
+    settings.values.update(workspace=str(workspace), env_file="")
+    settings.credentials = lambda: ("https://fake.example", "synthetic-test-token")
+    pipe = workspace / "events.pipe"
+    os.mkfifo(pipe)
+    with TestClient(create_app(settings)) as client:
+        client.headers["X-Local-Token"] = client.get("/api/bootstrap").json()["token"]
+        body = {"path": "events.pipe", "original": "", "content": "x"}
+        for call in (lambda: client.get("/api/file", params={"path": "events.pipe"}),
+                     lambda: client.put("/api/file", json=body)):
+            blocked, outcome = run_unblocking(call, pipe)
+            assert not blocked, "the Files route blocked on a named pipe"
+            assert 400 <= outcome["value"].status_code < 500, outcome
 
 
 def test_preview_diff_uses_lf_views_and_names_ending_only_changes():
@@ -462,3 +649,139 @@ def test_the_activity_log_names_the_limit_it_was_trimmed_to(tmp_path):
     content, stats = activity_content({"id": "s", "workspace": str(tmp_path), "events": events}, None, limit=16_000)
     assert stats["commands_omitted"] > 0 and len(content.encode()) <= 16_000
     assert f"{stats['commands_omitted']} earlier commands were omitted to stay within the 16 KB file limit." in content
+
+
+def _grow_after_fstat(monkeypatch, path, extra):
+    """Make a file grow right after read_file has checked its size, as another process could."""
+    real = os.fstat
+    state = {"done": False}
+
+    def fstat(descriptor):
+        info = real(descriptor)
+        if not state["done"]:
+            state["done"] = True
+            with open(path, "ab") as handle:
+                handle.write(extra)
+        return info
+
+    monkeypatch.setattr(os, "fstat", fstat)
+
+
+def test_read_file_never_returns_more_than_the_limit_when_the_file_grows_after_the_size_check(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "grow.txt").write_bytes(b"0123456789")
+    tools = WorkspaceTools(str(project), write_limit=16_000)
+    _grow_after_fstat(monkeypatch, project / "grow.txt", b"x" * 240_000)
+    with pytest.raises(NotText, match="too large for the text editor \\(16 KB limit\\)"):
+        tools.read_file("grow.txt")
+
+
+def test_read_file_stops_reading_at_the_limit_when_fstat_reports_a_small_size(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "big.txt").write_bytes(b"y" * 5_000_000)
+    tools = WorkspaceTools(str(project), write_limit=16_000)
+    real_read, taken = os.read, []
+    monkeypatch.setattr(os, "read", lambda descriptor, count: taken.append(count) or real_read(descriptor, count))
+    real = os.fstat
+
+    class Small:
+        def __init__(self, info):
+            self.st_mode, self.st_size = info.st_mode, 10
+
+    monkeypatch.setattr(os, "fstat", lambda descriptor: Small(real(descriptor)))
+    with pytest.raises(NotText, match="too large"):
+        tools.read_file("big.txt")
+    assert sum(taken) <= 16_000 + 1 + 65_536, taken  # At most the limit plus one chunk is ever requested.
+    assert len(taken) <= 2
+
+
+def test_read_file_accepts_exactly_the_limit_and_refuses_one_byte_more(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "exact.txt").write_bytes(b"a" * 16_000)
+    (project / "over.txt").write_bytes(b"a" * 16_001)
+    tools = WorkspaceTools(str(project), write_limit=16_000)
+    assert tools.read_file("exact.txt") == "a" * 16_000
+    with pytest.raises(NotText, match="too large"):
+        tools.read_file("over.txt")
+
+
+@pytest.mark.parametrize("chunk", [1, 2, 3, 5, 64 * 1024])
+def test_read_file_decodes_like_a_text_mode_open_for_every_chunk_size(tmp_path, monkeypatch, chunk):
+    from local_agent import tools as tools_module
+    monkeypatch.setattr(tools_module, "_READ_CHUNK", chunk)
+    project = tmp_path / "project"
+    project.mkdir()
+    samples = {
+        "crlf.txt": b"a\r\nb\r\n",
+        "cr.txt": b"a\rb\rc",
+        "mixed.txt": b"a\r\nb\rc\nd\r",
+        "split.txt": b"\r" + b"x" * 7 + b"\r\n",
+        "bom.txt": b"\xef\xbb\xbfabc\n",
+        "empty.txt": b"",
+        "multi.txt": "héllo € \U0001f642 数据\n".encode("utf-8"),
+    }
+    for name, data in samples.items():
+        (project / name).write_bytes(data)
+    tools = WorkspaceTools(str(project), write_limit=16_000)
+    for name in samples:
+        with open(project / name, encoding="utf-8") as reference:  # What the earlier text-mode read returned.
+            assert tools.read_file(name) == reference.read(), name
+    assert tools.read_file("bom.txt") == "﻿abc\n"
+    assert tools.read_file("crlf.txt") == "a\nb\n"
+    assert tools.read_file("cr.txt") == "a\nb\nc"
+    assert tools.read_file("empty.txt") == ""
+
+
+@pytest.mark.parametrize("chunk", [1, 3, 64 * 1024])
+def test_read_file_keeps_the_non_utf8_and_nul_errors_for_every_chunk_size(tmp_path, monkeypatch, chunk):
+    from local_agent import tools as tools_module
+    monkeypatch.setattr(tools_module, "_READ_CHUNK", chunk)
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "latin.txt").write_bytes(b"caf\xe9\n")
+    (project / "cut.txt").write_bytes("ok €".encode("utf-8")[:-1])
+    (project / "nul.txt").write_bytes(b"a\x00b")
+    tools = WorkspaceTools(str(project), write_limit=16_000)
+    for name in ("latin.txt", "cut.txt"):
+        with pytest.raises(NotText, match="not UTF-8 text"):
+            tools.read_file(name)
+    with pytest.raises(NotText, match="Binary files cannot be opened"):
+        tools.read_file("nul.txt")
+
+
+@pytest.mark.skipif(not os.path.isdir("/dev/fd"), reason="needs /dev/fd to count open descriptors")
+def test_read_file_closes_its_descriptor_after_200_failing_calls(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "grow.txt").write_bytes(b"0123456789")
+    (project / "latin.txt").write_bytes(b"\xff")
+    (project / "nul.txt").write_bytes(b"a\x00")
+    tools = WorkspaceTools(str(project), write_limit=16_000)
+    real = os.fstat
+
+    def grow(descriptor):
+        info = real(descriptor)
+        with open(project / "grow.txt", "ab") as handle:
+            handle.write(b"x" * 20_000)
+        return info
+
+    def attempt(name):
+        try:
+            tools.read_file(name)
+        except (ValueError, OSError):
+            pass
+
+    attempt("latin.txt")
+    before = len(os.listdir("/dev/fd"))
+    for _ in range(100):
+        attempt("latin.txt")
+        attempt("nul.txt")
+    monkeypatch.setattr(os, "fstat", grow)
+    for _ in range(100):
+        (project / "grow.txt").write_bytes(b"0123456789")
+        attempt("grow.txt")
+    monkeypatch.undo()
+    assert len(os.listdir("/dev/fd")) == before

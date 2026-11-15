@@ -10,7 +10,8 @@ from .context import DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT_TOKENS, SAFETY_M
 DEFAULT_MODEL = "databricks-claude-opus-5-5"
 LEGACY_DEFAULT_MODEL = "databricks-gpt-oss-120b"  # The default before Opus 5.5; used only by the Settings migration.
 LEGACY_DEFAULT_LIMITS = (131_072, 8_192)
-CONCURRENT_REQUESTS = 4  # One chat plus the three subagents planning.DelegateManager allows at once.
+CONCURRENT_REQUESTS = 4  # With the default Settings → Subagents limit: one chat plus the three subagents at once.
+NUMBER_WORDS = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six", 7: "seven", 8: "eight", 9: "nine"}
 OTPM_HEADROOM_FRACTION = 5  # Keep one fifth of the output-tokens-per-minute limit free.
 MAX_REQUEST_BYTES = 4_000_000  # Databricks payload limit per request (4 MB).
 MAX_EXECUTION_SECONDS = 597  # Databricks model execution limit per request.
@@ -154,14 +155,29 @@ def auxiliary_output_tokens(model, wanted):
     return min(tokens, profile["output_max"]) if profile.get("output_max") else tokens
 
 
+_running_max = CONCURRENT_REQUESTS - 1
+
+
+def set_subagents_running_max(count):
+    """Settings → Subagents → Subagents at once (config.Settings sets it when it loads or saves): the app divides an
+    endpoint's rate limits by concurrent_requests(), so more subagents at once means a smaller share for each request."""
+    global _running_max
+    _running_max = count
+
+
+def concurrent_requests():
+    """Requests that can run at once: one chat plus the subagents Settings allows at once (4 by default)."""
+    return _running_max + 1
+
+
 def output_concurrency_limit(profile):
-    """The largest max_tokens at which CONCURRENT_REQUESTS requests still leave a fifth of OTPM free."""
-    return profile["otpm"] * (OTPM_HEADROOM_FRACTION - 1) // OTPM_HEADROOM_FRACTION // CONCURRENT_REQUESTS
+    """The largest max_tokens at which concurrent_requests() requests still leave a fifth of OTPM free."""
+    return profile["otpm"] * (OTPM_HEADROOM_FRACTION - 1) // OTPM_HEADROOM_FRACTION // concurrent_requests()
 
 
 def context_rate_limit(profile):
-    """The context budget above which CONCURRENT_REQUESTS full steps in one minute reach ITPM."""
-    return profile["itpm"] // CONCURRENT_REQUESTS
+    """The context budget above which concurrent_requests() full steps in one minute reach ITPM."""
+    return profile["itpm"] // concurrent_requests()
 
 
 def effective_limits(model, context_window, max_output_tokens):
@@ -183,6 +199,7 @@ def limit_warnings(model, context_window, max_output_tokens):
     effective = effective_limits(model, context_window, max_output_tokens)
     output, context = effective["max_output_tokens"], effective["context_window"]
     concurrency, rate = output_concurrency_limit(profile), context_rate_limit(profile)
+    requests, helpers = (NUMBER_WORDS.get(count, str(count)) for count in (concurrent_requests(), concurrent_requests() - 1))
     context_max, output_max = profile.get("context_max"), profile.get("output_max")
     warnings = []
 
@@ -205,12 +222,12 @@ def limit_warnings(model, context_window, max_output_tokens):
     elif output > concurrency:
         add("output_concurrency", "warning",
             f"Databricks reserves Max output tokens against {label}'s limit of {otpm:,} output tokens per minute "
-            f"when each request starts. Above {concurrency:,}, four requests at once (this chat and up to three "
+            f"when each request starts. Above {concurrency:,}, {requests} requests at once (this chat and up to {helpers} "
             "subagents, or several chats) can be rejected with HTTP 429 before they start; the app then waits and "
             "retries. One chat on its own can use more.")
     if context > rate:
         add("context_itpm", "note",
-            f"Each agent step sends up to the whole context budget. Above {rate:,} tokens, four full steps in one "
+            f"Each agent step sends up to the whole context budget. Above {rate:,} tokens, {requests} full steps in one "
             f"minute can reach, after a short burst allowance, {label}'s limit of {itpm:,} input tokens per minute, "
             "so long turns and subagents wait on rate limits, and every step costs more.")
     recommended = profile.get("recommended_max_output_tokens")

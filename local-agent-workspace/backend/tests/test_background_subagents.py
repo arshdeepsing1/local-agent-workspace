@@ -5,6 +5,7 @@ wake-up continues an idle chat once; subagent_stop hooks run in the idle parent 
 import asyncio
 import json
 import time
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -1410,3 +1411,325 @@ async def test_stop_subagent_ends_a_subagent_waiting_for_its_start_hook_card_in_
     assert card(saved, "a")["delegation"]["terminal_reason"] == "stopped"
     assert saved["terminal_reason"] == "completed" and len(gateway.requests["parent"]) == 2
     assert "Survey" not in gateway.requests and manager.delegates.background_running(parent["id"]) == 0
+
+
+def folder_scenario(manager, tmp_path):
+    """An idle chat in Auto with two folder grants: (parent, {"revoked": folder, "kept": folder})."""
+    folders = {}
+    for name in ("revoked", "kept"):
+        folder = tmp_path / name
+        folder.mkdir()
+        (folder / "secret.txt").write_text(f"{name}-contents\n")
+        folders[name] = folder
+    parent = manager.store.create(manager.settings.values)
+    parent.update(title="Parent", title_generated=True, permission_mode="auto",
+                  allowed_directories=[str(folder) for folder in folders.values()])
+    manager.store.save(parent)
+    return parent, folders
+
+
+def background_gateway(monkeypatch, handler):
+    return Gateway(monkeypatch, [lambda: calls_reply(delegate("Survey", "a", background=True)),
+                                 lambda: reply("Going on.")], {"Survey": handler})
+
+
+async def remove_folder(client, parent, folder):
+    response = await client.request("DELETE", f"/api/sessions/{parent['id']}/folders", json={"path": str(folder)})
+    assert response.status_code == 200, response.text
+    return response
+
+
+async def test_removing_a_folder_grant_reaches_a_running_background_subagent(api, monkeypatch, tmp_path):
+    client, manager = api
+    parent, folders = folder_scenario(manager, tmp_path)
+    revoked, kept = folders["revoked"], folders["kept"]
+    removed = asyncio.Event()
+
+    async def child(count, body):
+        if count == 1:
+            await removed.wait()  # The user removes one grant while the subagent works.
+            return calls_reply(("read_file", {"path": str(kept / "secret.txt")}, "r2"),
+                               ("read_file", {"path": str(revoked / "secret.txt")}, "r1"))
+        return reply("Done.")
+    gateway = background_gateway(monkeypatch, child)
+    await run_turn(manager, parent)
+    await asyncio.wait_for(gateway.child_started("Survey").wait(), 5)
+    child_id = background_child(manager, parent)
+    assert manager.get(child_id)["allowed_directories"] == [str(revoked), str(kept)]
+
+    await remove_folder(client, parent, revoked)
+    assert manager.get(parent["id"])["allowed_directories"] == [str(kept)]
+    assert manager.get(child_id)["allowed_directories"] == [str(kept)]
+    assert manager.store.get(child_id)["allowed_directories"] == [str(kept)]
+    removed.set()
+    await eventually(lambda: manager.statuses.get(child_id) == "awaiting_approval")
+    events = {event["call_id"]: event for event in manager.get(child_id)["events"] if event.get("call_id") in ("r1", "r2")}
+    access = [event for event in manager.get(child_id)["events"] if event.get("name") == "access_directory"]
+    assert [event["state"] for event in access] in (["pending"], ["asking"])
+    assert events["r1"]["state"] not in ("completed", "error") and not events["r1"].get("output")
+    assert events["r2"]["state"] == "completed" and "kept-contents" in str(events["r2"]["output"])
+    assert "revoked-contents" not in json.dumps(manager.get(child_id)["events"])
+
+
+async def test_a_folder_the_subagent_was_granted_itself_stays_unless_that_path_is_removed(api, monkeypatch, tmp_path):
+    client, manager = api
+    parent, folders = folder_scenario(manager, tmp_path)
+    own = tmp_path / "own"
+    own.mkdir()
+    gate = asyncio.Event()
+    gateway = background_gateway(monkeypatch, gated(gate))
+    await run_turn(manager, parent)
+    await asyncio.wait_for(gateway.child_started("Survey").wait(), 5)
+    child = manager.get(background_child(manager, parent))
+    child["allowed_directories"].append(str(own))  # Granted on the subagent's own card.
+    await remove_folder(client, parent, folders["revoked"])
+    assert child["allowed_directories"] == [str(folders["kept"]), str(own)]
+    await remove_folder(client, parent, tmp_path / "never")  # A folder neither list holds changes nothing.
+    assert child["allowed_directories"] == [str(folders["kept"]), str(own)]
+    await remove_folder(client, parent, own)  # The user removes that same path.
+    assert child["allowed_directories"] == [str(folders["kept"])]
+    gate.set()
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+
+
+async def test_adding_a_folder_grant_does_not_reach_a_running_background_subagent(api, monkeypatch, tmp_path):
+    client, manager = api
+    parent, _ = folder_scenario(manager, tmp_path)
+    extra = tmp_path / "extra"
+    extra.mkdir()
+    gate = asyncio.Event()
+    gateway = background_gateway(monkeypatch, gated(gate))
+    await run_turn(manager, parent)
+    await asyncio.wait_for(gateway.child_started("Survey").wait(), 5)
+    response = await client.post(f"/api/sessions/{parent['id']}/folders", json={"path": str(extra)})
+    assert response.status_code == 200, response.text
+    assert str(extra) in manager.get(parent["id"])["allowed_directories"]
+    assert str(extra) not in manager.get(background_child(manager, parent))["allowed_directories"]
+    gate.set()
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+
+
+async def test_a_queued_background_subagent_starts_without_a_folder_removed_while_it_waited(api, monkeypatch, tmp_path):
+    client, manager = api
+    parent, folders = folder_scenario(manager, tmp_path)
+    full = full_slots(monkeypatch)
+    gate = asyncio.Event()
+    gateway = background_gateway(monkeypatch, gated(gate))
+    saved = await run_turn(manager, parent)
+    assert json.loads(card(saved, "a")["output"])["status"] == "queued"
+    await remove_folder(client, parent, folders["revoked"])
+    full["value"] = False
+    manager.delegates._wake()
+    await asyncio.wait_for(gateway.child_started("Survey").wait(), 5)
+    assert manager.get(background_child(manager, parent))["allowed_directories"] == [str(folders["kept"])]
+    gate.set()
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+
+
+async def test_removing_a_folder_grant_leaves_a_finished_background_subagent_alone(api, monkeypatch, tmp_path):
+    client, manager = api
+    parent, folders = folder_scenario(manager, tmp_path)
+    background_gateway(monkeypatch, lambda count, body: asyncio.sleep(0, reply("Done.")))
+    await run_turn(manager, parent)
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+    child_id = manager.store.get(parent["id"])["subagents"][0]["id"]
+    await remove_folder(client, parent, folders["revoked"])
+    assert manager.store.get(parent["id"])["allowed_directories"] == [str(folders["kept"])]
+    assert manager.store.get(child_id)["allowed_directories"] == [str(folders["revoked"]), str(folders["kept"])]
+
+
+async def test_removing_a_folder_grant_from_a_chat_without_subagents_only_changes_that_chat(api, tmp_path):
+    client, manager = api
+    parent, folders = folder_scenario(manager, tmp_path)
+    other = manager.store.create(manager.settings.values)
+    other.update(allowed_directories=[str(folders["revoked"])])
+    manager.store.save(other)
+    response = await remove_folder(client, parent, folders["revoked"])
+    assert response.json()["allowed_directories"] == [str(folders["kept"])]
+    assert manager.store.get(parent["id"])["allowed_directories"] == [str(folders["kept"])]
+    assert manager.store.get(other["id"])["allowed_directories"] == [str(folders["revoked"])]
+
+
+async def test_a_removed_chat_allow_rule_leaves_a_running_subagent_but_its_own_rule_stays(api, monkeypatch):
+    client, manager = api
+    inherited = {"behavior": "allow", "tool": "run_command", "command": "git status"}
+    own = {"behavior": "allow", "tool": "run_command", "command": "git log"}
+    parent = manager.store.create(manager.settings.values)
+    parent.update(title="Parent", title_generated=True, permission_mode="auto", allow_rules=[inherited])
+    manager.store.save(parent)
+    gate = asyncio.Event()
+    gateway = background_gateway(monkeypatch, gated(gate))
+    await run_turn(manager, parent)
+    await asyncio.wait_for(gateway.child_started("Survey").wait(), 5)
+    child = manager.get(background_child(manager, parent))
+    assert child["allow_rules"] == [inherited]
+    child["allow_rules"].append(dict(own))  # Remembered for the chat on the subagent's own card.
+    response = await client.request("DELETE", f"/api/sessions/{parent['id']}/allow-rules", json=inherited)
+    assert response.status_code == 200, response.text
+    assert manager.get(parent["id"])["allow_rules"] == []
+    assert child["allow_rules"] == [own]
+    assert manager.store.get(child["id"])["allow_rules"] == [own]
+    gate.set()
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+
+
+def running_chat(manager, tmp_path, *names):
+    """(chat, tools, {name: folder}): a chat with a running turn, granted the first two folders, whose tools hold
+    every folder: the others are extra ones a turn adds that neither the chat's list nor the standing ones hold."""
+    folders = {}
+    for name in names:
+        folders[name] = (tmp_path / name).resolve()
+        folders[name].mkdir()
+    chat = manager.store.create(manager.settings.values)
+    chat.update(permission_mode="manual", allowed_directories=[str(folder) for folder in list(folders.values())[:2]])
+    manager.store.save(chat)
+    manager.turns[chat["id"]] = {}
+    tools = manager.session_tools(chat)
+    tools.allowed_directories = [*tools.allowed_directories, *folders.values()]
+    tools.allowed_directories = list(dict.fromkeys(tools.allowed_directories))
+    return chat, tools, folders
+
+
+async def test_a_folder_a_turn_added_to_its_tools_stays_when_nothing_was_removed(runtime, tmp_path):
+    manager, _, _ = runtime
+    chat, tools, folders = running_chat(manager, tmp_path, "listed", "also", "extra")
+    before = list(tools.allowed_directories)
+    manager.follow_folders(chat, tools)
+    manager.follow_folders(chat, tools)
+    assert tools.allowed_directories == before and folders["extra"] in tools.allowed_directories
+
+
+async def test_removing_one_folder_drops_only_that_one_from_the_running_tools(runtime, tmp_path):
+    manager, _, _ = runtime
+    chat, tools, folders = running_chat(manager, tmp_path, "a", "b", "c")
+    await manager.remove_folder(chat, str(folders["a"]))
+    manager.follow_folders(chat, tools)
+    assert folders["a"] not in tools.allowed_directories
+    assert folders["b"] in tools.allowed_directories and folders["c"] in tools.allowed_directories
+
+
+async def test_a_folder_granted_again_through_the_card_is_usable_after_its_removal(runtime, tmp_path):
+    manager, _, _ = runtime
+    chat, tools, folders = running_chat(manager, tmp_path, "a", "b")
+    (folders["a"] / "note.txt").write_text("hello\n")
+    await manager.remove_folder(chat, str(folders["a"]))
+    manager.follow_folders(chat, tools)
+    assert not tools.permitted(folders["a"] / "note.txt")
+    asking = asyncio.create_task(manager.ensure_access(chat, tools, str(folders["a"] / "note.txt")))
+    await eventually(lambda: bool(waiting_cards(manager, chat["id"])))
+    (_, event_id), = waiting_cards(manager, chat["id"])
+    manager.decide(chat["id"], event_id, True)
+    assert await asyncio.wait_for(asking, 5) is True
+    manager.follow_folders(chat, tools)
+    assert tools.permitted(folders["a"] / "note.txt")
+    assert manager.revoked_folders.get(chat["id"], set()) == set()
+
+
+async def test_the_removal_record_is_gone_when_the_subagent_turn_ends(api, monkeypatch, tmp_path):
+    client, manager = api
+    parent, folders = folder_scenario(manager, tmp_path)
+    gate = asyncio.Event()
+    gateway = background_gateway(monkeypatch, gated(gate))
+    await run_turn(manager, parent)
+    await asyncio.wait_for(gateway.child_started("Survey").wait(), 5)
+    child_id = background_child(manager, parent)
+    await remove_folder(client, parent, folders["revoked"])
+    assert manager.revoked_folders == {child_id: {folders["revoked"].resolve()}}  # The idle chat has none.
+    gate.set()
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+    assert manager.revoked_folders == {}
+
+
+async def test_removing_a_folder_blocks_a_waiting_edit_card_of_the_subagent_inside_it(api, monkeypatch, tmp_path):
+    client, manager = api
+    parent, folders = folder_scenario(manager, tmp_path)
+    target = folders["revoked"] / "new.txt"
+    release = asyncio.Event()
+
+    async def child(count, body):
+        if count == 1:
+            await release.wait()
+            return calls_reply(("write_file", {"path": str(target), "content": "x\n"}, "w1"))
+        return reply("Done.")
+    gateway = background_gateway(monkeypatch, child)
+    await run_turn(manager, parent)
+    await asyncio.wait_for(gateway.child_started("Survey").wait(), 5)
+    child_id = background_child(manager, parent)
+    manager.get(child_id)["permission_mode"] = "manual"
+    release.set()
+    await eventually(lambda: bool(waiting_cards(manager, child_id)))
+    await remove_folder(client, parent, folders["revoked"])
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)
+    edit = next(event for event in manager.get(child_id)["events"] if event.get("call_id") == "w1")
+    assert edit["approval"] == "blocked" and "removed" in edit["blocked_reason"]
+    assert not target.exists()
+
+
+def case_variant(folder, name):
+    variant = folder.parent / name
+    if not variant.exists():
+        pytest.skip(f"this disk is case-sensitive, so {name!r} is another folder")
+    return variant
+
+
+async def test_removing_a_folder_by_a_case_variant_reaches_the_parent_the_child_and_the_removal_record(
+        api, monkeypatch, tmp_path):
+    client, manager = api
+    parent, folders = folder_scenario(manager, tmp_path)
+    revoked, kept = folders["revoked"], folders["kept"]
+    variant = case_variant(revoked, "REVOKED")
+    removed = asyncio.Event()
+
+    async def child(count, body):
+        if count == 1:
+            await removed.wait()
+            return calls_reply(("read_file", {"path": str(revoked / "secret.txt")}, "r1"))
+        return reply("Done.")
+    gateway = background_gateway(monkeypatch, child)
+    await run_turn(manager, parent)
+    await asyncio.wait_for(gateway.child_started("Survey").wait(), 5)
+    child_id = background_child(manager, parent)
+
+    response = await remove_folder(client, parent, variant)
+    assert response.json()["removed"] == [str(revoked)]
+    assert manager.get(parent["id"])["allowed_directories"] == [str(kept)]
+    assert manager.get(child_id)["allowed_directories"] == [str(kept)]
+    assert manager.store.get(child_id)["allowed_directories"] == [str(kept)]
+    assert manager.revoked_folders == {child_id: {revoked.resolve()}}  # The stored grant's spelling, not the request's.
+    tools = SimpleNamespace(allowed_directories=[revoked.resolve(), kept.resolve()])
+    manager.follow_folders(manager.get(child_id), tools)
+    assert tools.allowed_directories == [kept.resolve()]
+    removed.set()
+    await eventually(lambda: manager.statuses.get(child_id) == "awaiting_approval")
+    events = {event["call_id"]: event for event in manager.get(child_id)["events"] if event.get("call_id") == "r1"}
+    access = [event for event in manager.get(child_id)["events"] if event.get("name") == "access_directory"]
+    assert [event["state"] for event in access] in (["pending"], ["asking"])
+    assert events["r1"]["state"] not in ("completed", "error") and not events["r1"].get("output")
+    assert "revoked-contents" not in json.dumps(manager.get(child_id)["events"])
+
+
+async def test_granting_a_folder_again_by_a_case_variant_ends_its_removal_record(runtime, tmp_path):
+    manager, _, _ = runtime
+    chat, tools, folders = running_chat(manager, tmp_path, "a", "b")
+    variant = case_variant(folders["a"], "A")
+    await manager.remove_folder(chat, str(folders["a"]))
+    assert manager.revoked_folders == {chat["id"]: {folders["a"]}}
+    manager.forget_revocations(chat["id"], variant)
+    assert manager.revoked_folders == {}
+
+
+async def test_removing_a_folder_nobody_granted_reports_nothing_removed_and_changes_nothing(api, monkeypatch, tmp_path):
+    client, manager = api
+    parent, folders = folder_scenario(manager, tmp_path)
+    gate = asyncio.Event()
+    gateway = background_gateway(monkeypatch, gated(gate))
+    await run_turn(manager, parent)
+    await asyncio.wait_for(gateway.child_started("Survey").wait(), 5)
+    child_id = background_child(manager, parent)
+    both = [str(folders["revoked"]), str(folders["kept"])]
+    for path in (tmp_path / "never", tmp_path / "kept" / "..", tmp_path / "revoked" / "missing"):
+        body = (await remove_folder(client, parent, path)).json()
+        assert body["removed"] == [] and body["allowed_directories"] == both
+    assert manager.get(child_id)["allowed_directories"] == both and manager.revoked_folders == {}
+    gate.set()
+    await eventually(lambda: manager.delegates.background_running(parent["id"]) == 0)

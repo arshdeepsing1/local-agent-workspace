@@ -474,3 +474,82 @@ def test_the_places_kept_for_helpers_in_a_new_chat(runtime):
     assert counts() == (29, 0, 4)
     session["disabled_tools"] = ["use_skill"]
     assert counts() == (28, 2, 2)
+
+
+# The browser tool takes its place under the same 32-tool limit (browser_tool.fit_tools) --------------------------------
+
+def every_helper(manager, session):
+    """A chat that is offered every optional helper tool (get_tool_output, get_subagent_result, web_search,
+    report_findings), as the count test of the built-in tool set does."""
+    manager.settings.values.update(web_search_provider="searxng", web_search_url="http://127.0.0.1:8888")
+    session.update(tool_output_offered=True, findings_tool=True, background_subagents_offered=True, disabled_tools=[])
+
+
+def test_with_browsing_off_the_offered_list_and_its_order_are_unchanged(runtime):
+    from local_agent.agents import FEATURE_TOOLS, TOOL_DEFINITIONS
+    from local_agent.tool_profiles import filter_tools
+    manager, session, _, _ = runtime
+    every_helper(manager, session)
+    assert manager.settings.values["browser_tools"] is False
+    definitions, capped = manager.offered_tools(session, mcp_tools(10))
+    names = [item["function"]["name"] for item in definitions]
+    expected = [item["function"]["name"] for item in filter_tools(session, [*TOOL_DEFINITIONS, *FEATURE_TOOLS])
+                if item["function"]["name"] not in ("submit_report", "submit_plan")]
+    assert names == expected and "browser" not in names and len(names) == MAX_REQUEST_TOOLS == 32
+    assert capped == [f"mcp__many__tool{n:02d}" for n in range(10)] and "browser_tool" not in session
+
+
+def test_with_browsing_on_the_request_still_holds_at_most_32_tools_and_names_what_was_cut(runtime):
+    manager, session, _, _ = runtime
+    every_helper(manager, session)
+    manager.settings.values["browser_tools"] = True
+    definitions, capped = manager.offered_tools(session, mcp_tools(10))
+    names = [item["function"]["name"] for item in definitions]
+    assert len(names) <= MAX_REQUEST_TOOLS and "browser" in names and "get_tool_output" in names
+    # One priority for every tool: the browser, then get_tool_output, then the other helpers, then MCP tools.
+    assert capped[0] == "report_findings" and capped[1:] == [f"mcp__many__tool{n:02d}" for n in range(10)]
+    assert not any(name.startswith("mcp__") for name in names)
+    # Without the MCP tools only the helper of the lowest priority goes.
+    definitions, capped = manager.offered_tools(session, [])
+    assert len(definitions) == MAX_REQUEST_TOOLS and capped == ["report_findings"]
+
+
+async def test_the_notice_names_every_tool_left_out_once_and_keeps_the_mcp_wording(runtime, monkeypatch):
+    manager, session, _, _ = runtime
+    every_helper(manager, session)
+    manager.settings.values["browser_tools"] = True
+    sent = []
+
+    class Connection:
+        definitions = mcp_tools(10)
+        tool_names = {item["function"]["name"] for item in definitions}
+
+        async def discover(self):
+            return self.definitions
+
+    @asynccontextmanager
+    async def turn(**options):
+        yield Connection()
+    manager.extensions.turn = turn
+
+    async def handler(request):
+        payload = json.loads(request.content)
+        sent.append([item["function"]["name"] for item in payload["tools"]])
+        return stream("Done.")
+    gateway(monkeypatch, handler)
+    await manager.run(session, "Hello")
+    assert len(sent[0]) <= 32 and "browser" in sent[0] and "get_tool_output" in sent[0]
+    [notice] = notices(session)
+    assert notice.startswith("Databricks accepts at most 32 tools per request, so 11 tools were not offered")
+    assert "report_findings" in notice and "mcp__many__tool00" in notice
+    await manager.run(session, "Again")
+    assert len(notices(session)) == 1
+    # Once offered, the tool stays offered while the setting is off (a call is then refused), so nothing changes.
+    manager.settings.values["browser_tools"] = False
+    assert "browser" in [item["function"]["name"] for item in manager.offered_tools(session, [])[0]]
+    # The wording for MCP tools alone is kept (test_capped_tools_are_named_once_and_refused).
+    from local_agent.agents import AgentManager
+    fresh = {"id": "x", "events": [], "mcp_status": None}
+    manager.store.save = lambda item: None
+    await AgentManager.capped_notice(manager, fresh, ["mcp__many__tool00", "mcp__many__tool01"])
+    assert fresh["events"][0]["text"].startswith("Databricks accepts at most 32 tools per request, so 2 MCP tools were not offered")

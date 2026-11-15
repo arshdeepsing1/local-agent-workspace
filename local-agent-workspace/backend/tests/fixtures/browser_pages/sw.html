@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Service worker</title></head>
+<body>
+<h1>Service worker</h1>
+<p id="out">pending</p>
+<script>
+const out = document.getElementById('out');
+if (!navigator.serviceWorker) { out.textContent = 'SW-DONE unavailable'; }
+else {
+  const done = () => navigator.serviceWorker.getRegistrations().then((list) => { out.textContent = 'SW-DONE registrations=' + list.length; });
+  navigator.serviceWorker.register('/sw.js').then(done, done);
+}
+</script>
+</body></html>

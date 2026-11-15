@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>WebSocket</title></head>
+<body>
+<h1>WebSocket</h1>
+<p id="out">pending</p>
+<script>
+const ws = new WebSocket('ws://127.0.0.1:{{OTHER_PORT}}/ws');
+ws.onopen = () => { document.getElementById('out').textContent = 'WS-DONE open'; };
+ws.onclose = () => { document.getElementById('out').textContent = 'WS-DONE closed'; };
+ws.onerror = () => { document.getElementById('out').textContent = 'WS-DONE closed'; };
+</script>
+</body></html>

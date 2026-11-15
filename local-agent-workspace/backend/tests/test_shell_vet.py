@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -30,6 +31,9 @@ def build_project(root):
     (project / "notes" / "secrets.yaml").write_text("password: x\n")
     (project / "keys" / "credentials.json").write_text("{}\n")
     (project / "data" / "values.txt").write_text("3\n1\n2\n1\n")
+    (project / ".ssh").mkdir()
+    (project / ".ssh" / "deploy_key").write_text("PRIVATE-KEY-MATERIAL\n")  # a key name the credential list lacks
+    (project / ".ssh" / "known_hosts").write_text("host ssh-ed25519 AAAA\n")
     other = root / "other"
     other.mkdir()
     (other / "file.txt").write_text("other file\n")
@@ -251,6 +255,476 @@ def test_anything_else_is_refused_with_a_reason(world, text, reason):
 
 def test_the_table_is_large():
     assert len(ACCEPTED) + len(REFUSED) >= 80
+
+
+AWK_HIDDEN = [
+    # A '/' after ')' may start a regex: its quote must not open a string that hides what follows.
+    'awk \'BEGIN { if (1) /"/; print "x" > "out.txt"; if (1) /"/ }\'',
+    'awk \'BEGIN { if (1) /"/; system("echo ran > ran.txt"); if (1) /"/ }\'',
+    'awk \'BEGIN { if (1) /"/; print "x" | "cat > piped.txt"; if (1) /"/ }\'',
+    'awk \'BEGIN { if (1) /"/; getline l < "README.md"; if (1) /"/ }\'',
+    # A print statement goes on after a newline that follows ',', '&&', '||' (and in gawk '?' and ':').
+    'awk \'BEGIN { print "x",\n "y" > "pwned" }\'',
+    'awk \'BEGIN { print "x" &&\n "y" > "pwned" }\'',
+    'awk \'BEGIN { print "x" ||\n "y" > "pwned" }\'',
+    'awk \'BEGIN { printf "%s",\n "y" > "pwned" }\'',
+    'awk \'BEGIN { print "x", # note\n "y" >> "pwned" }\'',
+    # H1: awk allows any number of newlines and comment lines there.
+    'awk \'BEGIN { print "x",\n\n "y" > "pwned" }\'',
+    'awk \'BEGIN { print "x",\n# note\n "y" > "pwned" }\'',
+    'awk \'BEGIN { print "x",\n \t\n "y" > "pwned" }\'',
+    'awk \'BEGIN { print "x" &&\n\n "y" > "pwned" }\'',
+    'awk \'BEGIN { print "x" ||\n\n\n "y" > "pwned" }\'',
+    'awk \'BEGIN { printf "%s",\n\n "y" >> "pwned" }\'',
+    'awk \'BEGIN { print "x" &&\n# one\n\n# two\n "y" > "pwned" }\'',
+    'awk \'BEGIN { print 1 ?\n\n 2 :\n 3 > "pwned" }\'',
+    # H2: a number glued to a name is a number and then the name (1system(...) calls system).
+    'awk \'BEGIN { x = 1system("touch pwned") }\'',
+    'awk \'BEGIN { x = .5system("touch pwned") }\'',
+    'awk \'BEGIN { x = 1e3system("touch pwned") }\'',
+    'awk \'BEGIN { print 1system("touch pwned") }\'',
+    'awk \'BEGIN { x = 1getline line < "README.md"; print line }\'',
+    'awk \'BEGIN { x = 1ENVIRON["HOME"]; print x }\'',
+    "awk '{ print 1ARGV[1] }' README.md",
+    'awk \'BEGIN { x = 1e+system("touch pwned") }\'',
+    'awk \'BEGIN { x = 0x1gsystem("touch pwned") }\'',
+    'awk \'BEGIN { x = 0x1system("touch pwned") }\'',
+    'awk \'BEGIN { x = 0x1close("pwned") }\'',
+    'awk \'BEGIN { x = 1close("cat") }\'',
+    'awk \'BEGIN { x = 1fflush() }\'',
+    'awk \'BEGIN { 1print "x" > "pwned" }\'',
+    'awk \'BEGIN { 1printf "x" > "pwned" }\'',
+    'awk \'BEGIN { x = "a"system("touch pwned") }\'',
+    'awk \'BEGIN { x = 1 system("touch pwned") }\'',
+    # H3: case, default and switch are plain variables in one-true-awk (macOS), so '/' after them divides.
+    'awk \'BEGIN { x = default /"1/ 1 "; system("touch pwned") # " \n}\'',
+    'awk \'BEGIN { x = case /"1/ 1 "; print "x" > "pwned" # " \n}\'',
+    'awk \'BEGIN { x = switch /"1/ 1 "; while (("cat README.md" | getline l) > 0) print l # " \n}\' README.md',
+    'awk \'BEGIN { x = func /"1/ 1 "; system("touch pwned") # " \n}\'',
+    'awk \'BEGIN { x = nextfile /"1/ 1 "; system("touch pwned") # " \n}\'',
+    'awk \'BEGIN { x = BEGINFILE /"1/ 1 "; system("touch pwned") # " \n}\'',
+    'awk \'BEGIN { x = ENDFILE /"1/ 1 "; system("touch pwned") # " \n}\'',
+    'awk \'BEGIN { x = delete /"1/ 1 "; system("touch pwned") # " \n}\'',
+    'awk \'BEGIN { x = Default /"1/ 1 "; system("touch pwned") # " \n}\'',
+    'awk \'BEGIN { x = DEFAULT /"1/ 1 "; system("touch pwned") # " \n}\'',
+    'awk \'BEGIN { x = PRINT /"1/ 1 "; system("touch pwned") # " \n}\'',
+    "awk '{ x = length /\"1/ 1 \"; system(\"touch pwned\") # \" \\n}' README.md",
+    'awk \'BEGIN { x = in /"1/ 1 "; system("touch pwned") # " \n}\'',
+    'awk \'BEGIN { x = do /"1/ 1 "; system("touch pwned") # " \n}\'',
+    # Names in another letter case are other names in awk, but a check that guesses is a check that fails.
+    'awk \'BEGIN { SYSTEM("touch pwned") }\'',
+    'awk \'BEGIN { System("touch pwned") }\'',
+    'awk \'BEGIN { Getline x < "README.md" }\'',
+    # A regex after else, ';', '{', '!', '~', ',' and a quote inside it: lexed as a regex, then what follows is seen.
+    'awk \'BEGIN { if (0) x = 1; else /"/; system("touch pwned"); /"/ }\'',
+    'awk \'BEGIN { x = 1; /"/; system("touch pwned"); /"/ }\'',
+    "awk '{ /\"/; print \"x\" > \"pwned\"; /\"/ }' README.md",
+    "awk '!/\"/ { system(\"touch pwned\") } /\"/' README.md",
+    "awk '$0 ~ /\"/ { system(\"touch pwned\") } $0 ~ /\"/' README.md",
+    'awk \'BEGIN { print 1, /"/; print "x" > "pwned"; print 2, /"/ }\'',
+    'awk \'BEGIN { do /"/; system("touch pwned"); while (0) }\'',
+    'awk \'BEGIN { for (k in /"/) print k; system("touch pwned"); x = /"/ }\'',
+    # A comment with a quote before a redirect, tabs, carriage returns and a continuation inside a print.
+    'awk \'BEGIN { x = 1 # say "hi\n print "x" > "pwned" }\'',
+    'awk \'BEGIN {\tprint\t"x"\t>\t"pwned" }\'',
+    'awk \'BEGIN { print "x",\r\n "y" > "pwned" }\'',
+    # A bracket expression with '/' ends the regex in some awks and not in others.
+    "awk '$0 ~ /[/]/ { print 1 }' README.md",
+    "awk '$0 ~ /[[:alpha:]/]/ { print 1 }' README.md",
+    "awk '$0 ~ /[\\]/]/ { print 1 }' README.md",
+    # A comment that ends in a backslash may go on in some awks.
+    "awk 'BEGIN { x = 1 # note \\\n print \"x\" > \"pwned\" }'",
+]
+
+# These already passed before the first fix round: guards, not regressions.
+AWK_ALWAYS_REFUSED = [
+    'awk \'BEGIN { print "x" \\\n "y" > "pwned" }\'',
+    'awk \'BEGIN { print "x", \\\n "y" > "pwned" }\'',
+    "awk 'BEGIN { print \"x\" | \"cat > piped.txt\" }'",
+    "awk 'BEGIN { print \"x\" > \"/dev/stderr\" }'",
+]
+AWK_HIDDEN += AWK_ALWAYS_REFUSED
+
+AWK = "/usr/bin/awk"
+
+# Programs the macOS awk (one-true-awk) does NOT run as the hostile program: it reports a syntax error, or reads the
+# program differently from gawk or mawk. The decision "not vetted" protects against another implementation, so
+# nothing is asserted about the local effect of these. Every other entry of AWK_HIDDEN really creates a file here.
+AWK_OTHER_AWK = frozenset({
+    "awk '$0 ~ /[/]/ { print 1 }' README.md",
+    "awk '$0 ~ /[[:alpha:]/]/ { print 1 }' README.md",
+    "awk '$0 ~ /[\\]/]/ { print 1 }' README.md",
+    'awk \'BEGIN { x = 1fflush() }\'',
+    "awk '{ print 1ARGV[1] }' README.md",
+    'awk \'$0 ~ /"/ { system("touch pwned") } $0 ~ /"/\' README.md',
+    'awk \'BEGIN { 1print "x" > "pwned" }\'',
+    'awk \'BEGIN { 1printf "x" > "pwned" }\'',
+    'awk \'BEGIN { Getline x < "README.md" }\'',
+    'awk \'BEGIN { SYSTEM("touch pwned") }\'',
+    'awk \'BEGIN { System("touch pwned") }\'',
+    'awk \'BEGIN { do /"/; system("touch pwned"); while (0) }\'',
+    'awk \'BEGIN { for (k in /"/) print k; system("touch pwned"); x = /"/ }\'',
+    'awk \'BEGIN { if (1) /"/; getline l < "README.md"; if (1) /"/ }\'',
+    'awk \'BEGIN { print "x" > "/dev/stderr" }\'',
+    'awk \'BEGIN { print 1 ?\n\n 2 :\n 3 > "pwned" }\'',
+    'awk \'BEGIN { x = 0x1close("pwned") }\'',
+    'awk \'BEGIN { x = 0x1gsystem("touch pwned") }\'',
+    'awk \'BEGIN { x = 0x1system("touch pwned") }\'',
+    'awk \'BEGIN { x = 1ENVIRON["HOME"]; print x }\'',
+    'awk \'BEGIN { x = 1close("cat") }\'',
+    'awk \'BEGIN { x = 1getline line < "README.md"; print line }\'',
+    'awk \'BEGIN { x = delete /"1/ 1 "; system("touch pwned") # " \n}\'',
+    'awk \'BEGIN { x = do /"1/ 1 "; system("touch pwned") # " \n}\'',
+    'awk \'BEGIN { x = func /"1/ 1 "; system("touch pwned") # " \n}\'',
+    'awk \'BEGIN { x = in /"1/ 1 "; system("touch pwned") # " \n}\'',
+    'awk \'BEGIN { x = nextfile /"1/ 1 "; system("touch pwned") # " \n}\'',
+    'awk \'BEGIN { x = switch /"1/ 1 "; while (("cat README.md" | getline l) > 0) print l # " \n}\' README.md',
+    "awk '{ x = length /\"1/ 1 \"; system(\"touch pwned\") # \" \\n}' README.md",
+})
+
+# A1: a '/' after '++' or '--' is division in gawk and a regex in mawk (its scanner sends a '/' that follows an
+# increment or decrement token to the regex collector). Under mawk each of these runs the code the vetter would
+# read as a string. macOS awk reports a syntax error and gawk divides, so only the decision is asserted.
+MAWK_SLASH = [
+    'awk \'BEGIN { c = "touch pwned"; x++ /"a/ ; system(c) ; x++ /"a/ }\'',
+    "awk '{ f = \"pwned\"; n-- /\"a/ ; print $0 > f ; n-- /\"a/ }' README.md",
+    'awk \'BEGIN { c = "touch pwned"; x++ /="a/ ; system(c) ; x++ /="a/ }\'',
+    # Postfix on every kind of operand.
+    'awk \'BEGIN { c = "touch pwned"; x-- /"a/ ; system(c) ; x-- /"a/ }\'',
+    'awk \'BEGIN { c = "touch pwned"; x-- /="a/ ; system(c) ; x-- /="a/ }\'',
+    'awk \'{ c = "touch pwned"; $1++ /"a/ ; system(c) ; $1++ /"a/ }\' README.md',
+    'awk \'{ c = "touch pwned"; $NF-- /"a/ ; system(c) ; $NF-- /"a/ }\' README.md',
+    'awk \'BEGIN { c = "touch pwned"; a[1]++ /"a/ ; system(c) ; a[1]++ /"a/ }\'',
+    'awk \'BEGIN { c = "touch pwned"; a["k"]-- /"a/ ; system(c) ; a["k"]-- /"a/ }\'',
+    'awk \'BEGIN { c = "touch pwned"; x++\t/"a/ ; system(c) ; x++\t/"a/ }\'',
+    'awk \'BEGIN { c = "touch pwned"; x++/"a/ ; system(c) ; x++/"a/ }\'',
+    'awk \'BEGIN { c = "touch pwned"; (x)++ /"a/ ; system(c) ; (x)++ /"a/ }\'',
+    'awk \'BEGIN { c = "touch pwned"; x = y++ /"a/ ; system(c) ; x = y++ /"a/ }\'',
+    'awk \'BEGIN { c = "touch pwned"; print x++ /"a/ ; system(c) ; print x++ /"a/ }\'',
+    "awk '{ x++ / 2 }' README.md",
+    "awk '{ print x++ / 2 }' README.md",
+    "awk '{ print n-- / 2 }' README.md",
+]
+
+# A1 audit: every other token after which gawk, mawk and one-true-awk could disagree about '/'.
+AWK_SLASH_AMBIGUOUS = [
+    # A regex literal directly followed by '/': division in some scanners, a regex start in others.
+    'awk \'BEGIN { c = "touch pwned"; x = /a/ /"b/ ; system(c) ; y = /a/ /"b/ }\'',
+    'awk \'{ c = "touch pwned"; if ($0 ~ /a/ /"b/ ) system(c) ; if ($0 ~ /a/ /"b/ ) x }\' README.md',
+    # '>' is a redirect after print and a comparison elsewhere.
+    'awk \'BEGIN { c = "touch pwned"; x = (1 > /"a/ ; system(c) ; y = (1 > /"a/) }\'',
+    'awk \'BEGIN { c = "touch pwned"; x = (1 >/"a/ ; system(c) ; y = (1 >/"a/) }\'',
+    # '[' and '$' take an expression, but the scanners differ on what a '/' after them is.
+    'awk \'BEGIN { c = "touch pwned"; a[/"x/ ; system(c) ; a[/"x/] = 1 }\'',
+    'awk \'{ c = "touch pwned"; x = $/"x/ ; system(c) ; y = $/"x/ }\' README.md',
+    # A '/' after a division operator.
+    'awk \'BEGIN { c = "touch pwned"; x = 4 / /"a/ ; system(c) ; y = 4 / /"a/ }\'',
+    # A name that is a keyword or a builtin function in some awk and a plain variable in another.
+    'awk \'BEGIN { c = "touch pwned"; x = toupper /"a/ ; system(c) ; y = toupper /"a/ }\'',
+    'awk \'BEGIN { c = "touch pwned"; x = tolower /"a/ ; system(c) ; y = tolower /"a/ }\'',
+    'awk \'BEGIN { c = "touch pwned"; x = substr /"a/ ; system(c) ; y = substr /"a/ }\'',
+    'awk \'BEGIN { c = "touch pwned"; x = sprintf /"a/ ; system(c) ; y = sprintf /"a/ }\'',
+    'awk \'BEGIN { c = "touch pwned"; x = index /"a/ ; system(c) ; y = index /"a/ }\'',
+    'awk \'BEGIN { c = "touch pwned"; x = split /"a/ ; system(c) ; y = split /"a/ }\'',
+    'awk \'BEGIN { c = "touch pwned"; x = match /"a/ ; system(c) ; y = match /"a/ }\'',
+    'awk \'BEGIN { c = "touch pwned"; x = int /"a/ ; system(c) ; y = int /"a/ }\'',
+    'awk \'BEGIN { c = "touch pwned"; x = exp /"a/ ; system(c) ; y = exp /"a/ }\'',
+    'awk \'BEGIN { c = "touch pwned"; x = srand /"a/ ; system(c) ; y = srand /"a/ }\'',
+    'awk \'BEGIN { c = "touch pwned"; x = and /"a/ ; system(c) ; y = and /"a/ }\'',
+    'awk \'BEGIN { c = "touch pwned"; x = strftime /"a/ ; system(c) ; y = strftime /"a/ }\'',
+    'awk \'BEGIN { c = "touch pwned"; x = systime /"a/ ; system(c) ; y = systime /"a/ }\'',
+    'awk \'BEGIN { c = "touch pwned"; x = gensub /"a/ ; system(c) ; y = gensub /"a/ }\'',
+    'awk \'BEGIN { c = "touch pwned"; x = BEGIN /"a/ ; system(c) ; y = BEGIN /"a/ }\'',
+    'awk \'BEGIN { c = "touch pwned"; x = END /"a/ ; system(c) ; y = END /"a/ }\'',
+    'awk \'BEGIN { c = "touch pwned"; x = exit /"a/ ; system(c) ; y = exit /"a/ }\'',
+    'awk \'BEGIN { c = "touch pwned"; x = next /"a/ ; system(c) ; y = next /"a/ }\'',
+    'awk \'BEGIN { c = "touch pwned"; x = break /"a/ ; system(c) ; y = break /"a/ }\'',
+    'awk \'BEGIN { c = "touch pwned"; x = continue /"a/ ; system(c) ; y = continue /"a/ }\'',
+]
+
+
+def effects_of(text, folder):
+    """The files the raw awk command text creates when it runs for real with /usr/bin/awk in folder."""
+    (folder / "README.md").write_text("hello world\nsecond line\n")
+    before = set(os.listdir(folder))
+    words = shlex.split(text)
+    assert words[0] == "awk"
+    subprocess.run([AWK, *words[1:]], cwd=folder, stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+    return sorted(set(os.listdir(folder)) - before)
+
+
+def awk_cases(texts, implementation):
+    return [pytest.param(text, id=f"{implementation}:{index}:{text[:40]!r}") for index, text in enumerate(texts)]
+
+
+HIDDEN_CASES = [
+    *awk_cases([text for text in AWK_HIDDEN if text not in AWK_OTHER_AWK], "macos-awk"),
+    *awk_cases([text for text in AWK_HIDDEN if text in AWK_OTHER_AWK], "gawk-or-mawk"),
+    *awk_cases(MAWK_SLASH, "mawk"),
+    *awk_cases(AWK_SLASH_AMBIGUOUS, "mawk-gawk-or-onetrue"),
+]
+
+
+@pytest.mark.parametrize("text", HIDDEN_CASES)
+def test_awk_that_could_hide_a_write_or_a_program_is_not_vetted(world, text):
+    plan, reason = plan_of(world, text)
+    assert plan is None, text
+    assert reason, text
+
+
+@pytest.mark.skipif(not os.path.exists(AWK), reason="/usr/bin/awk is required")
+@pytest.mark.parametrize("text", awk_cases([text for text in AWK_HIDDEN if text not in AWK_OTHER_AWK], "macos-awk"))
+def test_the_refused_awk_really_creates_a_file_with_the_local_awk(tmp_path, text):
+    # Independent of the decision: the raw command, run in a scratch folder, does what the case documents.
+    assert effects_of(text, tmp_path), (text, "created no file here: move it to AWK_OTHER_AWK")
+
+
+def test_the_awk_cases_that_run_elsewhere_are_known_ones():
+    assert AWK_OTHER_AWK <= set(AWK_HIDDEN)
+    assert len(MAWK_SLASH) >= 3 and len(AWK_SLASH_AMBIGUOUS) >= 15
+
+
+@pytest.mark.skipif(not os.path.exists(AWK), reason="/usr/bin/awk is required")
+def test_the_local_awk_does_not_run_the_mawk_slash_cases(tmp_path):
+    # One-true-awk reports a syntax error for '/' after '++': only mawk executes the hidden code.
+    assert effects_of(MAWK_SLASH[0], tmp_path) == []
+
+
+ORDINARY_AWK = [
+    "awk '{ print $1 }' README.md",
+    "awk -F, '$2 ~ /x/ { n++ } END { print n }' README.md",
+    "awk -F: '{ print $1 }' README.md",
+    "awk 'BEGIN { x = 1 }\n{ print $1 }\n{ print $2,\n $1 }\nEND { print NR }' README.md",
+    "awk '{ print $1 }\n{ if ($1 > 2) print 1 }' README.md",
+    # M2: '/' after ']' and after any ')' but a if/while/for header's divides.
+    "awk '{c[$1]++} END {for (k in c) print k, c[k]/NR}' README.md",
+    "awk '{print length($0)/2}' README.md",
+    "awk '{print ($1+$2)/2}' README.md",
+    "awk '{a[NR]=$1} END {print a[1]/a[2]}' README.md",
+    "awk 'BEGIN { printf \"%d\\n\", (3+4) / 2 }'",
+    "awk '{ print substr($0,1,1) / 2 }' README.md",
+    "awk 'BEGIN { a[1] = 4; print a[1]/2 }'",
+    "awk '{ print $1 /2/ 3 }' README.md",
+    "awk '{ s += $1 } END { print s / NR }' README.md",
+    "awk '$2 ~ /x/ { n++ } END { print n }' README.md",
+    "awk 'NR % 2 == 0' README.md",
+    "awk '{ if ($1 > 5) print $0 }' README.md",
+    "awk '{ for (i = 1; i <= NF; i++) n++ } END { print n/2 }' README.md",
+    "awk 'BEGIN { x = 0x1f; y = 1e3; z = .5; print x, y, z }'",
+    "awk '/start/,/end/' README.md",
+    "awk '!seen[$0]++' README.md",
+    "awk '{ if ($1 ~ /x/) print $1; else if ($2 ~ /y\\/z/) print $2 }' README.md",
+    "awk '/[0-9]+/ { n++ } /[^a-z]x/ { m++ } END { print n, m }' README.md",
+    "awk '{ if (NR > 1) /x/ }' README.md",
+    "awk '{ while (i < 3) /a/; i++ }' README.md",
+    "awk '# header\nBEGIN { n = 0 } # start\n\n# count\n{ n += NF }  # fields\nEND {\n  # total\n  print n\n}' README.md",
+    "awk '{ print $1,\n\n  $2 }' README.md",
+    "awk '{ print $1 &&\n\n  $2 }' README.md",
+    "awk 'BEGIN { print (1 > 2) }'",
+    # A1: '/' after a NAME, a number, a string, ']', ')' and a field divides in every awk, and a regex starts
+    # after the operators and separators in AWK_REGEX_AFTER_CHARS: all three awk implementations agree.
+    "awk '{ n++ } END { print n/2 }' README.md",
+    "awk '{ print $1/$2 }' README.md",
+    "awk '{ print NR/2, NF/3 }' README.md",
+    "awk '{ s += $1 } END { print s/NR }' README.md",
+    "awk '{ a[$1]++ } END { for (k in a) print k, a[k]/NR }' README.md",
+    "awk 'NR > 1 && $3 ~ /x/' README.md",
+    "awk '!/^#/' README.md",
+    "awk '/a/ || /b/' README.md",
+    "awk '{ if ($1 ~ /^[0-9]+$/) n++ } END { print n }' README.md",
+    "awk '$1 == \"x\" { print $2 / 2 }' README.md",
+    "awk '{ x = $1 * 2 / 3; print x }' README.md",
+    "awk '{ print ($1 > 5) ? \"big\" : \"small\" }' README.md",
+    "awk '/a/ { n++ } /b/ { m++ } END { print n, m }' README.md",
+    "awk '{ x = 6 / 3 / 2; print x }' README.md",
+    "awk '{ x = \"8\" / 2; print x }' README.md",
+    "awk '$1 != /x/ { print }' README.md",
+    "awk '{ x = (y < /a/) + (y <= /b/) + (y >= /c/); print x }' README.md",
+    "awk '{ x = $1 ? /a/ : /b/; print x }' README.md",
+    "awk '{ x = 1 + /a/ - /b/ * /c/ % /d/ ^ /e/; print x }' README.md",
+    "awk '{ print ++n / 2 }' README.md",
+    "awk '{ n++; print n / 2 }' README.md",
+    "awk '{ n++\n print n / 2 }' README.md",
+    "awk '{ n++ ; /x/ }' README.md",
+    "awk '{ n++ } /x/' README.md",
+    "awk '{ n += $1 / 2; m -= $2 / 3; k *= 2 / 1 }' README.md",
+    "awk 'BEGIN { x = 1; x /= 2; print x }'",
+]
+
+
+@pytest.mark.parametrize("text", ORDINARY_AWK)
+def test_ordinary_awk_programs_are_still_vetted(world, text):
+    plan, reason = plan_of(world, text)
+    assert plan is not None, reason
+
+
+def test_a_slash_right_after_an_increment_asks_and_a_slash_after_a_name_does_not(world):
+    assert plan_of(world, "awk '{ n++ } END { print n/2 }' README.md")[0] is not None
+    assert plan_of(world, "awk '{ print n++/2 }' README.md")[0] is None
+    assert plan_of(world, "awk '{ x++ / 2 }' README.md")[0] is None
+    assert plan_of(world, "awk '{ print ++n/2 }' README.md")[0] is not None  # '/' follows the name n
+
+
+def test_there_are_enough_ordinary_awk_programs():
+    assert len(ORDINARY_AWK) >= 30
+
+
+@pytest.mark.parametrize("text", awk_cases([*MAWK_SLASH, *AWK_SLASH_AMBIGUOUS], "slash"))
+def test_an_ambiguous_slash_is_why_the_program_is_not_vetted(world, text):
+    # Not refused because of some later word (system, a redirect): the '/' itself is where the lexer stops.
+    plan, reason = plan_of(world, text)
+    assert plan is None and "'/'" in reason, (text, reason)
+
+
+@pytest.fixture
+def credential_folders(world):
+    """Ordinary and nested folders under the names of the five credential folders, removed after the test."""
+    project = world[2]
+    made = [".aws", ".docker", ".kube", "sub", "link", ".ssh/keys.pub"]
+    for path in (".aws/cli/cache", ".docker", ".kube", "sub/.ssh", ".ssh/keys.pub", ".ssh/sub", ".aws/sso/cache"):
+        (project / path).mkdir(parents=True, exist_ok=True)
+    (project / ".aws/cli/cache/abc.json").write_text("{}\n")
+    (project / ".aws/sso/cache/def.json").write_text("{}\n")
+    (project / ".aws/plain.txt").write_text("x\n")
+    (project / ".docker/compose.yml").write_text("a: 1\n")
+    (project / ".kube/notes.txt").write_text("x\n")
+    (project / "sub/.ssh/known_hosts").write_text("x\n")
+    (project / ".ssh/keys.pub/deploy").write_text("x\n")
+    (project / "link").symlink_to(project / ".ssh")
+    yield project
+    for name in made:
+        target = project / name
+        if target.is_symlink():
+            target.unlink()
+        elif target.exists():
+            shutil.rmtree(target)
+
+
+@pytest.mark.parametrize("text", [
+    "grep -r PRIVATE-KEY-MATERIAL .ssh/",
+    "grep -r PRIVATE-KEY-MATERIAL .ssh",
+    "grep -r x .SSH/",
+    "grep -r x ./.ssh",
+    "rg x .ssh",
+    "find .ssh -type f",
+    "ls -R .ssh",
+    "cd .ssh && grep -r PRIVATE-KEY-MATERIAL",
+    "cd .ssh/ && ls",
+    "cd .SSH && ls",
+    "cat .ssh/deploy_key",
+    "cd .ssh && cat deploy_key",
+    # M3: a folder or a file deeper in a credential folder (token caches) asks, as 'cd' into it does.
+    "grep -r PRIVATE .aws/cli",
+    "cat .aws/cli/cache/abc.json",
+    "cat .aws/sso/cache/def.json",
+    "grep -r x .aws/sso",
+    "grep -r PRIVATE .ssh/keys.pub",
+    "cat .ssh/keys.pub/deploy",
+    "cat .ssh/sub/../keys.pub/deploy",
+    "ls .ssh/keys.pub",
+    "ls .aws/cli",
+    "head -1 .aws/cli/cache/abc.json",
+    "wc -l .aws/cli/cache/abc.json",
+    "cd .aws/cli && cat cache/abc.json",
+    "cd .aws/cli && ls",
+    # Recursion and contents in the five folders.
+    "ls -R .docker",
+    "ls -R .kube",
+    "ls --recursive .aws",
+    "grep -r x .kube",
+    "rg x .docker",
+    "find .docker -type f",
+    "find .aws",
+    "du .aws",
+    "du -a .aws",
+    "du -sa .aws",
+    "grep -r x link",
+    "ls -R link",
+    "cat link/deploy_key",
+    "cd .docker && ls",
+    "cd .kube/ && ls",
+    # L1: git -C into a credential folder, by name, by a nested name and by a link.
+    "git -C .ssh status",
+    "git -C .ssh ls-files",
+    "git -C sub/.ssh diff",
+    "git -C link status",
+    "git -C .AWS log",
+    "git -C .aws/cli status",
+])
+def test_a_credential_folder_is_not_searched_read_or_entered_without_a_card(world, credential_folders, text):
+    plan, reason = plan_of(world, text)
+    assert plan is None, text
+    assert "credential" in reason, (text, reason)
+
+
+@pytest.mark.parametrize("text", [
+    # L2: the names in the top level of a credential folder, as before the first fix round.
+    "ls -la .docker",
+    "ls .kube",
+    "du -sh .aws",
+    "du -s .aws",
+    "ls -ld .ssh",
+    "ls -l .ssh",
+    "ls .ssh/",
+    "ls .AWS",
+    "ls -la sub/.ssh",
+    # A file directly in a credential folder that the credential rules leave alone.
+    "cat .docker/compose.yml",
+    "cat .aws/plain.txt",
+    "cat .kube/notes.txt",
+    "cat sub/.ssh/known_hosts",
+    "cat .ssh/known_hosts",
+    "ls .ssh/known_hosts",
+    "grep -r TODO .",
+    "grep -r TODO src/",
+    "cd src && grep -r TODO",
+    "find . -name '*.py'",
+])
+def test_names_and_ordinary_files_of_a_credential_folder_are_still_vetted(world, credential_folders, text):
+    plan, reason = plan_of(world, text)
+    assert plan is not None, (text, reason)
+
+
+@pytest.mark.parametrize("text", ["ls -la .docker", "cat README.md", "grep -r hello src", "cd src && ls",
+                                  "ls .ssh", "cat .docker/compose.yml"])
+def test_a_project_below_a_folder_with_a_credential_name_is_still_vetted(tmp_path, text):
+    # Only the parts of a path below the project count: ~/.docker/work/project is an ordinary project.
+    parent = tmp_path / ".docker" / "work"
+    parent.mkdir(parents=True)
+    project, _ = build_project(parent)
+    (project / ".docker").mkdir()
+    (project / ".docker" / "compose.yml").write_text("a: 1\n")
+    settings = Settings(parent / "state")
+    settings.values.update(workspace=str(project), env_file="")
+    store = Store(settings.state_dir / "vet.sqlite3")
+    try:
+        manager = AgentManager(store, settings)
+        session = store.create(settings.values)
+        session["allowed_directories"] = []
+        tools = manager.session_tools(session)
+        plan, reason = manager.vet_command(tools, {"command": text}, None)
+        assert plan is not None, (text, reason)
+        plan, reason = manager.vet_command(tools, {"command": "grep -r x .ssh"}, None)
+        assert plan is None and "credential" in reason
+        plan, reason = manager.vet_command(tools, {"command": "git -C .ssh status"}, None)
+        assert plan is None
+    finally:
+        store.db.close()
+
+
+def test_a_credential_folder_is_not_a_working_folder(world):
+    assert plan_of(world, "grep -r x", cwd=".ssh")[0] is None
+    assert plan_of(world, "ls", cwd=".ssh/")[0] is None
+
+
+# These also passed before the first fix round; they stay as guards.
+
+
+def test_a_recursive_search_from_the_project_never_prints_a_private_key_still(world):
+    plan, _ = plan_of(world, "grep -r PRIVATE-KEY-MATERIAL .")
+    done = subprocess.run(list(plan.stages[0].run), cwd=plan.stages[0].cwd, capture_output=True, text=True,
+                          stdin=subprocess.DEVNULL, timeout=20)
+    assert "PRIVATE-KEY-MATERIAL" not in done.stdout
 
 
 def test_paths_count_from_the_cwd_and_granted_folders_are_approved(world):
@@ -617,3 +1091,170 @@ async def test_a_waiting_card_resolved_by_auto_runs_the_script(runtime):
     result = json.loads(await asyncio.wait_for(task, 10))
     assert result["output"].strip() == "12"
     assert event_of(session, "switch")["approved_by_mode"] == "auto"
+
+
+# A2: tracked files inside credential folders at any depth never print through a vetted Git command -----------------
+
+KEY_FILES = {"sub/.ssh/deploy_key": "KEYMARK-sub-ssh", ".aws/cli/cache/abc.json": "KEYMARK-aws-cache",
+             ".ssh/keys.pub/deploy": "KEYMARK-ssh-pub-folder"}
+
+
+def repository_with_keys(project):
+    """The runtime project plus a second commit that tracks the key files, then a change to every one of them
+    and to src/app.py: any content of a key file in a diff is then a leak."""
+    def commit(message):
+        subprocess.run(["git", "add", "-f", "-A", "sub", ".aws", ".ssh/keys.pub", ".docker", "src"], cwd=project,
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", message],
+                       cwd=project, check=True, capture_output=True)
+    files = {**{path: f"{marker}-base\n" for path, marker in KEY_FILES.items()}, ".docker/compose.yml": "a: 1\n",
+             "src/app.py": "APPBASE = 1\n"}
+    for path, text in files.items():
+        (project / path).parent.mkdir(parents=True, exist_ok=True)
+        (project / path).write_text(text)
+    commit("track keys")
+    for path, marker in KEY_FILES.items():
+        (project / path).write_text(f"{marker}-changed\n")
+    (project / ".docker/compose.yml").write_text("a: 2\n")
+    (project / "src/app.py").write_text("APPCHANGE = 2\n")
+    commit("change keys")  # So that HEAD, HEAD~1 and the working tree all differ in the key files.
+    for path, marker in KEY_FILES.items():
+        (project / path).write_text(f"{marker}-working\n")
+    (project / "src/app.py").write_text("APPCHANGE = 3\n")
+
+
+# (command, whether src/app.py shows in its output)
+GIT_VIEWS = [
+    ("git diff", True), ("git diff HEAD", True), ("git show", True), ("git show HEAD", True),
+    ("git diff HEAD~1", True), ("git diff -- sub", False), ("git diff -- .", True), ("git diff -- '*.json'", False),
+    ("git -C sub diff", False), ("cd sub && git diff", False), ("git diff -w", True), ("git diff -U0", True),
+    ("git diff --stat", True), ("git diff --cached", False), ("git show --stat", True), ("git show -p HEAD~1", True),
+    ("git diff HEAD HEAD~1", True), ("git diff HEAD~1..HEAD", True), ("git diff HEAD~1...", True),
+    ("git status -v", True), ("git diff -- .aws", False), ("git diff -- .ssh", False), ("git diff -- sub/.ssh", False),
+    ("git diff -- .aws/cli", False), ("git diff -- ./.aws/cli/cache/abc.json", False),
+    ("git diff --relative=sub", False), ("git diff HEAD~1 -- sub .aws", False),
+]
+LEAK_COMMANDS = [
+    "git log -p", "git log -p -- sub", "git log --patch", "git show HEAD:sub/.ssh/deploy_key", "git show HEAD:.ssh/keys.pub/deploy",
+    "git show :sub/.ssh/deploy_key", "git grep KEYMARK", "git grep -n KEYMARK HEAD", "git stash show -p", "git stash show -p stash@{0}",
+    "git cat-file -p HEAD:sub/.ssh/deploy_key", "git cat-file blob HEAD:sub/.ssh/deploy_key", "git blame sub/.ssh/deploy_key",
+    "git format-patch -1 --stdout", "git range-diff HEAD~1 HEAD", "git diff --no-index sub/.ssh/deploy_key README.md",
+    "git ls-tree -r HEAD", "git archive HEAD", "git diff-tree -p HEAD", "git show-ref", "git reflog -p",
+    "git whatchanged -p", "git diff -- ..", "git -C sub diff -- ..", "cd sub && git diff -- ..", "cd sub && git diff -- ../.aws",
+    "git -C sub show -- ..", "git log --stat -p", "git diff -c HEAD", "git diff --cc",
+]
+
+
+def vetted(manager, tools, command):
+    plan, reason = manager.vet_command(tools, {"command": command}, None)
+    return plan, reason
+
+
+async def output_of(manager, session, tools, command, call_id):
+    """What the command printed when it ran (or the error text when running it failed)."""
+    try:
+        return json.loads(await run(manager, session, tools, command, call_id))["output"]
+    except (ValueError, KeyError, TypeError) as exc:
+        return f"error: {exc}"
+
+
+@needs_git
+@pytest.mark.parametrize("command, shows_app", GIT_VIEWS)
+async def test_a_vetted_git_view_never_prints_a_key_file_in_a_credential_folder(runtime, command, shows_app):
+    manager, session, project, tools = runtime
+    session["permission_mode"] = "plan"  # What is not vetted is refused at once, nothing waits for a card.
+    repository_with_keys(project)
+    plan, reason = vetted(manager, tools, command)
+    if plan is None:
+        return  # Asking is always safe.
+    output = await output_of(manager, session, tools, command, "view")
+    assert "KEYMARK" not in output, (command, output)
+    if shows_app:
+        assert "app.py" in output, (command, output)
+
+
+@needs_git
+@pytest.mark.parametrize("command", [
+    "git diff", "git diff HEAD", "git show", "git show HEAD", "git diff HEAD~1", "git diff -- .", "git diff -w", "git diff -U0",
+    "git -C sub diff", "cd sub && git diff", "git diff -- sub",
+])
+def test_the_git_views_of_a_project_are_vetted_not_just_asked(runtime, command):
+    manager, session, project, tools = runtime
+    repository_with_keys(project)
+    assert vetted(manager, tools, command)[0] is not None, command
+
+
+@needs_git
+@pytest.mark.parametrize("command", LEAK_COMMANDS)
+async def test_git_commands_that_could_print_a_key_file_are_not_vetted_or_print_none(runtime, command):
+    manager, session, project, tools = runtime
+    session["permission_mode"] = "plan"
+    repository_with_keys(project)
+    plan, reason = vetted(manager, tools, command)
+    if plan is None:
+        assert reason, command
+        return
+    output = await output_of(manager, session, tools, command, "leak")
+    assert "KEYMARK" not in output, (command, output)
+
+
+@needs_git
+@pytest.mark.parametrize("revisions", ["{blob}", "{blob} {old}", "{old} {blob}", "{blob_short}", "HEAD {blob}", "{old}..{blob}",
+                                       "{blob}^{{blob}}", "{tag}"])
+@pytest.mark.parametrize("command", ["git show", "git diff", "git show --stat", "git diff --stat"])
+async def test_a_blob_named_by_its_hash_never_prints_through_git_show_or_diff(runtime, command, revisions):
+    manager, session, project, tools = runtime
+    session["permission_mode"] = "plan"
+    repository_with_keys(project)
+    blob = subprocess.run(["git", "rev-parse", "HEAD:sub/.ssh/deploy_key"], cwd=project, check=True,
+                          capture_output=True, text=True).stdout.strip()
+    old = subprocess.run(["git", "rev-parse", "HEAD~1:sub/.ssh/deploy_key"], cwd=project, check=True,
+                         capture_output=True, text=True).stdout.strip()
+    subprocess.run(["git", "tag", "blobtag", blob], cwd=project, check=True, capture_output=True)
+    text = f"{command} " + revisions.format(blob=blob, old=old, blob_short=blob[:10], tag="blobtag")
+    plan, reason = vetted(manager, tools, text)
+    if plan is None:
+        return
+    output = await output_of(manager, session, tools, text, "blob")
+    assert "KEYMARK" not in output, (text, output)
+
+
+@needs_git
+def test_git_pathspecs_cannot_climb_out_of_the_folder_the_excludes_are_written_for(runtime):
+    manager, session, project, tools = runtime
+    repository_with_keys(project)
+    for command in ("cd sub && git diff -- ..", "git -C sub diff -- ../.aws", "git diff -- sub/..", "git diff -- ./../x"):
+        plan, reason = vetted(manager, tools, command)
+        assert plan is None and ".." in reason, (command, reason)
+    assert vetted(manager, tools, "git diff -- src/.")[0] is not None
+
+
+@needs_git
+@pytest.mark.parametrize("command", [
+    # A3: recursion and working-folder changes inside a credential-named folder always ask, even for .docker.
+    "cd .docker && ls", "cd .docker/ && ls", "grep -r a .docker", "grep -r a .docker/", "rg a .docker",
+    "find .docker -type f", "find .docker", "ls -R .docker", "ls --recursive .docker", "du -a .docker",
+    "git -C .docker status", "git -C .docker log", "cd .docker && git status",
+    "cd .aws && ls", "grep -r a .kube", "ls -R .kube", "git -C .kube status",
+])
+def test_a_command_that_goes_into_a_credential_named_folder_asks(world, credential_folders, command):
+    # The rule: recursion (grep -r, find, ls -R, du -a) and a change of working folder (cd, git -C) inside a
+    # folder named .ssh, .gnupg, .aws, .kube or .docker always ask. That also costs the harmless top-level .docker.
+    assert plan_of(world, command)[0] is None, command
+
+
+@needs_git
+@pytest.mark.parametrize("command", [
+    # A3, the other side of the same rule: a file named directly inside .aws, .kube or .docker follows the name
+    # rules (the credential names are refused, ordinary names are read), as it did before the first fix round.
+    "cat .docker/compose.yml", "cat .aws/plain.txt", "cat .kube/notes.txt", "head -1 .docker/compose.yml",
+    "wc -l .docker/compose.yml", "ls .docker", "ls -la .docker", "ls .docker/compose.yml",
+])
+def test_an_ordinary_file_directly_in_a_credential_named_folder_is_still_read_unasked(world, credential_folders, command):
+    assert plan_of(world, command)[0] is not None, command
+
+
+@pytest.mark.parametrize("command", ["cat .docker/config.json", "cat .aws/credentials", "cat .aws/config",
+                                     "cat .kube/config", "cat .DOCKER/CONFIG.JSON"])
+def test_the_credential_names_directly_in_a_credential_named_folder_still_ask(world, credential_folders, command):
+    assert plan_of(world, command)[0] is None, command

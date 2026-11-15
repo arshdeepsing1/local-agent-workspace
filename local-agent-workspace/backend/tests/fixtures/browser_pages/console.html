@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Console</title></head>
+<body>
+<h1>Console</h1>
+<p>This page logs, throws and asks for a file that is missing.</p>
+<img src="/missing.png" alt="missing picture">
+<script>
+console.log('hello log');
+console.error('oops error');
+setTimeout(() => { throw new Error('boom'); }, 20);
+fetch('/missing.json');
+</script>
+</body></html>

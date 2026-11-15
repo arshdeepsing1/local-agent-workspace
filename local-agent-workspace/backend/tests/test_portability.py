@@ -419,7 +419,7 @@ def test_reused_call_ids_in_separate_completed_exchanges_get_distinct_copy_ids(r
     assert second == copies[0]["wire"][8]["tool_call_id"]
 
 
-async def test_child_limit_and_disconnected_bundles_are_rejected_atomically(runtime):
+async def test_disconnected_bundles_are_rejected_atomically_and_extra_children_are_left_out(runtime):
     app, manager, source, destination = runtime
     children = []
     for _ in range(32):
@@ -428,8 +428,11 @@ async def test_child_limit_and_disconnected_bundles_are_rejected_atomically(runt
         manager.store.save(child)
         children.append(child)
     async with await client_for(app) as client:
+        # More conversations than a bundle holds no longer fail the export: the parent comes with the 31 newest
+        # children and the response counts the one left out (test_workflow_unit.py has the full cases).
         response = await client.get(f"/api/sessions/{source['id']}/export?include_children=true")
-        assert response.status_code == 400
+        assert response.status_code == 200 and len(response.json()["sessions"]) == 32
+        assert response.headers["X-Children-Omitted"] == "1"
         bundle = export_bundle([source, *children[:31]], source["id"])
         bundle["sessions"].append(copy.deepcopy(children[-1]))
         assert (await client.post("/api/sessions/import", params={"workspace": str(destination)}, json=bundle)).status_code == 400
@@ -576,3 +579,57 @@ async def test_the_app_record_and_reported_input_are_not_exported_and_large_summ
     source["context_state"]["summary"] = "\u00e9" * 16_001  # 16,001 characters, 32,002 UTF-8 bytes.
     with pytest.raises(ValueError, match="exceeds the 32,000-byte limit"):
         export_bundle([source], source["id"])
+
+
+async def test_an_export_leaves_out_the_page_only_details_of_a_batch_but_an_import_stays_strict(runtime):
+    """A card of a parallel batch also records who started it and how it was approved (and a waiting one its batch
+    approval): none of that is in the bundle, so a bundle stays valid for an older version, and the source keeps it."""
+    app, manager, source, destination = runtime
+    batch = {"id": "0123456789ab", "index": 0, "size": 2}
+    source["events"][1].update(name="delegate_task", input={"task": "Build"}, delegation_batch={**batch, "origin": "user", "approval": "batch"},
+                               batch_approval={"id": batch["id"], "size": 2, "event_ids": ["t1"], "review": False})
+    manager.store.save(source)
+    bundle = export_bundle([source], source["id"])
+    assert bundle["sessions"][0]["events"][1]["delegation_batch"] == batch
+    assert "batch_approval" not in bundle["sessions"][0]["events"][1]
+    assert source["events"][1]["delegation_batch"]["approval"] == "batch"
+    changed = copy.deepcopy(bundle)
+    changed["sessions"][0]["events"][1]["delegation_batch"]["origin"] = "user"
+    with pytest.raises(ValueError, match="schema"):
+        parse_bundle(json.dumps(changed).encode())
+
+
+def test_a_trim_mark_and_a_pass_notice_stay_out_of_the_bundle_and_the_wire_is_exported_as_it_is(runtime):
+    app, manager, source, destination = runtime
+    event = next(item for item in source["events"] if item["id"] == "t1")
+    event["context_trim"] = {"mode": "dropped", "by": "auto", "at": 1.0, "freed_tokens": 40,
+                             "content": "[Cleared by the app to save context: the read_file result for README.md.]"}
+    source["events"].append({"id": "n1", "type": "notice", "text": "Shortened 1 old tool result to save context.",
+                             "trim_pass": True})
+    bundle = export_bundle([source], source["id"])
+    text = json.dumps(bundle)
+    assert "context_trim" not in text and "trim_pass" not in text and "Cleared by the app" not in text
+    exported = bundle["sessions"][0]
+    assert exported["wire"][2]["content"] == "Historical result"  # The wire was never changed by the mark.
+    assert json.dumps(exported["wire"], sort_keys=True) == json.dumps(source["wire"], sort_keys=True)
+    assert parse_bundle(json.dumps(bundle).encode())["sessions"][0]["events"][1]["output"] == "Historical result"
+
+
+def test_an_import_counts_its_meter_from_its_own_wire(runtime, tmp_path):
+    app, manager, source, destination = runtime
+    parts = {"system_instructions": 900, "tool_definitions": 4_000, "messages_and_results": 10, "summary": 0,
+             "request_overhead": 50}
+    source["context_info"] = {"estimated_tokens": sum(parts.values()), "input_budget": 20_000, "context_window": 32_768,
+                              "reply_reserve": 4_096, "compactions": 0, "summarized_messages": 0,
+                              "estimate_method": "weighted_utf8", "breakdown": parts, "auto_compact_threshold": 18_000,
+                              "percent_used": 99, "used_tokens": 32_000, "last_request": {"input_tokens": 32_000},
+                              "largest_items": [{"label": "stale"}], "trimmed": {"events": 3, "tokens": 900}}
+    source["wire"][2]["content"] = "r" * 30_000
+    source["context_state"] = {"summary": "", "through": 0, "compactions": 0}
+    bundle = export_bundle([source], source["id"])
+    [copy_], _ = fresh_copies(bundle, str(destination))
+    info = copy_["context_info"]
+    assert info["trimmed"] == {"events": 0, "tokens": 0} and "last_request" not in info and "largest_items" not in info
+    assert info["breakdown"]["messages_and_results"] > 9_000 and info["breakdown"]["tool_definitions"] == 4_000
+    assert info["estimated_tokens"] == sum(info["breakdown"].values()) and info["is_estimate"] is True
+    assert info["used_tokens"] == info["estimated_tokens"] and info["percent_used"] == round(100 * info["used_tokens"] / 32_768)

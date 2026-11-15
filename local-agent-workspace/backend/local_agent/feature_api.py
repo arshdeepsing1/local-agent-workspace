@@ -19,6 +19,19 @@ class RestoreRequest(BaseModel):
     expected_current_hash: str = Field(min_length=1, max_length=128)
 
 
+class TrimRequest(BaseModel):
+    """The usage card's Shorten and Drop: one tool result of the live context (context.TRIM_MODES)."""
+    model_config = ConfigDict(extra="forbid")
+    event_id: str = Field(min_length=1, max_length=512, strict=True)
+    mode: Literal["shortened", "dropped"]
+
+
+class CompactionChoice(BaseModel):
+    """The answer to the card shown before an automatic compaction (agents.AgentManager.ask_compaction)."""
+    model_config = ConfigDict(extra="forbid")
+    choice: Literal["compact_now", "continue"]
+
+
 class ChangeTarget(BaseModel):
     path: str = Field(min_length=1, max_length=4096)
     current_hash: str | None = Field(default=None, max_length=128)
@@ -72,6 +85,42 @@ def register_features(app, manager, settings, store, session_or_404, workspace_t
         if not record:
             raise HTTPException(404, "Managed worktree not found in this workspace.")
         return record
+
+    def trim_failed(call):
+        try:
+            return call()
+        except KeyError as exc:
+            raise HTTPException(404, str(exc.args[0])) from None
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+
+    # The usage card's Largest items: take one old tool result out of what the next request sends. The event and the
+    # saved conversation keep the full result; the mark is the one an automatic pass writes (by "user").
+    @app.post("/api/sessions/{session_id}/context/trim")
+    async def trim_context_item(session_id: str, body: TrimRequest):
+        """Shorten or drop one old tool result in what the next request sends (the event keeps the full result).
+        Never the results trim_choice refuses (422): the user's answers and decisions, task and skill state, grants,
+        subagent reports (a background one may only be shortened). Returns {context_info, cache_cost_tokens}."""
+        session = session_or_404(session_id)
+        idle(session, "trimming context")
+        trim_failed(lambda: manager.trim_choice(session, body.event_id, body.mode))
+        return await manager.user_trim(session, body.event_id, body.mode)
+
+    @app.get("/api/sessions/{session_id}/context/trim-preview")
+    async def preview_context_trim(session_id: str, event_id: str, mode: Literal["shortened", "dropped"]):
+        """What a trim would free and cost, changing nothing: {freed_tokens, cache_cost_tokens}. cache_cost_tokens is
+        a lower bound: the tokens from the trimmed result on (its new notice and everything after it) that the
+        provider must read again uncached; its cached prefix may break earlier, so the real cost can be higher.
+        422: the result is one the app never trims, is already dropped or sits in the latest three turns."""
+        session = session_or_404(session_id)
+        return trim_failed(lambda: manager.trim_preview(session, event_id, mode))
+
+    # The card before an automatic compaction: Compact now or Continue without compacting (FR-028).
+    @app.post("/api/sessions/{session_id}/compaction-choice")
+    async def answer_compaction_choice(session_id: str, body: CompactionChoice):
+        session_or_404(session_id)
+        manager.answer_compaction_choice(session_id, body.choice)  # ValueError (400): nothing waits for it.
+        return {"ok": True}
 
     @app.get("/api/checkpoints")
     async def checkpoints(session_id: str | None = None):

@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Echo</title></head>
+<body>
+<h1>Echo</h1>
+<p>You sent: {{ECHO}}</p>
+<script>
+const text = new URLSearchParams(location.search).get('text') || '';
+console.log('echo ' + text);
+fetch('/ping?t=' + encodeURIComponent(text));
+</script>
+</body></html>

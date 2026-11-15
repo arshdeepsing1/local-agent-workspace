@@ -1,4 +1,5 @@
-"""Bounds on tool results: a hard cap per result, and a context allowance per model response.
+"""Bounds on tool results: a hard cap per result, a context allowance per model response, and the clipping of
+results that are already in the history.
 
 One model response can ask for many tool calls, and the next request must carry all
 of their results next to the latest exchange (which compaction keeps verbatim). The
@@ -6,12 +7,13 @@ allowance (ResultAllowance) is what is left of the input budget for those result
 agents.execute_tool charges each result against it. A read that does not fit is not
 sent (the model is told to ask again in its next response); a result of an action that
 already ran (a command, an edit, an MCP call) is shortened instead, because its side
-effects happened. Nothing already in the history is ever shortened here.
+effects happened. Nothing already in the history is shortened by the allowance. The clipping helpers below
+shorten a result's text for the summarizer's private copy (clip_result) and for the live context's trim
+(trimmed_content), which replaces an old result with a notice and keeps the event's full result.
 """
 import json
 import math
-
-from .context import estimate_text_tokens
+import re
 
 TOOL_RESULT_HARD_LIMIT = 131_072  # Bytes of one tool result as the model and the card receive it.
 ALLOWANCE_MARGIN_TOKENS = 1_024  # The next step's notices and other small changes.
@@ -169,6 +171,153 @@ def shortened_hint(name):
     return COMMAND_SHORTENED_HINT if name == "run_command" else SHORTENED_HINT
 
 
+# --- Clipping the text of a result that is already in the history ------------------------------------------
+
+def head_bytes(text, size):
+    """The longest prefix of text within size UTF-8 bytes (whole characters only)."""
+    return _head(text, size)
+
+
+def tail_bytes(text, size):
+    """The longest suffix of text within size UTF-8 bytes (whole characters only)."""
+    return _tail(text, size)
+
+
+def byte_size(text):
+    return _bytes(text)
+
+
+def kilobytes(size):
+    return f"{size / 1024:,.1f} KB" if size < 10 * 1024 else f"{round(size / 1024):,} KB"
+
+
+OUTLINE_MAX_LINES = 80
+ELIDED_RESULT = ("[The app shortened this tool result before summarizing: {omitted:,} of {total:,} bytes omitted "
+                 "from the middle. Run the tool again if the details matter.]")
+OUTLINE_HEADING = "Definition lines kept by the app (line: text):"
+OUTLINE_LINE = re.compile(r"^\d+: \s*(async\s+def|def|class|function|export\s|interface\s|type\s+\w+\s*=|struct\s|"
+                          r"enum\s|impl\s|fn\s|func\s|public\s|private\s|protected\s|module\s|package\s|#{1,3}\s)")
+
+
+def outline_lines(content, head_text, tail_text, limit):
+    """Definition lines from the part of a read_file page that head_text and tail_text omit."""
+    numbers = lambda text: [int(found) for found in re.findall(r'(?:"|\\n)(\d+): ', text)]
+    before, after = max(numbers(head_text), default=0), min(numbers(tail_text), default=math.inf)
+    kept, size = [], 0
+    for line in content.split("\n"):
+        number = re.match(r"(\d+): ", line)
+        if not number or not before < int(number.group(1)) < after or not OUTLINE_LINE.match(line):
+            continue
+        if len(kept) == OUTLINE_MAX_LINES or size + byte_size(line) + 1 > limit:
+            break
+        kept.append(line)
+        size += byte_size(line) + 1
+    return kept
+
+
+def clip_result(text, limit, stats=None):
+    """A tool result (or other app text) the summarizer sees: whole when it fits in
+    limit bytes, else its head and tail around ELIDED_RESULT. A read_file page also
+    keeps the definition lines (class, def, ...) of its omitted middle."""
+    total = byte_size(text)
+    if total <= limit:
+        return text
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict) and isinstance(parsed.get("content"), str) and isinstance(parsed.get("path"), str):
+        head, tail = head_bytes(text, limit * 2 // 3), tail_bytes(text, limit // 6)
+        outline = outline_lines(parsed["content"], head, tail, limit // 4)
+        omitted = total - byte_size(head) - byte_size(tail)
+        clipped = (head + "\n" + (OUTLINE_HEADING + "\n" + "\n".join(outline) + "\n" if outline else "")
+                   + tail + "\n" + ELIDED_RESULT.format(omitted=omitted, total=total))
+    else:
+        head, tail = head_bytes(text, limit * 2 // 3), tail_bytes(text, limit // 3)
+        omitted = total - byte_size(head) - byte_size(tail)
+        clipped = head + "\n" + ELIDED_RESULT.format(omitted=omitted, total=total) + "\n" + tail
+    if stats is not None:
+        stats["elided_bytes"] += omitted
+        stats["shortened"] += 1
+    return clipped
+
+
+# --- Notices for results the live context no longer carries --------------------------------------------------
+
+TRIM_KEEP_BYTES = 1_500  # A shortened result keeps this much of its text (two thirds head, one third tail).
+TRIM_SMALL_BYTES = 4_096  # The automatic pass drops a result under this size instead of shortening it.
+TRIM_DROPPED = "[Cleared by the app to save context: the {what}, {size}. {how}]"
+TRIM_SHORTENED = ("[Shortened by the app to save context: the {what}, {omitted:,} of {total:,} bytes omitted from "
+                  "the middle. {how}]")
+TRIM_FILE = "Read the file again if you need it."
+TRIM_COMMAND = "Run the command again or use get_job_output if it was a job."
+TRIM_STORED = "Use get_tool_output with result_id {id} to read it again (results are kept for this app run only)."
+TRIM_SUBAGENT = "Call get_subagent_result with subagent_id {id} to read the report again."
+TRIM_SUBAGENTS = "Call get_subagent_result again to read the report."
+READ_TOOLS = ("read_file", "notebook_read")
+COMMAND_TOOLS = ("run_command", "get_job_output", "wait_job")
+# Results the app never trims, automatically or by hand: the user's own words and decisions, what the model must keep
+# to act (instructions, grants, tasks, a saved note) and a foreground subagent's report, which nothing lets the model
+# read again (get_subagent_result reads background subagents only).
+NEVER_TRIM_TOOLS = ("ask_user", "submit_plan", "submit_report", "remember", "create_task", "update_task", "list_tasks",
+                    "get_task", "use_skill", "list_skills", "access_directory", "delegate_task")
+# A background subagent's report can be read again with get_subagent_result: it may be shortened, never dropped.
+SHORTEN_ONLY_TOOLS = ("get_subagent_result",)
+# A result that starts so records the user's decision on the call (an edited approval).
+DECISION_MARKERS = ("[The user edited",)
+
+
+def trim_how(name, content):
+    """How the model gets a trimmed result's content again: the result store (a result_id in the result), a file
+    read again, a command run again; "" when the notice just says the result was cleared to save context."""
+    try:
+        parsed = json.loads(content)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict) and isinstance(parsed.get("result_id"), str) and parsed["result_id"]:
+        return TRIM_STORED.format(id=parsed["result_id"])
+    if name in SHORTEN_ONLY_TOOLS:
+        found = parsed.get("subagent_id") if isinstance(parsed, dict) else None
+        return TRIM_SUBAGENT.format(id=found) if isinstance(found, str) and found else TRIM_SUBAGENTS
+    if name in READ_TOOLS:
+        return TRIM_FILE
+    return TRIM_COMMAND if name in COMMAND_TOOLS else ""
+
+
+def locked_result(name, content):
+    """Whether a tool result is one the app never trims (NEVER_TRIM_TOOLS, or a result that records the user's
+    decision on the call)."""
+    return name in NEVER_TRIM_TOOLS or (isinstance(content, str) and content.startswith(DECISION_MARKERS))
+
+
+def trim_mode(name, content, mode, keep=TRIM_KEEP_BYTES):
+    """The mode a result is trimmed in when mode is asked for it: "dropped" when the text sent is the cleared notice
+    (asked for, or a shortened result too small to keep a head and tail of), else "shortened". None when the result
+    would have to be dropped and its tool only allows shortening (SHORTEN_ONLY_TOOLS)."""
+    kept = mode == "shortened" and min(keep, _bytes(content) // 2) >= 200
+    if not kept and name in SHORTEN_ONLY_TOOLS:
+        return None
+    return "shortened" if kept else "dropped"
+
+
+def trimmed_content(content, name, subject, mode, keep=TRIM_KEEP_BYTES):
+    """What the model receives in place of a tool result's content: mode "dropped" is a notice that names the
+    tool and its subject (a path, command or URL; redacted by the caller), the original size and how to get the
+    content again; "shortened" keeps a head and tail of content (keep bytes at most, half of a small result) around
+    that notice. The same arguments always give the same text, so every later request sends the same bytes."""
+    total = _bytes(content)
+    tool = name if isinstance(name, str) and name else "tool"
+    what = f"{tool} result" + (f" for {subject}" if subject else "")
+    how = trim_how(tool, content)
+    keep = min(keep, total // 2)
+    if mode != "shortened" or keep < 200:
+        return TRIM_DROPPED.format(what=what, size=kilobytes(total), how=how).replace(" ]", "]")
+    head, tail = _head(content, keep * 2 // 3), _tail(content, keep // 3)
+    omitted = total - _bytes(head) - _bytes(tail)
+    notice = TRIM_SHORTENED.format(what=what, omitted=omitted, total=total, how=how).replace(" ]", "]")
+    return head + "\n" + notice + "\n" + tail
+
+
 class ResultAllowance:
     """The input tokens one model response's tool results may still add (see the module docstring).
 
@@ -186,6 +335,7 @@ class ResultAllowance:
 
     def cost(self, text):
         """Estimated scaled tokens a result adds to the next request, with its message framing."""
+        from .context import estimate_text_tokens  # context imports this module for the clipping helpers below.
         return math.ceil((estimate_text_tokens(text) + RESULT_FRAMING_TOKENS) * self.scale)
 
     def _settle(self):

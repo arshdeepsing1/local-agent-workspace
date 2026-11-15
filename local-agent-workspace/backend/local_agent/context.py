@@ -7,12 +7,17 @@ When the provider reports input tokens, callers may pass an estimate scale
 derived from them (see estimate_scale) so the budget tracks real counts.
 """
 import hashlib
+import inspect
 import json
 import math
 import posixpath
 import re
 
 from . import request_limits
+# The clipping helpers live in result_budget (the live trim shares them); these names stay importable from here.
+from .result_budget import (ELIDED_RESULT, OUTLINE_HEADING, OUTLINE_LINE, OUTLINE_MAX_LINES,  # noqa: F401
+                            byte_size as _size, clip_result, head_bytes as _head_bytes, kilobytes,
+                            outline_lines as _outline, tail_bytes as _tail_bytes, trimmed_content)
 from .request_limits import encode_payload, image_bytes, request_bytes_over
 from .telemetry import repair_counted_cache
 
@@ -129,7 +134,6 @@ CLEAR_KEEP_TURNS = 3
 CLEAR_MIN_BYTES = 2_048
 # A failed command keeps the end of its output, where the error usually is (the summary quotes errors exactly).
 CLEARED_ERROR_TAIL_BYTES = 600
-OUTLINE_MAX_LINES = 80
 # A chunk's summary is passed on unchanged to the next chunk while it is at most
 # this fraction of the summary request's input budget; it is condensed once, at the end.
 CARRY_DIVISOR = 4
@@ -146,8 +150,6 @@ SECTION_TRIM_ORDER = ("Key facts and gotchas", "Work done in detail", "Commands 
                       "Files read and changed", "Errors, causes and fixes", "Decisions and reasons")
 SECTION_MIN_BYTES = 300
 SECTION_TRIM_MARKER = "\n[... shortened by the app to fit the summary limit ...]\n"
-ELIDED_RESULT = ("[The app shortened this tool result before summarizing: {omitted:,} of {total:,} bytes omitted "
-                 "from the middle. Run the tool again if the details matter.]")
 SUPERSEDED_READ = ("[The app omitted this {tool} result for {path} before summarizing ({total:,} bytes): the file "
                    "was read again with the same arguments or changed later in the conversation.]")
 ELIDED_ARGUMENT = ("[The app omitted {total:,} bytes of {field} before summarizing; the file on disk has the "
@@ -159,9 +161,6 @@ OMITTED_IMAGE = "[The app omitted an image the user attached to this message bef
 CLEARED_ERROR_TAIL = "\nThe failed command's output ended with:\n"
 FAILED_STATES = ("failed", "timed_out")
 UNPARSED_ARGUMENT_MARKER = " [truncated by the app]"
-OUTLINE_HEADING = "Definition lines kept by the app (line: text):"
-OUTLINE_LINE = re.compile(r"^\d+: \s*(async\s+def|def|class|function|export\s|interface\s|type\s+\w+\s*=|struct\s|"
-                          r"enum\s|impl\s|fn\s|func\s|public\s|private\s|protected\s|module\s|package\s|#{1,3}\s)")
 APP_PROMPT_LABELS = {
     OUTPUT_LIMIT_CONTINUATION: "[Automatic retry by the app after an output cutoff; not the user's words.]",
     INVALID_ARGUMENTS_CONTINUATION: "[Automatic retry by the app after invalid tool arguments; not the user's words.]",
@@ -552,13 +551,15 @@ def context_boundary(wire, index):
     return role == "user" or (role == "assistant" and turn_start(wire, index) is not None)
 
 
-def context_messages(wire, state):
+def context_messages(wire, state, notices=None):
+    """The messages of a request: the summary, the retained request and wire[through:], where a tool result that has
+    a notice (notices: {wire position: text}) is sent as its notice. The wire itself is never changed."""
     state = state or {}
     summary = state.get("summary", "")
     messages = ([{"role": "user", "content": SUMMARY_PREFIX + summary + render_app_record(state)
                   + handoff_pointer(state.get("handoff_files"))}] if summary else [])
     through = state.get("through", 0)
-    return messages + retained_request(wire, through) + wire[through:]
+    return messages + retained_request(wire, through) + sent_messages(wire[through:], notices, through)
 
 
 def compaction_threshold(input_budget, percent):
@@ -591,21 +592,6 @@ def elision_limit(summary_input_budget):
 
 # --- The summarizer's view of archived messages -------------------------------
 
-def _head_bytes(text, size):
-    """The longest prefix of text within size UTF-8 bytes (whole characters only)."""
-    return text.encode("utf-8")[:max(0, size)].decode("utf-8", errors="ignore")
-
-
-def _tail_bytes(text, size):
-    """The longest suffix of text within size UTF-8 bytes (whole characters only)."""
-    data = text.encode("utf-8")
-    return data[len(data) - max(0, min(size, len(data))):].decode("utf-8", errors="ignore")
-
-
-def _size(text):
-    return len(text.encode("utf-8"))
-
-
 def verify_declined_message(command, note):
     """The hidden message that hands the user's note on a declined Verify run to the model."""
     return VERIFY_DECLINED_START + command + VERIFY_DECLINED_NOTE + note + VERIFY_DECLINED_END
@@ -637,49 +623,6 @@ def _attachment_start(content):
 def _has_attachments(content):
     from .mentions import HEADER
     return ATTACHMENT_SEPARATOR + HEADER.split("{nonce}", 1)[0] in content
-
-
-def _outline(content, head_text, tail_text, limit):
-    """Definition lines from the part of a read_file page that head_text and tail_text omit."""
-    numbers = lambda text: [int(found) for found in re.findall(r'(?:"|\\n)(\d+): ', text)]
-    before, after = max(numbers(head_text), default=0), min(numbers(tail_text), default=math.inf)
-    kept, size = [], 0
-    for line in content.split("\n"):
-        number = re.match(r"(\d+): ", line)
-        if not number or not before < int(number.group(1)) < after or not OUTLINE_LINE.match(line):
-            continue
-        if len(kept) == OUTLINE_MAX_LINES or size + _size(line) + 1 > limit:
-            break
-        kept.append(line)
-        size += _size(line) + 1
-    return kept
-
-
-def clip_result(text, limit, stats=None):
-    """A tool result (or other app text) the summarizer sees: whole when it fits in
-    limit bytes, else its head and tail around ELIDED_RESULT. A read_file page also
-    keeps the definition lines (class, def, ...) of its omitted middle."""
-    total = _size(text)
-    if total <= limit:
-        return text
-    try:
-        parsed = json.loads(text)
-    except ValueError:
-        parsed = None
-    if isinstance(parsed, dict) and isinstance(parsed.get("content"), str) and isinstance(parsed.get("path"), str):
-        head, tail = _head_bytes(text, limit * 2 // 3), _tail_bytes(text, limit // 6)
-        outline = _outline(parsed["content"], head, tail, limit // 4)
-        omitted = total - _size(head) - _size(tail)
-        clipped = (head + "\n" + (OUTLINE_HEADING + "\n" + "\n".join(outline) + "\n" if outline else "")
-                   + tail + "\n" + ELIDED_RESULT.format(omitted=omitted, total=total))
-    else:
-        head, tail = _head_bytes(text, limit * 2 // 3), _tail_bytes(text, limit // 3)
-        omitted = total - _size(head) - _size(tail)
-        clipped = head + "\n" + ELIDED_RESULT.format(omitted=omitted, total=total) + "\n" + tail
-    if stats is not None:
-        stats["elided_bytes"] += omitted
-        stats["shortened"] += 1
-    return clipped
 
 
 def _parsed_arguments(call):
@@ -779,8 +722,7 @@ def _read_key(name, arguments):
     return name, _frozen(_normal_arguments(arguments))
 
 
-def _kb(size):
-    return f"{size / 1024:,.1f} KB" if size < 10 * 1024 else f"{round(size / 1024):,} KB"
+_kb = kilobytes
 
 
 def _cleared_result(content, name, arguments, handoff):
@@ -809,6 +751,39 @@ def _cleared_from(archived, keep_turns):
     return starts[-keep_turns] if len(starts) >= keep_turns else 0
 
 
+def _call_positions(messages, completed_calls):
+    """(owners, last_change, last_read) over messages: the (name, arguments) of the call each tool result answers by
+    the result's position (the matching id in the nearest preceding assistant message, so a reused id never mixes
+    two calls up), the last position of a completed change to each normalised path, and of each completed read by
+    its arguments. A read is superseded when either is later (linear, not a scan of the later calls on its path,
+    which many paged reads of one file make quadratic). Without completed_calls nothing is superseded. The
+    summarizer and the live trim share this rule."""
+    owners, calls, last_change, last_read = {}, {}, {}, {}
+    for position, message in enumerate(messages):
+        if isinstance(message, dict) and message.get("role") == "tool":
+            owners[position] = calls.get(message.get("tool_call_id"), (None, None))
+        elif isinstance(message, dict) and message.get("role") == "assistant" and isinstance(message.get("tool_calls"), list):
+            for call in message["tool_calls"]:
+                name, arguments, _ = _parsed_arguments(call)
+                call_id = call.get("id") if isinstance(call, dict) else None
+                calls[call_id] = (name, arguments)
+                if completed_calls is None or call_id not in completed_calls or not isinstance(arguments, dict):
+                    continue
+                for value in _changed_paths(name, arguments):
+                    last_change[posixpath.normpath(value)] = position
+                if name in _READS and isinstance(arguments.get("path"), str):
+                    last_read[_read_key(name, arguments)] = position
+    return owners, last_change, last_read
+
+
+def _is_superseded(name, arguments, content, position, completed_calls, last_change, last_read):
+    """Whether a read's result is replaced by a later read of the same arguments or a later change to its file."""
+    return (name in _READS and isinstance(arguments, dict) and completed_calls is not None
+            and isinstance(arguments.get("path"), str) and _size(content) >= SUPERSEDED_MIN_BYTES
+            and (last_change.get(posixpath.normpath(arguments["path"]), -1) > position
+                 or last_read.get(_read_key(name, arguments), -1) > position))
+
+
 def summary_transcript(archived, later, result_limit, completed_calls=None, keep_turns=None, handoff=False):
     """(text, stats): the JSON transcript of archived messages the summarizer reads.
 
@@ -827,28 +802,14 @@ def summary_transcript(archived, later, result_limit, completed_calls=None, keep
     if keep_turns is not None:
         stats.update(cleared=0, cleared_bytes=0)
         clear_before = _cleared_from(archived, keep_turns)
-    combined = [*archived, *later]
-    # The last position of a completed change to each normalised path, and of each completed
-    # read by its arguments: a read is superseded when either is later (linear, not a scan of
-    # the later calls on its path, which many paged reads of one file make quadratic).
-    calls, last_change, last_read = {}, {}, {}
-    for position, message in enumerate(combined):
-        if isinstance(message, dict) and message.get("role") == "assistant" and isinstance(message.get("tool_calls"), list):
-            for call in message["tool_calls"]:
-                name, arguments, _ = _parsed_arguments(call)
-                call_id = call.get("id") if isinstance(call, dict) else None
-                calls[call_id] = (name, arguments)
-                if completed_calls is None or call_id not in completed_calls or not isinstance(arguments, dict):
-                    continue
-                for value in _changed_paths(name, arguments):
-                    last_change[posixpath.normpath(value)] = position
-                if name in _READS and isinstance(arguments.get("path"), str):
-                    last_read[_read_key(name, arguments)] = position
+    owners, last_change, last_read = _call_positions([*archived, *later], completed_calls)
     transformed = []
     for position, message in enumerate(archived):
         if not isinstance(message, dict):
             transformed.append(message)
             continue
+        if TRIM_KEY in message:
+            message = {key: value for key, value in message.items() if key != TRIM_KEY}  # It reads the full result.
         role, content = message.get("role"), message.get("content")
         if is_app_prompt(message):
             note = verify_note(message)
@@ -875,11 +836,8 @@ def summary_transcript(archived, later, result_limit, completed_calls=None, keep
             if any(new is not old for new, old in zip(shortened, message["tool_calls"])):
                 message = {**message, "tool_calls": shortened}
         elif role == "tool" and isinstance(content, str):
-            name, arguments = calls.get(message.get("tool_call_id"), (None, None))
-            if (name in _READS and isinstance(arguments, dict) and completed_calls is not None
-                    and isinstance(arguments.get("path"), str) and _size(content) >= SUPERSEDED_MIN_BYTES
-                    and (last_change.get(posixpath.normpath(arguments["path"]), -1) > position
-                         or last_read.get(_read_key(name, arguments), -1) > position)):
+            name, arguments = owners.get(position, (None, None))
+            if _is_superseded(name, arguments, content, position, completed_calls, last_change, last_read):
                 message = {**message, "content": SUPERSEDED_READ.format(
                     tool=name, path=arguments.get("path"), total=_size(content))}
                 stats["superseded"] += 1
@@ -892,6 +850,268 @@ def summary_transcript(archived, later, result_limit, completed_calls=None, keep
                 message = {**message, "content": clip_result(content, result_limit, stats)}
         transformed.append(message)
     return json.dumps(transformed, ensure_ascii=False), stats
+
+
+# --- The live trim: old tool results leave the request, not the history ------------
+
+# A trimmed tool result is a mark on its tool event, event["context_trim"] = {"mode": "dropped" | "shortened", "by",
+# "at", "freed_tokens", "content": the notice that requests send instead}. The notice text is made once, when the
+# result is marked, so every later request sends the same bytes. The stored wire is never changed: a request is built
+# with a {wire position: notice} map (notices) that replaces those results, and the summarizer, export and the saved
+# file read the full result. A wire message is tied to its event by position (result_events), never by call id alone.
+TRIM_KEY = "context_trim"
+TRIM_SUBJECT_KEYS = ("command", "query", "pattern", "path", "url")
+TRIM_SUBJECT_CHARS = 160
+TRIM_MODES = ("shortened", "dropped")
+ITEM_LIMIT = 10
+# A pass runs only when it pays: it frees at least this share of the input budget, or brings the estimate to its target.
+TRIM_MIN_FREE_PERCENT = 10
+# After a pass, the next one waits until this many turns have ended since it (the latest CLEAR_KEEP_TURNS turns are
+# kept whole, so a pass any sooner would find little new and break the provider's prompt cache again).
+TRIM_MIN_TURNS_BETWEEN = CLEAR_KEEP_TURNS + 1
+
+
+def sent_message(message, notice=None):
+    """message as a request carries it: a tool result with a notice is replaced by the notice (the same object
+    otherwise)."""
+    if not isinstance(notice, str) or not isinstance(message, dict):
+        return message
+    return {**message, "content": notice}
+
+
+def sent_messages(messages, notices=None, offset=0):
+    """messages as a request carries them; messages[0] is wire position offset."""
+    if not notices:
+        return list(messages)
+    return [sent_message(message, notices.get(position)) for position, message in enumerate(messages, offset)]
+
+
+def result_events(wire, events):
+    """{wire position: tool event} for the wire's tool results. The nth result of a call id belongs to the nth tool
+    event with that call id (a provider may reuse ids, the events and the wire are both in order). An id whose
+    results and events differ in number (an older chat) is left out: nothing is known about those results."""
+    positions, grouped = {}, {}
+    for position, message in enumerate(wire):
+        if isinstance(message, dict) and message.get("role") == "tool" and isinstance(message.get("tool_call_id"), str):
+            positions.setdefault(message["tool_call_id"], []).append(position)
+    for event in events or ():
+        if (isinstance(event, dict) and event.get("type") == "tool" and isinstance(event.get("call_id"), str)
+                and event["call_id"]):
+            grouped.setdefault(event["call_id"], []).append(event)
+    paired = {}
+    for call_id, spots in positions.items():
+        if len(grouped.get(call_id, ())) == len(spots):
+            paired.update(zip(spots, grouped[call_id]))
+    return paired
+
+
+def trim_marks_at(paired):
+    """{wire position: mark} of the paired events that carry a usable mark (a notice text and a mode)."""
+    return {position: event[TRIM_KEY] for position, event in paired.items() if isinstance(event.get(TRIM_KEY), dict)
+            and isinstance(event[TRIM_KEY].get("content"), str) and event[TRIM_KEY].get("mode") in TRIM_MODES}
+
+
+def trim_notices(marks):
+    """The notices map a request is built with: {wire position: notice text}."""
+    return {position: mark["content"] for position, mark in marks.items()}
+
+
+def repair_trim_marks(session):
+    """Move the earlier form of a trim mark, a private context_trim field in a stored wire message ({mode, content}),
+    to the tool event it belongs to, and delete it from the wire message. Idempotent; never raises."""
+    try:
+        wire = session.get("wire")
+        if not isinstance(wire, list) or not any(isinstance(message, dict) and TRIM_KEY in message for message in wire):
+            return
+        paired = result_events(wire, session.get("events"))
+        for position, message in enumerate(wire):
+            if not isinstance(message, dict) or TRIM_KEY not in message:
+                continue
+            old = message[TRIM_KEY]
+            event = paired.get(position)
+            if event is not None and isinstance(old, dict) and isinstance(old.get("content"), str) \
+                    and old.get("mode") in TRIM_MODES:
+                mark = event.get(TRIM_KEY) if isinstance(event.get(TRIM_KEY), dict) else {}
+                event[TRIM_KEY] = {"mode": old["mode"], "by": mark.get("by", "auto"), "at": mark.get("at", 0.0),
+                                   "freed_tokens": mark.get("freed_tokens", 0), "content": old["content"]}
+            wire[position] = {key: value for key, value in message.items() if key != TRIM_KEY}
+    except Exception:
+        pass
+
+
+def trim_subject(name, arguments):
+    """What a tool call acts on, in one line: its command, query, pattern, path or URL (the caller redacts it)."""
+    if not isinstance(arguments, dict):
+        return ""
+    for key in TRIM_SUBJECT_KEYS:
+        value = arguments.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().splitlines()[0][:TRIM_SUBJECT_CHARS]
+    return ""
+
+
+def _failed_result(content):
+    """Whether a tool result tells the model that its call failed."""
+    try:
+        parsed = json.loads(content)
+    except ValueError:
+        return False
+    return isinstance(parsed, dict) and bool(parsed.get("error_kind") or parsed.get("error")
+                                             or parsed.get("state") in FAILED_STATES)
+
+
+def trim_candidates(wire, through, completed_calls=None, failed=(), notices=None, protected=()):
+    """The tool results the automatic pass may replace, in its order: reads that a later read of the same arguments
+    or a later change of the file made stale (mode "dropped"), then results of CLEAR_MIN_BYTES or more, oldest first
+    ("shortened", or "dropped" under TRIM_SMALL_BYTES; a failed call keeps its error text, so it is always
+    shortened). Only results before the latest CLEAR_KEEP_TURNS turns and after the summary (through) qualify, and
+    none that has a notice already (notices), is one the app never trims (result_budget.locked_result, or a wire
+    position in protected: a call the user declined) or is a failed call (wire positions in failed). A tool that
+    allows shortening only is never dropped. Each is {index, call_id, name, arguments, mode, superseded}."""
+    from .result_budget import SHORTEN_ONLY_TOOLS, TRIM_SMALL_BYTES, locked_result
+    before = _cleared_from(wire, CLEAR_KEEP_TURNS)
+    owners, last_change, last_read = _call_positions(wire, completed_calls)
+    notices = notices or {}
+    superseded, large = [], []
+    for position in range(max(0, through), min(before, len(wire))):
+        message = wire[position]
+        if not isinstance(message, dict) or message.get("role") != "tool" or position in notices:
+            continue
+        content, call_id = message.get("content"), message.get("tool_call_id")
+        if not isinstance(content, str):
+            continue
+        name, arguments = owners.get(position, (None, None))
+        if position in protected or locked_result(name, content):
+            continue
+        failed_call = position in failed or _failed_result(content)
+        item = {"index": position, "call_id": call_id, "name": name, "arguments": arguments, "superseded": False}
+        if not failed_call and _is_superseded(name, arguments, content, position, completed_calls, last_change,
+                                              last_read):
+            superseded.append({**item, "mode": "shortened" if name in SHORTEN_ONLY_TOOLS else "dropped",
+                               "superseded": True})
+        elif _size(content) >= CLEAR_MIN_BYTES:
+            small = _size(content) < TRIM_SMALL_BYTES and not failed_call and name not in SHORTEN_ONLY_TOOLS
+            large.append({**item, "mode": "dropped" if small else "shortened"})
+    return superseded + large
+
+
+def trim_text(message, mode, name, arguments, subject=None, current=None):
+    """(text, tokens, mode): the text a request would carry for a tool result message trimmed in mode, the tokens it
+    frees at scale 1 next to what the request carries now (current, the notice it has now, else the message's own
+    content: the weighted size lost, over three; more when it was shortened before) and the mode that text is
+    (result_budget.trim_mode: a shortened result too small to keep a head and tail is sent as the cleared notice, so it
+    is "dropped"). The mode is None when the tool only allows shortening and the result is too small for it."""
+    from .result_budget import trim_mode
+    content = message["content"]
+    effective = trim_mode(name, content, mode)
+    if effective is None:
+        return None, 0, None
+    text = trimmed_content(content, name, (subject or trim_subject)(name, arguments), effective)
+    return text, max(0, (_weighted_size(current if isinstance(current, str) else content) - _weighted_size(text)) // 3), effective
+
+
+def call_owners(wire):
+    """{wire position of a tool result: (name, arguments) of the call it answers}: _call_positions' owners."""
+    return _call_positions(wire, None)[0]
+
+
+def find_result(wire, state, position, mark=None, protected=()):
+    """The live context's tool result at wire position: {index, name, arguments, can_trim, mode, locked, shorten_only}
+    (mode: how it is trimmed now, from mark, the event's mark, or None), else None when position is not a tool result
+    after the summary. can_trim is true before the latest CLEAR_KEEP_TURNS turns unless the result is already dropped
+    or is one the app never trims."""
+    from .result_budget import SHORTEN_ONLY_TOOLS, locked_result
+    through = (state or {}).get("through", 0)
+    if (type(position) is not int or not max(0, through) <= position < len(wire) or not isinstance(wire[position], dict)
+            or wire[position].get("role") != "tool" or not isinstance(wire[position].get("content"), str)):
+        return None
+    name, arguments = _call_positions(wire[:position + 1], None)[0].get(position, (None, None))
+    mode = mark.get("mode") if isinstance(mark, dict) else None
+    locked = position in protected or locked_result(name, wire[position]["content"])
+    return {"index": position, "name": name, "arguments": arguments, "mode": mode, "locked": locked,
+            "shorten_only": name in SHORTEN_ONLY_TOOLS,
+            "can_trim": position < _cleared_from(wire, CLEAR_KEEP_TURNS) and mode != "dropped" and not locked}
+
+
+def trim_pass(wire, through, completed_calls, estimate, target, scale=1.0, subject=None, failed=(), notices=None,
+              protected=()):
+    """Plan the notices of old tool results (trim_candidates, in order) until estimate, lowered by what each frees, is
+    at or under target, or nothing more qualifies. Nothing is changed: the caller stores the marks. Returns them, each
+    {index, call_id, name, mode, freed_tokens, superseded, content}."""
+    marks = []
+    for item in trim_candidates(wire, through, completed_calls, failed, notices, protected):
+        if estimate <= target:
+            break
+        text, freed, mode = trim_text(wire[item["index"]], item["mode"], item["name"], item["arguments"], subject)
+        if mode is None:
+            continue
+        freed = math.ceil(freed * scale)
+        estimate -= freed
+        marks.append({"index": item["index"], "call_id": item["call_id"], "name": item["name"], "mode": mode,
+                      "freed_tokens": freed, "superseded": item["superseded"], "content": text})
+    return marks
+
+
+def plan_trim(wire, through, completed_calls, estimate, *, target, threshold, input_budget, scale=1.0, subject=None,
+              failed=(), notices=None, protected=(), turns_since=None):
+    """trim_pass's marks when a pass should run now, else []. It runs only when it pays: it frees at least
+    TRIM_MIN_FREE_PERCENT of the input budget or brings the estimate to target, and, after an earlier pass, only
+    once TRIM_MIN_TURNS_BETWEEN turns have ended since it (turns_since: None when there was none). A request over
+    the compaction threshold needs no minimum share: a pass that brings it under the threshold avoids the
+    compaction. When it cannot, or the last pass is too recent, the chat compacts (a compaction rewrites the cached
+    prefix once; a pass and then a compaction would rewrite it twice)."""
+    if turns_since is not None and turns_since < TRIM_MIN_TURNS_BETWEEN:
+        return []  # Never twice within the window, even over the threshold: then the chat compacts once instead.
+    marks = trim_pass(wire, through, completed_calls, estimate, target, scale, subject, failed, notices, protected)
+    if not marks:
+        return []
+    freed = sum(mark["freed_tokens"] for mark in marks)
+    if estimate > threshold:
+        return marks if estimate - freed <= threshold else []
+    if estimate - freed > target and freed * 100 < input_budget * TRIM_MIN_FREE_PERCENT:
+        return []
+    return marks
+
+
+def context_items(wire, state, scale=1.0, limit=ITEM_LIMIT, marks=None, protected=()):
+    """The largest items of the live context (the summary and wire[through:]), biggest first: {index (wire position,
+    None for the summary), kind, tokens, can_trim, name, arguments, call_id}. kind: tool_result, file_read, attachment
+    (a message that carries @ files, a command, skills or a Git snapshot), message or summary. can_trim is true for a
+    tool result before the latest CLEAR_KEEP_TURNS turns that is not already dropped and that the app may trim
+    (result_budget.locked_result). tokens are the size of what a request sends (marks: {wire position: mark}), at
+    scale. One pass over the sizes context_breakdown measures."""
+    import heapq
+    from .result_budget import locked_result
+    state = state or {}
+    marks = marks or {}
+    through = state.get("through", 0)
+    before = _cleared_from(wire, CLEAR_KEEP_TURNS)
+    owners = _call_positions(wire, None)[0]
+    items = []
+    if state.get("summary"):
+        text = SUMMARY_PREFIX + state["summary"] + render_app_record(state) + handoff_pointer(state.get("handoff_files"))
+        items.append({"index": None, "kind": "summary", "can_trim": False,
+                      "size": _weighted_size({"role": "user", "content": text})})
+    for position, message in enumerate(wire):
+        if not isinstance(message, dict) or position < through:
+            continue
+        role, mark = message.get("role"), marks.get(position)
+        shown = sent_message(message, mark.get("content") if isinstance(mark, dict) else None)
+        item = {"index": position, "size": _weighted_size(shown) + 3 * message_image_tokens(shown)}
+        if role == "tool":
+            name, arguments = owners.get(position, (None, None))
+            dropped = isinstance(mark, dict) and mark.get("mode") == "dropped"
+            locked = position in protected or locked_result(name, message.get("content"))
+            item.update(kind="file_read" if name in _READS else "tool_result", name=name, arguments=arguments,
+                        call_id=message.get("tool_call_id"), can_trim=position < before and not dropped and not locked)
+        else:
+            content = message.get("content")
+            item.update(kind="attachment" if role == "user" and isinstance(content, str) and _attachment_start(content) >= 0
+                        else "message", can_trim=False)
+        items.append(item)
+    largest = heapq.nlargest(limit, items, key=lambda item: item["size"])
+    return [{**{key: value for key, value in item.items() if key != "size"},
+             "tokens": math.ceil(item["size"] // 3 * scale)} for item in largest]
 
 
 # --- The app record: the user's earlier requests and the app's notes -----------
@@ -1307,7 +1527,7 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
                           default_reply_reserve=DEFAULT_MAX_OUTPUT_TOKENS,
                           auto_compact_percent=MAX_AUTO_COMPACT_PERCENT, record_requests=False, app_record=None,
                           output_allowance=0, completed_calls=None, model_window=None, anchor=None,
-                          on_compaction=None, tool_servers=(), before_compaction=None):
+                          on_compaction=None, tool_servers=(), before_compaction=None, trim=None, hold=None, notices=None):
     """(messages, state, info) for the next request, compacting earlier turns when needed.
 
     Compaction runs when force_compact is set or the estimate passes auto_compact_percent
@@ -1327,6 +1547,22 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
     first summary request, with {estimated_input_tokens, threshold, input_budget}; it returns the
     preservation note to use (the user's before_compaction hooks add to it) or raises to stop a
     manual compaction. The defaults keep the behaviour before these options.
+
+    notices ({wire position: text}) are the notices of the tool results the request carries in place of the full ones
+    (trim_notices); wire is never changed. trim, when given, turns on the live trim: {"start": percent, "target":
+    percent, "on_trim": callback, "subject": callable, "failed" and "protected": wire positions, "turns_since": turns
+    that ended since the last pass or None}. Before the compaction decision, a request over start percent of the input
+    budget gets one pass (plan_trim, which says when a pass pays) that plans notices for old tool results until the
+    estimate is at or under target percent; they are added to notices, so the request carries them. on_trim(marks) is
+    called, and awaited when it returns an awaitable, before anything else uses the marks; it stores each mark, whose
+    "content" is the notice. A manual compaction skips the pass. Compaction then follows as usual when the request is
+    still over the threshold.
+
+    hold defers the automatic compaction of a request that is over the threshold but still fits the input budget
+    (and the byte target), as the user's choice to continue without compacting. True holds it; an awaitable callable
+    is awaited once with the same dict before_compaction gets, when such a compaction is about to start at a
+    turn's start (never for a manual or an in-turn compaction), and holds it when it returns True. The request is
+    then sent as it is, and info has compaction_held. A request that no longer fits the budget compacts as usual.
     """
     if not MIN_CONTEXT_WINDOW <= context_window <= MAX_CONTEXT_WINDOW:
         raise ValueError(f"Choose a context window between {MIN_CONTEXT_WINDOW} and {MAX_CONTEXT_WINDOW}.")
@@ -1364,10 +1600,27 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
     if handoff_path:
         handoff_files = [*handoff_files, {"path": handoff_path, "compaction": state["compactions"] + 1}]
     pointer = handoff_pointer(handoff_files)
-    messages = [system_message, *context_messages(wire, state)]
+    if trim and notices is None:
+        notices = {}
+    messages = [system_message, *context_messages(wire, state, notices)]
     raw = estimate_tokens(messages, tools)
     anchored = anchored_estimate(messages, raw, scale, anchor) if anchor else None
     estimate = before = anchored[0] if anchored else raw if scale == 1 else math.ceil(raw * scale)
+    if trim and not force_compact and estimate > input_budget * trim["start"] // 100:
+        marks = plan_trim(wire, state["through"], completed_calls, estimate, target=input_budget * trim["target"] // 100,
+                          threshold=threshold, input_budget=input_budget, scale=scale, subject=trim.get("subject"),
+                          failed=trim.get("failed") or (), notices=notices, protected=trim.get("protected") or (),
+                          turns_since=trim.get("turns_since"))
+        if marks:
+            notices.update({mark["index"]: mark["content"] for mark in marks})
+            if trim.get("on_trim") is not None:
+                result = trim["on_trim"](marks)
+                if inspect.isawaitable(result):
+                    await result
+            messages = [system_message, *context_messages(wire, state, notices)]
+            raw = estimate_tokens(messages, tools)  # The marked prefix is no longer the anchor's: counted anew.
+            anchored = anchored_estimate(messages, raw, scale, anchor) if anchor else None
+            estimate = before = anchored[0] if anchored else raw if scale == 1 else math.ceil(raw * scale)
     adjustment = fitted_to_budget = saved_handoff = compaction = cut = None
     in_turn = deferred = byte_fallback = False
     # The 4 MB Databricks request limit: compaction also runs when the request body would
@@ -1386,7 +1639,7 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
 
         def retained_at(candidate):
             return [{"role": "user", "content": SUMMARY_PREFIX + "x" * summary_limit + "x" * record_limit + pointer},
-                    *retained_request(wire, candidate), *wire[candidate:]]
+                    *retained_request(wire, candidate), *sent_messages(wire[candidate:], notices, candidate)]
 
         def needed_at(candidate):
             return scaled_estimate([system_message, *retained_at(candidate)], tools, scale)
@@ -1475,6 +1728,11 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
                            f"{with_summary or ','} which exceeds the available context budget.")
                 raise budget_error(problem, context_window, reply_reserve, input_budget, default_reply_reserve)
 
+    held = False
+    if cut is not None and hold and not force_compact and estimate <= input_budget and not over_bytes:
+        if hold is True or (not in_turn and await hold({"estimated_input_tokens": estimate, "threshold": threshold,
+                                                       "input_budget": input_budget})):
+            cut, held, in_turn = None, True, False
     if cut is not None:
         if before_compaction is not None:
             preservation_note = await before_compaction({"estimated_input_tokens": estimate, "threshold": threshold,
@@ -1563,7 +1821,7 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
                 updated["app_notes"] = notes
             else:
                 updated.pop("app_notes", None)
-        messages = [system_message, *context_messages(wire, updated)]
+        messages = [system_message, *context_messages(wire, updated, notices)]
         estimate, anchored = scaled_estimate(messages, tools, scale), None  # The summary is new: nothing to anchor on.
         # needed_at reserves summary_limit and record_limit ASCII bytes, but JSON escapes, non-ASCII
         # text and the record's headings weigh more. Shorten the summary, already paid for, until the
@@ -1581,7 +1839,7 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
             updated["summary"], change = await fit_summary(updated["summary"], limit, shorten)
             # Reported apart from summary_adjustment: the summary was within its own byte limit.
             fitted_to_budget = _further(fitted_to_budget, change)
-            messages = [system_message, *context_messages(wire, updated)]
+            messages = [system_message, *context_messages(wire, updated, notices)]
             estimate = scaled_estimate(messages, tools, scale)
         if estimate > input_budget:
             raise budget_error(
@@ -1603,7 +1861,7 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
                 updated["handoff_files"] = updated["handoff_files"][:-1]
                 if not updated["handoff_files"]:
                     del updated["handoff_files"]
-                messages = [system_message, *context_messages(wire, updated)]
+                messages = [system_message, *context_messages(wire, updated, notices)]
                 estimate = scaled_estimate(messages, tools, scale)
             else:
                 saved_handoff = handoff_path
@@ -1645,8 +1903,13 @@ async def prepare_context(wire, state, system_message, tools, context_window, su
         info["compacted_in_turn"] = True
     if deferred:
         info["compaction_deferred"] = True
+    if held:
+        info["compaction_held"] = True
     if compaction:
         info["compaction"] = compaction
+    # The request just prepared has no report yet, so this is the estimate. Whoever adds last_request or
+    # next_estimate to the info, or changes its budgets, refreshes the fields with with_context_reading.
+    info.update(context_reading(info))
     return messages, state, info
 
 
@@ -1698,6 +1961,17 @@ def last_request_report(call, context_info, model_window=None):
         write = _count(usage.get("cache_creation_input_tokens")) or 0
         total = uncached + read + write
         status, finish = call.get("status"), call.get("finish_reason")
+        output = _count(usage.get("output_tokens"))
+        # Cache counts the report cannot place: the input count (prompt_tokens or input_tokens, whatever the key)
+        # may or may not include them, and only total_tokens says which (telemetry.reported_usage). Such a report
+        # may count the cache twice. Neither does one that looks counted twice against the app's own raw estimate
+        # of the same request (double_counted).
+        raw = _count(call.get("estimated_input_tokens"))
+        unplaced = (read + write > 0 and _count(usage.get("total_tokens")) is None) or bool(
+            raw and double_counted({"input_tokens": uncached, "cache_read_input_tokens": read,
+                                    "cache_creation_input_tokens": write}, raw))
+        mismatched = (read + write > 0 and _count(usage.get("total_tokens")) is not None and output is not None
+                      and usage["total_tokens"] != total + output)
         report = {"call_id": call.get("id") if isinstance(call.get("id"), str) else None,
                   "model": call.get("model") if isinstance(call.get("model"), str) else None,
                   "status": status if isinstance(status, str) else None,
@@ -1708,6 +1982,8 @@ def last_request_report(call, context_info, model_window=None):
                   "cache_read_input_tokens": read, "cache_creation_input_tokens": write}
         if isinstance(finish, str):
             report["finish_reason"] = finish
+        if unplaced or mismatched:
+            report["usage_recognised"] = False  # context_reading then shows the app's estimate.
         for key in ("output_tokens", "reasoning_tokens"):
             if _count(usage.get(key)) is not None:
                 report[key] = usage[key]
@@ -1731,9 +2007,124 @@ def last_request_report(call, context_info, model_window=None):
         return None
 
 
+def _number(value):
+    return value if type(value) in (int, float) and math.isfinite(value) else None
+
+
+def _report_is_current(info, report, model):
+    """Whether report (info["last_request"]) describes the request the meter shows: the one rule behind "Last
+    model input" (the page's meterReading used to decide it). A report is history after a compaction, in a
+    preview, after the input budget changed, and, once a request to another model was prepared, after a model
+    switch. A report with missing or inconsistent token counts is never current."""
+    if not isinstance(report, dict) or report.get("usage_recognised") is False:
+        return False
+    total, parts = report.get("input_tokens"), [report.get(key) for key in (
+        "uncached_input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")]
+    if type(total) is not int or total <= 0 or _number(report.get("percent_of_input_budget")) is None:
+        return False
+    if all(type(part) is int and part >= 0 for part in parts) and sum(parts) != total:
+        return False
+    same_request = report.get("estimated_tokens") == info.get("estimated_tokens")
+    same_setup = report.get("input_budget") == info.get("input_budget") and (
+        same_request or not model or not report.get("model") or report.get("model") == model)
+    return (not info.get("prepared_for_next_turn") and not info.get("after_trim")
+            and report.get("compactions") == info.get("compactions") and same_setup)
+
+
+def _implausible(report, info, limit):
+    """Whether a current report would put the chat over its limit while the app's own estimate of the same
+    request, even at the largest scale calibration allows (MAX_ESTIMATE_SCALE), stays under it: the provider's
+    count is then not trusted, and the reading shows the estimate."""
+    estimated = _number(info.get("estimated_tokens"))
+    return (estimated is not None and report["input_tokens"] > limit
+            and estimated * MAX_ESTIMATE_SCALE < limit)
+
+
+def context_reading(info, model=None):
+    """The one context percentage, from a context_info dict (with its last_request and next_estimate when it has
+    them) and the chat's model: {percent_used, used_tokens, limit_tokens, limit_name, is_estimate,
+    compact_at_percent, last_request_cached}. {} when info lacks a positive context_window. Pure.
+
+    limit_tokens is the context budget (the context_window setting), the total the usage card's parts add up to.
+    used_tokens is what the card shows as used: the input Databricks reported for the last request while that
+    report is current, else the next request's estimate when a model or Settings change came after the request
+    (next_estimate), else the app's estimate of the request. is_estimate is true in the last two cases and when
+    the report is not usable. percent_used is rounded for display and never clamped: it passes 100 only when
+    used_tokens does. compact_at_percent is auto_compact_threshold over the same limit."""
+    if not isinstance(info, dict):
+        return {}
+    limit = info.get("context_window")
+    if type(limit) is not int or limit <= 0:
+        return {}
+    report = info.get("last_request") if isinstance(info.get("last_request"), dict) else None
+    estimated = _number(info.get("estimated_tokens"))
+    current = _report_is_current(info, report, model)
+    if current and _implausible(report, info, limit):
+        current = False
+    upcoming = info.get("next_estimate") if isinstance(info.get("next_estimate"), dict) else {}
+    changed = (not current and report is not None and report.get("estimated_tokens") == info.get("estimated_tokens")
+               and not info.get("prepared_for_next_turn") and not info.get("after_trim")
+               and report.get("compactions") == info.get("compactions")
+               and (report.get("input_budget") != info.get("input_budget")
+                    or (bool(model) and bool(report.get("model")) and report.get("model") != model))
+               and report.get("usage_recognised") is not False and _number(upcoming.get("tokens")) is not None)
+    if current:
+        used = report["input_tokens"]
+    elif changed:
+        used = upcoming["tokens"]
+    else:
+        used = estimated if estimated is not None else 0
+    used = int(used)
+    threshold = _number(info.get("auto_compact_threshold"))
+    if threshold is None:
+        threshold = _number(info.get("input_budget"))
+    cached = report.get("cache_read_input_tokens") if report else None
+    return {"percent_used": round(100 * used / limit), "used_tokens": used, "limit_tokens": limit,
+            "limit_name": "context budget", "is_estimate": not current,
+            "compact_at_percent": round(100 * threshold / limit) if threshold is not None else None,
+            # The cached part of the input of the last request, while that request is the one the meter shows
+            # (is_estimate false). 0 is a count too: right after a trim the cache was missed, and the card says so.
+            "last_request_cached": cached if current and type(cached) is int and cached > 0 else 0,
+            "warn": compaction_warn(info)}
+
+
+# context_info.warn: "near" from this share of the auto-compact threshold on.
+WARN_NEAR_PERCENT = 85
+
+
+def compaction_warn(info):
+    """"none", "near" or "at_threshold" for a context_info dict: whether the next request is near the automatic
+    compaction (at least WARN_NEAR_PERCENT percent of the threshold) or over it, so that the next user message
+    would start one (prepare_context's test: the estimate is over the threshold). A chat at rest is judged by its
+    next request's estimate, lowered by the trim pass that request would run first (next_estimate.after_trim_tokens);
+    a chat in a turn, by the request just prepared. A compaction that was deferred (nothing earlier brings the
+    request under the threshold) or held (the user chose to continue) is not about to happen: at most "near"."""
+    threshold = _number(info.get("auto_compact_threshold"))
+    if threshold is None or threshold <= 0:
+        return "none"
+    upcoming = info.get("next_estimate") if isinstance(info.get("next_estimate"), dict) else {}
+    tokens = _number(upcoming.get("after_trim_tokens"))
+    if tokens is None:
+        tokens = _number(upcoming.get("tokens"))
+    if tokens is None:
+        tokens = _number(info.get("estimated_tokens"))
+    if tokens is None:
+        return "none"
+    if tokens > threshold and not (info.get("compaction_deferred") or info.get("compaction_held")):
+        return "at_threshold"
+    return "near" if tokens * 100 >= WARN_NEAR_PERCENT * threshold else "none"
+
+
+def with_context_reading(info, model=None):
+    """info with context_reading's fields added (a new dict). The caller refreshes them whenever last_request,
+    next_estimate or the budgets change."""
+    return {**info, **context_reading(info, model)}
+
+
 def repair_session_usage(session):
     """Repair a loaded chat's ledger records that counted Databricks' cache twice (telemetry.repair_counted_cache),
-    and the meter's last request report when it describes one of them. Never raises."""
+    and the meter's last request report when it describes one of them; move an earlier trim mark out of the wire
+    (repair_trim_marks); give a chat saved before the reading existed its context_reading fields. Never raises."""
     try:
         calls = session.get("inference_calls")
         repaired = {call["id"]: call for call in calls if repair_counted_cache(call) and isinstance(call.get("id"), str)} \
@@ -1747,49 +2138,90 @@ def repair_session_usage(session):
             if fixed is not None:
                 fixed["next_estimate_scale"] = float(estimate_scale(calls, call.get("model")))
                 info["last_request"] = fixed
+                info.update(context_reading(info, session.get("model")))
+    except Exception:
+        pass
+    repair_trim_marks(session)  # The earlier form of a trim mark: a private field in the wire.
+    try:
+        # A chat saved before the reading existed is served with it: the page always gets one number.
+        info = session.get("context_info")
+        if isinstance(info, dict) and not isinstance(info.get("percent_used"), int):
+            info.update(context_reading(info, session.get("model")))
     except Exception:
         pass
 
 
-def in_turn_tokens(wire, state, system_message, tools, input_budget, scale=1.0, *, record=True):
+def recount_context_info(info, wire, state, model=None):
+    """context_info for a copy of a chat (a fork or an import) from the copy's own wire. A bundle carries no trim
+    marks, so the copy sends every result whole and its user drops are undone: the sender's estimate (which counted
+    the trimmed notices) is replaced by the size of the copy's messages at the copy's own scale (its ledger is empty:
+    the model's starting ratio, else 1), and the report of the sender's last request, the next-request estimate, the
+    largest items and the trim totals are those of the copy: no report, the estimate, none yet (the next time the
+    chat is opened or a turn runs fills them in), zero. The fixed parts of the estimate (instructions, tool
+    definitions, framing) stay as they were. A new dict; info itself when it holds no breakdown to start from."""
+    breakdown = info.get("breakdown") if isinstance(info, dict) else None
+    keys = ("system_instructions", "tool_definitions", "messages_and_results", "summary", "request_overhead")
+    if not isinstance(breakdown, dict) or any(type(breakdown.get(key)) is not int for key in keys):
+        return info
+    state = state or {}
+    scale = float(estimate_scale([], model)) if model else 1.0
+    messages = context_messages(wire, state)
+    body = messages[1:] if state.get("summary") else messages
+    weighted = sum(_weighted_size(message) + 3 * message_image_tokens(message) for message in body)
+    breakdown = {**breakdown, "messages_and_results": int(weighted // 3 * scale)}
+    total = sum(breakdown[key] for key in keys)
+    budget, threshold = info.get("input_budget"), info.get("auto_compact_threshold")
+    updated = {key: value for key, value in info.items() if key not in (
+        "last_request", "next_estimate", "largest_items", "trimmed", "after_trim", "estimate_scale", "estimate_prior",
+        "estimate_anchor", "prepared_for_next_turn", "compaction_deferred", "compaction_held", "compaction")}
+    updated.update(estimated_tokens=total, breakdown=breakdown, trimmed={"events": 0, "tokens": 0},
+                   next_estimate={"tokens": total, "scale": scale,
+                                  "percent_of_input_budget": round(total * 100 / budget, 1) if budget else None,
+                                  "percent_of_threshold": round(total * 100 / threshold, 1) if threshold else None})
+    if scale != 1:
+        updated["estimate_scale"] = scale
+    return with_context_reading(updated, model)
+
+
+def in_turn_tokens(wire, state, system_message, tools, input_budget, scale=1.0, *, record=True, notices=None):
     """The scaled estimate prepare_context's in-turn cut at the latest model response needs
     (its needed_at): the largest summary, the app record (record=True, as agent steps keep
     it), the handoff pointer with room for one more file, the turn's request and steered
     messages, and everything from that response on. Results of that response admitted
     within input_budget minus this therefore never make in-turn compaction fail."""
-    return scaled_estimate(_in_turn_messages(wire, state, system_message, input_budget, record), tools, scale)
+    return scaled_estimate(_in_turn_messages(wire, state, system_message, input_budget, record, notices), tools, scale)
 
 
-def _in_turn_messages(wire, state, system_message, input_budget, record):
+def _in_turn_messages(wire, state, system_message, input_budget, record, notices=None):
     """The request in_turn_tokens measures (the whole one before the turn's first model response)."""
     state = state or {}
     index = next((position for position in range(len(wire) - 1, -1, -1)
                   if wire[position].get("role") == "assistant"), None)
     if index is None:
-        return [system_message, *context_messages(wire, state)]
+        return [system_message, *context_messages(wire, state, notices)]
     pointer = handoff_pointer([*(state.get("handoff_files") or []), {"path": "x" * 128, "compaction": 999}])
     placeholder = {"role": "user", "content": SUMMARY_PREFIX + "x" * summary_byte_limit(input_budget)
                    + "x" * (app_record_limit(input_budget) if record else 0) + pointer}
-    return [system_message, placeholder, *retained_request(wire, index), *wire[index:]]
+    return [system_message, placeholder, *retained_request(wire, index), *sent_messages(wire[index:], notices, index)]
 
 
-def in_turn_bytes_fit(wire, state, system_message, tools, input_budget, *, record=True):
+def in_turn_bytes_fit(wire, state, system_message, tools, input_budget, *, record=True, notices=None):
     """Whether the next request stays under the app's byte target (request_limits), attached images included:
     as it is, or after the in-turn cut in_turn_tokens measures, which compaction makes when it is over. A
     message steered into a turn whose request carries large images can pass it with few tokens."""
-    for messages in ([system_message, *context_messages(wire, state or {})],
-                     _in_turn_messages(wire, state, system_message, input_budget, record)):
+    for messages in ([system_message, *context_messages(wire, state or {}, notices)],
+                     _in_turn_messages(wire, state, system_message, input_budget, record, notices)):
         if not request_bytes_over(messages, tools, estimate_tokens(messages, tools),
                                   request_limits.PAYLOAD_TARGET_BYTES):
             return True
     return False
 
 
-def next_request_estimate(wire, state, system, tools, scale, anchor=None):
+def next_request_estimate(wire, state, system, tools, scale, anchor=None, notices=None):
     """(tokens, anchored, raw): the estimated input of the next request before the user's next message,
     anchored on anchor when that request extends it (anchored_estimate's (estimate, added), else None), and
     its raw estimate_tokens."""
-    messages = [system, *context_messages(wire, state)]
+    messages = [system, *context_messages(wire, state, notices)]
     raw = estimate_tokens(messages, tools)
     anchored = anchored_estimate(messages, raw, scale, anchor) if anchor else None
     return anchored[0] if anchored else raw if scale == 1 else math.ceil(raw * scale), anchored, raw

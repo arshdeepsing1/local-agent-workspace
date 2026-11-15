@@ -11,7 +11,7 @@ from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationErr
 from . import uploads as attached
 from .composer_api import MAX_QUEUED
 from .config import MAX_MAX_AGENT_STEPS, MAX_TURN_MINUTES, MAX_TURN_TOKENS, MIN_MAX_AGENT_STEPS
-from .context import LARGE_SUMMARY_MAX_BYTES, MAX_ESTIMATE_SCALE, context_boundary
+from .context import LARGE_SUMMARY_MAX_BYTES, MAX_ESTIMATE_SCALE, context_boundary, recount_context_info
 from .extensions import HOOK_CONTEXT_CHARS, HOOK_EVENTS, HOOK_REPORT_CHARS, MAX_HOOKS
 from .jobs import JOB_END_STATES
 from .lifecycle_hooks import SHOWN_ARGUMENTS_BYTES
@@ -23,6 +23,7 @@ from .spending import MAX_LIMIT_DBU
 MAX_BUNDLE_BYTES = 16 * 1024 * 1024
 MAX_SESSIONS = 32
 FORMAT = "local-agent-workspace.conversations"
+TOO_LARGE = "Conversation bundle exceeds 16 MiB. Try exporting without subagents."
 Profile = Literal["inherit", "read_only", "file_editor"]
 # How a background job ended, on its end notice (the job's card reads it). A tool card's job_id stays out of a
 # bundle, like the job itself.
@@ -623,6 +624,9 @@ def export_bundle(sessions, root_id, with_reasoning=False, keep_images=False):
     records = []
     for source in sessions:
         record = {key: value for key, value in source.items() if key in Conversation.model_fields}
+        # The live trim is not part of the bundle format, which an older version must still read: the notice and its
+        # mode live on the events (context_trim), which the Event fields below leave out, and the wire holds the full
+        # results. A copy therefore has full results and no marks.
         if not with_reasoning:
             record["wire"] = [{key: value for key, value in message.items() if key != "reasoning"}
                               if isinstance(message, dict) and "reasoning" in message else message
@@ -632,6 +636,12 @@ def export_bundle(sessions, root_id, with_reasoning=False, keep_images=False):
         record["events"] = [{key: value for key, value in event.items() if key in Event.model_fields
                              and (key not in NOTICE_JOB_FIELDS or event.get("type") == "notice")}
                             for event in record["events"]]
+        for event in record["events"]:
+            # The page-only details of a batch (how it was approved, who started it) are not part of the bundle
+            # format: an older version rejects fields it does not know.
+            if isinstance(event.get("delegation_batch"), dict):
+                event["delegation_batch"] = {key: value for key, value in event["delegation_batch"].items()
+                                             if key in DelegationBatch.model_fields}
         # Keep only the fields a bundle defines; newer display details such as
         # a compaction's handoff path must not make the whole export invalid.
         for key, model in (("context_state", ContextState), ("context_info", ContextInfo)):
@@ -645,11 +655,59 @@ def export_bundle(sessions, root_id, with_reasoning=False, keep_images=False):
     remaining = MAX_BUNDLE_BYTES
     for chunk in json.JSONEncoder(ensure_ascii=False, allow_nan=False).iterencode(bundle):
         if len(chunk) > remaining:
-            raise ValueError("Conversation bundle exceeds 16 MiB. Try exporting without subagents.")
+            raise ValueError(TOO_LARGE)
         remaining -= len(chunk.encode("utf-8"))
         if remaining < 0:
-            raise ValueError("Conversation bundle exceeds 16 MiB. Try exporting without subagents.")
+            raise ValueError(TOO_LARGE)
     return validate_bundle(bundle)
+
+
+def child_started(child):
+    """When a subagent chat started: its delegation's start, else its creation time."""
+    progress = child.get("delegation") if isinstance(child.get("delegation"), dict) else {}
+    value = progress.get("started", child.get("created", 0))
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+
+
+def omitted_child(child, reason):
+    """How a response and a fork's card name a subagent chat that was left out: reason is limit (more than fit in
+    32 conversations), size (16 MiB), busy (it still runs or waits) or unreadable (its file cannot be exported)."""
+    return {"id": child["id"], "title": str(child.get("title") or "")[:160], "reason": reason}
+
+
+def export_with_children(parent, children, root_id, with_reasoning=False, keep_images=False):
+    """(bundle, omitted): the parent with the children that fit, newest start first, within the bundle limits of
+    32 conversations and 16 MiB. A child that does not fit or cannot be exported is left out and listed in
+    omitted (omitted_child); only a parent that cannot be exported fails. The bundle itself carries no note of
+    this: an older reader rejects fields it does not know, so the caller reports omitted outside the bundle."""
+    parent_bundle = export_bundle([parent], root_id, with_reasoning, keep_images)
+    used = len(json.dumps(parent_bundle, ensure_ascii=False).encode("utf-8"))
+    chosen, omitted = [], []
+    for child in sorted(children, key=child_started, reverse=True):
+        if len(chosen) >= MAX_SESSIONS - 1:
+            omitted.append(omitted_child(child, "limit"))
+            continue
+        try:
+            record = export_bundle([child], child["id"], with_reasoning, keep_images)["sessions"][0]
+        except ValueError as exc:
+            omitted.append(omitted_child(child, "size" if str(exc) == TOO_LARGE else "unreadable"))
+            continue
+        size = len(json.dumps(record, ensure_ascii=False).encode("utf-8")) + 2
+        if used + size > MAX_BUNDLE_BYTES:
+            omitted.append(omitted_child(child, "size"))
+            continue
+        used += size
+        chosen.append(child)
+    while True:
+        try:
+            return export_bundle([parent, *sorted(chosen, key=child_started)], root_id, with_reasoning, keep_images), omitted
+        except ValueError as exc:
+            if str(exc) != TOO_LARGE or not chosen:
+                raise
+            # The estimate above was a few bytes short: drop the oldest child kept and try again.
+            oldest = min(chosen, key=child_started)
+            chosen.remove(oldest)
+            omitted.append(omitted_child(oldest, "size"))
 
 
 def completed_for_fork(session):
@@ -768,6 +826,11 @@ def fresh_copies(bundle, workspace, *, kind="import"):
         if kind != "fork":
             # An imported image has no file in this app: a note says what it was.
             source["wire"] = [attached.images_as_notes(message, attached.NOT_EXPORTED) for message in source["wire"]]
+        if isinstance(source.get("context_info"), dict):
+            # The sender's numbers describe its trimmed requests; the copy sends every result whole (a bundle carries
+            # no trim marks), so its meter is counted again from its own wire.
+            source["context_info"] = recount_context_info(source["context_info"], source["wire"],
+                                                          source.get("context_state"), source.get("model"))
         for event in source["events"]:
             event["id"] = events[old_id][event["id"]]
             if kind != "fork" and isinstance(event.get("attachments"), list):

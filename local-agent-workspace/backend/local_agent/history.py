@@ -187,7 +187,10 @@ def cut_session(session, before_event_id=None, *, keep_local=False):
                 replacement["tool_definitions"] = state["tool_definitions"]
             result["context_state"] = replacement
             summary_dropped = True
-    for key in ("context_info", "turn_running", *(() if keep_local else ("queued_messages", "pending_context"))):
+    # compaction_choice: a Continue without compacting holds for the history it was given in; once turns are removed
+    # the chat asks again at its next crossing of the threshold.
+    for key in ("context_info", "turn_running", "compaction_choice",
+                *(() if keep_local else ("queued_messages", "pending_context"))):
         result.pop(key, None)
     # The read-before-write guard must not trust reads the model no longer remembers.
     result["file_views"] = {}

@@ -26,7 +26,7 @@ from pathlib import Path
 
 from . import config
 from .config import ENDPOINT_NAME
-from .feature_tools import FEATURE_TOOLS
+from .feature_tools import BROWSER_TOOL, FEATURE_TOOLS
 from .model_profiles import profile_for
 from .reasoning import EFFORT_LABELS, EFFORT_LEVELS
 from .redaction import redact_secrets
@@ -79,7 +79,7 @@ INDEX_DESCRIPTION = 150
 TOOL_ALIASES = {"Read": "read_file", "Write": "write_file", "Edit": "edit_file", "MultiEdit": "edit_file",
                 "Glob": "find_files", "Grep": "search_files", "LS": "list_files", "Bash": "run_command",
                 "NotebookRead": "notebook_read", "NotebookEdit": "notebook_edit", "WebFetch": "web_fetch",
-                "WebSearch": "web_search"}
+                "WebSearch": "web_search", "Browser": "browser"}
 # Claude Code's model values: not Databricks endpoints, so the chat's model is used.
 MODEL_ALIASES = ("sonnet", "opus", "haiku")
 INHERIT_VALUES = ("", "inherit", "default-model")
@@ -88,7 +88,7 @@ INDEX_HEADER = ("Custom subagents: set delegate_task agent_type to one of these 
 
 
 def known_tools():
-    return {item["function"]["name"] for item in (*TOOL_DEFINITIONS, *FEATURE_TOOLS)}
+    return {item["function"]["name"] for item in (*TOOL_DEFINITIONS, *FEATURE_TOOLS, BROWSER_TOOL)}
 
 
 def display_redactor(settings):

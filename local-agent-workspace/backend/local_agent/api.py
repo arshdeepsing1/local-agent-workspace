@@ -21,8 +21,9 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .agents import AgentManager, public_session
 from .config import APP_ROOT, ENDPOINT_NAME, MAX_APPROVAL_MINUTES, MAX_MAX_AGENT_STEPS, MIN_MAX_AGENT_STEPS, Settings
-from .config import MAX_COMMAND_ENV, MAX_USER_INSTRUCTIONS, MAX_WRITE_LIMIT_KB, MIN_WRITE_LIMIT_KB
-from .config import MAX_TURN_MINUTES, MAX_TURN_TOKENS
+from .config import BROWSER_TIMEOUT, MAX_COMMAND_ENV, MAX_USER_INSTRUCTIONS, MAX_WRITE_LIMIT_KB, MIN_WRITE_LIMIT_KB
+from .config import (MAX_TURN_MINUTES, MAX_TURN_TOKENS, SUBAGENT_LIMITS, TRIM_GAP, TRIM_START,
+                     TRIM_TARGET_LEAST)
 from .context import (
     MAX_CONTEXT_WINDOW, MAX_MAX_OUTPUT_TOKENS, MIN_CONTEXT_WINDOW, MIN_MAX_OUTPUT_TOKENS, SAFETY_MARGIN,
     effective_input_budget, model_context_window,
@@ -72,7 +73,10 @@ INLINE_TYPES = {"image/png": b"\x89PNG\r\n\x1a\n", "image/jpeg": b"\xff\xd8\xff"
                 "image/webp": b"RIFF", "application/pdf": b"%PDF-"}
 
 
-INDEX_POLICY = "frame-src blob:; frame-ancestors 'none'"
+# The page loads images and media only from itself or from bytes it holds (data:, blob:), so a reply that writes an
+# image address cannot make the browser request an outside host. frame-src: Workspace preview frames reach no address.
+# Not yet set: default-src, script-src, style-src and connect-src (the page has an inline boot script and inline styles).
+INDEX_POLICY = "img-src 'self' data: blob:; media-src 'self' data: blob:; frame-src blob:; frame-ancestors 'none'"
 
 
 def content_disposition(disposition, name):
@@ -211,6 +215,13 @@ class SettingsEdit(BaseModel):
     compaction_handoffs: bool | None = Field(default=None, strict=True)
     auto_compact_percent: int | None = Field(default=None, ge=MIN_AUTO_COMPACT_PERCENT, le=MAX_AUTO_COMPACT_PERCENT,
                                              strict=True)
+    # Settings -> Model and context: trim old tool results from requests (context.trim_pass). Each mark is checked for
+    # its own range; agents.trim_marks fits them to auto_compact_percent when a chat runs.
+    context_trim: bool | None = Field(default=None, strict=True)
+    context_trim_start_percent: int | None = Field(default=None, ge=TRIM_START[1], le=TRIM_START[2], strict=True)
+    context_trim_target_percent: int | None = Field(default=None, ge=TRIM_TARGET_LEAST, le=TRIM_START[2] - TRIM_GAP,
+                                                    strict=True)
+    compaction_ask: bool | None = Field(default=None, strict=True)  # Ask before an automatic compaction (agents.py).
     approval_timeout_minutes: int | None = Field(default=None, ge=0, le=MAX_APPROVAL_MINUTES, strict=True)
     system_notifications: bool | None = Field(default=None, strict=True)
     auto_keep_changes: bool | None = Field(default=None, strict=True)
@@ -238,6 +249,10 @@ class SettingsEdit(BaseModel):
     # Settings → Subagents: {explore|general|editor: {model, effort}}; config.subagent_defaults checks it.
     subagent_defaults: dict[str, dict[str, str]] | None = None
     background_subagent_wake: bool | None = Field(default=None, strict=True)  # planning.DelegateManager.maybe_wake
+    subagents_running_max: int | None = Field(default=None, ge=SUBAGENT_LIMITS["subagents_running_max"][1],
+                                              le=SUBAGENT_LIMITS["subagents_running_max"][2], strict=True)
+    subagents_per_turn_max: int | None = Field(default=None, ge=SUBAGENT_LIMITS["subagents_per_turn_max"][1],
+                                               le=SUBAGENT_LIMITS["subagents_per_turn_max"][2], strict=True)
     # Settings → Model and context: "" = none; config.Settings.update and AgentManager.fallback_allowed check it.
     fallback_model: str | None = Field(default=None, max_length=128, strict=True)
     # Settings → Web access: config.Settings.check_web_settings checks them; the key is a credential-file entry name.
@@ -248,6 +263,12 @@ class SettingsEdit(BaseModel):
     # Settings → Agent → Scheduled runs and Settings → Credentials → Token expires on ("" or YYYY-MM-DD): schedules.py.
     schedules_enabled: bool | None = Field(default=None, strict=True)
     token_expires_on: str | None = Field(default=None, max_length=10, strict=True)
+    # Settings → Browsing (browser_tool.py): the browser tool, its window and how long one action may take.
+    browser_tools: bool | None = Field(default=None, strict=True)
+    browser_headless: Literal["auto", "window", "headless"] | None = None  # config.BROWSER_HEADLESS
+    browser_action_timeout: int | None = Field(default=None, ge=BROWSER_TIMEOUT[1], le=BROWSER_TIMEOUT[2], strict=True)
+    # "auto", "none" or http://[user:password@]host:port; config.Settings.update checks it (browser_proxy.py).
+    browser_upstream_proxy: str | None = Field(default=None, max_length=300, strict=True)
 
 
 class ProjectTrust(BaseModel):
@@ -395,6 +416,7 @@ def create_app(settings=None):
         await asyncio.gather(*(manager.stop(sid) for sid in list(manager.tasks)))
         await manager.endpoint_runner.stop()  # An endpoint check keeps what came back so far.
         await manager.jobs.shutdown()
+        await manager.browser.close_all()  # Every chat's browser (Settings → Browsing); safe when none started.
         # Everything stopped: the next start reads only conversation headers. If a stop raised,
         # no marker is written and the next start loads every conversation (the safe direction).
         try:
@@ -794,11 +816,12 @@ def create_app(settings=None):
         session = session_or_404(session_id)
         ensure_idle(manager, session, "changing folder access")
         folder = str(Path(body.path).expanduser().resolve())
-        session["allowed_directories"] = [p for p in session.get("allowed_directories", []) if p != folder]
-        store.save(session)
+        removed = await manager.remove_folder(session, folder)  # A running background subagent loses it too.
         result = public_session(session)
         await manager.broadcast(session_id, {"type": "snapshot", "session": result})
-        return result
+        # Still 200 when nothing matched (a double click, a stale page): the page replaces its list from the
+        # answer, and an error status would show it as a failure. "removed" says what happened.
+        return {**result, "removed": removed}
 
     @app.get("/api/sessions/{session_id}")
     async def get_session(session_id: str):
@@ -880,9 +903,20 @@ def create_app(settings=None):
             "Cache-Control": "no-store"})
 
     @app.get("/api/sessions/{session_id}/transcript.md")
-    async def export_session_transcript(session_id: str):
+    async def export_session_transcript(session_id: str, subagents: bool = False):
+        """subagents=1: each subagent chat (found by its header link) is written under the card that started it."""
         session = session_or_404(session_id)
-        text = transcript(session, redact=settings.redact)
+        children = None
+        if subagents:
+            children = {}
+            for header in manager.delegates.children(session_id):
+                try:
+                    child = manager.get(header["id"])
+                except (ValueError, OSError):
+                    continue  # Unreadable: its card says it was not found.
+                if child:
+                    children[header["id"]] = child
+        text = transcript(session, redact=settings.redact, subagents=children)
         return Response(text, media_type="text/markdown; charset=utf-8", headers={
             "Content-Disposition": f'attachment; filename="{transcript_file_name(session, redact=settings.redact)}"',
             "Cache-Control": "no-store"})
@@ -903,6 +937,7 @@ def create_app(settings=None):
                 await manager.stop(member)
                 manager.delegates.forget(member, keep=family)  # A deleted subagent stays in its parent's index, marked.
                 await manager.jobs.remove_session(member)
+                await manager.browser.close_chat(member)
                 manager.task_board.delete_session(member)
                 manager.checkpoints.delete_session(member)
                 manager.changes.delete_session(member)
@@ -1292,8 +1327,9 @@ def create_app(settings=None):
     @app.get("/")
     async def index():
         if (frontend / "index.html").exists():
-            # frame-src: the Workspace preview's frames (a PDF from a blob, an HTML file in a sandboxed srcdoc
-            # frame) cannot navigate to any address, so a previewed page reaches no network.
+            # img-src and media-src: no image or media loads from another host. frame-src: the Workspace preview's
+            # frames (a PDF from a blob, an HTML file in a sandboxed srcdoc frame) cannot navigate to any address,
+            # so a previewed page reaches no network.
             return FileResponse(frontend / "index.html", headers={"Cache-Control": "no-cache",
                                                                   "Content-Security-Policy": INDEX_POLICY})
         return JSONResponse({"message": "The frontend folder is missing. See README.md."}, status_code=503)

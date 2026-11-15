@@ -6,7 +6,8 @@ turned-off tools, deny rules, Plan's denial, ask rules and uncertain commands,
 commands that name credential-looking files (a card in every mode), protected paths,
 the mode baseline, allow rules (never in Plan), Don't ask (and Bypass for a memory
 note), ask. Web tools (kind "web") ask in every mode but Bypass: a domain rule allows
-web_fetch for one host, and Plan always shows the card. In Auto and Plan, shell text
+web_fetch for one host, and Plan always shows the card. The browser tool (kind "browser") has its own step in
+evaluate, because an allow rule for a host decides with the action: see browser_baseline. In Auto and Plan, shell text
 the app can check (shell_vet) is matched stage by stage and, when every stage is
 read-only (or, in Auto, allowed by an argv or prefix rule), runs as a script the app builds.
 """
@@ -41,7 +42,13 @@ TOOL_KINDS = {
     "remember": "memory",
     # web_fetch.py: a card per new domain (domain rules), one for a chat's first search.
     **dict.fromkeys(("web_fetch", "web_search"), "web"),
+    # browser_tool.py: a card per new host (host rules); what an action does on an allowed host (browser_baseline).
+    "browser": "browser",
 }
+# The browser actions that only look: on an allowed host they need no card in any mode. Every other action
+# (click, type, select) changes a page, and an action that submits a form is a class of its own.
+BROWSER_READ_ACTIONS = ("open", "read", "find", "scroll", "tabs", "console", "network", "screenshot", "back", "forward",
+                        "close")
 # Every path-valued argument of each edit tool: protected-path checks and path rules cover all of them.
 EDIT_TOOL_PATHS = {"write_file": ("path",), "edit_file": ("path",), "insert_activity_log": ("path",),
                    "move_path": ("path", "destination"), "delete_path": ("path",), "notebook_edit": ("path",)}
@@ -92,11 +99,44 @@ def foreground(arguments):
     return not (isinstance(arguments, dict) and arguments.get("background") is True)
 
 
+def browser_class(arguments):
+    """'read', 'act' or 'submit' for a browser call. arguments carry the app's own facts (browser_tool.decide):
+    submits is True when the engine's preview says the action sends a form on a host that is not loopback."""
+    if not isinstance(arguments, dict):
+        return "act"
+    if arguments.get("submits") is True:
+        return "submit"
+    return "read" if arguments.get("action") in BROWSER_READ_ACTIONS else "act"
+
+
+def browser_baseline(mode, arguments, host_allowed):
+    """'allow', 'ask' or 'deny' for a browser call, given whether a rule allows its host. A host no rule allows asks
+    (Bypass shows no cards). On an allowed host the actions that only look run in every mode, click, type and
+    select run in Auto, Accept edits and Bypass, and an action that submits a form asks in every mode but Bypass.
+    Plan allows only the actions that look; it asks for a host not allowed yet."""
+    action = browser_class(arguments)
+    if mode == "plan":
+        if action != "read":
+            return "deny"
+        return "allow" if host_allowed else "ask"
+    if mode == "bypassPermissions":
+        return "allow"
+    if not host_allowed:
+        return "ask"
+    if action == "read":
+        return "allow"
+    if action == "submit":
+        return "ask"
+    return "allow" if mode in ("auto", "acceptEdits") else "ask"
+
+
 def tool_decision(mode: str, name: str, arguments: dict) -> str:
     """The mode's baseline decision, without rules: 'allow', 'ask' or 'deny'."""
     kind = tool_kind(name)
     if kind in NEVER_CARD_KINDS:
         return "allow"  # P3 rejects submit_plan outside Plan.
+    if kind == "browser":
+        return browser_baseline(mode, arguments, False)  # No rule is known here: evaluate adds the host's allow rule.
     read_only = kind == "command" and read_only_argv(command_argv(name, arguments)) and foreground(arguments)
     if mode == "plan":
         if read_only:
@@ -254,6 +294,17 @@ def evaluate(mode, name, arguments, *, chat_rules=(), project_rules=(), user_rul
                            "always needs an approval card, and Don't ask mode does not show cards. Continue "
                            "without it and tell the user which file needs their approval.", protected=reason)
         return Verdict("ask", "protected", protected=reason)
+    # (4b) The browser: an allow rule names a host, so the host's rule and the action decide together (Plan reads on
+    # an allowed host too). Deny and ask rules were handled above, and no allow rule skips an engine refusal.
+    if kind == "browser":
+        found = next(((rule, scope) for scope, rules in scoped for rule in rules
+                      if behavior_of(rule) == "allow" and matches(rule)), None)
+        outcome = browser_baseline(mode, arguments, found is not None)
+        if outcome == "allow":
+            return Verdict("allow", "rule" if found else "mode", rule=found and found[0], scope=found and found[1])
+        if mode == "dontAsk":
+            return Verdict("deny", "dont_ask", DONT_ASK_DENIED)
+        return Verdict("ask", "mode")
     # (5) The mode's own allowance; read-only list commands run hardened without a shell, and a vetted
     # command as the script the app builds (with the rule that allowed a stage, when one did).
     if vetted is not None:

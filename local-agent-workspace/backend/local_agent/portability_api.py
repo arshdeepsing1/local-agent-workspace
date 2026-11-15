@@ -6,7 +6,7 @@ import sqlite3
 import time
 import uuid
 
-from fastapi import HTTPException, Request
+from fastapi import HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import approvals, mentions
@@ -14,7 +14,8 @@ from .agents import delegated_prompt, public_session
 from .approvals import busy_status, ensure_idle
 from .composer_api import UploadRef, upload_refs, upload_refs_field
 from .history import HistoryError, cut_points, cut_session, rewind_turn_ids
-from .portability import MAX_BUNDLE_BYTES, MAX_SESSIONS, completed_for_fork, export_bundle, fresh_copies, parse_bundle
+from .portability import (MAX_BUNDLE_BYTES, completed_for_fork, export_with_children, fresh_copies,
+                          omitted_child, parse_bundle)
 from .recovery import rewind_refusal
 from .tools import WorkspaceTools, error_clause, file_error
 
@@ -111,21 +112,63 @@ def register_portability(app, manager, settings, store, session_or_404):
         return {"session": public_session(next(session for session in copies if session["id"] == root_id)),
                 "imported_count": len(copies)}
 
+    def fork_bundle(source, session_id, restrict):
+        """(bundle, omitted): the source with its ended subagent chats. restrict (a fork from a message): only the
+        chats whose delegate_task cards the fork keeps. A card whose chat was left out loses child_session_id and
+        names the reason in child_omitted (the page shows it). The bundle is only passed on to fresh_copies."""
+        keep = {event["child_session_id"] for event in source["events"] if event.get("child_session_id")} if restrict else None
+        children, left = linked_children(session_id, keep)
+        bundle, more = export_with_children(source, children, session_id, True, keep_images=True)
+        omitted = [*left, *more]
+        reasons = {item["id"]: item["reason"] for item in omitted}
+        for event in bundle["sessions"][0]["events"]:
+            if event.get("child_session_id") in reasons:
+                event["child_omitted"] = reasons[event["child_session_id"]]
+        return bundle, omitted
+
+    def forked(shown, result, omitted):
+        return {**shown, "children_copied": result["imported_count"] - 1, "children_omitted": omitted}
+
+    def linked_children(parent_id, keep=None):
+        """(children, omitted): the parent's subagent chats found by their header link (parent_session_id), not by
+        the parent's 200-entry index, as copies safe to export. A chat that still runs, queues or waits is left
+        out as busy, an unreadable one as unreadable (omitted_child). keep: only the chats with these IDs."""
+        working = {entry.get("child_session_id") for entries in manager.delegates.active.values() for entry in entries}
+        children, omitted, seen = [], [], set()
+        for header in manager.delegates.children(parent_id):
+            child_id = header["id"]
+            if child_id in seen or (keep is not None and child_id not in keep):
+                continue
+            seen.add(child_id)
+            try:
+                child = manager.get(child_id)
+            except (ValueError, OSError):
+                child = None
+            if not child:
+                omitted.append(omitted_child(header, "unreadable"))
+            elif busy_status(manager, child_id) != "idle" or child_id in working:
+                omitted.append(omitted_child(child, "busy"))
+            else:
+                children.append(copy.deepcopy(child))
+        return children, omitted
+
     @app.get("/api/sessions/{session_id}/export")
-    async def export(session_id: str, include_children: bool = False, with_reasoning: bool = False):
-        """with_reasoning keeps the replies' signed reasoning (reasoning_replay.py); without it none is exported."""
-        sessions = [idle(session_id)]
-        if include_children:
-            included = {session_id}
-            metadata = store.list()
-            for parent in sessions:
-                for child in metadata:
-                    if child.get("parent_session_id") == parent["id"] and child["id"] not in included:
-                        if len(sessions) >= MAX_SESSIONS:
-                            raise ValueError("Export at most 32 conversations at once. Exclude subagents or export a child separately.")
-                        sessions.append(idle(child["id"]))
-                        included.add(child["id"])
-        return export_bundle(sessions, session_id, with_reasoning)
+    async def export(session_id: str, response: Response, include_children: bool = True, with_reasoning: bool = False,
+                     report: bool = False):
+        """with_reasoning keeps the replies' signed reasoning (reasoning_replay.py); without it none is exported.
+        The chat's subagent chats come with it unless include_children=false: those that fit in 32 conversations and
+        16 MiB, newest first. Those left out (a busy one, or more than fit) are counted in the X-Children-Omitted
+        header; report=true answers {bundle, children_omitted: {count, children}} instead of the bare bundle. The
+        bundle never carries that note: an older version rejects fields it does not know."""
+        parent = idle(session_id)
+        children, left = linked_children(session_id) if include_children else ([], [])
+        bundle, more = export_with_children(parent, children, session_id, with_reasoning)
+        omitted = [*left, *more]
+        if omitted:
+            response.headers["X-Children-Omitted"] = str(len(omitted))
+        if report:
+            return {"bundle": bundle, "children_omitted": {"count": len(omitted), "children": omitted}}
+        return bundle
 
     @app.post("/api/sessions/import", status_code=201)
     async def import_conversations(request: Request, workspace: str):
@@ -146,9 +189,9 @@ def register_portability(app, manager, settings, store, session_or_404):
         if body is None:
             source = idle(session_id)
             completed_for_fork(source)
-            result = insert(export_bundle([source], session_id, True, keep_images=True), destination(source["workspace"]),
-                            "fork")
-            return result["session"]
+            bundle, omitted = fork_bundle(source, session_id, False)
+            result = insert(bundle, destination(source["workspace"]), "fork")
+            return forked(result["session"], result, omitted)
         live = session_or_404(session_id)
         # Like the other history actions: no running turn and no waiting approval, question or plan card.
         ensure_idle(manager, live, "forking from this point")
@@ -157,7 +200,7 @@ def register_portability(app, manager, settings, store, session_or_404):
         source = copy.deepcopy(live)
         try:
             cut, _ = cut_session(source, body.before_event_id)
-            bundle = export_bundle([cut], session_id, True, keep_images=True)
+            bundle, omitted = fork_bundle(cut, session_id, True)
         except HistoryError as exc:
             raise HTTPException(400, str(exc)) from exc
         project = root_project(manager, source["workspace"], source.get("worktree"))
@@ -191,7 +234,7 @@ def register_portability(app, manager, settings, store, session_or_404):
             session["worktree"] = {"id": worktree["id"], "branch": worktree["branch"], "source_workspace": project}
         if title is not None or worktree is not None:
             store.save(session)
-        return public_session(session)
+        return forked(public_session(session), result, omitted)
 
     async def remove_worktree(record):
         try:

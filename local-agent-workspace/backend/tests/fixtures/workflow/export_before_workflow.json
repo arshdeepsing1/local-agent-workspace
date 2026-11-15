@@ -1,0 +1,276 @@
+{
+ "exported_at": 1790000500.0,
+ "format": "local-agent-workspace.conversations",
+ "root_session_id": "11111111-1111-4111-8111-111111111111",
+ "sessions": [
+  {
+   "created": 1790000000.0,
+   "events": [
+    {
+     "created": 1790000000.0,
+     "id": "u1",
+     "text": "Plan the migration",
+     "type": "user"
+    },
+    {
+     "id": "a1",
+     "request_info": {
+      "finish_reason": "stop",
+      "model": "test-model",
+      "status": "completed"
+     },
+     "text": "I will delegate two tasks.",
+     "type": "assistant"
+    },
+    {
+     "call_id": "call-1",
+     "child_session_id": "22222222-2222-4222-8222-222222222222",
+     "delegation": {
+      "completed_tools": 0,
+      "ended": 1790000015.0,
+      "started": 1790000010.0,
+      "status": "completed",
+      "terminal_reason": "completed"
+     },
+     "id": "card1",
+     "input": {
+      "agent_type": "explore",
+      "task": "Survey the tables\nlist each one"
+     },
+     "name": "delegate_task",
+     "output": "{\"status\": \"completed\"}",
+     "state": "completed",
+     "type": "tool"
+    },
+    {
+     "id": "n1",
+     "subagent_id": "22222222-2222-4222-8222-222222222222",
+     "subagent_status": "completed",
+     "text": "Background subagent explore finished: Survey the tables",
+     "type": "notice"
+    },
+    {
+     "id": "a2",
+     "request_info": {
+      "finish_reason": "stop",
+      "model": "test-model",
+      "status": "completed"
+     },
+     "text": "The first part is done.",
+     "type": "assistant"
+    },
+    {
+     "created": 1790000100.0,
+     "id": "u2",
+     "text": "Now the second part",
+     "type": "user"
+    },
+    {
+     "call_id": "call-2",
+     "child_session_id": "33333333-3333-4333-8333-333333333333",
+     "delegation": {
+      "completed_tools": 0,
+      "ended": 1790000025.0,
+      "started": 1790000020.0,
+      "status": "completed",
+      "terminal_reason": "completed"
+     },
+     "id": "card2",
+     "input": {
+      "agent_type": "explore",
+      "task": "Check the indexes"
+     },
+     "name": "delegate_task",
+     "output": "{\"status\": \"completed\"}",
+     "state": "completed",
+     "type": "tool"
+    },
+    {
+     "id": "a3",
+     "request_info": {
+      "finish_reason": "stop",
+      "model": "test-model",
+      "status": "completed"
+     },
+     "text": "All done.",
+     "type": "assistant"
+    }
+   ],
+   "id": "11111111-1111-4111-8111-111111111111",
+   "model": "test-model",
+   "terminal_reason": "completed",
+   "title": "Plan the migration",
+   "updated": 1790000200.0,
+   "wire": [
+    {
+     "content": "Plan the migration",
+     "role": "user"
+    },
+    {
+     "content": "I will delegate two tasks.",
+     "role": "assistant",
+     "tool_calls": [
+      {
+       "function": {
+        "arguments": "{}",
+        "name": "delegate_task"
+       },
+       "id": "call-1",
+       "type": "function"
+      }
+     ]
+    },
+    {
+     "content": "completed",
+     "role": "tool",
+     "tool_call_id": "call-1"
+    },
+    {
+     "content": "The first part is done.",
+     "role": "assistant"
+    },
+    {
+     "content": "Now the second part",
+     "role": "user"
+    },
+    {
+     "content": null,
+     "role": "assistant",
+     "tool_calls": [
+      {
+       "function": {
+        "arguments": "{}",
+        "name": "delegate_task"
+       },
+       "id": "call-2",
+       "type": "function"
+      }
+     ]
+    },
+    {
+     "content": "completed",
+     "role": "tool",
+     "tool_call_id": "call-2"
+    },
+    {
+     "content": "All done.",
+     "role": "assistant"
+    }
+   ],
+   "workspace": "/project"
+  },
+  {
+   "agent_type": "explore",
+   "created": 1790000010.0,
+   "delegation": {
+    "completed_tools": 0,
+    "ended": 1790000015.0,
+    "started": 1790000010.0,
+    "status": "completed",
+    "terminal_reason": "completed"
+   },
+   "events": [
+    {
+     "created": 1790000010.0,
+     "id": "c1-u",
+     "origin": {
+      "kind": "delegated",
+      "parent_call_id": "call-1",
+      "parent_event_id": "card1",
+      "parent_session_id": "11111111-1111-4111-8111-111111111111"
+     },
+     "text": "Delegated task:\nSurvey the tables\nlist each one",
+     "type": "user"
+    },
+    {
+     "id": "c1-a",
+     "request_info": {
+      "finish_reason": "stop",
+      "model": "test-model",
+      "status": "completed"
+     },
+     "text": "# Findings\nFound 1 things.",
+     "type": "assistant"
+    }
+   ],
+   "id": "22222222-2222-4222-8222-222222222222",
+   "is_subagent": true,
+   "model": "test-model",
+   "parent_call_id": "call-1",
+   "parent_event_id": "card1",
+   "parent_session_id": "11111111-1111-4111-8111-111111111111",
+   "terminal_reason": "completed",
+   "title": "Subagent: Survey the tables",
+   "tool_profile": "read_only",
+   "updated": 1790000015.0,
+   "wire": [
+    {
+     "content": "Delegated task:\nSurvey the tables\nlist each one",
+     "role": "user"
+    },
+    {
+     "content": "# Findings\nFound 1 things.",
+     "role": "assistant"
+    }
+   ],
+   "workspace": "/project"
+  },
+  {
+   "agent_type": "explore",
+   "created": 1790000020.0,
+   "delegation": {
+    "completed_tools": 0,
+    "ended": 1790000025.0,
+    "started": 1790000020.0,
+    "status": "completed",
+    "terminal_reason": "completed"
+   },
+   "events": [
+    {
+     "created": 1790000020.0,
+     "id": "c2-u",
+     "origin": {
+      "kind": "delegated",
+      "parent_call_id": "call-2",
+      "parent_event_id": "card2",
+      "parent_session_id": "11111111-1111-4111-8111-111111111111"
+     },
+     "text": "Delegated task:\nCheck the indexes",
+     "type": "user"
+    },
+    {
+     "id": "c2-a",
+     "request_info": {
+      "finish_reason": "stop",
+      "model": "test-model",
+      "status": "completed"
+     },
+     "text": "# Findings\nFound 2 things.",
+     "type": "assistant"
+    }
+   ],
+   "id": "33333333-3333-4333-8333-333333333333",
+   "is_subagent": true,
+   "model": "test-model",
+   "parent_call_id": "call-2",
+   "parent_event_id": "card2",
+   "parent_session_id": "11111111-1111-4111-8111-111111111111",
+   "terminal_reason": "completed",
+   "title": "Subagent: Check the indexes",
+   "tool_profile": "read_only",
+   "updated": 1790000025.0,
+   "wire": [
+    {
+     "content": "Delegated task:\nCheck the indexes",
+     "role": "user"
+    },
+    {
+     "content": "# Findings\nFound 2 things.",
+     "role": "assistant"
+    }
+   ],
+   "workspace": "/project"
+  }
+ ],
+ "version": 1
+}
