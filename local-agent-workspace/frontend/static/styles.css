@@ -1098,6 +1098,8 @@ code.progress-item-title{font:var(--text-xs) var(--font-mono)}
   .approval-buttons{gap:6px}
   .approval-buttons button{padding-inline:10px}
   .split-button>.split-toggle{padding-inline:6px}
+  /* Wide fallback fonts (DejaVu on Linux) need this to keep two rows: the label wraps instead of the row. */
+  .split-button{flex:0 1 10em}
 }
 @container approval (max-width:320px){
   .split-button{flex:1 1 10em}

@@ -737,6 +737,14 @@ function botCheck() {
 }
 """
 
+# Whether a click on the element follows a link or submits a form into another tab (target other than the same one).
+NEW_TAB_TARGET_JS = r"""(e) => {
+  const link = e.closest('a[href], area[href]');
+  const form = e.form || e.closest('form');
+  const target = (link && link.target) || (e.formTarget || '') || (!link && form ? form.target : '') || '';
+  return target !== '' && !['_self', '_parent', '_top'].includes(target.toLowerCase());
+}"""
+
 OUTLINE_JS = "(opts) => {" + COMMON_JS + r"""
 const MAXC = opts.maxChars, MAXCTL = opts.maxControls, VIEW = !!opts.viewport, REG = opts.registry;
 if (REG.next < opts.floor) REG.next = opts.floor;
@@ -2019,6 +2027,9 @@ class BrowserSession:
         element = entry[0]
         before = tab.page.url
         pages_before = set(self._tabs)
+        new_tab_target = False
+        with contextlib.suppress(Exception):
+            new_tab_target = await asyncio.wait_for(element.evaluate(NEW_TAB_TARGET_JS), 1)
         try:
             await element.click(timeout=self.action_timeout * 1000 - 500, no_wait_after=True)
         except self._errors as exc:
@@ -2028,6 +2039,11 @@ class BrowserSession:
                 return self._stale(tab, args["ref"], "clicked")
             return Draft(status=[f"Not clicked: {self._safe(_short_error(exc))}"], tab=tab.id)
         await self._settle(tab.page)
+        # A link or form that targets a new tab: its tab can register after the settle on a busy machine. Wait for
+        # it briefly, so this result names it. A tab that comes later still gets its note.
+        waited = time.monotonic()
+        while new_tab_target and set(self._tabs) == pages_before and time.monotonic() - waited < 1.0:
+            await asyncio.sleep(0.05)
         draft = Draft(host=self._host_of(tab))
         after = tab.page.url
         draft.status.append(f"Clicked {args['ref']}: " + (f"the page is now {self._safe(after)}" if after != before
