@@ -57,7 +57,7 @@ def test_host_key_is_the_host_and_loopback_keys_keep_the_port(url, key):
     ("javascript:alert(1)", "unsupported_address"), ("blob:http://example.com/1", "unsupported_address"),
     ("chrome://version", "unsupported_address"), ("view-source:http://example.com/", "unsupported_address"),
     ("ftp://example.com/", "unsupported_address"), ("about:blank", "unsupported_address"), ("example.com", "unsupported_address"),
-    ("", "unsupported_address"), ("http://", "unsupported_address"), ("http://user:pw@example.com/", "unsupported_address"),
+    ("", "unsupported_address"), ("http://", "unsupported_address"), ("http://user:pw@example.test/", "unsupported_address"),
     ("http://user@localhost:3000/", "unsupported_address"), ("http://example.com:8080/", "unsupported_address"),
     ("https://example.com:22/", "unsupported_address"), ("http://example.com:notaport/", "unsupported_address"),
     ("http://exa mple.com/", "unsupported_address"), ("http://0x7f000001/", "unsupported_address"),

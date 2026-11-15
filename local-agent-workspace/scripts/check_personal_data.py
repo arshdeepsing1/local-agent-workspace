@@ -11,7 +11,8 @@ safety net for a public repository, not a complete secret scanner.
 import subprocess
 import sys
 
-PATTERN = r"/Users/[a-z]|/home/[a-z]|@[a-z0-9-]+\.(com|org|net)\b|dbc-[a-z0-9]|dapi[0-9a-f]{8}"
+# No \b here: macOS git grep ignores it, so the email rule never matched on a Mac.
+PATTERN = r"/Users/[a-z]|/home/[a-z]|@[a-z0-9-]+\.(com|org|net)([^a-z0-9]|$)|dbc-[a-z0-9]|dapi[0-9a-f]{8}"
 # (path suffix, text) pairs that are deliberate test fixtures.
 ALLOWED = [
     ("backend/tests/test_activity_log.py", "user:s3cret@github.com"),
