@@ -1,4 +1,4 @@
-import { html, useEffect, useRef, useState } from '../lib.js'
+import { html, hiddenNote, noteLine, visibleParts, visibleText, useEffect, useRef, useState } from '../lib.js'
 import { Check, ChevronDown, Plus, X } from '../icons.js'
 
 export const modes = [
@@ -47,20 +47,26 @@ function ruleParts(rule) {
     return ['Fetches from ', rule.domain, (rule.behavior || 'allow') === 'allow' ? '' : ' and its subdomains']
   }
   if (tool === 'web_search') return ['Web searches', null, '']
+  if (tool === 'browser') {
+    if (!rule.domain) return ['Browsing', null, '']
+    // A host with a port is this computer's own; a public host's deny and ask rules also cover its subdomains.
+    return ['Browse ', rule.domain, (rule.behavior || 'allow') === 'allow' || /:\d{1,5}$/.test(rule.domain) ? '' : ' and its subdomains']
+  }
   const server = /^mcp__(.+)__\*$/.exec(tool)?.[1]
   if (server) return ['All tools of MCP server ', server, '']
   return [`Tool: ${tool}`, null, '']
 }
 
-export function ruleLabel(rule) {
-  const [before, code, after] = ruleParts(rule)
-  return `${before}${code ?? ''}${after}`
-}
+// What the rule says, with hidden and direction-changing characters as visible escapes. The label is for reading
+// (a tooltip, a button's name); the rule itself, as the server sent it, is what removing it sends back.
+const rawLabel = rule => ruleParts(rule).map(part => part ?? '').join('')
+export const ruleLabel = rule => visibleText(rawLabel(rule))
 
 // The visible label. A command keeps its exact spacing, since an M1 rule matches only that exact text.
+// Each escape is its own element (visibleParts), so a typed backslash and a real character differ.
 export function RuleText({ rule }) {
   const [before, code, after] = ruleParts(rule)
-  return code === null ? before : html`${before}<code>${code}</code>${after}`
+  return code === null ? visibleParts(before) : html`${visibleParts(before)}<code>${visibleParts(code)}</code>${visibleParts(after)}`
 }
 
 const BADGES = { deny: 'Deny', ask: 'Always ask' }
@@ -128,6 +134,7 @@ export default function PermissionsMenu({ mode, busy, locked, onChange, onError,
   }
   const groups = { chat: rules, project: projectRules, user: userRules }
   let position = 0
+  const ruleNote = onRemoveRule ? hiddenNote(Object.values(groups).flatMap(list => (list || []).map(rawLabel))) : null
   const label = modes.find(m => m.value === mode)?.label
   return html`<div class="permissions-control" ref=${container}>
     <button ref=${trigger} class="permission-trigger" aria-haspopup="menu" aria-expanded=${open}
@@ -158,12 +165,13 @@ export default function PermissionsMenu({ mode, busy, locked, onChange, onError,
           const index = position++
           const text = ruleLabel(rule)
           const badge = BADGES[rule.behavior]
-          return html`<div class="allow-rule" key=${JSON.stringify(rule)}><span title=${text}><${RuleText} rule=${rule} /></span>
+          return html`<div class="allow-rule" key=${JSON.stringify(rule)}><span class="logical-order" title=${text}><${RuleText} rule=${rule} /></span>
             ${badge ? html`<span class=${`rule-badge rule-${rule.behavior}`}>${badge}</span>` : null}
             <button role="menuitem" class="icon-button" aria-label=${`Remove rule: ${text}`} aria-disabled=${blocked}
               onClick=${() => { if (!blocked) void act(() => onRemoveRule(scope, rule), index) }}><${X} size=${13} /></button></div>`
         })}
       </div>`) : null}
+      ${noteLine(ruleNote)}
       ${problem ? html`<div class="rules-problem"><p role="alert">${problem} They are ignored until you reset them.</p>
         <button role="menuitem" class="outline" aria-disabled=${blocked} onClick=${() => { if (!blocked && onReset) void act(onReset, 'reset') }}>Reset saved rules</button></div>` : null}
       ${onAddRule ? html`<button role="menuitem" class="add-rule" aria-disabled=${!!locked}

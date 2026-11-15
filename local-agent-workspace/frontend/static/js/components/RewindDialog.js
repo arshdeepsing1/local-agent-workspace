@@ -1,6 +1,6 @@
-import { html, useEffect, useRef, useState } from '../lib.js'
-import { X } from '../icons.js'
+import { html, hiddenNote, noteLine, visibleParts, useEffect, useRef, useState } from '../lib.js'
 import { api } from '../api.js'
+import DialogShell from './DialogShell.js'
 import { RefusedFiles } from './EditMessage.js'
 import { blockerOf, OpenBlockingChat } from './BlockingChat.js'
 
@@ -37,11 +37,6 @@ export default function RewindDialog({ session, event, onRewound, onClose, onSel
   const [error, setError] = useState(null)
   const [saving, setSaving] = useState(false)
   useEffect(() => {
-    const node = dialog.current
-    node?.showModal()
-    return () => { if (node?.open) node.close() }
-  }, [])
-  useEffect(() => {
     let current = true
     api(`/sessions/${encodeURIComponent(session.id)}/rewind-preview?before_event_id=${encodeURIComponent(event.id)}`)
       .then(result => {
@@ -70,11 +65,11 @@ export default function RewindDialog({ session, event, onRewound, onClose, onSel
     } catch (e) { setError(e); setSaving(false) }
   }
   const counts = removedCounts(session.events, event.id)
-  return html`<dialog ref=${dialog} class="settings-dialog rewind-dialog" aria-label="Rewind conversation"
-    onCancel=${onClose} onClick=${e => { if (e.target === dialog.current) onClose() }}>
-    <form class="dialog-content" onSubmit=${submit}>
-      <header><div><h2>Rewind to this message</h2><p class="rewind-quote">${(event.text || '').slice(0, 200)}</p></div>
-        <button type="button" class="icon-button" aria-label="Close" onClick=${onClose}><${X} size=${20} /></button></header>
+  return html`<${DialogShell} className="rewind-dialog" label="Rewind conversation" title="Rewind to this message"
+    description=${html`<p class="rewind-quote">${(event.text || '').slice(0, 200)}</p>`}
+    onClose=${onClose} onSubmit=${submit} dialogRef=${dialog} busy=${saving}
+    footer=${html`<button type="button" class="outline" disabled=${saving} onClick=${onClose}>Cancel</button>
+        <button type="submit" class="primary" disabled=${saving || !choice || !possible(choice)}>Rewind</button>`}>
       ${!preview && !error ? html`<p class="muted">Checking what can be rewound…</p>` : null}
       ${preview ? html`<fieldset><legend>Rewind</legend>${CHOICES.map(([value, label]) => {
         const reason = !possible(value) && value !== 'both' ? preview[value].reason : null
@@ -84,12 +79,10 @@ export default function RewindDialog({ session, event, onRewound, onClose, onSel
         ${preview.conversation.possible && choice !== 'code' ? html`<p class="field-help">${removedLine(counts)}</p>` : null}
         ${preview.conversation.summary_dropped && choice !== 'code' ? html`<p class="field-help">The summary of earlier turns covers messages after this point, so it is dropped; the next message may compact again.</p>` : null}
         ${preview.code.files.length ? html`<ul class="rewind-files" aria-label="Files">${preview.code.files.map(file => html`<li key=${file.path}>
-          <span class="rewind-path">${file.path}</span><span class=${`rewind-status ${file.status}`}>${file.status === 'unavailable' ? file.error || 'Unavailable' : FILE_STATUS[file.status] || file.status}</span></li>`)}</ul>` : null}
+          <span class="rewind-path logical-order">${visibleParts(file.path)}</span><span class=${`rewind-status ${file.status}`}>${file.status === 'unavailable' ? file.error || 'Unavailable' : FILE_STATUS[file.status] || file.status}</span></li>`)}</ul>
+          ${noteLine(hiddenNote(preview.code.files.map(file => file.path)))}` : null}
         <p class="settings-note">Changes made by commands or by subagents are not rewound. The current version is kept as an archived conversation.</p>` : null}
       ${error ? html`<div class="form-error" role="alert"><p>${error.message}</p><${RefusedFiles} error=${error} />
         <${OpenBlockingChat} blocker=${blockerOf(error)} currentId=${session.id} onSelect=${onSelectSession} /></div>` : null}
-      <footer><button type="button" class="outline" onClick=${onClose}>Cancel</button>
-        <button type="submit" class="primary" disabled=${saving || !choice || !possible(choice)}>Rewind</button></footer>
-    </form>
-  </dialog>`
+  <//>`
 }

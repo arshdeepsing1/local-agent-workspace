@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from './lib.js'
-import { api, ApiError, apiUpload, OFFLINE_MESSAGE, refreshToken, setToken, streamProtocols, streamUrl } from './api.js'
+import { api, ApiError, apiUpload, OFFLINE_MESSAGE, refreshToken, setActiveSession, setToken, streamProtocols, streamUrl } from './api.js'
 
 // Selection: { id: string | null, key: string, creating?: Promise<Session> }
 const sessionInUrl = () => new URL(window.location.href).searchParams.get('session')
@@ -24,6 +24,8 @@ export function useWorkspace() {
   const sessionsRequest = useRef(0)
   const [modelSaves, setModelSaves] = useState(() => new Set())
   const activeId = selection.id
+  // Components that call a chat's routes without a prop (the usage card's Shorten and Drop) read the shown chat from api.js.
+  useEffect(() => { setActiveSession(activeId) }, [activeId])
   const [error, setError] = useState('')
   const [online, setOnline] = useState(true)
   // false while the session poll cannot reach the local server (no chat socket is needed to notice).
@@ -360,15 +362,19 @@ export function useWorkspace() {
   const saveSettings = async next => {
     const { workspace, model, env_file, context_window, max_output_tokens, max_agent_steps, compaction_handoffs, approval_timeout_minutes,
       system_notifications, user_instructions, write_limit_kb, command_env, secret_file_patterns, rate_limit_auto_continue, auto_keep_changes,
-      coding_dir, python_venv, auto_compact_percent, reasoning_effort, reasoning_format, thinking_summaries, prompt_caching, subagent_defaults,
-      background_subagent_wake,
+      coding_dir, python_venv, auto_compact_percent, compaction_ask, context_trim, context_trim_start_percent, context_trim_target_percent, reasoning_effort, reasoning_format, thinking_summaries, prompt_caching, subagent_defaults,
+      background_subagent_wake, subagents_running_max, subagents_per_turn_max,
       spending_limit_dbu, fallback_model, user_agents_file, user_claude_file, project_memory, output_style, slash_commands, thinking_replay,
       web_fetch, web_search_provider, web_search_url, web_search_key, git_context, turn_token_limit, turn_time_limit_minutes,
-      schedules_enabled, token_expires_on } = next
+      schedules_enabled, token_expires_on, browser_tools, browser_headless, browser_action_timeout, browser_upstream_proxy } = next
     const saved = await api('/settings', 'PUT', {
       workspace, model, env_file, context_window, max_output_tokens, max_agent_steps,
       ...(typeof compaction_handoffs === 'boolean' ? { compaction_handoffs } : {}),
       ...(Number.isInteger(auto_compact_percent) ? { auto_compact_percent } : {}),
+      ...(typeof compaction_ask === 'boolean' ? { compaction_ask } : {}),
+      ...(typeof context_trim === 'boolean' ? { context_trim } : {}),
+      ...(Number.isInteger(context_trim_start_percent) ? { context_trim_start_percent } : {}),
+      ...(Number.isInteger(context_trim_target_percent) ? { context_trim_target_percent } : {}),
       ...(Number.isInteger(approval_timeout_minutes) ? { approval_timeout_minutes } : {}),
       ...(typeof system_notifications === 'boolean' ? { system_notifications } : {}),
       ...(typeof user_instructions === 'string' ? { user_instructions } : {}),
@@ -393,6 +399,8 @@ export function useWorkspace() {
       ...(typeof slash_commands === 'boolean' ? { slash_commands } : {}),
       ...(subagent_defaults && typeof subagent_defaults === 'object' ? { subagent_defaults } : {}),
       ...(typeof background_subagent_wake === 'boolean' ? { background_subagent_wake } : {}),
+      ...(Number.isInteger(subagents_running_max) ? { subagents_running_max } : {}),
+      ...(Number.isInteger(subagents_per_turn_max) ? { subagents_per_turn_max } : {}),
       ...(typeof user_agents_file === 'boolean' ? { user_agents_file } : {}),
       ...(typeof user_claude_file === 'boolean' ? { user_claude_file } : {}),
       ...(typeof project_memory === 'boolean' ? { project_memory } : {}),
@@ -402,6 +410,10 @@ export function useWorkspace() {
       ...(typeof web_search_provider === 'string' ? { web_search_provider } : {}),
       ...(typeof web_search_url === 'string' ? { web_search_url: web_search_url.trim() } : {}),
       ...(typeof web_search_key === 'string' ? { web_search_key: web_search_key.trim() } : {}),
+      ...(typeof browser_tools === 'boolean' ? { browser_tools } : {}),
+      ...(typeof browser_headless === 'string' ? { browser_headless } : {}),
+      ...(Number.isInteger(browser_action_timeout) ? { browser_action_timeout } : {}),
+      ...(typeof browser_upstream_proxy === 'string' ? { browser_upstream_proxy } : {}),
     })
     setSettings(saved)
     void checkConnection().catch(e => setError(e.message))

@@ -230,11 +230,12 @@ def test_an_unchecked_endpoint_says_where_to_check_it(ui, page):
 def test_an_export_with_reasoning_asks_for_it(ui, page):
     ui.mount("components/ConversationTransfer.js", "{ sessionId: 'source', workspace: '/project', onSelectSession: fake.spy('select'), onError: fake.spy('error') }",
              setup="""fake.captureDownloads(); fake.handle = path => path.startsWith('/api/sessions/source/export')
-               ? fake.json({ format: 'local-agent-workspace.conversations', version: 1, root_session_id: 'source', exported_at: 1, sessions: [] }) : undefined""")
+               ? fake.json({ bundle: { format: 'local-agent-workspace.conversations', version: 1, root_session_id: 'source', exported_at: 1, sessions: [] },
+                             children_omitted: { count: 0, children: [] } }) : undefined""")
     page.get_by_role("checkbox", name=re.compile("^Export with reasoning")).check()
     page.get_by_role("button", name="Export conversation").click()
     expect(page.get_by_role("status")).to_have_text("Conversation file exported.")
-    assert ui.js("fake.calls.map(call => call.path)") == ["/api/sessions/source/export?include_children=false&with_reasoning=true"]
+    assert ui.js("fake.calls.map(call => call.path)") == ["/api/sessions/source/export?include_children=true&report=true&with_reasoning=true"]
 
 
 def test_request_details_name_the_earlier_thinking_a_request_sent(ui, page):

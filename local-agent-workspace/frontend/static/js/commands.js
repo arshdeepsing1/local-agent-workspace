@@ -56,6 +56,17 @@ export function modelNamed(text, choices) {
 // The text of the last reply in a conversation's loaded events, or null.
 export const lastReply = session => session?.events?.findLast(event => event.type === 'assistant' && event.text)?.text || null
 
+// The subagent chats a fork or an export left out ([{id, title, reason}] from the server), as one sentence for
+// the page, or '' when none were. verb: "copied" or "exported".
+const OMITTED_WHY = { limit: 'more than fit in 32 conversations', size: 'over the 16 MiB limit', busy: 'still running',
+  unreadable: 'could not be read' }
+export function omittedMessage(omitted, verb) {
+  if (!Array.isArray(omitted) || !omitted.length) return ''
+  const count = omitted.length
+  const why = [...new Set(omitted.map(item => OMITTED_WHY[item.reason] || String(item.reason)))].join(', ')
+  return `${count} subagent ${count === 1 ? 'conversation was' : 'conversations were'} not ${verb} (${why}).`
+}
+
 // Copy text that is still loading. Safari allows a clipboard write only during the user's action, so the
 // write starts at once and receives the text when it arrives.
 export async function copyLoaded(load) {
@@ -127,6 +138,8 @@ export async function runCommand(id, args, ctx) {
     case 'fork': {
       const created = await api(`/sessions/${encodeURIComponent(chat().id)}/fork`, 'POST')
       app.setActiveId(created.id)
+      const left = omittedMessage(created.children_omitted, 'copied')
+      if (left) ctx.notify?.(left)
       void app.refreshSessions().catch(() => {})
       return
     }

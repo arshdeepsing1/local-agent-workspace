@@ -3,6 +3,7 @@
 Contrast is the WCAG 2.x ratio of an element's text colour, blended over its effective background (the
 non-transparent background colours of it and its ancestors, down to the first opaque one). Text needs 4.5:1;
 icons and focus indicators need 3:1 (an icon's colour is also faded by the opacity of it and its ancestors)."""
+import base64
 import json
 import re
 from pathlib import Path
@@ -406,10 +407,10 @@ def test_message_action_icons_have_three_to_one(ui, page):
 
 # V2, V3: the message box shows focus, and every focusable element gets the same 2 px --focus ring
 
-FOCUS = "rgb(44, 132, 219)"  # --focus
-SURFACE_2 = "rgb(240, 238, 230)"  # --surface-2: hovered buttons
-SURFACE_3 = "rgb(232, 230, 220)"  # --surface-3: hovered sidebar rows
-ACCENT_SOFT = "rgb(245, 236, 224)"  # --accent-soft: cards waiting for you
+FOCUS = "rgb(79, 70, 229)"  # --focus: B's indigo
+SURFACE_2 = "rgb(239, 241, 245)"  # --surface-2: hovered buttons
+SURFACE_3 = "rgb(224, 228, 235)"  # --surface-3: hovered sidebar rows
+ACCENT_SOFT = "rgb(236, 234, 253)"  # --accent-soft: cards waiting for you
 
 
 def keyboard_focus(page, locator):
@@ -419,22 +420,19 @@ def keyboard_focus(page, locator):
     assert locator.evaluate("e => document.activeElement === e && e.matches(':focus-visible')")
 
 
-@pytest.mark.parametrize("style,theme", [("claude", "light"), ("claude", "dark"), ("vscode", "light"), ("vscode", "dark")])
-def test_the_message_box_shows_keyboard_focus(ui, page, style, theme):
-    # V-T4. Mutation: delete the .app-shell .composer:focus-within rule. Focused, the card's subtle border and a 1 px ring
-    # around it turn to --border-strong in Claude style (its shadow deepens too) and to --focus in VS Code style: 3:1
-    # against the page, and 2 px together.
-    start_chat(ui, page, setup=f"localStorage.setItem('local.style', '{style}'); localStorage.setItem('local.theme', '{theme}')")
+def test_the_message_box_shows_keyboard_focus(ui, page):
+    # V-T4. Mutation: delete the .app-shell .composer:focus-within rule. Focused, the card's border turns to --focus and a
+    # 1 px ring of --focus sits outside it (2 px together, 3:1 against the page), with a soft halo around both.
+    start_chat(ui, page)
     composer = page.locator(".composer").first
     textbox = page.get_by_role("textbox", name="Message")
     textbox.evaluate("e => e.blur()")
     blurred = composer.evaluate("e => [getComputedStyle(e).borderTopColor, getComputedStyle(e).boxShadow]")
     keyboard_focus(page, textbox)
     focused = composer.evaluate("e => [getComputedStyle(e).borderTopColor, getComputedStyle(e).boxShadow]")
-    cue = "var(--border-strong)" if style == "claude" else "var(--focus)"
-    assert focused[0] != blurred[0] and focused[0] == page.evaluate(f"visual.resolve('{cue}')"), (blurred, focused)
+    assert focused[0] != blurred[0] and focused[0] == page.evaluate("visual.resolve('var(--focus)')"), (blurred, focused)
     assert focused[1].startswith(f"{focused[0]} 0px 0px 0px 1px"), focused  # the ring outside the border
-    assert page.evaluate(f"visual.pair('{cue}', 'var(--canvas)')") >= 3
+    assert page.evaluate("visual.pair('var(--focus)', 'var(--canvas)')") >= 3
 
 
 def outline(locator):
@@ -487,6 +485,11 @@ def test_rings_inside_clipped_cards_and_the_permission_menu_show(ui, page):
     ui.emit("a", {"type": "tasks", "tasks": [{"id": "t1", "title": "Read the parser", "description": "", "status": "completed",
                                               "depends_on": []}, {"id": "t2", "title": "Fix empty input", "description": "",
                                                                   "status": "pending", "depends_on": []}]})
+    # The changes lead the status row, so the checklist opens from its chip, which shows its own ring.
+    chip = page.get_by_role("button", name="Show Tasks 1/2 done")
+    keyboard_focus(page, chip)
+    assert outline(chip) == ["solid", "2px", FOCUS], chip
+    chip.click()
     targets = [page.locator(".tool-card .tool-heading").first, page.get_by_role("button", name=re.compile(r"^Tasks 1\/2 done"))]
     for target in targets:
         expect(target).to_be_visible()
@@ -692,17 +695,19 @@ def test_tool_group_and_run_heads_are_readable_and_at_least_eleven_pixels(ui, pa
     assert small_text(page, ".transcript") == []
 
 
-# Theme tokens (2026-10-20): one semantic colour set per style (Claude, VS Code) and theme (light, dark), on :root.
+# One style, B "Studio" (2026-11-15): one token block on :root, the new spacing, radius, type and control groups, and
+# every colour, font size and corner of the stylesheet taken from them.
 
 STYLESHEET = Path(__file__).resolve().parents[1] / "static" / "styles.css"
-TOKEN_BLOCK = re.compile(r':root(?:\[data-style="vscode"\])?(?:\[data-theme="(?:dark|system)"\])?\{[^{}]*\}')
-BLOCK_SELECTORS = [":root", ':root[data-theme="dark"]', ':root[data-theme="system"]', ':root[data-style="vscode"]',
-                   ':root[data-style="vscode"][data-theme="dark"]', ':root[data-style="vscode"][data-theme="system"]']
-NOT_COLOURS = ("text-scale", "serif", "font-ui", "font-mono")
+TOKEN_BLOCK = re.compile(r":root\{[^{}]*\}")
+NOT_COLOURS = ("text-scale", "font-ui", "font-mono", "lift")
 REQUIRED_TOKENS = ["canvas", "sidebar", "surface", "surface-2", "surface-3", "ink", "ink-2", "muted", "border", "border-strong",
-                   "accent", "accent-hover", "accent-text", "accent-soft", "on-accent", "on-ink", "focus", "danger", "danger-soft",
-                   "success", "success-soft", "warning", "warning-soft", "info", "info-soft", "shadow", "overlay",
-                   "primary", "primary-hover", "on-primary",
+                   "accent", "accent-hover", "accent-text", "accent-soft", "accent-border", "on-accent", "on-ink", "brand", "focus",
+                   "danger", "danger-soft", "danger-border", "success", "success-soft", "warning", "warning-soft", "warning-border",
+                   "info", "info-soft", "violet", "shadow", "shadow-strong", "overlay", "primary", "primary-hover", "on-primary",
+                   "terminal-bg", "terminal-ink", "paper", "paper-check", "image-backing",
+                   *(f"code-{name}" for name in ("keyword", "string", "number", "title", "type", "attr")),
+                   *(f"chart-{n}" for n in range(1, 5)),
                    *(f"ctx-{name}" for name in ("messages", "summary", "system", "instructions", "tools", "mcp", "overhead", "buffer",
                                                 "reserved", "free"))]
 NAMED_COLOURS = set((
@@ -728,26 +733,42 @@ PAIRS = ([(fg, bg, 4.5) for fg in TEXT for bg in BACKGROUNDS]
          + [(fg, "var(--surface-3)", 4.5) for fg in ("var(--ink)", "var(--ink-2)", "var(--muted)")]  # hovered and current rows
          + [(f"var(--{name})", bg, 4.5) for name in ("danger", "success", "warning", "info")
             for bg in ("var(--canvas)", "var(--surface)", "var(--surface-2)", f"var(--{name}-soft)")]
-         + [(fg, "var(--accent-soft)", 4.5) for fg in ("var(--accent-text)", "var(--muted)", "var(--ink)")]
+         + [(fg, "var(--accent-soft)", 4.5) for fg in ("var(--accent-text)", "var(--muted)", "var(--ink)")]  # the user's bubble, cards
          + [("var(--on-primary)", "var(--primary)", 4.5), ("var(--on-primary)", "var(--primary-hover)", 4.5),  # primary buttons
-            ("var(--on-accent)", "var(--accent)", 3), ("var(--on-accent)", "var(--accent-hover)", 3),  # the send button's arrow
+            ("var(--on-accent)", "var(--accent)", 4.5), ("var(--on-accent)", "var(--accent-hover)", 4.5),  # the send button's arrow
             ("var(--terminal-ink)", "var(--terminal-bg)", 4.5)]
          + [(f"var(--code-{name})", "var(--surface-2)", 4.5) for name in ("keyword", "string", "number", "title", "type", "attr")]
+         + [(f"var(--code-{name})", "var(--surface)", 4.5) for name in ("keyword", "string", "number", "title", "type", "attr")]
          + [(fg, bg, 3) for fg in ("var(--border-strong)", "var(--focus)", "var(--accent)") for bg in BACKGROUNDS])
-# Every style with every theme; Match system on a dark computer must equal Dark.
-LOOKS = [(style, theme) for style in ("claude", "vscode") for theme in ("light", "dark", "system")]
+CSS_WITHOUT_COMMENTS = re.sub(r"/\*.*?\*/", "", STYLESHEET.read_text(), flags=re.S)
 
 
-def choose(style, theme):
-    return f"localStorage.setItem('local.style', '{style}'); localStorage.setItem('local.theme', '{theme}')"
+def declarations(css=CSS_WITHOUT_COMMENTS):
+    """(selector, property, value) for every declaration outside the :root token block."""
+    rest = TOKEN_BLOCK.sub("", css)
+    for selector, body in re.findall(r"([^{}]+)\{([^{}]*)\}", rest):
+        for prop, value in re.findall(r"([-\w]+)\s*:([^;{}]*)", body):
+            yield selector.strip(), prop.strip(), value.strip()
+
+
+def tokens():
+    return dict(re.findall(r"--([\w-]+):([^;}]+)", TOKEN_BLOCK.findall(CSS_WITHOUT_COMMENTS)[0]))
+
+
+def test_the_stylesheet_has_one_token_block_and_no_other_look():
+    # Mutation: add [data-theme="dark"], [data-style="vscode"] or a prefers-color-scheme block back.
+    raw = STYLESHEET.read_text()
+    for gone in ("[data-theme", "[data-style", "data-theme", "data-style", "prefers-color-scheme", "color-scheme:dark"):
+        assert gone not in raw, gone
+    assert len(TOKEN_BLOCK.findall(CSS_WITHOUT_COMMENTS)) == 1
+    assert CSS_WITHOUT_COMMENTS.count(":root") == 1
+    assert tokens()["text-scale"].strip() == "1" and "color-scheme:light" in TOKEN_BLOCK.findall(CSS_WITHOUT_COMMENTS)[0]
+    assert "--serif" not in raw and "DM Sans" not in raw  # B uses the system UI font
 
 
 def test_the_stylesheet_takes_every_colour_from_a_token():
-    # Mutation: write a colour such as #fff or rgba(0,0,0,.1) in any rule outside the token blocks.
-    css = re.sub(r"/\*.*?\*/", "", STYLESHEET.read_text(), flags=re.S)
-    blocks = TOKEN_BLOCK.findall(css)
-    assert [block.split("{")[0] for block in blocks] == BLOCK_SELECTORS
-    rest = TOKEN_BLOCK.sub("", css)
+    # Mutation: write a colour such as #fff or rgba(0,0,0,.1) in any rule outside the token block.
+    rest = TOKEN_BLOCK.sub("", CSS_WITHOUT_COMMENTS)
     literal = r"#[0-9a-fA-F]{3,8}\b|\b(?:rgba?|hsla?|hwb|lab|lch|oklch|oklab|color|color-mix|light-dark)\("
     assert re.findall(r"[^{};]*(?:" + literal + r")[^;}]*", rest) == []
     # Named and system colours (white, rebeccapurple, Canvas, ButtonText…) in any declaration outside the tokens.
@@ -756,32 +777,97 @@ def test_the_stylesheet_takes_every_colour_from_a_token():
              for word in re.findall(r"(?<![-\w(.#'\"])[a-zA-Z]+(?![-\w(])", re.sub(r"var\([^)]*\)|'[^']*'|\"[^\"]*\"", "", value))
              if word.lower() in NAMED_COLOURS]
     assert named == []
-    names = [{name for name in re.findall(r"--([\w-]+):", block) if name not in NOT_COLOURS} for block in blocks]
-    assert set(REQUIRED_TOKENS) <= names[0], set(REQUIRED_TOKENS) - names[0]
-    assert all(found == names[0] for found in names), [names[0] ^ found for found in names]  # every palette sets every token
-    for dark, system in ((blocks[1], blocks[2]), (blocks[4], blocks[5])):
-        assert dark.split("{", 1)[1] == system.split("{", 1)[1]  # Match system in dark mode is exactly Dark
-        assert "@media (prefers-color-scheme:dark){" + system + "}" in css
+    names = {name for name in tokens() if name not in NOT_COLOURS}
+    assert set(REQUIRED_TOKENS) <= names, set(REQUIRED_TOKENS) - names
 
 
-@pytest.mark.parametrize("style,theme", LOOKS)
-def test_the_theme_tokens_meet_their_contrast_pairs(ui, page, style, theme):
-    page.emulate_media(color_scheme="dark")
-    page.add_init_script(script=CONTRAST_JS)
-    ui.app(scenario="workspace", setup=choose(style, theme))
+# Set at run time by the app (WorkspacePanel.js sets --panel-width on the shell, with fallbacks in the stylesheet).
+RUNTIME_TOKENS = {"panel-width"}
+
+
+def test_every_variable_the_stylesheet_uses_is_defined():
+    used = set(re.findall(r"var\(--([\w-]+)", CSS_WITHOUT_COMMENTS))
+    defined = set(tokens())
+    assert used - defined - RUNTIME_TOKENS == set(), used - defined - RUNTIME_TOKENS
+
+
+def test_the_new_token_groups_have_their_documented_values():
+    found = {name: re.sub(r"\s+", "", value) for name, value in tokens().items()}
+    assert [found[f"space-{n}"] for n in range(1, 9)] == ["4px", "8px", "12px", "16px", "20px", "24px", "32px", "40px"]
+    assert [found[f"radius-{size}"] for size in "sml"] == ["8px", "12px", "16px"]
+    assert [found[f"text-{size}"] for size in ("xs", "s", "m", "l", "xl")] == [
+        f"calc({px}px*var(--text-scale))" for px in (11, 12, 14, 16, 20)]
+    assert [found[f"control-{size}"] for size in "sm"] == ["28px", "34px"]
+    assert {"shadow-1", "shadow-2"} <= set(found)
+    assert "system-ui" in found["font-ui"] and "DMSans" not in found["font-ui"]
+    assert "monospace" in found["font-mono"]
+
+
+def test_the_type_tokens_follow_the_text_size(ui, page):
+    ui.app(scenario="workspace", setup="localStorage.setItem('local.textSize', '125')")
     expect(page.get_by_role("combobox", name="Model")).to_have_value("test-model")
-    assert ui.js("[document.documentElement.dataset.style, document.documentElement.dataset.theme]") == [style, theme]
+    sizes = page.evaluate("""() => ['xs', 's', 'm', 'l', 'xl'].map(size => {
+      const probe = document.createElement('i'); probe.style.fontSize = `var(--text-${size})`; document.body.append(probe)
+      const value = parseFloat(getComputedStyle(probe).fontSize); probe.remove(); return value })""")
+    assert sizes == [13.75, 15, 17.5, 20, 25], sizes
+
+
+TEXT_SIZE = re.compile(r"var\(--text-(?:xs|s|m|l|xl)\)")
+# var(--space-1) is the 4 px tail corner of the user's bubble.
+RADIUS = re.compile(r"var\(--radius-[sml]\)|calc\(var\(--radius-[sml]\)[^()]*\)|var\(--space-1\)|0|50%|999px|inherit")
+# (selector, property, value) written as plain pixels on purpose: the usage chart's SVG text is in viewBox units.
+LITERAL_ALLOWED = {(".usage-chart text", "font-size", "10px")}
+
+
+def test_every_font_size_and_corner_uses_a_token():
+    # Mutation: write font-size:13px, calc(13px*var(--text-scale)) or border-radius:9px in any rule.
+    bad = []
+    for selector, prop, value in declarations():
+        if (selector, prop, value) in LITERAL_ALLOWED:
+            continue
+        if prop == "font-size" and not TEXT_SIZE.fullmatch(value) and value not in ("inherit", "0"):
+            bad.append((selector, prop, value))
+        if prop == "font" and value != "inherit" and not re.match(r"(?:[1-9]00\s+)?" + TEXT_SIZE.pattern + r"(?:/[\w.()*-]+(?:\(.*?\))?)?\s", value + " "):
+            bad.append((selector, prop, value))
+        if prop.endswith("radius") and not all(RADIUS.fullmatch(part) for part in re.findall(r"calc\([^()]*(?:\([^()]*\)[^()]*)*\)|\S+", value)):
+            bad.append((selector, prop, value))
+    assert bad == [], bad[:20]
+
+
+SCALE = {4, 8, 12, 16, 20, 24, 32, 40}
+
+
+def test_spacing_on_the_four_pixel_scale_uses_the_space_tokens():
+    # Mutation: write padding:12px or gap:8px. 1 px borders, 2 px hairlines and sizes off the scale (6, 10, 14 px) stay as written.
+    bad, used = [], 0
+    for selector, prop, value in declarations():
+        if re.fullmatch(r"(?:padding|margin|gap|row-gap|column-gap)(?:-(?:top|right|bottom|left|inline|block)(?:-(?:start|end))?)?", prop):
+            used += value.count("var(--space-")
+            bad += [(selector, prop, value) for part in re.split(r"\s+", value)
+                    if re.fullmatch(r"-?\d+px", part) and abs(int(part[:-2])) in SCALE]
+    assert bad == [], bad[:20]
+    assert used >= 250, used
+
+
+def one_look_page(ui, page, setup=""):
+    page.emulate_media(color_scheme="dark")  # a dark system changes nothing
+    page.add_init_script(script=CONTRAST_JS)
+    ui.app(scenario="workspace", setup=setup)
+    expect(page.get_by_role("combobox", name="Model")).to_have_value("test-model")
+
+
+def test_the_tokens_meet_their_contrast_pairs(ui, page):
+    # Mutation: set --muted to #7f8796 (3.3:1) or --success to #2f9e60.
+    one_look_page(ui, page)
     values = page.evaluate("pairs => pairs.map(([fg, bg, min]) => [fg, bg, min, visual.pair(fg, bg)])", PAIRS)
     assert [value for value in values if value[3] < value[2]] == []
-    canvas = {"claude": ("rgb(250, 249, 245)", "rgb(38, 38, 36)"), "vscode": ("rgb(255, 255, 255)", "rgb(31, 31, 31)")}[style]
-    assert ui.js("getComputedStyle(document.body).backgroundColor") == canvas[theme != "light"]
+    assert ui.js("getComputedStyle(document.body).backgroundColor") == "rgb(244, 245, 248)"
 
 
-@pytest.mark.parametrize("style,theme", [look for look in LOOKS if look[1] != "system"])
-def test_form_fields_have_three_to_one_borders(ui, page, style, theme):
+def test_form_fields_have_three_to_one_borders(ui, page):
     # WCAG 1.4.11: a text field, select or text area is found by its border, so the border gets --border-strong.
     # Mutation: give .app-settings .dialog-content select border var(--border).
-    start_chat(ui, page, setup=choose(style, theme))
+    start_chat(ui, page)
     page.get_by_role("button", name="Settings", exact=True).click()
     fields = page.locator("dialog[open] :is(input:not([type=checkbox]):not([type=radio]), select, textarea)")
     expect(fields.first).to_be_visible()
@@ -790,15 +876,13 @@ def test_form_fields_have_three_to_one_borders(ui, page, style, theme):
     assert len(values) >= 8 and [value for value in values if value[1] < 3] == [], values
     page.keyboard.press("Escape")
     search = page.locator(".conversation-search")
-    assert search.evaluate("e => visual.borderRatio(e)") >= 3, theme
+    assert search.evaluate("e => visual.borderRatio(e)") >= 3
 
 
-@pytest.mark.parametrize("style,theme", [("claude", "dark"), ("claude", "system"), ("vscode", "light"), ("vscode", "dark"),
-                                         ("vscode", "system")])
-def test_other_looks_keep_a_chat_the_workspace_and_settings_readable(ui, page, style, theme):
-    # The page-wide checks of the Claude light tests above, in the other looks (system on a dark computer).
+def test_a_chat_the_workspace_and_settings_stay_readable_in_a_dark_system(ui, page):
+    # The page-wide checks of the tests above, with the system in dark mode: nothing changes.
     page.emulate_media(color_scheme="dark")
-    start_chat(ui, page, events=CHAT[:1] + [SPLIT_COMMAND], setup=choose(style, theme))
+    start_chat(ui, page, events=CHAT[:1] + [SPLIT_COMMAND])
     expect(page.locator(".split-button")).to_be_visible()  # an approval card (--accent-soft) and its buttons
     assert failures(page) == []
     start_chat(ui, page, setup=f"fake.sessions.get('a').context_info = {json.dumps(CONTEXT_INFO)}")
@@ -824,24 +908,33 @@ def families(value):
     return ["system-ui" if name == "BlinkMacSystemFont" else name for name in names]
 
 
-def test_the_vscode_style_changes_fonts_and_corners_but_claude_keeps_its_own(ui, page):
+def test_the_ui_uses_the_system_font_and_code_keeps_its_monospace(ui, page):
     start_chat(ui, page)
-    look = """() => [getComputedStyle(document.body).fontFamily, getComputedStyle(document.querySelector('.app-shell .composer')).borderTopLeftRadius,
-      getComputedStyle(document.querySelector('.markdown pre')).fontFamily]"""
-    claude = page.evaluate(look)
-    assert [families(claude[0]), claude[1], families(claude[2])] == [
-        families('"DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'), "18px",
-        families("ui-monospace, SFMono-Regular, Menlo, monospace")], claude
-    start_chat(ui, page, setup=choose("vscode", "light"))
-    vscode = page.evaluate(look)
-    assert [families(vscode[0]), vscode[1], families(vscode[2])] == [
-        families('-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif'), "5px",
-        families('"SF Mono", Menlo, Consolas, "Cascadia Mono", monospace')], vscode
+    look = page.evaluate("""() => [getComputedStyle(document.body).fontFamily, getComputedStyle(document.querySelector('.markdown pre')).fontFamily,
+      getComputedStyle(document.querySelector('.conversation-title')).fontFamily]""")
+    system = families('-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif')
+    assert [families(look[0]), families(look[1]), families(look[2])] == [
+        system, families("ui-monospace, SFMono-Regular, Menlo, monospace"), system], look
+
+
+def test_cards_lift_on_a_soft_shadow_and_corners_are_eight_twelve_and_sixteen(ui, page):
+    # B's shape language on the real components. Mutation: border-radius back to 9px on .tool-card, or no shadow on it.
+    start_chat(ui, page, events=CHAT[:3] + [SPLIT_COMMAND], setup="fake.sessions.get('a').status = 'awaiting_approval'")
+    corners = page.evaluate("""() => Object.fromEntries([['card', '.tool-card'], ['composer', '.app-shell .composer'], ['button', '.changes-bar .primary'],
+      ['bubble', '.user-message'], ['send', '.send-button']].map(([name, selector]) =>
+      [name, getComputedStyle(document.querySelector(selector)).borderTopLeftRadius]))""")
+    assert corners["card"] == "12px" and corners["composer"] == "16px" and corners["button"] == "8px", corners
+    assert corners["bubble"] == "16px" and corners["send"] not in ("0px", "8px"), corners
+    card = page.locator(".tool-card").first
+    assert card.evaluate("e => getComputedStyle(e).boxShadow") != "none"
+    assert card.evaluate("e => getComputedStyle(e).backgroundColor") == "rgb(255, 255, 255)"
+    assert page.locator(".user-message").first.evaluate("e => getComputedStyle(e).backgroundColor") == ACCENT_SOFT
+    assert page.locator(".send-button").first.evaluate("e => getComputedStyle(e).backgroundColor") == FOCUS  # one indigo
 
 
 def lab(hex_colour):
     """CIE L*a*b* (D65) of #rrggbb or #rgb."""
-    digits = hex_colour.lstrip("#")
+    digits = hex_colour.strip().lstrip("#")
     digits = "".join(c * 2 for c in digits) if len(digits) == 3 else digits
     rgb = [int(digits[i:i + 2], 16) / 255 for i in (0, 2, 4)]
     r, g, b = (c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in rgb)
@@ -850,13 +943,129 @@ def lab(hex_colour):
     return 116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)
 
 
+def delta_e(a, b):
+    return round(sum((p - q) ** 2 for p, q in zip(lab(tokens()[a]), lab(tokens()[b]))) ** .5, 1)
+
+
 def test_waiting_cards_do_not_look_like_errors_or_warnings():
     # A card waiting for you (--accent-soft) must not read as an error (--danger-soft) or a warning (--warning-soft):
-    # at least 6 apart (CIE76 ΔE) in every palette. Mutation: --accent-soft #f6e8e0 with --danger-soft #f8e7e4 (2.8).
-    css = re.sub(r"/\*.*?\*/", "", STYLESHEET.read_text(), flags=re.S)
-    gaps = {}
-    for block in TOKEN_BLOCK.findall(css):
-        tokens = dict(re.findall(r"--([\w-]+):([^;}]+)", block))
-        for a, b in (("accent-soft", "danger-soft"), ("accent-soft", "warning-soft"), ("danger-soft", "warning-soft")):
-            gaps[(block.split("{")[0], a, b)] = round(sum((p - q) ** 2 for p, q in zip(lab(tokens[a]), lab(tokens[b]))) ** .5, 1)
-    assert len(gaps) == 18 and {key: gap for key, gap in gaps.items() if gap < 6} == {}
+    # at least 6 apart (CIE76 ΔE). Mutation: --accent-soft #fdeceb with --danger-soft #fdecea (0.2).
+    gaps = {(a, b): delta_e(a, b) for a, b in (("accent-soft", "danger-soft"), ("accent-soft", "warning-soft"), ("danger-soft", "warning-soft"))}
+    assert {key: gap for key, gap in gaps.items() if gap < 6} == {}, gaps
+
+
+def test_the_status_tints_and_the_accent_tint_tell_apart():
+    soft = ["accent-soft", "danger-soft", "warning-soft", "success-soft", "info-soft"]
+    gaps = {(a, b): delta_e(a, b) for i, a in enumerate(soft) for b in soft[i + 1:]}
+    assert {key: gap for key, gap in gaps.items() if gap < 5} == {}, gaps
+
+
+def test_the_chart_and_context_colours_tell_apart():
+    # The context card's bar segments and the usage chart's lines. Greys that sit side by side need 4.5, hues 20.
+    hues = ["ctx-messages", "ctx-summary", "ctx-tools", "ctx-mcp", "ctx-overhead"]
+    greys = ["ctx-system", "ctx-instructions", "ctx-buffer", "ctx-reserved", "ctx-free"]
+    gaps = {(a, b): delta_e(a, b) for i, a in enumerate(hues) for b in hues[i + 1:]}
+    assert {key: gap for key, gap in gaps.items() if gap < 20} == {}, gaps
+    gaps = {(a, b): delta_e(a, b) for i, a in enumerate(greys) for b in greys[i + 1:]}
+    assert {key: gap for key, gap in gaps.items() if gap < 4.5} == {}, gaps
+    charts = {(f"chart-{a}", f"chart-{b}"): delta_e(f"chart-{a}", f"chart-{b}") for a in range(1, 5) for b in range(a + 1, 5)}
+    assert {key: gap for key, gap in charts.items() if gap < 20} == {}, charts
+
+
+# The components set no font size and no corner of their own: both come from the tokens (so they follow the Text size
+# setting). Nothing is allowed here; a size inside an SVG drawing would be an attribute, not a style.
+
+JS_ROOT = Path(__file__).resolve().parents[1] / "static" / "js"
+
+
+def test_components_set_no_inline_font_size_or_corner():
+    # Mutation: write style=${{ fontSize: '11px' }} or style="border-radius:6px" in any component.
+    pattern = re.compile(r"fontSize|font-size|borderRadius|border-radius")
+    found = [f"{path.relative_to(JS_ROOT)}:{number}: {line.strip()[:100]}" for path in sorted(JS_ROOT.rglob("*.js"))
+             for number, line in enumerate(path.read_text().splitlines(), 1) if pattern.search(line)]
+    assert found == [], found
+
+
+def test_the_shorten_and_drop_buttons_use_the_small_text_and_space_tokens(ui, page):
+    info = {"estimated_tokens": 90_000, "input_budget": 181_568, "context_window": 200_000, "reply_reserve": 16_384,
+            "auto_compact_threshold": 163_411, "auto_compact_percent": 90, "compactions": 0, "summarized_messages": 0,
+            "estimate_method": "weighted_utf8", "instruction_files": [], "warnings": [], "percent_used": 45, "used_tokens": 90_000,
+            "limit_tokens": 200_000, "limit_name": "context budget", "is_estimate": True, "compact_at_percent": 82,
+            "breakdown": {"system_instructions": 5_000, "tool_definitions": 8_000, "messages_and_results": 76_000, "summary": 0, "request_overhead": 1_000},
+            "largest_items": [{"event_id": "e1", "kind": "file_read", "label": "read_file: src/part.py", "tokens": 20_000, "can_trim": True}],
+            "trimmed": {"events": 0, "tokens": 0}}
+    ui.mount("components/ContextMeter.js", f"{{ info: {json.dumps(info)}, sessionId: 's1' }}")
+    page.locator("details.context-meter > summary").click()
+    button = page.get_by_role("button", name="Shorten")
+    expect(button).to_be_visible()
+    assert button.get_attribute("style") is None
+    token = page.evaluate("""() => { const e = document.createElement('span'); e.style.cssText = 'font-size:var(--text-xs);padding:var(--space-1) var(--space-2)'
+      document.body.append(e); const s = getComputedStyle(e); const out = [s.fontSize, s.paddingTop, s.paddingLeft]; e.remove(); return out }""")
+    assert button.evaluate("e => [getComputedStyle(e).fontSize, getComputedStyle(e).paddingTop, getComputedStyle(e).paddingLeft]") == token
+    page.evaluate("() => { document.documentElement.style.setProperty('--text-scale', '1.5') }")
+    assert button.evaluate("e => parseFloat(getComputedStyle(e).fontSize)") == pytest.approx(11 * 1.5)  # It follows Text size.
+
+
+# L4: high contrast (forced colours) removes backgrounds and shadows, so a control's edge has to be a border.
+
+def test_chips_the_primary_button_and_the_selected_row_keep_an_edge_in_forced_colours(ui, page):
+    page.emulate_media(forced_colors="active")
+    start_chat(ui, page)
+    ui.emit("a", {"type": "tasks", "tasks": [{"id": "t1", "title": "Read the parser", "description": "", "status": "pending", "depends_on": []}]})
+    edges = {"chip": page.locator(".status-chip").first, "selected row": page.locator(".conversation-row.selected").first}
+    page.get_by_role("button", name="Settings", exact=True).click()
+    edges["primary button"] = page.get_by_role("dialog").locator(".primary").last
+    for name, target in edges.items():
+        expect(target).to_be_visible()
+        edge = target.evaluate("e => { const s = getComputedStyle(e); return [s.borderTopStyle, parseFloat(s.borderTopWidth), s.borderTopColor] }")
+        assert edge[0] == "solid" and edge[1] >= 1, (name, edge)
+        assert edge[2] != "rgba(0, 0, 0, 0)", (name, edge)  # Forced colours paint it with a system colour.
+
+
+# L5: a focus ring is not cut off by the scroller around a chip or a sidebar row.
+
+def test_the_ring_of_a_status_chip_and_a_sidebar_row_lies_inside_its_scroller(ui, page):
+    start_chat(ui, page)
+    ui.emit("a", {"type": "tasks", "tasks": [{"id": "t1", "title": "Read the parser", "description": "", "status": "pending", "depends_on": []}]})
+    targets = [page.locator(".status-chips button").first, page.locator(".conversation-row > button:first-child").first]
+    assert len(targets) == 2
+    for target in targets:
+        expect(target).to_be_visible()
+        keyboard_focus(page, target)
+        assert outline(target)[:3:2] == ["solid", FOCUS] and outline(target)[1] == "2px", target
+        assert target.evaluate(RING_INSIDE_CLIP), (target, target.evaluate("e => getComputedStyle(e).outlineOffset"))
+
+
+# L6: the favicon and the app icons are B's indigo on its canvas; no old clay or ivory is left.
+
+STATIC = Path(__file__).resolve().parents[1] / "static"
+OLD_COLOURS = ("d97757", "faf9f5", "c96442", "ede9e0")
+
+
+def test_the_favicon_and_the_svg_icon_have_no_old_colour():
+    for path in (STATIC.parent / "index.html", STATIC / "icon.svg"):
+        text = path.read_text().lower()
+        assert [colour for colour in OLD_COLOURS if colour in text] == [], path.name
+    assert "%234f46e5" in (STATIC.parent / "index.html").read_text()
+    svg = (STATIC / "icon.svg").read_text().lower()
+    assert "#4f46e5" in svg and "#f4f5f8" in svg
+    assert "#f4f5f8" in (STATIC.parent / "index.html").read_text().lower()  # the theme colour, the canvas
+
+
+@pytest.mark.parametrize("name", ["icon-192.png", "icon-512.png", "apple-touch-icon.png"])
+def test_the_png_app_icons_are_indigo_with_no_old_clay(ui, page, name):
+    ui.start()
+    data = base64.b64encode((STATIC / name).read_bytes()).decode()
+    result = page.evaluate("""async encoded => {
+      const blob = new Blob([Uint8Array.from(atob(encoded), letter => letter.charCodeAt(0))], { type: 'image/png' })
+      const bitmap = await createImageBitmap(blob)
+      const canvas = document.createElement('canvas'); canvas.width = bitmap.width; canvas.height = bitmap.height
+      const context = canvas.getContext('2d'); context.drawImage(bitmap, 0, 0)
+      const data = context.getImageData(0, 0, bitmap.width, bitmap.height).data
+      const at = (x, y) => Array.from(data.slice((Math.round(y) * bitmap.width + Math.round(x)) * 4, (Math.round(y) * bitmap.width + Math.round(x)) * 4 + 3))
+      let clay = 0
+      for (let i = 0; i < data.length; i += 4) if (data[i + 3] > 200 && Math.abs(data[i] - 217) < 24 && Math.abs(data[i + 1] - 119) < 24 && Math.abs(data[i + 2] - 87) < 24) clay++
+      return { size: bitmap.width, tile: at(bitmap.width * 0.07, bitmap.height / 2), clay }
+    }""", data)
+    assert result["clay"] == 0, result
+    assert all(abs(a - b) <= 6 for a, b in zip(result["tile"], (79, 70, 229))), result

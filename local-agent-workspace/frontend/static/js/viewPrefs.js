@@ -37,3 +37,21 @@ export function useViewPrefs() {
   }, [])
   return { group }
 }
+
+// The Workspace panel: 'open' or 'closed' once you have chosen with the Workspace button or the panel's Close, null on a
+// first visit (the panel then starts closed). Kept in this browser's localStorage under 'workspace-panel'.
+const PANEL_KEY = 'workspace-panel'
+let chosenPanel = null  // this page's choice, for when storage is blocked
+
+export function savedWorkspacePanel() {
+  try {
+    const value = window.localStorage.getItem(PANEL_KEY)
+    if (value === 'open' || value === 'closed') return value
+  } catch { /* Storage blocked: this page's choice or none. */ }
+  return chosenPanel
+}
+
+export function saveWorkspacePanel(open) {
+  chosenPanel = open ? 'open' : 'closed'
+  try { window.localStorage.setItem(PANEL_KEY, chosenPanel) } catch { /* Kept for this page only. */ }
+}

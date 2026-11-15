@@ -45,7 +45,7 @@ function subagentRows(session, sessions) {
 const phaseOf = progress => progress.terminal_reason ? 'ended'
   : progress.status === 'awaiting_approval' ? 'waiting' : progress.status === 'queued' ? 'queued' : 'running'
 
-// The meter's reading (ContextMeter's meterReading, so the two agree), the auto-compact mark, compactions and
+// The meter's reading (ContextMeter's meterReading: the server's percent_used, so the views agree), the auto-compact mark, compactions and
 // warnings, the last turn's summary and the loaded instruction files.
 function ContextSection({ session, onOpenContext }) {
   const info = session.context_info
@@ -58,10 +58,10 @@ function ContextSection({ session, onOpenContext }) {
     info.warnings?.length ? plural(info.warnings.length, 'warning') : ''].filter(Boolean).join(' · ')
   return html`
     <p class="progress-context-line">${reading.label}</p>
-    ${reading.legacyEstimate ? null : html`<span class=${`context-bar progress-context-bar${mark !== null && reading.value >= mark ? ' over' : ''}`}>
+    ${reading.legacyEstimate ? null : html`<span class=${`context-bar progress-context-bar${reading.over ? ' over' : ''}`}>
       <progress aria-label="Context used" aria-valuetext=${reading.ariaValueText} value=${Math.min(reading.value, 100)} max=${100} />
       ${mark !== null ? html`<span class="context-bar-mark" aria-hidden="true" style=${`left:${mark}%`} />` : null}</span>`}
-    ${mark !== null ? html`<p class="progress-note">Compacts automatically at ${mark}% of the input budget.</p>` : null}
+    ${mark !== null ? html`<p class="progress-note">Compacts automatically at ${mark}% of the ${reading.limitName}.</p>` : null}
     ${counts ? html`<p class="progress-note">${counts}</p>` : null}
     ${summary ? html`<p class="progress-note" title=${summary.details}>Last turn: ${summary.text}</p>` : null}
     <${ContextUsage} usage=${contextUsage(info, reading)} bar=${false} />

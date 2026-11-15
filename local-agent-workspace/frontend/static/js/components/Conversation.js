@@ -1,4 +1,4 @@
-import { html, useEffect, useLayoutEffect, useMemo, useRef, useState } from '../lib.js'
+import { html, hiddenNote, noteLine, visibleParts, visibleText, useEffect, useLayoutEffect, useMemo, useRef, useState } from '../lib.js'
 import { Bot, Check, ChevronDown, ChevronRight, CircleAlert, Copy, FileText, GitBranch, LoaderCircle, Pencil, RefreshCw, Search, Terminal, Undo2, Workflow, X } from '../icons.js'
 import { api } from '../api.js'
 import { enhanceCodeBlocks, linkPaths, renderMarkdown } from '../markdown.js'
@@ -61,10 +61,19 @@ export function commandHeading(command, shorten, projectName = '', cwd = '') {
 // Returns Map<event id, { subject, shown, taskStatus? }> for every tool event. subject is the full text (the title
 // and accessible name); shown is what the heading shows: a path inside the project relative to it, one in an
 // allowed folder as "<folder name>/rest" (shorten: pathShortener), and a leading cd into such a folder shortened.
+// The first 240 characters of a heading on one line. A card that waits for you is read to decide, so only ordinary white
+// space (space, tab, newline) is folded; any other blank (an ideographic space, a carriage return) stays for
+// visibleParts to escape. A finished card folds every kind.
+function flatten(text, pending) {
+  let cut = text.slice(0, 240)
+  if (!pending) return cut.replace(/\s+/g, ' ')
+  if (text.length > 240 && /[\ud800-\udbff]$/.test(cut)) cut = cut.slice(0, -1)  // Not in the middle of a character.
+  return cut.replace(/[ \t\n]+/g, ' ')
+}
+
 function summarizeTools(events, shorten = path => path, projectName = '') {
   const taskTitles = new Map()
   const summaries = new Map()
-  const flat = text => text.slice(0, 240).replace(/\s+/g, ' ')
   for (const event of events) {
     if (event.type !== 'tool') continue
     const input = event.input || {}
@@ -80,6 +89,7 @@ function summarizeTools(events, shorten = path => path, projectName = '') {
     }
     if (event.name === 'remember') subject = shown = String(input.text ?? '')
     if (event.name === 'web_fetch') subject = shown = String(input.url ?? '')
+    if (event.name === 'browser') subject = shown = browserSubject(event)
     if (event.name === 'report_findings') {
       const count = Array.isArray(input.findings) ? input.findings.length : 0
       subject = shown = `${count} ${count === 1 ? 'finding' : 'findings'}`
@@ -112,7 +122,8 @@ function summarizeTools(events, shorten = path => path, projectName = '') {
         if (typeof status === 'string') taskStatus = status.replace(/_/g, ' ')
       }
     }
-    summaries.set(event.id, { subject: flat(subject), shown: flat(shown), taskStatus })
+    const pending = event.state === 'pending'
+    summaries.set(event.id, { subject: flatten(subject, pending), shown: flatten(shown, pending), taskStatus })
   }
   return summaries
 }
@@ -142,7 +153,7 @@ function shownPart(page) {
 // result the agent received (the edited-command note and the page).
 export function resultOf(event) {
   const name = event.name || ''
-  if (!(JOB_TOOLS.has(name) || name.startsWith('mcp__')) || event.state === 'running') return null
+  if (!(JOB_TOOLS.has(name) || name === 'browser' || name.startsWith('mcp__')) || event.state === 'running') return null
   const text = String(event.output || '')
   let note = null
   let json = text
@@ -347,17 +358,22 @@ function McpImages({ images, sessionId }) {
 }
 
 // failure: what a failed tool told the agent (toolError), or null.
+// What the user reads to approve is shown with hidden and direction-changing characters as visible escapes; a
+// finished card (the result of what already ran) prints its text as it is.
 function ToolDetails({ event, pending, result = null, failure = null }) {
   const { command, ...options } = event.input || {}
   const hasCommand = typeof command === 'string'
   const job = result?.job
+  const shown = text => pending ? visibleParts(text) : text
+  // What you read to approve is laid out in the order typed, however right-to-left words sit in it.
+  const order = pending ? 'logical-order' : undefined
   return html`
     ${event.hook_change ? html`<p class="tool-detail-label">Before the hook (the agent's proposal)</p>
-      <pre aria-label="Arguments before the hook">${pretty(event.hook_change.original)}</pre>` : null}
+      <pre class=${order} aria-label="Arguments before the hook">${shown(pretty(event.hook_change.original))}</pre>` : null}
     <p class="tool-detail-label">${hasCommand ? 'Command' : 'Input'}${event.hook_change ? ' after the hook' : ''}</p>
-    <pre aria-label=${hasCommand ? 'Command' : 'Input'}>${hasCommand ? (pending && event.preview ? event.preview : command) : JSON.stringify(event.input || {}, null, 2)}</pre>
-    ${hasCommand && Object.keys(options).length && !(pending && event.preview) ? html`<p class="tool-detail-label">Options</p><pre aria-label="Options">${JSON.stringify(options, null, 2)}</pre>` : null}
-    ${pending && !hasCommand && event.preview ? html`<p class="tool-detail-label">Approval preview</p><pre aria-label="Approval preview">${event.preview}</pre>` : null}
+    <pre class=${order} aria-label=${hasCommand ? 'Command' : 'Input'}>${shown(hasCommand ? (pending && event.preview ? event.preview : command) : JSON.stringify(event.input || {}, null, 2))}</pre>
+    ${hasCommand && Object.keys(options).length && !(pending && event.preview) ? html`<p class="tool-detail-label">Options</p><pre class=${order} aria-label="Options">${shown(JSON.stringify(options, null, 2))}</pre>` : null}
+    ${pending && !hasCommand && event.preview ? html`<p class="tool-detail-label">Approval preview</p><pre class=${order} aria-label="Approval preview">${shown(event.preview)}</pre>` : null}
     ${result ? html`${result.note && !event.edited ? html`<p class="tool-rule">${result.note}</p>` : null}
         <p class="tool-detail-label">Output</p><pre aria-label="Output">${result.text || 'No output.'}</pre>
         ${job ? html`<p class="muted tool-job-state">${jobStateLine(job)}</p>` : null}
@@ -451,6 +467,7 @@ const STOP_TEXT = { streaming: 'Stopped while replying', tools: 'Stopped during 
 
 function toolOutcome(event) {
   const clipped = clip(event.output)
+  if (browserRefusal(event) && event.state !== 'pending') return browserRefusal(event)
   if (event.state === 'rejected') {
     // A before-tool hook's deny: its hook and reason, not the text the model got.
     if (event.hook_blocked?.hook_id) return `Not run: hook ${event.hook_blocked.hook_id} blocked it${event.hook_blocked.reason ? `: ${clip(event.hook_blocked.reason)}` : ''}`
@@ -486,6 +503,8 @@ export function allowLabel(event) {
   if (name === 'remember') return 'Allow saving memory in this chat'
   // web_search: approving the card allows searches for the rest of the chat, so it needs no second button.
   if (name === 'web_fetch') return webDomain(event) ? `Allow ${webDomain(event)} in this chat` : null
+  // browser: the server's card names the host key; an action on a host that is allowed already offers no chat button.
+  if (name === 'browser') return event.browser?.choices?.find(choice => choice?.id === 'chat')?.label || null
   return null
 }
 
@@ -495,10 +514,85 @@ export function webDomain(event) {
   try { return new URL(String(event.input?.url || '')).hostname || '' } catch { return '' }
 }
 
+// Browser cards (browser_tool.py): the heading names the action and the host, the line under it the main argument.
+const BROWSER_VERBS = { open: 'Browse', read: 'Read', find: 'Find on', click: 'Click on', type: 'Type on', select: 'Choose on',
+  scroll: 'Scroll', back: 'Go back on', forward: 'Go forward on', tabs: 'Tabs of', screenshot: 'Screenshot of',
+  console: 'Console of', network: 'Network of', close: 'Close' }
+// The host key a browser card is about: the engine's (event.browser.host: a public host, or a loopback address with its
+// port), else the host of an open call's address.
+export function browserHost(event) {
+  if (typeof event.browser?.host === 'string' && event.browser.host) return event.browser.host
+  try { return new URL(String(event.input?.url || '')).host } catch { return '' }
+}
+// "Browse docs.example.com", "Click on localhost:3000". The server's card title wins (it also says "Submit a form on").
+export function browserHeading(event) {
+  if (typeof event.browser?.title === 'string' && event.browser.title) return event.browser.title
+  const verb = BROWSER_VERBS[event.input?.action] || 'Browser'
+  const host = browserHost(event)
+  return host ? `${verb} ${host}` : verb
+}
+// The main argument: the address, the control's description, the length of typed text (never the text itself), a query.
+export function browserSubject(event) {
+  const input = event.input || {}
+  const control = event.browser?.label || input.ref || ''
+  switch (input.action) {
+    case 'open': return String(input.url ?? '')
+    case 'click': return control
+    case 'type': return `${control} · ${Number.isInteger(input.text_length) ? input.text_length : String(input.text ?? '').length} characters${input.submit ? ' · then Enter' : ''}`
+    case 'select': return `${control} · ${input.value ?? ''}`
+    case 'find': return String(input.query ?? '')
+    case 'scroll': return String(input.direction || input.ref || '')
+    case 'tabs': case 'close': return String(input.tab || '')
+    case 'screenshot': return input.full_page ? 'full page' : String(input.ref || '')
+    default: return ''
+  }
+}
+// Why the engine stopped or refused, in plain words, by its reason code.
+export const BROWSER_REFUSALS = {
+  credential_field: 'Typing into password, card and code fields is left to you. Use the browser window.',
+  bot_check: 'The page asks for a bot check. The agent stopped; complete it yourself in the browser window.',
+  private_address: 'This address is on a private network, so the browser did not open it.',
+  unsupported_address: 'Only http and https addresses without a user name or password can be opened.',
+  download: 'The page tried to start a download. It was cancelled.',
+  dialog: 'A dialog opened on the page and was dismissed.',
+  file_chooser: 'The page asked for a file. No file was chosen.',
+  permission_prompt: 'The page asked for a permission such as location or camera. It was denied.',
+  host_not_allowed: 'The page moved to a host this chat has not allowed. The agent has to ask for it first.',
+  timeout: 'The page took longer than the action time limit, so the agent got what had loaded.',
+  stale_ref: 'The page changed since the agent last read it. It has to read the page again.',
+  tab_limit: 'Eight tabs are open, the most the browser keeps. One has to close first.',
+  not_open: 'No page is open yet. The agent has to open one first.',
+  submit_needs_approval: 'The page tried to send a form or other data. A submit on that host needs your approval first.',
+  page_changed: 'The page changed while the approval waited, so nothing was done. The agent has to read the page again.',
+}
+const browserRefusal = event => event.name === 'browser' ? BROWSER_REFUSALS[event.browser?.refused] || null : null
+
+// A browser card's screenshot (event.browser.image, an upload reference): a thumbnail that opens full size when clicked.
+function BrowserShot({ image, sessionId, host }) {
+  const [state, setState] = useState({})
+  const [large, setLarge] = useState(false)
+  useEffect(() => {
+    let active = true
+    setState({})
+    api(`/sessions/${encodeURIComponent(sessionId)}/uploads/${encodeURIComponent(image.upload)}/image`)
+      .then(data => { if (active) setState(IMAGE_TYPES.has(data.mime_type) && typeof data.data === 'string' ? { src: `data:${data.mime_type};base64,${data.data}` } : { error: 'This image cannot be shown.' }) })
+      .catch(e => { if (active) setState({ error: e.message }) })
+    return () => { active = false }
+  }, [sessionId, image.upload])
+  const name = `screenshot of ${visibleText(host || 'the page')}`
+  return html`<div class="mcp-image browser-shot">
+    ${state.src ? html`<button type="button" aria-expanded=${large} aria-label=${large ? `Show the ${name} as a thumbnail` : `Open the ${name} full size`}
+      onClick=${() => setLarge(value => !value)}><img class=${large ? '' : 'browser-thumb'} src=${state.src} alt=${name[0].toUpperCase() + name.slice(1)} /></button>`
+      : state.error ? html`<p class="form-error">${state.error}</p>` : html`<p class="muted">Loading the ${name}…</p>`}
+  </div>`
+}
+
 // The first sentence of a pending card.
 function approvalAsk(event, title) {
-  if (event.name === 'web_fetch' && webDomain(event)) return `Local needs your approval to fetch from ${webDomain(event)}.`
-  if (event.name === 'web_search') return `Local needs your approval to search the web${event.web_provider ? ` with ${event.web_provider}` : ''}.`
+  // A pending card's first sentence: names the host or provider the server sent, so hidden characters in them are escaped.
+  if (event.name === 'web_fetch' && webDomain(event)) return `Local needs your approval to fetch from ${visibleText(webDomain(event))}.`
+  if (event.name === 'browser' && event.browser?.title) return `Local needs your approval: ${visibleText(event.browser.title)}.`
+  if (event.name === 'web_search') return `Local needs your approval to search the web${event.web_provider ? ` with ${visibleText(event.web_provider)}` : ''}.`
   return `Local needs your approval to ${title.toLowerCase()}.`
 }
 
@@ -562,8 +656,9 @@ export function SubagentControls({ event, progress, onSelectSession, onError }) 
   }
   const decide = allowed => act(allowed ? 'allow' : 'decline', `/sessions/${encodeURIComponent(child)}/approvals/${encodeURIComponent(pending.event_id)}`, { allowed })
   return html`<div class="subagent-controls">
-    ${pending ? html`<p class="subagent-pending" title=${pending.title}>${pending.kind === 'approval' ? `Waits for approval: ${String(pending.name || '').replace(/_/g, ' ')} · ` : pending.kind === 'question' ? 'Asks: ' : 'Plan to review: '}${pending.title}</p>` : null}
-    ${pending?.kind === 'approval' && Array.isArray(pending.warnings) && pending.warnings.length ? html`<p class="subagent-pending-warning">Its card warns: ${pending.warnings.join('; ')}.</p>` : null}
+    ${pending ? html`<p class="subagent-pending logical-order" title=${visibleText(pending.title)}>${pending.kind === 'approval' ? visibleParts(`Waits for approval: ${String(pending.name || '').replace(/_/g, ' ')} · `) : pending.kind === 'question' ? 'Asks: ' : 'Plan to review: '}${visibleParts(pending.title)}</p>` : null}
+    ${pending?.kind === 'approval' && Array.isArray(pending.warnings) && pending.warnings.length ? html`<p class="subagent-pending-warning logical-order">Its card warns: ${visibleParts(pending.warnings.join('; '))}.</p>` : null}
+    ${pending ? noteLine(hiddenNote([pending.name, pending.title, ...(Array.isArray(pending.warnings) ? pending.warnings : [])])) : null}
     ${pending?.kind === 'approval' && !pending.review ? html`<button class="outline" disabled=${!!acting} onClick=${() => void decide(true)}>Allow</button>` : null}
     ${pending?.kind === 'approval' && pending.review && onSelectSession ? html`<button class="outline" onClick=${() => onSelectSession(child)}>Review in subagent</button>` : null}
     ${pending?.kind === 'approval' ? html`<button class="outline" disabled=${!!acting} onClick=${() => void decide(false)}>Decline</button>` : null}
@@ -681,9 +776,14 @@ function ToolCard({ event, summary, result, status, failure = null, sessionId, o
   const [deciding, setDeciding] = useState(false)
   const [note, setNote] = useState('')
   const pending = event.state === 'pending'
-  const title = (event.name || 'Tool').replace(/_/g, ' ')
+  // A card of a batch that waits for the batch's one decision (BatchApproval in the run head) has no buttons of its own.
+  const batchWait = pending && event.batch_approval && typeof event.batch_approval === 'object' ? event.batch_approval : null
+  // A card of a decided batch that waits for its turn (batch_decided): approved or declined, it only waits for the
+  // subagents before it; 'ask' asks on its own card then, like a card after Review one by one.
+  const queued = pending && !batchWait && Object.hasOwn(BATCH_QUEUED, event.batch_decided) ? event.batch_decided : null
+  const title = (pending || event.name === 'browser' ? visibleText : String)(event.name === 'browser' ? browserHeading(event) : (event.name || 'Tool').replace(/_/g, ' '))
   const isTask = event.name === 'create_task' || event.name === 'update_task'
-  const allowInChat = pending ? allowLabel(event) : null
+  const allowInChat = pending ? (label => label && visibleText(label))(allowLabel(event)) : null
   const rule = ruleLine(event)
   const hooked = hookSummary(event)
   const hints = hintText(event.mcp_annotations)
@@ -702,12 +802,13 @@ function ToolCard({ event, summary, result, status, failure = null, sessionId, o
   }
   // id and data-event-id let other views (a run's head, Workspace → Progress) find and reveal this card.
   const touch = onTouch ? () => onTouch(event.id) : undefined
-  return html`<div id=${`tool-${event.id}`} data-event-id=${event.id} class=${`tool-card ${isTask ? 'tool-task' : ''} ${pending ? 'needs-approval' : ''}${className ? ` ${className}` : ''}`}
+  return html`<div id=${`tool-${event.id}`} data-event-id=${event.id} data-batch-waiting=${batchWait && !batchWait.review ? batchWait.id : undefined}
+    class=${`tool-card ${isTask ? 'tool-task' : ''} ${pending && queued !== 'allowed' && queued !== 'declined' ? 'needs-approval' : ''}${className ? ` ${className}` : ''}`}
     onClick=${touch} onFocusIn=${touch}>
     <button class="tool-heading" onClick=${() => setExpanded(v => !v)} aria-expanded=${expanded || pending}
-      aria-label=${[title, summary.subject, summary.taskStatus ? `Task: ${summary.taskStatus}` : '', status.label].filter(Boolean).join(' ')}>
+      aria-label=${[title, pending ? visibleText(summary.subject) : summary.subject, summary.taskStatus ? `Task: ${summary.taskStatus}` : '', status.label].filter(Boolean).join(' ')}>
       ${event.name === 'delegate_task' ? html`<${Bot} size=${16} />` : event.name?.toLowerCase().includes('command') || event.name === 'Bash' ? html`<${Terminal} size=${16} />` : html`<${FileText} size=${16} />`}
-      <span class="tool-name">${title}</span><span class="tool-subject" title=${summary.subject}>${summary.shown ?? summary.subject}</span>
+      <span class="tool-name">${title}</span><span class=${pending ? 'tool-subject logical-order' : 'tool-subject'} title=${pending ? visibleText(summary.subject) : summary.subject}>${pending ? visibleParts(summary.shown ?? summary.subject) : summary.shown ?? summary.subject}</span>
       ${summary.taskStatus ? html`<span class="tool-task-status">Task: ${summary.taskStatus}</span>` : null}
       ${status.tone === 'running' ? html`<${LoaderCircle} size=${14} className="spin" />` : status.tone === 'ok' ? html`<${Check} size=${14} className="success-icon" />`
         : status.tone === 'warn' ? html`<${CircleAlert} size=${14} className="warning-icon" />` : null}
@@ -716,20 +817,22 @@ function ToolCard({ event, summary, result, status, failure = null, sessionId, o
       ${expanded || pending ? html`<${ChevronDown} size=${14} />` : html`<${ChevronRight} size=${14} />`}
     </button>
     <${DelegationStatus} event=${event} onSelectSession=${onSelectSession} onOpenPath=${onOpenPath} onError=${onError} />
-    ${event.sibling_change ? html`<p class="tool-sibling">Another subagent of this chat (${agentLabel(event.sibling_change.agent_type)}, ${String(event.sibling_change.subagent_id).slice(0, 8)}) changed ${event.sibling_change.path} during its run${event.state === 'pending' ? ', so this change asks first. Approve it only if both changes should stay.' : '.'}</p>` : null}
+    ${event.sibling_change ? html`<p class=${event.state === 'pending' ? 'tool-sibling logical-order' : 'tool-sibling'}>Another subagent of this chat (${event.state === 'pending' ? visibleParts(agentLabel(event.sibling_change.agent_type)) : agentLabel(event.sibling_change.agent_type)}, ${event.state === 'pending' ? visibleParts(String(event.sibling_change.subagent_id).slice(0, 8)) : String(event.sibling_change.subagent_id).slice(0, 8)}) changed ${event.state === 'pending' ? visibleParts(event.sibling_change.path) : event.sibling_change.path} during its run${event.state === 'pending' ? ', so this change asks first. Approve it only if both changes should stay.' : '.'}</p>` : null}
     ${liveLine ? html`<p class="tool-live" title=${liveLine}>${liveLine}</p>` : null}
     ${rule ? html`<p class="tool-rule">${rule}</p>` : null}
     ${hooked ? html`<p class="hook-outcome">${hooked}</p>` : null}
     ${hints ? html`<p class="tool-hints" title="Hints from the MCP server. They never change approvals.">Server says: ${hints}</p>` : null}
     ${expanded || pending ? html`<div class="tool-body">
-      ${pending ? html`<p>${approvalAsk(event, title)}${event.approval_expires
-          ? ` If you do not answer by ${expiryTime(event.approval_expires)}, it will not run.` : ''}</p>
-        <${ApprovalOptions} event=${event} sessionId=${sessionId} onError=${onError} deciding=${deciding} onDecide=${decide} allowInChat=${allowInChat}
-          approveLabel=${event.name === 'web_fetch' ? 'Allow once' : 'Approve'}
+      ${pending ? html`${queued === 'allowed' || queued === 'declined' ? null : html`<p>${approvalAsk(event, title)}${event.approval_expires
+          ? ` If you do not answer by ${expiryTime(event.approval_expires)}, it will not run.` : ''}</p>`}
+        ${batchWait || queued ? html`<p class="batch-waiting" role="status">${queued ? BATCH_QUEUED[queued] : batchWait.review ? 'Waits for the subagents before it' : 'Waiting for the batch decision'}</p>
+          <${ToolDetails} event=${event} pending=${true} />`
+        : html`<${ApprovalOptions} event=${event} sessionId=${sessionId} onError=${onError} deciding=${deciding} onDecide=${decide} allowInChat=${allowInChat}
+          approveLabel=${event.name === 'web_fetch' || event.name === 'browser' ? 'Allow once' : 'Approve'}
           details=${html`<${ToolDetails} event=${event} pending=${true} />`}
           declineNote=${html`<label class="decline-note"><span>Tell the agent why (optional)</span>
             <textarea rows=${2} maxLength=${2000} spellcheck=${false} value=${note} disabled=${deciding}
-              onInput=${e => setNote(e.currentTarget.value)} /></label>`} />`
+              onInput=${e => setNote(e.currentTarget.value)} /></label>`} />`}`
         : html`${event.state === 'completed' && allowanceNote(event) ? html`<p class="tool-allowance">${allowanceNote(event)}</p>` : null}
           <${ToolDetails} event=${event} pending=${false} result=${result} failure=${failure} />
           ${Array.isArray(event.mcp_images) && event.mcp_images.length ? html`<${McpImages} images=${event.mcp_images} sessionId=${sessionId} />` : null}
@@ -737,6 +840,8 @@ function ToolCard({ event, summary, result, status, failure = null, sessionId, o
           ${onOpenPath && typeof filePath === 'string' && filePath ? html`<button class="outline tool-open-file"
             onClick=${() => onOpenPath(startLine ? { path: filePath, line: startLine } : { path: filePath })}><${FileText} size=${14} />Open file</button>` : null}`}
     </div>` : null}
+    ${event.name === 'browser' && event.browser?.image?.upload ? html`<${BrowserShot} image=${event.browser.image} sessionId=${sessionId} host=${browserHost(event)} />` : null}
+    ${event.name === 'browser' && event.state === 'completed' && browserRefusal(event) ? html`<p class="tool-outcome browser-refusal">${browserRefusal(event)}</p>` : null}
     ${!expanded && (event.state === 'rejected' || event.state === 'cancelled' || event.state === 'error' || status.tone === 'warn')
       ? html`<p class="tool-outcome">${status.outcome || (result && failureOutcome(event, result, status)) || toolOutcome(event)}</p>` : null}
     ${!expanded && event.state === 'completed' && allowanceNote(event) ? html`<p class="tool-outcome">${allowanceNote(event)}</p>` : null}
@@ -978,7 +1083,7 @@ const keptRow = (event, status) => ['pending', 'error', 'rejected', 'cancelled']
 // region that changes only when a status does), how many finished, the time from the first start to the last end
 // (or to now, counted here each second while one runs), Background, the cards still being prepared, the ones on an
 // earlier page, and Show in panel (onShowProgress, when given). making: the turn that makes its cards still runs.
-function RunHead({ run, members, open, rows, onToggle, making, eventsStart, onShowProgress }) {
+function RunHead({ run, members, open, rows, onToggle, making, eventsStart, onShowProgress, sessionId, onError }) {
   const states = members.map(memberState)
   const live = states.some(state => !state.finished)
   const starts = members.map(event => event.delegation?.started).filter(value => typeof value === 'number')
@@ -1002,6 +1107,10 @@ function RunHead({ run, members, open, rows, onToggle, making, eventsStart, onSh
   // A turn stopped while it prepared the cards leaves fewer than the batch asked for, also while a later turn runs.
   const preparing = batch && known < batch.size ? making ? `Preparing ${known} of ${batch.size}` : `${known} of ${batch.size} started` : ''
   const background = members.some(event => event.delegation?.background)
+  // The cards that wait for the batch's one decision (batch_approval, until you choose Review one by one), and who
+  // started the batch (delegation_batch.origin: the /workflow skill or a command file, or the agent by itself).
+  const asking = members.filter(event => event.state === 'pending' && event.batch_approval && typeof event.batch_approval.id === 'string' && !event.batch_approval.review)
+  const origin = asking.length ? null : ORIGINS[members.find(event => ORIGINS[event.delegation_batch?.origin])?.delegation_batch.origin]
   return html`<div class=${`run-head${rows ? ' has-rows' : ''}`}>
     <button class="run-toggle" aria-expanded=${open} aria-controls=${members.map(event => `tool-${event.id}`).join(' ')} onClick=${onToggle}>
       <${Workflow} size=${16} /><span class="run-count">${members.length} ${members.length === 1 ? 'subagent' : 'subagents'}</span>
@@ -1010,12 +1119,75 @@ function RunHead({ run, members, open, rows, onToggle, making, eventsStart, onSh
     <span class="run-aggregate" role="status">${runAggregate(states)}</span>
     <progress aria-label="Subagents finished" value=${finished} max=${members.length} />
     ${elapsed != null ? html`<span class="run-elapsed" title=${live ? 'Time since the first one started' : 'Time from the first start to the last end'}>${elapsedText(elapsed)}</span>` : null}
+    ${origin ? html`<span class="run-note run-origin">${origin}</span>` : null}
     ${background ? html`<span class="run-chip" title="The chat goes on while they work; a notice says when each ends.">Background</span>` : null}
     ${preparing ? html`<span class="run-note">${preparing}</span>` : null}
     ${earlier ? html`<span class="run-note">${earlier} earlier, not loaded</span>` : null}
     ${onShowProgress ? html`<button class="outline run-show" onClick=${() => onShowProgress()}>Show in panel</button>` : null}
+  </div>
+  ${asking.length ? html`<${BatchApproval} key=${asking[0].batch_approval.id} members=${asking} sessionId=${sessionId} onError=${onError} />` : null}`
+}
+
+// What a card of a decided batch says while it waits to be released in call order (batch_decided).
+const BATCH_QUEUED = {
+  allowed: 'Approved, starts after the subagents before it',
+  declined: 'Will not start. The agent is told after the subagents before it.',
+  ask: 'Waits for the subagents before it',
+}
+const ORIGINS = { user: 'Started by you', agent: 'Started by the agent' }
+
+const firstLine = text => String(text ?? '').split(/\r\n|\r|\n/, 1)[0].trim().slice(0, 240)
+// What a batch's block shows of each subagent: the fields its own card shows (task, agent type, tool profile, step limit).
+function subagentFields(event) {
+  const input = event.input && typeof event.input === 'object' ? event.input : {}
+  const agent = typeof input.agent_type === 'string' && input.agent_type ? input.agent_type : 'general'
+  const steps = Number.isInteger(input.max_steps) ? input.max_steps : Number(/at most (\d+) steps/.exec(String(event.preview || ''))?.[1]) || null
+  return { task: firstLine(input.task), agent: agentLabel(agent), profile: typeof input.tool_profile === 'string' && input.tool_profile ? input.tool_profile : 'inherit', steps }
+}
+
+// The one approval of a batch of subagents (the cards' batch_approval): Allow all, Decline all (with a note, as one
+// card has) and Review one by one, which turns the batch into today's cards one at a time. Everything you read here
+// to decide is shown with hidden characters escaped, as on a single card.
+function BatchApproval({ members, sessionId, onError }) {
+  const [deciding, setDeciding] = useState(false)
+  const [note, setNote] = useState('')
+  const batchId = members[0].batch_approval.id
+  const allowInChat = (label => label && visibleText(label))(allowLabel(members[0]))
+  const rows = members.map(event => ({ event, ...subagentFields(event) }))
+  const expires = members.map(event => event.approval_expires).find(value => typeof value === 'number')
+  const path = `/sessions/${encodeURIComponent(sessionId)}/approvals/${encodeURIComponent(batchId)}`
+  const send = async (suffix, body) => {
+    setDeciding(true)
+    try { await api(path + suffix, 'POST', body) }
+    catch (e) { onError(e.message) }
+    finally { setDeciding(false) }
+  }
+  const decide = (allowed, extra = {}) => send('', { allowed, ...(allowed ? extra : {}), ...(!allowed && note.trim() ? { note: note.trim() } : {}) })
+  const label = `Approval for ${members.length} subagents`
+  return html`<div class="tool-card run-batch-approval" role="group" aria-label=${label} data-batch-approval=${batchId}>
+    <div class="tool-body">
+      <p>${`Local needs your approval to start ${members.length} subagents together.`}${expires ? ` If you do not answer by ${expiryTime(expires)}, none of them will start.` : ''}</p>
+      <${NoteFor} texts=${rows.flatMap(row => [row.task, row.agent, row.profile])} />
+      <ul class="progress-list" aria-label="Subagents to start">${rows.map(row => html`<li key=${row.event.id} class="progress-item logical-order">
+        <span class="progress-item-meta"><span><strong>${visibleParts(row.task)}</strong></span></span>
+        <span class="progress-item-meta"><span>Agent: ${visibleParts(row.agent)}</span><span>Tool profile: ${visibleParts(row.profile)}</span>${row.steps ? html`<span>At most ${row.steps} steps</span>` : null}</span>
+      </li>`)}</ul>
+      <label class="decline-note"><span>Tell the agent why (optional)</span>
+        <textarea rows=${2} maxLength=${2000} spellcheck=${false} value=${note} disabled=${deciding}
+          onInput=${e => setNote(e.currentTarget.value)} /></label>
+      <div class="approval-buttons">
+        <button class="outline" disabled=${deciding} onClick=${() => void send('/review', {})}>Review one by one</button>
+        <button class="outline" disabled=${deciding} onClick=${() => void decide(false)}><${X} size=${15} />Decline all</button>
+        ${allowInChat ? html`<button class="outline" disabled=${deciding} onClick=${() => void decide(true, { remember: true })}>${allowInChat}</button>` : null}
+        <button class="primary" disabled=${deciding} onClick=${() => void decide(true)}><${Check} size=${15} />Allow all</button>
+      </div>
+    </div>
   </div>`
 }
+
+// The note for the texts a block shows for a decision (lib.js hiddenNote): nothing when none holds a hidden or
+// right-to-left character.
+function NoteFor({ texts }) { return noteLine(hiddenNote(texts)) }
 
 // The cards waiting for your answer (an approval, a question, a plan): one per pending tool event, in transcript order.
 export const PENDING_CARDS = '.tool-card.needs-approval, .question-card.needs-answer, .plan-card.needs-answer'
@@ -1029,8 +1201,13 @@ export const PENDING_CARDS = '.tool-card.needs-approval, .question-card.needs-an
 export function revealCard(card, focus = false) {
   const box = card?.closest('.transcript')
   if (!box) return
+  // A subagent card that waits for its batch's decision has no buttons: the batch's block (in the run head) has them.
+  const waiting = card.dataset?.batchWaiting
+  const batch = waiting ? [...box.querySelectorAll('[data-batch-approval]')].find(item => item.dataset.batchApproval === waiting) : null
+  if (batch) card = batch
   const tool = card.matches('.tool-card')
-  const target = !focus ? null : tool ? card.querySelector('.tool-heading')
+  const target = !focus ? null : card.matches('.run-batch-approval') ? card.querySelector('.approval-buttons button:not(:disabled)')
+    : tool ? card.querySelector('.tool-heading')
     : card.matches(WAITING_SUBAGENTS) ? card.querySelector('.subagent-controls button:not(:disabled)')
     : card.querySelector('input:not(:disabled)') || card.querySelector(':is(.plan-actions, .approval-buttons) button:not(:disabled)')
   // Where the view ends up is found with instant scrolls (the browser's own 'nearest', scroll-padding included) and
@@ -1275,7 +1452,7 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
       const run = runs.get(item.key)
       return html`<${RunHead} key=${item.key} run=${item} members=${run.members} open=${run.open} rows=${run.classes.size > 0}
         onToggle=${() => toggleRun(item.key, run.open)} making=${run.thisTurn && session.status !== 'idle'}
-        eventsStart=${session.events_start || 0} onShowProgress=${onShowProgress} />`
+        eventsStart=${session.events_start || 0} onShowProgress=${onShowProgress} sessionId=${session.id} onError=${onError} />`
     }
     // A closed group's cards are not rendered at all, so a long chat keeps only their heads on the page.
     if (item.group) return groupOpen.get(item.group) ? renderEvent(item.event, 'grouped') : null
@@ -1293,7 +1470,7 @@ export default function Conversation({ session, onError, onSelectSession, onOpen
     ${tools.length ? html`<details class="activity-summary"><summary>Activity · ${tools.length} ${tools.length === 1 ? 'action' : 'actions'}</summary>
       <ol>${tools.map(event => {
         const summary = toolSummaries.get(event.id)
-        return html`<li key=${event.id}><span>${(event.name || 'Tool').replace(/_/g, ' ')}</span>${summary.subject ? html`<span class="activity-subject"> · ${summary.subject}</span>` : null}
+        return html`<li key=${event.id}><span>${(event.name || 'Tool').replace(/_/g, ' ')}</span>${summary.subject ? html`<span class=${event.state === 'pending' ? 'activity-subject logical-order' : 'activity-subject'}> · ${event.state === 'pending' ? visibleParts(summary.subject) : summary.subject}</span>` : null}
           ${summary.taskStatus ? html`<small>Task: ${summary.taskStatus}</small>` : null}<small>Action: ${actionText(event, toolStates.get(event.id)?.status)}${(label => label ? ` · ${label}` : '')(toolStates.get(event.id)?.status.label)}</small></li>`
       })}</ol>
     </details>` : null}

@@ -5,8 +5,6 @@ import re
 import pytest
 from playwright.sync_api import expect
 
-from conftest import ORIGIN
-
 
 def open_settings(ui, page, setup=""):
     ui.app(scenario="workspace", setup=setup)
@@ -258,22 +256,22 @@ def test_save_is_always_visible(ui, page, width, height):
     expect(dialog).to_have_accessible_description("Configure your local workspace.")
     save = dialog.get_by_role("button", name="Save settings")
     expect(save).to_be_in_viewport(ratio=1)
-    for top in ("dialog.scrollHeight", "0"):
-        ui.run(f"const dialog = document.querySelector('.settings-dialog'); dialog.scrollTop = {top}")
+    for top in ("body.scrollHeight", "0"):  # The dialog's body scrolls (DialogShell); its header and footer stay.
+        ui.run(f"const body = document.querySelector('.settings-dialog .dialog-body'); body.scrollTop = {top}")
         expect(save).to_be_in_viewport(ratio=1)
         expect(dialog.get_by_role("button", name="Cancel", exact=True)).to_be_in_viewport(ratio=1)
-    assert ui.js("(d => d.scrollHeight > d.clientHeight)(document.querySelector('.settings-dialog'))")  # It does scroll.
+    assert ui.js("(d => d.scrollHeight > d.clientHeight)(document.querySelector('.settings-dialog .dialog-body'))")  # It does scroll.
     expect(dialog.get_by_role("textbox", name="Custom instructions")).to_have_css("border-radius", "8px")
     expect(dialog.get_by_role("group", name="Model and context").get_by_role("spinbutton", name="Context budget (tokens)")).to_be_visible()
     expect(dialog.get_by_role("group", name="Project").get_by_role("textbox", name="Project folder")).to_be_visible()
     groups = dialog.locator("fieldset.settings-group")
-    expect(groups).to_have_count(10)
-    assert [groups.nth(n).locator("legend").inner_text() for n in range(10)] == [
-        "Project", "Model and context", "Reasoning", "Agent", "Subagents", "Commands and files", "Web access", "Appearance",
-        "Notifications", "Credentials"]
-    for n in range(10):
+    expect(groups).to_have_count(11)
+    assert [groups.nth(n).locator("legend").inner_text() for n in range(11)] == [
+        "Project", "Model and context", "Reasoning", "Agent", "Subagents", "Commands and files", "Web access", "Browsing",
+        "Appearance", "Notifications", "Credentials"]
+    for n in range(11):
         expect(dialog.get_by_role("group", name=groups.nth(n).locator("legend").inner_text(), exact=True)).to_have_count(1)
-    # The footer spans the dialog's padding without making it scroll sideways (phones have less padding).
+    # The footer spans the dialog's width without making it scroll sideways.
     fits = ui.js("""(d => { const box = d.getBoundingClientRect(), footer = d.querySelector('form > footer').getBoundingClientRect()
       return { sideways: d.scrollWidth - d.clientWidth, inside: footer.left >= box.left && footer.right <= box.right } })(document.querySelector('.settings-dialog'))""")
     assert fits == {"sideways": 0, "inside": True}, fits
@@ -287,7 +285,7 @@ SAVE_FAILS = """fake.override = (path, options) => path === '/api/settings' && o
 @pytest.mark.parametrize("width,height", LAYOUT_VIEWPORTS)
 def test_a_failed_save_shows_its_error_above_the_buttons(ui, page, width, height, scrolled):
     dialog = open_settings_at(ui, page, width, height, setup=SAVE_FAILS)
-    ui.run(f"const dialog = document.querySelector('.settings-dialog'); dialog.scrollTop = {'0' if scrolled == 'top' else 'dialog.scrollHeight'}")
+    ui.run(f"const body = document.querySelector('.settings-dialog .dialog-body'); body.scrollTop = {'0' if scrolled == 'top' else 'body.scrollHeight'}")
     dialog.get_by_role("button", name="Save settings").click()
     alert = dialog.get_by_role("alert").filter(has_text="The project folder does not exist")
     expect(alert).to_be_in_viewport(ratio=1)
@@ -323,7 +321,7 @@ def test_an_invalid_field_is_shown_above_the_footer(ui, page, width, height):
     dialog = open_settings_at(ui, page, width, height)
     limit = dialog.get_by_role("spinbutton", name="File write limit (KB)")
     limit.fill("5")
-    ui.run("document.querySelector('.settings-dialog').scrollTop = 0")
+    ui.run("document.querySelector('.settings-dialog .dialog-body').scrollTop = 0")
     dialog.get_by_role("button", name="Save settings").click()
     expect(limit).to_be_focused()
     assert limit.bounding_box()["y"] + limit.bounding_box()["height"] <= footer_top(ui) + 0.5
@@ -412,6 +410,157 @@ def test_web_access_shows_what_the_saved_provider_still_needs(ui, page):
     expect(group.get_by_role("status")).to_have_count(0)  # Checked again when saved.
 
 
+# Settings → Browsing
+
+def test_browsing_follows_web_access_and_loads_its_defaults(ui, page):
+    dialog = open_settings(ui, page)
+    groups = dialog.locator("fieldset.settings-group legend")
+    titles = [groups.nth(n).inner_text() for n in range(groups.count())]
+    assert titles.index("Browsing") == titles.index("Web access") + 1
+    expect(dialog.get_by_role("navigation", name="Settings sections").get_by_role("button", name="Browsing")).to_be_visible()
+    group = dialog.get_by_role("group", name="Browsing")
+    expect(group.get_by_role("checkbox", name="Let the agent use a browser")).not_to_be_checked()
+    window = group.get_by_role("combobox", name="Browser window")
+    expect(window).to_have_value("auto")
+    expect(window.locator("option")).to_have_text(["Automatic", "Show the window", "Hidden"])
+    limit = group.get_by_role("spinbutton", name="Time limit per action (seconds)")
+    expect(limit).to_have_value("30")
+    expect(limit).to_have_attribute("min", "5")
+    expect(limit).to_have_attribute("max", "120")
+    expect(limit).to_have_attribute("step", "1")
+    expect(group.get_by_role("status")).to_have_count(0)  # No browser_status: no status line.
+    expect(group.get_by_text(re.compile("asks before it opens a site it has not opened before in this chat"))).to_be_visible()
+    expect(group.get_by_text(re.compile("never types into password, card or code fields on a real site"))).to_be_visible()
+    expect(group.get_by_text(re.compile("32-tool request limit"))).to_be_visible()
+
+
+def test_browsing_saved_values_load_and_changed_values_save(ui, page):
+    dialog = open_settings(ui, page, setup="""fake.settings = { ...fake.settings, browser_tools: true,
+      browser_headless: 'headless', browser_action_timeout: 45 }""")
+    group = dialog.get_by_role("group", name="Browsing")
+    tools = group.get_by_role("checkbox", name="Let the agent use a browser")
+    window = group.get_by_role("combobox", name="Browser window")
+    limit = group.get_by_role("spinbutton", name="Time limit per action (seconds)")
+    expect(tools).to_be_checked()
+    expect(window).to_have_value("headless")
+    expect(limit).to_have_value("45")
+    tools.uncheck()
+    window.select_option("window")
+    limit.fill("90")
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    body = ui.bodies("/api/settings", "PUT")[0]
+    assert (body["browser_tools"], body["browser_headless"], body["browser_action_timeout"]) == (False, "window", 90)
+
+
+def test_browsing_cancel_discards_changes(ui, page):
+    dialog = open_settings(ui, page)
+    dialog.get_by_role("checkbox", name="Let the agent use a browser").check()
+    dialog.get_by_role("button", name="Cancel", exact=True).click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    assert ui.bodies("/api/settings", "PUT") == []
+
+
+def test_the_browser_time_limit_must_stay_in_range(ui, page):
+    dialog = open_settings(ui, page)
+    limit = dialog.get_by_role("spinbutton", name="Time limit per action (seconds)")
+    for bad in ("4", "121", ""):
+        limit.fill(bad)
+        dialog.get_by_role("button", name="Save settings").click()
+        expect(dialog).to_be_visible()
+        expect(limit).to_be_focused()
+        assert ui.bodies("/api/settings", "PUT") == []
+    limit.fill("5")
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    assert ui.bodies("/api/settings", "PUT")[0]["browser_action_timeout"] == 5
+
+
+def test_the_browser_status_line_says_ready_or_names_the_problem(ui, page):
+    dialog = open_settings(ui, page, setup="fake.settings = { ...fake.settings, browser_status: { ready: true } }")
+    expect(dialog.get_by_role("group", name="Browsing").get_by_role("status")).to_have_text("Ready.")
+    problem = "The browser is not installed. Run: python -m playwright install chromium"
+    page.get_by_role("button", name="Cancel", exact=True).click()
+    ui.app(scenario="workspace", setup=f"fake.settings = {{ ...fake.settings, browser_status: {{ ready: false, problem: '{problem}' }} }}")
+    expect(page.get_by_role("combobox", name="Model")).to_have_value("test-model")
+    page.get_by_role("button", name="Settings", exact=True).click()
+    expect(page.get_by_role("dialog").get_by_role("group", name="Browsing").get_by_role("status")).to_have_text(problem)
+
+
+def test_the_browser_proxy_field_defaults_to_auto_and_explains_its_values(ui, page):
+    dialog = open_settings(ui, page)
+    group = dialog.get_by_role("group", name="Browsing")
+    field = group.get_by_role("textbox", name="Proxy for the browser")
+    expect(field).to_have_value("auto")
+    expect(group.get_by_text(re.compile("auto uses the proxy your computer is set to"))).to_be_visible()
+    expect(group.get_by_text(re.compile("none connects directly"))).to_be_visible()
+    expect(group.get_by_text(re.compile("Zscaler in local proxy mode"))).to_be_visible()
+    expect(group.get_by_text(re.compile("shown as <redacted> afterwards"))).to_be_visible()
+    expect(group.get_by_text(re.compile(r"socks5://127\.0\.0\.1:1080 for a SOCKS5 proxy"))).to_be_visible()
+    expect(group.get_by_text(re.compile("uses a system SOCKS proxy only when it finds no HTTP or HTTPS proxy"))).to_be_visible()
+
+
+def test_the_browser_proxy_saved_value_loads_and_a_changed_value_saves(ui, page):
+    dialog = open_settings(ui, page, setup="""fake.settings = { ...fake.settings, browser_upstream_proxy: 'http://agent:<redacted>@proxy.test:8080' }""")
+    field = dialog.get_by_role("group", name="Browsing").get_by_role("textbox", name="Proxy for the browser")
+    expect(field).to_have_value("http://agent:<redacted>@proxy.test:8080")
+    field.fill("  none ")
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    assert ui.bodies("/api/settings", "PUT")[0]["browser_upstream_proxy"] == "none"
+
+
+def test_an_unchanged_redacted_proxy_address_is_sent_back_as_shown(ui, page):
+    dialog = open_settings(ui, page, setup="""fake.settings = { ...fake.settings, browser_upstream_proxy: 'http://agent:<redacted>@proxy.test:8080' }""")
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    assert ui.bodies("/api/settings", "PUT")[0]["browser_upstream_proxy"] == "http://agent:<redacted>@proxy.test:8080"
+
+
+def test_the_browser_proxy_field_cannot_be_empty(ui, page):
+    dialog = open_settings(ui, page)
+    field = dialog.get_by_role("textbox", name="Proxy for the browser")
+    field.fill("")
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(dialog).to_be_visible()
+    expect(field).to_be_focused()
+    assert ui.bodies("/api/settings", "PUT") == []
+
+
+def test_the_status_line_names_the_connection_mode_the_app_found(ui, page):
+    dialog = open_settings(ui, page, setup="""fake.settings = { ...fake.settings,
+      browser_status: { ready: true, proxy: 'system proxy 127.0.0.1:9000' } }""")
+    expect(dialog.get_by_role("group", name="Browsing").get_by_role("status")).to_have_text(
+        "Ready. Connection: system proxy 127.0.0.1:9000.")
+
+
+def test_a_pac_file_gets_a_sentence_that_says_to_enter_the_proxy_address(ui, page):
+    sentence = "This computer finds its proxy through a PAC file. Enter the proxy address in Settings → Browsing."
+    dialog = open_settings(ui, page, setup=f"""fake.settings = {{ ...fake.settings, browser_status: {{ ready: true,
+      proxy: 'PAC file found: enter the proxy address', proxy_problem: '{sentence}' }} }}""")
+    group = dialog.get_by_role("group", name="Browsing")
+    expect(group.get_by_role("status")).to_have_text("Ready. Connection: PAC file found: enter the proxy address.")
+    expect(group.get_by_text(sentence)).to_be_visible()
+
+
+# Settings → Model and context: the trim marks in effect
+
+def test_the_trim_hint_shows_the_marks_in_effect(ui, page):
+    dialog = open_settings(ui, page, setup="fake.settings = { ...fake.settings, context_trim_effective: { start: 65, target: 50 } }")
+    group = dialog.get_by_role("group", name="Model and context")
+    expect(group.get_by_text("In effect: trimming starts at 65% and stops at 50%.")).to_be_visible()
+    expect(group.get_by_text("Trimming is off for this threshold.")).to_have_count(0)
+
+
+def test_the_trim_hint_says_trimming_is_off_when_the_threshold_leaves_no_room(ui, page):
+    dialog = open_settings(ui, page, setup="fake.settings = { ...fake.settings, context_trim: true, context_trim_effective: null }")
+    group = dialog.get_by_role("group", name="Model and context")
+    expect(group.get_by_text("Trimming is off for this threshold.")).to_be_visible()
+    expect(group.get_by_text(re.compile("In effect"))).to_have_count(0)
+    group.get_by_role("checkbox", name="Trim old tool results from requests").uncheck()
+    expect(group.get_by_text("Trimming is off for this threshold.")).to_have_count(0)
+
+
 # Settings → Appearance → Text size (textSize.js): every font size at once, kept in this browser only.
 
 def test_text_size_scales_all_text_at_once_and_is_kept_in_this_browser(ui, page):
@@ -436,115 +585,7 @@ def test_text_size_scales_all_text_at_once_and_is_kept_in_this_browser(ui, page)
     assert ui.bodies("/api/settings", "PUT") == []  # Never saved with Settings.
 
 
-# Settings → Appearance → Theme (theme.js): Light by default, Dark, or Match system; kept in this browser only.
-
-BODY_BACKGROUND = "getComputedStyle(document.body).backgroundColor"
-LIGHT_CANVAS, DARK_CANVAS = "rgb(250, 249, 245)", "rgb(38, 38, 36)"
-
-
-def test_the_theme_switches_to_dark_and_is_kept_in_this_browser(ui, page):
-    dialog = open_settings(ui, page)
-    theme = dialog.get_by_role("group", name="Appearance").get_by_role("combobox", name="Theme")
-    expect(theme).to_have_value("light")
-    expect(theme.locator("option")).to_have_text(["Light", "Dark", "Match system"])
-    assert ui.js("document.documentElement.dataset.theme") == "light"
-    assert ui.js(BODY_BACKGROUND) == LIGHT_CANVAS
-    theme.select_option("dark")
-    assert ui.js("document.documentElement.dataset.theme") == "dark"
-    assert ui.js("localStorage.getItem('local.theme')") == "dark"
-    assert ui.js(BODY_BACKGROUND) == DARK_CANVAS
-    assert ui.js("getComputedStyle(document.documentElement).colorScheme") == "dark"  # native controls and scrollbars too
-    ui.app(scenario="workspace")  # The page again: the theme comes back from this browser's storage.
-    expect(page.get_by_role("combobox", name="Model")).to_have_value("test-model")
-    assert ui.js("document.documentElement.dataset.theme") == "dark"
-    assert ui.js(BODY_BACKGROUND) == DARK_CANVAS
-    page.get_by_role("button", name="Settings", exact=True).click()
-    theme = page.get_by_role("dialog").get_by_role("combobox", name="Theme")
-    expect(theme).to_have_value("dark")
-    theme.select_option("light")
-    assert ui.js(BODY_BACKGROUND) == LIGHT_CANVAS
-    assert ui.js("localStorage.getItem('local.theme')") is None
-    assert ui.bodies("/api/settings", "PUT") == []  # Never saved with Settings.
-
-
-def test_match_system_follows_the_operating_system(ui, page):
-    page.emulate_media(color_scheme="dark")
-    dialog = open_settings(ui, page)
-    assert ui.js(BODY_BACKGROUND) == LIGHT_CANVAS  # Light by default, whatever the system uses.
-    dialog.get_by_role("combobox", name="Theme").select_option("system")
-    assert ui.js("document.documentElement.dataset.theme") == "system"
-    assert ui.js("localStorage.getItem('local.theme')") == "system"
-    assert ui.js(BODY_BACKGROUND) == DARK_CANVAS
-    page.emulate_media(color_scheme="light")
-    assert ui.js(BODY_BACKGROUND) == LIGHT_CANVAS
-
-
-BOOT = [  # stored style, stored theme, system dark → data-style, data-theme, body background, <meta name="theme-color">
-    (None, None, False, "claude", "light", LIGHT_CANVAS, "#faf9f5"),
-    (None, "dark", False, "claude", "dark", DARK_CANVAS, "#262624"),
-    (None, "system", True, "claude", "system", DARK_CANVAS, "#262624"),
-    ("vscode", None, True, "vscode", "light", "rgb(255, 255, 255)", "#ffffff"),
-    ("vscode", "dark", False, "vscode", "dark", "rgb(31, 31, 31)", "#1f1f1f"),
-    ("vscode", "system", True, "vscode", "system", "rgb(31, 31, 31)", "#1f1f1f"),
-    ("vscode", "system", False, "vscode", "system", "rgb(255, 255, 255)", "#ffffff"),
-    ("solarized", "sepia", True, "claude", "light", LIGHT_CANVAS, "#faf9f5"),  # unknown values: the defaults
-]
-
-
-@pytest.mark.parametrize("stored_style,stored_theme,system_dark,style,theme,background,meta", BOOT)
-def test_the_page_applies_the_stored_look_before_its_script_runs(page, stored_style, stored_theme, system_dark, style, theme,
-                                                                  background, meta):
-    # index.html sets data-style and data-theme from storage before the stylesheet, so a dark page never flashes light.
-    # The app's own script is left out here: the page alone must have the look.
-    page.emulate_media(color_scheme="dark" if system_dark else "light")
-    page.route(f"{ORIGIN}/static/js/main.js", lambda route: route.fulfill(status=200, body="", content_type="text/javascript"))
-    stored = {"local.style": stored_style, "local.theme": stored_theme}
-    page.add_init_script(script="".join(f"localStorage.setItem('{key}', '{value}');" for key, value in stored.items() if value))
-    page.goto(f"{ORIGIN}/index.html")
-    assert page.evaluate("[document.documentElement.dataset.style, document.documentElement.dataset.theme]") == [style, theme]
-    assert page.evaluate(BODY_BACKGROUND) == background
-    assert page.evaluate("document.querySelector('meta[name=theme-color]').content") == meta
-
-
-def test_the_vscode_style_is_kept_in_this_browser_and_goes_with_dark(ui, page):
-    dialog = open_settings(ui, page)
-    appearance = dialog.get_by_role("group", name="Appearance")
-    style = appearance.get_by_role("combobox", name="Style", exact=True)
-    expect(style).to_have_value("claude")
-    expect(style.locator("option")).to_have_text(["Claude", "VS Code"])
-    assert ui.js("document.documentElement.dataset.style") == "claude"
-    style.select_option("vscode")
-    appearance.get_by_role("combobox", name="Theme").select_option("dark")
-    assert ui.js("[document.documentElement.dataset.style, document.documentElement.dataset.theme]") == ["vscode", "dark"]
-    assert ui.js("[localStorage.getItem('local.style'), localStorage.getItem('local.theme')]") == ["vscode", "dark"]
-    assert ui.js(BODY_BACKGROUND) == "rgb(31, 31, 31)"
-    save = dialog.get_by_role("button", name="Save settings")
-    expect(save).to_have_css("background-color", "rgb(0, 120, 212)")  # a blue primary button
-    expect(save).to_have_css("color", "rgb(255, 255, 255)")
-    ui.app(scenario="workspace")  # The page again: both come back from this browser's storage.
-    expect(page.get_by_role("combobox", name="Model")).to_have_value("test-model")
-    assert ui.js("[document.documentElement.dataset.style, document.documentElement.dataset.theme]") == ["vscode", "dark"]
-    page.get_by_role("button", name="Settings", exact=True).click()
-    dialog = page.get_by_role("dialog")
-    expect(dialog.get_by_role("combobox", name="Style", exact=True)).to_have_value("vscode")
-    expect(dialog.get_by_role("combobox", name="Theme")).to_have_value("dark")
-    dialog.get_by_role("combobox", name="Style", exact=True).select_option("claude")
-    assert ui.js("localStorage.getItem('local.style')") is None
-    assert ui.js(BODY_BACKGROUND) == DARK_CANVAS  # Claude dark
-    assert ui.bodies("/api/settings", "PUT") == []  # Never saved with Settings.
-
-
-def test_the_selects_show_the_look_of_the_page_when_storage_is_blocked(ui, page):
-    # Storage that throws keeps a choice for this page only; reopening Settings still shows it.
-    dialog = open_settings(ui, page, setup="""Object.defineProperty(window, 'localStorage', { get() { throw new Error('blocked') } })""")
-    dialog.get_by_role("combobox", name="Theme").select_option("dark")
-    dialog.get_by_role("combobox", name="Style", exact=True).select_option("vscode")
-    dialog.get_by_role("button", name="Cancel").click()
-    page.get_by_role("button", name="Settings", exact=True).click()
-    dialog = page.get_by_role("dialog")
-    expect(dialog.get_by_role("combobox", name="Theme")).to_have_value("dark")
-    expect(dialog.get_by_role("combobox", name="Style", exact=True)).to_have_value("vscode")
-    assert ui.js(BODY_BACKGROUND) == "rgb(31, 31, 31)"
+# The Style and Theme choices are gone (one light style): tests/test_one_style.py.
 
 
 @pytest.mark.parametrize("width,height", LAYOUT_VIEWPORTS)
@@ -555,3 +596,30 @@ def test_the_largest_text_size_keeps_the_workspace_within_the_window(ui, page, w
     assert ui.js("getComputedStyle(document.documentElement).getPropertyValue('--text-scale').trim()") == "1.5"
     assert ui.js("document.documentElement.scrollWidth <= innerWidth")
     expect(page.get_by_role("textbox", name="Message")).to_be_in_viewport()
+
+
+def test_every_settings_checkbox_keeps_its_size_at_320_px(ui, page):
+    page.set_viewport_size({"width": 320, "height": 700})
+    ui.app(scenario="workspace")
+    expect(page.get_by_role("combobox", name="Model")).to_have_value("test-model")
+    page.get_by_role("button", name="Open sidebar").click()  # On a phone the sidebar is a drawer.
+    page.get_by_role("button", name="Settings", exact=True).click()
+    dialog = page.get_by_role("dialog")
+    boxes = dialog.locator("input[type=checkbox]")
+    count = boxes.count()
+    assert count >= 5, count
+    narrow = boxes.evaluate_all("els => els.map(e => [e.closest('label')?.textContent.trim().slice(0, 40), e.getBoundingClientRect().width, e.getBoundingClientRect().height]).filter(([, w, h]) => w < 16 || h < 16)")
+    assert narrow == [], narrow
+
+
+def test_close_and_cancel_wait_while_settings_are_saving(ui, page):
+    dialog = open_settings(ui, page)
+    ui.run("const base = fake.override; fake.override = (path, options) => path === '/api/settings' && options.method === 'PUT' "
+           "? new Promise(() => {}) : base(path, options)")
+    dialog.get_by_role("button", name="Save settings").click()
+    expect(dialog.get_by_role("button", name="Saving…")).to_be_visible()
+    expect(dialog.get_by_role("button", name="Close settings")).to_be_disabled()
+    expect(dialog.get_by_role("button", name="Cancel", exact=True)).to_be_disabled()
+    page.keyboard.press("Escape")
+    page.mouse.click(4, 4)
+    expect(dialog).to_be_visible()

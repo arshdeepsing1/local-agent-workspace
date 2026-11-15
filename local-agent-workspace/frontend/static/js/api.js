@@ -11,6 +11,22 @@ function offline(error) {
   throw wrapped
 }
 export function setToken(value) { token = value }
+// The chat the page shows (useWorkspace sets it): for components that call a chat's routes without a session prop.
+let activeSession = null
+export function setActiveSession(id) { activeSession = id || null }
+export function activeSessionId() { return activeSession }
+// The usage card's Shorten and Drop (context.py trim): what a trim of one tool result frees and costs, and the trim.
+// mode is 'shortened' or 'dropped'; the trim answers { context_info, cache_cost_tokens }.
+export function previewContextTrim(sessionId, eventId, mode) {
+  return api(`/sessions/${encodeURIComponent(sessionId)}/context/trim-preview?${new URLSearchParams({ event_id: eventId, mode })}`)
+}
+// The answer to the card before an automatic compaction: 'compact_now' or 'continue'.
+export function answerCompactionChoice(sessionId, choice) {
+  return api(`/sessions/${encodeURIComponent(sessionId)}/compaction-choice`, 'POST', { choice })
+}
+export function trimContextItem(sessionId, eventId, mode) {
+  return api(`/sessions/${encodeURIComponent(sessionId)}/context/trim`, 'POST', { event_id: eventId, mode })
+}
 export function refreshToken() {
   if (!reconnecting) reconnecting = (async () => {
     const response = await fetch('/api/bootstrap').catch(offline)

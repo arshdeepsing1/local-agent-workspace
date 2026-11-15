@@ -85,21 +85,26 @@ def test_the_context_section_reads_as_the_meter_does_and_follows_each_context_pu
     open_progress(page)
     context = section(page, "Context")
     meter_line = page.locator(".chat-composer .context-meter > summary > span").first
-    expect(meter_line).to_have_text("Last model input · ~50%")
-    expect(context.locator(".progress-context-line")).to_have_text("Last model input · ~50%")
+    expect(meter_line).to_have_text("Last model input · ~46%")
+    expect(context.locator(".progress-context-line")).to_have_text("Last model input · ~46%")
     # Its own name: the composer's bar is "Estimated model input usage".
     bar = context.get_by_role("progressbar", name="Context used")
-    expect(bar).to_have_attribute("aria-valuetext", "Approximately 50% of input budget")
-    expect(context).to_contain_text("Compacts automatically at 90% of the input budget.")
+    expect(bar).to_have_attribute("aria-valuetext", "Approximately 46% of context budget")
+    expect(context).to_contain_text("Compacts automatically at 83% of the context budget.")
     expect(context).to_contain_text("1 compaction · 1 warning")
     expect(context).to_contain_text("Last turn: 3 steps · 5 tools · 1 min 10 s · 1.0k in / 200 out")
     expect(context.get_by_role("listitem")).to_have_text(["AGENTS.md", "src/AGENTS.md"])
     # A context push moves both views at once (meterReading is shared).
     ui.emit("a", {"type": "context", "context_info": {**CONTEXT_INFO, "estimated_tokens": 108748, "compactions": 2}})
-    expect(context.locator(".progress-context-line")).to_have_text("Last model input · ~90%")
-    expect(meter_line).to_have_text("Last model input · ~90%")
-    expect(bar).to_have_attribute("aria-valuetext", "Approximately 90% of input budget")
+    expect(context.locator(".progress-context-line")).to_have_text("Last model input · ~83%")
+    expect(meter_line).to_have_text("Last model input · ~83%")
+    expect(bar).to_have_attribute("aria-valuetext", "Approximately 83% of context budget")
     expect(context).to_contain_text("2 compactions · 1 warning")
+    # 108,748 tokens is one under the threshold (90% of the 120,832 input budget): both read 83%, but the bar
+    # turns over only at or past the threshold.
+    expect(context.locator(".context-bar.over")).to_have_count(0)
+    ui.emit("a", {"type": "context", "context_info": {**CONTEXT_INFO, "estimated_tokens": 120000, "compactions": 2}})
+    expect(context.locator(".progress-context-line")).to_have_text("Last model input · ~92%")
     expect(context.locator(".context-bar.over")).to_have_count(1)
 
 
@@ -366,7 +371,7 @@ def test_the_panel_remembers_its_tab_across_chats_and_reloads(ui, page):
     page.wait_for_function("window.harnessReady === true")
     page.evaluate("() => { mount('App.js', () => ({}), 'default') }")
     ui.show_session("b")
-    page.get_by_role("button", name=re.compile(r"^Workspace( \(|$)")).click()
+    expect(panel(page)).to_be_visible()  # The panel was open when the page went: that choice is kept (viewPrefs.js).
     expect(panel(page).get_by_role("button", name="Terminal", exact=True)).to_have_attribute("aria-pressed", "true")
     expect(panel(page).get_by_role("textbox", name="Shell command")).to_be_visible()
 

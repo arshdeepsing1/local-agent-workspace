@@ -30,9 +30,9 @@ export function TaskList({ tasks }) {
 // The conversation's tasks (create_task / update_task, or Agent tools → Tasks),
 // pushed live as { type: 'tasks', tasks }. Above the message box, under the
 // changes bar; hidden while there are none. Cancelled tasks are listed but not
-// counted. Props: tasks: Task[]
-export default function TaskChecklist({ tasks }) {
-  const [open, setOpen] = useState(false)
+// counted. Props: tasks: Task[], initialOpen (the list starts open: the status row's chip opens it)
+export default function TaskChecklist({ tasks, initialOpen = false }) {
+  const [open, setOpen] = useState(initialOpen)
   if (!tasks?.length) return null
   const { done, counted, current } = taskProgress(tasks)
   return html`<section class="task-checklist" aria-label="Tasks">

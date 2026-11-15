@@ -341,11 +341,11 @@ def test_a_long_plan_reads_in_the_transcript_with_its_actions_in_reach(ui, page)
     # B-T28. Mutations: remove the sticky rule, restore max-height:520px, restore .plan-body h1 at 17 px or more.
     card = plan_app(ui, page, 1440, 900)
     title, h1, h2, item = (font_size(card, selector) for selector in ("h3", ".plan-body h1", ".plan-body h2", ".plan-body li"))
-    assert (title, h1, h2, item) == (16, 15, 14, 14)
+    assert (title, h1, h2, item) == (16, 14, 14, 14)  # text-l, then text-m
     assert h1 < title and h2 <= h1 and item < title
-    # h3 and h4 sit under h2 (13/600). Mutation: drop the .plan-body :is(h3,h4) rule.
+    # h3 and h4 sit under h2 (text-s, 600). Mutation: drop the .plan-body :is(h3,h4) rule.
     for selector in (".plan-body h3", ".plan-body h4"):
-        assert font_size(card, selector) == 13
+        assert font_size(card, selector) == 12
         assert card.locator(selector).evaluate("e => getComputedStyle(e).fontWeight") == "600"
     body = card.locator(".plan-body")
     assert body.evaluate("e => e.scrollHeight <= e.clientHeight + 1")
@@ -419,3 +419,167 @@ def test_sticky_plan_actions_dock_at_the_edge_and_never_hide_the_focused_link(ui
           if (active.tagName !== 'A') return true
           return active.getBoundingClientRect().bottom <= document.querySelector('.plan-actions').getBoundingClientRect().top + 0.5
         })()""")
+
+
+# Hidden and direction-changing characters in a card that waits for you
+
+NOTE = "Hidden or direction-changing characters are shown as \\u escapes."
+RLO = "‮"
+HIDDEN_PLAN = ("Run it:\\n\\n```bash\\necho safe \\u202e txt.sh # rm -rf ~\\n```\\n\\n"
+               "Use `a\\u202eb` and plain \\u202e text and a \\u001b control and a typed \\\\u202e.")
+
+
+def hidden_plan(state="pending", **fields):
+    return ("{ id: 'plan', type: 'tool', name: 'submit_plan', state: '" + state + "', input: { title: 'Plan\\u202e', plan: '" + HIDDEN_PLAN
+            + "' }, output: '', ..." + json.dumps(fields) + " }")
+
+
+def test_a_pending_plan_shows_hidden_characters_escaped_and_approves_unchanged(ui, page):
+    show(ui, f"[{hidden_plan()}]")
+    card = page.get_by_role("region", name="Plan\\u202e")  # The accessible name is escaped too.
+    expect(card.get_by_role("heading", name="Plan\\u202e")).to_be_visible()
+    body = card.locator(".plan-body")
+    expect(body.locator("pre")).to_contain_text("echo safe \\u202e txt.sh # rm -rf ~")
+    expect(body.locator("p code")).to_have_text("a\\u202eb")
+    expect(body.locator("p").last).to_contain_text("plain \\u202e text and a \\x1b control and a typed \\u202e.")
+    expect(card.get_by_text(NOTE, exact=True)).to_have_count(1)
+    assert RLO not in card.text_content() and "\x1b" not in card.text_content() and RLO not in card.inner_html()
+    assert RLO not in (card.get_attribute("aria-label") or "")
+    # The typed backslash text is not marked; every real character is (title, code block, code span, text, control).
+    expect(card.locator(".hidden-char")).to_have_count(5)
+    card.get_by_role("button", name="Approve and use Manual", exact=True).click()
+    ui.wait("fake.calls.length === 1")
+    assert sent(ui, "/api/sessions/parent/plans/plan") == [{"choice": "manual"}]
+
+
+def test_a_plan_that_was_answered_is_shown_as_it_was_written(ui, page):
+    show(ui, f"[{hidden_plan('completed', plan_outcome='approved', plan_mode='manual')}]")
+    card = page.get_by_role("region", name="Plan" + RLO)
+    expect(card).to_have_count(1)
+    assert RLO in card.locator(".plan-body").text_content()
+    expect(card.get_by_text(NOTE, exact=True)).to_have_count(0)
+    expect(card.locator(".hidden-char")).to_have_count(0)
+
+
+def test_a_plan_loses_its_escapes_when_it_is_answered(ui, page):
+    show(ui, f"[{hidden_plan()}]")
+    pending_card = page.get_by_role("region", name="Plan\\u202e")
+    expect(pending_card.locator(".hidden-char")).to_have_count(5)
+    ui.rerender(f"{{ session: makeSession([{hidden_plan('completed', plan_outcome='approved', plan_mode='manual')}]), onError: fake.spy('onError') }}")
+    card = page.get_by_role("region", name="Plan" + RLO)
+    expect(card.locator(".plan-body pre")).to_contain_text("echo safe " + RLO + " txt.sh")
+    expect(card.locator(".hidden-char")).to_have_count(0)
+    expect(card.get_by_text(NOTE, exact=True)).to_have_count(0)
+
+
+def test_a_plan_without_hidden_characters_has_no_note(ui, page):
+    show(ui, f"[{plan_event()}]")
+    expect(page.get_by_role("region", name="Storage plan")).to_be_visible()
+    expect(page.get_by_text(NOTE, exact=True)).to_have_count(0)
+    expect(page.locator(".hidden-char")).to_have_count(0)
+
+
+def test_a_pending_question_escapes_its_texts_and_answers_with_the_original_option(ui, page):
+    questions = [{"question": "Run rm‮?", "header": "Ru‮le",
+                  "options": [{"label": "Yes‮", "description": "des‮c"}, {"label": "No"}]}]
+    show(ui, f"[{question_event(questions=questions)}]")
+    card = page.get_by_role("region", name="Local has a question")
+    legend = card.locator("legend")
+    expect(legend).to_contain_text("Ru\\u202ele")
+    expect(legend).to_contain_text("Run rm\\u202e?")
+    option = card.get_by_role("radio", name="Yes\\u202e")
+    expect(option).to_have_count(1)
+    expect(card.locator("small")).to_have_text("des\\u202ec")
+    expect(card.get_by_role("textbox", name="Other answer for: Run rm\\u202e?")).to_have_count(1)
+    expect(card.get_by_text(NOTE, exact=True)).to_have_count(1)
+    expect(card.locator(".hidden-char")).to_have_count(4)
+    assert RLO not in card.text_content()
+    assert not card.evaluate("node => [...node.querySelectorAll('[aria-label]')].some(item => item.getAttribute('aria-label').includes('\\u202e'))")
+    option.check()
+    card.get_by_role("button", name="Send answers", exact=True).click()
+    ui.wait("fake.calls.length === 1")
+    assert sent(ui, "/api/sessions/parent/questions/ask") == [{"answers": [{"selected": ["Yes" + RLO]}]}]
+
+
+def test_an_answered_question_is_shown_as_it_was_written(ui, page):
+    questions = [{"question": "Run rm‮?", "options": [{"label": "Yes‮"}]}]
+    show(ui, f"[{question_event('completed', questions=questions, question_outcome='answered', answers=[{'selected': ['Yes' + RLO]}])}]")
+    card = page.get_by_role("region", name="Local has a question")
+    assert RLO in card.text_content()
+    expect(card.get_by_text(NOTE, exact=True)).to_have_count(0)
+
+
+# A plan with very many hidden characters fails closed: escaped plain text, never the raw characters
+
+def big_plan_event(count, title="Big plan"):
+    return ("{ id: 'plan', type: 'tool', name: 'submit_plan', state: 'pending', output: '', input: { title: '" + title
+            + "', plan: '\\u007f'.repeat(" + str(count) + ") + '\\n\\n- a step \\u202e end' } }")
+
+
+def watch_errors(page):
+    problems = []
+    page.on("pageerror", lambda error: problems.append(str(error)))
+    page.on("console", lambda message: problems.append(message.text) if message.type == "error" else None)
+    return problems
+
+
+def test_a_plan_with_130000_hidden_characters_renders_escaped_without_an_error(ui, page):
+    problems = watch_errors(page)
+    show(ui, f"[{big_plan_event(130000)}]")
+    card = page.get_by_role("region", name="Big plan")
+    expect(card.get_by_text(NOTE, exact=True)).to_have_count(1)
+    expect(card.locator(".plan-plain")).to_have_count(1)
+    text = card.text_content()
+    assert RLO not in text and "\x7f" not in text, "the card holds a raw hidden character"
+    assert "\\u202e end" in text and text.count("\\x7f") == 130000
+    assert problems == []
+    card.get_by_role("button", name="Approve and use Manual", exact=True).click()
+    ui.wait("fake.calls.length === 1")
+    assert sent(ui, "/api/sessions/parent/plans/plan") == [{"choice": "manual"}]
+
+
+def test_a_plan_with_more_than_5000_hidden_characters_uses_the_plain_escaped_text(ui, page):
+    show(ui, f"[{big_plan_event(6000)}]")
+    card = page.get_by_role("region", name="Big plan")
+    expect(card.locator(".plan-plain")).to_have_count(1)
+    expect(card.get_by_text(NOTE, exact=True)).to_have_count(1)
+    assert card.locator(".plan-plain").evaluate("node => node.tagName") == "PRE"
+    assert RLO not in card.text_content() and "\x7f" not in card.text_content()
+
+
+def test_a_plan_with_a_few_hidden_characters_keeps_the_rich_rendering(ui, page):
+    show(ui, f"[{big_plan_event(200)}]")
+    card = page.get_by_role("region", name="Big plan")
+    expect(card.locator(".plan-plain")).to_have_count(0)
+    expect(card.locator(".plan-body li")).to_have_count(1)
+    expect(card.locator(".plan-body .hidden-char")).to_have_count(201)
+
+
+def test_a_failure_while_escaping_a_plan_shows_the_escaped_source_not_the_raw_text(ui, page):
+    walk = """window.breakEscaping = true
+      const original = document.createTreeWalker.bind(document)
+      document.createTreeWalker = (root, ...rest) => {
+        if (window.breakEscaping && root.classList?.contains('plan-body')) throw new Error('forced failure')
+        return original(root, ...rest)
+      }"""
+    show(ui, f"[{big_plan_event(3)}]", setup=walk)
+    card = page.get_by_role("region", name="Big plan")
+    expect(card.locator(".plan-plain")).to_have_count(1)
+    expect(card.get_by_text(NOTE, exact=True)).to_have_count(1)
+    assert RLO not in card.text_content() and "\x7f" not in card.text_content()
+    assert "\\x7f\\x7f\\x7f" in card.locator(".plan-plain").text_content()
+
+
+def test_a_plan_with_an_entity_for_a_hidden_character_shows_the_note(ui, page):
+    show(ui, "[{ id: 'plan', type: 'tool', name: 'submit_plan', state: 'pending', output: '', input: { title: 'Entity plan', plan: 'Run a&#x202e;b now' } }]")
+    card = page.get_by_role("region", name="Entity plan")
+    expect(card.locator(".plan-body .hidden-char")).to_have_count(1)
+    expect(card.get_by_text(NOTE, exact=True)).to_have_count(1)
+    assert RLO not in card.text_content()
+
+
+def test_a_link_title_in_a_pending_plan_is_cleaned(ui, page):
+    show(ui, "[{ id: 'plan', type: 'tool', name: 'submit_plan', state: 'pending', output: '', input: { title: 'Link plan', plan: '[docs](https://example.com/a \"read\\u202eme\")' } }]")
+    link = page.get_by_role("region", name="Link plan").locator(".plan-body a")
+    expect(link).to_have_attribute("title", "read\\u202eme")
+    assert RLO not in link.evaluate("node => node.outerHTML")

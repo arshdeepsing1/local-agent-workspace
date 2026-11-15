@@ -884,3 +884,61 @@ def test_menu_stays_below_the_top_bar(ui, page, width, height, lines):
     bypass = mode_item(page, "Bypass permissions")
     bypass.evaluate("e => e.scrollIntoView({ block: 'center' })")  # The menu scrolls when it is shorter than its items.
     expect(bypass).to_be_in_viewport(ratio=1)
+
+
+# Right-to-left words in a rule keep the order typed
+
+RTL_NOTE = ("Hidden or direction-changing characters are shown as \\u escapes."
+            " Right-to-left text is kept in typing order.")
+RTL_RULES = """fake.projectRules = [{ behavior: 'allow', tool: 'run_command', argv: ['mv', 'א', 'ב'] }]
+fake.override = (path, options) => {
+  if (path === '/api/permission-rules' && options.method === 'DELETE') {
+    const { rule } = JSON.parse(options.body)
+    fake.projectRules = fake.projectRules.filter(item => JSON.stringify(item) !== JSON.stringify(rule))
+    return fake.json(ruleSets('a'))
+  }
+}"""
+
+
+def test_a_saved_rule_with_right_to_left_words_is_listed_in_typing_order(ui, page):
+    from test_approvals import LEFT_EDGES
+    menu = open_menu(ui, page, setup=RTL_RULES)
+    row = menu.locator(".allow-rule")
+    expect(row).to_contain_text("mv 'א' 'ב'")
+    found = page.evaluate(LEFT_EDGES, [".permissions-menu .allow-rule", ["mv", "א", "ב"]])
+    lefts = [left for _, _, left in found]
+    assert all(left is not None for left in lefts), found
+    assert lefts == sorted(lefts) and len(set(lefts)) == len(lefts), found
+    assert row.evaluate("node => node.querySelector('bdi.rtl-run').closest('.logical-order') !== null")
+    expect(menu.get_by_text(RTL_NOTE, exact=True)).to_have_count(1)
+    menu.get_by_role("menuitem", name="Remove rule: Command: mv 'א' 'ב'").click()
+    expect(row).to_have_count(0)
+    assert ui.bodies("/api/permission-rules", "DELETE") == [
+        {"scope": "project", "session_id": "a", "rule": {"behavior": "allow", "tool": "run_command", "argv": ["mv", "א", "ב"]}}]
+
+
+def test_a_rule_list_with_only_ascii_shows_no_note(ui, page):
+    menu = open_menu(ui, page, setup=SCOPED)
+    expect(menu.get_by_role("group", name="This project", exact=True)).to_be_visible()
+    expect(menu.get_by_role("note")).to_have_count(0)
+    expect(menu.locator("bdi")).to_have_count(0)
+
+
+def test_the_rules_dialog_echoes_a_right_to_left_folder_in_typing_order(ui, page):
+    from test_approvals import LEFT_EDGES
+    dialog = open_dialog(ui, page)
+    dialog.get_by_role("combobox", name="Applies to").select_option(label="File edits")
+    folder = dialog.get_by_role("textbox", name="Only under this folder")
+    folder.fill("/srv/א ב/x")
+    echo = dialog.locator(".hidden-echo")
+    expect(echo).to_contain_text("/srv/א ב/x")
+    found = page.evaluate(LEFT_EDGES, [".permission-rules-dialog .hidden-echo code", ["srv", "א", "ב", "x"]])
+    lefts = [left for _, _, left in found]
+    assert all(left is not None for left in lefts), found
+    assert lefts == sorted(lefts) and len(set(lefts)) == len(lefts), found
+    assert echo.evaluate("node => node.classList.contains('logical-order')")
+    expect(dialog.get_by_text(RTL_NOTE, exact=True)).to_have_count(1)
+    expect(folder).to_have_value("/srv/א ב/x")
+    folder.fill("/srv/src")
+    expect(dialog.locator(".hidden-echo")).to_have_count(0)
+    expect(dialog.get_by_role("note")).to_have_count(0)

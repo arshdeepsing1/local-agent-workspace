@@ -1,10 +1,10 @@
-import { html, useCallback, useEffect, useLayoutEffect, useRef, useState } from '../lib.js'
+import { html, hiddenNote, noteLine, visibleParts, visibleText, useCallback, useEffect, useLayoutEffect, useRef, useState } from '../lib.js'
 import { Activity, ArrowLeft, ChevronRight, Code2, Download, Eye, File, FileDiff, Folder, GitBranch, Maximize2, Minimize2, Minus, Pencil, Plus, RefreshCw, Save, Terminal, X } from '../icons.js'
 import { api } from '../api.js'
 import FileRoots, { standingFolder, useWorkspaceFolders } from './FileRoots.js'
 import TerminalPanel from './TerminalPanel.js'
 import ProgressPanel from './ProgressPanel.js'
-import DiffReview, { DiffLine, UnsentComments } from './DiffReview.js'
+import DiffReview, { DiffLine, MAX_MARKED_LINES, UnsentComments, diffNote } from './DiffReview.js'
 import { DiffStat } from './ChangesBar.js'
 import FilePreview, { downloadFile, opensInPreview, previewKind } from './FilePreview.js'
 
@@ -134,20 +134,21 @@ function GitChanges({ query, workspace, busy, onOpenFile }) {
     const areaName = GIT_GROUPS.find(([area]) => area === entry.area)?.[1]
     return html`<div class="git-diff-view">
       <div class="editor-toolbar"><button ref=${backButton} class="icon-button" aria-label="Back to changes" title="Back to changes" onClick=${() => setSelected(null)}><${ArrowLeft} size=${16} /></button>
-        <span title=${entry.orig_path ? `${entry.orig_path} → ${entry.path}` : entry.path}>${entry.path}</span>
+        <span class="logical-order" title=${visibleText(entry.orig_path ? `${entry.orig_path} → ${entry.path}` : entry.path)}>${visibleParts(entry.path)}</span>
         ${exists ? html`<button class="editor-mode" onClick=${() => onOpenFile(entry.path, firstLine)}><${File} size=${14} />Open file</button>
           <${VSCodeLink} absolute=${workspace.startsWith('/') ? `${workspace.replace(/\/+$/, '')}/${entry.path}` : null} line=${firstLine} />` : null}
       </div>
       <div class="diff-review-summary"><span>${statusName}</span>
         ${areaName !== statusName ? html`<span>${areaName}</span>` : null}
         ${diff ? html`<${DiffStat} added=${diff.added} removed=${diff.removed} />` : null}
-        ${entry.orig_path ? html`<span class="diff-review-note">from ${entry.orig_path}</span>` : null}</div>
+        ${entry.orig_path ? html`<span class="diff-review-note logical-order">from ${visibleParts(entry.orig_path)}</span>` : null}</div>
+      ${noteLine(diff ? diffNote(diff.lines, [entry.path, entry.orig_path]) : hiddenNote([entry.path, entry.orig_path]))}
       ${selected.error ? html`<div class="panel-error" role="alert">${selected.error}</div>`
         : !diff ? html`<p class="panel-empty">Loading diff…</p>`
         : diff.binary ? html`<p class="panel-empty">Binary file: no text diff to show.</p>`
         : !diff.lines.length ? html`<p class="panel-empty">No line changes.</p>`
-        : html`<div class="diff-review-lines git-diff-lines" role="region" aria-label=${`Diff of ${entry.path}`} tabindex="0">
-          ${diff.lines.map((line, index) => html`<${DiffLine} key=${index} line=${line} />`)}</div>`}
+        : html`<div class="diff-review-lines git-diff-lines" role="region" aria-label=${`Diff of ${visibleText(entry.path)}`} tabindex="0">
+          ${diff.lines.map((line, index) => html`<${DiffLine} key=${index} line=${line} plain=${diff.lines.length > MAX_MARKED_LINES} />`)}</div>`}
       ${diff?.truncated ? html`<p class="panel-footnote">This diff is long: showing its first 512 KB.</p>` : null}
     </div>`
   }
@@ -186,17 +187,18 @@ function GitChanges({ query, workspace, busy, onOpenFile }) {
               const [letter, name] = GIT_STATUS[entry.status] || ['?', entry.status]
               const pathId = `${ids}-${area}-${index}`
               const content = html`<span class=${`git-letter ${entry.status}`} title=${name} aria-label=${name}>${letter}</span>
-                <span class="git-path" id=${pathId} title=${entry.orig_path ? `${entry.orig_path} → ${entry.path}` : entry.path}>${entry.path}</span>`
+                <span class="git-path logical-order" id=${pathId} title=${visibleText(entry.orig_path ? `${entry.orig_path} → ${entry.path}` : entry.path)}>${visibleParts(entry.path)}</span>`
               return entry.hidden ? html`<div key=${entry.path} class="git-row hidden" title=${HIDDEN_NOTES[entry.hidden]}>${content}<span class="git-hidden">${HIDDEN_NOTES[entry.hidden]}</span></div>`
                 : html`<div key=${entry.path} class="git-entry"><button class="git-row" data-area=${entry.area} data-path=${entry.path} onClick=${() => void showDiff(entry)}>${content}
                   ${Number.isInteger(entry.added) && Number.isInteger(entry.removed) ? html`<${DiffStat} added=${entry.added} removed=${entry.removed} />` : null}</button>
                   ${!stageable(entry) ? null : html`<button type="button" class="icon-button git-stage" aria-label=${verb} aria-describedby=${pathId}
-                    data-path=${entry.path} title=${lockedTitle || `${verb} ${entry.path}`} disabled=${locked}
+                    data-path=${entry.path} title=${lockedTitle || `${verb} ${visibleText(entry.path)}`} disabled=${locked}
                     onClick=${() => void stageFiles(entryPaths(entry), !staged)}>${staged ? html`<${Minus} size=${14} />` : html`<${Plus} size=${14} />`}</button>`}</div>`
             })}</section>` : null
         })}
       ${status?.truncated ? html`<p class="panel-empty">Git lists more files than shown here.</p>` : null}
     </div>
+    ${noteLine(hiddenNote(files.flatMap(entry => [entry.path, entry.orig_path])))}
     <p class="panel-footnote">Git's view of the project, including changes made by commands. Credential files are listed without their contents.</p>
   </div>`
 }

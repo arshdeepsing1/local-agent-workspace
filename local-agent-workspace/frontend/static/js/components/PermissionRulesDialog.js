@@ -1,5 +1,5 @@
-import { html, useEffect, useRef, useState } from '../lib.js'
-import { X } from '../icons.js'
+import { html, hiddenNote, needsParts, noteLine, visibleParts, useState } from '../lib.js'
+import DialogShell from './DialogShell.js'
 
 const BEHAVIORS = [['allow', 'Allow'], ['ask', 'Always ask'], ['deny', 'Deny']]
 const SCOPES = [['chat', 'This chat'], ['project', 'This project'], ['user', 'All projects']]
@@ -16,18 +16,16 @@ export function ruleDraft({ behavior, target, match, text, options, folder, tool
   return { tool: tool.trim(), behavior }
 }
 
+// A read-only echo of a typed value that holds an escape or a right-to-left run (the input keeps the real value).
+// The dialog shows the note once, so the echo has none.
+const Echo = ({ value, label }) => !needsParts(value) ? null
+  : html`<div class="hidden-echo logical-order"><p class="field-help">${label}: <code>${visibleParts(value)}</code></p></div>`
+
 // Props: onAdd(scope, draft) -> Promise, onClose, returnFocus? (called when the dialog goes away)
 export default function PermissionRulesDialog({ onAdd, onClose, returnFocus }) {
-  const dialog = useRef(null)
   const [form, setForm] = useState({ behavior: 'allow', scope: 'project', target: 'command', match: 'exact', text: '', options: '', folder: '', tool: '', domain: '' })
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
-  useEffect(() => {
-    const node = dialog.current
-    node?.showModal()
-    // The menu item that opened the dialog is gone, so focus goes back to where the caller says.
-    return () => { if (node?.open) node.close(); returnFocus?.() }
-  }, [])
   const set = (key, value) => { setForm(current => ({ ...current, [key]: value })); setError('') }
   const submit = async event => {
     event.preventDefault()
@@ -41,12 +39,16 @@ export default function PermissionRulesDialog({ onAdd, onClose, returnFocus }) {
     checked=${form[key] === value} disabled=${saving} onChange=${() => set(key, value)} /><span>${label}</span></label>`
   const ready = form.target === 'command' ? !!form.text.trim() : form.target === 'tool' ? !!form.tool.trim()
     : form.target === 'web' ? form.behavior !== 'allow' || !!form.domain.trim() : true
-  return html`<dialog ref=${dialog} class="settings-dialog permission-rules-dialog" aria-labelledby="permission-rules-title"
-    onCancel=${onClose} onClick=${e => { if (e.target === dialog.current) onClose() }}>
-    <form class="dialog-content" onSubmit=${submit}>
-      <header><div><h2 id="permission-rules-title">Add a permission rule</h2>
-        <p>Deny wins over Always ask, and Always ask over Allow. Plan, protected files and credential exclusions still apply.</p></div>
-        <button type="button" class="icon-button" aria-label="Close" onClick=${onClose}><${X} size=${20} /></button></header>
+  // The fields of the chosen target that hold hidden characters: each is echoed read-only with escapes.
+  const shown = form.target === 'command' ? [form.text, form.match === 'prefix' && form.behavior === 'allow' ? form.options : '']
+    : form.target === 'edits' ? [form.folder] : form.target === 'web' ? [form.domain] : [form.tool]
+  const note = hiddenNote(shown)
+  // The menu item that opened the dialog is gone, so focus goes back to where the caller says (returnFocus).
+  return html`<${DialogShell} className="permission-rules-dialog" labelledBy="permission-rules-title" title="Add a permission rule" titleId="permission-rules-title"
+    description=${html`<p>Deny wins over Always ask, and Always ask over Allow. Plan, protected files and credential exclusions still apply.</p>`}
+    onClose=${onClose} onSubmit=${submit} returnFocus=${returnFocus}
+    footer=${html`<button type="button" class="outline" onClick=${onClose}>Cancel</button>
+        <button type="submit" class="primary" disabled=${saving || !ready}>Add rule</button>`}>
       <label>Behavior<select disabled=${saving} value=${form.behavior} onChange=${e => set('behavior', e.currentTarget.value)}>
         ${BEHAVIORS.map(([value, label]) => html`<option key=${value} value=${value}>${label}</option>`)}</select></label>
       <fieldset><legend>Scope</legend>${SCOPES.map(([value, label]) => radio('scope', value, label))}</fieldset>
@@ -55,23 +57,26 @@ export default function PermissionRulesDialog({ onAdd, onClose, returnFocus }) {
       ${form.target === 'command' ? html`
         <fieldset><legend>Match</legend>${radio('match', 'exact', 'Exactly this command')}${radio('match', 'prefix', 'Commands starting with')}</fieldset>
         <label>Command<input required spellcheck=${false} disabled=${saving} value=${form.text} placeholder="git status" onInput=${e => set('text', e.currentTarget.value)} /></label>
+        <${Echo} value=${form.text} label="Command with escapes" />
         ${form.match === 'prefix' && form.behavior === 'allow' ? html`<label>Allowed options after it<input spellcheck=${false} disabled=${saving}
           value=${form.options} placeholder="--short" onInput=${e => set('options', e.currentTarget.value)} /></label>
+          <${Echo} value=${form.options} label="Options with escapes" />
           <p class="field-help">Separate options with spaces. Use --name= to allow any value. Nothing else may follow.</p>` : null}
         ${form.match === 'prefix' && form.behavior !== 'allow' ? html`<p class="field-help">Deny and Always ask rules match these words with any options.</p>` : null}` : null}
       ${form.target === 'edits' ? html`<label>Only under this folder<input spellcheck=${false} disabled=${saving} value=${form.folder}
         placeholder="/srv/project/src" onInput=${e => set('folder', e.currentTarget.value)} /></label>
+        <${Echo} value=${form.folder} label="Folder with escapes" />
         <p class="field-help">Optional. An absolute path; leave it empty for every file edit.</p>` : null}
       ${form.target === 'web' ? html`<label>Domain<input spellcheck=${false} disabled=${saving} value=${form.domain} required=${form.behavior === 'allow'}
         placeholder="docs.python.org" onInput=${e => set('domain', e.currentTarget.value)} /></label>
+        <${Echo} value=${form.domain} label="Domain with escapes" />
         <p class="field-help">${form.behavior === 'allow' ? 'Allow names one host exactly; other hosts, also its subdomains, still ask.'
           : 'Deny and Always ask cover the domain and its subdomains; leave it empty for every web fetch.'}</p>` : null}
       ${form.target === 'tool' ? html`<label>Tool name<input required spellcheck=${false} disabled=${saving} value=${form.tool}
         placeholder="mcp__docs__search" onInput=${e => set('tool', e.currentTarget.value)} /></label>
-        <p class="field-help">For example mcp__docs__search, mcp__docs__*, delegate_task, remember (project memory) or web_search.</p>` : null}
+        <${Echo} value=${form.tool} label="Tool name with escapes" />
+        <p class="field-help">For example mcp__docs__search, mcp__docs__*, delegate_task, remember (project memory), web_search or browser (a deny rule for browser turns browsing off; to allow one host, use Allow on its card).</p>` : null}
+      ${noteLine(note)}
       ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
-      <footer><button type="button" class="outline" onClick=${onClose}>Cancel</button>
-        <button type="submit" class="primary" disabled=${saving || !ready}>Add rule</button></footer>
-    </form>
-  </dialog>`
+  <//>`
 }

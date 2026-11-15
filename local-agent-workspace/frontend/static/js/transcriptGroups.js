@@ -25,8 +25,11 @@ const GROUPABLE = new Map([
   ['list_files', 'list'], ['project_overview', 'list'], ['find_files', 'search'], ['search_files', 'search'],
   ['list_jobs', 'jobs'], ['get_job_output', 'jobs'], ['wait_job', 'jobs'], ['web_fetch', 'fetch'], ['web_search', 'web'],
   ['list_tasks', 'lookup'], ['get_task', 'lookup'], ['list_skills', 'lookup'], ['get_tool_output', 'lookup'],
-  ['get_subagent_result', 'lookup'],
+  ['get_subagent_result', 'lookup'], ['browser', 'browse'],
 ])
+// The browser actions that only look; one that changes a page (click, type, select) never folds, and a screenshot stays
+// in view with its thumbnail.
+const BROWSER_LOOKS = new Set(['open', 'read', 'find', 'scroll', 'tabs', 'console', 'network', 'back', 'forward'])
 // Job tools whose neutral label reports the job, not the tool ("job exit 1", "wait timed out"): they still fold.
 const NEUTRAL_JOB_TOOLS = new Set(['wait_job', 'get_job_output', 'list_jobs'])
 const QUIET = 'quiet', HOOK = 'hook', DELEGATE = 'delegate', BREAK = 'break'
@@ -41,6 +44,7 @@ const PHRASES = {
   jobs: count => times(count, 'checked jobs'),
   fetch: count => `fetched ${plural(count, 'page', 'pages')}`,
   web: count => times(count, 'searched the web'),
+  browse: count => times(count, 'used the browser'),
   lookup: count => `looked up ${plural(count, 'item', 'items')}`,
   hook: count => `ran ${plural(count, 'hook', 'hooks')}`,
 }
@@ -72,6 +76,9 @@ function classify(event, state) {
   if (name.startsWith('hook_')) return status.tone === 'ok' && !state.hooked ? HOOK : BREAK
   const kind = GROUPABLE.get(name)
   if (!kind) return BREAK
+  // A browser card folds only when it looked at a page and nothing needed you: not one that waited for an answer
+  // (approval is set once a card was answered), was refused or ended early (browser.refused), or changed a page.
+  if (name === 'browser' && (!BROWSER_LOOKS.has(event.input?.action) || event.approval || event.browser?.refused)) return BREAK
   if (!(status.tone === 'ok' || (status.tone === 'neutral' && NEUTRAL_JOB_TOOLS.has(name)))) return BREAK
   // A background command goes on after its card: it never folds, also once it ended.
   if (name === 'run_command' && (event.input?.background || state.result?.job?.background || status.label === 'started in background')) return BREAK

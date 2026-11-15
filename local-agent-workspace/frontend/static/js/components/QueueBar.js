@@ -7,12 +7,14 @@ import { Pencil, X } from '../icons.js'
 const clipped = (text, size = 120) => text.length > size ? `${text.slice(0, size - 1)}…` : text
 const messageBox = () => document.querySelector('textarea[aria-label="Message"]')
 
-// Props: session, onRemove(id) -> Promise, onEdit(item) -> Promise, onSend() -> Promise, onError(message)
-export default function QueueBar({ session, onRemove, onEdit, onSend, onError }) {
+// Props: session, onRemove(id) -> Promise, onEdit(item) -> Promise, onSend() -> Promise, onError(message), hideError (the
+// status row shows session.queue_error itself, in an alert of its own)
+export default function QueueBar({ session, onRemove, onEdit, onSend, onError, hideError = false }) {
   const [working, setWorking] = useState(false)
   const bar = useRef(null)
   const queue = session?.queued_messages || []
-  if (!queue.length && !session?.queue_error) return null
+  const showError = !!session?.queue_error && !hideError
+  if (!queue.length && !showError) return null
   const busy = session.status !== 'idle'
   // focus(): where keyboard focus goes once the action is done and the page has updated, since the
   // button that was used is disabled meanwhile and may be gone.
@@ -29,7 +31,7 @@ export default function QueueBar({ session, onRemove, onEdit, onSend, onError })
     return buttons[Math.min(index, buttons.length - 1)] || messageBox()
   }
   return html`<div class="queue-bar" role="group" aria-label="Queued messages" ref=${bar}>
-    ${session.queue_error ? html`<p class="queue-error" role="alert">${session.queue_error}</p>` : null}
+    ${showError ? html`<p class="queue-error" role="alert">${session.queue_error}</p>` : null}
     ${queue.length ? html`<div class="queue-heading">${busy ? 'Queued — sent after the agent’s current step'
       : 'Not sent yet: queued messages wait when a reply is stopped or fails.'}
       ${!busy ? html`<button class="outline" disabled=${working} onClick=${() => void act(onSend, messageBox)}>Send queued messages</button>` : null}</div>` : null}

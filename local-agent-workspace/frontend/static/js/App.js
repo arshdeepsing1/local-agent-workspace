@@ -15,26 +15,19 @@ import { standingFolder } from './components/FileRoots.js'
 import { inside } from './paths.js'
 import { elapsedText } from './subagents.js'
 import PermissionRulesDialog from './components/PermissionRulesDialog.js'
-import ContextMeter from './components/ContextMeter.js'
-import ChangesBar, { plural } from './components/ChangesBar.js'
+import ContextMeter, { CompactionChoiceCard, waitingChoice } from './components/ContextMeter.js'
+import { plural } from './components/ChangesBar.js'
 import StorageNotice from './components/StorageNotice.js'
 import { ScheduleAlerts } from './components/SchedulesPanel.js'
 import { blockerOf, OpenBlockingChat } from './components/BlockingChat.js'
-import TaskChecklist from './components/TaskChecklist.js'
-import ContinueButton from './components/ContinueButton.js'
-import QueueBar from './components/QueueBar.js'
-import SideAnswer from './components/SideAnswer.js'
+import StatusRow from './components/StatusRow.js'
 import { removeDraft, useSavedDrafts } from './drafts.js'
-import { RewindNotice } from './rewindNotice.js'
 import WorktreeChat from './components/WorktreeChat.js'
-import CommandHelp from './components/CommandHelp.js'
 import { runCommand } from './commands.js'
 import { applyTextSize, textSize } from './textSize.js'
-import { applyStyle, applyTheme, style, theme } from './theme.js'
+import { savedWorkspacePanel, saveWorkspacePanel } from './viewPrefs.js'
 
 applyTextSize(textSize())  // Settings → Appearance → Text size, before the first render.
-applyStyle(style())  // Settings → Appearance → Style and Theme (index.html already applied stored ones before the stylesheet).
-applyTheme(theme())
 
 export default function App() {
   const app = useWorkspace()
@@ -61,7 +54,10 @@ export default function App() {
   // /help and /copy: { key (the view it belongs to), help? , text? }; /context opens the meter's details.
   const [commandNotice, setCommandNotice] = useState(null)
   const [contextSignal, setContextSignal] = useState(0)
-  const [workspaceOpen, setWorkspaceOpen] = useState(false)
+  // The Workspace panel starts closed on a first visit. A choice made with the Workspace button or the panel's Close is
+  // kept in this browser (viewPrefs.js), but a saved "open" does not cover a phone or a tablet, where the panel is a drawer.
+  const [workspaceOpen, setWorkspaceOpen] = useState(() => savedWorkspacePanel() === 'open' && !matchMedia('(width < 1024px)').matches)
+  const chooseWorkspace = value => setWorkspaceOpen(current => { const next = resolve(value, current); saveWorkspacePanel(next); return next })
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [foldersOpen, setFoldersOpen] = useState(false)
   // The token expiry warning (Settings → Credentials → Token expires on) you dismissed in this page, until it changes.
@@ -180,7 +176,8 @@ export default function App() {
     if (missingCodingDir && (changedInMissing || !busy)) void app.refreshSettings().catch(() => {})
   }, [missingCodingDir, changedInMissing, busy, workspaceOpen])
   // The hint's Show: the card it names (the last one waiting) comes into view with focus, wherever you scrolled.
-  const showWaiting = () => revealCard([...document.querySelectorAll(`.transcript :is(${PENDING_CARDS})`)].at(-1), true)
+  const showWaiting = () => waitingChoice(active) ? document.querySelector('.compaction-choice .primary')?.focus()
+    : revealCard([...document.querySelectorAll(`.transcript :is(${PENDING_CARDS})`)].at(-1), true)
   const openReview = path => { setReview({ path, viewKey: app.viewKey }); setWorkspaceOpen(true) }
   const openFileAt = ({ path, line }) => { setOpenPath({ path, line, viewKey: app.viewKey }); setWorkspaceOpen(true) }
   // Removing a rule saves the chat (a newer 'updated'); like a rename, your own change is not news.
@@ -244,7 +241,7 @@ export default function App() {
         <span class="conversation-title" title=${active ? `${active.title}\nSession: ${active.id}` : undefined}>${active?.title || (app.activeId ? 'Loading conversation…' : 'New conversation')}
           ${app.activeId ? html`<small class="session-id" title=${`Session: ${app.activeId}`}> · ${app.activeId.slice(0, 8)}</small>` : null}</span>
         <button class="outline agent-tools-toggle" title="Agent tools" onClick=${() => setAgentToolsOpen(true)}><${Wrench} size=${16} /><span class="toggle-label">Agent tools</span></button>
-        <button ref=${workspaceToggle} class=${`outline workspace-toggle ${workspaceOpen ? 'active' : ''}`} title="Workspace" onClick=${() => setWorkspaceOpen(v => !v)}><${PanelRight} size=${18} /><span class="toggle-label">Workspace</span>
+        <button ref=${workspaceToggle} class=${`outline workspace-toggle ${workspaceOpen ? 'active' : ''}`} title="Workspace" onClick=${() => chooseWorkspace(v => !v)}><${PanelRight} size=${18} /><span class="toggle-label">Workspace</span>
           ${changedFiles ? html`<span class="change-count" title=${`${plural(changedFiles, 'file')} changed by the agent`}><span aria-hidden="true">${changedFiles}</span><span class="sr-only">(${plural(changedFiles, 'changed file')})</span></span>` : null}</button>
       </header>
       ${app.error && (app.online || !app.offlineError) ? html`<div class="app-error" role="alert"><span>${app.error}</span>
@@ -266,12 +263,13 @@ export default function App() {
             <button class="outline" onClick=${() => setDraft('Run a command in this workspace: ')}><${Terminal} size=${16} />Run a command</button>
             <${WorktreeChat} key=${app.viewKey} sessionId=${app.activeId} onSelectSession=${app.setActiveId} onError=${showError} /></div>
         </div></div>`}
-      <div class="chat-composer"><div class="composer-bars"><${RewindNotice} sessionId=${app.activeId} onSelectSession=${app.setActiveId} />
-        <${ChangesBar} key=${`changes-${app.viewKey}`} changes=${app.changes} roots=${pathRoots} busy=${busy} onOpen=${openReview} onAction=${app.reviewChanges} onError=${showError} />
-        <${TaskChecklist} key=${`tasks-${app.viewKey}`} tasks=${app.tasks} />
-        <${ContinueButton} session=${active} disabled=${!app.ready || !app.online || app.modelSaving || !app.settings?.configured} onSend=${app.send} onError=${showError} />
-        <${QueueBar} session=${active} onRemove=${app.removeQueued} onSend=${app.sendQueued} onError=${showError}
-          onEdit=${async item => {
+      <div class="chat-composer"><div class="composer-bars"><${CompactionChoiceCard} session=${active} onError=${showError} />
+        <${StatusRow} key=${app.viewKey} viewKey=${app.viewKey} session=${active} sessionId=${app.activeId} changes=${app.changes} roots=${pathRoots} busy=${busy}
+          tasks=${app.tasks} side=${app.sideAnswer} notice=${commandNotice?.key === app.viewKey ? commandNotice : null}
+          canContinue=${app.ready && app.online && !app.modelSaving && !!app.settings?.configured}
+          onSend=${app.send} onError=${showError} onReview=${openReview} onChanges=${app.reviewChanges} onSelectSession=${app.setActiveId}
+          onRemoveQueued=${app.removeQueued} onSendQueued=${app.sendQueued} onDismissSide=${app.dismissSide} onDismissNotice=${() => setCommandNotice(null)}
+          onEditQueued=${async item => {
             await app.removeQueued(item.id)
             setDraft(current => current ? `${current}\n${item.text}` : item.text)
             // It goes as it was queued: as plain text again, its ! or / is not run as a command. Below a typed draft
@@ -281,11 +279,9 @@ export default function App() {
             const queued = (item.uploads || []).map(ref => ({ key: `queued-${item.id}-${ref.id}`, name: ref.name || 'Attached file',
               kind: ref.kind || 'document', record: { id: ref.id, name: ref.name, kind: ref.kind || 'document' }, asPath: !!ref.as_path }))
             if (queued.length) filesFor(app.viewKey)(current => [...current, ...queued.filter(item => !current.some(other => other.record?.id === item.record.id))])
-          }} />
-        <${SideAnswer} side=${app.sideAnswer} onDismiss=${app.dismissSide} onError=${showError} />
-        <${CommandHelp} notice=${commandNotice?.key === app.viewKey ? commandNotice : null} onDismiss=${() => setCommandNotice(null)} /></div>
+          }} /></div>
         ${composer}
-        ${active?.status === 'awaiting_approval' ? html`<p class="composer-hint"><span role="status">${(name => name === 'ask_user' ? 'The agent is waiting for your answer above.' : name === 'submit_plan' ? 'A plan is waiting for your review above.' : 'An action is waiting for your approval above.')(active.events?.findLast(event => event.state === 'pending')?.name)}</span>
+        ${active?.status === 'awaiting_approval' ? html`<p class="composer-hint"><span role="status">${(waiting => waiting?.compaction_choice ? 'A choice about compacting is waiting for you above.' : waiting?.name === 'ask_user' ? 'The agent is waiting for your answer above.' : waiting?.name === 'submit_plan' ? 'A plan is waiting for your review above.' : 'An action is waiting for your approval above.')(active.events?.findLast(event => event.state === 'pending'))}</span>
           <button class="composer-hint-show" onClick=${showWaiting}>Show</button></p>` : null}
         ${active && active.status !== 'awaiting_approval' && active.events?.some(event => subagentWaits(event.delegation)) ? html`<p class="composer-hint"><span role="status">A subagent is waiting for your answer above.</span>
           <button class="composer-hint-show" onClick=${() => revealCard([...document.querySelectorAll(`.transcript ${WAITING_SUBAGENTS}`)].at(-1), true)}>Show</button></p>` : null}
@@ -301,10 +297,10 @@ export default function App() {
     </main>
     ${drawerOpen && app.error && (app.online || !app.offlineError) ? html`<div class="drawer-alert" role="alert"><span>${app.error}</span>
       <${OpenBlockingChat} blocker=${blocker?.message === app.error ? blocker : null} currentId=${app.activeId} onSelect=${app.setActiveId} /><button class="icon-button" aria-label="Dismiss error" onClick=${() => { app.setError(''); document.querySelector('.workspace-panel [aria-label="Close workspace"]')?.focus() }}><${X} size=${16} /></button></div>` : null}
-    ${workspaceOpen && app.settings && (!app.activeId || active) ? html`<div class="workspace-scrim" aria-hidden="true" onClick=${() => setWorkspaceOpen(false)} />` : null}
+    ${workspaceOpen && app.settings && (!app.activeId || active) ? html`<div class="workspace-scrim" aria-hidden="true" onClick=${() => chooseWorkspace(false)} />` : null}
     ${workspaceOpen && app.settings && (!app.activeId || active) ? html`<${WorkspacePanel} key=${editorKey} sessionId=${app.activeId}
       worktree=${active?.worktree || null} allowedDirectories=${active?.allowed_directories || []} codingDir=${app.settings.coding_dir_status} pythonVenv=${app.settings.python_venv_status}
-      workspace=${workspace} file=${editorDrafts[editorKey] || null} setFile=${setEditorFile} onClose=${() => setWorkspaceOpen(false)}
+      workspace=${workspace} file=${editorDrafts[editorKey] || null} setFile=${setEditorFile} onClose=${() => chooseWorkspace(false)}
       changes=${app.changes} busy=${busy} review=${review?.viewKey === app.viewKey ? review : null} onReviewOpened=${() => setReview(null)} onReview=${app.reviewChanges} onSelectSession=${app.setActiveId}
       onSendComments=${text => app.send(text)}
       open=${openPath?.viewKey === app.viewKey ? openPath : null} onOpened=${() => setOpenPath(null)}

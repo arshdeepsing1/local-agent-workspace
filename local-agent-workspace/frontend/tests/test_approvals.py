@@ -604,3 +604,474 @@ def test_a_web_search_card_shows_the_query_and_needs_no_chat_button(ui, page):
     card.get_by_role("button", name="Approve", exact=True).click()
     ui.wait("fake.calls.length === 1")
     assert decisions(ui, "search") == [{"allowed": True}]
+
+
+# Hidden and direction-changing characters in what you approve are shown as visible escapes
+
+NOTE = "Hidden or direction-changing characters are shown as \\u escapes."
+
+
+def command_card(ui, command: str, extra: str = ""):
+    """A pending command card; `command` is the body of a JavaScript string literal (escapes allowed)."""
+    show(ui, f"[{{ id: 'card', type: 'tool', name: 'run_command', state: 'pending', input: {{ command: '{command}' }}, "
+             f"preview: '{command}\\n\\nTimeout: 60 seconds'{extra} }}]")
+
+
+@pytest.mark.parametrize("command, shown, raw", [
+    ("echo safe \\u202e txt.sh # rm -rf ~", "echo safe \\u202e txt.sh # rm -rf ~", "‮"),
+    ("echo a\\u200bb", "echo a\\u200bb", "​"),
+    ("echo a\\rrm -rf ~", "echo a\\x0drm -rf ~", "\r"),
+    ("echo \\u001b[2Jhi", "echo \\x1b[2Jhi", "\x1b"),
+    ("echo a\\u2028b", "echo a\\u2028b", " "),
+    ("echo a\\u{e0041}b", "echo a\\u{e0041}b", "\U000e0041"),
+])
+def test_a_command_with_hidden_characters_is_shown_with_visible_escapes(ui, page, command, shown, raw):
+    command_card(ui, command)
+    card = page.locator(".tool-card")
+    expect(card.get_by_label("Command", exact=True).first).to_contain_text(shown)
+    expect(card.get_by_text(NOTE, exact=True)).to_have_count(1)
+    assert raw not in card.inner_text() and raw not in card.text_content(), "the card holds the raw character"
+    assert raw not in (card.get_by_role("button").first.get_attribute("aria-label") or "")
+
+
+def test_the_note_appears_only_when_something_was_escaped(ui, page):
+    command_card(ui, 'echo "héllo 日本語 🙂"')
+    card = page.locator(".tool-card")
+    expect(card.get_by_label("Command", exact=True).first).to_have_text('echo "héllo 日本語 🙂"\n\nTimeout: 60 seconds')
+    expect(page.get_by_text("escapes.", exact=False)).to_have_count(0)
+    assert "\\u" not in card.inner_text()
+
+
+def test_approving_a_card_with_hidden_characters_sends_the_original_decision_only(ui, page):
+    command_card(ui, "echo safe \\u202e txt.sh # rm -rf ~")
+    page.get_by_role("button", name="Approve", exact=True).click()
+    ui.wait("fake.calls.length === 1")
+    assert decisions(ui, "card") == [{"allowed": True}]
+
+
+def test_editing_a_command_with_hidden_characters_shows_it_escaped_and_sends_what_you_type(ui, page):
+    command_card(ui, "echo a\\u202eb", ", editable: ['command']")
+    page.get_by_role("button", name="Edit", exact=True).click()
+    expect(page.get_by_text(NOTE, exact=True)).to_have_count(1)
+    original = page.get_by_label("Original command")
+    expect(original).to_have_text("echo a\\u202eb")
+    assert "‮" not in original.text_content()
+    editor = page.get_by_role("textbox", name="Command")
+    assert ui.js("document.querySelector('.approval-edit textarea').value") == "echo a‮b"  # What you edit stays as it is.
+    editor.fill("echo ‮ typed")
+    page.get_by_role("button", name="Save edit").click()
+    ui.wait("fake.calls.length === 1")
+    assert ui.bodies("/api/sessions/parent/approvals/card/edit", "POST") == [{"input": {"command": "echo ‮ typed"}}]
+
+
+def test_options_and_the_approval_preview_escape_hidden_characters(ui, page):
+    show(ui, r"""[{ id: 'opts', type: 'tool', name: 'run_command', state: 'pending', input: { command: 'make test', cwd: 'a‮b' } },
+      { id: 'prev', type: 'tool', name: 'write_file', state: 'pending', input: { path: 'a.txt', content: 'x' },
+        preview: 'Write a‮b.txt\n​new text' }]""")
+    expect(page.get_by_label("Options", exact=True)).to_contain_text("a\\u202eb")
+    preview = page.get_by_label("Approval preview", exact=True)
+    expect(preview).to_contain_text("Write a\\u202eb.txt\n\\u200bnew text")
+    assert "‮" not in page.locator(".tool-card").first.text_content() + page.locator(".tool-card").last.text_content()
+    assert "​" not in page.locator(".tool-card").last.text_content()
+    expect(page.get_by_text(NOTE, exact=True)).to_have_count(2)
+
+
+def test_the_paths_and_hook_arguments_of_an_approval_card_escape_hidden_characters(ui, page):
+    show(ui, r"""[{ id: 'card', type: 'tool', name: 'edit_file', state: 'pending', input: { path: 'a.txt' }, preview: 'p',
+      protected: 'a‮txt.sh', hook_change: { hooks: ['fix'], original: { command: 'x​y' } } }]""")
+    card = page.locator(".tool-card")
+    expect(card.get_by_text("Protected file: a\\u202etxt.sh.", exact=False)).to_have_count(1)
+    expect(card.get_by_label("Arguments before the hook")).to_contain_text("x\\u200by")
+    text = card.text_content()
+    assert "‮" not in text and "​" not in text
+
+
+def test_visible_text_escapes_only_characters_that_hide_or_reorder_text(ui):
+    ui.start()
+    result = ui.js("""(async () => {
+      const { visibleText } = await import('/static/js/lib.js')
+      const out = {}
+      for (const [name, text] of Object.entries({
+        bidi: '\\u202a\\u202b\\u202c\\u202d\\u202e\\u2066\\u2067\\u2068\\u2069', zeroWidth: '\\u200b\\u200c\\u200d\\u200e\\u200f\\u2060\\u2064\\ufeff\\u061c\\u180e',
+        controls: '\\u0000\\u0007\\u000b\\r\\u001b\\u007f\\u0085\\u009f', separators: '\\u2028\\u2029', tags: '\\u{e0000}\\u{e0041}\\u{e007f}',
+        plain: 'a\\nb\\tc héllo 日本語 🙂 e\\u0301 👨‍👩‍👧', }))
+        out[name] = visibleText(text)
+      return out })()""")
+    assert result["bidi"] == "\\u202a\\u202b\\u202c\\u202d\\u202e\\u2066\\u2067\\u2068\\u2069"
+    assert result["zeroWidth"] == "\\u200b\\u200c\\u200d\\u200e\\u200f\\u2060\\u2064\\ufeff\\u061c\\u180e"
+    assert result["controls"] == "\\x00\\x07\\x0b\\x0d\\x1b\\x7f\\x85\\x9f"
+    assert result["separators"] == "\\u2028\\u2029"
+    assert result["tags"] == "\\u{e0000}\\u{e0041}\\u{e007f}"
+    # Newline, tab, accented and CJK letters, emoji, combining marks and the joiners of an emoji sequence stay.
+    assert result["plain"] == "a\nb\tc héllo 日本語 🙂 é 👨‍👩‍👧"
+
+
+# Rules, other zero-width and blank characters, and which escapes are marked
+
+RLO = "‮"
+
+
+def js_escape(code: int) -> str:
+    """A JavaScript string-literal escape for one code point."""
+    return f"\\u{code:04x}" if code <= 0xFFFF else f"\\u{{{code:x}}}"
+
+
+def visible_escape(code: int) -> str:
+    """What visibleText writes for it."""
+    return f"\\x{code:02x}" if code < 0x100 else f"\\u{{{code:x}}}" if code > 0xFFFF else f"\\u{code:04x}"
+
+
+def remember_card(ui, rule_options: str, extra: str = ""):
+    show(ui, "[{ id: 'card', type: 'tool', name: 'run_command', state: 'pending', input: { command: 'echo safe x' }, "
+             "preview: 'echo safe x', rememberable: ['chat', 'project', 'user']" + extra + f", rule_options: {rule_options} }}]")
+
+
+def test_the_always_allow_form_shows_the_rule_with_visible_escapes_and_saves_the_original(ui, page):
+    remember_card(ui, "{ argv: ['echo', 'safe', '\\u202e', 'txt.sh'], "
+                      "prefixes: [{ prefix: ['echo', 'safe', '\\u202e'], flags: ['--x\\u202e'] }], reason: null }")
+    card = page.locator(".tool-card")
+    expect(card.get_by_text(NOTE, exact=True)).to_have_count(1)
+    page.get_by_role("button", name="Always allow…").click()
+    form = page.get_by_role("group", name="Remember this approval")
+    expect(form.locator("code").first).to_have_text("echo safe '\\u202e' txt.sh")
+    expect(form.locator("code .hidden-char")).to_have_count(1)
+    form.get_by_role("radio", name="Commands starting with").check()
+    expect(form.get_by_role("combobox", name="Command start").locator("option")).to_have_text(["echo safe '\\u202e'"])
+    # The input keeps the real value (it is what is sent); its escaped form is shown beside it, read-only.
+    assert ui.js("document.querySelector('.remember-prefix input').value") == f"--x{RLO}"
+    expect(form.locator(".hidden-echo code")).to_have_text("--x\\u202e")
+    assert RLO not in card.text_content() and RLO not in form.inner_text()
+    form.get_by_role("radio", name=re.compile("^Exactly this command")).check()
+    form.get_by_role("button", name="Approve and remember").click()
+    ui.wait("fake.calls.length === 1")
+    assert decisions(ui, "card") == [{"allowed": True, "scope": "project", "rule": {
+        "tool": "run_command", "behavior": "allow", "argv": ["echo", "safe", RLO, "txt.sh"]}}]
+
+
+def test_a_prefix_rule_is_saved_with_its_original_prefix_and_flags(ui, page):
+    remember_card(ui, "{ argv: ['echo'], prefixes: [{ prefix: ['echo', '\\u202e'], flags: ['--x\\u202e'] }], reason: null }")
+    page.get_by_role("button", name="Always allow…").click()
+    form = page.get_by_role("group", name="Remember this approval")
+    form.get_by_role("radio", name="Commands starting with").check()
+    form.get_by_role("button", name="Approve and remember").click()
+    ui.wait("fake.calls.length === 1")
+    assert decisions(ui, "card") == [{"allowed": True, "scope": "project", "rule": {
+        "tool": "run_command", "behavior": "allow", "prefix": ["echo", RLO], "flags": [f"--x{RLO}"]}}]
+
+
+def test_a_domain_and_a_folder_with_hidden_characters_are_shown_escaped(ui, page):
+    show(ui, "[{ id: 'fetch', type: 'tool', name: 'web_fetch', state: 'pending', preview: 'p', input: { url: 'https://docs.example.com/' }, "
+             "web_domain: 'docs.example.com\\u202e', rememberable: ['chat', 'project', 'user'], rule_options: { domain: 'docs.example.com\\u202e' } }, "
+             "{ id: 'edit', type: 'tool', name: 'edit_file', state: 'pending', preview: 'd', input: { path: 'a.py' }, "
+             "rememberable: ['chat', 'project', 'user'], rule_options: { folder: '/project/s\\u202erc' } }]")
+    fetch, edit = page.locator(".tool-card").first, page.locator(".tool-card").last
+    expect(fetch).to_contain_text("Local needs your approval to fetch from docs.example.com\\u202e.")
+    expect(fetch.get_by_text(NOTE, exact=True)).to_have_count(1)
+    fetch.get_by_role("button", name="Always allow…", exact=True).click()
+    expect(fetch.locator(".remember-domain code")).to_have_text("docs.example.com\\u202e")
+    expect(fetch.locator(".remember-domain .hidden-char")).to_have_count(1)
+    allow = fetch.get_by_role("button", name="Allow docs.example.com\\u202e in this chat", exact=True)
+    expect(allow).to_have_count(1)
+    assert RLO not in fetch.text_content() and RLO not in (allow.get_attribute("aria-label") or "") + (allow.get_attribute("title") or "")
+    allow.click()
+    ui.wait("fake.calls.length === 1")
+    assert decisions(ui, "fetch") == [{"allowed": True, "remember": True}]
+    expect(edit.get_by_text(NOTE, exact=True)).to_have_count(1)
+    edit.get_by_role("button", name="Always allow…", exact=True).click()
+    edit.get_by_role("radio", name="Files under").check()
+    assert ui.js("document.querySelector('.remember-folder input').value") == f"/project/s{RLO}rc"
+    expect(edit.locator(".hidden-echo code")).to_have_text("/project/s\\u202erc")
+    edit.get_by_role("button", name="Approve and remember").click()
+    ui.wait("fake.calls.length === 2")
+    assert decisions(ui, "edit") == [{"allowed": True, "scope": "project", "rule": {"tool": "edits", "behavior": "allow", "path": f"/project/s{RLO}rc"}}]
+
+
+def test_a_value_typed_into_the_options_input_is_echoed_escaped(ui, page):
+    remember_card(ui, "{ argv: ['echo'], prefixes: [{ prefix: ['echo'], flags: [] }], reason: null }")
+    page.get_by_role("button", name="Always allow…").click()
+    form = page.get_by_role("group", name="Remember this approval")
+    form.get_by_role("radio", name="Commands starting with").check()
+    expect(form.get_by_text(NOTE, exact=True)).to_have_count(0)
+    form.get_by_role("textbox", name="Allowed options after it").fill(f"--a{RLO}b")
+    expect(form.locator(".hidden-echo code")).to_have_text("--a\\u202eb")
+    expect(form.get_by_text(NOTE, exact=True)).to_have_count(1)
+
+
+RULES_MENU = """{ mode: 'manual', onChange: fake.spy('change'), onError: fake.spy('error'), onDone: fake.spy('done'),
+  onRemoveRule: fake.spy('remove'), onAddRule: fake.spy('add'), onReset: fake.spy('reset'),
+  rules: [{ behavior: 'allow', tool: 'run_command', argv: ['echo', 'safe', '\\u202e', 'txt.sh'] }],
+  projectRules: [{ behavior: 'deny', tool: 'run_command', prefix: ['echo', '\\u202e'] },
+                 { behavior: 'allow', tool: 'web_fetch', domain: 'docs.example.com\\u202e' }],
+  userRules: [{ behavior: 'allow', tool: 'run_command', prefix: ['git'], flags: ['--x\\u202e'] },
+              { behavior: 'allow', tool: 'edits', path: '/a\\u202eb' }] }"""
+
+
+def test_the_permissions_menu_shows_saved_rules_with_visible_escapes_and_removes_the_original(ui, page):
+    ui.mount("components/PermissionsMenu.js", RULES_MENU)
+    page.get_by_role("button", name=re.compile("^Permissions:")).click()
+    menu = page.get_by_role("menu")
+    rows = menu.locator(".allow-rule")
+    expect(rows).to_have_count(5)
+    expect(menu.get_by_role("menuitem", name="Remove rule: Command: echo safe '\\u202e' txt.sh")).to_have_count(1)
+    expect(menu.get_by_role("menuitem", name="Remove rule: Commands starting with echo '\\u202e' (any options)")).to_have_count(1)
+    expect(menu.get_by_role("menuitem", name="Remove rule: Fetches from docs.example.com\\u202e")).to_have_count(1)
+    expect(menu.get_by_role("menuitem", name="Remove rule: Commands starting with git with options '--x\\u202e'")).to_have_count(1)
+    expect(menu.get_by_role("menuitem", name="Remove rule: File edits under /a\\u202eb")).to_have_count(1)
+    expect(menu.locator(".allow-rule .hidden-char")).to_have_count(5)
+    assert RLO not in menu.text_content()
+    titles = menu.locator(".allow-rule > span[title]").evaluate_all("nodes => nodes.map(node => node.title).join('')")
+    assert RLO not in titles
+    expect(menu.get_by_text(NOTE, exact=True)).to_have_count(1)
+    # The harness has no stylesheet, so the menu is not laid out in the viewport: click through the DOM.
+    menu.get_by_role("menuitem", name="Remove rule: Command: echo safe '\\u202e' txt.sh").dispatch_event("click")
+    ui.wait("fake.spies.remove.length === 1")
+    assert ui.spy("remove") == [["chat", {"behavior": "allow", "tool": "run_command", "argv": ["echo", "safe", RLO, "txt.sh"]}]]
+
+
+def test_the_permissions_menu_has_no_note_without_hidden_characters(ui, page):
+    ui.mount("components/PermissionsMenu.js", "{ mode: 'manual', onChange: fake.spy('c'), onError: fake.spy('e'), onDone: fake.spy('d'), "
+                                              "onRemoveRule: fake.spy('r'), rules: [{ behavior: 'allow', tool: 'run_command', argv: ['echo', 'a b'] }] }")
+    page.get_by_role("button", name=re.compile("^Permissions:")).click()
+    expect(page.get_by_role("menu").locator(".allow-rule")).to_have_count(1)
+    expect(page.get_by_text(NOTE, exact=True)).to_have_count(0)
+    expect(page.locator(".hidden-char")).to_have_count(0)
+
+
+def test_the_add_rule_dialog_echoes_hidden_characters_escaped_and_sends_what_was_typed(ui, page):
+    ui.mount("components/PermissionRulesDialog.js", "{ onAdd: fake.spy('add'), onClose: fake.spy('close') }")
+    dialog = page.get_by_role("dialog", name="Add a permission rule")
+    command = dialog.get_by_role("textbox", name="Command")
+    expect(dialog.get_by_text(NOTE, exact=True)).to_have_count(0)
+    command.fill(f"echo safe {RLO} txt.sh")
+    expect(dialog.get_by_text(NOTE, exact=True)).to_have_count(1)
+    expect(dialog.locator(".hidden-echo code")).to_have_text("echo safe \\u202e txt.sh")
+    expect(dialog.locator(".hidden-echo .hidden-char")).to_have_count(1)
+    assert RLO not in dialog.locator(".hidden-echo").text_content()
+    assert command.input_value() == f"echo safe {RLO} txt.sh"
+    dialog.get_by_role("button", name="Add rule").click()
+    ui.wait("fake.spies.add.length === 1")
+    assert ui.spy("add") == [["project", {"tool": "run_command", "behavior": "allow", "text": f"echo safe {RLO} txt.sh", "match": "exact"}]]
+
+
+def test_the_add_rule_dialog_echoes_a_domain_and_a_folder(ui, page):
+    ui.mount("components/PermissionRulesDialog.js", "{ onAdd: fake.spy('add'), onClose: fake.spy('close') }")
+    dialog = page.get_by_role("dialog", name="Add a permission rule")
+    dialog.get_by_label("Applies to").select_option(label="Web fetches")
+    dialog.get_by_role("textbox", name="Domain").fill(f"docs.example.com{RLO}")
+    expect(dialog.locator(".hidden-echo code")).to_have_text("docs.example.com\\u202e")
+    dialog.get_by_label("Applies to").select_option(label="File edits")
+    dialog.get_by_role("textbox", name="Only under this folder").fill(f"/a{RLO}b")
+    expect(dialog.locator(".hidden-echo code")).to_have_text("/a\\u202eb")
+
+
+# Characters Chromium draws as nothing or as blank space
+
+ZERO_WIDTH_OR_BLANK = [
+    0x00AD, 0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x180B, 0x180C, 0x180D, 0x070F, 0xFE00, 0xFE0F, 0xE0100, 0xE01EF, 0x1D173, 0x1D17A,
+    0x3164, 0xFFA0, 0x2800, 0x00A0, 0x1680, 0x2000, 0x200A, 0x202F, 0x205F, 0x3000,
+    0x0600, 0x0605, 0x06DD, 0x0890, 0x0891, 0x08E2, 0xFFF9, 0xFFFB, 0x110BD, 0x110CD, 0x13430, 0x1343F, 0x1BCA0, 0x1BCA3,
+    0x200C, 0x200D,
+]
+
+
+@pytest.mark.parametrize("code", ZERO_WIDTH_OR_BLANK, ids=[f"U+{code:04X}" for code in ZERO_WIDTH_OR_BLANK])
+def test_a_pending_command_shows_an_escape_for_each_zero_width_or_blank_character(ui, page, code):
+    command_card(ui, f"echo a{js_escape(code)}b")
+    card = page.locator(".tool-card")
+    expect(card.get_by_label("Command", exact=True).first).to_contain_text(f"echo a{visible_escape(code)}b")
+    expect(card.get_by_text(NOTE, exact=True)).to_have_count(1)
+    expect(card.get_by_label("Command", exact=True).first.locator(".hidden-char")).to_have_count(1)
+    assert chr(code) not in card.text_content(), "the card holds the raw character"
+    assert chr(code) not in (card.get_by_role("button").first.get_attribute("aria-label") or "")
+
+
+def test_emoji_sequences_and_scripts_that_need_joiners_are_shown_unchanged_without_a_note(ui, page):
+    text = ("echo \\u{1f468}\\u200d\\u{1f469}\\u200d\\u{1f467} \\u2764\\ufe0f \\u{1f44d}\\u{1f3fd} 1\\ufe0f\\u20e3 h\\u00e9llo \\u65e5\\u672c\\u8a9e "
+            "\\u0633\\u0644\\u0627\\u0645\\u200c\\u0639\\u0644\\u06cc\\u06a9\\u0645 \\u0915\\u094d\\u200d\\u0937 \\u0915\\u094d\\u200c\\u0937")
+    command_card(ui, text)
+    card = page.locator(".tool-card")
+    shown = card.get_by_label("Command", exact=True).first
+    expect(shown).to_contain_text("echo 👨‍👩‍👧 ❤️ 👍🏽 1️⃣ héllo 日本語 سلام‌علیکم क्‍ष क्‌ष")
+    expect(card.get_by_text(NOTE, exact=True)).to_have_count(0)
+    expect(card.locator(".hidden-char")).to_have_count(0)
+
+
+@pytest.mark.parametrize("text, escaped", [
+    ("a\\u200db", "a\\u200db"),  # between ASCII letters
+    ("a\\u200cb", "a\\u200cb"),
+    ("\\u{1f468}\\u200d x", "👨\\u200d x"),  # a joiner that joins nothing
+    ("x\\ufe0f", "x\\ufe0f"),  # a variation selector after a plain letter
+    ("\\u0633\\u200d1", "س\\u200d1"),  # an Arabic letter and a digit
+])
+def test_a_joiner_or_selector_that_is_not_part_of_an_emoji_or_a_script_that_needs_it_is_escaped(ui, page, text, escaped):
+    command_card(ui, f"echo {text}")
+    card = page.locator(".tool-card")
+    expect(card.get_by_label("Command", exact=True).first).to_contain_text(f"echo {escaped}")
+    expect(card.get_by_text(RTL_NOTE if "\\u0633" in text else NOTE, exact=True)).to_have_count(1)  # An Arabic word is a run.
+
+
+def test_a_real_escape_is_marked_and_the_same_text_typed_is_not(ui, page):
+    command_card(ui, "echo \\u202e and \\\\u202e")
+    shown = page.locator(".tool-card").get_by_label("Command", exact=True).first
+    expect(shown).to_contain_text("echo \\u202e and \\u202e")
+    marks = shown.locator(".hidden-char")
+    expect(marks).to_have_count(1)
+    expect(marks).to_have_text("\\u202e")
+    expect(marks).to_have_attribute("title", "hidden character U+202E")
+    assert shown.evaluate("node => node.textContent.split('\\\\u202e').length - 1") == 2  # The real one and the typed one read the same.
+    assert ui.js("document.querySelector('.tool-card pre .hidden-char').previousSibling.textContent") == "echo "
+
+
+def test_helpers_escape_by_category(ui):
+    ui.start()
+    result = ui.js("""(async () => {
+      const { visibleText, visibleParts, hasHidden } = await import('/static/js/lib.js')
+      const cases = {
+        format: 'a\\u0600b\\u06ddc\\u08e2d', control: 'a\\u000cb', keep: 'a\\nb\\tc d', sep: 'a\\u2028b\\u2029c\\u00a0d\\u3000e',
+        lone: 'a\\ud800b\\udc00c', pair: 'a\\u{1f600}b', privateUse: 'a\\ue000b', unassigned: 'a\\u0378b',
+        selector: 'x\\ufe0f\\u{e0100}', emoji: '\\u2764\\ufe0f', keycap: '#\\ufe0f\\u20e3', zwj: 'a\\u200db', zwnjArabic: '\\u0633\\u200c\\u0639',
+        devanagari: '\\u0915\\u094d\\u200d\\u0937', bengali: '\\u09b0\\u200d\\u09af',
+      }
+      const out = {}
+      for (const [name, text] of Object.entries(cases)) out[name] = [visibleText(text), hasHidden(text)]
+      const parts = visibleParts('a\\u202eb\\u202ec')
+      out.parts = [parts.length, parts[0], parts[2], parts[4], parts[1].type, parts[1].props.class, parts[1].props.title, parts[1].props.children,
+        visibleParts('plain').join('|'), visibleParts('').length]
+      return out })()""")
+    assert result["format"] == ["a\\u0600b\\u06ddc\\u08e2d", True]
+    assert result["control"] == ["a\\x0cb", True]
+    assert result["keep"] == ["a\nb\tc d", False]
+    assert result["sep"] == ["a\\u2028b\\u2029c\\xa0d\\u3000e", True]
+    assert result["lone"] == ["a\\ud800b\\udc00c", True]
+    assert result["pair"] == ["a😀b", False]
+    assert result["privateUse"] == ["a\\ue000b", True]  # Private use and unassigned code points have no agreed look.
+    assert result["unassigned"] == ["a\\u0378b", True]
+    assert result["selector"] == ["x\\ufe0f\\u{e0100}", True]
+    assert result["emoji"] == ["❤️", False]
+    assert result["keycap"] == ["#️⃣", False]
+    assert result["zwj"] == ["a\\u200db", True]
+    assert result["zwnjArabic"] == ["س‌ع", False]
+    assert result["devanagari"] == ["क्‍ष", False]
+    assert result["bengali"] == ["র‍য", False]
+    count, first, third, fifth, tag, css, title, shown, plain, empty = result["parts"]
+    assert (count, first, third, fifth, tag, shown, plain, empty) == (5, "a", "b", "c", "span", "\\u202e", "plain", 0)
+    assert "hidden-char" in css.split() and title == "hidden character U+202E"
+
+
+# Right-to-left words keep the typing order of the command around them
+
+RTL_NOTE = NOTE + " Right-to-left text is kept in typing order."
+# Each command with the tokens that must read left to right in this order.
+RTL_COMMANDS = [
+    ("cat א > 1", ["cat", "א", ">", "1"]),
+    ("mv א ב", ["mv", "א", "ב"]),
+    ("cp א 1 2", ["cp", "א", "1", "2"]),
+    ("rm א && 1", ["rm", "א", "&&", "1"]),
+    ("echo א; 1 2", ["echo", "א", ";", "1", "2"]),
+    ("scp א 10.0.0.1:/x", ["scp", "א", "10.0.0.1", ":/x"]),
+    ("mv ١ ٢", ["mv", "١", "٢"]),
+    ("cat ܐ > 1", ["cat", "ܐ", ">", "1"]),
+    ("cp ߊ 1 2", ["cp", "ߊ", "1", "2"]),
+]
+# The left edge of the first character of each token, found one range per character.
+LEFT_EDGES = """([selector, tokens]) => {
+  const root = document.querySelector(selector)
+  const nodes = []
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+  while (walker.nextNode()) nodes.push(walker.currentNode)
+  const text = nodes.map(node => node.textContent).join('')
+  const lefts = []
+  for (const node of nodes) for (let i = 0; i < node.textContent.length; i++) {
+    const range = document.createRange()
+    range.setStart(node, i); range.setEnd(node, i + 1)
+    lefts.push(range.getClientRects()[0]?.left ?? null)
+  }
+  let from = 0
+  return tokens.map(token => { const at = text.indexOf(token, from); from = at + token.length; return [token, at, lefts[at]] })
+}"""
+
+
+@pytest.mark.parametrize("command, tokens", RTL_COMMANDS)
+def test_right_to_left_words_do_not_reorder_a_command_on_screen(ui, page, command, tokens):
+    command_card(ui, command)
+    card = page.locator(".tool-card")
+    expect(card.get_by_label("Command", exact=True).first).to_contain_text(command)
+    for selector in (".tool-card pre[aria-label='Command']", ".tool-card .tool-subject"):
+        found = page.evaluate(LEFT_EDGES, [selector, tokens])
+        lefts = [left for _, _, left in found]
+        assert all(left is not None for left in lefts), found
+        assert lefts == sorted(lefts) and len(set(lefts)) == len(lefts), f"{selector}: tokens are not left to right: {found}"
+    # An isolated run does not pull the neighbouring ASCII into the right-to-left order.
+    assert card.locator("pre[aria-label='Command'] bdi.rtl-run").count() >= 1
+    expect(card.get_by_text(RTL_NOTE, exact=True)).to_have_count(1)
+    assert card.locator("pre[aria-label='Command']").first.evaluate("node => node.classList.contains('logical-order')")
+    page.get_by_role("button", name="Approve", exact=True).click()
+    ui.wait("fake.calls.length === 1")
+    assert decisions(ui, "card") == [{"allowed": True}]
+
+
+def test_a_card_with_only_ascii_has_no_isolates_and_no_extra_note(ui, page):
+    command_card(ui, "cat a > 1")
+    card = page.locator(".tool-card")
+    expect(card.get_by_label("Command", exact=True).first).to_contain_text("cat a > 1")
+    expect(card.locator("bdi")).to_have_count(0)
+    expect(card.get_by_text("escapes.", exact=False)).to_have_count(0)
+    expect(card.get_by_text("Right-to-left", exact=False)).to_have_count(0)
+
+
+def test_a_right_to_left_file_name_shows_the_second_note_sentence(ui, page):
+    show(ui, "[{ id: 'card', type: 'tool', name: 'edit_file', state: 'pending', input: { path: 'docs/ש.txt' }, preview: 'Edit docs/ש.txt' }]")
+    card = page.locator(".tool-card")
+    expect(card.get_by_text(RTL_NOTE, exact=True)).to_have_count(1)
+    expect(card.locator("bdi.rtl-run").first).to_have_text("ש")
+
+
+def test_a_right_to_left_text_alongside_an_escape_shows_both_in_one_note(ui, page):
+    command_card(ui, "echo א \\u202e")
+    card = page.locator(".tool-card")
+    expect(card.get_by_text(RTL_NOTE, exact=True)).to_have_count(1)
+    expect(card.locator("pre .hidden-char")).to_have_count(1)
+
+
+# The escape rule is complete: a brute-force sweep of every code point
+
+def test_every_hidden_or_blank_code_point_is_escaped(ui):
+    ui.start()
+    result = ui.js("""(async () => {
+      const { hasHidden, visibleText } = await import('/static/js/lib.js')
+      const need = /[\\p{Default_Ignorable_Code_Point}\\p{Cn}\\p{Co}\\p{Cf}\\p{Cc}\\p{Zl}\\p{Zp}\\p{Zs}\\uFFFC]/u
+      let scanned = 0, checked = 0, escaped = 0
+      const missed = []
+      for (let code = 0; code <= 0x10ffff; code++) {
+        if (code >= 0xd800 && code <= 0xdfff) continue
+        scanned++
+        if (code === 0x20 || code === 0x0a || code === 0x09) continue
+        const char = String.fromCodePoint(code)
+        if (!need.test(char)) continue
+        checked++
+        // Between two ASCII letters, so a selector or joiner has no emoji or script to belong to.
+        if (hasHidden('a' + char + 'b')) escaped++
+        else if (missed.length < 20) missed.push(code.toString(16))
+      }
+      const sample = visibleText('a\\u{e0080}b\\u{fffc}c\\u0e00d')
+      return { scanned, checked, escaped, missed, sample } })()""")
+    print("brute force:", result)
+    assert result["scanned"] == 1114112 - 2048
+    assert result["missed"] == [] and result["escaped"] == result["checked"] > 100000
+    assert result["sample"] == "a\\u{e0080}b\\ufffcc\\u0e00d"
+
+
+def test_a_base_with_more_than_two_combining_marks_escapes_the_third_and_later(ui):
+    ui.start()
+    result = ui.js("""(async () => {
+      const { visibleText, hasHidden } = await import('/static/js/lib.js')
+      return {
+        stacked: visibleText('-\\u0334\\u0335\\u0336\\u20d2y'), two: visibleText('-\\u0334\\u0335y'),
+        one: visibleText('e\\u0301'), precomposed: visibleText('\\u00e9'), arabic: visibleText('\\u0628\\u0650\\u0651 \\u0643\\u064e\\u062a\\u064e\\u0628\\u064e'),
+        devanagari: visibleText('\\u0915\\u094d\\u0937\\u093f'), next: visibleText('a\\u0301\\u0301\\u0301 b\\u0301'), flag: hasHidden('a\\u0301\\u0301\\u0301') } })()""")
+    assert result["stacked"] == "-̴̵\\u0336\\u20d2y"
+    assert result["two"] == "-̴̵y"
+    assert result["one"] == "é" and result["precomposed"] == "é"
+    assert result["arabic"] == "بِّ كَتَبَ"
+    assert result["devanagari"] == "क्षि"
+    assert result["next"] == "á́\\u0301 b́" and result["flag"] is True

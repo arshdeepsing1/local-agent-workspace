@@ -1,4 +1,4 @@
-import { html, useEffect, useMemo, useRef, useState } from '../lib.js'
+import { html, hasRtl, hiddenNote, needsParts, noteLine, visibleParts, visibleText, useEffect, useMemo, useRef, useState } from '../lib.js'
 import { ChevronDown, ChevronUp, MessageSquarePlus, X } from '../icons.js'
 import { api } from '../api.js'
 import { MAX_COMMENT_LENGTH, MAX_COMMENTS, MAX_MESSAGE_LENGTH, TOO_LONG, TOO_MANY, reviewMessage, useReviewComments } from '../reviewComments.js'
@@ -18,12 +18,20 @@ import { blockerOf, OpenBlockingChat } from './BlockingChat.js'
 // One line of a diff: { kind: 'context'|'removed'|'added'|'hunk', text, old?, new?, newline? }.
 // A 'hunk' line is a Git hunk header ('@@ -1,3 +1,4 @@'), shown as a separator.
 // action: an element shown before the line numbers (the review's comment button).
-export function DiffLine({ line, action }) {
-  if (line.kind === 'hunk') return html`<div class="diff-line hunk"><span class="line-text">${line.text}</span></div>`
+// plain: a very long diff; a line with hidden characters then shows them as one escaped string, not as marked parts.
+// A line you decide on shows hidden and direction-changing characters as visible escapes (a bidi override in file
+// content can make code read differently from what it is) and right-to-left words in the order typed.
+export const MAX_MARKED_LINES = 2000
+// A very long diff marks only a line with a right-to-left run as parts (it must stay in typing order); other lines escape as one string.
+const lineText = (text, plain) => !needsParts(text) ? text : plain && !hasRtl(text) ? visibleText(text) : visibleParts(text)
+// The note for a diff and the paths around it, or null; show it once above the lines.
+export const diffNote = (lines, paths = []) => hiddenNote([...paths, ...lines.map(line => line.text)])
+export function DiffLine({ line, action, plain = false }) {
+  if (line.kind === 'hunk') return html`<div class="diff-line hunk"><span class="line-text logical-order">${lineText(line.text, plain)}</span></div>`
   return html`<div class=${`diff-line ${line.kind}`}>${action || null}
     <span class="line-number">${line.old ?? ''}</span><span class="line-number">${line.new ?? ''}</span>
     <span class="line-marker" aria-hidden="true">${line.kind === 'added' ? '+' : line.kind === 'removed' ? '−' : ''}</span>
-    <span class="line-text"><span class="sr-only">${line.kind === 'added' ? 'Added: ' : line.kind === 'removed' ? 'Removed: ' : ''}</span>${line.text}${line.newline === false ? html`<small class="no-newline">No newline at end of file</small>` : null}</span>
+    <span class="line-text logical-order"><span class="sr-only">${line.kind === 'added' ? 'Added: ' : line.kind === 'removed' ? 'Removed: ' : ''}</span>${lineText(line.text, plain)}${line.newline === false ? html`<small class="no-newline">No newline at end of file</small>` : null}</span>
   </div>`
 }
 
@@ -146,6 +154,8 @@ export default function DiffReview({ sessionId, path, version, busy, onAction, o
     return () => { current = false }
   }, [sessionId, path, version, revision])
   const starts = useMemo(() => new Map((diff?.hunks || []).map(hunk => [hunk.line, hunk.index])), [diff])
+  const note = useMemo(() => diff ? diffNote(diff.lines) : null, [diff])
+  const plain = (diff?.lines.length || 0) > MAX_MARKED_LINES
   const changes = diff?.hunks.length || 0
   const go = index => {
     setActive(index)
@@ -201,6 +211,7 @@ export default function DiffReview({ sessionId, path, version, busy, onAction, o
       <${OpenBlockingChat} blocker=${error ? blocker : null} currentId=${sessionId} onSelect=${onSelectSession} /></div>` : null}
     ${sender.error ? html`<div class="panel-error" role="alert">${sender.error}</div>` : null}
     <p class="sr-only" role="status">${sender.notice}</p>
+    ${noteLine(note)}
     <div class="diff-review-lines" ref=${scroller} tabindex="0">
       ${diff.lines.map((line, index) => {
         const hunk = starts.get(index)
@@ -209,7 +220,7 @@ export default function DiffReview({ sessionId, path, version, busy, onAction, o
             <button aria-label=${`Keep change ${hunk + 1}`} disabled=${working} onClick=${() => { setActive(hunk); void run('keep', hunk) }}>Keep</button>
             <button aria-label=${`Undo change ${hunk + 1}`} title=${undoTitle} disabled=${working || busy} onClick=${() => { setActive(hunk); void run('undo', hunk) }}>Undo</button>
           </div>`}
-          <${DiffLine} key=${index} line=${line} action=${line.kind === 'hunk' ? null : commentButton(line, index)} />
+          <${DiffLine} key=${index} line=${line} plain=${plain} action=${line.kind === 'hunk' ? null : commentButton(line, index)} />
           ${fileComments.filter(item => sameLine(item, lineRef(line))).map(item => html`<${LineComment} key=${item.id} item=${item} onRemove=${() => removeComment(item)} />`)}
           ${form && sameLine(form, lineRef(line)) ? commentForm : null}`
       })}

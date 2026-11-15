@@ -1,6 +1,7 @@
-import { html, useEffect, useRef, useState } from '../lib.js'
-import { X } from '../icons.js'
+import { html, useRef, useState } from '../lib.js'
 import { api } from '../api.js'
+import DialogShell from './DialogShell.js'
+import { omittedMessage } from '../commands.js'
 
 // A branch name stamped with the local time: <prefix>/YYYY-MM-DD-HHmmss (to the second, so a second
 // worktree made within the same minute gets its own default name).
@@ -13,37 +14,36 @@ export function stampedBranch(prefix, now = new Date()) {
 // Props: session, beforeEventId (the first user message after the reply; null for the last reply),
 // onSelectSession(new id), onClose.
 export default function ForkDialog({ session, beforeEventId, onSelectSession, onClose }) {
-  const dialog = useRef(null)
   const titleInput = useRef(null)
   const [title, setTitle] = useState(`${session.title || 'New conversation'} (fork)`.slice(0, 160))
   const [worktree, setWorktree] = useState(false)
   const [branch, setBranch] = useState(() => stampedBranch('fork'))
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
-  useEffect(() => {
-    const node = dialog.current
-    node?.showModal()
-    // After showModal, which focuses the first control (Close); the title is what to change first.
-    titleInput.current?.focus()
-    return () => { if (node?.open) node.close() }
-  }, [])
+  const [made, setMade] = useState(null)  // { id, note }: the fork exists but left subagent chats out
   const submit = async e => {
     e.preventDefault()
-    if (saving) return
+    if (saving || made) return
     setSaving(true); setError('')
     const body = { ...(beforeEventId ? { before_event_id: beforeEventId } : {}),
       ...(title.trim() ? { title: title.trim() } : {}), ...(worktree ? { worktree_branch: branch.trim() } : {}) }
     try {
       const created = await api(`/sessions/${encodeURIComponent(session.id)}/fork`, 'POST', body)
+      const note = omittedMessage(created.children_omitted, 'copied')
+      if (note) { setMade({ id: created.id, note }); setSaving(false); return }  // Shown before the fork opens.
       onClose()
       onSelectSession(created.id)
     } catch (e) { setError(e.message); setSaving(false) }
   }
-  return html`<dialog ref=${dialog} class="settings-dialog fork-dialog" aria-label="Fork conversation"
-    onCancel=${onClose} onClick=${e => { if (e.target === dialog.current) onClose() }}>
-    <form class="dialog-content" onSubmit=${submit}>
-      <header><div><h2>Fork from here</h2><p>A new chat with the conversation up to this reply. It starts in Manual mode, without this chat's folder grants or rules.</p></div>
-        <button type="button" class="icon-button" aria-label="Close" onClick=${onClose}><${X} size=${20} /></button></header>
+  // Closing after the fork was made still opens it: it exists either way.
+  const leave = () => { onClose(); if (made) onSelectSession(made.id) }
+  // The title is what to change first, so it has focus rather than Close.
+  return html`<${DialogShell} className="fork-dialog" label="Fork conversation" title="Fork from here"
+    description=${html`<p>A new chat with the conversation up to this reply, with the subagent chats it started up to here. It starts in Manual mode, without this chat's folder grants or rules.</p>`}
+    onClose=${leave} onSubmit=${submit} initialFocus=${titleInput} busy=${saving}
+    footer=${html`${made ? html`<button type="button" class="primary" onClick=${leave}>Open the fork</button>`
+        : html`<button type="button" class="outline" disabled=${saving} onClick=${onClose}>Cancel</button>
+        <button type="submit" class="primary" disabled=${saving || (worktree && !branch.trim())}>Fork</button>`}`}>
       <label>Title<input ref=${titleInput} maxLength=${160} spellcheck=${false} value=${title} disabled=${saving}
         onInput=${e => setTitle(e.currentTarget.value)} /></label>
       <label class="settings-checkbox"><input type="checkbox" checked=${worktree} disabled=${saving}
@@ -52,8 +52,6 @@ export default function ForkDialog({ session, beforeEventId, onSelectSession, on
           onInput=${e => setBranch(e.currentTarget.value)} /></label>
         <p class="field-help">The worktree starts from the last commit; uncommitted changes are not copied.</p>` : null}
       ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
-      <footer><button type="button" class="outline" onClick=${onClose}>Cancel</button>
-        <button type="submit" class="primary" disabled=${saving || (worktree && !branch.trim())}>Fork</button></footer>
-    </form>
-  </dialog>`
+      ${made ? html`<p role="status">Fork created. ${made.note}</p>` : null}
+  <//>`
 }

@@ -1,5 +1,6 @@
-import { html, useEffect, useRef, useState } from '../lib.js'
+import { html, useState } from '../lib.js'
 import { Check, Folder, LoaderCircle, X } from '../icons.js'
+import DialogShell from './DialogShell.js'
 import { api } from '../api.js'
 import { standingFolder } from './FileRoots.js'
 import { inside } from '../paths.js'
@@ -7,12 +8,10 @@ import { inside } from '../paths.js'
 // Check result: { accessible, path, error, python_executable? }
 // codingDir: Settings coding_dir_status; the default code folder is allowed in every conversation.
 export default function FolderAccessDialog({ workspace, folders, codingDir = null, busy, bypass, onAllow, onRemove, onClose }) {
-  const dialog = useRef(null)
   const [path, setPath] = useState('~/Downloads')
   const [result, setResult] = useState(null)
   const [working, setWorking] = useState(false)
   const [error, setError] = useState('')
-  useEffect(() => { dialog.current?.showModal() }, [])
   const check = async () => {
     setWorking(true); setError(''); setResult(null)
     try { setResult(await api('/folder-access/check', 'POST', { path })) }
@@ -28,11 +27,10 @@ export default function FolderAccessDialog({ workspace, folders, codingDir = nul
   const standing = standingFolder(codingDir, workspace)
   const granted = result && (folders.includes(result.path) || result.path === workspace
     || (standing && (result.path === standing.path || inside(result.path, standing.path))))
-  return html`<dialog ref=${dialog} class="settings-dialog folder-access-dialog" aria-labelledby="folder-access-title"
-    onCancel=${onClose} onClick=${e => { if (e.target === dialog.current) onClose() }}>
-    <div class="dialog-content">
-      <header><div><h2 id="folder-access-title">Folder access</h2><p>Choose folders this conversation can work with.</p></div>
-        <button class="icon-button" aria-label="Close folder access" onClick=${onClose}><${X} size=${20} /></button></header>
+  return html`<${DialogShell} className="folder-access-dialog" labelledBy="folder-access-title" title="Folder access" titleId="folder-access-title"
+    description=${html`<p>Choose folders this conversation can work with.</p>`} closeLabel="Close folder access" onClose=${onClose}
+    footer=${html`<button class="outline" onClick=${onClose}>Done</button><button class="primary" disabled=${working || busy || !result?.accessible || !!granted}
+        onClick=${() => { if (result?.accessible) void change(() => onAllow(result.path)) }}>${granted ? 'Allowed' : 'Allow folder'}</button>`}>
       <div class="folder-grants"><div class="folder-grant"><${Folder} size=${16} /><span title=${workspace}>${workspace}<small>Project folder</small></span></div>
         ${standing ? html`<div class="folder-grant"><${Folder} size=${16} /><span title=${standing.path}>${standing.path}<small>Default code folder · all conversations${standing.missing ? ' · created on first write' : ''}</small></span></div>` : null}
         ${folders.map(folder => html`<div class="folder-grant" key=${folder}><${Folder} size=${16} /><span title=${folder}>${folder}<small>Allowed in this conversation</small></span>
@@ -51,8 +49,5 @@ export default function FolderAccessDialog({ workspace, folders, codingDir = nul
       <p class="field-help">Allowing a folder lets the agent read its files and send relevant content to your model. File edits follow your selected permission mode. Browser approval cannot change macOS privacy settings.${standing ? ' The default code folder comes from Settings; change it there.' : ''}</p>
       ${busy ? html`<p class="field-help">Stop the current response before changing folder access.</p>` : null}
       ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
-      <footer><button class="outline" onClick=${onClose}>Done</button><button class="primary" disabled=${working || busy || !result?.accessible || !!granted}
-        onClick=${() => { if (result?.accessible) void change(() => onAllow(result.path)) }}>${granted ? 'Allowed' : 'Allow folder'}</button></footer>
-    </div>
-  </dialog>`
+  <//>`
 }

@@ -205,7 +205,7 @@ def test_the_section_list_jumps_to_a_section(ui, page):
     dialog = open_settings(ui, page)
     nav = dialog.get_by_role("navigation", name="Settings sections")
     expect(nav.get_by_role("button")).to_have_text(["Project", "Model and context", "Reasoning", "Agent", "Subagents",
-                                                    "Commands and files", "Web access", "Appearance", "Notifications",
+                                                    "Commands and files", "Web access", "Browsing", "Appearance", "Notifications",
                                                     "Credentials"])
     expect(nav.get_by_role("button", name="Project")).to_have_attribute("aria-current", "true")
     nav.get_by_role("button", name="Reasoning").click()
@@ -220,18 +220,20 @@ def test_the_section_list_jumps_to_a_section(ui, page):
     expect(dialog.get_by_role("combobox", name="Default effort for new chats")).to_be_focused()
     # Scrolling back to the top marks Project again.
     page.wait_for_timeout(350)
-    ui.run("document.querySelector('.settings-dialog').scrollTop = 0")
+    ui.run("document.querySelector('.settings-dialog .dialog-body').scrollTop = 0")
     expect(nav.get_by_role("button", name="Project")).to_have_attribute("aria-current", "true")
 
 
-def test_a_phone_shows_one_column_without_the_section_list(ui, page):
+def test_a_phone_shows_one_column_with_the_section_list_above_it(ui, page):
     page.set_viewport_size({"width": 390, "height": 844})
     ui.app(scenario="workspace")
     page.get_by_role("button", name="Open sidebar").click()
     page.get_by_role("button", name="Settings", exact=True).click()
     dialog = page.get_by_role("dialog", name="Settings")
     expect(dialog).to_be_visible()
-    expect(dialog.get_by_role("navigation", name="Settings sections")).to_be_hidden()
+    nav = dialog.get_by_role("navigation", name="Settings sections")
+    expect(nav).to_be_visible()  # The dialog frame puts the section list above the body on a phone, as a row that scrolls.
+    assert nav.bounding_box()["y"] + nav.bounding_box()["height"] <= dialog.locator(".dialog-body").bounding_box()["y"] + 2
     assert ui.js("(d => d.scrollWidth - d.clientWidth)(document.querySelector('.settings-dialog'))") == 0
     field = dialog.get_by_role("textbox", name="Project folder")
     assert field.bounding_box()["width"] > 300
@@ -248,11 +250,11 @@ def test_settings_type_scale(ui, page):
       helpLine: getComputedStyle(d.querySelector('fieldset .field-help')).lineHeight,
       helpColor: getComputedStyle(d.querySelector('fieldset .field-help')).color,
       width: d.getBoundingClientRect().width }))(document.querySelector('.settings-dialog'))""")
-    assert sizes["family"].startswith('"DM Sans"'), sizes
+    assert sizes["family"].startswith("-apple-system"), sizes  # the system UI font
     assert 20 <= float(sizes["title"][:-2]) <= 22 and 14 <= float(sizes["legend"][:-2]) <= 15, sizes
     assert 13 <= float(sizes["label"][:-2]) <= 14 and 13 <= float(sizes["input"][:-2]) <= 14, sizes
     assert 12 <= float(sizes["help"][:-2]) <= 13 and abs(float(sizes["helpLine"][:-2]) / float(sizes["help"][:-2]) - 1.45) < .06
-    assert sizes["helpColor"] == "rgb(101, 100, 94)"  # --muted
+    assert sizes["helpColor"] == "rgb(89, 97, 112)"  # --muted
     assert 760 <= sizes["width"] <= 880, sizes
 
 
@@ -353,7 +355,7 @@ def test_a_saved_reply_shows_how_long_it_thought(ui, page):
     # Thinking text is smaller and muted, the answer is not.
     styles = page.evaluate("""() => [document.querySelector('.thinking .markdown'), document.querySelector('.reply-content > .markdown')]
       .map(el => [getComputedStyle(el).fontSize, getComputedStyle(el).color])""")
-    assert styles[0] == ["13px", "rgb(101, 100, 94)"] and float(styles[1][0][:-2]) > 13, styles
+    assert styles[0] == ["12px", "rgb(89, 97, 112)"] and float(styles[1][0][:-2]) > 12, styles
 
 
 def test_thinking_without_a_summary_is_one_quiet_line(ui, page):

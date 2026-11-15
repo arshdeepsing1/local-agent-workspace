@@ -1,6 +1,6 @@
 import { html, useEffect, useRef, useState } from '../lib.js'
 import { api, apiFile, apiJsonText } from '../api.js'
-import { copyLoaded } from '../commands.js'
+import { copyLoaded, omittedMessage } from '../commands.js'
 
 const MAX_BYTES = 16 * 1024 * 1024
 
@@ -15,7 +15,8 @@ function saveFile(text, name, type) {
 export default function ConversationTransfer({ sessionId, workspace, busy = false, onSelectSession, onError }) {
   const [destination, setDestination] = useState(workspace)
   const [file, setFile] = useState(null)
-  const [includeChildren, setIncludeChildren] = useState(false)
+  const [thisChatOnly, setThisChatOnly] = useState(false)  // Export carries the subagent chats unless this is on. Fork always copies the ended ones (no option).
+  const [withSubagents, setWithSubagents] = useState(false)  // The Markdown transcript: with the subagents' transcripts.
   const [withReasoning, setWithReasoning] = useState(false)
   const [pending, setPending] = useState(false)
   const [error, setError] = useState('')
@@ -39,10 +40,11 @@ export default function ConversationTransfer({ sessionId, workspace, busy = fals
 
   const messages = html`${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
     ${notice ? html`<p role="status">${notice}</p>` : null}`
-  const transcriptPath = () => `/sessions/${encodeURIComponent(sessionId)}/transcript.md`
+  const transcriptPath = () => `/sessions/${encodeURIComponent(sessionId)}/transcript.md${withSubagents ? '?subagents=1' : ''}`
   return html`<section class="agent-tools-section" aria-label="Conversation transfer">
     <h3>Markdown transcript</h3>
     <p>A readable transcript of this conversation: messages, replies, notices and errors, and each tool call's main input, with command output shortened to 600 characters. Common secret shapes and the configured Databricks token are replaced with [REDACTED]; review it before sharing.</p>
+    <label class="agent-tools-task"><input type="checkbox" disabled=${pending || !sessionId} checked=${withSubagents} onChange=${e => setWithSubagents(e.currentTarget.checked)} />Include subagents (each one's transcript under the step that started it)</label>
     <div class="agent-tools-actions">
       <button class="outline" disabled=${pending || !sessionId} onClick=${() => void run(async () => {
         const file = await apiFile(transcriptPath())
@@ -60,19 +62,23 @@ export default function ConversationTransfer({ sessionId, workspace, busy = fals
     <p>Conversation files include messages, tool output, summaries, and reported usage, which may contain private data or pasted secrets. Review before sharing. Credential/settings files, file checkpoints, task-board records, and managed jobs are not copied.</p>
     <div class="agent-tools-actions">
       <button class="outline" disabled=${disabled || !sessionId} onClick=${() => void run(async () => {
-        const bundle = await api(`/sessions/${encodeURIComponent(sessionId)}/export?include_children=${includeChildren}${withReasoning ? '&with_reasoning=true' : ''}`)
+        // report=true: the answer is { bundle, children_omitted }, so the page can say what was left out (the file is the bundle alone).
+        const { bundle, children_omitted: left } = await api(`/sessions/${encodeURIComponent(sessionId)}/export?include_children=${!thisChatOnly}&report=true${withReasoning ? '&with_reasoning=true' : ''}`)
         if (!alive.current) return
         saveFile(JSON.stringify(bundle), `conversation-${sessionId}.json`, 'application/json')
-        setNotice('Conversation file exported.')
+        setNotice(['Conversation file exported.', omittedMessage(left?.children, 'exported')].filter(Boolean).join(' '))
       })}>Export conversation</button>
       <button class="outline" disabled=${disabled || !sessionId} onClick=${() => void run(async () => {
         const created = await api(`/sessions/${encodeURIComponent(sessionId)}/fork`, 'POST')
-        if (alive.current) onSelectSession(created.id)
+        if (!alive.current) return
+        const left = omittedMessage(created.children_omitted, 'copied')
+        if (left) { setNotice(`Fork created. ${left}`); setNoticeFor('transfer') }
+        onSelectSession(created.id)
       })}>Fork completed conversation</button>
     </div>
-    <label class="agent-tools-task"><input type="checkbox" disabled=${disabled || !sessionId} checked=${includeChildren} onChange=${e => setIncludeChildren(e.currentTarget.checked)} />Include subagent conversations in export (up to 32 total)</label>
+    <label class="agent-tools-task"><input type="checkbox" disabled=${disabled || !sessionId} checked=${thisChatOnly} onChange=${e => setThisChatOnly(e.currentTarget.checked)} />Export this chat only (leave out its subagent conversations; with them, up to 32 conversations in all). Fork always copies the subagent conversations that have ended.</label>
     <label class="agent-tools-task"><input type="checkbox" disabled=${disabled || !sessionId} checked=${withReasoning} onChange=${e => setWithReasoning(e.currentTarget.checked)} />Export with reasoning (the latest turn's signed thinking, kept only while Send earlier thinking back is on)</label>
-    <p class="field-help">Fork copies the full completed conversation into the same workspace. It does not copy child conversations or modify the source. Stop any active response before exporting or forking.</p>
+    <p class="field-help">Fork copies the full completed conversation, and the subagent conversations that have ended, into the same workspace. It does not modify the source. Stop any active response before exporting or forking.</p>
     <form class="agent-tools-form" onSubmit=${e => { e.preventDefault(); void run(async () => {
       if (!file) throw new Error('Choose a conversation JSON file.')
       if (file.size > MAX_BYTES) throw new Error('Conversation file exceeds the 16 MiB limit.')

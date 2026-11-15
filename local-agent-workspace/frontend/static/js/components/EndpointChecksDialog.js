@@ -1,6 +1,6 @@
-import { html, useEffect, useRef, useState } from '../lib.js'
-import { X } from '../icons.js'
+import { html, useEffect, useState } from '../lib.js'
 import { api } from '../api.js'
+import DialogShell from './DialogShell.js'
 
 // Settings → Model and context → Test model and Check endpoint…: what the checks send and their estimated cost
 // (backend endpoint_probes.plan). Nothing is sent until Run is pressed, and every run is approved again: the
@@ -35,7 +35,6 @@ export function testResultText(saved) {
 }
 
 export default function EndpointChecksDialog({ model, mode = 'check', onClose }) {
-  const dialog = useRef(null)
   const [plan, setPlan] = useState(null)
   const [planFor, setPlanFor] = useState(null)  // The choice of checks the shown plan was computed for.
   const [available, setAvailable] = useState(null)  // The checks that apply to this endpoint (the first plan's).
@@ -51,11 +50,6 @@ export default function EndpointChecksDialog({ model, mode = 'check', onClose })
   const choice = `${model}|${test ? 'basic' : (chosen || []).join()}`
   // While the plan for a changed choice is computed, the shown one is stale: Run waits for the new estimate.
   const planReady = !!plan && planFor === choice
-  useEffect(() => {
-    const node = dialog.current
-    node?.showModal()
-    return () => { if (node?.open) node.close() }
-  }, [])
   // The plan for the chosen checks: computed by the server, no request to the endpoint.
   useEffect(() => {
     let current = true
@@ -105,12 +99,13 @@ export default function EndpointChecksDialog({ model, mode = 'check', onClose })
   const cost = !planReady ? 'updating the estimate…' : plan.priced ? `about ${dbuText(plan.total_dbu)} DBU` : 'no price data'
   const title = test ? 'Test model' : 'Check endpoint capabilities'
   const finishedRun = run && !running ? run : null
-  const close = () => { if (!starting) onClose() }
-  return html`<dialog ref=${dialog} class="settings-dialog endpoint-checks-dialog" aria-label=${title}
-    onCancel=${event => { event.preventDefault(); close() }}>
-    <div class="dialog-content">
-      <header><div><h2>${title}</h2><p>${model}</p></div>
-        <button type="button" class="icon-button" onClick=${close} aria-label=${`Close ${title.toLowerCase()}`}><${X} /></button></header>
+  // The shared dialog frame. It sits above Settings: Escape and Close close only this one, and neither works while a run starts.
+  return html`<${DialogShell} className="endpoint-checks-dialog" label=${title} title=${title} description=${html`<p>${model}</p>`}
+    closeLabel=${`Close ${title.toLowerCase()}`} onClose=${onClose} busy=${starting} backdrop=${false}
+    footer=${html`<button type="button" class="outline" disabled=${starting} onClick=${onClose}>${finishedRun ? 'Close' : 'Cancel'}</button>
+        ${running ? html`<button type="button" class="primary" onClick=${() => void stop()}>Stop</button>`
+          : html`<button type="button" class="primary" disabled=${!planReady || starting} onClick=${() => void start()}>
+            ${starting ? 'Starting…' : `Run (${cost})`}</button>`}`}>
       <p class="field-help">${test
         ? 'Sends one short streamed request to this endpoint to check that it answers, and how fast.'
         : 'Each check sends a few small requests to this endpoint and records what it accepts. The results stay in this app\'s state folder; they change agent requests only where noted in the README (cache markers, images, earlier thinking).'}
@@ -143,12 +138,5 @@ export default function EndpointChecksDialog({ model, mode = 'check', onClose })
       ${!test && checks?.capabilities ? html`<h3 class="endpoint-results-title">Results${checks.saved ? ` (last check ${day(checks.saved.checked)})` : ''}</h3>
         <${CapabilityTable} rows=${checks.capabilities} />` : null}
       ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
-      <footer>
-        <button type="button" class="outline" disabled=${starting} onClick=${close}>${finishedRun ? 'Close' : 'Cancel'}</button>
-        ${running ? html`<button type="button" class="primary" onClick=${() => void stop()}>Stop</button>`
-          : html`<button type="button" class="primary" disabled=${!planReady || starting} onClick=${() => void start()}>
-            ${starting ? 'Starting…' : `Run (${cost})`}</button>`}
-      </footer>
-    </div>
-  </dialog>`
+  <//>`
 }

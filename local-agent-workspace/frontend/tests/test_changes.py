@@ -285,3 +285,130 @@ def test_on_a_narrow_screen_the_origin_badges_shrink_and_the_name_stays_readable
     assert width >= 70, width
     row = page.locator(".changes-file")
     assert row.evaluate("row => row.scrollWidth <= row.clientWidth")
+
+
+# Text you decide on in the review, the changed-files bar, the rewind dialog and the trust dialog shows hidden characters
+
+NOTE = "Hidden or direction-changing characters are shown as \\u escapes."
+RLO = "‮"
+
+
+def test_review_lines_with_a_bidi_override_show_escapes_and_keep_sends_the_same_request(ui, page):
+    diff = {"path": "a.txt", "status": "modified", "added": 1, "removed": 1, "baseline_hash": "b1", "current_hash": "c1",
+            "hunks": [{"index": 0, "line": 1, "added": 1, "removed": 1}],
+            "lines": [{"kind": "context", "text": "a = 1", "old": 1, "new": 1},
+                      {"kind": "removed", "text": "ok = 'safe'", "old": 2},
+                      {"kind": "added", "text": f"ok = '{RLO}fas'", "new": 2}]}
+    ui.mount("components/DiffReview.js", "{ sessionId: 's', path: 'a.txt', version: 1, busy: false, onAction: fake.spy('action', async () => ({})), "
+             "onSelectSession: () => {}, onSendComments: null }",
+             setup=f"fake.override = path => path.startsWith('/api/sessions/s/changes/diff') ? fake.json({json.dumps(diff)}) : undefined")
+    expect(page.locator(".diff-line.added .line-text")).to_have_text("Added: ok = '\\u202efas'")
+    expect(page.locator(".diff-line.added .line-text .hidden-char")).to_have_count(1)
+    expect(page.get_by_text(NOTE, exact=True)).to_have_count(1)
+    assert RLO not in page.locator(".diff-review").text_content()
+    assert page.locator(".diff-line.added .line-text").evaluate("node => node.classList.contains('logical-order')")
+    page.get_by_role("button", name="Keep this file").click()
+    ui.wait("fake.spies.action.length === 1")
+    assert ui.spy("action") == [["keep", [{"path": "a.txt", "current_hash": "c1"}]]]
+
+
+def test_a_long_diff_escapes_only_the_lines_that_need_it_and_as_plain_text(ui, page):
+    lines = [{"kind": "context", "text": f"line {n}", "old": n, "new": n} for n in range(1, 2501)]
+    lines[10] = {"kind": "added", "text": f"x{RLO}y", "new": 11}
+    diff = {"path": "a.txt", "status": "modified", "added": 1, "removed": 0, "baseline_hash": "b1", "current_hash": "c1",
+            "hunks": [], "lines": lines}
+    ui.mount("components/DiffReview.js", "{ sessionId: 's', path: 'a.txt', version: 1, busy: false, onAction: fake.spy('action', async () => ({})), "
+             "onSelectSession: () => {}, onSendComments: null }",
+             setup=f"fake.override = path => path.startsWith('/api/sessions/s/changes/diff') ? fake.json({json.dumps(diff)}) : undefined")
+    expect(page.locator(".diff-line.added .line-text")).to_have_text("Added: x\\u202ey")
+    assert RLO not in page.locator(".diff-review").text_content()
+    expect(page.get_by_text(NOTE, exact=True)).to_have_count(1)
+
+
+def test_a_changed_file_path_with_a_bidi_override_shows_escapes_in_the_bar(ui, page):
+    path = f"src/a{RLO}b.py"
+    changes = json.dumps({"added": 1, "removed": 0, "files": [{"path": path, "status": "modified", "added": 1, "removed": 0, "current_hash": "h1"}]})
+    mount_bar(ui, changes=changes)
+    bar(page).get_by_role("button", name=re.compile("^1 file changed")).click()
+    expect(bar(page).locator(".changes-name")).to_have_text("a\\u202eb.py")
+    expect(bar(page).get_by_text(NOTE, exact=True)).to_have_count(1)
+    assert RLO not in bar(page).text_content()
+    bar(page).get_by_role("button", name="Keep changes to src/a\\u202eb.py").click()
+    ui.wait("fake.spies.action.length === 1")
+    assert ui.spy("action") == [["keep", [{"path": path, "current_hash": "h1"}]]]
+
+
+def rewind_setup(path):
+    preview = {"conversation": {"possible": True, "reason": None, "events_removed": 1, "messages_removed": 1, "summary_dropped": False},
+               "code": {"possible": True, "reason": None, "files": [{"path": path, "status": "restore"}]}}
+    return (f"fake.override = (path, options) => path.startsWith('/api/sessions/a/rewind-preview') ? fake.json({json.dumps(preview)})"
+            " : path === '/api/sessions/a/rewind' ? fake.json({ backup_session_id: 'b' }) : undefined")
+
+
+def test_the_rewind_dialog_escapes_file_paths_and_sends_the_same_request(ui, page):
+    ui.mount("components/RewindDialog.js", "{ session: { id: 'a', events: [{ id: 'u1', type: 'user', text: 'hi' }] }, event: { id: 'u1', type: 'user', text: 'hi' }, "
+             "onRewound: fake.spy('rewound'), onClose: () => {}, onSelectSession: () => {} }", setup=rewind_setup(f"src/a{RLO}b.py"))
+    dialog = page.get_by_role("dialog", name="Rewind conversation")
+    expect(dialog.locator(".rewind-path")).to_have_text("src/a\\u202eb.py")
+    expect(dialog.get_by_text(NOTE, exact=True)).to_have_count(1)
+    assert RLO not in dialog.text_content()
+    dialog.get_by_role("button", name="Rewind", exact=True).click()
+    ui.wait("fake.requests('/api/sessions/a/rewind', 'POST').length === 1")
+    assert ui.bodies("/api/sessions/a/rewind", "POST") == [{"before_event_id": "u1", "conversation": True, "code": True}]
+
+
+def test_the_project_trust_dialog_escapes_what_a_settings_file_holds_and_sends_the_same_request(ui, page):
+    report = {"workspace": f"/proj{RLO}ect", "status": "pending", "changed": False, "decision": None, "sha256": "a" * 64,
+              "values": {}, "sources": {}, "followed": [], "notes": [],
+              "files": [{"layer": "project", "name": ".agents/settings.json", "sha256": "b" * 64,
+                         "values": {"model": f"m{RLO}x"}, "problems": [f"bad{RLO}key: no"], "ignored": [f"hoo{RLO}ks"]}]}
+    ui.mount("components/ProjectTrustDialog.js", f"{{ report: {json.dumps(report)}, sessionId: 'a', onDecided: fake.spy('decided'), onClose: () => {{}} }}",
+             setup="fake.override = (path, options) => path.startsWith('/api/settings/project/trust') ? fake.json({ status: 'trusted' }) : undefined")
+    dialog = page.get_by_role("dialog", name="Project settings files")
+    expect(dialog.locator(".project-trust-folder")).to_have_text("/proj\\u202eect")
+    expect(dialog.locator("dd")).to_have_text("m\\u202ex")
+    expect(dialog).to_contain_text("Not used: bad\\u202ekey: no")
+    expect(dialog).to_contain_text("Ignored (only Settings can set it): hoo\\u202eks")
+    expect(dialog.get_by_text(NOTE, exact=True)).to_have_count(1)
+    assert RLO not in dialog.text_content()
+    dialog.get_by_role("button", name="Trust", exact=True).click()
+    ui.wait("fake.requests('/api/settings/project/trust?session_id=a', 'POST').length === 1")
+    assert ui.bodies("/api/settings/project/trust?session_id=a", "POST") == [{"decision": "trust", "sha256": "a" * 64}]
+
+
+# Right-to-left words in a long diff keep the order typed
+
+RTL_NOTE = NOTE + " Right-to-left text is kept in typing order."
+
+
+def long_diff(ui, text):
+    lines = [{"kind": "context", "text": f"line {n}", "old": n, "new": n} for n in range(1, 2101)]
+    if text:
+        lines[2049] = {"kind": "added", "text": text, "new": 2050}
+    diff = {"path": "a.txt", "status": "modified", "added": 1, "removed": 0, "baseline_hash": "b1", "current_hash": "c1",
+            "hunks": [], "lines": lines}
+    ui.mount("components/DiffReview.js", "{ sessionId: 's', path: 'a.txt', version: 1, busy: false, onAction: fake.spy('action', async () => ({})), "
+             "onSelectSession: () => {}, onSendComments: null }",
+             setup=f"fake.override = path => path.startsWith('/api/sessions/s/changes/diff') ? fake.json({json.dumps(diff)}) : undefined")
+
+
+def test_a_long_diff_keeps_a_right_to_left_line_in_typing_order_and_shows_the_note(ui, page):
+    from test_approvals import LEFT_EDGES
+    long_diff(ui, "+ mv א 1")
+    line = page.locator(".diff-line.added .line-text")
+    expect(line).to_contain_text("+ mv א 1")
+    found = page.evaluate(LEFT_EDGES, [".diff-line.added .line-text", ["mv", "א", "1"]])
+    lefts = [left for _, _, left in found]
+    assert all(left is not None for left in lefts), found
+    assert lefts == sorted(lefts) and len(set(lefts)) == len(lefts), found
+    assert line.evaluate("node => node.classList.contains('logical-order')")
+    expect(line.locator("bdi.rtl-run")).to_have_count(1)
+    expect(page.locator(".diff-line bdi")).to_have_count(1)
+    expect(page.get_by_text(RTL_NOTE, exact=True)).to_have_count(1)
+
+
+def test_a_long_ascii_diff_shows_no_note(ui, page):
+    long_diff(ui, "")
+    expect(page.locator(".diff-line").first).to_be_visible()
+    expect(page.get_by_role("note")).to_have_count(0)
+    expect(page.locator(".diff-line bdi")).to_have_count(0)

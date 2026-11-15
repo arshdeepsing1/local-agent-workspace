@@ -131,20 +131,21 @@ def test_settings_edit_and_save_only_databricks_fields(ui, page):
     # No agent runtime options: CLAUDE.md is named only as an instruction file (the project's, or the read-only
     # ~/.claude/CLAUDE.md). No Claude CLI runtime settings (a model name such as Claude Opus 5.5 in help text, or the
     # Claude endpoints that Prompt caching applies to, is fine; so is Appearance → Style: Claude, "the Claude style").
-    expect(dialog.get_by_text(re.compile(r"(?<!\.)Claude(?!\.md|\.local\.md| Opus|-opus| endpoints\)| style|VS Code)(?!(?<=^Claude)$)|MCP|skills",
+    expect(dialog.get_by_text(re.compile(r"(?<!\.)Claude(?!\.md|\.local\.md| Opus|-opus| endpoints\)| style|VS Code)(?!(?<=^Claude)$)|MCP(?! tools out of the 32-tool)|skills",
                                          re.I))).to_have_count(0)
     expect(dialog.get_by_role("combobox", name="Prompt caching").locator("option").first).to_have_text(
         "Automatic (Claude endpoints)")
     checkboxes = dialog.get_by_role("checkbox")
-    expect(checkboxes).to_have_count(15)
+    expect(checkboxes).to_have_count(18)
     expect(dialog.locator("label:has(input[type=checkbox])")).to_have_text([
-        "Save a detailed handoff at each compaction", "Show thinking summaries",
+        "Ask before compacting a long chat", "Save a detailed handoff at each compaction",
+        "Trim old tool results from requests", "Show thinking summaries",
         "Send earlier thinking back (experimental)",
         "Keep agent changes automatically when a reply finishes", "Continue automatically after rate limits",
         "Load my instructions file ~/.agents/AGENTS.md", "Also load ~/.claude/CLAUDE.md", "Project memory",
         "Git status in messages", "Scheduled runs at their times", "Continue the chat when a background subagent finishes",
         "Run commands typed with /",
-        "Let the agent fetch web pages (web_fetch)", "Group tool calls in the transcript",
+        "Let the agent fetch web pages (web_fetch)", "Let the agent use a browser", "Group tool calls in the transcript",
         "Desktop notification when no browser tab is open"])
     dialog.get_by_label("Project folder").fill("/updated-project")
     endpoint.select_option(label="Other endpoint…")
@@ -509,7 +510,7 @@ def test_manual_compaction_keeps_stop_available(ui, page):
     start_app(ui, page, "a", setup="""fake.sessions.set('a', { ...makeSession('a'), context_info: contextInfo })
       fake.override = path => path === '/api/sessions/a/compact' ? fake.json({ ok: true }, 202) : undefined""")
     ui.show_session("a")
-    page.get_by_text("Last model input · ~50%").click()
+    page.get_by_text("Last model input · ~46%").click()
     page.get_by_role("textbox", name="Preservation note (optional)").fill("Preserve the migration decisions")
     page.get_by_role("button", name="Compact now").click()
     ui.wait("fake.requests('/api/sessions/a/compact').length === 1")
@@ -519,7 +520,7 @@ def test_manual_compaction_keeps_stop_available(ui, page):
     expect(page.get_by_role("button", name="Stop response")).to_be_visible()
     ui.emit("a", "{ type: 'context', context_info: { ...contextInfo, prepared_for_next_turn: true, compactions: 2 } }")
     ui.emit("a", {"type": "status", "status": "idle"})
-    expect(page.get_by_text("Context preview · ~50%")).to_be_visible()
+    expect(page.get_by_text("Context preview · ~46%")).to_be_visible()
     expect(page.get_by_role("button", name="Compact now")).to_be_enabled()
 
 
@@ -527,7 +528,7 @@ def test_the_meter_closes_for_an_approval_and_offers_no_compaction_after_one(ui,
     start_app(ui, page, "a", setup="fake.sessions.set('a', { ...makeSession('a'), context_info: contextInfo })")
     ui.show_session("a")
     details = page.locator("details.context-meter")
-    page.get_by_text("Last model input · ~50%").click()
+    page.get_by_text("Last model input · ~46%").click()
     expect(details).to_have_attribute("open", "")
     ui.emit("a", {"type": "status", "status": "running"})
     expect(details).to_have_attribute("open", "")
@@ -567,10 +568,10 @@ def test_context_estimate_and_instructions_are_per_conversation(ui, page):
     row(page, "Other conversation").click()
     ui.show_session("a")
     ui.run("window.firstSocket = fake.socketFor('a')")
-    expect(page.get_by_text("Last model input · ~50%")).to_be_visible()
+    expect(page.get_by_text("Last model input · ~46%")).to_be_visible()
     meter = page.get_by_role("progressbar", name="Estimated model input usage")
-    expect(meter).to_have_attribute("aria-valuetext", "Approximately 50% of input budget")
-    page.get_by_text("Last model input · ~50%").click()
+    expect(meter).to_have_attribute("aria-valuetext", "Approximately 46% of context budget")
+    page.get_by_text("Last model input · ~46%").click()
     expect(page.get_by_text("Approximately 60,380 of 120,832 input tokens used.")).to_be_visible()
     expect(page.get_by_text(re.compile("Heuristic text-size estimate, not a provider token count or billing usage"))).to_be_visible()
     expect(page.get_by_text(re.compile("Estimate for the last request; updates each model call"))).to_be_visible()
@@ -580,7 +581,7 @@ def test_context_estimate_and_instructions_are_per_conversation(ui, page):
     expect(page.get_by_text("src/AGENTS.md", exact=True)).to_be_visible()
     expect(page.get_by_text("Project instructions were truncated.")).to_be_visible()
     ui.emit("a", "{ type: 'context', context_info: { ...contextInfo, estimated_tokens: 90570, compactions: 2 } }")
-    expect(page.get_by_text("Last model input · ~75%")).to_be_visible()
+    expect(page.get_by_text("Last model input · ~69%")).to_be_visible()
     expect(page.get_by_text("· 2 compactions")).to_be_visible()
     row(page, "Empty conversation").click()
     ui.show_session("b")
@@ -594,17 +595,17 @@ def test_reported_input_pushed_over_the_socket_replaces_the_estimate(ui, page):
     start_app(ui, page, setup="fake.sessions.set('a', { ...makeSession('a', 'Other conversation'), context_info: contextInfo })")
     row(page, "Other conversation").click()
     ui.show_session("a")
-    expect(page.get_by_text("Last model input · ~50%")).to_be_visible()
+    expect(page.get_by_text("Last model input · ~46%")).to_be_visible()
     ui.emit("a", """{ type: 'context', context_info: { ...contextInfo, auto_compact_percent: 90, auto_compact_threshold: 108748,
       last_request: { status: 'completed', partial: false, model: 'test-model', input_tokens: 72000, uncached_input_tokens: 72000,
         cache_read_input_tokens: 0, cache_creation_input_tokens: 0, input_budget: 120832, context_window: 131072,
         compactions: 1, percent_of_input_budget: 59.6, percent_of_context_budget: 54.9, model_window: null,
         percent_of_model_window: null, estimated_tokens: 60380, estimate_scale: 1, estimate_gap_percent: 19.2 } } }""")
-    expect(page.get_by_text("Last model input · 72,000 tokens · 59.6%")).to_be_visible()
+    expect(page.get_by_text("Last model input · 72,000 tokens · 55%")).to_be_visible()
     expect(page.get_by_role("progressbar", name="Reported model input usage")).to_have_attribute(
-        "aria-valuetext", "59.6% of input budget: 72,000 of 120,832 tokens reported by Databricks")
+        "aria-valuetext", "55% of context budget: 72,000 of 131,072 tokens reported by Databricks")
     ui.emit("a", "{ type: 'context', context_info: { ...contextInfo, prepared_for_next_turn: true, compactions: 2 } }")
-    expect(page.get_by_text("Context preview · ~50%")).to_be_visible()
+    expect(page.get_by_text("Context preview · ~46%")).to_be_visible()
     ui.emit("a", {"type": "event", "event": {"id": "n1", "type": "notice", "text": "Context compacted (compaction 2).",
                                              "compaction": {"number": 2, "trigger": "manual"}}})
     ui.emit("a", {"type": "event", "event": {"id": "n2", "type": "notice", "text": "Verify passed: pytest"}})
@@ -621,7 +622,7 @@ def test_byte_based_estimates_are_not_shown_as_tokens(ui, page):
     expect(page.get_by_text(re.compile("The saved meter counted bytes as tokens"))).to_be_visible()
     expect(page.get_by_text(re.compile("Increasing the context budget does not increase the response limit"))).to_be_visible()
     ui.emit("a", "{ type: 'context', context_info: contextInfo }")
-    expect(page.get_by_text("Last model input · ~50%")).to_be_visible()
+    expect(page.get_by_text("Last model input · ~46%")).to_be_visible()
     expect(page.get_by_role("progressbar", name="Estimated model input usage")).to_be_visible()
     expect(page.get_by_text(re.compile("The saved meter counted bytes as tokens"))).to_have_count(0)
 
@@ -1104,3 +1105,37 @@ def test_subagent_progress_refreshes_the_sidebar_only_when_a_subagent_appears_or
     expect(page.get_by_label("Subagent progress").first).to_contain_text("Waiting for approval")
     ui.js("new Promise(done => setTimeout(done, 50))")
     assert lists() == before + 3
+
+
+# The staging view shows hidden characters in the paths and the diff lines you decide on
+
+STAGING_NOTE = "Hidden or direction-changing characters are shown as \\u escapes."
+STAGING_RLO = "‮"
+
+
+def test_the_staging_list_escapes_a_path_and_stage_sends_the_real_path(ui, page):
+    path = f"src/a{STAGING_RLO}b.py"
+    status = {"repository": True, "branch": "main", "truncated": False, "files": [
+        {"path": path, "area": "unstaged", "status": "modified", "added": 1, "removed": 0, "hidden": None}]}
+    panel = open_git(ui, page, status=status, setup="""window.stageAnswer = fake.json(gitStatus)
+      const before = fake.override
+      fake.override = (path, options) => path.startsWith('/api/git/stage') ? fake.json(gitStatus) : before(path, options)""")
+    expect(panel.locator(".git-path")).to_have_text("src/a\\u202eb.py")
+    expect(panel.get_by_text(STAGING_NOTE, exact=True)).to_have_count(1)
+    assert STAGING_RLO not in panel.text_content()
+    panel.locator("button.git-stage").click()
+    ui.wait("fake.requests('/api/git/stage', 'POST').length === 1")
+    assert ui.bodies("/api/git/stage", "POST") == [{"paths": [path], "staged": True}]
+
+
+def test_the_staging_diff_escapes_a_bidi_override_in_a_line_and_in_the_path(ui, page):
+    path = f"src/a{STAGING_RLO}b.py"
+    status = {"repository": True, "branch": "main", "truncated": False, "files": [
+        {"path": path, "area": "unstaged", "status": "modified", "added": 1, "removed": 0, "hidden": None}]}
+    diff = {"path": path, "area": "unstaged", "binary": False, "truncated": False, "added": 1, "removed": 0, "lines": [
+        {"kind": "added", "text": f"if x == '{STAGING_RLO}user':", "new": 1}]}
+    panel = open_git(ui, page, status=status, diff=diff)
+    panel.get_by_role("button", name=re.compile(r"a.*b\.py")).first.click()
+    expect(panel.locator(".diff-line.added .line-text")).to_have_text("Added: if x == '\\u202euser':")
+    expect(panel.get_by_text(STAGING_NOTE, exact=True)).to_have_count(1)
+    assert STAGING_RLO not in panel.text_content()

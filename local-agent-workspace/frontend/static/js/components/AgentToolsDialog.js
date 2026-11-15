@@ -1,4 +1,5 @@
 import { html, useCallback, useEffect, useRef, useState } from '../lib.js'
+import DialogShell from './DialogShell.js'
 import { X } from '../icons.js'
 import { api } from '../api.js'
 import ConversationTransfer from './ConversationTransfer.js'
@@ -66,14 +67,12 @@ export default function AgentToolsDialog(props) {
 }
 
 function AgentToolsScope(props) {
-  const dialog = useRef(null)
   const nav = useRef(null)
   const [tab, setTab] = useState(() => {
     if (!TABS.includes(props.initialTab)) return rememberedTab()
     rememberTab(props.initialTab)
     return props.initialTab
   })
-  useEffect(() => { dialog.current?.showModal() }, [])
   // In the narrow layout the navigation is one scrolling row: keep the open section's button in view.
   useEffect(() => { nav.current?.querySelector('[aria-pressed="true"]')?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' }) }, [tab])
   const open = useCallback(name => { setTab(name); rememberTab(name) }, [])
@@ -97,18 +96,14 @@ function AgentToolsScope(props) {
     Extensions: () => html`<${ExtensionsPanel} ...${props} />`,
     Schedules: () => html`<${SchedulesPanel} session=${props.session} onError=${props.onError} onSelectSession=${id => { props.onSelectSession(id); props.onClose() }} />`,
   }
-  return html`<dialog class="agent-tools-dialog" ref=${dialog} aria-label="Agent tools" onCancel=${props.onClose} onClick=${e => { if (e.target === dialog.current) props.onClose() }}>
-    <div class="agent-tools-content">
-      <header class="agent-tools-header"><div><h2>Agent tools</h2><p>${props.session?.title || 'Default workspace'}</p></div><button class="icon-button" aria-label="Close agent tools" onClick=${props.onClose}><${X} size=${18} /></button></header>
-      <div class="agent-tools-layout">
-        <nav class="agent-tools-tabs" ref=${nav} aria-label="Agent tools sections">${SECTIONS.map(section => html`<div class="agent-tools-group" role="group" aria-label=${section.group} key=${section.group}>
+  return html`<${DialogShell} className="agent-tools-dialog" frameClass="agent-tools-content" plain bodyClass="agent-tools-body" label="Agent tools" title="Agent tools"
+    description=${html`<p>${props.session?.title || 'Default workspace'}</p>`} closeLabel="Close agent tools" onClose=${props.onClose}
+    nav=${html`<nav class="agent-tools-tabs" ref=${nav} aria-label="Agent tools sections">${SECTIONS.map(section => html`<div class="agent-tools-group" role="group" aria-label=${section.group} key=${section.group}>
           <span class="agent-tools-group-label" aria-hidden="true">${section.group}</span>
           ${section.tabs.map(name => html`<button key=${name} aria-pressed=${tab === name} onClick=${() => open(name)}>${name}</button>`)}
-        </div>`)}</nav>
-        <div class="agent-tools-body">${sections[tab]()}</div>
-      </div>
-    </div>
-  </dialog>`
+        </div>`)}</nav>`}>
+    ${sections[tab]()}
+  <//>`
 }
 
 // Overview: this chat and its project at a glance, from the routes the sections use (nothing new or
@@ -603,7 +598,7 @@ const TOOL_GROUPS = [
   { name: 'Skills', tools: ['list_skills', 'use_skill', 'report_findings'] },
   { name: 'Memory', tools: ['remember'] },
   { name: 'MCP', tools: ['get_tool_output'] },
-  { name: 'Web', tools: ['web_fetch', 'web_search'] },
+  { name: 'Web', tools: ['web_fetch', 'web_search', 'browser'] },
 ]
 
 export function toolGroup(name) {

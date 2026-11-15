@@ -2,11 +2,21 @@
 //
 // Settings: { workspace, model, env_file, context_window, max_output_tokens,
 //   max_agent_steps, compaction_handoffs?, auto_compact_percent? (50-100, default 90: automatic compaction runs
-//   when the next request's estimate passes this share of the input budget), approval_timeout_minutes? (0 = no limit),
+//   when the next request's estimate passes this share of the input budget),
+//   context_trim? (default true: one pass replaces old tool results in requests with short notices), context_trim_start_percent?
+//   (40-90, default 70: the share of the input budget that starts the pass; a chat runs it at most 5 points below its
+//   auto-compact mark, agents.trim_marks), context_trim_target_percent? (20-85, default 55: the share it trims down to,
+//   at most 5 below the start), compaction_ask? (default true: a message that would start an automatic compaction first
+//   waits for the card, an event with compaction_choice {percent_used, compact_at_percent, options, answer}),
+//   approval_timeout_minutes? (0 = no limit),
 //   system_notifications? (server notifications while no page is open),
 //   auto_keep_changes? (true: Keep every listed change when a chat's reply ends), host, configured,
 //   background_subagent_wake? (true: an idle chat gets an app message, and so a paid turn, when one of its background
 //   subagents finishes; default false; planning.DelegateManager.maybe_wake),
+//   subagents_running_max? (1-8, default 3: subagents running at once over all chats; the rest wait queued. Each
+//   request's share of the endpoint's rate limits is split by this plus one chat; model_profiles.concurrent_requests),
+//   subagents_per_turn_max? (1-24, default 6: subagents one chat may start in one turn; a delegation over it is refused
+//   with a result that names the limit),
 //   secret_file_patterns? (at most 32 file name patterns, such as '*.tfvars': a command naming such a file
 //   always shows an approval card with a warning, like the built-in credential names; secret_paths.py),
 //   spending_limit_dbu? (0-100000, default 0 = none: the spending limit of chats without their own; spending.py),
@@ -39,6 +49,14 @@
 //   = no web_search), web_search_url: string (the SearXNG address), web_search_key: string (the credential-file entry
 //   that holds the API key; '' = BRAVE_API_KEY or TAVILY_API_KEY), web_search_status: { provider, ready, problem?,
 //   key_name? } | null (never the key),
+//   browser_tools: boolean (offer the browser tool; default false), browser_headless: 'auto' | 'window' | 'headless' (default
+//   'auto': a window when the computer has a display), browser_action_timeout: integer (5 to 120 seconds one browser action may
+//   take; default 30), browser_upstream_proxy: 'auto' | 'none' | 'http://[user:password@]host:port' | 'socks5://[user:password@]host:port' (the proxy the browser
+//   connects through; default 'auto' = the system's; a password comes back as <redacted> and a save with that text keeps
+//   the stored one), browser_status: { ready: boolean, problem?: string, proxy?: string, proxy_problem?: string } (whether
+//   Playwright and a browser are installed; problem names the fix; proxy is the connection mode found: 'direct', 'system
+//   proxy host:port', 'configured proxy host:port', 'system SOCKS proxy host:port', 'configured SOCKS proxy host:port', 'SOCKS4 proxy found: not supported, enter a SOCKS5 or http:// proxy address' or 'PAC file found: enter the proxy address', and proxy_problem says what
+//   to do about a PAC file or a SOCKS4 proxy; never a password; none of these is a project setting),
 //   git_context: boolean (each turn's first message carries a short Git snapshot: branch, upstream, change counts,
 //   recent commits; default true), schedules_enabled: boolean (the scheduler runs Agent tools → Schedules at their
 //   times; default false), token_expires_on: '' | 'YYYY-MM-DD' (the Databricks token's expiry, typed by the user),
@@ -186,7 +204,8 @@
 //   deny and ask only) | 'edits' (every edit tool; path = an absolute folder or file) | 'hook' (hook = id)
 //   | 'delegate_task' | 'stop_job' | 'mcp__<server>__<tool>' | 'mcp__<server>__*' (deny and ask only)
 //   | 'web_fetch' (domain = one host for allow, which needs it; deny and ask cover its subdomains too, or every fetch)
-//   | 'web_search' | another tool name (deny only). Deny wins over ask, ask over allow. A deny rule for read_file also covers
+//   | 'browser' (domain = a host key such as docs.example.com, or localhost:3000 with its port, for allow, which needs it; deny
+//   and ask cover a public host's subdomains too, or all browsing) | 'web_search' | another tool name (deny only). Deny wins over ask, ask over allow. A deny rule for read_file also covers
 //   outline_file, and one for list_files or find_files also covers project_overview.
 // Rule draft (POST only): { tool: 'run_command', behavior, text, match: 'exact'|'prefix', options?: string }.
 // RuleSets (GET /permission-rules?session_id=; POST /permission-rules { scope: 'chat'|'project'|'user',
@@ -235,7 +254,13 @@
 //   not be used: its submit_report arguments as written, redacted, which its parent's result carries as text),
 //   name?, input?, output?, preview?, state?, delegation?, origin?,
 //   (delegation: Delegation, on a delegate_task card or a notice with child_session_id; a delegate_task card of a
-//   response that delegated two or more tasks at once also has delegation_batch: { id, index (call order from 0), size }),
+//   response that delegated two or more tasks at once also has delegation_batch: { id, index (call order from 0), size,
+//   origin: 'user'|'agent' (the turn's message invoked the /workflow skill or a command file, or the agent delegated by
+//   itself), approval?: 'batch'|'single'|'none' (how the call was approved, once known) }; both are for the page only,
+//   the model never gets them), and batch_approval?: { id, size, event_ids, review } on each pending card of a batch that
+//   waits for one decision (POST /sessions/<id>/approvals/<batch id> { allowed, note?, remember? | scope? } answers all of
+//   them, POST .../approvals/<batch id>/review turns them into cards one at a time: review is then true on the cards that
+//   still wait for their turn; the card that asks on its own has no batch_approval),
 //   approval?: 'approved'|'declined'|'expired'|'blocked', approval_expires? (epoch seconds, only with a limit),
 //   decline_note? (the user's note sent with Decline), allowed_by_rule? (true: ran by a Rule, no card),
 //   rule_scope?: 'chat'|'project'|'user' (with allowed_by_rule), read_only_command? (true: ran from the fixed
@@ -252,7 +277,7 @@
 //   result was shortened for the agent),
 //   and on pending cards only: rememberable?: ('chat'|'project'|'user')[], rule_options?: { argv: string[] | null,
 //   prefixes: [{ prefix: string[], flags: string[] }], reason: string | null } (commands) | { folder } (edits) |
-//   { domain } (web_fetch),
+//   { domain } (web_fetch and browser: the host key),
 //   editable?: ('command'|'content'|'new_text')[], uncertain?: true (a command that could not be checked
 //   exactly against deny and ask rules) }
 //   ask_user events: { name: 'ask_user', input: { questions }, answers?: [{ question, selected, other }],
@@ -284,6 +309,12 @@
 //   result's output JSON has result_id, next_offset, total_chars (and rest_not_kept) for get_tool_output.
 //   Web cards (web_fetch.py): web_fetch carries web_domain? (the checked IDNA host the card and its rules name) and
 //   web_search web_provider? (the provider's label); their output JSON has a note that the content is untrusted.
+//   Browser cards (browser_tool.py, name 'browser'): input is the model's call (a pending card's input also holds host and
+//   submits); browser?: { action, host?, tab?, label? (the clicked or typed control's description), refused? (the engine's reason:
+//   credential_field, bot_check, private_address, unsupported_address, download, dialog, file_chooser, permission_prompt,
+//   host_not_allowed, timeout, stale_ref, tab_limit, not_open), image? (a screenshot's upload reference { upload, name,
+//   media_type, width, height, bytes }; GET /sessions/<id>/uploads/<upload>/image -> { mime_type, data }), and on a card
+//   waiting for you title, detail and choices: [{ id: 'once'|'chat', label }] }. The result is the page text as output JSON.
 // McpServerStatus: { id, name, status: 'connected'|'failed'|'skipped'|'off'|'disabled', tool_count, error?,
 //   stderr_tail? (redacted end of a stdio server's stderr), server_info?: { name, title?, version? },
 //   retry_seconds? (a failed server is tried again after 60 s), capped?: string[] (tools left out by the
@@ -367,6 +398,9 @@
 //   compactable? (false: Compact now has no earlier turn to summarize until the next user message; absent on
 //   older meters, which allow it),
 //   estimate_prior? (true: estimate_scale is the model's starting ratio, not yet from reported counts),
+//   largest_items? (at most ten, biggest first: { event_id, kind ('tool_result', 'file_read', 'attachment', 'message' or
+//   'summary'), label (redacted, at most 160 characters), tokens, can_trim }: what the usage card offers to Shorten or Drop),
+//   trimmed? ({ events, tokens }: what the trim has freed in this chat),
 //   auto_compact_threshold?, auto_compact_percent?, auto_compact_source? ('project' or 'local': a trusted project
 //   settings file sets the percent), compaction_deferred? (over the threshold but within the input
 //   budget, and no cut brings it under the threshold: sent as it was), compaction?: Compaction (when this request compacted), last_request?: LastRequest,
@@ -374,7 +408,14 @@
 //   held_anchor? (the same, kept after a change to another model so a change back anchors again),
 //   percent_of_input_budget, percent_of_threshold } (the app's estimate of the
 //   next request before the user's next message; set when a turn ends), payload_bytes? (the size of the request
-//   body sent), payload_limit_bytes? (the Databricks per-request limit, 4,000,000) }. After a model change or a
+//   body sent), payload_limit_bytes? (the Databricks per-request limit, 4,000,000), and the one context reading
+//   from the server (context.py context_reading; absent from an older server, then the page falls back):
+//   percent_used (whole number: used_tokens over limit_tokens; above 100 only when the request does not fit),
+//   used_tokens, limit_tokens, limit_name ('context budget'), is_estimate (true: the app's estimate, not a current
+//   Databricks report), compact_at_percent (where automatic compaction starts, on the same scale),
+//   last_request_cached (cached input tokens of the last request, 0 when none), warn ('none', 'near' from 85% of the
+//   compaction threshold, 'at_threshold' when the next message would start an automatic compaction), compaction_held?
+//   (true: you chose to continue without compacting) }. After a model change or a
 //   Settings save the budget fields, the threshold and next_estimate of an idle chat follow the new setup;
 //   estimated_tokens, estimate_scale and last_request still describe the last request.
 // Compaction: { number, trigger: 'manual'|'in_turn'|'auto', before_tokens, after_tokens, threshold_tokens,

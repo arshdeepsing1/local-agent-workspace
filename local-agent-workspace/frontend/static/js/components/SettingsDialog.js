@@ -6,15 +6,15 @@ import { levelLabel, useReasoningPreview } from './EffortPicker.js'
 import EndpointChecksDialog, { testResultText } from './EndpointChecksDialog.js'
 import ProjectTrustDialog, { LAYER_FILES, layerValue } from './ProjectTrustDialog.js'
 import { TEXT_SIZES, applyTextSize, textSize } from '../textSize.js'
-import { STYLES, THEMES, applyStyle, applyTheme, style as appStyle, theme } from '../theme.js'
 import { groupToolCalls, setGroupToolCalls } from '../viewPrefs.js'
+import DialogShell from './DialogShell.js'
 
 const LIMIT_LEVELS = { error: 'form-error', warning: 'settings-note', note: 'field-help' }
 const inRange = (value, low, high) => Number.isInteger(value) && value >= low && value <= high
 const LIMIT_KEYS = ['context_window', 'max_output_tokens']
 // The dialog's sections, in order: [id, title]. On wide screens a list beside them jumps to each.
 const SECTIONS = [['project', 'Project'], ['model', 'Model and context'], ['reasoning', 'Reasoning'], ['agent', 'Agent'],
-  ['subagents', 'Subagents'], ['commands', 'Commands and files'], ['web', 'Web access'], ['appearance', 'Appearance'], ['notifications', 'Notifications'],
+  ['subagents', 'Subagents'], ['commands', 'Commands and files'], ['web', 'Web access'], ['browsing', 'Browsing'], ['appearance', 'Appearance'], ['notifications', 'Notifications'],
   ['credentials', 'Credentials']]
 // Settings → Web access: web_search providers (backend web_fetch.PROVIDERS) and the credential-file entry each reads
 // its API key from when Settings names none (web_fetch.DEFAULT_KEYS); SearXNG takes an address instead.
@@ -26,7 +26,9 @@ const FORMATS = [['auto', 'Automatic (per endpoint)'], ['anthropic', 'Anthropic 
 // Settings → Prompt caching (backend config.PROMPT_CACHING): cache markers on agent requests to Claude endpoints;
 // 'messages' sends only the forms Databricks documents (prompt_cache.py level "messages").
 const CACHING = [['auto', 'Automatic (Claude endpoints)'], ['messages', 'Documented forms only'], ['off', 'Off']]
-const OTHER_ENDPOINT = '\u0000other'
+// Settings → Browsing: browser_headless values (backend config).
+const BROWSER_WINDOWS = [['auto', 'Automatic'], ['window', 'Show the window'], ['headless', 'Hidden']]
+const OTHER_ENDPOINT ='\u0000other'
 // Settings → Output style (backend output_styles.PRESETS): listed until GET /output-styles adds the style files.
 const BUILT_IN_STYLES = [{ id: 'default', name: 'Default' }, { id: 'concise', name: 'Concise' }, { id: 'explanatory', name: 'Explanatory' }]
 const FALLBACK_LEVELS = Object.entries(EFFORT_LABELS).map(([value, label]) => ({ value, label }))
@@ -121,7 +123,7 @@ function projectFilesText(layers) {
 
 // onProjectDecided(report): a Trust or Ignore chosen from Settings → Project (the app reads Settings again).
 export default function SettingsDialog({ settings, connection, onSave, onClose, onProjectDecided }) {
-  const dialog = useRef(null)
+  const body = useRef(null)  // the dialog's scrolling body (DialogShell)
   const [form, setForm] = useState(settings)
   // Folder states checked again when the dialog opens (a first write creates the default code folder).
   const [statuses, setStatuses] = useState({ coding_dir: settings.coding_dir_status, python_venv: settings.python_venv_status })
@@ -132,9 +134,6 @@ export default function SettingsDialog({ settings, connection, onSave, onClose, 
   const contextInput = useRef(null)
   const [saving, setSaving] = useState(false)
   const [scale, setScale] = useState(textSize)
-  // What the page shows now (storage may be blocked, so a choice made earlier on this page is not stored).
-  const [themeChoice, setThemeChoice] = useState(() => document.documentElement.dataset.theme || theme())
-  const [styleChoice, setStyleChoice] = useState(() => document.documentElement.dataset.style || appStyle())
   const [grouping, setGrouping] = useState(groupToolCalls)
   const [error, setError] = useState('')
   // The variable names as typed; the form holds them as a list.
@@ -189,7 +188,13 @@ export default function SettingsDialog({ settings, connection, onSave, onClose, 
   }
   const compactPercent = form.auto_compact_percent ?? 90
   const compactPercentValid = Number.isInteger(compactPercent) && compactPercent >= 50 && compactPercent <= 100
-  useEffect(() => { dialog.current?.showModal() }, [])
+  const trimStart = form.context_trim_start_percent ?? 70
+  const trimTarget = form.context_trim_target_percent ?? 55
+  const trimOn = form.context_trim !== false
+  // The marks the app really uses after fitting them below the compaction threshold (null: no room for trimming).
+  const trimEffective = settings.context_trim_effective
+  const trimMarks = trimEffective && typeof trimEffective === 'object' ? trimEffective : null
+  const browserStatus = settings.browser_status
   useEffect(() => {
     let current = true
     api('/settings').then(fresh => {
@@ -262,17 +267,6 @@ export default function SettingsDialog({ settings, connection, onSave, onClose, 
   const capped = requestBudget !== null && requestBudget !== inputBudget ? requestBudget : null
   const cappedReason = effective?.clamped ? 'which accepts less' : 'keeping 5% of its window for estimate error'
   const number = key => event => field(key, Number(event.currentTarget.value))
-  // A focused field must not end under the sticky footer. For a text box the browser scrolls only its
-  // caret into view, so on a phone the lower part of Custom instructions could stay hidden.
-  const keepAboveFooter = event => {
-    const target = event.target
-    const footer = event.currentTarget.querySelector(':scope > footer')
-    if (!footer || footer.contains(target) || !target.getBoundingClientRect) return
-    const box = target.getBoundingClientRect()
-    const top = footer.getBoundingClientRect().top
-    // Before the browser's own focus scroll, which then finds the caret already in view.
-    if (box.bottom > top + .5) target.scrollIntoView({ block: box.height < top - 60 ? 'nearest' : 'start' })
-  }
   const jump = id => {
     const section = sections.current[id]
     if (!section) return
@@ -283,7 +277,7 @@ export default function SettingsDialog({ settings, connection, onSave, onClose, 
   }
   // The section list follows scrolling (not the scroll a jump itself causes).
   const scrolled = () => {
-    const box = dialog.current
+    const box = body.current
     if (!box || Date.now() - jumping.current < 300) return
     const top = box.getBoundingClientRect().top
     let current = SECTIONS[0][0]
@@ -305,21 +299,24 @@ export default function SettingsDialog({ settings, connection, onSave, onClose, 
     const all = { ...SUBAGENT_DEFAULTS, ...(current.subagent_defaults || {}) }
     return { ...current, subagent_defaults: { ...all, [kind]: { ...all[kind], [key]: value } } }
   })
-  return html`<dialog ref=${dialog} class="settings-dialog app-settings" aria-label="Settings" aria-describedby="settings-description" onCancel=${onClose} onScroll=${scrolled} onClick=${e => { if (e.target === dialog.current) onClose() }}>
-    <div class="dialog-content"><header><div><h2>Settings</h2><p id="settings-description">Configure your local workspace.</p></div><button class="icon-button" onClick=${onClose} aria-label="Close settings"><${X} /></button></header>
-      <form onfocusin=${keepAboveFooter} onSubmit=${e => {
-        e.preventDefault()
-        // The server checks this too; saying it here avoids its raw validation error.
-        if ((form.command_env || []).length > 32) { setError('List at most 32 environment variable names.'); return }
-        if ((form.secret_file_patterns || []).length > 32) { setError('List at most 32 secret file name patterns.'); return }
-        setSaving(true); setError(''); void onSave(form).then(onClose).catch(e => setError(e.message)).finally(() => setSaving(false))
-      }}>
-        <div class="settings-layout">
-        <nav class="settings-nav" aria-label="Settings sections"><ul>
+  const save = e => {
+    e.preventDefault()
+    // The server checks this too; saying it here avoids its raw validation error.
+    if ((form.command_env || []).length > 32) { setError('List at most 32 environment variable names.'); return }
+    if ((form.secret_file_patterns || []).length > 32) { setError('List at most 32 secret file name patterns.'); return }
+    setSaving(true); setError(''); void onSave(form).then(onClose).catch(e => setError(e.message)).finally(() => setSaving(false))
+  }
+  return html`<${DialogShell} className="app-settings" label="Settings" describedBy="settings-description" title="Settings"
+    description=${html`<p id="settings-description">Configure your local workspace.</p>`} closeLabel="Close settings" onClose=${onClose} busy=${saving}
+    bodyRef=${body} onBodyScroll=${scrolled} onSubmit=${save}
+    nav=${html`<nav class="settings-nav" aria-label="Settings sections"><ul>
           ${SECTIONS.map(([id, title]) => html`<li key=${id}><button type="button" aria-current=${activeSection === id ? 'true' : null}
             onClick=${() => jump(id)}>${title}</button></li>`)}
-        </ul></nav>
-        <div class="settings-sections">
+        </ul></nav>`}
+    footer=${html`${error ? html`<p class="form-error" role="alert">${error}</p>` : null}<button type="button" class="outline" disabled=${saving} onClick=${onClose}>Cancel</button><button class="primary" disabled=${saving}>${saving ? 'Saving…' : 'Save settings'}</button>`}
+    after=${html`${checking ? html`<${EndpointChecksDialog} model=${model} mode=${checking} onClose=${() => setChecking(null)} />` : null}
+    ${reviewingFiles && layers?.files?.length ? html`<${ProjectTrustDialog} report=${layers} onDecided=${report => onProjectDecided?.(report)}
+      onClose=${() => setReviewingFiles(false)} />` : null}`}>
         ${group('project', html`
         <label>Project folder<input value=${form.workspace} required onInput=${e => field('workspace', e.currentTarget.value)} placeholder="/path/to/project" /></label>
         <p class="field-help">New conversations work in this folder: the agent reads files, edits code and runs approved commands here.</p>
@@ -378,11 +375,25 @@ export default function SettingsDialog({ settings, connection, onSave, onClose, 
           value=${form.auto_compact_percent === undefined ? 90 : form.auto_compact_percent || ''} onInput=${number('auto_compact_percent')} /></label>
         ${fromProject('auto_compact_percent')}
         <p class="field-help">Earlier turns are summarized automatically when the next request's estimated input passes this share of the input budget (default 90). ${compactPercentValid ? `With these settings that is about ${Math.floor(inputBudget * compactPercent / 100).toLocaleString()} tokens${capped ? ` (${Math.floor(capped * compactPercent / 100).toLocaleString()} for requests to this endpoint)` : ''}.` : 'Enter a whole number from 50 to 100.'} Lower values compact sooner and keep requests smaller; 100 waits until the input budget is full.</p>
+        <label class="settings-checkbox"><input type="checkbox" checked=${form.compaction_ask !== false}
+          onChange=${e => field('compaction_ask', e.currentTarget.checked)} />Ask before compacting a long chat</label>
+        <p class="field-help">When your message would start an automatic compaction, a card lets you compact first or continue without compacting. Scheduled runs and scripts never ask.</p>
         <label class="settings-checkbox"><input type="checkbox" checked=${form.compaction_handoffs !== false}
           onChange=${e => field('compaction_handoffs', e.currentTarget.checked)} />Save a detailed handoff at each compaction</label>
         ${fromProject('compaction_handoffs')}
         <p class="field-help">The model writes a detailed handoff (up to 16,000 output tokens, plus up to 8,192 for thinking on models that always think, such as Claude Opus 5.5) that the app saves to handoffs/auto/ in the project folder.</p>
         <${More} topic="compaction handoffs">The handoff includes an exact log of every command, and the model is told where to find it after compaction. Compaction then takes a few minutes longer and uses more output tokens.<//>
+        <label class="settings-checkbox"><input type="checkbox" checked=${trimOn}
+          onChange=${e => field('context_trim', e.currentTarget.checked)} />Trim old tool results from requests</label>
+        <p class="field-help">Once a request passes the start mark, old tool results (not in your latest three turns) go to the model as short notices. Your transcript keeps every result.</p>
+        <label>Start trimming at (% of input budget)<input type="number" min=${40} max=${90} step=${1} disabled=${!trimOn}
+          value=${form.context_trim_start_percent === undefined ? 70 : form.context_trim_start_percent || ''} onInput=${number('context_trim_start_percent')} /></label>
+        <p class="field-help">40 to 90. Default 70.${trimEffective === undefined && Number.isInteger(trimStart) && compactPercentValid && trimStart >= compactPercent ? ' Trimming starts 5 points below the compaction threshold.' : ''}</p>
+        <label>Trim down to (% of input budget)<input type="number" min=${20} max=${85} step=${1} disabled=${!trimOn}
+          value=${form.context_trim_target_percent === undefined ? 55 : form.context_trim_target_percent || ''} onInput=${number('context_trim_target_percent')} /></label>
+        <p class="field-help">20 to 85. Default 55. It stays at least 5 below the start mark.</p>
+        ${trimOn && trimMarks ? html`<p class="field-help">In effect: trimming starts at ${trimMarks.start}% and stops at ${trimMarks.target}%.</p>`
+          : trimOn && trimEffective === null ? html`<p class="field-help">Trimming is off for this threshold.</p>` : null}
         <label>Prompt caching<select value=${form.prompt_caching || 'auto'} onChange=${e => field('prompt_caching', e.currentTarget.value)}>
           ${CACHING.map(([value, label]) => html`<option key=${value} value=${value}>${label}</option>`)}
         </select></label>
@@ -486,6 +497,12 @@ export default function SettingsDialog({ settings, connection, onSave, onClose, 
         ${SUBAGENT_TYPES.map(([kind, label, help]) => html`<${SubagentDefaults} key=${kind} label=${label} help=${help}
           value=${subagents[kind] || {}} choices=${choices} onChange=${(key, value) => subagentField(kind, key, value)} />`)}
         <p class="field-help">Explore starts at Fast: reading and searching rarely needs long thinking. Default sends no effort field, so the subagent's endpoint uses its own.</p>
+        <label>Subagents at once<input type="number" required min=${1} max=${8} step=${1}
+          value=${form.subagents_running_max ?? 3} onInput=${number('subagents_running_max')} /></label>
+        <p class="field-help">How many subagents run together, over all chats. More subagents at once means a smaller share of the endpoint's rate limit for each request. A change never stops a running subagent.</p>
+        <label>Subagents per turn<input type="number" required min=${1} max=${24} step=${1}
+          value=${form.subagents_per_turn_max ?? 6} onInput=${number('subagents_per_turn_max')} /></label>
+        <p class="field-help">How many subagents one chat may start in one turn. The agent gets a refusal for each call over the limit and continues with the results it has.</p>
         <label class="settings-checkbox"><input type="checkbox" checked=${form.background_subagent_wake === true}
           onChange=${e => field('background_subagent_wake', e.currentTarget.checked)} />Continue the chat when a background subagent finishes</label>
         <p class="field-help">The agent can start a subagent in the background and keep working. When one finishes while the chat is idle, the chat gets a notice; with this on, the app also sends it a short message so the agent reads the report and goes on. Off by default: each such turn is a paid model request.</p>
@@ -518,15 +535,21 @@ export default function SettingsDialog({ settings, connection, onSave, onClose, 
           <p class="field-help">The name of the entry, for example ${form.web_search_key || SEARCH_KEYS[searchProvider]}=… in your credential file. The key itself stays there: it is read for each search and never saved in settings.</p>` : null}
         ${searchStatus ? html`<p class=${searchStatus.ready ? 'field-help' : 'settings-note'} role="status">${searchStatus.ready ? `${searchStatus.provider} is ready.` : searchStatus.problem}</p>` : null}
         <p class="field-help">With a provider, the agent gets a web_search tool. Each query goes to that provider, which may charge for it and sees what is searched; check your organization's rules first. The first search in each chat shows its query for your approval.</p>`)}
+        ${group('browsing', html`
+        <label class="settings-checkbox"><input type="checkbox" checked=${form.browser_tools === true}
+          onChange=${e => field('browser_tools', e.currentTarget.checked)} />Let the agent use a browser</label>
+        <label>Browser window<select value=${form.browser_headless || 'auto'} onChange=${e => field('browser_headless', e.currentTarget.value)}>
+          ${BROWSER_WINDOWS.map(([value, label]) => html`<option key=${value} value=${value}>${label}</option>`)}
+        </select></label>
+        <label>Time limit per action (seconds)<input type="number" required min=${5} max=${120} step=${1}
+          value=${form.browser_action_timeout ?? 30} onInput=${number('browser_action_timeout')} /></label>
+        <label>Proxy for the browser<input value=${form.browser_upstream_proxy ?? 'auto'} spellcheck=${false} required
+          placeholder="auto" onInput=${e => field('browser_upstream_proxy', e.currentTarget.value.trim())} /></label>
+        <p class="field-help">auto uses the proxy your computer is set to. It uses a system SOCKS proxy only when it finds no HTTP or HTTPS proxy. none connects directly, which also suits a VPN or Zscaler in tunnel mode. Or type an address such as http://127.0.0.1:9000, which is where Zscaler in local proxy mode usually listens. Use socks5://127.0.0.1:1080 for a SOCKS5 proxy (SOCKS4 is not supported). A password goes in the address (http://user:password@host:port or socks5://user:password@host:port) and is shown as ${'<redacted>'} afterwards. The app checks every address itself before anything goes to the proxy, and it never sends private addresses or this computer's other ports there.</p>
+        ${browserStatus ? html`<p class=${browserStatus.ready ? 'field-help' : 'settings-note'} role="status">${browserStatus.ready ? 'Ready.' : browserStatus.problem}${browserStatus.proxy ? ` Connection: ${browserStatus.proxy}.` : ''}</p>` : null}
+        ${browserStatus && browserStatus.proxy_problem ? html`<p class="settings-note">${browserStatus.proxy_problem}</p>` : null}
+        <p class="field-help">The agent asks before it opens a site it has not opened before in this chat. It never types into password, card or code fields on a real site. Turning more tools on can push MCP tools out of the 32-tool request limit.</p>`)}
         ${group('appearance', html`
-        <label>Style<select value=${styleChoice} onChange=${e => setStyleChoice(applyStyle(e.currentTarget.value))}>
-          ${STYLES.map(([value, label]) => html`<option key=${value} value=${value}>${label}</option>`)}
-        </select></label>
-        <p class="field-help">The Claude style has warm ivory, clay and rounded cards; the VS Code style has the editor's default colours, fonts and square corners. Either comes in light and dark (Theme below). In this browser only (not saved with Settings).</p>
-        <label>Theme<select value=${themeChoice} onChange=${e => setThemeChoice(applyTheme(e.currentTarget.value))}>
-          ${THEMES.map(([value, label]) => html`<option key=${value} value=${value}>${label}</option>`)}
-        </select></label>
-        <p class="field-help">Light or dark colours, or Match system to follow your computer's light or dark mode. In this browser only (not saved with Settings).</p>
         <label>Text size<select value=${String(scale)} onChange=${e => setScale(applyTextSize(Number(e.currentTarget.value)))}>
           ${TEXT_SIZES.map(size => html`<option value=${String(size)}>${size === 100 ? '100% (default)' : `${size}%`}</option>`)}
         </select></label>
@@ -545,13 +568,5 @@ export default function SettingsDialog({ settings, connection, onSave, onClose, 
         <label>Token expires on<input type="date" value=${form.token_expires_on || ''} onInput=${e => field('token_expires_on', e.currentTarget.value)} /></label>
         <p class="field-help">Optional: the day your Databricks personal access token expires. From 7 days before, a banner and Agent tools → Schedules remind you to renew it. The app never reads the token's date from Databricks.</p>`)}
         <p class="settings-note">Project, model and effort changes apply to new conversations; each chat keeps its own model and effort. Use Folder access above the chat input to allow additional folders. Commands run according to your selected permission mode.</p>
-        </div>
-        </div>
-        <footer>${error ? html`<p class="form-error" role="alert">${error}</p>` : null}<button type="button" class="outline" onClick=${onClose}>Cancel</button><button class="primary" disabled=${saving}>${saving ? 'Saving…' : 'Save settings'}</button></footer>
-      </form>
-    </div>
-    ${checking ? html`<${EndpointChecksDialog} model=${model} mode=${checking} onClose=${() => setChecking(null)} />` : null}
-    ${reviewingFiles && layers?.files?.length ? html`<${ProjectTrustDialog} report=${layers} onDecided=${report => onProjectDecided?.(report)}
-      onClose=${() => setReviewingFiles(false)} />` : null}
-  </dialog>`
+  <//>`
 }

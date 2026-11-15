@@ -1,6 +1,6 @@
-import { html, useEffect, useRef, useState } from '../lib.js'
-import { X } from '../icons.js'
+import { html, hiddenNote, noteLine, visibleParts, visibleText, useEffect, useState } from '../lib.js'
 import { api } from '../api.js'
+import DialogShell from './DialogShell.js'
 
 // Settings a project's files may set, by their Settings label (backend config.LAYERABLE).
 export const LAYER_LABELS = {
@@ -15,21 +15,19 @@ export const layerValue = value => typeof value === 'boolean' ? (value ? 'on' : 
   : typeof value === 'number' ? value.toLocaleString('en-US') : String(value)
 const query = sessionId => sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''
 
+// Every text from a repository's settings files that the dialog shows (the note covers them all).
+const readText = report => [report.workspace, ...report.files.flatMap(file => [file.name, ...Object.entries(file.values).flatMap(([key, value]) => [LAYER_LABELS[key] ? '' : key, layerValue(value)]),
+  ...file.problems, ...file.ignored])]
+
 // Asked the first time a project with .agents/settings.json or .agents/settings.local.json is opened, and again when
 // a file changed (backend settings_layers.py): what each file would set, what it cannot, and Trust or Ignore. Closing
 // it decides nothing: the files stay unused until you choose. report: a ProjectLayers (types.js); sessionId: the chat
 // whose project it is (none: the Settings project); onDecided(report) gets the new report.
 export default function ProjectTrustDialog({ report, sessionId, onDecided, onClose }) {
-  const dialog = useRef(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [shown, setShown] = useState(report)
   useEffect(() => { setShown(report) }, [report?.sha256])
-  useEffect(() => {
-    const node = dialog.current
-    node?.showModal()
-    return () => { if (node?.open) node.close() }
-  }, [])
   const decide = async decision => {
     if (busy) return
     setBusy(true); setError('')
@@ -44,30 +42,28 @@ export default function ProjectTrustDialog({ report, sessionId, onDecided, onClo
     } finally { setBusy(false) }
   }
   const names = shown.files.map(file => file.name)
-  return html`<dialog ref=${dialog} class="settings-dialog project-trust-dialog" aria-labelledby="project-trust-title"
-    aria-describedby="project-trust-description" onCancel=${event => { event.preventDefault(); if (!busy) onClose() }}>
-    <div class="dialog-content">
-      <header><div><h2 id="project-trust-title">Project settings files</h2>
-        <p id="project-trust-description">${shown.changed ? `${names.join(' and ')} changed since you chose ${shown.decision === 'trust' ? 'Trust' : 'Ignore'}. They are not used until you decide again.`
-          : `This project has settings in ${names.join(' and ')}. They apply to its chats only if you trust them.`}</p></div>
-        <button class="icon-button" type="button" aria-label="Decide later" title="Decide later" disabled=${busy} onClick=${onClose}><${X} /></button></header>
-      <p class="project-trust-folder" title=${shown.workspace}>${shown.workspace}</p>
-      ${shown.files.map(file => html`<section key=${file.layer} class="project-trust-file" aria-label=${file.name}>
-        <h3>${file.name}${file.layer === 'local' ? html` <span class="field-help">(yours, not shared)</span>` : null}</h3>
+  // Closing decides nothing (Decide later): the Close button has that name, and neither Escape nor a click outside
+  // closes it while a decision is being saved.
+  return html`<${DialogShell} className="project-trust-dialog" labelledBy="project-trust-title" describedBy="project-trust-description"
+    title="Project settings files" titleId="project-trust-title" closeLabel="Decide later" closeTitle="Decide later" closeDisabled=${busy}
+    description=${html`<p id="project-trust-description" class="logical-order">${shown.changed ? `${names.join(' and ')} changed since you chose ${shown.decision === 'trust' ? 'Trust' : 'Ignore'}. They are not used until you decide again.`
+          : `This project has settings in ${names.join(' and ')}. They apply to its chats only if you trust them.`}</p>`}
+    onClose=${onClose} busy=${busy} backdrop=${false}
+    footer=${html`<button type="button" class="outline" disabled=${busy} onClick=${() => void decide('ignore')}>Ignore</button>
+        <button type="button" class="primary" disabled=${busy} onClick=${() => void decide('trust')}>Trust</button>`}>
+      ${noteLine(hiddenNote(readText(shown)))}
+      <p class="project-trust-folder logical-order" title=${visibleText(shown.workspace)}>${visibleParts(shown.workspace)}</p>
+      ${shown.files.map(file => html`<section key=${file.layer} class="project-trust-file logical-order" aria-label=${visibleText(file.name)}>
+        <h3>${visibleParts(file.name)}${file.layer === 'local' ? html` <span class="field-help">(yours, not shared)</span>` : null}</h3>
         ${Object.keys(file.values).length ? html`<dl>${Object.entries(file.values).map(([key, value]) => html`<div key=${key}>
-          <dt>${LAYER_LABELS[key] || key}</dt><dd>${layerValue(value)}</dd></div>`)}</dl>`
+          <dt>${LAYER_LABELS[key] ?? visibleParts(key)}</dt><dd>${visibleParts(layerValue(value))}</dd></div>`)}</dl>`
           : html`<p class="field-help">It sets nothing the app uses.</p>`}
-        ${file.problems.map((problem, index) => html`<p key=${index} class="settings-note">Not used: ${problem}</p>`)}
-        ${file.ignored.length ? html`<p class="field-help">Ignored (only Settings can set ${file.ignored.length === 1 ? 'it' : 'them'}): ${file.ignored.join(', ')}</p>` : null}
+        ${file.problems.map((problem, index) => html`<p key=${index} class="settings-note">Not used: ${visibleParts(problem)}</p>`)}
+        ${file.ignored.length ? html`<p class="field-help">Ignored (only Settings can set ${file.ignored.length === 1 ? 'it' : 'them'}): ${visibleParts(file.ignored.join(', '))}</p>` : null}
       </section>`)}
       <p class="field-help">A project file can set only the model (an endpoint you already use), reasoning effort, context budgets, compaction, prompt caching, output style, Agent steps, Automatic Keep and a lower spending limit. Never credentials, permissions, commands, hooks or MCP servers. Settings → Project shows the files later.</p>
       ${error ? html`<p class="form-error" role="alert">${error}</p>` : null}
-      <footer>
-        <button type="button" class="outline" disabled=${busy} onClick=${() => void decide('ignore')}>Ignore</button>
-        <button type="button" class="primary" disabled=${busy} onClick=${() => void decide('trust')}>Trust</button>
-      </footer>
-    </div>
-  </dialog>`
+  <//>`
 }
 
 // The trust prompt's data: the report of the project the page shows (a chat's, or the Settings project's), read again

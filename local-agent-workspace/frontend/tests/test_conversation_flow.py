@@ -217,9 +217,10 @@ def test_open_changes_and_tasks_keep_the_message_box_on_screen(ui, page, width, 
     ui.run(f"fake.socketFor('a').emit({{ type: 'changes', changes: makeChanges({files}) }})")
     ui.emit("a", {"type": "tasks", "tasks": [{**TASKS[2], "id": f"t{n}", "title": f"Task number {n}"} for n in range(12)]})
     expect(page.get_by_role("alert")).to_contain_text("broken-1.jsonl")
-    page.get_by_role("button", name=re.compile("files changed")).click()
-    page.get_by_role("button", name=re.compile(r"^Tasks 0\/12 done")).click()
-    expect(page.get_by_role("region", name="Tasks").get_by_role("listitem")).to_have_count(12)
+    # The status row shows one bar at a time: Continue leads, the changes and the tasks are chips. Each is opened in
+    # turn, and none of them pushes the message box off the screen.
+    page.get_by_role("button", name="Show 12 changes").click()
+    expect(page.get_by_role("button", name=re.compile("files changed"))).to_be_visible()
     compact = page.get_by_role("button", name="Compact now")
     if meter:
         page.get_by_text(re.compile("^Last model input")).click()
@@ -243,12 +244,26 @@ def test_open_changes_and_tasks_keep_the_message_box_on_screen(ui, page, width, 
         assert ui.js("(e => e.scrollHeight === e.clientHeight)(document.querySelector('.context-meter'))")
         topbar = ui.js("document.querySelector('.topbar').getBoundingClientRect().bottom")
     # Every bar (or the open meter's button) is still reachable with the keyboard, with its focus shown.
-    for control in [compact] if meter else [page.get_by_role("button", name="Undo changes to src/module_11/file_11.py"), continue_button(page)]:
+    undo = page.get_by_role("button", name="Undo changes to src/module_11/file_11.py")
+    for control in [compact] if meter else [undo]:
         control.focus()
         expect(control).to_be_in_viewport(ratio=1)
         on_screen()
         if meter:
             assert control.bounding_box()["y"] >= topbar
+    if meter:  # Escape inside the open details closes them (the popover would cover the chip).
+        page.keyboard.press("Escape")
+        assert ui.js("!document.querySelector('.context-meter').open")
+    page.get_by_role("button", name="Show Tasks 0/12 done").click()
+    expect(page.get_by_role("region", name="Tasks").get_by_role("listitem")).to_have_count(12)
+    on_screen()
+    if not meter:
+        page.get_by_role("button", name=re.compile(r"^Tasks 0\/12 done")).focus()
+        page.keyboard.press("Escape")  # Back to Continue, the first item by priority.
+        expect(continue_button(page)).to_be_visible()
+        continue_button(page).focus()
+        expect(continue_button(page)).to_be_in_viewport(ratio=1)
+        on_screen()
 
 
 # Saved drafts

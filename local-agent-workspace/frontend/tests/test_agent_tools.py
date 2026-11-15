@@ -541,8 +541,9 @@ def test_tabs_stay_put(ui, page, width, height):
 def test_narrow_navigation_is_one_scrolling_row(ui, page, width):
     page.set_viewport_size({"width": width, "height": 740})
     open_dialog(ui)
+    # The section list is the dialog frame's scrolling row (.dialog-nav); the tabs sit inside it.
     nav = ui.js("(n => ({ box: n.getBoundingClientRect().toJSON(), scroll: n.scrollWidth, client: n.clientWidth }))"
-                "(document.querySelector('.agent-tools-tabs'))")
+                "(document.querySelector('.agent-tools-dialog .dialog-nav'))")
     content = ui.js("document.querySelector('.agent-tools-content').getBoundingClientRect().toJSON()")
     assert nav["box"]["left"] >= content["left"] - 0.5 and nav["box"]["right"] <= content["right"] + 0.5
     assert nav["scroll"] > nav["client"]  # More sections than fit: the row scrolls instead of wrapping.
@@ -553,7 +554,7 @@ def test_narrow_navigation_is_one_scrolling_row(ui, page, width):
     expect(page.get_by_role("region", name="Extensions")).to_be_visible()
     ui.js("new Promise(done => setTimeout(done, 400))")  # A smooth scroll settles.
     button = page.get_by_role("button", name="Extensions", exact=True).bounding_box()
-    nav_box = ui.js("document.querySelector('.agent-tools-tabs').getBoundingClientRect().toJSON()")
+    nav_box = ui.js("document.querySelector('.agent-tools-dialog .dialog-nav').getBoundingClientRect().toJSON()")
     assert button["x"] >= nav_box["left"] - 1 and button["x"] + button["width"] <= nav_box["right"] + 1
 
 

@@ -55,8 +55,7 @@ def test_the_panel_resizes_by_dragging_or_with_the_keyboard_and_keeps_its_width(
     page.wait_for_function("window.harnessReady === true")
     ui.page.evaluate("() => { mount('App.js', () => ({}), 'default') }")
     ui.show_session("a")
-    page.get_by_role("button", name="Workspace", exact=True).click()
-    expect(panel(page)).to_be_visible()
+    expect(panel(page)).to_be_visible()  # It was open when the page went: that choice is kept (viewPrefs.js).
     assert width(page) == 320
     # Enter (or a double-click) restores the stylesheet's width.
     resizer(page).focus()

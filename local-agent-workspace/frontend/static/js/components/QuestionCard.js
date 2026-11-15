@@ -1,4 +1,4 @@
-import { html, useEffect, useRef, useState } from '../lib.js'
+import { html, hiddenNote, noteLine, visibleParts, visibleText, useEffect, useRef, useState } from '../lib.js'
 import { Check } from '../icons.js'
 import { api } from '../api.js'
 import { expiryTime } from './Conversation.js'
@@ -27,9 +27,15 @@ function answerText(answer) {
   return parts.join(', ')
 }
 
+// A question that waits for you shows hidden and direction-changing characters as visible escapes (the texts the
+// model wrote); the answer sent back is still the option's own label.
 function Legend({ question }) {
-  return html`<legend>${question.header ? html`<span class="question-chip">${question.header}</span>` : null}<span>${question.question}</span></legend>`
+  return html`<legend class="logical-order">${question.header ? html`<span class="question-chip">${visibleParts(question.header)}</span>` : null}<span>${visibleParts(question.question)}</span></legend>`
 }
+
+// The note for the question texts: one when any holds an escaped character or a right-to-left run, else null.
+const questionNote = questions => hiddenNote(questions.flatMap(question => [question.header, question.question,
+  ...optionsOf(question).flatMap(option => [option.label, option.description])]))
 
 // An ask_user tool event: the questions with their options while it waits, then what the user answered.
 export default function QuestionCard({ event, sessionId, onError }) {
@@ -80,6 +86,7 @@ export default function QuestionCard({ event, sessionId, onError }) {
   return html`<section class="question-card needs-answer" aria-label=${heading}>
     <h3>${heading}</h3>
     ${event.approval_expires ? html`<p class="muted">If you do not answer by ${expiryTime(event.approval_expires)}, the agent continues without your answer.</p>` : null}
+    ${noteLine(questionNote(questions))}
     ${questions.map((question, index) => {
       const choice = choices[index] || { selected: [], other: false, text: '' }
       const multi = question.multi_select === true
@@ -99,15 +106,15 @@ export default function QuestionCard({ event, sessionId, onError }) {
         ${multi ? html`<p class="muted question-hint">Choose one or more.</p>` : null}
         ${optionsOf(question).map((option, at) => {
           const description = option.description ? `${name}-${at}-description` : undefined
-          return html`<label class="question-option" key=${at}>
-            <input type=${type} name=${name} aria-label=${option.label} aria-describedby=${description}
+          return html`<label class="question-option logical-order" key=${at}>
+            <input type=${type} name=${name} aria-label=${visibleText(option.label)} aria-describedby=${description}
               checked=${choice.selected.includes(option.label)} onChange=${() => choose(option.label)} />
-            <span><span>${option.label}</span>${option.description ? html`<small class="muted" id=${description}>${option.description}</small>` : null}</span>
+            <span><span>${visibleParts(option.label)}</span>${option.description ? html`<small class="muted" id=${description}>${visibleParts(option.description)}</small>` : null}</span>
           </label>`
         })}
         <div class="question-option question-other">
           <label onPointerDown=${() => { pointer.current = true }}><input type=${type} name=${name} aria-label="Other" checked=${choice.other} onChange=${chooseOther} /><span>Other</span></label>
-          <input type="text" ref=${element => { others.current[index] = element }} aria-label=${`Other answer for: ${question.question}`}
+          <input type="text" ref=${element => { others.current[index] = element }} aria-label=${`Other answer for: ${visibleText(question.question)}`}
             maxLength=${MAX_OTHER} spellcheck=${false} disabled=${!choice.other || sending} value=${choice.text}
             onInput=${e => { const text = e.currentTarget.value; update(index, () => ({ text })) }} />
         </div>

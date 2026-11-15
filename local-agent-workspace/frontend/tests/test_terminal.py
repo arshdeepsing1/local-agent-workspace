@@ -158,7 +158,7 @@ def test_the_shell_command_shows_keyboard_focus(ui, page):
     assert box.evaluate("e => getComputedStyle(e).outlineStyle") == "none"
 
 
-RING = ["solid", "2px", "rgb(44, 132, 219)"]  # the 2 px focus ring (--focus)
+RING = ["solid", "2px", "rgb(79, 70, 229)"]  # the 2 px focus ring (--focus)
 
 
 def test_the_terminal_options_show_keyboard_focus(ui, page):
