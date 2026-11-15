@@ -39,13 +39,19 @@ frontend that runs without a build step.
 - Configurable context budgeting, automatic summaries of older turns (and of a single long
   request's earlier tool results), and a visible context meter. Full conversation history
   stays on disk, and a script turns it into Markdown transcripts.
+- One context percentage in the meter, the context card and the Progress tab. Old tool results leave
+  the request before the chat compacts, a card asks before an automatic compaction, and the context
+  card lists the largest items with **Shorten** and **Drop** (see **Context and project instructions**).
+- An optional browser tool (off by default) that opens pages in a real browser, with an approval for
+  each site (see **Browsing**).
 - Automatic workspace-scoped `AGENTS.md` and `CLAUDE.md` guidance loading, with `.local` variants,
   `@path` imports, path-scoped project rules in `.agents/rules`, and your own `~/.agents/AGENTS.md`.
 - Project memory: short notes the agent saves with your approval (the `remember` tool) and every later
   chat in the project sees, kept in the app's state folder and reviewed in Agent tools → Memory.
 - Output styles (Default, Concise, Explanatory, or your own style files) and shipped skills for
-  writing and reading handoffs, verifying and debugging a change, drafting an `AGENTS.md` (`/init`),
-  committing, opening a pull request, and code and security reviews whose findings show as a card.
+  writing a two-file handoff memory and resuming from it, verifying and debugging a change, drafting an `AGENTS.md` (`/init`),
+  committing, opening a pull request, code and security reviews whose findings show as a card, and
+  running a task as a parallel workflow (`/workflow`).
 - A short Git snapshot (branch, upstream, change counts, recent commits) with the message that starts
   each reply.
 - Workspace file explorer (the project, the conversation's granted folders and folders you add), text
@@ -72,7 +78,8 @@ frontend that runs without a build step.
   and subagents the model starts on its own (explore, general, editor, or a custom agent
   defined in the project's `.agents/agents` files; several in parallel), each in its own
   conversation file linked from its parent's, with a model and effort per agent type. A background
-  subagent works while the chat goes on, and its report reaches the chat when it ends.
+  subagent works while the chat goes on, and its report reaches the chat when it ends. `/workflow <task>`
+  splits a task into parallel subagents, and one approval covers the whole batch.
 - Markdown transcripts of a conversation: download or copy one from the app, or write
   them for many saved conversations with a script.
 - A reasoning effort per conversation (Default, Fast, Medium, High, Extra high, Max) sent in the
@@ -95,10 +102,14 @@ frontend that runs without a build step.
   read 2 files"), subagents started together share a run card with each one's live step and current
   action, and **Workspace / Progress** shows the chat's context, task list and background tasks; a
   card that needs you is never folded away. The full list of actions stays under Activity.
-- Responsive desktop/mobile UI, bundled fonts, and no credential storage in the browser.
+- Responsive desktop/mobile UI with one light style, bundled fonts, and no credential storage in the browser.
 
-This release does not include a browser automation engine, OS computer control,
-cloud sessions, scheduled runs while the app is closed, a full PTY terminal, or an OS execution sandbox.
+This release does not include OS computer control, cloud sessions, scheduled runs while the app is
+closed, a full PTY terminal, or an OS execution sandbox. Browser automation is optional and off by
+default (see **Browsing**).
+
+[`PROGRESS.md`](PROGRESS.md) lists what is done and pending per area, with the percentage
+implemented and each area's share of the app.
 
 ## Quick start
 
@@ -271,8 +282,11 @@ requests or replayed. A local storage failure stops the response and reports tha
 recent history may not have been saved. Back up the whole `conversations/` folder
 (the JSONL files) and the separate operational SQLite database.
 
-**Agent tools → Export** exports a versioned JSON bundle, optionally with
-subagent conversations (32 total, 16 MiB maximum). Export requires idle chats. A reply's
+**Agent tools → Export** exports a versioned JSON bundle. It includes the chat's subagent
+conversations by default (32 conversations in total, 16 MiB at most, newest first). Tick **Export this
+chat only** to leave them out. A subagent chat that does not fit, or that still runs, is left out and
+named in a notice, and the export still succeeds. The bundle format is unchanged. Export requires idle
+chats. A reply's
 signed thinking (kept only while **Settings → Reasoning → Send earlier thinking back** is on,
 see **Reasoning effort and thinking**) is left out unless you tick **Export with reasoning**;
 forks keep it. The text of documents attached to messages is exported (it is in the message the
@@ -296,8 +310,11 @@ be forked this way. **Fork from here** on a reply (see **Edit, retry and rewind*
 copies the conversation up to that reply instead, also from a stopped or failed turn,
 and can put the copy in a new Git worktree. Every fork starts in Manual with no folder
 grants, allow rules or active skills, retains any tool profile restrictions and turned-off
-tools, and does not copy child conversations, task-board records, jobs, queued messages,
-or file checkpoints.
+tools, and does not copy task-board records, jobs, queued messages, or file checkpoints. A fork
+copies the chat's subagent chats that have ended and links the copies to the fork, so the fork and its
+subagents act as one unit. **Fork from here** copies the subagent chats that the kept replies started.
+A subagent chat that is still busy, or that would pass the limit of 31 copied chats, is left out, and
+a notice names it.
 
 An in-place rewind (**Edit**, **Retry**, **Rewind to here**) first saves the whole
 conversation as an archived copy titled `<title> (before rewind)`. The copy keeps the
@@ -323,11 +340,15 @@ when opening a conversation or performing restart recovery.
 
 ## Working with the app
 
-- **Style and theme**: **Settings → Appearance → Style** chooses **Claude** (the default: warm
-  ivory, clay and rounded cards) or **VS Code** (the editor's default colours, fonts and square
-  corners), and **Theme** chooses **Light** (the default), **Dark**, or **Match system**, which
-  follows your computer's light or dark mode and changes with it. Any style goes with any theme.
-  Both apply at once and are kept in this browser only (they are not part of Settings' saved values).
+- **One light style**: the app has one light style, called Studio: a cool grey-white page, white cards,
+  one indigo colour for buttons, selection and focus, and rounded corners. It has no dark mode and no
+  theme or style choice, and it ignores your computer's light or dark setting. Spacing, corners and type
+  sizes come from shared tokens (see `design/README.md`).
+- **Layout**: the workspace panel starts closed on a first visit. Open it with the **Workspace** button. The app
+  remembers your choice after that. One status row above the message box shows the most urgent item
+  (Continue, queued messages, changes or tasks) and the others as small chips. Every dialog (Settings,
+  Agent tools, Permission rules, Folder access and Project trust) has the same frame: a header, a close
+  button and a row of buttons.
 - **Text size**: **Settings → Appearance → Text size** (90% to 150%, default 100%) makes all text of
   the app larger or smaller at once; the layout keeps fitting the window. It applies as soon as you
   choose it and is kept in this browser only (it is not part of Settings' saved values). Browser
@@ -675,6 +696,9 @@ when opening a conversation or performing restart recovery.
   Unsaved editor text stays with its conversation when closing the workspace panel,
   attaching a file, or switching chats. Text entered during a save remains unsaved
   until the next save. Editor drafts are kept in the current page, not across reloads.
+- **Special files**: opening a named pipe, a socket or another special file in Files is refused at
+  once, so it cannot stall the app. Reading a file stops at the size limit, also when the file grows
+  while it is read.
 - **Preview and download files**: in **Workspace / Files**, images (PNG, JPEG, GIF, WebP and SVG) and
   PDF files open in a preview instead of the editor: an image with its size in pixels and bytes, a PDF
   in the browser's PDF viewer (which may name the file by an ID, also in its own download: **Download** in
@@ -684,7 +708,9 @@ when opening a conversation or performing restart recovery.
   editor's text, unsaved edits included, and **Edit** goes back. A Markdown preview is rendered like a
   reply: images beside the file are shown (in the project, or in a folder outside it that Files shows),
   images from the web are not loaded (a dashed note names them), links to files beside it open them in
-  the panel and web links open in a new tab. An HTML file
+  the panel and web links open in a new tab. Replies, plans and side answers follow the same rule: an
+  image from the web shows the text `Image not loaded from <host>: "<alt>"` instead, while images
+  embedded as `data:` and `blob:` addresses still show. An HTML file
   previews in a sandboxed frame with an origin of its own, so it cannot reach the app, its token or
   the API, and it loads nothing from any address (only what the file holds inline), whatever the file
   starts with. Its scripts are
@@ -1109,7 +1135,8 @@ when opening a conversation or performing restart recovery.
   click **Check access**, then **Allow folder** when the server can read it. This
   grants access only to the current conversation; before the first message it creates
   that conversation for you. The check reads no file contents and does not itself
-  grant access. Remove additional grants in the same dialog. When macOS blocks access,
+  grant access. Remove additional grants in the same dialog. Removing a folder under another
+  spelling of the same folder, such as another letter case on a case-insensitive disk, removes the grant. When macOS blocks access,
   expand **Python used by this server** to see the actual executable and compare it
   with the permission you enabled. Browser folder approval does not grant macOS access
   to a separate Python process.
@@ -1119,7 +1146,10 @@ when opening a conversation or performing restart recovery.
   jobs continue; stop them individually in Terminal or **Workspace / Progress**. Approved writes and completed
   shell side effects are retained. Stop also cancels its subagents. Deleting a
   conversation removes its jobs, tasks, and file checkpoint copies; edited files stay
-  on disk. Delete a chat with **More actions** → **Delete…**; one that has subagent chats asks first: **Delete with subagents**
+  on disk. Delete a chat with **More actions** → **Delete…**; one that has subagent chats asks once. The
+  dialog says how many subagent chats the chat has and how many of them still run, and it names up to
+  five of the running ones. A running subagent needs a tick on **Stop them first** before either button
+  works, and deleting the chat stops it either way. **Delete with subagents**
   deletes them too (at every depth, each stopped first), and **Delete, keep subagents** keeps
   them as chats of their own (the API default, `DELETE /api/sessions/<id>?children=keep`);
   a subagent turn the deletion stopped is recorded as stopped.
@@ -1265,7 +1295,10 @@ when opening a conversation or performing restart recovery.
   `scripts/conversation_transcript.py` script writes (see **Agent tools: MCP, skills,
   and hooks**): messages and replies in full, one line per tool call with its main
   input, `ask_user` questions with your answers, `submit_plan` plans in full with how you
-  reviewed them and your feedback, and command output shortened to 600 characters. Common secret shapes and the
+  reviewed them and your feedback, and command output shortened to 600 characters. Tick **Include
+  subagents** before either button to add each subagent's transcript under the card that started it
+  (the page asks for `GET /api/sessions/<id>/transcript.md?subagents=1`); a subagent that cannot be
+  read is named as not found, and the combined text stops at 16 MiB with a note. Common secret shapes and the
   configured Databricks token are replaced with `[REDACTED]`; review it before sharing.
   Both work during a response and show what has been saved so far; their result is shown
   right under the two buttons.
@@ -1289,6 +1322,9 @@ workspace anyway, because commands run in the workspace can still reach it.
   its parent (`parent_session_id`, `parent_event_id`), and the parent's header lists its
   subagents with their task, type, status and file (see **Linked transcripts** under
   **Agent tools: tasks, subagents, and activity**).
+- Malformed characters from the model (half of a surrogate pair) are replaced, so a chat always
+  saves. A pair split across two stream chunks becomes the intended character, and a lone half
+  becomes U+FFFD.
 - `uploads/<conversation-id>/`: the files attached to the chat's messages, each as
   `<sha256>.<extension>` with its record (`.json`: name, type, size, estimated tokens) and, for a
   document, its extracted text (`.extracted.txt`, so a `.txt` file stays as it was); folders 0700,
@@ -1821,6 +1857,109 @@ endpoint's image support off; signed thinking found rejected makes **Send earlie
 skip the endpoint. The thinking stream's shape is recorded for reference only. Databricks' serving
 state of the endpoint (ready, task) is read without a model request.
 
+### Browsing
+
+The agent can use a real browser to check a web app or read a page that needs scripts. This is off by
+default, so a new install has no `browser` tool.
+
+To turn it on:
+
+1. Install the extra into the app's environment: `python -m pip install -c constraints.txt -e './backend[browser]'`.
+2. Install a browser engine once: `python -m playwright install chromium`.
+3. Open **Settings → Browsing**, tick **Let the agent use a browser** and save.
+
+The page shows "Ready." when it works, or says what is missing. The app starts without Playwright. **Browser
+window** is **Automatic** (a window when your computer has a display, hidden otherwise), **Show the window**
+or **Hidden**. **Time limit per action** is 30 seconds by default (5 to 120). The setting names are
+`browser_tools`, `browser_headless`, `browser_action_timeout` and `browser_upstream_proxy`.
+
+The `browser` tool can open a page, read it as an outline with refs, find text, click, type, select, scroll,
+go back and forward, switch tabs, take a screenshot, and read the page's console messages and failed network
+requests. A screenshot shows in the chat. A model that takes images also receives it. A chat has at most
+8 tabs. The agent cannot download files, choose files for upload, accept a permission prompt or answer a
+dialog. The app dismisses these and tells the agent.
+
+Approvals:
+
+- The first time the agent opens a host in a chat, a card shows the action and the host. **Allow once**
+  covers that one action. The **Allow** button for the host in this chat saves a rule for the host (the rule includes the
+  port for a local address). The permission menus label these rules as browser rules.
+- A step that sends data to a public host, such as submitting a form, asks every time, in every mode except
+  Bypass. The card says it submits.
+- The approval holds only for what the card showed. If the tab, the host, the control or the submit fact
+  changed before the action ran, the app refuses with `page_changed` and asks again.
+- Plan mode allows read-only actions only.
+
+Credential fields are refused. The agent cannot type into a password, payment card or one-time code field
+on a real site. The app judges a field by its type, its autocomplete value and its name. The agent also
+stops at a bot check and hands it to you.
+
+Each chat has its own browser profile in the app's state folder (`browser-profiles/<chat id>`), so cookies
+and logins never mix between chats. A profile is kept for its chat, left out of exports and backups, and
+deleted with the chat. At most 3 chats have a live browser at once. A new chat closes the least recently
+used idle one. A browser also closes after 10 minutes without use.
+
+Page content is untrusted. Every page result starts with a notice that the text is data from the web. The
+agent must not follow instructions found on a page. The app redacts secrets from page text, marks text that
+imitates the app's own markers, and leaves out text a person cannot see. A long page comes in 8 KB parts, and
+the agent reads the rest with `get_tool_output`.
+
+#### Network safety
+
+The browser checks every address it loads and refuses private and loopback addresses that you did not
+allow. This covers links, redirects and requests that a public page makes.
+
+Chromium never resolves a host name itself. It sends every request, loopback included, to a filtering proxy
+that the app runs on 127.0.0.1 at a random port. Each chat's browser has its own random credentials for that
+proxy, and a request without them gets 407. The proxy resolves the name, refuses any address that is
+private, link-local, shared (CGNAT), unique-local, a metadata address, multicast or unspecified, and connects
+to the exact address it checked. A name that answers with a public address first and a private one later
+(DNS rebinding) therefore cannot reach your network. A local address works only for a host and port that you
+allowed in that chat. A name that is not a local name and resolves to a local address is refused. A refusal
+shows in the result as "blocked by the address check: host resolved to a private address". TLS stays end to
+end, because the proxy never decrypts. The browser also runs without QUIC and WebRTC UDP, and it sends no
+Windows or Kerberos sign-in to any server.
+
+**Behind a company proxy or Zscaler.** **Proxy for the browser** in **Settings → Browsing** is `auto`,
+`none` or an address:
+
+- `auto` (the default) uses the proxy that your computer is set to, read through Python's
+  `urllib.request.getproxies()`. The order is the environment of the app's backend first (`HTTPS_PROXY`,
+  `HTTP_PROXY` and `NO_PROXY`, in upper or lower case), then System Settings on macOS. An environment
+  variable therefore wins over System Settings. With Zscaler in local proxy mode this is usually
+  `127.0.0.1:9000`. With Zscaler in tunnel mode, or with a VPN, nothing is set, so the browser connects
+  directly and Zscaler captures the traffic below the app. A system SOCKS proxy (the `socks` entry of
+  `getproxies()`, or the SOCKS proxy in System Settings on macOS) is used only when no HTTP or HTTPS proxy
+  is set.
+- `none` always connects directly.
+- An address such as `http://127.0.0.1:9000` names the proxy yourself. Use this when your computer finds its
+  proxy through a PAC file, which the app cannot read: the status line then says "PAC file found: enter the
+  proxy address". A password goes in the address (`http://user:password@host:port`) and shows as `<redacted>`
+  in Settings, the status line and the logs. Only the explicit address can carry a password.
+- `socks5://127.0.0.1:1080` names a SOCKS5 proxy. A user name and password go in the address
+  (`socks5://user:password@host:port`, sent as RFC 1929 sign-in) and show as `<redacted>` in the same
+  places. SOCKS4 is not supported: the status line says so.
+
+With a company proxy the app still resolves and checks every name first, so a private target is refused
+before anything leaves your computer. Then it sends `CONNECT host:port` by host name to the company proxy, or a
+plain request as an absolute URL. The company proxy's TLS inspection works as before, and the certificate in
+your keychain keeps working, because the app adds no certificate flags. Local addresses never go to the
+company proxy, and a page cannot reach the company proxy's own address. A host on your `no_proxy` or
+bypass list (same order) connects directly, but only after it passed the same check.
+
+A SOCKS5 proxy gets the same treatment. The app resolves and checks the name first, then sends a SOCKS5
+CONNECT by host name to the proxy, and relays the bytes. A plain `http://` request goes through that tunnel
+to the checked host and port in its normal form, with the same one request for each connection as on a
+direct connection.
+
+The status line shows the connection that the app found: `direct`, `system proxy host:port`,
+`configured proxy host:port`, `system SOCKS proxy host:port`, `configured SOCKS proxy host:port`, the
+SOCKS4 sentence or the PAC sentence.
+
+One gap remains with a company proxy or a SOCKS proxy. The proxy resolves the name again, so a rebinding name could
+reach whatever that proxy can reach. The app cannot pin the address there without breaking the proxy's own
+rules by host name. Without an upstream proxy the gap is closed.
+
 ### Context and project instructions
 
 **Settings → Context budget (tokens)** and **Max output tokens** default to the endpoint's
@@ -1866,7 +2005,7 @@ checked 2026-10-13): Opus 5.5, Opus 4.8 and GPT OSS 120B each allow 1,000,000 in
 - Databricks reserves Max output tokens against OTPM when each request starts. Above 100,000 a
   request is documented to be rejected with HTTP 429 before it starts (a warning in Settings;
   some workspaces accept more). Above 20,000 four
-  requests at once (a chat and up to three subagents, or several chats) can be rejected; the
+  requests at once (a chat and up to three subagents at the default **Subagents at once**, or several chats) can be rejected; the
   app then waits and retries. 20,000 keeps one fifth of OTPM free; at 16,384, four requests
   reserve 65,536.
 - Each agent step sends up to the whole context budget. Above 250,000 tokens, four full steps
@@ -1955,6 +2094,50 @@ input budget, nothing is summarized: the request is sent as it is and the contex
 details say so. Only a request over the input budget, or a manual compaction, falls
 back to a cut that merely fits the budget, so compaction never runs a billed summary
 request that leaves the request over the threshold.
+
+**One context percentage.** The collapsed meter, the context card and **Workspace → Progress** show the
+same number. It is the tokens in use divided by the **Context budget** setting, and the card names that
+limit ("context budget"). While Databricks' count for the last request is current, the tokens are that
+count. Otherwise the tokens are the app's estimate, and the card shows "estimate". The auto-compact mark
+sits on the same scale, so a mark at 81% means the threshold is 81% of the context budget. The
+Auto-compact setting above is still a share of the input budget, which is smaller than the context budget.
+The card also shows how many tokens of the last request came from the cache.
+
+**Trimming old tool results.** Before a request goes out, the app can replace old tool results with a
+short notice. This is on by default (**Settings → Model and context → Trim old tool results from
+requests**). A pass starts when the request passes the start mark, 70% of the input budget by default
+(40 to 90). It stops once the estimate is under the target mark, 55% by default (20 to 85, at least 5
+below the start). The start mark is also kept at least 5 points below the auto-compact threshold, and the
+settings page shows the marks in effect.
+
+A pass takes results in this order: file reads that a later read or edit replaced, then results of 2 KB or
+more, oldest first. It never touches your last three turns, your messages, the summary or the results of
+tools such as `ask_user` and `remember`. A result under 4 KB is dropped. A larger one is shortened to its
+start and end. The notice says what was removed and how to get it back, for example by reading the file
+again. Your transcript and the saved conversation keep every full result. Two passes never run within
+four turns of each other. A pass also runs only when it frees at least 10% of the input budget or reaches
+the target, so one small pass does not start again at once. A pass adds one notice to the chat, such as
+"Shortened 6 old tool results to save context (about 21,000 tokens)". An export keeps the marks, and a
+rewind to before a result removes its mark.
+
+**Shorten and Drop.** The context card lists the ten largest items of the live context. For an item the app
+may trim, **Shorten** keeps its start and end and **Drop** replaces it with a notice. Each button first
+shows what it frees and how many cached tokens the next request reads again, and it acts only after you
+confirm. Items that the app never trims have no buttons. You cannot trim while a turn runs.
+
+**Why trimming costs cache.** Prompt caching keeps the start of a request cheap to send again. A trim
+changes the text inside that start, so the next request re-reads everything after the trimmed item at the
+normal rate, and the cache writes it again at the higher write rate. In the scripted long chat of the test
+suite, the first compaction came at turn 17 instead of turn 12 with trimming on, and cache writes were 1.52
+times those with trimming off. The chat compacted later but wrote more cache. Turn trimming off if you
+care more about cache cost than about how long a chat runs before it compacts.
+
+**Choice before compaction.** With **Ask before compacting a long chat** on (the default), a message that
+would start an automatic compaction first shows a card. **Compact now** summarizes earlier turns, then
+answers your message. **Continue without compacting** sends your message as it is, and the app compacts
+only when the request no longer fits, with a notice. From 85% of the threshold, a quiet notice offers
+**Compact now** ahead of time. The card never appears in the middle of a turn, in a scheduled run, for
+a script or for a subagent. With the setting off, compaction starts without asking, as before.
 
 **Last model input** shows what Databricks reported for the latest agent request
 once a report arrives: "Last model input · 10,000 tokens · 5.5%", where the
@@ -2701,7 +2884,7 @@ a listed skill with `use_skill` when it fits the task. Skill descriptions from
 that workspace, with the same trust as `AGENTS.md`: review skills you did not write. The
 context details list the index as **Skill index · applies to this workspace**.
 
-The app also ships seven short skills, available in every workspace and replaced the same way
+The app also ships these short skills, available in every workspace and replaced the same way
 by a project's own copy:
 
 - `/verify` (`skills/verify/SKILL.md`): finds the project's own test, lint and build commands
@@ -2719,21 +2902,24 @@ by a project's own copy:
   output), writes a message in the repository's style (Conventional Commits when it has none) and
   commits. Each `git add` and `git commit` is a command with its approval card; it never skips hooks,
   amends or pushes.
+- `/migrate-handoffs [project] [folder]` (`skills/migrate-handoffs/SKILL.md`): a one-time step per
+  project. It moves old one-file handoffs into `handoffs/HANDOFF/` as session logs with zero-padded
+  versions in date order, then writes the project brief. Run it once, then use `/handoff`.
 - `/pr` (`skills/pr/SKILL.md`): checks that `gh` is installed and signed in, creates a branch when you
   are on the base branch, commits as `/commit` does, pushes the branch (`git push -u origin HEAD`,
   never `--force`) and opens the pull request with `gh pr create` and a Summary, Changes and Testing
   body. Every push and `gh` command shows its card; it never merges, closes, approves or turns on
   auto-merge unless you ask. The Changes view then shows the pull request's status.
+- `/resume [project] [folder]` (`skills/resume/SKILL.md`): at the start of a session, reads the
+  project brief and the newest session log only. It replies with a five-line summary, the open items
+  and the next action, and starts no work. The brief wins when it disagrees with the log.
+- `/workflow <task>` (`skills/workflow/SKILL.md`): runs a task as a parallel workflow. Only you start
+  it: the model does not list or load it. It splits the task into independent parts, starts them as one
+  batch of subagents and combines their reports (see **Workflows** under **Agent tools: tasks,
+  subagents, and activity**).
 - `/review` (`skills/review/SKILL.md`): reviews the uncommitted changes, a branch or a pull request
   read-only (reading the code around each change and its callers) for correctness, security,
   regressions and missing tests, and reports with `report_findings`.
-- `/read-handoff` (`skills/read-handoff/SKILL.md`): reads a handoff without filling the context:
-  its Contents list (or headings) first, then only the sections that carry state (status, open
-  items, next actions, requirements, decisions, errors and fixes, work done, file changes, key
-  facts), skipping the command and activity logs, the runbook and resource lists, which it searches
-  only for a detail the task needs; then replies with a short orientation. `/handoff` reads a
-  compacted chat's auto handoffs the same way, oldest first, so its handoff covers the chat from
-  its start.
 - `/security-review` (`skills/security-review/SKILL.md`): traces untrusted input through the change
   (injection, access checks, secrets, network, crypto, files, dependencies) and reports only issues
   with an exploit path, with `report_findings`.
@@ -2790,24 +2976,54 @@ Review @$1 for correctness bugs, with a focus on $2. Report each one with path:l
 `/check src/parser.py "error handling"` then sends the review request with a snapshot of
 `src/parser.py` (the quotes keep the two words together as `$2`; without them `$2` is `error`).
 
-The app ships a detailed handoff skill at `skills/handoff/SKILL.md`, available in every
-workspace: send `/handoff Create a handoff for this conversation` (or type `/han` and
-press Enter to insert the command). To change it for one project, copy it to
-`<chat workspace>/.agents/skills/handoff/SKILL.md` (for example
-`my-project/.agents/skills/handoff/SKILL.md`) and edit the copy; that copy then
-replaces the shipped skill in that workspace. It asks for a cold-start
-document in the style of a long working-session memory file, written in parts of
-about half the file text one response can hold (about 16 KB at the 16,384 Opus 5.5
-default, about 8 KB at 8,192) so no single response hits the output limit,
-and ends by calling `insert_activity_log`. Select **Accept edits** first to avoid approving every part.
-The skill uses 6 KB of the 8 KB skill budget. Automatic compaction handoffs (see
-Context and project instructions) are written from the turns being compacted; use the
-skill when you want a curated handoff, for example before ending a session.
+The app ships three handoff skills, available in every workspace. Together they keep a
+two-file handoff memory for a project in the `handoffs/` folder of the workspace (or another
+folder you name):
 
-A handoff can also be built from a project's earlier material, such as older handoffs,
-memory files and past conversations, for example: `Read ~/notes/project-v*.md,
-handoffs/*.md and history/*.md, oldest first, and use /handoff to write one detailed
-handoff in handoffs/`. The skill tells the model to list the files, read each one once
+```text
+handoffs/
+  <project>-00-context.md                         the project brief
+  HANDOFF/
+    <project>-handoff-v01-2026-11-02-<topic>.md   session logs, one per session
+    <project>-handoff-v02-2026-11-09-<topic>.md
+  auto/                                           automatic compaction handoffs (unchanged)
+```
+
+- `/handoff [project] [folder]` (`skills/handoff/SKILL.md`) runs at the end of a session. It
+  writes a new session log in `HANDOFF/` with 12 fixed sections. A log is append-only: no later
+  session edits it. Its version is zero-padded (`v01`, `v02`) and its command list comes from
+  `insert_activity_log`. The same run creates or fully rewrites the brief,
+  `<project>-00-context.md`, which has 11 fixed sections and shows the project as it is now. The
+  brief has a session index that lists every log. Aim for 32 KB and never go over 48 KB. A
+  log splits into `-part2.md` at 100 KB, or at the file write limit if that is lower. Neither file
+  holds a secret value.
+- `/resume [project] [folder]` (`skills/resume/SKILL.md`) runs at the start of a session. It reads
+  the brief and the newest log only, replies with a five-line summary, the open items and the
+  next action, and starts no work. A new session reads one current brief and one log, not every
+  log. Older logs hold facts that later became false, so the brief wins a conflict.
+- `/migrate-handoffs [project] [folder]` (`skills/migrate-handoffs/SKILL.md`) runs once per
+  project. It moves old one-file handoffs into `HANDOFF/` with zero-padded versions in date
+  order and writes the brief.
+
+`<project>` is the name you give, else the Git repository name, else the workspace folder name.
+Send `/handoff` (or type `/han` and press Enter to insert the command). To change a skill for
+one project, copy it to `<chat workspace>/.agents/skills/<id>/SKILL.md` (for example
+`my-project/.agents/skills/handoff/SKILL.md`) and edit the copy. That copy replaces the shipped
+skill in that workspace.
+
+Each file is written in parts of about half the file text one response can hold (about 16 KB at
+the 16,384 Opus 5.5 default, about 8 KB at 8,192), so no single response hits the output limit.
+The log ends by calling `insert_activity_log`. Select **Accept edits** first to avoid approving
+every part. The `handoff` skill uses about 7 KB of the 8 KB skill budget. Automatic compaction handoffs
+(see Context and project instructions) are written from the turns being compacted. In a compacted
+chat, `/handoff` also reads that chat's automatic handoffs in `handoffs/auto/` by their Contents
+list and state sections, so its log covers the chat from its start. Use the skill when you want a
+curated handoff, for example before ending a session.
+
+A handoff can also be built from a project's earlier material, such as memory files and past
+conversations, for example: `Read ~/notes/project-v*.md and history/*.md, oldest first, and use
+/handoff to write the log and the brief in handoffs/`. A project with old one-file handoffs runs
+`/migrate-handoffs` once before its first `/handoff`. The skill tells the model to list the files, read each one once
 in full, and rely on the app's in-request compaction when they do not all fit (see
 Context and project instructions). Give it past conversations as Markdown transcripts,
 not as their `.jsonl` files, which are several times larger and hold lines too long for
@@ -2822,7 +3038,8 @@ the messages and replies in full (a subagent's delegated prompt and the app's me
 background subagent are labelled as not yours), one line per tool call with its main input, questions
 with the user's answers, plans in full with their review outcome and feedback, and
 command output shortened to 600 characters (`--excerpt`). `--out all.md` joins them,
-oldest first. The script needs only Python 3 and replaces common secret shapes with
+oldest first. With `--with-subagents`, each conversation's subagent chats (the files in the same
+folder whose header names it as parent) are written under the card that started them. The script needs only Python 3 and replaces common secret shapes with
 `[REDACTED]`, but transcripts contain whatever the conversations did: review them before
 sharing. Copy a conversation file first if the app is running.
 
@@ -3011,7 +3228,9 @@ applies. `max_steps` is 1–24 model requests (default 10). The child uses its a
 and effort (**Settings → Subagents**: explore runs at Fast on the chat's model by default) and
 otherwise the chat's model (and its reasoning setting when the chat has one). It inherits workspace,
 permission mode, folder grants, turned-off tools, and "Allow for this chat" rules (a copy:
-rules the child adds stay in the child); project and all-project rules apply to it as to the
+rules the child adds stay in the child; removing a folder grant or an "Allow for this chat" rule
+also takes it from the chat's running subagents, a call already running may finish and the next one
+asks, while adding one does not reach a running subagent); project and all-project rules apply to it as to the
 parent. Children cannot delegate again or start managed background jobs. The child's first
 prompt asks it to end with `submit_report`, a tool only subagents get: a structured report with a
 `summary` (up to 2,000 characters), `findings` (up to 30, each with `text` and optionally `path` and
@@ -3023,11 +3242,12 @@ answers in plain text instead still reports that reply, as before. In a subagent
 yourself, `submit_report` is not offered (and refused if called): the agent answers there in its reply.
 
 Several `delegate_task` calls next to each other in one model response run in parallel.
-Their approval cards (Manual and Plan ask) come one at a time, in call order, and none of
-them starts before every card is answered; then they all start. Other tool calls run one at
-a time in their order, so a call after the delegations waits for them. At most three
+In Manual and Plan, a batch of two or more asks once (see **Workflows** below), and
+none of the subagents starts before the answer; then they all start. Other tool calls run one at
+a time in their order, so a call after the delegations waits for them. By default three
 subagents run at once over all chats (a chat and three subagents is the model endpoint's
-request budget, see **Rate limits**); a further one waits for a free slot and its card says
+request budget, see **Rate limits**; **Settings → Subagents → Subagents at once** changes it, see
+**Workflows** below); a further one waits for a free slot and its card says
 **waiting for a free slot**. Every call gets exactly one result, in call order, also when a
 child fails or is stopped. Files are shared, so the model gives parallel subagents
 independent work, never edits that could conflict. If two running subagents of one chat change the
@@ -3052,6 +3272,66 @@ rows that wait for you, failed, were stopped or were not run. In chats from earl
 `delegate_task` cards next to each other (with only hook cards or notices between them) form a run
 the same way. With **Settings → Appearance → Group tool calls in the transcript** turned off, the
 cards show on their own, without the head.
+
+**Workflows.** A workflow is one batch of subagents that a chat starts for a task. Each subagent keeps
+its own conversation, and the chat combines their reports. Three ways start one:
+
+- The model delegates by itself with `delegate_task`, as described above.
+- `/workflow <task>` is a shipped skill (`skills/workflow/SKILL.md`) that only you start. It tells the
+  agent to split the task into a small number of independent parts, start them as one parallel batch of
+  subagents in the foreground, wait for all reports and combine them. It gives no two parts the same
+  files to edit. When the task has only one part, the agent does it itself.
+- A project can define its own workflow as a command file, `.agents/commands/<name>.md`, which you run
+  as `/<name> <arguments>` (see **Custom commands**). For example, `.agents/commands/review-parts.md`:
+
+  ```markdown
+  ---
+  description: Review a change in three parallel parts and combine the reports.
+  argument-hint: <what to review>
+  ---
+  Review this as a workflow of three subagents: $ARGUMENTS
+
+  Start the three parts below in one response, as three delegate_task calls next to each other.
+  A subagent sees nothing of this chat, so put the scope, the paths and the report you expect
+  into each task.
+
+  1. Correctness. agent_type explore. Look for wrong logic and missed edge cases.
+  2. Security. agent_type explore. Look for untrusted input that reaches commands, paths or SQL.
+  3. Tests. agent_type explore. List the changed behaviour that no test covers.
+
+  When all three reports are back, write one reply with a verdict in one sentence and the
+  findings in one list, most severe first. Change no file.
+  ```
+
+  `/review-parts the uncommitted changes` puts that text in place of `$ARGUMENTS`. In every case the
+  model decides how to run the parts, and nothing forces it to delegate.
+
+One approval covers a batch. When two or more subagents of one reply need approval (Manual and Plan
+modes), the run head shows one block that lists each subagent's task, agent type, tool profile and step
+limit. It offers **Allow all**, **Decline all** (with an optional note), **Allow subagents in this chat**
+and **Review one by one**. The last one turns the batch into one card per subagent, answered in turn as
+before. A lone `delegate_task` call keeps its own card, and a rule or a mode that allows subagents shows
+no card at all. When a hook changes a call after **Allow all**, that call asks again on its own card with
+the changed arguments. Inside a subagent, its own tool calls still ask on its own cards. The run head
+also says who started the batch: **Started by you** for `/workflow` or a command file, **Started by the
+agent** otherwise. This note is not part of an exported bundle.
+
+Two limits in **Settings → Subagents** bound a workflow:
+
+- **Subagents at once** (1 to 8, default 3) is how many subagents run together over all chats. The app
+  divides the endpoint's rate limits among the chat and this many subagents. More at once means a
+  smaller share for each request, and the Settings warnings about the output and context budgets use
+  that share. A change never stops a running subagent. A further one waits for a free slot.
+- **Subagents per turn** (1 to 24, default 6) is how many one chat may start in one turn, background ones
+  included. The agent gets a refusal for each call over the limit and continues with the subagents it
+  has. A wake turn after a background subagent (see below) shares the allowance of the turn that started
+  it. Your next message starts a fresh allowance.
+
+A chat and its subagent chats act as one unit. **Fork** copies the ended subagent chats, **Export**
+includes them, **Delete** asks once about them, and the Markdown transcript can hold them (see the
+sections on those actions). A subagent conversation stays a separate file linked to its parent: one
+shared file would make every save rewrite all children, and one damaged record would hide the whole chat.
+`docs/workflows-design.md` gives the reasons and the status of each limit.
 
 The parent receives a bounded result (at most 6,000 bytes as JSON; the prose report is shortened
 first, then the file list, then a structured report): `child_session_id`, `agent_type`, `tool_profile`, `status`
@@ -3094,7 +3374,7 @@ title. Unfinished delegated runs are marked interrupted on restart rather than l
 
 **Background subagents.** With `background: true` (or an agent file's `background: true` when the
 call does not say), `delegate_task` returns at once with the child's ID, `status` (`running`, or
-`queued` while all three subagent slots are taken) and `background: true`, and the chat goes on; its
+`queued` while all subagent slots are taken) and `background: true`, and the chat goes on; its
 turn may end while the subagent works. A queued one starts within what the chat allows when its slot
 frees (its subagent tool ceiling, turned-off tools and mode at that time); one that then cannot start
 (for example `delegate_task` was turned off, or the chat's new mode needs approval for it) ends as
@@ -3147,7 +3427,8 @@ call returns as cancelled. A restart closes a card that still waited without mar
 finished turn interrupted.
 
 **Linked transcripts.** Every subagent is a conversation of its own:
-`conversations/<id>.jsonl` in the state folder, like any chat. Its header (the first line)
+`conversations/<id>.jsonl` in the state folder, like any chat. It stays a separate file linked to its
+parent, and `docs/workflows-design.md` gives the reasons. Its header (the first line)
 keeps `parent_session_id`, `parent_event_id` (the parent's card) and `parent_call_id`, its
 `agent_type`, `tool_profile`, `max_steps`, and `delegation` (status, completed actions, last
 tool, the `model` and `effort` it started with, start and end times). A child whose agent set
@@ -3533,6 +3814,10 @@ Rule kinds:
   project folder (no `cwd`, or the project itself), because another folder has other Makefiles
   and scripts; **Allow for this chat** on a card for another folder remembers the exact text
   with that folder and matches only there. Deny and ask rules apply in every folder.
+  A folder rule also applies to another letter case, or another Unicode form, of the same folder
+  when the disk treats them as one folder (the macOS default). When the app cannot tell, a deny or
+  ask rule applies and an allow rule does not. A folder name with a non-ASCII letter does not make the
+  app misjudge the disk's letter case.
 - **File edits** (`write_file`, `edit_file`, `insert_activity_log`, `move_path`, `delete_path`,
   `notebook_edit`), optionally only under one absolute folder. An allow rule needs every path the
   tool touches inside the folder; a deny or ask rule applies when any of them is (both ends of a move).
@@ -3586,9 +3871,19 @@ file, so never an output file), `cut`, `tr`, `nl`, `tac`, `paste`, `comm`, `cmp`
 (files only, not `-r`), `ls`, `du`, `find` (tests and `-print` only: never `-exec`, `-delete`,
 `-fprint` or `-L`), `sed` (only `-n`, `-E` and scripts that print, delete, substitute or
 transliterate: no `-i`, `w`, `r` or `e`), `awk` (no `system`, `getline`, `ARGV`, `ENVIRON`, pipes
-or `print >` to a file; `-F` and `-v` only), `echo`, `pwd`, `basename`, `dirname`, `date +FORMAT`,
+or `print >` to a file, also when a `print` or `printf` runs over several lines; `-F` and `-v` only;
+an awk program the app cannot classify asks instead of running: a number written directly against
+a name, non-ASCII characters outside strings, and a regex with a `/` or a character class inside
+brackets. A `/` counts as division or as the start of a regex only where `gawk`, `mawk` and the
+one-true-awk agree: division after a number, a string, a name, a field, `]` or the `)` of an
+expression, and a regex after an operator, `{`, `}`, `;`, a newline, `print`, `return` or the `)` of an
+`if`, `while` or `for` header. Anywhere else the command asks, for example a `/` right after `++`
+or `--`, `$` or `[`, or after a keyword such as `case`, `default` or `switch`), `echo`, `pwd`, `basename`, `dirname`, `date +FORMAT`,
 `true` and `false`, and Git `status`, `diff`, `show`, `log` (no `-p`), `branch` (listing only),
-`rev-parse` and `ls-files` with their read-only options, `-C <folder>` and `-- <paths>`. Parts
+`rev-parse` and `ls-files` with their read-only options, `-C <folder>` and `-- <paths>`. `git diff`,
+`git show`, `git status` and `git ls-files` leave out files inside credential folders (`.ssh`, `.gnupg`,
+`.aws`, `.kube`, `.docker`, in any letter case) at any depth. They refuse a pathspec with `..`, and
+`git diff` and `git show` refuse to show a single blob. The Changes view is unchanged. Parts
 may be joined by `|`, `&&`, `||`, `;` and line breaks, start with `cd <folder> &&`, and use
 `2>&1`, `>/dev/null`, `2>/dev/null` and `</dev/null`. Every path and every folder (also `cwd`)
 must be in the project, a folder granted to the chat or the default code folder, and must not
@@ -3641,7 +3936,12 @@ letter outside ASCII (`é`, `ß`), a recursive `grep` or `rg` is not checked as 
 approval (Plan and Don't ask block it). So is a recursive `grep` when a pattern has a backslash or a bracket other than
 letters, digits and ranges (use `rg`). Neither skips a name that matches only once its letters are folded
 (`ſecrets.yaml` with a long s, a Kelvin sign `K` or a ligature such as `ﬁ`), though a command that names such
-a file still counts it as one. Command and MCP results are redacted before the agent sees them: the
+a file still counts it as one. A credential folder (`.ssh`, `.gnupg`, `.aws`, `.kube`, `.docker`, in any
+letter case) is stricter: a command that searches or reads it recursively (`grep -r`, `rg`, `find`,
+`ls -R`), names the folder or a file nested inside it, changes into it (`cd`, `git -C`) or starts inside
+it is not checked as read-only, so it asks (Plan and Don't ask block it). Listing the top level by name
+(`ls`, `ls -l`, `du -s`) is still checked as read-only, and so are the public files named above. Only
+folders below the project root count. Command and MCP results are redacted before the agent sees them: the
 Databricks token, the credential file's values for keys that name a token, secret, password, key,
 credential, auth or cookie (8 characters or more; not a sign-in method such as
 `DATABRICKS_AUTH_TYPE=databricks-cli`), MCP secret references, and GitHub, Databricks and AWS
@@ -3725,7 +4025,8 @@ by folder path, so a worktree or a moved project starts without them.
 The server binds to `127.0.0.1`, checks Host/Origin, and uses a random local access
 token to protect its API/WebSocket. The page cannot be shown inside another site's frame, and
 its own frames (the Workspace preview) can load nothing but the preview itself (the scripts of an
-HTML preview, once you choose **Run scripts**, can still open WebRTC connections). Databricks
+HTML preview, once you choose **Run scripts**, can still open WebRTC connections). The page's content
+security policy lets images and media load only from the app itself, `data:` and `blob:`. Databricks
 credentials stay server-side. File
 tools resolve paths and symlinks before checking the project and approved additional
 folders. Bypass mode skips that folder boundary; credential files and generated
@@ -4067,6 +4368,14 @@ echo "Review the diff" | python3 scripts/agent_run.py --output stream-json -
   terminal, and `json` / `stream-json` write such characters as `\u` escapes (the parsed JSON is
   the same). An answer the app refuses (an Other answer over 1,000 characters, say) is replaced at
   once by the default (declined, questions skipped, or back to planning), with a message on stderr.
+  The page's approval cards, plans and questions show such characters as visible escapes too, each
+  marked and with a note on the card, and what the app sends when you approve is unchanged. Emoji
+  sequences and scripts that need joiners are left as they are. Hidden characters are controls and
+  format characters, unassigned and private-use characters, default-ignorable characters, and a third
+  combining mark on one letter. Right-to-left words are not escaped. They are kept in typing order, so
+  they cannot reorder the command around them. The same escapes apply to diff lines and file paths in the
+  Changes view, the rewind dialog and the project trust dialog. A plan with very many hidden
+  characters is shown as plain escaped text.
   A subagent's cards are answered the same way. `--approve ask` also prints the card's warnings
   before you answer, as the page shows them: a secret file the command reads, a protected file, a
   hook that asked, a hook that changed what the agent proposed (with what it proposed), a command
@@ -4291,7 +4600,14 @@ python -m playwright install chromium
 python -m pip install -c constraints.txt -e './backend[lint]'
 python -m ruff check --select F,E9 backend frontend/tests scripts
 python3 scripts/check_personal_data.py
+
+# The percentages and shares in PROGRESS.md match its lists (also run by CI):
+python3 scripts/check_progress.py
 ```
+
+The progress check fails when a number in `PROGRESS.md` does not match its lists. After you tick or
+add an item, run `python3 scripts/check_progress.py --write` to refresh the numbers. CI runs the
+check.
 
 GitHub Actions (`.github/workflows/tests.yml` at the repository root) runs the personal-data
 check, the lint check and the backend, UI and end-to-end tests on Ubuntu and macOS for pull
@@ -4422,8 +4738,9 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
 - `backend/local_agent/activity.py`: app-generated activity log for handoffs (`insert_activity_log`).
 - `backend/local_agent/transcript.py` / `scripts/conversation_transcript.py`: Markdown transcripts of saved conversations (also `GET /api/sessions/<id>/transcript.md`).
 - `backend/local_agent/redaction.py`: common secret shapes replaced in logs, handoffs and transcripts, and the high-confidence ones in command and MCP results.
-- `skills/`: skills shipped with the app and offered in every workspace; `handoff/SKILL.md` is the detailed handoff skill and `read-handoff` reads one, `verify`, `debug` and `init` run a project's checks, debug a reported failure and draft its `AGENTS.md`, and `commit`, `pr`, `review` and `security-review` are the Git skills. A workspace's `.agents/skills/<id>/` replaces the shipped skill with that ID.
+- `skills/`: skills shipped with the app and offered in every workspace; `handoff` writes the session log and the project brief, `resume` reads the brief and the newest log, `migrate-handoffs` moves old handoffs into that layout once, `verify`, `debug` and `init` run a project's checks, debug a reported failure and draft its `AGENTS.md`, and `commit`, `pr`, `review` and `security-review` are the Git skills, and `workflow` runs a task as a parallel batch of subagents. A workspace's `.agents/skills/<id>/` replaces the shipped skill with that ID.
 - `agents/`: agent files shipped with the app (`plan.md`); a project's `.agents/agents/<name>.md` or `.claude/agents/<name>.md` of the same name replaces one.
+- `scripts/check_progress.py` / `PROGRESS.md`: the progress tracker and the script that recomputes its percentages and shares.
 - `backend/local_agent/telemetry.py`: inference ledger, validated usage, DBU estimates, and failure categories.
 - `backend/local_agent/usage_export.py` / `scripts/usage_report.py`: usage rows and CSV correlated with conversation history.
 - `backend/local_agent/usage_overview.py`: usage across chats (`GET /api/usage`, `usage_report.py --all`) from each conversation's usage summary.
@@ -4456,7 +4773,9 @@ scoping and permissions, and the Markdown transcript endpoint's content, redacti
   `attention.js` holds browser notifications, the tab-title count and unread tracking, `drafts.js` saves
   message drafts, `markdown.js` renders and highlights replies, and `components/AgentToolsDialog.js` is the Agent tools dialog.
 - `frontend/tests/`: browser tests (pytest + Playwright) with a fake backend.
-- `design/`: original visual concept and extracted design tokens.
+- `design/`: the Studio style (tokens, layout rules, the screen list and task click counts), the mock-ups in `mockups/` and the original concept image, kept as design history.
+- `docs/`: design notes. `docs/harness-study.md` records a feasibility study of running chats on a Claude
+  Code style agent harness, and `docs/workflows-design.md` records the workflow design.
 
 Provider documentation:
 [Databricks function calling](https://docs.databricks.com/aws/en/machine-learning/model-serving/function-calling),

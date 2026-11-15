@@ -4,6 +4,142 @@ Notable changes to Local Agent Workspace, newest first. Dates are UTC.
 
 ## Unreleased
 
+Agent workspace upgrade (2026-11-15), the eight items in short:
+
+- Handoffs: `/handoff` writes a session log and rewrites a project brief. `/resume` reads the brief and the
+  newest log only. `/migrate-handoffs` moves old one-file handoffs into the new layout. The
+  `read-handoff` skill is gone.
+- Browser: the agent can use a real browser (`browser` tool). It is off by default. Turn it on in
+  **Settings → Browsing** after you install the `browser` extra and Chromium (see **Browsing** in the
+  README). It asks per host, asks again for each step that sends data, refuses password, card and code
+  fields, and keeps one profile for each chat. The browser refuses private and loopback addresses that
+  you did not allow.
+- Browser network safety: Chromium sends every request to a local filtering proxy that resolves each name,
+  checks the address and connects to the address it checked, which closes DNS rebinding. It works behind a
+  company proxy such as Zscaler. New setting **Proxy for the browser** (`browser_upstream_proxy`: `auto`,
+  `none` or an address). QUIC and WebRTC UDP are off.
+- Interface: the app has one light style (Studio). Dark mode, **Theme** and **Style** are gone, and old
+  saved choices are ignored. The workspace panel starts closed on a first visit. One status row above
+  the message box replaces the separate bars. All dialogs share one frame.
+- Context: the meter, the context card and the Progress tab show one percentage, measured against the
+  context budget. The app shortens old tool results before the chat compacts (start 70%, target 55% of the
+  input budget, with a notice in the chat). The context card lists the largest items with **Shorten** and
+  **Drop**. A card asks before an automatic compaction. New settings are **Trim old tool results from
+  requests**, **Start trimming at**, **Trim down to** and **Ask before compacting a long chat**. Trimming
+  can raise cache writes, because the next request re-reads the text after a trimmed result.
+- Progress tracker: `PROGRESS.md` lists what is done and pending for each area, with percentages that
+  `scripts/check_progress.py` checks.
+- Harness study: `docs/harness-study.md` records whether to run chats on a Claude Code style harness.
+- Live checks: `docs/live-checks.md` gives the steps and a checklist for the checks that need a real
+  workspace: the paid harness check, measuring the trim default, and the browser behind a company proxy.
+- Workflows: each subagent chat stays a separate file linked to its parent, `/workflow <task>` starts a
+  parallel batch, and one approval covers a batch (details below).
+- Fixes: several rounds of security and reliability fixes (details below).
+
+Workflows (2026-11-15):
+
+- `/workflow <task>` is new. It is a shipped skill that only you start. It tells the agent to split the
+  task into a small number of independent parts, start them as one parallel batch of subagents, wait,
+  and combine the reports. A project can also define its own workflow as a command file,
+  `.agents/commands/<name>.md`.
+- One approval covers a batch. When several subagents of one reply need approval (Manual and Plan
+  modes), one block in the run head lists them with **Allow all**, **Decline all**, **Review one by one**
+  and **Allow subagents in this chat**. A call that a hook changes after **Allow all** asks again on its
+  own card with the changed arguments. The run head says "Started by you" or "Started by the agent".
+- **Settings → Subagents** has two new limits. **Subagents at once** (`subagents_running_max`, default 3,
+  1 to 8) sets how many run together. More at once means a smaller share of the endpoint's rate limit for
+  each request. **Subagents per turn** (`subagents_per_turn_max`, default 6, 1 to 24) limits one turn. A
+  call over the limit is refused and the agent continues with the subagents it has. A wake turn after a
+  background subagent shares the allowance of the turn that started it.
+- A chat and its subagent chats now act as one unit. Fork copies the ended subagent chats and relinks
+  them. Children over the limit of 31, or still busy, are left out and named. Export includes subagent
+  chats by default, has an **Export this chat only** option, and no longer fails when there are too many
+  or one is busy. Delete asks once, says how many subagent chats exist and how many still run, and needs a
+  tick to stop the running ones. The Markdown transcript can include each subagent's transcript under the
+  card that started it (`--with-subagents` for `scripts/conversation_transcript.py`, `?subagents=1` for
+  the route, **Include subagents** in the app). The bundle format is unchanged.
+- Subagent conversations stay separate files linked to their parent. The reasons are in
+  `docs/workflows-design.md`.
+
+Design notes (2026-11-15):
+
+- `docs/harness-study.md` records a feasibility study of running chats on a Claude Code style agent
+  harness. `docs/workflows-design.md` records the workflow design and its status.
+
+Security and robustness fixes (2026-11-15):
+
+- Read-only command check: in Auto and Plan, awk programs are checked more strictly. A `print` or
+  `printf` that runs over several lines keeps its redirect check. A number written directly against a
+  name and non-ASCII characters outside strings are no longer checked as read-only. A `/` is accepted
+  as division or as the start of a regex only where `gawk`, `mawk` and the one-true-awk agree. Division
+  after a number, a string, a name, a field, `]` or the `)` of an expression is accepted. A regex after
+  an operator, a `{`, `}`, `;`, a newline, `print`, `return` or the `)` of an `if`, `while` or `for`
+  header is accepted. Anywhere else the command asks (Auto) or is refused (Plan). Examples are a `/`
+  right after `++` or `--`, after `$` or `[`, after a keyword such as `case`, `default` or `switch`, and
+  inside a regex with a `/` or a character class in brackets.
+- Credential folders (`.ssh`, `.gnupg`, `.aws`, `.kube`, `.docker`, in any letter case): a command that
+  searches or reads one recursively (`grep -r`, `rg`, `find`, `ls -R`), names a folder or a file nested
+  inside one, changes into one (`cd`, `git -C`) or starts inside one is no longer checked as read-only.
+  Listing the top level by name and reading the documented public files still work. Only folders below
+  the project root count.
+- Git commands that the app checks as read-only (`git diff`, `git show`, `git status`, `git ls-files`)
+  now leave out files inside credential folders at any depth and in any letter case. They refuse a
+  pathspec with `..`, and `git diff` and `git show` refuse to print a single blob. The Changes view is
+  unchanged.
+- Replies, plans and side answers no longer load images from the web. A text placeholder shows the host
+  and the alt text (`Image not loaded from <host>: "<alt>"`). Images embedded as `data:` and `blob:` still
+  show. The page's content security policy now limits images and media to the app itself, `data:` and
+  `blob:`.
+- A chat no longer fails to save when text from the model holds half of a surrogate pair. A pair split
+  across two stream chunks becomes the intended character, and a lone half becomes U+FFFD. A turn now
+  always ends in a settled state when a save fails, and an unexpected save error is logged with its own
+  message.
+- A permission rule for a folder now also applies to another letter case, or another Unicode form, of the
+  same folder when the disk treats them as one folder (the macOS default). When the app cannot tell, a
+  deny or ask rule applies and an allow rule does not. The letter-case check no longer reads a disk
+  wrongly because of a folder name with a non-ASCII letter.
+- Opening a named pipe, a socket or another special file in Files is now refused at once. Before, it
+  could stall the whole app.
+- Reading a file now stops at the size limit, even when the file grows while the app reads it.
+- Removing a folder from Folder access, or removing an "Allow for this chat" rule, now also takes it from
+  that chat's running subagents. A call already running may finish, and the next one asks. A waiting card
+  for a path in the removed folder is blocked. Removing a folder under another spelling of the same
+  folder, such as another letter case on a case-insensitive disk, now removes the grant too.
+- Approval cards, plans, questions and permission lists now show hidden, control and direction-changing
+  characters as visible escapes such as `\u202e`, each marked, with a note on the card. Emoji sequences
+  and scripts that need joiners are left as they are. What the app sends when you approve is unchanged.
+  Right-to-left words are kept in typing order, so they cannot reorder a command. Hidden characters now
+  also include unassigned, private-use and default-ignorable characters, and a third combining mark on
+  one letter. The same escapes apply to diff lines and file paths in the Changes view, the rewind dialog
+  and the project trust dialog. A plan with very many hidden characters is shown as plain escaped text.
+
+Progress tracker (2026-11-14):
+
+- `PROGRESS.md` is new. It lists what is done and pending in each area of the app, with the
+  percentage implemented per area, each area's share of the app, an overall percentage and a ranked
+  table at the top.
+- `scripts/check_progress.py` is new. Without a flag it checks the file and exits 1 with one line per
+  stale number or structural problem. `--write` refreshes the numbers, the table order and the date
+  without changing any item. `--json` prints the computed numbers. CI runs the check.
+
+Two-file handoff memory (2026-11-14):
+
+- `/handoff` now writes two files. Each session adds a log, `handoffs/HANDOFF/<project>-handoff-vNN-YYYY-MM-DD-<topic>.md`,
+  with 12 fixed sections. A log is never edited later. The same run creates or fully rewrites the
+  project brief, `handoffs/<project>-00-context.md`, with 11 fixed sections and a session index of
+  every log. `<project>` is the name you give, else the Git repository name, else the workspace
+  folder name.
+- `/resume [project] [folder]` is new. At the start of a session it reads the brief and the newest
+  log only, replies with a five-line summary, the open items and the next action, and starts no
+  work. Older logs can hold facts that later became false, so the brief wins a conflict.
+- `/migrate-handoffs [project] [folder]` is new. Run it once per project. It moves old one-file
+  handoffs into `HANDOFF/` with zero-padded versions in date order and writes the brief.
+- `/read-handoff` is removed. `/handoff` now holds its rule for a compacted chat: it reads that
+  chat's automatic handoffs in `handoffs/auto/` by their Contents list and state sections, so its
+  log covers the chat from its start. The automatic handoffs themselves are unchanged.
+- Size limits: the brief aims for 32 KB and never goes over 48 KB. A log splits into `-part2.md` at
+  100 KB, or at the file write limit if that is lower. Neither file holds a secret value.
+
 Context accounting, file links and handoffs (2026-10-20):
 
 - The context meter no longer counts Databricks' cached tokens twice. On Claude endpoints
@@ -39,7 +175,7 @@ Context accounting, file links and handoffs (2026-10-20):
   file in and removes it. App versions old enough to reject these field records cannot open a chat
   saved since.
 - New shipped skill **`/read-handoff`**: reads a handoff's Contents or headings, then only the
-  sections that carry state, skipping command and activity logs, runbooks and resource lists.
+  sections that carry state, skipping command and activity logs, runbooks and resource lists. (Removed on 2026-11-14, see above.)
 
 Claude and VS Code themes (2026-10-20):
 

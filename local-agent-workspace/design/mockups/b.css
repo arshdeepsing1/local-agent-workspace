@@ -1,0 +1,112 @@
+/* Mock-up direction B, "Studio". A complete light style: every colour token of styles.css :root, the new token
+   groups (spacing, radius, type, control), then a short block of shape rules. Render it with
+   scripts/ui_screenshots.py --tokens design/mockups/b.css. This file is a mock-up, not part of the app. */
+:root {
+  color-scheme: light;
+  --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  --serif: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;  /* No serif in this direction. */
+  --font-mono: 'SF Mono', ui-monospace, Menlo, Consolas, monospace;
+
+  /* Surfaces and text */
+  --canvas: #f4f5f8; --sidebar: #eceef3; --surface: #ffffff; --surface-2: #eff1f5; --surface-3: #e0e4eb;
+  --ink: #171a21; --ink-2: #343a46; --muted: #596170;
+  --border: #dfe2e8; --border-strong: #7f8796;
+
+  /* Accent: one indigo for primary actions, selection and focus */
+  --accent: #4f46e5; --accent-hover: #4338ca; --accent-text: #4338ca; --accent-soft: #eceafd; --accent-border: #b4aef3;
+  --brand: #4f46e5; --on-accent: #ffffff; --on-ink: #ffffff;
+  --primary: #4f46e5; --primary-hover: #4338ca; --on-primary: #ffffff;
+  --focus: #4f46e5;
+
+  /* Status */
+  --danger: #b42318; --danger-soft: #fdecea; --danger-border: #f0b8b2;
+  --success: #1f7a4a; --success-soft: #e5f4ea;
+  --warning: #8a5a00; --warning-soft: #fbf0d5; --warning-border: #e3c88a;
+  --info: #1d64b8; --info-soft: #e6effa; --violet: #7c3aed;
+
+  /* Soft shadows lift the cards */
+  --shadow: rgba(23, 26, 33, .08); --shadow-strong: rgba(23, 26, 33, .18); --overlay: rgba(23, 26, 33, .35);
+
+  /* Terminal, previews, code */
+  --terminal-bg: #1e2230; --terminal-ink: #e4e7ee; --paper: #ffffff; --paper-check: #e6e9ef; --image-backing: transparent;
+  --code-keyword: #8f2d8f; --code-string: #1f6f43; --code-number: #9a4a00; --code-title: #2450b5; --code-type: #7a3fb0; --code-attr: #0b6b78;
+
+  /* Charts and the context card */
+  --chart-1: #4f46e5; --chart-2: #12956b; --chart-3: #e07a2f; --chart-4: #7b8494;
+  --ctx-messages: #4f46e5; --ctx-summary: #d99a2b; --ctx-system: #7b8494; --ctx-instructions: #b3bac6; --ctx-tools: #e0662f;
+  --ctx-mcp: #12956b; --ctx-overhead: #4b5261; --ctx-buffer: #d5d9e1; --ctx-reserved: #c1c7d1; --ctx-free: #e9ecf1;
+
+  /* New token groups (data model, section 6) */
+  --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px; --space-5: 20px; --space-6: 24px; --space-7: 32px; --space-8: 40px;
+  --radius-s: 8px; --radius-m: 12px; --radius-l: 16px;
+  --text-xs: calc(11px * var(--text-scale)); --text-s: calc(12px * var(--text-scale)); --text-m: calc(14px * var(--text-scale));
+  --text-l: calc(16px * var(--text-scale)); --text-xl: calc(20px * var(--text-scale));
+  --control-s: 28px; --control-m: 34px;
+  --lift: 0 1px 2px var(--shadow), 0 2px 8px var(--shadow);
+}
+
+/* ---- Shape rules (mock-up only): compact, rounded, cards lifted by a soft shadow, one accent ---- */
+/* Radii: small controls, cards, dialogs */
+:root[data-theme] :is(button,input,select,textarea,.outline,.primary,.context-chip,.code-copy,.code-label,.permission-trigger,.conversation-row,.conversation-row>button:first-child,.markdown code,.choice code,.remember-options code){border-radius:var(--radius-s)}
+:root[data-theme] :is(.composer,.composer textarea,.tool-card,.question-card,.plan-card,.plan-body,.run-head,.tool-group-head,.changes-bar,.task-checklist,.continue-bar,.queue-bar,.side-answer,.command-help,.reasoning-summary,.activity-summary,.context-details,.conversation-notice,.permissions-menu,.slash-menu,.row-menu,.tag-menu,.review-bar,.settings-note,.form-error,.panel-error,.remember-options,.approval-edit,.progress-item,.subagent-report,.terminal-output,.markdown pre,.tool-body pre,.conversation-search){border-radius:var(--radius-m)}
+:root[data-theme] :is(.settings-dialog,.agent-tools-dialog){border-radius:var(--radius-l)}
+:root[data-theme] .run-head.has-rows{border-radius:var(--radius-m) var(--radius-m) 0 0}
+:root[data-theme] .tool-card.run-member{border-radius:0}
+:root[data-theme] .tool-card.run-last{border-radius:0 0 var(--radius-m) var(--radius-m)}
+:root[data-theme] .split-button>button:first-child{border-radius:var(--radius-s) 0 0 var(--radius-s)}
+:root[data-theme] .split-button>.split-toggle{border-radius:0 var(--radius-s) var(--radius-s) 0}
+/* Cards: white, no visible outline, lifted */
+:root[data-theme] :is(.tool-card,.question-card,.plan-card,.changes-bar,.task-checklist,.queue-bar,.side-answer,.activity-summary,.reasoning-summary){border-color:transparent;box-shadow:var(--lift)}
+:root[data-theme] .tool-card.run-member{box-shadow:var(--lift);border-top-color:var(--border)}
+:root[data-theme] .run-head{background:var(--surface);border-color:transparent;box-shadow:var(--lift)}
+:root[data-theme] :is(.tool-card.needs-approval,.plan-card.needs-answer,.question-card.needs-answer,.run-batch-approval){background:var(--surface);border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft),var(--lift)}
+.remember-options,.approval-edit,.plan-body{background:var(--surface-2);border-color:transparent}
+.markdown pre,.tool-body pre{background:var(--surface-2)}
+/* Top bar and sidebar */
+.app-shell .topbar{background:var(--surface);border-bottom:1px solid var(--border);height:48px;min-height:48px}
+.app-shell .sidebar{padding:var(--space-3) var(--space-2) var(--space-3)}
+.app-shell .brand{margin-bottom:var(--space-3)}
+.app-shell .project-button{margin:var(--space-3) 0 var(--space-1);padding:var(--space-2) var(--space-3)}
+.app-shell .new-conversation{background:var(--surface);box-shadow:var(--lift);height:var(--control-m)}
+.app-shell .conversation-list{padding-top:var(--space-2)}
+.app-shell .section-label{margin-bottom:var(--space-2)}
+.app-shell .conversation-row{margin:1px 0}
+.app-shell .conversation-row>button:first-child{padding:6px var(--space-3);font-size:calc(13px*var(--text-scale))}
+.app-shell .conversation-row:hover{background:var(--surface-3)}
+.app-shell .conversation-row.selected{background:var(--surface);box-shadow:var(--lift)}
+.app-shell .conversation-row.selected>button:first-child{color:var(--accent-text);font-weight:600}
+.row-tags{margin-bottom:2px}
+.conversation-search{border-color:transparent;box-shadow:var(--lift);margin-bottom:var(--space-2)}
+.app-shell .sidebar-footer{padding-top:var(--space-2)}
+/* Messages: compact, the user's message in an accent bubble */
+.app-shell .transcript{padding-top:var(--space-3)}
+.app-shell .markdown,.app-shell .user-message{font-size:var(--text-m)}
+.app-shell .markdown,.app-shell .markdown p{line-height:1.6}
+.app-shell .markdown p{margin-bottom:var(--space-2)}
+.app-shell .markdown:not(.plan-body) h2{font-size:var(--text-xl);font-weight:650;margin:var(--space-1) 0 var(--space-2)}
+.app-shell .assistant-reply{margin:var(--space-3) 0}
+.app-shell .user-message{background:var(--accent-soft);border-radius:var(--radius-l) var(--radius-l) var(--space-1) var(--radius-l);padding:var(--space-2) var(--space-4);margin-bottom:var(--space-5);line-height:1.5}
+.tool-card,.plan-card,.question-card{margin-top:6px;margin-bottom:6px}
+.tool-heading{padding:var(--space-2) var(--space-3)}
+.tool-body pre{padding:var(--space-2) var(--space-3);margin:var(--space-2) 0}
+.activity-summary,.reasoning-summary{padding:var(--space-2) var(--space-3);margin-bottom:var(--space-3);background:var(--surface)}
+/* Buttons: rounded, filled accent for the main action */
+:root[data-theme] .outline{border-color:var(--border);box-shadow:0 1px 1px var(--shadow)}
+:root[data-theme] .outline:hover:not(:disabled){border-color:var(--border-strong)}
+:root[data-theme] .approval-buttons button{padding:6px var(--space-3)}
+.app-shell .welcome h1{font-weight:650;letter-spacing:-.4px}
+.app-shell .suggestions .outline{border-radius:999px;padding:var(--space-2) var(--space-4)}
+.context-chip{border-radius:999px;background:var(--surface)}
+/* Composer: a lifted white card with a round accent send button */
+.app-shell .composer,.app-shell .composer textarea{border-radius:var(--radius-l)}
+.app-shell .composer{border-color:transparent;box-shadow:0 1px 2px var(--shadow),0 6px 20px var(--shadow-strong)}
+.app-shell .composer:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft),0 6px 20px var(--shadow-strong)}
+.app-shell .composer textarea{font-size:var(--text-m);padding:var(--space-3) var(--space-4);min-height:44px}
+.app-shell .send-button{border-radius:999px;margin-bottom:7px}
+.changes-bar,.task-checklist,.queue-bar{margin-bottom:6px}
+/* Dialogs and menus: no outline, a deep soft shadow */
+:root[data-theme] :is(.settings-dialog,.agent-tools-dialog){border-color:transparent;box-shadow:0 24px 80px var(--shadow-strong),0 2px 8px var(--shadow)}
+:root[data-theme] :is(.permissions-menu,.slash-menu,.row-menu,.tag-menu,.review-bar){border-color:transparent;box-shadow:0 8px 30px var(--shadow-strong),0 1px 3px var(--shadow)}
+.dialog-content h2,.agent-tools-dialog h2{font-weight:650;font-size:var(--text-xl);letter-spacing:-.2px}
+.app-settings .settings-nav button[aria-current=true]{background:var(--accent-soft);color:var(--accent-text)}
+.workspace-panel{background:var(--surface);border-left:1px solid var(--border)}

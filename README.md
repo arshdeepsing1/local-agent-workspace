@@ -8,6 +8,8 @@ build step.
 
 See [`local-agent-workspace/README.md`](local-agent-workspace/README.md) for
 setup, usage and development.
+[`local-agent-workspace/PROGRESS.md`](local-agent-workspace/PROGRESS.md) tracks what is done and
+pending.
 
 Licensed under the [MIT License](LICENSE). Third-party files in
 `local-agent-workspace/frontend/static/vendor/` and `frontend/static/fonts/`

@@ -48,14 +48,73 @@ Check endpoint…) get short scripted answers, so the whole check can be rehears
 Scripted turns, chosen by words in your message (the agent only calls tools the chat offers):
   edit / keep      writes a file, then edits it twice with pauses (try Keep in between)
   job / background starts a background command and waits for it with wait_job
-  delegate         delegates a read-only survey to a subagent; "parallel" delegates two;
+  delegate         delegates a read-only survey to a subagent; "parallel" delegates two, "parallel" and "three" three;
                    "custom" uses the first custom agent of the system message's agent index
   ask              asks you a question with ask_user
   task             creates and completes tasks
   read             project_overview and read_file
+  browse the form  with an address in the message ("browse the form http://localhost:8123/form.html"): drives the browser
+                   tool through five steps (open the page, type a name, click Send order, read the page, screenshot)
   rate limit       the first request is answered with HTTP 429 and Retry-After: 2
   long             a long Markdown reply
+  step N           the long_chat scenario (below): a message that is exactly "step 1", "step 2" ...
+  question: ...    one of its ten fixed questions (below)
 anything else gets a short reply that says which effort and fields the request carried.
+
+The long_chat scenario drives a long, deterministic chat for testing context management. The user's
+messages are "step 1", "step 2" and so on (40 or more); each makes the model do that step's scripted work
+and reply. It is chosen like the other scenarios, by the words of the user's message (a message that is
+exactly "step <number>" or "question: <topic>", or one of the two standing instructions). Facts come up at
+fixed steps, and the reply of that step states the fixed text (the constants LONG_CHAT_GOAL, LONG_CHAT_TASKS,
+LONG_CHAT_DECISIONS, LONG_CHAT_INSTRUCTIONS and LONG_CHAT_CLOSED):
+
+  step  1  goal                    step  2  task 1 opened      step  3  decision 1
+  step  4  instruction 1 (the test sends the text of LONG_CHAT_INSTRUCTIONS[0], or "step 4: <that text>")
+  step  5  task 2 opened           step  7  decision 2
+  step  8  instruction 2 (LONG_CHAT_INSTRUCTIONS[1], same way)
+  step  9  task 3 opened           step 12  decision 3         step 18  decision 4
+  step 20  task 2 closed (LONG_CHAT_CLOSED), so tasks 1 and 3 stay open
+
+Every step calls one tool, so the context grows by a known size. Large results come from run_command with
+`yes '<text>' | head -c <bytes>` (exactly that many bytes of output; the command line is the same for
+the same step and size). Two files the test creates with long_chat_files(workspace) are read with read_file:
+long-chat/shared.txt (5,000 bytes, read again at the same arguments, so a later read supersedes an earlier
+one) and long-chat/small.txt (200 bytes). The bytes of a run_command step are the base size times the gateway's
+long_chat_scale (start_gateway(long_chat_scale=...), --long-chat-scale; default 1.0):
+
+  step                           tool         result (bytes, scale 1.0)
+  2, 7, 20                       run_command   6,000
+  3, 9, 18                       run_command  12,000
+  5, 12                          run_command  24,000
+  1, 4, 8 and every 7th step     read_file     small.txt, 200
+  6, 10 and every 5th step       read_file     shared.txt, 5,000 (steps 6, 10, 15, 25, 30, 35, 40)
+  any other step n               run_command   6,000, 12,000 or 24,000 for n % 3 == 0, 1 or 2
+
+(a step that is both a 5th and a 7th step reads shared.txt; the fixed steps above win.) The table is
+long_chat_plan(step, scale). With scale 1.0 the 40 steps put about 420 KB of results in the context.
+
+The ten questions are the whole message "question: goal", "question: open tasks", "question: decision 1"
+to "question: decision 4", "question: instruction 1", "question: instruction 2", "question: closed task"
+and "question: last step". The scripted model looks for the fixed text in the messages of the request it
+was sent (system message, summary, history) and replies with that text, or exactly "not in context" when it
+is missing. For "open tasks" it needs tasks 1 and 3 and replies LONG_CHAT_OPEN_TASKS; for "last step" it
+looks for the highest "Step N done." and replies "Last step: N". The gateway keeps nothing between requests.
+A reply that states a fact puts that text in the chat again: ask a question when the answer should show what
+survived compaction, and read its reply once.
+
+The app's summary, handoff and condense requests (not streamed) get a summary built from the request:
+under each "## " heading the system message asks for, the fixed texts found in the request are carried
+forward (the goal and the closed task under "Goal and current status", the open tasks under "Open tasks and
+next steps", the instructions under "User requirements, preferences and constraints", the decisions under
+"Decisions and reasons"). A section with nothing found says "None.". An app that drops a section loses its facts.
+
+Compactions: the estimate grows with the results above. With the app's defaults (context window 131,072,
+auto-compact at 90%: threshold 108,748 tokens) and scale 1.0 only one compaction is due (near step 29; scale 3
+gives four: near steps 12, 20, 29 and 37). Sizes are the parameter: with context_window 65,536 and the default
+scale 1.0 (threshold 49,766) three are due near steps 12, 22 and 31; with 32,768 (threshold 20,275) and
+long_chat_scale 0.25 five, near steps 11, 17, 25, 32 and 40 (estimates from the request sizes, the tool
+definitions and a 12 KB system message, the summary taken as 3 KB; the app's own messages move them a little).
+test_simulator.py checks that at least three are reachable under the last two.
 
 Conversations and settings live in a separate state folder (default .local/simulator), so
 simulated chats never mix with real ones. Your credential file is never read.
@@ -118,6 +177,124 @@ def endpoint_profile(endpoint):
     return {"family": "plain", "always_thinks": False, "default": None}
 SCENARIO_HINT = ("Try a message with one of these words: edit, job, delegate, parallel, ask, task, read, "
                  "rate limit, long.")
+
+# The long_chat scenario (see the module docstring). The texts have no quotes, backslashes or non-ASCII
+# characters, so they stay unchanged inside the JSON transcript a summary request carries.
+LONG_CHAT_GOAL = "Goal: build an example importer that converts notes.txt files in /project into Markdown pages."
+LONG_CHAT_TASKS = ("Task 1: write the notes.txt parser and its tests.",
+                   "Task 2: draft the report format for the converted pages.",
+                   "Task 3: add a dry-run option to the importer.")
+LONG_CHAT_CLOSED = "Closed task 2: the report format was agreed with the user."
+LONG_CHAT_DECISIONS = (
+    "Decision 1: keep the intermediate files as JSON Lines, because they append safely and diff cleanly.",
+    "Decision 2: parse notes.txt line by line, because the files can be larger than memory allows.",
+    "Decision 3: write the Markdown pages next to the sources, because reviewers open them from the same folder.",
+    "Decision 4: skip files that did not change, because a full run took too long in the trial.")
+LONG_CHAT_INSTRUCTIONS = ("Always answer in British English", "Never edit files under vendor/")
+LONG_CHAT_OPEN_TASKS = "Open tasks: " + LONG_CHAT_TASKS[0] + " " + LONG_CHAT_TASKS[2]
+LONG_CHAT_NOT_IN_CONTEXT = "not in context"
+LONG_CHAT_QUESTIONS = ("goal", "open tasks", "decision 1", "decision 2", "decision 3", "decision 4",
+                       "instruction 1", "instruction 2", "closed task", "last step")
+# step: the fact that step's reply states (an index into the tuples above, or "goal" / "closed").
+LONG_CHAT_FACT_STEPS = {1: ("goal", 0), 2: ("task", 0), 3: ("decision", 0), 4: ("instruction", 0), 5: ("task", 1),
+                        7: ("decision", 1), 8: ("instruction", 1), 9: ("task", 2), 12: ("decision", 2),
+                        18: ("decision", 3), 20: ("closed", 0)}
+LONG_CHAT_SIZES = (6_000, 12_000, 24_000)  # run_command result bytes at scale 1.0 (see long_chat_plan)
+LONG_CHAT_FIXED_SIZES = {2: 6_000, 3: 12_000, 5: 24_000, 7: 6_000, 9: 12_000, 12: 24_000, 18: 12_000, 20: 6_000}
+LONG_CHAT_SHARED = ("long-chat/shared.txt", 5_000)
+LONG_CHAT_SMALL = ("long-chat/small.txt", 200)
+LONG_CHAT_STEP = re.compile(r"step (\d{1,4})", re.IGNORECASE)
+LONG_CHAT_QUESTION = re.compile(r"question: (" + "|".join(LONG_CHAT_QUESTIONS) + ")", re.IGNORECASE)
+LONG_CHAT_DONE = re.compile(r"Step (\d+) done\.")
+
+
+def long_chat_files(workspace):
+    """Create the two files the long_chat scenario reads under workspace/long-chat (same content every time);
+    returns their paths."""
+    folder = Path(workspace) / "long-chat"
+    folder.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for name, size in (LONG_CHAT_SHARED, LONG_CHAT_SMALL):
+        lines, total, number = [], 0, 0
+        while total < size:
+            number += 1
+            line = f"{Path(name).stem} line {number:04d} of the long chat fixture"[:49].ljust(49)
+            lines.append(line)
+            total += len(line) + 1
+        content = "\n".join(lines)[:size - 1] + "\n"
+        path = Path(workspace) / name
+        path.write_text(content)
+        paths.append(path)
+    return paths
+
+
+def long_chat_plan(step, scale=1.0):
+    """The tool call of a long_chat step: {"tool", "arguments", "bytes"} (the bytes its result carries, before the
+    app's own framing)."""
+    if step not in LONG_CHAT_FIXED_SIZES:
+        read = (LONG_CHAT_SHARED if step in (6, 10) or step % 5 == 0
+                else LONG_CHAT_SMALL if step in (1, 4, 8) or step % 7 == 0 else None)
+        if read:
+            return {"tool": "read_file", "arguments": {"path": read[0], "max_lines": 400}, "bytes": read[1]}
+    size = max(200, int(LONG_CHAT_FIXED_SIZES.get(step, LONG_CHAT_SIZES[step % 3]) * scale))
+    return {"tool": "run_command", "bytes": size,
+            "arguments": {"command": f"yes 'long chat step {step} filler line' | head -c {size}", "timeout_seconds": 30}}
+
+
+def long_chat_fact(step):
+    """The fixed text the reply of this step states, or None."""
+    kind = LONG_CHAT_FACT_STEPS.get(step)
+    if not kind:
+        return None
+    name, index = kind
+    return {"goal": lambda: LONG_CHAT_GOAL, "closed": lambda: LONG_CHAT_CLOSED,
+            "task": lambda: LONG_CHAT_TASKS[index], "decision": lambda: LONG_CHAT_DECISIONS[index],
+            "instruction": lambda: "Understood. Standing instruction: " + LONG_CHAT_INSTRUCTIONS[index] + "."}[name]()
+
+
+def request_text(messages):
+    return "\n".join(text_of(message.get("content")) for message in messages if isinstance(message, dict))
+
+
+def long_chat_answer(topic, request):
+    """The reply to "question: <topic>", from the text of the request alone."""
+    topic = topic.lower()
+    if topic == "last step":
+        steps = [int(number) for number in LONG_CHAT_DONE.findall(request)]
+        return f"Last step: {max(steps)}" if steps else LONG_CHAT_NOT_IN_CONTEXT
+    if topic == "open tasks":
+        found = LONG_CHAT_TASKS[0] in request and LONG_CHAT_TASKS[2] in request
+        return LONG_CHAT_OPEN_TASKS if found else LONG_CHAT_NOT_IN_CONTEXT
+    kind, _, number = topic.partition(" ")
+    text = (LONG_CHAT_GOAL if topic == "goal" else LONG_CHAT_CLOSED if topic == "closed task"
+            else (LONG_CHAT_DECISIONS if kind == "decision" else LONG_CHAT_INSTRUCTIONS)[int(number) - 1])
+    return text if text in request else LONG_CHAT_NOT_IN_CONTEXT
+
+
+def long_chat_summary(messages):
+    """A summary built from a compaction request (None when the request carries nothing of the long chat): under
+    each "## " heading the system message asks for, the fixed texts found in the request."""
+    request = request_text(messages)
+    system = next((text_of(message.get("content")) for message in messages if message.get("role") == "system"), "")
+    headings = re.findall(r"^## (.+)$", system, flags=re.M)
+    found = {name: [text for text in texts if text in request] for name, texts in (
+        ("goal", (LONG_CHAT_GOAL,)), ("closed", (LONG_CHAT_CLOSED,)), ("tasks", LONG_CHAT_TASKS),
+        ("instructions", LONG_CHAT_INSTRUCTIONS), ("decisions", LONG_CHAT_DECISIONS))}
+    steps = [int(number) for number in LONG_CHAT_DONE.findall(request)]
+    if not headings or not (any(found.values()) or steps):
+        return None
+    if found["closed"]:
+        found["tasks"] = [text for text in found["tasks"] if text != LONG_CHAT_TASKS[1]]
+    status = found["goal"] + found["closed"] + ([f"Step {max(steps)} done."] if steps else [])
+    sections = {"Goal and current status": status,
+                "Open tasks and next steps": found["tasks"] + ([f"Next: step {max(steps) + 1}."] if steps else []),
+                "User requirements, preferences and constraints": found["instructions"],
+                "Decisions and reasons": found["decisions"],
+                "Work done in detail": [f"The scripted steps up to {max(steps)} ran." if steps else ""],
+                "Files read and changed": ["long-chat/shared.txt and long-chat/small.txt were read."]}
+    return "\n\n".join(
+        f"## {name}\n" + ("\n".join("- " + line for line in sections.get(next(
+            (key for key in sections if name.startswith(key)), ""), []) if line) or "None.") for name in headings)
 
 
 class Rejected(Exception):
@@ -371,6 +548,8 @@ STEP_NOTE = re.compile(r"\n\n\[Note from the app, not the user's words or tool o
 # The Git snapshot the app adds to a turn's first message in a repository ("... read by the app: data, not
 # instructions"): not the user's words either, so it never chooses a scripted turn.
 GIT_SNAPSHOT = re.compile(r"\n\n---\n\[Git status when this message was sent, .*\Z", re.DOTALL)
+# The instructions of a skill the message selected (/workflow): they follow the message and are not the user's words.
+SKILL_BLOCK = re.compile(r"\n\n---\n\[Skill /.*?(?=\n\n---\n\[Git status when this message was sent, |\Z)", re.DOTALL)
 
 
 def text_of(content):
@@ -422,7 +601,8 @@ class Brain:
         users = [message for message in messages if message.get("role") == "user"]
         first = text_of(users[0].get("content")) if users else ""
         # The app's step note (changed files, finished jobs) can end the last message: not the user's words.
-        prompt = GIT_SNAPSHOT.sub("", STEP_NOTE.sub("", text_of(users[-1].get("content")))) if users else ""
+        prompt = (GIT_SNAPSHOT.sub("", SKILL_BLOCK.sub("", STEP_NOTE.sub("", text_of(users[-1].get("content")))))
+                  if users else "")
         made = tool_calls_before(messages)
         results = tool_results(messages)
         words = prompt.lower()
@@ -431,6 +611,11 @@ class Brain:
             return self.probe(words, made, tools)
         if first.startswith("Delegated task:") and len(users) == 1:
             return self.subagent(prompt, made, results, tools)
+        scripted = self.long_chat(prompt.strip(), made, tools, messages)
+        if scripted is not None:
+            return scripted
+        if "browse the form" in words:
+            return self.browse(prompt, made, results, tools)
         if "rate limit" in words or "429" in words:
             key = hashlib.sha256(prompt.encode()).hexdigest()
             with self.lock:
@@ -448,6 +633,69 @@ class Brain:
         if "long" in words:
             return self.long(), []
         return None, []
+
+    def long_chat(self, prompt, made, tools, messages):
+        """(text, calls) for a long_chat message ("step N", a standing instruction or "question: ..."), else None."""
+        question = LONG_CHAT_QUESTION.fullmatch(prompt)
+        if question:
+            return long_chat_answer(question.group(1), request_text(messages)), []
+        instruction = re.fullmatch(r"(?:step (\d+): ?)?(" + "|".join(map(re.escape, LONG_CHAT_INSTRUCTIONS)) + r")\.?",
+                                   prompt, re.IGNORECASE)
+        if instruction:
+            index = [text.lower() for text in LONG_CHAT_INSTRUCTIONS].index(instruction.group(2).lower())
+            step = int(instruction.group(1) or (4, 8)[index])
+        else:
+            match = LONG_CHAT_STEP.fullmatch(prompt)
+            if not match:
+                return None
+            step = int(match.group(1))
+        plan = long_chat_plan(step, Gateway.long_chat_scale)
+        if made or plan["tool"] not in tools:
+            fact = long_chat_fact(step)
+            return (fact + "\n\n" if fact else "") + f"Step {step} done.", []
+        what = "a generated command" if plan["tool"] == "run_command" else plan["arguments"]["path"]
+        return f"Step {step}: working with {what}.", [call(plan["tool"], **plan["arguments"])]
+
+    def browse(self, prompt, made, results, tools):
+        """The browser scenario: open the page the message names, type a name into its form, click Send order, read the
+        result page and take a screenshot. Each step reads its control's ref (r4 and so on) from the page text the
+        browser tool returned, as a model would, so the page may be any form with a field named name and a Send order
+        button (the test's own page server)."""
+        if "browser" not in tools:
+            return "The browser tool is turned off in this chat, so the browse scenario cannot run.", []
+        found = re.search(r"https?://\S+", prompt)
+        if not found:
+            return "Name the page to browse, for example: browse the form http://localhost:8123/form.html", []
+        step = len(made)
+
+        def page(index):
+            """The page text of the browser result of an earlier step."""
+            text = results.get(made[index].get("id"), "")
+            try:
+                return json.loads(text).get("output", text)
+            except ValueError:
+                return text
+
+        def ref(index, pattern):
+            match = re.search(rf"\[(r\d+)\] {pattern}", page(index))
+            return match.group(1) if match else None
+        if step == 0:
+            return "Opening the form.", [call("browser", action="open", url=found.group(0))]
+        if step == 1:
+            name = ref(0, r"input type=text name=name")
+            if not name:
+                return "The form has no name field: " + page(0)[:200], []
+            return "Typing the name.", [call("browser", action="type", ref=name, text="Ada Lovelace")]
+        if step == 2:
+            button = ref(0, r'button "Send order"')
+            if not button:
+                return "The form has no Send order button.", []
+            return "Sending the order.", [call("browser", action="click", ref=button)]
+        if step == 3:
+            return "Reading the result page.", [call("browser", action="read")]
+        if step == 4:
+            return "Taking a screenshot.", [call("browser", action="screenshot")]
+        return "Browse finished: the order was received.", []
 
     def probe(self, words, made, tools):
         """Short answers to the app's endpoint checks (endpoint_probes.py)."""
@@ -517,10 +765,14 @@ class Brain:
                         "(see Custom agents in the README).", [])
             extra = {"agent_type": custom[0]}
         tasks = ["Survey the project: list its top-level folders and name the three most important files.",
-                 "Find the README and summarize what the project does in three bullet points."]
+                 "Find the README and summarize what the project does in three bullet points.",
+                 "List the test folders and name how the tests are run."]
         if "parallel" not in words:
             tasks = tasks[:1]
-        return ("Delegating " + ("two independent surveys in parallel." if len(tasks) > 1 else "a read-only survey."),
+        elif not re.search(r"\bthree\b", words):
+            tasks = tasks[:2]
+        return ("Delegating " + (f"{'three' if len(tasks) > 2 else 'two'} independent surveys in parallel." if len(tasks) > 1
+                                 else "a read-only survey."),
                 [call("delegate_task", task=task, context="Simulated run: be brief.", max_steps=4, **extra)
                  for task in tasks])
 
@@ -606,6 +858,7 @@ class Gateway(BaseHTTPRequestHandler):
     response_format_mode = "accept"
     prompt_cache = PromptCache()
     speed = 1.0
+    long_chat_scale = 1.0
     protocol_version = "HTTP/1.1"
 
     def log_message(self, format, *args):
@@ -678,6 +931,8 @@ class Gateway(BaseHTTPRequestHandler):
         request = "\n".join(text_of(message.get("content")) for message in messages)
         if "Create a short title" in request:
             text = "Simulated conversation"
+        elif long_chat_summary(messages) is not None:
+            text = long_chat_summary(messages)  # A compaction request of a long_chat: built from the request.
         else:
             headings = list(dict.fromkeys(re.findall(r"^## (.+)$", request, flags=re.M)))
             text = ("\n\n".join(f"## {name}\nSimulated summary content for {name.lower()}." for name in headings)
@@ -788,10 +1043,11 @@ def demo_workspace(state):
 
 
 def start_gateway(port=0, *, claude_fields="both", cache="accept", replay="accept", vision="accept",
-                  response_format="accept", speed=1.0):
+                  response_format="accept", speed=1.0, long_chat_scale=1.0):
     """Start the fake gateway on 127.0.0.1:port (0: any free port) in a daemon thread, with a fresh prompt cache
     and rate-limit marks: (server, its URL). server.shutdown() and server.server_close() stop it."""
     Gateway.claude_fields, Gateway.cache_mode, Gateway.speed = claude_fields, cache, max(0.0, speed)
+    Gateway.long_chat_scale = max(0.01, long_chat_scale)
     Gateway.replay_mode, Gateway.vision_mode, Gateway.response_format_mode = replay, vision, response_format
     Gateway.prompt_cache, Gateway.brain = PromptCache(), Brain()
     server = ThreadingHTTPServer(("127.0.0.1", port), Gateway)
@@ -861,11 +1117,14 @@ def main():
     parser.add_argument("--response-format", choices=("accept", "reject"), default="accept",
                         help="whether response_format is taken together with tools")
     parser.add_argument("--speed", type=float, default=1.0, help="multiplies simulated thinking and typing time")
+    parser.add_argument("--long-chat-scale", type=float, default=1.0,
+                        help="multiplies the result sizes of the run_command steps of the long_chat scenario")
     parser.add_argument("--gateway-only", action="store_true", help="run only the fake gateway (for your own launcher)")
     args = parser.parse_args()
 
     _, gateway = start_gateway(args.gateway_port, claude_fields=args.claude_fields, cache=args.cache, replay=args.replay,
-                               vision=args.vision, response_format=args.response_format, speed=args.speed)
+                               vision=args.vision, response_format=args.response_format, speed=args.speed,
+                               long_chat_scale=args.long_chat_scale)
     log(f"fake Databricks gateway on {gateway} (Claude reasoning fields accepted: {args.claude_fields}; "
         f"cache markers: {args.cache}; thinking sent back: {args.replay}; images: {args.vision}; "
         f"response_format: {args.response_format})")
