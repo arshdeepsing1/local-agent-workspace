@@ -32,6 +32,8 @@ jobs:
         run: python -m playwright install ${{ runner.os == 'Linux' && '--with-deps' || '' }} chromium
       - name: Personal-data check
         run: python scripts/check_personal_data.py
+      - name: Progress tracker numbers
+        run: python scripts/check_progress.py
       - name: Lint (errors and unused names)
         run: python -m ruff check --select F,E9 backend frontend/tests scripts
       # ripgrep is optional for the app; the tests compare search results with and without it.
