@@ -46,6 +46,14 @@ def waiting(live):
     return [event for event in live["events"] if event.get("name") == "delegate_task" and event.get("state") == "pending"]
 
 
+def asks_alone(manager, live, call_id):
+    """The card asks on its own, as the page shows it with buttons: pending, out of its batch (no batch_approval) and
+    not queued behind a decided batch (no batch_decided), with its own approval wait registered."""
+    item = card(live, call_id)
+    return (item["state"] == "pending" and not {"batch_approval", "batch_decided"} & set(item)
+            and (live["id"], item["id"]) in manager.pending)
+
+
 async def waiting_batch(manager, parent, size=3):
     """Wait until `size` delegate_task cards wait; returns the live chat."""
     await eventually(lambda: manager.live.get(parent["id"]) and len(waiting(manager.live[parent["id"]])) == size)
@@ -202,7 +210,7 @@ async def test_review_one_by_one_asks_today_s_cards_in_turn_and_each_is_answered
     batch = waiting(live)[0]["batch_approval"]["id"]
     manager.review_batch(parent["id"], batch)
     for call_id, allowed in (("call-1", True), ("call-2", False), ("call-3", True)):
-        await eventually(lambda: card(live, call_id)["state"] == "pending" and "batch_approval" not in card(live, call_id))
+        await eventually(lambda: asks_alone(manager, live, call_id))
         # The card now asks alone, with its own wait; the later ones still wait their turn.
         assert [key[1] for key in manager.pending if key[0] == parent["id"]] == [card(live, call_id)["id"]]
         assert started(gateway) == []
@@ -227,7 +235,7 @@ async def test_answering_one_card_by_its_event_id_falls_back_to_cards_and_answer
     live = await waiting_batch(manager, parent)
     ids = {item["call_id"]: item["id"] for item in waiting(live)}
     manager.decide(parent["id"], ids["call-3"], False, note="Skip the third")
-    await eventually(lambda: card(live, "call-1")["state"] == "pending" and "batch_approval" not in card(live, "call-1"))
+    await eventually(lambda: asks_alone(manager, live, "call-1"))
     manager.decide(parent["id"], ids["call-2"], True)  # Its turn has not come: the answer waits for it.
     manager.decide(parent["id"], ids["call-1"], True)
     await asyncio.wait_for(manager.tasks[parent["id"]], 10)
@@ -676,7 +684,7 @@ async def allow_all_and_wait_for_second(manager, parent):
     manager.start(parent["id"], "Delegate three")
     live = await waiting_batch(manager, parent)
     manager.decide(parent["id"], waiting(live)[0]["batch_approval"]["id"], True)
-    await eventually(lambda: card(live, "call-2")["state"] == "pending" and "batch_approval" not in card(live, "call-2"))
+    await eventually(lambda: asks_alone(manager, live, "call-2"))
     return live
 
 
@@ -820,7 +828,7 @@ async def test_calls_that_wait_behind_a_hook_card_after_allow_all_are_decided_an
     live = await waiting_batch(manager, parent)
     batch = waiting(live)[0]["batch_approval"]["id"]
     manager.decide(parent["id"], batch, True)
-    await eventually(lambda: card(live, "call-1")["state"] == "pending" and "batch_approval" not in card(live, "call-1"))
+    await eventually(lambda: asks_alone(manager, live, "call-1"))
     assert not any(undecided(item) for item in live["events"])
     for call_id in ("call-2", "call-3"):
         queued = card(live, call_id)
@@ -856,13 +864,13 @@ async def test_a_rule_that_settles_one_call_leaves_the_others_to_ask_alone_and_n
     batch = waiting(live)[0]["batch_approval"]["id"]
     rule["on"] = True
     await manager.recheck_pending(live, "rules")
-    await eventually(lambda: card(live, "call-1")["state"] == "pending" and "batch_approval" not in card(live, "call-1"))
+    await eventually(lambda: asks_alone(manager, live, "call-1"))
     assert not any(undecided(item) for item in live["events"])
     assert card(live, "call-2")["batch_decided"] == "allowed" and card(live, "call-3")["batch_decided"] == "ask"
     with pytest.raises(ValueError, match="no longer pending"):
         manager.decide(parent["id"], batch, True)
     manager.decide(parent["id"], card(live, "call-1")["id"], True)
-    await eventually(lambda: card(live, "call-3")["state"] == "pending" and "batch_decided" not in card(live, "call-3"))
+    await eventually(lambda: asks_alone(manager, live, "call-3"))
     manager.decide(parent["id"], card(live, "call-3")["id"], True)
     await asyncio.wait_for(manager.tasks[parent["id"]], 10)
     saved = manager.store.get(parent["id"])
@@ -903,7 +911,7 @@ async def test_no_broadcast_after_a_batch_decision_carries_an_undecided_batch_ap
         mark = len(sent)
         if decision == "review":
             manager.review_batch(parent["id"], batch)
-            await eventually(lambda: card(live, "call-1")["state"] == "pending" and "batch_approval" not in card(live, "call-1"))
+            await eventually(lambda: asks_alone(manager, live, "call-1"))
             manager.decide(parent["id"], card(live, "call-1")["id"], False)
             manager.decide(parent["id"], card(live, "call-2")["id"], False)
             manager.decide(parent["id"], card(live, "call-3")["id"], False)
@@ -975,7 +983,7 @@ async def test_a_call_a_rule_allows_during_review_records_no_card_and_a_shown_ca
     manager.start(parent["id"], "Delegate three")
     live = await waiting_batch(manager, parent)
     manager.review_batch(parent["id"], waiting(live)[0]["batch_approval"]["id"])
-    await eventually(lambda: card(live, "call-1")["state"] == "pending" and "batch_approval" not in card(live, "call-1"))
+    await eventually(lambda: asks_alone(manager, live, "call-1"))
     live.setdefault("allow_rules", []).append({"behavior": "allow", "tool": "delegate_task"})
     await manager.rules_changed("chat", live)
     await asyncio.wait_for(manager.tasks[parent["id"]], 10)
