@@ -4611,7 +4611,8 @@ check.
 
 GitHub Actions (`.github/workflows/tests.yml` at the repository root) runs the personal-data
 check, the lint check and the backend, UI and end-to-end tests on Ubuntu and macOS for pull
-requests, pushes to `main`, and on demand. It uses no credentials and makes no model calls. Notable changes are
+requests, pushes to `main`, and on demand. Each system has two jobs: the checks and the backend
+tests, and the UI and end-to-end tests. It uses no credentials and makes no model calls. Notable changes are
 listed in `CHANGELOG.md`.
 
 `python -m playwright install chromium` downloads Playwright's own Chromium; to use

@@ -12,13 +12,15 @@ permissions:
 
 jobs:
   test:
+    name: ${{ matrix.suite }} (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        # Two jobs per system: on macOS the backend tests alone take about 16 minutes.
+        suite: [backend, ui]
     runs-on: ${{ matrix.os }}
-    # macOS needs about 35 minutes since the browser, workflow and proxy tests were added.
-    timeout-minutes: 45
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: local-agent-workspace
@@ -29,32 +31,38 @@ jobs:
           python-version: "3.12"
       - name: Install the app with test and lint extras
         run: python -m pip install -c constraints.txt -e './backend[test,ui-test,lint]'
-      - name: Install Chromium for the UI tests
+      # Both suites need Chromium: the backend's browser tests drive a real one.
+      - name: Install Chromium
         run: python -m playwright install ${{ runner.os == 'Linux' && '--with-deps' || '' }} chromium
       - name: Personal-data check
+        if: matrix.suite == 'backend'
         run: python scripts/check_personal_data.py
       - name: Progress tracker numbers
+        if: matrix.suite == 'backend'
         run: python scripts/check_progress.py
       - name: Lint (errors and unused names)
+        if: matrix.suite == 'backend'
         run: python -m ruff check --select F,E9 backend frontend/tests scripts
-      # ripgrep is optional for the app; the tests compare search results with and without it.
+      # ripgrep is optional for the app; the backend tests compare search results with and without it.
       - name: Install ripgrep (Linux)
-        if: runner.os == 'Linux'
+        if: matrix.suite == 'backend' && runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y ripgrep
       - name: Install ripgrep (macOS)
-        if: runner.os == 'macOS'
+        if: matrix.suite == 'backend' && runner.os == 'macOS'
         run: brew install ripgrep
         env:
           HOMEBREW_NO_AUTO_UPDATE: "1"
       - name: Backend tests
+        if: matrix.suite == 'backend'
         working-directory: local-agent-workspace/backend
         run: python -m pytest -q
       - name: UI tests
+        if: matrix.suite == 'ui'
         working-directory: local-agent-workspace/frontend
         run: python -m pytest -q --ignore=tests/e2e
       # The real page and app against the offline simulator (scripts/simulate_databricks.py): under a minute.
       # It runs, and reports, also when an earlier test step failed.
       - name: End-to-end tests
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.suite == 'ui' }}
         working-directory: local-agent-workspace/frontend
         run: python -m pytest -q tests/e2e

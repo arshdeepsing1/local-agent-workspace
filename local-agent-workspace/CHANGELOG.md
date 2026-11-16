@@ -35,6 +35,9 @@ Agent workspace upgrade (2026-11-15), the eight items in short:
 - Workflows: each subagent chat stays a separate file linked to its parent, `/workflow <task>` starts a
   parallel batch, and one approval covers a batch (details below).
 - Fixes: several rounds of security and reliability fixes (details below).
+- Continuous integration: the tests now pass on Ubuntu as well as macOS. Several new tests had only run on
+  macOS. CI runs the backend and the UI tests as separate jobs on each system, so each job stays under
+  its 30-minute limit.
 
 Workflows (2026-11-15):
 
